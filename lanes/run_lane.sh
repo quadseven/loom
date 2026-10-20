@@ -71,6 +71,7 @@ LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_ROOT/../infra-public/.github/scripts/check_private_leaks.py}"
 INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
 
@@ -235,7 +236,7 @@ summary_note() {
 # tickets took six or more rounds: no lane ran a test before opening its pull
 # request, and most fix rounds answered review findings a checklist covers.
 work_note() {
-  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
+  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
 # Lists the files the agent's commits added (BASE..HEAD) that only probe the
@@ -1881,6 +1882,7 @@ fi
 
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
+  PR_BODY=""
   TICKET="$(basename "$BRIEF" .md)"
   REPO="$(field Repo "$BRIEF")"
   BRANCH="$(field Branch "$BRIEF")"
@@ -1985,16 +1987,20 @@ for BRIEF in "$INBOX"/*.md; do
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
     park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue
   fi
+  if ! REPO_PRIVATE="$(timeout "$NET_TIMEOUT" gh api "repos/$REPO" --jq .private)"; then
+    echo "$TICKET: gh api repos/$REPO failed; will retry next pass" >&2; continue
+  fi
+  case "$REPO_PRIVATE" in
+    true|false) ;;
+    *) echo "$TICKET: unexpected privacy answer '$REPO_PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
+  esac
   # Providers that train on prompts take public repos only. Asked before the
   # clone; a failed lookup proves nothing, so the brief waits for the next pass.
   if trains_on_prompts; then
-    if ! PRIVATE="$(timeout "$NET_TIMEOUT" gh api "repos/$REPO" --jq .private)"; then
-      echo "$TICKET: gh api repos/$REPO failed; will retry next pass" >&2; continue
-    fi
-    case "$PRIVATE" in
+    case "$REPO_PRIVATE" in
       false) ;;
       true) park "$BRIEF" "$REPO is private; lane $LANE with $MODEL trains on prompts and takes public repos only"; continue ;;
-      *) echo "$TICKET: unexpected privacy answer '$PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
+      *) echo "$TICKET: unexpected privacy answer '$REPO_PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
     esac
   fi
 
@@ -2272,6 +2278,40 @@ for BRIEF in "$INBOX"/*.md; do
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
   fi
+  if [ "$REPO_PRIVATE" = false ]; then
+    if [ ! -f "$LEAK_SCANNER" ]; then
+      park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed" transient
+      continue
+    fi
+    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$BASE..HEAD" 2>&1)"; then
+      park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
+      continue
+    fi
+    printf '%s\n' "$LEAK_OUT" >> "$LOG"
+    if [ -z "$FIX_PR" ]; then
+      INTENT_CLASS=""
+      INTENT_TEXT=""
+      prepare_intent "$BRIEF" >> "$LOG" 2>&1
+      if [ -n "$DROPPED_FILES" ]; then
+        INTENT_TEXT="${INTENT_TEXT}
+- Dropped sandbox probe files: ${DROPPED_FILES//$'\n'/, }"
+      fi
+      PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+      PR_BODY="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
+        'import sys; from bus.factory import SCAN_REF_RE; owner, name = sys.argv[1].lower().split("/", 1); f = lambda m: m.group(0) if m.group(2).lower() == name and (m.group(1) or owner).lower() == owner else "issue %s of another repo" % m.group(3); print("\n".join(SCAN_REF_RE.sub(f, x) for x in sys.stdin.read().splitlines()))' "$REPO")" || {
+        park "$BRIEF" "could not prepare public repo PR text; nothing pushed" transient; continue
+      }
+      BODY_FILE="$(mktemp "$LOOM_HOME/run/$SLOT-leak-body.XXXXXX")"
+      printf '%s\n' "$PR_BODY" > "$BODY_FILE"
+      if ! LEAK_OUT="$(timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$BODY_FILE" 2>&1)"; then
+        rm -f "$BODY_FILE"
+        park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $LEAK_OUT"
+        continue
+      fi
+      rm -f "$BODY_FILE"
+      printf '%s\n' "$LEAK_OUT" >> "$LOG"
+    fi
+  fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
   if [ -n "$FIX_PR" ] && ! fix_pr_open; then
@@ -2367,17 +2407,14 @@ for BRIEF in "$INBOX"/*.md; do
     mv "$BRIEF" "$INBOX/done/"
     continue
   fi
-  INTENT_CLASS=""
-  INTENT_TEXT=""
-  prepare_intent "$BRIEF" >> "$LOG" 2>&1
-  # Name every sandbox probe file the runner dropped, per the ticket.
-  if [ -n "$DROPPED_FILES" ]; then
-    INTENT_TEXT="${INTENT_TEXT}
-- Dropped sandbox probe files: ${DROPPED_FILES//$'\n'/, }"
+  if [ "$REPO_PRIVATE" = true ]; then
+    INTENT_CLASS=""
+    INTENT_TEXT=""
+    prepare_intent "$BRIEF" >> "$LOG" 2>&1
   fi
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
-  PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+  [ -n "${PR_BODY:-}" ] || PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
   # Briefs are checked when filed, so this only fires on a brief filed
   # before that check or edited by hand: the PR still opens (the work is
   # done), and the log names what the review bot will hold it for.
