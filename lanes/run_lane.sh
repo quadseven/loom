@@ -1755,7 +1755,12 @@ update_fix_branch() {
   fi
   timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
     merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
-  FIX_UPSTREAM="origin/$default"
+  # The commit, not the ref: the scope check and the leak scan read it after
+  # the agent ran.
+  if ! FIX_UPSTREAM="$(git -C "$TREE" rev-parse --verify -q "origin/$default^{commit}")" ||
+     [ -z "$FIX_UPSTREAM" ]; then
+    UPDATE_REASON="could not read origin/$default"; return 1
+  fi
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        merge --no-edit "origin/$default" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] $TICKET: merged $default into $BRANCH" >> "$LOG"
@@ -2422,7 +2427,12 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed" transient
       continue
     fi
-    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$BASE..HEAD" 2>&1)"; then
+    # A fix round that merged the default branch scans what the pull request
+    # adds to it: BASE..HEAD would hold all the default branch gained since,
+    # text that branch's own CI accepts and the scan of a lane's change flags.
+    SCAN_RANGE="$BASE..HEAD"
+    [ -n "$FIX_UPSTREAM" ] && SCAN_RANGE="$FIX_UPSTREAM...HEAD"
+    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$SCAN_RANGE" 2>&1)"; then
       park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
       continue
     fi

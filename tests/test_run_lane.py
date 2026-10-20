@@ -1537,6 +1537,31 @@ cat > /dev/null
         self.assertIn(before, self.parents(after))
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
+    def test_a_fix_round_that_merges_main_scans_only_what_the_pull_request_adds(self):
+        # The default branch may carry text the public repo scan flags in a
+        # lane's change (its own issue refs, which its own CI accepts); a fix
+        # round that merges it is not refused for them (2026-10-20).
+        name, before = self.fix_brief()
+        self.advance_main("main.txt", "see other#5\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("leak scan failed", self.run_log(name + ".log"))
+        after = self.remote_head(self.FIX_BRANCH)
+        self.assertEqual(self.remote_file(after, "main.txt"), "see other#5\n")
+        self.assertIn(before, self.parents(after))
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_that_merges_main_still_scans_the_agents_change(self):
+        name, before = self.fix_brief()
+        self.advance_main("main.txt", "main moved\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "echo 'see other#9' > first.txt\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("public repo leak scan failed", self.run_log(name + ".log"))
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+
     def test_a_fix_round_that_adds_a_stray_file_beside_a_merge_is_refused(self):
         # main.txt came in with the merge, so only the agent's file is named.
         name, before = self.fix_brief()
