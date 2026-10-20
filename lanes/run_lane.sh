@@ -2422,7 +2422,12 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed" transient
       continue
     fi
-    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$BASE..HEAD" 2>&1)"; then
+    # A fix round that merged the default branch scans what the pull request
+    # adds to it: BASE..HEAD would hold all the default branch gained since,
+    # text that branch's own CI accepts and the scan of a lane's change flags.
+    SCAN_RANGE="$BASE..HEAD"
+    [ -n "$FIX_UPSTREAM" ] && SCAN_RANGE="$FIX_UPSTREAM...HEAD"
+    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$SCAN_RANGE" 2>&1)"; then
       park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
       continue
     fi
