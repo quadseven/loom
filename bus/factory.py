@@ -1563,7 +1563,7 @@ class Factory:
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
         elif not sensitive:
-            self._land(repo, number, full, issue)
+            self._land(repo, number, full, issue, comments)
 
     def _run_again(self, repo: str, number: int, sha: str) -> bool:
         """Re-run the failed Actions jobs on this commit once. False when a
@@ -1597,9 +1597,11 @@ class Factory:
         return int(data.get("behind_by") or 0)
 
     def _land(self, repo: str, number: int, full: Dict[str, Any],
-              issue: Dict[str, Any]) -> None:
+              issue: Dict[str, Any], comments: List[Dict[str, Any]]) -> None:
         """Merge a ready pull request that is up to date with its base, one a
-        repo a pass; bring one that is behind up to date instead."""
+        repo a pass; bring one that is behind up to date instead. A pull
+        request that cannot be brought up to date cleanly goes back for a
+        fix round, as a conflict does."""
         if repo in self.landed:
             return
         if self._behind(repo, full):
@@ -1610,7 +1612,8 @@ class Factory:
             done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
                                 {"expected_head_sha": sha}, ok=(422,))
             if done.status == 422:
-                _say("could not bring %s#%d up to date; it waits for the next pass" % (repo, number))
+                self._send_back(repo, full, issue, comments,
+                                "could not be brought up to date with its base")
                 return
             self.actions += 1
             _say("brought %s#%d up to date with its base; it lands once its checks "
