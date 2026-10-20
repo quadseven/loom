@@ -1282,6 +1282,30 @@ print('leak guard: clean (shape patterns only)')
         self.assertFalse(beat["available"])
         self.assertGreater(beat["retry_at"], int(time.time()))
 
+    def test_a_timeout_after_editing_keeps_the_edits_on_a_timedout_branch(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EDIT="1", FAKE_EXIT="124")
+        reason = self.failure_line()
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-timedout-" in h]
+        self.assertEqual(len(side), 1, heads)
+        self.assertTrue(side[0].startswith("loom/T042-fix-the-thing-timedout-"), side)
+        self.assertTrue(reason.startswith("[transient] agent exited 124; "), reason)
+        self.assertIn("the edits are on branch " + side[0], reason)
+        kept = subprocess.run(["git", "--git-dir", str(self.remote), "show", side[0] + ":fix.txt"],
+                              capture_output=True, text=True, check=True).stdout
+        self.assertEqual(kept, "partial\n")
+        self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", heads)
+
+    def test_a_timeout_that_edited_nothing_pushes_no_side_branch(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EXIT="124")
+        self.assertEqual(self.failure_line(), "[transient] agent exited 124")
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-timedout-", heads)
+
     def test_a_non_limit_pattern_is_still_read_from_the_short_tail(self):
         # loom#934: the auth and transient (network) patterns still read the
         # short tail, not the whole output. A key-expiry line buried in the

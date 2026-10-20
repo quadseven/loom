@@ -1573,17 +1573,36 @@ final_validation() {
   VALIDATED="check exited 0 at ${rev:0:12}"
 }
 
-# A run that failed validation keeps its edits: they are committed and pushed
-# to a side branch, never to the ticket's branch or an open pull request.
-preserve_unvalidated() {
-  local side
-  side="$BRANCH-unvalidated-$(date +%s)"
+# Push a commit of the lane tree to a side branch of the ticket's branch and
+# say where the edits are. Never touches the ticket's branch or an open pull
+# request.
+push_side() {
+  local from="$1" side="$2"
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-       push -q origin "$BRANCH:refs/heads/$side" >> "$LOG" 2>&1; then
+       push -q origin "$from:refs/heads/$side" >> "$LOG" 2>&1; then
     printf 'the edits are on branch %s' "$side"
   else
     printf 'the push of %s failed; the edits are committed in the lane tree' "$side"
   fi
+}
+
+# A run that failed validation keeps its edits: they are committed and pushed
+# to a side branch, never to the ticket's branch or an open pull request.
+preserve_unvalidated() {
+  push_side "$BRANCH" "$BRANCH-unvalidated-$(date +%s)"
+}
+
+# A run that timed out after editing keeps its edits the same way, on a
+# -timedout- branch the station names to the next attempt. The agent's tree
+# may hold uncommitted files, so they are committed first.
+preserve_timedout() {
+  rm -f "$TREE/$SUMMARY_FILE"
+  if [ -n "$(safe_git status --porcelain 2>> "$LOG")" ] &&
+     ! { safe_git add -A && safe_git commit -qm "$TICKET: edits before the timeout"; } >> "$LOG" 2>&1; then
+    printf 'the edits could not be committed in the lane tree'
+    return 0
+  fi
+  push_side HEAD "$BRANCH-timedout-$(date +%s)"
 }
 
 # What the agent is told about the contract, after its brief.
@@ -2311,6 +2330,9 @@ for BRIEF in "$INBOX"/*.md; do
     ask_renew_key "$AUTH_WHY"
     park "$BRIEF" "agent exited $STATUS: $AUTH_WHY" auth
     break
+  fi
+  if [ "$STATUS" -eq 124 ] && [ -n "$EDITED" ] && [ "$FAIL_CLASS" = transient ]; then
+    park "$BRIEF" "agent exited 124; $(preserve_timedout)" "$FAIL_CLASS"; continue
   fi
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS" "$FAIL_CLASS"; continue; fi
   if [ "$DELIVERABLE" = verify ]; then
