@@ -5733,49 +5733,60 @@ class Station:
             for repo in self._verify_repos():
                 if left <= 0 or self._deferred():
                     return
-                sources = [i for i in self._paginate(
-                    "/repos/%s/issues?labels=loom:rewritten&state=open" % repo)
-                    if isinstance(i, dict) and "pull_request" not in i]
-                if not sources:
-                    continue
-                listed = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
-                still_open = {int(i["number"]) for i in listed if isinstance(i, dict)}
-                for source in sources:
-                    if left <= 0:
-                        break
-                    key = "%s#%d" % (repo, int(source["number"]))
-                    if key not in pairs:
-                        pairs[key] = self._rewritten_as(repo, int(source["number"]))
-                    ticket = pairs[key]
-                    if not isinstance(ticket, int) or not ticket or ticket in still_open:
-                        continue
-                    issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, ticket)).data or {}
-                    if issue.get("state") != "closed":
-                        continue
-                    labels = set(_label_names(issue))
-                    if ("loom:ticket" not in labels or not tickets.brief_author_trusted(
-                            issue, self.s.authors, self.s.briefers)):
-                        pairs[key] = 0
-                        continue
-                    # Closed as completed settles the source only when the
-                    # ticket's work landed, the close rule's bar; any other
-                    # completed close is left for a person.
-                    completed = issue.get("state_reason") == "completed"
-                    if completed and not labels & set(SETTLE_LANDED):
-                        pairs[key] = 0
-                        continue
-                    said = brain.settle_source(self.gh, repo, ticket, issue.get("body"),
-                                               "completed" if completed else "not_planned",
-                                               unproven=completed)
-                    if said is None or not completed:
-                        pairs[key] = 0  # nothing more to do for this source
-                    if said is not None:
-                        left -= 1
-                        _say("settled the source of %s#%d: %s" % (repo, ticket, said))
+                left -= self._settle_repo_sources(repo, pairs, left)
             state["_at"] = self.now
         finally:
             state["pairs"] = pairs
             _write_json(path, state)
+
+    def _settle_repo_sources(self, repo: str, pairs: Dict[str, Any], left: int) -> int:
+        """Settle up to `left` of the repo's orphaned sources; how many were."""
+        sources = [i for i in self._paginate(
+            "/repos/%s/issues?labels=loom:rewritten&state=open" % repo)
+            if isinstance(i, dict) and "pull_request" not in i]
+        if not sources:
+            return 0
+        listed = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        still_open = {int(i["number"]) for i in listed if isinstance(i, dict)}
+        done = 0
+        for source in sources:
+            if done >= left:
+                break
+            key = "%s#%d" % (repo, int(source["number"]))
+            if key not in pairs:
+                pairs[key] = self._rewritten_as(repo, int(source["number"]))
+            ticket = pairs[key]
+            if isinstance(ticket, int) and ticket and ticket not in still_open:
+                done += self._settle_source_of(repo, key, ticket, pairs)
+        return done
+
+    def _settle_source_of(self, repo: str, key: str, ticket: int,
+                          pairs: Dict[str, Any]) -> int:
+        """Settle the source of a ticket not listed open: 1 when something
+        was said or done, else 0. A source with nothing left to do is
+        recorded as 0 in `pairs` and not read again."""
+        issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, ticket)).data or {}
+        if issue.get("state") != "closed":
+            return 0
+        labels = set(_label_names(issue))
+        completed = issue.get("state_reason") == "completed"
+        # Closed as completed settles the source only when the ticket's work
+        # landed, the close rule's bar; any other completed close is left for
+        # a person.
+        if ("loom:ticket" not in labels
+                or not tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)
+                or (completed and not labels & set(SETTLE_LANDED))):
+            pairs[key] = 0
+            return 0
+        said = brain.settle_source(self.gh, repo, ticket, issue.get("body"),
+                                   "completed" if completed else "not_planned",
+                                   unproven=completed)
+        if said is None or not completed:
+            pairs[key] = 0  # nothing more to do for this source
+        if said is None:
+            return 0
+        _say("settled the source of %s#%d: %s" % (repo, ticket, said))
+        return 1
 
     def _rewritten_as(self, repo: str, number: int) -> int:
         """The ticket the newest rewrite comment by a briefing login names, 0
