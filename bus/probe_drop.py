@@ -9,6 +9,8 @@ in its pull request. A new file is a sandbox probe when all of these hold:
   directory that is itself new in the diff,
 - nothing else in the diff references it, by path or by file name.
 
+Files under .github/ remain subject to the brief's path check.
+
 ``find_probes(tree, base, head)`` returns the probe paths. As a script it
 prints one probe path per line::
 
@@ -58,6 +60,8 @@ def bin_is_new(tree: str, base: str) -> bool:
 
 def probe_name(path: str, new_bin: bool) -> bool:
     """True when the path looks like a probe: .test* or under a new bin/."""
+    if path.startswith(".github/"):
+        return False
     name = path.rsplit("/", 1)[-1]
     if name.startswith(".test"):
         return True

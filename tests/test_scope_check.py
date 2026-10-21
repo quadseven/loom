@@ -62,6 +62,27 @@ class ScopeCheckTest(unittest.TestCase):
         self.assertEqual(sorted(self.stray()), [".agents/hooks.json", ".github/workflows/extra.yml",
                                                 "bin/test.txt", "test_hook.sh"])
 
+    def test_scratch_rules_only_select_new_unnamed_files(self):
+        self.write("test_debug.py", "print('scratch')\n")
+        self.write("module_debug.txt", "scratch\n")
+        self.write("artifact.o", "object\n")
+        self.write("build_test/result.o", "object\n")
+        self.write("nested/result.o", "object\n")
+        self.write(".loom/test.txt", "probe\n")
+        self.write(".loom/validation.conf", "check: true\n")
+        self.write(".github/workflows/extra.yml", "on: push\n")
+        self.commit("work")
+        found = scope_check.scratch_files(str(self.tree), self.base, "HEAD", "")
+        self.assertEqual(sorted(found), [".loom/test.txt", "artifact.o",
+                                         "build_test/result.o", "module_debug.txt",
+                                         "nested/result.o", "test_debug.py"])
+
+    def test_referenced_top_level_test_file_is_kept(self):
+        self.write("test_probe.py", "print('probe')\n")
+        self.write("README.md", "Run test_probe.py to verify this change.\n")
+        self.commit("work")
+        self.assertEqual(scope_check.scratch_files(str(self.tree), self.base, "HEAD", ""), [])
+
     def test_a_new_file_in_a_tracked_hidden_subdirectory_is_in_scope(self):
         # A test beside a tracked .github script was refused (2026-10-19).
         self.write(".github/scripts/deploy.py", "x = 1\n")
