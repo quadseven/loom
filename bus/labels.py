@@ -82,7 +82,6 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:factory": {"color": "b60205", "description": "A factory validation incident"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},
-    "stale-brain": {"color": "b60205", "description": "Stuck in brain review past the stale threshold; needs operator attention"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
     "loom:regression": {"color": "b60205", "description": "Fixes a measured regression of a shipped ticket"},
     "loom:revert": {"color": "b60205", "description": "Reverts the merge that turned the default branch red"},

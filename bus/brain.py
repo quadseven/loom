@@ -677,7 +677,6 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
 
 VERIFY_DUE_HEADING = "### Verify due"
 VERIFY_RESUME_MAX = 5
-SENSITIVE_RESUME_MAX = 5
 _LIVE_LINE = re.compile(r"^[ \t]*(?:[-*][ \t]*)?(?:\[[ xX]\][ \t]*)?(Live\b.*?)[ \t]*$", re.M)
 
 
@@ -745,11 +744,18 @@ def stale_needs_brain(gh: GitHub, repos: Sequence[str], now: Optional[datetime] 
     This monitors the brain review queue for tickets waiting too long."""
     now = now or datetime.now(timezone.utc)
     limit = timedelta(hours=hours)
+    cutoff = now - limit
     out = []
     for repo in repos:
         issues = _issues(gh, repo)
         needs_brain = [i for i in issues if "needs-brain" in _labels(i)]
         for issue in needs_brain:
+            # Optimization: if the issue was updated after the cutoff,
+            # it can't have had needs-brain for longer than the threshold
+            # (adding the label updates the issue's updated_at).
+            updated = _stamp(issue.get("updated_at", ""))
+            if updated and updated > cutoff:
+                continue
             since = _needs_brain_since(gh, repo, issue)
             if since and now - since > limit:
                 out.append((since, issue, repo))
@@ -3801,13 +3807,17 @@ def _sensitive_head(gh: GitHub, repo: str, pr: Dict[str, Any]
 
 def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
                      check: str) -> Optional[Dict[str, Any]]:
-    """A needs-brain sensitive pull request older than 2 hours whose checks
-    are green and whose review check passed on its head, with its ticket;
-    None otherwise."""
-    if "needs-brain" not in _labels(pr) or "class:sensitive" not in _labels(pr):
+    """A needs-brain pull request needing brain attention:
+    - class:sensitive + needs-brain older than 2 hours, or
+    - needs-brain (without class:sensitive) older than 4 hours.
+    Returns the PR with its ticket and details if checks are green and review passed; None otherwise."""
+    labels = _labels(pr)
+    if "needs-brain" not in labels:
         return None
+    is_sensitive = "class:sensitive" in labels
+    threshold_hours = 2 if is_sensitive else 4
     created = _stamp(str(pr.get("created_at") or ""))
-    if created is None or (now - created).total_seconds() <= 2 * 3600:
+    if created is None or (now - created).total_seconds() <= threshold_hours * 3600:
         return None
     try:
         ticket = _ticket_association(repo, pr)
@@ -3818,27 +3828,29 @@ def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
     sha, details = _sensitive_head(gh, repo, pr)
     if not _checks_green(details) or not sha or not _review_check_passed(gh, repo, sha, check):
         return None
-    return {"created": created, "repo": repo, "pr": pr, "ticket": ticket, "details": details}
+    return {"created": created, "repo": repo, "pr": pr, "ticket": ticket, "details": details, "is_sensitive": is_sensitive}
 
 
 def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
                             env: Optional[Dict[str, str]]) -> List[str]:
-    """Ready sensitive PRs needing brain attention, oldest first."""
+    """Ready PRs needing brain attention, oldest first."""
     check = review_check_name(env)
     ready = [item for repo in repos
              for item in (_ready_sensitive(gh, repo, pr, now, check)
                           for pr in gh.paginate("/repos/%s/pulls?state=open" % repo))
              if item is not None]
     ready.sort(key=lambda item: (item["created"], item["repo"], int(item["pr"]["number"])))
-    out = ["", "## Sensitive pull requests (up to %d, oldest first)" % SENSITIVE_RESUME_MAX]
-    for item in ready[:SENSITIVE_RESUME_MAX]:
+    out = ["", "## Pull requests needing brain attention (oldest first)"]
+    for item in ready:
         pr, ticket = item["pr"], item["ticket"]
         title = str((gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}).get("title") or "")
         threads = (item["details"].get("reviewThreads") or {}).get("nodes") or []
         open_threads = sum(1 for thread in threads if not thread.get("isResolved"))
-        out.append("- resume sensitive %s#%s ticket %s#%s %s - %s - %dh old - %d open review threads" % (
-            item["repo"], pr["number"], ticket[0], ticket[1], title,
-            pr.get("title", ""), _age(pr, now), open_threads))
+        age_hours = _age(pr, now)
+        kind = "sensitive" if item.get("is_sensitive") else "needs-brain"
+        out.append("- resume %s %s#%s ticket %s#%s %s - %s - %dh old - %d open review threads" % (
+            kind, item["repo"], pr["number"], ticket[0], ticket[1], title,
+            pr.get("title", ""), age_hours, open_threads))
     return out if ready else out + ["- none"]
 
 

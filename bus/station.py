@@ -7564,26 +7564,7 @@ class Station:
             for since, issue, repo in stale:
                 hours = int((self.now - since.timestamp()) // 3600)
                 _say("stale brain: %s#%d %s - needs-brain for %dh" % (repo, issue["number"], issue.get("title", ""), hours))
-                # Escalate: add stale-brain label and notify operator
-                self._escalate_stale_brain(repo, int(issue["number"]), hours)
         _write_json(path, state)
-
-    def _escalate_stale_brain(self, repo: str, number: int, hours: int) -> None:
-        """Escalate a stale needs-brain ticket by adding a label and posting a comment."""
-        try:
-            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
-            if not isinstance(issue, dict):
-                return
-            names = _label_names(issue)
-            if "stale-brain" not in names:
-                names.append("stale-brain")
-                self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": names})
-            body = ("This ticket has been in brain review (needs-brain) for %d hours. "
-                    "The brain should review and move it on, or the operator may need to intervene." % hours)
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
-            _say("escalated stale brain ticket %s#%d" % (repo, number))
-        except (GitHubError, OSError) as err:
-            _say("failed to escalate stale brain ticket %s#%d: %s" % (repo, number, err))
 
     # -- talking to the brain --------------------------------------------
     @staticmethod

@@ -323,12 +323,12 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertIn("%s#1 ticket %s#1 Ticket1 - PR1 - 3h old - 1 open review threads" %
                       (REPO, REPO), items[0])
 
-    def test_sensitive_resume_is_capped_at_five_oldest_first(self):
+    def test_sensitive_resume_lists_all_oldest_first(self):
         entries = [(n, 2 + n, "SUCCESS", True) for n in range(1, 8)]
         lines = brain._sensitive_resume_lines(self.make_gh(entries), [REPO], self.NOW, {})
         numbers = [int(line.split("#")[1].split()[0]) for line in lines
                    if line.startswith("- resume sensitive")]
-        self.assertEqual([7, 6, 5, 4, 3], numbers)
+        self.assertEqual([7, 6, 5, 4, 3, 2, 1], numbers)
 
     def test_goal_trunk_reads_the_trunk_line_from_a_goal_body(self):
         self.assertEqual(brain.goal_trunk({"body": "Trunk: side\n\n## Why\n"}), "side")
