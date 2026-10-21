@@ -599,6 +599,17 @@ skips the step. `LOOM_SETTLE_CLAIMED_MAX` (default 10) caps the issues settled
 a run, and writes are at least 3 seconds apart. Turning writes on is the
 operator's call: set `LOOM_SETTLE_CLAIMED=on` and run the installer again.
 
+A pull request that merged with the review check neutral (the review degraded)
+can never pass that gate, so its issue would stay open with its work merged
+(loom#1221). When every other check on its head passed, the same step posts one
+comment on the merged pull request starting `<!-- loom:claimed-rereview v1 -->`
+and asking the review bot to review it again (`LOOM_REVIEW_AGAIN`). The request
+is recorded in `claimed.json` and by that marker, so it is never asked twice,
+and at most 3 requests and follow-up issues are written a run. A later
+review success settles the issue by the rule above. A later failure files its
+findings as a `loom:triage` issue, once, and comments on the original naming it;
+the original stays open. A second neutral result is left for a person.
+
 ### Proof audits
 
 A lane proof passed the shape check, which cannot tell evidence a lane read
