@@ -2664,8 +2664,9 @@ class CorruptStateTest(Base):
         # scan's merged and shipped lists, and the invariant check's read of
         # open pull requests (their plan checks) still run, and so does
         # reconciliation's read of the open tickets (loom#784) and the
-        # done-ticket close step's, and the hourly read of rewritten sources.
-        self.assertEqual(self.run_pass().requests, 11)
+        # done-ticket close step's, and the hourly read of rewritten sources,
+        # and the stale brain tickets check.
+        self.assertEqual(self.run_pass().requests, 12)
 
 
 class TicketsTest(unittest.TestCase):

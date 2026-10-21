@@ -60,6 +60,7 @@ from .labels import LANES
 from .labels import REMOTE_LANES
 
 HEARTBEAT_MAX_AGE = 600
+STALE_BRAIN_CHECK = 1800  # 30 minutes
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 RUNAWAY = "loom:runaway"
@@ -7542,6 +7543,48 @@ class Station:
         if url is not None:
             self._tell_brain(url, path, fresh, last, ok_at, journal)
 
+    def check_stale_brain_tickets(self) -> None:
+        """Check for tickets stuck in needs-brain beyond the threshold and
+        escalate them. Runs at most every STALE_BRAIN_CHECK seconds."""
+        if not self.s.repos:
+            return
+        path = os.path.join(self.state, "stale-brain.json")
+        state = _read_json(path, {}, strict=False)
+        checked = state.get("checked")
+        if self._num(checked) and 0 <= self.now - checked < STALE_BRAIN_CHECK:
+            return
+        state["checked"] = self.now
+        try:
+            stale = brain.stale_needs_brain(self.gh, self.s.repos, datetime.fromtimestamp(self.now, timezone.utc))
+        except (GitHubError, OSError, ValueError) as err:
+            _say("check_stale_brain_tickets failed: %s" % err)
+            return
+        if stale:
+            _say("found %d ticket(s) stale in needs-brain" % len(stale))
+            for since, issue, repo in stale:
+                hours = int((self.now - since.timestamp()) // 3600)
+                _say("stale brain: %s#%d %s - needs-brain for %dh" % (repo, issue["number"], issue.get("title", ""), hours))
+                # Escalate: add stale-brain label and notify operator
+                self._escalate_stale_brain(repo, int(issue["number"]), hours)
+        _write_json(path, state)
+
+    def _escalate_stale_brain(self, repo: str, number: int, hours: int) -> None:
+        """Escalate a stale needs-brain ticket by adding a label and posting a comment."""
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+            if not isinstance(issue, dict):
+                return
+            names = _label_names(issue)
+            if "stale-brain" not in names:
+                names.append("stale-brain")
+                self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": names})
+            body = ("This ticket has been in brain review (needs-brain) for %d hours. "
+                    "The brain should review and move it on, or the operator may need to intervene." % hours)
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
+            _say("escalated stale brain ticket %s#%d" % (repo, number))
+        except (GitHubError, OSError) as err:
+            _say("failed to escalate stale brain ticket %s#%d: %s" % (repo, number, err))
+
     # -- talking to the brain --------------------------------------------
     @staticmethod
     def _num(value: Any) -> bool:
@@ -8554,8 +8597,8 @@ class Station:
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
-                     self.watch_default_branches, self.run_factory, self.check_invariants,
-                     self.release_factory_held):
+                     self.watch_default_branches, self.run_factory, self.check_stale_brain_tickets,
+                     self.check_invariants, self.release_factory_held):
             if self._deferred():
                 break
             try:
