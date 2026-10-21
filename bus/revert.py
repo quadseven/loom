@@ -74,8 +74,12 @@ HAND_REVERT_WINDOW = 7 * 86400
 # One marker per revert pull request on the ticket it undoes: the station
 # moves the ticket back once for each revert pull request.
 HAND_REVERT_MARKER = "<!-- loom:hand-revert %d -->"
-REVERT_TITLE_RE = re.compile(r'^Revert "')
-REVERT_NUM_TITLE_RE = re.compile(r"^Revert #(\d+)\b")
+# A title may lead with a "[scope] " or a "scope: " / "fix(x): " prefix, and
+# "revert" is any case; a title that only mentions the word later does not
+# count.
+_TITLE_LEAD = r"^(?:\[[^\]]+\]\s*|[\w./-]+(?:\([^)]*\))?!?:\s+)?revert"
+REVERT_TITLE_RE = re.compile(_TITLE_LEAD + r'\s+"', re.I)
+REVERT_NUM_TITLE_RE = re.compile(_TITLE_LEAD + r"[\s:]+#(\d+)\b", re.I)
 GIT_REVERT_RE = re.compile(r"\bgit revert (?:--no-edit )?([0-9a-f]{7,40})\b")
 REVERTS_NUM_RE = re.compile(r"\bReverts\s+(?:[\w.-]+/[\w.-]+)?#(\d+)\b")
 
@@ -91,9 +95,16 @@ def is_hand_revert(pr: Dict[str, Any], now: float, default_branch: str) -> bool:
         return False
     if now - _ts(str(pr.get("merged_at") or "")) > HAND_REVERT_WINDOW:
         return False
-    return bool(REVERT_TITLE_RE.match(str(pr.get("title") or ""))
-                or REVERT_NUM_TITLE_RE.match(str(pr.get("title") or ""))
-                or GIT_REVERT_RE.search(str(pr.get("body") or "")))
+    return looks_like_revert(pr)
+
+
+def looks_like_revert(pr: Dict[str, Any]) -> bool:
+    """The pull request is a revert by its title or body, whatever its age
+    or base: such a pull request is never the one that ships a ticket."""
+    return bool(isinstance(pr, dict)
+                and (REVERT_TITLE_RE.match(str(pr.get("title") or ""))
+                     or REVERT_NUM_TITLE_RE.match(str(pr.get("title") or ""))
+                     or GIT_REVERT_RE.search(str(pr.get("body") or ""))))
 
 
 def reverted_keys(pr: Dict[str, Any]) -> List[str]:
@@ -108,8 +119,9 @@ def reverted_keys(pr: Dict[str, Any]) -> List[str]:
     m = REVERT_NUM_TITLE_RE.match(title)
     if m:
         keys.append("pr:" + m.group(1))
-    if REVERT_TITLE_RE.match(title):
-        keys.append("title:" + " ".join(title[len('Revert "'):].rstrip('"').split()))
+    m = REVERT_TITLE_RE.match(title)
+    if m:
+        keys.append("title:" + " ".join(title[m.end():].rstrip('"').split()))
     return keys
 
 

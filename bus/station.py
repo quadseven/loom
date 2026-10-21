@@ -3670,11 +3670,12 @@ class Station:
         return [pr for pr in pulls if revert.is_hand_revert(pr, self.now, branch)]
 
     def _ticket_pulls(self, repo: str, wanted: set) -> Dict[int, List[Dict[str, Any]]]:
-        """Every merged pull request of each wanted ticket."""
+        """Every merged pull request of each wanted ticket, a revert not
+        counting as one of the ticket's own."""
         groups: Dict[int, List[Dict[str, Any]]] = {}
         for pr in self._closed_pulls(repo):
             number = self._pr_ticket_number(repo, pr)
-            if number in wanted:
+            if number in wanted and not revert.looks_like_revert(pr):
                 groups.setdefault(number, []).append(pr)
         return groups
 
@@ -3819,9 +3820,13 @@ class Station:
             url = _next_link(resp.headers.get("link", ""))
             if not url or wanted <= set(found):
                 break
+        # A revert is never the pull request that ships a ticket, and a
+        # ticket whose newest merged pull request is one stays merged
+        # (a ticket shipped through its own revert, 2026-10-21).
+        found = {n: pr for n, pr in found.items() if not revert.looks_like_revert(pr)}
         for number in sorted(wanted - set(found))[:SHIP_PER_PASS]:
             pr = self._ticket_pull_beyond_window(repo, number)
-            if pr is not None:
+            if pr is not None and not revert.looks_like_revert(pr):
                 found[number] = pr
                 if seen is not None:
                     seen.append(pr)
