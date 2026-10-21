@@ -507,6 +507,43 @@ class Redo(Base):
         self.assertEqual(self.moved, [])
 
 
+class RevertTitles(unittest.TestCase):
+    """A revert title may carry a scope prefix and any case of 'revert'."""
+
+    def keys(self, title):
+        return revert.reverted_keys({"title": title, "body": ""})
+
+    def test_a_bracketed_scope_prefix_and_lowercase_revert_name_the_pull_request(self):
+        self.assertEqual(self.keys("[scope] revert #5637: The unpin left it broken"),
+                         ["pr:5637"])
+        self.assertEqual(self.keys("[scope] Revert #12"), ["pr:12"])
+
+    def test_a_scope_colon_prefix_is_accepted(self):
+        self.assertEqual(self.keys("fix(x): revert #77: undo it"), ["pr:77"])
+        self.assertEqual(self.keys("ops: Revert #8"), ["pr:8"])
+
+    def test_a_quoted_title_revert_behind_a_prefix_names_the_title(self):
+        self.assertEqual(self.keys('[scope] revert "Change  the   thing"'),
+                         ["title:Change the thing"])
+
+    def test_the_plain_forms_still_match(self):
+        self.assertEqual(self.keys("Revert #5"), ["pr:5"])
+        self.assertEqual(self.keys('Revert "Change"'), ["title:Change"])
+
+    def test_a_title_that_only_mentions_the_word_is_not_a_revert(self):
+        for title in ("Stop the revert detector double counting",
+                      "Handle revert #5 in the parser",
+                      "[scope] Stop the revert detector double counting",
+                      "Reverting the change", "Reverts the change"):
+            self.assertEqual(self.keys(title), [], title)
+            self.assertFalse(revert.looks_like_revert({"title": title, "body": ""}), title)
+
+    def test_a_prefixed_title_is_a_hand_revert(self):
+        pr = {"title": "[scope] revert #5: why", "body": "", "merged_at": iso(60),
+              "base": {"ref": "main"}}
+        self.assertTrue(revert.is_hand_revert(pr, NOW, "main"))
+
+
 class HandRevert(Base):
     """A ticket whose merged pull requests a hand-made revert undid goes
     back to loom:briefed on its lane (T486)."""

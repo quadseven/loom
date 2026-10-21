@@ -3819,9 +3819,13 @@ class Station:
             url = _next_link(resp.headers.get("link", ""))
             if not url or wanted <= set(found):
                 break
+        # A revert is never the pull request that ships a ticket, and a
+        # ticket whose newest merged pull request is one stays merged
+        # (infra#5419 shipped through its own revert, 2026-10-21).
+        found = {n: pr for n, pr in found.items() if not revert.looks_like_revert(pr)}
         for number in sorted(wanted - set(found))[:SHIP_PER_PASS]:
             pr = self._ticket_pull_beyond_window(repo, number)
-            if pr is not None:
+            if pr is not None and not revert.looks_like_revert(pr):
                 found[number] = pr
                 if seen is not None:
                     seen.append(pr)
