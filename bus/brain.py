@@ -17,6 +17,7 @@ from urllib.parse import quote
 from .github import GitHub, GitHubError, RateLimited, _next_link, auth_from_env, rest_login, unreadable
 from . import audit, change_class, handoff, hunt_plan, journal, lock, pr_repair, proof, text, tickets
 from . import naming
+from .status import is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
@@ -351,9 +352,10 @@ def _ticket_lines(tickets: List[Dict[str, Any]], now: datetime,
     return lines
 
 
-def runaway_lines(tickets: List[Dict[str, Any]]) -> List[str]:
+def runaway_lines(issues: List[Dict[str, Any]]) -> List[str]:
     """List held runaway tickets for immediate brain review."""
-    rows = [i for i in tickets if RUNAWAY in _labels(i)]
+    rows = [i for i in issues if RUNAWAY in _labels(i)
+            and tickets.ticket_state(i) not in tickets.MERGED_STATES]
     return ["### Runaway tickets"] + (["- #%s %s" % (i["number"], i.get("title", ""))
                                       for i in rows] or ["- none"])
 
@@ -476,16 +478,38 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
 def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
     allowed = {a.lower() for a in authors}
     last_claim = newest = -1
+    # Newest stamps seen, for the timestamped comparison below. A claim line
+    # inside the ticket's status comment carries its own time: the station
+    # edits that one comment in place, so the line's stamp - not the
+    # comment's position - is what the fix ask is measured against (loom#1203).
+    claim_stamp = fix_stamp = ""
     for i, comment in enumerate(comments):
         if not isinstance(comment, dict):
             continue
         body = str(comment.get("body") or "")
         if _CLAIM.fullmatch(body.strip()):
             last_claim = i
+            created = str(comment.get("created_at") or "")
+            if created > claim_stamp:
+                claim_stamp = created
+        elif (is_status_comment(body)
+                and tickets._login(comment.get("user")) in allowed):
+            # The unexpanded read: claims as bullet lines in the status
+            # comment. Only a trusted writer's lines count, as with expansion.
+            for at, text in parse_status_events(body):
+                if _CLAIM.fullmatch(text.strip()) and at > claim_stamp:
+                    claim_stamp = at
         if (tickets._login(comment.get("user")) in allowed
                 and body.startswith(FIX_MARKER)
                 and BRAIN_FIX_MARKER in body):
             newest = i
+            created = str(comment.get("created_at") or "")
+            if created > fix_stamp:
+                fix_stamp = created
+    if claim_stamp and fix_stamp:
+        # A brain-fix ask newer than the last real claim still blocks the
+        # merge; only the detection of the claim changed (loom#1203).
+        return fix_stamp > claim_stamp
     return newest > last_claim
 
 
@@ -764,7 +788,8 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
             lambda repo: _readable_section(gh, repo, now, bot, authors, found,
                                            review_check_name(env)), repos))
     runaway = [(repo, issue) for repo, items in found.items() for issue in items
-               if RUNAWAY in _labels(issue)]
+               if RUNAWAY in _labels(issue)
+               and tickets.ticket_state(issue) not in tickets.MERGED_STATES]
     out += [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
         repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
     out += [""] + priority_lines(found, now)
@@ -1704,8 +1729,9 @@ def _check_ticket_headers(full_body: str, written: Dict[str, Optional[str]]) -> 
 
 def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional[str]) -> None:
     """A brief the station must place needs a difficulty tier. Without one the
-    ticket gets no lane and waits for a brain to notice (2026-10-16: five
-    factory tickets briefed without --difficulty sat queued up to 17 hours).
+    ticket waited for a brain to notice (2026-10-16: five factory tickets
+    briefed without --difficulty sat queued up to 17 hours); the factory now
+    places it as factory.DEFAULT_DIFFICULTY, which may be the wrong tier.
     A brief with --lane is claimed by that lane, so it needs none."""
     if lane or difficulty:
         return
@@ -2401,9 +2427,10 @@ def prioritize(gh: GitHub, repo: str, number: int, priority: Optional[str],
                env: Optional[Dict[str, str]] = None,
                difficulty: Optional[str] = None) -> None:
     """Rank an open ticket, or set its Difficulty, requiring its author to be
-    trusted. A queued ticket with no Difficulty line gets no lane, and before
-    this a brain could only fix one by hand-editing the body (2026-10-16: five
-    factory tickets sat queued up to 17 hours)."""
+    trusted. A queued ticket with no Difficulty line runs in the default tier
+    (factory.DEFAULT_DIFFICULTY); before this a brain could only set its tier
+    by hand-editing the body (2026-10-16: five factory tickets sat queued up
+    to 17 hours)."""
     if priority is None and difficulty is None:
         raise ValueError("give a priority, a difficulty, or both")
     if priority is not None and priority not in tickets.PRIORITIES:
@@ -3246,11 +3273,36 @@ def _job_log_tail(gh: GitHub, repo: str, job_id: int) -> Optional[str]:
     return None if lines is None else log_excerpt(lines)
 
 
+def newest_check_runs(runs: Sequence[Any]) -> List[Dict[str, Any]]:
+    """The newest run of each check name by started_at (id breaks a tie): a
+    re-run replaces the run before it. The check-runs default filter can
+    still return an older failure after a later run of the same check passed,
+    so callers ask for filter=all and reduce here."""
+    newest: Dict[str, Dict[str, Any]] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        name = str(run.get("name") or "")
+        held = newest.get(name)
+        if held is None or _run_order(run) >= _run_order(held):
+            newest[name] = run
+    return list(newest.values())
+
+
+def _run_order(run: Dict[str, Any]) -> Tuple[str, int]:
+    try:
+        ident = int(run.get("id") or 0)
+    except (TypeError, ValueError):
+        ident = 0
+    return str(run.get("started_at") or ""), ident
+
+
 def _failing_checks(gh: GitHub, repo: str, sha: str) -> List[Tuple[str, str]]:
     """(name, last log lines or summary) for every failing check and status."""
     found: List[Tuple[str, str]] = []
-    runs = (gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data
-            or {}).get("check_runs") or []
+    runs = newest_check_runs((gh.rest(
+        "GET", "/repos/%s/commits/%s/check-runs?filter=all&per_page=100" % (repo, sha)).data
+        or {}).get("check_runs") or [])
     for run in runs:
         if run.get("conclusion") not in FAILED_CONCLUSIONS:
             continue

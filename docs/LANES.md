@@ -178,7 +178,10 @@ The station turns trusted
 ticket, with local paths removed from failure reasons; the runner adds
 `Refs <owner/name>#<number>` to the pull request. A limit or transient
 failure moves the ticket to another available lane as a new attempt, at most
-`LOOM_RETRY_MAX` times (default 2); a fix round that fails transiently goes
+`LOOM_RETRY_MAX` times (default 2). A run that exits 124 after editing pushes
+its edits to a side branch `<branch>-timedout-<time>` and names it in the
+failure reason; the retry's brief tells the next attempt to start from that
+branch. A fix round that fails transiently goes
 back to `loom:pr`, and one that fails its work goes to `loom:failed`, so the
 factory climbs the ladder and sends the fix to the next rung; a lane that hit its provider limit stays unavailable until the
 provider's reset (else 60 minutes; delete its heartbeat file in
@@ -1094,6 +1097,19 @@ lookup leaves the brief for the next pass. The rule covers:
   newer models (glm-5.3-flash) are paid-plan only.
 - Runs `cloudflare-workers-ai/@cf/...` models only. Cloudflare does not train
   on prompts, so private repos are allowed.
+
+## free provider slots on the spark-gateway
+
+Set `LOOM_FREE_GATEWAY_URL` to your gateway's origin. The five free slots use
+separate pinned routes: `free-ollama` uses `/free/ollama-cloud/v1`,
+`free-gemma` uses `/free/gemini/v1`, and `free-nvidia`, `free-kilo` and
+`free-groq` use `/free-public/nvidia-nim/v1`, `/free-public/kilo/v1` and
+`/free-public/groq/v1`. A slot's `LOOM_FREE_<PROVIDER>_URL` overrides its
+derived URL. Each slot probes its own route's `/models` before a run. A 503
+holds only that slot for 15 minutes as a limit, so the station can assign the
+ticket elsewhere without counting it as a work failure. Ollama and Gemma
+accept private repos; the other three accept public repos only. The routes
+need your own gateway and provider configuration.
 
 ## spark: a local vLLM coder, one stream at a time
 

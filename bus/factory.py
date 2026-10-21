@@ -161,12 +161,29 @@ ANSWER_RE = re.compile(r"^Lane [A-Za-z0-9_.-]+ %s" % re.escape(ANSWER_REPLY))
 # carries the head commit, so the ask happens once per head.
 IMPROVE_MARKER = "<!-- loom:improve-head %s -->"
 # The review bot's check output title that means it did not finish every part
-# of the diff ("WARN Elder review coverage partial", "WARN Grug eyes clouded").
+# of the diff, or did not trust its own result ("WARN Elder review coverage
+# partial", "WARN Grug eyes clouded", "WARN Elder review low confidence").
 # A lane cannot finish someone else's review by editing code, so the factory
 # asks the bot to look at the head again instead of sending the pull request
 # back for a fix round it cannot close.
 PARTIAL_REVIEW_TITLES = ("WARN Elder review coverage partial",
-                         "WARN Grug eyes clouded")
+                         "WARN Grug eyes clouded",
+                         "WARN Elder review low confidence")
+# The review bot's own words for a result that is not a verdict ("Degraded
+# review (low_confidence_review): not a verdict. Comment /grug improve to
+# re-run once the backend recovers.").
+DEGRADED_REVIEW_MARK = "Degraded review ("
+
+
+def degraded_review(title: str, summary: str) -> bool:
+    """True when a review check's output is a partial or degraded result, not
+    a verdict: the summary carries the review bot's degraded marker, or the
+    title names a partial-review form anywhere (a hunt title puts a commit
+    range before it, "Living Hunt a..b - WARN ...")."""
+    return (DEGRADED_REVIEW_MARK in str(summary or "")
+            or any(mark in str(title or "") for mark in PARTIAL_REVIEW_TITLES))
+
+
 # Posted once per head commit on a pull request whose only failing check is a
 # partial review, so a second partial result on the same head goes back.
 REVIEW_AGAIN_MARKER = "<!-- loom:review-again v1 sha=%s -->"
@@ -327,6 +344,9 @@ CLAIM_RE = re.compile(r"^Claimed for lane ")
 STALL_MOVE_RE = re.compile(r"^Not a failure \(briefed \d+ hours on lane ")
 # bus/station.py's note when a fix round ended without a commit.
 NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
+# Fix rounds in a row that end with no commit on one failing check before the
+# ticket goes to a person.
+NO_CHANGE_LIMIT = 2
 # bus/station.py's note on a failed run, and the runner's reason when a run
 # committed nothing and its agent wrote no reason why (lanes/run_lane.sh).
 FAILED_RE = re.compile(r"^Lane \S+ failed: ")
@@ -616,6 +636,28 @@ def no_change_at(comments: Sequence[Dict[str, Any]]) -> float:
         if NO_CHANGE_RE.match(body):
             return _ts(c.get("created_at"))
     return 0.0
+
+
+def no_change_rounds(comments: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    """Per check name, the fix rounds in a row that named it and ended with no
+    commit (a loom:fix comment, then a no-change note). A round that changed
+    something, or one that no longer names the check, ends its count."""
+    counts: Dict[str, int] = {}
+    asked: set = set()
+    answered = True
+    for c in comments:
+        body = str(c.get("body") or "")
+        if body.startswith(FIX_MARKER):
+            names = {n.strip() for n in re.findall(r"^### Check: (.*)$", body, re.M)}
+            if not answered:
+                counts = {}
+            counts = {n: v for n, v in counts.items() if n in names}
+            asked, answered = names, False
+        elif NO_CHANGE_RE.match(body) and not answered:
+            answered = True
+            for name in asked:
+                counts[name] = counts.get(name, 0) + 1
+    return counts
 
 
 def fixes_of(comments: Sequence[Dict[str, Any]]) -> int:
@@ -1090,12 +1132,28 @@ def without_model(body: str) -> str:
     return MODEL_LINE.sub("", head + "\n", count=1).rstrip("\n") + sep + rest
 
 
-def difficulty_of(issue: Dict[str, Any]) -> str:
-    """The ticket's Difficulty: line, "" when it has none readable."""
+# The tier of a ticket whose Difficulty line is missing or names no tier.
+# Such a ticket was in no tier, so no lane ever took it: one waited a day in
+# the queue (2026-10-21). Medium's FALLBACK reaches both other tiers.
+DEFAULT_DIFFICULTY = "medium"
+
+
+def has_difficulty(issue: Dict[str, Any]) -> bool:
+    """Whether the ticket's own Difficulty: line names a tier (difficulty_of
+    gives DEFAULT_DIFFICULTY in place of one that does not)."""
     try:
-        return str(tickets.parse(issue.get("body"))[0].get("Difficulty", ""))
+        found = str(tickets.parse(issue.get("body"))[0].get("Difficulty", "")).strip().lower()
     except ValueError:
-        return ""
+        return False
+    return found in TIERS
+
+
+def difficulty_of(issue: Dict[str, Any]) -> str:
+    """The ticket's Difficulty: line, DEFAULT_DIFFICULTY when it has none
+    readable or it names no tier."""
+    if not has_difficulty(issue):
+        return DEFAULT_DIFFICULTY
+    return str(tickets.parse(issue.get("body"))[0]["Difficulty"]).strip().lower()
 
 
 def lanes_of(difficulty: str, private: bool) -> Tuple[str, ...]:
@@ -1139,7 +1197,8 @@ class Factory:
                  model_limits: Optional[Dict[str, Dict[str, float]]] = None,
                  silent: Optional[Dict[str, float]] = None,
                  down: Sequence[str] = (),
-                 limit_until: Optional[Dict[str, float]] = None) -> None:
+                 limit_until: Optional[Dict[str, float]] = None,
+                 human: Callable[..., Any] = brain.human) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1150,6 +1209,7 @@ class Factory:
         self.review_check = review_check
         self.review_bot = review_bot
         self.merge, self.fix, self.move = merge, fix, move
+        self.human = human
         self.close = close if close is not None else _default_close
         self.limited = set(limited)
         # Lanes whose fresh heartbeat says unavailable for another reason (an
@@ -1174,6 +1234,10 @@ class Factory:
         # running ticket past SILENT_MAX, with those tickets.
         self.silent = dict(silent or {})
         self.silent_running: Dict[str, List[Tuple[str, int]]] = {}
+        # "OWNER/NAME#N" -> why this pass left that ticket where it is, for
+        # the station to time (invariants.ticket_waiting). A ticket held by
+        # its own Not before: line is waiting on purpose and is not here.
+        self.waits: Dict[str, str] = {}
         self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
         self.actions = 0
@@ -1283,16 +1347,16 @@ class Factory:
         return None, ""
 
     def _check_runs(self, repo: str, sha: str) -> List[Dict[str, Any]]:
-        """Every check run on the commit, all pages."""
+        """The newest run of each check on the commit, all pages."""
         runs: List[Dict[str, Any]] = []
         for page in range(1, 11):
-            data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100&page=%d"
+            data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?filter=all&per_page=100&page=%d"
                                 % (repo, sha, page)).data or {}
             batch = [r for r in data.get("check_runs") or [] if isinstance(r, dict)]
             runs += batch
             if len(batch) < 100:
                 break
-        return runs
+        return brain.newest_check_runs(runs)
 
     def _files(self, repo: str, number: int) -> List[str]:
         """Every file path the pull request changes, all pages (GitHub lists
@@ -1490,6 +1554,10 @@ class Factory:
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
                    no_test: bool = False, unticked: Sequence[str] = ()) -> None:
         number = int(issue["number"])
+        if "loom:human" in _labels(issue):
+            return  # a person has it: no more rounds, no more comments
+        if checks_failing and self._past_no_change(repo, issue, comments):
+            return
         age = self.now - _ts(pr.get("created_at"))
         if stuck(comments, open_threads, checks_failing, age, self.now, no_test, unticked):
             footer = self._footer(repo, pr)
@@ -1504,6 +1572,7 @@ class Factory:
                     asked = self._ask_reviewer(repo, pr)
                     note = ("; the review bot was asked to judge the answer on #%d"
                             % int(pr["number"])) if asked else ""
+                    self._waiting(repo, number, "no lane is up for its next rung")
                     _say("%s#%d waits: no lane is up for its next rung%s"
                          % (repo, number, note))
                     return
@@ -1532,6 +1601,27 @@ class Factory:
             self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes)
         self.actions += 1
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
+
+    def _past_no_change(self, repo: str, issue: Dict[str, Any],
+                        comments: Sequence[Dict[str, Any]]) -> bool:
+        """After NO_CHANGE_LIMIT fix rounds in a row that ended with no commit
+        on one failing check, hand the ticket to a person with one comment
+        naming the check (2026-10-19: 19 rounds, 19 emails, no fix). The
+        loom:human label stops every later round and comment."""
+        stalled = sorted(n for n, k in no_change_rounds(comments).items()
+                         if k >= NO_CHANGE_LIMIT)
+        if not stalled:
+            return False
+        number = int(issue["number"])
+        names = ", ".join("`%s`" % n for n in stalled)
+        self.human(self.gh, repo, number,
+                   "Kind: decision\n%d fix rounds in a row made no change for the failing %s "
+                   "%s, so another round would do the same. Decide whether the check is stale "
+                   "or what the lane should change." % (NO_CHANGE_LIMIT, "check" if len(stalled) == 1
+                                                         else "checks", names))
+        self.actions += 1
+        _say("%s#%d has gone to a person: no change for %s" % (repo, number, names))
+        return True
 
     def _ask_reviewer(self, repo: str, pr: Dict[str, Any]) -> bool:
         """Ask the review bot to judge a lane's answer on a pull request whose
@@ -1778,7 +1868,7 @@ class Factory:
                             "code changed without a test", no_test=True)
         elif not sensitive:
             self._file_criterion_follow_up(repo, number, issue, full)
-            self._land(repo, number, full, issue)
+            self._land(repo, number, full, issue, comments)
 
     def _file_criterion_follow_up(self, repo: str, number: int,
                                   issue: Dict[str, Any], full: Dict[str, Any]) -> None:
@@ -1834,8 +1924,9 @@ class Factory:
         review = [r for r in failed if r.get("name") == self.review_check]
         if len(review) != 1 or len(failed) != 1:
             return False
-        title = str((review[0].get("output") or {}).get("title") or "")
-        if not any(title.startswith(mark) for mark in PARTIAL_REVIEW_TITLES):
+        output = review[0].get("output") or {}
+        if not degraded_review(str(output.get("title") or ""),
+                               str(output.get("summary") or "")):
             return False
         marker = REVIEW_AGAIN_MARKER % sha
         for comment in self.gh.paginate(
@@ -1857,9 +1948,11 @@ class Factory:
         return int(data.get("behind_by") or 0)
 
     def _land(self, repo: str, number: int, full: Dict[str, Any],
-              issue: Dict[str, Any]) -> None:
+              issue: Dict[str, Any], comments: List[Dict[str, Any]]) -> None:
         """Merge a ready pull request that is up to date with its base, one a
-        repo a pass; bring one that is behind up to date instead."""
+        repo a pass; bring one that is behind up to date instead. A pull
+        request that cannot be brought up to date cleanly goes back for a
+        fix round, as a conflict does."""
         if repo in self.landed:
             return
         if self._behind(repo, full):
@@ -1870,24 +1963,68 @@ class Factory:
             done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
                                 {"expected_head_sha": sha}, ok=(422,))
             if done.status == 422:
-                _say("could not bring %s#%d up to date; it waits for the next pass" % (repo, number))
+                self._send_back(repo, full, issue, comments,
+                                "could not be brought up to date with its base")
+                # keep repo in updated to retry on next pass
                 return
+            # reset updated for future merges
+            self.updated.remove(repo)
             self.actions += 1
             _say("brought %s#%d up to date with its base; it lands once its checks "
                  "and review pass on the new head" % (repo, number))
             return
-        if self._merge(repo, number, issue):
+        if self._merge(repo, number, issue, str((full.get("head") or {}).get("sha") or "")):
             self.landed.add(repo)
 
-    def _merge(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
+    def _merge(self, repo: str, number: int, issue: Dict[str, Any], sha: str = "") -> bool:
+        ticket = (repo, int(issue["number"]))
         try:
-            self.merge(self.gh, repo, number, (repo, int(issue["number"])))
+            try:
+                self.merge(self.gh, repo, number, ticket)
+            except GitHubError as err:
+                if err.status != 405 or not self._dismiss_bot_change_requests(repo, number, sha):
+                    raise
+                self.merge(self.gh, repo, number, ticket)
         except (ValueError, GitHubError) as err:
             _say("did not merge %s#%d: %s" % (repo, number, err))
             return False
         self.actions += 1
         _say("merged %s#%d for #%d" % (repo, number, issue["number"]))
         return True
+
+    def _dismiss_bot_change_requests(self, repo: str, number: int, sha: str) -> bool:
+        """Dismiss the review bot's change requests that its own review check
+        superseded, and say whether any was: each one submitted before that
+        check last passed on the head commit `sha` (only a ready pull request
+        reaches _merge). The review bot leaves the change request of a failing
+        review in place after its own later review of the same head passes,
+        and the merge was refused every pass (2026-10-21). A person's change
+        request, another bot's, and one newer than the passing check stay."""
+        passed = [_ts(r.get("completed_at")) for r in self._runs.get(sha, [])
+                  if r.get("name") == self.review_check and r.get("conclusion") in GREEN]
+        if not sha or not passed:
+            return False
+        cleared = max(passed)
+        bot = {self.review_bot.lower(), self.review_bot.lower() + "[bot]"}
+        dismissed = 0
+        for review in self.gh.paginate("/repos/%s/pulls/%d/reviews" % (repo, number)):
+            user = review.get("user") or {}
+            if (review.get("state") != "CHANGES_REQUESTED" or user.get("type") != "Bot"
+                    or str(user.get("login") or "").lower() not in bot
+                    or _ts(review.get("submitted_at")) >= cleared):
+                continue
+            self.gh.rest("PUT", "/repos/%s/pulls/%d/reviews/%d/dismissals"
+                         % (repo, number, int(review["id"])),
+                         {"event": "DISMISS", "message":
+                          "Superseded: %s passed on this head commit after this review. "
+                          "The factory dismisses the review bot's change request that "
+                          "its own later review cleared." % self.review_check})
+            dismissed += 1
+        if dismissed:
+            self.actions += 1
+            _say("dismissed %d superseded review-bot change request(s) on %s#%d"
+                 % (dismissed, repo, number))
+        return bool(dismissed)
 
     def failed(self, repo: str, issue: Dict[str, Any],
                prs: Dict[int, Dict[str, Any]]) -> None:
@@ -1989,6 +2126,10 @@ class Factory:
             _say("moved running %s#%d off silent lane %s to %s" % (repo, number, old, lane))
         self.load[old] = self.load.get(old, 0) - 1
         self.actions += 1
+
+    def _waiting(self, repo: str, number: Any, reason: str) -> None:
+        """Record why this pass leaves the ticket where it is (self.waits)."""
+        self.waits["%s#%s" % (repo, number)] = reason
 
     def _relabel(self, repo: str, issue: Dict[str, Any], labels: List[str]) -> None:
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, issue["number"]),
@@ -2220,6 +2361,8 @@ class Factory:
             _say("queued %s#%d off lane %s, %s" % (repo, number, old, why))
             return
         if lane is None:
+            self._waiting(repo, number, "on lane %s, %s: no free lane in its %s"
+                          % (old, why, "rung" if rung else "tier"))
             _say("%s#%d waits on lane %s, %s: no free lane in its %s"
                  % (repo, number, old, why, "rung" if rung else "tier"))
             return
@@ -2304,15 +2447,18 @@ class Factory:
         assigned = _lane(issue)
         if assigned in REMOTE_LANES and not self._is_private(repo) and self._up(assigned):
             # A live remote assignment stays queued for its pull worker.
+            self._waiting(repo, issue["number"], "remote lane %s has not pulled it" % assigned)
             return "%s waits for remote lane %s to pull it" % (ref, assigned)
         if assigned in REMOTE_LANES:
             lane, fallback = self._tier_move(repo, issue, old=assigned)
         else:
             lane, fallback = self._tier_move(repo, issue)
         if lane is None:
-            return "%s waits: no free lane in tier %s" % (ref, difficulty_of(issue) or "(none)")
+            self._waiting(repo, issue["number"], "no free lane in tier %s" % difficulty_of(issue))
+            return "%s waits: no free lane in tier %s" % (ref, difficulty_of(issue))
         tier = difficulty_of(issue) + (", " + fallback if fallback else "")
         if not self._guarded(self._assign_queued_one, repo, issue, lane, tier):
+            self._waiting(repo, issue["number"], "giving it a lane failed")
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
 
@@ -2328,6 +2474,9 @@ class Factory:
         lane = self._queued_model_lane(repo, model)
         if lane is None:
             why = "%s waits: no free lane takes model %s" % (ref, model)
+            self._waiting(repo, issue["number"], "no free lane takes model %s" % (
+                model if tickets.MODEL_RE.fullmatch(model) and len(model) <= 64
+                else "(its Model: line names no model id)"))
             _say(why)
             return why
         if not self._guarded(self._assign_queued_one, repo, issue, lane, "model %s" % model):

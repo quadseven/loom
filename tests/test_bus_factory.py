@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-from bus import factory, labels, station, status
+from bus import brain, factory, labels, station, status
 from bus.github import GitHubError, Response
 from bus.tickets import FIX_MARKER
 
@@ -47,6 +47,7 @@ class FakeGitHub:
         self.issues = {}
         self.comments = {}
         self.events = {}
+        self.reviews = {}
         self.pulls = {}
         self.runs = {}
         self.details = {}
@@ -111,6 +112,9 @@ class FakeGitHub:
         m = re.search(r"/issues/(\d+)/events$", path)
         if m:
             return list(self.events[int(m.group(1))])
+        m = re.search(r"/pulls/(\d+)/reviews$", path)
+        if m:
+            return list(self.reviews.get(int(m.group(1)), []))
         raise AssertionError("unexpected paginate %s" % path)
 
     def rest(self, method, path, body=None, etag=None, ok=()):
@@ -154,6 +158,12 @@ class FakeGitHub:
 
     def _write(self, method, path, body):
         self.writes.append((method, path, body))
+        m = re.search(r"/pulls/(\d+)/reviews/(\d+)/dismissals$", path)
+        if m:
+            for review in self.reviews.get(int(m.group(1)), []):
+                if review["id"] == int(m.group(2)):
+                    review["state"] = "DISMISSED"
+            return Response(200, {})
         if path.endswith("/update-branch"):
             return Response(self.update_status, {})
         if method == "POST" and path.endswith("/issues"):
@@ -209,10 +219,14 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
+        self.humans = []
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
            down=(), limit_until=None):
         def merge(gh, repo, number, ticket):
+            # As GitHub does: a standing change request blocks the merge.
+            if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
+                raise GitHubError("PUT /repos/%s/pulls/%d/merge -> 405" % (repo, number), 405)
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes, lane=None, model=None):
             f.notes = notes
@@ -226,8 +240,12 @@ class Base(unittest.TestCase):
         def close(gh, repo, number, comment):
             self.closed.append((number, comment))
             factory._default_close(gh, repo, number, comment)
+        def human(gh, repo, number, ask):
+            self.humans.append((number, ask))
+            gh.comments[number].append({"body": brain.HUMAN_MARKER + "\n" + ask, "user": ME})
+            gh.issues[number]["labels"].append({"name": "loom:human"})
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
-                            merge=merge, fix=fix, move=move, close=close,
+                            merge=merge, fix=fix, move=move, close=close, human=human,
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
                             silent=silent, down=down, limit_until=limit_until)
@@ -344,6 +362,39 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.merged, [])
         self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+
+    def blocked_by(self, login, user_type="Bot", submitted=600):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        # The review check passed 60s ago; the change request is older.
+        self.gh.runs["sha50"] = [{"name": "unittest", "status": "completed", "conclusion": "success"},
+                                 {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+                                  "conclusion": "success", "completed_at": iso(60)}]
+        self.gh.reviews[50] = [{"id": 7, "state": "CHANGES_REQUESTED", "submitted_at": iso(submitted),
+                                "user": {"login": login, "type": user_type}}]
+        self.go()
+        return [w for w in self.gh.writes if "/dismissals" in w[1]]
+
+    def test_a_ready_pull_request_blocked_by_the_review_bots_old_change_request_lands(self):
+        # The bot's failing review left a change request that its own later
+        # green review on the same head never dismissed, and the merge was
+        # refused every pass (2026-10-21).
+        (dismissal,) = self.blocked_by("grug-tribe[bot]")
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertTrue(dismissal[1].endswith("/reviews/7/dismissals"))
+        self.assertEqual(dismissal[2]["event"], "DISMISS")
+        self.assertIn(factory.DEFAULT_REVIEW_CHECK, dismissal[2]["message"])
+
+    def test_a_persons_or_another_bots_change_request_is_never_dismissed(self):
+        for login, user_type in (("Alice-Example", "User"), ("security-scanner[bot]", "Bot")):
+            with self.subTest(login=login):
+                self.merged.clear()
+                self.assertEqual(self.blocked_by(login, user_type), [])
+                self.assertEqual(self.merged, [])
+
+    def test_a_change_request_newer_than_the_passing_review_stays(self):
+        self.assertEqual(self.blocked_by("grug-tribe[bot]", submitted=10), [])
+        self.assertEqual(self.merged, [])
 
     def test_code_with_a_test_on_a_later_page_lands(self):
         self.gh.ticket(5, "pr")
@@ -703,22 +754,59 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.model(6), "gpt-6-sol")
 
+    def test_a_ready_pull_request_up_to_date_with_main_merges_with_no_update_call(self):
+        # Acceptance: a ready pull request that is up to date with main
+        # merges as before, with no update call.
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        with mock.patch("bus.factory._say") as say:
+            self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertNotIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
+                          {"expected_head_sha": "sha50"}), self.gh.writes)
+        for call in say.call_args_list:
+            self.assertNotIn("up to date", call.args[0])
+
     def test_a_ready_pull_request_behind_its_base_is_brought_up_to_date_not_merged(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)
         self.gh.behind[50] = 3
-        self.go()
+        with mock.patch("bus.factory._say") as say:
+            self.go()
         self.assertEqual(self.merged, [])
         self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
                        {"expected_head_sha": "sha50"}), self.gh.writes)
+        # One log line per update.
+        say.assert_called_once_with(
+            "brought %s#50 up to date with its base; it lands once its checks "
+            "and review pass on the new head" % REPO)
 
-    def test_a_refused_update_waits_for_the_next_pass(self):
+    def test_a_refused_update_goes_back_for_a_fix_round_like_a_conflict(self):
+        # 2026-10-20: an update that cannot be applied cleanly goes back for
+        # a fix round, as a conflict does, instead of silently waiting.
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)
         self.gh.behind[50] = 1
         self.gh.update_status = 422
         f = self.go()
-        self.assertEqual((self.merged, self.fixed, f.actions), ([], [], 0))
+        self.assertEqual(self.merged, [])
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(f.actions, 1)
+
+    def test_an_updated_pull_request_lands_on_a_later_pass_once_green(self):
+        # First pass: the pull request is behind, so it is updated, not
+        # merged. Second pass: its new head is up to date and green, so it
+        # merges with no further update call.
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 3
+        self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+        self.assertEqual(len(self.gh.writes), 1)
+        self.gh.behind[50] = 0
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertEqual(len(self.gh.writes), 1)
 
     def test_each_repo_lands_one_pull_request_a_pass_oldest_first(self):
         self.gh.ticket(5, "pr")
@@ -803,6 +891,27 @@ class PullRequests(Base):
         bodies = [str(c.get("body") or "") for c in self.gh.comments[50]]
         self.assertTrue(any("/grug improve" in body for body in bodies))
         self.assertTrue(any(factory.REVIEW_AGAIN_MARKER % "sha50" in body for body in bodies))
+
+    def test_a_prefixed_low_confidence_review_asks_for_improve(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
+             "output": {"title": "Living Hunt 3c63e18b..30d00ebb - WARN Elder review "
+                                 "low confidence (deep append)",
+                        "summary": "Degraded review (low_confidence_review): not a verdict."},
+             "details_url": "https://github.com/%s/actions/runs/81/job/1" % REPO}]
+        self.go()
+        self.assertEqual(self.fixed, [])
+        bodies = [str(c.get("body") or "") for c in self.gh.comments[50]]
+        self.assertTrue(any("/grug improve" in body
+                            and factory.REVIEW_AGAIN_MARKER % "sha50" in body for body in bodies))
+
+    def test_degraded_review_reads_the_bot_marker_and_titles_anywhere(self):
+        self.assertTrue(factory.degraded_review("anything", "Degraded review (timeout): not a verdict."))
+        self.assertTrue(factory.degraded_review("Living Hunt a..b - WARN Grug eyes clouded", ""))
+        self.assertTrue(factory.degraded_review("WARN Elder review coverage partial", ""))
+        self.assertFalse(factory.degraded_review("FAIL Elder found 2 problems", "Fix the null check."))
 
     def test_a_second_partial_review_on_the_same_head_is_sent_back(self):
         self.gh.ticket(5, "pr")
@@ -1109,6 +1218,53 @@ class ReviewBotThreads(Base):
         self.assertEqual(len(self.fixed), 1)
 
 
+class NoChangeRounds(Base):
+    def rounds(self, *kinds):
+        for n, kind in enumerate(kinds):
+            body = FIX_ASKED if kind == "fix" else NO_CHANGE
+            self.gh.comments[5].append({"body": body, "user": ME,
+                                        "created_at": iso(20000 - 1000 * n)})
+
+    def setUp(self):
+        super().setUp()
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.pull(50, 5, resolved=False, green=False)
+
+    def test_two_no_change_rounds_on_one_check_hand_the_ticket_to_a_person(self):
+        self.rounds("fix", "none", "fix", "none")
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(len(self.humans), 1)
+        self.assertIn("`lint`", self.humans[0][1])
+        self.assertTrue(self.humans[0][1].startswith("Kind: decision"))
+
+    def test_a_second_pass_neither_sends_a_round_nor_repeats_the_comment(self):
+        self.rounds("fix", "none", "fix", "none")
+        self.go()
+        count = len(self.gh.comments[5])
+        self.go()
+        self.assertEqual((len(self.humans), self.fixed), (1, []))
+        self.assertEqual(len(self.gh.comments[5]), count)
+
+    def test_one_no_change_round_still_sends_the_next_round_up_the_ladder(self):
+        self.rounds("fix", "none")
+        self.go()
+        self.assertEqual((len(self.fixed), self.humans), (1, []))
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+
+    def test_a_round_that_changed_something_resets_the_count(self):
+        self.rounds("fix", "none", "fix", "fix", "none")
+        self.go()
+        self.assertEqual(self.humans, [])
+
+    def test_a_check_a_later_round_does_not_name_loses_its_count(self):
+        other = FIX_ASKED.replace("### Check: lint", "### Check: unit")
+        self.rounds("fix", "none")
+        self.gh.comments[5] += [{"body": other, "user": ME, "created_at": iso(18000)},
+                                {"body": NO_CHANGE, "user": ME, "created_at": iso(17000)}]
+        self.assertEqual(factory.no_change_rounds(self.gh.comments[5]), {"unit": 1})
+
+
 MEDIUM = "\U0001f7e0 medium | _robustness_ | `missing-error-handling` | quick win\n\nGrug see a gap."
 HIGH = "\U0001f525 high | _correctness_ | `null-deref` | quick win\n\nGrug see a crash."
 ASKED_ONCE = FIX_MARKER + "\nPull request: x#50\n\n### Thread PRRT_1 (comment 1) at a.py:1\n\n    gap"
@@ -1313,6 +1469,19 @@ class Queued(Base):
         worker.assign_queued()
         return worker
 
+    def test_a_queued_ticket_that_waits_says_why_in_waits(self):
+        # The factory's reason for leaving a ticket where it is reached only
+        # the log; nothing saw the same reason repeat for hours (2026-10-21).
+        self.queued(7, body="Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n")
+        self.queued(8)
+        self.queued(9, body="Not before: 2099-01-01T00:00:00Z\nDifficulty: medium\n\n## Why\nx\n")
+        self.queued(10, body="Model: <b>`x`\nDifficulty: medium\n\n## Why\nx\n")
+        worker = self.assign(available=[])
+        self.assertEqual(worker.waits, {
+            "%s#7" % REPO: "no free lane takes model claude-opus-5-5",
+            "%s#8" % REPO: "no free lane in tier medium",
+            "%s#10" % REPO: "no free lane takes model (its Model: line names no model id)"})
+
     def test_queued_ladder_model_uses_a_compatible_lane(self):
         body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
         self.queued(7, body=body)
@@ -1405,11 +1574,6 @@ class Queued(Base):
         self.assign(available=["codex"])
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
 
-    def test_missing_difficulty_stays_queued(self):
-        self.queued(7, body="## Why\nx\n")
-        self.assign(available=["codex"])
-        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
-
     def test_oldest_takes_the_free_lane_first(self):
         self.queued(7, age=60)
         self.queued(8, age=600)
@@ -1451,6 +1615,15 @@ class Queued(Base):
             self.assign(available=[])
         say.assert_called_once_with("assigned 0 of 1 queued: %s#7 waits: no free lane "
                                     "in tier medium" % REPO)
+
+    def test_a_queued_ticket_with_no_difficulty_takes_a_medium_lane(self):
+        # A queued ticket whose body had no Difficulty line was in no tier, so
+        # no lane could ever take it; one waited a day (2026-10-21).
+        for body in ("Priority: P2\n\n## Why\nx\n", "Difficulty: Medium-ish\n\n## Why\nx\n"):
+            with self.subTest(body=body):
+                self.queued(7, body=body)
+                self.assign(available=["codex"])
+                self.assertEqual(self.lane(7), "codex")
 
     def test_a_pass_that_assigns_a_queued_ticket_says_no_count(self):
         self.queued(7, age=600)
@@ -2275,6 +2448,24 @@ class Helpers(unittest.TestCase):
         f = factory.Factory(gh, [REPO], NOW, trusted=["alice-example"])
         self.assertEqual(f._review_state(REPO, 1, "sha", NOW), "reviewed")
 
+    def test_a_check_judged_by_its_newest_run_not_a_stale_failure(self):
+        gh = FakeGitHub()
+        seen = []
+        runs = [{"id": 1, "name": "leak-scan", "status": "completed", "conclusion": "failure",
+                 "started_at": "2030-01-01T00:29:00Z"},
+                {"id": 3, "name": "leak-scan", "status": "completed", "conclusion": "success",
+                 "started_at": "2030-01-01T01:56:00Z"},
+                {"id": 2, "name": "leak-scan", "status": "completed", "conclusion": "success",
+                 "started_at": "2030-01-01T01:27:00Z"}]
+
+        def rest(method, path, body=None, etag=None, ok=()):
+            seen.append(path)
+            return Response(200, {"check_runs": runs})
+        gh.rest = rest
+        f = factory.Factory(gh, [REPO], NOW, trusted=["alice-example"])
+        self.assertEqual([r["id"] for r in f._check_runs(REPO, "sha")], [3])
+        self.assertIn("filter=all", seen[0])
+
     def test_the_station_setting_turns_it_off(self):
         self.assertFalse(station.Settings.from_env({"LOOM_FACTORY": "0"}).factory_on)
         on = station.Settings.from_env({})
@@ -2309,7 +2500,7 @@ class Helpers(unittest.TestCase):
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
                          model_limits=None, silent=None, down=(), limit_until=None):
-                self.silent_running, self.silent = {}, silent
+                self.silent_running, self.silent, self.waits = {}, silent, {}
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))
 

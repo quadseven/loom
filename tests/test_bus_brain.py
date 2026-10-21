@@ -1626,6 +1626,52 @@ class FixTests(unittest.TestCase):
              "body": "Claimed for lane codex (body sha256 0123456789ab)"}],
             ["alice-example"]))
 
+    def _status_with_claim(self, claim_at):
+        return {"user": {"login": "station"},
+                "created_at": "2026-10-20T14:55:56Z",
+                "body": ("<!-- loom:status v1 -->\n"
+                         "Loom status for this ticket, newest first.\n\n"
+                         "- %s Claimed for lane codex (body sha256 7b0568360b2b)\n"
+                         "- 2026-10-20T14:52:16Z The station gave this queued ticket lane zen.\n"
+                         % claim_at)}
+
+    def _fix_comment(self, created_at):
+        return {"user": {"login": "alice-example"},
+                "created_at": created_at,
+                "body": "<!-- loom:fix v1 -->\n<!-- loom:brain-fix v1 --> criteria not ticked"}
+
+    def test_pending_brain_fix_finds_claim_lines_inside_the_status_comment(self):
+        # loom#1203: the station edits one status comment in place, so claims
+        # arrive as timestamped lines inside it, not as whole comments. The
+        # line's own stamp - not the comment's position - decides against the
+        # fix ask.
+        comments = [self._status_with_claim("2026-10-20T18:10:14Z"),
+                    self._fix_comment("2026-10-20T17:00:00Z")]
+        self.assertFalse(brain._pending_brain_fix(comments, ["alice-example", "station"]))
+
+    def test_pending_brain_fix_still_blocks_when_the_fix_ask_is_newer(self):
+        comments = [self._status_with_claim("2026-10-20T18:10:14Z"),
+                    self._fix_comment("2026-10-20T19:13:32Z")]
+        self.assertTrue(brain._pending_brain_fix(comments, ["alice-example", "station"]))
+
+    def test_pending_brain_fix_ignores_claim_lines_from_untrusted_writers(self):
+        forged = dict(self._status_with_claim("2026-10-20T18:10:14Z"))
+        forged["user"] = {"login": "stranger"}
+        comments = [forged, self._fix_comment("2026-10-20T17:00:00Z")]
+        self.assertTrue(brain._pending_brain_fix(comments, ["alice-example", "station"]))
+
+    def test_a_check_that_later_passed_is_not_a_failing_check(self):
+        runs = {"check_runs": [
+            {"id": 41, "name": "leak-scan", "conclusion": "failure", "started_at": "2030-01-01T00:29:00Z",
+             "output": {"title": "old failure"}},
+            {"id": 42, "name": "leak-scan", "conclusion": "success", "started_at": "2030-01-01T01:56:00Z"},
+            {"id": 43, "name": "lint", "conclusion": "failure", "started_at": "2030-01-01T01:00:00Z",
+             "output": {"title": "still red"}}]}
+        fake = Fake(reply(200, runs), reply(200, {"statuses": []}))
+        found = brain._failing_checks(GitHub("t", transport=fake), REPO, "abc123")
+        self.assertEqual([name for name, _ in found], ["lint"])
+        self.assertIn("filter=all", fake.calls[0][1])
+
     def test_fix_refuses_notes_the_brain_must_never_post(self):
         with self.assertRaises(ValueError):
             brain.fix(GitHub("t", transport=Fake()), REPO, 8, (REPO, 9), "This does not fix #9")
@@ -3423,6 +3469,13 @@ class HeldTicketsTest(unittest.TestCase):
         report = self.status_for(self.dependency(state="merged"), self.waiting()[0])
         self.assertIn("### Held tickets\n- none", report)
         self.assertNotIn("### Held tickets\n- #12", report)
+
+    def test_status_omits_a_merged_runaway_ticket_from_runaway_tickets(self):
+        issue = dict(ticket("merged"), number=12, title="Merged already",
+                     created_at="2030-01-01T00:00:00Z")
+        issue["labels"] = issue["labels"] + [{"name": "loom:runaway"}]
+        report = self.status_for(issue)
+        self.assertIn("## Runaway tickets\n- none", report)
 
     def test_a_hold_of_more_than_two_days_is_reported_as_stuck(self):
         waiting, events = self.waiting(briefed=OLD)

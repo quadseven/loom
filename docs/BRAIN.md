@@ -700,7 +700,14 @@ lane as a `loom:fix` comment, using the same findings format as
 pushes fixes to the existing branch. `LOOM_FIX_ROUNDS` caps automatic rounds
 per ticket (default 3), after which the station adds `needs-brain`. A clean
 PR receives `loom:ready`; a later push removes that label until the new head
-has finished checks and review again.
+has finished checks and review again. A degraded or partial result of the
+review check (its summary says `Degraded review (...): not a verdict`, or its
+title carries a partial-review form such as `WARN Elder review low
+confidence`) is not sent back: a lane cannot fix it. The station leaves the
+ticket at `loom:pr` with no fix comment, no round counted and no
+`loom:ready`, and the factory asks the review bot to review the head again
+(`/grug improve`, once per head commit). Real failures beside it are sent
+back without it.
 
 When the station claims a ticket whose latest comment from an allowed login
 is such a fix comment, newer than its last claim, the brief keeps the pull
