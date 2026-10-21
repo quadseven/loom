@@ -671,7 +671,7 @@ print('leak guard: clean (shape patterns only)')
         # A longer name is another repo: the posted body says so instead.
         self.drop_brief(text=BRIEF.replace(
             "The thing is broken for every user.",
-            "The thing is broken for every user, as repo-legacy-private#3 found."))
+            "The thing is broken for every user, as repo-legacy-private#3 found."))  # leak-guard-allow: the case under test
         result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         body = self.body.read_text()
