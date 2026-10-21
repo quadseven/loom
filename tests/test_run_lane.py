@@ -1709,6 +1709,31 @@ print('leak guard: clean (shape patterns only)')
         self.assertTrue(reason.startswith("[limit] "), reason)
         self.assertIn("the edits are on branch " + side[0], reason)
 
+    def test_a_limit_ending_after_editing_keeps_the_edits(self):
+        # A free pool that runs dry 20 minutes into a run ends it with exit 1
+        # and a limit; the next attempt starts from these edits, not the base.
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="429 RESOURCE_EXHAUSTED quota resets in 1 hours",
+                      FAKE_EDIT="1", FAKE_EXIT="1")
+        reason = self.failure_line()
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-timedout-" in h]
+        self.assertEqual(len(side), 1, heads)
+        self.assertTrue(reason.startswith("[limit] "), reason)
+        self.assertIn("the edits are on branch " + side[0], reason)
+        kept = subprocess.run(["git", "--git-dir", str(self.remote), "show", side[0] + ":fix.txt"],
+                              capture_output=True, text=True, check=True).stdout
+        self.assertEqual(kept, "partial\n")
+
+    def test_a_work_failure_after_editing_pushes_no_side_branch(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="I could not finish", FAKE_EDIT="1", FAKE_EXIT="1")
+        self.assertTrue(self.failure_line().startswith("[work] "), self.failure_line())
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-timedout-", heads)
+
     def test_a_failed_status_read_never_names_an_uncommitted_timeout_branch(self):
         self.write_tool(self.bin / "git", """#!/usr/bin/env bash
 if [[ " $* " == *" status --porcelain "* ]] &&
