@@ -1472,6 +1472,25 @@ tracked_changes() {
   safe_git status --porcelain --untracked-files=no --ignore-submodules=dirty | head -5 | tr '\n' ' '
 }
 
+# The first submodule whose tracked files the agent changed or whose commit it
+# moved, as "path (file file ...)"; empty when there is none. A push of this
+# repo carries only the submodule's pinned commit, so a check run on those
+# edits passes on code CI never sees: a pull request passed its
+# lane check and failed CI on the C++ it needed (2026-10-21).
+submodule_edits() {
+  local line path files
+  while read -r line; do
+    path="$(printf '%s' "$line" | awk '{print $2}')"
+    case "$line" in
+      -*) continue ;;  # not checked out: git there would read this repo
+      +*|U*) files="its checked-out commit" ;;
+      *) files="$(safe_git -C "$path" status --porcelain --untracked-files=no 2>> "$LOG" |
+                  cut -c4- | head -3 | sed "s|^|$path/|" | tr '\n' ' ')" ;;
+    esac
+    [ -z "$files" ] || { printf '%s (%s)' "$path" "${files% }"; return 0; }
+  done < <(safe_git submodule status --recursive 2>> "$LOG")
+}
+
 # Check the trusted default branch in its own worktree when a fix branch is
 # red or has merge conflicts. The merged branch and its setup files remain
 # available for the agent. DEFAULT_EXIT is the default branch's check result.
@@ -1725,6 +1744,7 @@ validation_note() {
   [ -n "$HAS_CONTRACT" ] || return 0
   printf '\n\n## Validation environment\nThe runner prepared this tree from %s (interpreter: %s, submodules: %s, setup: %s). After you finish it runs the check below on your committed tree; the pull request opens only if it exits 0 and changes no tracked file. On the base it exited %s.\n\n    %s\n' \
     "$CONTRACT_FILE" "${C_INTERP:-any}" "$C_SUBMODULES" "${C_SETUP:-none}" "$BASELINE_EXIT" "$C_CHECK"
+  [ "$C_SUBMODULES" != yes ] || printf '\nNever edit files inside a submodule: the push carries only its pinned commit, so the runner refuses a run that does and pushes nothing.\n'
 }
 
 # Keep the agent's session transcripts (Claude Code .jsonl; opencode's SQLite
@@ -2550,6 +2570,10 @@ for BRIEF in "$INBOX"/*.md; do
     rm -f "$TREE/$SUMMARY_FILE"
   else
     rm -f "$TREE/$SUMMARY_FILE"
+  fi
+  SUBMODULE_EDITS="$(submodule_edits)"
+  if [ -n "$SUBMODULE_EDITS" ]; then
+    park "$BRIEF" "the change edits files inside submodule $SUBMODULE_EDITS, which a push of this repo does not carry; that repo needs the change first. nothing pushed"; continue
   fi
   # During a merge the branch is already checked out, and the commit
   # completes the merge.

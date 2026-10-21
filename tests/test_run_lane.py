@@ -4263,6 +4263,7 @@ exit %d
         # The agent worked in the prepared tree and was told the check.
         self.assertIn("agent-saw submodule", self.calls())
         self.assertIn("## Validation environment", self.log.read_text())
+        self.assertIn("Never edit files inside a submodule", self.log.read_text())
         records = self.records()
         self.assertEqual([(r["phase"], r["exit"], r["ok"]) for r in records],
                          [("prepare", 0, True), ("setup", 0, True), ("baseline", 0, True), ("final", 0, True)])
@@ -4279,6 +4280,33 @@ exit %d
         self.assertNotIn(".prepared", files)
         # The check's scratch home is gone once the run is over (loom#643).
         self.assertFalse((self.loom / "run" / "codex-check").exists())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_an_edit_inside_a_submodule_is_refused_before_the_check(self):
+        # The push carries only the submodule's pinned commit, so a check that
+        # passed on the agent's edits inside it passed on code CI never sees:
+        # a pull request went up green locally and red in CI (2026-10-21).
+        self.contract_repo()
+        self.drop_brief()
+        self.write_tool(self.bin / "codex", """#!/usr/bin/env bash
+printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
+cat > /dev/null
+echo edited > vendor/sub/value.txt
+cat > check.py <<'PY'
+import pathlib
+assert pathlib.Path("vendor/sub/value.txt").read_text() == "edited\\n"
+PY
+echo fixed > fix.txt
+""")
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        self.assertIn("failed: [work] the change edits files inside submodule vendor/sub"
+                      " (vendor/sub/value.txt), which a push of this repo does not carry",
+                      self.lane_log())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertFalse(any(r["phase"] == "final" for r in self.records()))
+        self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", self.remote_heads())
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_zero_exit_agent_with_a_failing_check_opens_no_pr_and_keeps_its_edits(self):
