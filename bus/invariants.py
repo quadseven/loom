@@ -400,10 +400,18 @@ def marker_cadence(f: Facts) -> List[Breach]:
     return out
 
 
+# A brief the runner parked before its agent ran: the fix round's pull
+# request had merged or closed, or another push moved its branch
+# (lanes/run_lane.sh fix_pr_open and the branch-moved park).
+_PARKED_UNRUN = re.compile(r"(\[[a-z]+\] )?(pull request #[0-9]+ is no longer open on |branch moved: )")
+
+
 def _says_lane_health(r: Run) -> bool:
     """A run whose end says something about the lane itself: a limit, an
-    expired key or a factory incident (the repo's check or setup) does not."""
-    return not r.reason.startswith(("[limit]", "[auth]", "[factory]"))
+    expired key, a factory incident (the repo's check or setup) or a brief
+    parked before its agent ran does not."""
+    return not (r.reason.startswith(("[limit]", "[auth]", "[factory]"))
+                or _PARKED_UNRUN.match(r.reason))
 
 
 def lane_no_success(f: Facts) -> List[Breach]:
