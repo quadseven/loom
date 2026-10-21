@@ -38,7 +38,11 @@ agent_cli() {
 # (2026-10-20). Providers say the quota is reached, exceeded or exhausted.
 # A full shared free pool ("has no lane available; retry after 1s") is a
 # short limit, not the agent's failure (18 runs, 2026-10-21).
-LIMIT_RE='usage limit|rate[ _-]?limit|has no lane available|quota (reached|exceeded|exhausted|resets?)|exceeded (your |the )?(current )?quota|resource[ _]exhausted|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
+LIMIT_RE='usage limit|rate[ _-]?limit|has no lane available|quota (reached|exceeded|exhausted|resets?)|exceeded (your |the )?(current )?quota|resource[ _]exhausted|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required'
+# A bare HTTP status counts only in the short tail: a repo's own test output
+# printed "status=error detail=http 402", and a codex run that exited 0 was
+# classed out of credit and its lane parked a day (2026-10-21).
+LIMIT_CODE_RE='(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
 KEY_STATE='expired|revoked|invalid|incorrect|disabled'
 AUTH_RE="($KEY_STATE)[ _-]*api[ _-]*key|api[ _-]*key([ _-]*(is|was|has|been|are))*[ _-]*($KEY_STATE)|(http|status|code|error)[^0-9a-z]{0,3}401([^0-9]|\$)"
 # A quota on the whole account, not one model: every model of the lane is
@@ -46,7 +50,8 @@ AUTH_RE="($KEY_STATE)[ _-]*api[ _-]*key|api[ _-]*key([ _-]*(is|was|has|been|are)
 # Resets in 67h", but only the model that ran was marked, so the lane stayed
 # available and took a claim every few minutes).
 ACCOUNT_QUOTA_RE='individual quota reached|quota (exceeded|reached) for (this|the|your) (account|project|user|organization)'
-OUT_OF_CREDIT_RE='credit balance is too low|insufficient[ _](credit|balance|funds)|payment required|(http|status|code|error)[^0-9a-z]{0,3}402([^0-9]|$)'
+OUT_OF_CREDIT_RE='credit balance is too low|insufficient[ _](credit|balance|funds)|payment required'
+CREDIT_CODE_RE='(http|status|code|error)[^0-9a-z]{0,3}402([^0-9]|$)'
 NET_RE='econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|network error|fetch failed|connection (reset|refused|closed)|could not resolve host|overloaded|service unavailable|bad gateway|gateway timeout|internal server error|(http|status|code|error)[^0-9a-z]{0,3}(500|502|503|504|529)([^0-9]|$)'
 # When the provider says its limit lifts: an epoch after "limit reached|" or a
 # "reset" key, or a "retry after" / "try again in" / "resets in" duration.
@@ -121,19 +126,21 @@ provider_text() {
 classify_failure() {
   local status="$1" whole="$2" edited="$3" now n tail cap stated monthly=0
   tail="${4:-$whole}"
-  FAIL_CLASS=work RETRY_AT=""
+  FAIL_CLASS=work RETRY_AT="" OUT_OF_CREDIT=""
   now="$(date +%s)"
   shopt -s nocasematch
   if [[ "$tail" =~ $AUTH_RE ]]; then
     FAIL_CLASS=auth
   elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
-  elif [[ "$whole" =~ $LIMIT_RE ]]; then
+  elif [[ "$whole" =~ $LIMIT_RE ]] || [[ "$tail" =~ $LIMIT_CODE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT)) cap=$LIMIT_WAIT_MAX
-    if [[ "$whole" =~ $OUT_OF_CREDIT_RE ]]; then
-      RETRY_AT=$((now + LIMIT_WAIT_MAX))
-    elif stated="$(stated_reset "$whole")" && [ -n "$stated" ]; then
+    # A reset time the provider states wins: codex's five-hour limit says
+    # "purchase more credits or try again at 10:28 AM" (2026-10-21).
+    if stated="$(stated_reset "$whole")" && [ -n "$stated" ]; then
       RETRY_AT="$stated" cap=$RESET_WAIT_MAX
+    elif [[ "$whole" =~ $OUT_OF_CREDIT_RE ]] || [[ "$tail" =~ $CREDIT_CODE_RE ]]; then
+      OUT_OF_CREDIT=1 RETRY_AT=$((now + LIMIT_WAIT_MAX))
     elif [[ "$whole" =~ $EPOCH_RE ]]; then
       RETRY_AT="${BASH_REMATCH[2]}"
     elif [[ "$whole" =~ $AFTER_RE ]]; then

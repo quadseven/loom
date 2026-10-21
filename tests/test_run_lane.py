@@ -2090,6 +2090,38 @@ cat > /dev/null
         expected = int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp())
         self.assertEqual(int(retry_at), expected)
 
+    def classified(self, whole, tail, status=1):
+        script = (RUNNER.parent / "agent_cli.sh").read_text() + (
+            'classify_failure "$1" "$2" edited "$3"; '
+            'printf "%s %s %s\\n" "$FAIL_CLASS" "${RETRY_AT:-0}" "${OUT_OF_CREDIT:-none}"')
+        result = subprocess.run(["bash", "-c", script, "x", str(status), whole, tail],
+                                 capture_output=True, text=True, check=True)
+        kind, retry_at, credit = result.stdout.split()
+        return kind, int(retry_at), credit
+
+    # A repo's own test output printed "status=error detail=http 402": a codex
+    # run that exited 0 was classed out of credit and the lane parked a day,
+    # and a five-hour usage limit that said "try again at 10:28 AM" was parked
+    # a day too (2026-10-21).
+    TEST_402 = "jev: backend=openai kind=k status=error detail=http 402 (0 like it held back)"
+
+    def test_an_http_code_in_the_runs_own_output_is_not_a_limit(self):
+        whole = "\n".join([self.TEST_402, "FAILED (failures=2)", "agent: tests still fail"])
+        kind, _, credit = self.classified(whole, "FAILED (failures=2)\nagent: tests still fail")
+        self.assertEqual((kind, credit), ("work", "none"))
+
+    def test_a_stated_reset_time_wins_over_a_credit_pattern(self):
+        limit = ("ERROR: You've hit your usage limit. Upgrade to Pro, visit the usage page to "
+                 "purchase more credits or try again at 10:28 AM.")
+        kind, retry_at, credit = self.classified("\n".join([self.TEST_402, limit]), limit)
+        self.assertEqual((kind, credit), ("limit", "none"))
+        self.assertLess(retry_at - time.time(), 24 * 3600 - 60)
+
+    def test_a_402_from_the_provider_is_out_of_credit(self):
+        tail = "Error: 402 Payment Required: your credit balance is too low"
+        kind, retry_at, credit = self.classified(tail, tail)
+        self.assertEqual((kind, credit), ("limit", "1"))
+
     def api_lane(self, lane, extra="", **env):
         if not sandbox_caps.LOCALHOST:
             self.skipTest(sandbox_caps.NO_LOCALHOST)
