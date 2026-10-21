@@ -6264,7 +6264,14 @@ class Station:
             _say("settle-claimed: would ask the review bot to review %s#%d again" % (repo, pull))
             return
         url = "/repos/%s/issues/%d/comments" % (repo, pull)
+        # Anyone may comment on a public pull request: only a marker by one of
+        # ours (the trusted authors and this client's App login) counts.
+        ours = {author.lower() for author in self.s.authors}
+        own = getattr(self.gh, "_status_logins", None)
+        if callable(own):
+            ours |= {str(login).lower() for login in own()}
         if not any(str(c.get("body") or "").startswith(claimed.REREVIEW_MARKER)
+                   and tickets._login(c.get("user")) in ours
                    for c in self._paginate(url) if isinstance(c, dict)):
             pacer.wait()
             self.gh.rest("POST", url, {"body": "%s\n%s" % (

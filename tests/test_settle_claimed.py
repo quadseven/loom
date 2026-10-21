@@ -142,7 +142,8 @@ class FakeGitHub:
                 self.issues[n].update(data)
             return reply(200, self.issues[n])
         if sub == "comments" and method == "POST":
-            self.comments[n].append({"body": data["body"], "user": {"login": "station"}})
+            self.comments[n].append({"body": data["body"],
+                                     "user": {"login": "example-login"}})
             return reply(201, self.comments[n][-1])
         if sub == "comments":
             return reply(200, self.comments[n])
@@ -395,6 +396,14 @@ class RereviewTest(Base):
         os.remove(os.path.join(st.state, claimed.STATE_FILE))
         self.settle(now=9000.0)
         self.assertEqual(len(self.asks()), 1)
+
+    def test_a_marker_from_an_untrusted_author_does_not_suppress_the_request(self):
+        self.merged_neutral()
+        self.fake.comments[41] = [{"body": claimed.REREVIEW_MARKER + "\n/grug improve",
+                                   "user": {"login": "a-stranger"}}]
+        self.settle(now=5000.0)
+        ours = [c for c in self.asks() if c["user"]["login"] == "example-login"]
+        self.assertEqual(len(ours), 1)
 
     def test_a_successful_re_review_lets_the_issue_settle(self):
         self.merged_neutral()
