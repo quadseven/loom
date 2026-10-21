@@ -7635,7 +7635,7 @@ class ClaimDropTest(Base):
 
     def test_a_move_from_pr_to_queued_strips_ready(self):
         # The pull request was merged but left criteria unbuilt: the ticket is
-        # requeued, and it may not stay loom:ready (infra#5502 read queued+ready).
+        # requeued, and it may not stay loom:ready (a watched ticket read queued and ready at once).
         self.fake.add(12, state="pr", body=("Difficulty: easy\n\n## Acceptance criteria\n"
                                             "- [ ] one\n- [ ] two\n"))
         self.fake.issues[12]["labels"].append({"name": "loom:ready"})
