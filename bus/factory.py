@@ -2166,7 +2166,34 @@ class Factory:
         else:
             lane, fallback = self._tier_move(repo, issue, old, allow_remote=False)
         if lane is None and rung and self._rung_waits_long(repo, rung):
-            climbed = self._climb(repo, issue, self._comments(repo, number),
+            comments = self._comments(repo, number)
+            tried_lanes = {match.group(1) for comment in comments
+                           for match in [CLAIMED_RE.match(str(comment.get("body") or ""))]
+                           if match}
+            free_lane = next((candidate for candidate in lanes_of(
+                difficulty_of(issue), self._is_private(repo))
+                if lane_kind(candidate) == "free" and candidate not in tried_lanes
+                and self._free(candidate)), None)
+            if free_lane is not None:
+                body = without_model(str(issue.get("body") or ""))
+                self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+                kept = [x for x in _labels(issue) if not x.startswith("lane:")] \
+                    + ["lane:" + free_lane]
+                self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": kept})
+                issue["body"] = body
+                issue["labels"] = [{"name": x} for x in kept]
+                self._status_note(repo, number,
+                                  "Not a failure (lane %s is %s for over %d hours): the factory "
+                                  "moved this ticket to free lane %s; its paid rung remains "
+                                  "untried." % (old, why, RUNG_LIMIT_WAIT // 3600, free_lane))
+                self.load[old] = self.load.get(old, 0) - 1
+                self.load[free_lane] = self.load.get(free_lane, 0) + 1
+                self.actions += 1
+                _say("moved %s#%d off lane %s to free lane %s" % (
+                    repo, number, old, free_lane))
+                return
+            climbed = self._climb(repo, issue, comments,
                                   "lane %s is %s for over %d hours" % (
                                       old, why, RUNG_LIMIT_WAIT // 3600),
                                   head="Not a failure", failed_here=False, skip=rung)
