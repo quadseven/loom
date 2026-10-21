@@ -2469,7 +2469,7 @@ for BRIEF in "$INBOX"/*.md; do
     # this lane the retry. The rest of the inbox waits for the reset.
     LIMIT_REASON="provider limit reached"
     [[ "$RUN_OUTPUT" =~ $MODEL_GONE_RE ]] && LIMIT_REASON="model $MODEL not found by the agent CLI"
-    if [[ "$(printf '%s' "$RUN_OUTPUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
+    if [ -n "$OUT_OF_CREDIT" ]; then
       LIMIT_REASON="out of credit"
       hold_shared_credit "$RETRY_AT"
       heartbeat false "limit: out of credit; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
