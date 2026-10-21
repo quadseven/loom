@@ -889,12 +889,23 @@ def attempt_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) ->
 
 
 def runaway_comment(trigger: str, rows: Sequence[Tuple[int, str, str, str]], model: str,
-                    ran: Optional[Dict[str, str]] = None) -> str:
+                    ran: Optional[Dict[str, str]] = None,
+                    counted: Optional[Callable[[str], bool]] = None) -> str:
     """The comment a flagged ticket carries: why, and its attempt table, each
-    attempt with the model it ran (`ran`, from attempt_models), else `model`."""
+    attempt with the model it ran (`ran`, from attempt_models), else `model`.
+    With `counted` (reason -> counts as a work attempt), each row says so: a
+    brain read a limit row in the table as a counted attempt and filed a
+    factory ticket against a detector that was right (2026-10-21)."""
     ran = ran or {}
-    lines = ["Runaway: %s." % trigger, "| Time | Lane | Model | Reason |", "|---|---|---|---|"]
-    lines += ["| %s | %s | %s | %s |" % (stamp, lane, ran.get(stamp) or model, _cell(reason))
+    if counted is None:
+        lines = ["Runaway: %s." % trigger, "| Time | Lane | Model | Reason |", "|---|---|---|---|"]
+        lines += ["| %s | %s | %s | %s |" % (stamp, lane, ran.get(stamp) or model, _cell(reason))
+                  for _, stamp, lane, reason in rows]
+        return "\n".join(lines)
+    lines = ["Runaway: %s." % trigger, "| Time | Lane | Model | Reason | Counted |",
+             "|---|---|---|---|---|"]
+    lines += ["| %s | %s | %s | %s | %s |" % (stamp, lane, ran.get(stamp) or model, _cell(reason),
+                                              "yes" if counted(reason) else "no")
               for _, stamp, lane, reason in rows]
     return "\n".join(lines)
 
