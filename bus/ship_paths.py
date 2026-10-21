@@ -29,64 +29,56 @@ def _inline_list(text: str) -> Optional[List[str]]:
     return [_strip(p) for p in text[1:-1].split(",") if p.strip()]
 
 
+def _content(lines: List[str], start: int):
+    """(index, indent, line) of each non-blank, non-comment line from start."""
+    for index in range(start, len(lines)):
+        line = lines[index]
+        if line.strip() and not line.lstrip().startswith("#"):
+            yield index, len(line) - len(line.lstrip()), line
+
+
+def _name(line: str):
+    """(key name, rest of line) of a `key: value` line, or (None, "")."""
+    key = _KEY.match(line)
+    if not key:
+        return None, ""
+    return key.group(2) or key.group(3) or key.group(4), key.group(5)
+
+
+def _child(lines: List[str], parent_at: int, parent_indent: int, names):
+    """(index, indent, name, rest) of the first key in `names` inside the
+    block that starts after line parent_at, or None."""
+    for index, indent, line in _content(lines, parent_at + 1):
+        if indent <= parent_indent:
+            return None
+        name, rest = _name(line)
+        if name in names:
+            return index, indent, name, rest
+    return None
+
+
 def push_paths(workflow: str) -> List[str]:
     """The `paths` filter of the workflow's push trigger; [] when it has no
-    push trigger or no paths filter (such a workflow is not path-scoped)."""
+    push trigger or no paths filter (such a workflow is not path-scoped).
+    A paths-ignore filter comes back inverted, as the equivalent paths
+    filter: every path counts unless a pattern ignores it."""
     lines = workflow.splitlines()
-    on_at = push_at = None
-    for index, line in enumerate(lines):
-        key = _KEY.match(line)
-        if key and not key.group(1) and (key.group(2) or key.group(3) or key.group(4)) in ("on", "true"):
-            on_at = index
-            break
-    if on_at is None:
+    on_at = next((i for i, indent, line in _content(lines, 0)
+                  if not indent and _name(line)[0] in ("on", "true")), None)
+    push = _child(lines, on_at, 0, ("push",)) if on_at is not None else None
+    paths = _child(lines, push[0], push[1], ("paths", "paths-ignore")) if push else None
+    if not paths:
         return []
-    on_indent = 0
-    push_indent = 0
-    for index in range(on_at + 1, len(lines)):
-        line = lines[index]
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip())
-        if indent <= on_indent:
-            break
-        key = _KEY.match(line)
-        if key and (key.group(2) or key.group(3) or key.group(4)) == "push":
-            push_at, push_indent = index, indent
-            break
-    if push_at is None:
-        return []
-    found: List[str] = []
-    paths_at = None
-    for index in range(push_at + 1, len(lines)):
-        line = lines[index]
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip())
-        if indent <= push_indent:
-            break
-        key = _KEY.match(line)
-        name = key and (key.group(2) or key.group(3) or key.group(4))
-        if name in ("paths", "paths-ignore"):
-            # paths-ignore is the same filter inverted: every path counts
-            # unless a pattern ignores it (the last matching pattern decides).
-            ignore = name == "paths-ignore"
-            inline = _inline_list(key.group(5))
-            if inline is not None:
-                return _inverted(inline) if ignore else inline
-            paths_at = (index, indent)
-            break
-    if paths_at is None:
-        return []
-    for line in lines[paths_at[0] + 1:]:
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip())
-        item = re.match(r"^\s*-\s+(.*)$", line)
-        if not item or indent < paths_at[1]:
-            break
-        found.append(_strip(item.group(1)))
-    return _inverted(found) if ignore and found else found
+    index, indent, name, rest = paths
+    found = _inline_list(rest)
+    if found is None:
+        found = []
+        for _, item_indent, line in _content(lines, index + 1):
+            item = re.match(r"^\s*-\s+(.*)$", line)
+            if not item or item_indent < indent:
+                break
+            found.append(_strip(item.group(1)))
+    return _inverted(found) if name == "paths-ignore" and found else found
 
 
 def _inverted(ignored: List[str]) -> List[str]:
