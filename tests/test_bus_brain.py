@@ -182,6 +182,30 @@ class BrainTests(unittest.TestCase):
         children = [ticket("loom:shipped")] * 3 + [waiting] * 20
         brain._check_goal_unproven(children, 30)
 
+    def test_a_ticket_held_for_a_live_event_is_counted_apart_from_open_work(self):
+        # loom#1220: wait:live-event is held apart, uncapped, and not due a verifier.
+        def ticket(*names):
+            return {"state": "open", "labels": [{"name": n} for n in ("loom:ticket",) + names]}
+        held = ticket("loom:shipped", brain.WAIT_LIVE_EVENT)
+        self.assertFalse(brain._unproven(held))
+        self.assertFalse(brain._awaiting(held))
+        self.assertTrue(brain._held_for_live_event(held))
+        self.assertFalse(brain._held_for_live_event(ticket("loom:shipped")))
+        self.assertFalse(brain._held_for_live_event(dict(held, state="closed")))
+        # Not capped like awaiting tickets: a hundred of them never hold the limit.
+        self.assertEqual(brain._count_unproven([ticket("loom:shipped")] + [held] * 100), (1, 0))
+        brain._check_goal_unproven([held] * 100, 30)
+
+    def test_verify_due_leaves_out_a_ticket_held_for_a_live_event(self):
+        def issue(number, *names):
+            return {"number": number, "state": "open", "updated_at": "2030-01-01T00:00:00Z",
+                    "labels": [{"name": n} for n in ("loom:ticket", "loom:shipped") + names]}
+        gh = GitHub("t", transport=EpicWalk())
+        gh.paginate = lambda path: []
+        due = brain.verify_due(gh, REPO, [issue(1), issue(2, brain.WAIT_LIVE_EVENT)],
+                               datetime(2030, 1, 2, tzinfo=timezone.utc))
+        self.assertEqual([i["number"] for _, i in due], [1])
+
     def test_the_awaiting_label_cannot_switch_the_limit_off(self):
         # The label comes from a lane's verify.json: past twice the limit,
         # awaiting tickets hold the limit again.
@@ -3863,6 +3887,19 @@ class GoalWalksEpicsTest(unittest.TestCase):
         self.assertIn("  - unproven work 0/%d (shipped with no standing proof; "
                       "0 more await live evidence and do not count)" % brain.unverified_limit(),
                       lines)
+
+    def test_status_counts_tickets_held_for_a_live_event_apart(self):
+        walk = EpicWalk(state="loom:shipped")
+        for ticket in walk.subs[10]:
+            ticket["labels"].append({"name": brain.WAIT_LIVE_EVENT})
+        gh = GitHub("t", transport=walk)
+        now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        lines = brain._goal_lines([goal()], {"goals": {}}, now, None, gh, REPO)
+        self.assertIn("  - unproven work 4/%d (shipped with no standing proof; "
+                      "0 more await live evidence and do not count)" % brain.unverified_limit(),
+                      lines)
+        self.assertIn("  - 3 more are held for a rare live event (wait:live-event): counted "
+                      "apart from open work", lines)
 
     def test_a_closed_epic_is_not_an_open_epic_in_status(self):
         gh = GitHub("t", transport=EpicWalk(closed_epic=True))

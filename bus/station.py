@@ -411,10 +411,15 @@ IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
 CACHE_KEEP = 24 * 3600
 VERIFY_INTERVAL = 6 * 3600
+# A shipped ticket whose Live box has seen no matching log line this many days
+# after it shipped waits on a rare event, not on a verifier: it gets
+# wait:live-event and is held apart from open work (loom#1220).
+VERIFY_WAIT_DAYS = 7
 # Fewest characters a verifier's "missing evidence" may have to earn the
 # loom:awaiting-evidence label: a reason, not a word.
 MISSING_MIN = 20
 VERIFY_FILE = "verify-runs.json"
+LIVE_EVENT_MARKER = "<!-- loom:wait-live-event v1 -->"
 # A shipped ticket whose proof was refused this many times leaves the verify
 # queue and goes to the brain with the refusals listed (loom#1307): the
 # retries every VERIFY_INTERVAL had handed one ticket out 18 times.
@@ -2726,6 +2731,8 @@ class Station:
     def _write_verify_brief(self, repo: str, lane: str, issue: Dict[str, Any]) -> None:
         number = int(issue["number"])
         self._clear_awaiting(repo, number)
+        if brain.WAIT_LIVE_EVENT in _label_names(issue):
+            self._clear_live_event(repo, number)
         stamp = int(self.now)
         text = tickets.render_verify_brief(
             repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
@@ -2812,12 +2819,56 @@ class Station:
         self._evidence_text["%s#%d" % (repo, number)] = text
         if seen is not False:
             return False
-        if brain.AWAITING_EVIDENCE not in _label_names(issue):
+        names = _label_names(issue)
+        if brain.WAIT_LIVE_EVENT in names:
+            _say("not verifying %s#%d: held for a live event no log line shows yet" % (repo, number))
+            return True
+        shipped = float(issue.get("shipped_at") or 0)
+        if shipped and self.now - shipped >= VERIFY_WAIT_DAYS * 86400:
+            self._hold_for_live_event(repo, number, live)
+            return True
+        if brain.AWAITING_EVIDENCE not in names:
             self._await_evidence(repo, number,
                                  "No log line names the live criterion's strings yet; the "
                                  "station checks again in %d hours." % (VERIFY_INTERVAL // 3600))
         _say("not verifying %s#%d yet: no log line names its live criterion" % (repo, number))
         return True
+
+    def _hold_for_live_event(self, repo: str, number: int, live: str) -> None:
+        """Move a shipped ticket whose Live box has seen no matching event for
+        VERIFY_WAIT_DAYS days to wait:live-event, with one note naming the
+        event it waits for. It stops counting as open work; the station checks
+        the log for the event on every verify cooldown and verifies the ticket
+        once a line shows (the hand-out drops the label, _clear_live_event)."""
+        try:
+            self._add_label(repo, number, brain.WAIT_LIVE_EVENT)
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                         % (repo, number, quote(brain.AWAITING_EVIDENCE, safe="")), ok=(404,))
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
+                "%s\nNo log line has named this ticket's Live box in %d days since it shipped, "
+                "so it is held apart from open work (%s). It waits for this event: %s\n\n"
+                "The station keeps checking the log every %d hours and runs the verify again "
+                "as soon as a matching line appears; the ticket then closes on proof as usual."
+                % (LIVE_EVENT_MARKER, VERIFY_WAIT_DAYS, brain.WAIT_LIVE_EVENT,
+                   self._note_text(live), VERIFY_INTERVAL // 3600)})
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not hold %s#%d for a live event: %s" % (repo, number, err))
+            return
+        _say("held %s#%d for a live event: no log line names its live criterion after %d days"
+             % (repo, number, VERIFY_WAIT_DAYS))
+
+    def _clear_live_event(self, repo: str, number: int) -> None:
+        """Drop wait:live-event when the event showed and the ticket is handed
+        out to be verified, so a failed run re-earns the hold."""
+        try:
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                         % (repo, number, quote(brain.WAIT_LIVE_EVENT, safe="")), ok=(404,))
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not clear the live-event hold on %s#%d: %s" % (repo, number, err))
 
     def _verify_note(self, repo: str, number: int, lane: str, why: str) -> None:
         # A log line, not a comment: each failed verify run emailed the
