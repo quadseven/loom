@@ -3628,6 +3628,48 @@ class RetryTest(Base):
         self.assertIn("Automatic retry 1 of 2 (limit): moved from lane codex to lane anthropic.",
                       self.bodies()[-2])
 
+    def waiting(self, label, lane="anthropic", state="queued", body=PLAIN, number=20):
+        self.fake.add(number, lane=lane, body=body, state=state)
+        self.fake.issues[number]["labels"].append({"name": label})
+
+    def test_a_retry_leaves_a_lane_a_regression_ticket_is_labelled_for(self):
+        # loom#1292: retries kept taking the lane a queued regression waited for.
+        self.heartbeat("anthropic")
+        self.heartbeat("opencode-go")
+        self.waiting("loom:regression", lane="anthropic")
+        self.failed(reason="[limit] agent exited 1: provider limit reached")
+        self.run_pass()
+        self.assertIn("lane:opencode-go", self.fake.names(12))
+        self.assertIn("moved from lane codex to lane opencode-go.", self.bodies()[-2])
+
+    def test_a_retry_leaves_a_lane_that_serves_the_model_a_first_ticket_is_pinned_to(self):
+        self.heartbeat("anthropic")
+        self.heartbeat("opencode-go")
+        self.waiting("loom:urgent", lane="codex-2", state="briefed",
+                     body="Difficulty: hard\nModel: claude-sonnet-5-5\n\n## What\nDo it.\n")
+        self.failed(reason="[limit] agent exited 1: provider limit reached")
+        self.run_pass()
+        self.assertIn("lane:opencode-go", self.fake.names(12))
+
+    def test_a_retry_with_only_the_waited_for_lane_left_is_not_retried(self):
+        self.heartbeat("anthropic")
+        self.waiting("loom:revert", lane="anthropic")
+        self.failed(reason="[limit] agent exited 1: provider limit reached")
+        self.run_pass()
+        self.assertNotIn("lane:anthropic", self.fake.names(12))
+        self.assertNotIn("loom:failed", self.fake.names(12))
+
+    def test_a_retry_with_no_first_ticket_waiting_keeps_its_lane(self):
+        # A plain queued ticket, and a first-label one that is already running,
+        # hold no lane back.
+        self.heartbeat("anthropic")
+        self.heartbeat("opencode-go")
+        self.waiting("loom:ticket", lane="anthropic")
+        self.waiting("loom:regression", lane="anthropic", state="running", number=21)
+        self.failed(reason="[limit] agent exited 1: provider limit reached")
+        self.run_pass()
+        self.assertIn("lane:anthropic", self.fake.names(12))
+
     def test_an_unavailable_lane_is_skipped(self):
         self.heartbeat("codex-2", available=False)
         self.heartbeat("anthropic", age=3600)

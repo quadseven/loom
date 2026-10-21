@@ -1181,6 +1181,21 @@ opencode_bin() {
   printf '%s' "${b:-opencode}"
 }
 
+# Whether the agent CLI lists a model: 0 when it does, 1 when its list for the
+# model's provider lacks it. Only opencode lanes are asked (the other CLIs
+# have no list command here); a list that cannot be read (command error,
+# timeout, empty answer) is unknown, and unknown counts as listed, so a
+# broken probe never holds a lane for good.
+model_listed() {
+  local model="$1" provider list
+  case "$LANE" in openrouter|opencode-go|zen|zai|workersai|spark|free) ;; *) return 0 ;; esac
+  provider="${model%%/*}"
+  [ "$provider" != "$model" ] || return 0
+  list="$(timeout "$NET_TIMEOUT" "$(opencode_bin)" models "$provider" 2>/dev/null < /dev/null)" || return 0
+  [ -n "$list" ] || return 0
+  printf '%s\n' "$list" | tr -d '\r' | grep -qxF -- "$model"
+}
+
 # Usage: opencode_agent <key_var> <run arguments...>
 opencode_agent() {
   local key_var="$1"
@@ -2134,6 +2149,17 @@ if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt 
     NEW_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
     [ -n "$NEW_UNTIL" ] && LIMIT_UNTIL="$NEW_UNTIL"
     heartbeat false "$HELD_REASON" "$LIMIT_UNTIL"
+    exit 0
+  fi
+fi
+
+# A model-gone hold that has run out: the lane claims again only when the agent
+# CLI lists the model, else it holds another LIMIT_WAIT with no ticket round.
+if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -le "$(date +%s)" ]; then
+  GONE_MODEL="$(sed -nE 's/.*"reason": *"limit: model ([A-Za-z0-9._:\/@-]+) not found by the agent CLI.*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+  if [ -n "$GONE_MODEL" ] && ! model_listed "$GONE_MODEL"; then
+    GONE_UNTIL=$(( $(date +%s) + LIMIT_WAIT ))
+    heartbeat false "limit: model $GONE_MODEL not found by the agent CLI; lane waits until $(utc "$GONE_UNTIL")" "$GONE_UNTIL"
     exit 0
   fi
 fi
