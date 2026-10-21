@@ -376,7 +376,20 @@ asking for a test that fails without the change, instead of landing; that
 round climbs only if the next one still adds no test. A repo with no test
 harness opts out in `LOOM_NO_TEST_REPOS` (space separated `OWNER/NAME`), and
 a ticket whose body has the line `Tests: none needed (<reason>)` skips the
-check. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
+check. Scope check (`bus/scope_fit.py`): with `LOOM_SCOPE_CHECK_URL` set to a
+keyless https chat-completions route (for example the gateway's free-public
+route for Gemma) and optionally `LOOM_SCOPE_CHECK_MODEL` (default
+`gemma-4-31b-it`), a ready pull request on a public repo is checked once
+before it lands: the model gets the ticket's `## What` section and the
+changed-file list and answers whether the files fit the ticket and the repos
+and resources it names. `YES` lands it as before. `NO: <reason>` holds it:
+`needs-brain` on the pull request, a comment with the reason and a hold marker
+(once per head commit, so a later pass does not ask again), and a note on the
+ticket; the brain or a person reads the diff and merges it or sends it back.
+No route, a limit, a timeout, a reply that is not `YES` or `NO: <reason>`, a
+ticket with no `## What` section or an unset URL lands it as before: the check
+is advisory and never blocks a merge on a dead route. A private repo is never
+asked. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
 
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`

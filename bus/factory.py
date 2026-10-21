@@ -35,6 +35,13 @@ Neither needs a model:
   a repo in LOOM_NO_TEST_REPOS (one with no test harness) and a ticket whose
   body says "Tests: none needed (<reason>)" skip the check. The send-back is
   a finding round: it climbs only when the next round still adds no test.
+- A pull request on a public repo is checked against its ticket before it
+  lands (bus/scope_fit.py, LOOM_SCOPE_CHECK_URL): a cheap model is asked
+  whether the changed files fit the ticket's What section and the repos and
+  resources it names. A NO with a reason holds the pull request (needs-brain,
+  a comment with the reason, once per head commit); a YES, no route, a limit
+  or a reply it cannot read lands it as before, so a dead route never blocks
+  a merge. A private repo is never asked.
 - A reviewed, green pull request whose only open threads are the review
   bot's medium or low findings files them in one loom:triage follow-up
   issue, answers and resolves each thread, and lands, with no fix round
@@ -129,7 +136,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, change_class, labels, naming, status, tickets
+from . import brain, change_class, labels, naming, scope_fit, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -426,6 +433,8 @@ NOT_BUILT_RE = re.compile(r"\s*;\s*not built:\s*\S.+$", re.I)
 SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
                          r"([a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9])#(\d+)\b", re.I)
 BODY_LEAK_MARKER = "<!-- loom:body-leak-repaired %s -->"
+# On the pull request: the scope check held this head commit (bus/scope_fit.py).
+SCOPE_HOLD_MARKER = "<!-- loom:scope-hold %s -->"
 MODEL_LINE = re.compile(r"^Model:[^\n]*\n?", re.M)
 GREEN = ("success", "neutral", "skipped")
 # bus/revert.py's revert tickets, landed first and on green.
@@ -1232,7 +1241,8 @@ class Factory:
                  silent: Optional[Dict[str, float]] = None,
                  down: Sequence[str] = (),
                  limit_until: Optional[Dict[str, float]] = None,
-                 human: Callable[..., Any] = brain.human) -> None:
+                 human: Callable[..., Any] = brain.human,
+                 scope: Optional[scope_fit.Ask] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1274,6 +1284,9 @@ class Factory:
         self.waits: Dict[str, str] = {}
         self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
+        # Sends the scope check's prompt to a cheap model (bus/scope_fit.py);
+        # None skips the check.
+        self.scope = scope
         self.actions = 0
         self.load: Dict[str, int] = {}
         self.landed: set = set()
@@ -2031,8 +2044,49 @@ class Factory:
             _say("brought %s#%d up to date with its base; it lands once its checks "
                  "and review pass on the new head" % (repo, number))
             return
+        if self._scope_holds(repo, number, full, issue):
+            return
         if self._merge(repo, number, issue, str((full.get("head") or {}).get("sha") or "")):
             self.landed.add(repo)
+
+    def _scope_holds(self, repo: str, number: int, full: Dict[str, Any],
+                     issue: Dict[str, Any]) -> bool:
+        """Whether a cheap model says the pull request's files do not fit its
+        ticket, so it is held for the brain instead of landing. Advisory: no
+        route, no answer or an unreadable one lets it land. Asked only of a
+        public repo (a private repo's text stays off a free route), once per
+        head commit: a hold leaves a marker comment that later passes read
+        instead of asking again."""
+        if self.scope is None or self._is_private(repo):
+            return False
+        sha = str((full.get("head") or {}).get("sha") or "")
+        marker = SCOPE_HOLD_MARKER % sha
+        if any(marker in str(c.get("body") or "") for c in self._comments(repo, number)):
+            return True
+        verdict = scope_fit.judge(self.scope, str(issue.get("body") or ""),
+                                  self._files(repo, number))
+        if verdict.kind == scope_fit.UNKNOWN:
+            _say("scope check of %s#%d gave no answer (%s); it lands as before"
+                 % (repo, number, verdict.reason))
+            return False
+        if verdict.kind == scope_fit.FITS:
+            return False
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": (
+            "%s\nHeld for the brain: a scope check asked whether this pull request's "
+            "changed files fit the ticket's What section and the repos and resources "
+            "it names, and the answer was no: %s\nThe check is advisory. The brain or "
+            "a person reads the diff against the ticket and merges it, or sends it "
+            "back." % (marker, verdict.reason))})
+        if "needs-brain" not in _labels(full):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["needs-brain"]})
+        self._status_note(repo, int(issue["number"]), (
+            "Pull request #%d is held for the brain: its changed files may not fit this "
+            "ticket (%s)." % (number, verdict.reason)))
+        self.actions += 1
+        _say("held %s#%d for the brain: its files may not fit the ticket (%s)"
+             % (repo, number, verdict.reason))
+        return True
 
     def _merge(self, repo: str, number: int, issue: Dict[str, Any], sha: str = "") -> bool:
         ticket = (repo, int(issue["number"]))

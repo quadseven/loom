@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from . import audit
 from . import brain_memory
 from . import claimed
+from . import scope_fit
 from . import stale_claims
 from . import factory
 from . import friction_intake
@@ -501,6 +502,8 @@ class Settings:
                  review_check: str = factory.DEFAULT_REVIEW_CHECK,
                  review_bot: str = factory.DEFAULT_REVIEW_BOT,
                  no_test_repos: Sequence[str] = (),
+                 scope_url: str = "",
+                 scope_model: str = "",
                  metrics_goal: str = "",
                  transcript_url: str = "",
                  transcript_token_ssm: str = "",
@@ -593,6 +596,10 @@ class Settings:
         self.review_check = review_check
         self.review_bot = review_bot
         self.no_test_repos = list(no_test_repos)
+        # The keyless chat route and model the scope check asks (bus/scope_fit.py);
+        # no URL, no check.
+        self.scope_url = scope_url
+        self.scope_model = scope_model
         self.metrics_goal = metrics_goal
         self.transcript_url = transcript_url
         self.transcript_token_ssm = transcript_token_ssm
@@ -659,6 +666,8 @@ class Settings:
                    review_bot=(env.get("LOOM_REVIEW_BOT", "").strip()
                                or factory.DEFAULT_REVIEW_BOT),
                    no_test_repos=words("LOOM_NO_TEST_REPOS"),
+                   scope_url=env.get("LOOM_SCOPE_CHECK_URL", "").strip(),
+                   scope_model=env.get("LOOM_SCOPE_CHECK_MODEL", "").strip(),
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
                    transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
@@ -8239,6 +8248,9 @@ class Station:
 
     def _factory(self) -> factory.Factory:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
+        ask = scope_fit.asker(self.s.scope_url, self.s.scope_model)
+        # Passed only when the check is on, so the factory's default stays off.
+        extra = {"scope": ask} if ask is not None else {}
         return factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
                                briefers=self.s.briefers,
                                review_check=self.s.review_check,
@@ -8250,7 +8262,7 @@ class Station:
                                held=list(self._held_tickets()) + self._gate_held(),
                                silent=self._silent_lanes(),
                                down=self.down_lanes(),
-                               limit_until=self.limit_until())
+                               limit_until=self.limit_until(), **extra)
 
     def watch_default_branches(self) -> None:
         """Fix forward after a red lane merge, then revert if it stays red.
