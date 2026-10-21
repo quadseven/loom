@@ -415,6 +415,8 @@ VERIFY_INTERVAL = 6 * 3600
 # after it shipped waits on a rare event, not on a verifier: it gets
 # wait:live-event and is held apart from open work (loom#1220).
 VERIFY_WAIT_DAYS = 7
+# The hours of log an evidence command is documented to search (.env.example).
+EVIDENCE_WINDOW_HOURS = 24.0
 # Fewest characters a verifier's "missing evidence" may have to earn the
 # loom:awaiting-evidence label: a reason, not a word.
 MISSING_MIN = 20
@@ -548,6 +550,7 @@ class Settings:
                  health_every: int = health.EVERY,
                  friction_mode: str = "",
                  evidence_cmds: Optional[Dict[str, str]] = None,
+                 evidence_window_hours: float = EVIDENCE_WINDOW_HOURS,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
                  pin_ship_repos: Sequence[str] = (),
                  briefers: Sequence[str] = (),
@@ -599,6 +602,10 @@ class Settings:
         # (bus/friction_intake.py).
         self.friction_mode = friction_mode
         self.evidence_cmds = evidence_cmds or {}
+        # LOOM_EVIDENCE_WINDOW_HOURS: the hours of log the evidence command
+        # searches, which bounds the absence a verify can prove (a command that
+        # prints loom-evidence-window-hours: N overrides it per run).
+        self.evidence_window_hours = evidence_window_hours
         self.roll_ship_docs = roll_ship_docs or []
         # Local times (hour, minute) to send one digest of every goal's
         # reports; empty forwards each report as it is posted.
@@ -709,6 +716,8 @@ class Settings:
                    plan_check=(env.get("LOOM_PLAN_CHECK", "").strip()
                                or invariants.DEFAULT_PLAN_CHECK),
                    evidence_cmds=_evidence_commands(env),
+                   evidence_window_hours=_hours(env.get("LOOM_EVIDENCE_WINDOW_HOURS", ""),
+                                                EVIDENCE_WINDOW_HOURS),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
                    friction_mode=friction_intake.mode(env.get("LOOM_FRICTION_INTAKE", "")),
@@ -858,6 +867,15 @@ def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
         _say("ignoring LOOM_EVIDENCE_CMDS: %s" % err)
         return {}
     return commands
+
+
+def _hours(raw: str, default: float) -> float:
+    """A positive number of hours, else default."""
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 def _seconds(raw: str, default: int) -> int:
@@ -2861,13 +2879,34 @@ class Station:
         comment) and checked again after its cooldown. mod-overseer#922 spent a
         run and posted a comment every 6 hours for days waiting on an event that had not happened."""
         live = brain.live_criterion(issue.get("body"), limit=None)
-        text, seen = evidence.gather(self.s.evidence_cmds, repo, live)
+        text, seen, reported = evidence.gather_window(self.s.evidence_cmds, repo, live)
         number = int(issue["number"])
+        names = _label_names(issue)
+        absence = evidence.is_absence(live)
+        if absence and seen is None and self.s.evidence_cmds.get(repo):
+            # A command that errored or timed out proved nothing, either way.
+            _say("not verifying %s#%d yet: the log command gave no answer for its absence "
+                 "criterion" % (repo, number))
+            self._await_absence(repo, number, names)
+            return True
+        if absence and seen is False:
+            window = reported if reported is not None else self.s.evidence_window_hours
+            span = evidence.required_span(live)
+            if span is not None and window < span:
+                _say("not verifying %s#%d yet: the log covers %s of the %s hours its absence "
+                     "criterion needs; the missing window is %s hours"
+                     % (repo, number, evidence.hours_text(window), evidence.hours_text(span),
+                        evidence.hours_text(span - window)))
+                self._await_absence(repo, number, names)
+                return True
+            # Nothing found over the window is the evidence: the brief says so.
+            text += evidence.absence_section(evidence.needles(live), window, span)
+            self._evidence_text["%s#%d" % (repo, number)] = text
+            return False
         # The brief quotes the same lines, so the command runs once.
         self._evidence_text["%s#%d" % (repo, number)] = text
         if seen is not False:
             return False
-        names = _label_names(issue)
         if brain.WAIT_LIVE_EVENT in names:
             _say("not verifying %s#%d: held for a live event no log line shows yet" % (repo, number))
             return True
@@ -2881,6 +2920,16 @@ class Station:
                                  "station checks again in %d hours." % (VERIFY_INTERVAL // 3600))
         _say("not verifying %s#%d yet: no log line names its live criterion" % (repo, number))
         return True
+
+    def _await_absence(self, repo: str, number: int, names: List[str]) -> None:
+        """Label an absence criterion the log cannot yet prove, once and with
+        no comment. It is never held for a live event: an event cannot make
+        an absence provable, a longer log window or a working command can."""
+        if brain.AWAITING_EVIDENCE not in names:
+            self._await_evidence(repo, number,
+                                 "The log command gave no answer, or its log does not cover "
+                                 "the span the absence criterion needs; the station checks "
+                                 "again in %d hours." % (VERIFY_INTERVAL // 3600))
 
     def _hold_for_live_event(self, repo: str, number: int, live: str) -> None:
         """Move a shipped ticket whose Live box has seen no matching event for

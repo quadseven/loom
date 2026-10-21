@@ -654,6 +654,13 @@ the verify runs and closes the ticket on proof as for any shipped ticket; a run
 that finds the evidence missing again lands on `loom:awaiting-evidence` and is
 held again once the log shows no matching line.
 
+This waiting applies to a Live box that needs a line to appear. A box that needs its
+strings to be absent ("no `X` line appears") is the other way round: an empty
+answer from the log command, over a window that covers the span the box states, is
+the evidence, so the ticket is handed a verify run whose brief states the zero count
+and the hours searched (docs/LANES.md, Verify runs). It is never held for a live
+event; if the log covers less than the box needs, it stays on `loom:awaiting-evidence`.
+
 ### Proof audits
 
 A lane proof passed the shape check, which cannot tell evidence a lane read

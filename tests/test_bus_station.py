@@ -8181,6 +8181,86 @@ class VerifyDispatchTest(Base):
         # The gate's read is the brief's: the command runs once per needle.
         self.assertEqual(popen.call_count, 1)
 
+    def absence_ticket(self, live="no `presence flag:` line appears over 24 hours"):
+        # loom#1386: a Live box that needs a line to be ABSENT.
+        self.fake.issues[1]["body"] = SHIPPED_BODY.replace(
+            "prints `daily status ready`", "the daily line shows it")
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace("prints `daily status ready`", live)
+
+    def test_an_absence_criterion_with_an_empty_answer_is_handed_a_run_stating_the_zero_count(self):
+        self.absence_ticket()
+        self.evidence_says("other line\n")
+        self.run_pass()
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        brief = " ".join(self.text().split())
+        self.assertIn("## Absence check, station data", brief)
+        self.assertIn("0 lines name any of its strings in the last 24 hours", brief)
+        self.assertNotIn("loom:awaiting-evidence", self.fake.names(2))
+
+    def test_an_absence_criterion_whose_command_errors_is_not_handed_a_run(self):
+        self.absence_ticket()
+        popen = self.evidence_says("")
+        popen.return_value.returncode = 2
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertIn("loom:awaiting-evidence", self.fake.names(2))
+        self.assertEqual(self.fake.comments[2], [])
+        self.assertIn("loom:shipped", self.fake.names(2))
+
+    def test_an_absence_criterion_whose_command_times_out_is_not_handed_a_run(self):
+        self.absence_ticket()
+        self.settings.evidence_cmds = {REPO: "fake evidence command"}
+        with mock.patch.object(station.evidence.subprocess, "Popen") as popen, \
+             mock.patch.object(station.evidence.os, "killpg"):
+            popen.return_value.pid = 123
+            popen.return_value.communicate.side_effect = [
+                subprocess.TimeoutExpired("fake", 60), ("", "")]
+            self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertIn("loom:awaiting-evidence", self.fake.names(2))
+
+    def test_a_presence_criterion_with_an_empty_answer_keeps_waiting_for_evidence(self):
+        self.absence_ticket("the log shows `presence flag:` once the pass ends")
+        self.evidence_says("other line\n")
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertIn("loom:awaiting-evidence", self.fake.names(2))
+
+    def test_a_criterion_mixing_present_and_absent_strings_is_not_an_absence_criterion(self):
+        self.absence_ticket("`sweep finished` is logged and no `sweep failed` line appears")
+        self.evidence_says("other line\n")
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertIn("loom:awaiting-evidence", self.fake.names(2))
+
+    def test_an_absence_span_longer_than_the_log_window_is_not_proven_and_says_so(self):
+        self.absence_ticket("no `presence flag:` line appears for 72 hours")
+        self.evidence_says("other line\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertIn("loom:awaiting-evidence", self.fake.names(2))
+        self.assertNotIn("wait:live-event", self.fake.names(2))
+        self.assertIn("covers 24 of the 72 hours", err.getvalue())
+
+    def test_a_window_the_command_reports_shorter_than_the_span_is_not_proven(self):
+        # A restart truncates pod logs: the command knows how far back they go.
+        self.absence_ticket()
+        self.evidence_says("loom-evidence-window-hours: 5\nother line\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertIn("covers 5 of the 24 hours", err.getvalue())
+
+    def test_a_window_the_command_reports_wide_enough_proves_a_long_span(self):
+        self.absence_ticket("no `presence flag:` line appears over 3 days")
+        self.evidence_says("loom-evidence-window-hours: 80\nother line\n")
+        self.run_pass()
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertIn("in the last 80 hours", " ".join(self.text().split()))
+
     def test_repo_without_evidence_command_runs_nothing(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
             "prints `daily status ready`", "see `presence flag:` in the log")
@@ -8892,6 +8972,24 @@ class TemplatedNeedleTest(unittest.TestCase):
         literal, _ = station.evidence.needle_pattern(
             "cache: left N file(s) to the module's cold store for M account member(s)")
         self.assertEqual(literal, "file(s) to the module's cold store for")
+
+    def test_absence_wording_is_read_per_string(self):
+        absent = station.evidence.absent_needles
+        self.assertEqual(absent("no `auction: took ... nothing yet` line appears when zero qualify"),
+                         ["auction: took ... nothing yet"])
+        self.assertEqual(absent("it never logs `bad line`"), ["bad line"])
+        self.assertEqual(absent('"bad line" does not appear'), ["bad line"])
+        self.assertEqual(absent("`bad line` line is never logged"), ["bad line"])
+        self.assertEqual(absent("prints `daily status ready`"), [])
+        self.assertEqual(absent("`ok line` is logged and no `bad line` appears"), ["bad line"])
+
+    def test_the_required_span_is_read_from_the_criterion_outside_its_strings(self):
+        span = station.evidence.required_span
+        self.assertEqual(span("no `x line` appears over 24h"), 24)
+        self.assertEqual(span("no `x line` for 3 days"), 72)
+        self.assertEqual(span("no `x line` in the last 2 weeks"), 336)
+        self.assertIsNone(span("no `x 48 hours` appears"))
+        self.assertIsNone(span("no `x line` appears"))
 
     def test_a_plain_needle_stays_exact(self):
         self.assertEqual(station.evidence.needle_pattern("server ready"), ("server ready", None))
