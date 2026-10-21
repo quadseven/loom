@@ -335,6 +335,18 @@ class DashboardAppTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(dash.TicketStore().auth, "token")
 
+    def test_a_token_dashboard_reads_the_trusted_writers_status_events(self):
+        # Without the writers, a token client showed a status comment as one
+        # opaque comment, so a pushed fix or a lane failure left the timeline.
+        from dashboard import github as dash
+        env = {"LOOM_REPOS": "example-owner/example-repo",
+               "LOOM_DASHBOARD_GITHUB_TOKEN": "dashboard-token",
+               "LOOM_BRIEF_AUTHORS": "Alice-Example,bob-example"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            store = dash.TicketStore()
+        self.assertEqual(store.auth, "token")
+        self.assertEqual(store.gh.status_authors, {"alice-example", "bob-example"})
+
     FILE_ENV = {"LOOM_REPOS": "example-owner/example-repo",
                 "LOOM_DASHBOARD_GITHUB_TOKEN": "dashboard-token",
                 "LOOM_GITHUB_APP_ID": "123", "LOOM_GITHUB_APP_INSTALLATION_ID": "456"}
@@ -393,6 +405,76 @@ class DashboardAppTests(unittest.TestCase):
             self.assertEqual(store.auth, "token")
             self.assertIn(secret, logged.output[0])
             self.assertNotIn(KEY_MARK, "\n".join(logged.output))
+
+
+class ReadSsmProxyTests(unittest.TestCase):
+    """read_ssm passes only https_proxy to the AWS CLI."""
+
+    def _capture_env(self, env_vars):
+        """Run read_ssm with mocked subprocess and capture the env passed."""
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["env"] = kwargs.get("env")
+            captured["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, "fake-value", "")
+
+        with mock.patch.dict(os.environ, env_vars, clear=True), \
+                mock.patch.object(github.subprocess, "run", fake_run):
+            github.read_ssm("/test/param", "us-east-1")
+        return captured["env"]
+
+    def test_only_https_proxy_is_passed_when_all_proxies_set(self):
+        env = {
+            "http_proxy": "http://192.0.2.1:3128",
+            "HTTP_PROXY": "http://192.0.2.1:3128",
+            "https_proxy": "http://192.0.2.2:3128",
+            "HTTPS_PROXY": "http://192.0.2.2:3128",
+            "all_proxy": "socks5://192.0.2.3:1080",
+            "ALL_PROXY": "socks5://192.0.2.3:1080",
+        }
+        passed_env = self._capture_env(env)
+        # Only https_proxy (lowercase) should be present
+        self.assertIn("https_proxy", passed_env)
+        self.assertEqual(passed_env["https_proxy"], "http://192.0.2.2:3128")
+        self.assertNotIn("http_proxy", passed_env)
+        self.assertNotIn("HTTP_PROXY", passed_env)
+        self.assertNotIn("HTTPS_PROXY", passed_env)
+        self.assertNotIn("all_proxy", passed_env)
+        self.assertNotIn("ALL_PROXY", passed_env)
+
+    def test_only_HTTPS_PROXY_is_passed_when_only_uppercase_set(self):
+        env = {
+            "HTTPS_PROXY": "http://192.0.2.2:3128",
+        }
+        passed_env = self._capture_env(env)
+        self.assertIn("HTTPS_PROXY", passed_env)
+        self.assertEqual(passed_env["HTTPS_PROXY"], "http://192.0.2.2:3128")
+        self.assertNotIn("https_proxy", passed_env)
+
+    def test_no_proxy_vars_when_none_set(self):
+        env = {"PATH": "/usr/bin", "HOME": "/home/user"}
+        passed_env = self._capture_env(env)
+        self.assertNotIn("http_proxy", passed_env)
+        self.assertNotIn("HTTP_PROXY", passed_env)
+        self.assertNotIn("https_proxy", passed_env)
+        self.assertNotIn("HTTPS_PROXY", passed_env)
+        self.assertNotIn("all_proxy", passed_env)
+        self.assertNotIn("ALL_PROXY", passed_env)
+        # Other env vars should still be passed
+        self.assertEqual(passed_env["PATH"], "/usr/bin")
+        self.assertEqual(passed_env["HOME"], "/home/user")
+
+    def test_https_proxy_lowercase_preferred_when_both_set(self):
+        env = {
+            "https_proxy": "http://192.0.2.2:3128",
+            "HTTPS_PROXY": "http://198.51.100.2:3128",
+        }
+        passed_env = self._capture_env(env)
+        # Lowercase should win
+        self.assertIn("https_proxy", passed_env)
+        self.assertEqual(passed_env["https_proxy"], "http://192.0.2.2:3128")
+        self.assertNotIn("HTTPS_PROXY", passed_env)
 
 
 if __name__ == "__main__":

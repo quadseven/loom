@@ -59,7 +59,8 @@ def is_epic(issue: Dict[str, Any]) -> bool:
 
 def covered_issues(repo: str, ticket: Dict[str, Any]) -> List[Key]:
     """The (repo, number) issues a ticket's body says it was written from."""
-    body = str(ticket.get("body") or "")
+    # The original text an in-place rewrite kept is the author's, not a source.
+    body = tickets.without_original(str(ticket.get("body") or ""))
     found = [(repo, int(n)) for n in _REWRITTEN_FROM_RE.findall(body)]
     found += [(named or repo, int(n)) for named, n in _REFS_RE.findall(body)]
     return list(dict.fromkeys(found))

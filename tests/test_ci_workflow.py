@@ -69,6 +69,51 @@ class UnittestStep(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("Parallel unittest total: Ran 3 tests across 3 modules",
                           result.stdout)
+            # Each module lists its slowest tests, so a stalled one is named.
+            self.assertEqual(result.stdout.count("Slowest test durations"), 3)
+
+    def test_parallel_runner_shards_a_large_module_and_keeps_its_rules(self):
+        # One module bounds the step's wall time unless its tests are split
+        # across processes; a failure or a disallowed skip in any shard must
+        # still fail the run, and the shards' totals must add up.
+        runner = WORKFLOW.parents[1] / "unittest_parallel.py"
+        with tempfile.TemporaryDirectory() as temp:
+            tests = Path(temp, "tests")
+            tests.mkdir()
+            body = "".join(" def test_%d(self): %s\n" % (index, action)
+                           for index, action in enumerate(
+                               ["pass", "pass", "self.fail('middle shard')", "pass", "pass"]))
+            Path(tests, "test_big.py").write_text(
+                "import unittest\nclass Big(unittest.TestCase):\n" + body)
+            failed = subprocess.run([sys.executable, str(runner), "--tests-dir", str(tests),
+                                     "--shard-size", "2"], text=True, capture_output=True)
+            for shard in (1, 2, 3):
+                self.assertIn("===== test_big [%d/3] =====" % shard, failed.stdout)
+            self.assertIn("Parallel unittest total: Ran 5 tests", failed.stdout)
+            self.assertIn("middle shard", failed.stdout)
+            self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+
+            Path(tests, "test_big.py").write_text(
+                "import unittest\nclass Big(unittest.TestCase):\n"
+                " def test_0(self): pass\n def test_1(self): pass\n"
+                " @unittest.skip('not allowed')\n def test_2(self): pass\n")
+            skipped = subprocess.run([sys.executable, str(runner), "--tests-dir", str(tests),
+                                      "--shard-size", "2"], text=True, capture_output=True)
+            self.assertIn("===== test_big [2/2] =====", skipped.stdout)
+            self.assertIn("::error::a test skipped", skipped.stdout)
+            self.assertEqual(skipped.returncode, 1, skipped.stdout + skipped.stderr)
+
+    def test_parallel_runner_runs_a_module_whole_when_its_ids_cannot_load(self):
+        runner = WORKFLOW.parents[1] / "unittest_parallel.py"
+        with tempfile.TemporaryDirectory() as temp:
+            tests = Path(temp, "tests")
+            tests.mkdir()
+            Path(tests, "test_broken.py").write_text("import a_module_that_does_not_exist\n")
+            result = subprocess.run([sys.executable, str(runner), "--tests-dir", str(tests),
+                                     "--shard-size", "2"], text=True, capture_output=True)
+            self.assertIn("===== test_broken =====", result.stdout)
+            self.assertIn("a_module_that_does_not_exist", result.stdout)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
 
 class ConcurrencyTest(unittest.TestCase):

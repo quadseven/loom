@@ -81,6 +81,60 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("---\nLoom ticket T42, lane codex, model gpt-test.", body)
         self.assertIn("\nRefs example-owner/example-repo#42", body)
 
+    TICKED_BODY = RUNNER_BODY.replace("- [ ] The thing works", "- [x] The thing works").replace(
+        "- [ ] Nothing else changes", "- [ ] Nothing else changes; not built: out of reach")
+
+    def test_a_fix_rounds_checklist_ticks_the_body(self):
+        # A fix round's ticks never reached its pull request: the repair
+        # rendered the ticket's unticked criteria every round (2026-10-20).
+        self.write_brief(BRIEF)
+        summary = os.path.join(self._tmp.name, "summary.md")
+        with open(summary, "w", encoding="utf-8") as fh:
+            fh.write("Fix it\n\n## Acceptance criteria\n- [x] The thing works\n"
+                     "- [x] A test covers the thing\n- [x] Nothing else changes\n")
+        result = pr_repair.reconcile(self.brief, "Fix the thing", RUNNER_BODY,
+                                     "codex", "gpt-test", "T42", summary_path=summary)
+        self.assertTrue(result["changed"])
+        self.assertIn("## Acceptance criteria\n- [x] The thing works\n- [x] A test covers the thing\n"
+                      "- [x] Nothing else changes\n", result["body"])
+
+    def test_a_lane_can_tick_but_never_rewrite_a_criterion_or_add_unsafe_text(self):
+        self.write_brief(BRIEF)
+        summary = os.path.join(self._tmp.name, "summary.md")
+        with open(summary, "w", encoding="utf-8") as fh:
+            fh.write("## Acceptance criteria\n- [x] The thing works\n"
+                     "- [x] A test covers everything, see 192.0.2.3\n"
+                     "- [ ] Nothing else changes; not built: see 192.0.2.5\n"
+                     "- [x] An extra criterion\n")
+        result = pr_repair.reconcile(self.brief, "Fix the thing", RUNNER_BODY,
+                                     "codex", "gpt-test", "T42", summary_path=summary)
+        self.assertIn("## Acceptance criteria\n- [x] The thing works\n- [ ] A test covers the thing\n"
+                      "- [ ] Nothing else changes\n\n", result["body"])
+        for unsafe in ("192.0.2.3", "192.0.2.5", "extra"):
+            self.assertNotIn(unsafe, result["body"])
+
+    def test_a_plain_not_built_reason_is_kept(self):
+        self.write_brief(BRIEF)
+        summary = os.path.join(self._tmp.name, "summary.md")
+        with open(summary, "w", encoding="utf-8") as fh:
+            fh.write("## Acceptance criteria\n- [ ] Nothing else changes; not built: needs the next deploy\n")
+        result = pr_repair.reconcile(self.brief, "Fix the thing", RUNNER_BODY,
+                                     "codex", "gpt-test", "T42", summary_path=summary)
+        self.assertIn("- [ ] Nothing else changes; not built: needs the next deploy\n", result["body"])
+
+    def test_ticks_already_in_the_body_survive_a_round_with_no_checklist(self):
+        self.write_brief(BRIEF)
+        result = pr_repair.reconcile(self.brief, "Fix the thing", self.TICKED_BODY,
+                                     "codex", "gpt-test", "T42")
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["body"], self.TICKED_BODY)
+
+    def test_a_corrected_ticket_still_replaces_criteria_whose_text_changed(self):
+        self.write_brief(BRIEF_CORRECTED)
+        result = pr_repair.reconcile(self.brief, "Fix the thing", self.TICKED_BODY,
+                                     "codex", "gpt-test", "T42")
+        self.assertIn("- [ ] The edge case is handled", result["body"])
+
     def test_no_change_when_body_and_title_match(self):
         self.write_brief(BRIEF)
         result = pr_repair.reconcile(

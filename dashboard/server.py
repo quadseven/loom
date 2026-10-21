@@ -9,6 +9,7 @@ import hmac
 import ssl
 import statistics
 import socket
+import socketserver
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -33,6 +34,7 @@ from . import ticket as ticket_view
 from . import goals as goals_view
 from . import ticket_data
 from . import tickets_table
+from . import tree as tree_view
 from . import operators as operators_view
 from . import needs_you as needs_you_view
 
@@ -89,6 +91,13 @@ def _stale_notice(payload, now=None):
             % (age, reason, html.escape(when)))
 
 
+def _attempt_flag(attempt):
+    """Format the attempt prefix for a ticket flag."""
+    if isinstance(attempt, int) and attempt > 1:
+        return "attempt %s / " % html.escape(str(attempt))
+    return ""
+
+
 def _ticket_row(row):
     current = row.get("state") if row.get("state") in STATES else None
     index = STATES.index(current) if current else -1
@@ -96,7 +105,7 @@ def _ticket_row(row):
         "failed" if current == "failed" and i == index else
         "current" if i == index else "done" if i < index else "") for i in range(7))
     attempt = row.get("attempts")
-    flag = ("attempt %s / " % html.escape(str(attempt)) if isinstance(attempt, int) and attempt > 1 else "")
+    flag = _attempt_flag(attempt)
     flag += html.escape(str(current or "unlabeled"))
     identifier = "%s#%s" % (row.get("repo", ""), row.get("number", ""))
     lane_model = "%s / %s" % (row.get("lane") or "unassigned",
@@ -108,6 +117,13 @@ def _ticket_row(row):
                 html.escape(_ticket_href(row), quote=True), html.escape(identifier),
                 html.escape(str(current or "queued")), flag, html.escape(str(row.get("title") or "Untitled ticket")),
                 segments, html.escape(lane_model))
+
+
+def _extract_backlog_entries(data):
+    """Extract the ticket entries list from a backlog document."""
+    if isinstance(data, dict):
+        return data.get("tickets", data.get("issues", data.get("backlog", [])))
+    return data
 
 
 def _backlog(state):
@@ -125,10 +141,7 @@ def _backlog(state):
             if not isinstance(ready, list):
                 return None, "backlog ready_for_human must be a list"
             return len(epics) + len(ready), None
-        if isinstance(data, dict):
-            entries = data.get("tickets", data.get("issues", data.get("backlog", [])))
-        else:
-            entries = data
+        entries = _extract_backlog_entries(data)
         if not isinstance(entries, list):
             return None, "backlog source must contain a list of tickets"
         return len(entries), None
@@ -817,6 +830,14 @@ def _ticket_page(state, parsed):
     return page("Tickets", "tickets", body, status="snapshot")
 
 
+def _tree(state):
+    payload = state.response()
+    body = tree_view.render(_all_tickets(state), payload.get("goal_context") or {},
+                            entered=payload.get("state_entered") or {}, now=time.time(),
+                            ticket_href=_ticket_href, short_ref=_short_ref)
+    return page("Tree", "tree", body, status="snapshot")
+
+
 def _tickets(state, parsed):
     return _ticket_page(state, parsed)
 
@@ -994,7 +1015,7 @@ def _dispatch_get(handler, state):
         return _dispatch_tiers(handler, state)
     if path in ("/brain", "/hot-spots"):
         return _dispatch_brain_hot_spots(handler, state, path)
-    if path in ("/", "/goals", "/tickets"):
+    if path in ("/", "/goals", "/tickets", "/tree"):
         return _dispatch_view(handler, state, path, parsed)
     if re.fullmatch(r"/t/[^/]+/[^/]+/[0-9]+", path):
         return _dispatch_ticket_page(handler, state, path, parsed)
@@ -1081,7 +1102,7 @@ def _dispatch_static(handler, path):
 def _dispatch_view(handler, state, path, parsed):
     if path == "/tickets":
         return handler.send_page(_tickets(state, parsed))
-    return handler.send_page({"/": _floor, "/goals": _goals}[path](state))
+    return handler.send_page({"/": _floor, "/goals": _goals, "/tree": _tree}[path](state))
 
 
 def _dispatch_ticket_page(handler, state, path, parsed):
@@ -1262,6 +1283,13 @@ def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
     state = store or TicketStore()
 
     class DashboardHTTPServer(ThreadingHTTPServer):
+        def server_bind(self):
+            # HTTPServer.server_bind also resolves server_name with
+            # socket.getfqdn, a reverse-DNS lookup nothing here reads; it took
+            # tens of seconds per server on the macOS runner (issue 1188).
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address[:2]
+
         def server_close(self):
             state.stop_background()
             super().server_close()

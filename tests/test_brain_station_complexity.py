@@ -1,9 +1,9 @@
-"""Complexity caps for the two deferred PR 301 high-complexity findings.
+"""Complexity caps for deferred high-complexity review findings.
 
-The review bot caps a function at cyclomatic complexity 15. The deferred
-review findings tracked by this ticket flagged high complexity in
-`bus/brain.py` and `bus/station.py`; this pins the two refactored functions
-under the cap so the warnings stay resolved.
+The review bot caps a function at cyclomatic complexity 15. Deferred review
+findings flagged high complexity in `bus/brain.py` and `bus/station.py`
+(PR 301's two, and PR 120's `Station._claim`); this pins the refactored
+functions under the cap so the warnings stay resolved.
 """
 import ast
 import pathlib
@@ -14,6 +14,7 @@ CAP = 15
 TARGETS = (
     ("bus/brain.py", "_ready_sensitive"),
     ("bus/station.py", "Station._deliver_unlinked"),
+    ("bus/station.py", "Station._claim"),
 )
 
 
@@ -59,7 +60,7 @@ class BrainStationComplexityTest(unittest.TestCase):
                 if name == want and complexity(node) > CAP]
         self.assertEqual(over, [])
 
-    def test_both_targets_still_exist(self):
+    def test_every_target_still_exists(self):
         names = {path: {name for name, _ in qualified_names(path)}
                  for path, _ in TARGETS}
         for path, want in TARGETS:
