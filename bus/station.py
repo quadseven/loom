@@ -8531,7 +8531,15 @@ class Station:
                                held=list(self._held_tickets()) + self._gate_held(),
                                silent=self._silent_lanes(),
                                down=self.down_lanes(),
-                               limit_until=self.limit_until(), **extra)
+                               limit_until=self.limit_until(),
+                               known_waits=self._saved_waits(), **extra)
+
+    def _saved_waits(self) -> Dict[str, str]:
+        """Each ticket's wait reason as the last pass recorded it (_record_waits)."""
+        saved = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
+        return {str(key): info["reason"] for key, info in
+                (saved.items() if isinstance(saved, dict) else [])
+                if isinstance(info, dict) and isinstance(info.get("reason"), str)}
 
     def watch_default_branches(self) -> None:
         """Fix forward after a red lane merge, then revert if it stays red.

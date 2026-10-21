@@ -330,6 +330,13 @@ PUBLIC_ONLY = ("zen", "zai", "agy", "copilot", "opencode-go-4", "muse", "free-nv
 # its only up lane was the busy claude lane (2026-10-19). The last rung takes
 # the work regardless.
 RUNG_BUSY = 2
+# A rung with one lane up holds at most this many waiting tickets while another
+# untried rung has a shorter wait: past it, a waiting ticket climbs to an
+# untried rung whose least-loaded lane holds at least three fewer, though that
+# lane is no longer free (RUNG_BUSY). Left to wait for the
+# one lane, 13 tickets stalled on the claude lane while the anthropic lanes
+# were out of credit, two of them 10 hours (loom#1280, 2026-10-21).
+ONE_LANE_MAX = 4
 # A ladder ticket whose rung has no lane serving its model for longer than
 # this (each lane down, or its model limited past it) climbs to the next
 # untried rung instead of waiting, as no failure. An account quota held a
@@ -1241,6 +1248,7 @@ class Factory:
                  silent: Optional[Dict[str, float]] = None,
                  down: Sequence[str] = (),
                  limit_until: Optional[Dict[str, float]] = None,
+                 known_waits: Optional[Dict[str, str]] = None,
                  human: Callable[..., Any] = brain.human,
                  scope: Optional[scope_fit.Ask] = None) -> None:
         self.gh = gh
@@ -1282,6 +1290,9 @@ class Factory:
         # the station to time (invariants.ticket_waiting). A ticket held by
         # its own Not before: line is waiting on purpose and is not here.
         self.waits: Dict[str, str] = {}
+        # The same map as the last pass left it (the station's saved waits): a
+        # ticket whose reason is unchanged is not announced again.
+        self.known_waits = dict(known_waits or {})
         self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
         # Sends the scope check's prompt to a cheap model (bus/scope_fit.py);
@@ -2275,6 +2286,15 @@ class Factory:
         """Record why this pass leaves the ticket where it is (self.waits)."""
         self.waits["%s#%s" % (repo, number)] = reason
 
+    def _wait_said(self, repo: str, number: Any, reason: str, message: str) -> None:
+        """Record the wait and say `message` only when the ticket starts waiting
+        for this reason, not on each pass it repeats it: 716 identical stall
+        lines in two days hid the ones that mattered (loom#1280)."""
+        key = "%s#%s" % (repo, number)
+        if self.known_waits.get(key) != reason:
+            _say(message)
+        self._waiting(repo, number, reason)
+
     def _relabel(self, repo: str, issue: Dict[str, Any], labels: List[str]) -> None:
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, issue["number"]),
                      {"labels": labels})
@@ -2344,7 +2364,7 @@ class Factory:
         """A ticket briefed BRIEFED_STALL with no lane claiming it moves to the
         least-loaded other lane of its tier (or of its rung), with no rung
         marker: it never ran, so it has not failed on any model. With no such
-        lane it stays briefed, and the stall is said once per pass."""
+        lane it stays briefed, and the stall is said once, when it starts."""
         number = int(issue["number"])
         comments = self._comments(repo, number)
         since = self._briefed_since(repo, issue, comments)
@@ -2357,8 +2377,11 @@ class Factory:
         rung = current_rung(issue)
         lanes = self._stall_lanes(repo, issue, rung)
         if not lanes:
-            _say("%s#%d stalled on lane %s: no other lane of its %s is available"
-                 % (repo, number, old, "rung" if rung else "tier"))
+            kind = "rung" if rung else "tier"
+            self._wait_said(repo, number, "stalled on lane %s: no other lane of its %s is available"
+                            % (old, kind),
+                            "%s#%d stalled on lane %s: no other lane of its %s is available"
+                            % (repo, number, old, kind))
             return
         lane = pick_lane(lanes, self.load)
         waiting, there = self.load.get(old, 0), self.load.get(lane, 0)
@@ -2366,8 +2389,10 @@ class Factory:
             # A move to a lane with as long a wait only restarts the stall
             # clock: three tickets bounced codex-2 -> codex -> codex-2 for six
             # hours unclaimed (2026-10-21). It moves to a free or shorter lane.
-            _say("%s#%d stalled on lane %s: lane %s waits as long (%d vs %d)"
-                 % (repo, number, old, lane, there, waiting))
+            self._wait_said(repo, number, "stalled on lane %s: another lane of its %s waits as long"
+                            % (old, "rung" if rung else "tier"),
+                            "%s#%d stalled on lane %s: lane %s waits as long (%d vs %d)"
+                            % (repo, number, old, lane, there, waiting))
             return
         self._move_stalled(repo, issue, lane, (self.now - since) / 3600, rung)
 
@@ -2397,7 +2422,9 @@ class Factory:
         rung 2 on codex-2 and rung 3 on claude 8 times in 90 minutes and was
         never claimed (2026-10-20). The target's least-loaded up lane must be
         another lane holding fewer than this lane less one, so a move always
-        shortens the wait and the next pass cannot move it back."""
+        shortens the wait and the next pass cannot move it back. A rung with one
+        lane up and more than ONE_LANE_MAX waiting also moves its overflow to a
+        rung that is busy but holds three or more fewer (loom#1280)."""
         here = current_rung(issue)
         old = _lane(issue)
         waiting = self.load.get(old, 0)
@@ -2406,10 +2433,18 @@ class Factory:
         comments = self._comments(repo, int(issue["number"]))
         tried, reached = self._tried(issue, comments, failed_here=False)
         up = self._up_lanes(repo)
+        # A rung with one lane up sends its overflow to a rung with fewer
+        # waiting even when that one is busy too, so it holds a bounded few.
+        overflow = len(up[here]) <= 1 and waiting > ONE_LANE_MAX
 
         def shorter(lanes: Tuple[str, ...]) -> bool:
             lane = pick_lane(lanes, self.load)
-            return lane != old and self.load.get(lane, 0) < min(RUNG_BUSY, waiting - 1)
+            load = self.load.get(lane, 0)
+            if lane == old or load >= waiting - 1:
+                return False
+            # Overflow moves only to a rung with three or more fewer waiting,
+            # so two busy rungs never trade a ticket back and forth.
+            return load < RUNG_BUSY or (overflow and load + 2 < waiting)
 
         if not any(shorter(up[n]) for n in climb_rungs(tried | {here}, reached) if up[n]):
             return False

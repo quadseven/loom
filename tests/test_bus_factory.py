@@ -222,7 +222,7 @@ class Base(unittest.TestCase):
         self.humans = []
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
-           down=(), limit_until=None, scope=None):
+           down=(), limit_until=None, scope=None, known_waits=None):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
@@ -248,7 +248,8 @@ class Base(unittest.TestCase):
                             merge=merge, fix=fix, move=move, close=close, human=human,
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
-                            silent=silent, down=down, limit_until=limit_until, scope=scope)
+                            silent=silent, down=down, limit_until=limit_until, scope=scope,
+                            known_waits=known_waits)
         f.run()
         return f
 
@@ -1921,6 +1922,30 @@ class Tickets(Base):
         self.gh.events[number] = [{"event": "labeled", "label": {"name": "loom:briefed"},
                                    "created_at": iso(factory.BRIEFED_STALL + 600)}]
 
+    def one_lane_stall(self, number=7, known_waits=None):
+        """A rung 1 ticket stalled on claude, the rung's only lane; the lines said."""
+        said = []
+        with mock.patch.object(factory, "_say", said.append):
+            f = self.go(known_waits=known_waits)
+        return f, [s for s in said if "stalled on lane" in s]
+
+    def test_a_stall_with_no_other_lane_is_said_once_not_every_pass(self):
+        # 716 identical lines in two days (loom#1280).
+        self.stalled(7, lane="claude",
+                     body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        f, said = self.one_lane_stall()
+        self.assertEqual(len(said), 1, said)
+        self.assertEqual(list(f.waits), ["%s#7" % REPO])
+        again, said = self.one_lane_stall(known_waits=f.waits)
+        self.assertEqual(said, [])
+        self.assertEqual(again.waits, f.waits)
+
+    def test_a_stall_with_a_new_reason_is_said_again(self):
+        self.stalled(7, lane="claude",
+                     body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        _, said = self.one_lane_stall(known_waits={"%s#7" % REPO: "some older reason"})
+        self.assertEqual(len(said), 1, said)
+
     def test_a_briefed_ticket_nobody_claims_moves_within_its_tier(self):
         self.stalled(7)
         self.go()
@@ -2471,6 +2496,38 @@ class Tickets(Base):
             self.assertFalse(any(factory.RUNG_MARKER % 3 in c["body"]
                                  for c in self.gh.comments[n]))
 
+    def test_a_one_lane_rung_sends_its_overflow_to_a_busy_rung_with_a_shorter_wait(self):
+        # 13 tickets waited on the one claude lane (two for 10 hours) while the
+        # other rungs held two or three each and so never counted as free
+        # (loom#1280, 2026-10-21).
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        for n in range(1, 9):
+            self.gh.ticket(n, "briefed", lane="claude", body=body)
+            self.gh.comments[n].append({"body": factory.RUNG_MARKER % 1, "user": ME})
+        for n, lane in ((11, "codex"), (12, "codex"), (13, "codex"),
+                        (14, "codex-2"), (15, "codex-2"), (16, "codex-2")):
+            self.gh.ticket(n, "briefed", lane=lane)
+        self.go(limited=factory.ANTHROPIC)
+        stayed = [n for n in range(1, 9) if self.lane(n) == "claude"]
+        self.assertLess(len(stayed), 8)
+        self.assertLessEqual(len(stayed), factory.ONE_LANE_MAX + 2)
+        moved = [n for n in range(1, 9) if self.lane(n) != "claude"]
+        self.assertTrue(all(self.model(n) == "gpt-6-sol" for n in moved))
+        # No lane it moved to ends up longer than the one it left.
+        loads = [sum(1 for n in list(range(1, 9)) + list(range(11, 17)) if self.lane(n) == lane)
+                 for lane in ("claude", "codex", "codex-2")]
+        self.assertLessEqual(max(loads) - min(loads), 2)
+
+    def test_a_one_lane_rung_at_its_limit_keeps_tickets_when_no_rung_is_shorter(self):
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        for n in range(1, 6):
+            self.gh.ticket(n, "briefed", lane="claude", body=body)
+            self.gh.comments[n].append({"body": factory.RUNG_MARKER % 1, "user": ME})
+        for n in range(11, 19):  # codex and codex-2 hold 4 each: none holds 3 fewer
+            self.gh.ticket(n, "briefed", lane="codex" if n % 2 else "codex-2")
+        self.go(limited=factory.ANTHROPIC)
+        self.assertEqual([self.lane(n) for n in range(1, 6)], ["claude"] * 5)
+
     def test_two_busy_rungs_do_not_ping_pong_a_ticket(self):
         # One ticket flipped between rung 2 on codex-2 and rung 3 on claude 8
         # times in 90 minutes, as each rung looked free by a lane that was
@@ -2753,7 +2810,8 @@ class Helpers(unittest.TestCase):
         class Fake:
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
-                         model_limits=None, silent=None, down=(), limit_until=None):
+                         model_limits=None, silent=None, down=(), limit_until=None,
+                         known_waits=None):
                 self.silent_running, self.silent, self.waits = {}, silent, {}
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))

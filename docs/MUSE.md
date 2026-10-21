@@ -626,6 +626,12 @@ already failed it, and never a free lane:
 4. `gemini-4-argon-high` on agy, public repos only (the Opus equivalent and
    agy's hard-tier model, bus/factory.py EQUIVALENTS and HARD_MODELS).
 
+A rung with one lane up holds a bounded few waiting tickets: past
+`ONE_LANE_MAX` (4), the overflow climbs to an untried rung whose least-loaded
+lane holds three or more fewer, even though that lane is not free. A stall the
+factory cannot move (no other lane of the rung or tier) is said once, when the
+ticket starts waiting for that reason, and then shows as a wait the station times.
+
 A rung counts as tried once the ticket was claimed on its model. The model a
 claim ran is what ran: the `Model:` line in force (the ticket's own before the
 ladder started, then the ladder's moves), else the model the runner footer of
