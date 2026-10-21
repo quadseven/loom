@@ -61,6 +61,12 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 # that is one tick (REPORT_GRACE) past due is overdue.
 REPORT_EVERY = 6 * 3600
 REPORT_GRACE = 30 * 60
+# A report is owed to the brain this long before it is due. The station posts
+# its data-only standup 15 minutes before due (station.STANDUP_LEAD), and that
+# report restarts the clock: owed only from due, no brain ever wrote one, and
+# one goal home went a day and a half on the station's reports (2026-10-21).
+# Two hours and a quarter gives an hourly tick two chances to write it first.
+REPORT_OWED_EARLY = 2 * 3600 + 15 * 60
 TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage", "journal", "unlock")
 RUNAWAY = "loom:runaway"
 STEP_MARKER = "loom:tick="
@@ -234,7 +240,7 @@ def _report_deadline(last: datetime, now: datetime) -> Tuple[datetime, str]:
     due = last + timedelta(seconds=REPORT_EVERY)
     if now >= due + timedelta(seconds=REPORT_GRACE):
         return due, "overdue"
-    if now >= due:
+    if now >= due - timedelta(seconds=REPORT_OWED_EARLY):
         return due, "due"
     return due, "ok"
 
@@ -291,6 +297,9 @@ def _owed_line(issue: Dict[str, Any], led: Dict[str, Any], comments: List[Dict[s
                                 for c in comments), now, authors or ())
     if held is not None:
         return "- #%s report HELD: %s" % (issue["number"], journal.hold_message(held, now))
+    if led["state"] == "due":
+        return "- #%s report DUE by %s; the station posts a data-only one 15 minutes before" % (
+            issue["number"], led["due"] or "an unknown time")
     return "- #%s report %s since %s" % (
         issue["number"], led["state"].upper(), led["due"] or "an unknown time")
 

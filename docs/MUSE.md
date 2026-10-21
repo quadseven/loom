@@ -283,9 +283,10 @@ this tick"; a step with no note shows nothing there.
    for each goal, its latest journal, report, measurement and completed
    action, and its report deadline. Every goal under "Reports owed before
    unlock" gets its report in the report step this tick, in every scope,
-   including live. If the brain cannot write it, the station posts the
-   data-only report once the last report is 1 hour 45 minutes old, so no
-   goal's report passes 2 hours; never hand an owed report to another brain.
+   including live. A report is owed from 3 hours 45 minutes after the last
+   one. If the brain has not written it, the station posts the data-only
+   report once the last report is 5 hours 45 minutes old, so no goal's
+   report passes 6 hours; never hand an owed report to another brain.
    A goal listed as `report HELD` already has a report under 90 minutes old
    (the station's included): skip it this tick. Each lane
    pull request's line ends in `READY`
