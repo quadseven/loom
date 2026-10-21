@@ -10,6 +10,13 @@ agent `com.loom.dashboard` (restarted if it exits, logging to
 environment; `LOOM_DASHBOARD=0` removes it. With no `LOOM_DB_PASSWORD` the
 agent sets `LOOM_TRANSCRIPTS_MEMORY=1`, so it starts with transcripts kept in
 memory, and its log says so.
+Check it from a second device on the private network, not from the lane
+machine itself: `curl -sS -o /dev/null -w '%{http_code}\n'
+http://192.0.2.10:8080/readyz` answers 503 until the first snapshot has read
+a repository and 200 after it, while `/livez` answers 200 as soon as the
+server is up. With `LOOM_DASHBOARD_HOST` set, the port is closed on the
+machine's other interfaces, so the same command against another address of
+that machine is refused (`curl: (7) Failed to connect`).
 Set `LOOM_DASHBOARD_PORT` to change the port and `LOOM_REPOS` to a
 space-separated list of `OWNER/NAME` repositories. Set
 `LOOM_DASHBOARD_GITHUB_TOKEN` to provide a read-only GitHub token; without it,
