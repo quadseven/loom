@@ -346,6 +346,25 @@ class BrainTickTest(unittest.TestCase):
         self.assertEqual([], self.agent_calls(calls, "claude"))
         self.assertEqual(1, len(self.agent_calls(calls, "codex")))
 
+    def test_a_lane_mid_run_keeps_its_usage_though_its_heartbeat_aged(self):
+        # A runner writes its heartbeat between runs, not during one: at 11:04Z
+        # on 2026-10-21 the claude lane was 30 minutes into a run and the spark
+        # lane 40, so the tick skipped with "no brain lane has usage".
+        self.usage("claude", True, age=1800)
+        lock = self.home / "run" / "claude.lock"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text("%d\n" % os.getpid())
+        _, calls = self.tick()
+        self.assertEqual(1, len(self.agent_calls(calls, "claude")))
+
+    def test_a_dead_runners_lock_does_not_keep_an_aged_heartbeat(self):
+        self.usage("claude", True, age=1800)
+        lock = self.home / "run" / "claude.lock"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text("999999\n")
+        _, calls = self.tick()
+        self.assertEqual([], self.agent_calls(calls, "claude"))
+
     def test_a_limit_failure_moves_the_tick_to_the_next_rung_once(self):
         for lane in ("codex", "spark"):
             self.usage(lane, True)
