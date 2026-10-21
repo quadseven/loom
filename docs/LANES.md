@@ -1164,6 +1164,19 @@ ticket elsewhere without counting it as a work failure. Ollama and Gemma
 accept private repos; the other three accept public repos only. The routes
 need your own gateway and provider configuration.
 
+## opencode lanes: one continue for a described step
+
+Every opencode lane (openrouter, opencode-go, zen, zai, workersai, spark and
+the free slots) runs `opencode run --format json`. A model that answers with
+a described step ("Let me read the build files.") and then stops, with no
+tool call, no commit, and no "nothing to change" summary, gets one more
+run with `--continue` asking it to carry out that step. A second such end
+fails the ticket as "ended on a described step without taking it". The spark
+lane's log keeps the raw events; every other lane's log keeps what a plain run
+printed (the model's text and any non-event line, such as a provider error),
+so its failure classes and the final message quoted in a failure reason are
+unchanged for a run that did not end on a described step.
+
 ## spark: a local vLLM coder, one stream at a time
 
 - opencode against a vLLM server you run yourself, through a custom
