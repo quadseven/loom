@@ -14,6 +14,14 @@ from . import text
 # backticked span is matched first, so a quote inside one is not a needle.
 NEEDLE_RE = re.compile(r'`([^`]+)`|"([^"\n]+)"')
 IP_RE = re.compile(r"\b[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?::[0-9]+)?\b")
+# Live strings are often written as templates: `sync: ... (waiting)`,
+# "left N file(s)", `export <report>: ...`, "account 'X' charges 'Y'". No log
+# line contains those literally, so each placeholder matches any text and only
+# the fixed text around it has to appear (2026-10-20: nine shipped tickets sat
+# awaiting evidence for good because grep -F looked for the template itself).
+PLACEHOLDER_RE = re.compile(r"\.\.\.|<[A-Za-z][A-Za-z0-9_-]*>|(?<=')[A-Z](?=')|(?<!\w)[NM](?!\w)")
+# A template whose longest fixed part is shorter than this matches too much.
+MIN_LITERAL = 6
 MAX_NEEDLES = 5
 MAX_LINES = 20
 TIMEOUT = 60
@@ -25,6 +33,23 @@ def needles(live: str) -> List[str]:
     return list(dict.fromkeys(value for value in found
                               if 0 < len(value) <= 120 and value.isascii()
                               and all(32 <= ord(char) < 127 for char in value)))[:MAX_NEEDLES]
+
+
+def needle_pattern(needle: str) -> Tuple[str, Optional[re.Pattern[str]]]:
+    """(the text handed to the log command, the pattern a line must match).
+    A needle with no placeholder is (needle, None) and is matched exactly.
+    For a template the text is its longest fixed part, so a `grep -F` command
+    still narrows the log to a superset, and the pattern requires every fixed
+    part in order with something in each placeholder's place. A template whose
+    longest fixed part is under MIN_LITERAL characters is ("", None): too
+    general to search."""
+    pieces = PLACEHOLDER_RE.split(needle)
+    if len(pieces) == 1:
+        return needle, None
+    literal = max((piece.strip() for piece in pieces), key=len)
+    if len(literal) < MIN_LITERAL:
+        return "", None
+    return literal, re.compile(".+?".join(re.escape(piece) for piece in pieces))
 
 
 def safe_line(line: str, known: Iterable[str] = ()) -> bool:
@@ -48,8 +73,12 @@ def safe_line(line: str, known: Iterable[str] = ()) -> bool:
 
 def _quote(command: str, needle: str) -> Tuple[str, Optional[int]]:
     """(the quoted section lines for one needle, how many safe lines named it;
-    None when the command gave no answer)."""
-    env = dict(os.environ, LOOM_EVIDENCE_NEEDLE=needle)
+    None when the command gave no answer or the needle is too general to run)."""
+    literal, pattern = needle_pattern(needle)
+    if not literal:
+        return ("- `%s`: too general to search (its longest fixed text is under %d "
+                "characters); no lines quoted." % (needle, MIN_LITERAL)), None
+    env = dict(os.environ, LOOM_EVIDENCE_NEEDLE=literal)
     try:
         # Station config supplies the script; ticket text enters only through env.
         process = subprocess.Popen(["/bin/sh", "-c", command], stdout=subprocess.PIPE,
@@ -67,7 +96,8 @@ def _quote(command: str, needle: str) -> Tuple[str, Optional[int]]:
         return "- `%s`: command could not start (%s); no lines quoted." % (needle, type(err).__name__), None
     if process.returncode not in (0, 1):
         return "- `%s`: command exited %d; no lines quoted." % (needle, process.returncode), None
-    matching = [line for line in stdout.splitlines() if needle in line]
+    matching = [line for line in stdout.splitlines()
+                if (pattern.search(line) if pattern else needle in line)]
     safe = [line for line in matching if safe_line(line)]
     kept = safe[:MAX_LINES]
     dropped = len(matching) - len(safe)
@@ -82,9 +112,11 @@ def quote(command: str, needle: str) -> str:
 
 def gather(commands: Dict[str, str], repo: str, live: str) -> Tuple[str, Optional[bool]]:
     """(the brief's log data section, whether any line names one of the live
-    criterion's strings). The second is None when there is no command, no
-    string, or a command gave no answer; False only when every command run
-    answered and none found a line. One run of the command per needle."""
+    criterion's strings). A string written as a template (`...`, <name>, 'X',
+    a bare N or M) matches the lines that fill it in (needle_pattern). The
+    second is None when there is no command, no string, or a command gave no
+    answer; False only when every command run answered and none found a line.
+    One run of the command per needle."""
     command = commands.get(repo)
     requested = needles(live)
     if not command or not requested:

@@ -33,7 +33,10 @@ agent_cli() {
 # the short tail (the last five non-blank lines), so a ticket that is about
 # expired keys or network errors is not read as a fault, and the reason shown
 # to people stays the short tail.
-LIMIT_RE='usage limit|rate[ _-]?limit|quota|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
+# A bare "quota" is no limit: a timed-out agent's git log or a file it read
+# can say it, and three Spark lanes were held an hour on a commit subject
+# (2026-10-20). Providers say the quota is reached, exceeded or exhausted.
+LIMIT_RE='usage limit|rate[ _-]?limit|quota (reached|exceeded|exhausted|resets?)|exceeded (your |the )?(current )?quota|resource[ _]exhausted|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
 KEY_STATE='expired|revoked|invalid|incorrect|disabled'
 AUTH_RE="($KEY_STATE)[ _-]*api[ _-]*key|api[ _-]*key([ _-]*(is|was|has|been|are))*[ _-]*($KEY_STATE)|(http|status|code|error)[^0-9a-z]{0,3}401([^0-9]|\$)"
 # A quota on the whole account, not one model: every model of the lane is
@@ -52,6 +55,10 @@ AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|h
 # OpenRouter: "free-models-per-day"). The fixed hour retried it, and failed,
 # every hour until then (2026-10-19).
 DAILY_RE='daily (free )?(allocation|allowance|limit|quota)|per[ _-]day'
+# A model the agent CLI no longer offers (opencode drops one models.dev marks
+# deprecated): no retry within the day brings it back, so the model rests
+# LIMIT_WAIT_MAX like a spent allowance and the lane stops claiming.
+MODEL_GONE_RE='ProviderModelNotFoundError: Model not found'
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
 
@@ -64,6 +71,18 @@ LIMIT_WAIT_MAX=86400
 # auth: no retry and no attempt can fix it, so the runner takes its lanes
 # offline until the operator renews it. A crash before any edit, a timeout,
 # a signal or a network fault is transient; anything else is work.
+# An agent CLI's JSON events that carry the work, not the provider's word:
+# tool results, the model's own text and reasoning, step markers (opencode
+# --format json). Code about rate limits that a tool read is no limit: two
+# Spark lanes were held an hour on such tool results (2026-10-21). A provider
+# error arrives as its own line ({"type":"error",...} or plain text).
+WORK_EVENT_RE='^\{"type":"(tool_use|text|reasoning|step_start|step_finish)"'
+
+# Stdin without the agent's work events, for the limit and credit patterns.
+provider_text() {
+  grep -vE "$WORK_EVENT_RE" || true
+}
+
 classify_failure() {
   local status="$1" whole="$2" edited="$3" now n tail
   tail="${4:-$whole}"
@@ -72,6 +91,8 @@ classify_failure() {
   shopt -s nocasematch
   if [[ "$tail" =~ $AUTH_RE ]]; then
     FAIL_CLASS=auth
+  elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
+    FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT_MAX))
   elif [[ "$whole" =~ $LIMIT_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
     if [[ "$whole" =~ $OUT_OF_CREDIT_RE ]]; then

@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
@@ -415,6 +416,93 @@ class HandoffCommandTest(unittest.TestCase):
         with self.assertRaises(OSError) as ctx:
             brain_memory.fetch_handoff("http://dashboard.example.com/x?key=Q", "TOKEN")
         self.assertNotIn("dashboard", str(ctx.exception))
+
+
+class FetchRetryTest(unittest.TestCase):
+    """The fetch_json function retries on connection failures."""
+
+    def _make_resp(self, status, body):
+        resp = mock.Mock()
+        resp.status = status
+        resp.read.return_value = body
+        resp.__enter__ = mock.Mock(return_value=resp)
+        resp.__exit__ = mock.Mock(return_value=None)
+        return resp
+
+    def test_fetch_retries_on_connection_failure_then_succeeds(self):
+        attempts = []
+        packet = {"ticks": [], "commitments": [], "rules": []}
+
+        def fake_open(req, timeout):
+            attempts.append(req.full_url)
+            if len(attempts) < 3:
+                raise urllib.error.URLError("connection reset")
+            return self._make_resp(200, json.dumps(packet).encode())
+
+        with mock.patch.object(brain_memory._OPENER, "open", fake_open):
+            result = brain_memory.fetch_json(
+                "https://dashboard.example.com/api/brain/handoff", "TOKEN")
+        self.assertEqual(result, packet)
+        self.assertEqual(len(attempts), 3)
+
+    def test_fetch_retries_exhausted_raises_error(self):
+        attempts = []
+
+        def fake_open(req, timeout):
+            attempts.append(req.full_url)
+            raise urllib.error.URLError("connection reset")
+
+        with mock.patch.object(brain_memory._OPENER, "open", fake_open):
+            with self.assertRaises(OSError) as ctx:
+                brain_memory.fetch_json(
+                    "https://dashboard.example.com/api/brain/handoff", "TOKEN")
+        self.assertIn("failed to connect", str(ctx.exception))
+        self.assertEqual(len(attempts), 3)  # initial + 2 retries
+
+    def test_fetch_does_not_retry_on_http_error(self):
+        attempts = []
+
+        def fake_open(req, timeout):
+            attempts.append(req.full_url)
+            err = urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+            raise err
+
+        with mock.patch.object(brain_memory._OPENER, "open", fake_open):
+            with self.assertRaises(OSError) as ctx:
+                brain_memory.fetch_json(
+                    "https://dashboard.example.com/api/brain/handoff", "TOKEN")
+        self.assertIn("answered 401", str(ctx.exception))
+        self.assertEqual(len(attempts), 1)  # no retry on HTTP error
+
+    def test_fetch_retries_on_5xx_then_succeeds(self):
+        attempts = []
+        packet = {"ticks": [], "commitments": [], "rules": []}
+
+        def fake_open(req, timeout):
+            attempts.append(req.full_url)
+            if len(attempts) < 3:
+                return self._make_resp(503, b"Service Unavailable")
+            return self._make_resp(200, json.dumps(packet).encode())
+
+        with mock.patch.object(brain_memory._OPENER, "open", fake_open):
+            result = brain_memory.fetch_json(
+                "https://dashboard.example.com/api/brain/handoff", "TOKEN")
+        self.assertEqual(result, packet)
+        self.assertEqual(len(attempts), 3)
+
+    def test_fetch_retries_on_5xx_exhausted_raises_error(self):
+        attempts = []
+
+        def fake_open(req, timeout):
+            attempts.append(req.full_url)
+            return self._make_resp(502, b"Bad Gateway")
+
+        with mock.patch.object(brain_memory._OPENER, "open", fake_open):
+            with self.assertRaises(OSError) as ctx:
+                brain_memory.fetch_json(
+                    "https://dashboard.example.com/api/brain/handoff", "TOKEN")
+        self.assertIn("answered 502", str(ctx.exception))
+        self.assertEqual(len(attempts), 3)  # initial + 2 retries
 
 
 if __name__ == "__main__":

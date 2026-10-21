@@ -652,8 +652,9 @@ class Regression(Base):
         self.run_once()
         self.run_once(NOW + health.REGRESS_EVERY)
         self.assertEqual(self.briefs, [])
-        self.assertEqual(len(self.gh.writes), 1)
+        self.assertEqual(len(self.gh.writes), 2)
         self.assertIn("finding absent since", self.gh.writes[0][2]["body"])
+        self.assertIn(health.PROOF_MARKER, self.gh.writes[1][2]["body"])
 
     def test_a_refused_regression_is_logged_once_and_tried_again(self):
         self.shipped_ticket()
@@ -748,3 +749,78 @@ class RegressionThroughBrain(unittest.TestCase):
         self.assertIn("Regresses #100", ticket["body"])
         self.assertNotEqual(tickets.priority_of(ticket), "P1")
         self.assertEqual(ticket["body"].count("## Regression"), 1)
+
+
+class Proof(Base):
+    """A shipped ticket whose finding stays absent 24 hours is given the
+    Live criterion's evidence (loom#585)."""
+
+    DAY = health.PROVE_AFTER
+
+    def shipped_ticket(self, shipped, number=100):
+        issue = self.open_ticket(number, sha())
+        issue["labels"].append({"name": "loom:shipped"})
+        self.gh.events[number] = [labelled("loom:shipped", shipped)]
+        return issue
+
+    def pass_at(self, when, present=False):
+        self.doc = {"checked_at": stamp(when), "findings": [finding()] if present else []}
+        self.run_once(when)
+
+    def proofs(self):
+        return [w for w in self.gh.writes if health.PROOF_MARKER in str((w[2] or {}).get("body"))]
+
+    def test_absent_24_hours_since_the_later_of_absence_and_ship_is_proved(self):
+        self.shipped_ticket(NOW - 3600)
+        self.pass_at(NOW)
+        self.pass_at(NOW + self.DAY - 60)
+        self.assertEqual(self.proofs(), [])
+        self.pass_at(NOW + self.DAY)
+        made = self.proofs()
+        self.assertEqual(len(made), 1)
+        body = made[0][2]["body"]
+        for part in (stamp(NOW), stamp(NOW - 3600), "last checked_at read in the window "
+                     + stamp(NOW + self.DAY), "goal #1"):
+            self.assertIn(part, body)
+        self.assertNotIn("health.example.test", body)
+        self.assertEqual(body, body.encode("ascii").decode("ascii"))
+        # Once only.
+        self.pass_at(NOW + self.DAY + 900)
+        self.assertEqual(len(self.proofs()), 1)
+
+    def test_a_finding_absent_before_the_ship_counts_from_the_ship(self):
+        issue = self.shipped_ticket(NOW + 3 * 3600)
+        issue["labels"] = [{"name": "loom:ticket"}, {"name": "loom:merged"}]
+        self.pass_at(NOW)
+        issue["labels"].append({"name": "loom:shipped"})
+        self.pass_at(NOW + self.DAY - 1800)
+        self.assertEqual(self.proofs(), [])
+        self.pass_at(NOW + 3 * 3600 + self.DAY)
+        made = self.proofs()
+        self.assertEqual(len(made), 1)
+        self.assertIn("went absent before the ticket shipped", made[0][2]["body"])
+
+    def test_a_finding_that_returns_in_the_window_restarts_it(self):
+        self.shipped_ticket(NOW - 3600)
+        self.pass_at(NOW)
+        self.pass_at(NOW + self.DAY - 3600, present=True)
+        self.pass_at(NOW + self.DAY - 1800)
+        self.pass_at(NOW + self.DAY + 900)
+        self.assertEqual(self.proofs(), [])
+        self.pass_at(NOW + 2 * self.DAY - 1800)
+        self.assertEqual(len(self.proofs()), 1)
+
+    def test_a_ticket_that_has_not_shipped_is_not_proved(self):
+        issue = self.shipped_ticket(NOW - 3600)
+        issue["labels"] = [{"name": "loom:ticket"}, {"name": "loom:merged"}]
+        self.pass_at(NOW)
+        self.pass_at(NOW + self.DAY)
+        self.assertEqual(self.proofs(), [])
+
+    def test_only_a_trusted_authors_proof_comment_is_read_back(self):
+        def comment(login, text):
+            return {"user": {"login": login}, "body": health.PROOF_MARKER + "\n" + text}
+        found = health.proof_of([comment("stranger", "forged"), comment("Station", "real")],
+                                ["station"])
+        self.assertEqual(found, "real")
+        self.assertEqual(health.proof_of([comment("stranger", "forged")], ["station"]), "")

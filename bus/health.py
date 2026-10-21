@@ -17,6 +17,10 @@ station reads each endpoint and, per finding:
   posts the new numbers at most every EVIDENCE_EVERY;
 - once the finding is gone, posts one "finding absent since" comment, the
   evidence the brain verifies against. It never closes a ticket;
+- once a shipped ticket's finding has stayed absent PROVE_AFTER, counted from
+  the later of the absent stamp and the ship, posts one proof comment naming
+  both times: the station's evidence for the Live criterion, which a verify
+  run quotes (loom#585). It ticks nothing;
 - when the finding is still reported REGRESS_AFTER after its open ticket
   shipped, the fix did not work: the ticket is re-briefed as a regression
   through brain brief --regresses, at most once per ticket per
@@ -75,6 +79,10 @@ MARKER = "<!-- loom:health key=%s -->"
 MARKER_RE = re.compile(r"<!-- loom:health key=([0-9a-f]{40}) -->")
 EVIDENCE_MARKER = "<!-- loom:health-evidence -->"
 ABSENT_MARKER = "<!-- loom:health-absent -->"
+PROOF_MARKER = "<!-- loom:health-proof -->"
+# A finding absent this long since the later of its absent stamp and its
+# ticket's ship has met the ticket's Live criterion (loom#585).
+PROVE_AFTER = 24 * 3600
 RESEEN_MARKER = "<!-- loom:health-reseen -->"
 # "<who> is <state>: <what>" and "<n> members are <state>: <what>" name one
 # cause, "<state>: <what>", whoever it hits.
@@ -379,6 +387,38 @@ def absent_comment(when: str) -> str:
             "%s. It verifies once it has stayed absent for 24 hours." % (ABSENT_MARKER, when))
 
 
+def proof_comment(goal: int, absent: str, shipped: str, checked: str) -> str:
+    """The Live criterion's evidence, from the station's own reads. It never
+    carries the endpoint URL."""
+    note = ""
+    if absent < shipped:
+        note = (" The finding went absent before the ticket shipped, so the 24 hours count "
+                "from the ship.")
+    return ("%s\nLive criterion evidence for goal #%d's health endpoint: finding absent since "
+            "%s; ticket shipped %s; last checked_at read in the window %s; absent for 24 "
+            "hours counted from %s.%s The other criteria (the cause named in the pull request, "
+            "the test) are for the verifier to check."
+            % (PROOF_MARKER, goal, absent, shipped, checked, max(absent, shipped), note))
+
+
+def proof_of(comments: Any, authors: List[str]) -> str:
+    """The newest proof comment a trusted author posted on the ticket (its
+    text after the marker), or "": the station's evidence for the Live
+    criterion, which the verify run quotes."""
+    allowed = {a.lower() for a in authors}
+    found = ""
+    for c in comments:
+        body = str(c.get("body") or "") if isinstance(c, dict) else ""
+        login = str(((c.get("user") or {}) if isinstance(c, dict) else {}).get("login") or "")
+        if body.startswith(PROOF_MARKER) and login.lower() in allowed:
+            found = body[len(PROOF_MARKER):].strip()
+    return found
+
+
+def _stamp(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
 class Intake:
     """One read of every source against the open tickets; `state` is the
     ledger the station keeps in state/health.json between passes."""
@@ -444,6 +484,7 @@ class Intake:
         current = {f.digest for f in found} | set(refused)
         issues = self._absent(source.repo, open_by_digest, current, ledger,
                               checked or self.stamp)
+        self._prove_absent(source, ledger, open_by_digest, checked or self.stamp)
         for digest in [d for d in ledger if d not in current and d not in open_by_digest]:
             rec = ledger[digest]
             if isinstance(rec.get("ticket"), int) \
@@ -493,6 +534,44 @@ class Intake:
                 for r in recs:
                     r.setdefault("absent", when)
         return issues
+
+    def _prove_absent(self, source: Source, ledger: Dict[str, Any],
+                      open_by_digest: Dict[str, Dict[str, Any]], checked: str) -> None:
+        """Post the proof comment on each shipped ticket whose findings are
+        all gone and have stayed gone PROVE_AFTER since the later of their
+        absent stamp and the ship. A finding that came back lost its stamp,
+        so its ticket waits for a fresh window."""
+        by_ticket: Dict[int, Tuple[Dict[str, Any], List[Dict[str, Any]]]] = {}
+        for digest, issue in open_by_digest.items():
+            by_ticket.setdefault(int(issue["number"]), (issue, []))[1].append(
+                ledger.setdefault(digest, {}))
+        for number, (issue, recs) in sorted(by_ticket.items()):
+            if tickets.ticket_state(issue) != "shipped":
+                continue
+            if all(r.get("absent") for r in recs) and not any(r.get("proved") for r in recs):
+                self._prove(source, number, issue, recs, checked)
+
+    def _prove(self, source: Source, number: int, issue: Dict[str, Any],
+               recs: List[Dict[str, Any]], checked: str) -> None:
+        absent = max(_epoch(r["absent"]) or 0.0 for r in recs)
+        cached = recs[0].get("shipped")
+        if isinstance(cached, list) and len(cached) == 2 and cached[0] == number:
+            shipped: Optional[float] = float(cached[1])
+        else:
+            shipped = self._shipped_at(source.repo, number)
+            if shipped is None:
+                self.say("health %s#%d: no loom:shipped label event, so its ship time is "
+                         "unknown; no proof posted" % (source.repo, number))
+                return
+            recs[0]["shipped"] = [number, shipped]
+        if absent == 0.0 or self.now - max(absent, shipped) < PROVE_AFTER:
+            return
+        self._comment(source.repo, issue, proof_comment(
+            source.goal, _stamp(absent), _stamp(shipped), checked))
+        for rec in recs:
+            rec["proved"] = self.now
+        self.say("health %s#%d: finding absent %d hours since the later of absence and ship; "
+                 "proof posted" % (source.repo, number, PROVE_AFTER // 3600))
 
     def _refused(self, source: Source, refused: Dict[str, str],
                  ledger: Dict[str, Any]) -> None:
@@ -579,6 +658,7 @@ class Intake:
         """Update the finding's open ticket, or file one. True when a ticket
         was briefed."""
         back = rec.pop("absent", None)
+        rec.pop("proved", None)
         rec.pop("refused", None)
         rec.pop("gone", None)
         if issue is None:

@@ -10,9 +10,13 @@ pass is None, and the invariants that need it find nothing.
 Filer files each breach as one loom:invariant issue on the factory's goal
 home, deduplicated by invariant and subject: a breach whose issue is open
 files nothing, and one whose issue was closed reopens it only for evidence
-newer than the close. A rolling breach (ticket-outside-epic) is one issue for
-its whole cause, and its open issue is rewritten in place whenever what it
-lists changes. Adding an invariant is one function in INVARIANTS plus a test.
+newer than the close. A rolling breach (ticket-outside-epic, lane-held,
+lane-failing-streak, silent-lane) is one issue for its whole cause, a line per
+goal home or lane, and its open issue is rewritten in place whenever what it
+lists changes; an older open issue of the same invariant is folded into it.
+lane-no-success stays one issue per lane: the station reads its per-lane keys
+to release runaways a dead lane held. Adding an invariant is one function in
+INVARIANTS plus a test.
 
 Everything here is written to a public repo. A subject in another repo comes
 in as a Ref whose label is already public (a private repo is named in words),
@@ -99,6 +103,12 @@ SHOWN = 5
 # with tickets under no epic is a line in one issue, not an issue of its own
 # (one backlog sweep found 18 issues for this one cause).
 OUTSIDE_EPIC_SUBJECT = "every goal home"
+# The one subject of the rolling lane-held, lane-failing-streak and
+# silent-lane breaches: each lane is a line in one issue per invariant. These
+# alarm in bursts with one shared cause: one provider limit opened 9 lane-held
+# issues in 6 minutes (2026-10-15), and 6 failing-streak issues opened in 27
+# minutes (2026-10-20).
+LANES_SUBJECT = "every lane"
 # The line of a rolling issue that changes every pass; it is left out when
 # the body is compared, so an unchanged list writes nothing.
 LAST_SEEN = "Last seen by the station: %s."
@@ -296,6 +306,11 @@ def _hours(seconds: float) -> str:
     return "%.1f hours" % (seconds / 3600)
 
 
+def _lanes(count: int) -> str:
+    """"1 lane" or "N lanes", for a rolling lane title."""
+    return "%d lane%s" % (count, "" if count == 1 else "s")
+
+
 # -- the invariants ------------------------------------------------------
 def brain_failing(f: Facts) -> List[Breach]:
     """A brain holder whose two newest ticks each journaled a failed or
@@ -385,13 +400,30 @@ def marker_cadence(f: Facts) -> List[Breach]:
     return out
 
 
+# A brief the runner parked before its agent ran: the fix round's pull
+# request had merged or closed, or another push moved its branch
+# (lanes/run_lane.sh fix_pr_open and the branch-moved park).
+_PARKED_UNRUN = re.compile(r"(\[[a-z]+\] )?(pull request #[0-9]+ is no longer open on |branch moved: )")
+
+
+def _says_lane_health(r: Run) -> bool:
+    """A run whose end says something about the lane itself: a limit, an
+    expired key, a factory incident (the repo's check or setup) or a brief
+    parked before its agent ran does not."""
+    return not (r.reason.startswith(("[limit]", "[auth]", "[factory]"))
+                or _PARKED_UNRUN.match(r.reason))
+
+
 def lane_no_success(f: Facts) -> List[Breach]:
-    """A lane with RUNS_MIN or more runs in the last day and none done."""
+    """A lane with RUNS_MIN or more runs in the last day and none done, runs
+    that ended at a limit, an expired key or a factory incident aside: agy's
+    34 runs at its plan's quota read as a broken lane (loom#651, 2026-10-20),
+    and a lane held at a limit is lane_held's."""
     if f.runs is None:
         return []
     lanes: Dict[str, List[Run]] = {}
     for r in f.runs:
-        if 0 <= f.now - r.at <= DAY:
+        if 0 <= f.now - r.at <= DAY and _says_lane_health(r):
             lanes.setdefault(r.lane, []).append(r)
     out = []
     for lane, runs in sorted(lanes.items()):
@@ -408,61 +440,68 @@ def lane_no_success(f: Facts) -> List[Breach]:
 
 
 def lane_failing_streak(f: Facts) -> List[Breach]:
-    """A lane whose newest FAILING_STREAK runs in the last day all failed,
+    """Lanes whose newest FAILING_STREAK runs in the last day all failed,
     a limit, an expired key or a factory incident aside, after a success
     earlier that day (a lane with none is lane_no_success). On 2026-10-19
     zen's free model left the
     catalogue at about 12:13Z and every run after failed, while a success at
-    05:00Z kept lane_no_success quiet all day."""
+    05:00Z kept lane_no_success quiet all day. One rolling breach, a line per
+    lane."""
     if f.runs is None:
         return []
     lanes: Dict[str, List[Run]] = {}
     for r in f.runs:
-        # A limit, an expired key or a factory incident (the repo's check or
-        # setup, not the lane) says nothing about the lane's own health: two
-        # base-check incidents counted toward zen's streak (2026-10-19).
-        if 0 <= f.now - r.at <= DAY and not r.reason.startswith(("[limit]", "[auth]", "[factory]")):
+        # Two base-check incidents counted toward zen's streak (2026-10-19).
+        if 0 <= f.now - r.at <= DAY and _says_lane_health(r):
             lanes.setdefault(r.lane, []).append(r)
-    out = []
+    lines, last = [], []
     for lane, runs in sorted(lanes.items()):
         runs.sort(key=lambda r: r.at, reverse=True)
         newest = runs[:FAILING_STREAK]
         if (len(newest) < FAILING_STREAK or any(r.done for r in newest)
                 or not any(r.done for r in runs)):
             continue
-        since = newest[-1].at
-        out.append(Breach("lane-failing-streak", lane,
-                          "Lane %s: its last %d runs failed" % (lane, FAILING_STREAK),
-                          ("%d runs in a row failed since %s" % (FAILING_STREAK, utc(since)),
-                           "Last failure at %s: %s" % (utc(newest[0].at), public(newest[0].reason)
-                                                       or "no reason was recorded")),
-                          newest[0].at))
-    return out
+        lines.append("%s: %d runs in a row failed since %s; the last at %s: %s"
+                     % (lane, FAILING_STREAK, utc(newest[-1].at), utc(newest[0].at),
+                        public(newest[0].reason) or "no reason was recorded"))
+        last.append(newest[0].at)
+    if not lines:
+        return []
+    return [Breach("lane-failing-streak", LANES_SUBJECT,
+                   "%s failed %s last %d runs" % (_lanes(len(lines)),
+                                           "its" if len(lines) == 1 else "their", FAILING_STREAK),
+                   ("Lanes whose newest %d runs all failed after a success earlier in the "
+                    "day, limits and expired keys aside:" % FAILING_STREAK,) + tuple(lines),
+                   max(last), rolling=True)]
 
 
 def lane_held(f: Facts) -> List[Breach]:
-    """A lane held by a limit for over HELD_MAX while tickets of its tier
-    are queued. A lane out of credit on an account the operator never tops
-    up (Facts.no_topup) is skipped: stamped with the pass time, its breach
-    reopened every day until the credit renewed (loom#399 to loom#406)."""
+    """Lanes held by a limit for over HELD_MAX while tickets of their tier
+    are queued: one rolling breach, a line per lane. A lane out of credit on
+    an account the operator never tops up (Facts.no_topup) is skipped:
+    stamped with the pass time, its breach reopened every day until the
+    credit renewed (loom#399 to loom#406)."""
     if f.held is None or f.queued is None:
         return []
-    out = []
+    lines = []
     for lane, since in sorted(f.held.items()):
         if f.now - since <= HELD_MAX or lane in (f.no_topup or ()):
             continue
         waiting = [ref for ref, lanes in f.queued if lane in lanes]
         if not waiting:
             continue
-        shown = ", ".join(r.label for r in waiting[:SHOWN])
-        more = " and %d more" % (len(waiting) - SHOWN) if len(waiting) > SHOWN else ""
-        out.append(Breach("lane-held", lane,
-                          "Lane %s held by a limit for %s while %d tickets of its tier wait"
-                          % (lane, _hours(f.now - since), len(waiting)),
-                          ("Held by a limit since %s" % utc(since),
-                           "Queued for its tier: %s%s" % (shown, more)),
-                          f.now))
-    return out
+        # The hold's start, not its length: a line that changes every pass
+        # would rewrite the issue every pass.
+        lines.append("%s: held by a limit since %s; %d tickets of its tier queued: %s"
+                     % (lane, utc(since), len(waiting), _refs(waiting)))
+    if not lines:
+        return []
+    return [Breach("lane-held", LANES_SUBJECT,
+                   "%s held by a limit while %s" % (_lanes(len(lines)),
+                                    "its tier waits" if len(lines) == 1 else "their tiers wait"),
+                   ("Lanes held by a limit for over %s while tickets of their tier are "
+                    "queued:" % _hours(HELD_MAX),) + tuple(lines),
+                   f.now, rolling=True)]
 
 
 def _refs(found: Sequence[Ref]) -> str:
@@ -643,24 +682,22 @@ def remote_silent(f: Facts) -> List[Breach]:
 
 
 def silent_lane(f: Facts) -> List[Breach]:
-    """A lane that held a running ticket while it sent no heartbeat, so the
-    claim could not end (loom#538)."""
+    """Lanes that held a running ticket while they sent no heartbeat, so the
+    claim could not end (loom#538): one rolling breach, a line per lane."""
     if f.silent_runs is None:
         return []
-    out = []
-    for run in sorted(f.silent_runs, key=lambda r: r.lane):
-        if not 0 <= f.now - run.at <= SILENT_KEEP:
-            continue
-        shown = ", ".join(t.label for t in run.tickets[:SHOWN])
-        more = " and %d more" % (len(run.tickets) - SHOWN) if len(run.tickets) > SHOWN else ""
-        out.append(Breach("silent-lane", run.lane,
-                          "Lane %s held a running ticket while silent for %s"
-                          % (run.lane, _hours(run.silent_for)),
-                          ("Silent for %s when found, at %s" % (_hours(run.silent_for), utc(run.at)),
-                           "Running tickets it held: %s%s" % (shown or "none", more),
-                           "Each moved to a free lane of its tier, or back to the queue"),
-                          run.at))
-    return out
+    found = [run for run in sorted(f.silent_runs, key=lambda r: r.lane)
+             if 0 <= f.now - run.at <= SILENT_KEEP]
+    if not found:
+        return []
+    lines = tuple("%s: silent for %s when found at %s; running tickets it held: %s"
+                  % (run.lane, _hours(run.silent_for), utc(run.at), _refs(run.tickets) or "none")
+                  for run in found)
+    return [Breach("silent-lane", LANES_SUBJECT,
+                   "%s held a running ticket while silent" % _lanes(len(found)),
+                   ("Lanes found holding a running ticket with no heartbeat:",) + lines +
+                   ("Each ticket moved to a free lane of its tier, or back to the queue",),
+                   max(run.at for run in found), rolling=True)]
 
 
 def gate_hold(f: Facts) -> List[Breach]:
@@ -911,7 +948,8 @@ class Filer:
 
     def _rolled_into(self, key: str, current: Dict[str, Breach]) -> Optional[int]:
         """The open rolling issue an older issue of the same invariant now
-        lives in (the per-goal ticket-outside-epic issues), or None."""
+        lives in (the per-goal ticket-outside-epic issues, the per-lane
+        lane-held, lane-failing-streak and silent-lane issues), or None."""
         invariant = key.split("/", 1)[0]
         for b in current.values():
             number = self._rolling_open.get(b.key)
@@ -945,12 +983,16 @@ class Filer:
                 continue
             labels = [str(x.get("name", "")) for x in issue.get("labels", [])
                       if isinstance(x, dict)]
-            if "loom:triage" not in labels:
+            if "loom:triage" not in labels and "loom:rewritten" not in labels:
                 continue
             comments = self._comments(number)
             into = self._rolled_into(key, current)
             if into is not None and into != number:
-                # Still broken, so no clear wait: its goal is a line of #into.
+                if any(n.startswith("needs:") for n in labels):
+                    # An ask for an operator (needs:<login>) stays open on
+                    # its own issue: folding would close it unanswered.
+                    continue
+                # Still broken, so no clear wait: its subject is a line of #into.
                 if self.writes + 2 > WRITES_MAX:
                     return
                 self._fold(number, into, comments)
@@ -959,7 +1001,7 @@ class Filer:
 
     def _close_quiet(self, number: int, issue: Dict[str, Any], labels: List[str],
                      comments: List[Dict[str, Any]]) -> bool:
-        """Close an open triage issue whose breach has been gone CLEAR_AFTER,
+        """Close an open triage or rewritten issue whose breach has been gone CLEAR_AFTER,
         or mark it loom:recurring when it broke 3 times in RECURRING_AFTER.
         False when the pass has no writes left for it."""
         breaches = [_epoch(issue.get("created_at"))]
@@ -979,7 +1021,9 @@ class Filer:
             return False
         body = ("The invariant cleared by %s; its last breach was observed at %s, "
                 "more than 6 hours earlier." % (utc(self.now), utc(max(times))))
+        # A note from an earlier close does not explain this one (loom#651).
         already_explained = any("The invariant cleared by " in str(c.get("body", ""))
+                                and (_epoch(c.get("created_at")) or 0) >= max(times)
                                 for c in comments)
         if not already_explained:
             _text.check(body)

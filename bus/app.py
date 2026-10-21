@@ -82,6 +82,26 @@ def print_manifest(owner: str, org: bool, name: Optional[str], as_form: bool,
     return 0
 
 
+def print_token(out: TextIO, env: Optional[Dict[str, str]] = None,
+                transport: Optional[Transport] = None,
+                sign: Callable[[bytes, str], bytes] = openssl_sign) -> int:
+    """Print the installation token of the App the LOOM_GITHUB_APP_* settings
+    name, for a lane's or the brain's `gh` and `git` (loom#1142). Without
+    those settings it prints nothing and fails: a writer that should post as
+    its App never falls back to the operator's personal token."""
+    env = os.environ if env is None else env
+    found = AppToken.from_env(env)
+    if found is None:
+        print("error: LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and "
+              "LOOM_GITHUB_APP_KEY_SSM (or LOOM_GITHUB_APP_KEY_FILE) name no App",
+              file=sys.stderr)
+        return 2
+    gh = GitHub(AppToken(found.app_id, found.installation_id, _key_reader(env), sign=sign),
+                transport=transport or urllib_transport)
+    out.write(gh.app_token() + "\n")
+    return 0
+
+
 def _key_reader(env: Dict[str, str]) -> Callable[[], str]:
     """Read the key the way AppToken.from_env does: the file wins."""
     key_file = env.get(APP_KEY_FILE, "").strip()

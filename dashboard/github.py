@@ -279,6 +279,10 @@ class TicketStore:
                 raise ValueError("GitHub API base must use https, or a loopback HTTP URL for tests")
             gh = GitHub(app if app is not None else token, api=api,
                         cache_dir=tempfile.gettempdir() + "/loom-dashboard-github-cache")
+            # Status comments by the trusted writers read as events, as the
+            # brain and the station read them (bus/status.py): on a token, not
+            # only an App, the timeline still shows each push and failure.
+            gh.status_authors |= {a.lower() for a in brain.trusted_authors()}
         self.gh = gh
         self.budget_floor = (int(os.environ.get("LOOM_DASHBOARD_BUDGET_FLOOR", "500"))
                              if budget_floor is None else budget_floor)
@@ -312,21 +316,24 @@ class TicketStore:
         # outcomes), read once a pass below, never by a page request.
         self.tier_sources = tiers_sources.TierSources(runs_store=self._runs_store)
 
+    def _snapshot_get(self, key):
+        return self._snapshot[key]
+
     @property
     def data(self):
-        return self._snapshot["tickets"]
+        return self._snapshot_get("tickets")
 
     @property
     def errors(self):
-        return self._snapshot["errors"]
+        return self._snapshot_get("errors")
 
     @property
     def stale(self):
-        return self._snapshot["stale"]
+        return self._snapshot_get("stale")
 
     @property
     def ready(self):
-        return self._snapshot["ready"]
+        return self._snapshot_get("ready")
 
     def start_background(self) -> None:
         if self._refresh_thread is not None:
