@@ -601,7 +601,19 @@ backticked string from the ticket's Live criterion in
 fixed-string match (see `.env.example`). The station runs it once per string,
 with a 60-second timeout, then quotes up to 20 matching lines per string in
 the verify brief. It accepts at most five ASCII strings of at most 120
-characters. Lines containing credentials, private hosts, IP addresses or
+characters.
+A Live criterion that needs its strings to be absent ("no `X` line appears",
+"never logs `X`", "`X` does not appear", every string so worded) is verified on an
+empty answer: when every command run answered and no line named any string, the
+ticket is handed a verify run and the brief carries a `## Absence check, station
+data` section naming the zero count and the hours of log searched
+(`LOOM_EVIDENCE_WINDOW_HOURS`, default 24; a command may print
+`loom-evidence-window-hours: N` to report the log it really read, as a pod restart
+cuts it short). When the criterion states a span ("over 24h", "for 3 days") longer
+than that window, absence is not proven: the station logs the missing hours, labels
+the ticket `loom:awaiting-evidence` and tries again after its cooldown. A command
+error or timeout proves nothing either way. A criterion that needs a string present
+still waits for a line. Lines containing credentials, private hosts, IP addresses or
 local paths are dropped and counted. A timeout or command error is stated in
 the brief without quoting its output. Repos without a command run none.
 Verify lanes have no network, so every verify brief also carries a
