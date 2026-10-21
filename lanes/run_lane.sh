@@ -1309,6 +1309,8 @@ opencode_agent_continuing() {
     opencode_json_pass "$key_var" "$view" "$events" --continue \
       "Continue: carry out the step you just described, then commit or write .loom/summary.md"
     status=$?
+    # A failed continue is not swallowed: its exit status goes to the runner,
+    # which classes it (limit, auth, transient or work) from the run's output.
     [ "$status" -eq 0 ] || return "$status"
     if opencode_has_no_work && opencode_described_step "$events"; then
       : > "$WORKDIR/$TICKET.described-step"
