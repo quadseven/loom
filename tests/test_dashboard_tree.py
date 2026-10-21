@@ -13,6 +13,10 @@ EPIC_A = REPO + "#20"
 EPIC_B = REPO + "#21"
 
 
+def _ref(number):
+    return "%s#%d" % (REPO, number)
+
+
 def _row(number, title, state, epic=EPIC_A, lane=None, labels=None, **extra):
     labels = (["loom:ticket", "loom:" + state] if state else []) + (labels or [])
     return dict({"repo": REPO, "number": number, "title": title, "state": state, "goal": GOAL if epic else None,
@@ -51,7 +55,7 @@ def _render():
 
 
 def _item(body, number):
-    found = re.findall(r'<li class="tree-row"[^>]*>(?:(?!</li>).)*?octo/app#%d\b.*?</li>' % number, body, re.S)
+    found = re.findall(r'<li class="tree-row"[^>]*>(?:(?!</li>).)*?%s\b.*?</li>' % re.escape(_ref(number)), body, re.S)
     return found
 
 
@@ -64,9 +68,9 @@ class TreePageTest(unittest.TestCase):
         second = next(e for e in epics if "Safer tokens" in e)
         for number in (31, 32):
             self.assertEqual(len(_item(body, number)), 1)
-            self.assertIn("octo/app#%d" % number, first)
-        self.assertIn("octo/app#41", second)
-        self.assertNotIn("octo/app#41", first)
+            self.assertIn(_ref(number), first)
+        self.assertIn(_ref(41), second)
+        self.assertNotIn(_ref(41), first)
         running = _item(body, 31)[0]
         self.assertIn("running", running)
         self.assertIn("codex", running)
@@ -81,13 +85,13 @@ class TreePageTest(unittest.TestCase):
         self.assertIn("under no epic", group.split("</summary>")[0])
         self.assertIn("octo/app", group.split("</summary>")[0])
         for number in (50, 51, 52):
-            self.assertIn("octo/app#%d" % number, group)
+            self.assertIn(_ref(number), group)
             self.assertEqual(len(_item(body, number)), 1)
 
     def test_being_worked_filter_shows_only_running_and_pr_children(self):
         body = _render()
         self.assertIn('data-tree-filter="worked"', body)
-        kinds = {int(re.search(r"octo/app#(\d+)", item).group(1)): set(kind.split())
+        kinds = {int(re.search(r"#(\d+)", item).group(1)): set(kind.split())
                  for kind, item in re.findall(r'<li class="tree-row" data-kinds="([^"]*)"[^>]*>(.*?)</li>', body, re.S)}
         worked = {n for n, k in kinds.items() if "worked" in k}
         self.assertEqual(worked, {31, 41})

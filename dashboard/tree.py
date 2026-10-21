@@ -106,12 +106,9 @@ def _epic_html(ref, info, members, entered, now, ticket_href, short_ref) -> str:
     return _box("tree-epic", short_ref(ref), title, facts, _list(live, entered, now, ticket_href))
 
 
-def render(rows: Sequence[Dict[str, Any]], goal_data: Dict[str, Any], *, entered: Dict[str, Sequence[Any]],
-           now: float, ticket_href, short_ref) -> str:
-    """The page body: a filter row, then one box per goal holding one box per
-    epic, then the open issues under no epic, one box per repo."""
-    esc = html.escape
-    goal_data = goal_data if isinstance(goal_data, dict) else {}
+def _split(rows):
+    """(children by epic ref, open issues under no epic by repo); closed
+    issues are history and appear in neither."""
     by_epic: Dict[str, List[Dict[str, Any]]] = {}
     orphans: Dict[str, List[Dict[str, Any]]] = OrderedDict()
     for row in rows:
@@ -121,6 +118,12 @@ def render(rows: Sequence[Dict[str, Any]], goal_data: Dict[str, Any], *, entered
             by_epic.setdefault(row["epic"], []).append(row)
         else:
             orphans.setdefault(str(row.get("repo")), []).append(row)
+    return by_epic, orphans
+
+
+def _epics_by_goal(goal_data, by_epic):
+    """(epic info by ref, epic refs by goal). An epic the goal data does not
+    list still shows, under no goal."""
     epic_info: Dict[str, Dict[str, Any]] = {}
     goal_epics: Dict[str, List[str]] = {}
     for goal, info in goal_data.items():
@@ -128,29 +131,43 @@ def render(rows: Sequence[Dict[str, Any]], goal_data: Dict[str, Any], *, entered
             if isinstance(epic, dict) and epic.get("ref"):
                 epic_info[epic["ref"]] = epic
                 goal_epics.setdefault(goal, []).append(epic["ref"])
-    # An epic the goal data does not list still shows, under no goal.
     for ref in by_epic:
         if ref not in epic_info:
             epic_info[ref] = {}
             goal_epics.setdefault(NO_GOAL, []).append(ref)
-    bar = ('<div class="tree-bar" data-tree-bar role="group" aria-label="Filter the tree">%s</div>' % "".join(
+    return epic_info, goal_epics
+
+
+def _filter_bar() -> str:
+    return ('<div class="tree-bar" data-tree-bar role="group" aria-label="Filter the tree">%s</div>' % "".join(
         '<button type="button" class="chip" data-tree-filter="%s" aria-pressed="%s">%s</button>' % (
-            key, "true" if key == "all" else "false", esc(label)) for key, label in FILTERS))
+            key, "true" if key == "all" else "false", html.escape(label)) for key, label in FILTERS))
+
+
+def _goal_html(goal, refs, goal_data, epic_info, by_epic, entered, now, ticket_href, short_ref) -> str:
+    epics = "".join(_epic_html(ref, epic_info[ref], by_epic.get(ref, []), entered, now, ticket_href, short_ref)
+                    for ref in refs)
+    total = sum(len(by_epic.get(ref, [])) for ref in refs)
+    info = goal_data.get(goal) or {}
+    title = strip_kind(info.get("title")) or (short_ref(goal) if goal != NO_GOAL else "Epics with no goal")
+    return _box("tree-goal", short_ref(goal) if goal != NO_GOAL else NO_GOAL, title, "%d open" % total, epics)
+
+
+def render(rows: Sequence[Dict[str, Any]], goal_data: Dict[str, Any], *, entered: Dict[str, Sequence[Any]],
+           now: float, ticket_href, short_ref) -> str:
+    """The page body: a filter row, then one box per goal holding one box per
+    epic, then the open issues under no epic, one box per repo."""
+    goal_data = goal_data if isinstance(goal_data, dict) else {}
+    by_epic, orphans = _split(rows)
+    epic_info, goal_epics = _epics_by_goal(goal_data, by_epic)
     parts = []
     for goal in sorted(goal_epics, key=lambda g: (g == NO_GOAL, g)):
         refs = [ref for ref in goal_epics[goal] if by_epic.get(ref) or epic_info[ref].get("open", True)]
-        if not refs:
-            continue
-        epics = "".join(_epic_html(ref, epic_info[ref], by_epic.get(ref, []), entered, now, ticket_href, short_ref)
-                        for ref in refs)
-        total = sum(len(by_epic.get(ref, [])) for ref in refs)
-        info = goal_data.get(goal) or {}
-        title = strip_kind(info.get("title")) or (short_ref(goal) if goal != NO_GOAL else "Epics with no goal")
-        parts.append(_box("tree-goal", short_ref(goal) if goal != NO_GOAL else NO_GOAL, title,
-                          "%d open" % total, epics))
+        if refs:
+            parts.append(_goal_html(goal, refs, goal_data, epic_info, by_epic, entered, now, ticket_href, short_ref))
     for repo, members in orphans.items():
         parts.append(_box("tree-orphans", repo, "Open issues under no epic", "%d open" % len(members),
                           _list(members, entered, now, ticket_href)))
     shown = "".join(parts) or '<p class="empty-state">No open issues in the snapshot.</p>'
     empty = '<p class="empty-state" data-tree-empty hidden>No issue matches this filter.</p>'
-    return '<section class="tree-view">%s%s%s<script>%s</script></section>' % (bar, shown, empty, SCRIPT)
+    return '<section class="tree-view">%s%s%s<script>%s</script></section>' % (_filter_bar(), shown, empty, SCRIPT)
