@@ -1887,59 +1887,69 @@ class Factory:
         elif review == "reviewed":
             self._land_or_ask_test(repo, number, full, issue, comments, sensitive)
 
+    def _split_summary(self, issue: Dict[str, Any], sha: str) -> Optional[str]:
+        """The review check's summary when it is the only failing check and
+        failed on a note asking for a split (bus/split.py), else None."""
+        if "loom:human" in _labels(issue):
+            return None
+        failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
+        if len(failed) != 1 or failed[0].get("name") != self.review_check:
+            return None
+        output = failed[0].get("output") or {}
+        title, summary = str(output.get("title") or ""), str(output.get("summary") or "")
+        return summary if split.asks_split(title, summary) else None
+
+    def _file_parts(self, repo: str, number: int, issue: Dict[str, Any],
+                    summary: str) -> Optional[List[int]]:
+        """File the parts of a split as queued tickets and return their
+        numbers, or None, with nothing filed, when the note leaves nothing to
+        split on or the text of a part is refused by the written-text check."""
+        ticket = int(issue["number"])
+        body = str(issue.get("body") or "")
+        criteria = acceptance_criteria(body)
+        parts = split.plan(summary, criteria)
+        if parts is None:
+            _say("%s#%d: the review asks for a split but names nothing to split on"
+                 % (repo, number))
+            return None
+        headers, epic = split.header_lines(body), split.epic_of(body, ticket)
+        drafts = []
+        for index, part in enumerate(parts, start=1):
+            name = "%s (part %d of %d)" % (str(issue.get("title") or "").strip(),
+                                           index, len(parts))
+            drafts.append((name[:100], split.ticket_body(
+                ticket, number, headers, part, index, len(parts), epic, criteria)))
+        try:
+            for name, text in drafts:
+                brain._check_written_text(name + "\n" + text)
+        except ValueError as err:
+            # Ticket text the written-text check refuses must not stop the pass,
+            # nor leave half the parts filed; the usual fix round handles it.
+            _say("%s#%d: split ticket text refused (%s)" % (repo, number, err))
+            return None
+        return [int((self.gh.rest("POST", "/repos/%s/issues" % repo, {
+            "title": name, "body": text, "labels": ["loom:ticket", "loom:queued"]}).data
+            or {})["number"]) for name, text in drafts]
+
     def _split_pr(self, repo: str, number: int, full: Dict[str, Any],
                   issue: Dict[str, Any], comments: List[Dict[str, Any]], sha: str) -> bool:
         """When the review check is the only failing check and failed on a note
-        asking for the pull request to be split (bus/split.py), file the
-        parts as tickets and close the pull request with a pointer, instead
-        of another fix round that cannot split it (loom#1218). Any other
-        failing check or finding goes back as before. False leaves the pull
-        request to the usual paths, as does a note that leaves nothing to
-        split on."""
-        if "loom:human" in _labels(issue):
-            return False
-        failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
-        if len(failed) != 1 or failed[0].get("name") != self.review_check:
-            return False
-        output = failed[0].get("output") or {}
-        title, summary = str(output.get("title") or ""), str(output.get("summary") or "")
-        if not split.asks_split(title, summary):
+        asking for the pull request to be split, file the parts as tickets and
+        close the pull request with a pointer, instead of another fix round
+        that cannot split it (loom#1218). Any other failing check or finding
+        goes back as before. False leaves the pull request to the usual
+        paths, as does a note that leaves nothing to split on."""
+        summary = self._split_summary(issue, sha)
+        if summary is None:
             return False
         ticket = int(issue["number"])
         marker = split.SPLIT_MARKER % number
         done = next((str(c.get("body") or "") for c in comments
                      if marker in str(c.get("body") or "")), None)
         if done is None:
-            body = str(issue.get("body") or "")
-            criteria = acceptance_criteria(body)
-            parts = split.plan(summary, criteria)
-            if parts is None:
-                _say("%s#%d: the review asks for a split but names nothing to split on"
-                     % (repo, number))
+            filed = self._file_parts(repo, number, issue, summary)
+            if filed is None:
                 return False
-            headers, epic = split.header_lines(body), split.epic_of(body, ticket)
-            drafts = []
-            for index, part in enumerate(parts, start=1):
-                text = split.ticket_body(ticket, number, headers, part, index, len(parts),
-                                         epic, criteria)
-                name = "%s (part %d of %d)" % (str(issue.get("title") or "").strip(),
-                                               index, len(parts))
-                drafts.append((name[:100], text))
-            try:
-                for name, text in drafts:
-                    brain._check_written_text(name + "\n" + text)
-            except ValueError as err:
-                # Ticket text the written-text check refuses must not stop the
-                # pass, nor leave half the parts filed; the usual fix round
-                # handles the pull request.
-                _say("%s#%d: split ticket text refused (%s)" % (repo, number, err))
-                return False
-            filed = []
-            for name, text in drafts:
-                made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
-                    "title": name, "body": text,
-                    "labels": ["loom:ticket", "loom:queued"]}).data or {}
-                filed.append(int(made["number"]))
             done = ("%s\nPull request #%d failed the review check only on a note asking for it "
                     "to be split, and no fix round can split it, so it is closed and this "
                     "ticket is split into %s." % (
