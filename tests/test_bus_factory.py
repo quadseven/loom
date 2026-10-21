@@ -1611,6 +1611,62 @@ class ChangeClasses(Base):
         self.assertEqual(self.merged, [])
 
 
+class SendBackNeedsAFinding(Base):
+    """loom#1389: a lane pull request goes back only with a new finding."""
+
+    def test_a_ticket_held_by_needs_brain_is_not_sent_back(self):
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5]["labels"].append({"name": "needs-brain"})
+        self.gh.pull(50, 5, green=False)
+        f = self.go()
+        self.assertEqual((self.fixed, self.moved, self.merged), ([], [], []))
+        self.assertEqual(f.actions, 0)
+
+    def test_a_ticket_held_by_needs_brain_is_not_sent_back_for_threads_or_a_conflict(self):
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5]["labels"].append({"name": "needs-brain"})
+        self.gh.pull(50, 5, resolved=False, mergeable=False)
+        self.go()
+        self.assertEqual(self.fixed, [])
+
+    def test_a_failure_among_same_named_runs_sends_the_pull_request_back(self):
+        # Three workflows each have a job of this name; the failed one is not
+        # the newest by name (infra#5704, 2026-10-21).
+        name = "trust gate (collaborator-only on self-hosted)"
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=True)
+        self.gh.runs["sha50"] += [
+            {"id": 1, "name": name, "status": "completed", "conclusion": "success",
+             "started_at": iso(100), "check_suite": {"id": 1}},
+            {"id": 2, "name": name, "status": "completed", "conclusion": "failure",
+             "started_at": iso(101), "check_suite": {"id": 2}},
+            {"id": 3, "name": name, "status": "completed", "conclusion": "success",
+             "started_at": iso(102), "check_suite": {"id": 3}}]
+        self.go()
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+
+    def test_pr_faults_reads_the_reduced_runs_beside_the_rollup(self):
+        green = {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
+                 "reviewThreads": {"nodes": []}}
+        failed = [{"name": "a", "conclusion": "failure"}]
+        self.assertEqual(factory.pr_faults(green, {"mergeable": True}), [])
+        self.assertEqual(factory.pr_faults(green, {"mergeable": True}, [{"name": "a", "conclusion": "success"}]), [])
+        self.assertEqual(factory.pr_faults(green, {"mergeable": True}, failed), ["failing checks"])
+
+    def test_a_send_back_brain_fix_refused_is_not_counted(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        refused = []
+        def fix(gh, repo, number, ticket, notes, lane=None, model=None):
+            refused.append(number)
+            return False
+        f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"], fix=fix,
+                            merge=lambda *a: None, move=lambda *a, **k: None)
+        f.run()
+        self.assertEqual(refused, [50])
+        self.assertEqual(f.actions, 0)
+
+
 class Trust(Base):
     def test_a_strangers_ticket_or_pull_request_is_never_touched(self):
         self.gh.ticket(5, "pr")

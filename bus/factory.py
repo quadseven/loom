@@ -463,6 +463,15 @@ plain to the next reader, and say why in the commit message.
 - Keep the whole suite green, and change nothing the threads and checks do not \
 ask for."""
 
+# The note for a ticket whose lane run failed with its pull request open: the
+# failed run is the finding, so it is not the stock FIX_NOTES that brain.fix
+# refuses to send alone.
+FAILED_RUN_NOTES = """The lane's last run on this ticket failed before it finished. The \
+open pull request holds the work so far.
+
+- Read the pull request's branch and finish the ticket on it.
+- Keep the whole suite green, and change nothing the ticket does not ask for."""
+
 # A green pull request that leaves ticket criteria unticked goes back with
 # each one named under this heading (2026-10-20: the generic note listed no
 # finding, so lanes had nothing to act on and one pull request came back six
@@ -1029,9 +1038,14 @@ def next_rung(tried: set, load: Dict[str, int], eligible: Optional[set] = None,
     return free[0] if free else min(untried, key=lambda n: (least[n], n))
 
 
-def pr_faults(details: Dict[str, Any], full: Dict[str, Any]) -> List[str]:
-    """What keeps a pull request from landing, in words for its ticket."""
-    return [w for bad, w in ((not brain._checks_green(details), "failing checks"),
+def pr_faults(details: Dict[str, Any], full: Dict[str, Any],
+              runs: Sequence[Dict[str, Any]] = ()) -> List[str]:
+    """What keeps a pull request from landing, in words for its ticket. A
+    failing check is a red rollup or a failed run among `runs`, the newest
+    run of each check (brain.newest_check_runs), which is what the fix brief
+    quotes, so the factory and the brief name the same failures."""
+    failed = any(r.get("conclusion") in brain.FAILED_CONCLUSIONS for r in runs)
+    return [w for bad, w in ((failed or not brain._checks_green(details), "failing checks"),
                              (not brain._threads_resolved(details), "open review threads"),
                              (full.get("mergeable") is False, "a conflict")) if bad]
 
@@ -1650,6 +1664,12 @@ class Factory:
         number = int(issue["number"])
         if "loom:human" in _labels(issue):
             return  # a person has it: no more rounds, no more comments
+        if "needs-brain" in _labels(issue):
+            # The round cap, a hold or a past-the-ladder give-up put it with
+            # the brain: another round is a comment nobody asked for.
+            _say("%s#%d is with the brain (needs-brain); not sent back for %s"
+                 % (repo, number, why))
+            return
         if checks_failing and self._past_no_change(repo, issue, comments):
             return
         age = self.now - _ts(pr.get("created_at"))
@@ -1693,9 +1713,14 @@ class Factory:
                 _say("%s#%d: unticked criteria not quoted in the fix note (%s)"
                      % (repo, number, err))
         if lane is not None:
-            self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane)
+            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane)
         else:
-            self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes)
+            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes)
+        if sent is False:
+            # brain.fix found nothing new to say and wrote nothing.
+            _say("%s#%d not sent back for #%d (%s): the brief would add nothing"
+                 % (repo, pr["number"], number, why))
+            return
         self.actions += 1
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
 
@@ -1891,7 +1916,8 @@ class Factory:
         sha = str((full.get("head") or {}).get("sha") or "")
         self._resolve_bot_fixed(repo, number)
         details = brain._pr_graphql(self.gh, repo, number)
-        faults = pr_faults(details, full)
+        runs = self._runs.get(sha, [])
+        faults = pr_faults(details, full, runs)
         # Medium and low findings never send a pull request back on their own
         # (2026-10-14: 64% of 361 fix rounds were review threads, most of them
         # medium; "high-complexity" alone was 220 of ~1000 findings). They go
@@ -1901,7 +1927,7 @@ class Factory:
                 and self._defer_minor(repo, number, int(issue["number"]), sha, comments,
                                       True)):
             details = brain._pr_graphql(self.gh, repo, number)
-            faults = pr_faults(details, full)
+            faults = pr_faults(details, full, runs)
         if faults == ["failing checks"] and (
                 self._split_pr(repo, number, full, issue, comments, sha)
                 or self._repair_body_leak(repo, number, full, issue, comments, sha)
@@ -2281,7 +2307,7 @@ class Factory:
             # Back to loom:pr so the fix brief reuses its open pull request.
             kept = [x for x in _labels(issue) if x != "loom:failed"] + ["loom:pr"]
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
-            self.fix(self.gh, repo, int(pr["number"]), (repo, number), FIX_NOTES)
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number), FAILED_RUN_NOTES)
         else:
             self.move(self.gh, repo, number, "briefed", lane=lane)
         self.actions += 1
