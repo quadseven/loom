@@ -1204,7 +1204,12 @@ print('leak guard: clean (shape patterns only)')
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertFalse(beat["available"])
         self.assertIn("provider limit reached", beat["reason"])
-        self.assertAlmostEqual(beat["retry_at"] - time.time(), 3600, delta=30)
+        # The stated reset time, its next occurrence (2026-10-21).
+        from datetime import datetime, timedelta
+        reset = datetime.now().replace(hour=12, minute=21, second=0, microsecond=0)
+        if reset <= datetime.now():
+            reset += timedelta(days=1)
+        self.assertAlmostEqual(beat["retry_at"], reset.timestamp(), delta=30)
         # The next brief waits until the provider limit lifts.
         agents = sum(c.startswith("codex ") for c in self.calls())
         self.drop_brief("T043-next.md", BRIEF.replace("T042", "T043"))
@@ -1257,6 +1262,31 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("[limit]", self.run_log())
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertLessEqual(beat["retry_at"] - time.time(), 120)
+    def test_a_stated_reset_time_holds_the_lane_until_then(self):
+        # Codex said when its limit resets and the lane retried every hour
+        # anyway, a ticket round each time: one ticket failed rounds 6 to 11
+        # an hour apart (2026-10-21). A reset days away is trusted up to a week.
+        from datetime import datetime, timedelta
+        later = (datetime.now() + timedelta(days=3)).replace(second=0, microsecond=0)
+        day = later.day
+        suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+        stamp = "%s %d%s, %d %s" % (later.strftime("%b"), day, suffix, later.year,
+                                    later.strftime("%I:%M %p").lstrip("0"))
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "ERROR: You've hit your usage limit. Upgrade to Pro or try again at %s." % stamp))
+        self.assertIn("[limit]", self.run_log())
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
+
+    def test_a_reset_time_of_day_is_its_next_occurrence(self):
+        from datetime import datetime, timedelta
+        later = (datetime.now() + timedelta(hours=5)).replace(second=0, microsecond=0)
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "ERROR: You've hit your usage limit. Try again at %s." % later.strftime("%I:%M %p").lstrip("0")))
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
 
     def test_provider_quota_messages_are_still_limits(self):
         for out in ("429 RESOURCE_EXHAUSTED quota resets in 1 hours",

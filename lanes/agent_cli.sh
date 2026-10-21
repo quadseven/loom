@@ -63,6 +63,36 @@ DAILY_RE='daily (free )?(allocation|allowance|limit|quota)|per[ _-]day'
 MODEL_GONE_RE='ProviderModelNotFoundError: Model not found'
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
+# A reset time the provider states ("try again at 11:46 PM", "try again at
+# Oct 24th, 2026 4:43 PM") holds the lane until then, up to a week: codex
+# said when its limit reset and the lane retried hourly anyway, a ticket
+# round each time (2026-10-21).
+RESET_WAIT_MAX=$((7 * 86400))
+
+# The epoch of the reset time stated in $1 ("try again at ..."), read as the
+# machine's local time, the time of day alone meaning its next occurrence;
+# prints nothing when $1 states none.
+stated_reset() {
+  python3 -c '
+import re, sys, time
+from datetime import datetime, timedelta
+m = re.search(r"try again at (?:([A-Za-z]{3}) ([0-9]{1,2})(?:st|nd|rd|th)?, ([0-9]{4}) )?([0-9]{1,2}):([0-9]{2}) ?([AP]M)", sys.argv[1], re.I)
+if m:
+    hour = int(m.group(4)) % 12 + (12 if m.group(6).upper() == "PM" else 0)
+    now = datetime.now()
+    try:
+        if m.group(1):
+            at = datetime.strptime("%s %s %s" % (m.group(1).title(), m.group(2), m.group(3)), "%b %d %Y")
+            at = at.replace(hour=hour, minute=int(m.group(5)))
+        else:
+            at = now.replace(hour=hour, minute=int(m.group(5)), second=0, microsecond=0)
+            if at <= now:
+                at += timedelta(days=1)
+        print(int(time.mktime(at.timetuple())))
+    except ValueError:
+        pass
+' "$1" 2>/dev/null
+}
 
 # Sets FAIL_CLASS (auth, limit, transient or work) for a run that ended with
 # exit status $1 and output $2, where $3 is "edited" when the agent changed
@@ -86,7 +116,7 @@ provider_text() {
 }
 
 classify_failure() {
-  local status="$1" whole="$2" edited="$3" now n tail
+  local status="$1" whole="$2" edited="$3" now n tail cap stated
   tail="${4:-$whole}"
   FAIL_CLASS=work RETRY_AT=""
   now="$(date +%s)"
@@ -96,9 +126,11 @@ classify_failure() {
   elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT_MAX))
   elif [[ "$whole" =~ $LIMIT_RE ]]; then
-    FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
+    FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT)) cap=$LIMIT_WAIT_MAX
     if [[ "$whole" =~ $OUT_OF_CREDIT_RE ]]; then
       RETRY_AT=$((now + LIMIT_WAIT_MAX))
+    elif stated="$(stated_reset "$whole")" && [ -n "$stated" ]; then
+      RETRY_AT="$stated" cap=$RESET_WAIT_MAX
     elif [[ "$whole" =~ $EPOCH_RE ]]; then
       RETRY_AT="${BASH_REMATCH[2]}"
     elif [[ "$whole" =~ $AFTER_RE ]]; then
@@ -109,7 +141,7 @@ classify_failure() {
       RETRY_AT=$((now - now % 86400 + 86400))
     fi
     [ "$RETRY_AT" -ge $((now + 60)) ] || RETRY_AT=$((now + 60))
-    [ "$RETRY_AT" -le $((now + LIMIT_WAIT_MAX)) ] || RETRY_AT=$((now + LIMIT_WAIT_MAX))
+    [ "$RETRY_AT" -le $((now + cap)) ] || RETRY_AT=$((now + cap))
   elif [ "$status" -ne 0 ]; then
     if [ "$status" -eq 124 ] || [ "$status" -gt 128 ] || [ "$edited" != edited ] ||
        [[ "$tail" =~ $NET_RE ]]; then
