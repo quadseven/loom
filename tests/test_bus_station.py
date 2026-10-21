@@ -83,6 +83,7 @@ class FakeGitHub:
         self.check_runs = {}
         self.pull_files = {}
         self.carried = set()
+        self.head = "a" * 40
         self.check_runs_status = 200
 
     def add_foreign(self, repo, number, labels=("loom:pr",), state="open", reason=None):
@@ -223,6 +224,8 @@ class FakeGitHub:
         if method == "GET" and one:
             hit = [p for p in self.pulls if p.get("number") == int(one.group(1))]
             return reply(200, hit[0]) if hit else reply(404, {"message": "Not Found"})
+        if method == "GET" and rest == "commits/main":
+            return reply(200, {"sha": self.head})
         if method == "GET" and rest.startswith("compare/"):
             base = rest[len("compare/"):].split("...", 1)[0]
             return reply(200, {"status": "ahead" if base in self.carried else "behind"})
@@ -4380,6 +4383,50 @@ class FactoryIncidentTest(Base):
         with mock.patch.object(station, "FACTORY_REPO", REPO):
             self.run_pass()
         self.assertIn("loom:queued", self.fake.names(12))
+
+
+    def hold_two(self, probe_head="a" * 40, age=7200):
+        """Tickets 12 and 13 held for one open incident, `age` seconds ago,
+        and the head the station last saw on the default branch."""
+        self.heartbeat("muse")
+        self.failed(number=12)
+        self.failed(number=13)
+        self.run_pass()
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        with open(path) as fh:
+            held = json.load(fh)
+        for offset, key in enumerate(sorted(held)):
+            held[key]["at"] = time.time() - age + offset
+        self.write(path, json.dumps(held))
+        self.write(os.path.join(self.home, "state", "station", "factory_probe.json"),
+                   json.dumps({REPO: {"head": probe_head, "at": time.time() - age}}))
+
+    def queued(self):
+        return [n for n in (12, 13) if "loom:queued" in self.fake.names(n)]
+
+    def test_a_new_default_branch_head_lets_one_held_ticket_probe_an_open_incident(self):
+        self.hold_two()
+        self.fake.head = "b" * 40
+        self.run_pass()
+        self.assertEqual(self.queued(), [12])
+        self.assertIn("wait:incident", self.fake.names(13))
+
+    def test_held_tickets_stay_held_while_the_head_is_unchanged_and_the_hour_is_not_up(self):
+        self.hold_two(age=600)
+        self.run_pass()
+        self.assertEqual(self.queued(), [])
+
+    def test_a_failed_probe_rehelds_without_a_comment_and_the_next_waits_the_interval(self):
+        self.hold_two()
+        self.fake.head = "b" * 40
+        self.run_pass()
+        self.assertEqual(self.queued(), [12])
+        self.failed(number=12)
+        self.fake.head = "c" * 40
+        self.run_pass()
+        self.assertFalse([b for b in self.bodies(12) if "held:" in b], self.bodies(12))
+        self.assertEqual(self.queued(), [])
+        self.assertIn("loom:running", self.fake.names(12))
 
 
 class PruneTest(Base):

@@ -317,6 +317,10 @@ RETRY_MAX = 2
 # FACTORY_REPO), and the marker and ticket line their bodies carry.
 FACTORY_REPO = "quadseven/loom"
 INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
+# A repo whose held tickets have all waited this long under open incidents
+# gets one ticket let through as a probe, on a new default-branch head or once
+# per this interval (loom#1095).
+PROBE_AFTER = 3600
 HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)")
 RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
                       r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
@@ -4143,6 +4147,51 @@ class Station:
             return
         for key, info in list(held.items()):
             self._release_held(key, info, closed_incidents)
+        self._probe_held(closed_incidents)
+
+    def _probe_held(self, closed_incidents: Dict[str, Dict[str, Any]]) -> None:
+        """Let one held ticket of a repo through when every ticket held for
+        an open incident there has waited PROBE_AFTER: only a lane run whose
+        check passes closes a base-check incident, so a repo with all its
+        tickets held would never clear it. The probe goes on a new default
+        branch head, or once per interval after the last probe or first look.
+        A passing run closes the incident and the rest release as usual; a
+        failing one is held again in silence (see _hold_for_factory)."""
+        waiting: Dict[str, List[Tuple[float, str]]] = {}
+        for key, info in self._held_tickets().items():
+            ref = info.get("incident") if isinstance(info, dict) else None
+            if ref and ref not in closed_incidents:
+                waiting.setdefault(key.rpartition("#")[0], []).append(
+                    (float(info.get("at") or 0), key))
+        for repo, entries in waiting.items():
+            try:
+                self._probe_repo(repo, sorted(entries))
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("factory probe: could not probe %s: %s" % (repo, err))
+
+    def _probe_repo(self, repo: str, entries: List[Tuple[float, str]]) -> None:
+        path = os.path.join(self.state, "factory_probe.json")
+        probes = _read_json(path, {})
+        head = str(self.gh.rest("GET", "/repos/%s/commits/%s" % (
+            repo, self._default_branch(repo))).data.get("sha") or "")
+        last = probes.get(repo) if isinstance(probes.get(repo), dict) else None
+        if last is None:
+            probes[repo] = {"head": head, "at": entries[0][0]}
+            last = probes[repo]
+        waited = self.now - last.get("at", 0)
+        changed = head != last.get("head") and not last.get("ticket")
+        if entries[-1][0] > self.now - PROBE_AFTER or not (changed or waited >= PROBE_AFTER):
+            _write_json(path, probes)
+            return
+        key = entries[0][1]
+        number = int(key.rpartition("#")[2])
+        probes[repo] = {"head": head, "at": self.now, "ticket": key}
+        _write_json(path, probes)
+        self._relabel(repo, number, "loom:queued")
+        self._forget_held(key)
+        _say("factory probe: %s re-queued as the probe for %s" % (key, repo))
 
     def _closed_incidents(self) -> Dict[str, Dict[str, Any]]:
         """Closed factory incidents the runner filed, by "owner/repo#n".
@@ -4208,6 +4257,13 @@ class Station:
             and _factory.CLAIMED_RE.fullmatch(str(c.get("body") or "").strip())
             and (self._epoch(str(c.get("created_at") or "")) or 0) > closed
             for c in comments)
+
+    def _was_probe(self, repo: str, number: int) -> bool:
+        """The ticket is the repo's last probe, failing again: its hold posts
+        no comment, since the original hold already said it."""
+        probes = _read_json(os.path.join(self.state, "factory_probe.json"), {})
+        last = probes.get(repo) if isinstance(probes, dict) else None
+        return isinstance(last, dict) and last.get("ticket") == "%s#%d" % (repo, number)
 
     def _held_tickets(self) -> Dict[str, Any]:
         """Tickets the station held for a factory incident and has not yet
@@ -4529,9 +4585,10 @@ class Station:
             self._note_held(repo, number,
                             "%s#%s" % (match.group(1), match.group(2)) if match else None)
             self._set_wait(repo, self._issue(repo, number), "incident")
-            self._routine(repo, number,
-                          "Lane %s held: %s. The ticket keeps its rung and returns to the "
-                          "queue when the factory incident closes." % (lane, bare))
+            if not self._was_probe(repo, number):
+                self._routine(repo, number,
+                              "Lane %s held: %s. The ticket keeps its rung and returns to "
+                              "the queue when the factory incident closes." % (lane, bare))
             _say("held %s#%d for the factory: %s" % (repo, number, reason))
             return True
         if klass == "auth":
