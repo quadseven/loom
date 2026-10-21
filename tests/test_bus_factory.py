@@ -481,6 +481,17 @@ class PullRequests(Base):
         self.assertNotEqual(self.lane(5), "muse")
         self.assertEqual(self.lane(5), "spark")
 
+    def test_a_fix_round_for_a_ticket_with_no_lane_label_names_a_lane(self):
+        # A silent-lane requeue drops the lane label and the run's pull request
+        # can still open after it; the fix brief then needs exactly one lane.
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5]["labels"] = [x for x in self.gh.issues[5]["labels"]
+                                       if not x["name"].startswith("lane:")]
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.lane(5), "spark")
+
     def test_a_thread_that_survives_a_fix_round_climbs_to_the_first_rung(self):
         self.gh.ticket(5, "pr", lane="opencode-go")
         self.gh.comments[5].append({"body": FIX_ASKED, "user": ME})
@@ -1482,6 +1493,51 @@ class Queued(Base):
             "%s#8" % REPO: "no free lane in tier medium",
             "%s#10" % REPO: "no free lane takes model (its Model: line names no model id)"})
 
+    def first_label_ticket(self, number, label="loom:regression", model="gpt-6-sol"):
+        self.queued(number, body="Model: %s\nDifficulty: medium\n\n## Why\nx\n" % model)
+        self.gh.issues[number]["labels"].append({"name": label})
+
+    def busy(self, number, lane):
+        self.gh.ticket(number, "running", lane=lane)
+
+    def test_a_first_label_model_ticket_is_briefed_onto_a_busy_up_lane(self):
+        # loom#1300, 2026-10-21: both lanes of the model always had another
+        # fix round waiting, so a pinned regression ticket was never briefed.
+        self.first_label_ticket(7)
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        self.assign(available=["codex", "codex-2"])
+        self.assertEqual(self.lane(7), "codex")
+        self.assertEqual(factory._state(self.gh.issues[7]), "briefed")
+
+    def test_a_first_label_model_ticket_skips_a_lane_limited_for_the_model(self):
+        self.first_label_ticket(7)
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["codex", "codex-2"],
+                                 model_limits={"codex": {"gpt-6-sol": NOW + 3600}})
+        worker.assign_queued()
+        self.assertEqual(self.lane(7), "codex-2")
+
+    def test_a_first_label_model_ticket_waits_when_its_lanes_are_limited_or_down(self):
+        self.first_label_ticket(7)
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        for kwargs in ({"limited": ["codex", "codex-2"], "available": ["codex", "codex-2"]},
+                       {"available": []}):
+            worker = self.assign(**kwargs)
+            self.assertEqual(worker.waits["%s#7" % REPO], "no free lane takes model gpt-6-sol")
+            self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+
+    def test_a_model_ticket_without_a_first_label_waits_for_a_free_lane(self):
+        self.queued(7, body="Model: gpt-6-sol\nDifficulty: medium\n\n## Why\nx\n")
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        worker = self.assign(available=["codex", "codex-2"])
+        self.assertEqual(worker.waits["%s#7" % REPO], "no free lane takes model gpt-6-sol")
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+
     def test_queued_ladder_model_uses_a_compatible_lane(self):
         body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
         self.queued(7, body=body)
@@ -1805,6 +1861,18 @@ class Tickets(Base):
         moves = [c["body"] for c in self.gh.paginate("/repos/%s/issues/7/comments" % REPO)
                  if factory.STALL_MOVE_RE.match(c["body"])]
         self.assertEqual(len(moves), 2)
+
+    def test_a_stall_never_moves_to_a_lane_with_as_long_a_wait(self):
+        # loom#410, #977 and #1073 bounced codex-2 -> codex -> codex-2 for six
+        # hours, unclaimed, each move restarting the stall wait (2026-10-21).
+        body = "Model: gpt-6-sol\nDifficulty: medium\n\n## Why\nx\n"
+        self.stalled(7, body=body)
+        self.gh.ticket(8, "briefed", lane="codex", body=body)
+        for number in (9, 10):
+            self.gh.ticket(number, "briefed", lane="codex-2", body=body)
+        self.go()
+        self.assertEqual(self.lane(7), "codex")
+        self.assertEqual(self.gh.comments[7], [])
 
     def test_a_stall_with_no_available_lane_stays_briefed(self):
         self.stalled(7)
@@ -2404,6 +2472,25 @@ class Helpers(unittest.TestCase):
         # A rung with no lane serving it now is passed over.
         self.assertEqual(factory.next_rung(set(), {"claude": 2},
                                            lanes={1: ("claude",), 2: (), 3: ("anthropic",)}), 3)
+
+    def test_a_pull_request_for_another_repos_ticket_has_no_ticket_and_no_log_line(self):
+        # 2026-10-20: an image-pin pull request ships another repo's ticket by
+        # design, and logged a refusal for it on every pass.
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        other = {"number": 50, "body": "## Why\nx\n\nRefs example-org/other-repo#5\n",  # leak-guard-allow
+                 "head": {"ref": "pin-image"}}
+        with mock.patch("bus.factory._say") as say:
+            self.assertIsNone(f._association(REPO, other))
+        say.assert_not_called()
+
+    def test_conflicting_ticket_references_still_log_their_line(self):
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        both = {"number": 50, "body": "Refs %s#5\nRefs %s#6\n" % (REPO, REPO),
+                "head": {"ref": "pin-image"}}
+        with mock.patch("bus.factory._say") as say:
+            self.assertIsNone(f._association(REPO, both))
+        say.assert_called_once_with(
+            "no ticket for %s#50: pull request has conflicting ticket references" % REPO)
 
     def test_the_tiers_match_the_lane_choice_in_muse_md(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

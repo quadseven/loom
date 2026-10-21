@@ -1597,7 +1597,10 @@ class Factory:
                                                  if 1 <= n <= len(CLIMB)])
                 return
         lane = None
-        if _lane(issue) in REMOTE_LANES:
+        # A ticket with no lane label (a silent-lane requeue drops it, and the
+        # run's pull request opens after; loom#1095, 2026-10-21) failed every
+        # fix brief on "exactly one lane label": it moves like a remote one.
+        if not _lane(issue) or _lane(issue) in REMOTE_LANES:
             lane, _ = self._tier_move(repo, issue, allow_remote=False)
             if lane is None:
                 lane = LADDER[0][0][0]
@@ -1766,6 +1769,11 @@ class Factory:
     def _association(self, repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
         try:
             return brain._ticket_association(repo, pr)
+        except brain.OtherRepoTicket:
+            # By design, not a refusal: an infra image-pin pull request ships
+            # another repo's ticket. It has no ticket here; a line for it
+            # every pass would bury the real refusals.
+            return None
         except ValueError as err:
             _say("no ticket for %s#%s: %s" % (repo, pr.get("number"), err))
             return None
@@ -2242,8 +2250,16 @@ class Factory:
             _say("%s#%d stalled on lane %s: no other lane of its %s is available"
                  % (repo, number, old, "rung" if rung else "tier"))
             return
-        self._move_stalled(repo, issue, pick_lane(lanes, self.load),
-                           (self.now - since) / 3600, rung)
+        lane = pick_lane(lanes, self.load)
+        waiting, there = self.load.get(old, 0), self.load.get(lane, 0)
+        if self._up(old) and there and there >= waiting - 1:
+            # A move to a lane with as long a wait only restarts the stall
+            # clock: three tickets bounced codex-2 -> codex -> codex-2 for six
+            # hours unclaimed (2026-10-21). It moves to a free or shorter lane.
+            _say("%s#%d stalled on lane %s: lane %s waits as long (%d vs %d)"
+                 % (repo, number, old, lane, there, waiting))
+            return
+        self._move_stalled(repo, issue, lane, (self.now - since) / 3600, rung)
 
     def _move_stalled(self, repo: str, issue: Dict[str, Any], lane: str,
                       hours: float, rung: int) -> None:
@@ -2427,10 +2443,13 @@ class Factory:
                         and self._up(_lane(issue)))):
                 self.load[_lane(issue)] = self.load.get(_lane(issue), 0) + 1
 
-    def _queued_model_lane(self, repo: str, model: str) -> Optional[str]:
+    def _queued_model_lane(self, repo: str, model: str, busy_ok: bool = False) -> Optional[str]:
+        """The first lane that takes `model` and is free; with `busy_ok`, the
+        first that is merely up and not limited for the model, busy or not."""
         from .station import model_lanes, needs_public_repo
         return next((candidate for candidate in model_lanes(model)
-                     if self._free(candidate)
+                     if (self._up(candidate) and self._serves(candidate, model)
+                         if busy_ok else self._free(candidate))
                      and (not needs_public_repo(candidate, model)
                           or not self._is_private(repo))), None)
 
@@ -2498,6 +2517,12 @@ class Factory:
                 return "%s: giving it lane %s failed" % (ref, equivalent[0])
             return ""
         lane = self._queued_model_lane(repo, model)
+        if lane is None and set(FIRST) & set(_labels(issue)):
+            # A lane that always has another fix round waiting is never free,
+            # so a pinned regression ticket sat queued for days (loom#1300,
+            # 2026-10-21). Brief it on an up lane; the station claims FIRST
+            # tickets before the lane's other work.
+            lane = self._queued_model_lane(repo, model, busy_ok=True)
         if lane is None:
             why = "%s waits: no free lane takes model %s" % (ref, model)
             self._waiting(repo, issue["number"], "no free lane takes model %s" % (
