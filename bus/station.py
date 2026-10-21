@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from . import audit
 from . import brain_memory
 from . import claimed
+from . import stale_claims
 from . import factory
 from . import friction_intake
 from . import evidence
@@ -519,8 +520,13 @@ class Settings:
                  log_keep_days: int = LOG_KEEP_DAYS,
                  disk_free_min_gb: float = DISK_FREE_MIN_GB,
                  settle_claimed: str = "off",
-                 settle_claimed_max: int = claimed.PER_RUN) -> None:
+                 settle_claimed_max: int = claimed.PER_RUN,
+                 claim_idle_hours: int = 0) -> None:
         self.home = home
+        # LOOM_CLAIM_IDLE_HOURS: another operator's claim its claimer has left
+        # alone this long comes back to this Loom (bus/stale_claims.py); 0, the
+        # default for a Settings built in code, is off; from_env defaults to 24.
+        self.claim_idle_hours = claim_idle_hours
         # LOOM_SETTLE_CLAIMED: "on" settles operator-claimed issues whose pull
         # requests merged, "dry" (from_env's default) logs what it would do,
         # "off" skips it; off for a Settings built in code, like the factory
@@ -669,7 +675,8 @@ class Settings:
                    log_keep_days=_keep_days(env.get("LOOM_LOG_KEEP_DAYS", "")),
                    disk_free_min_gb=_free_floor(env.get("LOOM_DISK_FREE_MIN_GB", "")),
                    settle_claimed=claimed.mode(env.get("LOOM_SETTLE_CLAIMED", "")),
-                   settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")))
+                   settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")),
+                   claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")))
 
 
 def _keep_days(raw: str) -> int:
@@ -6302,6 +6309,79 @@ class Station:
             state["_at"] = self.now
             _write_json(path, state)
 
+    def release_stale_claims(self) -> None:
+        """Take back another operator's claims their claimer left alone for
+        claim_idle_hours (bus/stale_claims.py): remove the claim label and
+        unassign them, at most stale_claims.PER_RUN issues a run, at most once
+        an hour. A claim nobody worked held its issue forever (2026-10-21)."""
+        if self.s.claim_idle_hours <= 0:
+            return
+        path = os.path.join(self.state, stale_claims.STATE_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        last = state.get("_at")
+        if isinstance(last, (int, float)) and 0 <= self.now - last < stale_claims.EVERY:
+            return
+        left = stale_claims.PER_RUN
+        try:
+            for repo in self._verify_repos():
+                if left <= 0 or self._deferred():
+                    break
+                try:
+                    left -= self._release_stale_claims_repo(repo, left)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("could not read the claims of %s: %s" % (repo, err))
+        finally:
+            state["_at"] = self.now
+            _write_json(path, state)
+
+    def _foreign_claimed(self, repo: str) -> Dict[int, Dict[str, Any]]:
+        """The repo's open issues another operator claims by label, or that
+        are assigned to a trusted briefer (another operator's login)."""
+        ours = {a.lower() for a in self.s.authors}
+        found: Dict[int, Dict[str, Any]] = {}
+        names = [str(label.get("name") or "") for label in self.gh.paginate(
+            "/repos/%s/labels" % repo) if isinstance(label, dict)]
+        queries = ["labels=%s" % quote(name, safe=":") for name in names
+                   if name.lower().startswith(stale_claims.CLAIM_PREFIX)
+                   and name[len(stale_claims.CLAIM_PREFIX):].strip().lower() not in ours]
+        queries += ["assignee=%s" % quote(login) for login in self.s.briefers
+                    if login.lower() not in ours]
+        for query in queries:
+            for issue in self._paginate("/repos/%s/issues?%s&state=open" % (repo, query)):
+                if isinstance(issue, dict) and "pull_request" not in issue:
+                    found[int(issue["number"])] = issue
+        return found
+
+    def _release_stale_claims_repo(self, repo: str, left: int) -> int:
+        """Release up to `left` of the repo's idle foreign claims; how many."""
+        idle = self.s.claim_idle_hours * 3600
+        released = 0
+        for number, issue in sorted(self._foreign_claimed(repo).items()):
+            if released >= left:
+                break
+            owners = stale_claims.claimers(issue, self.s.authors)
+            if not owners:
+                continue
+            timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
+            due = {login: label for login, label in owners.items()
+                   if stale_claims.stale(issue, timeline, login, label, self.now, idle)}
+            if not due:
+                continue
+            for login, label in due.items():
+                if label:
+                    self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                                 % (repo, number, quote(label, safe="")), ok=(404,))
+                if any(stale_claims._login(p) == login for p in issue.get("assignees") or []):
+                    self.gh.rest("DELETE", "/repos/%s/issues/%d/assignees" % (repo, number),
+                                 {"assignees": [login]})
+            _say("released %s#%d from %s: no act of theirs on it in %d hours"
+                 % (repo, number, ", ".join(sorted(due)), self.s.claim_idle_hours))
+            released += 1
+        return released
+
     def _settle_claimed_repo(self, repo: str, left: int, pacer: "claimed.Pacer") -> int:
         """Settle up to `left` of the repo's claimed issues; how many were."""
         found = self._claimed_issues(repo)
@@ -8680,7 +8760,8 @@ class Station:
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.close_done_tickets, self.settle_orphan_sources,
-                     self.settle_claimed_tickets, self.restate_shipped_live,
+                     self.settle_claimed_tickets, self.release_stale_claims,
+                     self.restate_shipped_live,
                      self.health_intake, self.intake_friction,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
