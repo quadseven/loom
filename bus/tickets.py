@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
-from . import proof
+from . import proof, status
 
 # The runner's own patterns (lanes/run_lane.sh).
 MODEL_RE = re.compile(r"[A-Za-z0-9._:][A-Za-z0-9._:/@-]*")
@@ -83,13 +83,19 @@ ORIGINAL_HEADING = "## Original issue"
 
 def with_original(body: str, issue: Dict[str, Any]) -> str:
     """The ticket body followed by the issue's original title and text,
-    quoted in a collapsed section."""
-    text = str(issue.get("body") or "").replace("\r\n", "\n").replace("\r", "\n")
+    quoted in a collapsed section. The issue's status section (loom#1341)
+    is not quoted: it stays at the end as a live section."""
+    kept = status.body_events(issue.get("body"))
+    text = status.strip_body(issue.get("body")).replace("\r\n", "\n").replace("\r", "\n")
     lines = ["Original title: %s" % " ".join(str(issue.get("title") or "").split()), ""]
     lines += text.rstrip("\n").split("\n")
     quoted = "\n".join(("> " + line) if line.strip() else ">" for line in lines)
-    return "%s\n\n%s\n\n<details><summary>Original issue</summary>\n\n%s\n\n</details>\n" % (
+    out = "%s\n\n%s\n\n<details><summary>Original issue</summary>\n\n%s\n\n</details>\n" % (
         body.rstrip("\n"), ORIGINAL_HEADING, quoted)
+    try:
+        return status.with_body_events(out, kept) if kept else out
+    except ValueError:
+        return out
 
 
 def without_original(body: str) -> str:
@@ -155,7 +161,9 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
     ValueError for a value the runner would refuse, a repeated header, or a
     later body line the runner would mistake for a header.
     """
-    lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    # The status section the station keeps at the end of the body (loom#1341)
+    # is not the ticket's text.
+    lines = status.strip_body(body).replace("\r\n", "\n").replace("\r", "\n").split("\n")
     headers: Dict[str, str] = {}
     i = 0
     while i < len(lines):

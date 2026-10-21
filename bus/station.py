@@ -9013,6 +9013,7 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         if gh is None:
             from .github import auth_from_env
             gh = GitHub(auth_from_env())
+            gh.status_in_body = True
         _trust_app_login(settings, gh)
         if gh.cache_dir is None:
             # Every GET is conditional: a list re-read each pass costs a 304.
