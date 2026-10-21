@@ -1717,6 +1717,35 @@ class FixTests(unittest.TestCase):
         self.assertEqual([name for name, _ in found], ["lint"])
         self.assertIn("filter=all", fake.calls[0][1])
 
+    def test_failing_checks_uses_check_runs_when_combined_status_is_forbidden(self):
+        class StatusForbidden:
+            def rest(self, method, path):
+                if path.endswith("check-runs?filter=all&per_page=100"):
+                    return types.SimpleNamespace(data={"check_runs": [
+                        {"name": "lint", "conclusion": "failure", "output": {"title": "failed"}}]})
+                if path.endswith("/status"):
+                    raise GitHubError("status unavailable", 403)
+                raise AssertionError("unexpected request: %s" % path)
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            found = brain._failing_checks(StatusForbidden(), REPO, "abc123")
+        self.assertEqual(found, [("lint", "failed")])
+        self.assertIn(REPO, err.getvalue())
+        self.assertIn("commit statuses were not readable", err.getvalue())
+
+    def test_failing_checks_still_raises_on_combined_status_server_error(self):
+        class StatusServerError:
+            def rest(self, method, path):
+                if path.endswith("check-runs?filter=all&per_page=100"):
+                    return types.SimpleNamespace(data={"check_runs": []})
+                if path.endswith("/status"):
+                    raise GitHubError("status unavailable", 500)
+                raise AssertionError("unexpected request: %s" % path)
+
+        with self.assertRaises(GitHubError):
+            brain._failing_checks(StatusServerError(), REPO, "abc123")
+
     def test_fix_refuses_notes_the_brain_must_never_post(self):
         with self.assertRaises(ValueError):
             brain.fix(GitHub("t", transport=Fake()), REPO, 8, (REPO, 9), "This does not fix #9")
