@@ -273,11 +273,12 @@ class Facts:
     beats: Optional[Dict[str, Optional[float]]] = None
     # Lanes that held a running ticket while silent, in the last SILENT_KEEP.
     silent_runs: Optional[List[SilentRun]] = None
-    waits: Optional[List[Wait]] = None
     events: Optional[List[Event]] = None
     # untrusted labeler login -> briefed tickets refused for it in the last
     # LABELER_WINDOW seconds.
     label_refusals: Optional[Dict[str, int]] = None
+    # Last, so no positional construction shifts.
+    waits: Optional[List[Wait]] = None
 
 
 @dataclass(frozen=True)
