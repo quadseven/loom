@@ -3107,7 +3107,7 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
 # The close-completeness guard's escape hatch (bus/github.py): a close by
 # rule, not a claim that each box was seen to hold.
 FORCE_CLOSE_LABEL = "force-close"
-_REWRITTEN_FROM = re.compile(r"^Rewritten from issue (\d+)\.[ \t]*$", re.M)
+_REWRITTEN_FROM = tickets.REWRITTEN_FROM_RE
 # Rewrites before loom#462 ended the ticket with this line instead.
 _REFS_LINE = re.compile(r"^Refs #(\d+)[ \t]*$", re.M)
 
