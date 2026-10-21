@@ -35,6 +35,7 @@ runner never mistakes a failed check for a clean one.
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 import subprocess
 import sys
@@ -54,10 +55,10 @@ class GitError(RuntimeError):
 
 def _git(tree: str, *args: str) -> str:
     proc = subprocess.run(["git", "-C", tree, "-c", "core.quotePath=false", *args],
-                          capture_output=True, text=True, check=False)
+                          capture_output=True, check=False)
     if proc.returncode != 0:
-        raise GitError("git %s: %s" % (" ".join(args), proc.stderr.strip()))
-    return proc.stdout
+        raise GitError("git %s: %s" % (" ".join(args), proc.stderr.decode(errors="replace").strip()))
+    return proc.stdout.decode(errors="surrogateescape")
 
 
 def _names(out: str) -> List[str]:
@@ -134,12 +135,13 @@ def stray_files(tree: str, base: str, head: str, brief_text: str,
 
 def referenced_by_tracked_file(tree: str, head: str, path: str) -> bool:
     """Whether a reference or ambiguous name prevents dropping this file."""
-    if "\n" in path:
-        return True  # Git grep splits newline patterns; leave the path for scope refusal.
+    if not path.isprintable():
+        return True  # Control characters make pattern input and runner output ambiguous.
     name = path.rsplit("/", 1)[-1]
+    patterns = os.fsencode(path) + b"\n" + os.fsencode(name) + b"\n"
     proc = subprocess.run(["git", "-C", tree, "grep", "-I", "-l", "-z", "-F",
-                           "-e", path, "-e", name, head, "--", "."],
-                          capture_output=True, check=False)
+                           "-f", "-", head, "--", "."],
+                          input=patterns, capture_output=True, check=False)
     if proc.returncode not in (0, 1):
         raise GitError("git grep failed: %s" % proc.stderr.decode(errors="replace").strip())
     return any(found != (head + ":" + path).encode() for found in proc.stdout.split(b"\0") if found)

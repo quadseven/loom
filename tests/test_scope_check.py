@@ -89,11 +89,19 @@ class ScopeCheckTest(unittest.TestCase):
         self.write("test_*.py", "print('work')\n")
         self.commit("work")
         self.assertEqual(scope_check.scratch_files(str(self.tree), self.base, "HEAD", ""), [])
+        self.assertEqual(self.stray(), ["test_*.py"])
 
     def test_scratch_file_with_newline_in_name_is_kept_for_scope_check(self):
         self.write("test_\nprobe.py", "print('scratch')\n")
         self.commit("work")
         self.assertEqual(scope_check.scratch_files(str(self.tree), self.base, "HEAD", ""), [])
+        self.assertEqual(self.stray(), ["test_\nprobe.py"])
+
+    def test_scratch_file_with_carriage_return_in_name_is_kept_for_scope_check(self):
+        self.write("test_\rprobe.py", "print('scratch')\n")
+        self.commit("work")
+        self.assertEqual(scope_check.scratch_files(str(self.tree), self.base, "HEAD", ""), [])
+        self.assertEqual(self.stray(), ["test_\rprobe.py"])
 
     def test_a_new_file_in_a_tracked_hidden_subdirectory_is_in_scope(self):
         # A test beside a tracked .github script was refused (2026-10-19).
