@@ -913,8 +913,15 @@ itself when that epic cannot be read) of the invariant goal home
 goal home that is not a backlog), as a sub-issue and with a `Part of #N`
 line, carrying the evidence. A hidden marker holds a hash of the invariant
 and its subject: an open issue for the same breach files nothing, and a
-closed one is reopened with a comment only for evidence newer than its
-close. Issues and pull requests in a private repo are named in words, and
+closed one is reopened only for evidence newer than its close, at most once
+while the breach stands (it stays closed if something closes it again before
+the breach clears; the station logs that and says nothing on the issue). The
+reopen is one "Broken again" note on the issue, edited with a count and the last
+time, never a new comment each time. An issue that carries `loom:ticket` (an
+invariant issue rewritten into work) is no longer the breach's issue: it is
+never reopened, rewritten or commented on, and a breach that outlives a closed
+ticket gets one separate invariant issue that refs the ticket (loom#1223
+flipped 18 times in a day before this). Issues and pull requests in a private repo are named in words, and
 failure reasons have repos, paths and credentials replaced. One pass files
 or reopens at most 5, and below the GitHub budget floor files nothing.
 `python3 -m bus.brain status` lists the open ones under "Invariants broken"

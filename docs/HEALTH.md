@@ -118,7 +118,9 @@ Per finding, on each read:
   build state (queued to merged) gets only the updates above.
 - The finding is gone and its ticket is open: one comment, "finding absent
   since <time>". That is the evidence the brain verifies against. A ticket
-  that carries several findings gets it once all of them are gone. The
+  that carries several findings gets it once all of them are gone. A finding
+  that flaps (gone, back, gone) leaves that one note: a flip inside 24 hours of
+  the note writes nothing, a later one edits the note with a count. The
   station never closes a ticket.
 - The finding is gone, its ticket is `loom:shipped` and the finding has
   stayed gone 24 hours counted from the later of the absent stamp and the

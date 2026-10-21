@@ -120,13 +120,21 @@ class FakeGH:
         if m and method == "PATCH":
             self.issues[int(m.group(1))].update(body)
             return Response(200, {})
+        m = re.fullmatch(r"/repos/[^/]+/[^/]+/issues/comments/(\d+)", path)
+        if method == "PATCH" and m:
+            for notes in self.comments.values():
+                for note in notes:
+                    if note.get("id") == int(m.group(1)):
+                        note["body"] = body["body"]
+            return Response(200, {})
         if method == "POST" and path.endswith("/comments"):
             m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/comments", path)
             if m:
+                self.next_comment = getattr(self, "next_comment", 500) + 1
                 self.comments.setdefault((m.group(1), int(m.group(2))), []).append(
-                    {"body": body["body"], "created_at": stamp(T0 + 10),
+                    {"id": self.next_comment, "body": body["body"], "created_at": stamp(T0 + 10),
                      "user": {"login": AUTHOR}})
-            return Response(201, {"id": 1})
+            return Response(201, {"id": getattr(self, "next_comment", 1)})
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls\?state=open&per_page=100", path)
         if m:
             return Response(200, self.pulls.get(m.group(1), []))
@@ -769,6 +777,94 @@ class FilerTest(unittest.TestCase):
         self.assertEqual(self.gh.issues[number]["state"], "open")
         self.assertEqual(len(self.gh.issues), 1)
         self.assertTrue(any(w[1].endswith("/%d/comments" % number) for w in self.gh.writes))
+
+    def test_a_closed_ticket_is_never_reopened_patched_or_commented_on(self):
+        # loom#1223: an invariant issue rewritten into a ticket was reopened by
+        # the filer and closed by the ticket path 18 times in one day.
+        self.file(self.breach())
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(
+            state="closed", closed_at=stamp(T0 + 60), state_reason="completed",
+            labels=[{"name": x} for x in ("loom:ticket", "loom:invariant", "loom:rewritten")],
+            body=self.gh.issues[number]["body"] + "\nA ticket brief now.")
+        before = dict(self.gh.issues[number])
+        self.gh.writes.clear()
+        self.file(self.breach(at=T0 + 120), now=T0 + 120)
+        self.assertFalse([w for w in self.gh.writes if "/issues/%d" % number in w[1]
+                          and w[0] in ("PATCH", "POST")], self.gh.writes)
+        self.assertEqual(self.gh.issues[number], before)
+        self.assertNotIn((REPO, number), self.gh.comments)
+        # The breach stands, so one separate invariant issue refs the ticket.
+        (other,) = [n for n in self.gh.issues if n != number]
+        self.assertIn("Refs #%d" % number, self.gh.issues[other]["body"])
+        self.assertRegex(self.gh.issues[other]["body"], invariants.MARKER_RE)
+        self.assertEqual(self.state[self.breach().key], other)
+        # Later passes use that issue, not the ticket and not a third one.
+        self.file(self.breach(at=T0 + 240), now=T0 + 240)
+        self.assertEqual(sorted(self.gh.issues), sorted([number, other]))
+
+    def test_an_open_ticket_is_not_rewritten_back_to_the_invariant_text(self):
+        self.file(self.rolling("1 open tickets sit under no epic across 1 goal homes",
+                               ("Goal home #30: 1 open, #7",)))
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(
+            labels=[{"name": x} for x in ("loom:ticket", "loom:invariant")],
+            title="Ship the intake epic", body=self.gh.issues[number]["body"] + "\nbrief")
+        self.gh.writes.clear()
+        self.file(self.rolling("2 open tickets sit under no epic across 1 goal homes",
+                               ("Goal home #30: 2 open, #7, #8",), at=T0 + 600), now=T0 + 600)
+        self.assertEqual(self.gh.writes, [])
+        self.assertEqual(self.gh.issues[number]["title"], "Ship the intake epic")
+
+    def test_a_plain_invariant_issue_beside_a_ticket_is_the_breachs_issue(self):
+        self.file(self.breach())
+        (ticket,) = self.gh.issues
+        self.gh.issues[ticket].update(state="closed", closed_at=stamp(T0 + 60),
+                                      labels=[{"name": "loom:ticket"}, {"name": "loom:invariant"}])
+        self.file(self.breach(at=T0 + 120), now=T0 + 120)
+        (plain,) = [n for n in self.gh.issues if n != ticket]
+        self.state.clear()
+        self.gh.issues[plain].update(labels=[{"name": x} for x in invariants.LABELS])
+        self.file(self.breach(at=T0 + 180), now=T0 + 180)
+        self.assertEqual(sorted(self.gh.issues), sorted([ticket, plain]))
+        self.assertEqual(self.state[self.breach().key], plain)
+
+    def test_a_breach_that_keeps_standing_reopens_its_issue_once_over_ten_passes(self):
+        self.file(self.breach())
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(labels=[{"name": x} for x in invariants.LABELS])
+        self.gh.writes.clear()
+        for i in range(1, 11):
+            at = T0 + 100 * i
+            # Whatever closes it (the ticket path, a person) closes it again.
+            if self.gh.issues[number]["state"] == "open" and i > 1:
+                self.gh.issues[number].update(state="closed", closed_at=stamp(at - 50))
+            elif i == 1:
+                self.gh.issues[number].update(state="closed", closed_at=stamp(at - 50))
+            self.file(self.breach(at=at), now=at)
+        reopens = [w for w in self.gh.writes if w[2] == {"state": "open"}]
+        self.assertEqual(len(reopens), 1)
+        notes = self.gh.comments[(REPO, number)]
+        self.assertEqual(len(notes), 1)
+        self.assertLessEqual(len([w for w in self.gh.writes if w[1].endswith("/comments")]), 1)
+        self.assertTrue(any("not reopened" in line for line in self.said))
+
+    def test_a_breach_that_clears_and_returns_edits_the_one_broken_again_note(self):
+        self.file(self.breach(at=T0 - 7 * 3600), now=T0 - 7 * 3600)
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(state="closed", closed_at=stamp(T0 - 6 * 3600),
+                                      labels=[{"name": x} for x in invariants.LABELS])
+        self.file(self.breach(at=T0 - 5 * 3600), now=T0 - 5 * 3600)
+        self.assertEqual(self.gh.issues[number]["state"], "open")
+        self.gh.comments[(REPO, number)].append(
+            {"id": 900, "body": "The invariant cleared by x; its last breach was observed earlier.",
+             "created_at": stamp(T0 - 3 * 3600)})
+        self.gh.issues[number].update(state="closed", closed_at=stamp(T0 - 3 * 3600))
+        self.file(self.breach(at=T0), now=T0)
+        self.assertEqual(self.gh.issues[number]["state"], "open")
+        notes = [c for c in self.gh.comments[(REPO, number)] if invariants.BROKEN_MARKER in c["body"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Reopened 2 times; last at %s" % invariants.utc(T0), notes[0]["body"])
 
     def test_lost_state_finds_the_issue_by_its_marker(self):
         self.file(self.breach())
