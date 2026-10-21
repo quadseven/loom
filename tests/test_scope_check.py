@@ -83,6 +83,18 @@ class ScopeCheckTest(unittest.TestCase):
         self.commit("work")
         self.assertEqual(scope_check.scratch_files(str(self.tree), self.base, "HEAD", ""), [])
 
+    def test_referenced_scratch_file_with_glob_character_is_kept(self):
+        self.write("test_reference.py", "Run test_*.py to verify this change.\n")
+        self.base = self.commit("reference")
+        self.write("test_*.py", "print('work')\n")
+        self.commit("work")
+        self.assertEqual(scope_check.scratch_files(str(self.tree), self.base, "HEAD", ""), [])
+
+    def test_scratch_file_with_newline_in_name_is_kept_for_scope_check(self):
+        self.write("test_\nprobe.py", "print('scratch')\n")
+        self.commit("work")
+        self.assertEqual(scope_check.scratch_files(str(self.tree), self.base, "HEAD", ""), [])
+
     def test_a_new_file_in_a_tracked_hidden_subdirectory_is_in_scope(self):
         # A test beside a tracked .github script was refused (2026-10-19).
         self.write(".github/scripts/deploy.py", "x = 1\n")

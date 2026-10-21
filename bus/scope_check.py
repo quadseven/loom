@@ -133,14 +133,16 @@ def stray_files(tree: str, base: str, head: str, brief_text: str,
 
 
 def referenced_by_tracked_file(tree: str, head: str, path: str) -> bool:
-    """Whether another tracked file mentions this scratch file by name or path."""
+    """Whether a reference or ambiguous name prevents dropping this file."""
+    if "\n" in path:
+        return True  # Git grep splits newline patterns; leave the path for scope refusal.
     name = path.rsplit("/", 1)[-1]
-    proc = subprocess.run(["git", "-C", tree, "grep", "-I", "-q", "-F",
-                           "-e", path, "-e", name, head, "--", ".",
-                           ":(exclude)" + path], capture_output=True, check=False)
+    proc = subprocess.run(["git", "-C", tree, "grep", "-I", "-l", "-z", "-F",
+                           "-e", path, "-e", name, head, "--", "."],
+                          capture_output=True, check=False)
     if proc.returncode not in (0, 1):
         raise GitError("git grep failed: %s" % proc.stderr.decode(errors="replace").strip())
-    return proc.returncode == 0
+    return any(found != (head + ":" + path).encode() for found in proc.stdout.split(b"\0") if found)
 
 
 def scratch_files(tree: str, base: str, head: str, brief_text: str,
