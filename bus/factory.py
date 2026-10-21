@@ -463,6 +463,9 @@ plain to the next reader, and say why in the commit message.
 - Keep the whole suite green, and change nothing the threads and checks do not \
 ask for."""
 
+# A ticket with either label is never sent back: a person or the brain has it.
+SEND_BACK_HOLDS = frozenset(("loom:human", "needs-brain"))
+
 # The note for a ticket whose lane run failed with its pull request open: the
 # failed run is the finding, so it is not the stock FIX_NOTES that brain.fix
 # refuses to send alone.
@@ -1662,13 +1665,13 @@ class Factory:
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
                    no_test: bool = False, unticked: Sequence[str] = ()) -> None:
         number = int(issue["number"])
-        if "loom:human" in _labels(issue):
-            return  # a person has it: no more rounds, no more comments
-        if "needs-brain" in _labels(issue):
-            # The round cap, a hold or a past-the-ladder give-up put it with
-            # the brain: another round is a comment nobody asked for.
-            _say("%s#%d is with the brain (needs-brain); not sent back for %s"
-                 % (repo, number, why))
+        held = SEND_BACK_HOLDS & set(_labels(issue))
+        if held:
+            # A person has it (no more rounds, no more comments), or the round
+            # cap, a hold or a past-the-ladder give-up put it with the brain:
+            # another round is a comment nobody asked for.
+            _say("%s#%d is held (%s); not sent back for %s"
+                 % (repo, number, ", ".join(sorted(held)), why))
             return
         if checks_failing and self._past_no_change(repo, issue, comments):
             return

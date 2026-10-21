@@ -3539,6 +3539,13 @@ def _hidden(lines: List[str]) -> List[str]:
     return [l.replace("--!>", "-- !>").replace("-->", "-- >") for l in lines]
 
 
+def _fix_header(repo: str, number: int, branch: str, key: str) -> List[str]:
+    """The first lines of a loom:fix comment: the markers the station reads,
+    the pull request and branch, and the key of this send-back when known."""
+    return [FIX_MARKER, "Pull request: %s#%d, branch %s" % (repo, number, branch),
+            BRAIN_FIX_MARKER + (" " + FIX_KEY % key if key else ""), ""]
+
+
 def _fix_body(repo: str, number: int, branch: str, notes: str,
               checks: List[Tuple[str, str]], threads: List[Dict[str, Any]],
               conflict: bool = False, key: str = "") -> str:
@@ -3547,8 +3554,7 @@ def _fix_body(repo: str, number: int, branch: str, notes: str,
     text, which the lane's brief is built from, sit in an HTML comment
     neither shows (the operator got a whole review board three times by
     email, 2026-10-20). The factory reads the ### headings in it."""
-    out = [FIX_MARKER, "Pull request: %s#%d, branch %s" % (repo, number, branch),
-           BRAIN_FIX_MARKER + (" " + FIX_KEY % key if key else ""), ""]
+    out = _fix_header(repo, number, branch, key)
     if notes.strip():
         out += [notes.strip(), ""]
     if conflict:
@@ -3617,6 +3623,18 @@ def _repeats_last_fix(gh: GitHub, ticket: Tuple[str, int], issue: Dict[str, Any]
     return False
 
 
+def _fix_refusal(gh: GitHub, ticket: Tuple[str, int], issue: Dict[str, Any], notes: str,
+                 found: Tuple[List[Any], List[Any], bool], sha: str, digest: str) -> str:
+    """Why a send-back would say nothing new, or "": the stock notes with no
+    failing check, no open thread and no conflict; or the same head, findings
+    and worker as the newest loom:fix comment on the ticket."""
+    if not any(found) and _generic_fix_notes(notes):
+        return "it has no failing check, no open thread and no conflict"
+    if sha and _repeats_last_fix(gh, ticket, issue, digest):
+        return "the newest loom:fix comment holds this head and these findings"
+    return ""
+
+
 def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
         lane: Optional[str] = None, model: Optional[str] = None) -> bool:
     """Send a lane's pull request back to the lane: the failing checks and the
@@ -3642,15 +3660,11 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     checks = _failing_checks(gh, repo, sha) if sha else []
     threads = _open_threads(gh, repo, number)
     conflict = pr.get("mergeable") is False
-    if not (checks or threads or conflict) and _generic_fix_notes(notes):
-        print("brain: not sending %s#%d back for %s#%d: it has no failing check, no open "
-              "thread and no conflict" % (repo, number, ticket[0], ticket[1]), file=sys.stderr)
-        return False
     digest = _fix_digest(sha, notes, checks, threads, conflict, lane, model)
-    if sha and _repeats_last_fix(gh, ticket, issue, digest):
-        print("brain: not sending %s#%d back again for %s#%d: the newest loom:fix comment "
-              "holds this head and these findings" % (repo, number, ticket[0], ticket[1]),
-              file=sys.stderr)
+    why = _fix_refusal(gh, ticket, issue, notes, (checks, threads, conflict), sha, digest)
+    if why:
+        print("brain: not sending %s#%d back for %s#%d: %s"
+              % (repo, number, ticket[0], ticket[1], why), file=sys.stderr)
         return False
     body = _fix_body(repo, number, pr["head"]["ref"], notes, checks, threads, conflict,
                      digest if sha else "")
