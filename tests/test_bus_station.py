@@ -7553,6 +7553,100 @@ def shipped_at(age_hours):
     return [dict(labeled("loom:shipped", "alice-example"), created_at=stamp)]
 
 
+class ClaimDropTest(Base):
+    """A ticket that leaves loom:running or closes drops this Loom's own claim
+    label and keeps another login's (loom#1393). The claim marks a run, not a
+    ticket's whole life: 162 open tickets held claim:<login> while 7 ran."""
+
+    OURS = "claim:alice-example"
+    THEIRS = "claim:other-op"
+
+    failed = RetryTest.failed
+    bodies = RetryTest.bodies
+
+    def running(self, number=12, lane="codex"):
+        self.fake.add(number, lane=lane, body=PLAIN, state="running")
+        self.fake.issues[number]["labels"] += [{"name": self.OURS}, {"name": self.THEIRS}]
+        return station.Station(GitHub("token", transport=self.fake), self.settings)
+
+    def test_a_running_ticket_moved_to_failed_loses_our_claim_and_keeps_theirs(self):
+        self.heartbeat("anthropic")
+        self.failed(body=BODY)  # no other lane takes Model: model-x
+        self.fake.issues[12]["labels"] += [{"name": self.OURS}, {"name": self.THEIRS}]
+        self.run_pass()
+        names = self.fake.names(12)
+        self.assertIn("loom:failed", names)
+        self.assertNotIn(self.OURS, names)
+        self.assertIn(self.THEIRS, names)
+
+    def test_a_running_ticket_the_station_briefs_elsewhere_loses_our_claim(self):
+        self.heartbeat("anthropic")
+        runner = self.running()
+        self.assertEqual("", runner._retry(REPO, 12, "codex", "transient", "agent exited 1"))
+        names = self.fake.names(12)
+        self.assertIn("loom:briefed", names)
+        self.assertNotIn("loom:running", names)
+        self.assertNotIn(self.OURS, names)
+        self.assertIn(self.THEIRS, names)
+
+    def test_a_running_ticket_the_station_queues_loses_our_claim(self):
+        runner = self.running()
+        runner._relabel(REPO, 12, "loom:queued")
+        names = self.fake.names(12)
+        self.assertIn("loom:queued", names)
+        self.assertNotIn(self.OURS, names)
+        self.assertIn(self.THEIRS, names)
+
+    def test_a_claim_that_starts_a_run_is_still_added(self):
+        self.fake.add(12, lane="codex", body=PLAIN, state="briefed")
+        self.run_pass()
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertIn(self.OURS, self.fake.names(12))
+
+    def test_closing_a_done_ticket_removes_its_state_and_our_claim(self):
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body=SHIPPED_BODY.replace(
+            "prints `daily status ready`", "the daily line shows it"), state="shipped")
+        self.fake.issues[1]["labels"] += [
+            {"name": x} for x in ("loom:running", "loom:ready", "wait:gate", "needs-brain",
+                                  self.OURS, self.THEIRS)]
+        station.Station(GitHub("token", transport=self.fake), self.settings).close_done_tickets()
+        self.assertEqual("closed", self.fake.issues[1]["state"])
+        self.assertEqual(["loom:ticket", "loom:shipped", "lane:codex", self.THEIRS, "force-close"],
+                         self.fake.names(1))
+
+    def test_a_merged_pull_request_strips_ready_and_our_claim(self):
+        self.fake.add(12, state="pr")
+        self.fake.issues[12]["labels"] += [{"name": "loom:ready"}, {"name": self.OURS},
+                                           {"name": self.THEIRS}]
+        self.fake.pulls = [{"number": 99, "state": "closed",
+                            "merged_at": "2030-01-02T00:00:00Z",
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        names = self.fake.names(12)
+        self.assertIn("loom:merged", names)
+        self.assertNotIn("loom:ready", names)
+        self.assertNotIn(self.OURS, names)
+        self.assertIn(self.THEIRS, names)
+
+    def test_a_move_from_pr_to_queued_strips_ready(self):
+        # The pull request was merged but left criteria unbuilt: the ticket is
+        # requeued, and it may not stay loom:ready (infra#5502 read queued+ready).
+        self.fake.add(12, state="pr", body=("Difficulty: easy\n\n## Acceptance criteria\n"
+                                            "- [ ] one\n- [ ] two\n"))
+        self.fake.issues[12]["labels"].append({"name": "loom:ready"})
+        self.fake.pulls = [{"number": 99, "state": "closed",
+                            "merged_at": "2030-01-02T00:00:00Z",
+                            "body": "Refs %s#12\n\n## Acceptance criteria\n- [x] one\n" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        names = self.fake.names(12)
+        self.assertIn("loom:queued", names)
+        self.assertNotIn("loom:ready", names)
+        self.assertNotIn("loom:pr", names)
+
+
 class CloseDoneTest(Base):
     """The operator's close rule (2026-10-19): a shipped ticket whose Live
     line names nothing a log search can find closes; one that names a string

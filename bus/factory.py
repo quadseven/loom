@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, change_class, labels, naming, scope_fit, split, status, tickets
+from . import brain, change_class, labels, naming, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -2415,7 +2415,9 @@ class Factory:
         if lane is None:
             self._status_note(repo, number,
                               said + "no lane of its tier is free, so the ticket goes back to the queue.")
-            kept = [x for x in _labels(issue) if x != "loom:running" and not x.startswith("lane:")]
+            kept = stale_claims.without_own_claim(
+                [x for x in _labels(issue) if x != "loom:running" and not x.startswith("lane:")],
+                brain.trusted_authors())
             self._relabel(repo, issue, kept + ["loom:queued"])
             _say("queued %s#%d: lane %s sent no heartbeat for %d minutes"
                  % (repo, number, old, silent // 60))

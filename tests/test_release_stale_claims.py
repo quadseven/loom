@@ -20,6 +20,7 @@ from bus import stale_claims, station  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
+HOUR = 3600
 DAY = 24 * 3600
 
 
@@ -197,6 +198,32 @@ class OwnRules(unittest.TestCase):
         found = own(1, labels=("claim:me", "wait:model-limit"))
         self.assertTrue(self.lapsed(found, [labeled("claim:me", "me", 3 * DAY)]))
 
+    def test_the_stations_own_relabels_do_not_keep_the_claim(self):
+        # loom#1174 failed, was briefed again nine minutes later, and held its
+        # claim: every relabel by the App counted as activity.
+        line = [labeled("claim:me", "loom-app[bot]", 3 * DAY),
+                labeled("loom:failed", "loom-app[bot]", 3 * HOUR),
+                labeled("loom:briefed", "loom-app[bot]", 3 * HOUR),
+                commented("loom-app[bot]", 3600)]
+        self.assertFalse(self.lapsed(own(1), line))
+        self.assertTrue(stale_claims.lapsed(own(1), line, [], "claim:me", time.time(), DAY,
+                                            ["Loom-App[bot]"]))
+
+    def test_the_claim_labels_own_putting_on_still_counts(self):
+        line = [labeled("claim:me", "loom-app[bot]", 3600)]
+        self.assertFalse(stale_claims.lapsed(own(1), line, [], "claim:me", time.time(), DAY,
+                                             ["loom-app[bot]"]))
+
+    def test_a_person_acting_on_the_ticket_keeps_the_claim_whoever_the_apps_are(self):
+        line = [labeled("claim:me", "loom-app[bot]", 3 * DAY), commented("someone", 3600)]
+        self.assertFalse(stale_claims.lapsed(own(1), line, [], "claim:me", time.time(), DAY,
+                                             ["loom-app[bot]"]))
+
+    def test_without_own_claim_keeps_another_logins_claim(self):
+        names = ["loom:ticket", "claim:Me", "claim:other-op", "lane:codex"]
+        self.assertEqual(["loom:ticket", "claim:other-op", "lane:codex"],
+                         stale_claims.without_own_claim(names, ["me"]))
+
     def test_own_claims_are_the_labels_naming_our_logins(self):
         found = stale_claims.own_claims(issue(1, labels=("claim:Me", "claim:other-op")), ["me"])
         self.assertEqual({"me": "claim:Me"}, found)
@@ -205,6 +232,15 @@ class OwnRules(unittest.TestCase):
 class OwnStep(unittest.TestCase):
     setUp = Step.setUp
     run_step = Step.run_step
+
+    def test_the_stations_own_relabels_do_not_keep_a_claim_from_lapsing(self):
+        self.settings.authors.append("loom-app[bot]")
+        self.fake.issues[1] = own(1, assignees=("me",))
+        self.fake.timelines[1] = [labeled("claim:me", "loom-app[bot]", 3 * DAY),
+                                  labeled("loom:briefed", "loom-app[bot]", 3600)]
+        self.run_step()
+        self.assertIn(("DELETE", "issues/1/labels/claim:me"),
+                      [(m, p) for m, p, _ in self.fake.writes])
 
     def test_an_unworked_claim_is_dropped_with_a_status_note(self):
         self.fake.issues[1] = own(1, assignees=("me",))

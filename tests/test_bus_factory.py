@@ -2789,6 +2789,25 @@ class SilentLane(Base):
         self.assertEqual(station.retry_chain(self.gh.comments[7]), (0, set(), None))
         self.assertEqual(f.silent_running, {"codex": [(REPO, 7)]})
 
+    def test_a_ticket_moved_off_a_silent_lane_drops_our_claim_and_keeps_theirs(self):
+        # loom#1393: the claim marks a run, and the run ended with the lane.
+        busy = [x for x in factory.lanes_of("medium", True) if x != "codex"]
+        for n, lane in enumerate(busy, 20):
+            self.gh.ticket(n, "briefed", lane=lane)
+        for free in (False, True):
+            with self.subTest(free_lane=free):
+                self.silent_ticket()
+                self.gh.issues[7]["labels"] += [{"name": "claim:alice-example"},
+                                                {"name": "claim:other-op"}]
+                with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "alice-example"}):
+                    if free:
+                        self.go(silent={"codex": 31 * 60})
+                    else:
+                        self.go(silent={"codex": 31 * 60}, available=busy)
+                self.assertNotIn("loom:running", self.labels())
+                self.assertNotIn("claim:alice-example", self.labels())
+                self.assertIn("claim:other-op", self.labels())
+
 
 class Helpers(unittest.TestCase):
     def test_with_model_replaces_or_inserts_the_header(self):

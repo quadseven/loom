@@ -507,7 +507,15 @@ only what is its own, and adding an operator is configuration:
   label does not keep a claim alive: a ticket held only by a model limit, a
   brain or a runaway hold lapses once it has been quiet that long. A claim
   with no Loom label is an operator's own session's and is left to the
-  claimed-issue settle (`bus/stale_claims.py`).
+  claimed-issue settle (`bus/stale_claims.py`). The station's own relabels
+  (events by this Loom's App logins) are not activity for this lapse, so a
+  ticket that moves between lanes and the brain still lapses; only the claim
+  label's own putting-on, a person's act, or a pull request update count.
+- The claim marks a run, not a ticket's whole life. Any station or brain move
+  out of `loom:running` (a retry, a limit, a failure, a pull request opened, a
+  merge) removes this Loom's own `claim:<login>` label in the same labels
+  write, and so does any close of a ticket. A `claim:<login>` label of another
+  login is never touched. The next claim adds it again.
 - When the station claims a ticket, it assigns the issue to its operator
   login, the first `LOOM_BRIEF_AUTHORS` login that is not an app (`[bot]`),
   before it relabels it, and adds `claim:<that login>` with the relabel
