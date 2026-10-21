@@ -882,6 +882,22 @@ def _is_brief(body: str) -> bool:
     return any(rx.search(body) for rx in BRIEF_RES)
 
 
+# The head of the note _give_up leaves when a ticket is past the last rung.
+GAVE_UP = "The factory tried every rung of the model ladder"
+# The class bus/station.py's CLASS_RE reads off a reported reason.
+ENDING_CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
+
+
+def newest_ending_class(comments: Sequence[Any]) -> str:
+    """The class of the ending that closed the ticket's newest claim: limit,
+    transient, factory, auth or work. A reason with no class, and a newest
+    claim with no recorded ending, are work (the cautious reading: only an
+    ending that says the lane did no work may keep a ticket from climbing)."""
+    rows = attempts(comments)
+    match = ENDING_CLASS_RE.match(rows[-1][3]) if rows else None
+    return match.group(1) if match else "work"
+
+
 def attempts_since_brief(comments: Sequence[Any]) -> List[Tuple[int, str, str, str]]:
     """The attempts after the ticket's last brief (its last lane assignment),
     oldest first, each with the failure that followed it. A ticket briefed
@@ -1606,7 +1622,7 @@ class Factory:
             return
         if _state(issue) != "failed":
             self.move(self.gh, repo, number, "failed",
-                      note="The factory tried every rung of the model ladder (%s; ran on %s). "
+                      note=GAVE_UP + " (%s; ran on %s). "
                            "The brain rewrites this brief smaller, or asks the "
                            "operator one exact question." % (why, ", ".join(ran) or "none"))
         _say("%s#%d is past the last rung; left failed for the brain" % (repo, number))
@@ -2161,6 +2177,8 @@ class Factory:
             self._hold_other_repo(repo, issue, other)
             return
         pr = prs.get(number)
+        if self._not_work(repo, issue, comments, pr):
+            return
         footer = self._footer(repo, pr)
         lane = self._climb(repo, issue, comments, "it failed on lane %s" % _lane(issue),
                            footer=footer)
@@ -2184,6 +2202,53 @@ class Factory:
             self.move(self.gh, repo, number, "briefed", lane=lane)
         self.actions += 1
         _say("re-briefed failed %s#%d on %s" % (repo, number, lane))
+
+    @staticmethod
+    def _gave_up_since_claim(comments: Sequence[Dict[str, Any]]) -> bool:
+        """Whether _give_up's note came after the ticket's newest claim."""
+        gave_up = False
+        for c in comments:
+            body = str(c.get("body") or "")
+            if CLAIMED_RE.fullmatch(body.strip()):
+                gave_up = False
+            elif GAVE_UP in body:
+                gave_up = True
+        return gave_up
+
+    def _not_work(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
+                  pr: Optional[Dict[str, Any]]) -> bool:
+        """A failed ticket whose newest claim ended [transient], [limit],
+        [factory] or [auth] did no work for a stronger model to redo: it
+        climbs nothing, and goes back where it was on its current rung and
+        model, to loom:pr when it has a pull request, else to the queue.
+        Of 227 climbs since 2026-10-14, 43 followed such an ending
+        (loom#1395). True when it moved the ticket. A runaway or
+        needs-brain ticket stays held for the brain."""
+        klass = newest_ending_class(comments)
+        names = _labels(issue)
+        if klass == "work" or RUNAWAY in names or "needs-brain" in names:
+            return False
+        if self._gave_up_since_claim(comments):
+            # _give_up left it failed past the ladder: moving it back would
+            # only have the next pass fail it again.
+            return False
+        number = int(issue["number"])
+        if pr is not None:
+            kept = [x for x in names if x != "loom:failed"] + ["loom:pr"]
+            where = "back to loom:pr; its pull request is unchanged"
+        else:
+            kept = [x for x in brain._moved_labels(names, "queued", None)
+                    if not x.startswith("lane:")]
+            where = "back in the queue"
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        issue["labels"] = [{"name": x} for x in kept]
+        self._status_note(repo, number,
+                          "Not a failure (the newest run ended [%s]): the lane did no work on "
+                          "this ticket, so the factory did not climb the model ladder. The "
+                          "ticket is %s, on its current rung." % (klass, where))
+        self.actions += 1
+        _say("%s#%d failed with a [%s] ending; %s, no rung spent" % (repo, number, klass, where))
+        return True
 
     def _hold_no_reason(self, repo: str, issue: Dict[str, Any]) -> None:
         """Leave a ticket failed for the brain instead of climbing a second
