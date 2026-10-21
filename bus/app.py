@@ -102,6 +102,26 @@ def print_token(out: TextIO, env: Optional[Dict[str, str]] = None,
     return 0
 
 
+def print_login(out: TextIO, env: Optional[Dict[str, str]] = None,
+                transport: Optional[Transport] = None,
+                sign: Callable[[bytes, str], bytes] = openssl_sign) -> int:
+    """Print the "<slug>[bot]" login of the App the LOOM_GITHUB_APP_* settings
+    name. The brain's agent holds only the installation token, and GET /user
+    refuses one with 403, so brain.sh hands the agent this login for its
+    journal (LOOM_GITHUB_LOGIN)."""
+    env = os.environ if env is None else env
+    found = AppToken.from_env(env)
+    if found is None:
+        print("error: LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and "
+              "LOOM_GITHUB_APP_KEY_SSM (or LOOM_GITHUB_APP_KEY_FILE) name no App",
+              file=sys.stderr)
+        return 2
+    gh = GitHub(AppToken(found.app_id, found.installation_id, _key_reader(env), sign=sign),
+                transport=transport or urllib_transport)
+    out.write("%s\n" % gh.app_login())
+    return 0
+
+
 def _key_reader(env: Dict[str, str]) -> Callable[[], str]:
     """Read the key the way AppToken.from_env does: the file wins."""
     key_file = env.get(APP_KEY_FILE, "").strip()

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -75,6 +76,24 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(text.count(handoff.EARLIER_OPEN), 1)
         order = [text.index("- Decided: %s" % n) for n in ("third", "second", "first")]
         self.assertEqual(order, sorted(order))
+
+    def test_an_app_token_with_its_login_in_the_settings_never_asks_for_the_user(self):
+        # The brain's agent holds only the Brain App's installation token, and
+        # GET /user refuses an installation token with 403: the lane brain's
+        # journal failed on it (2026-10-21). brain.sh hands it the App's login.
+        class AppFake(Fake):
+            def __call__(self, method, url, headers, body):
+                if url.endswith("/user"):
+                    self.calls.append((method, "/user", None))
+                    return 403, {}, b'{"message": "Resource not accessible by integration"}'
+                return Fake.__call__(self, method, url, headers, body)
+        first = tick("2030-01-01T09:00:00Z")
+        fake = AppFake([comment(41, first, "2030-01-01T09:00:05Z", login="loom-brain[bot]")])
+        with unittest.mock.patch.dict(os.environ, {"LOOM_GITHUB_LOGIN": "loom-brain[bot]"}):
+            journal.post(GitHub("ghs_t", transport=fake), REPO, 7, tick("2030-01-01T10:00:00Z"))
+        self.assertNotIn(("GET", "/user", None), fake.calls)
+        [(method, path, _)] = fake.writes()
+        self.assertEqual((method, path), ("PATCH", "/repos/%s/issues/comments/41" % REPO))
 
     def test_the_first_tick_of_a_new_utc_day_posts_a_new_comment(self):
         fake = Fake([comment(41, tick("2030-01-01T23:50:00Z"), "2030-01-01T23:50:05Z")])
