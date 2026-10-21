@@ -22,6 +22,10 @@ from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
+# In a loom:fix comment: the head commit and a hash of what was asked, so a
+# second send-back of the same findings on the same head is told apart.
+FIX_KEY = "<!-- loom:fix-key %s -->"
+FIX_KEY_RE = re.compile(r"<!-- loom:fix-key ([0-9a-f]+:[0-9a-f]+) -->")
 
 STATES = ("queued", "briefed", "running", "pr", "answered", "failed", "merged", "shipped", "verified")
 # Tickets that hold a lane slot: waiting for a lane, in one, or back from one.
@@ -3352,19 +3356,33 @@ def _job_log_tail(gh: GitHub, repo: str, job_id: int) -> Optional[str]:
     return None if lines is None else log_excerpt(lines)
 
 
+def _run_key(run: Dict[str, Any]) -> Tuple[str, str]:
+    """What a check run is a re-run of: the workflow run's check suite (the
+    app, for a check that has no suite) and the run's name. Three workflows
+    each had a job named "trust gate (collaborator-only on self-hosted)"; keyed
+    by name alone the newest of them, a success, hid the one that failed
+    (2026-10-21: a pull request in the deploy repo was sent back with nothing to fix)."""
+    suite = (run.get("check_suite") or {}).get("id")
+    if suite is None:
+        suite = (run.get("app") or {}).get("id")
+    return "" if suite is None else str(suite), str(run.get("name") or "")
+
+
 def newest_check_runs(runs: Sequence[Any]) -> List[Dict[str, Any]]:
-    """The newest run of each check name by started_at (id breaks a tie): a
-    re-run replaces the run before it. The check-runs default filter can
-    still return an older failure after a later run of the same check passed,
-    so callers ask for filter=all and reduce here."""
-    newest: Dict[str, Dict[str, Any]] = {}
+    """The newest run of each check by started_at (id breaks a tie), where a
+    check is a name within one workflow's check suite: a re-run replaces the
+    run before it, and a job of the same name in another workflow stays. The
+    check-runs default filter can still return an older failure after a later
+    run of the same check passed, so callers ask for filter=all and reduce
+    here."""
+    newest: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for run in runs:
         if not isinstance(run, dict):
             continue
-        name = str(run.get("name") or "")
-        held = newest.get(name)
+        key = _run_key(run)
+        held = newest.get(key)
         if held is None or _run_order(run) >= _run_order(held):
-            newest[name] = run
+            newest[key] = run
     return list(newest.values())
 
 
@@ -3521,17 +3539,26 @@ def _hidden(lines: List[str]) -> List[str]:
     return [l.replace("--!>", "-- !>").replace("-->", "-- >") for l in lines]
 
 
+def _fix_header(repo: str, number: int, branch: str, key: str) -> List[str]:
+    """The first lines of a loom:fix comment: the markers the station reads,
+    the pull request and branch, and the key of this send-back when known."""
+    return [FIX_MARKER, "Pull request: %s#%d, branch %s" % (repo, number, branch),
+            BRAIN_FIX_MARKER + (" " + FIX_KEY % key if key else ""), ""]
+
+
 def _fix_body(repo: str, number: int, branch: str, notes: str,
-              checks: List[Tuple[str, str]], threads: List[Dict[str, Any]]) -> str:
+              checks: List[Tuple[str, str]], threads: List[Dict[str, Any]],
+              conflict: bool = False, key: str = "") -> str:
     """The loom:fix comment. The page and its email show the notes and one
     line for each failing check and open thread; the quoted logs and review
     text, which the lane's brief is built from, sit in an HTML comment
     neither shows (the operator got a whole review board three times by
     email, 2026-10-20). The factory reads the ### headings in it."""
-    out = [FIX_MARKER, "Pull request: %s#%d, branch %s" % (repo, number, branch),
-           BRAIN_FIX_MARKER, ""]
+    out = _fix_header(repo, number, branch, key)
     if notes.strip():
         out += [notes.strip(), ""]
+    if conflict:
+        out.append("- The branch conflicts with the default branch")
     out += ["- Check %s failed" % _shown(name) for name, _ in checks]
     hidden: List[str] = []
     if checks or threads:
@@ -3560,12 +3587,66 @@ def _fix_body(repo: str, number: int, branch: str, notes: str,
     return head + "\n\n<!-- loom:fix-detail\n" + detail + "\n-->\n"
 
 
+def _fix_digest(sha: str, notes: str, checks: List[Tuple[str, str]],
+                threads: List[Dict[str, Any]], conflict: bool,
+                lane: Optional[str], model: Optional[str]) -> str:
+    """head:hash of one send-back. The hash covers the notes, the names of the
+    failing checks (not their log tails, which change), the open thread ids,
+    the conflict and the lane and model it goes to: a different worker is new
+    information, the same worker with the same findings is not."""
+    asked = json.dumps([notes.strip(), sorted(name for name, _ in checks),
+                        sorted(str(t.get("id")) for t in threads), bool(conflict),
+                        lane or "", model or ""], sort_keys=True)
+    return "%s:%s" % (sha[:40].lower() if re.fullmatch(r"[0-9a-fA-F]+", sha) else "0",
+                      hashlib.sha256(asked.encode("utf-8")).hexdigest()[:16])
+
+
+def _generic_fix_notes(notes: str) -> bool:
+    """Are these the factory's stock notes, which say what a send-back is but
+    name nothing to fix? A brain's own notes, the unticked criteria and the
+    missing-test note each name their finding and are not generic."""
+    from . import factory  # factory imports this module
+    return not notes.strip() or notes.strip() == factory.FIX_NOTES.strip()
+
+
+def _repeats_last_fix(gh: GitHub, ticket: Tuple[str, int], issue: Dict[str, Any],
+                      digest: str) -> bool:
+    """Is the newest loom:fix comment on the ticket for this same head and
+    these same findings? (loom#1106 got six byte-identical ones in a day.)"""
+    if not int(issue.get("comments") or 0):
+        return False
+    for comment in reversed(gh.paginate("/repos/%s/issues/%d/comments" % ticket)):
+        body = str(comment.get("body") or "") if isinstance(comment, dict) else ""
+        if body.startswith(FIX_MARKER):
+            found = FIX_KEY_RE.search(body)
+            return bool(found) and found.group(1) == digest
+    return False
+
+
+def _fix_refusal(gh: GitHub, ticket: Tuple[str, int], issue: Dict[str, Any], notes: str,
+                 found: Tuple[List[Any], List[Any], bool], sha: str, digest: str) -> str:
+    """Why a send-back would say nothing new, or "": the stock notes with no
+    failing check, no open thread and no conflict; or the same head, findings
+    and worker as the newest loom:fix comment on the ticket."""
+    if not any(found) and _generic_fix_notes(notes):
+        return "it has no failing check, no open thread and no conflict"
+    if sha and _repeats_last_fix(gh, ticket, issue, digest):
+        return "the newest loom:fix comment holds this head and these findings"
+    return ""
+
+
 def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
-        lane: Optional[str] = None, model: Optional[str] = None) -> None:
+        lane: Optional[str] = None, model: Optional[str] = None) -> bool:
     """Send a lane's pull request back to the lane: the failing checks and the
     unresolved review threads go on the ticket as a loom:fix comment, and the
     ticket moves from loom:pr back to loom:briefed on the same lane, or on
-    another lane and model when given (the body's Model: line is rewritten)."""
+    another lane and model when given (the body's Model: line is rewritten).
+
+    A send-back needs something new to say. It is refused, with the reason on
+    stderr and no comment, label or model change, when the stock notes are all
+    there is (no failing check, no open thread, no conflict), and when the
+    newest loom:fix comment on the ticket already holds this head and these
+    findings. Returns True when it sent the pull request back."""
     if lane is not None and lane not in LANES:
         raise ValueError("unknown lane")
     if lane is not None and lane in REMOTE_LANES:
@@ -3578,7 +3659,15 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     sha = str((pr.get("head") or {}).get("sha") or "")
     checks = _failing_checks(gh, repo, sha) if sha else []
     threads = _open_threads(gh, repo, number)
-    body = _fix_body(repo, number, pr["head"]["ref"], notes, checks, threads)
+    conflict = pr.get("mergeable") is False
+    digest = _fix_digest(sha, notes, checks, threads, conflict, lane, model)
+    why = _fix_refusal(gh, ticket, issue, notes, (checks, threads, conflict), sha, digest)
+    if why:
+        print("brain: not sending %s#%d back for %s#%d: %s"
+              % (repo, number, ticket[0], ticket[1], why), file=sys.stderr)
+        return False
+    body = _fix_body(repo, number, pr["head"]["ref"], notes, checks, threads, conflict,
+                     digest if sha else "")
     state = next((x.split(":", 1)[1] for x in _labels(issue)
                   if x in ("loom:briefed", "loom:running", "loom:pr", "loom:failed")), "pr")
     kept = _moved_labels(_labels(issue), "briefed", lane) if state in ("pr", "failed") else None
@@ -3591,6 +3680,7 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
           file=sys.stderr)
     if kept is not None:
         gh.rest("PUT", "/repos/%s/issues/%d/labels" % ticket, {"labels": kept})
+    return True
 
 
 def item_revision(gh: GitHub, repo: str, number: int) -> Optional[str]:

@@ -801,6 +801,20 @@ the parts, one each. A note that leaves nothing to split on, a blocking
 finding or another failing check sends the pull request back for a fix round as
 before.
 
+A send-back needs something new to fix. `python3 -m bus.brain fix` (the
+factory's send-back and the brain's) posts nothing, changes no label and says
+why on stderr when the pull request has no failing check, no open review
+thread and no conflict and the notes are only the factory's stock text; notes
+that name their own finding (the brain's, the unticked criteria, the missing
+test) still go. It also posts nothing when the newest `loom:fix` comment on the
+ticket was written for the same head commit, the same findings and the same
+lane and model: the comment carries a `loom:fix-key` line for that. The factory
+sends nothing for a ticket that carries `needs-brain` (the round cap, a hold
+or a give-up put it there), and a failing check is read per workflow: a check
+run is the newest run of its name within one check suite, so a job of the same
+name in two workflows stays two checks, and the factory reads failures from
+the same reduced runs the brief quotes.
+
 When the station claims a ticket whose latest comment from an allowed login
 is such a fix comment, newer than its last claim, the brief keeps the pull
 request's branch, gets a `Fix-PR: <number>` header and ends with a `## Fix`

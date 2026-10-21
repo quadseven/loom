@@ -2142,6 +2142,128 @@ class ModelFlagTests(unittest.TestCase):
             self.assertEqual(fake.calls, [])
 
 
+def suite_run(ident, suite, conclusion, started, name="trust gate (collaborator-only on self-hosted)"):
+    return {"id": ident, "name": name, "conclusion": conclusion, "started_at": started,
+            "check_suite": {"id": suite}, "output": {"title": "%s in suite %s" % (conclusion, suite)}}
+
+
+THREE_TRUST_GATES = [suite_run(1, 100, "success", "2030-01-01T01:00:00Z"),
+                     suite_run(2, 200, "failure", "2030-01-01T01:00:05Z"),
+                     suite_run(3, 300, "success", "2030-01-01T01:00:09Z")]
+
+
+class SendBackNeedsAFindingTests(unittest.TestCase):
+    """A lane pull request goes back only with something new to fix
+    (loom#1389; 101 empty loom:fix comments on 54 tickets, 2026-10-13..21)."""
+
+    def routes(self, runs=(), pr=None, ticket=None, comments=(), threads=()):
+        ticket = dict(fix_ticket() if ticket is None else ticket)
+        if comments:
+            ticket["comments"] = len(comments)
+        graphql = {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": list(threads)}}}}}
+        return Routed({("GET", "/pulls/8"): reply(200, fix_pr() if pr is None else pr),
+                       ("GET", "/issues/9"): reply(200, ticket),
+                       ("GET", "/check-runs"): reply(200, {"check_runs": list(runs)}),
+                       ("GET", "/status"): reply(200, {"statuses": []}),
+                       ("GET", "/issues/9/comments"): reply(200, list(comments)),
+                       ("POST", "/graphql"): reply(200, graphql),
+                       ("POST", "/issues/9/comments"): reply(201, {"id": 5})})
+
+    def no_writes(self, fake):
+        self.assertEqual([c for c in fake.calls if c[0] in ("POST", "PUT", "PATCH")
+                          and "graphql" not in c[1]], [])
+
+    def test_same_named_checks_of_different_workflows_stay_separate(self):
+        newest = brain.newest_check_runs(THREE_TRUST_GATES)
+        self.assertEqual(sorted(r["id"] for r in newest), [1, 2, 3])
+        self.assertEqual([r["id"] for r in newest if r["conclusion"] == "failure"], [2])
+
+    def test_a_rerun_in_one_workflow_still_replaces_its_earlier_run(self):
+        runs = THREE_TRUST_GATES + [suite_run(4, 200, "success", "2030-01-01T02:00:00Z")]
+        newest = brain.newest_check_runs(runs)
+        self.assertEqual(sorted(r["id"] for r in newest), [1, 3, 4])
+        self.assertFalse([r for r in newest if r["conclusion"] == "failure"])
+
+    def test_failing_checks_finds_the_failure_among_same_named_runs(self):
+        fake = self.routes(runs=THREE_TRUST_GATES)
+        found = brain._failing_checks(GitHub("t", transport=fake), REPO, "abc123")
+        self.assertEqual([name for name, _ in found],
+                         ["trust gate (collaborator-only on self-hosted)"])
+        self.assertIn("failure in suite 200", found[0][1])
+
+    def test_fix_with_nothing_to_fix_posts_nothing_and_keeps_the_labels(self):
+        from bus import factory
+        fake = self.routes(runs=[suite_run(1, 100, "success", "2030-01-01T01:00:00Z")])
+        err = io.StringIO()
+        with redirect_stderr(err):
+            sent = brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), factory.FIX_NOTES,
+                             lane="codex")
+        self.assertIs(sent, False)
+        self.no_writes(fake)
+        self.assertIn("no failing check, no open thread and no conflict", err.getvalue())
+
+    def test_fix_with_a_conflict_alone_is_sent_and_names_the_conflict(self):
+        from bus import factory
+        fake = self.routes(pr=fix_pr(mergeable=False))
+        self.assertIs(brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), factory.FIX_NOTES), True)
+        body = fake.sent("POST", "/issues/9/comments")[0]["body"]
+        self.assertIn("- The branch conflicts with the default branch", body)
+
+    def test_fix_with_its_own_notes_is_sent_though_no_check_or_thread_failed(self):
+        fake = self.routes()
+        self.assertIs(brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                                "The ticket asks for a second case; add it."), True)
+        self.assertEqual(len(fake.sent("POST", "/issues/9/comments")), 1)
+
+    def test_a_second_fix_for_the_same_head_and_findings_posts_nothing(self):
+        from bus import factory
+        runs = THREE_TRUST_GATES
+        first = self.routes(runs=runs)
+        self.assertIs(brain.fix(GitHub("t", transport=first), REPO, 8, (REPO, 9), factory.FIX_NOTES), True)
+        posted = first.sent("POST", "/issues/9/comments")[0]["body"]
+        self.assertIn("<!-- loom:fix-key abc123:", posted)
+        again = self.routes(runs=runs, comments=[{"body": posted, "user": {"login": "station"}}])
+        err = io.StringIO()
+        with redirect_stderr(err):
+            sent = brain.fix(GitHub("t", transport=again), REPO, 8, (REPO, 9), factory.FIX_NOTES)
+        self.assertIs(sent, False)
+        self.no_writes(again)
+        self.assertIn("holds this head and these findings", err.getvalue())
+
+    def test_a_new_head_or_new_findings_or_another_lane_is_sent_again(self):
+        from bus import factory
+        first = self.routes(runs=THREE_TRUST_GATES)
+        brain.fix(GitHub("t", transport=first), REPO, 8, (REPO, 9), factory.FIX_NOTES)
+        posted = first.sent("POST", "/issues/9/comments")[0]["body"]
+        held = [{"body": posted, "user": {"login": "station"}}]
+        moved_head = fix_pr()
+        moved_head["head"] = dict(moved_head["head"], sha="def456")
+        cases = {
+            "new head": dict(runs=THREE_TRUST_GATES, pr=moved_head),
+            "new finding": dict(runs=THREE_TRUST_GATES + [suite_run(9, 400, "failure", "2030-01-01T01:00:10Z",
+                                                                    name="lint")]),
+        }
+        for label, kw in cases.items():
+            with self.subTest(label):
+                fake = self.routes(comments=held, **kw)
+                self.assertIs(brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                                        factory.FIX_NOTES), True)
+        other = self.routes(runs=THREE_TRUST_GATES, comments=held)
+        self.assertIs(brain.fix(GitHub("t", transport=other), REPO, 8, (REPO, 9),
+                                factory.FIX_NOTES, lane="spark"), True)
+
+    def test_only_the_newest_fix_comment_is_compared(self):
+        from bus import factory
+        first = self.routes(runs=THREE_TRUST_GATES)
+        brain.fix(GitHub("t", transport=first), REPO, 8, (REPO, 9), factory.FIX_NOTES)
+        posted = first.sent("POST", "/issues/9/comments")[0]["body"]
+        newer = "<!-- loom:fix v1 -->\nPull request: %s#8, branch loom/9-work\nother findings\n" % REPO
+        fake = self.routes(runs=THREE_TRUST_GATES, comments=[
+            {"body": posted, "user": {"login": "station"}},
+            {"body": newer, "user": {"login": "station"}}])
+        self.assertIs(brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), factory.FIX_NOTES), True)
+
+
 LANE_TABLE = "<!-- loom:lanes v1 -->\n| lane | available | heartbeat (UTC) |\n|---|---|---|\n%s"
 
 
