@@ -1519,6 +1519,10 @@ class Factory:
             return None
         lanes, model = up[rung], CLIMB[rung - 1][1]
         lane = pick_lane(lanes, self.load)
+        if rung == len(LADDER):
+            _say("%s#%d is on the last rung of the model ladder (%s on %s): one more "
+                 "failure leaves it past the ladder and its lane pull request stalls"
+                 % (repo, number, model, lane))
         body = with_model(str(issue.get("body") or ""), model)
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
         kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
@@ -1544,6 +1548,18 @@ class Factory:
                            "The brain rewrites this brief smaller, or asks the "
                            "operator one exact question." % (why, ", ".join(ran) or "none"))
         _say("%s#%d is past the last rung; left failed for the brain" % (repo, number))
+
+    def _close_past_ladder_pr(self, repo: str, pr: Dict[str, Any]) -> None:
+        """Close an open lane pull request whose ticket is past the last rung of
+        the model ladder, naming why, so the lane does not stall on it
+        indefinitely. The brain re-briefs the work as a new loom:ticket."""
+        number = int(pr["number"])
+        comment = ("Its ticket is past the last rung of the model ladder and is "
+                   "left loom:failed for the brain. Re-brief the work as a new "
+                   "loom:ticket, or close this pull request as superseded.")
+        self.close(self.gh, repo, number, comment)
+        self.actions += 1
+        _say("closed %s#%d: its ticket is past the model ladder" % (repo, number))
 
     def _send_back(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
                    comments: List[Dict[str, Any]], why: str,
@@ -2023,10 +2039,20 @@ class Factory:
             self._hold_no_reason(repo, issue)
             return
         pr = prs.get(number)
+        footer = self._footer(repo, pr)
         lane = self._climb(repo, issue, comments, "it failed on lane %s" % _lane(issue),
-                           footer=self._footer(repo, pr))
+                           footer=footer)
         if lane is None:
-            return  # it stays failed: for a free lane, or for the brain
+            if self._rungs_left(repo, issue, comments, footer):
+                return  # waits: no lane of an untried rung is up yet
+            # Past the last rung of the model ladder: leave the ticket failed
+            # for the brain, and close its open lane pull request so the lane
+            # does not stall on it indefinitely. The brain re-briefs the work
+            # as a new loom:ticket.
+            if pr is not None:
+                self._close_past_ladder_pr(repo, pr)
+            self._give_up(repo, issue, "it failed on lane %s" % _lane(issue))
+            return
         if pr is not None:
             # Back to loom:pr so the fix brief reuses its open pull request.
             kept = [x for x in _labels(issue) if x != "loom:failed"] + ["loom:pr"]

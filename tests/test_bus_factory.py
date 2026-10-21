@@ -1673,6 +1673,29 @@ class Tickets(Base):
         self.go()
         self.assertEqual((self.moved, self.fixed), ([], []))
 
+    def test_a_failed_ticket_past_the_last_rung_closes_its_lane_pull_request(self):
+        # A ticket that ran every rung is left loom:failed for the brain, but
+        # its open lane pull request is closed so the lane does not stall on it.
+        self.gh.ticket(7, "failed")
+        self.gh.comments[7] += ALL_RUNGS
+        self.gh.pull(70, 7, resolved=False)
+        self.go()
+        self.assertEqual((self.moved, self.fixed), ([], []))
+        self.assertEqual(len(self.closed), 1)
+        self.assertEqual(self.closed[0][0], 70)
+        self.assertIn("past the last rung of the model ladder", self.closed[0][1])
+        self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
+
+    def test_a_failed_ticket_climbed_to_the_last_ladder_rung_alerts(self):
+        said = []
+        with mock.patch.object(factory, "_say", said.append):
+            self.gh.ticket(8, "failed", lane="codex-2",
+                           body="Model: gpt-6-sol\nDifficulty: medium\n\n## Why\nx\n")
+            self.gh.comments[8] += [{"body": factory.RUNG_MARKER % 2, "user": ME}]
+            self.go()
+        self.assertEqual(self.moved, [(8, "briefed", "claude")])
+        self.assertTrue(any("last rung of the model ladder" in s for s in said), said)
+
     def stalled(self, number, lane="codex", body="Difficulty: medium\n\n## Why\nx\n"):
         self.gh.ticket(number, "briefed", lane=lane, body=body)
         self.gh.events[number] = [{"event": "labeled", "label": {"name": "loom:briefed"},
