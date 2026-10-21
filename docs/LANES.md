@@ -450,6 +450,15 @@ only what is its own, and adding an operator is configuration:
   routing and pull request pass, `bus.brain move`, the station's claim, pull
   request adoption and the verify picker all skip one assigned to anyone
   else. The station logs each skip once (`state/station/owned.json`).
+- A claim is not forever. Once an hour the station reads each open issue
+  another operator claims (a `claim:<login>` label not its own, or an
+  assignment to a `LOOM_TRUSTED_BRIEFERS` login). When neither the claim nor
+  any act of the claimer's on it (a comment, a label, an assignment, a
+  reference from their issue or pull request) is newer than
+  `LOOM_CLAIM_IDLE_HOURS` (default 24; 0 is off), and no open pull request of
+  theirs names it, the station removes the claim label and unassigns them,
+  at most 20 issues a run (`bus/stale_claims.py`). The issue is then this
+  Loom's like any unowned one. A label removal sends no email.
 - When the station claims a ticket, it assigns the issue to its operator
   login, the first `LOOM_BRIEF_AUTHORS` login that is not an app (`[bot]`),
   before it relabels it, and adds `claim:<that login>` with the relabel
