@@ -1327,7 +1327,7 @@ class StandingLaneHeldTest(unittest.TestCase):
         self.assertIn("- zen: held by a limit since %s" % invariants.utc(again - 3 * 3600),
                       issue["body"])
         # An edit, not a reopen: no state change and no comment (a comment mails people).
-        for method, path, body in self.gh.writes[writes:]:
+        for method, _path, body in self.gh.writes[writes:]:
             self.assertEqual(method, "PATCH")
             self.assertNotIn("state", body)
         self.assertNotIn((REPO, number), self.gh.comments)
