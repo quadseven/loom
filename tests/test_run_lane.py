@@ -2046,12 +2046,12 @@ cat > /dev/null
         # codex runs in a day ran the ladder's gpt-6-sol pin and spent the
         # weekly limit.
         self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: gpt-6-sol"))
-        self.run_lane(LOOM_CODEX_ONLY_MODEL="gpt-6-luna")
+        self.run_lane(LOOM_CODEX_ONLY_MODEL="gpt-6-luna", LOOM_CODEX_MODEL="gpt-6-luna")
         runs = [c for c in self.calls() if c.startswith("codex ")]
         self.assertTrue(runs, self.calls())
         self.assertIn("--model gpt-6-luna", runs[0])
         self.assertNotIn("gpt-6-sol", runs[0])
-        self.assertIn("runs gpt-6-luna, not the brief's gpt-6-sol", self.lane_log())
+        self.assertIn("ignores the brief's Model: gpt-6-sol", self.lane_log())
 
     def test_without_the_codex_only_model_setting_the_briefs_pin_runs(self):
         self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: gpt-6-sol"))
@@ -2482,7 +2482,8 @@ cat > /dev/null
         self.anthropic_skill_run("T045-last.md")
         self.assertEqual(snapshot.read_text(), "impeccable v2\n")
 
-    def agy_lane(self, runas_ok=True, model="gemini-3.8-flash-high", cache_link=None, agy_bin=None, **env):
+    def agy_lane(self, runas_ok=True, model="gemini-3.8-flash-high", cache_link=None, agy_bin=None,
+                 brief_model=None, **env):
         lane_home = Path(self._tmp.name) / "loomuser"
         workdir = lane_home / "lanes"
         (lane_home / "tmp").mkdir(parents=True)
@@ -2511,7 +2512,10 @@ cat > /dev/null
         self.write_tool(runas, FAKE_RUNAS if runas_ok else "#!/usr/bin/env bash\nexit 1\n")
         inbox = self.loom / "briefs" / "agy"
         inbox.mkdir(parents=True)
-        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: agy"))
+        brief = BRIEF.replace("Lane: codex", "Lane: agy")
+        if brief_model:
+            brief = brief.replace("Difficulty: medium", "Difficulty: medium\nModel: %s" % brief_model)
+        (inbox / "T042-fix-the-thing.md").write_text(brief)
         result = self.run_lane(
             "agy",
             LOOM_AGY_RUNAS=str(runas),
@@ -2700,6 +2704,18 @@ cat > /dev/null
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(agy), 1, self.calls())
         self.assertIn("--model claude-sonnet-5-5-high", agy[0])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_agy_lane_runs_its_own_flash_model_over_an_argon_pin(self):
+        # The operator, 2026-10-21: agy runs Gemini Flash only. Its lane
+        # default and hard-ticket pins were gemini-4-argon-high, which spent
+        # the shared Gemini quota until the next day.
+        _, _, result, agy = self.agy_lane(model="gemini-3.8-flash-high", brief_model="gemini-4-argon-high",
+                                          LOOM_AGY_ONLY_MODEL="gemini-3.8-flash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(agy), 1, self.calls())
+        self.assertIn("--model gemini-3.8-flash-high", agy[0])
+        self.assertIn("ignores the brief's Model: gemini-4-argon-high", self.lane_log("agy"))
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_agy_lane_uses_its_configured_effort_for_a_bare_model(self):
@@ -4288,8 +4304,8 @@ exit %d
         return subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
                               capture_output=True, text=True, check=True).stdout
 
-    def lane_log(self):
-        return (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+    def lane_log(self, lane="codex"):
+        return (self.loom / "logs" / lane / "T042-fix-the-thing.log").read_text()
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
     def test_an_unprepared_workspace_is_a_setup_failure_and_the_agent_never_runs(self):
