@@ -2201,6 +2201,25 @@ class Tickets(Base):
         # The rung it left was not failed on, so it stays untried.
         self.assertEqual(self.moved, [])
 
+    def test_a_rung_ticket_whose_only_lane_is_out_of_credit_for_a_day_climbs(self):
+        # A whole-lane limit (out of credit, no limited_models) never counted
+        # as a long wait: nine tickets waited on codex and codex-2 for a day
+        # while claude and the spark lanes had room (2026-10-21).
+        self.gh.private = False
+        body = "Model: gemini-4-argon-high\nDifficulty: hard\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="agy", body=body)
+        self.go(limited=["agy"], limit_until={"agy": NOW + 86400})
+        self.assertNotEqual(self.lane(7), "agy")
+        self.assertIn("Not a failure (lane agy is at a limit for over 2 hours)",
+                      self.gh.comments[7][-1]["body"])
+
+    def test_a_rung_ticket_whose_only_lane_frees_within_two_hours_waits(self):
+        self.gh.private = False
+        body = "Model: gemini-4-argon-high\nDifficulty: hard\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="agy", body=body)
+        self.go(limited=["agy"], limit_until={"agy": NOW + 3600})
+        self.assertEqual((self.lane(7), self.model(7)), ("agy", "gemini-4-argon-high"))
+
     def test_a_paid_rung_limited_longer_than_two_hours_uses_the_strongest_free_lane(self):
         self.gh.private = False
         body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
