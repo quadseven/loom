@@ -6362,7 +6362,7 @@ class Station:
         for number, issue in sorted(self._foreign_claimed(repo).items()):
             if released >= left:
                 break
-            owners = stale_claims.claimers(issue, self.s.authors)
+            owners = stale_claims.claimers(issue, self.s.authors, self.s.briefers)
             if not owners:
                 continue
             timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))

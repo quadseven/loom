@@ -92,10 +92,15 @@ def stale(issue: Dict[str, Any], timeline: Iterable[Any], login: str, label: str
     return bool(newest) and now - max(newest) >= idle_seconds
 
 
-def claimers(issue: Dict[str, Any], ours: Iterable[str]) -> Dict[str, str]:
+def claimers(issue: Dict[str, Any], ours: Iterable[str],
+             operators: Iterable[str] = ()) -> Dict[str, str]:
     """{login: the claim label naming it, or "" when only assigned} for each
-    owner of the issue who is not one of `ours`."""
+    other operator who owns the issue: a `claim:<login>` label not ours, or an
+    assignment to one of `operators` (LOOM_TRUSTED_BRIEFERS) or to a login a
+    claim label names. Empty when the issue is also assigned to anyone else:
+    a person this Loom knows nothing of owns it, and it is never released."""
     mine = {x.lower() for x in ours}
+    known = {x.lower() for x in operators}
     found: Dict[str, str] = {}
     for label in issue.get("labels") or []:
         name = str(label.get("name") or "") if isinstance(label, dict) else ""
@@ -105,6 +110,9 @@ def claimers(issue: Dict[str, Any], ours: Iterable[str]) -> Dict[str, str]:
                 found[login] = name
     for person in issue.get("assignees") or []:
         login = _login(person)
-        if login and login not in mine:
-            found.setdefault(login, "")
+        if not login or login in mine:
+            continue
+        if login not in known and login not in found:
+            return {}
+        found.setdefault(login, "")
     return found

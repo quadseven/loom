@@ -78,8 +78,16 @@ class Rules(unittest.TestCase):
 
     def test_our_own_claims_are_never_anyones_else(self):
         found = stale_claims.claimers(issue(1, labels=("claim:me", "claim:Other-Op"),
-                                            assignees=("me", "third")), ["me"])
-        self.assertEqual({"other-op": "claim:Other-Op", "third": ""}, found)
+                                            assignees=("me", "other-op", "briefer")),
+                                      ["me"], ["briefer"])
+        self.assertEqual({"other-op": "claim:Other-Op", "briefer": ""}, found)
+
+    def test_an_issue_also_assigned_to_an_unknown_person_is_never_released(self):
+        # Found by the automated security review: any assignee not ours was
+        # a releasable claimer, so a stranger's assignment would be removed.
+        found = stale_claims.claimers(issue(1, assignees=("other-op", "stranger")),
+                                      ["me"], ["other-op"])
+        self.assertEqual({}, found)
 
     def test_the_setting_reads_whole_hours_and_zero_is_off(self):
         self.assertEqual(24, stale_claims.idle_hours(""))
