@@ -5209,9 +5209,9 @@ class Station:
         said = self._no_change_said(lane, name)
         issue = self._issue(repo, number)
         names = _label_names(issue)
+        undoes = bool(set(names) & {REGRESSION, factory.REVERT_LABEL})
         merged = self._merged_linked(repo, issue) if (
-            issue.get("state") == "open" and RUNNING in names
-            and not set(names) & {REGRESSION, factory.REVERT_LABEL}) else []
+            issue.get("state") == "open" and RUNNING in names and not undoes) else []
         if merged:
             pr = merged[0]
             states = {"loom:" + s for s in brain.STATES}
@@ -5224,8 +5224,9 @@ class Station:
                     % (int(pr["number"]), pr.get("merged_at"), str(pr["merge_commit_sha"])[:12]))
         else:
             self._relabel(repo, number, "loom:answered")
-            note = ("No merged pull request references this ticket, so it waits at "
-                    "loom:answered for the brain to verify it or brief it again.")
+            note = ("%s, so it waits at loom:answered for the brain to verify it or brief it "
+                    "again." % ("This is a regression or revert ticket" if undoes else
+                                "No merged pull request references this ticket"))
         self._routine(repo, number, "%s\n\n%s" % (said, note))
 
     def _merged_linked(self, repo: str, issue: Dict[str, Any]) -> List[Dict[str, Any]]:

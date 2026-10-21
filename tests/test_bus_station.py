@@ -5256,6 +5256,8 @@ class NoChangeAnswerTest(Base):
                                "head": {"ref": "a-fix"}}], labels=("loom:regression",))
         self.assertIn("loom:answered", self.fake.names(12))
         self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertIn("This is a regression or revert ticket, so it waits at loom:answered",
+                      self.events()[0])
 
     def test_a_pull_request_merged_into_another_branch_does_not_count(self):
         self.no_change(pulls=[{"number": 77, "state": "closed", "merged_at": "2030-01-01T00:00:00Z",
