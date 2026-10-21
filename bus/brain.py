@@ -2445,6 +2445,15 @@ def _prioritize_write(gh: GitHub, repo: str, number: int, method: str,
                           exc.status, exc.body) from exc
 
 
+def _prioritize_note(gh: GitHub, repo: str, number: int, note: str) -> None:
+    """The priority note, a new comment; a failure names the operation."""
+    try:
+        notify.post(gh, repo, number, note, notify.NOTE)
+    except GitHubError as exc:
+        raise GitHubError("prioritize note comment failed: %s" % exc,
+                          exc.status, exc.body) from exc
+
+
 def _prioritize_body(issue: Dict[str, Any], priority: Optional[str],
                      env: Optional[Dict[str, str]],
                      difficulty: Optional[str] = None) -> str:
@@ -2477,11 +2486,7 @@ def _write_priority(gh: GitHub, repo: str, number: int, body: str,
     _prioritize_write(gh, repo, number, "PATCH", path, {"body": body},
                       "ticket body update")
     if note is not None:
-        try:
-            notify.post(gh, repo, number, note, notify.NOTE)
-        except GitHubError as exc:
-            raise GitHubError("prioritize note comment failed: %s" % exc,
-                              exc.status, exc.body) from exc
+        _prioritize_note(gh, repo, number, note)
 
 
 def prioritize(gh: GitHub, repo: str, number: int, priority: Optional[str],
@@ -2509,9 +2514,7 @@ def prioritize(gh: GitHub, repo: str, number: int, priority: Optional[str],
     if updated != body:
         _write_priority(gh, repo, number, updated, note)
     elif note is not None:
-        path = "/repos/%s/issues/%d/comments" % (repo, number)
-        _prioritize_write(gh, repo, number, "POST", path, {"body": note},
-                          "note comment")
+        _prioritize_note(gh, repo, number, note)
 
 
 def restate_live(gh: GitHub, repo: str, number: int, text: str,

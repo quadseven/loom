@@ -33,35 +33,58 @@ ALLOWED = {
 _SHELL_COMMENT = re.compile(r"""gh\s+(issue|pr)\s+comment\b|["'](issue|pr)["']\s*,\s*["']comment["']""")
 
 
-def _is_comment_post(node):
+def _assigned(scope_node):
+    """The names a function (or module) assigns, as {name: the values assigned}."""
+    assigned = {}
+    for node in ast.walk(scope_node):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assigned.setdefault(target.id, []).append(node.value)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and isinstance(node.target, ast.Name):
+            if node.value is not None:
+                assigned.setdefault(node.target.id, []).append(node.value)
+    return assigned
+
+
+def _strings(expr, assigned, depth=4):
+    """Every string literal in `expr`, following a name to what the scope
+    assigned it (`path = base + "/comments"` then `rest("POST", path, ...)`)."""
+    for part in ast.walk(expr):
+        if isinstance(part, ast.Constant) and isinstance(part.value, str):
+            yield part.value
+        elif isinstance(part, ast.Name) and depth:
+            for value in assigned.get(part.id, ()):
+                yield from _strings(value, assigned, depth - 1)
+
+
+def _is_comment_post(node, assigned=None):
     """A call that passes "POST" and a path that names an issue's comments."""
     if not isinstance(node, ast.Call):
         return False
     pieces = list(node.args)
     if not any(isinstance(a, ast.Constant) and a.value == "POST" for a in pieces):
         return False
-    for arg in pieces:
-        for part in ast.walk(arg):
-            if (isinstance(part, ast.Constant) and isinstance(part.value, str)
-                    and "comments" in part.value and "/pulls/" not in part.value):
-                return True
-    return False
+    assigned = assigned or {}
+    return any("comments" in text and "/pulls/" not in text
+               for arg in pieces for text in _strings(arg, assigned))
 
 
 def _python_posts(path, rel):
     tree = ast.parse(path.read_text(encoding="utf-8"))
     found = []
 
-    def walk(node, scope):
+    def walk(node, scope, assigned):
         for child in ast.iter_child_nodes(node):
-            inner = scope
+            inner, names = scope, assigned
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 inner = scope + [child.name]
-            if _is_comment_post(child):
+                names = _assigned(child)
+            if _is_comment_post(child, assigned):
                 found.append((rel, ".".join(scope) or "<module>"))
-            walk(child, inner)
+            walk(child, inner, names)
 
-    walk(tree, [])
+    walk(tree, [], _assigned(tree))
     return found
 
 
@@ -115,6 +138,14 @@ class RawCommentPostTest(unittest.TestCase):
                 'self._write(gh, "POST", path + "/comments", {"body": b})'):
             tree = ast.parse(source).body[0].value
             self.assertTrue(_is_comment_post(tree), source)
+        # A path built in a variable first, one or two names deep.
+        for source in (
+                'path = "/repos/%s/issues/%d/comments" % (r, n)\ngh.rest("POST", path, {})',
+                'base = "/repos/%s/issues/%d" % (r, n)\npath = base + "/comments"\n'
+                'self.gh.rest("POST", path, body)',
+                'url = f"/repos/{r}/issues/{n}/comments"\ngh.rest("POST", url, {"body": b})'):
+            module = ast.parse(source)
+            self.assertTrue(_is_comment_post(module.body[-1].value, _assigned(module)), source)
         for source in (
                 'gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (r, n), {})',
                 'gh.rest("POST", "/repos/%s/issues/%d/labels" % (r, n), {})',

@@ -388,7 +388,7 @@ def _gate_alert(gh: GitHub, goal: str, deploy: str, pr: dict[str, Any]) -> None:
     body = ("<!-- loom:journal v1 -->\n%s\nFamily gate is open; source-pin pull "
             "request %s#%d needs a brain merge review. Its merge checks or review "
             "rules did not pass." % (marker, deploy, int(pr["number"])))
-    gh.rest("POST", path, {"body": body})
+    notify.post(gh, repo, number, body, notify.JOURNAL)
 
 
 def run(gh: GitHub, documents: list[dict[str, str]],

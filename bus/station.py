@@ -7126,8 +7126,8 @@ class Station:
                    and tickets._login(c.get("user")) in ours
                    for c in self._paginate(url) if isinstance(c, dict)):
             pacer.wait()
-            self.gh.rest("POST", url, {"body": "%s\n%s" % (
-                claimed.REREVIEW_MARKER, factory.review_again())})
+            notify.post(self.gh, repo, pull, "%s\n%s" % (
+                claimed.REREVIEW_MARKER, factory.review_again()), notify.REVIEW_REQUEST)
         self._claimed_rereviews[key] = {"at": self.now, "run": stamp}
         _say("settle-claimed: asked the review bot to review %s#%d again, merged with a "
              "neutral review" % (repo, pull))
