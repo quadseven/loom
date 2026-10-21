@@ -58,6 +58,8 @@ Transport = Callable[[str, str, Dict[str, str], Optional[bytes]],
 # programmatic close in the factory funnels through GitHub.rest, so this is
 # the choke point the close-completeness gate watches.
 _ISSUE_PATH = re.compile(r"^/repos/[^/]+/[^/]+/issues/[0-9]+$")
+# The repo and issue number of an issue-comment list path.
+_COMMENTS_OF = re.compile(r"/repos/([^/]+/[^/]+)/issues/([0-9]+)/comments(?:\?|$)")
 
 # Labels that let an issue close as completed with unchecked boxes, mirroring
 # the close-completeness guard's escape hatches.
@@ -498,6 +500,11 @@ class GitHub:
         # client's own App bot login is added on first use; a caller adds its
         # trusted writers (the station its LOOM_BRIEF_AUTHORS).
         self.status_authors: set = set()
+        # Whether this client keeps a ticket's routine events in the issue
+        # body's status section and reads them back (bus/status.py, loom#1341).
+        # The station, the brain and the dashboard turn it on, together: a
+        # client that does not read the section must not write into it.
+        self.status_in_body = False
         self._sleep = sleep
         self.api = api.rstrip("/")
         self.transport = transport or urllib_transport
@@ -532,6 +539,7 @@ class GitHub:
 
     def rest(self, method: str, path: str, body: Any = None,
              etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
+        body = self._keep_status_section(method, path, body)
         resp = self._rest(method, path, body, etag, ok)
         if method == "POST" and self.unsubscribe and self.app is None:
             self._leave_thread(path, resp.data)
@@ -539,9 +547,67 @@ class GitHub:
             # A ticket's status comment reads as one comment per event, so
             # every reader of those events sees them as before (loom#866).
             expanded = status.expand(resp.data, self._status_logins())
+            expanded = self._with_body_events(path, expanded)
             if expanded is not resp.data:
                 resp = Response(resp.status, expanded, resp.etag, resp.headers)
         return resp
+
+    def _with_body_events(self, path: str, items: Any) -> Any:
+        """The first page of a ticket's comments with the events of its issue
+        body's status section added, one pseudo-comment each (loom#1341). They
+        carry the issue author's login, trusted only when it is one of ours,
+        and a negative id: no comment holds them, so nothing can edit one."""
+        found = _COMMENTS_OF.search(path)
+        if not self.status_in_body or not found:
+            return items
+        allowed = self._status_logins()
+        if not allowed or _page_of(path) != 1 or not isinstance(items, list):
+            return items
+        try:
+            issue = self._rest("GET", "/repos/%s/issues/%s" % found.groups()).data
+        except GitHubError as err:
+            if err.status == 404:
+                return items  # the issue is gone or moved: no section to read
+            raise
+        if not isinstance(issue, dict) or "pull_request" in issue:
+            return items
+        user = issue.get("user")
+        if not isinstance(user, dict) or str(user.get("login") or "").lower() not in allowed:
+            return items
+        events = status.body_events(issue.get("body"))
+        if not events:
+            return items
+        ident = issue.get("id")
+        ident = -ident if isinstance(ident, int) and not isinstance(ident, bool) and ident else -1
+        extra = []
+        for at, text in reversed(events):
+            extra.append({"id": ident, "user": user, "body": text, "created_at": at,
+                          "updated_at": at, status.EXPANDED: True, status.FROM_BODY: True})
+        return status.resort(list(items) + extra)
+
+    def _keep_status_section(self, method: str, path: str, body: Any) -> Any:
+        """A PATCH that sets an issue's body keeps the status section the issue
+        has now: the caller read the body some time ago, and the station may
+        have added events since (loom#1341). The status writer's own PATCH
+        (status.OwnBody) is left as it is."""
+        if (method != "PATCH" or not _ISSUE_PATH.match(path) or not isinstance(body, dict)
+                or isinstance(body, status.OwnBody) or "body" not in body):
+            return body
+        allowed = self._status_logins() if self.status_in_body else set()
+        if not allowed:
+            return body
+        issue = self._rest("GET", path, etag=status.FRESH).data
+        user = issue.get("user") if isinstance(issue, dict) else None
+        if not isinstance(user, dict) or str(user.get("login") or "").lower() not in allowed:
+            return body
+        events = status.body_events(issue.get("body"))
+        if not events or status.body_events(body.get("body")) == events:
+            return body
+        try:
+            kept = status.with_body_events(str(body.get("body") or ""), events)
+        except ValueError:
+            return body
+        return dict(body, body=kept)
 
     def _rest(self, method: str, path: str, body: Any = None,
               etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:

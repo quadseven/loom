@@ -283,6 +283,7 @@ class TicketStore:
             # brain and the station read them (bus/status.py): on a token, not
             # only an App, the timeline still shows each push and failure.
             gh.status_authors |= {a.lower() for a in brain.trusted_authors()}
+            gh.status_in_body = True  # events in the issue body too (loom#1341)
         self.gh = gh
         self.budget_floor = (int(os.environ.get("LOOM_DASHBOARD_BUDGET_FLOOR", "500"))
                              if budget_floor is None else budget_floor)

@@ -854,6 +854,32 @@ opened, a failure, merged, shipped, verified, an ask, a runaway hold) and
 comment per event, timed by its line, so every reader sees each event as the
 comment it used to be. Only a trusted login's status comment is edited.
 
+The first routine event on a ticket used to post that comment, and so emailed
+the operator once per ticket (loom#1341). Where the client keeps events in the
+issue body (`GitHub.status_in_body`, on for the station, the brain and the
+dashboard), a ticket with no status comment gets its events in a section at the
+end of the issue body instead, between `<!-- loom:status-body v1 begin -->` and
+`<!-- loom:status-body v1 end -->`, same `- <UTC time> <text>` lines, newest
+first; a body edit sends no email. A ticket that already has a status comment
+keeps editing it. Rules:
+
+- Only an issue written by a trusted login or the App has its section written
+  or read; for any other issue the event goes to a comment as before.
+- The client reads the section into the first page of every comment list as one
+  comment per event, by the issue author's login and a negative id (no comment
+  holds it), so the readers (`factory.attempts`, the ready mark, the rung climb)
+  count them as before. That costs one conditional issue read per comment list.
+- The writer reads the body in full, merges its event into the section, reads
+  the body again just before the PATCH and starts over if it moved; after three
+  moves it posts a comment rather than overwrite an operator edit. GitHub has no
+  conditional issue write, so an edit landing inside the one request between
+  that second read and the PATCH can still be lost.
+- Any other body PATCH through the client keeps the section the issue has now
+  (the caller's copy may be older), so a rewrite, a model header change or a
+  regression note never drops events.
+- `tickets.parse` leaves the section out of the brief and `with_original` does
+  not quote it.
+
 ## Polling budget
 
 The GitHub API limit (5,000 requests an hour) is shared by every client of
