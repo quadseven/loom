@@ -3337,10 +3337,23 @@ class FixTest(Base):
                 station.Station(GitHub("token", transport=self.fake), self.settings).run_pass()
         self.assertEqual(reasons, ["pre-roll findings without dispositions: F1"])
 
+    def test_a_finished_fix_that_pushed_no_commit_does_not_report_pushed_fixes(self):
+        self.fake.add(12, state="running")
+        fix = tickets.parse_fix(REPO, FIX_BODY)
+        name = tickets.ticket_name(REPO, 12, 2)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex", 2, fix))
+        self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
+        self.run_pass()
+        texts = [text for c in self.fake.comments[12] for _, text in status.parse(c["body"])]
+        self.assertEqual(texts, ["Lane codex made no code change for a fix to a pull request: "
+                                 "https://example.com/pull/99"])
+
     def test_a_finished_fix_reports_pushed_fixes(self):
         self.fake.add(12, state="running")
         fix = tickets.parse_fix(REPO, FIX_BODY)
         name = tickets.ticket_name(REPO, 12, 2)
+        self.write(os.path.join(self.home, "logs", "codex", name + ".pushed"), "")
         self.write(self.inbox("codex", "done", name + ".md"),
                    tickets.render_brief(REPO, self.fake.issues[12], "codex", 2, fix))
         self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]

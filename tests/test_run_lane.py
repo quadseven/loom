@@ -1156,6 +1156,9 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("- `%s` `%s`" % (head[:7], subject), text)
         self.assertIn("CI and review run again on the new head; the factory lands the "
                       "pull request once they pass.", text)
+        # The station reads this marker to say a round pushed; without it the
+        # round is reported as a no-code-change round.
+        self.assertTrue((self.loom / "logs" / "codex" / "T042-fix-the-thing.pushed").exists())
 
     def test_fix_runner_posts_and_resolves_agent_thread_replies_after_push(self):
         self.fix_brief()

@@ -4450,7 +4450,15 @@ class Station:
                 # A fix round's push is routine (the pull request already
                 # exists and the lane comments on it): three of them emailed
                 # one ticket's author on 2026-10-20.
-                self._routine(repo, number, "Lane %s pushed fixes to a pull request: %s" % (lane, url))
+                # Only a run that pushed a commit says so: a round that answered
+                # threads or repaired text, or whose check was stale, pushed
+                # nothing (zippie-style loop, 2026-10-19).
+                if self._pushed(lane, name):
+                    self._routine(repo, number, "Lane %s pushed fixes to a pull request: %s"
+                                  % (lane, url))
+                else:
+                    self._routine(repo, number, "Lane %s made no code change for a fix to a "
+                                  "pull request: %s" % (lane, url))
             else:
                 self._comment(repo, number, "Lane %s opened a pull request: %s" % (lane, url))
             _say("reported %s#%d done: %s" % (repo, number, url))
@@ -4767,6 +4775,11 @@ class Station:
         thread the brief asked about, on its pull request, gets one."""
         asked = set(factory.FIX_THREAD_RE.findall(brief))
         self._post_thread_answers(repo, {pr}, lane, name, brief, asked)
+
+    def _pushed(self, lane: str, name: str) -> bool:
+        """Did the runner push a commit for this run? Read from the runner's
+        marker file (lanes/run_lane.sh), never from the log."""
+        return os.path.isfile(os.path.join(self.s.home, "logs", lane, name + ".pushed"))
 
     def _answered(self, lane: str, name: str) -> bool:
         """Did the runner report this run answered: it committed nothing

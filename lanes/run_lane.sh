@@ -2288,7 +2288,7 @@ for BRIEF in "$INBOX"/*.md; do
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
   rm -f "$WORKDIR/$TICKET.described-step" "$WORKDIR/$TICKET.opencode-events"
-  rm -f "$LOGDIR/$TICKET.answered"
+  rm -f "$LOGDIR/$TICKET.answered" "$LOGDIR/$TICKET.pushed"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
          { [ -n "$FIX_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
@@ -2653,6 +2653,8 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "push failed" transient; continue
     fi
     [ -z "$PUSH_OUT" ] || printf '%s\n' "$PUSH_OUT" >> "$LOG"
+    # The station reads this marker, not the log, to say the round pushed.
+    : > "$LOGDIR/$TICKET.pushed"
   fi
   if [ -n "$FIX_PR" ]; then
     post_replies
