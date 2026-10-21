@@ -35,6 +35,10 @@ Neither needs a model:
   a repo in LOOM_NO_TEST_REPOS (one with no test harness) and a ticket whose
   body says "Tests: none needed (<reason>)" skip the check. The send-back is
   a finding round: it climbs only when the next round still adds no test.
+- A pull request whose only failing check is the review check, failed on a
+  note asking for the change to be split (bus/split.py), is not sent back: the
+  parts are filed as tickets and the pull request is closed with a pointer
+  (loom#1218). A blocking finding or another failing check goes back as usual.
 - A pull request on a public repo is checked against its ticket before it
   lands (bus/scope_fit.py, LOOM_SCOPE_CHECK_URL): a cheap model is asked
   whether the changed files fit the ticket's What section and the repos and
@@ -136,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, change_class, labels, naming, scope_fit, status, tickets
+from . import brain, change_class, labels, naming, scope_fit, split, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -1883,7 +1887,8 @@ class Factory:
             details = brain._pr_graphql(self.gh, repo, number)
             faults = pr_faults(details, full)
         if faults == ["failing checks"] and (
-                self._repair_body_leak(repo, number, full, issue, comments, sha)
+                self._split_pr(repo, number, full, issue, comments, sha)
+                or self._repair_body_leak(repo, number, full, issue, comments, sha)
                 or self._run_again(repo, number, sha)
                 or self._review_again(repo, number, full, sha)):
             return
@@ -1892,6 +1897,85 @@ class Factory:
                             ", ".join(faults), open_thread_ids(details), "failing checks" in faults)
         elif review == "reviewed":
             self._land_or_ask_test(repo, number, full, issue, comments, sensitive)
+
+    def _split_summary(self, issue: Dict[str, Any], sha: str) -> Optional[str]:
+        """The review check's summary when it is the only failing check and
+        failed on a note asking for a split (bus/split.py), else None."""
+        if "loom:human" in _labels(issue):
+            return None
+        failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
+        if len(failed) != 1 or failed[0].get("name") != self.review_check:
+            return None
+        output = failed[0].get("output") or {}
+        title, summary = str(output.get("title") or ""), str(output.get("summary") or "")
+        return summary if split.asks_split(title, summary) else None
+
+    def _file_parts(self, repo: str, number: int, issue: Dict[str, Any],
+                    summary: str) -> Optional[List[int]]:
+        """File the parts of a split as queued tickets and return their
+        numbers, or None, with nothing filed, when the note leaves nothing to
+        split on or the text of a part is refused by the written-text check."""
+        ticket = int(issue["number"])
+        body = str(issue.get("body") or "")
+        criteria = acceptance_criteria(body)
+        parts = split.plan(summary, criteria)
+        if parts is None:
+            _say("%s#%d: the review asks for a split but names nothing to split on"
+                 % (repo, number))
+            return None
+        headers, epic = split.header_lines(body), split.epic_of(body, ticket)
+        drafts = []
+        for index, part in enumerate(parts, start=1):
+            name = "%s (part %d of %d)" % (str(issue.get("title") or "").strip(),
+                                           index, len(parts))
+            drafts.append((name[:100], split.ticket_body(
+                ticket, number, headers, part, index, len(parts), epic, criteria)))
+        try:
+            for name, text in drafts:
+                brain._check_written_text(name + "\n" + text)
+        except ValueError as err:
+            # Ticket text the written-text check refuses must not stop the pass,
+            # nor leave half the parts filed; the usual fix round handles it.
+            _say("%s#%d: split ticket text refused (%s)" % (repo, number, err))
+            return None
+        return [int((self.gh.rest("POST", "/repos/%s/issues" % repo, {
+            "title": name, "body": text, "labels": ["loom:ticket", "loom:queued"]}).data
+            or {})["number"]) for name, text in drafts]
+
+    def _split_pr(self, repo: str, number: int, full: Dict[str, Any],
+                  issue: Dict[str, Any], comments: List[Dict[str, Any]], sha: str) -> bool:
+        """When the review check is the only failing check and failed on a note
+        asking for the pull request to be split, file the parts as tickets and
+        close the pull request with a pointer, instead of another fix round
+        that cannot split it (loom#1218). Any other failing check or finding
+        goes back as before. False leaves the pull request to the usual
+        paths, as does a note that leaves nothing to split on."""
+        summary = self._split_summary(issue, sha)
+        if summary is None:
+            return False
+        ticket = int(issue["number"])
+        marker = split.SPLIT_MARKER % number
+        done = next((str(c.get("body") or "") for c in comments
+                     if marker in str(c.get("body") or "")), None)
+        if done is None:
+            filed = self._file_parts(repo, number, issue, summary)
+            if filed is None:
+                return False
+            done = ("%s\nPull request #%d failed the review check only on a note asking for it "
+                    "to be split, and no fix round can split it, so it is closed and this "
+                    "ticket is split into %s." % (
+                        marker, number, ", ".join("#%d" % n for n in filed)))
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, ticket), {"body": done})
+        names = ", ".join(re.findall(r"#\d+", done.partition("split into")[2])) or "new tickets"
+        self.close(self.gh, repo, number,
+                   "Closed by the station: the review asked for this change to be split and "
+                   "no fix round can do it. The work continues as %s." % names)
+        self._relabel(repo, issue, brain._moved_labels(_labels(issue), "closed-unmerged", None))
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, ticket),
+                     {"state": "closed", "state_reason": "not_planned"})
+        self.actions += 1
+        _say("split %s#%d into %s and closed it" % (repo, number, names))
+        return True
 
     def _repair_body_leak(self, repo: str, number: int, full: Dict[str, Any],
                           issue: Dict[str, Any], comments: List[Dict[str, Any]],
