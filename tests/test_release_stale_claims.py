@@ -99,6 +99,7 @@ class Rules(unittest.TestCase):
 class Fake:
     def __init__(self):
         self.issues, self.timelines, self.writes = {}, {}, []
+        self.pulls = []
 
     def __call__(self, method, url, headers, body):
         parts = urlsplit(url)
@@ -117,6 +118,10 @@ class Fake:
                      if (label and label in [x["name"] for x in i["labels"]])
                      or (who and who in [a["login"] for a in i["assignees"]])]
             return 200, {}, json.dumps(found).encode()
+        if rest == "pulls":
+            return 200, {}, json.dumps(self.pulls).encode()
+        if rest.endswith("/comments"):
+            return 200, {}, b"[]"
         if rest.endswith("/timeline"):
             number = int(rest.split("/")[1])
             return 200, {}, json.dumps(self.timelines.get(number, [])).encode()
@@ -155,6 +160,67 @@ class Step(unittest.TestCase):
 
     def test_from_env_turns_it_on_at_24_hours(self):
         self.assertEqual(24, station.Settings.from_env({}).claim_idle_hours)
+
+
+def own(number, labels=("claim:me", "loom:briefed"), assignees=(), created=10 * DAY):
+    return issue(number, labels=labels, assignees=assignees, created=created)
+
+
+class OwnRules(unittest.TestCase):
+    """This Loom's own claim lapses when no lane works the ticket (loom#1217)."""
+
+    def lapsed(self, found, line, pulls=()):
+        return stale_claims.lapsed(found, line, pulls, "claim:me", time.time(), DAY)
+
+    def test_a_claim_with_no_run_and_no_pull_request_activity_lapses(self):
+        line = [labeled("claim:me", "me", 3 * DAY), labeled("loom:briefed", "bot", 2 * DAY)]
+        self.assertTrue(self.lapsed(own(1), line, [at(2 * DAY)]))
+
+    def test_a_run_in_progress_keeps_the_claim(self):
+        found = own(1, labels=("claim:me", "loom:running"))
+        self.assertFalse(self.lapsed(found, [labeled("claim:me", "me", 3 * DAY)]))
+
+    def test_a_pull_request_updated_within_the_limit_keeps_the_claim(self):
+        line = [labeled("claim:me", "me", 3 * DAY)]
+        self.assertFalse(self.lapsed(own(1), line, [at(2 * DAY), at(3600)]))
+
+    def test_a_recent_event_on_the_ticket_keeps_the_claim(self):
+        for line in ([labeled("loom:running", "bot", 3600)], [commented("someone", 3600)]):
+            with self.subTest(line=line[0]["event"]):
+                self.assertFalse(self.lapsed(own(1), line))
+
+    def test_a_claim_without_a_loom_label_never_lapses_here(self):
+        found = own(1, labels=("claim:me",))
+        self.assertFalse(self.lapsed(found, [labeled("claim:me", "me", 9 * DAY)]))
+
+    def test_a_wait_label_does_not_keep_the_claim(self):
+        found = own(1, labels=("claim:me", "wait:model-limit"))
+        self.assertTrue(self.lapsed(found, [labeled("claim:me", "me", 3 * DAY)]))
+
+    def test_own_claims_are_the_labels_naming_our_logins(self):
+        found = stale_claims.own_claims(issue(1, labels=("claim:Me", "claim:other-op")), ["me"])
+        self.assertEqual({"me": "claim:Me"}, found)
+
+
+class OwnStep(unittest.TestCase):
+    setUp = Step.setUp
+    run_step = Step.run_step
+
+    def test_an_unworked_claim_is_dropped_with_a_status_note(self):
+        self.fake.issues[1] = own(1, assignees=("me",))
+        self.fake.timelines[1] = [labeled("claim:me", "me", 3 * DAY)]
+        self.fake.issues[2] = own(2)
+        self.fake.timelines[2] = [labeled("claim:me", "me", 3 * DAY)]
+        self.fake.pulls = [{"number": 9, "body": "Refs #2", "updated_at": at(60)}]
+        self.fake.issues[3] = own(3, labels=("claim:me", "loom:running"))
+        self.run_step()
+        methods = [(m, p) for m, p, _ in self.fake.writes]
+        self.assertEqual([("DELETE", "issues/1/labels/claim:me"),
+                          ("DELETE", "issues/1/assignees"),
+                          ("POST", "issues/1/comments")], methods)
+        note = self.fake.writes[-1][2]["body"]
+        self.assertIn("Released the claim label claim:me", note)
+        self.assertIn("24 hours", note)
 
 
 if __name__ == "__main__":
