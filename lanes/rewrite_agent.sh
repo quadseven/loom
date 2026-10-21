@@ -155,7 +155,17 @@ for i in "${!MODELS[@]}"; do
       # the public rewriter names one: bus/rewrite.command_for refuses a
       # private command with a free/ entry, as the provider may train on it.
       command -v "$BIN" > /dev/null || fail "$BIN not on PATH"
-      if [[ "${LOOM_REWRITE_FREE_URL:-}" =~ ^https://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]]; then
+      # The gateway cools a free pool for about 5 minutes after a refusal, and
+      # every rewrite in a burst then spent its whole free limit before the
+      # next model answered (2026-10-21). A failed free entry starts a
+      # cooldown (LOOM_REWRITE_FREE_COOLDOWN seconds, default 300) in which
+      # later runs pass it over at once.
+      COOL_FILE="$LOOM_HOME/state/rewrite-free.cooldown"
+      COOL_UNTIL="$(tr -cd '0-9' < "$COOL_FILE" 2>/dev/null)"
+      if [ -n "$COOL_UNTIL" ] && [ "$COOL_UNTIL" -gt "$(date +%s)" ]; then
+        echo "the free pool is cooling down until $(date -u -r "$COOL_UNTIL" +%FT%TZ 2>/dev/null || echo "$COOL_UNTIL")" > "$OUT"
+        false
+      elif [[ "${LOOM_REWRITE_FREE_URL:-}" =~ ^https://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]]; then
         # A cooled-down free pool answers 503 with a retry-after and opencode
         # keeps retrying, so a free entry gets its own short limit
         # (LOOM_REWRITE_FREE_TIMEOUT, default 90 seconds) before the next
@@ -176,6 +186,12 @@ for i in "${!MODELS[@]}"; do
       opencode_run "$KEY_VAR" "$BIN" --format json > "$OUT" ;;
   esac
   status=$?
+  if [ "$PROVIDER" = free ] && [ -n "${COOL_UNTIL:-}" ] && [ "$COOL_UNTIL" -gt "$(date +%s)" ]; then
+    reason="$(head -c 200 "$OUT")"
+    REASONS="${REASONS:+$REASONS; }$MODEL: $reason"
+    echo "rewrite_agent: passed over $MODEL: $reason" >&2
+    continue
+  fi
   if [ "$PROVIDER" = codex ] || [ "$PROVIDER" = claude ]; then
     reason="$(python3 -I -c "$LANE_EXTRACT" "$OUT" "$PROVIDER" 2>&1 > "$ANSWER_FILE")"
   else
@@ -190,6 +206,7 @@ for i in "${!MODELS[@]}"; do
     if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
       case "$ANSWER" in *"$CLAUDE_CODE_OAUTH_TOKEN"*) fail "the answer holds the subscription token" ;; esac
     fi
+    [ "$PROVIDER" != free ] || rm -f "$COOL_FILE"
     # The station logs which model answered (bus/rewrite.run_agent).
     echo "rewrite_agent: answered by $MODEL" >&2
     printf '%s\n' "$ANSWER"
@@ -213,5 +230,10 @@ for i in "${!MODELS[@]}"; do
   fi
   REASONS="${REASONS:+$REASONS; }$MODEL: $why"
   echo "rewrite_agent: passed over $MODEL: $why" >&2
+  if [ "$PROVIDER" = free ]; then
+    COOLDOWN="${LOOM_REWRITE_FREE_COOLDOWN:-300}"
+    [[ "$COOLDOWN" =~ ^[0-9]+$ ]] || COOLDOWN=300
+    mkdir -p "$LOOM_HOME/state" && printf '%s\n' "$(( $(date +%s) + COOLDOWN ))" > "$COOL_FILE"
+  fi
 done
 fail "all models failed: $REASONS"
