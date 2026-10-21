@@ -7384,7 +7384,7 @@ class Station:
                            ("in_flight", bool(labels & {"loom:queued", "loom:briefed",
                                                         "loom:running", "loom:pr"})),
                            ("needs_difficulty", "loom:queued" in labels and
-                            not factory.tier_lanes(issue, False)),
+                            not factory.has_difficulty(issue)),
                            ("asks", bool(labels & {NEEDS_OPERATOR, HUMAN}))):
             if hit:
                 found.append(group)

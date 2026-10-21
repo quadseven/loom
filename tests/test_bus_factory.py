@@ -47,6 +47,7 @@ class FakeGitHub:
         self.issues = {}
         self.comments = {}
         self.events = {}
+        self.reviews = {}
         self.pulls = {}
         self.runs = {}
         self.details = {}
@@ -111,6 +112,9 @@ class FakeGitHub:
         m = re.search(r"/issues/(\d+)/events$", path)
         if m:
             return list(self.events[int(m.group(1))])
+        m = re.search(r"/pulls/(\d+)/reviews$", path)
+        if m:
+            return list(self.reviews.get(int(m.group(1)), []))
         raise AssertionError("unexpected paginate %s" % path)
 
     def rest(self, method, path, body=None, etag=None, ok=()):
@@ -154,6 +158,12 @@ class FakeGitHub:
 
     def _write(self, method, path, body):
         self.writes.append((method, path, body))
+        m = re.search(r"/pulls/(\d+)/reviews/(\d+)/dismissals$", path)
+        if m:
+            for review in self.reviews.get(int(m.group(1)), []):
+                if review["id"] == int(m.group(2)):
+                    review["state"] = "DISMISSED"
+            return Response(200, {})
         if path.endswith("/update-branch"):
             return Response(self.update_status, {})
         if method == "POST" and path.endswith("/issues"):
@@ -214,6 +224,9 @@ class Base(unittest.TestCase):
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
            down=(), limit_until=None):
         def merge(gh, repo, number, ticket):
+            # As GitHub does: a standing change request blocks the merge.
+            if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
+                raise GitHubError("PUT /repos/%s/pulls/%d/merge -> 405" % (repo, number), 405)
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes, lane=None, model=None):
             f.notes = notes
@@ -349,6 +362,29 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.merged, [])
         self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+
+    def test_a_ready_pull_request_blocked_by_the_review_bots_old_change_request_lands(self):
+        # The bot's failing review left a change request that its own later
+        # green review on the same head never dismissed, and the merge was
+        # refused every pass (2026-10-21).
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.reviews[50] = [{"id": 7, "state": "CHANGES_REQUESTED",
+                                "user": {"login": "grug-tribe[bot]", "type": "Bot"}}]
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        (dismissal,) = [w for w in self.gh.writes if w[1].endswith("/reviews/7/dismissals")]
+        self.assertEqual(dismissal[2]["event"], "DISMISS")
+        self.assertIn(factory.DEFAULT_REVIEW_CHECK, dismissal[2]["message"])
+
+    def test_a_persons_change_request_is_never_dismissed(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.reviews[50] = [{"id": 8, "state": "CHANGES_REQUESTED",
+                                "user": {"login": "Alice-Example", "type": "User"}}]
+        self.go()
+        self.assertEqual(self.merged, [])
+        self.assertFalse([w for w in self.gh.writes if "/dismissals" in w[1]])
 
     def test_code_with_a_test_on_a_later_page_lands(self):
         self.gh.ticket(5, "pr")
@@ -1457,11 +1493,6 @@ class Queued(Base):
         self.assign(available=["codex"])
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
 
-    def test_missing_difficulty_stays_queued(self):
-        self.queued(7, body="## Why\nx\n")
-        self.assign(available=["codex"])
-        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
-
     def test_oldest_takes_the_free_lane_first(self):
         self.queued(7, age=60)
         self.queued(8, age=600)
@@ -1503,6 +1534,15 @@ class Queued(Base):
             self.assign(available=[])
         say.assert_called_once_with("assigned 0 of 1 queued: %s#7 waits: no free lane "
                                     "in tier medium" % REPO)
+
+    def test_a_queued_ticket_with_no_difficulty_takes_a_medium_lane(self):
+        # A queued ticket whose body had no Difficulty line was in no tier, so
+        # no lane could ever take it; one waited a day (2026-10-21).
+        for body in ("Priority: P2\n\n## Why\nx\n", "Difficulty: Medium-ish\n\n## Why\nx\n"):
+            with self.subTest(body=body):
+                self.queued(7, body=body)
+                self.assign(available=["codex"])
+                self.assertEqual(self.lane(7), "codex")
 
     def test_a_pass_that_assigns_a_queued_ticket_says_no_count(self):
         self.queued(7, age=600)
