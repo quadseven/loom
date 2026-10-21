@@ -11,8 +11,8 @@ Filer files each breach as one loom:invariant issue on the factory's goal
 home, deduplicated by invariant and subject: a breach whose issue is open
 files nothing, and one whose issue was closed reopens it only for evidence
 newer than the close. A rolling breach (ticket-outside-epic, lane-held,
-lane-failing-streak, silent-lane) is one issue for its whole cause, a line per
-goal home or lane, and its open issue is rewritten in place whenever what it
+lane-failing-streak, silent-lane, roll-pin-off) is one issue for its whole
+cause, a line per goal home or lane, and its open issue is rewritten in place whenever what it
 lists changes; an older open issue of the same invariant is folded into it.
 lane-no-success stays one issue per lane: the station reads its per-lane keys
 to release runaways a dead lane held. Adding an invariant is one function in
@@ -113,6 +113,9 @@ LANES_SUBJECT = "every lane"
 # factory gives for a ticket's wait is a line in one issue, so a lane outage
 # that holds forty tickets is one line, not forty issues.
 TICKETS_SUBJECT = "every ticket"
+# The one subject of the rolling roll-pin-off breach: each goal home that
+# ships by roll with no roll ship document is a line in one issue.
+ROLL_SUBJECT = "every roll goal"
 # How long a ticket may wait for one reason the factory repeats every pass
 # before it is raised: six fix rounds waited nine hours on a lane at a limit
 # above the last rung of the ladder, logged every pass and raised by nothing
@@ -279,6 +282,10 @@ class Facts:
     label_refusals: Optional[Dict[str, int]] = None
     # Last, so no positional construction shifts.
     waits: Optional[List[Wait]] = None
+    # The goal homes whose body names a roll that no LOOM_ROLL_SHIP_DOCS
+    # entry names, and how many entries there are.
+    roll_goals: Optional[List[Ref]] = None
+    roll_docs: int = 0
 
 
 @dataclass(frozen=True)
@@ -775,6 +782,24 @@ def gate_hold(f: Facts) -> List[Breach]:
     return out
 
 
+def roll_pin_off(f: Facts) -> List[Breach]:
+    """Goal homes that ship by roll with no roll ship document: the station
+    opens no source-pin pull request when their module changes merge."""
+    if not f.roll_goals:
+        return []
+    why = ("No LOOM_ROLL_SHIP_DOCS entry names them" if f.roll_docs else
+           "LOOM_ROLL_SHIP_DOCS is empty, so the station's roll source-pin pass is off")
+    return [Breach("roll-pin-off", ROLL_SUBJECT,
+                   ("1 goal home ships" if len(f.roll_goals) == 1 else
+                    "%d goal homes ship" % len(f.roll_goals)) + " by roll with no source-pin pass",
+                   ("Goal homes whose body names a roll: %s" % _refs(f.roll_goals),
+                    why + "; their merged module changes wait for a brain to bump the pins",
+                    "Give each ship document a loom-roll-pins block and add an entry for its "
+                    "goal home to LOOM_ROLL_SHIP_DOCS in the station environment "
+                    "(README.md, Roll source pins)"),
+                   f.now, rolling=True)]
+
+
 def _decision(kind: str) -> str:
     """The decision an event kind reports on: rewrite_failed, rewrite_skipped
     and rewrite_succeeded all report on rewrite."""
@@ -842,7 +867,7 @@ INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
     plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
     repeated_failure, ticket_waiting,
-    untrusted_labeler)
+    untrusted_labeler, roll_pin_off)
 
 
 def check(facts: Facts, say: Say,

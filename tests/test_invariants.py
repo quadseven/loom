@@ -1305,3 +1305,49 @@ class StandingEpicTest(unittest.TestCase):
         f = Facts(T0, shapes=[invariants.GoalShape(goal, 6, epics + (repairs,), ())])
         self.assertEqual(invariants.epic_over_cap(f), [])
         self.assertEqual(invariants.goal_epics_over_cap(f), [])
+
+
+class RollPinOffTest(StationBase):
+    """A goal home whose ship rules name a roll, with no roll ship document
+    naming it: its merged module changes get no source-pin pull request, and
+    the station said nothing about it (loom#528)."""
+
+    def roll_goal(self, repo=REPO, number=GOAL):
+        self.gh.goal_issues[repo] = [{
+            "number": number, "title": "A server goal", "labels": [{"name": "loom:goal"}],
+            "body": "Ship rules: at most one server roll per hour."}]
+
+    def test_the_invariant_names_each_roll_goal_in_one_rolling_breach(self):
+        goals = [Ref("%s#%d" % (REPO, GOAL), "#%d" % GOAL),
+                 Ref("%s#3" % OTHER, "issue 3 of a private repo")]
+        self.assertEqual(invariants.roll_pin_off(Facts(T0)), [])  # not read
+        self.assertEqual(invariants.roll_pin_off(Facts(T0, roll_goals=[])), [])
+        (b,) = invariants.roll_pin_off(Facts(T0, roll_goals=goals))
+        self.assertTrue(b.rolling)
+        self.assertEqual(b.subject, invariants.ROLL_SUBJECT)
+        self.assertIn("2 goal homes", b.title)
+        self.assertTrue(any("LOOM_ROLL_SHIP_DOCS is empty" in line for line in b.evidence))
+        self.assertTrue(any("issue 3 of a private repo" in line for line in b.evidence))
+        (named,) = invariants.roll_pin_off(Facts(T0, roll_goals=goals[:1], roll_docs=1))
+        self.assertEqual(named.key, b.key)
+        self.assertFalse(any("is empty" in line for line in named.evidence))
+
+    def test_a_roll_goal_with_the_pass_configured_off_files_a_finding(self):
+        self.roll_goal()
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertIn("roll-pin-off", filed["body"])
+        self.assertIn("#%d" % GOAL, filed["body"])
+        self.assertIn("LOOM_ROLL_SHIP_DOCS", filed["body"])
+
+    def test_a_roll_goal_its_ship_document_names_files_nothing(self):
+        self.roll_goal()
+        self.settings.roll_ship_docs = [{"goal": "%s#%d" % (REPO, GOAL), "repo": REPO,
+                                         "path": "docs/ship.md"}]
+        self.run_at(T0)
+        self.assertEqual(self.breaches(), [])
+
+    def test_a_goal_that_ships_without_a_roll_files_nothing(self):
+        self.gh.goal_issues[REPO][0]["body"] = "Ship rules: rolling deploys, with rollback."
+        self.run_at(T0)
+        self.assertEqual(self.breaches(), [])

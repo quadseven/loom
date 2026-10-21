@@ -823,6 +823,11 @@ Each invariant is one function returning breaches with evidence:
 - A remote lane whose newest heartbeat is older than its `beat_max`.
 - Lanes that held a running ticket while they sent no heartbeat
   (`silent-lane`, above).
+- Goal homes whose body names a roll (the word `roll` or `rolls`) that no
+  `LOOM_ROLL_SHIP_DOCS` entry names (`roll-pin-off`, one rolling issue for
+  every such goal): the station opens no source-pin pull request when their
+  module changes merge (README.md, Roll source pins). The issue says when
+  the setting is empty, which turns the pass off.
 
 The failing-streak, lane-held and silent-lane invariants are one rolling
 issue each, a line per lane, rewritten in place while the list changes, as
