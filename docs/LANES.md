@@ -152,6 +152,10 @@ no model set, or a name with no runner, is passed over. agy has no rung:
 its CLI runs only as the agy lane user, which cannot read the brain's
 checkout or GitHub sign-in, and run as the operator it would read the login
 keychain. The `tick start` line in `brain.log` names the lane and model.
+A tool call a rung's sandbox refuses (the spark rung's opencode denies paths
+outside the checkout) reaches the agent as a tool error and the tick goes
+on; the log watch counts it on the tick and files it only when it hurt the
+tick or keeps coming back (Log watch).
 Each tick resets the checkout to origin's head with hooks and fsmonitor
 off and removes untracked and ignored files, nested repositories included;
 a checkout that still is not clean is cloned again, so nothing a run left
@@ -798,7 +802,9 @@ Each station pass reads the lines each component added to its log since the
 last pass: by default `logs/station.log` (as `station`), `logs/brain.log`
 (`brain`) and each lane's `logs/<lane>-service.log` (named after the lane).
 `LOOM_WATCH` replaces that list with lines of `name=path`, a relative path
-being under `$LOOM_HOME`. A line counts when it says `error`, `failed`,
+being under `$LOOM_HOME`. Each line first loses its terminal escape codes
+(colours and the like, raw or shown in caret notation as `^[[91m`) and other
+control characters. A line counts when it says `error`, `failed`,
 `Traceback` or `refused`, or carries an HTTP 4xx or 5xx; a Python traceback
 counts once, as its exception line. A line of a GitHub Actions job log that
 an agent echoed (a seven-digit-fraction timestamp, after the job and step
@@ -814,11 +820,56 @@ times, numbers, hex ids and SHAs, long mixed ids, repos and issue numbers,
 paths, addresses and mentions become placeholders, so a 403 on two repos is
 one signature (the status code is kept).
 
+An agent CLI's sandbox or permission refusal is not an error and never a
+signature: opencode's `The user has specified a rule which prevents you from
+using this specific tool call` (a lane or the spark brain rung reaching
+outside its tree, which `lanes/agent_sandbox.sh` denies on purpose) or `The
+user rejected permission to use this specific tool call`, claude's `Claude
+requested permissions to ... but you haven't granted it yet` and `Permission
+to use ... has been denied`, codex's `rejected by user approval settings`
+patch refusals and gemini's `Tool execution ... denied by policy`. The agent
+gets it as a tool error and carries on (loom#202). The watcher counts each
+refusal on its run, keyed by the tool and the denied path; the line opencode
+prints right before it (`<cross> Read <path> failed`) names both and is not a
+signature either. A run is what the log marks between a start and an end:
+the brain's `tick start (lane <rung>, ...)` and `tick end (exit <n>)`, or a
+lane run's `<ticket> start, lane <slot>` and its `done, ...` or `failed:
+[<class>] ...` line. Refusals outside a marked run settle at the end of the
+pass as one run of unknown outcome.
+
+When a run ends its refusals go into `watch.json` (the day's runs and
+counts per refusal) and the hourly summary line (`N agent refusals (M that
+hurt a run)`). A refusal files an issue only when it hurt:
+
+- the run failed (a non-zero tick exit, or a lane failure not classed
+  `[transient]` or `[limit]`) or made no change (`made no commit`,
+  `nothing to change`);
+- it repeated 5 times in that one run (`REFUSAL_REPEAT`); or
+- it came back in 5 runs within 24 hours (`REFUSAL_RUNS`), even when each
+  carried on: a brief or prompt that keeps steering the agent outside its tree.
+
+Then it files or counts one `loom:triage` issue per component (with the
+brain's rung or the lane), tool and denied path, titled `<component>/<lane>:
+sandbox refused <tool> <path>` (`brain/spark: sandbox refused Read
+~/.config/gh/hosts.yml`). It names the CLI, the denied path, the rule (for
+opencode the last deny rule it lists, `external_directory * deny`), how often
+in the last run and the last 24 hours, and the effect, so a person decides:
+widen the sandbox for that path or teach the brief to stay inside it. The
+watcher never loosens the sandbox. The path is shown with the home directory
+as `~`, a temp directory as `<tmp>`, a goal repo's name (any `LOOM_REPOS`
+repo but the lanes repo) as `<repo>`, and numbers and ids as placeholders, so
+one path is one issue; a path that still fails the written-text check (an
+absolute path outside home and temp) is withheld. The issue then rolls like a
+signature's: one count comment an hour while the refusal recurs, edited in
+place, also for runs it did not hurt, and a quiet close after 24 hours.
+
 A signature seen 3 or more times within 30 minutes, and not seen in the 24
 hours before, files one `loom:triage` issue in `LOOM_STATUS_REPO` titled
 `<component>: <signature>`, with the count and the first and last example
-lines. The examples have paths, credential shapes, mail addresses, mentions,
-private hosts, IP addresses and repo names replaced, and each must pass the
+lines. An example keeps the whole line up to 2000 characters; a longer one
+keeps its start and its end around ` ... `. The examples have paths,
+credential shapes, mail addresses, mentions, private hosts, IP addresses and
+repo names replaced, and each must pass the
 written-text check (`bus/text.py`) or is withheld. An open `loom:triage` issue
 with the same title is counted instead of filed again. While the signature
 keeps repeating its open issue gets a count comment at most once an hour,
