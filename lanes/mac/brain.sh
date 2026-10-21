@@ -115,8 +115,21 @@ rung_ready() {
   fi
   [[ "$beat" =~ \"at\":\ *([0-9]+) ]] || { RUNG_WHY="usage heartbeat has no time"; return 1; }
   at="${BASH_REMATCH[1]}" now="$(date +%s)"
-  [ $((now - at)) -le 600 ] && [ $((at - now)) -le 60 ] ||
+  [ $((at - now)) -le 60 ] || { RUNG_WHY="usage heartbeat is from the future"; return 1; }
+  [ $((now - at)) -le 600 ] || { [ $((now - at)) -le 7200 ] && lane_running "$lane"; } ||
     { RUNG_WHY="usage heartbeat is $((now - at)) seconds old"; return 1; }
+}
+
+# Whether lane $1's runner holds its lock with a live process. A runner
+# writes its heartbeat between runs, not during one, so a lane mid-run looked
+# like one with no usage: at 11:04Z on 2026-10-21 the claude lane was 30
+# minutes into a run and the spark lane 40, and the tick skipped. The beat's
+# age is capped at 2 hours (a run's agent and check timeouts) above, so a
+# recycled pid cannot keep a dead lane's heartbeat alive.
+lane_running() {
+  local pid
+  pid="$(cat "$LOOM_HOME/run/$1.lock/pid" 2>/dev/null)" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
 }
 
 # Whether any rung can take the tick; when none can, LADDER_WHY holds every
