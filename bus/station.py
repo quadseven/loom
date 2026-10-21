@@ -5220,8 +5220,9 @@ class Station:
         names = _label_names(self._issue(repo, number))
         if RUNNING not in names:
             return
-        labels = [n for n in names if n not in (RUNNING, BRIEFED) and not n.startswith(
-            ("lane:", WAIT))] + ["loom:queued", WAIT + "lane"]
+        labels = self._drop_claim(n for n in names if n not in (RUNNING, BRIEFED)
+                                  and not n.startswith(("lane:", WAIT))
+                                  ) + ["loom:queued", WAIT + "lane"]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
         self._stopped(repo, number, lane, "transient",
                       "%s. Not retried: %s; the ticket is back in the queue on its rung."
