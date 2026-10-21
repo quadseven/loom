@@ -138,6 +138,14 @@ class FreeIssuesTest(unittest.TestCase):
         self.assertEqual(entries[0]["bucket"], free.TAKEN)
         self.assertEqual(entries[0]["reason"], "Loom ticket #20 is open")
 
+    def test_an_in_place_tickets_kept_original_covers_no_issue(self):
+        # loom#1229: the original text an in-place rewrite keeps below the
+        # ticket may say "Refs #9"; that is the author's line, not a source.
+        body = tickets.with_original("## Why\nwhy\n\nPart of #40\n",
+                                     {"title": "Old", "body": "Refs #9\nRewritten from issue 8.\n"})
+        ticket = _issue(6, ["loom:ticket", "loom:queued"], body=body)
+        self.assertEqual(free.covered_issues(REPO, ticket), [])
+
     def test_a_rewritten_issue_with_no_ticket_found_is_listed_to_check(self):
         covers = free.coverage({REPO: []})
         entries = free.free_issues(REPO, [_issue(31, ["loom:rewritten"])], ME, covers)

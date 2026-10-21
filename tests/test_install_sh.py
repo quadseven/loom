@@ -2,6 +2,7 @@
 with a fake launchctl and a throwaway HOME/LOOM_HOME."""
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -51,7 +52,8 @@ class InstallScriptTest(unittest.TestCase):
         # owner check or the App check.
         full = {k: v for k, v in os.environ.items()
                 if k not in ("LOOM_REPOS", "LOOM_STATUS_REPO")
-                and not k.startswith("LOOM_GITHUB_APP_")}
+                and not k.startswith(("LOOM_GITHUB_APP_", "LOOM_LANES_GITHUB_APP_",
+                                       "LOOM_BRAIN_GITHUB_APP_"))}
         full.update(PATH="%s:/usr/bin:/bin" % self.bin,
                     HOME=str(self.home),
                     LOOM_HOME=str(self.loom),
@@ -168,6 +170,13 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_LOG_KEEP_DAYS</key><string>14</string>", plist)
         self.assertIn("<key>LOOM_DISK_FREE_MIN_GB</key><string>20</string>", plist)
 
+    def test_claimed_settle_settings_are_written_to_station_plist(self):
+        result = self.run_install(LOOM_SETTLE_CLAIMED="on", LOOM_SETTLE_CLAIMED_MAX="5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_SETTLE_CLAIMED</key><string>on</string>", plist)
+        self.assertIn("<key>LOOM_SETTLE_CLAIMED_MAX</key><string>5</string>", plist)
+
     def test_trusted_briefers_are_written_to_station_and_brain_plists(self):
         result = self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -225,6 +234,46 @@ class InstallScriptTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertIn(missing + " is missing", result.stderr)
                 self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def job_env(self, label):
+        plist = (self.home / "Library" / "LaunchAgents" / ("%s.plist" % label)).read_text()
+        return dict(re.findall(r"<key>(LOOM_[A-Z_]*GITHUB_APP_[A-Z_]+)</key><string>([^<]*)</string>",
+                               plist))
+
+    def test_each_writer_gets_its_own_app_in_its_own_job(self):
+        # loom#1142: the lanes and the brain post as their own Apps.
+        result = self.run_install(
+            LOOM_GITHUB_APP_ID="1", LOOM_GITHUB_APP_INSTALLATION_ID="2",
+            LOOM_GITHUB_APP_KEY_SSM="/station/key",
+            LOOM_LANES_GITHUB_APP_ID="11", LOOM_LANES_GITHUB_APP_INSTALLATION_ID="12",
+            LOOM_LANES_GITHUB_APP_KEY_SSM="/lanes/key",
+            LOOM_BRAIN_GITHUB_APP_ID="21", LOOM_BRAIN_GITHUB_APP_INSTALLATION_ID="22",
+            LOOM_BRAIN_GITHUB_APP_KEY_SSM="/brain/key")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.job_env("com.loom.codex"), {
+            "LOOM_GITHUB_APP_ID": "11", "LOOM_GITHUB_APP_INSTALLATION_ID": "12",
+            "LOOM_GITHUB_APP_KEY_SSM": "/lanes/key"})
+        self.assertEqual(self.job_env("com.loom.brain"), {
+            "LOOM_GITHUB_APP_ID": "21", "LOOM_GITHUB_APP_INSTALLATION_ID": "22",
+            "LOOM_GITHUB_APP_KEY_SSM": "/brain/key"})
+        station = self.job_env("com.loom.station")
+        self.assertEqual((station["LOOM_GITHUB_APP_ID"], station["LOOM_GITHUB_APP_KEY_SSM"]),
+                         ("1", "/station/key"))
+        self.assertFalse([k for k in station if not k.startswith("LOOM_GITHUB_APP_")], station)
+
+    def test_without_their_own_app_a_lane_gets_none_and_the_brain_keeps_the_stations(self):
+        result = self.run_install(LOOM_GITHUB_APP_ID="1", LOOM_GITHUB_APP_INSTALLATION_ID="2",
+                                  LOOM_GITHUB_APP_KEY_SSM="/station/key")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.job_env("com.loom.codex"), {})
+        self.assertEqual(self.job_env("com.loom.brain")["LOOM_GITHUB_APP_ID"], "1")
+
+    def test_half_a_lanes_app_installs_nothing(self):
+        result = self.run_install(LOOM_LANES_GITHUB_APP_ID="11",
+                                  LOOM_LANES_GITHUB_APP_KEY_SSM="/lanes/key")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("LOOM_LANES_GITHUB_APP_INSTALLATION_ID is missing", result.stderr)
+        self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
 
     def test_the_app_id_alone_names_the_missing_installation_id(self):
         result = self.run_install(LOOM_GITHUB_APP_ID="123")

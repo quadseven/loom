@@ -33,7 +33,12 @@ agent_cli() {
 # the short tail (the last five non-blank lines), so a ticket that is about
 # expired keys or network errors is not read as a fault, and the reason shown
 # to people stays the short tail.
-LIMIT_RE='usage limit|rate[ _-]?limit|quota|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
+# A bare "quota" is no limit: a timed-out agent's git log or a file it read
+# can say it, and three Spark lanes were held an hour on a commit subject
+# (2026-10-20). Providers say the quota is reached, exceeded or exhausted.
+# A full shared free pool ("has no lane available; retry after 1s") is a
+# short limit, not the agent's failure (18 runs, 2026-10-21).
+LIMIT_RE='usage limit|rate[ _-]?limit|has no lane available|quota (reached|exceeded|exhausted|resets?)|exceeded (your |the )?(current )?quota|resource[ _]exhausted|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
 KEY_STATE='expired|revoked|invalid|incorrect|disabled'
 AUTH_RE="($KEY_STATE)[ _-]*api[ _-]*key|api[ _-]*key([ _-]*(is|was|has|been|are))*[ _-]*($KEY_STATE)|(http|status|code|error)[^0-9a-z]{0,3}401([^0-9]|\$)"
 # A quota on the whole account, not one model: every model of the lane is
@@ -59,6 +64,36 @@ MONTHLY_RE='copilot.*(allowance|limit|quota|usage|request)|monthly ([a-z]+ )*(al
 MODEL_GONE_RE='ProviderModelNotFoundError: Model not found'
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
+# A reset time the provider states ("try again at 11:46 PM", "try again at
+# Oct 24th, 2026 4:43 PM") holds the lane until then, up to a week: codex
+# said when its limit reset and the lane retried hourly anyway, a ticket
+# round each time (2026-10-21).
+RESET_WAIT_MAX=$((7 * 86400))
+
+# The epoch of the reset time stated in $1 ("try again at ..."), read as the
+# machine's local time, the time of day alone meaning its next occurrence;
+# prints nothing when $1 states none.
+stated_reset() {
+  python3 -c '
+import re, sys, time
+from datetime import datetime, timedelta
+m = re.search(r"try again at (?:([A-Za-z]{3}) ([0-9]{1,2})(?:st|nd|rd|th)?, ([0-9]{4}) )?([0-9]{1,2}):([0-9]{2}) ?([AP]M)", sys.argv[1], re.I)
+if m:
+    hour = int(m.group(4)) % 12 + (12 if m.group(6).upper() == "PM" else 0)
+    now = datetime.now()
+    try:
+        if m.group(1):
+            at = datetime.strptime("%s %s %s" % (m.group(1).title(), m.group(2), m.group(3)), "%b %d %Y")
+            at = at.replace(hour=hour, minute=int(m.group(5)))
+        else:
+            at = now.replace(hour=hour, minute=int(m.group(5)), second=0, microsecond=0)
+            if at <= now:
+                at += timedelta(days=1)
+        print(int(time.mktime(at.timetuple())))
+    except ValueError:
+        pass
+' "$1" 2>/dev/null
+}
 
 # Sets FAIL_CLASS (auth, limit, transient or work) for a run that ended with
 # exit status $1 and output $2, where $3 is "edited" when the agent changed
@@ -69,8 +104,20 @@ LIMIT_WAIT_MAX=86400
 # auth: no retry and no attempt can fix it, so the runner takes its lanes
 # offline until the operator renews it. A crash before any edit, a timeout,
 # a signal or a network fault is transient; anything else is work.
+# An agent CLI's JSON events that carry the work, not the provider's word:
+# tool results, the model's own text and reasoning, step markers (opencode
+# --format json). Code about rate limits that a tool read is no limit: two
+# Spark lanes were held an hour on such tool results (2026-10-21). A provider
+# error arrives as its own line ({"type":"error",...} or plain text).
+WORK_EVENT_RE='^\{"type":"(tool_use|text|reasoning|step_start|step_finish)"'
+
+# Stdin without the agent's work events, for the limit and credit patterns.
+provider_text() {
+  grep -vE "$WORK_EVENT_RE" || true
+}
+
 classify_failure() {
-  local status="$1" whole="$2" edited="$3" now n tail monthly=0
+  local status="$1" whole="$2" edited="$3" now n tail cap stated monthly=0
   tail="${4:-$whole}"
   FAIL_CLASS=work RETRY_AT=""
   now="$(date +%s)"
@@ -80,9 +127,11 @@ classify_failure() {
   elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT_MAX))
   elif [[ "$whole" =~ $LIMIT_RE ]]; then
-    FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
+    FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT)) cap=$LIMIT_WAIT_MAX
     if [[ "$whole" =~ $OUT_OF_CREDIT_RE ]]; then
       RETRY_AT=$((now + LIMIT_WAIT_MAX))
+    elif stated="$(stated_reset "$whole")" && [ -n "$stated" ]; then
+      RETRY_AT="$stated" cap=$RESET_WAIT_MAX
     elif [[ "$whole" =~ $EPOCH_RE ]]; then
       RETRY_AT="${BASH_REMATCH[2]}"
     elif [[ "$whole" =~ $AFTER_RE ]]; then
@@ -96,7 +145,9 @@ classify_failure() {
       RETRY_AT="$(python3 -c 'from datetime import datetime, timezone; n=datetime.now(timezone.utc); y=n.year+(n.month==12); m=1 if n.month==12 else n.month+1; print(int(datetime(y,m,1,tzinfo=timezone.utc).timestamp()))')"
     fi
     [ "$RETRY_AT" -ge $((now + 60)) ] || RETRY_AT=$((now + 60))
-    [ "$monthly" -eq 1 ] || { [ "$RETRY_AT" -le $((now + LIMIT_WAIT_MAX)) ] || RETRY_AT=$((now + LIMIT_WAIT_MAX)); }
+    if [ "$monthly" -eq 0 ] && [ "$RETRY_AT" -gt $((now + cap)) ]; then
+      RETRY_AT=$((now + cap))
+    fi
   elif [ "$status" -ne 0 ]; then
     if [ "$status" -eq 124 ] || [ "$status" -gt 128 ] || [ "$edited" != edited ] ||
        [[ "$tail" =~ $NET_RE ]]; then

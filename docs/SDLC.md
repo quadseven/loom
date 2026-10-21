@@ -44,6 +44,7 @@ The `review` stage involves automated and/or human review of the pull request. T
 **Code involved:**
 - `bus/brain.py` - `review` function monitors PR comments and review threads
 - `bus/station.py` - review bot integration (`/grug improve` trigger)
+- `bus/factory.py` - asks the review bot to judge an answered thread (`/grug improve` trigger)
 - `bus/handoff.py` - logs `merge` stage handoff before moving to PR
 
 The review stage ends when all review comments are addressed and the PR is approved.

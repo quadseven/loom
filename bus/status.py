@@ -2,7 +2,8 @@
 
 Routine ticket events (a lane given, a claim, a stall or limit move, a rung
 climb, an equivalent-model move, an automatic retry, a lane failure or factory
-hold the factory acts on itself) were each a new comment, and every new
+hold the factory acts on itself, a fix round's push, a ready mark) were each a
+new comment, and every new
 comment emails the operator: zippie#264 carried 77 of them on 2026-10-18. They
 now go into one comment per ticket, newest first, which the station edits; an
 edit sends no email (loom#866). Outcomes (a pull request, merged, shipped,

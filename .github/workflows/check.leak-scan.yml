@@ -1,0 +1,34 @@
+name: check.leak-scan
+
+# Thin caller for the shared public-repo leak scan. This repo is public:
+# every pull request's diff AND its title and body are scanned for private
+# infrastructure identifiers (hostnames, private-range IPs, device
+# identifiers, local user paths, refs that may name a private repo). A lane
+# already scans its own diff before it pushes (#1074); this covers pull
+# requests opened by anyone else, and text edited after the push. The scanner
+# and its patterns live in quadseven/infra-public; see _reusable.leak-scan.yml
+# there for the mechanism and exit-code contract.
+#
+# Generic shapes only: no deny-list, so no secret and no cloud role.
+#
+# Fails closed: a scan that could not run is a red check, never a green one.
+# A deliberate, reviewed exception goes on its own line with the marker
+# `leak-guard-allow`.
+#
+# `edited` is in the trigger list on purpose: a pull request body can leak
+# long after the last push.
+#
+# allowed-repo-refs: the public repos this one cites by `<name>#123` as a
+# matter of course. This repo's own refs are always exempt and need no entry.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  leak-scan:
+    uses: quadseven/infra-public/.github/workflows/_reusable.leak-scan.yml@2ee764949a68bed6a1b4b3bcd6785a251f49da8f
+    permissions:
+      contents: read
+    with:
+      allowed-repo-refs: grug,infra-public,wow-overseer,mod-overseer,zippie,muster,assay,conducted

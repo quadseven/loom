@@ -74,6 +74,28 @@ _AFTER_REF_RE = re.compile(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#([0-9]+)")
 # that looks like a header must not follow the real header lines.
 FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR|Deliverable):")
 SLUG_MAX = 40
+# An issue rewritten in place (brain.brief --refs, loom#1229) keeps its
+# original title and text under this last section, quoted line by line, so
+# no reader takes a header, section, checkbox or Refs line from it and the
+# lane pull request body (which copies named sections) never carries it.
+ORIGINAL_HEADING = "## Original issue"
+
+
+def with_original(body: str, issue: Dict[str, Any]) -> str:
+    """The ticket body followed by the issue's original title and text,
+    quoted in a collapsed section."""
+    text = str(issue.get("body") or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = ["Original title: %s" % " ".join(str(issue.get("title") or "").split()), ""]
+    lines += text.rstrip("\n").split("\n")
+    quoted = "\n".join(("> " + line) if line.strip() else ">" for line in lines)
+    return "%s\n\n%s\n\n<details><summary>Original issue</summary>\n\n%s\n\n</details>\n" % (
+        body.rstrip("\n"), ORIGINAL_HEADING, quoted)
+
+
+def without_original(body: str) -> str:
+    """The body without the original text an in-place rewrite kept."""
+    found = re.search(r"^%s[ \t]*$" % re.escape(ORIGINAL_HEADING), body, re.M)
+    return body[:found.start()] if found else body
 
 
 def slug(title: str) -> str:
@@ -419,10 +441,25 @@ ANSWER_NOTE = (
     "finding on a strong model's round; anything else still needs a fix.")
 
 
+# Where a run that timed out after editing left its edits (lanes/run_lane.sh
+# preserve_timedout), as the failure reason names it.
+TIMEDOUT_RE = re.compile(r"the edits are on branch ([A-Za-z0-9._/-]+-timedout-[0-9]+)")
+
+
+def timedout_branch(texts: List[str]) -> Optional[str]:
+    """The newest timed-out branch any of `texts` (oldest first) names."""
+    found = None
+    for text in texts:
+        match = TIMEDOUT_RE.search(text)
+        if match:
+            found = match.group(1)
+    return found
+
+
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   fix: Optional[Fix] = None,
                   ci_checks: Optional[List[Tuple[str, str]]] = None,
-                  has_contract: bool = True) -> str:
+                  has_contract: bool = True, resume: Optional[str] = None) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -457,6 +494,11 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += "\n"
     if body:
         text += body + "\n"
+    if resume:
+        text += ("\n## Earlier attempt\n\nAn earlier attempt timed out after editing, and the "
+                 "runner kept its edits on branch %s. Start from them: run `git fetch origin %s` "
+                 "and `git merge FETCH_HEAD`, check what is there, and finish the ticket instead "
+                 "of starting over.\n" % (resume, resume))
     if fix:
         text += ("\n## Fix\n\nThis ticket already has pull request #%d on branch %s. "
                  "Fix what is listed below on that branch: change only what the findings "
@@ -492,7 +534,10 @@ top of your work directory. It holds exactly one of:
    and criteria: one {criterion, result, evidence} per acceptance criterion
    below, in order, with the criterion text copied exactly and result "pass".
    A runtime record also needs environment, artifact, and measure {name,
-   baseline, target, after}.
+   baseline, target, after}. The revision must be a merge commit the GitHub
+   data section shows, or a later commit on the default branch, and
+   observed.start must not be before that pull request merged: the station
+   refuses a proof of a stale build or of evidence seen before the merge.
 2. {"missing": "<the evidence that does not exist yet>"} when you cannot
    prove every criterion. Name the evidence precisely; do not guess.
 

@@ -178,7 +178,10 @@ The station turns trusted
 ticket, with local paths removed from failure reasons; the runner adds
 `Refs <owner/name>#<number>` to the pull request. A limit or transient
 failure moves the ticket to another available lane as a new attempt, at most
-`LOOM_RETRY_MAX` times (default 2); a fix round that fails transiently goes
+`LOOM_RETRY_MAX` times (default 2). A run that exits 124 after editing pushes
+its edits to a side branch `<branch>-timedout-<time>` and names it in the
+failure reason; the retry's brief tells the next attempt to start from that
+branch. A fix round that fails transiently goes
 back to `loom:pr`, and one that fails its work goes to `loom:failed`, so the
 factory climbs the ladder and sends the fix to the next rung; a lane that hit its provider limit stays unavailable until the
 provider's reset (else 60 minutes; delete its heartbeat file in
@@ -237,6 +240,28 @@ a permission Loom needs that it lacks. It never prints or writes the key or
 the tokens it mints. The dashboard takes the same three settings when its host has
 the `openssl` and `aws` CLIs, and otherwise keeps
 `LOOM_DASHBOARD_GITHUB_TOKEN`.
+
+The station, the brain and the lanes each post as their own App, never as
+the operator (loom#1142). The installer writes the station's App
+(`LOOM_GITHUB_APP_*`) into the station and dashboard, `LOOM_LANES_GITHUB_APP_*`
+into every lane and `LOOM_BRAIN_GITHUB_APP_*` into the brain, each as that
+launchd job's own `LOOM_GITHUB_APP_*`; the brain keeps the station's App until
+it has its own, and half an App's settings install nothing.
+`python3 -m bus app token` prints the installation token of the App those
+settings name, and fails with no output without them. A lane with the
+settings drops any personal `GH_TOKEN` or `GITHUB_TOKEN`, mints a token at the
+start of each run and again after its agent (a token lasts an hour), clones
+over https with `gh` as git's credential helper, and runs its agent without
+the token, the App settings or that helper; a failed mint parks the run
+`[transient]` before anything is posted. `lanes/mac/brain.sh` mints once per
+tick, after the lock, and gives every rung that token as `GH_TOKEN`,
+`GITHUB_TOKEN` and `LOOM_GITHUB_TOKEN`; a failed mint, or a
+`LOOM_BRAIN_MINUTES` over 50, runs no rung. The station trusts its own App's
+login by itself, so the brain's and the lanes' logins (`<slug>[bot]`) go in
+`LOOM_BRIEF_AUTHORS`, and a repo whose workflows admit only collaborators must
+admit the lanes' login for lane pull requests to run.
+A new App is easiest made from
+`https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=read`.
 
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
@@ -304,6 +329,12 @@ answer as the reply on its thread, redacted and text-checked. The station
 resolves the thread only when the round ran on a ladder model and the thread
 is the review bot's own medium or low finding; any other answered thread
 stays open, and the factory reads it as a finding that survived.
+An answered thread that survives and leaves its ticket with no lane up for
+its next rung does not wait with nothing to move it: the factory asks the
+review bot to judge the answer instead, commenting `/grug improve` on the
+pull request once per head commit, so Elder re-reviews the head with the
+reply in view. It clears the head if the answer holds, and keeps the finding
+if it does not, and the ticket then waits for its rung as before.
 A fix brief that ends with nothing committed (most often
 every thread was already fixed and the review thread is stale) is not a
 failure: the station posts the lane's explanation on the pull request, asks
@@ -328,7 +359,7 @@ ticket on a local lane with no live heartbeat for 30 minutes (an unloaded or
 crashed lane, or a machine that is off) moves the same way, with a comment
 naming the lane and how long it was silent: to a free lane of its tier, or of
 its Model, else back to `loom:queued`. It is no failure and no retry, so it
-never climbs, and the station files a `silent-lane` invariant naming the lane.
+never climbs, and the station's `silent-lane` invariant lists the lane.
 A failed or stalled
 ticket climbs, and past the last rung it is left `loom:failed` for the brain. Landing
 keeps the default branch green: a ready pull request that is behind its base
@@ -530,7 +561,22 @@ to the lane's log folder as `<brief>.verify.json`, with the run's model
 beside it in `<brief>.verify.model`. The station checks a record with
 `bus/proof.py`, ticks the criteria and moves the ticket to verified with the
 proof, marked `"verified_by": "<lane>/<model>"` (`<lane>/unknown` when the
-run recorded no model). A refused record, a missing result or no
+run recorded no model). It refuses a record whose revision does not contain
+the merge commit of each linked pull request merged into the default branch
+(the compare API), or whose observed window starts before the newest of them
+merged: a stale build or evidence read before the fix proves nothing. A
+GitHub error on that check leaves the ticket shipped, and a ticket with no
+linked merged pull request is left to the close rule. The station also reads
+the merged pull requests again, as for the brief: a record whose criterion
+evidence says every check passed ("all checks passed", "checks green") while
+the newest run of a check on a merge commit concluded other than success or
+skipped is refused, and so is any record when GitHub cannot be read for
+them (the ticket is tried again after its cooldown). The proof comment then
+carries a `Checked by the station:` section, one line per merged pull
+request, the same sentence the done close writes (merged time, merge commit,
+each check that did not conclude success or skipped, whether the default
+branch contains it), stored in the record as `station_facts`; a record that
+brings its own `station_facts` is not believed. A refused record, a missing result or no
 `verify.json` leaves the ticket shipped with one note on it. The run is
 counted like any lane run, and the Spread line also shows how many were
 verify runs. The brain audits lane proofs (docs/BRAIN.md, Proof audits): a
@@ -738,14 +784,18 @@ Each invariant is one function returning breaches with evidence:
   for 90 minutes once one has been seen.
 - A `loom:metrics` line posted more than once for one day, or two
   `loom:report` comments within 90 minutes, on one goal home.
-- A lane with 5 or more runs in 24 hours and none done.
-- A lane held by a limit for over 2 hours while tickets of its tier are
+- A lane with 5 or more runs in 24 hours and none done (one issue per lane:
+  the station reads these to release a runaway a dead lane held).
+- Lanes whose newest 5 runs all failed after a success earlier in the day,
+  limits, expired keys and factory incidents aside.
+- Lanes held by a limit for over 2 hours while tickets of their tier are
   queued. Only truly queued tickets count: `loom:queued` is their only state
   label, and no other operator has claimed them. `LOOM_NO_TOPUP` names the
   provider lanes whose credit the operator never tops up (for example
   `anthropic`); a slot of one held out of credit is skipped, since it waits
   for the credit to renew and nothing is briefed onto it meanwhile. Unset,
-  every held lane counts.
+  every held lane counts. A hold whose reset has passed is no hold: the lane
+  is free again, as the Usage view reads the same heartbeat.
 - The epic shape (decision 0003): a goal home with open `loom:ticket` issues
   under no epic (one rolling issue for every goal, a line per goal home,
   rewritten in place while the list changes; the older per-goal issues are
@@ -762,6 +812,15 @@ Each invariant is one function returning breaches with evidence:
   command that unsticks it (`bus.brain move`, `bus.brain brief` as a
   re-ticket, `bus.brain fix`, or closing the pull request as superseded).
 - A remote lane whose newest heartbeat is older than its `beat_max`.
+- Lanes that held a running ticket while they sent no heartbeat
+  (`silent-lane`, above).
+
+The failing-streak, lane-held and silent-lane invariants are one rolling
+issue each, a line per lane, rewritten in place while the list changes, as
+the tickets-outside-an-epic issue is: one provider limit opened 9 lane-held
+issues in 6 minutes on 2026-10-15. An older per-lane issue of the same
+invariant is closed as folded into the rolling one, unless it carries a
+`needs:<login>` label, which leaves an operator's ask open on its own issue.
 
 Each breach files one issue labelled `loom:triage` and `loom:invariant` under
 the standing repairs epic (docs/BRAIN.md, Filing under an epic; the goal home
@@ -852,10 +911,22 @@ cannot query the viewer or any other local service.
   `x-opencode-session`), the runner sends one `max_tokens` 1 request for the
   run's model before each run, and again after a run that timed out (exit
   124). The key goes to curl on stdin, never in argv or a log. A 429 naming
-  `GoUsageLimitError` holds the lane 12 hours (heartbeat `limit: the
-  provider's weekly limit ...` with a `retry_at`) and hands the brief on as
-  `[limit]`; any other answer lets the run go ahead. Another provider can
-  name its own endpoint in the same setting.
+  `GoUsageLimitError` holds the lane until the reset the provider's
+  `Retry-After` header gives (heartbeat `limit: the provider's weekly limit
+  ...` with a `retry_at`) and hands the brief on as `[limit]`; a provider that
+  gives no reset holds the lane for a week, the fallback for a window the
+  runner does not know. Any other answer lets the run go ahead. Another
+  provider can name its own endpoint in the same setting.
+- A lane held by such a limit asks the provider again every 30 minutes and
+  comes back as soon as it serves the lane again, because the provider's
+  allowance refills while the lane sleeps (OpenCode Go refills 20% of a
+  model's allowance every 5 hours). It asks about the model the probe found at
+  a limit, and only for a hold the probe itself took: a hold the agent CLI
+  recorded (a model it no longer offers, a spent allowance) stands, for no
+  probe says otherwise. On 2026-10-20 the four opencode-go slots stayed held
+  for days (the provider's `Retry-After` was never read, so every limit fell
+  back to a week) and the lane-held invariant fired while 33 tickets of the
+  tier waited.
 - The Usage view's meters for the free lanes (loom#812). After a ready
   heartbeat the openrouter and workersai lanes read their provider's
   read-only meter with the key they already hold, at most every five minutes,
@@ -1033,6 +1104,19 @@ lookup leaves the brief for the next pass. The rule covers:
   newer models (glm-5.3-flash) are paid-plan only.
 - Runs `cloudflare-workers-ai/@cf/...` models only. Cloudflare does not train
   on prompts, so private repos are allowed.
+
+## free provider slots on the spark-gateway
+
+Set `LOOM_FREE_GATEWAY_URL` to your gateway's origin. The five free slots use
+separate pinned routes: `free-ollama` uses `/free/ollama-cloud/v1`,
+`free-gemma` uses `/free/gemini/v1`, and `free-nvidia`, `free-kilo` and
+`free-groq` use `/free-public/nvidia-nim/v1`, `/free-public/kilo/v1` and
+`/free-public/groq/v1`. A slot's `LOOM_FREE_<PROVIDER>_URL` overrides its
+derived URL. Each slot probes its own route's `/models` before a run. A 503
+holds only that slot for 15 minutes as a limit, so the station can assign the
+ticket elsewhere without counting it as a work failure. Ollama and Gemma
+accept private repos; the other three accept public repos only. The routes
+need your own gateway and provider configuration.
 
 ## spark: a local vLLM coder, one stream at a time
 
