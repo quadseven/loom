@@ -753,3 +753,22 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
   .tiers-table td::before { display: block; color: var(--muted); font: 10px var(--font-mono); letter-spacing: .06em; text-transform: uppercase; content: attr(data-label); }
   .tiers-live-list li > a { display: inline-flex; min-height: 44px; align-items: center; }
 }
+
+/* Tree page (loom#1257): goal, epic, child as nested details; rows wrap, so
+   a phone never scrolls sideways. */
+.tree-bar { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+.tree-bar .chip[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-on-bg); }
+.tree-box { margin: 0 0 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--row); }
+.tree-box .tree-box { margin: 0 10px 10px; }
+.tree-box > summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 8px 12px; cursor: pointer; }
+.tree-box-title { min-width: 0; color: var(--text); font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.tree-count { margin-left: auto; }
+.tree-rows { margin: 0; padding: 0; list-style: none; }
+.tree-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; padding: 6px 12px; border-top: 1px solid var(--line); font-size: 13px; }
+.tree-row[hidden], .tree-box[hidden], [data-tree-empty][hidden] { display: none; }
+.tree-title { flex: 1 1 14em; min-width: 0; color: var(--body-on-row); overflow-wrap: anywhere; }
+.tree-title:hover { color: var(--text); text-decoration: underline; }
+.tree-meta { display: flex; flex-wrap: wrap; gap: 2px 10px; }
+@media (max-width: 959px) {
+  .tree-row a, .tree-bar .chip { display: inline-flex; min-height: 44px; align-items: center; }
+}

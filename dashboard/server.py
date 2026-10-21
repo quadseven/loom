@@ -34,6 +34,7 @@ from . import ticket as ticket_view
 from . import goals as goals_view
 from . import ticket_data
 from . import tickets_table
+from . import tree as tree_view
 from . import operators as operators_view
 from . import needs_you as needs_you_view
 
@@ -818,6 +819,14 @@ def _ticket_page(state, parsed):
     return page("Tickets", "tickets", body, status="snapshot")
 
 
+def _tree(state):
+    payload = state.response()
+    body = tree_view.render(_all_tickets(state), payload.get("goal_context") or {},
+                            entered=payload.get("state_entered") or {}, now=time.time(),
+                            ticket_href=_ticket_href, short_ref=_short_ref)
+    return page("Tree", "tree", body, status="snapshot")
+
+
 def _tickets(state, parsed):
     return _ticket_page(state, parsed)
 
@@ -995,7 +1004,7 @@ def _dispatch_get(handler, state):
         return _dispatch_tiers(handler, state)
     if path in ("/brain", "/hot-spots"):
         return _dispatch_brain_hot_spots(handler, state, path)
-    if path in ("/", "/goals", "/tickets"):
+    if path in ("/", "/goals", "/tickets", "/tree"):
         return _dispatch_view(handler, state, path, parsed)
     if re.fullmatch(r"/t/[^/]+/[^/]+/[0-9]+", path):
         return _dispatch_ticket_page(handler, state, path, parsed)
@@ -1082,7 +1091,7 @@ def _dispatch_static(handler, path):
 def _dispatch_view(handler, state, path, parsed):
     if path == "/tickets":
         return handler.send_page(_tickets(state, parsed))
-    return handler.send_page({"/": _floor, "/goals": _goals}[path](state))
+    return handler.send_page({"/": _floor, "/goals": _goals, "/tree": _tree}[path](state))
 
 
 def _dispatch_ticket_page(handler, state, path, parsed):
