@@ -17,6 +17,7 @@ from urllib.parse import quote
 from .github import GitHub, GitHubError, RateLimited, _next_link, auth_from_env, rest_login, unreadable
 from . import audit, change_class, handoff, hunt_plan, journal, lock, pr_repair, proof, text, tickets
 from . import naming
+from .status import is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
@@ -476,16 +477,38 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
 def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
     allowed = {a.lower() for a in authors}
     last_claim = newest = -1
+    # Newest stamps seen, for the timestamped comparison below. A claim line
+    # inside the ticket's status comment carries its own time: the station
+    # edits that one comment in place, so the line's stamp - not the
+    # comment's position - is what the fix ask is measured against (loom#1203).
+    claim_stamp = fix_stamp = ""
     for i, comment in enumerate(comments):
         if not isinstance(comment, dict):
             continue
         body = str(comment.get("body") or "")
         if _CLAIM.fullmatch(body.strip()):
             last_claim = i
+            created = str(comment.get("created_at") or "")
+            if created > claim_stamp:
+                claim_stamp = created
+        elif (is_status_comment(body)
+                and tickets._login(comment.get("user")) in allowed):
+            # The unexpanded read: claims as bullet lines in the status
+            # comment. Only a trusted writer's lines count, as with expansion.
+            for at, text in parse_status_events(body):
+                if _CLAIM.fullmatch(text.strip()) and at > claim_stamp:
+                    claim_stamp = at
         if (tickets._login(comment.get("user")) in allowed
                 and body.startswith(FIX_MARKER)
                 and BRAIN_FIX_MARKER in body):
             newest = i
+            created = str(comment.get("created_at") or "")
+            if created > fix_stamp:
+                fix_stamp = created
+    if claim_stamp and fix_stamp:
+        # A brain-fix ask newer than the last real claim still blocks the
+        # merge; only the detection of the claim changed (loom#1203).
+        return fix_stamp > claim_stamp
     return newest > last_claim
 
 
