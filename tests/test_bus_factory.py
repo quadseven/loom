@@ -1631,7 +1631,7 @@ class SendBackNeedsAFinding(Base):
 
     def test_a_failure_among_same_named_runs_sends_the_pull_request_back(self):
         # Three workflows each have a job of this name; the failed one is not
-        # the newest by name (infra#5704, 2026-10-21).
+        # the newest by name (2026-10-21, a pull request in the deploy repo).
         name = "trust gate (collaborator-only on self-hosted)"
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, green=True)

@@ -3361,7 +3361,7 @@ def _run_key(run: Dict[str, Any]) -> Tuple[str, str]:
     app, for a check that has no suite) and the run's name. Three workflows
     each had a job named "trust gate (collaborator-only on self-hosted)"; keyed
     by name alone the newest of them, a success, hid the one that failed
-    (2026-10-21, infra#5704: a pull request sent back with nothing to fix)."""
+    (2026-10-21: a pull request in the deploy repo was sent back with nothing to fix)."""
     suite = (run.get("check_suite") or {}).get("id")
     if suite is None:
         suite = (run.get("app") or {}).get("id")
