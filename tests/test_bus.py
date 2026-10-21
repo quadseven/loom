@@ -113,7 +113,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(json.loads(t.calls[1][3]), {"k": "v"})
 
     def test_written_bodies_never_mention_a_user_by_accident(self):
-        # wow-overseer#921: a decorator in a proof table notified a stranger.
+        # A decorator in a proof table notified a stranger (loom#1394).
         t = Scripted(*[reply(201, {}) for _ in range(5)])
         gh = GitHub("tok", transport=t)
         gh.rest("POST", "/repos/%s/issues/1/comments" % REPO, {"body": "uses @property"})

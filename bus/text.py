@@ -40,7 +40,7 @@ SECRET_RE = re.compile(CREDENTIAL_RE.pattern + r"|\b[A-Za-z0-9+/_-]{32,}={0,2}")
 # An at-sign followed by a login-shaped word is a GitHub mention wherever it
 # sits outside code: a Python decorator, a CSS at-rule and an npm scope all
 # look like one, and a real user or organization may own the name
-# (wow-overseer#921, #866). A word, a slash or a backtick in front means an
+# (loom#1394). A word, a slash or a backtick in front means an
 # email address, a URL or a path, which GitHub does not turn into a mention.
 _MENTION = re.compile(
     r"(?<![A-Za-z0-9_/`])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)"

@@ -32,7 +32,7 @@ class TextModuleTest(unittest.TestCase):
 
 class ScrubMentionsTest(unittest.TestCase):
     """A plain-text at-sign word is a GitHub mention that notifies a real
-    person and cannot be undone (wow-overseer#921, #866)."""
+    person and cannot be undone (loom#1394)."""
 
     def test_decorator_at_rule_and_npm_scope_in_plain_text_are_wrapped(self):
         for token in ("@property", "@media", "@types/node", "@app.route", "@dataclass"):
@@ -48,7 +48,9 @@ class ScrubMentionsTest(unittest.TestCase):
                          "`@a` and `@b`\n- `@c-d`")
 
     def test_the_review_bot_short_name_is_wrapped_too(self):
-        self.assertEqual(text.scrub_mentions("ping @grug please"), "ping `@grug` please")
+        bot = "@" + text.REVIEW_BOT_SHORT_NAME
+        self.assertEqual(text.scrub_mentions("ping %s please" % bot),
+                         "ping `%s` please" % bot)
 
     def test_code_spans_and_fences_are_left_unchanged(self):
         for body in (

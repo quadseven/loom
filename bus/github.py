@@ -558,7 +558,7 @@ class GitHub:
     def _without_mentions(method: str, body: Any) -> Any:
         """A write's text with every would-be mention wrapped in backticks. A
         decorator or a CSS at-rule in plain text is a mention of whoever owns
-        that login, and a mention cannot be undone (wow-overseer#921). Every
+        that login, and a mention cannot be undone (loom#1394). Every
         comment, issue and pull request body the factory writes funnels through
         rest(), so this is the one place that makes the accident impossible.
         A GraphQL mutation's text is its "body" variable."""
