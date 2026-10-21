@@ -1132,12 +1132,28 @@ def without_model(body: str) -> str:
     return MODEL_LINE.sub("", head + "\n", count=1).rstrip("\n") + sep + rest
 
 
-def difficulty_of(issue: Dict[str, Any]) -> str:
-    """The ticket's Difficulty: line, "" when it has none readable."""
+# The tier of a ticket whose Difficulty line is missing or names no tier.
+# Such a ticket was in no tier, so no lane ever took it: one waited a day in
+# the queue (2026-10-21). Medium's FALLBACK reaches both other tiers.
+DEFAULT_DIFFICULTY = "medium"
+
+
+def has_difficulty(issue: Dict[str, Any]) -> bool:
+    """Whether the ticket's own Difficulty: line names a tier (difficulty_of
+    gives DEFAULT_DIFFICULTY in place of one that does not)."""
     try:
-        return str(tickets.parse(issue.get("body"))[0].get("Difficulty", ""))
+        found = str(tickets.parse(issue.get("body"))[0].get("Difficulty", "")).strip().lower()
     except ValueError:
-        return ""
+        return False
+    return found in TIERS
+
+
+def difficulty_of(issue: Dict[str, Any]) -> str:
+    """The ticket's Difficulty: line, DEFAULT_DIFFICULTY when it has none
+    readable or it names no tier."""
+    if not has_difficulty(issue):
+        return DEFAULT_DIFFICULTY
+    return str(tickets.parse(issue.get("body"))[0]["Difficulty"]).strip().lower()
 
 
 def lanes_of(difficulty: str, private: bool) -> Tuple[str, ...]:
@@ -1946,18 +1962,58 @@ class Factory:
             _say("brought %s#%d up to date with its base; it lands once its checks "
                  "and review pass on the new head" % (repo, number))
             return
-        if self._merge(repo, number, issue):
+        if self._merge(repo, number, issue, str((full.get("head") or {}).get("sha") or "")):
             self.landed.add(repo)
 
-    def _merge(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
+    def _merge(self, repo: str, number: int, issue: Dict[str, Any], sha: str = "") -> bool:
+        ticket = (repo, int(issue["number"]))
         try:
-            self.merge(self.gh, repo, number, (repo, int(issue["number"])))
+            try:
+                self.merge(self.gh, repo, number, ticket)
+            except GitHubError as err:
+                if err.status != 405 or not self._dismiss_bot_change_requests(repo, number, sha):
+                    raise
+                self.merge(self.gh, repo, number, ticket)
         except (ValueError, GitHubError) as err:
             _say("did not merge %s#%d: %s" % (repo, number, err))
             return False
         self.actions += 1
         _say("merged %s#%d for #%d" % (repo, number, issue["number"]))
         return True
+
+    def _dismiss_bot_change_requests(self, repo: str, number: int, sha: str) -> bool:
+        """Dismiss the review bot's change requests that its own review check
+        superseded, and say whether any was: each one submitted before that
+        check last passed on the head commit `sha` (only a ready pull request
+        reaches _merge). The review bot leaves the change request of a failing
+        review in place after its own later review of the same head passes,
+        and the merge was refused every pass (2026-10-21). A person's change
+        request, another bot's, and one newer than the passing check stay."""
+        passed = [_ts(r.get("completed_at")) for r in self._runs.get(sha, [])
+                  if r.get("name") == self.review_check and r.get("conclusion") in GREEN]
+        if not sha or not passed:
+            return False
+        cleared = max(passed)
+        bot = {self.review_bot.lower(), self.review_bot.lower() + "[bot]"}
+        dismissed = 0
+        for review in self.gh.paginate("/repos/%s/pulls/%d/reviews" % (repo, number)):
+            user = review.get("user") or {}
+            if (review.get("state") != "CHANGES_REQUESTED" or user.get("type") != "Bot"
+                    or str(user.get("login") or "").lower() not in bot
+                    or _ts(review.get("submitted_at")) >= cleared):
+                continue
+            self.gh.rest("PUT", "/repos/%s/pulls/%d/reviews/%d/dismissals"
+                         % (repo, number, int(review["id"])),
+                         {"event": "DISMISS", "message":
+                          "Superseded: %s passed on this head commit after this review. "
+                          "The factory dismisses the review bot's change request that "
+                          "its own later review cleared." % self.review_check})
+            dismissed += 1
+        if dismissed:
+            self.actions += 1
+            _say("dismissed %d superseded review-bot change request(s) on %s#%d"
+                 % (dismissed, repo, number))
+        return bool(dismissed)
 
     def failed(self, repo: str, issue: Dict[str, Any],
                prs: Dict[int, Dict[str, Any]]) -> None:
@@ -2380,7 +2436,7 @@ class Factory:
         else:
             lane, fallback = self._tier_move(repo, issue)
         if lane is None:
-            return "%s waits: no free lane in tier %s" % (ref, difficulty_of(issue) or "(none)")
+            return "%s waits: no free lane in tier %s" % (ref, difficulty_of(issue))
         tier = difficulty_of(issue) + (", " + fallback if fallback else "")
         if not self._guarded(self._assign_queued_one, repo, issue, lane, tier):
             return "%s: giving it lane %s failed" % (ref, lane)

@@ -1704,8 +1704,9 @@ def _check_ticket_headers(full_body: str, written: Dict[str, Optional[str]]) -> 
 
 def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional[str]) -> None:
     """A brief the station must place needs a difficulty tier. Without one the
-    ticket gets no lane and waits for a brain to notice (2026-10-16: five
-    factory tickets briefed without --difficulty sat queued up to 17 hours).
+    ticket waited for a brain to notice (2026-10-16: five factory tickets
+    briefed without --difficulty sat queued up to 17 hours); the factory now
+    places it as factory.DEFAULT_DIFFICULTY, which may be the wrong tier.
     A brief with --lane is claimed by that lane, so it needs none."""
     if lane or difficulty:
         return
@@ -2401,9 +2402,10 @@ def prioritize(gh: GitHub, repo: str, number: int, priority: Optional[str],
                env: Optional[Dict[str, str]] = None,
                difficulty: Optional[str] = None) -> None:
     """Rank an open ticket, or set its Difficulty, requiring its author to be
-    trusted. A queued ticket with no Difficulty line gets no lane, and before
-    this a brain could only fix one by hand-editing the body (2026-10-16: five
-    factory tickets sat queued up to 17 hours)."""
+    trusted. A queued ticket with no Difficulty line runs in the default tier
+    (factory.DEFAULT_DIFFICULTY); before this a brain could only set its tier
+    by hand-editing the body (2026-10-16: five factory tickets sat queued up
+    to 17 hours)."""
     if priority is None and difficulty is None:
         raise ValueError("give a priority, a difficulty, or both")
     if priority is not None and priority not in tickets.PRIORITIES:
