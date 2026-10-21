@@ -1482,6 +1482,51 @@ class Queued(Base):
             "%s#8" % REPO: "no free lane in tier medium",
             "%s#10" % REPO: "no free lane takes model (its Model: line names no model id)"})
 
+    def first_label_ticket(self, number, label="loom:regression", model="gpt-6-sol"):
+        self.queued(number, body="Model: %s\nDifficulty: medium\n\n## Why\nx\n" % model)
+        self.gh.issues[number]["labels"].append({"name": label})
+
+    def busy(self, number, lane):
+        self.gh.ticket(number, "running", lane=lane)
+
+    def test_a_first_label_model_ticket_is_briefed_onto_a_busy_up_lane(self):
+        # loom#1300, 2026-10-21: both lanes of the model always had another
+        # fix round waiting, so a pinned regression ticket was never briefed.
+        self.first_label_ticket(7)
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        self.assign(available=["codex", "codex-2"])
+        self.assertEqual(self.lane(7), "codex")
+        self.assertEqual(factory._state(self.gh.issues[7]), "briefed")
+
+    def test_a_first_label_model_ticket_skips_a_lane_limited_for_the_model(self):
+        self.first_label_ticket(7)
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["codex", "codex-2"],
+                                 model_limits={"codex": {"gpt-6-sol": NOW + 3600}})
+        worker.assign_queued()
+        self.assertEqual(self.lane(7), "codex-2")
+
+    def test_a_first_label_model_ticket_waits_when_its_lanes_are_limited_or_down(self):
+        self.first_label_ticket(7)
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        for kwargs in ({"limited": ["codex", "codex-2"], "available": ["codex", "codex-2"]},
+                       {"available": []}):
+            worker = self.assign(**kwargs)
+            self.assertEqual(worker.waits["%s#7" % REPO], "no free lane takes model gpt-6-sol")
+            self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+
+    def test_a_model_ticket_without_a_first_label_waits_for_a_free_lane(self):
+        self.queued(7, body="Model: gpt-6-sol\nDifficulty: medium\n\n## Why\nx\n")
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        worker = self.assign(available=["codex", "codex-2"])
+        self.assertEqual(worker.waits["%s#7" % REPO], "no free lane takes model gpt-6-sol")
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+
     def test_queued_ladder_model_uses_a_compatible_lane(self):
         body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
         self.queued(7, body=body)
