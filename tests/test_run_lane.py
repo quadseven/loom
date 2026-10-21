@@ -137,7 +137,8 @@ fi
 # $FAKE_EXIT, editing a file first when $FAKE_EDIT is set ($FAKE_AGENT=say).
 # $FAKE_AGENT=stray also commits files no brief here names (a hook config,
 # a scratch file under .loom/, a top-level test script).
-# The file holds $FAKE_AGENT_TEXT (default "fixed"); $FAKE_AGENT_WEAKEN
+# $FAKE_AGENT=contract-edit commits $FAKE_CONTRACT_TEXT as the validation
+# contract. The file holds $FAKE_AGENT_TEXT (default "fixed"); $FAKE_AGENT_WEAKEN
 # rewrites the validation contract.
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
@@ -246,6 +247,14 @@ if [ "${FAKE_AGENT:-commit}" = binref ]; then
   mkdir -p bin
   printf '#!/bin/sh\\n' > bin/tool
   printf '#!/bin/sh\\n./bin/tool\\n' > run.sh
+  printf 'fixed\\n' > fix.txt
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
+if [ "${FAKE_AGENT:-commit}" = contract-edit ]; then
+  mkdir -p .loom
+  printf '%s' "$FAKE_CONTRACT_TEXT" > .loom/validation.conf
   printf 'fixed\\n' > fix.txt
   git add -A
   git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
@@ -4515,6 +4524,44 @@ echo fixed > fix.txt
         records = [json.loads(line) for line in path.read_text().splitlines()]
         self.assertEqual(records[-1]["command"], "test -f .prepared && loom-test-python check.py")
         self.assertFalse(records[-1]["ok"])
+
+    def contract_edit_lane(self, text):
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_AGENT="contract-edit", FAKE_CONTRACT_TEXT=text)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.lane_log()
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_lane_contract_the_reader_cannot_read_is_refused_and_nothing_is_pushed(self):
+        log = self.contract_edit_lane('[[deploy]]\ncommand = "make deploy"\n')
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists(), log)
+        self.assertIn("commit refused: .loom/validation.conf is one the runner cannot read:"
+                      " unknown kind 'deploy'", log)
+        self.assertIn("nothing pushed", log)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", self.remote_heads())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_lane_contract_whose_check_fails_on_the_lanes_tree_is_refused(self):
+        # The 2026-10-20 contract named a binary by an unset variable.
+        bad = CONTRACT.replace("check: test -f .prepared && loom-test-python check.py",
+                               "check: $LOOM_UNSET_TOOL --version")
+        log = self.contract_edit_lane(bad)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists(), log)
+        self.assertIn("commit refused: the check in .loom/validation.conf exited 127 on the lane's own tree",
+                      log)
+        self.assertIn("nothing pushed", log)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", self.remote_heads())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_lane_contract_that_reads_and_passes_under_itself_is_pushed(self):
+        log = self.contract_edit_lane("[[test]]\ncommand = \"loom-test-python check.py\"\n\n"
+                                      "[[lint]]\ncommand = \"loom-test-python -c pass\"\n")
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), log)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("refs/heads/loom/T042-fix-the-thing\n", self.remote_heads())
 
     def test_a_contract_with_an_unknown_line_is_a_setup_failure(self):
         self.contract_repo(contract=CONTRACT + "python: 3.12\n")

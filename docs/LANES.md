@@ -63,6 +63,12 @@ prepares the tree (a venv, locked dependencies, a pinned linter) and `check`
 is the required check. Point the repo's CI at the same two scripts so the
 lane and CI cannot drift apart. Unknown lines are refused.
 
+The runner's reader (`bus/contract.py`) also accepts a list of
+`<kind> | <command>` lines, or `[kind]`, `[kind.name]` and `[[kind]]` tables
+with a `command = "..."` key, for the kinds lint, format, type and test. It
+joins the commands, in that order, into one `check`. List only commands that
+run on a lane machine with no secrets, simulators or unset variables.
+
 - The runner reads the file from the base revision before the agent starts
   (on a fix run, from the base branch, not the pull request's branch);
   what the agent edits never changes what is checked. `setup` and `check`
@@ -75,6 +81,13 @@ lane and CI cannot drift apart. Unknown lines are refused.
   it). What setup leaves untracked goes into `.git/info/exclude`, so it is
   never committed.
 - The agent is told the check and how it did on the base.
+- A lane change that adds or edits `.loom/validation.conf` must read and pass
+  under itself. Before the push the runner reads the committed file with the
+  same reader and runs its `check` (and its `setup`, when that differs from
+  the base's) on the lane's tree. A file the reader refuses, a check that
+  exits non-zero or changes tracked files, or a missing interpreter parks the
+  brief as `commit refused: ...; nothing pushed`. The records are the
+  `contract-setup` and `contract-check` phases.
 - After the agent: the runner commits, then runs `check` on that commit. It
   passes only with exit 0 and no tracked file changed (a formatter that has
   to rewrite the agent's files is a failure). Only then is the branch pushed
@@ -91,7 +104,7 @@ lane and CI cannot drift apart. Unknown lines are refused.
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
 - `logs/<lane>/<ticket>.validation.jsonl` holds one line per step: phase
-  (`prepare`, `setup`, `baseline`, `final`), command, exit code, tree
+  (`prepare`, `setup`, `baseline`, `contract-setup`, `contract-check`, `final`), command, exit code, tree
   revision, `ok` and detail (the interpreter's version, the submodule
   revisions).
 - A repo without the file is not validated by the runner; CI still is.
