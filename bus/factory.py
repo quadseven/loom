@@ -926,6 +926,24 @@ def repeated_no_reason(comments: Sequence[Dict[str, Any]]) -> bool:
     return bool(seen) and seen[-1] and sum(seen) >= 2
 
 
+# lanes/run_lane.sh's reason when the agent edited a submodule (loom#1316).
+SUBMODULE_EDIT_RE = re.compile(r"the change edits files inside submodule (\S+)")
+
+
+def needs_other_repo(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
+    """The submodule the ticket's newest failure says needs the change, else
+    None. The change belongs in that submodule's own repo, which a push of
+    this one cannot carry, so a stronger model fails the same way: three
+    tickets needed such a split on 2026-10-21."""
+    newest = None
+    for c in comments:
+        body = str(c.get("body") or "")
+        if FAILED_RE.match(body):
+            newest = body
+    match = SUBMODULE_EDIT_RE.search(newest or "")
+    return match.group(1) if match else None
+
+
 def current_rung(issue: Dict[str, Any]) -> int:
     """The rung whose model and lane the ticket runs on now, 0 when none: a
     brief can start on a ladder model, and failing there tries that rung."""
@@ -2068,6 +2086,10 @@ class Factory:
         if repeated_no_reason(comments):
             self._hold_no_reason(repo, issue)
             return
+        other = needs_other_repo(comments)
+        if other:
+            self._hold_other_repo(repo, issue, other)
+            return
         pr = prs.get(number)
         footer = self._footer(repo, pr)
         lane = self._climb(repo, issue, comments, "it failed on lane %s" % _lane(issue),
@@ -2112,6 +2134,24 @@ class Factory:
         self.actions += 1
         _say("%s#%d failed again with no commit and no reason; left for the brain"
              % (repo, number))
+
+    def _hold_other_repo(self, repo: str, issue: Dict[str, Any], submodule: str) -> None:
+        """Leave a ticket failed for the brain to split, once (needs-brain says
+        it was reported), when its change needed files inside a submodule."""
+        names = _labels(issue)
+        if "needs-brain" in names:
+            return
+        number = int(issue["number"])
+        self._status_note(repo, number, (
+            "Not climbing the model ladder: lane %s's change needed files inside "
+            "submodule %s, which a push of this repo cannot carry, and a stronger model "
+            "cannot change that. The brain splits the ticket: the %s part as a ticket "
+            "in that repo, and an After: line here naming it." % (_lane(issue), submodule, submodule)))
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": names + ["needs-brain"]})
+        self.actions += 1
+        _say("%s#%d needs a change in submodule %s; left for the brain to split"
+             % (repo, number, submodule))
 
     def briefed(self, repo: str, issue: Dict[str, Any]) -> None:
         if self.now < held_until(issue):
