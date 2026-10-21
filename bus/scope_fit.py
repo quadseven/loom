@@ -148,8 +148,10 @@ def asker(url: str, model: str = DEFAULT_MODEL, timeout: float = DEFAULT_TIMEOUT
         payload = json.dumps({"model": model or DEFAULT_MODEL, "temperature": 0,
                               "max_tokens": MAX_TOKENS,
                               "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
-        request = urllib.request.Request(endpoint, data=payload, method="POST",
-                                         headers={"Content-Type": "application/json"})
+        # URL_RE let only an https URL through, so no file: or custom scheme.
+        request = urllib.request.Request(  # noqa: S310
+            endpoint, data=payload, method="POST",
+            headers={"Content-Type": "application/json"})
         try:
             with urlopen(request, timeout=timeout) as response:
                 if getattr(response, "status", 200) != 200:
