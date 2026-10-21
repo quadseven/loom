@@ -156,10 +156,17 @@ for i in "${!MODELS[@]}"; do
       # private command with a free/ entry, as the provider may train on it.
       command -v "$BIN" > /dev/null || fail "$BIN not on PATH"
       if [[ "${LOOM_REWRITE_FREE_URL:-}" =~ ^https://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]]; then
-        LANE=free SPARK_URL="$LOOM_REWRITE_FREE_URL"
+        # A cooled-down free pool answers 503 with a retry-after and opencode
+        # keeps retrying, so a free entry gets its own short limit
+        # (LOOM_REWRITE_FREE_TIMEOUT, default 90 seconds) before the next
+        # model: one hung the rewriter's whole 480 seconds (2026-10-21).
+        FREE_TIMEOUT="${LOOM_REWRITE_FREE_TIMEOUT:-90}"
+        [[ "$FREE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] && [ "$FREE_TIMEOUT" -lt "$AGENT_TIMEOUT" ] || FREE_TIMEOUT="$AGENT_TIMEOUT"
+        BASE_TIMEOUT="$AGENT_TIMEOUT"
+        LANE=free SPARK_URL="$LOOM_REWRITE_FREE_URL" AGENT_TIMEOUT="$FREE_TIMEOUT"
         opencode_run - "$BIN" --format json > "$OUT"
         # shellcheck disable=SC2034 # read by the sourced agent_sandbox.sh
-        LANE=rewrite SPARK_URL=""
+        LANE=rewrite SPARK_URL="" AGENT_TIMEOUT="$BASE_TIMEOUT"
       else
         echo "LOOM_REWRITE_FREE_URL is not an https URL" > "$OUT"
         false

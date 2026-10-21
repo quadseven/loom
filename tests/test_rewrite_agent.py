@@ -6,6 +6,7 @@ import re
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -49,6 +50,7 @@ printf '%s' "$prompt" > "$log.stdin"
 case "$prompt" in
   *MODE=rate-first*) case "$*" in *"@RATE_MODEL@"*) printf '%s\n' '{"type":"error","error":{"name":"RateLimitError","data":{"message":"temporarily rate limited"}}}'; exit 0 ;; esac ;;
   *MODE=fail*) echo "connection reset" >&2; exit 3 ;;
+  *MODE=hang*) case "$*" in *free/*) sleep 30 ;; esac ;;
   *MODE=error*) printf '{"type":"error","error":{"name":"APIError","data":{"message":"bad key %s"}}}\n' "$key"; exit 0 ;;
   *MODE=notext*) printf '%s\n' '{"type":"step_start","part":{"type":"step-start"}}'; exit 0 ;;
   *MODE=leak*) printf '{"type":"text","part":{"type":"text","text":"the key is %s"}}\n' "$key"; exit 0 ;;
@@ -253,6 +255,18 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertEqual(config["provider"]["free"]["options"]["baseURL"], url)
         self.assertEqual(self.agent()["key"], "none")
         self.assertNotIn("aws ssm", self.log.read_text() if self.log.exists() else "")
+
+    def test_a_free_model_that_hangs_gives_way_within_its_own_timeout(self):
+        # The gateway answers a cooled-down free pool with 503 and a
+        # retry-after, and opencode keeps retrying: one rewrite hung its whole
+        # 480 seconds, which a station pass would wait out (2026-10-21).
+        started = time.time()
+        result = self.run_wrapper("MODE=hang", args=("-", "free/gemma-4-31b-it,codex/test-model"),
+                                  env_overrides={"LOOM_REWRITE_FREE_URL": "https://gateway.invalid/v1",
+                                                 "LOOM_REWRITE_FREE_TIMEOUT": "3"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.time() - started, 25)
+        self.assertIn("codex", self.lane_log.read_text())
 
     def test_a_free_model_with_no_route_set_falls_through_to_the_next(self):
         result = self.run_wrapper("Rewrite this", args=("-", "free/gemma-4-31b-it,codex/test-model"))
