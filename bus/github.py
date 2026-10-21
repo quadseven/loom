@@ -9,8 +9,11 @@ returns that answer: GitHub does not count a 304 against the hourly budget.
 With the GitHub App settings present (auth_from_env), requests carry an App
 installation token instead of a personal token, so they spend the
 installation's own hourly budget. The token is minted at run time from the
-App's private key, read from SSM, kept in memory only, and refreshed before
-it expires.
+App's private key, read from SSM, and refreshed before it expires. The key
+and the token are held in memory; a caller that runs one pass per process (the
+station) may also name a state file (AppToken.state_file, mode 0600) that keeps
+the token across passes, so the ETags cached on the last pass still match
+(GitHub's ETags differ per token; loom#1306). Nothing else is written to disk.
 """
 from __future__ import annotations
 
@@ -315,8 +318,11 @@ class AppToken:
 
     The key is read through read_key each time a token is minted and dropped
     after signing; the token is kept in memory until APP_TOKEN_MARGIN seconds
-    before its expires_at. Neither is written to disk, and no error or log
-    line carries either. Thread safe: parallel reads share one token."""
+    before its expires_at. The key is never written to disk. The token is
+    written only to state_file, when one is set, as a 0600 file: a process
+    that lives for one pass then reuses the last pass's token and the ETags
+    cached under it answer 304 (loom#1306). No error or log line carries
+    either. Thread safe: parallel reads share one token."""
 
     def __init__(self, app_id: str, installation_id: str,
                  read_key: Callable[[], str],
@@ -333,6 +339,9 @@ class AppToken:
         self._token: Optional[str] = None
         self._expires = 0.0
         self.minted = 0
+        # Where the token is kept between processes (0600); None keeps it in
+        # memory only.
+        self.state_file: Optional[str] = None
         # Where the key is read from: "ssm" (the aws CLI) or "file".
         self.key_source = "ssm"
         self.key_file = ""
@@ -396,11 +405,14 @@ class AppToken:
         jwt) -> (token, expires_at) when none is held or it expires within
         APP_TOKEN_MARGIN seconds."""
         with self._lock:
+            if self._token is None:
+                self._load()
             if self._token is None or self._clock() >= self._expires - APP_TOKEN_MARGIN:
                 path = "/app/installations/%s/access_tokens" % self.installation_id
                 token, expires_at = mint(path, self.jwt())
                 self._token, self._expires = token, _expiry(expires_at)
                 self.minted += 1
+                self._save()
             return self._token
 
     def invalidate(self) -> None:
@@ -408,6 +420,54 @@ class AppToken:
         with self._lock:
             self._token = None
             self._expires = 0.0
+            self._forget()
+
+    def _load(self) -> None:
+        """Take the token the state file keeps, when it is this App's, not
+        yet within APP_TOKEN_MARGIN of expiring, and private to this user. A
+        missing or odd file only costs one mint."""
+        if not self.state_file:
+            return
+        try:
+            st = os.stat(self.state_file)
+            if st.st_uid != os.getuid() or st.st_mode & 0o077:
+                return
+            with open(self.state_file, encoding="utf-8") as fh:
+                kept = json.load(fh)
+            token, expires = kept["token"], float(kept["expires"])
+            same = kept["app_id"] == self.app_id and kept["installation_id"] == self.installation_id
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        if same and isinstance(token, str) and token.strip() \
+                and self._clock() < expires - APP_TOKEN_MARGIN:
+            self._token, self._expires = token.strip(), expires
+
+    def _save(self) -> None:
+        """Keep the token in the state file, created 0600 and replaced whole.
+        A failure only means the next process mints its own."""
+        if not self.state_file or self._token is None:
+            return
+        tmp = "%s.%d.tmp" % (self.state_file, os.getpid())
+        try:
+            os.makedirs(os.path.dirname(self.state_file) or ".", exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"app_id": self.app_id, "installation_id": self.installation_id,
+                           "token": self._token, "expires": self._expires}, fh)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.state_file)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def _forget(self) -> None:
+        if self.state_file:
+            try:
+                os.unlink(self.state_file)
+            except OSError:
+                pass
 
     def __repr__(self) -> str:
         return "AppToken(installation)"

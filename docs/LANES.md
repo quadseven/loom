@@ -211,7 +211,11 @@ own hourly budget, not the operator account's. The token is minted at run
 time: the key is read from SSM, an RS256 JWT is signed with the `openssl`
 CLI (key on stdin, never on the command line or on disk), and
 `POST /app/installations/<id>/access_tokens` returns a token kept in memory
-until 5 minutes before its `expires_at`. Mints count under `app token` in the
+until 5 minutes before its `expires_at`. The station runs one pass per process
+and GitHub's ETags differ per token, so it also keeps the token in
+`state/station/app-token.json` (mode 0600, the only place a token is written)
+and the next pass reuses it until 5 minutes before expiry; the ETags cached on
+the last pass then answer 304 (loom#1306). A 401 deletes the file. Mints count under `app token` in the
 requests line, and the budget line reads `GitHub App budget`. With any of the
 three unset, the token above is used as before. Instead of SSM, the station
 and the brain can read the key from a file: set `LOOM_GITHUB_APP_KEY_FILE` to
