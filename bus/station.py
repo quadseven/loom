@@ -187,6 +187,10 @@ REWRITE_PER_HOUR = 5
 # A brief that has waited this long in a down lane's inbox stops blocking its
 # ticket's next claim (_return_dead_brief).
 DEAD_BRIEF_AGE = 3600
+# A runner stamps state/usage/<slot>.alive every minute while it lives
+# (lanes/run_lane.sh, loom#1281); a stamp this old or less says its runner is
+# running, whatever its heartbeat's age. Several missed stamps still count.
+ALIVE_MAX_AGE = 300
 REWRITE_PER_PASS = 5
 # A recorded ticket wait the factory has not repeated for this long is gone:
 # the ticket moved, or left the factory (invariants.ticket_waiting).
@@ -1935,6 +1939,48 @@ class Station:
         except PermissionError:
             pass  # alive, owned by another user (the lane user)
         return True
+
+    def _keepalive_age(self, lane: str) -> Optional[float]:
+        """Seconds since lane's runner last stamped state/usage/<lane>.alive
+        (a unix time, written every minute while the runner lives); None when
+        there is no readable stamp. A runner writes its heartbeat only between
+        runs, so a lane deep in a run is told alive by this stamp (loom#1281)."""
+        if lane not in LANES:
+            return None
+        path = os.path.join(self.s.home, "state", "usage", lane + ".alive")
+        try:
+            with open(path) as fh:
+                at = float(fh.read().strip())
+        except (OSError, ValueError):
+            return None
+        if at - max(self.now, time.time()) > 60:
+            return None  # from the future: not a stamp this runner wrote
+        return max(0.0, self.now - at)
+
+    def _keepalive_fresh(self, lane: str) -> bool:
+        age = self._keepalive_age(lane)
+        return age is not None and age <= ALIVE_MAX_AGE
+
+    def _runner_state(self, lane: str) -> str:
+        """What the station sees of lane's runner, for the log line that
+        names why a lane was read as silent (loom#1281)."""
+        if lane not in LANES:
+            return "not a lane"
+        lock = os.path.join(self.s.home, "run", lane + ".lock")
+        if not os.path.isdir(lock):
+            lock_state = "no lock"
+        else:
+            try:
+                with open(os.path.join(lock, "pid")) as fh:
+                    pid = int(fh.read().strip())
+            except (OSError, ValueError):
+                lock_state = "lock without a readable pid"
+            else:
+                lock_state = ("lock pid %d dead" % pid if not self._runner_alive(lane)
+                              else "lock pid %d alive" % pid)
+        age = self._keepalive_age(lane)
+        return "%s, %s" % (lock_state, "no keepalive stamp" if age is None
+                           else "keepalive stamp %d seconds old" % age)
 
     def _claim_label(self, repo: str) -> Optional[str]:
         """The claim:<operator login> label a claim adds, created in the repo
@@ -8230,10 +8276,13 @@ class Station:
         long run writes no heartbeat until the run ends: counted silent, two
         spark runs had their tickets re-queued and lane labels removed while
         they ran, and their finished pull requests were left with no lane
-        (2026-10-19)."""
+        (2026-10-19). A runner also stamps <lane>.alive every minute while it
+        lives, so a fresh stamp keeps a lane from being read as silent even
+        when its lock cannot be read as a live runner (loom#1281)."""
         out = {}
         for lane in LANES:
-            if lane in REMOTE_LANES or self._heartbeat_ok(lane) or self._runner_alive(lane):
+            if (lane in REMOTE_LANES or self._heartbeat_ok(lane)
+                    or self._runner_alive(lane) or self._keepalive_fresh(lane)):
                 continue
             beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
                               None, strict=False)
@@ -8255,6 +8304,9 @@ class Station:
         for lane, held in found.items():
             saved[lane] = {"at": self.now, "silent_for": silent[lane],
                            "tickets": ["%s#%d" % item for item in held]}
+            _say("lane %s held %s while silent for %d minutes; runner seen as: %s"
+                 % (lane, ", ".join("%s#%d" % item for item in held),
+                    silent[lane] // 60, self._runner_state(lane)))
         _write_json(path, saved)
 
     def _return_silent_briefs(self, found: Dict[str, List[Tuple[str, int]]]) -> None:

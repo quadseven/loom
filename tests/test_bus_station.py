@@ -4392,6 +4392,47 @@ class SilentLaneTest(Base):
             fh.write("999999")
         self.assertIn("spark-3", self.station()._silent_lanes())
 
+    def stamp_alive(self, lane, age):
+        d = os.path.join(self.home, "state", "usage")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, lane + ".alive"), "w") as fh:
+            fh.write("%d\n" % (time.time() - age))
+
+    def test_a_lane_whose_runner_stamps_its_keepalive_is_not_silent(self):
+        # loom#1281: a run past SILENT_MAX with no readable live lock was read
+        # as silent and its ticket re-queued while it ran.
+        self.heartbeat("spark-4", age=64 * 60)
+        self.stamp_alive("spark-4", age=30)
+        self.assertNotIn("spark-4", self.station()._silent_lanes())
+
+    def test_a_stale_keepalive_stamp_does_not_keep_a_lane_from_being_silent(self):
+        self.heartbeat("spark-4", age=64 * 60)
+        self.stamp_alive("spark-4", age=station.ALIVE_MAX_AGE + 60)
+        self.assertIn("spark-4", self.station()._silent_lanes())
+
+    def test_a_keepalive_stamp_from_the_future_or_unreadable_counts_for_nothing(self):
+        self.heartbeat("spark-4", age=64 * 60)
+        self.stamp_alive("spark-4", age=-3600)
+        self.assertIn("spark-4", self.station()._silent_lanes())
+        path = os.path.join(self.home, "state", "usage", "spark-4.alive")
+        with open(path, "w") as fh:
+            fh.write("not a time")
+        self.assertIn("spark-4", self.station()._silent_lanes())
+
+    def test_the_station_says_what_it_saw_of_a_silent_lanes_runner(self):
+        self.heartbeat("spark-4", age=64 * 60)
+        lock = os.path.join(self.home, "run", "spark-4.lock")
+        os.makedirs(lock)
+        with open(os.path.join(lock, "pid"), "w") as fh:
+            fh.write("999999")
+        self.assertEqual(self.station()._runner_state("spark-4"),
+                         "lock pid 999999 dead, no keepalive stamp")
+        self.assertEqual(self.station()._runner_state("codex"),
+                         "no lock, no keepalive stamp")
+        self.stamp_alive("spark-4", age=30)
+        self.assertRegex(self.station()._runner_state("spark-4"),
+                         r"^lock pid 999999 dead, keepalive stamp \d+ seconds old$")
+
     def test_the_lanes_found_holding_a_running_ticket_become_an_invariant_fact(self):
         st = self.station()
         st._record_silent({"codex": [(REPO, 12)]}, {"codex": 1860.0})

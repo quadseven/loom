@@ -4257,6 +4257,27 @@ exit %d
                 except ProcessLookupError:
                     pass
 
+    def test_a_runner_stamps_a_keepalive_through_a_long_run_and_removes_it_after(self):
+        # loom#1281: the heartbeat is written between runs, so a run past the
+        # station's silence limit read as silent. The stamp is refreshed while
+        # the agent runs and goes with the runner.
+        self.drop_brief()
+        seen = Path(self._tmp.name) / "stamp.seen"
+        stamp = self.loom / "state" / "usage" / "codex.alive"
+        self.write_tool(self.bin / "real-codex", FAKE_AGENT)
+        self.write_tool(self.bin / "codex",
+                        "#!/bin/bash\n"
+                        "sleep 3\n"
+                        f"cp '{stamp}' '{seen}' 2>/dev/null || echo missing > '{seen}'\n"
+                        f"exec \"{self.bin / 'real-codex'}\" \"$@\"\n")
+        started = int(time.time())
+        result = self.run_lane(LOOM_KEEPALIVE_SECONDS="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), result.stderr)
+        at = int(seen.read_text().strip())  # "missing" fails here: no stamp during the run
+        self.assertGreaterEqual(at, started + 2, "the stamp was not refreshed during the run")
+        self.assertFalse(stamp.exists())
+
     def test_a_check_home_left_by_a_killed_runner_goes_with_the_next_pass(self):
         # loom#643: 17 of these, about 300 MB each, filled run/.
         left = self.loom / "run" / "codex-check" / "Library" / "Caches"
