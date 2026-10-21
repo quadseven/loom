@@ -431,8 +431,9 @@ this tick"; a step with no note shows nothing there.
    lane of its Difficulty tier, by priority, then oldest queued first. Use `--lane LANE`
    when the brain needs to choose the lane itself. `brief` refuses a brief
    with neither `--lane` nor `--difficulty`. A queued ticket without a
-   readable Difficulty line stays queued and appears in the goal's next
-   station standup as needing a difficulty; set one in the same tick with
+   readable Difficulty line (or one naming no tier) takes a medium lane, and
+   appears in the goal's next station standup as needing a difficulty; set
+   the right one in the same tick with
    `python3 -m bus.brain prioritize OWNER/NAME#N --difficulty easy|medium|hard`. A brief named but not written this
    tick is deferred with the `brief` stage (`defer OWNER/NAME#GOAL --stage brief --holder muse --note "one-line problem statement"`),
    never only in journal prose.
@@ -631,7 +632,9 @@ request, once per head commit) instead of waiting with nothing to move it
 (docs/LANES.md). A green, reviewed pull request is not escalated: a ticket
 whose open pull request has nothing to fix (its head is green, the review
 check passed on that head, and no review thread is open) is landed, whatever
-its fix rounds.
+its fix rounds. When GitHub refuses that merge because a bot's change request
+from an earlier failing review still stands, the factory dismisses the bot's
+change request and merges; a person's change request is never dismissed.
 
 The factory applies this ladder on its own (bus/factory.py, recorded as
 `<!-- loom:rung N -->` comments). For work the factory cannot see, such as a
