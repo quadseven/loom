@@ -19,8 +19,8 @@
 # A limit failure also holds this lane unavailable until the provider's reset
 # (else 60 minutes). The agent edits (and
 # may commit); this runner commits what is left, pushes, and opens the PR.
-# A commit that adds a file outside the brief's paths (bus/scope_check.py)
-# is refused before validation and push, and nothing is pushed.
+# Unreferenced scratch files added outside the brief's paths are dropped;
+# other added files outside those paths are refused before validation and push.
 # A repo with a validation contract (.loom/validation.conf) is prepared
 # before the agent and checked again on its commit; a failing check parks
 # the brief and keeps the edits on a side branch instead of opening a PR.
@@ -253,43 +253,40 @@ work_note() {
   printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
-# Lists the files the agent's commits added (BASE..HEAD) that only probe the
-# sandbox -- an empty or one-line added file named .test* or under a new
-# top-level bin/, referenced nowhere else in the diff -- and removes them
-# from the branch. A never-pushed branch is rebuilt without them so no
-# commit carries them; a fix round (already pushed, or mid-merge) gets a
+# Lists the sandbox probes and out-of-path scratch files the agent added
+# (BASE..HEAD), then removes them from the branch. A never-pushed branch is
+# rebuilt without them so no commit carries them; a fix round gets a
 # removal commit on top so the push stays fast-forward. Names each file
-# dropped on stdout and sets DROPPED_FILES to the newline-separated paths.
-# A helper failure is a no-op: the run continues and the review bot and
-# factory stay the backstop.
-drop_probe_files() {
-  local probes f stamp
+# dropped on stdout and sets DROPPED_FILES and DROPPED_SCRATCH_FILES.
+drop_agent_files() {
+  local probes scratch dropped f stamp
   DROPPED_FILES=""
-  probes="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.probe_drop "$TREE" "$BASE" HEAD 2>/dev/null)" || return 0
-  [ -n "$probes" ] || return 0
+  DROPPED_SCRATCH_FILES=""
+  probes="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.probe_drop "$TREE" "$BASE" HEAD 2>/dev/null)" || return 1
+  scratch="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.scope_check --scratch "$TREE" "$BASE" HEAD "$BRIEF" ${FIX_UPSTREAM:+"$FIX_UPSTREAM"})" || return 1
+  dropped="$(printf '%s\n%s\n' "$probes" "$scratch" | sed '/^$/d' | sort -u)"
+  [ -n "$dropped" ] || return 0
   stamp="$(date -u +%FT%TZ)"
   while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    rm -f "$TREE/$f"
-    printf '[%s] %s dropped sandbox probe file: %s\n' "$stamp" "$TICKET" "$f"
+    safe_git rm -q -f -- "$f" || return 1
+    if printf '%s\n' "$probes" | grep -Fxq -- "$f"; then
+      printf '[%s] %s dropped sandbox probe file: %s\n' "$stamp" "$TICKET" "$f"
+    else
+      printf '[%s] %s dropped scratch file: %s\n' "$stamp" "$TICKET" "$f"
+    fi
   done <<EOF
-$probes
+$dropped
 EOF
   DROPPED_FILES="$probes"
+  DROPPED_SCRATCH_FILES="$scratch"
   if [ -z "$FIX_PR" ] && [ -z "$CONFLICTS" ]; then
     safe_git reset -q --soft "$BASE" || return 1
     safe_git add -A || return 1
     safe_git diff --cached --quiet && return 0
     safe_git commit -qm "${TITLE:-$TICKET}" || return 1
   else
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      safe_git rm -q -r -- "$f" 2>/dev/null || true
-    done <<EOF
-$probes
-EOF
     safe_git diff --cached --quiet && return 0
-    safe_git commit -qm "Drop sandbox probe files: ${probes//$'\n'/, }" || return 1
+    safe_git commit -qm "Drop agent scratch files: ${dropped//$'\n'/, }" || return 1
   fi
 }
 
@@ -605,8 +602,12 @@ lane_app_token() {
 APP_TOKEN_WHY="could not mint the lane's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
 
 park() {
+  local reason="$2"
   [ -z "${REPLIES_FILE:-}" ] || rm -f "$REPLIES_FILE"
-  echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $2" | tee -a "$LOG" >&2
+  if [ -n "${DROPPED_SCRATCH_FILES:-}" ]; then
+    reason="$reason; dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+  fi
+  echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $reason" | tee -a "$LOG" >&2
   mv "$1" "$INBOX/failed/"
 }
 
@@ -806,8 +807,10 @@ PROBE_TIMEOUT=20
 # Go refills 20% of a model's allowance every 5 hours), so a lane that waited
 # out the whole window sat idle for days while the provider served it again
 # (opencode-go, 2026-10-20: the lane-held invariant fired and the tier's
-# tickets waited behind a lane the provider had long since freed).
+# tickets waited behind a lane the provider had long since freed). Other
+# providers retain their existing recheck interval.
 LIMIT_RECHECK=1800
+[ "$LANE" = opencode-go ] && LIMIT_RECHECK=300
 
 # The provider's own word for a usage limit. It is in the body the provider
 # answers with and in the reason the heartbeat carries, so a lane that asks
@@ -869,34 +872,52 @@ provider_at_limit() {
 }
 
 # When the provider was last asked whether it is at a limit: the epoch, one
-# line. A lane held by a limit asks it again every LIMIT_RECHECK minutes
+# line. A lane held by a limit asks it again every LIMIT_RECHECK seconds
 # (provider_limit_lifted), so the hold ends when the provider serves it.
 provider_checked() {
   mkdir -p "$LOOM_HOME/state/usage"
   printf '%s\n' "$(date +%s)" > "$LOOM_HOME/state/usage/$SLOT.provider-check"
 }
 
+# Older shared holds recorded the provider answer only on the slot that saw
+# it. Use that answer when another slot in the group wakes first.
+provider_limit_source() {
+  local slot
+  if [ -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json" ]; then
+    printf '%s' "$SLOT"
+    return 0
+  fi
+  for slot in $(key_group); do
+    if [ -f "$LOOM_HOME/state/usage/$slot.provider-limit.json" ]; then
+      printf '%s' "$slot"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Whether the lane asks the provider again: the last probe was at least
-# LIMIT_RECHECK minutes ago, and the hold in force is the one the probe took
+# LIMIT_RECHECK seconds ago, and the hold in force is the one the probe took
 # (its reason names the provider's limit; no other hold carries that).
 provider_recheck_due() {
-  local at reason
-  [ -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json" ] || return 1
+  local at reason source
+  source="$(provider_limit_source)" || return 1
   reason="$(sed -nE 's/.*"reason": *"([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
   case "$reason" in *"$GO_LIMIT_ERROR"*) ;; *) return 1 ;; esac
-  at="$(cat "$LOOM_HOME/state/usage/$SLOT.provider-check" 2>/dev/null)"
+  at="$(cat "$LOOM_HOME/state/usage/$source.provider-check" 2>/dev/null)"
   [[ "$at" =~ ^[0-9]+$ ]] || return 1
   [ "$(( $(date +%s) - at ))" -ge "$LIMIT_RECHECK" ]
 }
 
 # Whether the provider serves this lane again. The provider is asked at most
-# once every LIMIT_RECHECK minutes, and only for a hold the probe itself took:
+# once every LIMIT_RECHECK seconds, and only for a hold the probe itself took:
 # a hold the agent CLI recorded (a model it no longer offers, a spent
 # allowance) stands, for no probe says otherwise. A provider that cannot be
 # reached is not a provider that serves the lane: the hold stands.
 provider_limit_lifted() {
-  local model key_ssm
+  local model key_ssm source
   provider_recheck_due || return 1
+  source="$(provider_limit_source)" || return 1
   [ -n "$(lane_setting PROBE_URL)" ] || return 1
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || return 1
@@ -905,7 +926,7 @@ provider_limit_lifted() {
   # The model the probe found at a limit: the provider's answer is about that
   # model, so that is the model to ask about again.
   model="$(sed -nE 's/.*"model": *"([A-Za-z0-9._:/@-]+)".*/\1/p' \
-    "$LOOM_HOME/state/usage/$SLOT.provider-limit.json" 2>/dev/null | head -1)"
+    "$LOOM_HOME/state/usage/$source.provider-limit.json" 2>/dev/null | head -1)"
   [ -n "$model" ] || model="$(lane_setting MODEL)"
   [ -n "$model" ] || return 1
   MODEL="$model"
@@ -983,10 +1004,18 @@ limit_until() {
 # Hold every slot in this slot's group until the provider's reset, and
 # hand on every brief still in the inbox this pass.
 hold_provider_limit() {
-  local until slot
+  local until slot source checked
   until="$(limit_until)" || return 0
   LIMITED=1
+  source="$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
+  checked="$(date +%s)"
   for slot in $(key_group); do
+    if [ "$slot" != "$SLOT" ]; then
+      cp "$source" "$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp" || return 1
+      mv -f "$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp" \
+        "$LOOM_HOME/state/usage/$slot.provider-limit.json" || return 1
+    fi
+    printf '%s\n' "$checked" > "$LOOM_HOME/state/usage/$slot.provider-check" || return 1
     write_beat "$slot" false "limit: $LIMIT_WHY; unavailable until $(utc "$until")" "$until"
   done
 }
@@ -2098,6 +2127,7 @@ fi
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
   PR_BODY=""
+  DROPPED_SCRATCH_FILES=""
   TICKET="$(basename "$BRIEF" .md)"
   REPO="$(field Repo "$BRIEF")"
   BRANCH="$(field Branch "$BRIEF")"
@@ -2467,12 +2497,11 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "could not check out $BRANCH after the agent run" transient; continue
   fi
   COMMITTED=0
-  # A lane pull request never carries the files its agent wrote to probe
-  # the sandbox. Before validation, push and PR, the runner drops those
-  # files from the agent's commits and names each one in the run log (and,
-  # for a new PR, in the Intent section).
-  if ! drop_probe_files >> "$LOG" 2>&1; then
-    park "$BRIEF" "could not drop sandbox probe files" transient; continue
+  # Before validation, push and PR, drop sandbox probes and qualifying
+  # out-of-path scratch files from the agent's commits and name each one
+  # in the run log and pull request text.
+  if ! drop_agent_files >> "$LOG" 2>&1; then
+    park "$BRIEF" "could not drop agent scratch files" transient; continue
   fi
   if ! BRANCH_HEAD="$(safe_git rev-parse "$BRANCH" 2>> "$LOG")" || [ -z "$BRANCH_HEAD" ]; then
     park "$BRIEF" "could not read the lane branch after validation" transient; continue
@@ -2521,6 +2550,10 @@ for BRIEF in "$INBOX"/*.md; do
       if [ -n "$DROPPED_FILES" ]; then
         INTENT_TEXT="${INTENT_TEXT}
 - Dropped sandbox probe files: ${DROPPED_FILES//$'\n'/, }"
+      fi
+      if [ -n "$DROPPED_SCRATCH_FILES" ]; then
+        INTENT_TEXT="${INTENT_TEXT}
+- Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
       fi
       PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
       PR_BODY="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
@@ -2637,6 +2670,11 @@ $CHECKED"
     else
       COMMENT="Lane $SLOT repaired the PR text for: ${ITEMS:-the findings on the ticket}"
     fi
+    if [ -n "$DROPPED_SCRATCH_FILES" ]; then
+      COMMENT="$COMMENT
+
+Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+    fi
     if ! timeout "$NET_TIMEOUT" gh pr comment "$FIX_PR" -R "$REPO" --body "$COMMENT" >> "$LOG" 2>&1; then
       echo "[$(date -u +%FT%TZ)] $TICKET: fixes are pushed but the comment on #$FIX_PR failed" >> "$LOG"
     fi
@@ -2654,6 +2692,10 @@ $CHECKED"
     INTENT_CLASS=""
     INTENT_TEXT=""
     prepare_intent "$BRIEF" >> "$LOG" 2>&1
+    if [ -n "$DROPPED_SCRATCH_FILES" ]; then
+      INTENT_TEXT="${INTENT_TEXT}
+- Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+    fi
   fi
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).

@@ -3922,6 +3922,28 @@ class SilentLaneTest(Base):
         st._record_silent({}, {})
         self.assertEqual(st._invariant_silent(), [])
 
+    def test_a_brief_left_in_a_silent_lanes_inbox_is_returned_when_its_ticket_moves(self):
+        # loom#1206: the factory moved #12 off silent lane codex, but its
+        # brief was still in codex's inbox; a revived runner would pick up
+        # the stale brief and work a ticket it no longer holds.
+        st = self.station()
+        self.write(self.inbox("codex", "example-owner.example-repo-12.md"), "brief")
+        self.write(self.inbox("codex", "example-owner.example-repo-12-r2.md"), "brief")
+        self.write(self.inbox("codex", "example-owner.example-repo-1.md"), "other ticket")
+        self.write(self.inbox("codex", "example-owner.example-repo-13.md"), "other ticket")
+        st._return_silent_briefs({"codex": [(REPO, 12)]})
+        self.assertEqual(self.listing("codex"),
+                         ["example-owner.example-repo-1.md",
+                          "example-owner.example-repo-13.md",
+                          "returned"])
+        self.assertEqual(sorted(os.listdir(self.inbox("codex", "returned"))),
+                         ["example-owner.example-repo-12-r2.md",
+                          "example-owner.example-repo-12.md"])
+
+    def test_returning_silent_briefs_tolerates_a_missing_inbox(self):
+        st = self.station()
+        st._return_silent_briefs({"codex": [(REPO, 12)]})  # no inbox dir: no crash
+
 
 class DeadLaneRunawayTest(Base):
     """A runaway held because one dead lane kept failing it (loom#565): every
