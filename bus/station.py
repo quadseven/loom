@@ -282,6 +282,7 @@ PIN_SHIP_LOOKBACK = 7 * 24 * 3600
 PIN_SHIP_SETTLE = 3600
 PIN_SHIPS_FILE = "pin_ships.json"
 SHIP_PATH_FILES = "ship_path_files.json"
+SHIP_PATH_MANUAL = "ship_path_manual.json"
 # The pull request files API returns at most this many files.
 PULL_FILES_MAX = 3000
 # Adopting open pull requests no ticket links (decision 0002, item 1): each
@@ -1355,6 +1356,7 @@ class Station:
         self._branch_cache: Dict[str, str] = {}
         # Per pass: each path-scoped repo's workflow filters, and its deploy runs.
         self._path_filters: Dict[str, Dict[str, List[str]]] = {}
+        self._manual_listed: Dict[str, List[str]] = {}
         self._path_runs: Dict[Tuple[str, str], Optional[Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]]] = {}
         # Repos whose claim:<login> label this pass has made sure of.
         self._claim_labels: set = set()
@@ -4049,6 +4051,10 @@ class Station:
         saved = _read_json(cache_path, {}, strict=False)
         known = saved if isinstance(saved, dict) else {}
         kept: Dict[str, Any] = {}
+        manual_path = os.path.join(self.state, SHIP_PATH_MANUAL)
+        noted = _read_json(manual_path, {}, strict=False)
+        told = noted if isinstance(noted, dict) else {}
+        listed = self._manual_listed_paths(repo)
         shipped = 0
         try:
             for _, number, pr in sorted((str(pr["merged_at"]), n, pr) for n, pr in latest.items()):
@@ -4061,6 +4067,10 @@ class Station:
                     if files is None:
                         continue
                 kept[key] = files
+                by_hand = ship_paths.manual_files(files, filters, listed)
+                if by_hand:
+                    self._note_by_hand(repo, number, pr, by_hand, told)
+                    continue
                 needed = sorted(w for w, pats in filters.items()
                                 if any(ship_paths.matches(pats, f) for f in files))
                 how, revision = self._path_cover(repo, pr, branch, needed)
@@ -4070,6 +4080,41 @@ class Station:
                     shipped += 1
         finally:
             _write_json(cache_path, {**{k: v for k, v in known.items() if k.split("#")[0] != repo}, **kept})
+            _write_json(manual_path, told)
+
+    def _manual_listed_paths(self, repo: str) -> List[str]:
+        """The path patterns the repo's .loom/manual-paths lists as applied by
+        hand, read once a pass; [] when the repo has no such file."""
+        if repo not in self._manual_listed:
+            text = self._contents_text(repo, ship_paths.MANUAL_PATHS_FILE)
+            self._manual_listed[repo] = ship_paths.listed_manual(text) if text else []
+        return self._manual_listed[repo]
+
+    def _note_by_hand(self, repo: str, number: int, pr: Dict[str, Any],
+                      files: List[str], told: Dict[str, Any]) -> None:
+        """Leave a ticket at loom:merged because its pull request changed
+        paths that are applied by hand, and name the manual step once on the
+        ticket (kept in ship_path_manual.json, so a pass never repeats it)."""
+        key = "%s#%d" % (repo, number)
+        if told.get(key) == int(pr["number"]):
+            return
+        shown = ", ".join("`%s`" % f for f in files[:5]) + (
+            " and %d more" % (len(files) - 5) if len(files) > 5 else "")
+        _say("%s stays merged: pull request #%d changed paths applied by hand: %s" % (
+            key, int(pr["number"]), ", ".join(files[:5])))
+        body = ("Not shipped on merge: pull request #%d changed %s, which merging does not "
+                "deploy (applied by hand: a Helm values file no deploy workflow covers, or a "
+                "path listed in `%s`). The ticket stays at loom:merged until the manual step "
+                "(for a chart, the helm upgrade) is run and the brain or an operator moves it "
+                "to loom:shipped." % (int(pr["number"]), shown, ship_paths.MANUAL_PATHS_FILE))
+        try:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not note the manual step on %s: %s" % (key, err))
+            return
+        told[key] = int(pr["number"])
 
     def _workflow_filters(self, repo: str, branch: str) -> Optional[Dict[str, List[str]]]:
         """Workflow file name to its on.push.paths filter, for the repo's

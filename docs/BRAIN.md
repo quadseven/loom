@@ -115,7 +115,14 @@ the changed files of each open `loom:merged` ticket's pull request (kept in
 `ship_path_files.json`). The ticket moves to `loom:shipped` when, for every
 workflow whose filter matches a changed file, a successful push run on the
 default branch ran on the merge commit or a later run carries it. A pull
-request that changes no file a filter matches ships on merge. A `!` pattern
+request that changes no file a filter matches ships on merge, unless it
+changed a path that is applied by hand: a Helm values file (`values.yaml`,
+`values-*.yaml`) that no workflow's filter covers, or a path matched by the
+repo's `.loom/manual-paths` (one pattern per line, `#` comments, `!` excludes,
+read from the default branch once a pass). Merging deploys none of those, so
+the ticket stays at `loom:merged` and the station comments once naming the
+files and the manual step (for a chart, the helm upgrade); the brain or an
+operator moves it to `loom:shipped` after. A `!` pattern
 excludes, as GitHub does; a workflow without a `paths` filter is not a deploy
 workflow here. Reverts and the 20 moves per pass limit apply as above.
 
