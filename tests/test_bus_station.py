@@ -6983,6 +6983,29 @@ class CloseDoneTest(Base):
         # Ticket 1 should remain open because there's no time window to check
         self.assertEqual(self.fake.issues[1]["state"], "open")
 
+    def test_a_shipped_ticket_whose_evidence_log_lives_outside_logs_stays_open(self):
+        # An evidence command pointing outside the configured log root is
+        # rejected, so no earliest record is read and the ticket stays open.
+        self.fake.private = False
+        import time
+        outside = os.path.join(os.path.dirname(self.home), "evidence.outside.log")
+        with open(outside, "w") as f:
+            f.write("")
+        stamp = time.mktime(time.struct_time((2026, 4, 1, 0, 0, 0, 0, 0, -1)))
+        os.utime(outside, (stamp, stamp))
+        self.settings.evidence_cmds = {REPO: outside}
+
+        with_window = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "prints `daily status ready` on or after 2026-01-01 and before 2026-03-01"
+        )
+        self.fake.add(1, lane="codex", body=with_window, state="shipped")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        # The log is outside the logs root, so the window-end check cannot run
+        # and the ticket stays open for a verify run.
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+
     def test_the_done_close_names_a_neutral_review_check(self):
         # The merge gate lets a non-sensitive pull request land with the
         # review check neutral, so the close may not say "green checks".

@@ -468,30 +468,35 @@ def live_needles(body: Optional[str]) -> Optional[List[str]]:
     return evidence.needles(live)
 
 
-def _evidence_log_path(repo: str, command: str) -> Optional[str]:
+def _evidence_log_path(repo: str, command: str, log_root: str) -> Optional[str]:
     """Get the log file path for a repo and evidence command, or None.
-    
-    The command string may be a path to a file or a command to run. If it's
-    a path, return it; if it's a command, try to find the log file.
+
+    Only a path that resolves inside the configured log root is returned, so
+    an evidence command cannot read a log outside it. A command that is not a
+    file path (an absolute path or a name ending in ".log") returns None.
     """
-    if os.path.isabs(command):
-        return command
-    if command.endswith(".log"):
-        return command
-    return None
+    if not (os.path.isabs(command) or command.endswith(".log")):
+        return None
+    root = os.path.realpath(log_root)
+    path = os.path.realpath(command)
+    if path != root and not path.startswith(root + os.sep):
+        return None
+    return command
 
 
-def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str) -> Optional[datetime]:
+def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
+                              log_root: str) -> Optional[datetime]:
     """Get the earliest record from the evidence source for the given repo, or None.
     
     This reads the log file's modification time as a proxy for when the log
     started being written. If the command is not configured for this repo or
-    the log file does not exist, return None.
+    the log file does not exist, return None. The log path must live inside
+    the configured log root.
     """
     command = evidence_cmds.get(repo)
     if not command:
         return None
-    log_path = _evidence_log_path(repo, command)
+    log_path = _evidence_log_path(repo, command, log_root)
     if not log_path:
         return None
     try:
@@ -6103,6 +6108,7 @@ class Station:
         if self._deferred():
             return
         left = CLOSE_DONE_PER_PASS
+        log_root = os.path.join(self.s.home, "logs")
         for repo in self._verify_repos():
             for issue in self._tickets_open(repo):
                 if left <= 0:
@@ -6111,14 +6117,13 @@ class Station:
                 if not why:
                     continue
                 number = int(issue["number"])
-                # Check if the ticket has a Live time window that ended before
-                # the evidence source starts. If so, close it with both times.
                 live = brain.live_criterion(issue.get("body"), limit=None)
                 time_window = _live_time_window(live)
                 if time_window:
-                    earliest_record = _earliest_evidence_record(self.s.evidence_cmds, repo)
+                    earliest_record = _earliest_evidence_record(
+                        self.s.evidence_cmds, repo, log_root)
                     if earliest_record is not None:
-                        window_start, window_end = time_window
+                        _, window_end = time_window
                         if earliest_record > window_end:
                             # The evidence source starts after the window ends.
                             # Close the ticket with both times.
@@ -6126,52 +6131,46 @@ class Station:
                             close_reason = close_reason % (
                                 window_end.strftime("%Y-%m-%d"),
                                 earliest_record.strftime("%Y-%m-%d"))
-                            branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
-                            if error:
-                                _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
-                            try:
-                                self._routine(repo, number, "Closed: %s. %s Not verified live; its criteria "
-                                              "were not ticked one by one."
-                                              % (close_reason, verify_data.close_facts(branch, pulls, error)))
-                                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
-                                             {"labels": [CLOSE_DONE_LABEL]})
-                                self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
-                                             {"state": "closed", "state_reason": "completed"})
-                            except RateLimited:
-                                raise
-                            except GitHubError as err:
-                                _say("could not close done %s#%d: %s" % (repo, number, err))
-                                continue
-                            left -= 1
-                            _say("closed done %s#%d: %s" % (repo, number, close_reason))
+                            if self._close_done_ticket(repo, issue, close_reason):
+                                left -= 1
+                                _say("closed done %s#%d: %s" % (repo, number, close_reason))
                             continue
                     # If the evidence source starts before or during the window,
-                    # do not close the ticket (it will stay open for a verify run).
+                    # or has no record yet, do not close the ticket (it will stay
+                    # open for a verify run).
                     continue
                 # Normal close for tickets without a time window or with an
                 # open window.
-                branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
-                if error:
-                    _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
-                try:
-                    self._routine(repo, number, "Closed: %s. %s Not verified live; its criteria "
-                                  "were not ticked one by one."
-                                  % (why, verify_data.close_facts(branch, pulls, error)))
-                    # force-close is the close-completeness guard's escape hatch:
-                    # this close is by rule, not a claim that each box was seen to
-                    # hold. Without it the guard reopened 46 of 175 such closes,
-                    # each with an email (2026-10-19).
-                    self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
-                                 {"labels": [CLOSE_DONE_LABEL]})
-                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
-                                 {"state": "closed", "state_reason": "completed"})
-                except RateLimited:
-                    raise
-                except GitHubError as err:
-                    _say("could not close done %s#%d: %s" % (repo, number, err))
-                    continue
-                left -= 1
-                _say("closed done %s#%d: %s" % (repo, number, why))
+                if self._close_done_ticket(repo, issue, why):
+                    left -= 1
+                    _say("closed done %s#%d: %s" % (repo, number, why))
+
+    def _close_done_ticket(self, repo: str, issue: Dict[str, Any],
+                           reason: str) -> bool:
+        """Close one done ticket with `reason`; True when the close writes
+        landed, False when GitHub refused and the run moves on."""
+        number = int(issue["number"])
+        branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+        if error:
+            _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
+        try:
+            self._routine(repo, number, "Closed: %s. %s Not verified live; its criteria "
+                          "were not ticked one by one."
+                          % (reason, verify_data.close_facts(branch, pulls, error)))
+            # force-close is the close-completeness guard's escape hatch:
+            # this close is by rule, not a claim that each box was seen to
+            # hold. Without it the guard reopened 46 of 175 such closes,
+            # each with an email (2026-10-19).
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": [CLOSE_DONE_LABEL]})
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                         {"state": "closed", "state_reason": "completed"})
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not close done %s#%d: %s" % (repo, number, err))
+            return False
+        return True
 
     def settle_orphan_sources(self) -> None:
         """Settle each open loom:rewritten issue whose ticket is closed. A
