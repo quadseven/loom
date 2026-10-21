@@ -42,6 +42,7 @@ from . import metrics
 from . import naming
 from . import proof
 from . import rewrite
+from . import ship_paths
 from . import roll_pin
 from . import revert
 from . import spend
@@ -279,6 +280,9 @@ PUBLISHED_RE = re.compile(r"^\+\s*#\s*Published from\s+([A-Za-z0-9._-]+(?:/[A-Za
 PIN_SHIP_LOOKBACK = 7 * 24 * 3600
 PIN_SHIP_SETTLE = 3600
 PIN_SHIPS_FILE = "pin_ships.json"
+SHIP_PATH_FILES = "ship_path_files.json"
+# The pull request files API returns at most this many files.
+PULL_FILES_MAX = 3000
 # Adopting open pull requests no ticket links (decision 0002, item 1): each
 # pass files at most one "Land or supersede" ticket per scanned repo, oldest
 # pull request first, and marks the pull request with ADOPTED_MARKER so it is
@@ -515,6 +519,7 @@ class Settings:
                  briefers: Sequence[str] = (),
                  ship_on_merge: Sequence[str] = (),
                  ship_workflows: Optional[Dict[str, str]] = None,
+                 ship_path_workflows: Sequence[str] = (),
                  no_topup: Sequence[str] = (),
                  log_keep_days: int = LOG_KEEP_DAYS,
                  disk_free_min_gb: float = DISK_FREE_MIN_GB,
@@ -541,6 +546,8 @@ class Settings:
         # merge commit, repo to workflow file (ship_workflows).
         self.ship_on_merge = list(ship_on_merge)
         self.ship_workflows = dict(ship_workflows or {})
+        # Repos with many path-scoped deploy workflows (ship_paths.py).
+        self.ship_path_workflows = list(ship_path_workflows)
         # Deployment repos whose merged pin pull requests ship the tickets
         # of the source revision they publish (ship_pins).
         self.pin_ship_repos = list(pin_ship_repos)
@@ -665,6 +672,7 @@ class Settings:
                    briefers=words("LOOM_TRUSTED_BRIEFERS"),
                    ship_on_merge=words("LOOM_SHIP_ON_MERGE"),
                    ship_workflows=_ship_workflows(words("LOOM_SHIP_WORKFLOWS")),
+                   ship_path_workflows=words("LOOM_SHIP_PATH_WORKFLOWS"),
                    no_topup=words("LOOM_NO_TOPUP"),
                    log_keep_days=_keep_days(env.get("LOOM_LOG_KEEP_DAYS", "")),
                    disk_free_min_gb=_free_floor(env.get("LOOM_DISK_FREE_MIN_GB", "")),
@@ -1338,6 +1346,9 @@ class Station:
         self._claimed_rereviews: Dict[str, Any] = {}
         self._claimed_writes = 0
         self._branch_cache: Dict[str, str] = {}
+        # Per pass: each path-scoped repo's workflow filters, and its deploy runs.
+        self._path_filters: Dict[str, Dict[str, List[str]]] = {}
+        self._path_runs: Dict[Tuple[str, str], Optional[Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]]] = {}
         # Repos whose claim:<login> label this pass has made sure of.
         self._claim_labels: set = set()
         self._issue_stamps: Dict[Tuple[str, int], str] = {}
@@ -3996,6 +4007,118 @@ class Station:
                         workflow, repo, str(run["head_sha"])[:12], run.get("id")),
                     "workflow %s" % workflow):
                 shipped += 1
+
+    def ship_path_workflows(self) -> None:
+        """Move the open merged tickets of each LOOM_SHIP_PATH_WORKFLOWS repo
+        to loom:shipped once every deploy workflow its pull request's files
+        trigger (by the workflow's on.push.paths filter) has a successful push
+        run carrying the merge commit; a pull request that changes no deployed
+        path ships on merge."""
+        for repo in sorted(r for r in self.s.ship_path_workflows if tickets.REPO_RE.fullmatch(r)):
+            try:
+                self._ship_by_paths(repo)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not ship %s by deploy paths: %s" % (repo, err))
+
+    def _ship_by_paths(self, repo: str) -> None:
+        merged = self._merged_tickets(repo)
+        branch = self._default_branch(repo) if merged else ""
+        if not branch:
+            return
+        filters = self._workflow_filters(repo, branch)
+        if filters is None:
+            _say("could not ship %s by deploy paths: its workflow files could not all be read" % repo)
+            return
+        seen: List[Dict[str, Any]] = []
+        latest = self._merged_pulls(repo, merged, seen)
+        cache_path = os.path.join(self.state, SHIP_PATH_FILES)
+        saved = _read_json(cache_path, {}, strict=False)
+        known = saved if isinstance(saved, dict) else {}
+        kept: Dict[str, Any] = {}
+        shipped = 0
+        try:
+            for _, number, pr in sorted((str(pr["merged_at"]), n, pr) for n, pr in latest.items()):
+                if shipped >= SHIP_PER_PASS:
+                    break
+                key = "%s#%d" % (repo, int(pr["number"]))
+                files = known.get(key)
+                if not isinstance(files, list):
+                    files = self._pull_paths(repo, int(pr["number"]))
+                    if files is None:
+                        continue
+                kept[key] = files
+                needed = sorted(w for w, pats in filters.items()
+                                if any(ship_paths.matches(pats, f) for f in files))
+                how, revision = self._path_cover(repo, pr, branch, needed)
+                if not how or self._reverted(repo, pr, seen, revision):
+                    continue
+                if self._ship_one(repo, number, pr, how, "deploy paths"):
+                    shipped += 1
+        finally:
+            _write_json(cache_path, {**{k: v for k, v in known.items() if k.split("#")[0] != repo}, **kept})
+
+    def _workflow_filters(self, repo: str, branch: str) -> Optional[Dict[str, List[str]]]:
+        """Workflow file name to its on.push.paths filter, for the repo's
+        workflows on its default branch that have one, read once a pass.
+        None when the listing or any workflow file cannot be read: with a
+        filter missing, a pull request could look as if it touched no
+        deployed path, so nothing in the repo ships this pass."""
+        if repo not in self._path_filters:
+            listing = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s" % (
+                repo, ship_paths.WORKFLOWS_DIR, quote(branch, safe="")), ok=(404,)).data
+            texts: Optional[Dict[str, str]] = {} if isinstance(listing, list) else None
+            for item in listing if isinstance(listing, list) else []:
+                name = str(item.get("name") or "") if isinstance(item, dict) else ""
+                if not re.fullmatch(r"[\w.-]+\.ya?ml", name):
+                    continue
+                data = self.gh.rest("GET", "/repos/%s/contents/%s/%s?ref=%s" % (
+                    repo, ship_paths.WORKFLOWS_DIR, name, quote(branch, safe="")), ok=(404,)).data
+                try:
+                    texts[name] = base64.b64decode(data["content"]).decode("utf-8", "replace")
+                except (KeyError, TypeError, ValueError):
+                    texts = None
+                    break
+            self._path_filters[repo] = (
+                ship_paths.scoped_workflows(texts) if texts is not None else None)
+        return self._path_filters[repo]
+
+    def _pull_paths(self, repo: str, number: int) -> Optional[List[str]]:
+        """Every path a pull request changed, a renamed file's old path too;
+        None when the list may be cut off (the files API stops at 3000), so a
+        pull request is never shipped on a partial list."""
+        files = [f for f in self._paginate("/repos/%s/pulls/%d/files" % (repo, number))
+                 if isinstance(f, dict)]
+        if len(files) >= PULL_FILES_MAX:
+            _say("not shipping %s#%d by deploy paths: it changed %d+ files" % (
+                repo, number, PULL_FILES_MAX))
+            return None
+        return sorted({str(f.get(k) or "") for f in files
+                       for k in ("filename", "previous_filename") if f.get(k)})
+
+    def _path_cover(self, repo: str, pr: Dict[str, Any], branch: str,
+                    needed: List[str]) -> Tuple[str, str]:
+        """(how it shipped, the revision to check reverts against), or ("", "")
+        while a workflow the pull request's files trigger has not deployed it."""
+        if not needed:
+            return ("%s ships on merge (LOOM_SHIP_PATH_WORKFLOWS): pull request #%d changed no "
+                    "deployed path" % (repo, int(pr["number"])), branch)
+        covers = []
+        for workflow in needed:
+            if (repo, workflow) not in self._path_runs:
+                runs = self._deploy_runs(repo, workflow, branch)
+                self._path_runs[(repo, workflow)] = (
+                    ({str(r["head_sha"]): r for r in runs},
+                     max(runs, key=lambda r: str(r.get("created_at") or ""))) if runs else None)
+            known = self._path_runs[(repo, workflow)]
+            run = self._covering_run(repo, pr, known[0], known[1]) if known else None
+            if run is None:
+                return "", ""
+            covers.append((workflow, run))
+        workflow, run = max(covers, key=lambda c: str(c[1].get("created_at") or ""))
+        return ("workflows %s succeeded on %s revisions (latest run %s)" % (
+            ", ".join(w for w, _ in covers), repo, run.get("id")), str(run["head_sha"]))
 
     def _deploy_runs(self, repo: str, workflow: str, branch: str) -> List[Dict[str, Any]]:
         """The workflow's recent successful push runs on the repo's own
@@ -8679,7 +8802,7 @@ class Station:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
         for step in (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_merged,
-                     self.ship_workflows, self.unwind_reverts,
+                     self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.close_done_tickets, self.settle_orphan_sources,
