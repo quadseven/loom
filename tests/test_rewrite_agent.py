@@ -254,6 +254,7 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertEqual(config["permission"], {"*": "deny"})
         self.assertEqual(config["provider"]["free"]["options"]["baseURL"], url)
         self.assertEqual(self.agent()["key"], "none")
+        self.assertIn("rewrite_agent: answered by free/gemma-4-31b-it", result.stderr)
         self.assertNotIn("aws ssm", self.log.read_text() if self.log.exists() else "")
 
     def test_a_free_model_that_hangs_gives_way_within_its_own_timeout(self):
