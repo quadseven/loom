@@ -185,6 +185,11 @@ REWRITE_PER_HOUR = 5
 # ticket's next claim (_return_dead_brief).
 DEAD_BRIEF_AGE = 3600
 REWRITE_PER_PASS = 5
+# A recorded ticket wait the factory has not repeated for this long is gone:
+# the ticket moved, or left the factory (invariants.ticket_waiting).
+WAIT_UNSEEN = 3600
+# A wait reason reaches a public incident: only these characters, this long.
+WAIT_REASON_RE = re.compile(r"[A-Za-z0-9 ,:.()/@_-]{1,160}")
 # Rewrites across every backlog goal in any hour: each one comments on its
 # issue or files a ticket, and both email the operator. Per goal alone, ten
 # backlog goals let about 80 through in ten minutes (2026-10-18).
@@ -6723,6 +6728,7 @@ class Station:
         for name, read in (("events", self._read_events),
                            ("runs", self._invariant_runs),
                            ("silent_runs", self._invariant_silent),
+                           ("waits", self._invariant_waits),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):
             try:
@@ -7794,6 +7800,7 @@ class Station:
             return
         runner = self._factory()
         runner.run()
+        self._record_waits(runner.waits)
         self._record_silent(runner.silent_running, runner.silent)
         self._return_silent_briefs(runner.silent_running)
 
@@ -7883,7 +7890,42 @@ class Station:
     def assign_queued(self) -> None:
         """Give ready queued tickets a free lane after this pass's claims."""
         if self.s.factory_on:
-            self._factory().assign_queued()
+            runner = self._factory()
+            runner.assign_queued()
+            self._record_waits(runner.waits)
+
+    def _record_waits(self, found: Dict[str, str]) -> None:
+        """Time each ticket the factory left where it is: a reason it repeats
+        keeps its start, a new reason starts again, and a ticket it has not
+        named for WAIT_UNSEEN is dropped (invariants.ticket_waiting)."""
+        path = os.path.join(self.state, "ticket-waits.json")
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        for key, reason in found.items():
+            old = saved.get(key)
+            if isinstance(old, dict) and old.get("reason") == reason and self._num(old.get("since")):
+                old["seen"] = self.now
+            else:
+                saved[key] = {"reason": reason, "since": self.now, "seen": self.now}
+        kept = {key: info for key, info in saved.items() if isinstance(info, dict)
+                and self._num(info.get("seen")) and self.now - info["seen"] <= WAIT_UNSEEN}
+        if kept or saved:
+            _write_json(path, kept)
+
+    def _invariant_waits(self) -> List[invariants.Wait]:
+        """The ticket waits _record_waits kept, each ticket named for a
+        public issue."""
+        saved = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
+        out = []
+        for key, info in sorted(saved.items() if isinstance(saved, dict) else []):
+            match = re.fullmatch(r"(.+)#([0-9]+)", str(key))
+            if not (match and isinstance(info, dict) and self._num(info.get("since"))
+                    and isinstance(info.get("reason"), str)
+                    and WAIT_REASON_RE.fullmatch(info["reason"])):
+                continue
+            out.append(invariants.Wait(self._invariant_ref(match.group(1), int(match.group(2))),
+                                       info["reason"], info["since"]))
+        return out
 
     def _factory(self) -> factory.Factory:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]

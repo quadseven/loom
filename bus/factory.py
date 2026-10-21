@@ -1234,6 +1234,10 @@ class Factory:
         # running ticket past SILENT_MAX, with those tickets.
         self.silent = dict(silent or {})
         self.silent_running: Dict[str, List[Tuple[str, int]]] = {}
+        # "OWNER/NAME#N" -> why this pass left that ticket where it is, for
+        # the station to time (invariants.ticket_waiting). A ticket held by
+        # its own Not before: line is waiting on purpose and is not here.
+        self.waits: Dict[str, str] = {}
         self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
         self.actions = 0
@@ -1568,6 +1572,7 @@ class Factory:
                     asked = self._ask_reviewer(repo, pr)
                     note = ("; the review bot was asked to judge the answer on #%d"
                             % int(pr["number"])) if asked else ""
+                    self._waiting(repo, number, "no lane is up for its next rung")
                     _say("%s#%d waits: no lane is up for its next rung%s"
                          % (repo, number, note))
                     return
@@ -2122,6 +2127,10 @@ class Factory:
         self.load[old] = self.load.get(old, 0) - 1
         self.actions += 1
 
+    def _waiting(self, repo: str, number: Any, reason: str) -> None:
+        """Record why this pass leaves the ticket where it is (self.waits)."""
+        self.waits["%s#%s" % (repo, number)] = reason
+
     def _relabel(self, repo: str, issue: Dict[str, Any], labels: List[str]) -> None:
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, issue["number"]),
                      {"labels": labels})
@@ -2352,6 +2361,8 @@ class Factory:
             _say("queued %s#%d off lane %s, %s" % (repo, number, old, why))
             return
         if lane is None:
+            self._waiting(repo, number, "on lane %s, %s: no free lane in its %s"
+                          % (old, why, "rung" if rung else "tier"))
             _say("%s#%d waits on lane %s, %s: no free lane in its %s"
                  % (repo, number, old, why, "rung" if rung else "tier"))
             return
@@ -2436,15 +2447,18 @@ class Factory:
         assigned = _lane(issue)
         if assigned in REMOTE_LANES and not self._is_private(repo) and self._up(assigned):
             # A live remote assignment stays queued for its pull worker.
+            self._waiting(repo, issue["number"], "remote lane %s has not pulled it" % assigned)
             return "%s waits for remote lane %s to pull it" % (ref, assigned)
         if assigned in REMOTE_LANES:
             lane, fallback = self._tier_move(repo, issue, old=assigned)
         else:
             lane, fallback = self._tier_move(repo, issue)
         if lane is None:
+            self._waiting(repo, issue["number"], "no free lane in tier %s" % difficulty_of(issue))
             return "%s waits: no free lane in tier %s" % (ref, difficulty_of(issue))
         tier = difficulty_of(issue) + (", " + fallback if fallback else "")
         if not self._guarded(self._assign_queued_one, repo, issue, lane, tier):
+            self._waiting(repo, issue["number"], "giving it a lane failed")
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
 
@@ -2460,6 +2474,9 @@ class Factory:
         lane = self._queued_model_lane(repo, model)
         if lane is None:
             why = "%s waits: no free lane takes model %s" % (ref, model)
+            self._waiting(repo, issue["number"], "no free lane takes model %s" % (
+                model if tickets.MODEL_RE.fullmatch(model) and len(model) <= 64
+                else "(its Model: line names no model id)"))
             _say(why)
             return why
         if not self._guarded(self._assign_queued_one, repo, issue, lane, "model %s" % model):

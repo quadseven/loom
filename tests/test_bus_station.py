@@ -4012,6 +4012,36 @@ class SilentLaneTest(Base):
         (breach,) = invariants.silent_lane(invariants.Facts(st.now, silent_runs=[run]))
         self.assertTrue(any(line.startswith("codex:") for line in breach.evidence))
 
+    def test_a_wait_keeps_its_start_while_the_reason_holds(self):
+        # The factory's wait reasons were only logged; the station times each
+        # so ticket_waiting can raise the ones that never move (2026-10-21).
+        st = self.station()
+        start = st.now
+        key = "%s#12" % REPO
+        st._record_waits({key: "no free lane in tier medium"})
+        st.now = start + 3 * 3600
+        st._record_waits({key: "no free lane in tier medium"})
+        (wait,) = st._invariant_waits()
+        self.assertEqual((wait.reason, wait.since), ("no free lane in tier medium", start))
+        self.assertEqual(wait.ticket, st._invariant_ref(REPO, 12))
+        st._record_waits({key: "no free lane takes model gpt-6-sol"})
+        (wait,) = st._invariant_waits()
+        self.assertEqual(wait.since, start + 3 * 3600)
+
+    def test_a_wait_reason_that_could_carry_ticket_text_never_reaches_the_invariant(self):
+        st = self.station()
+        st._record_waits({"%s#12" % REPO: "no free lane takes model `x` <img src=y>",
+                          "%s#13" % REPO: "no free lane in tier medium"})
+        self.assertEqual([w.reason for w in st._invariant_waits()], ["no free lane in tier medium"])
+
+    def test_a_ticket_no_longer_waiting_is_dropped(self):
+        st = self.station()
+        st._record_waits({"%s#12" % REPO: "no free lane in tier medium"})
+        st.now += station.WAIT_UNSEEN + 1
+        st._record_waits({"%s#13" % REPO: "no free lane in tier hard"})
+        self.assertEqual([w.ticket.label for w in st._invariant_waits()],
+                         [st._invariant_ref(REPO, 13).label])
+
     def test_nothing_found_records_nothing(self):
         st = self.station()
         st._record_silent({}, {})
