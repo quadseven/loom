@@ -1248,6 +1248,16 @@ print('leak guard: clean (shape patterns only)')
             '{"type":"error","error":{"message":"429 Too Many Requests: usage limit reached"}}'))
         self.assertIn("[limit]", self.run_log())
 
+    def test_a_full_free_pool_is_a_short_limit_not_the_agents_failure(self):
+        # The shared free pool answered "has no lane available" 18 times; the
+        # runs were classed limit, transient or work at random (2026-10-21).
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "Error: free pool (private) has no lane available; retry after 1s"))
+        self.assertIn("[limit]", self.run_log())
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertLessEqual(beat["retry_at"] - time.time(), 120)
+
     def test_provider_quota_messages_are_still_limits(self):
         for out in ("429 RESOURCE_EXHAUSTED quota resets in 1 hours",
                     "Error: You exceeded your current quota, please check your plan",
