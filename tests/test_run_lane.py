@@ -324,6 +324,15 @@ ln -s "$real_home/loom/run/elsewhere" "$HOME/.claude" 2>/dev/null
 echo fixed > fix.txt
 """
 
+# Fake copilot: records argv, the token it was handed and its HOME, then edits
+# a file. Like opencode, it runs in the API sandbox, which denies writes under
+# .git, so it leaves the commit to the runner.
+FAKE_COPILOT = """#!/usr/bin/env bash
+printf 'copilot %s | COPILOT_GITHUB_TOKEN=%s | home=%s\\n' "$(printf %s "$*" | tr '\\n' ' ')" \\
+  "${COPILOT_GITHUB_TOKEN:-}" "$HOME" >> "$TMPDIR/agent.log"
+echo fixed > fix.txt
+"""
+
 # opencode 2.0 starts a real TCP listener so the run checks the sandbox rule.
 FAKE_OPENCODE_2 = FAKE_OPENCODE.replace('echo "1.18.4"', 'echo "opencode v2.0.28"').replace(
     'args="$*"; args=', '''if [ "${1:-}" = serve ]; then
@@ -508,9 +517,7 @@ class LaneRunnerTest(unittest.TestCase):
         self.write_tool(self.bin / "gh", FAKE_GH)
         self.write_tool(self.bin / "codex", FAKE_AGENT)
         self.write_tool(self.bin / "opencode", FAKE_OPENCODE)
-        self.write_tool(self.bin / "copilot", FAKE_AGENT.replace(
-            'printf \'%s %s\\n\' "$(basename "$0")" "$*" >> "$FAKE_LOG"',
-            'printf \'copilot %s | token=%s | home=%s\\n\' "$(printf %s "$*" | tr \'\\n\' \' \')" "${COPILOT_GITHUB_TOKEN:-}" "$HOME" >> "$TMPDIR/agent.log"'))
+        self.write_tool(self.bin / "copilot", FAKE_COPILOT)
         self.write_tool(self.bin / "aws", FAKE_AWS)
         self.write_tool(self.bin / "curl", FAKE_CURL)
         self.scanner = root / "check_private_leaks.py"
