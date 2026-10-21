@@ -4460,6 +4460,15 @@ class SilentLaneTest(Base):
         (wait,) = st._invariant_waits()
         self.assertEqual(wait.since, start + 3 * 3600)
 
+    def test_the_factory_is_given_the_waits_the_last_pass_saved(self):
+        # The stall line is said once per reason, so the factory must know the
+        # reasons it gave last pass (loom#1280).
+        st = self.station()
+        key = "%s#12" % REPO
+        st._record_waits({key: "stalled on lane claude: no other lane of its rung is available"})
+        self.assertEqual(st._factory().known_waits,
+                         {key: "stalled on lane claude: no other lane of its rung is available"})
+
     def test_a_wait_reason_that_could_carry_ticket_text_never_reaches_the_invariant(self):
         st = self.station()
         st._record_waits({"%s#12" % REPO: "no free lane takes model `x` <img src=y>",
