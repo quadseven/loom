@@ -1759,6 +1759,25 @@ class Tickets(Base):
         self.go()  # once: the next pass says nothing more
         self.assertEqual((self.moved, len(self.gh.comments[6])), ([], posted))
 
+    def test_a_change_a_submodule_needed_is_held_for_the_brain_not_climbed(self):
+        # The runner refuses edits inside a submodule (loom#1316): the change
+        # belongs in the submodule's own repo, and a stronger model cannot push
+        # it either. Three tickets needed such a split on 2026-10-21.
+        self.gh.ticket(6, "failed", lane="zai")
+        self.gh.comments[6] += [self.ZAI_CLAIM, {"body": (
+            "Lane zai failed: [work] the change edits files inside submodule mod-overseer "
+            "(mod-overseer/src/mod_overseer.cpp), which a push of this repo does not carry; "
+            "that repo needs the change first. nothing pushed"), "user": ME}]
+        self.go()
+        self.assertEqual((self.moved, self.fixed), ([], []))
+        self.assertIn({"name": "needs-brain"}, self.gh.issues[6]["labels"])
+        note = self.gh.comments[6][-1]["body"]
+        self.assertIn("submodule mod-overseer", note)
+        self.assertIn("split", note)
+        posted = len(self.gh.comments[6])
+        self.go()  # once: the next pass says nothing more
+        self.assertEqual((self.moved, len(self.gh.comments[6])), ([], posted))
+
     def test_a_no_reason_failure_after_a_ladder_restart_climbs_again(self):
         self.gh.ticket(6, "failed", lane="zai")
         self.gh.comments[6] += [self.no_reason_failure(6), {"body": factory.RUNG_MARKER % 0, "user": ME},

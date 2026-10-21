@@ -17,6 +17,13 @@ SHA = re.compile(r"[0-9a-f]{40}\Z")
 KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 BLOCK = re.compile(r"(?ms)^```loom-roll-pins\s*\n(.*?)\n```\s*$")
 MARKER = "<!-- loom:roll-pin "
+# A goal home whose body names a roll ("roll" or "rolls", not "rolling" or
+# "rollback") ships through one, so it needs a roll ship document.
+ROLL_WORD = re.compile(r"(?i)\brolls?\b")
+
+
+def ships_by_roll(body: str) -> bool:
+    return bool(ROLL_WORD.search(body))
 
 
 def specs_from_env(raw: str) -> list[dict[str, str]]:

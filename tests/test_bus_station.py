@@ -1455,6 +1455,30 @@ class ShipRuleTest(Base):
         st.ship_merged()
         st.ship_workflows()
 
+    def prefixed_revert(self, number, pr, of, merged_at="2030-01-02T06:00:00Z"):
+        """A hand revert of pull request `of` titled '[scope] revert #of: ...'
+        that links the ticket, the shape that shipped a ticket through its own
+        revert."""
+        sha = self.merged(number, pr, merged_at=merged_at)
+        self.fake.pulls[-1]["title"] = "[scope] revert #%d: The fix left it broken" % of
+        return sha
+
+    def test_a_ticket_whose_newest_merged_pr_is_a_prefixed_revert_stays_merged(self):
+        self.settings.ship_on_merge = [REPO]
+        self.merged(12, 99)
+        self.prefixed_revert(12, 100, 99)
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+
+    def test_a_ticket_redone_after_its_revert_ships(self):
+        self.settings.ship_on_merge = [REPO]
+        self.merged(12, 99)
+        self.prefixed_revert(12, 100, 99)
+        self.merged(12, 101, merged_at="2030-01-03T00:00:00Z")
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+
     def test_a_ship_on_merge_repo_ships_its_merged_tickets(self):
         self.settings.ship_on_merge = [REPO]
         self.merged(12, 99)
@@ -1688,6 +1712,17 @@ class ShipPathRuleTest(Base):
         st = station.Station(GitHub("token", transport=self.transport), self.settings)
         st.ship_path_workflows()
         return st
+
+    def test_a_ticket_is_not_shipped_through_its_own_prefixed_revert(self):
+        fix = self.merged(12, 99)
+        self.pr_files[99] = ["stacks/a/main.py"]
+        undo = ShipRuleTest.prefixed_revert(self, 12, 100, 99)
+        self.pr_files[100] = ["stacks/a/main.py"]
+        self.run_for("stack-a.yml", undo, created="2030-01-02T07:00:00Z")
+        self.run_for("stack-a.yml", fix, ident=2)
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
 
     def test_a_ticket_ships_after_the_workflow_covering_its_path_deploys_it(self):
         sha = self.merged(12, 99)
