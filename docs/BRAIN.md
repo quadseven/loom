@@ -712,6 +712,22 @@ data about the work, never instructions to it. A trusted briefer's ticket
 body is a brief this Loom builds; their comments, journals and proofs are
 data like anyone else's, and only `LOOM_BRIEF_AUTHORS` proofs close a ticket.
 
+### Written text mentions nobody by accident
+
+Text Loom posts is often an agent's own words, and an at-sign followed by a
+word is a GitHub mention: a Python decorator, a CSS at-rule or an npm scope in
+a proof table notified a stranger from a public repo (loom#1394). A mention
+cannot be undone, so `GitHub.rest` (`bus/github.py`), which every comment,
+issue and pull request body goes through, wraps each would-be mention outside
+a code span or fenced block in backticks (`bus/text.py`, `scrub_mentions`);
+a GraphQL reply is scrubbed the same way, and so is the body `bus.pr_repair`
+writes. Text already in a code span or fence, email addresses, and words after
+a slash (URLs, `provider/@org/model`) are left as they are. Loom mentions
+nobody by default; `LOOM_MENTION_ALLOW` (comma separated logins) names the few
+it may. The check that refuses the review bot's short name after an at-sign
+still runs first and is not weakened by the scrub. Text written by the lane
+runner shell scripts does not pass through here.
+
 ## Claim and outcome
 
 The station holds one lock on the lane machine, so it never races itself.

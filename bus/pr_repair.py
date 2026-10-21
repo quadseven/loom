@@ -321,7 +321,7 @@ def _gh_pr_view(repo: str, number: int) -> Dict[str, object]:
 
 def _gh_pr_edit(repo: str, number: int, title: str, body: str) -> None:
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as fh:
-        fh.write(body)
+        fh.write(text.scrub_mentions(body))
         body_file = fh.name
     try:
         out = subprocess.run(
