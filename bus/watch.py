@@ -435,8 +435,27 @@ def run_mark(line: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def _hurt(outcome: str) -> bool:
-    return outcome == "no change" or outcome.startswith("failed")
+def _refusal_key(item: Dict[str, Any]) -> str:
+    """The refusal's issue title: its component (with the lane), tool and
+    denied path."""
+    what = "%s %s" % (item["tool"], item["path"]) if item["path"] else str(item["tool"])
+    return (REFUSAL_TITLE % (item["component"], what))[:TITLE_MAX]
+
+
+def _effects(outcome: str, n: int, runs: int) -> List[str]:
+    """How a refusal hurt: its run failed or made no change, it repeated
+    REFUSAL_REPEAT times in the run, or it came back in REFUSAL_RUNS runs
+    within a DAY. Empty when the runs carried on."""
+    effects = []
+    if outcome == "no change":
+        effects.append("the run made no change")
+    elif outcome.startswith("failed"):
+        effects.append("the run %s" % outcome)
+    if n >= REFUSAL_REPEAT:
+        effects.append("refused %d times in one run" % n)
+    if runs >= REFUSAL_RUNS:
+        effects.append("refused in %d runs in %d hours" % (runs, DAY // 3600))
+    return effects
 
 
 def keep(line: str) -> bool:
@@ -573,31 +592,41 @@ class Watcher:
         out: List[str] = []
         prev, prev_hit = str(rec.get("prev") or ""), False
         for line in lines:
-            hit = False
-            if rec.get("tb"):
-                if not line.strip() or line[:1] in (" ", "\t"):
-                    continue
-                rec["tb"] = False
-                out.append(line)
-                hit = True
-            elif TRACEBACK in line:
-                rec["tb"] = True
-            elif SELF not in line:
-                mark = run_mark(line)
-                if mark is not None:
-                    self._mark(rec, name, mark)
-                found = refusal(line, prev, self.private)
-                if found is not None:
-                    if prev_hit and out and TOOL_FAILED_RE.match(prev):
-                        out.pop()
-                    self._refused(rec, found, line)
-                elif keep(line):
-                    out.append(line)
-                    hit = True
+            if rec.get("tb") and (not line.strip() or line[:1] in (" ", "\t")):
+                continue
+            hit = self._judge(rec, name, line, (prev, prev_hit), out)
             if line.strip():
                 prev, prev_hit = line, hit
         rec["prev"] = prev[:EXAMPLE_MAX]
         return out
+
+    def _judge(self, rec: Dict[str, Any], name: str, line: str, before: Tuple[str, bool],
+               out: List[str]) -> bool:
+        """Judge one line after the line before it (and whether that one was
+        a hit); True when the line was added to out."""
+        if rec.get("tb"):
+            rec["tb"] = False
+            out.append(line)
+            return True
+        if TRACEBACK in line:
+            rec["tb"] = True
+            return False
+        if SELF in line:
+            return False
+        mark = run_mark(line)
+        if mark is not None:
+            self._mark(rec, name, mark)
+        prev, prev_hit = before
+        found = refusal(line, prev, self.private)
+        if found is None:
+            if not keep(line):
+                return False
+            out.append(line)
+            return True
+        if prev_hit and out and TOOL_FAILED_RE.match(prev):
+            out.pop()
+        self._refused(rec, found, line)
+        return False
 
     # -- agent refusals --------------------------------------------------
     def _mark(self, rec: Dict[str, Any], name: str, mark: Tuple[str, str]) -> None:
@@ -652,6 +681,21 @@ class Watcher:
         """Record each settled refusal in the day's ledger, and make the ones
         that hurt (_effects) due on their one rolling issue. A refusal that
         did not hurt still counts on an issue it already has."""
+        ledger = self._ledger(state)
+        counts = {"refusals": 0, "refusals_hurt": 0}
+        for item in self.settled:
+            key = _refusal_key(item)
+            runs = self._log_refusal(ledger, key, item)
+            effects = _effects(str(item["outcome"]), int(item["n"]), len(runs))
+            counts["refusals"] += int(item["n"])
+            counts["refusals_hurt"] += 1 if effects else 0
+            if effects or isinstance(state["sigs"].get(key), dict):
+                self._refusal_record(state["sigs"], key, item, runs, effects)
+        self.settled = []
+        return counts
+
+    def _ledger(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """watch.json's refusals seen in the last DAY, older ones dropped."""
         ledger = state.get("refusals")
         if not isinstance(ledger, dict):
             ledger = state["refusals"] = {}
@@ -659,51 +703,44 @@ class Watcher:
                     if not isinstance(v, dict) or _num(v.get("last")) is None
                     or self.now - v["last"] >= DAY]:
             del ledger[key]
-        sigs: Dict[str, Any] = state["sigs"]
-        counts = {"refusals": 0, "refusals_hurt": 0}
-        for item in self.settled:
-            n, outcome = int(item["n"]), str(item["outcome"])
-            what = "%s %s" % (item["tool"], item["path"]) if item["path"] else str(item["tool"])
-            key = (REFUSAL_TITLE % (item["component"], what))[:TITLE_MAX]
-            old = ledger.get(key) if isinstance(ledger.get(key), dict) else {}
-            runs = [r for r in old.get("runs") or [] if isinstance(r, list) and len(r) == 2
-                    and _num(r[0]) is not None and _num(r[1]) is not None
-                    and self.now - r[0] < DAY] + [[self.now, n]]
-            ledger[key] = {"runs": runs, "total": int(old.get("total") or 0) + n,
-                           "last": self.now, "outcome": outcome,
-                           **{k: item[k] for k in ("cli", "tool", "path", "rule")}}
-            effects = []
-            if _hurt(outcome):
-                effects.append("the run made no change" if outcome == "no change"
-                               else "the run %s" % outcome)
-            if n >= REFUSAL_REPEAT:
-                effects.append("refused %d times in one run" % n)
-            if len(runs) >= REFUSAL_RUNS:
-                effects.append("refused in %d runs in %d hours" % (len(runs), DAY // 3600))
-            counts["refusals"] += n
-            counts["refusals_hurt"] += 1 if effects else 0
-            rec = sigs.get(key)
-            if not effects and not isinstance(rec, dict):
-                continue
-            last = _num(rec.get("last")) if isinstance(rec, dict) else None
-            if not isinstance(rec, dict) or last is None or self.now - last >= DAY:
-                issue = rec.get("issue") if isinstance(rec, dict) else None
-                rec = sigs[key] = {"first": self.now, "hits": [], "total": 0,
-                                   "first_line": item["line"], "issue": issue,
-                                   "told": 0, "told_total": 0}
-            told = rec.get("refusal") if isinstance(rec.get("refusal"), dict) else {}
-            rec["total"] = rec.get("total", 0) + n
-            rec["last"] = self.now
-            rec["last_line"] = item["line"]
-            rec["refusal"] = {
-                "cli": item["cli"], "tool": item["tool"], "path": item["path"],
-                "rule": item["rule"], "in_run": n, "runs": len(runs),
-                "day_total": int(sum(r[1] for r in runs)),
-                "effect": "; ".join(effects) or str(told.get("effect") or "")}
-            if effects and rec.get("issue") is None and not rec.get("done"):
-                rec["due"] = "file"
-        self.settled = []
-        return counts
+        return ledger
+
+    def _log_refusal(self, ledger: Dict[str, Any], key: str,
+                     item: Dict[str, Any]) -> List[List[float]]:
+        """Add one run's refusal to the ledger; the [time, count] of each run
+        in the last DAY that saw it, this one included."""
+        old = ledger.get(key) if isinstance(ledger.get(key), dict) else {}
+        runs = [r for r in old.get("runs") or [] if isinstance(r, list) and len(r) == 2
+                and _num(r[0]) is not None and _num(r[1]) is not None
+                and self.now - r[0] < DAY] + [[self.now, int(item["n"])]]
+        ledger[key] = {"runs": runs, "total": int(old.get("total") or 0) + int(item["n"]),
+                       "last": self.now, "outcome": item["outcome"],
+                       **{k: item[k] for k in ("cli", "tool", "path", "rule")}}
+        return runs
+
+    def _refusal_record(self, sigs: Dict[str, Any], key: str, item: Dict[str, Any],
+                        runs: List[List[float]], effects: List[str]) -> None:
+        """Update the refusal's rolling-issue record (new after a quiet DAY,
+        keeping the issue it was filed on); one that hurt and has no issue
+        yet comes due to file."""
+        rec = sigs.get(key)
+        last = _num(rec.get("last")) if isinstance(rec, dict) else None
+        if not isinstance(rec, dict) or last is None or self.now - last >= DAY:
+            issue = rec.get("issue") if isinstance(rec, dict) else None
+            rec = sigs[key] = {"first": self.now, "hits": [], "total": 0,
+                               "first_line": item["line"], "issue": issue,
+                               "told": 0, "told_total": 0}
+        told = rec.get("refusal") if isinstance(rec.get("refusal"), dict) else {}
+        rec["total"] = rec.get("total", 0) + int(item["n"])
+        rec["last"] = self.now
+        rec["last_line"] = item["line"]
+        rec["refusal"] = {
+            "cli": item["cli"], "tool": item["tool"], "path": item["path"],
+            "rule": item["rule"], "in_run": int(item["n"]), "runs": len(runs),
+            "day_total": int(sum(r[1] for r in runs)),
+            "effect": "; ".join(effects) or str(told.get("effect") or "")}
+        if effects and rec.get("issue") is None and not rec.get("done"):
+            rec["due"] = "file"
 
     def _hit(self, sigs: Dict[str, Any], name: str, line: str) -> None:
         sig = signature(line)
