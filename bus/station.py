@@ -1825,6 +1825,8 @@ class Station:
         or when its newest claim's brief is still waiting or running in a
         lane inbox (left for the next pass)."""
         number = int(issue["number"])
+        if self._verify_before_build(repo, issue):
+            return False
         comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         try:
             fix_source = self._fix_for(repo, comments)
@@ -3372,8 +3374,6 @@ class Station:
                 or fresh.get("updated_at") != issue.get("updated_at"):
             _say("%s#%s changed since it was checked; next pass" % (repo, issue["number"]))
             return False
-        if self._verify_before_build(repo, fresh):
-            return False
         model = headers.get("Model", "")
         if model and labelled_lane and not lane_takes_model(labelled_lane, model):
             lane = self._route_model_claim(repo, fresh, labelled_lane, model, free)
@@ -3419,7 +3419,8 @@ class Station:
         if any(t.startswith(tickets.FIX_MARKER) for t in texts):
             return False
         judged = set(tickets.judged_pulls(texts))
-        fresh = [pr for pr in merged if int(pr["number"]) not in judged]
+        fresh = [pr for pr in merged if isinstance(pr.get("number"), int)
+                 and pr["number"] not in judged]
         if not fresh:
             return False
         pr = fresh[0]
@@ -4242,11 +4243,7 @@ class Station:
                         and COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or ""))
                         and (adopted or self._pr_ticket_number(repo, pr) == number)):
                     found.append(pr)
-            if not found and isinstance(issue, dict) and tickets.rewritten_source(issue.get("body")):
-                # A ticket rewritten from an issue ships with that issue's
-                # merged pull request (loom#1385).
-                found = [dict(pr) for pr in self._closed_pulls(repo)
-                         if _covers_pr(issue, repo, pr) and not _linked_pr(issue, repo, pr)]
+            found = found or self._source_pulls(repo, issue)
         except RateLimited:
             raise
         except (GitHubError, ValueError, TypeError) as err:
@@ -4255,6 +4252,15 @@ class Station:
             self._lookup_failed(key)
             return None
         return max(found, key=lambda pr: str(pr["merged_at"]))
+
+    def _source_pulls(self, repo: str, issue: Any) -> List[Dict[str, Any]]:
+        """The merged pull requests of the issue a ticket was rewritten from
+        (its "Rewritten from issue" line): a ticket rewritten from an issue
+        ships with that issue's merged pull request (loom#1385)."""
+        if not isinstance(issue, dict) or not tickets.rewritten_source(issue.get("body")):
+            return []
+        return [dict(pr) for pr in self._closed_pulls(repo)
+                if _covers_pr(issue, repo, pr) and not _linked_pr(issue, repo, pr)]
 
     def _adopted_pull_number(self, issue: Dict[str, Any]) -> Optional[int]:
         """The pull request an adoption ticket names, when a trusted login
