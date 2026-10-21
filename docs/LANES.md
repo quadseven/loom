@@ -848,6 +848,13 @@ issues in 6 minutes on 2026-10-15. An older per-lane issue of the same
 invariant is closed as folded into the rolling one, unless it carries a
 `needs:<login>` label, which leaves an operator's ask open on its own issue.
 
+The lane-held issue is also a standing one (loom#845): when no lane is held any
+more the station edits it in place to say "No lane is held by a limit now" with
+the time it went clear, and leaves it open; the next hold edits it back, so a
+hold that comes and goes never closes and reopens an issue (each reopen mailed
+the people watching it). The lanes it listed move into a "Hold log" in the body
+(a line per hold, newest first, the last 20).
+
 Each breach files one issue labelled `loom:triage` and `loom:invariant` under
 the standing repairs epic (docs/BRAIN.md, Filing under an epic; the goal home
 itself when that epic cannot be read) of the invariant goal home

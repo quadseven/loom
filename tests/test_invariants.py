@@ -1296,6 +1296,91 @@ class RollingLaneTest(unittest.TestCase):
         self.assertFalse(any(b.rolling for b in found))
 
 
+class StandingLaneHeldTest(unittest.TestCase):
+    """loom#845: the lane-held issue is a standing one. A hold that clears
+    updates it in place to say so, and the next hold edits it again; it is
+    never closed and reopened (every reopen sent a notification email)."""
+
+    def setUp(self):
+        self.gh = FakeGH()
+        self.said = []
+        self.state = {}
+
+    def file(self, breaches, now=T0):
+        invariants.Filer(self.gh, REPO, GOAL, self.state, now, self.said.append).run(breaches)
+
+    def held(self, lanes, now):
+        return invariants.lane_held(lane_facts(lanes, now=now))
+
+    def test_a_second_hold_edits_the_standing_issue_instead_of_reopening_a_closed_one(self):
+        self.file(self.held(("zen",), T0), now=T0)
+        (number,) = self.gh.issues
+        cleared = T0 + 7 * 3600
+        self.file([], now=cleared)
+        again = T0 + 2 * DAY_S
+        writes = len(self.gh.writes)
+        self.file(self.held(("zen",), again), now=again)
+        self.assertEqual(list(self.gh.issues), [number])
+        issue = self.gh.issues[number]
+        self.assertEqual(issue["state"], "open")
+        self.assertIn("1 lane held by a limit", issue["title"])
+        self.assertIn("- zen: held by a limit since %s" % invariants.utc(again - 3 * 3600),
+                      issue["body"])
+        # An edit, not a reopen: no state change and no comment (a comment mails people).
+        for method, _path, body in self.gh.writes[writes:]:
+            self.assertEqual(method, "PATCH")
+            self.assertNotIn("state", body)
+        self.assertNotIn((REPO, number), self.gh.comments)
+
+    def test_a_cleared_hold_is_marked_clear_in_place_and_not_closed(self):
+        self.file(self.held(("zen",), T0), now=T0)
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(labels=[{"name": x} for x in invariants.LABELS])
+        cleared = T0 + 7 * 3600
+        self.file([], now=cleared)
+        issue = self.gh.issues[number]
+        self.assertEqual(issue["state"], "open")
+        self.assertIn("No lane is held by a limit now", issue["title"])
+        self.assertIn("Clear since %s." % invariants.utc(cleared), issue["body"])
+        self.assertRegex(issue["body"], invariants.MARKER_RE)
+        self.assertNotIn((REPO, number), self.gh.comments)
+        # The hold goes to the log in the body, not to a new issue.
+        self.assertIn("- zen: held since %s, cleared %s"
+                      % (invariants.utc(T0 - 3 * 3600), invariants.utc(cleared)), issue["body"])
+        # Another clear pass writes nothing.
+        writes = len(self.gh.writes)
+        self.file([], now=cleared + 600)
+        self.assertEqual(len(self.gh.writes), writes)
+
+    def test_the_hold_log_survives_the_next_hold(self):
+        self.file(self.held(("zen",), T0), now=T0)
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(labels=[{"name": x} for x in invariants.LABELS])
+        cleared = T0 + 7 * 3600
+        self.file([], now=cleared)
+        again = T0 + 2 * DAY_S
+        self.file(self.held(("agy",), again), now=again)
+        body = self.gh.issues[number]["body"]
+        self.assertIn("- agy: held by a limit since", body)
+        self.assertIn("- zen: held since %s, cleared %s"
+                      % (invariants.utc(T0 - 3 * 3600), invariants.utc(cleared)), body)
+        # A lane that drops out while another stays held is logged too.
+        later = again + 3600
+        self.file(self.held(("agy", "codex"), later), now=later)
+        self.file(self.held(("codex",), later + 600), now=later + 600)
+        body = self.gh.issues[number]["body"]
+        self.assertIn("- agy: held since", body)
+        self.assertEqual(self.gh.issues[number]["state"], "open")
+
+    def test_an_old_per_lane_issue_is_still_closed_when_cleared(self):
+        old = invariants.Breach("lane-held", "zen", "Lane zen held", ("x",), T0)
+        self.file([old], now=T0)
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(labels=[{"name": x} for x in invariants.LABELS])
+        self.file([], now=T0 + 7 * 3600)
+        self.assertEqual(self.gh.issues[number]["state"], "closed")
+
+
 class StandingEpicTest(unittest.TestCase):
     def test_the_repairs_epic_is_exempt_from_both_caps(self):
         goal = Ref("%s#%d" % (REPO, GOAL), "#30")
