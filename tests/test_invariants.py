@@ -925,6 +925,19 @@ class InvariantTest(unittest.TestCase):
         (b,) = invariants.lane_no_success(Facts(T0, runs=runs))
         self.assertEqual(b.title, "Lane agy: 5 runs in 24 hours and none done")
 
+    def test_briefs_parked_unrun_are_no_breach(self):
+        # A fix brief whose pull request merged or closed, or whose branch
+        # moved, is parked before the agent runs: the lane did nothing, so
+        # nothing about the lane is shown (loom#736, 2026-10-20).
+        for reason in ("[work] pull request #1228 is no longer open on loom/736-x (MERGED loom/736-x)",
+                       "[work] pull request #9 is no longer open on loom/9-y (CLOSED loom/9-y)",
+                       "[work] branch moved: loom/5-z is at 0123456789ab on the remote, not ba9876543210"):
+            with self.subTest(reason=reason):
+                runs = [Run("zen", False, T0 - i * 600, reason) for i in range(6)]
+                self.assertEqual(invariants.lane_no_success(Facts(T0, runs=runs)), [])
+                runs.insert(0, Run("zen", True, T0 - 9 * 3600, ""))
+                self.assertEqual(invariants.lane_failing_streak(Facts(T0, runs=runs)), [])
+
     def test_a_lane_failing_its_last_runs_after_an_earlier_success_is_a_breach(self):
         runs = [Run("zen", True, T0 - 9 * 3600, "")]
         runs += [Run("zen", False, T0 - i * 600, "[transient] agent exited 1") for i in range(5)]

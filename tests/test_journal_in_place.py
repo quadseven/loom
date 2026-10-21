@@ -89,6 +89,57 @@ class WriterTests(unittest.TestCase):
         journal.post(GitHub("t", transport=fake), REPO, 7, tick("2030-01-01T10:00:00Z"))
         self.assertEqual([m for m, _, _ in fake.writes()], ["POST"])
 
+    def test_a_loose_tick_header_is_replaced_never_stacked(self):
+        # loom#1241, 2026-10-20 23:12Z, on a project issue: the brain wrote
+        # "Tick 2026-10-20 23:07Z, muse" (a space, not one token), the writer
+        # did not see a Tick line and put its own on top, so the journal
+        # opened with two tick headers.
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:05Z")
+        first = tick(today[:11] + "00:00:00Z", "muse", "- Decided: first")
+        fake = Fake([comment(41, first, today)])
+        loose = "\n".join([M, "Tick 2030-01-01 10:00Z, muse", "", "Unstuck evidence: 5 held."])
+        journal.post(GitHub("t", transport=fake), REPO, 7, loose, "muse")
+        [(method, path, body)] = fake.writes()
+        self.assertEqual((method, path), ("PATCH", "/repos/%s/issues/comments/41" % REPO))
+        top = body["body"].split(handoff.EARLIER_OPEN)[0]
+        self.assertEqual(len([l for l in top.splitlines() if l.startswith("Tick ")]), 1)
+        self.assertRegex(top.splitlines()[1], r"^Tick \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ, muse$")
+        self.assertIn("Unstuck evidence: 5 held.", top)
+        self.assertNotIn("Tick 2030-01-01 10:00Z", body["body"])
+
+    def test_a_loose_tick_header_naming_another_holder_is_refused(self):
+        fake = Fake([])
+        loose = "\n".join([M, "Tick 2030-01-01 10:00Z, muse", "x"])
+        with self.assertRaisesRegex(ValueError, "names muse, not lane-machine"):
+            journal.post(GitHub("t", transport=fake), REPO, 7, loose, "lane-machine")
+        self.assertEqual(fake.calls, [])
+
+    def test_plain_evidence_with_a_holder_edits_the_days_journal(self):
+        # The 17:44Z comment on the same issue was plain prose posted with the
+        # GitHub CLI, because the writer refused a body with no marker: one
+        # more email to the issue's watchers.
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:05Z")
+        first = tick(today[:11] + "00:00:00Z", "muse", "- Decided: first")
+        fake = Fake([comment(41, first, today)])
+        journal.post(GitHub("t", transport=fake), REPO, 7,
+                     "Tick evidence: Zug 66 min on a vendor wait.\n", "muse")
+        [(method, path, body)] = fake.writes()
+        self.assertEqual((method, path), ("PATCH", "/repos/%s/issues/comments/41" % REPO))
+        text = body["body"]
+        self.assertTrue(text.startswith(M + "\nTick "))
+        # Prose that only starts with the word is kept, not taken for a header.
+        self.assertIn("\nTick evidence: Zug 66 min", text)
+        self.assertLess(text.index("Zug 66 min"), text.index("- Decided: first"))
+
+    def test_plain_text_needs_a_holder_and_an_unknown_marker_is_refused(self):
+        fake = Fake([])
+        with self.assertRaisesRegex(ValueError, "holder"):
+            journal.post(GitHub("t", transport=fake), REPO, 7, "Unstuck evidence.")
+        with self.assertRaisesRegex(ValueError, "marker"):
+            journal.post(GitHub("t", transport=fake), REPO, 7,
+                         "<!-- loom:evidence v1 -->\nUnstuck evidence.", "muse")
+        self.assertEqual(fake.calls, [])
+
     def test_the_edited_journal_stays_under_the_comment_limit(self):
         old = tick("2030-01-01T09:00:00Z", "lane-machine", "x" * 40000)
         older = journal.merged(old, tick("2030-01-01T08:00:00Z", "lane-machine", "y" * 30000))
@@ -98,6 +149,31 @@ class WriterTests(unittest.TestCase):
         self.assertTrue(body.startswith(new))
         self.assertIn("x" * 100, body)       # the newer earlier tick is kept
         self.assertNotIn("y" * 100, body)    # the oldest is dropped
+
+
+class InstructionTests(unittest.TestCase):
+    """The brain picks where its evidence goes in prose, so its instructions
+    carry the rule: on 2026-10-20 (loom#1241) it filed vendor-wait
+    evidence on a banker-wait issue "as the closest open kind"."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def read(self, *parts):
+        with open(os.path.join(self.ROOT, *parts), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_rules_send_tick_evidence_through_the_journal_writer(self):
+        rules = self.read("docs", "MUSE.md").split("\n## Rules\n", 1)[1]
+        rule = " ".join(rules.split())
+        self.assertIn("goes through `python3 -m bus journal", rule)
+        self.assertIn("Never `gh issue comment`", rule)
+        self.assertIn("no issue of exactly that kind goes to the goal home's journal", rule)
+        self.assertIn("never to the closest", rule)
+
+    def test_the_lane_machine_prompt_says_the_same(self):
+        prompt = " ".join(self.read("lanes", "mac", "brain.sh").replace("\\\n", " ").split())
+        self.assertIn("every other note or evidence a tick leaves on an issue", prompt)
+        self.assertIn("goal home's journal, never the closest", prompt)
 
 
 class ReaderTests(unittest.TestCase):
