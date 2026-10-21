@@ -2997,11 +2997,7 @@ class Station:
         or evidence read before the fix landed, proves nothing about the fix.
         A ticket with no linked merged pull request is left to the close rule,
         and a pull request merged into another branch is not counted."""
-        branch = self._default_branch(repo)
-        linked = sorted((pr for pr in self._closed_pulls(repo) if _linked_pr(issue, repo, pr)
-                         and str((pr.get("base") or {}).get("ref") or branch) == branch),
-                        key=lambda pr: str(pr.get("merged_at") or ""), reverse=True)
-        linked = linked[:verify_data.MAX_PULLS]
+        linked = self._merged_linked(repo, issue)[:verify_data.MAX_PULLS]
         if not linked:
             return ""
         revision = str(record["revision"]).strip()
@@ -4784,6 +4780,7 @@ class Station:
             if not self._field(text, "Fix-PR") and self._answered(lane, name):
                 prs = {int(n) for n in NAMED_PR_RE.findall(text)}
                 self._post_thread_answers(repo, prs, lane, name, text, None)
+                self._settle_no_change(repo, number, lane, name)
                 _say("reported %s#%d answered by lane %s: nothing to change" % (repo, number, lane))
                 return True
             branch = self._field(text, "Branch")
@@ -5172,6 +5169,73 @@ class Station:
         (lanes/run_lane.sh, no_change_reason)? Read from the runner's marker
         file, never from the log, which carries the agent's own output."""
         return os.path.isfile(os.path.join(self.s.home, "logs", lane, name + ".answered"))
+
+    def _no_change_said(self, lane: str, name: str) -> str:
+        """The answer the runner wrote into the .answered marker: the lane's
+        reason, quoted in full. It is lane output, so it passes the text
+        checks again here, and a marker with nothing usable gives a plain
+        sentence instead."""
+        plain = ("Lane %s made no change: the agent found this work already done or no "
+                 "longer applying." % lane)
+        try:
+            with open(os.path.join(self.s.home, "logs", lane, name + ".answered"),
+                      encoding="utf-8", errors="replace") as fh:
+                said = fh.read(32768).strip()
+        except OSError:
+            return plain
+        if not said:
+            return plain
+        try:
+            _text.check(said)
+        except ValueError:
+            return plain[:-1] + "; its reason did not pass the text checks and is in the lane log."
+        return said
+
+    def _settle_no_change(self, repo: str, number: int, lane: str, name: str) -> None:
+        """Record a build run's no-change answer and settle its ticket from it.
+
+        The answer is an event in the ticket's status comment, quoting the
+        lane in full: the runner's new comment emailed the ticket's author for
+        what is a routine outcome (a watched repo's ticket, 2026-10-21). When a
+        pull request linked to the ticket has merged into the default branch,
+        the work the lane found done is that pull request's: the ticket moves
+        to loom:merged, so the ship rules move it to loom:shipped and a verify
+        run checks its acceptance criteria against live evidence, closing it
+        with a proof or marking what evidence is missing. Without one, it
+        waits at loom:answered for the brain, as before. So does a regression
+        or revert ticket: the pull request linked to it is the change that
+        regressed or must be undone, not this ticket's work. A ticket no
+        longer running (moved while the station was away) keeps its labels."""
+        said = self._no_change_said(lane, name)
+        issue = self._issue(repo, number)
+        names = _label_names(issue)
+        merged = self._merged_linked(repo, issue) if (
+            issue.get("state") == "open" and RUNNING in names
+            and not set(names) & {REGRESSION, factory.REVERT_LABEL}) else []
+        if merged:
+            pr = merged[0]
+            states = {"loom:" + s for s in brain.STATES}
+            labels = [n for n in names if n not in states and not n.startswith(WAIT)]
+            labels.append("loom:merged")
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+            note = ("Pull request #%d (merged %s, merge commit %s) already carries this "
+                    "ticket's work, so the ticket moved to loom:merged: it ships and is verified "
+                    "against its acceptance criteria like any merged ticket."
+                    % (int(pr["number"]), pr.get("merged_at"), str(pr["merge_commit_sha"])[:12]))
+        else:
+            self._relabel(repo, number, "loom:answered")
+            note = ("No merged pull request references this ticket, so it waits at "
+                    "loom:answered for the brain to verify it or brief it again.")
+        self._routine(repo, number, "%s\n\n%s" % (said, note))
+
+    def _merged_linked(self, repo: str, issue: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The ticket's pull requests merged into the default branch, linked
+        the way reconcile links them (a Refs line or a loom/<number> branch),
+        newest merge first, from the closed pull requests cached for the pass."""
+        branch = self._default_branch(repo)
+        return sorted((pr for pr in self._closed_pulls(repo) if _linked_pr(issue, repo, pr)
+                       and str((pr.get("base") or {}).get("ref") or branch) == branch),
+                      key=lambda pr: str(pr.get("merged_at") or ""), reverse=True)
 
     def _post_thread_answers(self, repo: str, prs: Set[int], lane: str, name: str,
                              brief: str, asked: Optional[Set[str]]) -> None:

@@ -281,7 +281,7 @@ SUMMARY_FILE=.loom/summary.md
 # What section, or the reason a run changed nothing (no_change_reason). The
 # file itself is never committed.
 summary_note() {
-  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion built, leave Live criteria unticked, and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and the runner posts it on the ticket as the answer.\n' "$SUMMARY_FILE"
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion built, leave Live criteria unticked, and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE"
 }
 
 # How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
@@ -589,15 +589,25 @@ no_change_reason() {
   [ -z "$NO_CHANGE_WHY" ]
 }
 
-# Post an answered run's reason on its ticket, label the ticket
-# loom:answered for the brain, and hand its thread answers to the station,
-# which posts each on the pull request the ticket names. Says what failed.
+# Hand an answered run's reason and its thread answers to whoever reports
+# it. The reason goes into the .answered marker. A station brief (an `Issue:
+# OWNER/NAME#N` line) is reported by the station, which records the reason as
+# an event in the ticket's status comment and settles the ticket
+# (docs/BRAIN.md, Claim and outcome): a new comment here emailed the ticket's
+# author for a routine outcome (a watched repo's ticket, 2026-10-21). Any other
+# brief has no reporter, so the runner posts the reason on its ticket and
+# labels it loom:answered itself. Says what failed.
 post_no_change() {
-  if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$NO_CHANGE_TEXT" >> "$LOG" 2>&1; then
-    echo "answer comment failed"; return 1
+  if ! printf '%s\n' "$NO_CHANGE_TEXT" > "$LOGDIR/$TICKET.answered.tmp"; then
+    echo "answer could not be written"; return 1
   fi
-  if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
-    echo "answer posted but ticket label update failed"; return 1
+  if ! [[ "$ISSUE_REF" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]]; then
+    if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$NO_CHANGE_TEXT" >> "$LOG" 2>&1; then
+      echo "answer comment failed"; return 1
+    fi
+    if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
+      echo "answer posted but ticket label update failed"; return 1
+    fi
   fi
   if [ -d "$WORKDIR/$TICKET.answers" ]; then
     rm -rf "$INBOX/answers/$TICKET"
@@ -2585,7 +2595,7 @@ for BRIEF in "$INBOX"/*.md; do
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
   rm -f "$WORKDIR/$TICKET.described-step" "$WORKDIR/$TICKET.opencode-events"
-  rm -f "$LOGDIR/$TICKET.answered" "$LOGDIR/$TICKET.pushed"
+  rm -f "$LOGDIR/$TICKET.answered" "$LOGDIR/$TICKET.answered.tmp" "$LOGDIR/$TICKET.pushed"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
          { [ -n "$FIX_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
@@ -2950,9 +2960,11 @@ for BRIEF in "$INBOX"/*.md; do
     if [[ ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
       park "$BRIEF" "agent made no commit and its reason has no ticket number to go on"; continue
     fi
-    if ! WHY="$(post_no_change)"; then park "$BRIEF" "$WHY" transient; continue; fi
+    if ! WHY="$(post_no_change)"; then
+      rm -f "$LOGDIR/$TICKET.answered.tmp"; park "$BRIEF" "$WHY" transient; continue
+    fi
     # The station reads this marker, not the log, which carries agent output.
-    : > "$LOGDIR/$TICKET.answered"
+    mv "$LOGDIR/$TICKET.answered.tmp" "$LOGDIR/$TICKET.answered"
     echo "[$(date -u +%FT%TZ)] $TICKET done, answered: nothing to change" >> "$LOG"
     mv "$BRIEF" "$INBOX/done/"
     continue

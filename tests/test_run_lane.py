@@ -947,7 +947,28 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("Fix the thing so it works", intent)
         self.assertIn("Files: 1", intent)
 
+    def test_a_station_briefs_no_change_answer_goes_to_the_station_not_a_comment(self):
+        # A new ticket comment emailed the ticket's author for a routine
+        # outcome (a watched repo's ticket, 2026-10-21): the station records the
+        # reason as a status event and settles the ticket instead.
+        self.drop_brief(text=BRIEF.replace("Lane: codex", "Lane: codex\nIssue: example/repo#42"))
+        result = self.run_lane(FAKE_AGENT="no-change",
+                               FAKE_SUMMARY="nothing to change: the finding no longer holds")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertFalse(any(c.startswith("gh issue comment") or c.startswith("gh issue edit")
+                             for c in calls), calls)
+        marker = self.loom / "logs" / "codex" / "T042-fix-the-thing.answered"
+        said = marker.read_text()
+        self.assertTrue(said.startswith("Lane codex made no change: the agent found this work "
+                                        "already done or no longer applying. It said:\n\n"), said)
+        self.assertIn("\n> nothing to change: the finding no longer holds\n", said)
+        self.assertFalse((self.loom / "logs" / "codex" / "T042-fix-the-thing.answered.tmp").exists())
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
     def test_no_commit_with_a_nothing_to_change_summary_is_answered_not_failed(self):
+        # A brief with no Issue line has no station to report it: the runner
+        # posts the reason on the ticket itself.
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="no-change",
                                FAKE_SUMMARY="nothing to change: the finding no longer holds")
