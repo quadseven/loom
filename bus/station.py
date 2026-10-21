@@ -3670,11 +3670,12 @@ class Station:
         return [pr for pr in pulls if revert.is_hand_revert(pr, self.now, branch)]
 
     def _ticket_pulls(self, repo: str, wanted: set) -> Dict[int, List[Dict[str, Any]]]:
-        """Every merged pull request of each wanted ticket."""
+        """Every merged pull request of each wanted ticket, a revert not
+        counting as one of the ticket's own."""
         groups: Dict[int, List[Dict[str, Any]]] = {}
         for pr in self._closed_pulls(repo):
             number = self._pr_ticket_number(repo, pr)
-            if number in wanted:
+            if number in wanted and not revert.looks_like_revert(pr):
                 groups.setdefault(number, []).append(pr)
         return groups
 

@@ -578,6 +578,16 @@ class HandRevert(Base):
         self.assertNotIn("loom:merged", self.labels_of(4))
         self.assertIn("undid #4", log)
 
+    def test_a_fix_reverted_by_a_prefixed_revert_that_links_the_ticket_goes_back(self):
+        self.merged_ticket(ticket=4, pr=41)
+        self.gh.hand_revert("r1", 91, sha("m1"), title="[scope] revert #41: it broke",
+                            body="Refs %s#4\n\n## Why\nIt broke the build.\n" % REPO)
+        self.gh.pulls[-1]["head"]["ref"] = "revert-41"
+        log = self.beat()
+        self.assertIn("loom:briefed", self.labels_of(4))
+        self.assertNotIn("loom:merged", self.labels_of(4))
+        self.assertIn("undid #4", log)
+
     def test_the_comment_names_the_revert_and_quotes_its_why(self):
         self.merged_ticket()
         self.gh.hand_revert("r1", 91, sha("m1"))
