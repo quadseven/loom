@@ -267,11 +267,15 @@ def validate(answer: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
 
 def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
     """Open loom:triage issues (not pull requests), oldest first, leaving out
-    one assigned to another operator (docs/LANES.md, Two Looms)."""
+    one assigned to another operator (docs/LANES.md, Two Looms) and one that is
+    not work for a lane (brain.not_work_reason: wayfinder, awaiting a live
+    check, a factory incident, an epic), as triage does, so an issue labelled
+    loom:triage before a rule existed is not rewritten into a ticket."""
     found = gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open"
                         "&sort=created&direction=asc&per_page=100" % repo)
     return [i for i in found if isinstance(i, dict) and "pull_request" not in i
-            and not brain.owned_elsewhere(i) and NEEDS_BRAIN not in _names(i)]
+            and not brain.owned_elsewhere(i) and NEEDS_BRAIN not in _names(i)
+            and not brain.not_work_reason(i)]
 
 
 def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: str,

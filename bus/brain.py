@@ -1655,9 +1655,13 @@ def _in_place_refusal(source: Dict[str, Any], env: Optional[Dict[str, str]]) -> 
     issue in the brief's repo)."""
     if source.get("locked"):
         return "it is locked"
-    if not tickets.brief_author_trusted(source, trusted_authors(env)):
-        return ("its author is not a LOOM_BRIEF_AUTHORS login, so the station would never "
-                "claim it (docs/BRAIN.md, Trust)")
+    # A LOOM_TRUSTED_BRIEFERS author counts: the rewrite makes the issue their
+    # loom:ticket brief, which the station claims (7 of 7 new-issue rewrites on
+    # 2026-10-21 had such an author). Claim trust itself is unchanged.
+    if not tickets.brief_author_trusted(source, trusted_authors(env), trusted_briefers(env),
+                                        as_ticket=True):
+        return ("its author is not a LOOM_BRIEF_AUTHORS or LOOM_TRUSTED_BRIEFERS login, so the "
+                "station would never claim it (docs/BRAIN.md, Trust)")
     return None
 
 
@@ -2046,16 +2050,21 @@ def _is_epic(issue: Dict[str, Any]) -> bool:
             or int(summary.get("total") or 0) > 0)
 
 
-def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
-                 briefers: Sequence[str] = ()) -> Optional[str]:
-    if "pull_request" in issue:
-        return "pull request"
-    if authors and tickets.owned_elsewhere(issue, authors, briefers):
-        # Another operator's Loom owns an issue assigned to them.
-        return "another operator's"
+# Finished or decided work: an issue Loom Merged and is waiting to see live
+# (bus/claimed.py owns the label), 55 open on 2026-10-21 and 35 of them in a
+# Loom state again, briefed and run a second time.
+LIVE_CHECK_LABEL = "awaiting-live-check"
+
+
+def not_work_reason(issue: Dict[str, Any]) -> Optional[str]:
+    """Why an issue is not work for a lane, whatever Loom labels it carries, or
+    None. Triage and the rewriter both ask this, so a loom:triage issue
+    labelled before a rule existed cannot slip past it (loom#34, a wayfinder
+    decision question, became a ticket that churned for 34 hours)."""
     names = _labels(issue)
-    if any(name.startswith("loom:") for name in names) or "needs-operator" in names:
-        return "already labelled"
+    if LIVE_CHECK_LABEL in names:
+        # Merged and awaiting a live check: finished work, not new work.
+        return "awaiting a live check"
     if any(name.startswith("wayfinder:") for name in names):
         # A wayfinder map or decision ticket is planning, not work for a lane.
         return "wayfinder"
@@ -2066,6 +2075,19 @@ def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
     if _is_epic(issue):
         return "epic"
     return None
+
+
+def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
+                 briefers: Sequence[str] = ()) -> Optional[str]:
+    if "pull_request" in issue:
+        return "pull request"
+    if authors and tickets.owned_elsewhere(issue, authors, briefers):
+        # Another operator's Loom owns an issue assigned to them.
+        return "another operator's"
+    names = _labels(issue)
+    if any(name.startswith("loom:") for name in names) or "needs-operator" in names:
+        return "already labelled"
+    return not_work_reason(issue)
 
 
 def _oldest_open_issues(gh: GitHub, repo: str):

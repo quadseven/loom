@@ -673,16 +673,18 @@ def _is_ticket(issue: Dict[str, Any]) -> bool:
 
 
 def brief_author_trusted(issue: Dict[str, Any], authors: Iterable[str],
-                         briefers: Iterable[str] = ()) -> bool:
+                         briefers: Iterable[str] = (), as_ticket: bool = False) -> bool:
     """Whether the issue's author may brief this Loom: a LOOM_BRIEF_AUTHORS
     login, or a LOOM_TRUSTED_BRIEFERS login on a loom:ticket (a brief is the
-    hand-off). Every briefing trust check asks this, so they cannot drift."""
+    hand-off). as_ticket asks about the issue as it will be once a brief has
+    made it the ticket. Every briefing trust check asks this, so they cannot
+    drift."""
     author = _login(issue.get("user"))
     if not author:
         return False
     if author in {a.lower() for a in authors}:
         return True
-    return author in {b.lower() for b in briefers} and _is_ticket(issue)
+    return author in {b.lower() for b in briefers} and (as_ticket or _is_ticket(issue))
 
 
 def trusted(issue: Dict[str, Any], events: List[Dict[str, Any]],
