@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import sys
+from datetime import datetime, timezone
 import unittest
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -323,6 +324,15 @@ ln -s "$real_home/loom/run/elsewhere" "$HOME/.claude" 2>/dev/null
 echo fixed > fix.txt
 """
 
+# Fake copilot: records argv, the token it was handed and its HOME, then edits
+# a file. Like opencode, it runs in the API sandbox, which denies writes under
+# .git, so it leaves the commit to the runner.
+FAKE_COPILOT = """#!/usr/bin/env bash
+printf 'copilot %s | COPILOT_GITHUB_TOKEN=%s | home=%s\\n' "$(printf %s "$*" | tr '\\n' ' ')" \\
+  "${COPILOT_GITHUB_TOKEN:-}" "$HOME" >> "$TMPDIR/agent.log"
+echo fixed > fix.txt
+"""
+
 # opencode 2.0 starts a real TCP listener so the run checks the sandbox rule.
 FAKE_OPENCODE_2 = FAKE_OPENCODE.replace('echo "1.18.4"', 'echo "opencode v2.0.28"').replace(
     'args="$*"; args=', '''if [ "${1:-}" = serve ]; then
@@ -507,6 +517,7 @@ class LaneRunnerTest(unittest.TestCase):
         self.write_tool(self.bin / "gh", FAKE_GH)
         self.write_tool(self.bin / "codex", FAKE_AGENT)
         self.write_tool(self.bin / "opencode", FAKE_OPENCODE)
+        self.write_tool(self.bin / "copilot", FAKE_COPILOT)
         self.write_tool(self.bin / "aws", FAKE_AWS)
         self.write_tool(self.bin / "curl", FAKE_CURL)
         self.scanner = root / "check_private_leaks.py"
@@ -2024,6 +2035,36 @@ cat > /dev/null
         self.assertEqual(result.returncode, 0, result.stderr)
         log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
         self.assertIn("failed: [transient] model claude-sonnet-5-5 is not an opencode-go model", log)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_copilot_runs_prompt_with_ssm_token_and_scratch_home(self):
+        inbox, result = self.api_lane(
+            "copilot", LOOM_COPILOT_KEY_SSM="/k/copilot",
+            FAKE_SECRET__k_copilot="fake-copilot-token")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [c for c in self.calls() if c.startswith("copilot ")]
+        self.assertEqual(len(calls), 1, self.calls())
+        self.assertIn("-p", calls[0])
+        self.assertIn("# Brief: T042-fix-the-thing", calls[0])
+        self.assertIn("--allow-all-tools", calls[0])
+        self.assertIn("COPILOT_GITHUB_TOKEN=fake-copilot-token", calls[0])
+        agent_home = calls[0].split("home=", 1)[1]
+        self.assertNotEqual(agent_home, str(self.home))
+        self.assertIn("/run/copilot-home", agent_home)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_copilot_monthly_usage_limit_holds_until_next_month(self):
+        script = (RUNNER.parent / "agent_cli.sh").read_text() + (
+            'classify_failure 1 "Copilot monthly usage limit reached" edited; '
+            'printf "%s %s\\n" "$FAIL_CLASS" "$RETRY_AT"')
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+        kind, retry_at = result.stdout.split()
+        self.assertEqual(kind, "limit")
+        now = datetime.now(timezone.utc)
+        year = now.year + (now.month == 12)
+        month = 1 if now.month == 12 else now.month + 1
+        expected = int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(int(retry_at), expected)
 
     def api_lane(self, lane, extra="", **env):
         if not sandbox_caps.LOCALHOST:
