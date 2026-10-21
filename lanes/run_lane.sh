@@ -1279,28 +1279,12 @@ safe_git() {
 # an agent edits changes what is checked. A repo without the file is not
 # validated by the runner (its CI still is).
 CONTRACT_FILE=.loom/validation.conf
-load_contract() {
-  local rev="$BASE" mode line key val canon
-  HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK=""
-  if [ -n "$FIX_PR" ] && ! { timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
-       -c core.fsmonitor=false fetch -q --depth 1 origin "${BASE_BRANCH:-HEAD}" >> "$LOG" 2>&1 &&
-       rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
-    HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
-    note_factory_incident environment "could not fetch the base branch for $CONTRACT_FILE" SETUP_REASON
-    return 1
-  fi
-  mode="$(safe_git ls-tree "$rev" -- "$CONTRACT_FILE" | cut -d' ' -f1)"
-  [ -n "$mode" ] || return 0
-  HAS_CONTRACT=1
-  [ "$mode" = 100644 ] || [ "$mode" = 100755 ] || { SETUP_REASON="$CONTRACT_FILE is not a regular file"; return 1; }
-  # bus/contract.py reads every contract form repos use and prints the
-  # key: value lines below; a form it cannot read is a factory incident:
-  # the runner's reader is behind the repos, not the ticket's work.
-  canon="$(safe_git cat-file blob "$rev:$CONTRACT_FILE" | PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.contract)" || {
-    SETUP_REASON="$CONTRACT_FILE ${canon:0:120}"
-    note_factory_incident contract "contract: $canon" SETUP_REASON
-    return 1
-  }
+# Read the key: value lines bus.contract printed into C_INTERP, C_SUBMODULES,
+# C_SETUP and C_CHECK. Returns 1 with SETUP_REASON when a line, the check,
+# submodules, the interpreter or a command is unusable.
+parse_contract() {
+  local canon="$1" line key val
+  C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK=""
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     key="${line%%:*}" val="${line#*:}"
@@ -1321,6 +1305,31 @@ load_contract() {
     contract_command_ok "$val" ||
       { SETUP_REASON="$CONTRACT_FILE setup: and check: must be printable ASCII, at most 1000 characters"; return 1; }
   done
+}
+
+load_contract() {
+  local rev="$BASE" mode canon
+  HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK=""
+  if [ -n "$FIX_PR" ] && ! { timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
+       -c core.fsmonitor=false fetch -q --depth 1 origin "${BASE_BRANCH:-HEAD}" >> "$LOG" 2>&1 &&
+       rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
+    HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
+    note_factory_incident environment "could not fetch the base branch for $CONTRACT_FILE" SETUP_REASON
+    return 1
+  fi
+  mode="$(safe_git ls-tree "$rev" -- "$CONTRACT_FILE" | cut -d' ' -f1)"
+  [ -n "$mode" ] || return 0
+  HAS_CONTRACT=1
+  [ "$mode" = 100644 ] || [ "$mode" = 100755 ] || { SETUP_REASON="$CONTRACT_FILE is not a regular file"; return 1; }
+  # bus/contract.py reads every contract form repos use and prints the
+  # key: value lines below; a form it cannot read is a factory incident:
+  # the runner's reader is behind the repos, not the ticket's work.
+  canon="$(safe_git cat-file blob "$rev:$CONTRACT_FILE" | PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.contract)" || {
+    SETUP_REASON="$CONTRACT_FILE ${canon:0:120}"
+    note_factory_incident contract "contract: $canon" SETUP_REASON
+    return 1
+  }
+  parse_contract "$canon"
 }
 
 # setup and check are shell by design (like a CI run: step), so their content
@@ -1717,6 +1726,73 @@ final_validation() {
   drop_check_home
   [ "$ok" = true ] || { VALIDATION_REASON="$VALIDATION_REASON at ${rev:0:12} (base check exited $BASELINE_EXIT)"; return 1; }
   VALIDATED="check exited 0 at ${rev:0:12}"
+}
+
+# Run the check of the contract the lane commits (C_* hold it) on the lane's
+# own tree, in the check sandbox. Its setup runs only when it differs from
+# the base setup in $1, which prepare_validation already ran. Sets CONTRACT_REFUSAL
+# and returns 1 when the interpreter is missing, a step fails or the check
+# changes tracked files; 2 when the runner cannot run a check at all.
+run_committed_contract() {
+  local base_setup="$1" rc changed rev
+  command -v sandbox-exec > /dev/null || { CONTRACT_REFUSAL="sandbox-exec not available"; return 2; }
+  if [ -n "$C_INTERP" ] && ! command -v "$C_INTERP" > /dev/null; then
+    CONTRACT_REFUSAL="the contract names interpreter $C_INTERP, which is not on the lane machine's PATH"
+    return 1
+  fi
+  CHECK_CLI="${C_INTERP:-bash}"
+  mkdir -p "$CHECK_HOME/tmp" || { CONTRACT_REFUSAL="could not prepare the check home"; return 2; }
+  rev="$(safe_git rev-parse HEAD)"
+  if [ -n "$C_SETUP" ] && [ "$C_SETUP" != "$base_setup" ]; then
+    contract_run "$C_SETUP"; rc=$?
+    record contract-setup "$C_SETUP" "$rc" "$rev" "$([ "$rc" -eq 0 ] && echo true || echo false)"
+    [ "$rc" -eq 0 ] || { CONTRACT_REFUSAL="the setup in $CONTRACT_FILE exited $rc on the lane's own tree"; return 1; }
+  fi
+  contract_run "$C_CHECK"; rc=$?
+  changed="$(tracked_changes)"
+  record contract-check "$C_CHECK" "$rc" "$rev" "$([ "$rc" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
+    "${changed:+changed tracked files: $changed}"
+  if [ "$rc" -ne 0 ]; then
+    CONTRACT_REFUSAL="the check in $CONTRACT_FILE exited $rc on the lane's own tree"
+  elif [ -n "$changed" ]; then
+    CONTRACT_REFUSAL="the check in $CONTRACT_FILE changed tracked files on the lane's own tree ($changed)"
+  fi
+  [ -z "$CONTRACT_REFUSAL" ]
+}
+
+# A lane change that adds or edits the validation contract must read and
+# pass under itself (loom#1290): the runner checks a change against the
+# base's contract, so a contract the lane wrote was never read or run before
+# it merged, and a broken one failed every later lane run on the repo. When
+# the lane's commits (the pull request's own changes on a fix round) touch
+# the file, the runner reads the committed blob with bus.contract and runs
+# its check on the lane's tree. Returns 0 when the file is untouched, gone or
+# good, 1 with CONTRACT_REFUSAL when it is not, 2 when the check could not
+# run. The base contract's settings are restored either way.
+check_contract_change() {
+  local range="$BASE..HEAD" touched mode canon rc=0
+  local b_interp="$C_INTERP" b_subs="$C_SUBMODULES" b_setup="$C_SETUP" b_check="$C_CHECK" b_cli="${CHECK_CLI:-}"
+  CONTRACT_REFUSAL=""
+  [ -z "$FIX_UPSTREAM" ] || range="$FIX_UPSTREAM...HEAD"
+  touched="$(safe_git diff --name-only "$range" -- "$CONTRACT_FILE" 2>> "$LOG")" ||
+    { CONTRACT_REFUSAL="could not read the lane's changes"; return 2; }
+  [ -n "$touched" ] || return 0
+  mode="$(safe_git ls-tree HEAD -- "$CONTRACT_FILE" | cut -d' ' -f1)"
+  [ -n "$mode" ] || return 0
+  if [ "$mode" != 100644 ] && [ "$mode" != 100755 ]; then
+    CONTRACT_REFUSAL="$CONTRACT_FILE is not a regular file"; return 1
+  fi
+  if ! canon="$(safe_git cat-file blob "HEAD:$CONTRACT_FILE" | PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.contract)"; then
+    CONTRACT_REFUSAL="$CONTRACT_FILE is one the runner cannot read: ${canon:0:160}"; return 1
+  fi
+  if ! parse_contract "$canon"; then
+    CONTRACT_REFUSAL="$CONTRACT_FILE is one the runner cannot use: ${SETUP_REASON#"$CONTRACT_FILE "}"; rc=1
+  else
+    run_committed_contract "$b_setup" || rc=$?
+  fi
+  C_INTERP="$b_interp" C_SUBMODULES="$b_subs" C_SETUP="$b_setup" C_CHECK="$b_check" CHECK_CLI="$b_cli"
+  [ -n "$HAS_CONTRACT" ] || drop_check_home
+  return "$rc"
 }
 
 # Push a commit of the lane tree to a side branch of the ticket's branch and
@@ -2676,6 +2752,16 @@ for BRIEF in "$INBOX"/*.md; do
     if [ -n "$STRAY_FILES" ]; then
       park "$BRIEF" "commit refused: it adds files outside the brief's paths: $(stray_list); nothing pushed"; continue
     fi
+  fi
+  # A contract the lane adds or edits must read and pass under itself before
+  # anything is pushed (loom#1290).
+  if [ "$COMMITTED" -eq 1 ]; then
+    check_contract_change; CONTRACT_RC=$?
+    case "$CONTRACT_RC" in
+      0) ;;
+      1) park "$BRIEF" "commit refused: $CONTRACT_REFUSAL; nothing pushed"; continue ;;
+      *) park "$BRIEF" "could not check the committed validation contract: $CONTRACT_REFUSAL" transient; continue ;;
+    esac
   fi
   # An agent's exit code is not evidence: only a passing check on the
   # committed head hands the work on.

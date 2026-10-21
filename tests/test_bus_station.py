@@ -3077,6 +3077,8 @@ class ValidationContractTest(Base):
         # Filed under the goal's intake epic (brief_intake finds it).
         self.assertEqual(file_ticket.call_args.args[2], 2)
         self.assertIn(".loom/validation.conf", file_ticket.call_args.args[4])
+        # The brief says which commands a lane machine can run (loom#1290).
+        self.assertIn("no secrets, simulators or unset variables", file_ticket.call_args.args[4])
 
         worker.gh.rest = mock.Mock(return_value=type("Response", (), {"data": [
             {"number": 3, "title": "Add the repository validation contract"}
