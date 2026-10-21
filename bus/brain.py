@@ -723,6 +723,40 @@ def _since(shipped: datetime, now: datetime) -> str:
     return "%dh" % hours
 
 
+# How long a ticket may wait in needs-brain before it is considered stale.
+# The lane PR stall invariant triggers at 6 hours (PR_STALLED), so we flag
+# at 4 hours to give the brain time to act before the invariant fires.
+STALE_NEEDS_BRAIN_HOURS = 4
+
+
+def _needs_brain_since(gh: GitHub, repo: str, issue: Dict[str, Any]) -> Optional[datetime]:
+    """When the needs-brain label was added to this issue, or None if not found."""
+    events = gh.paginate("/repos/%s/issues/%s/events" % (repo, issue["number"]))
+    stamps = [_stamp(e.get("created_at")) for e in events
+              if e.get("event") == "labeled"
+              and (e.get("label") or {}).get("name") == "needs-brain"]
+    return max(stamps) if stamps else None
+
+
+def stale_needs_brain(gh: GitHub, repos: Sequence[str], now: Optional[datetime] = None,
+                      hours: int = STALE_NEEDS_BRAIN_HOURS) -> List[Tuple[datetime, Dict[str, Any], str]]:
+    """Open tickets with needs-brain label that have had it for more than
+    `hours` hours. Returns list of (since, issue, repo) tuples, oldest first.
+    This monitors the brain review queue for tickets waiting too long."""
+    now = now or datetime.now(timezone.utc)
+    limit = timedelta(hours=hours)
+    out = []
+    for repo in repos:
+        issues = _issues(gh, repo)
+        needs_brain = [i for i in issues if "needs-brain" in _labels(i)]
+        for issue in needs_brain:
+            since = _needs_brain_since(gh, repo, issue)
+            if since and now - since > limit:
+                out.append((since, issue, repo))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
 def _verify_due_lines(due: List[Tuple[datetime, Dict[str, Any]]], now: datetime) -> List[str]:
     lines = [VERIFY_DUE_HEADING]
     for shipped, issue in due:
@@ -4244,6 +4278,7 @@ def parser() -> argparse.ArgumentParser:
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check"); ob.add_argument("--operator")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
+    sn = sub.add_parser("stale-needs-brain"); sn.add_argument("repos", nargs="+"); sn.add_argument("--hours", type=int, default=STALE_NEEDS_BRAIN_HOURS)
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
     return p
 
@@ -4348,6 +4383,13 @@ def _cmd_onboard(gh: GitHub, args: argparse.Namespace) -> None:
         print(line)
 
 
+def _cmd_stale_needs_brain(gh: GitHub, args: argparse.Namespace) -> None:
+    now = datetime.now(timezone.utc)
+    for since, issue, repo in stale_needs_brain(gh, [_repo(x) for x in args.repos], now, args.hours):
+        hours = int((now - since).total_seconds() // 3600)
+        print("%s#%s %s - needs-brain for %dh" % (repo, issue["number"], issue.get("title", ""), hours))
+
+
 def _cmd_fix(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.pull_request, "pull request")
     fix(gh, repo, number, _ref(args.ticket, "ticket"), _read(args.file), args.lane, args.model)
@@ -4377,7 +4419,7 @@ COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate, "epic": _cmd_epic,
-            "close-epic": _cmd_close_epic}
+            "close-epic": _cmd_close_epic, "stale-needs-brain": _cmd_stale_needs_brain}
 COMMANDS["step"] = _cmd_step
 
 

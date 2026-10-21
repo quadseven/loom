@@ -3995,3 +3995,94 @@ class WaitLabelTests(unittest.TestCase):
                      "wait:after", "wait:window"):
             self.assertIn(name, labels.LABELS)
         self.assertIn("wait:", labels.MANAGED_PREFIXES)
+
+
+class StaleNeedsBrainTests(unittest.TestCase):
+    """loom#1250: brain monitors tickets stuck in needs-brain beyond threshold."""
+
+    def test_stale_needs_brain_finds_tickets_waiting_too_long(self):
+        """Tickets with needs-brain label older than threshold are reported."""
+        now = datetime(2030, 1, 5, 12, 0, tzinfo=timezone.utc)
+        stale_issue = {
+            "number": 1, "title": "Stale brain review",
+            "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}],
+            "created_at": "2030-01-05T07:00:00Z",
+        }
+        fresh_issue = {
+            "number": 2, "title": "Fresh brain review",
+            "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}],
+            "created_at": "2030-01-05T10:00:00Z",
+        }
+        other_issue = {
+            "number": 3, "title": "No brain needed",
+            "labels": [{"name": "loom:ticket"}],
+            "created_at": "2030-01-05T07:00:00Z",
+        }
+        # Call order: issues page, events for issue 1, events for issue 2
+        # (issue 3 has no needs-brain, so no events call for it)
+        fake = Fake(
+            reply(200, [stale_issue, fresh_issue, other_issue]),  # issues
+            reply(200, [{
+                "event": "labeled",
+                "created_at": "2030-01-05T07:00:00Z",
+                "label": {"name": "needs-brain"}
+            }]),  # events for issue 1
+            reply(200, [{
+                "event": "labeled",
+                "created_at": "2030-01-05T10:00:00Z",
+                "label": {"name": "needs-brain"}
+            }]),  # events for issue 2
+        )
+        gh = GitHub("t", transport=fake)
+        stale = brain.stale_needs_brain(gh, [REPO], now, hours=4)
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0][1]["number"], 1)
+        self.assertEqual(stale[0][2], REPO)
+
+    def test_stale_needs_brain_respects_hours_threshold(self):
+        """Only tickets older than the threshold are reported."""
+        now = datetime(2030, 1, 5, 12, 0, tzinfo=timezone.utc)
+        issue = {
+            "number": 1, "title": "Brain review",
+            "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}],
+            "created_at": "2030-01-05T09:00:00Z",  # 3 hours ago
+        }
+        fake = Fake(
+            reply(200, [issue]),
+            reply(200, [{
+                "event": "labeled",
+                "created_at": "2030-01-05T09:00:00Z",
+                "label": {"name": "needs-brain"}
+            }]),
+        )
+        gh = GitHub("t", transport=fake)
+        stale = brain.stale_needs_brain(gh, [REPO], now, hours=4)
+        self.assertEqual(len(stale), 0)
+        # But with 2 hour threshold it would be found
+        fake2 = Fake(
+            reply(200, [issue]),
+            reply(200, [{
+                "event": "labeled",
+                "created_at": "2030-01-05T09:00:00Z",
+                "label": {"name": "needs-brain"}
+            }]),
+        )
+        gh2 = GitHub("t", transport=fake2)
+        stale = brain.stale_needs_brain(gh2, [REPO], now, hours=2)
+        self.assertEqual(len(stale), 1)
+
+    def test_stale_needs_brain_empty_when_no_needs_brain_label(self):
+        """Tickets without needs-brain are never reported."""
+        now = datetime(2030, 1, 5, 12, 0, tzinfo=timezone.utc)
+        issue = {
+            "number": 1, "title": "Regular ticket",
+            "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}],
+            "created_at": "2030-01-05T07:00:00Z",
+        }
+        fake = Fake(
+            reply(200, [issue]),
+            # No events call because issue has no needs-brain label
+        )
+        gh = GitHub("t", transport=fake)
+        stale = brain.stale_needs_brain(gh, [REPO], now, hours=4)
+        self.assertEqual(len(stale), 0)
