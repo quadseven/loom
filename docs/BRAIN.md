@@ -760,9 +760,12 @@ When the runner finishes, the station finds the brief in `done/` or
   pull request is left.
 - Failed: label `loom:failed`, comment with the reason from the runner's
   log line, with local paths removed.
-  A run that committed nothing and gave no reason fails with `agent made no
-  commit and wrote no reason`. The factory climbs the model ladder once for
-  it; at the second such failure since the ladder last started it does not
+  A run that committed nothing and wrote no summary carries the end of what
+  the agent said (one ASCII line, at most 600 characters, through the same
+  text checks as an answer) in the reason: `agent made no commit; it said:
+  ...`. Only a run that said nothing, or whose words fail the checks, fails
+  with `agent made no commit and wrote no reason`. The factory climbs the
+  model ladder once for that; at the second such failure since the ladder last started it does not
   climb again but leaves the ticket failed with `needs-brain` and one
   comment saying why.
 - Limited (a reason starting `limit:` after its class, the spark lane's
