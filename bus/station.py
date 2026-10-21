@@ -1752,8 +1752,11 @@ class Station:
         """The side branch a timed-out attempt kept its edits on, as the
         factory's own status events name it; None when none did."""
         allowed = {a.lower() for a in self.s.authors}
+        expanded = status.expand(comments, self.s.authors)
+        if not isinstance(expanded, list):
+            return None
         return tickets.timedout_branch(
-            [str(c.get("body") or "") for c in status.expand(comments, self.s.authors)
+            [str(c.get("body") or "") for c in expanded
              if isinstance(c, dict) and tickets._login(c.get("user")).lower() in allowed])
 
     def _fix_refusal(self, fix: Optional[tickets.Fix]) -> Optional[str]:

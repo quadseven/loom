@@ -3401,6 +3401,11 @@ class RetryTest(Base):
         with open(self.inbox("codex", "example-owner.example-repo-12-r2.md")) as fh:
             self.assertNotIn("Earlier attempt", fh.read())
 
+    def test_a_comment_list_that_is_not_a_list_names_no_timed_out_branch(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(station.status, "expand", return_value=None):
+            self.assertIsNone(runner._timedout_branch([]))
+
     def test_a_failure_on_one_opencode_go_slot_is_not_retried_on_another(self):
         for lane in ("opencode-go", "opencode-go-3", "anthropic"):
             self.heartbeat(lane)
