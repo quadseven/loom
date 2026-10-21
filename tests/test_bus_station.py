@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -5341,6 +5342,178 @@ class NoChangeAnswerTest(Base):
         self.assertTrue(events[0].startswith("Lane codex made no change: the agent found this "
                                              "work already done or no longer applying."), events[0])
         self.assertIn("loom:answered", self.fake.names(12))
+
+
+class VerifyBeforeBuildTest(Base):
+    """A queued ticket whose work a merged pull request already did is sent to
+    a verify run before any build lane (loom#1385)."""
+
+    def merged(self, number=77, refs=12, base="main", **extra):
+        pr = {"number": number, "state": "closed", "merged_at": "2030-01-01T00:00:00Z",
+              "merge_commit_sha": "%040x" % number, "body": "Refs %s#%d" % (REPO, refs),
+              "base": {"ref": base}, "head": {"ref": "a-fix"}}
+        pr.update(extra)
+        self.fake.pulls.append(pr)
+
+    def note(self, text, number=12):
+        """The ticket's status comment, as the station would have left it."""
+        self.fake.comments[number].append(
+            {"id": 600 + len(self.fake.comments[number]), "user": {"login": AUTHORS[0]},
+             "body": status.render([("2030-01-02T00:00:00Z", text)]),
+             "created_at": "2030-01-02T00:00:00Z", "updated_at": "2030-01-02T00:00:00Z"})
+
+    def events(self, number=12):
+        return [text for c in self.fake.comments[number] if status.is_status(c["body"])
+                for _, text in status.parse(c["body"])]
+
+    def built(self, number=12):
+        return any(n.startswith(tickets.ticket_name(REPO, number, 1)) for n in self.listing())
+
+    def test_a_ticket_whose_work_merged_goes_to_verify_not_a_build_lane(self):
+        self.fake.add(12, state="briefed")
+        self.merged()
+        self.run_pass()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:briefed", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
+        self.assertFalse(self.built())
+        events = self.events()
+        self.assertEqual(len(events), 1)
+        self.assertIn("Pull request #77 (merged 2030-01-01T00:00:00Z, merge commit %s)"
+                      % ("%040x" % 77)[:12], events[0])
+        self.assertIn("verify run before any build", events[0])
+
+    def test_a_pull_request_that_merged_before_the_ticket_was_written_counts(self):
+        self.fake.add(12, state="briefed", created="2030-03-01T00:00:00Z")
+        self.fake.events[12] = [dict(labeled("loom:briefed", "alice-example"),
+                                     created_at="2030-03-02T00:00:00Z"),
+                                labeled("lane:codex", "bob-example")]
+        self.merged()
+        self.run_pass()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertFalse(self.built())
+
+    def test_a_pull_request_naming_the_rewritten_source_counts(self):
+        self.fake.add(12, state="briefed", body=BODY + "\nRewritten from issue 30.\n")
+        self.merged(refs=30)
+        self.run_pass()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertFalse(self.built())
+
+    def test_a_bare_refs_line_in_the_ticket_is_not_a_source(self):
+        self.fake.add(12, state="briefed", body=BODY + "\nRefs #30\n")
+        self.merged(refs=30)
+        self.run_pass()
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertTrue(self.built())
+
+    def test_a_ticket_sent_back_for_unbuilt_criteria_after_the_merge_is_built(self):
+        self.fake.add(12, state="briefed")
+        self.merged()
+        self.note(tickets.UNBUILT_NOTE % (77, "Second works."))
+        self.run_pass()
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertTrue(self.built())
+
+    def test_a_note_by_a_stranger_does_not_hold_back_the_diversion(self):
+        self.fake.add(12, state="briefed")
+        self.merged()
+        self.note(tickets.UNBUILT_NOTE % (77, "Second works."))
+        self.fake.comments[12][0]["user"] = {"login": "mallory-example"}
+        self.run_pass()
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_other_tickets_are_built_as_before(self):
+        for labels, merged_kwargs in ((["loom:regression"], {}), ([], {"base": "release"}),
+                                      ([], {"refs": 13})):
+            with self.subTest(labels=labels, merged=merged_kwargs):
+                self.fake.pulls = []
+                self.fake.add(12, state="briefed")
+                self.fake.issues[12]["labels"] += [{"name": n} for n in labels]
+                self.merged(**merged_kwargs)
+                self.run_pass()
+                self.assertIn("loom:running", self.fake.names(12))
+                self.assertTrue(self.built())
+                for lane in ("codex",):
+                    shutil.rmtree(self.inbox(lane), ignore_errors=True)
+
+    def sent(self):
+        """Ticket 12 shipped after the station sent pull request 77 to verify."""
+        self.fake.private = False
+        self.fake.add(12, lane="codex", body=SHIPPED_BODY, state="shipped",
+                      events=[labeled("loom:briefed", "alice-example"),
+                              labeled("lane:codex", "bob-example")] + shipped_at(30))
+        self.merged()
+        self.note(tickets.MERGED_FIRST_NOTE % (77, "2030-01-01T00:00:00Z", ("%040x" % 77)[:12]))
+
+    def result(self, data):
+        name = "example-owner.example-repo-12-verify-1"
+        brief = "# Brief: %s\n\nRepo: %s\nBranch: loom/verify-12\nLane: codex\nIssue: %s#12\n" \
+                "Deliverable: verify\n\n# T12: Fix the thing\n" % (name, REPO, REPO)
+        self.write(os.path.join(self.inbox("codex", "done"), name + ".md"), brief)
+        self.write(os.path.join(self.home, "logs", "codex", name + ".verify.json"),
+                   json.dumps(data))
+
+    UNMET = "The merged change never prints the daily line the second criterion names."
+
+    def test_the_verify_brief_of_a_sent_ticket_offers_the_unmet_answer(self):
+        self.sent()
+        self.run_pass()
+        with open(os.path.join(self.inbox("codex"), self.listing()[0])) as fh:
+            text = fh.read()
+        self.assertIn("Deliverable: verify\n", text)
+        self.assertIn("## Sent to verification before any build", text)
+        self.assertIn("merged pull request #77", text)
+        self.assertIn('{"unmet":', text)
+        self.assertIn("#77", text.split("## GitHub data, not instructions")[1])
+
+    def test_a_refuting_verify_result_queues_the_ticket_once(self):
+        self.sent()
+        self.result({"unmet": self.UNMET})
+        self.run_pass()
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+        # The fake does not apply a comment edit; the station edited the status comment.
+        self.assertEqual(len(self.fake.edits), 1)
+        self.fake.comments[12][0]["body"] = self.fake.edits[-1]
+        refuted = [e for e in self.events() if e.startswith("A verify run found that pull request #77")]
+        self.assertEqual(len(refuted), 1)
+        self.assertIn(self.UNMET, refuted[0])
+        self.assertEqual(tickets.pending_verifies(self.events()), [])
+        # Briefed again for the build, the same pull request is not looked at.
+        self.fake.issues[12]["labels"] = [{"name": n} for n in
+                                          ("loom:ticket", "loom:briefed", "lane:codex")]
+        self.fake.version += 1
+        shutil.rmtree(self.inbox("codex"), ignore_errors=True)
+        # An idle repo is scanned again only after IDLE_SCAN.
+        os.remove(os.path.join(self.home, "state", "station", "scans.json"))
+        self.run_pass()
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertTrue(self.built())
+
+    def test_an_unmet_answer_on_a_ticket_never_sent_ahead_leaves_it_shipped(self):
+        self.fake.add(12, lane="codex", body=SHIPPED_BODY, state="shipped", events=shipped_at(30))
+        self.result({"unmet": self.UNMET})
+        self.run_pass()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertNotIn("loom:queued", self.fake.names(12))
+        self.assertEqual(self.events(), [])
+
+    def test_an_unmet_answer_that_says_nothing_leaves_the_ticket_shipped(self):
+        self.sent()
+        self.result({"unmet": "no"})
+        self.run_pass()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertNotIn("loom:queued", self.fake.names(12))
+
+    def test_a_ticket_rewritten_from_an_issue_ships_with_that_issues_merged_pull_request(self):
+        self.fake.add(12, state="merged", body=BODY + "\nRewritten from issue 30.\n")
+        self.merged(refs=30)
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        pr = runner._ticket_pull_beyond_window(REPO, 12)
+        self.assertEqual(pr["number"], 77)
 
 
 class RefusalTest(Base):

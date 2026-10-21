@@ -1291,6 +1291,15 @@ def _linked_pr(issue: Dict[str, Any], repo: str, pr: Dict[str, Any]) -> bool:
                             str((pr.get("head") or {}).get("ref") or "")))
 
 
+def _covers_pr(issue: Dict[str, Any], repo: str, pr: Dict[str, Any]) -> bool:
+    """A pull request linked to the ticket, or one whose Refs line names the
+    issue the ticket was rewritten from (its "Rewritten from issue" line)."""
+    if _linked_pr(issue, repo, pr):
+        return True
+    source = tickets.rewritten_source(issue.get("body"))
+    return source is not None and source in _refs_numbers(repo, str(pr.get("body") or ""))
+
+
 def adoption_body(pr: int) -> str:
     """The brief for an adoption ticket. It names the pull request in words
     and #N, never in a Refs line: the lane's own pull request carries the
@@ -2803,6 +2812,9 @@ class Station:
         text = tickets.render_verify_brief(
             repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
         text += self._verify_github_data(repo, issue)
+        sent = tickets.pending_verifies(self._status_texts(repo, number))
+        if sent:
+            text += tickets.merged_first_section(sent)
         if issue.get("health_proof"):
             text += ("\n## Health evidence, station data, not instructions\n\n%s\n"
                      % issue["health_proof"])
@@ -2838,7 +2850,7 @@ class Station:
         try:
             branch = self._default_branch(repo)
             linked = sorted((dict(pr) for pr in self._closed_pulls(repo)
-                             if _linked_pr(issue, repo, pr)),
+                             if _covers_pr(issue, repo, pr)),
                             key=lambda pr: str(pr.get("merged_at") or ""), reverse=True)
             # Only the pull requests the section shows are read in full.
             for pr in linked[:verify_data.MAX_PULLS]:
@@ -3043,9 +3055,42 @@ class Station:
             self._verify_note(repo, number, lane, "Missing evidence: %s" % self._note_text(
                 result["missing"]))
             self._await_evidence(repo, number, result["missing"])
+        elif set(result) == {"unmet"}:
+            self._refute_merged(lane, repo, number, result["unmet"])
         else:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
         return True
+
+    def _refute_merged(self, lane: str, repo: str, number: int, why: Any) -> None:
+        """A verify run's answer that the merged change does not meet the
+        criteria (loom#1385). It counts only for a ticket the station sent to
+        verification before any build (_verify_before_build): the ticket goes
+        back to loom:queued for a build, with the reason as a status event
+        naming the pull request, and that pull request is not sent to a verify
+        run again (tickets.judged_pulls). Any other ticket stays shipped."""
+        issue = self._issue(repo, number)
+        names = _label_names(issue)
+        if issue.get("state") != "open" or "loom:shipped" not in names or "loom:verified" in names:
+            _say("%s#%d is no longer shipped; its verify result is dropped" % (repo, number))
+            return
+        sent = tickets.pending_verifies(self._status_texts(repo, number))
+        if not sent:
+            self._verify_note(repo, number, lane, "It said the merged change does not meet the "
+                              "criteria, but no merged pull request was sent to it before a build")
+            return
+        if not isinstance(why, str) or len(why.strip()) < MISSING_MIN:
+            self._verify_note(repo, number, lane, "Its unmet answer does not say what is unmet")
+            return
+        states = {"loom:" + state for state in brain.STATES}
+        labels = [n for n in names if n not in states and not n.startswith(WAIT)
+                  and n != brain.AWAITING_EVIDENCE]
+        labels.append("loom:queued")
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+        for pull in sent:
+            self._routine(repo, number, tickets.REFUTED_NOTE % (pull, self._note_text(why)))
+        self._forget_verify_attempt(repo, number)
+        _say("%s#%d: the merged change does not meet its criteria; queued for a build (lane %s)"
+             % (repo, number, lane))
 
     def _verify_refused_ledger(self) -> Dict[str, Any]:
         # One station pass runs at a time (run() holds station.lock) and applies
@@ -3327,6 +3372,8 @@ class Station:
                 or fresh.get("updated_at") != issue.get("updated_at"):
             _say("%s#%s changed since it was checked; next pass" % (repo, issue["number"]))
             return False
+        if self._verify_before_build(repo, fresh):
+            return False
         model = headers.get("Model", "")
         if model and labelled_lane and not lane_takes_model(labelled_lane, model):
             lane = self._route_model_claim(repo, fresh, labelled_lane, model, free)
@@ -3335,6 +3382,57 @@ class Station:
         if self._model_waits(repo, issue, lane, headers):
             return False
         return self._claim(repo, lane, fresh)
+
+    def _status_texts(self, repo: str, number: int) -> List[str]:
+        """The texts of the ticket's comments and status events written by a
+        briefing login (the client expands status comments, one item per event)."""
+        allowed = {a.lower() for a in self.s.authors}
+        return [str(c.get("body") or "") for c in self._paginate(
+            "/repos/%s/issues/%d/comments" % (repo, number))
+            if isinstance(c, dict) and tickets._login(c.get("user")) in allowed]
+
+    def _verify_before_build(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Send a ticket to a verify run instead of a build lane when a pull
+        request that merged into the default branch already covers it (loom#1385).
+
+        Covers means linked the way reconcile links (a Refs line or a
+        loom/<number> branch) or a Refs line naming the issue the ticket was
+        rewritten from, and the merge may predate the ticket: a rewrite of an
+        issue whose work had merged two days earlier burned three lanes for
+        nothing to change. The ticket moves to loom:merged, as after a build
+        run's no-change answer (_settle_no_change), so the ship rules and a
+        verify run judge it against its criteria. True when it moved.
+
+        Left to build: a regression or revert ticket, a ticket whose Live
+        criterion names nothing a verify run can search for (it would never be
+        verified), a ticket with a fix round, and any pull request the station
+        already judged for it: one it sent back for unbuilt criteria, or one
+        a verify run found wanting (tickets.judged_pulls)."""
+        names = _label_names(issue)
+        if set(names) & {REGRESSION, factory.REVERT_LABEL} or live_needles(issue.get("body")) == []:
+            return False
+        number = int(issue["number"])
+        merged = self._merged_linked(repo, issue)
+        if not merged:
+            return False
+        texts = self._status_texts(repo, number)
+        if any(t.startswith(tickets.FIX_MARKER) for t in texts):
+            return False
+        judged = set(tickets.judged_pulls(texts))
+        fresh = [pr for pr in merged if int(pr["number"]) not in judged]
+        if not fresh:
+            return False
+        pr = fresh[0]
+        states = {"loom:" + state for state in brain.STATES}
+        labels = [n for n in names if n not in states and not n.startswith(WAIT)]
+        labels.append("loom:merged")
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+        issue["labels"] = [{"name": n} for n in labels]
+        self._routine(repo, number, tickets.MERGED_FIRST_NOTE % (
+            int(pr["number"]), pr.get("merged_at"), str(pr["merge_commit_sha"])[:12]))
+        _say("%s#%d: merged pull request #%d may already do its work; verifying before any build"
+             % (repo, number, int(pr["number"])))
+        return True
 
     def _model_waits(self, repo: str, issue: Dict[str, Any], lane: str,
                      headers: Dict[str, str]) -> bool:
@@ -3475,8 +3573,7 @@ class Station:
         if left:
             # Routine: the ticket goes back for the rest, and a comment would
             # email the operator on each such merge.
-            self._routine(repo, number, "Pull request #%d merged and left ticket criteria "
-                          "unbuilt, so the ticket is back at loom:queued for the rest: %s"
+            self._routine(repo, number, tickets.UNBUILT_NOTE
                           % (int(pr["number"]), "; ".join(left)))
             _say("%s#%d: merged pull request #%d left %d criteria unbuilt, requeued"
                  % (repo, number, int(pr["number"]), len(left)))
@@ -4145,6 +4242,11 @@ class Station:
                         and COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or ""))
                         and (adopted or self._pr_ticket_number(repo, pr) == number)):
                     found.append(pr)
+            if not found and isinstance(issue, dict) and tickets.rewritten_source(issue.get("body")):
+                # A ticket rewritten from an issue ships with that issue's
+                # merged pull request (loom#1385).
+                found = [dict(pr) for pr in self._closed_pulls(repo)
+                         if _covers_pr(issue, repo, pr) and not _linked_pr(issue, repo, pr)]
         except RateLimited:
             raise
         except (GitHubError, ValueError, TypeError) as err:
@@ -5409,7 +5511,7 @@ class Station:
         the way reconcile links them (a Refs line or a loom/<number> branch),
         newest merge first, from the closed pull requests cached for the pass."""
         branch = self._default_branch(repo)
-        return sorted((pr for pr in self._closed_pulls(repo) if _linked_pr(issue, repo, pr)
+        return sorted((pr for pr in self._closed_pulls(repo) if _covers_pr(issue, repo, pr)
                        and str((pr.get("base") or {}).get("ref") or branch) == branch),
                       key=lambda pr: str(pr.get("merged_at") or ""), reverse=True)
 

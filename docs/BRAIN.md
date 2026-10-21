@@ -765,6 +765,26 @@ closed ticket keeps no active state (`loom:queued`, `briefed`, `running`,
 as "already reported", so a ticket kept it and was never reported when it
 stalled again.
 
+Before step 2, the station looks for a pull request that already did the
+ticket's work (loom#1385). One counts when it merged into the default branch,
+whenever it merged (a rewrite of an issue whose work merged days earlier is
+the case that burned three lanes for nothing to change), and either links to
+the ticket as reconcile does (a `Refs` line or a `loom/<number>` branch) or has
+a `Refs` line naming the issue the ticket was rewritten from (its
+`Rewritten from issue M.` line; a bare `Refs` line is no source). Then the
+ticket is not claimed: it moves to `loom:merged`, as after a build run's
+no-change answer (see below), with a status event naming the pull request, its
+merge time and merge commit. The ship rules move it to `loom:shipped` and a
+verify run judges its criteria against the pull request's facts (docs/LANES.md,
+Verify runs). If that run finds the change falls short, the ticket returns to
+`loom:queued` for a build with the reason as a status event, and that pull
+request is never sent to a verify run again. Left to build as before: a
+regression or revert ticket, a ticket whose Live criterion names no string a
+verify run can search, a ticket with a fix round, and a pull request the
+station already judged for the ticket (one it sent back for unbuilt criteria
+after that merge, or one a verify run found wanting). The status events are
+the record; the station keeps no other state for it.
+
 A ticket briefed again after `loom:failed` gets a fresh branch:
 `loom/<number>-<slug>-r<attempt>`, where the attempt is one more than the
 station's earlier claim comments on it.
