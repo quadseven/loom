@@ -20,6 +20,12 @@ no open pull request updated within LOOM_CLAIM_IDLE_HOURS loses the claim
 label, and this operator's assignment, with a status note naming why. A claim
 no lane works locked every other operator's Loom out of the ticket while its
 claimer waited on a model limit or a brain.
+
+Timeline events made by this Loom's own App logins do not count as activity
+for that lapse: the station relabels a waiting ticket every few hours, and a
+ticket that moves between lanes and the brain never looked idle (loom#1393).
+The claim is also dropped the moment its run ends or its ticket closes
+(without_own_claim): it marks a run in progress, not a ticket's whole life.
 """
 from __future__ import annotations
 
@@ -126,6 +132,16 @@ def claimers(issue: Dict[str, Any], ours: Iterable[str],
     return found
 
 
+def without_own_claim(names: Iterable[str], ours: Iterable[str]) -> list:
+    """`names` without any claim:<login> label naming one of `ours` (this
+    Loom's own logins). A claim:<login> label of another login stays: it is
+    that operator's, and this Loom never touches it."""
+    mine = {x.lower() for x in ours}
+    return [n for n in names
+            if not (str(n).lower().startswith(CLAIM_PREFIX)
+                    and str(n)[len(CLAIM_PREFIX):].strip().lower() in mine)]
+
+
 def own_claims(issue: Dict[str, Any], ours: Iterable[str]) -> Dict[str, str]:
     """{login: the claim label naming it} for each claim:<login> label on the
     issue naming one of `ours` (this Loom's own logins)."""
@@ -155,17 +171,27 @@ def running(issue: Dict[str, Any]) -> bool:
                for x in issue.get("labels") or [])
 
 
+def _made_by(event: Dict[str, Any], logins: Iterable[str]) -> bool:
+    """A timeline event one of `logins` made (its actor, or the author of a
+    comment)."""
+    mine = {x.lower() for x in logins}
+    return bool(mine) and (_login(event.get("actor")) in mine or _login(event.get("user")) in mine)
+
+
 def lapsed(issue: Dict[str, Any], timeline: Iterable[Any], pull_updates: Iterable[Any],
-           label: str, now: float, idle_seconds: float) -> bool:
+           label: str, now: float, idle_seconds: float,
+           own_apps: Iterable[str] = ()) -> bool:
     """This Loom's own claim is not being worked: the issue is Loom-managed
     and no run is in progress, and nothing on its timeline (any event, the
     claim label's last putting-on among them), no open pull request naming
     it (`pull_updates`: their updated_at stamps) and not its creation is
-    within idle_seconds."""
+    within idle_seconds. Events made by `own_apps` (this Loom's App logins)
+    are not activity, except the claim label's own putting-on: the station's
+    relabels of a waiting ticket kept a claim alive for days (loom#1393)."""
     if not loom_managed(issue) or running(issue):
         return False
     events = [e for e in timeline if isinstance(e, dict)]
-    seen = [_stamp(e.get("created_at")) for e in events]
+    seen = [_stamp(e.get("created_at")) for e in events if not _made_by(e, own_apps)]
     seen += [_stamp(x) for x in pull_updates]
     seen += [_claimed_at(events, label), _stamp(issue.get("created_at"))]
     known = [t for t in seen if t is not None]

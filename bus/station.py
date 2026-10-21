@@ -27,7 +27,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import quote
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from . import audit
 from . import brain_memory
@@ -1899,6 +1899,13 @@ class Station:
             labels.append(mark)
         return labels
 
+    def _drop_claim(self, names: Iterable[str]) -> List[str]:
+        """`names` without this Loom's own claim:<login> label. The claim
+        marks a run in progress: a ticket that leaves loom:running, or whose
+        run's pull request merges, holds no claim (loom#1393). A claim held
+        by another login is left."""
+        return stale_claims.without_own_claim(names, self.s.authors)
+
     def _return_dead_brief(self, lane: str, name: str) -> bool:
         """Move a brief out of a dead lane's inbox into the inbox's returned/
         (which nothing reads), so the ticket can be claimed on a live lane.
@@ -2416,8 +2423,8 @@ class Station:
             _say("%s#%d stays held: its dead lane %s has no free tier lane"
                  % (repo, number, lane))
             return
-        names = [n for n in names
-                 if n != RUNAWAY and n != RUNNING and not n.startswith("lane:")]
+        names = self._drop_claim(n for n in names
+                                 if n != RUNAWAY and n != RUNNING and not n.startswith("lane:"))
         if BRIEFED not in names:
             names.append(BRIEFED)
         names.append("lane:" + target)
@@ -3399,10 +3406,12 @@ class Station:
                         or "loom:queued" in labels):
                     return
                 target = "loom:queued"
-        state_names = ("queued", "briefed", "running", "pr", "failed", "merged",
-                       "shipped", "verified", "closed-unmerged")
+        # ready and answered are states too: a ticket moved on from loom:pr kept
+        # loom:ready and read as ready everywhere (loom#1393).
+        state_names = ("queued", "briefed", "running", "pr", "ready", "answered", "failed",
+                       "merged", "shipped", "verified", "closed-unmerged")
         states = {"loom:" + state for state in state_names}
-        kept = [name for name in labels if name not in states]
+        kept = self._drop_claim(name for name in labels if name not in states)
         cleared = target == "loom:merged" and RUNAWAY in kept
         if cleared:
             kept = [name for name in kept if name != RUNAWAY]
@@ -3457,8 +3466,8 @@ class Station:
         merged target, its merge commit and time, and drop the lane label."""
         number = int(ticket["number"])
         states = {"loom:" + state for state in brain.STATES + tickets.TICKET_STATES}
-        kept = [name for name in _label_names(ticket)
-                if name not in states and not name.startswith(("lane:", "wait:"))]
+        kept = self._drop_claim(name for name in _label_names(ticket)
+                                if name not in states and not name.startswith(("lane:", "wait:")))
         cleared = RUNAWAY in kept
         if cleared:
             kept = [name for name in kept if name != RUNAWAY]
@@ -4832,9 +4841,9 @@ class Station:
 
     def _move_fix_to_lane(self, repo: str, number: int, lane: str,
                           names: List[str]) -> None:
-        labels = [name for name in names if name not in (
+        labels = self._drop_claim(name for name in names if name not in (
             "loom:pr", "loom:ready", "needs-brain", "loom:running", "loom:briefed")
-                  and not name.startswith("lane:")]
+                                  and not name.startswith("lane:"))
         labels.extend(("loom:briefed", "lane:" + lane))
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
 
@@ -5083,7 +5092,7 @@ class Station:
                        "to lane %s. Lane %s failed: %s"
                        % (used + 1, self.s.retry_max, klass, lane, target, lane, reason),
                        self.now, self.s.authors)
-        labels = [n for n in names if n != RUNNING and not n.startswith("lane:")]
+        labels = self._drop_claim(n for n in names if n != RUNNING and not n.startswith("lane:"))
         labels += [BRIEFED, "lane:" + target]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
         _say("retrying %s#%d on lane %s after a %s failure on lane %s"
@@ -5211,8 +5220,9 @@ class Station:
         names = _label_names(self._issue(repo, number))
         if RUNNING not in names:
             return
-        labels = [n for n in names if n not in (RUNNING, BRIEFED) and not n.startswith(
-            ("lane:", WAIT))] + ["loom:queued", WAIT + "lane"]
+        labels = self._drop_claim(n for n in names if n not in (RUNNING, BRIEFED)
+                                  and not n.startswith(("lane:", WAIT))
+                                  ) + ["loom:queued", WAIT + "lane"]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
         self._stopped(repo, number, lane, "transient",
                       "%s. Not retried: %s; the ticket is back in the queue on its rung."
@@ -5475,7 +5485,7 @@ class Station:
         names = _label_names(self._issue(repo, number))
         if RUNNING not in names:
             return
-        labels = [n for n in names if n != RUNNING and not n.startswith(WAIT)]
+        labels = self._drop_claim(n for n in names if n != RUNNING and not n.startswith(WAIT))
         if new not in labels:
             labels.append(new)
         if wait:
@@ -6654,6 +6664,12 @@ class Station:
                                  {"labels": [CLOSE_DONE_LABEL]})
                     self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
                                  {"state": "closed", "state_reason": "completed"})
+                    # The closed ticket keeps no active state, wait or claim label
+                    # (loom#1393): 46 closed tickets still read as running or queued.
+                    kept = brain.closing_labels(_label_names(issue), self.s.authors)
+                    self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                                 {"labels": kept if CLOSE_DONE_LABEL in kept
+                                  else kept + [CLOSE_DONE_LABEL]})
                 except RateLimited:
                     raise
                 except GitHubError as err:
@@ -6867,6 +6883,7 @@ class Station:
             return 0
         idle = self.s.claim_idle_hours * 3600
         pulls = self._open_pull_updates(repo)
+        apps = self._own_apps()
         lapsed = 0
         for number, issue in sorted(found.items()):
             if lapsed >= left:
@@ -6874,11 +6891,25 @@ class Station:
             timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
             due = {login: label for login, label in stale_claims.own_claims(issue, ours).items()
                    if stale_claims.lapsed(issue, timeline, pulls.get(number, []), label,
-                                          self.now, idle)}
+                                          self.now, idle, apps)}
             if due:
                 self._drop_own_claim(repo, issue, due)
                 lapsed += 1
         return lapsed
+
+    def _own_apps(self) -> Set[str]:
+        """This Loom's own App logins: the trusted authors that are apps
+        ("[bot]"), and the login the GitHub client writes as. Their timeline
+        events are the station's own relabels, not work on the ticket."""
+        apps = {a.lower() for a in self.s.authors if a.lower().endswith("[bot]")}
+        login = getattr(self.gh, "app_login", None)
+        try:
+            named = login() if callable(login) else None
+        except GitHubError:
+            named = None
+        if isinstance(named, str) and named:
+            apps.add(named.lower())
+        return apps
 
     def _own_claimed(self, repo: str, ours: set) -> Dict[int, Dict[str, Any]]:
         """The repo's open Loom-managed issues with no run in progress that

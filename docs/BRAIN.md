@@ -749,6 +749,15 @@ then the oldest:
    temporary brief finishes that claim first, so a crash between steps
    never strands a ticket.
 
+The claim label lasts as long as the run. Any move out of `loom:running`
+removes this Loom's own `claim:<login>` label with the state label, and a
+closed ticket keeps no active state (`loom:queued`, `briefed`, `running`,
+`pr`, `ready`, `answered`, `failed`), `wait:*`, `needs-brain` or claim label
+(`merged`, `shipped` and `verified` stay: they say how it ended). A brain move
+(`brain.move`) also drops `needs-brain` and `loom:ready`: `needs-brain` reads
+as "already reported", so a ticket kept it and was never reported when it
+stalled again.
+
 A ticket briefed again after `loom:failed` gets a fresh branch:
 `loom/<number>-<slug>-r<attempt>`, where the attempt is one more than the
 station's earlier claim comments on it.

@@ -1876,9 +1876,26 @@ class TextAndCloseTests(unittest.TestCase):
         self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
 
     def test_close_not_planned_needs_no_proof(self):
-        fake = Fake(reply(200, ticket("failed", UNCHECKED)), reply(200, {}))
+        fake = Fake(reply(200, ticket("failed", UNCHECKED)), reply(200, {}), reply(200, []))
         brain.close(GitHub("t", transport=fake), REPO, 9, "not_planned", env=ENV)
-        self.assertEqual(fake.calls[-1][2], {"state": "closed", "state_reason": "not_planned"})
+        self.assertEqual(fake.calls[1][2], {"state": "closed", "state_reason": "not_planned"})
+        # The closed ticket keeps no active state (loom#1393).
+        self.assertEqual(fake.calls[-1][2], {"labels": ["loom:ticket", "lane:codex"]})
+
+    def test_closing_a_ticket_drops_our_claim_and_keeps_another_logins(self):
+        issue = ticket("queued", UNCHECKED)
+        issue["labels"] += [{"name": x} for x in ("claim:brain-bot", "claim:other-op",
+                                                  "wait:gate", "needs-brain")]
+        fake = Fake(reply(200, issue), reply(200, {}), reply(200, []))
+        brain.close(GitHub("t", transport=fake), REPO, 9, "not_planned", env=ENV)
+        self.assertEqual(fake.calls[-1][2],
+                         {"labels": ["loom:ticket", "lane:codex", "claim:other-op"]})
+
+    def test_a_verified_ticket_keeps_the_state_that_says_how_it_ended(self):
+        self.assertEqual(
+            brain.closing_labels(["loom:ticket", "loom:verified", "loom:ready", "lane:codex"],
+                                 ["brain-bot"]),
+            ["loom:ticket", "loom:verified", "lane:codex"])
 
 
 TICKET_BODY = ("## Why\nwhy\n## What\nwhat\n## Acceptance criteria\n"
@@ -4190,6 +4207,40 @@ class RepairsEpicTests(unittest.TestCase):
         brain.brief(gh, REPO, epic, "Repair", BODY, "codex")
         tree = brain.goal_tree(gh, REPO, 1)[1]
         self.assertNotIn(epic, [e["number"] for e in brain.finished_epics(tree)])
+
+
+class ClaimDropMoveTests(unittest.TestCase):
+    """A move out of loom:running drops this Loom's own claim; any move drops
+    needs-brain, which also reads "already reported" (loom#1393)."""
+
+    ENV = {"LOOM_BRIEF_AUTHORS": "brain-bot other"}
+    HAVE = ["loom:ticket", "loom:running", "lane:codex", "claim:brain-bot", "claim:other-op"]
+
+    def test_a_move_out_of_running_drops_our_claim_and_keeps_another_logins(self):
+        for state, lane in (("briefed", "claude"), ("queued", None), ("failed", None),
+                            ("pr", None)):
+            with self.subTest(state=state):
+                kept = brain._moved_labels(self.HAVE, state, lane, env=self.ENV)
+                self.assertNotIn("claim:brain-bot", kept)
+                self.assertIn("claim:other-op", kept)
+                self.assertIn("loom:" + state, kept)
+
+    def test_a_move_that_is_not_out_of_running_leaves_the_claim(self):
+        have = ["loom:ticket", "loom:queued", "claim:brain-bot"]
+        self.assertIn("claim:brain-bot", brain._moved_labels(have, "briefed", "claude", env=self.ENV))
+
+    def test_a_move_from_pr_to_queued_removes_ready_and_needs_brain(self):
+        have = ["loom:ticket", "loom:pr", "loom:ready", "needs-brain", "wait:gate"]
+        self.assertEqual(brain._moved_labels(have, "queued", None, env=self.ENV),
+                         ["loom:ticket", "loom:queued"])
+
+    def test_the_brain_move_writes_the_labels_without_the_claim(self):
+        issue = {"state": "open", "labels": [{"name": x} for x in self.HAVE + ["needs-brain"]]}
+        fake = Fake(reply(200, issue), reply(200, []))
+        with unittest.mock.patch.dict(os.environ, self.ENV):
+            brain.move(GitHub("t", transport=fake), REPO, 8, "briefed", "codex")
+        self.assertEqual(fake.calls[1][2], {"labels": [
+            "loom:ticket", "claim:other-op", "loom:briefed", "lane:codex"]})
 
 
 class WaitLabelTests(unittest.TestCase):

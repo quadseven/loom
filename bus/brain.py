@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, RateLimited, _next_link, auth_from_env, rest_login, unreadable
-from . import audit, change_class, handoff, hunt_plan, journal, lock, pr_repair, proof, text, tickets
+from . import audit, change_class, handoff, hunt_plan, journal, lock, pr_repair, proof, stale_claims, text, tickets
 from . import naming
 from .status import is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
@@ -2372,15 +2372,22 @@ def _check_move_args(state: str, lane: Optional[str], note: Optional[str],
         _check_written_text(note)
 
 
-def _moved_labels(have: List[str], state: str, lane: Optional[str]) -> List[str]:
+def _moved_labels(have: List[str], state: str, lane: Optional[str],
+                  env: Optional[Dict[str, str]] = None) -> List[str]:
     # Every state label goes, not only the ones a move can set: a ticket
     # moved to shipped that kept loom:ready read as "ready" everywhere
     # (tickets.ticket_state), and the Priorities list showed shipped work as
     # lane work (2026-10-15).
     states = ["loom:" + item for item in STATES + tickets.TICKET_STATES]
     # A move ends whatever the ticket waited for, so its wait:* label goes.
+    # needs-brain goes too: it also reads "already reported", so a ticket
+    # re-briefed with it was never reported when it stalled again (loom#1393).
     kept = [x for x in have if x not in states and not x.startswith("wait:")
+            and x != "needs-brain"
             and not (lane is not None and x.startswith("lane:"))]
+    if "loom:running" in have and state != "running":
+        # The claim marks a run in progress; the run is over.
+        kept = stale_claims.without_own_claim(kept, trusted_authors(env))
     kept.append("loom:" + state)
     if lane:
         kept.append("lane:" + lane)
@@ -3041,6 +3048,22 @@ def _check_proven(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
     return url
 
 
+# The states of a ticket that is still going. A closed ticket keeps none: 46
+# closed tickets read as running, queued or briefed (loom#1393). Merged,
+# shipped and verified stay: they say how the ticket ended.
+ACTIVE_STATES = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:ready",
+                 "loom:answered", "loom:failed")
+
+
+def closing_labels(have: Sequence[str], authors: Sequence[str]) -> List[str]:
+    """A ticket's labels once it closes: no active state, wait or needs-brain
+    label, and no claim of this Loom's (`authors`, its own logins). A claim
+    held by another login stays."""
+    kept = [x for x in have if x not in ACTIVE_STATES and not x.startswith("wait:")
+            and x != "needs-brain"]
+    return stale_claims.without_own_claim(kept, authors)
+
+
 def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
           note: Optional[str] = None, env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Close a ticket. Completed only once it is verified with a proof that
@@ -3065,6 +3088,10 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
             {"state": "closed", "state_reason": reason})
+    # After the close, so a refused close leaves the ticket's labels as they were.
+    kept = closing_labels(names, trusted_authors(env))
+    if kept != names:
+        gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
     return settle_source(gh, repo, number, issue.get("body"), reason, proof_url)
 
 
