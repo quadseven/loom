@@ -6630,6 +6630,27 @@ class Station:
         if left <= 0:
             return 0
         ours = {a.lower() for a in self.s.authors}
+        found = self._own_claimed(repo, ours)
+        if not found:
+            return 0
+        idle = self.s.claim_idle_hours * 3600
+        pulls = self._open_pull_updates(repo)
+        lapsed = 0
+        for number, issue in sorted(found.items()):
+            if lapsed >= left:
+                break
+            timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
+            due = {login: label for login, label in stale_claims.own_claims(issue, ours).items()
+                   if stale_claims.lapsed(issue, timeline, pulls.get(number, []), label,
+                                          self.now, idle)}
+            if due:
+                self._drop_own_claim(repo, issue, due)
+                lapsed += 1
+        return lapsed
+
+    def _own_claimed(self, repo: str, ours: set) -> Dict[int, Dict[str, Any]]:
+        """The repo's open Loom-managed issues with no run in progress that
+        carry a claim label naming one of `ours`."""
         names = [str(label.get("name") or "") for label in self.gh.paginate(
             "/repos/%s/labels" % repo) if isinstance(label, dict)]
         queries = ["labels=%s" % quote(name, safe=":") for name in names
@@ -6641,40 +6662,36 @@ class Station:
                 if isinstance(issue, dict) and "pull_request" not in issue \
                         and stale_claims.loom_managed(issue) and not stale_claims.running(issue):
                     found[int(issue["number"])] = issue
-        if not found:
-            return 0
-        idle = self.s.claim_idle_hours * 3600
+        return found
+
+    def _open_pull_updates(self, repo: str) -> Dict[int, List[Any]]:
+        """{ticket number: updated_at of each open pull request whose body
+        names it with a Refs line}."""
         pulls: Dict[int, List[Any]] = {}
         for pr in self.gh.paginate("/repos/%s/pulls?state=open" % repo):
             if isinstance(pr, dict):
                 for n in _refs_numbers(repo, str(pr.get("body") or "")):
                     pulls.setdefault(n, []).append(pr.get("updated_at"))
-        lapsed = 0
-        for number, issue in sorted(found.items()):
-            if lapsed >= left:
-                break
-            claims = stale_claims.own_claims(issue, ours)
-            timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
-            due = {login: label for login, label in claims.items()
-                   if stale_claims.lapsed(issue, timeline, pulls.get(number, []), label,
-                                          self.now, idle)}
-            if not due:
-                continue
-            for login, label in due.items():
-                self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
-                             % (repo, number, quote(label, safe="")), ok=(404,))
-                if any(stale_claims._login(p) == login for p in issue.get("assignees") or []):
-                    self.gh.rest("DELETE", "/repos/%s/issues/%d/assignees" % (repo, number),
-                                 {"assignees": [login]})
-            status.add(self.gh, repo, number,
-                       "Released the claim label %s: no lane run, pull request update or "
-                       "ticket activity for %d hours, so another operator's Loom may take "
-                       "this ticket" % (", ".join(sorted(due.values())), self.s.claim_idle_hours),
-                       self.now, self.s.authors)
-            _say("lapsed the claim on %s#%d: this Loom has not worked it in %d hours"
-                 % (repo, number, self.s.claim_idle_hours))
-            lapsed += 1
-        return lapsed
+        return pulls
+
+    def _drop_own_claim(self, repo: str, issue: Dict[str, Any], due: Dict[str, str]) -> None:
+        """Remove the claim labels (and the matching assignments) in `due`
+        ({login: label}) from the issue and say why in its status."""
+        number = int(issue["number"])
+        for login, label in due.items():
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                         % (repo, number, quote(label, safe="")), ok=(404,))
+            if any(stale_claims._login(p) == login for p in issue.get("assignees") or []):
+                self.gh.rest("DELETE", "/repos/%s/issues/%d/assignees" % (repo, number),
+                             {"assignees": [login]})
+        hours = self.s.claim_idle_hours
+        status.add(self.gh, repo, number,
+                   "Released the claim label %s: no lane run, pull request update or "
+                   "ticket activity for %d hours, so another operator's Loom may take "
+                   "this ticket" % (", ".join(sorted(due.values())), hours),
+                   self.now, self.s.authors)
+        _say("lapsed the claim on %s#%d: this Loom has not worked it in %d hours"
+             % (repo, number, hours))
 
     def _settle_claimed_repo(self, repo: str, left: int, pacer: "claimed.Pacer") -> int:
         """Settle up to `left` of the repo's claimed issues; how many were."""
