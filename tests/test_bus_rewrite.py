@@ -311,6 +311,16 @@ class StationRewriteTest(Base):
         self.assertEqual(len(self.fake.created), 1)
         self.assertIn("rewrite %s#7: brief" % REPO, err)
 
+    def test_a_goal_at_its_ticket_cap_runs_no_agent(self):
+        # 17 of 72 rewrites ran the model only for intake to refuse the brief
+        # at the goal's in-flight cap (2026-10-21).
+        self.fake.add_triage(7)
+        with mock.patch.object(brain, "_goal_in_flight", return_value=brain.goal_cap()):
+            err = self.run_station(self.station(cmd=self.agent(BRIEF)))
+        self.assertFalse(os.path.exists(self.prompt_file))
+        self.assertEqual(self.fake.created, [])
+        self.assertIn("tickets in flight", err)
+
     def test_a_private_repo_with_an_empty_private_command_is_skipped(self):
         self.fake.private = True
         self.fake.add_triage(7)
