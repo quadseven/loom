@@ -57,7 +57,7 @@ that talks to GitHub about tickets.
 | `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
 | `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
 | `loom:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
-| `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:window` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, or a deploy or roll window. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
+| `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:window`, `wait:live-event` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, a deploy or roll window, or (`wait:live-event`, on a shipped ticket) its Live box needs a rare event the log has not shown in 7 days since it shipped. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs-operator` | An ask for the operator (see Asks). |
@@ -628,6 +628,23 @@ and at most 3 requests and follow-up issues are written a run. A later
 review success settles the issue by the rule above. A later failure files its
 findings as a `loom:triage` issue, once, and comments on the original naming it;
 the original stays open. A second neutral result is left for a person.
+
+### Rare live events (`wait:live-event`)
+
+A shipped ticket whose Live box needs something that happens rarely (a weekly
+group event, a skill level no character has reached yet) cannot be proven on
+demand. When the station's log command finds no line naming the Live box's
+strings and the ticket shipped at least 7 days ago (`VERIFY_WAIT_DAYS`), the
+station gives it `wait:live-event` once, drops `loom:awaiting-evidence` and posts
+one comment (marker `<!-- loom:wait-live-event v1 -->`) naming the event it waits
+for. The ticket then no longer counts as open work: it does not hold its goal's
+unproven-work limit, the `Verify due` lists leave it out, and the status report
+and the dashboard count it apart ("held for a rare live event"). The station
+still runs the log command on every verify cooldown and costs no verify run
+until a line appears. When one does, the hand-out removes `wait:live-event` and
+the verify runs and closes the ticket on proof as for any shipped ticket; a run
+that finds the evidence missing again lands on `loom:awaiting-evidence` and is
+held again once the log shows no matching line.
 
 ### Proof audits
 

@@ -396,6 +396,9 @@ def _goal_unproven_html(info):
     note = "unproven work %d/%d (merged or shipped with no standing proof)" % (held, limit)
     if held > limit:
         note += " - over limit: no new build tickets until the goal finishes its proof"
+    apart = info.get("live_event_held")
+    if isinstance(apart, int) and apart:
+        note += "; %d more held for a rare live event, counted apart from open work" % apart
     return '<p class="machine-fact">%s</p>' % html.escape(note)
 
 

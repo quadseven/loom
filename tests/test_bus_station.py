@@ -7829,6 +7829,63 @@ class VerifyDispatchTest(Base):
         self.assertEqual(self.fake.comments[2], [])
         self.assertEqual(popen.call_count, 1)
 
+    def rare_event_ticket(self, number, age_days, labels=()):
+        body = SHIPPED_BODY.replace("prints `daily status ready`", "see `weekly sweep finished` in the log")
+        self.fake.add(number, lane="codex", body=body, state="shipped",
+                      events=shipped_at(age_days * 24))
+        self.fake.issues[number]["labels"] += [{"name": x} for x in labels]
+
+    def evidence_says(self, text):
+        self.settings.evidence_cmds = {REPO: "fake evidence command"}
+        patch = mock.patch.object(station.evidence.subprocess, "Popen")
+        popen = patch.start()
+        self.addCleanup(patch.stop)
+        popen.return_value.communicate.return_value = (text, "")
+        popen.return_value.returncode = 0
+        return popen
+
+    def test_a_ticket_with_no_matching_event_for_a_week_is_held_apart_from_open_work(self):
+        # loom#1220: a Live box waiting on a rare event stayed open and counted
+        # for weeks after the fix shipped.
+        for n in (1, 2):
+            self.fake.issues.pop(n)
+        self.rare_event_ticket(6, station.VERIFY_WAIT_DAYS + 1, labels=["loom:awaiting-evidence"])
+        self.evidence_says("other line\n")
+        self.run_pass()
+        self.assertFalse(any("-6-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertIn("wait:live-event", self.fake.names(6))
+        self.assertNotIn("loom:awaiting-evidence", self.fake.names(6))
+        self.assertIn("loom:shipped", self.fake.names(6))
+        notes = [c["body"] for c in self.fake.comments[6]]
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0].startswith("<!-- loom:wait-live-event v1 -->"))
+        self.assertIn("weekly sweep finished", notes[0])
+        # A later check with the event still absent changes nothing and posts nothing.
+        self.write(os.path.join(self.home, "state", "station", station.VERIFY_FILE), "{}")
+        self.run_pass()
+        self.assertEqual(len(self.fake.comments[6]), 1)
+        self.assertFalse(any("-6-verify-" in n for n in self.briefs()), self.briefs())
+
+    def test_a_ticket_shipped_less_than_a_week_ago_is_only_awaiting_evidence(self):
+        for n in (1, 2):
+            self.fake.issues.pop(n)
+        self.rare_event_ticket(6, station.VERIFY_WAIT_DAYS - 2)
+        self.evidence_says("other line\n")
+        self.run_pass()
+        self.assertNotIn("wait:live-event", self.fake.names(6))
+        self.assertIn("loom:awaiting-evidence", self.fake.names(6))
+        self.assertEqual(self.fake.comments[6], [])
+
+    def test_a_held_ticket_is_verified_again_once_its_event_shows_in_the_log(self):
+        for n in (1, 2):
+            self.fake.issues.pop(n)
+        self.rare_event_ticket(6, station.VERIFY_WAIT_DAYS + 3, labels=["wait:live-event"])
+        self.evidence_says("sweep: weekly sweep finished at 2030-01-01T01:00Z\n")
+        self.run_pass()
+        self.assertTrue(any("-6-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertNotIn("wait:live-event", self.fake.names(6))
+        self.assertIn("loom:shipped", self.fake.names(6))
+
     def test_verify_pool_never_hands_ticket_with_unsearchable_live_line(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
             "prints `daily status ready`", "the daily line shows it")
@@ -8254,6 +8311,14 @@ class VerifyResultTest(Base):
         self.assertNotIn("loom:shipped", self.fake.names(5))
         self.assertEqual(self.fake.issues[5]["state"], "closed")
         self.assertEqual(self.fake.issues[5].get("state_reason"), "completed")
+
+    def test_a_held_ticket_closes_on_proof_and_loses_its_hold_label(self):
+        self.fake.issues[5]["labels"].append({"name": "wait:live-event"})
+        self.result(self.good())
+        self.run_pass()
+        self.assertIn("loom:verified", self.fake.names(5))
+        self.assertNotIn("wait:live-event", self.fake.names(5))
+        self.assertEqual(self.fake.issues[5]["state"], "closed")
 
     def test_a_verified_ticket_with_an_unticked_box_is_not_closed(self):
         self.result(self.good())

@@ -47,6 +47,12 @@ AWAITING_EVIDENCE = "loom:awaiting-evidence"
 # label comes from a lane's verify.json, so a lane that always says "missing"
 # must not be able to switch the limit off.
 AWAITING_CAP_FACTOR = 2
+# A shipped ticket whose Live box has seen no matching event for
+# bus.station.VERIFY_WAIT_DAYS days (a weekly group event, a skill level no
+# character has reached yet) is held apart from open work (loom#1220): it no
+# longer holds the unproven-work limit, is not offered to a verifier, and the
+# station looks for its event in the log and verifies it once the event shows.
+WAIT_LIVE_EVENT = "wait:live-event"
 # Raised 15 -> 30 on 2026-10-17: 15 held the factory still on most days.
 DEFAULT_UNVERIFIED_LIMIT = 30
 # A ticket admitted for a measured regression of a shipped one. Past the cap,
@@ -327,6 +333,10 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
             lines.append("  - unproven work %d/%d (shipped with no standing proof; "
                          "%d more await live evidence and do not count)"
                          % (held, limit, waiting))
+            apart = sum(1 for i in _flatten(loose, tree) if _held_for_live_event(i))
+            if apart:
+                lines.append("  - %d more are held for a rare live event (%s): counted apart "
+                             "from open work" % (apart, WAIT_LIVE_EVENT))
             if tree:
                 lines += epic_lines(tree)
             if held > limit:
@@ -743,7 +753,8 @@ def verify_due(gh: GitHub, repo: str, tickets: List[Dict[str, Any]], now: dateti
     """Open loom:shipped tickets, oldest ship first. A verified ticket carries
     loom:verified instead, so it never appears."""
     shipped = [issue for issue in tickets
-               if "loom:shipped" in _labels(issue) and "loom:verified" not in _labels(issue)]
+               if "loom:shipped" in _labels(issue) and "loom:verified" not in _labels(issue)
+               and WAIT_LIVE_EVENT not in _labels(issue)]
     # One events read per ticket, in parallel: 93 in a row took 36 s of a
     # 68 s status on 2026-10-15.
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
@@ -1460,8 +1471,16 @@ def _unproven(issue: Dict[str, Any]) -> bool:
     counts."""
     names = _labels(issue)
     return (issue.get("state") == "open" and "loom:ticket" in names
-            and AWAITING_EVIDENCE not in names
+            and AWAITING_EVIDENCE not in names and WAIT_LIVE_EVENT not in names
             and any(state in names for state in UNPROVEN))
+
+
+def _held_for_live_event(issue: Dict[str, Any]) -> bool:
+    """An open shipped ticket held apart from open work because the event its
+    Live box needs has not happened (wait:live-event)."""
+    names = _labels(issue)
+    return (issue.get("state") == "open" and "loom:ticket" in names
+            and WAIT_LIVE_EVENT in names and any(state in names for state in UNPROVEN))
 
 
 def _awaiting(issue: Dict[str, Any]) -> bool:
@@ -1469,7 +1488,8 @@ def _awaiting(issue: Dict[str, Any]) -> bool:
     live evidence (loom:awaiting-evidence)."""
     names = _labels(issue)
     return (issue.get("state") == "open" and "loom:ticket" in names
-            and AWAITING_EVIDENCE in names and any(state in names for state in UNPROVEN))
+            and AWAITING_EVIDENCE in names and WAIT_LIVE_EVENT not in names
+            and any(state in names for state in UNPROVEN))
 
 
 def _count_unproven(children: List[Dict[str, Any]]) -> Tuple[int, int]:
