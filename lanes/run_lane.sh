@@ -1966,8 +1966,8 @@ preserve_unvalidated() {
   push_side "$BRANCH" "$BRANCH-unvalidated-$(date +%s)"
 }
 
-# A run that timed out after editing keeps its edits the same way, on a
-# -timedout- branch the station names to the next attempt. The agent's tree
+# A run that timed out, or hit a limit, after editing keeps its edits the same
+# way, on a -timedout- branch the station names to the next attempt. The agent's tree
 # may hold uncommitted files, so they are committed first.
 preserve_timedout() {
   local tree_status
@@ -2180,8 +2180,8 @@ update_fix_branch() {
   return 0
 }
 
-# An earlier attempt that timed out after editing kept its edits on a side
-# branch, which the brief's Earlier attempt section names. The agent cannot
+# An earlier attempt that timed out or hit a limit after editing kept its
+# edits on a side branch, which the brief's Earlier attempt section names. The agent cannot
 # fetch it: the sandbox keeps .git read-only, and two codex runs on one ticket
 # started over and ended with no commit (2026-10-21). So the runner merges it
 # into the tree before the agent starts. A branch that will not fetch or merge
@@ -2720,10 +2720,15 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
   fi
-  # A timeout after editing keeps its edits whatever the failure is classed as;
-  # every park below names the branch.
+  # A timeout after editing keeps its edits whatever the failure is classed as,
+  # and so does a run cut short by a limit, an expired key or a transient error
+  # (a free pool runs dry 20 minutes in): every park below names the branch.
+  # A work failure keeps nothing, so its next rung starts from the base.
   TIMEDOUT_NOTE=""
-  if [ "$STATUS" -eq 124 ] && [ -n "$EDITED" ]; then TIMEDOUT_NOTE="; $(preserve_timedout)"; fi
+  if [ -n "$EDITED" ] && { [ "$STATUS" -eq 124 ] ||
+       { [ "$STATUS" -ne 0 ] && [ "$FAIL_CLASS" != work ]; }; }; then
+    TIMEDOUT_NOTE="; $(preserve_timedout)"
+  fi
   if [ "$FAIL_CLASS" != transient ]; then
     transient_clear
   elif REST_UNTIL="$(transient_strike)"; then
