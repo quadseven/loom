@@ -364,6 +364,13 @@ crashed lane, or a machine that is off) moves the same way, with a comment
 naming the lane and how long it was silent: to a free lane of its tier, or of
 its Model, else back to `loom:queued`. It is no failure and no retry, so it
 never climbs, and the station's `silent-lane` invariant lists the lane.
+A lane deep in a run is not silent: its runner writes the heartbeat between
+runs, so while it lives it also stamps `state/usage/<lane>.alive` with the time
+every `LOOM_KEEPALIVE_SECONDS` (default 60), and the station counts a lane
+with a stamp under five minutes old, like one whose runner holds its lock with
+a live pid, as running. The stamp says nothing of availability. When the
+factory does find a lane silent with a running ticket, the station log names
+what it saw of the runner (its lock and the stamp's age).
 A failed or stalled
 ticket climbs, and past the last rung it is left `loom:failed` for the brain. Landing
 keeps the default branch green: a ready pull request that is behind its base

@@ -121,7 +121,34 @@ echo $$ > "$LOCK/pid"
 # built its caches) goes with the runner, before the lock is let go, so run/
 # holds one only while its lane is running (loom#643).
 drop_check_home() { [ -z "${CHECK_HOME:-}" ] || rm -rf "$CHECK_HOME"; }
-trap 'drop_check_home; rm -rf "$LOCK"' EXIT
+# The runner writes its usage heartbeat between runs, not during one, and a
+# run can take over an hour (loom#1281). While this runner lives, a background
+# loop stamps state/usage/<slot>.alive with the time every
+# LOOM_KEEPALIVE_SECONDS, so the station reads a lane deep in a run as alive
+# whatever its heartbeat's age or its lock says. The loop ends when this
+# runner's pid is gone (a killed runner), and the stamp goes with the runner;
+# a stamp left by a runner killed hard goes stale after the station's window.
+# The stamp is no heartbeat: it says nothing of availability, so a busy lane
+# is not offered more work and no limit or hold is hidden.
+ALIVE="$LOOM_HOME/state/usage/$SLOT.alive"
+KEEPALIVE_PID=""
+keepalive_loop() {
+  local parent="$1" every="${LOOM_KEEPALIVE_SECONDS:-60}" tmp="$ALIVE.$1"
+  [[ "$every" =~ ^[1-9][0-9]*$ ]] || every=60
+  while kill -0 "$parent" 2>/dev/null; do
+    date +%s > "$tmp" 2>/dev/null && mv -f "$tmp" "$ALIVE" 2>/dev/null
+    sleep "$every"
+  done
+  rm -f "$tmp"
+}
+stop_keepalive() {
+  [ -z "$KEEPALIVE_PID" ] || { pkill -P "$KEEPALIVE_PID" 2>/dev/null; kill "$KEEPALIVE_PID" 2>/dev/null; }
+  rm -f "$ALIVE"
+}
+mkdir -p "$LOOM_HOME/state/usage"
+keepalive_loop $$ > /dev/null 2>&1 &
+KEEPALIVE_PID=$!
+trap 'drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
