@@ -265,6 +265,12 @@ git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
 # which the runner points at the agent's scratch home.
 FAKE_OPENCODE = """#!/usr/bin/env bash
 [ "${1:-}" = --version ] && { echo "1.18.4"; exit 0; }
+# The model list: $FAKE_MODELS is its output, $FAKE_MODELS_EXIT its status.
+if [ "${1:-}" = models ]; then
+  echo "opencode $*" >> "${FAKE_LOG:-/dev/null}"
+  [ -z "${FAKE_MODELS:-}" ] || printf '%s\\n' "$FAKE_MODELS"
+  exit "${FAKE_MODELS_EXIT:-0}"
+fi
 args="$*"; args="${args//$'\\n'/ }"
 keyvar=none; key=none
 for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY CLOUDFLARE_API_KEY; do
@@ -3771,7 +3777,7 @@ exit %d
         self.assertEqual(self.calls(), [])
         self.assertFalse(self.beat()["available"])
 
-    def test_a_model_the_cli_no_longer_offers_rests_the_lane_for_a_day(self):
+    def test_a_model_the_cli_no_longer_offers_rests_the_lane_for_an_hour(self):
         # openrouter, 2026-10-20: models.dev marked the lane's free model
         # deprecated, opencode dropped it and printed only "UnknownError:
         # Unexpected server error", and every run failed transient while the
@@ -3784,7 +3790,66 @@ exit %d
         self.assertIn("not found by the agent CLI", self.failure_line())
         beat = self.beat()
         self.assertFalse(beat["available"])
-        self.assertGreater(beat["retry_at"], int(time.time()) + 86000)
+        self.assertGreater(beat["retry_at"], int(time.time()) + 3500)
+        self.assertLessEqual(beat["retry_at"], int(time.time()) + 3600)
+
+    GONE = "opencode/gone-free"
+
+    def hold_gone_model(self, lane="zen", retry_at=None):
+        # The beat a model-gone failure left, its hour now over.
+        retry_at = int(time.time()) - 60 if retry_at is None else retry_at
+        (self.loom / "state" / "usage").mkdir(parents=True, exist_ok=True)
+        (self.loom / "state" / "usage" / (lane + ".json")).write_text(json.dumps({
+            "lane": lane, "at": retry_at - 3600, "available": False, "retry_at": retry_at,
+            "reason": "limit: model %s not found by the agent CLI; lane waits until x" % self.GONE,
+            "limited_models": {}}))
+
+    def models_calls(self):
+        return [c for c in self.calls() if c.startswith("opencode models")]
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_lifted_model_gone_hold_stays_while_the_cli_does_not_list_the_model(self):
+        self.hold_gone_model()
+        before = int(time.time())
+        result = self.run_lane("zen", FAKE_MODELS="opencode/other-free")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.models_calls(), ["opencode models opencode"])
+        beat = self.beat("zen")
+        self.assertFalse(beat["available"])
+        self.assertIn("model %s not found by the agent CLI; lane waits until" % self.GONE, beat["reason"])
+        self.assertTrue(before + 3500 <= beat["retry_at"] <= int(time.time()) + 3600, beat)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_lifted_model_gone_hold_clears_when_the_cli_lists_the_model(self):
+        self.hold_gone_model()
+        result = self.run_lane("zen", FAKE_MODELS="opencode/other-free\n%s" % self.GONE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.models_calls(), ["opencode models opencode"])
+        self.assertTrue(self.beat("zen")["available"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_model_list_that_fails_does_not_hold_the_lane(self):
+        for env in ({"FAKE_MODELS_EXIT": "1"}, {"FAKE_MODELS_EXIT": "1", "FAKE_MODELS": "boom"},
+                    {}):
+            with self.subTest(env=env):
+                self.hold_gone_model()
+                self.log.write_text("")
+                self.run_lane("zen", **env)
+                self.assertEqual(len(self.models_calls()), 1)
+                self.assertTrue(self.beat("zen")["available"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_model_gone_hold_still_running_asks_the_cli_nothing(self):
+        self.hold_gone_model(retry_at=int(time.time()) + 1800)
+        self.run_lane("zen", FAKE_MODELS="opencode/other-free")
+        self.assertEqual(self.models_calls(), [])
+        self.assertFalse(self.beat("zen")["available"])
+
+    def test_a_lane_whose_cli_has_no_model_list_claims_when_the_hold_lifts(self):
+        self.hold_gone_model(lane="codex")
+        self.run_lane("codex", FAKE_MODELS="opencode/other-free")
+        self.assertEqual(self.models_calls(), [])
+        self.assertTrue(self.beat("codex")["available"])
 
     def test_a_lane_with_no_transient_count_writes_nothing_to_its_service_log(self):
         # 2026-10-20: every pass read the missing count file with the stderr
