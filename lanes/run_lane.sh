@@ -512,6 +512,27 @@ NO_CHANGE_RE='nothing (left )?to (change|fix|do)|no (code )?change (is )?needed|
 # and its agent gave no such reason.
 NO_REASON="agent made no commit and wrote no reason"
 
+# The longest final message a failure reason carries, in characters.
+FINAL_SAID_MAX=600
+
+# What the agent said last, for a run that committed nothing and wrote no
+# summary (loom#1362): the end of the run's output, without the provider's
+# work events (RUN_OUTPUT), as one ASCII line cut to FINAL_SAID_MAX, through
+# checked_text. Sets FINAL_SAID, empty when the agent said nothing or its words
+# were refused.
+final_said() {
+  local file="$WORKDIR/$TICKET.final-message" line
+  FINAL_SAID=""
+  line="$(printf '%s\n' "$RUN_OUTPUT" | tail -n 20 | LC_ALL=C tr -cd '\11\12\40-\176' |
+          tr -s ' \t\n' ' ' | sed 's/^ //; s/ $//')"
+  [ -n "$line" ] || return 0
+  [ "${#line}" -le "$FINAL_SAID_MAX" ] || line="${line:0:FINAL_SAID_MAX}..."
+  printf '%s\n' "$line" > "$file"
+  FINAL_SAID="$(checked_text "$file" 2>> "$LOG")" || FINAL_SAID=""
+  rm -f "$file"
+  FINAL_SAID="${FINAL_SAID%$'\n'}"
+}
+
 # A run that committed nothing is an answer, not a failure, when its agent
 # said why: an Intent summary that the work is already done or no longer
 # applies, or an answer to a thread kept aside by keep_answers. Sets
@@ -2757,6 +2778,10 @@ for BRIEF in "$INBOX"/*.md; do
       [ -z "$NO_CHANGE_WHY" ] || { park "$BRIEF" "agent made no commit and its reason was refused: $NO_CHANGE_WHY"; continue; }
       if [ -f "$WORKDIR/$TICKET.described-step" ]; then
         park "$BRIEF" "ended on a described step without taking it"; continue
+      fi
+      final_said
+      if [ -n "$FINAL_SAID" ]; then
+        park "$BRIEF" "agent made no commit; it said: $FINAL_SAID (on $BRANCH)"; continue
       fi
       park "$BRIEF" "$NO_REASON on $BRANCH"; continue
     fi
