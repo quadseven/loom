@@ -7299,8 +7299,14 @@ class Station:
         repo = self.s.status_repo
         if not repo or not tickets.REPO_RE.fullmatch(repo):
             return
+        # A denied path an agent reached for may sit in another goal repo's
+        # checkout; those names stay out of the public lanes repo. The lanes
+        # repo's own name is public already.
+        own = repo.rsplit("/", 1)[-1]
+        private = sorted({r.rsplit("/", 1)[-1] for r in self.s.repos
+                          if isinstance(r, str) and "/" in r} - {own})
         watch.Watcher(self.gh, repo, self.s.watched, os.path.join(self.state, "watch.json"),
-                      self.now, _say, write=not self._deferred()).run()
+                      self.now, _say, write=not self._deferred(), private=private).run()
 
     # -- invariants -------------------------------------------------------
     def check_invariants(self) -> None:
