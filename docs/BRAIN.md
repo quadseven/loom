@@ -969,6 +969,32 @@ keeps editing it. Rules:
 - `tickets.parse` leaves the section out of the brief and `with_original` does
   not quote it.
 
+### Lane comments edited in place
+
+A lane that repeats a fact edits one comment instead of posting a new one each
+time; every new comment emailed the ticket's author and participants (186
+blank-bodied remote claim beats in a week, about 60 fix round notes a day, 13
+"Still failing" notes on one incident). The text of each comes from
+`bus/sticky.py`; the runner reads and writes the comment with `gh`, finds it by
+its marker, and posts it only when no comment starts with the marker. A read
+that fails posts nothing, so a bad API answer cannot start a second comment.
+
+- A remote lane's claim is one `<!-- loom:remote-claim v1 <lane> <ticket> <beat>
+  [<claim>] -->` comment per ticket claim. `bus.lane heartbeat` edits it with
+  the newest beat and keeps the claim time as the last field. A claim expires
+  from its newest beat (`CLAIM_AGE`) or from its claim time (`PR_AGE`). Only the
+  ticket's newest claim comment counts, so an earlier claim, handed back since,
+  does not age the one held now. A claim comment written before this form has
+  one time and reads as both.
+- A fix round on a lane pull request goes in one `<!-- loom:lane-round v1 -->`
+  comment on that pull request, a `### Round N, <UTC time>` section per round,
+  newest first, at most 12 shown and the older ones counted. The push and the
+  body edit are already on the pull request's timeline.
+- A factory incident that is still failing, and an expired key that is still
+  expired, edit one `<!-- loom:incident-repeat v1 -->` or
+  `<!-- loom:key-repeat v1 -->` comment on the open issue: a running count, the
+  first and last time, the tickets (or lanes) seen, and the latest detail.
+
 ## Polling budget
 
 The GitHub API limit (5,000 requests an hour) is shared by every client of

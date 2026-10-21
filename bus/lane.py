@@ -15,7 +15,11 @@ from . import change_class, hunt_plan, pr_repair, tickets
 from .github import GitHub, GitHubError, auth_from_env
 from .labels import REMOTE_LANES
 
-CLAIM_RE = re.compile(r"^<!-- loom:remote-claim v1 ([^ ]+) ([0-9]+) ([0-9.]+) -->$")
+# One claim comment per ticket claim: the first time is the claim, and each
+# heartbeat edits the same comment to add the newest beat as the third field
+# and keep the claim time as the fourth. A comment from before that has the
+# one time and no fourth field.
+CLAIM_RE = re.compile(r"^<!-- loom:remote-claim v1 ([^ ]+) ([0-9]+) ([0-9.]+)(?: ([0-9.]+))? -->$")
 CLAIM_AGE = 2 * 3600
 PR_AGE = 3 * 3600
 
@@ -30,16 +34,24 @@ def _comments(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
             if isinstance(c, dict)]
 
 
-def _claims(comments: Sequence[Dict[str, Any]], lane: str) -> List[Tuple[int, float]]:
+def _claims(comments: Sequence[Dict[str, Any]], lane: str) -> List[Tuple[int, float, float]]:
+    """(index, newest beat, first claim time) for each claim comment of the lane."""
     out = []
     for index, comment in enumerate(comments):
         match = CLAIM_RE.fullmatch(str(comment.get("body") or "").strip())
         if match and match.group(1) == lane:
             try:
-                out.append((index, float(match.group(3))))
+                beat = float(match.group(3))
+                first = float(match.group(4)) if match.group(4) else beat
             except ValueError:
                 continue
+            out.append((index, beat, first))
     return out
+
+
+def _claim_body(lane: str, number: int, beat: float, first: Optional[float] = None) -> str:
+    tail = "" if first is None or first == beat else " %.3f" % first
+    return "<!-- loom:remote-claim v1 %s %d %.3f%s -->" % (lane, number, beat, tail)
 
 
 def _hand_back(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
@@ -122,9 +134,12 @@ def _recover_and_count(gh: GitHub, repos: Sequence[str], lane: str,
         for issue in found:
             if not isinstance(issue, dict) or "pull_request" in issue:
                 continue
-            claims = [at for _, at in _claims(_comments(gh, repo, int(issue["number"])), lane)]
-            if not claims:
+            # The newest claim comment is this claim: an earlier claim of the
+            # ticket, handed back since, must not age the one held now.
+            held = _claims(_comments(gh, repo, int(issue["number"])), lane)
+            if not held:
                 continue
+            _, last_beat, first_claim = held[-1]
             branch = tickets.branch_for(int(issue["number"]), str(issue.get("title") or ""))
             if _pull_for(gh, repo, branch) is not None:
                 _to_pr(gh, repo, issue, lane)
@@ -134,7 +149,7 @@ def _recover_and_count(gh: GitHub, repos: Sequence[str], lane: str,
             if _merged_pull_naming(repo, int(issue["number"]), closed) is not None:
                 _to_pr(gh, repo, issue, lane)
                 continue
-            if now - max(claims) > CLAIM_AGE or now - min(claims) > PR_AGE:
+            if now - last_beat > CLAIM_AGE or now - first_claim > PR_AGE:
                 _hand_back(gh, repo, issue, lane,
                            "remote lane claim expired without a pull request")
                 continue
@@ -178,8 +193,8 @@ def _take(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
     number = int(issue["number"])
     labels = [x for x in _names(issue) if x != "loom:queued"] + ["loom:running"]
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-        "body": "<!-- loom:remote-claim v1 %s %d %.3f -->" % (lane, number, now)})
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+            {"body": _claim_body(lane, number, now)})
     info = gh.rest("GET", "/repos/%s" % repo).data
     default = str((info.get("default_branch") if isinstance(info, dict) else "") or "main")
     return {"repo": repo, "number": number, "base": default,
@@ -210,7 +225,7 @@ def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
                 skipped.append("#%s skipped: branch %s already has pull request #%s" %
                                (issue["number"], branch, pr.get("number", "")))
                 continue
-            recent = [at for _, at in _claims(_comments(gh, repo, int(issue["number"])), lane)
+            recent = [at for _, at, _ in _claims(_comments(gh, repo, int(issue["number"])), lane)
                       if now - at < CLAIM_AGE]
             if len(recent) >= REMOTE_LANES[lane]["slots"]:
                 skipped.append("#%s skipped: claim active" % issue["number"])
@@ -227,14 +242,24 @@ def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
 
 def heartbeat(gh: GitHub, repo: str, number: int, lane: str = "muse",
               now: Optional[float] = None) -> None:
+    """Record a beat on the ticket's claim. The claim comment is edited in
+    place, so a beat sends no email and the ticket gains no comment; a ticket
+    with no claim comment of this lane gets one."""
     if lane not in REMOTE_LANES:
         raise ValueError("unknown remote lane: %s" % lane)
     now = time.time() if now is None else now
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     if "loom:running" not in _names(issue) or "lane:" + lane not in _names(issue):
         raise ValueError("ticket is not held by this remote lane")
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-        "body": "<!-- loom:remote-claim v1 %s %d %.3f -->" % (lane, number, now)})
+    comments = _comments(gh, repo, number)
+    held = [c for c in _claims(comments, lane) if comments[c[0]].get("id")]
+    if held:
+        index, _, first = held[-1]
+        gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(comments[index]["id"])),
+                {"body": _claim_body(lane, number, now, first)})
+        return
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+            {"body": _claim_body(lane, number, now)})
 
 
 def lane_heartbeat(gh: GitHub, repo: str, lane: str = "muse",

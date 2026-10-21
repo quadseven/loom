@@ -24,6 +24,7 @@ from bus import hunt_plan, pr_repair, text, tickets  # noqa: E402
 from tests import sandbox_caps  # noqa: E402
 from tests.local_http import LocalHTTPServer  # noqa: E402
 
+ROUND_MARKER = "<!-- loom:lane-round v1 -->"
 RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
 INSTALL_LOCK = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "lock.sh"
 
@@ -70,6 +71,31 @@ printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
 if [ -n "${FAKE_GH_HANG:-}" ]; then exec sleep 30; fi
 if [ "$1" = api ]; then
   [ -z "${FAKE_GH_API_FAIL:-}" ] || { echo "HTTP 502" >&2; exit 1; }
+  # Comments the lane edits in place live in "$FAKE_LOG.comments": file ID is
+  # the body, ID.on is "OWNER/NAME NUMBER". A listing prints the IDs whose body
+  # starts with $MARKER; $FAKE_GH_COMMENTS_FAIL fails every comment read.
+  store="$FAKE_LOG.comments"
+  case "$*" in
+    "api --paginate repos/"*"/comments --jq "*)
+      [ -z "${FAKE_GH_COMMENTS_FAIL:-}" ] || { echo "HTTP 502" >&2; exit 1; }
+      where="${3#repos/}"; where="${where%/comments}"; repo="${where%/issues/*}"; num="${where##*/}"
+      for on in "$store"/*.on; do
+        [ -e "$on" ] || continue
+        [ "$(cat "$on")" = "$repo $num" ] || continue
+        id="$(basename "$on" .on)"
+        case "$(cat "$store/$id")" in "$MARKER"*) echo "$id" ;; esac
+      done
+      exit 0 ;;
+    "api repos/"*"/issues/comments/"*" --jq .body")
+      cat "$store/${2##*/}"; exit 0 ;;
+    "api -X PATCH repos/"*"/issues/comments/"*" -F body=@"*)
+      cp "${6#body=@}" "$store/${4##*/}"; exit 0 ;;
+    "api -X POST repos/"*"/issues/"*"/comments -F body=@"*)
+      mkdir -p "$store"; id=$((5000 + $(ls "$store" | wc -l)))
+      where="${4#repos/}"; where="${where%/comments}"
+      printf '%s %s' "${where%/issues/*}" "${where##*/}" > "$store/$id.on"
+      cp "${6#body=@}" "$store/$id"; exit 0 ;;
+  esac
   [ "$*" = "api repos/example/repo --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
   exit 0
 fi
@@ -597,6 +623,14 @@ print('leak guard: clean (shape patterns only)')
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
             **env,
         }
+
+    def sticky_bodies(self):
+        """The bodies of the comments the fake gh holds, oldest first."""
+        store = Path(str(self.log) + ".comments")
+        if not store.is_dir():
+            return []
+        return [p.read_text() for p in sorted((p for p in store.iterdir() if p.name.isdigit()),
+                                              key=lambda p: int(p.name))]
 
     def calls(self):
         extra = []
@@ -1228,23 +1262,24 @@ print('leak guard: clean (shape patterns only)')
         heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("-r2", heads)
-        comment = [c for c in calls if c.startswith("gh pr comment")]
-        # The call log keeps the comment's first line (the full text has its own test).
-        self.assertEqual(comment, ["gh pr comment 7 -R example/repo --body Lane codex "
-                                   "(gpt-test-default) pushed 1 commit for: Check: lint; "
-                                   "Thread PRRT_1 (comment 11) at a.py:3"])
+        # The round goes in the pull request's one lane-round comment, never a new comment.
+        self.assertFalse([c for c in calls if c.startswith("gh pr comment")])
+        [round_note] = self.sticky_bodies()
+        self.assertTrue(round_note.startswith(ROUND_MARKER + "\n"), round_note)
+        self.assertIn("Lane codex (gpt-test-default) pushed 1 commit for: Check: lint; "
+                      "Thread PRRT_1 (comment 11) at a.py:3", round_note)
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
     def test_a_fix_round_comment_says_what_was_pushed_and_what_happens_next(self):
         # 2026-10-20: "Lane claude pushed fixes for: the findings on the
         # ticket" told the reader nothing about a round that merged main.
         name, _ = self.fix_brief()
-        comment = Path(self._tmp.name) / "comment.md"
-        self.run_lane(FAKE_GH_EXISTING="7", FAKE_COMMENT=str(comment))
+        self.run_lane(FAKE_GH_EXISTING="7")
         head = self.remote_head(self.FIX_BRANCH)
-        text = comment.read_text()
-        self.assertTrue(text.startswith("Lane codex (gpt-test-default) pushed 1 commit for: "
-                                        "Check: lint; Thread PRRT_1 (comment 11) at a.py:3\n"), text)
+        [text] = self.sticky_bodies()
+        self.assertIn("### Round 1, ", text)
+        self.assertIn("Lane codex (gpt-test-default) pushed 1 commit for: "
+                      "Check: lint; Thread PRRT_1 (comment 11) at a.py:3\n", text)
         subject = subprocess.run(["git", "--git-dir", str(self.remote), "log", "-1", "--format=%s",
                                   head], capture_output=True, text=True, check=True).stdout.strip()
         self.assertIn("- `%s` `%s`" % (head[:7], subject), text)
@@ -1253,6 +1288,35 @@ print('leak guard: clean (shape patterns only)')
         # The station reads this marker to say a round pushed; without it the
         # round is reported as a no-code-change round.
         self.assertTrue((self.loom / "logs" / "codex" / (name + ".pushed")).exists())
+
+    def test_two_fix_rounds_on_one_pr_leave_one_lane_round_comment_listing_both(self):
+        # 2026-10-21: 17 "repaired the PR text" comments on one pull request in
+        # 3 hours, each emailed to everyone on it.
+        name, _ = self.fix_brief()
+        brief = (self.inbox / (name + ".md")).read_text()
+        first = self.run_lane(FAKE_GH_EXISTING="7")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "printf 'second try\\n' > first.txt\n")
+        self.drop_brief(name + ".md", brief)
+        second = self.run_lane(FAKE_GH_EXISTING="7")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        [note] = self.sticky_bodies()
+        self.assertEqual(note.count(ROUND_MARKER), 1)
+        self.assertIn("### Round 1, ", note)
+        self.assertIn("### Round 2, ", note)
+        self.assertLess(note.index("### Round 2, "), note.index("### Round 1, "))
+        writes = [c for c in self.calls() if c.startswith("gh api -X ")]
+        self.assertEqual([c.split()[3] for c in writes], ["POST", "PATCH"])
+        self.assertFalse([c for c in self.calls() if c.startswith("gh pr comment")])
+
+    def test_a_failed_read_of_the_round_comment_posts_no_second_one(self):
+        name, _ = self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_GH_COMMENTS_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sticky_bodies(), [])
+        self.assertFalse([c for c in self.calls() if c.startswith("gh api -X ")])
+        self.assertIn("the comment on #7 failed",
+                      (self.loom / "logs" / "codex" / (name + ".log")).read_text())
 
     def test_fix_runner_posts_and_resolves_agent_thread_replies_after_push(self):
         self.fix_brief()
@@ -1971,13 +2035,12 @@ cat > /dev/null
 
     def test_a_fix_round_names_dropped_scratch_in_its_pr_comment(self):
         name, _ = self.fix_brief()
-        comment = Path(self._tmp.name) / "fix-comment.txt"
         self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
                         "printf 'scratch\\n' > test_debug.py\n"
                         "printf 'fixed again\\n' > first.txt\n")
-        result = self.run_lane(FAKE_COMMENT=str(comment))
+        result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Dropped scratch files: test_debug.py", comment.read_text())
+        self.assertIn("Dropped scratch files: test_debug.py", "".join(self.sticky_bodies()))
         self.assertEqual(self.remote_file(self.remote_head(self.FIX_BRANCH), "test_debug.py"), "")
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
@@ -2062,6 +2125,7 @@ cat > /dev/null
         self.assertIn("failed: [transient] push failed",
                       (self.loom / "logs" / "codex" / (name + ".log")).read_text())
         self.assertFalse(any(c.startswith("gh pr comment") for c in self.calls()))
+        self.assertEqual(self.sticky_bodies(), [])
 
     def test_a_push_refused_for_the_workflows_permission_is_a_factory_incident(self):
         # GitHub refuses a GitHub App's push that touches .github/workflows
@@ -2108,6 +2172,7 @@ cat > /dev/null
                       % (self.FIX_BRANCH, moved[:12], before[:12]), log)
         self.assertNotIn("failed: push failed", log)
         self.assertFalse(any(c.startswith("gh pr comment") for c in self.calls()))
+        self.assertEqual(self.sticky_bodies(), [])
 
     def test_a_codex_lane_runs_luna_whatever_model_the_brief_pins(self):
         # The operator, 2026-10-21: codex lanes run gpt-6-luna only. 53 of 72
@@ -3764,17 +3829,25 @@ echo fixed > fix.txt
         self.assertEqual(len(filed), 1, self.calls())
         self.assertIn("--label needs-operator", filed[0])
         self.assertIn("renew /k/go", filed[0])
-        # The next lane to hit that key finds the open ask and comments on it,
-        # so the operator has one thread to answer, not one per lane.
+        # The next lane to hit that key finds the open ask and edits one
+        # repeat comment on it, so the operator has one thread to answer, not
+        # one comment per lane or per failure.
         script = ('FACTORY_REPO=quadseven/loom KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"\n'
-                  'SLOT=opencode-go-2 LOG=/dev/null\n'
-                  + self.source_functions("open_issue", "ask_renew_key") +
+                  'KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"\n'
+                  'SLOT=opencode-go-2 LOG=/dev/null NET_TIMEOUT=30 LOOM_ROOT="%s"\n' % RUNNER.parent.parent
+                  + self.source_functions("open_issue", "upsert_sticky_comment", "ask_renew_key") +
+                  'ask_renew_key "API key expired: renew /k/go"\n'
+                  'SLOT=opencode-go-3\n'
+                  'ask_renew_key "API key expired: renew /k/go"\n'
                   'ask_renew_key "API key expired: renew /k/go"\n')
         result = subprocess.run(["bash", "-c", script, "bash"],
                                 env={**self.lane_env(), "FAKE_GH_SEARCH": "7"},
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(any(c.startswith("gh issue comment") for c in self.calls()))
+        self.assertFalse(any(c.startswith("gh issue comment") for c in self.calls()))
+        [note] = self.sticky_bodies()
+        self.assertIn("Could not use the key again: 3 times since ", note)
+        self.assertIn("Lanes seen: opencode-go-2, opencode-go-3\n", note)
         self.assertEqual(len([c for c in self.calls() if c.startswith("gh issue create")]), 1)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
@@ -4712,7 +4785,23 @@ echo fixed > fix.txt
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertIn("factory incident quadseven/loom#7", self.lane_log())
         self.assertFalse(any(c.startswith("gh issue create") for c in self.calls()))
-        self.assertTrue(any(c.startswith("gh issue comment") for c in self.calls()))
+        # The repeat edits one comment on the open incident; it posts no "Still failing" of its own.
+        self.assertFalse(any(c.startswith("gh issue comment") for c in self.calls()))
+        [note] = self.sticky_bodies()
+        self.assertIn("Still failing: 1 times since ", note)
+        self.assertIn("Tickets seen: T042-fix-the-thing", note)
+
+    def test_a_second_still_failing_edits_the_existing_incident_comment(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        self.assertEqual(self.run_contract_lane(FAKE_GH_SEARCH="7").returncode, 0)
+        self.drop_brief("T043-other-thing.md", BRIEF.replace("T042", "T043"))
+        self.assertEqual(self.run_contract_lane(FAKE_GH_SEARCH="7").returncode, 0)
+        [note] = self.sticky_bodies()
+        self.assertIn("Still failing: 2 times since ", note)
+        writes = [c for c in self.calls() if c.startswith("gh api -X ")]
+        self.assertEqual([c.split()[3] for c in writes], ["POST", "PATCH"])
+        self.assertFalse(any(c.startswith("gh issue comment") for c in self.calls()))
 
     def test_a_failed_incident_filing_still_parks_as_factory(self):
         self.contract_repo(contract=CONTRACT + "python: 3.12\n")
