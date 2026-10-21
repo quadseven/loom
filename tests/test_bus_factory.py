@@ -1937,6 +1937,34 @@ class Tickets(Base):
         # The rung it left was not failed on, so it stays untried.
         self.assertEqual(self.moved, [])
 
+    def test_a_paid_rung_limited_longer_than_two_hours_uses_the_strongest_free_lane(self):
+        self.gh.private = False
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="claude", body=body)
+        self.go(model_limits={lane: {"claude-sonnet-5-5": NOW + 3 * 3600}
+                              for lane in factory.LADDER[0][0]})
+        self.assertEqual(self.lane(7), "free-ollama")
+        self.assertIsNone(self.model(7))
+        self.assertIn("Not a failure", self.gh.comments[7][-1]["body"])
+
+    def test_a_paid_rung_freeing_within_two_hours_is_still_waited_for(self):
+        self.gh.private = False
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="claude", body=body)
+        self.go(model_limits={lane: {"claude-sonnet-5-5": NOW + 90 * 60}
+                              for lane in factory.LADDER[0][0]})
+        self.assertEqual((self.lane(7), self.model(7)), ("claude", "claude-sonnet-5-5"))
+
+    def test_a_long_paid_wait_skips_free_lanes_the_ticket_already_tried(self):
+        self.gh.private = False
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="claude", body=body)
+        self.gh.comments[7].append({"body": "Claimed for lane free-ollama (body sha256 abcdef123456)",
+                                    "user": ME})
+        self.go(model_limits={lane: {"claude-sonnet-5-5": NOW + 3 * 3600}
+                              for lane in factory.LADDER[0][0]})
+        self.assertEqual(self.lane(7), "free-gemma")
+
     def test_a_ladder_ticket_at_a_limit_stays_on_its_rung(self):
         body = "Model: claude-opus-5-5\nDifficulty: easy\n\n## Why\nx\n"
         self.gh.ticket(7, "briefed", lane="claude", body=body)
