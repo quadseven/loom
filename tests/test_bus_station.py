@@ -6336,6 +6336,50 @@ class BrainTest(Base):
         self.go()
         self.assertEqual(len(self.sent), 1)
 
+    def test_check_stale_brain_tickets_escalates_stale_tickets(self):
+        """Stale needs-brain tickets get a stale-brain label and a comment."""
+        self.settings.webhook_ssm = "/example/webhook"
+        self.settings.status_repo = REPO
+        now = time.time()
+        # Use a past date for the issue so updated_at doesn't skip the staleness check
+        past_created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 6 * 3600))
+        # Add a ticket with needs-brain label that was added 5 hours ago
+        self.fake.add(100, title="Stale brain ticket", state="briefed", lane="codex", created=past_created)
+        self.fake.issues[100]["labels"].append({"name": "needs-brain"})
+        # The needs-brain label was added 5 hours ago (events for API)
+        self.fake.events[100] = [{
+            "event": "labeled",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 5 * 3600)),
+            "label": {"name": "needs-brain"},
+            "actor": {"login": "alice-example"}
+        }]
+        # Also add a fresh ticket with needs-brain (should not be escalated)
+        self.fake.add(101, title="Fresh brain ticket", state="briefed", lane="codex", created=past_created)
+        self.fake.issues[101]["labels"].append({"name": "needs-brain"})
+        self.fake.events[101] = [{
+            "event": "labeled",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 1 * 3600)),
+            "label": {"name": "needs-brain"},
+            "actor": {"login": "alice-example"}
+        }]
+
+        sent = []
+        def post(url, payload):
+            sent.append(payload["content"])
+
+        gh = GitHub("token", transport=self.fake)
+        st = station.Station(gh, self.settings, now=now, read_secret=lambda n, r: URL, post=post)
+        st.check_stale_brain_tickets()
+
+        # The stale ticket should have stale-brain label and a comment
+        self.assertIn("stale-brain", self.fake.names(100))
+        # The fresh ticket should not have stale-brain label
+        self.assertNotIn("stale-brain", self.fake.names(101))
+        # A comment should have been posted on the stale ticket
+        stale_comments = [c for c in self.fake.comments[100] if "for **5h**" in c.get("body", "")]
+        self.assertEqual(len(stale_comments), 1)
+        self.assertIn("brain review", stale_comments[0]["body"].lower())
+
 
 if __name__ == "__main__":
     unittest.main()
