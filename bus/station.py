@@ -4996,7 +4996,11 @@ class Station:
                 # waits briefed for a lane that serves it (loom#572, #271).
                 self._limited(repo, number, False, lane, reason)
                 return True
-            note = ". Not retried: %s." % note
+            # A transient ending did no work either: loom:failed made the
+            # factory climb the ladder for it (a token-mint outage put six
+            # tickets a rung up in 35 minutes, 2026-10-20; loom#1395).
+            self._requeue_transient(repo, number, lane, reason, note)
+            return True
         self._relabel(repo, number, "loom:failed")
         self._routine(repo, number, "Lane %s failed: %s%s" % (lane, reason, note))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
@@ -5195,6 +5199,26 @@ class Station:
         # detector does not count it as work.
         self._stopped(repo, number, lane, "limit", reason)
         _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+
+    def _requeue_transient(self, repo: str, number: int, lane: str, reason: str,
+                           why_not: str) -> None:
+        """A transient ending with no retry left (every automatic retry used,
+        or no other lane to take it). The lane did no work on the ticket, so it
+        is no failure and costs no rung: it goes back to loom:queued with
+        wait:lane, its Model: line and rung markers untouched, and the factory
+        gives it a lane again. A status event, not a comment, ends the claim as
+        [transient] and names why it was not retried (loom#1395)."""
+        names = _label_names(self._issue(repo, number))
+        if RUNNING not in names:
+            return
+        labels = [n for n in names if n not in (RUNNING, BRIEFED) and not n.startswith(
+            ("lane:", WAIT))] + ["loom:queued", WAIT + "lane"]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+        self._stopped(repo, number, lane, "transient",
+                      "%s. Not retried: %s; the ticket is back in the queue on its rung."
+                      % (CLASS_RE.sub("", reason), why_not))
+        _say("requeued %s#%d after a transient ending on lane %s, not retried: %s"
+             % (repo, number, lane, why_not))
 
     def _unauthenticated(self, repo: str, number: int, fix: bool, lane: str,
                          reason: str) -> None:

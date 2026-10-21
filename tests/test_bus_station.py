@@ -3962,8 +3962,8 @@ class RetryTest(Base):
         self.heartbeat("anthropic")
         self.failed(body=BODY)
         self.run_pass()
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
-        self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:queued", "wait:lane"])
+        self.assertIn("Not retried: no other eligible lane is available;", self.bodies()[-1])
 
     def test_a_ticket_body_that_does_not_parse_is_not_retried(self):
         # Model: given twice with two values, so no lane's eligibility can be judged.
@@ -3971,8 +3971,45 @@ class RetryTest(Base):
         self.failed(body=BODY)
         self.fake.issues[12]["body"] = "Model: claude-sonnet-5-5\nModel: claude-opus-5-5\n\nWork."
         self.run_pass()
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
-        self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:queued", "wait:lane"])
+        self.assertIn("Not retried: no other eligible lane is available;", self.bodies()[-1])
+
+    def test_a_transient_ending_with_no_retry_left_keeps_its_rung_and_is_no_failure(self):
+        # A token-mint outage climbed six tickets a rung each in 35 minutes
+        # (2026-10-20): the retries were used, so the ticket went to
+        # loom:failed and the factory climbed (loom#1395).
+        body = BODY.replace("Model: model-x", "Model: claude-opus-5-5")
+        self.failed(body=body, reason="[transient] could not mint a GitHub App token")
+        self.fake.comments[12][:0] = [
+            {"body": "Automatic retry 1 of 2 (transient): moved from lane a to lane b. x"},
+            {"body": "Automatic retry 2 of 2 (transient): moved from lane b to lane codex. x"}]
+        plain = list(self.fake.comments[12])
+        self.run_pass()
+        names = self.fake.names(12)
+        self.assertNotIn("loom:failed", names)
+        self.assertNotIn("loom:running", names)
+        self.assertIn("loom:queued", names)
+        self.assertIn("wait:lane", names)
+        self.assertEqual([n for n in names if n.startswith("lane:")], [])
+        # The rung is its Model: line and its rung markers: neither moved.
+        self.assertIn("Model: claude-opus-5-5", self.fake.issues[12]["body"])
+        self.assertFalse([b for b in self.bodies() if factory.RUNG_RE.search(b)])
+        # Only a status event that ends the claim as [transient].
+        self.assertEqual([b for b in self.bodies() if b.startswith("Lane codex")],
+                         ["Lane codex stopped: [transient] could not mint a GitHub App token. "
+                          "Not retried: 2 of 2 automatic retries used; the ticket is back in "
+                          "the queue on its rung."])
+        # No new comment: each one emails the operator.
+        self.assertEqual([c for c in self.fake.comments[12]
+                          if not c["body"].startswith(status.MARKER)], plain)
+
+    def test_a_transient_ending_that_cannot_retry_is_not_counted_toward_runaway(self):
+        self.failed(body=BODY, reason="[transient] agent exited 1")
+        self.run_pass()
+        self.failed(body=BODY, reason="[transient] agent exited 1", number=13)
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+        self.assertNotIn("loom:runaway", self.fake.names(13))
 
     def test_a_limit_with_no_other_lane_to_retry_on_is_not_a_failure(self):
         # On 2026-10-18 such a limit went to loom:failed and the factory
@@ -3991,10 +4028,10 @@ class RetryTest(Base):
         self.heartbeat("zen")
         self.failed(body=PLAIN)
         self.run_pass()
-        self.assertIn("loom:failed", self.fake.names(12))
+        self.assertNotIn("lane:zen", self.fake.names(12))
         self.failed(body=EASY, number=13)
         self.run_pass()
-        self.assertIn("loom:failed", self.fake.names(13))  # the repo is private
+        self.assertNotIn("lane:zen", self.fake.names(13))  # the repo is private
         self.fake.private = False
         self.failed(body=EASY, number=14)
         self.run_pass()
@@ -4011,9 +4048,10 @@ class RetryTest(Base):
                      "Lane anthropic failed: [limit] agent exited 1"},
         ]
         self.run_pass()
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
-        self.assertEqual(self.bodies()[-1], "Lane codex failed: [transient] agent exited 1. "
-                                            "Not retried: 2 of 2 automatic retries used.")
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:queued", "wait:lane"])
+        self.assertEqual(self.bodies()[-1],
+                         "Lane codex stopped: [transient] agent exited 1. Not retried: 2 of 2 "
+                         "automatic retries used; the ticket is back in the queue on its rung.")
         self.assertEqual(self.listing("codex-2"), [])
 
     def test_the_cap_comes_from_the_settings(self):
@@ -4021,7 +4059,8 @@ class RetryTest(Base):
         self.settings.retry_max = 0
         self.failed()
         self.run_pass()
-        self.assertIn("loom:failed", self.fake.names(12))
+        self.assertNotIn("loom:failed", self.fake.names(12))
+        self.assertIn("loom:queued", self.fake.names(12))
 
     def test_lanes_an_earlier_retry_left_are_not_chosen_again(self):
         self.heartbeat("codex-2")
@@ -4277,6 +4316,21 @@ class RetryTest(Base):
         self.assertEqual(self.bodies()[-1], "Lane codex failed: [transient] agent exited 1. "
                          "This was a fix round on pull request #99; the ticket is back at "
                          "loom:pr and the pull request is unchanged.")
+        self.assertEqual(self.listing("codex-2"), [])
+
+    def test_a_fix_round_with_a_transient_ending_and_no_retry_stays_on_its_pull_request(self):
+        # No retry is left, and a fix round is never retried on a new branch:
+        # the ticket keeps its pull request, its lane and its rung (loom#1395).
+        self.heartbeat("codex-2")
+        self.settings.retry_max = 0
+        fix = tickets.parse_fix(REPO, FIX_BODY)
+        self.failed(reason="[transient] could not mint a GitHub App token", attempt=2, fix=fix)
+        body_before = self.fake.issues[12]["body"]
+        self.run_pass()
+        names = self.fake.names(12)
+        self.assertEqual(names, ["loom:ticket", "lane:codex", "loom:pr"])
+        self.assertEqual(self.fake.issues[12]["body"], body_before)
+        self.assertFalse([b for b in self.bodies() if factory.RUNG_RE.search(b)])
         self.assertEqual(self.listing("codex-2"), [])
 
     def test_a_fix_brief_that_fails_its_work_goes_to_failed_so_the_factory_climbs(self):

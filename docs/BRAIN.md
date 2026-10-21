@@ -884,8 +884,19 @@ second one.
   the slots share), then anthropic, its slots, codex, codex-2, opencode-go
   and agy, then free lanes for an easy ticket on a public repo. Never
   claude, and never a lane an earlier retry left.
-- Any other failure, or one with no retry or lane left, is reported as
-  failed above, saying why it was not retried.
+- A transient failure with no retry or lane left costs the ticket nothing: it
+  goes back to `loom:queued` with `wait:lane`, its `Model:` line and rung
+  markers untouched, and a status event `Lane <lane> stopped: [transient]
+  <reason>. Not retried: <why>` ends the claim (a limit ending likewise waits
+  `loom:briefed`). It never goes to `loom:failed`, and the factory gives the
+  queued ticket a lane again (loom#1395).
+- Any other failure is reported as failed above. The factory climbs the model
+  ladder for a `loom:failed` ticket only when the class of its newest ending
+  is `[work]` (or none). A ticket whose newest claim ended `[transient]`,
+  `[limit]`, `[factory]` or `[auth]` that is found at `loom:failed` anyway goes
+  back to `loom:pr` (it has a pull request) or `loom:queued`, on its current
+  rung, with a `Not a failure` status event. A runaway or `needs-brain` ticket,
+  and one the factory already gave up on past the last rung, stays as it is.
 
 The station applies the retry labels with its own login, so that login must
 be in `LOOM_BRIEF_AUTHORS`, or the trust rules refuse the retried ticket.

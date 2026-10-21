@@ -1899,6 +1899,87 @@ class Tickets(Base):
         self.assertIn({"name": "loom:pr"}, self.fixed[0][2])
         self.assertNotIn({"name": "loom:failed"}, self.fixed[0][2])
 
+    def ended(self, number, text, lane="zai"):
+        """The ticket's claim on `lane` and the ending that closed it."""
+        at = iso(3600 - 60 * len(self.gh.comments[number]))
+        self.gh.comments[number] += [
+            {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane, "user": ME,
+             "created_at": at},
+            {"body": text, "user": ME, "created_at": at}]
+
+    def requeued(self, number):
+        labels = [x["name"] for x in self.gh.issues[number]["labels"]]
+        return ("loom:queued" in labels and "loom:failed" not in labels
+                and not [x for x in labels if x.startswith("lane:")])
+
+    def notes(self, number):
+        return [c["body"] for c in status.expand(self.gh.comments[number], [ME["login"]])]
+
+    def test_a_failed_ticket_does_not_climb_for_a_transient_limit_or_factory_ending(self):
+        # 43 of 227 climbs since 2026-10-14 followed such an ending (loom#1395).
+        for n, text in ((6, "Lane zai failed: [transient] could not mint a GitHub App token. "
+                            "Not retried: 2 of 2 automatic retries used."),
+                        (7, "Lane zai failed: [limit] agent exited 3: provider limit reached"),
+                        (8, "Lane zai failed: [factory] held: validation incident"),
+                        (9, "Lane zai failed: [auth] the key was refused"),
+                        (10, "Lane zai stopped: [transient] agent exited 1")):
+            self.gh.ticket(n, "failed", lane="zai")
+            self.ended(n, text)
+        self.go()
+        self.assertEqual((self.moved, self.fixed), ([], []))
+        for n in range(6, 11):
+            self.assertTrue(self.requeued(n), n)
+            self.assertIsNone(self.model(n))  # its Model: line is untouched
+            self.assertFalse([c for c in self.gh.comments[n] if factory.RUNG_RE.search(c["body"])])
+            self.assertTrue([b for b in self.notes(n) if b.startswith("Not a failure")], n)
+
+    def test_a_failed_ticket_still_climbs_for_a_work_ending(self):
+        for n, text in ((6, "Lane zai failed: [work] validation failed: the check exited 2"),
+                        (7, "Lane zai failed: agent exited 1")):
+            self.gh.ticket(n, "failed", lane="zai")
+            self.ended(n, text)
+        self.go()
+        self.assertEqual(self.moved, [(6, "briefed", "claude"), (7, "briefed", "claude")])
+
+    def test_only_the_newest_ending_decides_whether_a_failed_ticket_climbs(self):
+        self.gh.ticket(6, "failed", lane="zai")
+        self.ended(6, "Lane zai failed: [transient] agent exited 1")
+        self.ended(6, "Lane zai failed: [work] validation failed: the check exited 2")
+        self.gh.ticket(7, "failed", lane="zai")
+        self.ended(7, "Lane zai failed: [work] validation failed: the check exited 2")
+        self.ended(7, "Lane zai stopped: [limit] agent exited 3: provider limit reached")
+        self.go()
+        self.assertEqual(self.moved, [(6, "briefed", "claude")])
+        self.assertTrue(self.requeued(7))
+
+    def test_a_failed_ticket_with_a_pull_request_and_a_transient_ending_goes_back_to_pr(self):
+        self.gh.ticket(6, "failed", lane="zai")
+        self.gh.pull(60, 6, runs=(("unittest", "in_progress"),))
+        self.ended(6, "Lane zai failed: [transient] agent exited 1")
+        self.go()
+        self.assertEqual((self.moved, self.fixed), ([], []))
+        labels = [x["name"] for x in self.gh.issues[6]["labels"]]
+        self.assertIn("loom:pr", labels)
+        self.assertNotIn("loom:failed", labels)
+        self.assertIn("lane:zai", labels)
+
+    def test_a_transient_ending_does_not_free_a_ticket_left_past_the_ladder(self):
+        # _give_up leaves such a ticket failed; moving it back would only
+        # have the next pass fail it again.
+        self.gh.ticket(6, "failed", lane="zai")
+        self.ended(6, "Lane zai failed: [transient] agent exited 1")
+        self.gh.comments[6].append({"body": factory.GAVE_UP + " (x; ran on none).", "user": ME})
+        self.go()
+        self.assertFalse(self.requeued(6))
+        self.assertIn({"name": "loom:failed"}, self.gh.issues[6]["labels"])
+
+    def test_a_runaway_ticket_with_a_transient_ending_stays_held(self):
+        self.gh.ticket(6, "failed", lane="zai")
+        self.gh.issues[6]["labels"].append({"name": "loom:runaway"})
+        self.ended(6, "Lane zai failed: [transient] agent exited 1")
+        self.go()
+        self.assertFalse(self.requeued(6))
+
     def no_reason_failure(self, number):
         return {"body": "Lane zai failed: [work] agent made no commit and wrote no reason "
                         "on loom/%d-x" % number, "user": ME}

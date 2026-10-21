@@ -191,7 +191,8 @@ The station turns trusted
 ticket, with local paths removed from failure reasons; the runner adds
 `Refs <owner/name>#<number>` to the pull request. A limit or transient
 failure moves the ticket to another available lane as a new attempt, at most
-`LOOM_RETRY_MAX` times (default 2). A run that exits 124 after editing pushes
+`LOOM_RETRY_MAX` times (default 2); one with no retry left goes back to
+`loom:queued` on its rung, never to `loom:failed` (loom#1395). A run that exits 124 after editing pushes
 its edits to a side branch `<branch>-timedout-<time>` and names it in the
 failure reason; the retry's brief tells the next attempt to start from that
 branch. A fix round that fails transiently goes
