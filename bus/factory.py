@@ -2322,13 +2322,18 @@ class Factory:
 
     def _rung_waits_long(self, repo: str, rung: int) -> bool:
         """Whether no lane of the rung serves its model within RUNG_LIMIT_WAIT:
-        each is down, or holds the model limited past it. A lane at a limit
-        with no known end is not counted as a long wait."""
+        each is down, at a limit lifting past it, or holds the model limited
+        past it. A lane at a limit with no known end is not counted as a long
+        wait. A whole-lane limit (out of credit: no limited_models) once never
+        counted, and nine tickets waited a day on codex and codex-2 while other
+        lanes had room (2026-10-21)."""
         model = CLIMB[rung - 1][1]
         lanes = self._rung_lanes(repo, rung)
+        later = self.now + RUNG_LIMIT_WAIT
         return bool(lanes) and all(
             lane in self.down
-            or self.model_limits.get(lane, {}).get(model, 0) > self.now + RUNG_LIMIT_WAIT
+            or (lane in self.limited and self.limit_until.get(lane, 0) > later)
+            or self.model_limits.get(lane, {}).get(model, 0) > later
             for lane in lanes)
 
     def _step_aside(self, repo: str, issue: Dict[str, Any]) -> None:
