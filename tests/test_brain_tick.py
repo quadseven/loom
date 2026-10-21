@@ -31,6 +31,11 @@ if [ "$3 $4" = "app token" ]; then
   printf '%s\\n' "$FAKE_APP_TOKEN"
   exit 0
 fi
+if [ "$3 $4" = "app login" ]; then
+  [ -n "${FAKE_APP_LOGIN:-}" ] || { echo "no App key" >&2; exit 2; }
+  printf '%s\\n' "$FAKE_APP_LOGIN"
+  exit 0
+fi
 if [ "$3" = lock ]; then
   # FAKE_LOCK_FREE_AFTER=n: the lock is held for the first n tries.
   if [ -n "${FAKE_LOCK_FREE_AFTER:-}" ]; then
@@ -60,6 +65,7 @@ FAKE_LOG=@LOG@
 printf 'opencode %s\\n' "$*" >> "$FAKE_LOG"
 printf 'opencode env GH_TOKEN=%s GITHUB_TOKEN=%s LOOM_REPOS=%s HOME=%s\\n' \\
   "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" "${LOOM_REPOS:-}" "$HOME" >> "$FAKE_LOG"
+printf 'opencode login %s\\n' "${LOOM_GITHUB_LOGIN:-none}" >> "$FAKE_LOG"
 printf 'opencode cwd %s\\n' "$PWD" >> "$FAKE_LOG"
 env | grep -E '^(LOOM_|SSL_CERT_FILE=)' | sed 's/^/opencode setting /' >> "$FAKE_LOG"
 exit "${FAKE_OPENCODE_EXIT:-0}"
@@ -465,6 +471,17 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("opencode env GH_TOKEN=ghs_brain.tok-en GITHUB_TOKEN=ghs_brain.tok-en "
                       "LOOM_REPOS=example/project HOME=%s/run/brain-home" % self.home, calls)
         self.assertNotIn("gh auth token", calls)
+
+    def test_the_brains_agent_is_told_its_app_login(self):
+        # GET /user refuses an installation token, so the agent's journal
+        # needs the App's login handed to it (2026-10-21).
+        self.usage("claude", False, "limit: provider limit reached")
+        self.usage("spark", True)
+        _, calls = self.tick(LOOM_SPARK_MODEL="spark/coder",
+                             LOOM_SPARK_URL="http://spark.invalid:8000/v1",
+                             LOOM_GITHUB_APP_ID="123", FAKE_APP_TOKEN="ghs_brain.tok-en",
+                             FAKE_APP_LOGIN="loom-brain[bot]")
+        self.assertIn("opencode login loom-brain[bot]", calls)
 
     def test_a_tick_whose_app_token_cannot_be_minted_runs_no_rung(self):
         self.usage("codex", True)

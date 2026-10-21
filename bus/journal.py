@@ -1,6 +1,7 @@
 """The journal and report comment formats from docs/BRAIN.md."""
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
@@ -200,9 +201,11 @@ def merged(new: str, old: str, limit: int = JOURNAL_MAX) -> str:
 
 
 def _self_login(gh: GitHub) -> str:
-    """The login this client posts as: the App's bot login, else the token's
-    user (read once and kept on the client)."""
-    login = gh.app_login()
+    """The login this client posts as: the App's bot login, else
+    LOOM_GITHUB_LOGIN (brain.sh sets it for an agent that holds only an
+    installation token, which GET /user refuses), else the token's user (read
+    once and kept on the client)."""
+    login = gh.app_login() or os.environ.get("LOOM_GITHUB_LOGIN", "").strip()
     if login:
         return login
     if getattr(gh, "_journal_login", None) is None:

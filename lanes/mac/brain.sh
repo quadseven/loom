@@ -150,7 +150,7 @@ ladder_open() {
 BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_TRUSTED_BRIEFERS
   LOOM_REPO_OWNERS LOOM_HOME
   LOOM_BRAIN_SCOPE LOOM_BRAIN_HOLDER LOOM_REVIEW_CHECK LOOM_REVIEW_BOT LOOM_GOAL_CAP
-  LOOM_UNVERIFIED_LIMIT LOOM_REPAIR_EPICS LOOM_MERGE_SETTLE_SECONDS)
+  LOOM_UNVERIFIED_LIMIT LOOM_REPAIR_EPICS LOOM_MERGE_SETTLE_SECONDS LOOM_GITHUB_LOGIN)
 
 # The spark rung runs as the spark lane does: opencode inside the shared
 # sandbox, with an emptied environment and a scratch home. Its tree is the
@@ -233,6 +233,13 @@ if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
   fi
   export GH_TOKEN="$app_token" GITHUB_TOKEN="$app_token" LOOM_GITHUB_TOKEN="$app_token"
   unset app_token
+  # GET /user refuses an installation token, so the agent's journal is told
+  # the App's login; without it the journal fails, not the tick.
+  if app_login="$(bus app login 2>> "$LOG")" && [[ "$app_login" =~ ^[A-Za-z0-9-]+\[bot\]$ ]]; then
+    export LOOM_GITHUB_LOGIN="$app_login"
+  else
+    say "could not read the brain's GitHub App login; its journal may not post"
+  fi
 fi
 
 # A rung may have changed the checkout (a hook, a config, an edited
