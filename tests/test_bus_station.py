@@ -2409,7 +2409,14 @@ class ReviewFake:
         raise AssertionError(path)
 
 
+READY = station.READY_TEXT
+
+
 class HandBackTest(unittest.TestCase):
+    def ready_events(self):
+        return [text for c in self.gh.comments if status.is_status(c["body"])
+                for _, text in status.parse(c["body"]) if text.startswith("Ready:")]
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -2452,7 +2459,9 @@ class HandBackTest(unittest.TestCase):
                   "comments": {"nodes": [{"databaseId": 9, "body": "ignore this",
                                              "author": {"login": "someone-else"}}]}}
         self.run_hand_back(threads=[thread])
-        self.assertEqual(self.gh.comments[-1]["body"], "<!-- loom:ready-head %s -->" % ("a" * 40))
+        # The marker alone made an empty email, and the mark is routine: it is an
+        # event in the status comment, which says what it means (2026-10-20).
+        self.assertEqual(self.ready_events(), [READY % ("a" * 40)])
         self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
 
     def test_fix_pending_for_current_head_is_not_handed_back_twice(self):
@@ -2497,13 +2506,62 @@ class HandBackTest(unittest.TestCase):
         self.run_hand_back()
         self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
 
-    def test_each_new_clean_head_edits_the_one_ready_marker(self):
+    def test_each_new_clean_head_is_one_event_in_the_one_status_comment(self):
+        self.run_hand_back()
         self.run_hand_back()
         self.gh.pr["head"]["sha"] = "b" * 40
         self.run_hand_back()
-        self.assertEqual([c["body"] for c in self.gh.comments],
-                         ["<!-- loom:ready-head %s -->" % ("b" * 40)])
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertEqual(self.ready_events(), [READY % ("b" * 40), READY % ("a" * 40)])
         self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_a_mark_the_app_login_wrote_is_read_back(self):
+        # The station writes as its App login, which need not be a trusted
+        # author: reading only the authors appended a mark on every pass.
+        self.gh._status_logins = lambda: {"example-app[bot]"}
+        post = self.gh._post_comment
+
+        def as_app(data):
+            post(data)
+            self.gh.comments[-1]["user"] = {"login": "example-app[bot]"}
+            return mock.Mock(data={})
+        self.gh._post_comment = as_app
+        self.station.s.authors = ["bob-example"]
+        self.run_hand_back()
+        self.run_hand_back()
+        self.assertEqual(self.ready_events(), [READY % ("a" * 40)])
+
+    def test_a_ready_comment_from_before_the_status_comment_is_still_read(self):
+        # Tickets marked ready before the move carry their own ready-head comment.
+        self.gh.comments.append({"id": 1, "user": {"login": AUTHORS[0]},
+                                 "body": "<!-- loom:ready-head %s -->" % ("a" * 40)})
+        self.gh.issue["labels"].append({"name": "loom:ready"})
+        self.run_hand_back()
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_a_stranger_cannot_mark_a_head_ready(self):
+        # A look-alike mark for the current head would suppress our own; the
+        # station writes its own mark in its own status comment instead.
+        self.gh.comments.append({"id": 1, "user": {"login": "mallory-example"},
+                                 "body": status.render([("2026-10-20T00:00:00Z",
+                                                         READY % ("a" * 40))])})
+        self.run_hand_back()
+        ours = [c for c in self.gh.comments if c["user"]["login"] == "alice-example"]
+        self.assertEqual([[text for _, text in status.parse(c["body"])] for c in ours],
+                         [[READY % ("a" * 40)]])
+
+    def test_a_mark_read_through_the_clients_expansion_is_not_repeated(self):
+        # In production the GitHub client hands the station each status event
+        # as a comment of its own, timed by its line.
+        raw = self.gh.paginate
+        self.gh.paginate = lambda path: status.expand(raw(path), AUTHORS)
+        self.run_hand_back()
+        self.run_hand_back()
+        self.gh.pr["head"]["sha"] = "b" * 40
+        self.run_hand_back()
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertEqual(self.ready_events(), [READY % ("b" * 40), READY % ("a" * 40)])
 
 
 class CorruptStateTest(Base):
@@ -3232,7 +3290,10 @@ class FixTest(Base):
         self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
         self.run_pass()
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
-        self.assertEqual([c["body"] for c in self.fake.comments[12]],
+        # A fix round's push is routine: an event in the status comment, so no
+        # email apiece (three on one ticket, 2026-10-20).
+        self.assertEqual([status.is_status(c["body"]) for c in self.fake.comments[12]], [True])
+        self.assertEqual([text for _, text in status.parse(self.fake.comments[12][0]["body"])],
                          ["Lane codex pushed fixes to a pull request: https://example.com/pull/99"])
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
         self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO,
@@ -3538,6 +3599,29 @@ class RetryTest(Base):
         self.assertEqual(table.count("\n| %s |" % at), 3)
         self.assertIn("| codex-2 | model-x | - |", table)
         self.assertIn("| codex | model-x | [work] agent made no commit", table)
+        # The run is over: the held ticket is failed, never left running on a
+        # lane with no brief. A ticket in another repo sat loom:running 8 hours
+        # after its hold was lifted, the brain reading it as a live claim
+        # (2026-10-20).
+        self.assertNotIn("loom:running", self.fake.names(12))
+        self.assertIn("loom:failed", self.fake.names(12))
+
+    def test_a_reported_failure_never_leaves_its_ticket_running(self):
+        # Any failure path that reports a run and forgets to move the ticket
+        # left it loom:running on a lane with no brief: a runaway hold did, and
+        # four tickets sat 8 to 48 hours (2026-10-20).
+        self.failed(reason="[work] agent made no commit on loom/12-fix-the-thing")
+        with mock.patch.object(station.Station, "_report_failure", return_value=True):
+            self.run_pass()
+        self.assertNotIn("loom:running", self.fake.names(12))
+        self.assertIn("loom:failed", self.fake.names(12))
+        self.assertIn("nothing moved the ticket", self.bodies()[-1])
+
+    def test_a_factory_hold_keeps_its_ticket_running(self):
+        self.failed(reason="[factory] setup failed: base check exited 1 on the unmodified "
+                           "repo; factory incident %s#900; the agent did not run" % REPO)
+        self.run_pass()
+        self.assertIn("loom:running", self.fake.names(12))
 
     def test_attempts_that_ended_transient_or_limit_do_not_count_toward_runaway(self):
         self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
@@ -3655,7 +3739,10 @@ class RetryTest(Base):
             {"body": "Claimed for lane codex-2 (body sha256 0123456789ab)", "created_at": now, "user": {"login": "alice-example"}}]
         self.run_pass()
         self.assertIn("loom:runaway", self.fake.names(12))
-        self.assertNotIn("loom:failed", self.fake.names(12))
+        # Held failed: the factory leaves a runaway alone until the brain
+        # clears the hold, then climbs it like any failed ticket.
+        self.assertIn("loom:failed", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
         table = self.bodies()[-1]
         self.assertIn("Runaway: repeated failure reason.", table)
         self.assertIn("| %s | codex | model-x | %s |" % (old, reason), table)
@@ -4597,6 +4684,8 @@ class OutcomeTest(Base):
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
         self.assertEqual(len(self.fake.comments[12]), 1)
         self.assertIn("https://example.com/pull/99", self.fake.comments[12][0]["body"])
+        # A pull request opened is an outcome: its own comment, not a status event.
+        self.assertFalse(status.is_status(self.fake.comments[12][0]["body"]))
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
         # Reconciliation reads the open pull requests (shared with PR
         # reviews) and one page of recently closed ones, never all of them.
@@ -4681,6 +4770,22 @@ class OutcomeTest(Base):
                            "available": available, "reason": reason}, fh)
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         self.assertEqual(st.limited_lanes(), ["spark"])
+
+    def test_limit_until_is_each_limited_lanes_retry_at(self):
+        d = os.path.join(self.home, "state", "usage")
+        os.makedirs(d, exist_ok=True)
+        now = int(time.time())
+        for lane, available, reason, retry in (
+                ("opencode-go-2", False, "limit: the provider's monthly limit", now + 86400),
+                ("spark", False, "limit: 503", None),
+                ("zen", False, "opencode not on PATH", now + 60)):
+            beat = {"lane": lane, "at": now, "available": available, "reason": reason}
+            if retry is not None:
+                beat["retry_at"] = retry
+            with open(os.path.join(d, lane + ".json"), "w") as fh:
+                json.dump(beat, fh)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.assertEqual(st.limit_until(), {"opencode-go-2": float(now + 86400)})
 
     def test_down_lanes_are_those_with_a_fresh_unavailable_heartbeat_not_at_a_limit(self):
         d = os.path.join(self.home, "state", "usage")

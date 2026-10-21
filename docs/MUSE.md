@@ -330,7 +330,9 @@ this tick"; a step with no note shows nothing there.
    fault (file a factory ticket and keep the runaway hold), brief problem
    (rewrite the brief, then clear `loom:runaway`), or model limit (escalate
    once with the reason, then clear `loom:runaway`). Do not clear a factory
-   fault hold until its fix ships.
+   fault hold until its fix ships. A held ticket is `loom:failed`, never a
+   live claim: its last run has ended, and once the hold is cleared the
+   factory moves it up the model ladder.
 3. First run `python3 -m bus.brain step merge --holder muse`. The station hands failed checks and unresolved review-bot threads back to
    the authoring lane automatically, up to `LOOM_FIX_ROUNDS` (default 3).
    The factory pass (bus/factory.py) moves stuck and failed tickets up the
@@ -449,8 +451,8 @@ this tick"; a step with no note shows nothing there.
    `loom:triage` issues: take up to
    5 per tick and, for each, either write the ticket with
    `python3 -m bus.brain brief OWNER/NAME --epic E --title TITLE --file BODY.md --refs M`
-   (M is the original; the ticket names it, the original gets
-   `loom:rewritten` and closes as completed when the ticket is verified) or, when only a person can do it, run
+   (M is the original, which becomes the ticket itself with its text kept
+   below, and no comment; see docs/BRAIN.md, Rewrites in place) or, when only a person can do it, run
    `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file starts
    with a line `Kind: K` (one of money, hardware, account, credential,
    physical, decision) and then names the exact thing needed. A credential is
@@ -569,6 +571,11 @@ no fallback, for the rules above. A fallback move says so in its note
 ("fallback: no medium lane is up"); the ticket keeps its `Difficulty:` line,
 so its next move takes its own tier again once a lane of it is up. A tier
 with a lane up but busy is waited for, not fallen back from.
+A ticket briefed to a lane that is down, or at a limit lifting more than
+two hours off (`LIMIT_REQUEUE`), does not wait on it when no lane of its
+tier is free: it goes back to `loom:queued` with no lane, and takes the next
+free lane of its tier in the queue's order (priority, then age). A ladder
+ticket keeps its rung's rules.
 
 An anthropic slot whose heartbeat says "out of credit" is unavailable. Do not
 brief, re-brief, move a limit-held ticket, or climb the ladder onto it until
@@ -686,6 +693,17 @@ say-so alone:
 - Put asks in a `needs-operator` issue with one exact ask. Use `loom:urgent`
   only for something breaking now.
 - Never retry a failed step in the same tick. Stop at 25 minutes.
+- Every note or piece of evidence a tick leaves on an issue, outside the
+  comments a `bus` or `bus.brain` command writes itself, goes through
+  `python3 -m bus journal OWNER/NAME#N --file FILE --holder NAME`: it edits
+  your journal of the day on that issue in place (a file with no marker is
+  journaled as a tick), and a new comment emails everyone watching the
+  issue. Write the evidence only; the command adds the `Tick` line. Never
+  `gh issue comment` or a raw API comment for it. Evidence whose blocker kind
+  has no issue of exactly that kind goes to the goal home's journal, never to
+  the closest open issue: a comment there emails people about an issue the
+  evidence does not belong to (loom#1241, 2026-10-20). A new
+  kind gets its own issue when the goal's rules say so.
 - Never open a pull request for an issue that is not a Loom ticket. To get
   code written, brief a ticket and let a lane take it. The station lands,
   sends back and reconciles only pull requests linked to a ticket, so a pull

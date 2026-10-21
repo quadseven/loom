@@ -1,10 +1,10 @@
 """Use a configured agent to rewrite a loom:triage issue into a ticket.
 
 The agent command reads the issue prompt on stdin and writes a JSON draft to
-stdout. Code validates that draft, then files a queued ticket or a human ask.
-The original issue is never retitled or edited; brain.brief and
-brain.human add a comment and labels, and brain.settle_source closes it once
-its ticket is verified.
+stdout. Code validates that draft, then makes a queued ticket or a human ask.
+brain.brief turns the issue itself into the ticket, or, for an issue the
+station could not claim, files a new ticket and brain.settle_source closes
+the issue once that ticket is verified; brain.human adds a comment and labels.
 """
 from __future__ import annotations
 

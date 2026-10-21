@@ -211,7 +211,7 @@ class Base(unittest.TestCase):
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
-           down=()):
+           down=(), limit_until=None):
         def merge(gh, repo, number, ticket):
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes, lane=None, model=None):
@@ -230,7 +230,7 @@ class Base(unittest.TestCase):
                             merge=merge, fix=fix, move=move, close=close,
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
-                            silent=silent, down=down)
+                            silent=silent, down=down, limit_until=limit_until)
         f.run()
         return f
 
@@ -1727,6 +1727,33 @@ class Tickets(Base):
                             for c in say.call_args_list), say.call_args_list)
         self.assertEqual(self.moved, [])
 
+    def tier_busy_on(self, lane, lifts_in):
+        """A medium ticket briefed on `lane`, at a limit that lifts in
+        `lifts_in` seconds, while every other lane of its tier is up and busy."""
+        self.gh.ticket(7, "briefed", lane=lane, body="Difficulty: medium\n\n## Why\nx\n")
+        self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                              "created_at": iso(60)}]
+        busy = [x for x in factory.lanes_of("medium", True) if x != lane]
+        for n, other in enumerate(busy, 20):
+            self.gh.ticket(n, "briefed", lane=other)
+        self.go(limited=[lane], available=busy, limit_until={lane: NOW + lifts_in})
+
+    def test_a_ticket_on_a_lane_limited_for_days_goes_back_to_the_queue(self):
+        # Two medium tickets sat 18 hours briefed to lanes at a monthly limit
+        # while the queue took every lane of their tier as it freed
+        # (loom#1224, 2026-10-20).
+        self.tier_busy_on("opencode-go-2", 11 * 86400)
+        self.assertIn("loom:queued", {x["name"] for x in self.gh.issues[7]["labels"]})
+        self.assertEqual({x["name"] for x in self.gh.issues[7]["labels"]} & {"loom:briefed", "lane:opencode-go-2"}, set())
+        note = self.gh.comments[7][-1]["body"]
+        self.assertIn("Not a failure (lane opencode-go-2 is at a limit until", note)
+        self.assertIn("goes back to the queue", note)
+
+    def test_a_ticket_whose_lane_frees_up_soon_keeps_waiting_for_it(self):
+        self.tier_busy_on("opencode-go-2", 30 * 60)
+        self.assertEqual(self.lane(7), "opencode-go-2")
+        self.assertIn("loom:briefed", {x["name"] for x in self.gh.issues[7]["labels"]})
+
     def test_a_limit_move_posts_no_rung_marker(self):
         self.limited_easy()
         self.assertFalse(any(factory.RUNG_RE.search(c["body"]) for c in self.gh.comments[7]))
@@ -2253,7 +2280,7 @@ class Helpers(unittest.TestCase):
         class Fake:
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
-                         model_limits=None, silent=None, down=()):
+                         model_limits=None, silent=None, down=(), limit_until=None):
                 self.silent_running, self.silent = {}, silent
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))

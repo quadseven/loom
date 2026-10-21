@@ -124,6 +124,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
@@ -311,6 +312,9 @@ RUNG_BUSY = 2
 # rung's one lane for a day while two fix rounds and their open pull requests
 # waited on it (2026-10-19).
 RUNG_LIMIT_WAIT = 2 * 3600
+# A tier ticket briefed to a lane that is down, or at a limit lifting further
+# off than this, goes back to the queue when no lane of its tier is free.
+LIMIT_REQUEUE = 2 * 3600
 # A running ticket on a lane with no live heartbeat for this long moves off it.
 SILENT_MAX = 30 * 60
 RUNG_MARKER = "<!-- loom:rung %d -->"
@@ -1134,7 +1138,8 @@ class Factory:
                  held: Sequence[str] = (),
                  model_limits: Optional[Dict[str, Dict[str, float]]] = None,
                  silent: Optional[Dict[str, float]] = None,
-                 down: Sequence[str] = ()) -> None:
+                 down: Sequence[str] = (),
+                 limit_until: Optional[Dict[str, float]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1152,6 +1157,8 @@ class Factory:
         # aside as from a limit. Left to the BRIEFED_STALL move, three tickets
         # waited two hours on lanes whose key had expired (2026-10-19).
         self.down = set(down)
+        # Lane -> epoch its limit lifts, from its heartbeat (retry_at).
+        self.limit_until = dict(limit_until or {})
         # Lane -> {model: epoch its limit lifts}: a lane with a model ladder
         # is up while one model is limited, but not for that model.
         self.model_limits = dict(model_limits or {})
@@ -2123,6 +2130,13 @@ class Factory:
         _say("moved %s#%d off busy lane %s to %s" % (repo, issue["number"], old, lane))
         return True
 
+    def _out_long(self, lane: str) -> bool:
+        """Whether the lane will take no work for over LIMIT_REQUEUE: down, or
+        at a limit whose heartbeat says it lifts past that."""
+        if lane in self.down and lane not in self.limited:
+            return True
+        return self.limit_until.get(lane, 0) > self.now + LIMIT_REQUEUE
+
     def _rung_waits_long(self, repo: str, rung: int) -> bool:
         """Whether no lane of the rung serves its model within RUNG_LIMIT_WAIT:
         each is down, or holds the model limited past it. A lane at a limit
@@ -2161,6 +2175,23 @@ class Factory:
                 self.actions += 1
                 _say("climbed %s#%d off lane %s, %s, to %s" % (repo, number, old, why, climbed))
                 return
+        if lane is None and not rung and self._out_long(old):
+            # Briefed to a lane that will not take it for hours, it is in no
+            # queue: the queue took each lane of its tier as it freed, and two
+            # tickets sat 18 hours on lanes at a monthly limit (loom#1224).
+            until = self.limit_until.get(old)
+            self._status_note(repo, number, "Not a failure (lane %s is %s): no lane of its "
+                              "tier is free, so the ticket goes back to the queue and takes "
+                              "the next one in its turn." % (
+                                  old, "at a limit until %s" % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until))
+                                  if until else why))
+            kept = [x for x in brain._moved_labels(_labels(issue), "queued", None)
+                    if not x.startswith("lane:")]
+            self._relabel(repo, issue, kept)
+            self.load[old] = self.load.get(old, 0) - 1
+            self.actions += 1
+            _say("queued %s#%d off lane %s, %s" % (repo, number, old, why))
+            return
         if lane is None:
             _say("%s#%d waits on lane %s, %s: no free lane in its %s"
                  % (repo, number, old, why, "rung" if rung else "tier"))

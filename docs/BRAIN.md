@@ -55,7 +55,7 @@ that talks to GitHub about tickets.
 | `loom:shipped` | Deployed. Loom's own tickets are shipped by the station when it deploys the revision that carries their pull request (see Shipping Loom itself); other repos keep their goal home's ship rules, under whoever owns shipping there (which may not be the brain). |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
 | `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
-| `loom:rewritten` | The brain wrote a ticket from this issue; the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
+| `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
 | `loom:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
 | `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:window` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, or a deploy or roll window. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
@@ -366,8 +366,9 @@ epic under that epic's goal.
 
 Triage, the rewriter, health intake, validation contracts and pull request
 adoption file under the goal's intake epic ("Epic: work that triage,
-rewrites and health intake find"), opened by `bus.brain onboard` and again
-whenever the open one holds 15 tickets.
+rewrites and health intake find"): the newest open one holding fewer than 15
+tickets. One is opened by `bus.brain onboard`, and again whenever no open
+intake epic has room.
 
 The station assigns queued tickets to free lanes on each pass. A brain that
 wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
@@ -452,9 +453,33 @@ Code checks the answer before anything is written: the body has every brief
 section, checkboxes under Acceptance criteria, no header lines, and passes the
 written-text check; difficulty is one of the three. A brief is filed queued
 (no lane) with `brief --refs M`; a human ask goes through `human`; a skip or
-an invalid answer writes nothing and is logged. The original issue is never
-retitled or edited; it closes with its ticket (Rewritten issues close with
-their ticket).
+an invalid answer writes nothing and is logged. The issue itself becomes the
+ticket (Rewrites in place).
+
+### Rewrites in place
+
+This changed on 2026-10-20 (loom#1229). Before it, every `brief --refs M`
+filed a second issue and commented "Rewritten as ticket #N" on the first:
+two more notification emails per rewrite, and a duplicate open issue until
+the ticket was verified. Now the issue M itself becomes the ticket:
+
+- its title is the brief's title and its body is the ticket body, with the
+  original title and text kept below under `## Original issue`, collapsed
+  and quoted line by line, so nothing is lost and no reader takes a header,
+  section, checkbox or `Refs` line from it (the lane pull request copies
+  only the named sections);
+- it gets the labels a new ticket would (`loom:ticket` and `loom:queued`, or
+  `loom:briefed` and the lane), is linked under the epic as a sub-issue (its
+  Part of line when GitHub refuses), and loses `loom:triage` and
+  `needs-brain`;
+- no comment is posted and no issue is filed.
+
+A new ticket, the rewrite comment and `loom:rewritten` are kept only where
+the issue cannot become the ticket: its author is not a `LOOM_BRIEF_AUTHORS`
+login (the station claims only a ticket such a login wrote, see Trust), or
+it is locked. A pull request is refused as before, and `--refs` names an
+issue in the brief's own repo. Those sources, and every `loom:rewritten`
+pair made before this change, close with their ticket as below.
 
 A repo that is not public (or whose visibility cannot be read) only ever uses
 the private command, because the public one may run a provider that trains on
@@ -540,6 +565,39 @@ labelled `loom:rewritten`, and carrying the rewrite comment that names this
 ticket. A `Refs #M` line to any other issue changes nothing. Each outcome is
 said once per ticket, and a GitHub failure on the source is logged, never
 raised, since the ticket has already moved.
+
+### Operator-claimed issues close when their pull requests merge
+
+Pull requests never carry a closing keyword, so an issue an operator session
+files or claims (a `claim:<login>` label, no `loom:` label) had nothing to
+close it once its pull request merged: about 60 stayed open in one day
+(loom#1204). Once an hour the station reads each open issue carrying a
+`claim:` label (`bus/claimed.py`). It leaves alone any issue with a `loom:`,
+`needs:`, `needs-`, `ready-for-human`, `wontfix` or `awaiting-live-check`
+label, an epic (`epic` label, an `Epic:` title or sub-issues), and one with
+no acceptance boxes. The rest settle only when every pull request whose
+`Refs` line names the issue is merged into the default branch, the review
+check (`LOOM_REVIEW_CHECK`) concluded success on its head (neutral is not a
+pass), every other check on the head concluded success, skipped or neutral
+(the review bot's other checks conclude neutral when they have nothing to say),
+and no open pull request names the issue. Then:
+
+- **Every box asks for merged code or tests:** one comment starting
+  `<!-- loom:claimed-settle v1 -->` states each pull request, its merge
+  commit, each head check's conclusion by name, and the test functions it
+  added that the default branch still defines; the boxes are ticked and the
+  issue is closed as completed. A comment already there is not posted again.
+- **A box asks for live, deployed or production behaviour, a time window or
+  an observed event:** the issue gets the `awaiting-live-check` label once and
+  stays open for a person. The test is wide on purpose: a box wrongly read as
+  live only labels the issue.
+
+`LOOM_SETTLE_CLAIMED` picks the mode. Unset or `dry` (the default) logs
+`settle-claimed: would close OWNER/NAME#N ...` or `would label ...` and writes
+nothing, so a dry run can be read in the station log first; `on` writes; `off`
+skips the step. `LOOM_SETTLE_CLAIMED_MAX` (default 10) caps the issues settled
+a run, and writes are at least 3 seconds apart. Turning writes on is the
+operator's call: set `LOOM_SETTLE_CLAIMED=on` and run the installer again.
 
 ### Proof audits
 
@@ -743,10 +801,12 @@ newest event first, one `- <UTC time> <text>` line per event (continuation
 lines indented two spaces). That covers a lane given to a queued ticket, a
 claim, a stall, limit or heartbeat move, a rung climb, an equivalent-model
 move, an automatic retry, a lane failure or factory hold the factory acts on
-itself, and a lane stop (a limit, an expired key, a moved branch). A new comment emails the operator; an edit does
+itself, a lane stop (a limit, an expired key, a moved branch), a fix round's
+push to its pull request, and a ready mark (`Ready: checks and review passed on
+head <sha>`; loom#1244). A new comment emails the operator; an edit does
 not (loom#866: zippie#264 carried 77 bot comments). Outcomes (a pull request
-opened or pushed, a failure, merged, shipped, verified, an ask, a runaway
-hold) and `loom:fix` briefs stay new comments. The GitHub client
+opened, a failure, merged, shipped, verified, an ask, a runaway hold) and
+`loom:fix` briefs stay new comments. The GitHub client
 (bus/github.py) expands a status comment in any issue-comment list into one
 comment per event, timed by its line, so every reader sees each event as the
 comment it used to be. Only a trusted login's status comment is edited.
@@ -1043,7 +1103,11 @@ posts the day's first tick and edits that comment for every later tick, the
 new tick at the top and the earlier ticks of the day under a
 `<details><summary>Earlier ticks today</summary>` block, newest first,
 dropping the oldest past 60000 characters. A new comment emails the operator
-and an edit does not. Readers split an edited journal back into its ticks,
+and an edit does not. `bus journal --holder NAME` also takes a file with no
+marker, the brain's evidence or a note for that issue, and journals it as a
+tick the same way, and it replaces a hand-written tick header after the
+marker (`Tick 2026-10-20 23:07Z, muse`) with the canonical line instead of
+stacking two. Readers split an edited journal back into its ticks,
 each at the time on its Tick line (`bus.handoff.expand_journals`). Each tick
 looks like this:
 
