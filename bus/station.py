@@ -421,6 +421,13 @@ VERIFY_FILE = "verify-runs.json"
 VERIFY_REFUSAL_CAP = 3
 # Per ticket, the reasons its proofs were refused.
 VERIFY_REFUSED_FILE = "verify-refused.json"
+# A shipped ticket still unverified this long after its ship takes a lane
+# ahead of build work (loom#964): verify used to run only on a lane with
+# nothing else to do, so a busy factory never verified. At most one lane is
+# taken per VERIFY_RESERVE_EVERY, and the last check is kept here.
+VERIFY_RESERVE_AFTER = 2 * 3600
+VERIFY_RESERVE_EVERY = 1800
+VERIFY_RESERVE_FILE = "verify-reserve.json"
 # Per-lane transient verify failures and the holds they earn (loom#714).
 VERIFY_LANES_FILE = "verify-lanes.json"
 VERIFY_STRIKES = 2
@@ -2292,6 +2299,8 @@ class Station:
         # A runaway held because one dead lane kept failing it goes back to a
         # free lane of its tier on its own (loom#565), before claims.
         self._release_dead_lane_runaways(free)
+        # A starved shipped ticket takes one free lane ahead of build work.
+        free = self._reserve_verify(free)
         if not free:
             self._claim_candidates([])
             self._record_slot_sample(False)
@@ -2654,16 +2663,19 @@ class Station:
     def _verify_repos(self) -> List[str]:
         return [repo for repo in self.s.repos if tickets.REPO_RE.fullmatch(repo)]
 
-    def _verify_pool(self, attempts: Dict[str, Any]
+    def _verify_pool(self, attempts: Dict[str, Any], queued_holds: bool = True
                      ) -> Tuple[List[Tuple[str, Dict[str, Any]]], set]:
         """(the tickets due a verify run, oldest ship first; the lanes queued
-        build work could take, or a failed audit holds)."""
+        build work could take, or a failed audit holds). The reserved lane
+        (_reserve_verify) passes queued_holds=False: queued build work is the
+        very thing it must not wait behind."""
         held = set(self._audit_holds())
         shipped: List[Tuple[str, Dict[str, Any]]] = []
         counts: Dict[Tuple[str, int], int] = {}
         for repo in self._verify_repos():
             issues = self._tickets_open(repo)
-            held |= self._queued_lanes(repo, issues, counts)
+            if queued_holds:
+                held |= self._queued_lanes(repo, issues, counts)
             shipped += [(repo, i) for i in issues]
         unsearchable = sum(1 for _, issue in shipped
                            if "loom:shipped" in _label_names(issue)
@@ -2692,10 +2704,32 @@ class Station:
                  % (lane, time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(until))))
         return holds
 
-    def _hand_verifies(self, idle: List[str]) -> None:
+    def _reserve_verify(self, free: List[str]) -> List[str]:
+        """Take one free lane for the oldest shipped ticket that has waited
+        VERIFY_RESERVE_AFTER since its ship, ahead of build work (loom#964).
+        Idle lanes still verify through _hand_verifies; this gives verify an
+        owner when no lane is ever idle. At most one lane per
+        VERIFY_RESERVE_EVERY, so build work is delayed, never starved. Returns
+        the free lanes that still have an empty inbox."""
+        if not free:
+            return free
+        path = os.path.join(self.state, VERIFY_RESERVE_FILE)
+        last = _read_json(path, {}, strict=False)
+        checked = last.get("at") if isinstance(last, dict) else None
+        if isinstance(checked, (int, float)) and 0 <= self.now - float(checked) < VERIFY_RESERVE_EVERY:
+            return free
+        _write_json(path, {"at": self.now})
+        self._hand_verifies(free, starved_for=VERIFY_RESERVE_AFTER, limit=1)
+        return [lane for lane in free if self._inbox_empty(lane)]
+
+    def _hand_verifies(self, idle: List[str], starved_for: float = 0.0,
+                       limit: int = 0) -> None:
         """Give each idle slot that may verify, has no build work and is
         empty one shipped ticket to verify. The ticket keeps its labels: the
-        station moves it when the result comes back (_report_verify)."""
+        station moves it when the result comes back (_report_verify).
+        starved_for > 0 is the reserved lane's call: only tickets shipped at
+        least that long ago, ignoring the lanes queued build work wants, and
+        at most `limit` hand-outs."""
         lanes = [x for x in idle if provider(x) not in VERIFY_SKIP and self._inbox_empty(x)]
         if not lanes:
             return
@@ -2703,13 +2737,19 @@ class Station:
         attempts = _read_json(path, {}, strict=False)
         attempts = attempts if isinstance(attempts, dict) else {}
         try:
-            pool, held = self._verify_pool(attempts)
+            pool, held = self._verify_pool(attempts, queued_holds=not starved_for)
         except RateLimited:
             raise
         except GitHubError as err:
             _say("could not list tickets to verify: %s" % err)
             return
+        if starved_for:
+            pool = [(repo, issue) for repo, issue in pool
+                    if self.now - float(issue.get("shipped_at", 0) or 0) >= starved_for]
+        handed = 0
         for lane in lanes:
+            if limit and handed >= limit:
+                return
             if lane in held or self._verify_lane_held(lane):
                 continue
             for repo, issue in list(pool):
@@ -2721,6 +2761,7 @@ class Station:
                 if self._no_live_evidence(repo, issue):
                     continue
                 self._write_verify_brief(repo, lane, issue)
+                handed += 1
                 break
 
     def _write_verify_brief(self, repo: str, lane: str, issue: Dict[str, Any]) -> None:
