@@ -588,6 +588,11 @@ one), is free, and has no build work (no briefed ticket claimed for it and no
 queued ticket of its tier or model) is handed one verify run instead of
 idling: the oldest shipped ticket without a proof, at most once per 6 hours
 per ticket, on a public repo only. The brief carries `Deliverable: verify`.
+A shipped ticket that has waited 2 hours since its ship does not wait for an
+idle slot: every 30 minutes at most, one free slot that may verify is taken
+from build work for the oldest such ticket (queued work of the slot's tier does
+not hold it back; a failed proof audit still does), so a factory with build
+work for every lane still verifies what it ships.
 When `LOOM_EVIDENCE_CMDS` is set in the station plist, it is a JSON map from
 `owner/repo` to a read-only shell command. The command receives each eligible
 backticked string from the ticket's Live criterion in

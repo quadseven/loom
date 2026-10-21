@@ -8093,16 +8093,73 @@ class VerifyDispatchTest(Base):
         self.assertEqual(self.briefs("anthropic"), [])
         self.assertEqual(self.briefs("claude"), [])
 
-    def test_build_work_for_the_slot_comes_first(self):
+    def fresh(self):
+        """Both shipped tickets shipped an hour ago: too young to reserve a lane."""
+        for n in (1, 2):
+            self.fake.events[n] = shipped_at(1)
+
+    def test_build_work_for_the_slot_comes_first_while_shipped_work_is_young(self):
+        self.fresh()
         self.fake.add(3, lane="codex", state="briefed")
         self.run_pass()
         self.assertIn("Issue: %s#3\n" % REPO, self.text())
         self.assertEqual(len(self.briefs()), 1)
 
-    def test_a_queued_ticket_of_the_slots_tier_holds_the_slot(self):
+    def test_a_queued_ticket_of_the_slots_tier_holds_the_slot_while_shipped_work_is_young(self):
+        self.fresh()
         self.fake.add(3, lane="codex", state="queued", body="Difficulty: medium\n\nBody\n")
         self.run_pass()
         self.assertEqual(self.briefs(), [])
+
+    # loom#964: verify ran only on a lane with nothing else to do, so a factory
+    # with build work for every lane never verified a shipped ticket.
+    def test_a_busy_lane_verifies_the_oldest_shipped_ticket_ahead_of_build_work(self):
+        self.fake.add(3, lane="codex", state="briefed")
+        self.run_pass()
+        self.assertIn("Issue: %s#2\n" % REPO, self.text())
+        self.assertIn("Deliverable: verify\n", self.text())
+        self.assertEqual(len(self.briefs()), 1)
+        self.assertIn("loom:briefed", self.fake.names(3))
+
+    def test_a_queued_ticket_of_the_slots_tier_does_not_starve_a_shipped_ticket(self):
+        self.fake.add(3, lane="codex", state="queued", body="Difficulty: medium\n\nBody\n")
+        self.run_pass()
+        self.assertIn("Issue: %s#2\n" % REPO, self.text())
+
+    def test_only_one_lane_a_pass_is_taken_from_build_work(self):
+        self.heartbeat("zen")
+        self.fake.add(3, lane="codex", state="briefed")
+        self.fake.add(4, lane="zen", state="briefed")
+        self.run_pass()
+        verifies = [lane for lane in ("codex", "zen")
+                    if any("-verify-" in n for n in self.listing(lane))]
+        self.assertEqual(len(verifies), 1)
+
+    def test_the_lane_is_taken_at_most_once_an_interval(self):
+        self.fake.add(3, lane="codex", state="briefed")
+        self.fake.add(4, lane="codex", state="briefed")
+        self.run_pass()
+        os.remove(os.path.join(self.inbox(), self.briefs()[0]))
+        self.run_pass()
+        self.assertIn("Issue: %s#3\n" % REPO, self.text())
+        self.assertNotIn("Deliverable: verify", self.text())
+
+    def test_the_lane_is_taken_again_after_the_interval(self):
+        self.fake.add(3, lane="codex", state="briefed")
+        self.run_pass()
+        os.remove(os.path.join(self.inbox(), self.briefs()[0]))
+        path = os.path.join(self.home, "state", "station", station.VERIFY_RESERVE_FILE)
+        with open(path, "w") as fh:
+            json.dump({"at": time.time() - station.VERIFY_RESERVE_EVERY - 1}, fh)
+        self.run_pass()
+        self.assertIn("Issue: %s#1\n" % REPO, self.text())
+        self.assertIn("Deliverable: verify\n", self.text())
+
+    def test_a_failed_audit_hold_still_keeps_the_lane_from_the_reserved_run(self):
+        self.failed_audit("codex", 2)
+        self.fake.add(3, lane="codex", state="briefed")
+        self.run_pass()
+        self.assertIn("Issue: %s#3\n" % REPO, self.text())
 
     def test_a_private_repo_is_not_verified_on_a_free_model_lane(self):
         self.fake.private = True
