@@ -3186,6 +3186,21 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         return subprocess.run(["bash", "-c", script, "bash"], env=env,
                               capture_output=True, text=True)
 
+    def test_a_failed_copy_into_a_group_slot_leaves_no_temp_file_behind(self):
+        self.write_provider_limit("opencode-go", "weekly", None)
+        script = self.source_functions("hold_provider_limit", "limit_until", "key_group",
+                                       "write_beat", "utc") + (
+            'mv() { case "$*" in *provider-limit.json) return 1;; esac; command mv "$@"; }\n'
+            'SLOT=opencode-go LANE=opencode-go LIMIT_WHY="the provider weekly limit"\n'
+            'hold_provider_limit; echo "rc=$?"\n')
+        env = {**self.lane_env(), "LOOM_HOME": str(self.loom), "SLOT": "opencode-go",
+               "LANE": "opencode-go"}
+        result = subprocess.run(["bash", "-c", script, "bash"], env=env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "rc=1", result.stderr)
+        leftovers = list((self.loom / "state" / "usage").glob("*.tmp"))
+        self.assertEqual(leftovers, [])
+
     GROUP = ["opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4"]
 
     def test_a_weekly_limit_on_one_group_slot_holds_every_group_slot_until_the_stated_reset(self):

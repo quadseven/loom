@@ -1004,16 +1004,19 @@ limit_until() {
 # Hold every slot in this slot's group until the provider's reset, and
 # hand on every brief still in the inbox this pass.
 hold_provider_limit() {
-  local until slot source checked
+  local until slot source checked tmp
   until="$(limit_until)" || return 0
   LIMITED=1
   source="$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
   checked="$(date +%s)"
   for slot in $(key_group); do
     if [ "$slot" != "$SLOT" ]; then
-      cp "$source" "$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp" || return 1
-      mv -f "$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp" \
-        "$LOOM_HOME/state/usage/$slot.provider-limit.json" || return 1
+      tmp="$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp"
+      if ! cp "$source" "$tmp" \
+        || ! mv -f "$tmp" "$LOOM_HOME/state/usage/$slot.provider-limit.json"; then
+        rm -f "$tmp"
+        return 1
+      fi
     fi
     printf '%s\n' "$checked" > "$LOOM_HOME/state/usage/$slot.provider-check" || return 1
     write_beat "$slot" false "limit: $LIMIT_WHY; unavailable until $(utc "$until")" "$until"
