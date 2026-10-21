@@ -6306,34 +6306,67 @@ class Station:
             return "shipped, and its Live line names nothing a log search can find"
         return ""
 
-    def restate_shipped_live(self) -> None:
-        """Restate shipped Live lines with no searchable exact string, using
-        the rewrite command and its own hourly allowance (RESTATE_PER_HOUR)."""
-        if not (self.s.rewrite_cmd or self.s.rewrite_private_cmd):
+    @staticmethod
+    def _live_needs_restating(issue: Dict[str, Any]) -> bool:
+        """A shipped ticket whose Live line names no exact string to search."""
+        live = brain.live_criterion(issue.get("body"), limit=None)
+        return ("loom:shipped" in _label_names(issue)
+                and live != "(no Live criterion on the ticket)"
+                and not live_needles(issue.get("body")))
+
+    def _restate_one(self, repo: str, key: str, issue: Dict[str, Any], cmd: str) -> None:
+        """Ask the rewrite command for a new Live line and write it."""
+        prompt = ("Rewrite the shipped ticket's Live criterion. Return one JSON object "
+                  'with "action":"restate" and a "line" string: one complete Live: '
+                  "line naming an exact string the merged pull request makes the live "
+                  "system print or serve. "
+                  "Do not include markdown or explanation.\n\nTitle: %s\nBody:\n%s" %
+                  (issue.get("title", ""), issue.get("body", "")))
+        try:
+            answer = rewrite.parse_answer(rewrite.run_agent(cmd, prompt, REWRITE_TIMEOUT))
+            line = answer.get("line")
+            if not isinstance(line, str):
+                raise rewrite.Invalid("the answer has no Live line")
+            brain.restate_live(self.gh, repo, int(issue["number"]), line,
+                               env={"LOOM_BRIEF_AUTHORS": ",".join(self.s.authors),
+                                    "LOOM_BRIEFERS": ",".join(self.s.briefers)})
+        except RateLimited:
+            raise
+        except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
+            _say("could not restate the Live criterion of %s: %s" % (key, err))
             return
-        path = os.path.join(self.state, "rewrite.json")
+        _say("restated the Live criterion of %s" % key)
+
+    def _restate_state(self, path: str) -> Tuple[Dict[str, Any], List[float], Dict[str, Any]]:
+        """The rewrite state file, the restate runs of the last hour, and the
+        per-ticket last-try times."""
         state = _read_json(path, {}, strict=False)
         if not isinstance(state, dict):
             state = {}
         recent = [t for t in state.get(RESTATE_KEY) or []
                   if isinstance(t, (int, float)) and 0 <= self.now - t < 3600]
         state[RESTATE_KEY] = recent
-        budget = min(REWRITE_PER_PASS, RESTATE_PER_HOUR - len(recent))
-        if budget <= 0:
-            return
         tried = state.get("_live_tried")
         if not isinstance(tried, dict):
             tried = state["_live_tried"] = {}
+        return state, recent, tried
+
+    def restate_shipped_live(self) -> None:
+        """Restate shipped Live lines with no searchable exact string, using
+        the rewrite command and its own hourly allowance (RESTATE_PER_HOUR)."""
+        if not (self.s.rewrite_cmd or self.s.rewrite_private_cmd):
+            return
+        path = os.path.join(self.state, "rewrite.json")
+        state, recent, tried = self._restate_state(path)
+        budget = min(REWRITE_PER_PASS, RESTATE_PER_HOUR - len(recent))
+        if budget <= 0:
+            return
         cmds: Dict[str, str] = {}
         for repo in self._verify_repos():
             for issue in self._tickets_open(repo):
                 if budget <= 0 or self._deferred():
                     break
-                labels = _label_names(issue)
-                live = brain.live_criterion(issue.get("body"), limit=None)
-                if ("loom:shipped" not in labels
-                        or live == "(no Live criterion on the ticket)"
-                        or live_needles(issue.get("body"))):
+                if not self._live_needs_restating(issue):
                     continue
                 key = "%s#%s" % (repo, issue["number"])
                 last = tried.get(key)
@@ -6345,26 +6378,7 @@ class Station:
                 tried[key] = self.now
                 recent.append(self.now)
                 budget -= 1
-                prompt = ("Rewrite the shipped ticket's Live criterion. Return one JSON object "
-                          'with "action":"restate" and a "line" string: one complete Live: '
-                          "line naming an exact string the merged pull request makes the live "
-                          "system print or serve. "
-                          "Do not include markdown or explanation.\n\nTitle: %s\nBody:\n%s" %
-                          (issue.get("title", ""), issue.get("body", "")))
-                try:
-                    answer = rewrite.parse_answer(rewrite.run_agent(cmd, prompt, REWRITE_TIMEOUT))
-                    line = answer.get("line")
-                    if not isinstance(line, str):
-                        raise rewrite.Invalid("the answer has no Live line")
-                    brain.restate_live(self.gh, repo, int(issue["number"]), line,
-                                       env={"LOOM_BRIEF_AUTHORS": ",".join(self.s.authors),
-                                            "LOOM_BRIEFERS": ",".join(self.s.briefers)})
-                except RateLimited:
-                    raise
-                except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
-                    _say("could not restate the Live criterion of %s: %s" % (key, err))
-                    continue
-                _say("restated the Live criterion of %s" % key)
+                self._restate_one(repo, key, issue, cmd)
             _write_json(path, state)
 
     # -- health findings -------------------------------------------------
