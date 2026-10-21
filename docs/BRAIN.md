@@ -323,7 +323,9 @@ repo for Loom in one step, and a second run changes nothing:
 `python3 -m bus.brain triage <owner/name> --goal N [--limit 25]` walks the
 repo's open issues oldest first and labels at most `--limit` of them. It
 skips pull requests, epics (an `epic` label or sub-issues), `needs-operator`
-asks and anything with a `loom:` label. A ready issue (Why, What,
+asks, `wayfinder:*` planning issues, factory incidents, issues labelled
+`awaiting-live-check` (finished work waiting to be seen live, not new work)
+and anything with a `loom:` label. A ready issue (Why, What,
 Acceptance criteria with checkboxes, Size and Out of scope, and a body the
 runner accepts) gets `loom:ticket` and `loom:queued` and becomes a sub-issue
 of goal N's intake epic, while the goal is under `LOOM_GOAL_CAP`; past the cap it is left
@@ -431,6 +433,9 @@ turning it on; each ticket filed logs `friction OWNER/NAME: filed #N`.
 ### Agent rewrites
 
 The station rewrites `loom:triage` issues without a brain tick (`bus/rewrite.py`).
+It applies the same skips as triage (`brain.not_work_reason`: a `wayfinder:*`
+label, `awaiting-live-check`, a factory incident, an epic), so an issue
+labelled `loom:triage` before a skip existed is not rewritten into a ticket.
 It only briefs or skips: when its model answers that only a person can do the
 work, the issue keeps `loom:triage`, gains `needs-brain` (no comment), and the
 station leaves it alone from then on; the brain decides whether it becomes a
@@ -494,8 +499,10 @@ the ticket was verified. Now the issue M itself becomes the ticket:
 - no comment is posted and no issue is filed.
 
 A new ticket, the rewrite comment and `loom:rewritten` are kept only where
-the issue cannot become the ticket: its author is not a `LOOM_BRIEF_AUTHORS`
-login (the station claims only a ticket such a login wrote, see Trust), or
+the issue cannot become the ticket: its author is neither a
+`LOOM_BRIEF_AUTHORS` login nor a `LOOM_TRUSTED_BRIEFERS` login (the station
+claims only a ticket such a login wrote, see Trust; a trusted briefer's
+issue becomes their `loom:ticket` in place, and claim trust is unchanged), or
 it is locked. A pull request is refused as before, and `--refs` names an
 issue in the brief's own repo. Those sources, and every `loom:rewritten`
 pair made before this change, close with their ticket as below.

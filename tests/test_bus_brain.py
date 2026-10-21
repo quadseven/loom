@@ -2812,6 +2812,18 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
         self.assert_never_edited(routes)
 
+    def test_an_issue_awaiting_a_live_check_is_not_triaged(self):
+        # 2026-10-21: 55 open issues carried awaiting-live-check and 35 of them
+        # were briefed and run again. Finished work is not new work.
+        routes = Routes([
+            item(5, labels=["awaiting-live-check"], body="Merged, awaiting a live check"),
+            item(6, labels=["bug", "awaiting-live-check"], body="broken"),
+            item(8, labels=["bug"], body="broken"),
+        ])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
+        self.assert_never_edited(routes)
+
     def test_a_factory_incident_issue_is_not_triaged(self):
         # loom#918: a factory incident is filed as a plain open issue; the
         # backlog triage must leave it alone (no loom:triage, no comment).
@@ -3023,6 +3035,25 @@ class HumanAndRefsTests(unittest.TestCase):
                                           reply(200, []))
         self.assertIn("Part of #%d" % EPIC, fake.calls[3][2]["body"])
         self.assertIn("refused the sub-issue link", err.getvalue())
+
+    def test_a_trusted_briefers_issue_is_rewritten_in_place(self):
+        # 2026-10-21: all 7 new-issue rewrites had a LOOM_TRUSTED_BRIEFERS
+        # author, because the check passed only LOOM_BRIEF_AUTHORS. The rewrite
+        # makes their issue their loom:ticket brief, which the station claims.
+        env = dict(TRUSTED, LOOM_TRUSTED_BRIEFERS="example-other")
+        source = self.source(user={"login": "example-other"})
+        fake = Fake(reply(200, source), reply(200, goal()), reply(200, []), reply(200, {}),
+                    reply(200, []), reply(201, {}), reply(200, []), reply(200, []))
+        url = brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, refs=6, env=env)
+        fake.assert_all_used()
+        self.assertEqual(url, "https://example.com/6")
+        self.assertEqual([c[0] for c in fake.calls if c[0] != "GET"],
+                         ["PATCH", "POST", "POST", "DELETE", "DELETE"])
+        self.assertEqual(fake.calls[4][2], {"labels": ["loom:ticket", "loom:queued"]})
+        self.assertFalse(any(c[1].endswith("/issues") or c[1].endswith("/comments")
+                             for c in fake.calls if c[0] == "POST"))
+        # The same author is still not a briefer where none is configured.
+        self.assertIn("LOOM_TRUSTED_BRIEFERS", brain._in_place_refusal(source, TRUSTED))
 
     def test_a_source_the_station_could_not_claim_is_rewritten_as_a_new_ticket(self):
         made = {"id": 202, "number": 20, "html_url": "https://example.com/t"}

@@ -219,6 +219,21 @@ class RewriteIssueTest(Base):
         self.fake.triage[7]["labels"] = [{"name": "loom:triage"}, {"name": "needs-brain"}]
         self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
 
+    def test_work_that_is_not_for_a_lane_is_not_a_candidate(self):
+        # loom#34, a wayfinder decision question labelled loom:triage before
+        # triage skipped wayfinder issues, became a ticket that churned for
+        # 34 hours. The rewriter applies the same skips as triage.
+        marker = "<!-- loom:factory-incident v1 -->"
+        for number, extra in ((8, {"labels": [{"name": "loom:triage"}, {"name": "wayfinder:grilling"}]}),
+                              (9, {"labels": [{"name": "loom:triage"}, {"name": "awaiting-live-check"}]}),
+                              (10, {"body": marker + "\nKind: environment\n"}),
+                              (11, {"sub_issues_summary": {"total": 2, "completed": 0}}),
+                              (12, {"labels": [{"name": "loom:triage"}, {"name": "epic"}]})):
+            self.fake.add_triage(number)
+            self.fake.triage[number].update(extra)
+        self.fake.add_triage(7)
+        self.assertEqual([i["number"] for i in rewrite.candidates(self.gh(), REPO)], [7])
+
     def test_a_human_answer_without_a_person_only_kind_writes_nothing(self):
         # 2026-10-18: a free model parked "Using GitHub credentials, locate the
         # 25 tickets..." and "Diagnose the station's 403..." as waiting on the
