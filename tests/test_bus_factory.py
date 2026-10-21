@@ -481,6 +481,17 @@ class PullRequests(Base):
         self.assertNotEqual(self.lane(5), "muse")
         self.assertEqual(self.lane(5), "spark")
 
+    def test_a_fix_round_for_a_ticket_with_no_lane_label_names_a_lane(self):
+        # A silent-lane requeue drops the lane label and the run's pull request
+        # can still open after it; the fix brief then needs exactly one lane.
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5]["labels"] = [x for x in self.gh.issues[5]["labels"]
+                                       if not x["name"].startswith("lane:")]
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.lane(5), "spark")
+
     def test_a_thread_that_survives_a_fix_round_climbs_to_the_first_rung(self):
         self.gh.ticket(5, "pr", lane="opencode-go")
         self.gh.comments[5].append({"body": FIX_ASKED, "user": ME})
@@ -1851,6 +1862,18 @@ class Tickets(Base):
                  if factory.STALL_MOVE_RE.match(c["body"])]
         self.assertEqual(len(moves), 2)
 
+    def test_a_stall_never_moves_to_a_lane_with_as_long_a_wait(self):
+        # loom#410, #977 and #1073 bounced codex-2 -> codex -> codex-2 for six
+        # hours, unclaimed, each move restarting the stall wait (2026-10-21).
+        body = "Model: gpt-6-sol\nDifficulty: medium\n\n## Why\nx\n"
+        self.stalled(7, body=body)
+        self.gh.ticket(8, "briefed", lane="codex", body=body)
+        for number in (9, 10):
+            self.gh.ticket(number, "briefed", lane="codex-2", body=body)
+        self.go()
+        self.assertEqual(self.lane(7), "codex")
+        self.assertEqual(self.gh.comments[7], [])
+
     def test_a_stall_with_no_available_lane_stays_briefed(self):
         self.stalled(7)
         self.go(available=["codex"])
@@ -2449,6 +2472,25 @@ class Helpers(unittest.TestCase):
         # A rung with no lane serving it now is passed over.
         self.assertEqual(factory.next_rung(set(), {"claude": 2},
                                            lanes={1: ("claude",), 2: (), 3: ("anthropic",)}), 3)
+
+    def test_a_pull_request_for_another_repos_ticket_has_no_ticket_and_no_log_line(self):
+        # 2026-10-20: an image-pin pull request ships another repo's ticket by
+        # design, and logged a refusal for it on every pass.
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        other = {"number": 50, "body": "## Why\nx\n\nRefs example-org/other-repo#5\n",  # leak-guard-allow
+                 "head": {"ref": "pin-image"}}
+        with mock.patch("bus.factory._say") as say:
+            self.assertIsNone(f._association(REPO, other))
+        say.assert_not_called()
+
+    def test_conflicting_ticket_references_still_log_their_line(self):
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        both = {"number": 50, "body": "Refs %s#5\nRefs %s#6\n" % (REPO, REPO),
+                "head": {"ref": "pin-image"}}
+        with mock.patch("bus.factory._say") as say:
+            self.assertIsNone(f._association(REPO, both))
+        say.assert_called_once_with(
+            "no ticket for %s#50: pull request has conflicting ticket references" % REPO)
 
     def test_the_tiers_match_the_lane_choice_in_muse_md(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -888,6 +888,8 @@ class Filer:
         self.write = write
         self.writes = 0
         self._listed: Optional[Dict[str, int]] = None
+        # Issue numbers the listing found closed: clearing skips them unread.
+        self._listed_closed: set = set()
         # Rolling breach key -> its issue, once this pass has it open.
         self._rolling_open: Dict[str, int] = {}
 
@@ -903,6 +905,8 @@ class Filer:
                 m = MARKER_RE.search(str(issue.get("body") or ""))
                 if m and m.group(1) not in self._listed:
                     self._listed[m.group(1)] = int(issue["number"])
+                    if issue.get("state") == "closed":
+                        self._listed_closed.add(int(issue["number"]))
         return self._listed
 
     def _issue(self, number: int) -> Optional[Dict[str, Any]]:
@@ -1024,7 +1028,7 @@ class Filer:
         for key, number in self._listing().items():
             if self.writes >= WRITES_MAX:
                 return
-            if key in current:
+            if key in current or number in self._listed_closed:
                 continue
             issue = self._issue(number)
             if issue is None or issue.get("state") != "open":

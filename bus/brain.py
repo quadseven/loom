@@ -3343,6 +3343,10 @@ _TICKET_REF = re.compile(r"^Refs ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)[ \t]
 _BRANCH_TICKET = re.compile(r"^loom/([0-9]+)(?:-[A-Za-z0-9._/-]+)?$")
 
 
+class OtherRepoTicket(ValueError):
+    """The pull request's one ticket reference names another repository."""
+
+
 def _ticket_association(repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
     """Resolve the PR's ticket from its runner reference and/or Loom branch."""
     refs = {(match.group(1), int(match.group(2)))
@@ -3356,7 +3360,7 @@ def _ticket_association(repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, in
         return None
     association = next(iter(refs))
     if association[0] != repo:
-        raise ValueError("ticket and pull request must be in the same repository")
+        raise OtherRepoTicket("ticket and pull request must be in the same repository")
     return association
 
 

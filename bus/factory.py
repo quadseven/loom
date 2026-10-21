@@ -1597,7 +1597,10 @@ class Factory:
                                                  if 1 <= n <= len(CLIMB)])
                 return
         lane = None
-        if _lane(issue) in REMOTE_LANES:
+        # A ticket with no lane label (a silent-lane requeue drops it, and the
+        # run's pull request opens after; loom#1095, 2026-10-21) failed every
+        # fix brief on "exactly one lane label": it moves like a remote one.
+        if not _lane(issue) or _lane(issue) in REMOTE_LANES:
             lane, _ = self._tier_move(repo, issue, allow_remote=False)
             if lane is None:
                 lane = LADDER[0][0][0]
@@ -1766,6 +1769,11 @@ class Factory:
     def _association(self, repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
         try:
             return brain._ticket_association(repo, pr)
+        except brain.OtherRepoTicket:
+            # By design, not a refusal: an infra image-pin pull request ships
+            # another repo's ticket. It has no ticket here; a line for it
+            # every pass would bury the real refusals.
+            return None
         except ValueError as err:
             _say("no ticket for %s#%s: %s" % (repo, pr.get("number"), err))
             return None
@@ -2242,8 +2250,16 @@ class Factory:
             _say("%s#%d stalled on lane %s: no other lane of its %s is available"
                  % (repo, number, old, "rung" if rung else "tier"))
             return
-        self._move_stalled(repo, issue, pick_lane(lanes, self.load),
-                           (self.now - since) / 3600, rung)
+        lane = pick_lane(lanes, self.load)
+        waiting, there = self.load.get(old, 0), self.load.get(lane, 0)
+        if self._up(old) and there and there >= waiting - 1:
+            # A move to a lane with as long a wait only restarts the stall
+            # clock: three tickets bounced codex-2 -> codex -> codex-2 for six
+            # hours unclaimed (2026-10-21). It moves to a free or shorter lane.
+            _say("%s#%d stalled on lane %s: lane %s waits as long (%d vs %d)"
+                 % (repo, number, old, lane, there, waiting))
+            return
+        self._move_stalled(repo, issue, lane, (self.now - since) / 3600, rung)
 
     def _move_stalled(self, repo: str, issue: Dict[str, Any], lane: str,
                       hours: float, rung: int) -> None:
