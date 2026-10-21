@@ -6987,6 +6987,14 @@ class Station:
         return invariants.GoalShape(self._invariant_ref(repo, number),
                                     brain.goal_epic_cap(goal), epics, outside)
 
+    def _roll_goals(self, homes: List[Tuple[str, Dict[str, Any]]]) -> List[invariants.Ref]:
+        """The goal homes whose body names a roll that no LOOM_ROLL_SHIP_DOCS
+        entry names: the roll source-pin pass skips them (loom#528)."""
+        named = {spec["goal"] for spec in self.s.roll_ship_docs}
+        return [self._invariant_ref(repo, int(goal["number"])) for repo, goal in homes
+                if roll_pin.ships_by_roll(str(goal.get("body") or ""))
+                and "%s#%d" % (repo, int(goal["number"])) not in named]
+
     def _invariant_goal_facts(self, facts: invariants.Facts) -> None:
         """Goal homes with their epics and open tickets under none, and their journals and
         marker posts; a source that cannot be read stays None."""
@@ -7003,6 +7011,8 @@ class Station:
             raise
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the goal tickets: %s" % err)
+        facts.roll_goals = self._roll_goals(homes)
+        facts.roll_docs = len(self.s.roll_ship_docs)
         try:
             facts.journals, facts.posts = self._invariant_comments(homes)
         except RateLimited:
