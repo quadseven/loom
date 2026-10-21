@@ -1874,7 +1874,10 @@ class Factory:
             if done.status == 422:
                 self._send_back(repo, full, issue, comments,
                                 "could not be brought up to date with its base")
+                # keep repo in updated to retry on next pass
                 return
+            # reset updated for future merges
+            self.updated.remove(repo)
             self.actions += 1
             _say("brought %s#%d up to date with its base; it lands once its checks "
                  "and review pass on the new head" % (repo, number))
