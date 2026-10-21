@@ -1283,16 +1283,16 @@ class Factory:
         return None, ""
 
     def _check_runs(self, repo: str, sha: str) -> List[Dict[str, Any]]:
-        """Every check run on the commit, all pages."""
+        """The newest run of each check on the commit, all pages."""
         runs: List[Dict[str, Any]] = []
         for page in range(1, 11):
-            data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100&page=%d"
+            data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?filter=all&per_page=100&page=%d"
                                 % (repo, sha, page)).data or {}
             batch = [r for r in data.get("check_runs") or [] if isinstance(r, dict)]
             runs += batch
             if len(batch) < 100:
                 break
-        return runs
+        return brain.newest_check_runs(runs)
 
     def _files(self, repo: str, number: int) -> List[str]:
         """Every file path the pull request changes, all pages (GitHub lists

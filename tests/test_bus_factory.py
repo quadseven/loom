@@ -2275,6 +2275,24 @@ class Helpers(unittest.TestCase):
         f = factory.Factory(gh, [REPO], NOW, trusted=["alice-example"])
         self.assertEqual(f._review_state(REPO, 1, "sha", NOW), "reviewed")
 
+    def test_a_check_judged_by_its_newest_run_not_a_stale_failure(self):
+        gh = FakeGitHub()
+        seen = []
+        runs = [{"id": 1, "name": "leak-scan", "status": "completed", "conclusion": "failure",
+                 "started_at": "2030-01-01T00:29:00Z"},
+                {"id": 3, "name": "leak-scan", "status": "completed", "conclusion": "success",
+                 "started_at": "2030-01-01T01:56:00Z"},
+                {"id": 2, "name": "leak-scan", "status": "completed", "conclusion": "success",
+                 "started_at": "2030-01-01T01:27:00Z"}]
+
+        def rest(method, path, body=None, etag=None, ok=()):
+            seen.append(path)
+            return Response(200, {"check_runs": runs})
+        gh.rest = rest
+        f = factory.Factory(gh, [REPO], NOW, trusted=["alice-example"])
+        self.assertEqual([r["id"] for r in f._check_runs(REPO, "sha")], [3])
+        self.assertIn("filter=all", seen[0])
+
     def test_the_station_setting_turns_it_off(self):
         self.assertFalse(station.Settings.from_env({"LOOM_FACTORY": "0"}).factory_on)
         on = station.Settings.from_env({})
