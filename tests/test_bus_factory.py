@@ -809,6 +809,27 @@ class PullRequests(Base):
         self.assertTrue(any("/grug improve" in body for body in bodies))
         self.assertTrue(any(factory.REVIEW_AGAIN_MARKER % "sha50" in body for body in bodies))
 
+    def test_a_prefixed_low_confidence_review_asks_for_improve(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
+             "output": {"title": "Living Hunt 3c63e18b..30d00ebb - WARN Elder review "
+                                 "low confidence (deep append)",
+                        "summary": "Degraded review (low_confidence_review): not a verdict."},
+             "details_url": "https://github.com/%s/actions/runs/81/job/1" % REPO}]
+        self.go()
+        self.assertEqual(self.fixed, [])
+        bodies = [str(c.get("body") or "") for c in self.gh.comments[50]]
+        self.assertTrue(any("/grug improve" in body
+                            and factory.REVIEW_AGAIN_MARKER % "sha50" in body for body in bodies))
+
+    def test_degraded_review_reads_the_bot_marker_and_titles_anywhere(self):
+        self.assertTrue(factory.degraded_review("anything", "Degraded review (timeout): not a verdict."))
+        self.assertTrue(factory.degraded_review("Living Hunt a..b - WARN Grug eyes clouded", ""))
+        self.assertTrue(factory.degraded_review("WARN Elder review coverage partial", ""))
+        self.assertFalse(factory.degraded_review("FAIL Elder found 2 problems", "Fix the null check."))
+
     def test_a_second_partial_review_on_the_same_head_is_sent_back(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, green=False)
