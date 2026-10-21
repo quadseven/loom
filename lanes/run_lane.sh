@@ -1665,17 +1665,44 @@ final_validation() {
   VALIDATED="check exited 0 at ${rev:0:12}"
 }
 
-# A run that failed validation keeps its edits: they are committed and pushed
-# to a side branch, never to the ticket's branch or an open pull request.
-preserve_unvalidated() {
-  local side
-  side="$BRANCH-unvalidated-$(date +%s)"
+# Push a commit of the lane tree to a side branch of the ticket's branch and
+# say where the edits are. Never touches the ticket's branch or an open pull
+# request.
+push_side() {
+  local from="$1" side="$2"
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-       push -q origin "$BRANCH:refs/heads/$side" >> "$LOG" 2>&1; then
+       push -q origin "$from:refs/heads/$side" >> "$LOG" 2>&1; then
     printf 'the edits are on branch %s' "$side"
   else
     printf 'the push of %s failed; the edits are committed in the lane tree' "$side"
   fi
+}
+
+# A run that failed validation keeps its edits: they are committed and pushed
+# to a side branch, never to the ticket's branch or an open pull request.
+preserve_unvalidated() {
+  push_side "$BRANCH" "$BRANCH-unvalidated-$(date +%s)"
+}
+
+# A run that timed out after editing keeps its edits the same way, on a
+# -timedout- branch the station names to the next attempt. The agent's tree
+# may hold uncommitted files, so they are committed first.
+preserve_timedout() {
+  local tree_status
+  if ! rm -f "$TREE/$SUMMARY_FILE" 2>> "$LOG"; then
+    printf 'the lane tree could not be prepared; the edits were not preserved'
+    return 1
+  fi
+  if ! tree_status="$(safe_git status --porcelain 2>> "$LOG")"; then
+    printf 'could not read the lane tree; the edits were not preserved'
+    return 1
+  fi
+  if [ -n "$tree_status" ] &&
+     ! { safe_git add -A && safe_git commit -qm "$TICKET: edits before the timeout"; } >> "$LOG" 2>&1; then
+    printf 'the edits could not be committed in the lane tree'
+    return 1
+  fi
+  push_side HEAD "$BRANCH-timedout-$(date +%s)"
 }
 
 # What the agent is told about the contract, after its brief.
@@ -2375,11 +2402,15 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
   fi
+  # A timeout after editing keeps its edits whatever the failure is classed as;
+  # every park below names the branch.
+  TIMEDOUT_NOTE=""
+  if [ "$STATUS" -eq 124 ] && [ -n "$EDITED" ]; then TIMEDOUT_NOTE="; $(preserve_timedout)"; fi
   if [ "$FAIL_CLASS" != transient ]; then
     transient_clear
   elif REST_UNTIL="$(transient_strike)"; then
     heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
-    park "$BRIEF" "agent exited $STATUS" transient
+    park "$BRIEF" "agent exited $STATUS$TIMEDOUT_NOTE" transient
     break
   fi
   if [ "$FAIL_CLASS" = limit ]; then
@@ -2414,7 +2445,7 @@ for BRIEF in "$INBOX"/*.md; do
     else
       heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     fi
-    park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")" limit
+    park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")$TIMEDOUT_NOTE" limit
     break
   fi
   if [ "$FAIL_CLASS" = auth ]; then
@@ -2429,10 +2460,10 @@ for BRIEF in "$INBOX"/*.md; do
       hold_expired_key "$AUTH_WHY"
     fi
     ask_renew_key "$AUTH_WHY"
-    park "$BRIEF" "agent exited $STATUS: $AUTH_WHY" auth
+    park "$BRIEF" "agent exited $STATUS: $AUTH_WHY$TIMEDOUT_NOTE" auth
     break
   fi
-  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS" "$FAIL_CLASS"; continue; fi
+  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS$TIMEDOUT_NOTE" "$FAIL_CLASS"; continue; fi
   if [ "$DELIVERABLE" = verify ]; then
     # The station reads the result from the log folder and applies it; the
     # runner moves no label and opens no pull request.

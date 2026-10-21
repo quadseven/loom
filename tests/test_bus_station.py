@@ -3551,6 +3551,35 @@ class RetryTest(Base):
         self.assertFalse([n for n in names if n.startswith("lane:spark")], names)
         self.assertIn("lane:codex", names)
 
+    def test_a_retry_after_a_timeout_starts_from_the_branch_that_kept_the_edits(self):
+        side = "loom/12-fix-the-thing-timedout-1760000000"
+        self.heartbeat("codex")
+        self.failed(lane="spark-3",
+                    reason="[transient] agent exited 124; the edits are on branch " + side)
+        self.run_pass()
+        self.assertIn("Lane spark-3 failed: [transient] agent exited 124; "
+                      "the edits are on branch " + side, self.bodies()[-2])
+        with open(self.inbox("codex", "example-owner.example-repo-12-r2.md")) as fh:
+            text = fh.read()
+        self.assertIn("Branch: loom/12-fix-the-thing-r2\n", text)
+        self.assertIn("## Earlier attempt", text)
+        self.assertIn("git fetch origin %s" % side, text)
+
+    def test_a_retry_after_a_timeout_that_kept_nothing_has_no_earlier_attempt(self):
+        self.heartbeat("codex")
+        self.failed(lane="spark-3", reason="[transient] agent exited 124")
+        self.run_pass()
+        with open(self.inbox("codex", "example-owner.example-repo-12-r2.md")) as fh:
+            self.assertNotIn("Earlier attempt", fh.read())
+
+    def test_a_malformed_comment_list_warns_and_names_no_timed_out_branch(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(station.status, "expand", return_value={"body": "x"}), \
+                mock.patch.object(station, "_say") as warn:
+            self.assertIsNone(runner._timedout_branch([]))
+        warn.assert_called_once()
+        self.assertIn("timed-out branch", warn.call_args.args[0])
+
     def test_a_failure_on_one_opencode_go_slot_is_not_retried_on_another(self):
         for lane in ("opencode-go", "opencode-go-3", "anthropic"):
             self.heartbeat(lane)

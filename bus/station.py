@@ -1756,8 +1756,8 @@ class Station:
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
         has_contract, checks = self._validation_checks(repo)
-        text = tickets.render_brief(repo, issue, lane, attempt, fix,
-                                    checks, has_contract)
+        text = tickets.render_brief(repo, issue, lane, attempt, fix, checks, has_contract,
+                                    None if fix else self._timedout_branch(comments))
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
@@ -1780,6 +1780,19 @@ class Station:
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
+
+    def _timedout_branch(self, comments: List[Any]) -> Optional[str]:
+        """The side branch a timed-out attempt kept its edits on, as the
+        factory's own status events name it; None when none did."""
+        allowed = {a.lower() for a in self.s.authors}
+        # The imported status module expands the factory's event comments.
+        expanded = status.expand(comments, self.s.authors)
+        if not isinstance(expanded, list):
+            _say("could not find timed-out branch: expanded issue comments are not a list")
+            return None
+        return tickets.timedout_branch(
+            [str(c.get("body") or "") for c in expanded
+             if isinstance(c, dict) and tickets._login(c.get("user")).lower() in allowed])
 
     def _fix_refusal(self, fix: Optional[tickets.Fix]) -> Optional[str]:
         """Why a fix brief cannot go out yet, or None when it can (no fix, or

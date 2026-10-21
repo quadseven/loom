@@ -1532,6 +1532,65 @@ print('leak guard: clean (shape patterns only)')
         self.assertFalse(beat["available"])
         self.assertGreater(beat["retry_at"], int(time.time()))
 
+    def test_a_timeout_after_editing_keeps_the_edits_on_a_timedout_branch(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EDIT="1", FAKE_EXIT="124")
+        reason = self.failure_line()
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-timedout-" in h]
+        self.assertEqual(len(side), 1, heads)
+        self.assertTrue(side[0].startswith("loom/T042-fix-the-thing-timedout-"), side)
+        self.assertTrue(reason.startswith("[transient] agent exited 124; "), reason)
+        self.assertIn("the edits are on branch " + side[0], reason)
+        kept = subprocess.run(["git", "--git-dir", str(self.remote), "show", side[0] + ":fix.txt"],
+                              capture_output=True, text=True, check=True).stdout
+        self.assertEqual(kept, "partial\n")
+        self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", heads)
+
+    def test_a_limited_timeout_after_editing_still_keeps_the_edits(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="429 RESOURCE_EXHAUSTED quota resets in 1 hours",
+                      FAKE_EDIT="1", FAKE_EXIT="124")
+        reason = self.failure_line()
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-timedout-" in h]
+        self.assertEqual(len(side), 1, heads)
+        self.assertTrue(reason.startswith("[limit] "), reason)
+        self.assertIn("the edits are on branch " + side[0], reason)
+
+    def test_a_failed_status_read_never_names_an_uncommitted_timeout_branch(self):
+        self.write_tool(self.bin / "git", """#!/usr/bin/env bash
+if [[ " $* " == *" status --porcelain "* ]] &&
+   [ "$(cat "$FAKE_EDITED_TREE/fix.txt" 2>/dev/null)" = partial ]; then
+  count=$(cat "$FAKE_STATUS_COUNT" 2>/dev/null || echo 0)
+  count=$((count + 1))
+  echo "$count" > "$FAKE_STATUS_COUNT"
+  if [ "$count" -eq 2 ]; then echo 'status unavailable' >&2; exit 17; fi
+fi
+exec /usr/bin/git "$@"
+""")
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        tree = self.loom / "worktrees" / "T042-fix-the-thing"
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EDIT="1",
+                      FAKE_EXIT="124", FAKE_EDITED_TREE=str(tree),
+                      FAKE_STATUS_COUNT=str(self.home / "status-count"))
+        reason = self.failure_line()
+        self.assertIn("could not read the lane tree", reason)
+        self.assertNotIn("the edits are on branch", reason)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-timedout-", heads)
+
+    def test_a_timeout_that_edited_nothing_pushes_no_side_branch(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EXIT="124")
+        self.assertEqual(self.failure_line(), "[transient] agent exited 124")
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-timedout-", heads)
+
     def test_a_non_limit_pattern_is_still_read_from_the_short_tail(self):
         # loom#934: the auth and transient (network) patterns still read the
         # short tail, not the whole output. A key-expiry line buried in the

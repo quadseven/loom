@@ -441,10 +441,25 @@ ANSWER_NOTE = (
     "finding on a strong model's round; anything else still needs a fix.")
 
 
+# Where a run that timed out after editing left its edits (lanes/run_lane.sh
+# preserve_timedout), as the failure reason names it.
+TIMEDOUT_RE = re.compile(r"the edits are on branch ([A-Za-z0-9._/-]+-timedout-[0-9]+)")
+
+
+def timedout_branch(texts: List[str]) -> Optional[str]:
+    """The newest timed-out branch any of `texts` (oldest first) names."""
+    found = None
+    for text in texts:
+        match = TIMEDOUT_RE.search(text)
+        if match:
+            found = match.group(1)
+    return found
+
+
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   fix: Optional[Fix] = None,
                   ci_checks: Optional[List[Tuple[str, str]]] = None,
-                  has_contract: bool = True) -> str:
+                  has_contract: bool = True, resume: Optional[str] = None) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -479,6 +494,11 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += "\n"
     if body:
         text += body + "\n"
+    if resume:
+        text += ("\n## Earlier attempt\n\nAn earlier attempt timed out after editing, and the "
+                 "runner kept its edits on branch %s. Start from them: run `git fetch origin %s` "
+                 "and `git merge FETCH_HEAD`, check what is there, and finish the ticket instead "
+                 "of starting over.\n" % (resume, resume))
     if fix:
         text += ("\n## Fix\n\nThis ticket already has pull request #%d on branch %s. "
                  "Fix what is listed below on that branch: change only what the findings "
