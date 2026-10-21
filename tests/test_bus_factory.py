@@ -222,7 +222,7 @@ class Base(unittest.TestCase):
         self.humans = []
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
-           down=(), limit_until=None):
+           down=(), limit_until=None, scope=None):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
@@ -248,7 +248,7 @@ class Base(unittest.TestCase):
                             merge=merge, fix=fix, move=move, close=close, human=human,
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
-                            silent=silent, down=down, limit_until=limit_until)
+                            silent=silent, down=down, limit_until=limit_until, scope=scope)
         f.run()
         return f
 
@@ -344,6 +344,92 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.merged, [(50, (REPO, 5))])
         self.assertEqual(self.fixed, [])
+
+    # -- the scope check (bus/scope_fit.py; loom#1348) ------------------
+    SCOPE_TICKET = ("Difficulty: medium\n\n## Why\nx\n\n## What\nKeep four Deployments off one "
+                    "worker with an anti-affinity in each Deployment's own repo.\n\n## Size\nS\n")
+
+    def scoped(self, files=("charts/runner/values.yaml", "docs/x.md"), private=False):
+        self.gh.private = private
+        self.gh.ticket(5, "pr", body=self.SCOPE_TICKET)
+        self.gh.pull(50, 5, files=files)
+        self.asked = []
+
+        def ask(prompt):
+            self.asked.append(prompt)
+            return self.reply
+        return ask
+
+    def test_a_pull_request_whose_files_do_not_fit_its_ticket_is_held_not_merged(self):
+        # 2026-10-21: the ticket named four Deployments in other repos; the lane
+        # changed the CI runner pool's values instead, and it landed.
+        ask = self.scoped()
+        self.reply = "NO: it edits the runner pool values, not the four Deployments' repos."
+        self.go(scope=ask)
+        self.assertEqual(self.merged, [])
+        self.assertEqual(len(self.asked), 1)
+        self.assertIn("anti-affinity", self.asked[0])
+        self.assertIn("charts/runner/values.yaml", self.asked[0])
+        self.assertIn({"name": "needs-brain"}, self.gh.pulls[50]["labels"])
+        held = self.gh.comments[50][-1]["body"]
+        self.assertIn(factory.SCOPE_HOLD_MARKER % "sha50", held)
+        self.assertIn("runner pool values", held)
+        self.assertIn("runner pool values", self.gh.comments[5][-1]["body"])
+
+    def test_a_held_pull_request_is_not_asked_about_again_for_the_same_head(self):
+        ask = self.scoped()
+        self.reply = "NO: wrong repo."
+        self.go(scope=ask)
+        posted = len(self.gh.comments[50])
+        self.reply = "YES"
+        self.go(scope=ask)
+        self.assertEqual((self.merged, len(self.asked), len(self.gh.comments[50])), ([], 1, posted))
+
+    def test_a_new_head_commit_is_asked_about_again(self):
+        ask = self.scoped()
+        self.reply = "NO: wrong repo."
+        self.go(scope=ask)
+        self.gh.pulls[50]["head"]["sha"] = "sha51"
+        self.gh.details[50]["headRefOid"] = "sha51"
+        self.gh.runs["sha51"] = self.gh.runs["sha50"]
+        self.reply = "YES"
+        self.go(scope=ask)
+        self.assertEqual((self.merged, len(self.asked)), ([(50, (REPO, 5))], 2))
+
+    def test_a_pull_request_whose_files_fit_is_merged_as_before(self):
+        ask = self.scoped()
+        self.reply = "YES"
+        self.go(scope=ask)
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertEqual(len(self.asked), 1)
+
+    def test_no_answer_never_blocks_a_merge(self):
+        ask = self.scoped()
+        for reply in (None, "", "I am not sure what you mean", "NO", "maybe"):
+            self.setUp()
+            ask = self.scoped()
+            self.reply = reply
+            self.go(scope=ask)
+            self.assertEqual(self.merged, [(50, (REPO, 5))], reply)
+
+    def test_a_broken_asker_never_blocks_a_merge(self):
+        self.scoped()
+
+        def broken(prompt):
+            raise RuntimeError("route down")
+        self.go(scope=broken)
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_a_private_repo_is_never_asked(self):
+        ask = self.scoped(private=True)
+        self.reply = "NO: wrong repo."
+        self.go(scope=ask)
+        self.assertEqual((self.merged, self.asked), ([(50, (REPO, 5))], []))
+
+    def test_without_a_scope_route_the_check_is_off(self):
+        self.scoped()
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
 
     def test_code_without_a_test_goes_back_for_a_failing_test(self):
         self.gh.ticket(5, "pr", lane="codex")
@@ -2631,6 +2717,17 @@ class Helpers(unittest.TestCase):
         self.assertEqual(on.no_test_repos, [])
         self.assertEqual(station.Settings.from_env(
             {"LOOM_NO_TEST_REPOS": "a/b c/d"}).no_test_repos, ["a/b", "c/d"])
+
+    def test_the_station_builds_the_scope_check_only_from_an_https_route(self):
+        def scope(env):
+            with tempfile.TemporaryDirectory() as home:
+                settings = station.Settings.from_env(dict(env, LOOM_REPOS=REPO, LOOM_HOME=home))
+                st = station.Station(FakeGitHub(), settings, now=NOW)
+                with mock.patch.object(station.Station, "_heartbeat_ok", return_value=True):
+                    return st._factory().scope
+        self.assertIsNone(scope({}))
+        self.assertIsNone(scope({"LOOM_SCOPE_CHECK_URL": "http://gw.invalid/v1"}))
+        self.assertTrue(callable(scope({"LOOM_SCOPE_CHECK_URL": "https://gw.invalid/free-public/gemini/v1"})))
 
 
     def test_the_station_tells_the_factory_which_tickets_it_holds(self):
