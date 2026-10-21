@@ -32,7 +32,7 @@ for MODEL in "${MODELS[@]}"; do
     openrouter) KEY_VARS+=(OPENROUTER_API_KEY) ;;
     zai) KEY_VARS+=(ZHIPU_API_KEY) ;;
     anthropic) KEY_VARS+=(ANTHROPIC_API_KEY) ;;
-    codex|claude) KEY_VARS+=(-) ;;
+    codex|claude|free) KEY_VARS+=(-) ;;
     *) fail "no key variable known for provider ${MODEL%%/*}" 2 ;;
   esac
 done
@@ -148,6 +148,22 @@ for i in "${!MODELS[@]}"; do
       API_KEY="${CLAUDE_CODE_OAUTH_TOKEN:-}" api_agent "$CLAUDE_KEY_VAR" claude -p --model "$MODEL_ID" --output-format stream-json \
         --verbose --tools "" --strict-mcp-config --disable-slash-commands \
         --setting-sources "" < "$AGENT_STDIN" > "$OUT" ;;
+    free)
+      # A free provider's route on the spark-gateway (LOOM_REWRITE_FREE_URL,
+      # for example its free-public/gemini route for Gemma), keyless and
+      # declared as opencode provider free, as the free lane declares it. Only
+      # the public rewriter names one: bus/rewrite.command_for refuses a
+      # private command with a free/ entry, as the provider may train on it.
+      command -v "$BIN" > /dev/null || fail "$BIN not on PATH"
+      if [[ "${LOOM_REWRITE_FREE_URL:-}" =~ ^https://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]]; then
+        LANE=free SPARK_URL="$LOOM_REWRITE_FREE_URL"
+        opencode_run - "$BIN" --format json > "$OUT"
+        # shellcheck disable=SC2034 # read by the sourced agent_sandbox.sh
+        LANE=rewrite SPARK_URL=""
+      else
+        echo "LOOM_REWRITE_FREE_URL is not an https URL" > "$OUT"
+        false
+      fi ;;
     *)
       command -v "$BIN" > /dev/null || fail "$BIN not on PATH"
       opencode_run "$KEY_VAR" "$BIN" --format json > "$OUT" ;;
