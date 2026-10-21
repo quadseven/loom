@@ -476,6 +476,17 @@ only what is its own, and adding an operator is configuration:
   theirs names it, the station removes the claim label and unassigns them,
   at most 20 issues a run (`bus/stale_claims.py`). The issue is then this
   Loom's like any unowned one. A label removal sends no email.
+- A Loom's own claim lapses too. The same hourly step reads each open ticket
+  carrying this Loom's `claim:<login>` label and a Loom label (`loom:*`,
+  `wait:*` or `needs-brain`). When it is not `loom:running`, nothing on its
+  timeline is newer than `LOOM_CLAIM_IDLE_HOURS`, and no open pull request
+  naming it (a `Refs` line) was updated within that time, the station removes
+  the claim label, unassigns this operator, and adds a status note saying why,
+  so another operator's Loom may take the ticket by the rules above. A wait
+  label does not keep a claim alive: a ticket held only by a model limit, a
+  brain or a runaway hold lapses once it has been quiet that long. A claim
+  with no Loom label is an operator's own session's and is left to the
+  claimed-issue settle (`bus/stale_claims.py`).
 - When the station claims a ticket, it assigns the issue to its operator
   login, the first `LOOM_BRIEF_AUTHORS` login that is not an app (`[bot]`),
   before it relabels it, and adds `claim:<that login>` with the relabel
