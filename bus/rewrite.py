@@ -140,6 +140,10 @@ def build_prompt(issue: Dict[str, Any], comments: List[Dict[str, Any]], fmt: str
     ])
 
 
+# lanes/rewrite_agent.sh's line naming the model that answered.
+ANSWERED_RE = re.compile(r"^rewrite_agent: answered by ([A-Za-z0-9._:/@-]+)$", re.M)
+
+
 def run_agent(cmd: str, prompt: str, timeout: float) -> str:
     """The command's stdout. The command line is split like a shell would but
     run without one."""
@@ -161,6 +165,11 @@ def run_agent(cmd: str, prompt: str, timeout: float) -> str:
         reason = SECRET_RE.sub("[redacted]", lines[-1]) if lines else "the agent command exited %d" % out.returncode
         reason = scrub_paths(reason)[:300]
         raise CommandFailure("the agent command exited %d: %s" % (out.returncode, reason))
+    # The rewriter tries Gemma's free tier, then OpenRouter's, then codex: the
+    # log says which answered, so the free tier's share can be read.
+    answered = ANSWERED_RE.search(out.stderr or "")
+    if answered:
+        print("rewrite: answered by %s" % answered.group(1), file=sys.stderr)
     return out.stdout[:OUTPUT_MAX]
 
 

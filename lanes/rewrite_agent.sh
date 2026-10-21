@@ -190,6 +190,8 @@ for i in "${!MODELS[@]}"; do
     if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
       case "$ANSWER" in *"$CLAUDE_CODE_OAUTH_TOKEN"*) fail "the answer holds the subscription token" ;; esac
     fi
+    # The station logs which model answered (bus/rewrite.run_agent).
+    echo "rewrite_agent: answered by $MODEL" >&2
     printf '%s\n' "$ANSWER"
     exit 0
   fi

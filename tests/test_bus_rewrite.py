@@ -279,6 +279,17 @@ class RewriteIssueTest(Base):
                                   "%s -c 'raise SystemExit(3)'" % shlex.quote(sys.executable))
         self.assertEqual(self.fake.writes_to(7), [])
 
+    def test_a_successful_command_logs_which_model_answered(self):
+        # The rewriter tries Gemma's free tier first, then OpenRouter, then
+        # codex (2026-10-21); without the answering model in the station log,
+        # nobody could tell how much work the free tier took.
+        cmd = ("%s -c 'import sys; print(\"rewrite_agent: answered by free/gemma-4-31b-it\", "
+               "file=sys.stderr); print(\"{}\")'" % shlex.quote(sys.executable))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(rewrite.run_agent(cmd, "prompt", 30).strip(), "{}")
+        self.assertIn("rewrite: answered by free/gemma-4-31b-it", err.getvalue())
+
     def test_a_failing_command_includes_its_last_stderr_line(self):
         self.fake.add_triage(7)
         cmd = "%s -c 'import sys; print(\"diagnostic reason\", file=sys.stderr); raise SystemExit(3)'" % shlex.quote(sys.executable)
