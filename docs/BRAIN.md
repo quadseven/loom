@@ -46,7 +46,7 @@ that talks to GitHub about tickets.
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. An `After:` line holds it there until the tickets it names are merged. |
 | `loom:running` | The station handed it to that lane's runner. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
-| `loom:answered` | The runner posted a diagnosis answer, or a run's reason that its work is already done or no longer applies; the brain reviews it, then closes/verifies the ticket or briefs it again. |
+| `loom:answered` | The runner posted a diagnosis answer, or a run found its work already done or no longer applying and no merged pull request carries it (see Claim and outcome); the brain reviews it, then closes/verifies the ticket or briefs it again. |
 | `loom:ready` | Checks passed and review-bot threads are resolved for the current PR head. |
 | `needs-brain` | The automatic fix round limit was reached, or a ticket failed a second time with no commit and no reason; review this ticket in full. |
 | `loom:failed` | The runner gave up and the station did not retry it; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
@@ -783,14 +783,35 @@ When the runner finishes, the station finds the brief in `done/` or
 - Answered: a run that committed nothing, whose agent said in
   `.loom/summary.md` that the work is already done or no longer applies
   ("nothing to change", "no longer holds", "already fixed", ...) or answered
-  a thread in `.loom-answers/`, is an answer, not a failure. The runner posts
-  that reason on the ticket and labels it `loom:answered`; the station posts
-  each thread answer on the pull request the ticket names (as a settle
-  findings ticket names the pull request its findings were left on),
-  resolving it by the fix round rules. The brain reviews it like any answer:
-  a settle findings ticket whose threads are all answered or resolved is
-  verified with that note as its evidence, or closed as not planned when no
-  pull request is left.
+  a thread in `.loom-answers/`, is an answer, not a failure. The runner
+  writes that reason, quoted in full, into the run's `.answered` marker; the
+  station posts each thread answer on the pull request the ticket names (as
+  a settle findings ticket names the pull request its findings were left
+  on), resolving it by the fix round rules, and records the reason as an
+  event in the ticket's status comment, never as a new comment: a new
+  comment emailed the ticket's author for a routine outcome (a watched
+  repo's ticket, 2026-10-21). The reason passes the text checks again first; one
+  that does not is replaced by a sentence saying it is in the lane log. Then
+  the station settles the ticket from the answer:
+  - When a pull request linked to the ticket (a `Refs` line or a
+    `loom/<number>` branch) has merged into the default branch, that pull
+    request carries the work the lane found done. The ticket moves to
+    `loom:merged`, and the event names the pull request, its merge time and
+    merge commit. From there it is any merged ticket: the ship rules move it
+    to `loom:shipped`, and a verify run checks its acceptance criteria
+    against live evidence (docs/LANES.md, Verify runs), closing it with a
+    proof or marking the evidence it still misses. A regression or revert
+    ticket never moves this way: its linked pull request is the change that
+    regressed or must be undone.
+  - Otherwise the ticket goes to `loom:answered` and the event says it waits
+    for the brain. The brain reviews it like any answer: a settle findings
+    ticket whose threads are all answered or resolved is verified with that
+    note as its evidence, or closed as not planned when no pull request is
+    left.
+
+  A brief with no `Issue: OWNER/NAME#N` line has no station report, so for
+  one the runner posts the reason on the ticket and labels it
+  `loom:answered` itself.
 - Failed: label `loom:failed`, comment with the reason from the runner's
   log line, with local paths removed.
   A run that committed nothing and wrote no summary carries the end of what
@@ -878,8 +899,9 @@ lines indented two spaces). That covers a lane given to a queued ticket, a
 claim, a stall, limit or heartbeat move, a rung climb, an equivalent-model
 move, an automatic retry, a lane failure or factory hold the factory acts on
 itself, a lane stop (a limit, an expired key, a moved branch), a fix round's
-push to its pull request, and a ready mark (`Ready: checks and review passed on
-head <sha>`; loom#1244). A new comment emails the operator; an edit does
+push to its pull request, a ready mark (`Ready: checks and review passed on
+head <sha>`; loom#1244), and a build run's no-change answer with where it left
+the ticket (Claim and outcome). A new comment emails the operator; an edit does
 not (loom#866: zippie#264 carried 77 bot comments). Outcomes (a pull request
 opened, a failure, merged, shipped, verified, an ask, a runaway hold) and
 `loom:fix` briefs stay new comments. The GitHub client

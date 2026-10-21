@@ -5168,7 +5168,7 @@ class AnswerTest(Base):
     def answered(self, answers, title="Settle the review findings left from PR #99"):
         """A run with no pull request that the runner reported answered."""
         body = BODY.replace("Model: model-x", "Model: claude-opus-5-5")
-        self.fake.add(12, title=title, state="answered", body=body)
+        self.fake.add(12, title=title, state="running", body=body)
         name = tickets.ticket_name(REPO, 12, 1)
         self.write(self.inbox("codex", "done", name + ".md"),
                    tickets.render_brief(REPO, self.fake.issues[12], "codex"))
@@ -5185,9 +5185,10 @@ class AnswerTest(Base):
         self.assertIn("> The finding no longer holds", self.fake.replies[0][1])
         self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
         self.assertFalse(os.path.exists(self.inbox("codex", "answers", name)))
-        # The runner already labelled and commented; no pull request is looked for.
+        # The station labels it and records the answer as a status event, not
+        # a comment; no pull request of the run's own is looked for.
         self.assertIn("loom:answered", self.fake.names(12))
-        self.assertEqual(self.fake.comments[12], [])
+        self.assertEqual([status.is_status(c["body"]) for c in self.fake.comments[12]], [True])
         self.assertFalse(any("/pulls?head=" in path for path in self.fake.paths("GET")))
 
     def test_an_answered_line_the_agent_printed_in_the_log_is_not_an_answer(self):
@@ -5206,6 +5207,86 @@ class AnswerTest(Base):
         name = self.answered({"PRRT_abcd1": "Does not apply."})
         self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
         self.assertFalse(os.path.exists(self.inbox("codex", "answers", name)))
+
+
+NO_CHANGE_SAID = ("Lane codex made no change: the agent found this work already done or no "
+                  "longer applying. It said:\n\n> nothing to change: the walk is already "
+                  "suppressed when zero candidates pass.\n>\n> ## Acceptance criteria\n"
+                  "> - [x] The walk is suppressed\n")
+
+
+class NoChangeAnswerTest(Base):
+    """A build run that committed nothing because the work is already done or
+    no longer applies. The runner hands its reason to the station in the
+    .answered marker; the station records it and settles the ticket."""
+
+    def no_change(self, said=NO_CHANGE_SAID, pulls=(), labels=()):
+        self.fake.add(12, state="running")
+        self.fake.issues[12]["labels"] += [{"name": label} for label in labels]
+        self.fake.pulls = list(pulls)
+        name = tickets.ticket_name(REPO, 12, 1)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex"))
+        self.write(os.path.join(self.home, "logs", "codex", name + ".answered"), said)
+        self.run_pass()
+        self.run_pass()
+        return name
+
+    def events(self):
+        self.assertEqual([status.is_status(c["body"]) for c in self.fake.comments[12]], [True],
+                         "a no-change answer is a status event, never a comment that emails")
+        return [text for _, text in status.parse(self.fake.comments[12][0]["body"])]
+
+    def test_the_answer_is_a_status_event_quoting_the_lane_in_full(self):
+        self.no_change()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:answered"])
+        events = self.events()
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0].startswith(NO_CHANGE_SAID.rstrip("\n")), events[0])
+        self.assertIn("No merged pull request references this ticket", events[0])
+        self.assertIn("waits at loom:answered for the brain", events[0])
+
+    def test_a_merged_pull_request_for_the_ticket_moves_it_to_merged_for_ship_and_verify(self):
+        sha = "%040x" % 77
+        self.no_change(pulls=[{"number": 77, "state": "closed", "merged_at": "2030-01-01T00:00:00Z",
+                               "merge_commit_sha": sha, "body": "Refs %s#12" % REPO,
+                               "head": {"ref": "a-fix"}, "user": {"login": "carol-example"}}])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:merged"])
+        events = self.events()
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0].startswith(NO_CHANGE_SAID.rstrip("\n")), events[0])
+        self.assertIn("Pull request #77 (merged 2030-01-01T00:00:00Z, merge commit %s)"
+                      % sha[:12], events[0])
+        self.assertIn("moved to loom:merged", events[0])
+
+    def test_a_regression_ticket_waits_for_the_brain_whatever_merged_before(self):
+        self.no_change(pulls=[{"number": 77, "state": "closed", "merged_at": "2030-01-01T00:00:00Z",
+                               "merge_commit_sha": "%040x" % 77, "body": "Refs %s#12" % REPO,
+                               "head": {"ref": "a-fix"}}], labels=("loom:regression",))
+        self.assertIn("loom:answered", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertIn("This is a regression or revert ticket, so it waits at loom:answered",
+                      self.events()[0])
+
+    def test_a_pull_request_merged_into_another_branch_does_not_count(self):
+        self.no_change(pulls=[{"number": 77, "state": "closed", "merged_at": "2030-01-01T00:00:00Z",
+                               "merge_commit_sha": "%040x" % 77, "body": "Refs %s#12" % REPO,
+                               "base": {"ref": "release"}, "head": {"ref": "a-fix"}}])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:answered"])
+
+    def test_a_reason_that_fails_the_text_checks_is_not_quoted(self):
+        self.no_change(said="Lane codex made no change. It said:\n\n> Fixes #12 already.\n")
+        events = self.events()
+        self.assertNotIn("Fixes #12", events[0])
+        self.assertIn("its reason did not pass the text checks", events[0])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:answered"])
+
+    def test_an_empty_marker_still_settles_the_ticket(self):
+        self.no_change(said="")
+        events = self.events()
+        self.assertTrue(events[0].startswith("Lane codex made no change: the agent found this "
+                                             "work already done or no longer applying."), events[0])
+        self.assertIn("loom:answered", self.fake.names(12))
 
 
 class RefusalTest(Base):
