@@ -26,6 +26,7 @@ class FakeGitHub:
                                {"name": "lane:muse"}], "state": "open"}}
         self.comments = {4: [], 9: []}
         self.pulls = []
+        self.closed = []
         self.calls = []
 
     def rest(self, method, path, body=None, **kwargs):
@@ -50,6 +51,8 @@ class FakeGitHub:
                         comment["body"] = body["body"]
         if path.endswith("/contents/.loom/sensitive-paths"):
             return type("Response", (), {"data": {"content": base64.b64encode(b"secret/*").decode()}})()
+        if method == "GET" and "/pulls?state=closed" in path:
+            return type("Response", (), {"data": list(self.closed)})()
         if path.endswith("/pulls") and method == "POST":
             return type("Response", (), {"data": {"number": 9, "html_url": "https://example.com/pr/9"}})()
         return type("Response", (), {"data": {}})()
@@ -109,6 +112,54 @@ class RemoteLaneTests(unittest.TestCase):
         self.assertFalse(pulls)  # paginate is used, never a full pull listing
         # The lookup names the branch instead of listing every pull request.
         self.assertTrue(lane._pull_for(gh, "example/project", "loom/4-add-a-feature"))
+
+    def stranded(self, closed):
+        # A ticket held by the lane whose work merged from a branch that is not
+        # the ticket branch (loom#412 merged by #413, loom#414 by #415).
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        gh.closed = closed
+        return gh
+
+    def merged(self, body, ref="fix/other-branch", number=13, merged=True):
+        return {"number": number, "state": "closed", "body": body,
+                "merged_at": "2026-10-20T10:00:00Z" if merged else None,
+                "head": {"ref": ref}}
+
+    def test_a_merged_pull_request_on_another_branch_naming_the_ticket_advances_it(self):
+        # The full form is built, not written, so the diff holds no cross-repo ref.
+        for line in ("Refs #4", "Refs " + "example/project" + "#4", "Refs #4 and more words"):
+            gh = self.stranded([self.merged("## Why\nx\n\n%s\n" % line)])
+            active = lane._recover_and_count(gh, ["example/project"], "muse", 1001)
+            self.assertEqual(active, 0, line)
+            self.assertIn("loom:pr", labels(gh), line)
+            self.assertNotIn("loom:running", labels(gh), line)
+            self.assertFalse(any(x["body"].startswith("[transient]") for x in gh.comments[4]))
+
+    def test_a_stranded_ticket_is_advanced_not_handed_back_when_its_claim_expired(self):
+        gh = self.stranded([self.merged("Refs #4")])
+        lane._recover_and_count(gh, ["example/project"], "muse", 1000 + lane.PR_AGE + 1)
+        self.assertIn("loom:pr", labels(gh))
+        self.assertNotIn("loom:queued", labels(gh))
+
+    def test_a_mention_or_another_ticket_or_an_unmerged_pull_does_not_claim_the_ticket(self):
+        for pull in (self.merged("This follows up #4 but is its own change"),
+                     self.merged("See ticket #4.\nRefs #44\nRefs #5"),
+                     self.merged("Refs " + "other/project" + "#4"),
+                     self.merged("Refs #4", merged=False),
+                     self.merged("not Refs #4 at the start of a line")):
+            gh = self.stranded([pull])
+            active = lane._recover_and_count(gh, ["example/project"], "muse", 1001)
+            self.assertEqual(active, 1, pull["body"])
+            self.assertIn("loom:running", labels(gh), pull["body"])
+            self.assertNotIn("loom:pr", labels(gh), pull["body"])
+
+    def test_the_branch_match_stays_primary_and_reads_no_closed_pulls(self):
+        gh = self.stranded([])
+        gh.pulls = [{"number": 9, "head": {"ref": "loom/4-add-a-feature"}}]
+        lane._recover_and_count(gh, ["example/project"], "muse", 1001)
+        self.assertIn("loom:pr", labels(gh))
+        self.assertFalse([c for c in gh.calls if "state=closed" in c[1]])
 
     def test_a_heartbeat_keeps_a_claim_and_a_claim_with_no_pr_expires_after_pr_age(self):
         gh = FakeGitHub()
