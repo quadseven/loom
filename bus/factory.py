@@ -479,9 +479,14 @@ def _say(message: str) -> None:
 
 
 def _default_close(gh: GitHub, repo: str, number: int, comment: str) -> None:
+    """Close a pull request with its reason appended to its body, in one edit:
+    a comment and then a close sent the operator two emails for one event
+    (2026-10-21), and a body edit sends none."""
     brain._check_written_text(comment)
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
-    gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number), {"state": "closed"})
+    pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+    body = str(pr.get("body") or "").rstrip()
+    gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number),
+            {"state": "closed", "body": (body + "\n\n" if body else "") + comment})
 
 
 def _ts(value: Any) -> float:
@@ -1587,9 +1592,9 @@ class Factory:
         the model ladder, naming why, so the lane does not stall on it
         indefinitely. The brain re-briefs the work as a new loom:ticket."""
         number = int(pr["number"])
-        comment = ("Its ticket is past the last rung of the model ladder and is "
-                   "left loom:failed for the brain. Re-brief the work as a new "
-                   "loom:ticket, or close this pull request as superseded.")
+        comment = ("Closed by the station: its ticket is past the last rung of the "
+                   "model ladder and is left loom:failed for the brain, which re-briefs "
+                   "the work as a new loom:ticket.")
         self.close(self.gh, repo, number, comment)
         self.actions += 1
         _say("closed %s#%d: its ticket is past the model ladder" % (repo, number))

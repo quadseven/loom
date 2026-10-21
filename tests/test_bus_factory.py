@@ -956,7 +956,8 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.closed, [(50, "Superseded by #52.")])
         self.assertEqual(self.gh.pulls[50]["state"], "closed")
-        self.assertEqual(self.gh.comments[50][-1]["body"], "Superseded by #52.")
+        self.assertTrue(self.gh.pulls[50]["body"].endswith("Superseded by #52."))
+        self.assertEqual(self.gh.comments.get(50, []), [])
         self.assertEqual(self.merged, [(52, (REPO, 5))])
 
     def test_lane_pull_request_closed_when_ticket_merged_through_different_pr(self):
@@ -967,7 +968,8 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.closed, [(50, "Superseded by #51.")])
         self.assertEqual(self.gh.pulls[50]["state"], "closed")
-        self.assertEqual(self.gh.comments[50][-1]["body"], "Superseded by #51.")
+        self.assertTrue(self.gh.pulls[50]["body"].endswith("Superseded by #51."))
+        self.assertEqual(self.gh.comments.get(50, []), [])
         self.assertEqual(self.merged, [])
 
     def test_old_merge_does_not_supersede_regression_pull_request(self):
@@ -1810,6 +1812,13 @@ class Tickets(Base):
         self.assertEqual(self.closed[0][0], 70)
         self.assertIn("past the last rung of the model ladder", self.closed[0][1])
         self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
+        # One email, not two: the reason goes into the pull request's body
+        # with the close, and it says what happened rather than asking someone
+        # to close what the station just closed (2026-10-21).
+        self.assertEqual(self.gh.comments.get(70, []), [])
+        self.assertEqual(self.gh.pulls[70]["state"], "closed")
+        self.assertIn("past the last rung of the model ladder", self.gh.pulls[70]["body"])
+        self.assertNotIn("close this pull request", self.gh.pulls[70]["body"])
 
     def test_a_failed_ticket_climbed_to_the_last_ladder_rung_alerts(self):
         said = []
