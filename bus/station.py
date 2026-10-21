@@ -7424,8 +7424,8 @@ class Station:
         rows = self._standup_rows
         counts = [(len(groups[k]), word) for k, word in (
             ("merged", "merged"), ("verified", "verified"), ("sent_back", "shipped"),
-            ("failed", "failed"), ("aged_pr", "stuck"), ("in_flight", "in flight"),
-            ("asks", "waiting on you"))]
+            ("failed", "failed"), ("regressed", "regressed"), ("aged_pr", "stuck"),
+            ("in_flight", "in flight"), ("queued", "queued"), ("asks", "waiting on you"))]
         summary = ", ".join("%d %s" % (n, word) for n, word in counts if n)
         first = ("%s since the last report." % summary) if summary else "Nothing moved since the last report."
         stuck = "Past the stuck age in PR: %s." % rows(groups["aged_pr"])
@@ -7439,11 +7439,13 @@ class Station:
             "", "### Going well", "Merged: %s. Verified: %s. Shipped: %s." %
             (rows(groups["merged"]), rows(groups["verified"]),
              rows(groups["sent_back"])), "",
-            "### Not going well", "Failed: %s." % rows(groups["failed"])]
+            "### Not going well", "Failed: %s." % rows(groups["failed"]),
+            "Regressed after shipping: %s." % rows(groups["regressed"])]
             + (["Invariants broken: %s." % rows(breaches)] if breaches is not None else [])
             + ["",
             "### Still stuck", stuck, "",
             "### Next", "In flight: %s." % rows(groups["in_flight"]),
+            "Queued for a lane: %s." % rows(groups["queued"]),
             "Needs difficulty: %s." % rows(groups["needs_difficulty"])]
             + (["Epics with every ticket closed (check the done-when, then close): %s."
                 % rows(finished)] if finished else [])
@@ -7456,8 +7458,8 @@ class Station:
         """Tickets by standup heading. Merged, verified and shipped count only
         tickets updated since the last report, so a standup says what changed."""
         groups: Dict[str, List[Dict[str, Any]]] = {key: [] for key in (
-            "merged", "verified", "sent_back", "failed", "aged_pr", "in_flight",
-            "needs_difficulty", "asks")}
+            "merged", "verified", "sent_back", "failed", "regressed", "aged_pr",
+            "in_flight", "queued", "needs_difficulty", "asks")}
         for issue in children:
             if isinstance(issue, dict):
                 for group in self._standup_groups_of(issue, since):
@@ -7477,10 +7479,14 @@ class Station:
             return found
         created = self._epoch(str(issue.get("created_at") or ""))
         aged = created is not None and self.now - created > factory.STUCK_AGE
+        # Queued is not in flight: no lane holds it yet (2026-10-21, a goal
+        # report named a queued ticket "in flight" twice while nothing ran).
         for group, hit in (("failed", "loom:failed" in labels),
+                           ("regressed", "loom:regression" in labels),
                            ("aged_pr", "loom:pr" in labels and aged),
-                           ("in_flight", bool(labels & {"loom:queued", "loom:briefed",
-                                                        "loom:running", "loom:pr"})),
+                           ("in_flight", bool(labels & {"loom:briefed", "loom:running",
+                                                        "loom:pr"})),
+                           ("queued", "loom:queued" in labels),
                            ("needs_difficulty", "loom:queued" in labels and
                             not factory.has_difficulty(issue)),
                            ("asks", bool(labels & {NEEDS_OPERATOR, HUMAN}))):

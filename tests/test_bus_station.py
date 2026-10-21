@@ -5996,6 +5996,30 @@ class ReportsTest(Base):
         self.assertNotIn("#50 Epic", body)
         self.assertIn("3 in flight", body.splitlines()[1])
 
+    def test_station_standup_splits_queued_from_in_flight_and_names_regressions(self):
+        # 2026-10-21: two goal reports said "In flight: #59" while
+        # #59 sat queued with no lane, and neither named the three tickets
+        # whose shipped fix had regressed.
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
+        self.fake.comments[40][0]["created_at"] = old
+        ticket = lambda n, title, *labels: {  # noqa: E731
+            "number": n, "title": title, "state": "open", "body": "Size: S",
+            "labels": [{"name": name} for name in ("loom:ticket",) + labels]}
+        self.fake.sub_issues[40] = [
+            ticket(41, "Waiting one", "loom:queued"),
+            ticket(42, "Running one", "loom:running"),
+            ticket(43, "Came back", "loom:shipped", "loom:regression")]
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time()).post_overdue_standups()
+        body = self.fake.comments[40][-1]["body"]
+        self.assertIn("In flight: #42 Running one.", body)
+        self.assertIn("Queued for a lane: #41 Waiting one.", body)
+        self.assertIn("Regressed after shipping: #43 Came back.", body)
+        self.assertIn("1 regressed, 1 in flight, 1 queued", body.splitlines()[1])
+
     def test_station_standup_flags_an_epic_whose_tickets_are_all_closed(self):
         self.add_goal()
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
