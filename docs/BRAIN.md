@@ -728,6 +728,22 @@ ticket at `loom:pr` with no fix comment, no round counted and no
 (`/grug improve`, once per head commit). Real failures beside it are sent
 back without it.
 
+A review check that failed only on a split request is not sent back either.
+When its summary carries a `Reviewability` note of kind `cross-cohort-proof`,
+`plan-truncated` or `cross-cohort-module` (each asks the author to split the
+change), it has no blocking finding in its title and no other check failed, the
+factory files the split (`bus/split.py`, `Factory._split_pr`): the paths the
+note names are grouped by stem so a file and its test stay in one part, each
+part becomes a `loom:ticket` + `loom:queued` ticket with the original's
+`Difficulty:`, `Priority:` and epic, and the pull request is closed with a
+pointer to them. The original ticket gets one comment naming the parts
+(`<!-- loom:split pr=N -->`, so a pass that was cut off does not file them
+twice), moves to `loom:closed-unmerged` and closes as not planned. When the
+note names fewer than two groups, the ticket's unchecked non-Live criteria are
+the parts, one each. A note that leaves nothing to split on, a blocking
+finding or another failing check sends the pull request back for a fix round as
+before.
+
 When the station claims a ticket whose latest comment from an allowed login
 is such a fix comment, newer than its last claim, the brief keeps the pull
 request's branch, gets a `Fix-PR: <number>` header and ends with a `## Fix`

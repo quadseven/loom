@@ -185,7 +185,7 @@ class FakeGitHub:
                 self.comments.setdefault(number, []).append(
                     {"id": self.next_comment, "body": body["body"], "created_at": iso(0), "user": ME})
             elif method == "PATCH":
-                self.issues[number]["body"] = body["body"]
+                self.issues[number].update(body)
         m = re.search(r"/issues/comments/(\d+)$", path)
         if m and method == "PATCH":
             for found in self.comments.values():
@@ -1027,6 +1027,85 @@ class PullRequests(Base):
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
         self.assertEqual(len([c for c in self.gh.comments[50]
                               if "/grug improve" in str(c.get("body") or "")]), 1)
+
+    SPLIT_SUMMARY = (
+        "Walked part of the diff.\n\nCoverage: 3/4 cohorts completed.\n\n**Reviewability**\n"
+        "- `cross-cohort-proof`: Related implementation and verification changes do not fit in "
+        "one bounded proof unit; split the pull request or reduce coupling so behavior and its "
+        "evidence can be reviewed together. Paths: `bus/a.py`, `tests/test_a.py`, `bus/b.py`, "
+        "`tests/test_b.py`")
+
+    def split_ticket(self, title="WARN Elder review coverage partial", summary=None, **extra):
+        body = ("Difficulty: hard\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] A1 first\n"
+                "- [ ] A2 second\n\nPart of #7\n")
+        self.gh.ticket(5, "pr", body=body)
+        self.gh.issues[5]["title"] = "Do the thing"
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
+             "output": {"title": title, "summary": summary or self.SPLIT_SUMMARY},
+             "details_url": "https://github.com/%s/actions/runs/80/job/1" % REPO}]
+
+    def test_a_pull_request_the_review_asks_to_split_is_split_into_tickets(self):
+        # loom#1218: the fix round sent the same lane back with the same
+        # instructions and nothing re-split the work.
+        self.split_ticket()
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(len(self.gh.filed), 2)
+        for index, made in enumerate(self.gh.filed, start=1):
+            self.assertEqual(made["labels"], ["loom:ticket", "loom:queued"])
+            self.assertIn("(part %d of 2)" % index, made["title"])
+            self.assertIn("Difficulty: hard", made["body"])
+            self.assertTrue(made["body"].rstrip().endswith("Part of #7"))
+        self.assertIn("`bus/a.py`, `tests/test_a.py`", self.gh.filed[0]["body"])
+        self.assertIn("`bus/b.py`, `tests/test_b.py`", self.gh.filed[1]["body"])
+        self.assertEqual([c[0] for c in self.closed], [50])
+        self.assertIn("#900, #901", self.closed[0][1])
+        self.assertEqual(self.gh.pulls[50]["state"], "closed")
+        self.assertEqual(self.gh.issues[5]["state"], "closed")
+        self.assertIn("loom:closed-unmerged", [x["name"] for x in self.gh.issues[5]["labels"]])
+        self.assertEqual(len([c for c in self.gh.comments[5] if "loom:split pr=50" in c["body"]]), 1)
+
+    def test_a_split_that_filed_but_did_not_close_is_not_filed_twice(self):
+        self.split_ticket()
+        self.gh.comments[5].append({"body": "<!-- loom:split pr=50 -->\nsplit into #900, #901.",
+                                    "user": ME})
+        self.go()
+        self.assertEqual(self.gh.filed, [])
+        self.assertEqual([c[0] for c in self.closed], [50])
+
+    def test_a_pull_request_with_a_blocking_finding_beside_the_note_still_goes_back(self):
+        self.split_ticket(title="Elder markings - 1 blocking, 2 total")
+        self.go()
+        self.assertEqual(self.gh.filed, [])
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_another_failing_check_beside_the_note_still_goes_back(self):
+        self.split_ticket()
+        self.gh.runs["sha50"].append({"name": "unittest", "status": "completed",
+                                      "conclusion": "failure"})
+        self.go()
+        self.assertEqual(self.gh.filed, [])
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_note_that_names_nothing_to_split_goes_back_for_a_fix_round(self):
+        summary = ("**Reviewability**\n- `cross-cohort-proof`: split the pull request. "
+                   "Paths: `bus/a.py`, `tests/test_a.py`")
+        self.split_ticket(title="Elder markings - 0 blocking, 0 total", summary=summary)
+        self.gh.issues[5]["body"] = "Difficulty: hard\n\n## Why\nx\n\nPart of #7\n"
+        self.go()
+        self.assertEqual(self.gh.filed, [])
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_one_file_pair_is_split_by_acceptance_criterion(self):
+        summary = ("**Reviewability**\n- `cross-cohort-proof`: split the pull request. "
+                   "Paths: `bus/a.py`, `tests/test_a.py`")
+        self.split_ticket(summary=summary)
+        self.go()
+        self.assertEqual(len(self.gh.filed), 2)
+        self.assertIn("A1 first", self.gh.filed[0]["body"].split("## What")[1].split("The whole")[0])
+        self.assertEqual([c[0] for c in self.closed], [50])
 
     def test_pull_requests_of_tickets_not_in_pr_are_left_alone(self):
         self.gh.ticket(5, "briefed")
