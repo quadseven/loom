@@ -602,7 +602,7 @@ def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
                         data: Dict[str, Any], bot: str,
                         authors: Sequence[str] = (), check: str = "Grug - Elder") -> List[str]:
     """The pull request lines for status: heading, merge readiness for each
-    loom pull request, and the pending brain fix mark when one waits."""
+    loom pull request, including a pending brain fix as a blocker."""
     lines = ["### Pull requests"]
     for pr in prs:
         line = _status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check)
@@ -613,7 +613,8 @@ def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
         if ticket is not None and authors:
             comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
             if _pending_brain_fix(comments, authors):
-                line += " - pending brain fix"
+                line = (line.removesuffix("READY") + "blocked: pending brain fix"
+                        if line.endswith(" - READY") else line + ", pending brain fix")
         lines.append(line)
     return lines
 
@@ -2746,7 +2747,7 @@ def merge(gh: GitHub, repo: str, number: int,
 def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
                         env: Optional[Dict[str, str]]) -> None:
     """Refuse a merge while the ticket's brain fix has not run: status marks
-    such a pull request "READY - pending brain fix", and merging it then would
+    such a pull request "blocked: pending brain fix", and merging it then would
     land the head the fix was sent to change (2026-10-15)."""
     authors = trusted_authors(env)
     if ticket is None or not authors:
