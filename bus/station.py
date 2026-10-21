@@ -4269,11 +4269,20 @@ class Station:
             self._remove_ready_if_present(repo, number, names)
             return
         failed = brain._failing_checks(self.gh, repo, sha)
+        # A degraded review result is the review bot's "not a verdict": a lane
+        # cannot fix it, so it stays at loom:pr for the factory's re-review
+        # (factory._review_again) instead of spending a fix round.
+        kept = [(name, tail) for name, tail in failed
+                if not (name == self.s.review_check and factory.degraded_review(tail, tail))]
+        degraded = len(kept) != len(failed)
+        failed = kept
         threads = self._bot_threads(repo, pr_number)
-        if not failed and not threads:
+        if not failed and not threads and not degraded:
             self._mark_ready(repo, number, sha, names, ready)
             return
         self._remove_ready_if_present(repo, number, names)
+        if not failed and not threads:
+            return
         self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
                                    comments, names, failed, threads, rounds)
 
@@ -4450,7 +4459,15 @@ class Station:
                 # A fix round's push is routine (the pull request already
                 # exists and the lane comments on it): three of them emailed
                 # one ticket's author on 2026-10-20.
-                self._routine(repo, number, "Lane %s pushed fixes to a pull request: %s" % (lane, url))
+                # Only a run that pushed a commit says so: a round that answered
+                # threads or repaired text, or whose check was stale, pushed
+                # nothing (zippie-style loop, 2026-10-19).
+                if self._pushed(lane, name):
+                    self._routine(repo, number, "Lane %s pushed fixes to a pull request: %s"
+                                  % (lane, url))
+                else:
+                    self._routine(repo, number, "Lane %s made no code change for a fix to a "
+                                  "pull request: %s" % (lane, url))
             else:
                 self._comment(repo, number, "Lane %s opened a pull request: %s" % (lane, url))
             _say("reported %s#%d done: %s" % (repo, number, url))
@@ -4767,6 +4784,11 @@ class Station:
         thread the brief asked about, on its pull request, gets one."""
         asked = set(factory.FIX_THREAD_RE.findall(brief))
         self._post_thread_answers(repo, {pr}, lane, name, brief, asked)
+
+    def _pushed(self, lane: str, name: str) -> bool:
+        """Did the runner push a commit for this run? Read from the runner's
+        marker file (lanes/run_lane.sh), never from the log."""
+        return os.path.isfile(os.path.join(self.s.home, "logs", lane, name + ".pushed"))
 
     def _answered(self, lane: str, name: str) -> bool:
         """Did the runner report this run answered: it committed nothing

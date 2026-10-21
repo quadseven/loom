@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-from bus import factory, labels, station, status
+from bus import brain, factory, labels, station, status
 from bus.github import GitHubError, Response
 from bus.tickets import FIX_MARKER
 
@@ -209,6 +209,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
+        self.humans = []
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
            down=(), limit_until=None):
@@ -226,8 +227,12 @@ class Base(unittest.TestCase):
         def close(gh, repo, number, comment):
             self.closed.append((number, comment))
             factory._default_close(gh, repo, number, comment)
+        def human(gh, repo, number, ask):
+            self.humans.append((number, ask))
+            gh.comments[number].append({"body": brain.HUMAN_MARKER + "\n" + ask, "user": ME})
+            gh.issues[number]["labels"].append({"name": "loom:human"})
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
-                            merge=merge, fix=fix, move=move, close=close,
+                            merge=merge, fix=fix, move=move, close=close, human=human,
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
                             silent=silent, down=down, limit_until=limit_until)
@@ -804,6 +809,27 @@ class PullRequests(Base):
         self.assertTrue(any("/grug improve" in body for body in bodies))
         self.assertTrue(any(factory.REVIEW_AGAIN_MARKER % "sha50" in body for body in bodies))
 
+    def test_a_prefixed_low_confidence_review_asks_for_improve(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
+             "output": {"title": "Living Hunt 3c63e18b..30d00ebb - WARN Elder review "
+                                 "low confidence (deep append)",
+                        "summary": "Degraded review (low_confidence_review): not a verdict."},
+             "details_url": "https://github.com/%s/actions/runs/81/job/1" % REPO}]
+        self.go()
+        self.assertEqual(self.fixed, [])
+        bodies = [str(c.get("body") or "") for c in self.gh.comments[50]]
+        self.assertTrue(any("/grug improve" in body
+                            and factory.REVIEW_AGAIN_MARKER % "sha50" in body for body in bodies))
+
+    def test_degraded_review_reads_the_bot_marker_and_titles_anywhere(self):
+        self.assertTrue(factory.degraded_review("anything", "Degraded review (timeout): not a verdict."))
+        self.assertTrue(factory.degraded_review("Living Hunt a..b - WARN Grug eyes clouded", ""))
+        self.assertTrue(factory.degraded_review("WARN Elder review coverage partial", ""))
+        self.assertFalse(factory.degraded_review("FAIL Elder found 2 problems", "Fix the null check."))
+
     def test_a_second_partial_review_on_the_same_head_is_sent_back(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, green=False)
@@ -1107,6 +1133,53 @@ class ReviewBotThreads(Base):
         self.gh.pull(50, 5, resolved=False, green=False)
         self.go()
         self.assertEqual(len(self.fixed), 1)
+
+
+class NoChangeRounds(Base):
+    def rounds(self, *kinds):
+        for n, kind in enumerate(kinds):
+            body = FIX_ASKED if kind == "fix" else NO_CHANGE
+            self.gh.comments[5].append({"body": body, "user": ME,
+                                        "created_at": iso(20000 - 1000 * n)})
+
+    def setUp(self):
+        super().setUp()
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.pull(50, 5, resolved=False, green=False)
+
+    def test_two_no_change_rounds_on_one_check_hand_the_ticket_to_a_person(self):
+        self.rounds("fix", "none", "fix", "none")
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(len(self.humans), 1)
+        self.assertIn("`lint`", self.humans[0][1])
+        self.assertTrue(self.humans[0][1].startswith("Kind: decision"))
+
+    def test_a_second_pass_neither_sends_a_round_nor_repeats_the_comment(self):
+        self.rounds("fix", "none", "fix", "none")
+        self.go()
+        count = len(self.gh.comments[5])
+        self.go()
+        self.assertEqual((len(self.humans), self.fixed), (1, []))
+        self.assertEqual(len(self.gh.comments[5]), count)
+
+    def test_one_no_change_round_still_sends_the_next_round_up_the_ladder(self):
+        self.rounds("fix", "none")
+        self.go()
+        self.assertEqual((len(self.fixed), self.humans), (1, []))
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+
+    def test_a_round_that_changed_something_resets_the_count(self):
+        self.rounds("fix", "none", "fix", "fix", "none")
+        self.go()
+        self.assertEqual(self.humans, [])
+
+    def test_a_check_a_later_round_does_not_name_loses_its_count(self):
+        other = FIX_ASKED.replace("### Check: lint", "### Check: unit")
+        self.rounds("fix", "none")
+        self.gh.comments[5] += [{"body": other, "user": ME, "created_at": iso(18000)},
+                                {"body": NO_CHANGE, "user": ME, "created_at": iso(17000)}]
+        self.assertEqual(factory.no_change_rounds(self.gh.comments[5]), {"unit": 1})
 
 
 MEDIUM = "\U0001f7e0 medium | _robustness_ | `missing-error-handling` | quick win\n\nGrug see a gap."
@@ -2274,6 +2347,24 @@ class Helpers(unittest.TestCase):
         gh.rest = rest
         f = factory.Factory(gh, [REPO], NOW, trusted=["alice-example"])
         self.assertEqual(f._review_state(REPO, 1, "sha", NOW), "reviewed")
+
+    def test_a_check_judged_by_its_newest_run_not_a_stale_failure(self):
+        gh = FakeGitHub()
+        seen = []
+        runs = [{"id": 1, "name": "leak-scan", "status": "completed", "conclusion": "failure",
+                 "started_at": "2030-01-01T00:29:00Z"},
+                {"id": 3, "name": "leak-scan", "status": "completed", "conclusion": "success",
+                 "started_at": "2030-01-01T01:56:00Z"},
+                {"id": 2, "name": "leak-scan", "status": "completed", "conclusion": "success",
+                 "started_at": "2030-01-01T01:27:00Z"}]
+
+        def rest(method, path, body=None, etag=None, ok=()):
+            seen.append(path)
+            return Response(200, {"check_runs": runs})
+        gh.rest = rest
+        f = factory.Factory(gh, [REPO], NOW, trusted=["alice-example"])
+        self.assertEqual([r["id"] for r in f._check_runs(REPO, "sha")], [3])
+        self.assertIn("filter=all", seen[0])
 
     def test_the_station_setting_turns_it_off(self):
         self.assertFalse(station.Settings.from_env({"LOOM_FACTORY": "0"}).factory_on)

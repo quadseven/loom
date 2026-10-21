@@ -2502,6 +2502,32 @@ class HandBackTest(unittest.TestCase):
         self.assertLess(len(body), 65536)
         self.assertIn("loom:fix-head " + "a" * 40, body)
 
+    def test_a_degraded_review_is_not_handed_back(self):
+        # The review bot's own "not a verdict" result: a lane cannot fix it, so
+        # the station leaves it at loom:pr for the factory's re-review.
+        self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK,
+                                    "WARN Elder review low confidence\n"
+                                    "Degraded review (low_confidence_review): not a verdict.")])
+        names = [x["name"] for x in self.gh.issue["labels"]]
+        self.assertFalse(any(str(c.get("body") or "").startswith(tickets.FIX_MARKER)
+                             for c in self.gh.comments))
+        self.assertIn("loom:pr", names)
+        for label in ("loom:briefed", "needs-brain", "loom:ready"):
+            self.assertNotIn(label, names)
+
+    def test_a_degraded_review_beside_a_real_failure_sends_only_the_real_one(self):
+        self.run_hand_back(checks=[
+            ("lint", "last log line"),
+            (factory.DEFAULT_REVIEW_CHECK,
+             "Living Hunt 3c63e18b..30d00ebb - WARN Elder review low confidence (deep append)\n"
+             "Degraded review (low_confidence_review): not a verdict.")])
+        body = self.gh.comments[0]["body"]
+        self.assertIn("lint", body)
+        self.assertIn("last log line", body)
+        self.assertNotIn("Degraded review", body)
+        self.assertNotIn(factory.DEFAULT_REVIEW_CHECK, body)
+        self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+
     def test_unresolved_review_bot_thread_is_sent_back(self):
         thread = {"id": "PRRT_fake", "path": "a.py", "line": 4,
                   "comments": {"nodes": [{"databaseId": 9, "body": "change this",
@@ -3337,10 +3363,23 @@ class FixTest(Base):
                 station.Station(GitHub("token", transport=self.fake), self.settings).run_pass()
         self.assertEqual(reasons, ["pre-roll findings without dispositions: F1"])
 
+    def test_a_finished_fix_that_pushed_no_commit_does_not_report_pushed_fixes(self):
+        self.fake.add(12, state="running")
+        fix = tickets.parse_fix(REPO, FIX_BODY)
+        name = tickets.ticket_name(REPO, 12, 2)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex", 2, fix))
+        self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
+        self.run_pass()
+        texts = [text for c in self.fake.comments[12] for _, text in status.parse(c["body"])]
+        self.assertEqual(texts, ["Lane codex made no code change for a fix to a pull request: "
+                                 "https://example.com/pull/99"])
+
     def test_a_finished_fix_reports_pushed_fixes(self):
         self.fake.add(12, state="running")
         fix = tickets.parse_fix(REPO, FIX_BODY)
         name = tickets.ticket_name(REPO, 12, 2)
+        self.write(os.path.join(self.home, "logs", "codex", name + ".pushed"), "")
         self.write(self.inbox("codex", "done", name + ".md"),
                    tickets.render_brief(REPO, self.fake.issues[12], "codex", 2, fix))
         self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
