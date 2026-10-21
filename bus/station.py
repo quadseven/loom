@@ -6057,6 +6057,16 @@ class Station:
             _say("rewrite %s: no agent command for this repo; skipped" % key)
             self._event("rewrite_skipped", "no agent command for this repo", key)
             return 0
+        # Intake refuses a brief at the goal's in-flight cap, so a model run
+        # then writes nothing (17 of 72 rewrites on 2026-10-21).
+        try:
+            in_flight = brain._goal_in_flight(self.gh, repo, goal)
+        except ValueError:
+            in_flight = 0  # not an open goal: intake says why per issue
+        if in_flight >= brain.goal_cap():
+            _say("rewrite %s: goal has %d tickets in flight (cap %d); skipped"
+                 % (key, in_flight, brain.goal_cap()))
+            return 0
         done = 0
         for issue in rewrite.candidates(self.gh, repo):
             if done >= room or self._deferred():

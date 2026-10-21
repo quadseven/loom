@@ -1862,6 +1862,18 @@ class Tickets(Base):
                  if factory.STALL_MOVE_RE.match(c["body"])]
         self.assertEqual(len(moves), 2)
 
+    def test_a_stall_never_moves_to_a_lane_with_as_long_a_wait(self):
+        # loom#410, #977 and #1073 bounced codex-2 -> codex -> codex-2 for six
+        # hours, unclaimed, each move restarting the stall wait (2026-10-21).
+        body = "Model: gpt-6-sol\nDifficulty: medium\n\n## Why\nx\n"
+        self.stalled(7, body=body)
+        self.gh.ticket(8, "briefed", lane="codex", body=body)
+        for number in (9, 10):
+            self.gh.ticket(number, "briefed", lane="codex-2", body=body)
+        self.go()
+        self.assertEqual(self.lane(7), "codex")
+        self.assertEqual(self.gh.comments[7], [])
+
     def test_a_stall_with_no_available_lane_stays_briefed(self):
         self.stalled(7)
         self.go(available=["codex"])

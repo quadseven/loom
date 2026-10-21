@@ -840,6 +840,16 @@ class FilerTest(unittest.TestCase):
                          self.said.append).run([])
         self.assertEqual(sum("cleared" in c.get("body", "") for c in self.gh.comments[(REPO, number)]), 1)
 
+    def test_a_closed_issue_in_the_listing_is_never_read_again(self):
+        # 131 of 146 invariant issues were closed, and each was read every pass.
+        self.file(self.breach(at=T0 - 7 * 3600), now=T0 - 7 * 3600)
+        number = next(iter(self.gh.issues))
+        self.gh.issues[number].update(state="closed")
+        self.gh.calls.clear()
+        invariants.Filer(self.gh, REPO, GOAL, self.state, T0 + invariants.CHECK_EVERY,
+                         self.said.append).run([])
+        self.assertNotIn(("GET", "/repos/%s/issues/%d" % (REPO, number)), self.gh.calls)
+
     def test_a_rewritten_issue_closes_after_the_clear_wait_like_a_triage_one(self):
         self.file(self.breach(at=T0 - 7 * 3600), now=T0 - 7 * 3600)
         number = next(iter(self.gh.issues))
