@@ -2003,7 +2003,7 @@ cat > /dev/null
         hook = self.remote / "hooks" / "pre-receive"
         hook.write_text("#!/bin/sh\n"
                         "echo 'refusing to allow a GitHub App to create or update workflow"
-                        " `.github/workflows/ci.yml` without `workflows` permission' >&2\n"
+                        " `.github/workflows/@someone [x](y).yml` without `workflows` permission' >&2\n"
                         "exit 1\n")
         hook.chmod(0o755)
         self.drop_brief()
@@ -2014,6 +2014,10 @@ cat > /dev/null
         self.assertIn("failed: [factory] push refused: the GitHub App has no workflows permission", log)
         self.assertNotIn("[transient] push failed", log)
         self.assertTrue(any(c.startswith("gh issue create") for c in self.calls()))
+        # The agent names the file: no mention or Markdown of its reaches the issue.
+        filed = self.log.read_text()
+        self.assertIn("it changes `.github/workflows/someonexy.yml`", filed)
+        self.assertNotIn("@someone", filed)
 
     def test_a_fix_brief_whose_branch_moved_during_the_run_is_parked_as_branch_moved(self):
         name, before = self.fix_brief()

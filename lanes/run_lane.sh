@@ -2731,7 +2731,10 @@ for BRIEF in "$INBOX"/*.md; do
       # shellcheck disable=SC2016 # GitHub's literal backquotes
       if REFUSED="$(printf '%s\n' "$PUSH_OUT" | grep -m1 'without `workflows` permission')"; then
         PUSH_REASON="push refused: the GitHub App has no workflows permission"
-        note_factory_incident workflows-permission "The push of $BRANCH was refused: ${REFUSED#remote: }
+        # The agent names the workflow file, so only a path-safe, capped
+        # copy of it reaches the public incident, never a mention or Markdown.
+        REFUSED="$(printf '%s' "$REFUSED" | sed -n 's/.*workflow `\([^`]*\)`.*/\1/p' | tr -cd 'A-Za-z0-9._/-' | cut -c1-120)"
+        note_factory_incident workflows-permission "The push of $BRANCH was refused: it changes \`${REFUSED:-a workflow file}\`, and the lanes' GitHub App has no workflows permission.
 
 Grant the lanes' GitHub App the workflows permission (read and write), or land the workflow change from an operator session, then close this issue. Its held tickets return to the queue when it closes." PUSH_REASON
         park "$BRIEF" "$PUSH_REASON" "$PARK_CLASS"; continue
