@@ -2355,7 +2355,8 @@ for BRIEF in "$INBOX"/*.md; do
   # The whole run output (from LOG_START), for the limit and credit patterns;
   # the short tail (its last five non-blank lines), kept for the reason shown
   # to people and for the auth/transient patterns (loom#934).
-  RUN_OUTPUT="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$')"
+  # The limit patterns read only what the provider said (provider_text).
+  RUN_OUTPUT="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$' | provider_text)"
   FAILURE_OUT="$(printf '%s\n' "$RUN_OUTPUT" | tail -n 5)"
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"

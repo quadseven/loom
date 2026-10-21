@@ -71,6 +71,18 @@ LIMIT_WAIT_MAX=86400
 # auth: no retry and no attempt can fix it, so the runner takes its lanes
 # offline until the operator renews it. A crash before any edit, a timeout,
 # a signal or a network fault is transient; anything else is work.
+# An agent CLI's JSON events that carry the work, not the provider's word:
+# tool results, the model's own text and reasoning, step markers (opencode
+# --format json). Code about rate limits that a tool read is no limit: two
+# Spark lanes were held an hour on such tool results (2026-10-21). A provider
+# error arrives as its own line ({"type":"error",...} or plain text).
+WORK_EVENT_RE='^\{"type":"(tool_use|text|reasoning|step_start|step_finish)"'
+
+# Stdin without the agent's work events, for the limit and credit patterns.
+provider_text() {
+  grep -vE "$WORK_EVENT_RE" || true
+}
+
 classify_failure() {
   local status="$1" whole="$2" edited="$3" now n tail
   tail="${4:-$whole}"
