@@ -7079,6 +7079,42 @@ class CloseDoneTest(Base):
         self.assertIn("needs-operator", asks[0]["labels"])
         self.assertIn(second, asks[0]["title"])
 
+    def test_operator_ask_missing_number_raises(self):
+        second = "example-owner/second-repo"
+        self.settings.repos.append(second)
+        self.settings.status_repo = REPO
+
+        def request(method, url, headers, body):
+            path = urlsplit(url).path
+            if path == "/repos/" + second:
+                return reply(404, {"message": "Not Found"})
+            if method == "POST" and path == "/repos/%s/issues" % REPO:
+                return reply(201, {"ok": True})
+            return self.fake(method, url, headers, body)
+
+        st = station.Station(GitHub("token", transport=request), self.settings, now=10000)
+        with self.assertRaisesRegex(GitHubError, "no operator access ask was created"):
+            st.check_repo_access()
+
+    def test_operator_ask_skipped_when_no_status_repo(self):
+        second = "example-owner/second-repo"
+        self.settings.repos.append(second)
+        self.settings.status_repo = None
+        posts = []
+
+        def request(method, url, headers, body):
+            path = urlsplit(url).path
+            if path == "/repos/" + second:
+                return reply(404, {"message": "Not Found"})
+            if method == "POST":
+                posts.append(path)
+            return self.fake(method, url, headers, body)
+
+        st = station.Station(GitHub("token", transport=request), self.settings, now=10000)
+        self.assertTrue(st.check_repo_access())
+        self.assertNotIn(second, self.settings.repos)
+        self.assertEqual(posts, [])
+
     def test_401_abort_still_persists_operator_ask(self):
         second = "example-owner/second-repo"
         self.settings.repos = [REPO, second]
