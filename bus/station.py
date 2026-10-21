@@ -4718,16 +4718,48 @@ class Station:
         model = headers.get("Model", "")
         order = self._retry_order(failed, klass, headers.get("Difficulty"))
         public: Dict[str, bool] = {}
+        first: Optional[List[Dict[str, Any]]] = None
         busy = None
         for cand in dict.fromkeys(order):
             if cand in skip or not self._retry_eligible(repo, cand, failed, klass, model, public):
                 continue
             if self.model_limited(cand, brief_model(cand, headers)) is not None:
                 continue
+            if first is None:
+                first = self._first_waiting()
+            if self._first_waits_for(first, cand):
+                # A regression, revert or urgent ticket queued for this lane
+                # never got it while retries kept taking it: one waited 2026-10-19
+                # to 2026-10-21 and held its goal's regression slot (loom#1292).
+                continue
             if self._inbox_empty(cand):
                 return cand
             busy = busy or cand
         return busy
+
+    def _first_waiting(self) -> List[Dict[str, Any]]:
+        """Open tickets of the station's repos at loom:queued or loom:briefed
+        with a FIRST_LABELS label: one list read per repo, made once per retry
+        and only when a candidate lane is otherwise eligible."""
+        found: List[Dict[str, Any]] = []
+        for repo in self._verify_repos():
+            for issue in self._tickets_open(repo):
+                names = set(_label_names(issue))
+                if names & set(tickets.FIRST_LABELS) and names & {"loom:queued", BRIEFED}:
+                    found.append(issue)
+        return found
+
+    @staticmethod
+    def _first_waits_for(first: List[Dict[str, Any]], lane: str) -> bool:
+        """Whether a ticket in first is labelled for lane or pinned (Model:
+        header) to a model lane serves."""
+        for issue in first:
+            if "lane:" + lane in _label_names(issue):
+                return True
+            model = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+            if model and lane_takes_model(lane, model.group(1)):
+                return True
+        return False
 
     def _retry_order(self, failed: str, klass: str, difficulty: Optional[str]) -> List[str]:
         order = list(RETRY_ORDER)
