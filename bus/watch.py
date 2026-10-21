@@ -19,7 +19,8 @@ files one loom:triage issue in the lanes repo titled "<component>: <signature>"
 with the count and the first and last example lines (redacted, then passed
 through the written-text check). A signature already open as an issue gets a
 count comment at most once an hour, with when it was last seen: one rolling
-issue per signature. The issue a signature was filed on is remembered until
+issue per signature. A signature not seen for a DAY has its open issue closed as
+not planned, with one comment that says when it was last seen. The issue a signature was filed on is remembered until
 it closes, so a signature that comes back after a quiet day, on an issue the
 brain has since retitled or relabelled, is counted there, not filed twice. Offsets and signatures are kept in the
 station's state directory (watch.json); no model is involved.
@@ -451,6 +452,8 @@ class Watcher:
             rec = sigs[key]
             last = _num(rec.get("last")) if isinstance(rec, dict) else None
             if last is None or self.now - last >= DAY:
+                if isinstance(rec, dict) and rec.get("issue") is not None:
+                    continue  # kept until _close_quiet has closed its issue
                 del sigs[key]
                 continue
             rec["hits"] = [h for h in rec.get("hits") or []
@@ -605,6 +608,42 @@ class Watcher:
         self._told(rec)
         return "counted"
 
+    def _quiet_body(self, rec: Dict[str, Any]) -> str:
+        return "\n".join([
+            MARKER,
+            "This signature has not been seen for %d hours. Last seen %s."
+            % (DAY // 3600,
+               time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_num(rec.get("last")) or self.now))),
+            "",
+            "Closing as not planned. A new sighting files or reopens it."])
+
+    def _close_quiet(self, sigs: Dict[str, Any]) -> None:
+        """Close the open issue of each signature not seen for a DAY, as not
+        planned. A signature that comes back files again as usual."""
+        for key, rec in sorted(sigs.items(), key=lambda kv: kv[1].get("first", 0)):
+            number = _num(rec.get("issue")) if isinstance(rec, dict) else None
+            last = _num(rec.get("last")) if isinstance(rec, dict) else None
+            if number is None or last is None or self.now - last < DAY:
+                continue
+            if not self.write or self.writes + 2 > WRITES_MAX:
+                continue
+            try:
+                if self._is_open(int(number)):
+                    body = self._quiet_body(rec)
+                    _text.check(body)
+                    self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
+                                 {"body": body})
+                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                                 {"state": "closed", "state_reason": "not_planned"})
+                    self.writes += 2
+                    self.say("watch: closed quiet %s#%d" % (self.repo, number))
+            except (GitHubError, OSError, ValueError) as err:
+                self.say("watch: could not close a quiet %s signature: %s"
+                         % (key.split(": ", 1)[0], err))
+                continue
+            rec["issue"] = None
+            self.issues.pop(key, None)
+
     def _tell(self, sigs: Dict[str, Any], done: Dict[str, int]) -> None:
         for key, rec in sorted(sigs.items(), key=lambda kv: kv[1].get("first", 0)):
             kind = self._due(rec)
@@ -627,6 +666,7 @@ class Watcher:
         seen = self._scan(state)
         sigs = state["sigs"]
         self._remember(state)
+        self._close_quiet(sigs)
         self._prune(sigs)
         done: Dict[str, int] = {}
         try:

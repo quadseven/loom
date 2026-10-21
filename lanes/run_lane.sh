@@ -1004,16 +1004,19 @@ limit_until() {
 # Hold every slot in this slot's group until the provider's reset, and
 # hand on every brief still in the inbox this pass.
 hold_provider_limit() {
-  local until slot source checked
+  local until slot source checked tmp
   until="$(limit_until)" || return 0
   LIMITED=1
   source="$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
   checked="$(date +%s)"
   for slot in $(key_group); do
     if [ "$slot" != "$SLOT" ]; then
-      cp "$source" "$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp" || return 1
-      mv -f "$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp" \
-        "$LOOM_HOME/state/usage/$slot.provider-limit.json" || return 1
+      tmp="$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp"
+      if ! cp "$source" "$tmp" \
+        || ! mv -f "$tmp" "$LOOM_HOME/state/usage/$slot.provider-limit.json"; then
+        rm -f "$tmp"
+        return 1
+      fi
     fi
     printf '%s\n' "$checked" > "$LOOM_HOME/state/usage/$slot.provider-check" || return 1
     write_beat "$slot" false "limit: $LIMIT_WHY; unavailable until $(utc "$until")" "$until"
@@ -2355,7 +2358,8 @@ for BRIEF in "$INBOX"/*.md; do
   # The whole run output (from LOG_START), for the limit and credit patterns;
   # the short tail (its last five non-blank lines), kept for the reason shown
   # to people and for the auth/transient patterns (loom#934).
-  RUN_OUTPUT="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$')"
+  # The limit patterns read only what the provider said (provider_text).
+  RUN_OUTPUT="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$' | provider_text)"
   FAILURE_OUT="$(printf '%s\n' "$RUN_OUTPUT" | tail -n 5)"
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
@@ -2561,13 +2565,12 @@ for BRIEF in "$INBOX"/*.md; do
         park "$BRIEF" "could not prepare public repo PR text; nothing pushed" transient; continue
       }
       BODY_FILE="$(mktemp "$LOOM_HOME/run/$SLOT-leak-body.XXXXXX")"
-      # The body refs its own ticket ("Refs OWNER/NAME#N"), which names nothing
-      # private, and the scanner flags every OWNER/NAME#N; its --allow-repo-ref
-      # would also pass NAME-legacy-private#N and other owners' NAME#N. So the
-      # copy it scans says "#N" for exactly this repo, and the body posted is
-      # unchanged.
-      printf '%s\n' "${PR_BODY//"$REPO#"/#}" > "$BODY_FILE"
-      if ! LEAK_OUT="$(timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$BODY_FILE" 2>&1)"; then
+      # The body cites its own repo's tickets ("Refs OWNER/NAME#N", and NAME#N
+      # from the ticket text), which name nothing private. An OWNER/NAME
+      # --allow-repo-ref exempts exactly those two forms, as for the diff:
+      # rewriting only OWNER/NAME#N to #N left NAME#N flagged (2026-10-21).
+      printf '%s\n' "$PR_BODY" > "$BODY_FILE"
+      if ! LEAK_OUT="$(timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$BODY_FILE" --allow-repo-ref "$REPO" 2>&1)"; then
         rm -f "$BODY_FILE"
         park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $LEAK_OUT"
         continue

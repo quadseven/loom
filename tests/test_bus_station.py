@@ -675,6 +675,62 @@ class ReconcilePullRequestTest(Base):
         runner.reconcile_pull_requests()
         self.assertEqual(puts, len([call for call in self.fake.calls if call[0] == "PUT"]))
 
+    CRITERIA = "## Acceptance criteria\n\n- [ ] First works; test.\n- [ ] Second works.\n- [ ] Third works.\n"
+
+    def merged_with(self, pull_criteria, number=99, merged_at="2030-01-02T00:00:00Z"):
+        """Ticket 12 at loom:pr; a merged pull request whose body carries these criteria."""
+        if 12 not in self.fake.issues:
+            self.fake.add(12, state="pr", body=BODY + "\n" + self.CRITERIA)
+        body = "Refs %s#12\n\n## Acceptance criteria\n\n%s" % (REPO, pull_criteria)
+        self.fake.pulls.append({"number": number, "state": "closed", "merged_at": merged_at,
+                                "body": body, "head": {"ref": "loom/12-fix-the-thing"}})
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+
+    def requeued(self, at):
+        """The ticket goes back to loom:pr after a requeue at `at`."""
+        self.fake.events[12].append(dict(labeled("loom:queued", "alice-example"), created_at=at))
+        self.fake.issues[12]["labels"] = [{"name": "loom:pr" if n == "loom:queued" else n}
+                                          for n in self.fake.names(12)]
+
+    def test_a_merged_pr_that_ticks_every_criterion_moves_the_ticket_to_merged(self):
+        self.merged_with("- [x] First works; test.\n- [x] Second works.\n- [x] Third works.\n")
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:queued", self.fake.names(12))
+
+    def test_a_merged_pr_that_leaves_criteria_unbuilt_returns_the_ticket_to_the_queue(self):
+        self.merged_with("- [x] First works; test.\n- [ ] Second works.\n- [ ] Third works.\n")
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:pr", self.fake.names(12))
+        # The note is an event in the status comment, never a comment of its own.
+        self.assertEqual([status.is_status(c["body"]) for c in self.fake.comments[12]], [True])
+        note = [c["body"] for c in status.expand(self.fake.comments[12], AUTHORS)][0]
+        self.assertIn("#99", note)
+        self.assertIn("Second works.", note)
+        self.assertIn("Third works.", note)
+        self.assertNotIn("First works", note)
+
+    def test_a_criterion_marked_not_built_with_a_reason_counts_as_answered(self):
+        self.merged_with("- [x] First works; test.\n- [ ] Second works.; not built: needs a key\n"
+                         "- [x] Third works.\n")
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_a_pr_merged_before_the_requeue_does_not_requeue_the_ticket_again(self):
+        self.merged_with("- [x] First works; test.\n")
+        self.requeued("2030-01-03T00:00:00Z")
+        self.fake.calls.clear()
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertEqual(self.fake.paths("PUT"), [])
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertEqual(len(self.fake.comments[12]), 1)
+
+    def test_criteria_built_by_an_earlier_merged_pr_count_for_a_later_one(self):
+        self.merged_with("- [x] First works; test.\n- [x] Second works.\n", number=98)
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.requeued("2030-01-03T00:00:00Z")
+        self.merged_with("- [x] Third works.\n", number=99, merged_at="2030-01-04T00:00:00Z")
+        self.assertIn("loom:merged", self.fake.names(12))
+
     def test_a_failed_issues_fetch_is_logged_and_the_pass_survives(self):
         self.fake.add(12, state="pr")
         next_repo = "second-owner/second-repo"
