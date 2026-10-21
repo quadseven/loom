@@ -1995,6 +1995,26 @@ cat > /dev/null
                       (self.loom / "logs" / "codex" / (name + ".log")).read_text())
         self.assertFalse(any(c.startswith("gh pr comment") for c in self.calls()))
 
+    def test_a_push_refused_for_the_workflows_permission_is_a_factory_incident(self):
+        # GitHub refuses a GitHub App's push that touches .github/workflows
+        # unless the App holds the workflows permission. No lane or model can
+        # change that, so it is not [transient]: five runs on three tickets
+        # climbed the model ladder to claude on it (2026-10-21).
+        hook = self.remote / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\n"
+                        "echo 'refusing to allow a GitHub App to create or update workflow"
+                        " `.github/workflows/ci.yml` without `workflows` permission' >&2\n"
+                        "exit 1\n")
+        hook.chmod(0o755)
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = self.lane_log()
+        self.assertIn("failed: [factory] push refused: the GitHub App has no workflows permission", log)
+        self.assertNotIn("[transient] push failed", log)
+        self.assertTrue(any(c.startswith("gh issue create") for c in self.calls()))
+
     def test_a_fix_brief_whose_branch_moved_during_the_run_is_parked_as_branch_moved(self):
         name, before = self.fix_brief()
         # Another lane pushes to the pull request's branch while this run's

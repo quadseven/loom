@@ -2724,6 +2724,18 @@ for BRIEF in "$INBOX"/*.md; do
           park "$BRIEF" "branch moved: $BRANCH is at ${NOW_HEAD:0:12} on the remote, not ${BASE:0:12} as when the run started"; continue
         fi
       fi
+      # GitHub refuses an App's push that touches .github/workflows unless
+      # the App holds the workflows permission. No lane or model can change
+      # that: retried as [transient], five runs climbed to claude on it
+      # (2026-10-21). The ticket keeps its rung until the incident closes.
+      # shellcheck disable=SC2016 # GitHub's literal backquotes
+      if REFUSED="$(printf '%s\n' "$PUSH_OUT" | grep -m1 'without `workflows` permission')"; then
+        PUSH_REASON="push refused: the GitHub App has no workflows permission"
+        note_factory_incident workflows-permission "The push of $BRANCH was refused: ${REFUSED#remote: }
+
+Grant the lanes' GitHub App the workflows permission (read and write), or land the workflow change from an operator session, then close this issue. Its held tickets return to the queue when it closes." PUSH_REASON
+        park "$BRIEF" "$PUSH_REASON" "$PARK_CLASS"; continue
+      fi
       park "$BRIEF" "push failed" transient; continue
     fi
     [ -z "$PUSH_OUT" ] || printf '%s\n' "$PUSH_OUT" >> "$LOG"
