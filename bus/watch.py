@@ -193,12 +193,12 @@ REFUSAL_RUNS = 5
 REFUSED_MAX = 50
 PATH_MAX = 120
 # Run boundaries a log marks: the brain's tick (lanes/mac/brain.sh say) and a
-# lane run (lanes/run_lane.sh: "<ticket> start, lane <slot>", "<ticket> done,
-# ...", "<ticket> failed: [<class>] <reason>").
+# lane run (lanes/run_lane.sh: "<ticket> start, lane <slot>", "<ticket> done"
+# with what it did after a comma, "<ticket> failed: [<class>] <reason>").
 TICK_START_RE = re.compile(r"\bbrain: tick start \(lane (?P<lane>[a-z][a-z0-9-]*)\b")
 TICK_END_RE = re.compile(r"\bbrain: tick end \(exit (?P<code>[0-9]+)\)")
 RUN_START_RE = re.compile(r"^(?P<ticket>\S+) start, lane (?P<lane>[A-Za-z0-9_.-]+)\s*$")
-RUN_DONE_RE = re.compile(r"^(?P<ticket>\S+) done, (?P<what>.*)$")
+RUN_DONE_RE = re.compile(r"^(?P<ticket>\S+) done(?:, (?P<what>.*))?$")
 RUN_FAILED_RE = re.compile(r"^(?P<ticket>\S+) failed: \[(?P<cls>[a-z-]+)\] (?P<why>.*)$")
 NO_CHANGE_RE = re.compile(r"(?i)nothing to change|made no (?:commit|change)")
 REFUSAL_TITLE = "%s: sandbox refused %s"
@@ -424,7 +424,7 @@ def run_mark(line: str) -> Optional[Tuple[str, str]]:
         return "start", m.group("lane")
     m = RUN_DONE_RE.match(text)
     if m:
-        return "end", "no change" if NO_CHANGE_RE.search(m.group("what")) else "ok"
+        return "end", "no change" if NO_CHANGE_RE.search(m.group("what") or "") else "ok"
     m = RUN_FAILED_RE.match(text)
     if m:
         if m.group("cls") in ("transient", "limit"):

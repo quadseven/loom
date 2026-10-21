@@ -678,6 +678,18 @@ class AgentRefusalTest(WatchBase):
         self.assertEqual(len(self.gh.issues), 1)
         self.assertIn("no change", self.gh.issues[1]["body"])
 
+    def test_run_marks(self):
+        self.assertEqual(watch.run_mark(TICK_START), ("start", "spark"))
+        self.assertEqual(watch.run_mark(TICK_END % 0), ("end", "ok"))
+        self.assertEqual(watch.run_mark(TICK_END % 124), ("end", "failed (exit 124)"))
+        for line, outcome in (("T042 done", "ok"), ("T042 done, answer posted", "ok"),
+                              ("T042 done, answered: nothing to change", "no change"),
+                              ("T042 failed: [transient] agent exited 124",
+                               "ended early ([transient])"),
+                              ("T042 failed: [work] tests failed", "failed ([work])")):
+            self.assertEqual(watch.run_mark("[2026-10-21T10:10:00Z] " + line), ("end", outcome))
+        self.assertIsNone(watch.run_mark("station: reported o/r#5 failed: [work] x"))
+
     def test_a_run_cut_short_by_a_limit_is_not_hurt_by_its_refusal(self):
         self.append("[2026-10-21T10:00:00Z] T042 start, lane spark",
                     TOOL_FAILED_LINE, REFUSAL_LINE,
