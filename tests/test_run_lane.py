@@ -1041,6 +1041,15 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("run the repo's full test suite", prompt)
         self.assertIn("cyclomatic complexity under 15", prompt)
 
+    def test_the_agent_is_told_never_to_write_another_repos_issue_ref(self):
+        # Lane agents wrote made-up OWNER/NAME references into test fixtures
+        # in public repos, and the leak scan refused the push (2026-10-21).
+        self.drop_brief()
+        self.run_lane()
+        prompt = self.log.read_text()
+        self.assertIn("never write a reference to another repo's issue", prompt)
+        self.assertIn("NAME#N", prompt)
+
     def test_pr_body_ends_with_refs_for_a_station_brief(self):
         self.drop_brief(text=BRIEF.replace("Lane: codex\n", "Lane: codex\nIssue: example/repo#42\n"))
         result = self.run_lane()
@@ -1204,7 +1213,12 @@ print('leak guard: clean (shape patterns only)')
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertFalse(beat["available"])
         self.assertIn("provider limit reached", beat["reason"])
-        self.assertAlmostEqual(beat["retry_at"] - time.time(), 3600, delta=30)
+        # The stated reset time, its next occurrence (2026-10-21).
+        from datetime import datetime, timedelta
+        reset = datetime.now().replace(hour=12, minute=21, second=0, microsecond=0)
+        if reset <= datetime.now():
+            reset += timedelta(days=1)
+        self.assertAlmostEqual(beat["retry_at"], reset.timestamp(), delta=30)
         # The next brief waits until the provider limit lifts.
         agents = sum(c.startswith("codex ") for c in self.calls())
         self.drop_brief("T043-next.md", BRIEF.replace("T042", "T043"))
@@ -1247,6 +1261,41 @@ print('leak guard: clean (shape patterns only)')
             '{"type":"tool_use","part":{"state":{"output":"ok"}}}\n'
             '{"type":"error","error":{"message":"429 Too Many Requests: usage limit reached"}}'))
         self.assertIn("[limit]", self.run_log())
+
+    def test_a_full_free_pool_is_a_short_limit_not_the_agents_failure(self):
+        # The shared free pool answered "has no lane available" 18 times; the
+        # runs were classed limit, transient or work at random (2026-10-21).
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "Error: free pool (private) has no lane available; retry after 1s"))
+        self.assertIn("[limit]", self.run_log())
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertLessEqual(beat["retry_at"] - time.time(), 120)
+    def test_a_stated_reset_time_holds_the_lane_until_then(self):
+        # Codex said when its limit resets and the lane retried every hour
+        # anyway, a ticket round each time: one ticket failed rounds 6 to 11
+        # an hour apart (2026-10-21). A reset days away is trusted up to a week.
+        from datetime import datetime, timedelta
+        later = (datetime.now() + timedelta(days=3)).replace(second=0, microsecond=0)
+        day = later.day
+        suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+        stamp = "%s %d%s, %d %s" % (later.strftime("%b"), day, suffix, later.year,
+                                    later.strftime("%I:%M %p").lstrip("0"))
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "ERROR: You've hit your usage limit. Upgrade to Pro or try again at %s." % stamp))
+        self.assertIn("[limit]", self.run_log())
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
+
+    def test_a_reset_time_of_day_is_its_next_occurrence(self):
+        from datetime import datetime, timedelta
+        later = (datetime.now() + timedelta(hours=5)).replace(second=0, microsecond=0)
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "ERROR: You've hit your usage limit. Try again at %s." % later.strftime("%I:%M %p").lstrip("0")))
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
 
     def test_provider_quota_messages_are_still_limits(self):
         for out in ("429 RESOURCE_EXHAUSTED quota resets in 1 hours",
@@ -1379,6 +1428,23 @@ print('leak guard: clean (shape patterns only)')
         self.assertFalse(missing, "function not found in runner: %s" % ", ".join(missing))
         return "".join(found[n].group(0) for n in names)
 
+    def test_free_slots_use_distinct_pinned_gateway_routes(self):
+        script = self.source_functions("setting_var", "lane_var", "lane_setting") + 'lane_setting URL'
+        routes = {
+            "free-ollama": "/free/ollama-cloud/v1",
+            "free-gemma": "/free/gemini/v1",
+            "free-nvidia": "/free-public/nvidia-nim/v1",
+            "free-kilo": "/free-public/kilo/v1",
+            "free-groq": "/free-public/groq/v1",
+        }
+        for slot, route in routes.items():
+            with self.subTest(slot=slot):
+                env = self.lane_env(SLOT=slot, LANE="free",
+                                    LOOM_FREE_GATEWAY_URL="https://gateway.example.invalid/")
+                result = subprocess.run(["bash", "-c", script], env=env,
+                                        capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout, "https://gateway.example.invalid" + route)
+
     def hold_credit(self, slot, until=4102444800):
         script = self.source_functions("write_beat", "utc", "hold_shared_credit") + (
             'heartbeat() { :; }\nhold_shared_credit "$1"')
@@ -1465,6 +1531,65 @@ print('leak guard: clean (shape patterns only)')
         beat = self.beat()
         self.assertFalse(beat["available"])
         self.assertGreater(beat["retry_at"], int(time.time()))
+
+    def test_a_timeout_after_editing_keeps_the_edits_on_a_timedout_branch(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EDIT="1", FAKE_EXIT="124")
+        reason = self.failure_line()
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-timedout-" in h]
+        self.assertEqual(len(side), 1, heads)
+        self.assertTrue(side[0].startswith("loom/T042-fix-the-thing-timedout-"), side)
+        self.assertTrue(reason.startswith("[transient] agent exited 124; "), reason)
+        self.assertIn("the edits are on branch " + side[0], reason)
+        kept = subprocess.run(["git", "--git-dir", str(self.remote), "show", side[0] + ":fix.txt"],
+                              capture_output=True, text=True, check=True).stdout
+        self.assertEqual(kept, "partial\n")
+        self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", heads)
+
+    def test_a_limited_timeout_after_editing_still_keeps_the_edits(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="429 RESOURCE_EXHAUSTED quota resets in 1 hours",
+                      FAKE_EDIT="1", FAKE_EXIT="124")
+        reason = self.failure_line()
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-timedout-" in h]
+        self.assertEqual(len(side), 1, heads)
+        self.assertTrue(reason.startswith("[limit] "), reason)
+        self.assertIn("the edits are on branch " + side[0], reason)
+
+    def test_a_failed_status_read_never_names_an_uncommitted_timeout_branch(self):
+        self.write_tool(self.bin / "git", """#!/usr/bin/env bash
+if [[ " $* " == *" status --porcelain "* ]] &&
+   [ "$(cat "$FAKE_EDITED_TREE/fix.txt" 2>/dev/null)" = partial ]; then
+  count=$(cat "$FAKE_STATUS_COUNT" 2>/dev/null || echo 0)
+  count=$((count + 1))
+  echo "$count" > "$FAKE_STATUS_COUNT"
+  if [ "$count" -eq 2 ]; then echo 'status unavailable' >&2; exit 17; fi
+fi
+exec /usr/bin/git "$@"
+""")
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        tree = self.loom / "worktrees" / "T042-fix-the-thing"
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EDIT="1",
+                      FAKE_EXIT="124", FAKE_EDITED_TREE=str(tree),
+                      FAKE_STATUS_COUNT=str(self.home / "status-count"))
+        reason = self.failure_line()
+        self.assertIn("could not read the lane tree", reason)
+        self.assertNotIn("the edits are on branch", reason)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-timedout-", heads)
+
+    def test_a_timeout_that_edited_nothing_pushes_no_side_branch(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EXIT="124")
+        self.assertEqual(self.failure_line(), "[transient] agent exited 124")
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-timedout-", heads)
 
     def test_a_non_limit_pattern_is_still_read_from_the_short_tail(self):
         # loom#934: the auth and transient (network) patterns still read the

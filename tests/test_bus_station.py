@@ -909,6 +909,29 @@ class ReconcilePullRequestTest(Base):
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:pr", self.fake.names(12))
 
+    def test_a_merged_pull_request_clears_the_runaway_hold(self):
+        self.fake.add(12, state="pr")
+        self.fake.issues[12]["labels"].append({"name": "loom:runaway"})
+        self.fake.pulls = [{"number": 99, "state": "closed",
+                            "merged_at": "2030-01-02T00:00:00Z",
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+        self.assertTrue(any("Pull request #99 merged, so this ticket's loom:runaway hold is cleared"
+                            in c["body"] for c in self.fake.comments[12]))
+
+    def test_a_pull_request_closed_unmerged_keeps_the_runaway_hold(self):
+        self.fake.add(12, state="pr")
+        self.fake.issues[12]["labels"].append({"name": "loom:runaway"})
+        self.fake.pulls = [{"number": 99, "state": "closed", "merged_at": None,
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:closed-unmerged", self.fake.names(12))
+        self.assertIn("loom:runaway", self.fake.names(12))
+
     def adoption(self, number, pr, state="queued", lane="codex"):
         self.fake.add(number, state=state, lane=lane, body=station.adoption_body(pr))
         self.fake.issues[number]["title"] = "Land or supersede #%d: A fix" % pr
@@ -3296,6 +3319,25 @@ class FixTest(Base):
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running",
                                                "claim:alice-example"])
 
+    def test_a_claimed_fix_is_not_claimed_again_on_the_next_pass(self):
+        # The claim was stamped with the pass's start time, earlier than the
+        # fix comment the same pass had just posted, so the next pass read the
+        # fix as unclaimed and sent the same round again: 39 duplicate fix
+        # rounds, 30 on the paid lanes (2026-10-21). Here the fix comment is
+        # newer than the pass that claims it, as there.
+        self.fake.add(12)
+        self.comment(12, "Lane codex opened a pull request: https://example.com/pull/99")
+        self.comment(12, FIX_BODY)
+        self.run_pass()
+        self.assertIn("Fix-PR: 99\n", self.claimed_brief("example-owner.example-repo-12"))
+        os.remove(self.inbox("codex", "example-owner.example-repo-12.md"))
+        issue = self.fake.issues[12]
+        issue["labels"] = [x for x in issue["labels"] if x["name"] != "loom:running"] + [
+            {"name": "loom:briefed"}]
+        self.fake.version += 1
+        self.run_pass()
+        self.assertNotIn("Fix-PR", self.claimed_brief("example-owner.example-repo-12-r2"))
+
     def assert_plain_brief(self):
         text = self.claimed_brief()
         self.assertNotIn("Fix-PR", text)
@@ -3532,6 +3574,35 @@ class RetryTest(Base):
         names = self.fake.names(12)
         self.assertFalse([n for n in names if n.startswith("lane:spark")], names)
         self.assertIn("lane:codex", names)
+
+    def test_a_retry_after_a_timeout_starts_from_the_branch_that_kept_the_edits(self):
+        side = "loom/12-fix-the-thing-timedout-1760000000"
+        self.heartbeat("codex")
+        self.failed(lane="spark-3",
+                    reason="[transient] agent exited 124; the edits are on branch " + side)
+        self.run_pass()
+        self.assertIn("Lane spark-3 failed: [transient] agent exited 124; "
+                      "the edits are on branch " + side, self.bodies()[-2])
+        with open(self.inbox("codex", "example-owner.example-repo-12-r2.md")) as fh:
+            text = fh.read()
+        self.assertIn("Branch: loom/12-fix-the-thing-r2\n", text)
+        self.assertIn("## Earlier attempt", text)
+        self.assertIn("git fetch origin %s" % side, text)
+
+    def test_a_retry_after_a_timeout_that_kept_nothing_has_no_earlier_attempt(self):
+        self.heartbeat("codex")
+        self.failed(lane="spark-3", reason="[transient] agent exited 124")
+        self.run_pass()
+        with open(self.inbox("codex", "example-owner.example-repo-12-r2.md")) as fh:
+            self.assertNotIn("Earlier attempt", fh.read())
+
+    def test_a_malformed_comment_list_warns_and_names_no_timed_out_branch(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(station.status, "expand", return_value={"body": "x"}), \
+                mock.patch.object(station, "_say") as warn:
+            self.assertIsNone(runner._timedout_branch([]))
+        warn.assert_called_once()
+        self.assertIn("timed-out branch", warn.call_args.args[0])
 
     def test_a_failure_on_one_opencode_go_slot_is_not_retried_on_another(self):
         for lane in ("opencode-go", "opencode-go-3", "anthropic"):
@@ -4012,6 +4083,36 @@ class SilentLaneTest(Base):
         self.assertEqual(len(run.tickets), 1)
         (breach,) = invariants.silent_lane(invariants.Facts(st.now, silent_runs=[run]))
         self.assertTrue(any(line.startswith("codex:") for line in breach.evidence))
+
+    def test_a_wait_keeps_its_start_while_the_reason_holds(self):
+        # The factory's wait reasons were only logged; the station times each
+        # so ticket_waiting can raise the ones that never move (2026-10-21).
+        st = self.station()
+        start = st.now
+        key = "%s#12" % REPO
+        st._record_waits({key: "no free lane in tier medium"})
+        st.now = start + 3 * 3600
+        st._record_waits({key: "no free lane in tier medium"})
+        (wait,) = st._invariant_waits()
+        self.assertEqual((wait.reason, wait.since), ("no free lane in tier medium", start))
+        self.assertEqual(wait.ticket, st._invariant_ref(REPO, 12))
+        st._record_waits({key: "no free lane takes model gpt-6-sol"})
+        (wait,) = st._invariant_waits()
+        self.assertEqual(wait.since, start + 3 * 3600)
+
+    def test_a_wait_reason_that_could_carry_ticket_text_never_reaches_the_invariant(self):
+        st = self.station()
+        st._record_waits({"%s#12" % REPO: "no free lane takes model `x` <img src=y>",
+                          "%s#13" % REPO: "no free lane in tier medium"})
+        self.assertEqual([w.reason for w in st._invariant_waits()], ["no free lane in tier medium"])
+
+    def test_a_ticket_no_longer_waiting_is_dropped(self):
+        st = self.station()
+        st._record_waits({"%s#12" % REPO: "no free lane in tier medium"})
+        st.now += station.WAIT_UNSEEN + 1
+        st._record_waits({"%s#13" % REPO: "no free lane in tier hard"})
+        self.assertEqual([w.ticket.label for w in st._invariant_waits()],
+                         [st._invariant_ref(REPO, 13).label])
 
     def test_nothing_found_records_nothing(self):
         st = self.station()

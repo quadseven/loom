@@ -109,6 +109,15 @@ OUTSIDE_EPIC_SUBJECT = "every goal home"
 # issues in 6 minutes (2026-10-15), and 6 failing-streak issues opened in 27
 # minutes (2026-10-20).
 LANES_SUBJECT = "every lane"
+# The one subject of the rolling ticket-waiting breach: each reason the
+# factory gives for a ticket's wait is a line in one issue, so a lane outage
+# that holds forty tickets is one line, not forty issues.
+TICKETS_SUBJECT = "every ticket"
+# How long a ticket may wait for one reason the factory repeats every pass
+# before it is raised: six fix rounds waited nine hours on a lane at a limit
+# above the last rung of the ladder, logged every pass and raised by nothing
+# (2026-10-21).
+WAIT_LIMIT = 6 * 3600
 # The line of a rolling issue that changes every pass; it is left out when
 # the body is compared, so an unchanged list writes nothing.
 LAST_SEEN = "Last seen by the station: %s."
@@ -209,6 +218,15 @@ class GateHold(NamedTuple):
     idle: int
 
 
+class Wait(NamedTuple):
+    """A ticket the factory leaves where it is, each pass, for the same
+    reason (bus/factory.py Factory.waits): the reason without the ticket's
+    name, and since when it has given that reason."""
+    ticket: Ref
+    reason: str
+    since: float
+
+
 class SilentRun(NamedTuple):
     """A lane that held running tickets while it sent no heartbeat: how long
     it had been silent when the factory found them, the tickets, and when."""
@@ -259,6 +277,8 @@ class Facts:
     # untrusted labeler login -> briefed tickets refused for it in the last
     # LABELER_WINDOW seconds.
     label_refusals: Optional[Dict[str, int]] = None
+    # Last, so no positional construction shifts.
+    waits: Optional[List[Wait]] = None
 
 
 @dataclass(frozen=True)
@@ -700,6 +720,34 @@ def silent_lane(f: Facts) -> List[Breach]:
                    max(run.at for run in found), rolling=True)]
 
 
+def ticket_waiting(f: Facts) -> List[Breach]:
+    """Tickets the factory has left in place for over WAIT_LIMIT, each pass
+    for the same reason: one rolling breach, a line per reason, so the brain
+    sees what nothing in the factory moves and decides each line (climb the
+    ticket, set its tier, rewrite it, or ask the operator one question)."""
+    if f.waits is None:
+        return []
+    groups: Dict[str, List[Wait]] = {}
+    for wait in f.waits:
+        if f.now - wait.since > WAIT_LIMIT:
+            groups.setdefault(wait.reason, []).append(wait)
+    if not groups:
+        return []
+    lines = []
+    for reason, found in sorted(groups.items(), key=lambda item: min(w.since for w in item[1])):
+        found.sort(key=lambda w: w.since)
+        lines.append(("%s: %d ticket%s, longest %s: %s" % (
+            reason, len(found), "" if len(found) == 1 else "s",
+            _hours(f.now - found[0].since), _refs([w.ticket for w in found])))[:LINE_MAX])
+    count = sum(len(found) for found in groups.values())
+    return [Breach("ticket-waiting", TICKETS_SUBJECT,
+                   "%d ticket%s waited over %s for the same reason" % (
+                       count, "" if count == 1 else "s", "%d hours" % (WAIT_LIMIT // 3600)),
+                   ("Each line is a reason the factory gave every pass, with nothing "
+                    "moving the ticket:",) + tuple(lines),
+                   max(w.since for found in groups.values() for w in found), rolling=True)]
+
+
 def gate_hold(f: Facts) -> List[Breach]:
     """A goal the unproven-work gate refused briefed tickets for past
     GATE_HOLD_MAX: the refusal would otherwise live only in the station log
@@ -793,7 +841,7 @@ INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     lane_held,
     ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
     plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
-    repeated_failure,
+    repeated_failure, ticket_waiting,
     untrusted_labeler)
 
 

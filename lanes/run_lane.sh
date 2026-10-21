@@ -167,9 +167,20 @@ field() { grep -m1 "^$1:" "$2" | cut -d' ' -f2-; }
 setting_var() { printf 'LOOM_%s_%s' "$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')" "$2"; }
 lane_var() { setting_var "$LANE" "$1"; }
 lane_setting() {
-  local s v
+  local s v value route
   s="$(setting_var "$SLOT" "$1")" v="$(lane_var "$1")"
-  printf '%s' "${!s:-${!v:-}}"
+  value="${!s:-${!v:-}}"
+  if [ -z "$value" ] && [ "$LANE" = free ] && [ "$1" = URL ] && [ -n "${LOOM_FREE_GATEWAY_URL:-}" ]; then
+    case "$SLOT" in
+      free-ollama) route=/free/ollama-cloud/v1 ;;
+      free-gemma) route=/free/gemini/v1 ;;
+      free-nvidia) route=/free-public/nvidia-nim/v1 ;;
+      free-kilo) route=/free-public/kilo/v1 ;;
+      free-groq) route=/free-public/groq/v1 ;;
+    esac
+    value="${LOOM_FREE_GATEWAY_URL%/}$route"
+  fi
+  printf '%s' "$value"
 }
 
 # Each pass records whether this lane can take work. The dispatcher routes
@@ -250,7 +261,7 @@ summary_note() {
 # tickets took six or more rounds: no lane ran a test before opening its pull
 # request, and most fix rounds answered review findings a checklist covers.
 work_note() {
-  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
+  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line. In a public repo, never write a reference to another repo'"'"'s issue in the OWNER/NAME#<number> or NAME#<number> shape, not even a made-up one in a test fixture: write NAME#N, or add leak-guard-allow to that line when the shape is what the test is about.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
 # Lists the sandbox probes and out-of-path scratch files the agent added
@@ -1654,17 +1665,44 @@ final_validation() {
   VALIDATED="check exited 0 at ${rev:0:12}"
 }
 
-# A run that failed validation keeps its edits: they are committed and pushed
-# to a side branch, never to the ticket's branch or an open pull request.
-preserve_unvalidated() {
-  local side
-  side="$BRANCH-unvalidated-$(date +%s)"
+# Push a commit of the lane tree to a side branch of the ticket's branch and
+# say where the edits are. Never touches the ticket's branch or an open pull
+# request.
+push_side() {
+  local from="$1" side="$2"
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-       push -q origin "$BRANCH:refs/heads/$side" >> "$LOG" 2>&1; then
+       push -q origin "$from:refs/heads/$side" >> "$LOG" 2>&1; then
     printf 'the edits are on branch %s' "$side"
   else
     printf 'the push of %s failed; the edits are committed in the lane tree' "$side"
   fi
+}
+
+# A run that failed validation keeps its edits: they are committed and pushed
+# to a side branch, never to the ticket's branch or an open pull request.
+preserve_unvalidated() {
+  push_side "$BRANCH" "$BRANCH-unvalidated-$(date +%s)"
+}
+
+# A run that timed out after editing keeps its edits the same way, on a
+# -timedout- branch the station names to the next attempt. The agent's tree
+# may hold uncommitted files, so they are committed first.
+preserve_timedout() {
+  local tree_status
+  if ! rm -f "$TREE/$SUMMARY_FILE" 2>> "$LOG"; then
+    printf 'the lane tree could not be prepared; the edits were not preserved'
+    return 1
+  fi
+  if ! tree_status="$(safe_git status --porcelain 2>> "$LOG")"; then
+    printf 'could not read the lane tree; the edits were not preserved'
+    return 1
+  fi
+  if [ -n "$tree_status" ] &&
+     ! { safe_git add -A && safe_git commit -qm "$TICKET: edits before the timeout"; } >> "$LOG" 2>&1; then
+    printf 'the edits could not be committed in the lane tree'
+    return 1
+  fi
+  push_side HEAD "$BRANCH-timedout-$(date +%s)"
 }
 
 # What the agent is told about the contract, after its brief.
@@ -2364,11 +2402,15 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
   fi
+  # A timeout after editing keeps its edits whatever the failure is classed as;
+  # every park below names the branch.
+  TIMEDOUT_NOTE=""
+  if [ "$STATUS" -eq 124 ] && [ -n "$EDITED" ]; then TIMEDOUT_NOTE="; $(preserve_timedout)"; fi
   if [ "$FAIL_CLASS" != transient ]; then
     transient_clear
   elif REST_UNTIL="$(transient_strike)"; then
     heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
-    park "$BRIEF" "agent exited $STATUS" transient
+    park "$BRIEF" "agent exited $STATUS$TIMEDOUT_NOTE" transient
     break
   fi
   if [ "$FAIL_CLASS" = limit ]; then
@@ -2403,7 +2445,7 @@ for BRIEF in "$INBOX"/*.md; do
     else
       heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     fi
-    park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")" limit
+    park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")$TIMEDOUT_NOTE" limit
     break
   fi
   if [ "$FAIL_CLASS" = auth ]; then
@@ -2418,10 +2460,10 @@ for BRIEF in "$INBOX"/*.md; do
       hold_expired_key "$AUTH_WHY"
     fi
     ask_renew_key "$AUTH_WHY"
-    park "$BRIEF" "agent exited $STATUS: $AUTH_WHY" auth
+    park "$BRIEF" "agent exited $STATUS: $AUTH_WHY$TIMEDOUT_NOTE" auth
     break
   fi
-  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS" "$FAIL_CLASS"; continue; fi
+  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS$TIMEDOUT_NOTE" "$FAIL_CLASS"; continue; fi
   if [ "$DELIVERABLE" = verify ]; then
     # The station reads the result from the log folder and applies it; the
     # runner moves no label and opens no pull request.

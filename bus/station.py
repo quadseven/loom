@@ -186,6 +186,11 @@ REWRITE_PER_HOUR = 5
 # ticket's next claim (_return_dead_brief).
 DEAD_BRIEF_AGE = 3600
 REWRITE_PER_PASS = 5
+# A recorded ticket wait the factory has not repeated for this long is gone:
+# the ticket moved, or left the factory (invariants.ticket_waiting).
+WAIT_UNSEEN = 3600
+# A wait reason reaches a public incident: only these characters, this long.
+WAIT_REASON_RE = re.compile(r"[A-Za-z0-9 ,:.()/@_-]{1,160}")
 # Rewrites across every backlog goal in any hour: each one comments on its
 # issue or files a ticket, and both email the operator. Per goal alone, ten
 # backlog goals let about 80 through in ten minutes (2026-10-18).
@@ -1714,6 +1719,19 @@ class Station:
             raise ValueError("the loom:fix comment was edited after it was posted")
         return tickets.parse_fix(repo, newest_fix[2]), newest_fix[1].get("id")
 
+    def _claim_time(self, comments: List[Any], fix_comment_id: Any) -> float:
+        """When a claim is stamped: the pass time, or one second after the
+        fix comment it claims when that was posted later. The factory posts a
+        fix in the same pass, after self.now, and a claim sorted before its
+        fix left the fix unclaimed, so the next pass sent the same round
+        again (39 duplicate fix rounds, 2026-10-21)."""
+        for c in comments if fix_comment_id is not None else ():
+            if isinstance(c, dict) and c.get("id") == fix_comment_id:
+                posted = self._epoch(str(c.get("created_at") or ""))
+                if posted is not None and posted >= self.now:
+                    return posted + 1
+        return self.now
+
     def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
         """Steps 2 and 3 for an issue already re-read and trusted. False when
         its fix comment cannot be used (refused, as an untrusted ticket is),
@@ -1739,8 +1757,8 @@ class Station:
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
         has_contract, checks = self._validation_checks(repo)
-        text = tickets.render_brief(repo, issue, lane, attempt, fix,
-                                    checks, has_contract)
+        text = tickets.render_brief(repo, issue, lane, attempt, fix, checks, has_contract,
+                                    None if fix else self._timedout_branch(comments))
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
@@ -1750,7 +1768,8 @@ class Station:
         # The claim marker goes on the ticket's one status comment, edited in
         # place: a new comment emailed the operator on every claim (loom#866).
         status.add(self.gh, repo, number, "Claimed for lane %s (body sha256 %s)"
-                   % (lane, _sha12(issue.get("body"))), self.now, self.s.authors)
+                   % (lane, _sha12(issue.get("body"))),
+                   self._claim_time(comments, fix_comment_id), self.s.authors)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         if fix:
             _say("rendered %s#%d fix brief from loom:fix comment %s"
@@ -1762,6 +1781,19 @@ class Station:
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
+
+    def _timedout_branch(self, comments: List[Any]) -> Optional[str]:
+        """The side branch a timed-out attempt kept its edits on, as the
+        factory's own status events name it; None when none did."""
+        allowed = {a.lower() for a in self.s.authors}
+        # The imported status module expands the factory's event comments.
+        expanded = status.expand(comments, self.s.authors)
+        if not isinstance(expanded, list):
+            _say("could not find timed-out branch: expanded issue comments are not a list")
+            return None
+        return tickets.timedout_branch(
+            [str(c.get("body") or "") for c in expanded
+             if isinstance(c, dict) and tickets._login(c.get("user")).lower() in allowed])
 
     def _fix_refusal(self, fix: Optional[tickets.Fix]) -> Optional[str]:
         """Why a fix brief cannot go out yet, or None when it can (no fix, or
@@ -3149,10 +3181,17 @@ class Station:
                        "shipped", "verified", "closed-unmerged")
         states = {"loom:" + state for state in state_names}
         kept = [name for name in labels if name not in states]
+        cleared = target == "loom:merged" and RUNAWAY in kept
+        if cleared:
+            kept = [name for name in kept if name != RUNAWAY]
         kept.append(target)
         self.gh.rest("PUT", "/repos/%s/issues/%s/labels" % (repo, ticket["number"]),
                      {"labels": kept})
         ticket["labels"] = [{"name": name} for name in kept]
+        if cleared:
+            self._routine(repo, number,
+                          "Pull request #%d merged, so this ticket's loom:runaway hold "
+                          "is cleared." % int(pr["number"]))
         if left:
             # Routine: the ticket goes back for the rest, and a comment would
             # email the operator on each such merge.
@@ -3198,6 +3237,9 @@ class Station:
         states = {"loom:" + state for state in brain.STATES + tickets.TICKET_STATES}
         kept = [name for name in _label_names(ticket)
                 if name not in states and not name.startswith(("lane:", "wait:"))]
+        cleared = RUNAWAY in kept
+        if cleared:
+            kept = [name for name in kept if name != RUNAWAY]
         kept.append("loom:merged")
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": kept})
@@ -3207,6 +3249,10 @@ class Station:
                     int(pr["number"]), str(pr.get("merged_at") or "").replace("T", " "),
                     str(pr.get("merge_commit_sha") or "")[:12]))
         self._comment(repo, number, note)
+        if cleared:
+            self._routine(repo, number,
+                          "Pull request #%d merged, so this ticket's loom:runaway hold "
+                          "is cleared." % int(pr["number"]))
         _say("moved %s#%d to loom:merged: land-or-supersede target #%d merged"
              % (repo, number, int(pr["number"])))
 
@@ -6724,6 +6770,7 @@ class Station:
         for name, read in (("events", self._read_events),
                            ("runs", self._invariant_runs),
                            ("silent_runs", self._invariant_silent),
+                           ("waits", self._invariant_waits),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):
             try:
@@ -7818,6 +7865,7 @@ class Station:
             return
         runner = self._factory()
         runner.run()
+        self._record_waits(runner.waits)
         self._record_silent(runner.silent_running, runner.silent)
         self._return_silent_briefs(runner.silent_running)
 
@@ -7907,7 +7955,42 @@ class Station:
     def assign_queued(self) -> None:
         """Give ready queued tickets a free lane after this pass's claims."""
         if self.s.factory_on:
-            self._factory().assign_queued()
+            runner = self._factory()
+            runner.assign_queued()
+            self._record_waits(runner.waits)
+
+    def _record_waits(self, found: Dict[str, str]) -> None:
+        """Time each ticket the factory left where it is: a reason it repeats
+        keeps its start, a new reason starts again, and a ticket it has not
+        named for WAIT_UNSEEN is dropped (invariants.ticket_waiting)."""
+        path = os.path.join(self.state, "ticket-waits.json")
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        for key, reason in found.items():
+            old = saved.get(key)
+            if isinstance(old, dict) and old.get("reason") == reason and self._num(old.get("since")):
+                old["seen"] = self.now
+            else:
+                saved[key] = {"reason": reason, "since": self.now, "seen": self.now}
+        kept = {key: info for key, info in saved.items() if isinstance(info, dict)
+                and self._num(info.get("seen")) and self.now - info["seen"] <= WAIT_UNSEEN}
+        if kept or saved:
+            _write_json(path, kept)
+
+    def _invariant_waits(self) -> List[invariants.Wait]:
+        """The ticket waits _record_waits kept, each ticket named for a
+        public issue."""
+        saved = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
+        out = []
+        for key, info in sorted(saved.items() if isinstance(saved, dict) else []):
+            match = re.fullmatch(r"(.+)#([0-9]+)", str(key))
+            if not (match and isinstance(info, dict) and self._num(info.get("since"))
+                    and isinstance(info.get("reason"), str)
+                    and WAIT_REASON_RE.fullmatch(info["reason"])):
+                continue
+            out.append(invariants.Wait(self._invariant_ref(match.group(1), int(match.group(2))),
+                                       info["reason"], info["since"]))
+        return out
 
     def _factory(self) -> factory.Factory:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
