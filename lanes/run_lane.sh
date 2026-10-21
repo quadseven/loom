@@ -1645,11 +1645,19 @@ preserve_unvalidated() {
 # -timedout- branch the station names to the next attempt. The agent's tree
 # may hold uncommitted files, so they are committed first.
 preserve_timedout() {
-  rm -f "$TREE/$SUMMARY_FILE"
-  if [ -n "$(safe_git status --porcelain 2>> "$LOG")" ] &&
+  local tree_status
+  if ! rm -f "$TREE/$SUMMARY_FILE" 2>> "$LOG"; then
+    printf 'the lane tree could not be prepared; the edits were not preserved'
+    return 1
+  fi
+  if ! tree_status="$(safe_git status --porcelain 2>> "$LOG")"; then
+    printf 'could not read the lane tree; the edits were not preserved'
+    return 1
+  fi
+  if [ -n "$tree_status" ] &&
      ! { safe_git add -A && safe_git commit -qm "$TICKET: edits before the timeout"; } >> "$LOG" 2>&1; then
     printf 'the edits could not be committed in the lane tree'
-    return 0
+    return 1
   fi
   push_side HEAD "$BRANCH-timedout-$(date +%s)"
 }

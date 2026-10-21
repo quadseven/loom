@@ -1762,8 +1762,10 @@ class Station:
         """The side branch a timed-out attempt kept its edits on, as the
         factory's own status events name it; None when none did."""
         allowed = {a.lower() for a in self.s.authors}
+        # The imported status module expands the factory's event comments.
         expanded = status.expand(comments, self.s.authors)
         if not isinstance(expanded, list):
+            _say("could not find timed-out branch: expanded issue comments are not a list")
             return None
         return tickets.timedout_branch(
             [str(c.get("body") or "") for c in expanded

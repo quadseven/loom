@@ -1411,6 +1411,29 @@ print('leak guard: clean (shape patterns only)')
         self.assertTrue(reason.startswith("[limit] "), reason)
         self.assertIn("the edits are on branch " + side[0], reason)
 
+    def test_a_failed_status_read_never_names_an_uncommitted_timeout_branch(self):
+        self.write_tool(self.bin / "git", """#!/usr/bin/env bash
+if [[ " $* " == *" status --porcelain "* ]] &&
+   [ "$(cat "$FAKE_EDITED_TREE/fix.txt" 2>/dev/null)" = partial ]; then
+  count=$(cat "$FAKE_STATUS_COUNT" 2>/dev/null || echo 0)
+  count=$((count + 1))
+  echo "$count" > "$FAKE_STATUS_COUNT"
+  if [ "$count" -eq 2 ]; then echo 'status unavailable' >&2; exit 17; fi
+fi
+exec /usr/bin/git "$@"
+""")
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        tree = self.loom / "worktrees" / "T042-fix-the-thing"
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EDIT="1",
+                      FAKE_EXIT="124", FAKE_EDITED_TREE=str(tree),
+                      FAKE_STATUS_COUNT=str(self.home / "status-count"))
+        reason = self.failure_line()
+        self.assertIn("could not read the lane tree", reason)
+        self.assertNotIn("the edits are on branch", reason)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-timedout-", heads)
+
     def test_a_timeout_that_edited_nothing_pushes_no_side_branch(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EXIT="124")
