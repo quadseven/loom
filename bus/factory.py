@@ -1766,6 +1766,11 @@ class Factory:
     def _association(self, repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
         try:
             return brain._ticket_association(repo, pr)
+        except brain.OtherRepoTicket:
+            # By design, not a refusal: an infra image-pin pull request ships
+            # another repo's ticket. It has no ticket here; a line for it
+            # every pass would bury the real refusals.
+            return None
         except ValueError as err:
             _say("no ticket for %s#%s: %s" % (repo, pr.get("number"), err))
             return None
