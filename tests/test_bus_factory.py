@@ -481,6 +481,17 @@ class PullRequests(Base):
         self.assertNotEqual(self.lane(5), "muse")
         self.assertEqual(self.lane(5), "spark")
 
+    def test_a_fix_round_for_a_ticket_with_no_lane_label_names_a_lane(self):
+        # A silent-lane requeue drops the lane label and the run's pull request
+        # can still open after it; the fix brief then needs exactly one lane.
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5]["labels"] = [x for x in self.gh.issues[5]["labels"]
+                                       if not x["name"].startswith("lane:")]
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.lane(5), "spark")
+
     def test_a_thread_that_survives_a_fix_round_climbs_to_the_first_rung(self):
         self.gh.ticket(5, "pr", lane="opencode-go")
         self.gh.comments[5].append({"body": FIX_ASKED, "user": ME})

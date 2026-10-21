@@ -1597,7 +1597,10 @@ class Factory:
                                                  if 1 <= n <= len(CLIMB)])
                 return
         lane = None
-        if _lane(issue) in REMOTE_LANES:
+        # A ticket with no lane label (a silent-lane requeue drops it, and the
+        # run's pull request opens after; loom#1095, 2026-10-21) failed every
+        # fix brief on "exactly one lane label": it moves like a remote one.
+        if not _lane(issue) or _lane(issue) in REMOTE_LANES:
             lane, _ = self._tier_move(repo, issue, allow_remote=False)
             if lane is None:
                 lane = LADDER[0][0][0]
