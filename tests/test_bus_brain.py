@@ -445,7 +445,7 @@ class SensitiveResumeTests(unittest.TestCase):
         report = brain.status(GitHub("t", transport=transport), [REPO], REPO, env={}, authors=())
         self.assertIn("- #4 Docs - READY", report)
 
-    def test_status_pull_request_lines_with_and_without_pending_brain_fix(self):
+    def test_status_does_not_mark_pull_request_ready_while_brain_fix_pending(self):
         pr = {"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}
         authors = ["alice-example"]
         comments_with = [{"user": {"login": "alice-example"},
@@ -463,7 +463,7 @@ class SensitiveResumeTests(unittest.TestCase):
                                    env=TRUSTED, authors=authors)
         lines = report_with.splitlines()
         at = lines.index("### Pull requests")
-        self.assertEqual(lines[at + 1], "- #4 PR - READY - pending brain fix")
+        self.assertEqual(lines[at + 1], "- #4 PR - blocked: pending brain fix")
 
         comments_without = [{"user": {"login": "alice-example"},
                              "body": "%s normal fix" % tickets.FIX_MARKER}]
@@ -492,7 +492,13 @@ class SensitiveResumeTests(unittest.TestCase):
                      "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
         gh_fix = GitHub("t", transport=Fake(reply(200, with_fix)))
         lines_with = brain._pull_request_lines(gh_fix, REPO, [pr], data, bot, authors)
-        self.assertEqual(lines_with, ["### Pull requests", "- #4 PR - READY - pending brain fix"])
+        self.assertEqual(lines_with, ["### Pull requests", "- #4 PR - blocked: pending brain fix"])
+
+        blocked = {"prs": {4: ready_node(checks="FAILURE")}}
+        gh_blocked = GitHub("t", transport=Fake(reply(200, with_fix)))
+        lines_blocked = brain._pull_request_lines(gh_blocked, REPO, [pr], blocked, bot, authors)
+        self.assertEqual(lines_blocked,
+                         ["### Pull requests", "- #4 PR - blocked: checks failure, pending brain fix"])
 
         without_fix = [{"user": {"login": "alice-example"},
                         "body": "%s normal fix" % tickets.FIX_MARKER}]
