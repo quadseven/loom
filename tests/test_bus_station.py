@@ -7253,6 +7253,26 @@ class VerifyDueTest(unittest.TestCase):
         self.assertEqual([i["number"] for _, i in station.verify_due(
             [(REPO, missing), (REPO, exact)], {}, 99999)], [5])
 
+    def test_a_ticket_whose_proof_was_refused_the_cap_times_is_not_due(self):
+        def item(number):
+            return (REPO, {"number": number, "state": "open", "shipped_at": number,
+                           "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]})
+        refused = {"%s#1" % REPO: ["why"] * station.VERIFY_REFUSAL_CAP,
+                   "%s#2" % REPO: ["why"] * (station.VERIFY_REFUSAL_CAP - 1)}
+        found = station.verify_due([item(1), item(2), item(3)], {}, 99999, refused)
+        self.assertEqual([issue["number"] for _, issue in found], [2, 3])
+
+
+class StationLogTimeTest(unittest.TestCase):
+    def test_every_station_log_line_starts_with_a_utc_time(self):
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            station._say("handed example#1 to lane codex to verify")
+        self.assertRegex(out.getvalue(),
+                         r"^\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\] station: handed example#1 ")
+        # A quoted line now names a time, so the live-evidence check accepts it.
+        self.assertTrue(station._SEEN_AT.search(out.getvalue()))
+
 
 SHIPPED_BODY = ("Difficulty: easy\n\n## Why\nBecause.\n\n## Acceptance criteria\n"
                 "- [ ] A test passes\n- [ ] Live: prints `daily status ready`\n")
@@ -8143,6 +8163,40 @@ class VerifyResultTest(Base):
         self.assertEqual(len(facts), 1)
         self.assertIn("PR #31 merged 2029-12-31T00:00:00Z as %s" % sha[:12], facts[0])
         self.assertIn("main contains it: yes", facts[0])
+
+    def refuse_n(self, count):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=time.time())
+        for _ in range(count):
+            st._apply_proof("codex", REPO, 5, self.good(criteria=[]), "model-x")
+        return st
+
+    def test_a_ticket_refused_the_cap_times_goes_to_the_brain_once_with_the_refusals(self):
+        self.refuse_n(station.VERIFY_REFUSAL_CAP - 1)
+        self.assertEqual(self.fake.comments[5], [])
+        self.assertNotIn("needs-brain", self.fake.names(5))
+        st = self.refuse_n(1)
+        self.assertIn("needs-brain", self.fake.names(5))
+        self.assertIn("loom:shipped", self.fake.names(5))
+        self.assertEqual(len(self.fake.comments[5]), 1)
+        note = self.fake.comments[5][0]["body"]
+        self.assertEqual(note.count("- Its proof was refused"), station.VERIFY_REFUSAL_CAP)
+        # A late result from a run already out does not say it again.
+        self.refuse_n(1)
+        self.assertEqual(len(self.fake.comments[5]), 1)
+        # It is no longer due, though its cooldown is long over.
+        st.now = time.time() + 10 * station.VERIFY_INTERVAL
+        with mock.patch.object(st, "_shipped_stamp", return_value=1), \
+             mock.patch.object(st, "_proven", return_value=False):
+            pool, _ = st._verify_pool({})
+        self.assertNotIn(5, [issue["number"] for _, issue in pool])
+
+    def test_a_ticket_refused_fewer_times_stays_due(self):
+        st = self.refuse_n(station.VERIFY_REFUSAL_CAP - 1)
+        st.now = time.time() + 10 * station.VERIFY_INTERVAL
+        with mock.patch.object(st, "_shipped_stamp", return_value=1), \
+             mock.patch.object(st, "_proven", return_value=False):
+            pool, _ = st._verify_pool({})
+        self.assertIn(5, [issue["number"] for _, issue in pool])
 
     def test_an_invalid_proof_leaves_the_ticket_shipped_with_no_comment(self):
         self.result(self.good(criteria=[]))

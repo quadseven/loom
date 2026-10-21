@@ -593,6 +593,14 @@ lane whose proof failed its audit in the last 24 hours is handed no verify
 run, and the daily line's Throughput number splits the verified tickets into
 lane and brain proofs.
 
+A ticket whose proofs were refused `VERIFY_REFUSAL_CAP` times (3,
+`bus/station.py`; the count is kept in `state/station/verify-refused.json`)
+leaves the verify queue instead of coming back every 6 hours: the station
+posts one comment listing the refusals and adds `needs-brain`, and the brain
+proves the ticket or rewrites it. Every station log line starts with its UTC
+time (`[2026-10-21T08:29:40Z] station: ...`), so evidence that quotes a
+station log line can name when it was seen.
+
 ### Talking to the brain from Discord
 
 The webhook only posts. To let the operator answer a report, ask a question

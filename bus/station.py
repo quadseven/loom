@@ -409,6 +409,12 @@ VERIFY_INTERVAL = 6 * 3600
 # loom:awaiting-evidence label: a reason, not a word.
 MISSING_MIN = 20
 VERIFY_FILE = "verify-runs.json"
+# A shipped ticket whose proof was refused this many times leaves the verify
+# queue and goes to the brain with the refusals listed (loom#1307): the
+# retries every VERIFY_INTERVAL had handed one ticket out 18 times.
+VERIFY_REFUSAL_CAP = 3
+# Per ticket, the reasons its proofs were refused.
+VERIFY_REFUSED_FILE = "verify-refused.json"
 # Per-lane transient verify failures and the holds they earn (loom#714).
 VERIFY_LANES_FILE = "verify-lanes.json"
 VERIFY_STRIKES = 2
@@ -445,8 +451,12 @@ NOTE_MAX = 1500
 
 
 def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
-               attempts: Dict[str, Any], now: float) -> List[Tuple[str, Dict[str, Any]]]:
-    """Shipped tickets without a proof, oldest ship event first, outside cooldown."""
+               attempts: Dict[str, Any], now: float,
+               refused: Optional[Dict[str, Any]] = None
+               ) -> List[Tuple[str, Dict[str, Any]]]:
+    """Shipped tickets without a proof, oldest ship event first, outside
+    cooldown. A ticket whose proof was refused VERIFY_REFUSAL_CAP times
+    (`refused`: ticket -> reasons) is left to the brain."""
     due = []
     for repo, issue in issues:
         labels = _label_names(issue)
@@ -460,6 +470,9 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
             continue
         last = attempts.get(key)
         if isinstance(last, (int, float)) and now - float(last) < VERIFY_INTERVAL:
+            continue
+        reasons = (refused or {}).get(key)
+        if isinstance(reasons, list) and len(reasons) >= VERIFY_REFUSAL_CAP:
             continue
         due.append((repo, issue))
     # A ticket the health pass has proved absent for 24 hours goes first: it
@@ -974,7 +987,10 @@ def _snowflake(at: float) -> int:
 
 
 def _say(msg: str) -> None:
-    print("station: " + msg, file=sys.stderr)
+    # The UTC time leads the line, so evidence that quotes a station log line
+    # can name when it was seen (loom#1307).
+    print("[%s] station: %s" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg),
+          file=sys.stderr)
 
 
 class StateError(Exception):
@@ -2593,16 +2609,17 @@ class Station:
         if unsearchable:
             _say("skipped %d shipped tickets whose Live criterion names no exact string" %
                  unsearchable)
+        refused = self._verify_refused_ledger()
         # The cheap filters first: the events and comments of a ticket are
         # read only when its cooldown is over.
         found = []
-        for repo, issue in verify_due(shipped, attempts, self.now):
+        for repo, issue in verify_due(shipped, attempts, self.now, refused):
             issue["shipped_at"] = self._shipped_stamp(repo, issue)
             issue["has_proof"] = self._proven(repo, int(issue["number"]))
             issue["health_proof"] = health.proof_of(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))), self.s.authors)
             found.append((repo, issue))
-        return verify_due(found, attempts, self.now), held
+        return verify_due(found, attempts, self.now, refused), held
 
     def _audit_holds(self) -> Dict[str, float]:
         """The lanes a failed audit of their proof holds from verify runs,
@@ -2820,6 +2837,40 @@ class Station:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
         return True
 
+    def _verify_refused_ledger(self) -> Dict[str, Any]:
+        data = _read_json(os.path.join(self.state, VERIFY_REFUSED_FILE), {}, strict=False)
+        return data if isinstance(data, dict) else {}
+
+    def _forget_refusals(self, repo: str, number: int) -> None:
+        data = self._verify_refused_ledger()
+        if data.pop("%s#%d" % (repo, number), None) is not None:
+            _write_json(os.path.join(self.state, VERIFY_REFUSED_FILE), data)
+
+    def _proof_refused(self, repo: str, number: int, lane: str, names: List[str],
+                       why: str) -> None:
+        """Log a refused proof and count it. At VERIFY_REFUSAL_CAP the ticket
+        leaves the verify queue (verify_due) and goes to the brain once: one
+        comment lists the refusals and the ticket gains needs-brain."""
+        self._verify_note(repo, number, lane, why)
+        data = self._verify_refused_ledger()
+        key = "%s#%d" % (repo, number)
+        reasons = data.get(key)
+        reasons = (reasons if isinstance(reasons, list) else []) + [why]
+        data[key] = reasons
+        _write_json(os.path.join(self.state, VERIFY_REFUSED_FILE), data)
+        if len(reasons) != VERIFY_REFUSAL_CAP:
+            return
+        if "needs-brain" not in names:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
+                "<!-- loom:verify-refused v1 -->\n"
+                "The station stops handing this ticket out to verify: %d proofs were "
+                "refused. The brain reads the ticket and its live criterion, then proves "
+                "it or rewrites it.\n\n%s\n" % (
+                    len(reasons), "\n".join("- " + self._note_text(x) for x in reasons))})
+            self._add_label(repo, number, "needs-brain")
+        _say("%s#%d left the verify queue after %d refused proofs; left for the brain"
+             % (repo, number, len(reasons)))
+
     def _forget_verify_attempt(self, repo: str, number: int) -> None:
         path = os.path.join(self.state, VERIFY_FILE)
         attempts = _read_json(path, {}, strict=False)
@@ -2945,22 +2996,22 @@ class Station:
         try:
             proof.check(record, ticked)
         except ValueError as err:
-            self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))
+            self._proof_refused(repo, number, lane, names, "Its proof was refused: %s." % self._note_text(err))
             return
         if _text.CREDENTIAL_RE.search(proof.render(record, ticked)):
-            self._verify_note(repo, number, lane, "Its proof holds text shaped like a credential.")
+            self._proof_refused(repo, number, lane, names, "Its proof holds text shaped like a credential.")
             return
         unseen = unseen_live_evidence(record)
         if unseen:
-            self._verify_note(repo, number, lane, "Its proof was refused: %s." % unseen)
+            self._proof_refused(repo, number, lane, names, "Its proof was refused: %s." % unseen)
             return
         refusal = self._merge_refusal(repo, issue, record)
         if refusal:
-            self._verify_note(repo, number, lane, refusal)
+            self._proof_refused(repo, number, lane, names, refusal)
             return
         contradiction, facts = self._proof_facts(repo, issue, record)
         if contradiction:
-            self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(
+            self._proof_refused(repo, number, lane, names, "Its proof was refused: %s." % self._note_text(
                 contradiction))
             return
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
@@ -2969,8 +3020,9 @@ class Station:
                                 verified_by="%s/%s" % (lane, model), facts=facts)
         except ValueError as err:
             self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
-            self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))
+            self._proof_refused(repo, number, lane, names, "Its proof was refused: %s." % self._note_text(err))
             return
+        self._forget_refusals(repo, number)
         _say("verified %s#%d from the proof lane %s gathered" % (repo, number, lane))
         if source:
             _say("%s#%d: %s" % (repo, number, source))
