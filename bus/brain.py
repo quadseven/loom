@@ -3340,6 +3340,10 @@ def _open_threads(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
 
 
 _TICKET_REF = re.compile(r"^Refs ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)[ \t]*$", re.M)
+# The same-repo "Refs #N" form the station also reads (_refs_numbers). Only a
+# fallback: a bare line a lane copied from an older rewrite names the source
+# issue, so a full Refs line or a loom branch always wins over it.
+_BARE_TICKET_REF = re.compile(r"^Refs #([0-9]+)[ \t]*$", re.M)
 _BRANCH_TICKET = re.compile(r"^loom/([0-9]+)(?:-[A-Za-z0-9._/-]+)?$")
 
 
@@ -3354,6 +3358,9 @@ def _ticket_association(repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, in
     branch = _BRANCH_TICKET.fullmatch(str((pr.get("head") or {}).get("ref") or ""))
     if branch:
         refs.add((repo, int(branch.group(1))))
+    if not refs:
+        refs = {(repo, int(match.group(1)))
+                for match in _BARE_TICKET_REF.finditer(str(pr.get("body") or ""))}
     if len(refs) > 1:
         raise ValueError("pull request has conflicting ticket references")
     if not refs:

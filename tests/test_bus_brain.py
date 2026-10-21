@@ -765,6 +765,30 @@ class SensitiveResumeTests(unittest.TestCase):
         section = report.split(brain.ADOPT_HEADING, 1)[1].split("\n###", 1)[0]
         self.assertNotIn("#6", section)
 
+    def test_a_same_repo_bare_refs_line_links_the_pull_request_to_its_ticket(self):
+        # An operator's pull request said "Refs #59"; the brain adopted it as
+        # ticketless, so its merge never reached #59, which stayed queued for a
+        # lane to redo (2026-10-21). The station already reads that form.
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, []),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [
+                      self._ticketless_pr(body="## Refs\nRefs #9\n")]),
+                  ("POST", "/graphql"): reply(200, {"data": {"repository": {"p6": ready_node()}}})}
+        routes.update(lanes_routes(()))
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
+                              env={"LOOM_BRIEF_AUTHORS": "example-brain"})
+        section = report.split(brain.ADOPT_HEADING, 1)[1].split("\n###", 1)[0]
+        self.assertNotIn("#6", section)
+        self.assertEqual(brain._ticket_association(REPO, self._ticketless_pr(body="Refs #9")),
+                         (REPO, 9))
+
+    def test_a_full_refs_line_wins_over_a_bare_one(self):
+        # A bare "Refs #M" a lane copied from an older rewrite names the
+        # source issue, not the ticket: it never conflicts with the real link.
+        pr = self._ticketless_pr(body="Refs #3\n\nRefs %s#9\n" % REPO)
+        self.assertEqual(brain._ticket_association(REPO, pr), (REPO, 9))
+        branch = self._ticketless_pr(body="Refs #3", head={"ref": "loom/9-fix", "sha": "head1"})
+        self.assertEqual(brain._ticket_association(REPO, branch), (REPO, 9))
+
     def test_brief_refusals_create_nothing(self):
         cases = [
             ("## Why\nmissing", "codex", 0),
