@@ -1042,7 +1042,7 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("cyclomatic complexity under 15", prompt)
 
     def test_the_agent_is_told_never_to_write_another_repos_issue_ref(self):
-        # Lane agents wrote made-up OWNER/NAME#5 references into test fixtures
+        # Lane agents wrote made-up OWNER/NAME references into test fixtures
         # in public repos, and the leak scan refused the push (2026-10-21).
         self.drop_brief()
         self.run_lane()
