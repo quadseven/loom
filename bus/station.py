@@ -9017,6 +9017,11 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         if gh.cache_dir is None:
             # Every GET is conditional: a list re-read each pass costs a 304.
             gh.cache_dir = os.path.join(state, "station", "etags")
+        app = getattr(gh, "app", None)
+        if app is not None and getattr(app, "state_file", None) is None:
+            # GitHub's ETags differ per token: keep the App token across
+            # passes (0600) so last pass's ETags still answer 304 (loom#1306).
+            app.state_file = os.path.join(state, "station", "app-token.json")
         st = Station(gh, settings, **hooks)
         try:
             st.run_pass()

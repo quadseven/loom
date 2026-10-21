@@ -456,6 +456,31 @@ class Base(unittest.TestCase):
             return []
 
 
+class StationKeepsAppTokenTest(Base):
+    """One pass per process: the App token outlives the pass (loom#1306)."""
+
+    def app_gh(self, minted):
+        def transport(method, url, headers, body):
+            path = urlsplit(url).path
+            if method == "POST" and path.endswith("/access_tokens"):
+                minted.append(1)
+                expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+                return reply(201, {"token": "ghs_pass_token", "expires_at": expires})
+            if method == "GET" and path == "/app":
+                return reply(200, {"slug": "loom-test"})
+            return self.fake(method, url, headers, body)
+        app = AppToken("123", "456", lambda: "key", sign=lambda data, key: b"sig")
+        return GitHub(app, transport=transport)
+
+    def test_a_second_pass_reuses_the_token_the_first_pass_kept(self):
+        minted = []
+        for _ in range(2):
+            self.assertEqual(station.run(self.settings, self.app_gh(minted)), 0)
+        self.assertEqual(len(minted), 1)
+        kept = os.path.join(self.home, "state", "station", "app-token.json")
+        self.assertEqual(os.stat(kept).st_mode & 0o777, 0o600)
+
+
 class StationReadBudgetTest(Base):
     def reader(self):
         return station.Station(GitHub("token", transport=self.fake), self.settings)
