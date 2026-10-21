@@ -1438,10 +1438,12 @@ class Queued(Base):
         self.queued(7, body="Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n")
         self.queued(8)
         self.queued(9, body="Not before: 2099-01-01T00:00:00Z\nDifficulty: medium\n\n## Why\nx\n")
+        self.queued(10, body="Model: <b>`x`\nDifficulty: medium\n\n## Why\nx\n")
         worker = self.assign(available=[])
         self.assertEqual(worker.waits, {
             "%s#7" % REPO: "no free lane takes model claude-opus-5-5",
-            "%s#8" % REPO: "no free lane in tier medium"})
+            "%s#8" % REPO: "no free lane in tier medium",
+            "%s#10" % REPO: "no free lane takes model (its Model: line names no model id)"})
 
     def test_queued_ladder_model_uses_a_compatible_lane(self):
         body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"

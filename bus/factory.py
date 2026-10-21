@@ -2468,7 +2468,9 @@ class Factory:
         lane = self._queued_model_lane(repo, model)
         if lane is None:
             why = "%s waits: no free lane takes model %s" % (ref, model)
-            self._waiting(repo, issue["number"], "no free lane takes model %s" % model)
+            self._waiting(repo, issue["number"], "no free lane takes model %s" % (
+                model if tickets.MODEL_RE.fullmatch(model) and len(model) <= 64
+                else "(its Model: line names no model id)"))
             _say(why)
             return why
         if not self._guarded(self._assign_queued_one, repo, issue, lane, "model %s" % model):

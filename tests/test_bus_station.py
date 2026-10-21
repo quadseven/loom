@@ -4028,6 +4028,12 @@ class SilentLaneTest(Base):
         (wait,) = st._invariant_waits()
         self.assertEqual(wait.since, start + 3 * 3600)
 
+    def test_a_wait_reason_that_could_carry_ticket_text_never_reaches_the_invariant(self):
+        st = self.station()
+        st._record_waits({"%s#12" % REPO: "no free lane takes model `x` <img src=y>",
+                          "%s#13" % REPO: "no free lane in tier medium"})
+        self.assertEqual([w.reason for w in st._invariant_waits()], ["no free lane in tier medium"])
+
     def test_a_ticket_no_longer_waiting_is_dropped(self):
         st = self.station()
         st._record_waits({"%s#12" % REPO: "no free lane in tier medium"})

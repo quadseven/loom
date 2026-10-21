@@ -188,6 +188,8 @@ REWRITE_PER_PASS = 5
 # A recorded ticket wait the factory has not repeated for this long is gone:
 # the ticket moved, or left the factory (invariants.ticket_waiting).
 WAIT_UNSEEN = 3600
+# A wait reason reaches a public incident: only these characters, this long.
+WAIT_REASON_RE = re.compile(r"[A-Za-z0-9 ,:.()/@_-]{1,160}")
 # Rewrites across every backlog goal in any hour: each one comments on its
 # issue or files a ticket, and both email the operator. Per goal alone, ten
 # backlog goals let about 80 through in ten minutes (2026-10-18).
@@ -7918,7 +7920,8 @@ class Station:
         for key, info in sorted(saved.items() if isinstance(saved, dict) else []):
             match = re.fullmatch(r"(.+)#([0-9]+)", str(key))
             if not (match and isinstance(info, dict) and self._num(info.get("since"))
-                    and isinstance(info.get("reason"), str)):
+                    and isinstance(info.get("reason"), str)
+                    and WAIT_REASON_RE.fullmatch(info["reason"])):
                 continue
             out.append(invariants.Wait(self._invariant_ref(match.group(1), int(match.group(2))),
                                        info["reason"], info["since"]))
