@@ -447,26 +447,25 @@ pushed_commits() {
 # bad API answer cannot start a second comment; a failed write returns 1 for
 # the caller to log. Arguments: repo, number, marker, mode, bus.sticky's own.
 upsert_sticky_comment() {
-  local repo="$1" number="$2" marker="$3" mode="$4" listing id old_file new_file
+  local repo="$1" number="$2" marker="$3" mode="$4" listing id old_file new_file input_file ok=0
   shift 4
-  old_file="$(mktemp)" && new_file="$(mktemp)" || return 1
-  cat > "$old_file.text"
+  old_file="$(mktemp)" && new_file="$(mktemp)" && input_file="$(mktemp)" || return 1
+  cat > "$input_file"
   if ! listing="$(MARKER="$marker" timeout "$NET_TIMEOUT" gh api --paginate \
         "repos/$repo/issues/$number/comments" \
         --jq '.[] | select(.body | startswith(env.MARKER)) | .id' 2>> "$LOG")"; then
-    rm -f "$old_file" "$old_file.text" "$new_file"; return 1
+    rm -f "$old_file" "$input_file" "$new_file"; return 1
   fi
   id="$(printf '%s\n' "$listing" | head -1 | tr -cd '0-9')"
   : > "$old_file"
   if [ -n "$id" ] && ! timeout "$NET_TIMEOUT" gh api "repos/$repo/issues/comments/$id" \
         --jq .body > "$old_file" 2>> "$LOG"; then
-    rm -f "$old_file" "$old_file.text" "$new_file"; return 1
+    rm -f "$old_file" "$input_file" "$new_file"; return 1
   fi
   if ! PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.sticky "$mode" --marker "$marker" \
-        --now "$(date -u +%FT%TZ)" --old "$old_file" "$@" < "$old_file.text" > "$new_file" 2>> "$LOG"; then
-    rm -f "$old_file" "$old_file.text" "$new_file"; return 1
+        --now "$(date -u +%FT%TZ)" --old "$old_file" "$@" < "$input_file" > "$new_file" 2>> "$LOG"; then
+    rm -f "$old_file" "$input_file" "$new_file"; return 1
   fi
-  local ok=0
   if [ -n "$id" ]; then
     timeout "$NET_TIMEOUT" gh api -X PATCH "repos/$repo/issues/comments/$id" \
       -F "body=@$new_file" >> "$LOG" 2>&1 || ok=1
@@ -474,7 +473,7 @@ upsert_sticky_comment() {
     timeout "$NET_TIMEOUT" gh api -X POST "repos/$repo/issues/$number/comments" \
       -F "body=@$new_file" >> "$LOG" 2>&1 || ok=1
   fi
-  rm -f "$old_file" "$old_file.text" "$new_file"
+  rm -f "$old_file" "$input_file" "$new_file"
   return "$ok"
 }
 # The marker on the one comment per pull request that lists a lane's fix rounds.
