@@ -95,6 +95,17 @@ STEP_RE = re.compile(r"(?im)^[ \t]*[-*]?[ \t]*(?:step[ \t]+)?(%s)(?:[ \t]+step)?
 LABEL = "loom:invariant"
 LABELS = ["loom:triage", LABEL]
 MARKER = "<!-- loom:invariant v1 key=%s -->"
+# The one note an issue carries for every time its breach came back, edited
+# with a count and the last time (never a new comment per reopen).
+BROKEN_MARKER = "<!-- loom:broken-again -->"
+BROKEN_TEXT = "Broken again after this was closed:"
+BROKEN_TIMES_RE = re.compile(r"<!-- loom:broken-again times=([0-9,]*) -->")
+BROKEN_LAST_RE = re.compile(r"last at ([0-9T:Z-]+)")
+BROKEN_COUNT_RE = re.compile(r"Reopened (\d+) time")
+# Times kept in the note: enough for the 3-in-RECURRING_AFTER count.
+BROKEN_TIMES_MAX = 12
+CLEARED_TEXT = "The invariant cleared by "
+TICKET_LABEL = "loom:ticket"
 MARKER_RE = re.compile(r"<!-- loom:invariant v1 key=([a-z-]+/[0-9a-f]{12}) -->")
 # Issues filed plus issues reopened in one pass.
 WRITES_MAX = 5
@@ -933,6 +944,9 @@ class Filer:
         self._listed: Optional[Dict[str, int]] = None
         # Issue numbers the listing found closed: clearing skips them unread.
         self._listed_closed: set = set()
+        # Issue numbers the listing found carrying loom:ticket: a ticket is
+        # the work, no longer the breach's own issue.
+        self._ticketed: set = set()
         # Rolling breach key -> its issue, once this pass has it open.
         self._rolling_open: Dict[str, int] = {}
 
@@ -946,11 +960,25 @@ class Filer:
                 if not isinstance(issue, dict) or "pull_request" in issue:
                     continue
                 m = MARKER_RE.search(str(issue.get("body") or ""))
-                if m and m.group(1) not in self._listed:
-                    self._listed[m.group(1)] = int(issue["number"])
-                    if issue.get("state") == "closed":
-                        self._listed_closed.add(int(issue["number"]))
+                if not m:
+                    continue
+                number = int(issue["number"])
+                ticket = TICKET_LABEL in self._label_names(issue)
+                if ticket:
+                    self._ticketed.add(number)
+                if issue.get("state") == "closed":
+                    self._listed_closed.add(number)
+                held = self._listed.get(m.group(1))
+                # The first issue of a key wins, but a plain invariant issue
+                # replaces a ticket: the ticket is not where a breach lives.
+                if held is None or (held in self._ticketed and not ticket):
+                    self._listed[m.group(1)] = number
         return self._listed
+
+    @staticmethod
+    def _label_names(issue: Dict[str, Any]) -> List[str]:
+        return [str(x.get("name", "")) if isinstance(x, dict) else str(x)
+                for x in issue.get("labels") or []]
 
     def _issue(self, number: int) -> Optional[Dict[str, Any]]:
         try:
@@ -1033,11 +1061,15 @@ class Filer:
         self.writes += 1
         self.say("invariants: updated %s#%d: %s" % (self.repo, number, title))
 
-    def _file(self, b: Breach) -> None:
+    def _file(self, b: Breach, ticket: Optional[int] = None) -> None:
         # The body quotes the whole breach; the title is clipped to the
-        # naming standard's TITLE_MAX.
+        # naming standard's TITLE_MAX. ticket names the closed ticket this
+        # breach outlived: it is left alone and referenced.
         title = naming.clip(b.title)
         body = self._body(b)
+        if ticket is not None:
+            body = body.replace("\n\nPart of #", "\n\nThe breach outlived #%d, a ticket for "
+                                "it that is closed; Refs #%d.\n\nPart of #" % (ticket, ticket))
         _text.check(title + "\n" + body)
         made = self.gh.rest("POST", "/repos/%s/issues" % self.repo,
                             {"title": title, "body": body, "labels": LABELS}).data
@@ -1054,13 +1086,66 @@ class Filer:
                      % (self.repo, number, self._home(), err))
         self.say("invariants: filed %s#%d: %s" % (self.repo, number, title))
 
-    def _reopen(self, b: Breach, number: int) -> None:
-        body = "\n".join([MARKER % b.key,
-                          "Broken again after this was closed: %s." % b.title,
+    @staticmethod
+    def _broken_note(comment: Dict[str, Any]) -> Optional[float]:
+        """When a broken-again note was last written: its "last at" time, else
+        its creation (a note from before there was one note per issue)."""
+        body = str(comment.get("body", ""))
+        if BROKEN_MARKER not in body and BROKEN_TEXT not in body:
+            return None
+        m = BROKEN_LAST_RE.search(body)
+        return (_epoch(m.group(1)) if m else None) or _epoch(comment.get("created_at"))
+
+    def _broken_times(self, comments: List[Dict[str, Any]]) -> List[float]:
+        """Every time an issue's breach came back, from its one note's list
+        and from any older note of its own."""
+        times: List[float] = []
+        for c in comments:
+            body = str(c.get("body", ""))
+            m = BROKEN_TIMES_RE.search(body)
+            if m:
+                times += [float(t) for t in m.group(1).split(",") if t]
+            elif BROKEN_TEXT in body:
+                at = _epoch(c.get("created_at"))
+                if at is not None:
+                    times.append(at)
+        return sorted(set(times))
+
+    def _already_reopened(self, comments: List[Dict[str, Any]]) -> bool:
+        """True when the breach has already reopened this issue and not
+        cleared since: a breach that stands reopens its issue once."""
+        noted = [t for t in (self._broken_note(c) for c in comments) if t is not None]
+        if not noted:
+            return False
+        cleared = [t for t in (_epoch(c.get("created_at")) for c in comments
+                               if CLEARED_TEXT in str(c.get("body", ""))) if t is not None]
+        return not cleared or max(noted) >= max(cleared)
+
+    def _reopen(self, b: Breach, number: int, comments: List[Dict[str, Any]]) -> None:
+        """Reopen the issue and say so in its one broken-again note: a count
+        and the last time, edited in place (a new comment each time mailed
+        everyone watching, loom#1223)."""
+        mine = [c for c in comments if BROKEN_MARKER in str(c.get("body", ""))]
+        note = mine[-1] if mine else None
+        times = (self._broken_times(comments) + [self.now])[-BROKEN_TIMES_MAX:]
+        count = 1
+        if note is not None:
+            m = BROKEN_COUNT_RE.search(str(note.get("body", "")))
+            count = (int(m.group(1)) if m else 1) + 1
+        body = "\n".join([BROKEN_MARKER,
+                          "<!-- loom:broken-again times=%s -->" % ",".join(str(int(t)) for t in times),
+                          "%s %s." % (BROKEN_TEXT, b.title),
+                          "Reopened %d time%s; last at %s." % (count, "" if count == 1 else "s",
+                                                                utc(self.now)),
                           "", "Evidence:"] + self._evidence(b))
         _text.check(body)
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number), {"state": "open"})
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number), {"body": body})
+        if note is not None and note.get("id") is not None:
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%s" % (self.repo, note["id"]),
+                         {"body": body})
+        else:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
+                         {"body": body})
         self.writes += 1
         self.say("invariants: reopened %s#%d: %s" % (self.repo, number, b.title))
 
@@ -1153,9 +1238,7 @@ class Filer:
         """Close an open triage or rewritten issue whose breach has been gone CLEAR_AFTER,
         or mark it loom:recurring when it broke 3 times in RECURRING_AFTER.
         False when the pass has no writes left for it."""
-        breaches = [_epoch(issue.get("created_at"))]
-        breaches += [_epoch(c.get("created_at")) for c in comments
-                     if "Broken again after this was closed:" in str(c.get("body", ""))]
+        breaches = [_epoch(issue.get("created_at"))] + self._broken_times(comments)
         times = [at for at in breaches if at is not None]
         if not times or self.now - max(times) < CLEAR_AFTER:
             return True
@@ -1171,7 +1254,7 @@ class Filer:
         body = ("The invariant cleared by %s; its last breach was observed at %s, "
                 "more than 6 hours earlier." % (utc(self.now), utc(max(times))))
         # A note from an earlier close does not explain this one (loom#651).
-        already_explained = any("The invariant cleared by " in str(c.get("body", ""))
+        already_explained = any(CLEARED_TEXT in str(c.get("body", ""))
                                 and (_epoch(c.get("created_at")) or 0) >= max(times)
                                 for c in comments)
         if not already_explained:
@@ -1197,6 +1280,28 @@ class Filer:
                 self._rolling_open[b.key] = self.state[b.key]
             return
         self.state[b.key] = number
+        if TICKET_LABEL in self._label_names(issue):
+            # A ticket (an invariant issue rewritten into work) is no longer
+            # the breach's own issue: it is never reopened or rewritten back to
+            # the invariant text (loom#1223 flipped 18 times).
+            if issue.get("state") == "open":
+                if b.rolling:
+                    self._rolling_open[b.key] = number
+                return
+            closed = _epoch(issue.get("closed_at"))
+            if closed is not None and b.at <= closed:
+                return
+            plain = self._listing().get(b.key)
+            if plain is not None and plain != number and plain not in self._ticketed:
+                # The breach already has its own invariant issue beside the ticket.
+                self.state[b.key] = plain
+                self._one(b)
+                return
+            self.state.pop(b.key, None)
+            self._file(b, ticket=number)
+            if b.rolling:
+                self._rolling_open[b.key] = self.state[b.key]
+            return
         if issue.get("state") == "open":
             if b.rolling:
                 self._rolling_open[b.key] = number
@@ -1204,7 +1309,14 @@ class Filer:
             return
         closed = _epoch(issue.get("closed_at"))
         if closed is None or b.at > closed:
-            self._reopen(b, number)
+            comments = self._comments(number)
+            if self._already_reopened(comments):
+                # Reopened once for this breach and closed again while it still
+                # stands: say so in the log, do not reopen it again.
+                self.say("invariants: %s#%d was closed again while its breach stands; not "
+                         "reopened: %s" % (self.repo, number, b.title))
+                return
+            self._reopen(b, number, comments)
             if b.rolling:
                 self._rolling_open[b.key] = number
                 if self.writes < WRITES_MAX:
