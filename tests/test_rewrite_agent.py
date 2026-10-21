@@ -269,6 +269,22 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertLess(time.time() - started, 25)
         self.assertIn("codex", self.lane_log.read_text())
 
+    def test_a_free_model_that_failed_is_passed_over_while_its_pool_cools(self):
+        # The gateway cools a free pool for about 5 minutes after a refusal;
+        # every rewrite in a burst then spent its 90 seconds on Gemma before the
+        # next model answered (2026-10-21). The first failure starts a
+        # cooldown; the rewrites after it skip the free entry at once.
+        env = {"LOOM_REWRITE_FREE_URL": "https://gateway.invalid/v1", "LOOM_REWRITE_FREE_TIMEOUT": "3"}
+        first = self.run_wrapper("MODE=hang", args=("-", "free/gemma-4-31b-it,codex/test-model"),
+                                 env_overrides=env)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        started = time.time()
+        second = self.run_wrapper("MODE=hang", args=("-", "free/gemma-4-31b-it,codex/test-model"),
+                                  env_overrides=env)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertLess(time.time() - started, 2.5)
+        self.assertIn("cooling down", second.stderr)
+
     def test_a_free_model_with_no_route_set_falls_through_to_the_next(self):
         result = self.run_wrapper("Rewrite this", args=("-", "free/gemma-4-31b-it,codex/test-model"))
         self.assertEqual(result.returncode, 0, result.stderr)
