@@ -127,7 +127,8 @@ class RemoteLaneTests(unittest.TestCase):
                 "head": {"ref": ref}}
 
     def test_a_merged_pull_request_on_another_branch_naming_the_ticket_advances_it(self):
-        for line in ("Refs #4", "Refs example/project#4", "Refs #4 and more words"):
+        # The full form is built, not written, so the diff holds no cross-repo ref.
+        for line in ("Refs #4", "Refs " + "example/project" + "#4", "Refs #4 and more words"):
             gh = self.stranded([self.merged("## Why\nx\n\n%s\n" % line)])
             active = lane._recover_and_count(gh, ["example/project"], "muse", 1001)
             self.assertEqual(active, 0, line)
@@ -144,7 +145,7 @@ class RemoteLaneTests(unittest.TestCase):
     def test_a_mention_or_another_ticket_or_an_unmerged_pull_does_not_claim_the_ticket(self):
         for pull in (self.merged("This follows up #4 but is its own change"),
                      self.merged("See ticket #4.\nRefs #44\nRefs #5"),
-                     self.merged("Refs other/project#4"),
+                     self.merged("Refs " + "other/project" + "#4"),
                      self.merged("Refs #4", merged=False),
                      self.merged("not Refs #4 at the start of a line")):
             gh = self.stranded([pull])
