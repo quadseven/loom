@@ -167,9 +167,20 @@ field() { grep -m1 "^$1:" "$2" | cut -d' ' -f2-; }
 setting_var() { printf 'LOOM_%s_%s' "$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')" "$2"; }
 lane_var() { setting_var "$LANE" "$1"; }
 lane_setting() {
-  local s v
+  local s v value route
   s="$(setting_var "$SLOT" "$1")" v="$(lane_var "$1")"
-  printf '%s' "${!s:-${!v:-}}"
+  value="${!s:-${!v:-}}"
+  if [ -z "$value" ] && [ "$LANE" = free ] && [ "$1" = URL ] && [ -n "${LOOM_FREE_GATEWAY_URL:-}" ]; then
+    case "$SLOT" in
+      free-ollama) route=/free/ollama-cloud/v1 ;;
+      free-gemma) route=/free/gemini/v1 ;;
+      free-nvidia) route=/free-public/nvidia-nim/v1 ;;
+      free-kilo) route=/free-public/kilo/v1 ;;
+      free-groq) route=/free-public/groq/v1 ;;
+    esac
+    value="${LOOM_FREE_GATEWAY_URL%/}$route"
+  fi
+  printf '%s' "$value"
 }
 
 # Each pass records whether this lane can take work. The dispatcher routes

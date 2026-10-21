@@ -1379,6 +1379,23 @@ print('leak guard: clean (shape patterns only)')
         self.assertFalse(missing, "function not found in runner: %s" % ", ".join(missing))
         return "".join(found[n].group(0) for n in names)
 
+    def test_free_slots_use_distinct_pinned_gateway_routes(self):
+        script = self.source_functions("setting_var", "lane_var", "lane_setting") + 'lane_setting URL'
+        routes = {
+            "free-ollama": "/free/ollama-cloud/v1",
+            "free-gemma": "/free/gemini/v1",
+            "free-nvidia": "/free-public/nvidia-nim/v1",
+            "free-kilo": "/free-public/kilo/v1",
+            "free-groq": "/free-public/groq/v1",
+        }
+        for slot, route in routes.items():
+            with self.subTest(slot=slot):
+                env = self.lane_env(SLOT=slot, LANE="free",
+                                    LOOM_FREE_GATEWAY_URL="https://gateway.example.invalid/")
+                result = subprocess.run(["bash", "-c", script], env=env,
+                                        capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout, "https://gateway.example.invalid" + route)
+
     def hold_credit(self, slot, until=4102444800):
         script = self.source_functions("write_beat", "utc", "hold_shared_credit") + (
             'heartbeat() { :; }\nhold_shared_credit "$1"')
