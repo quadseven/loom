@@ -2702,10 +2702,10 @@ class TriageTests(unittest.TestCase):
         self.assertFalse(any(c[1].endswith("/comments") for c in routes.calls))
         self.assertEqual(lines, [
             "#6 loom:triage, missing What, Acceptance criteria, Size (a ## Size section or a "
-            "Size: XS|S|M|L line), Out of scope",
+            "Size: XS|S|M|L line (or Small, Medium, Large)), Out of scope",
             "#7 loom:triage, missing checkboxes under Acceptance criteria",
             "#8 loom:triage, missing Why, What, Acceptance criteria, Size (a ## Size section or a "
-            "Size: XS|S|M|L line), Out of scope"])
+            "Size: XS|S|M|L line (or Small, Medium, Large)), Out of scope"])
         self.assertFalse(any(c[1].endswith("/sub_issues") and c[0] == "POST" for c in routes.calls))
         self.assert_never_edited(routes)
 
@@ -2723,7 +2723,7 @@ class TriageTests(unittest.TestCase):
 
     def test_a_missing_size_names_both_forms(self):
         missing = brain.missing_sections(BODY.replace("## Size\nS\n", ""))
-        self.assertEqual(missing, ["Size (a ## Size section or a Size: XS|S|M|L line)"])
+        self.assertEqual(missing, ["Size (a ## Size section or a Size: XS|S|M|L line (or Small, Medium, Large))"])
         with self.assertRaises(ValueError):
             brain._check_brief_args("t", BODY.replace("## Size\nS\n", ""), None, None, None)
 
