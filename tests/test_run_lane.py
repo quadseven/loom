@@ -1165,6 +1165,28 @@ print('leak guard: clean (shape patterns only)')
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertNotIn("limit", beat.get("reason") or "")
 
+    def test_a_limit_word_in_a_tool_result_is_not_a_limit(self):
+        # Two Spark lanes were held an hour as "provider limit reached": each
+        # agent read code about rate limits and timed out, and the only match
+        # was in its JSON tool results (2026-10-21).
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_EXIT="124", FAKE_OUT=(
+            '{"type":"step_start","part":{}}\n'
+            '{"type":"tool_use","part":{"state":{"output":"a lane at its usage limit '
+            'waits; HTTP 429 means too many requests"}}}\n'
+            '{"type":"text","part":{"text":"The rate limit path is next."}}\n'
+            '{"type":"step_finish","part":{}}'))
+        log = self.run_log()
+        self.assertNotIn("[limit]", log)
+        self.assertIn("[transient]", log)
+
+    def test_a_provider_error_event_is_still_a_limit(self):
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            '{"type":"tool_use","part":{"state":{"output":"ok"}}}\n'
+            '{"type":"error","error":{"message":"429 Too Many Requests: usage limit reached"}}'))
+        self.assertIn("[limit]", self.run_log())
+
     def test_provider_quota_messages_are_still_limits(self):
         for out in ("429 RESOURCE_EXHAUSTED quota resets in 1 hours",
                     "Error: You exceeded your current quota, please check your plan",
