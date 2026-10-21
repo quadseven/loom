@@ -2427,10 +2427,13 @@ class Factory:
                         and self._up(_lane(issue)))):
                 self.load[_lane(issue)] = self.load.get(_lane(issue), 0) + 1
 
-    def _queued_model_lane(self, repo: str, model: str) -> Optional[str]:
+    def _queued_model_lane(self, repo: str, model: str, busy_ok: bool = False) -> Optional[str]:
+        """The first lane that takes `model` and is free; with `busy_ok`, the
+        first that is merely up and not limited for the model, busy or not."""
         from .station import model_lanes, needs_public_repo
         return next((candidate for candidate in model_lanes(model)
-                     if self._free(candidate)
+                     if (self._up(candidate) and self._serves(candidate, model)
+                         if busy_ok else self._free(candidate))
                      and (not needs_public_repo(candidate, model)
                           or not self._is_private(repo))), None)
 
@@ -2498,6 +2501,12 @@ class Factory:
                 return "%s: giving it lane %s failed" % (ref, equivalent[0])
             return ""
         lane = self._queued_model_lane(repo, model)
+        if lane is None and set(FIRST) & set(_labels(issue)):
+            # A lane that always has another fix round waiting is never free,
+            # so a pinned regression ticket sat queued for days (loom#1300,
+            # 2026-10-21). Brief it on an up lane; the station claims FIRST
+            # tickets before the lane's other work.
+            lane = self._queued_model_lane(repo, model, busy_ok=True)
         if lane is None:
             why = "%s waits: no free lane takes model %s" % (ref, model)
             self._waiting(repo, issue["number"], "no free lane takes model %s" % (

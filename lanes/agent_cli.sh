@@ -59,8 +59,10 @@ AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|h
 DAILY_RE='daily (free )?(allocation|allowance|limit|quota)|per[ _-]day'
 MONTHLY_RE='copilot.*(allowance|limit|quota|usage|request)|monthly ([a-z]+ )*(allocation|allowance|limit|quota)|per[ _-]month|resets? (at|on) the first of (the )?month'
 # A model the agent CLI no longer offers (opencode drops one models.dev marks
-# deprecated): no retry within the day brings it back, so the model rests
-# LIMIT_WAIT_MAX like a spent allowance and the lane stops claiming.
+# deprecated) rests the lane LIMIT_WAIT, then the lane checks the CLI's model
+# list before it claims (model_listed in run_lane.sh). A day's rest assumed
+# the model stays gone; free catalogs rotate within hours (2026-10-21: zen's
+# model was listed again within 13 hours, with the lane parked for 11 more).
 MODEL_GONE_RE='ProviderModelNotFoundError: Model not found'
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
@@ -125,7 +127,7 @@ classify_failure() {
   if [[ "$tail" =~ $AUTH_RE ]]; then
     FAIL_CLASS=auth
   elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
-    FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT_MAX))
+    FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
   elif [[ "$whole" =~ $LIMIT_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT)) cap=$LIMIT_WAIT_MAX
     if [[ "$whole" =~ $OUT_OF_CREDIT_RE ]]; then
