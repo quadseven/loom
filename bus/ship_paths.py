@@ -66,10 +66,14 @@ def push_paths(workflow: str) -> List[str]:
         if indent <= push_indent:
             break
         key = _KEY.match(line)
-        if key and (key.group(2) or key.group(3) or key.group(4)) == "paths":
+        name = key and (key.group(2) or key.group(3) or key.group(4))
+        if name in ("paths", "paths-ignore"):
+            # paths-ignore is the same filter inverted: every path counts
+            # unless a pattern ignores it (the last matching pattern decides).
+            ignore = name == "paths-ignore"
             inline = _inline_list(key.group(5))
             if inline is not None:
-                return inline
+                return _inverted(inline) if ignore else inline
             paths_at = (index, indent)
             break
     if paths_at is None:
@@ -82,7 +86,12 @@ def push_paths(workflow: str) -> List[str]:
         if not item or indent < paths_at[1]:
             break
         found.append(_strip(item.group(1)))
-    return found
+    return _inverted(found) if ignore and found else found
+
+
+def _inverted(ignored: List[str]) -> List[str]:
+    """A paths-ignore list as the equivalent paths filter."""
+    return ["**"] + [p[1:] if p.startswith("!") else "!" + p for p in ignored]
 
 
 def _glob(pattern: str) -> "re.Pattern[str]":
@@ -120,7 +129,13 @@ def matches(patterns: List[str], path: str) -> bool:
     hit = False
     for pattern in patterns:
         negated = pattern.startswith("!")
-        if _glob(pattern[1:] if negated else pattern).fullmatch(path):
+        try:
+            compiled = _glob(pattern[1:] if negated else pattern)
+        except re.error:
+            # A pattern this reader cannot compile counts the workflow as
+            # needed, so a ticket never ships past a deploy it cannot rule out.
+            return True
+        if compiled.fullmatch(path):
             hit = not negated
     return hit
 

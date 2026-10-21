@@ -37,5 +37,19 @@ class MatchesTest(unittest.TestCase):
         self.assertTrue(ship_paths.matches(["a/**", "!a/docs/**"], "a/x.md"))
 
 
+class PathsIgnoreTest(unittest.TestCase):
+    def test_paths_ignore_counts_every_path_it_does_not_ignore(self):
+        block = ship_paths.push_paths("on:\n  push:\n    paths-ignore:\n      - 'docs/**'\n")
+        inline = ship_paths.push_paths("on:\n  push:\n    paths-ignore: ['docs/**']\n")
+        for patterns in (block, inline):
+            self.assertTrue(ship_paths.matches(patterns, "src/x.py"))
+            self.assertFalse(ship_paths.matches(patterns, "docs/x.md"))
+
+
+class BadPatternTest(unittest.TestCase):
+    def test_a_pattern_that_will_not_compile_counts_the_workflow_as_needed(self):
+        self.assertTrue(ship_paths.matches(["a/[z-a]"], "b/c.py"))
+
+
 if __name__ == "__main__":
     unittest.main()

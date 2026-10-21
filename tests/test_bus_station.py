@@ -1668,10 +1668,13 @@ class ShipPathRuleTest(Base):
         content = re.match(r"/repos/%s/contents/.github/workflows/([\w.-]+)$" % REPO, parts.path)
         if content:
             text = self.WORKFLOWS[content.group(1)]
+            if text is None:
+                return reply(200, {"type": "file", "encoding": "none"})
             return reply(200, {"content": base64.b64encode(text.encode()).decode()})
         files = re.match(r"/repos/%s/pulls/(\d+)/files$" % REPO, parts.path)
         if files:
-            return reply(200, [{"filename": f} for f in self.pr_files.get(int(files.group(1)), [])])
+            return reply(200, [f if isinstance(f, dict) else {"filename": f}
+                               for f in self.pr_files.get(int(files.group(1)), [])])
         compare = re.match(r"/repos/%s/compare/([0-9a-f]+)\.\.\.([0-9A-Za-z_./-]+)$" % REPO,
                            parts.path)
         if compare:
@@ -1741,6 +1744,25 @@ class ShipPathRuleTest(Base):
         self.ship()
         self.assertEqual(self.requests.count("/repos/%s/contents/.github/workflows" % REPO), 1)
         self.assertEqual(self.requests.count("/repos/%s/contents/.github/workflows/stack-a.yml" % REPO), 1)
+
+    def test_an_unreadable_workflow_file_ships_nothing(self):
+        self.merged(12, 99)
+        self.pr_files[99] = ["README.md"]
+        self.WORKFLOWS = dict(self.WORKFLOWS, **{"stack-c.yml": None})
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_a_pull_request_at_the_files_api_cap_does_not_ship_on_merge(self):
+        self.merged(12, 99)
+        self.pr_files[99] = ["notes/%d.md" % i for i in range(station.PULL_FILES_MAX)]
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_a_file_renamed_out_of_a_deployed_path_still_needs_that_deploy(self):
+        self.merged(12, 99)
+        self.pr_files[99] = [{"filename": "attic/main.py", "previous_filename": "stacks/a/main.py"}]
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
 
     def test_an_unlisted_repo_is_left_alone(self):
         self.settings.ship_path_workflows = []

@@ -281,6 +281,8 @@ PIN_SHIP_LOOKBACK = 7 * 24 * 3600
 PIN_SHIP_SETTLE = 3600
 PIN_SHIPS_FILE = "pin_ships.json"
 SHIP_PATH_FILES = "ship_path_files.json"
+# The pull request files API returns at most this many files.
+PULL_FILES_MAX = 3000
 # Adopting open pull requests no ticket links (decision 0002, item 1): each
 # pass files at most one "Land or supersede" ticket per scanned repo, oldest
 # pull request first, and marks the pull request with ADOPTED_MARKER so it is
@@ -4026,6 +4028,9 @@ class Station:
         if not branch:
             return
         filters = self._workflow_filters(repo, branch)
+        if filters is None:
+            _say("could not ship %s by deploy paths: its workflow files could not all be read" % repo)
+            return
         seen: List[Dict[str, Any]] = []
         latest = self._merged_pulls(repo, merged, seen)
         cache_path = os.path.join(self.state, SHIP_PATH_FILES)
@@ -4040,8 +4045,9 @@ class Station:
                 key = "%s#%d" % (repo, int(pr["number"]))
                 files = known.get(key)
                 if not isinstance(files, list):
-                    files = [str(f.get("filename") or "") for f in self._paginate(
-                        "/repos/%s/pulls/%d/files" % (repo, int(pr["number"]))) if isinstance(f, dict)]
+                    files = self._pull_paths(repo, int(pr["number"]))
+                    if files is None:
+                        continue
                 kept[key] = files
                 needed = sorted(w for w, pats in filters.items()
                                 if any(ship_paths.matches(pats, f) for f in files))
@@ -4053,23 +4059,43 @@ class Station:
         finally:
             _write_json(cache_path, {**{k: v for k, v in known.items() if k.split("#")[0] != repo}, **kept})
 
-    def _workflow_filters(self, repo: str, branch: str) -> Dict[str, List[str]]:
+    def _workflow_filters(self, repo: str, branch: str) -> Optional[Dict[str, List[str]]]:
         """Workflow file name to its on.push.paths filter, for the repo's
-        workflows on its default branch that have one, read once a pass."""
+        workflows on its default branch that have one, read once a pass.
+        None when the listing or any workflow file cannot be read: with a
+        filter missing, a pull request could look as if it touched no
+        deployed path, so nothing in the repo ships this pass."""
         if repo not in self._path_filters:
             listing = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s" % (
                 repo, ship_paths.WORKFLOWS_DIR, quote(branch, safe="")), ok=(404,)).data
-            texts: Dict[str, str] = {}
+            texts: Optional[Dict[str, str]] = {} if isinstance(listing, list) else None
             for item in listing if isinstance(listing, list) else []:
                 name = str(item.get("name") or "") if isinstance(item, dict) else ""
                 if not re.fullmatch(r"[\w.-]+\.ya?ml", name):
                     continue
                 data = self.gh.rest("GET", "/repos/%s/contents/%s/%s?ref=%s" % (
                     repo, ship_paths.WORKFLOWS_DIR, name, quote(branch, safe="")), ok=(404,)).data
-                if isinstance(data, dict) and data.get("content"):
+                try:
                     texts[name] = base64.b64decode(data["content"]).decode("utf-8", "replace")
-            self._path_filters[repo] = ship_paths.scoped_workflows(texts)
+                except (KeyError, TypeError, ValueError):
+                    texts = None
+                    break
+            self._path_filters[repo] = (
+                ship_paths.scoped_workflows(texts) if texts is not None else None)
         return self._path_filters[repo]
+
+    def _pull_paths(self, repo: str, number: int) -> Optional[List[str]]:
+        """Every path a pull request changed, a renamed file's old path too;
+        None when the list may be cut off (the files API stops at 3000), so a
+        pull request is never shipped on a partial list."""
+        files = [f for f in self._paginate("/repos/%s/pulls/%d/files" % (repo, number))
+                 if isinstance(f, dict)]
+        if len(files) >= PULL_FILES_MAX:
+            _say("not shipping %s#%d by deploy paths: it changed %d+ files" % (
+                repo, number, PULL_FILES_MAX))
+            return None
+        return sorted({str(f.get(k) or "") for f in files
+                       for k in ("filename", "previous_filename") if f.get(k)})
 
     def _path_cover(self, repo: str, pr: Dict[str, Any], branch: str,
                     needed: List[str]) -> Tuple[str, str]:
