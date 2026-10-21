@@ -2409,7 +2409,7 @@ class ReviewFake:
         raise AssertionError(path)
 
 
-READY = "Ready: checks and review passed on head %s; the factory lands the pull request in its turn."
+READY = station.READY_TEXT
 
 
 class HandBackTest(unittest.TestCase):
@@ -2515,6 +2515,22 @@ class HandBackTest(unittest.TestCase):
         self.assertEqual(self.ready_events(), [READY % ("b" * 40), READY % ("a" * 40)])
         self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
 
+    def test_a_mark_the_app_login_wrote_is_read_back(self):
+        # The station writes as its App login, which need not be a trusted
+        # author: reading only the authors appended a mark on every pass.
+        self.gh._status_logins = lambda: {"example-app[bot]"}
+        post = self.gh._post_comment
+
+        def as_app(data):
+            post(data)
+            self.gh.comments[-1]["user"] = {"login": "example-app[bot]"}
+            return mock.Mock(data={})
+        self.gh._post_comment = as_app
+        self.station.s.authors = ["bob-example"]
+        self.run_hand_back()
+        self.run_hand_back()
+        self.assertEqual(self.ready_events(), [READY % ("a" * 40)])
+
     def test_a_ready_comment_from_before_the_status_comment_is_still_read(self):
         # Tickets marked ready before the move carry their own ready-head comment.
         self.gh.comments.append({"id": 1, "user": {"login": AUTHORS[0]},
@@ -2525,13 +2541,27 @@ class HandBackTest(unittest.TestCase):
         self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
 
     def test_a_stranger_cannot_mark_a_head_ready(self):
-        self.gh.issue["labels"].append({"name": "loom:ready"})
+        # A look-alike mark for the current head would suppress our own; the
+        # station writes its own mark in its own status comment instead.
         self.gh.comments.append({"id": 1, "user": {"login": "mallory-example"},
                                  "body": status.render([("2026-10-20T00:00:00Z",
                                                          READY % ("a" * 40))])})
-        self.gh.check_runs = [{"status": "in_progress"}]
         self.run_hand_back()
-        self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        ours = [c for c in self.gh.comments if c["user"]["login"] == "alice-example"]
+        self.assertEqual([[text for _, text in status.parse(c["body"])] for c in ours],
+                         [[READY % ("a" * 40)]])
+
+    def test_a_mark_read_through_the_clients_expansion_is_not_repeated(self):
+        # In production the GitHub client hands the station each status event
+        # as a comment of its own, timed by its line.
+        raw = self.gh.paginate
+        self.gh.paginate = lambda path: status.expand(raw(path), AUTHORS)
+        self.run_hand_back()
+        self.run_hand_back()
+        self.gh.pr["head"]["sha"] = "b" * 40
+        self.run_hand_back()
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertEqual(self.ready_events(), [READY % ("b" * 40), READY % ("a" * 40)])
 
 
 class CorruptStateTest(Base):
@@ -4654,6 +4684,8 @@ class OutcomeTest(Base):
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
         self.assertEqual(len(self.fake.comments[12]), 1)
         self.assertIn("https://example.com/pull/99", self.fake.comments[12][0]["body"])
+        # A pull request opened is an outcome: its own comment, not a status event.
+        self.assertFalse(status.is_status(self.fake.comments[12][0]["body"]))
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
         # Reconciliation reads the open pull requests (shared with PR
         # reviews) and one page of recently closed ones, never all of them.

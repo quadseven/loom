@@ -1260,7 +1260,8 @@ def adoption_comment(repo: str, ticket: int) -> str:
 READY_TEXT = ("Ready: checks and review passed on head %s; the factory lands the pull "
               "request in its turn.")
 READY_RE = re.compile(r"Ready: checks and review passed on head ([0-9a-f]{40})\b")
-# The ready-head comment of its own a ticket marked before the status event.
+# A ticket marked ready before the status event kept a ready-head comment of
+# its own; it is still read.
 OLD_READY_RE = re.compile(r"<!-- loom:ready-head ([0-9a-f]+) -->")
 
 
@@ -4218,7 +4219,7 @@ class Station:
             return
         comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         names = _label_names(issue)
-        ready = self._ready_marker(comments)
+        ready = self._ready_head(comments)
         if brain._pending_brain_fix(comments, self.s.authors):
             self._move_fix_to_lane(repo, number, lane, names)
             return
@@ -4239,11 +4240,16 @@ class Station:
         self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
                                    comments, names, failed, threads, rounds)
 
-    def _ready_marker(self, comments: List[Any]) -> Optional[str]:
+    def _ready_head(self, comments: List[Any]) -> Optional[str]:
         """The head the newest ready mark of ours names. A mark is an event in
         the status comment (raw, or expanded by the GitHub client); a ticket
-        marked before that keeps its own ready-head comment, read the same."""
+        marked before that keeps its own ready-head comment, read the same.
+        Ours means the logins status.add writes as: the trusted authors and
+        this client's own App login."""
         authors = {author.lower() for author in self.s.authors}
+        own = getattr(self.gh, "_status_logins", None)
+        if callable(own):
+            authors |= {str(login).lower() for login in own()}
         marks: List[Tuple[str, str]] = []
         for comment in comments:
             if not isinstance(comment, dict) or tickets._login(comment.get("user")) not in authors:
@@ -4514,7 +4520,8 @@ class Station:
 
     def _routine(self, repo: str, number: int, text: str) -> None:
         """A lane failure, factory hold or stop the factory acts on by itself,
-        as an event in the ticket's status comment: an edit sends no email.
+        a fix round's push or a ready mark, as an event in the ticket's status
+        comment: an edit sends no email.
         Each one was a new comment, an email apiece (an infra ticket,
         2026-10-19). The GitHub client expands status events, so the attempt
         table still reads each "Lane X failed:", "held:" and "stopped:" line
