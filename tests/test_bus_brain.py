@@ -2010,6 +2010,21 @@ class ModelFlagTests(unittest.TestCase):
         order = [c[0] for c in fake.calls if c[0] in ("PATCH", "PUT")]
         self.assertEqual(order, ["PATCH", "PUT"])
 
+    def test_fix_with_a_lane_takes_a_ticket_that_lost_its_lane_label(self):
+        # A silent-lane requeue drops the lane label and the run's pull request
+        # opens after it; the factory then names the lane (loom#1303).
+        ticket = dict(fix_ticket(), body=BODY)
+        ticket["labels"] = [x for x in ticket["labels"] if not x["name"].startswith("lane:")]
+        fake = Routed({("GET", "/pulls/8"): reply(200, fix_pr()), ("GET", "/issues/9"): reply(200, ticket),
+                       ("POST", "/issues/9/comments"): reply(201, {"id": 5})})
+        brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), "Notes.", "spark")
+        self.assertEqual(fake.sent("PUT", "/issues/9/labels"),
+                         [{"labels": ["loom:ticket", "custom", "loom:briefed", "lane:spark"]}])
+        # With no lane named, the check still refuses it.
+        fake = Routed({("GET", "/pulls/8"): reply(200, fix_pr()), ("GET", "/issues/9"): reply(200, ticket)})
+        with self.assertRaises(ValueError):
+            brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), "Notes.")
+
     def test_fix_refuses_an_unknown_lane_or_bad_model(self):
         for kw in (dict(lane="bogus"), dict(lane="muse"), dict(model="bad model")):
             fake = Fake()

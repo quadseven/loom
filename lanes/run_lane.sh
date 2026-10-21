@@ -1745,6 +1745,8 @@ archive_transcripts() {
     (
       cd "$home_real/$parent" 2> /dev/null || exit 0
       [ "$(pwd -P)" = "$home_real/$parent" ] || exit 0
+      # No such leaf (an opencode run's .claude holds only skills): nothing to keep.
+      [ -e "$leaf" ] || [ -L "$leaf" ] || exit 0
       mkdir -p "$dest/$parent"
       if ! rsync -a --no-links --prune-empty-dirs --include='*/' --include='*.json' \
           --include='*.jsonl' --include='opencode.db' --include='opencode.db-wal' \

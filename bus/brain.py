@@ -3392,7 +3392,7 @@ def _validate_ticket_association(gh: GitHub, repo: str, number: int,
 
 
 def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
-               issue: Dict[str, Any]) -> None:
+               issue: Dict[str, Any], lane: Optional[str] = None) -> None:
     head = pr.get("head") or {}
     names = _labels(issue)
     rules = [
@@ -3406,7 +3406,11 @@ def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
         # A failed ticket is one a runaway hold left after its run ended.
         (bool({"loom:briefed", "loom:running", "loom:pr", "loom:failed"} & set(names)),
          "ticket is not loom:briefed, loom:running, loom:pr or loom:failed"),
-        (sum(1 for x in names if x.startswith("lane:")) == 1, "ticket must have exactly one lane label"),
+        # A named lane replaces the label, so a ticket a silent-lane requeue
+        # left with none passes (loom#1303: 146 refused fix rounds).
+        (sum(1 for x in names if x.startswith("lane:")) == 1
+         or (lane is not None and not any(x.startswith("lane:") for x in names)),
+         "ticket must have exactly one lane label"),
     ]
     for ok, reason in rules:
         if not ok:
@@ -3478,7 +3482,7 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     _check_written_text(notes)
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
-    _check_fix(repo, pr, ticket, issue)
+    _check_fix(repo, pr, ticket, issue, lane)
     sha = str((pr.get("head") or {}).get("sha") or "")
     checks = _failing_checks(gh, repo, sha) if sha else []
     threads = _open_threads(gh, repo, number)
