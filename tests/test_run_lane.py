@@ -2330,6 +2330,17 @@ cat > /dev/null
             self.assertFalse(p.stat().st_mode & 0o222, p)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_home_with_skills_but_no_transcripts_archives_without_a_warning(self):
+        # Every opencode run has .claude/skills and no .claude/projects: rsync
+        # failed on the missing name and the log said the transcript may be
+        # incomplete, 425 runs by 2026-10-21.
+        self.operator_skills()
+        self.anthropic_skill_run()
+        logs = [p.read_text() for p in (self.loom / "logs").rglob("*.log") if p.is_file()]
+        self.assertTrue(logs)
+        self.assertFalse(any("transcript may be incomplete" in text for text in logs))
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_the_skill_snapshot_refreshes_at_most_hourly_and_a_failed_refresh_keeps_it(self):
         checkout = self.operator_skills()
         self.anthropic_skill_run()
