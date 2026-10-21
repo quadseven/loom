@@ -2041,6 +2041,24 @@ cat > /dev/null
         self.assertNotIn("failed: push failed", log)
         self.assertFalse(any(c.startswith("gh pr comment") for c in self.calls()))
 
+    def test_a_codex_lane_runs_luna_whatever_model_the_brief_pins(self):
+        # The operator, 2026-10-21: codex lanes run gpt-6-luna only. 53 of 72
+        # codex runs in a day ran the ladder's gpt-6-sol pin and spent the
+        # weekly limit.
+        self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: gpt-6-sol"))
+        self.run_lane(LOOM_CODEX_ONLY_MODEL="gpt-6-luna")
+        runs = [c for c in self.calls() if c.startswith("codex ")]
+        self.assertTrue(runs, self.calls())
+        self.assertIn("--model gpt-6-luna", runs[0])
+        self.assertNotIn("gpt-6-sol", runs[0])
+        self.assertIn("runs gpt-6-luna, not the brief's gpt-6-sol", self.lane_log())
+
+    def test_without_the_codex_only_model_setting_the_briefs_pin_runs(self):
+        self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: gpt-6-sol"))
+        self.run_lane()
+        runs = [c for c in self.calls() if c.startswith("codex ")]
+        self.assertIn("--model gpt-6-sol", runs[0])
+
     def test_a_model_from_another_lanes_family_is_refused(self):
         self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: claude-sonnet-4-5"))
         self.run_lane()

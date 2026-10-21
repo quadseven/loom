@@ -2283,6 +2283,15 @@ for BRIEF in "$INBOX"/*.md; do
       continue
     fi
   fi
+  # LOOM_CODEX_ONLY_MODEL: the one model a codex lane runs, whatever gpt
+  # model the brief pins (unset: the pin runs as written). The operator's rule
+  # (2026-10-21) is gpt-6-luna: the ladder's gpt-6-sol pin ran 53 of 72 codex
+  # runs in a day and spent the weekly limit.
+  CODEX_ONLY="${LOOM_CODEX_ONLY_MODEL:-}"
+  if [ "$LANE" = codex ] && [ -n "$CODEX_ONLY" ] && [[ "$MODEL" == gpt-* ]] && [ "$MODEL" != "$CODEX_ONLY" ]; then
+    echo "[$(date -u +%FT%TZ)] $TICKET runs $CODEX_ONLY, not the brief's $MODEL: codex lanes run $CODEX_ONLY only" >> "$LOG"
+    MODEL="$CODEX_ONLY"
+  fi
   if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:/@-]*$ ]]; then
     park "$BRIEF" "no usable model '$MODEL': set Model: in the brief or $(lane_var MODEL)"; continue
   fi
