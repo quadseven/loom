@@ -1713,6 +1713,19 @@ class Station:
             raise ValueError("the loom:fix comment was edited after it was posted")
         return tickets.parse_fix(repo, newest_fix[2]), newest_fix[1].get("id")
 
+    def _claim_time(self, comments: List[Any], fix_comment_id: Any) -> float:
+        """When a claim is stamped: the pass time, or one second after the
+        fix comment it claims when that was posted later. The factory posts a
+        fix in the same pass, after self.now, and a claim sorted before its
+        fix left the fix unclaimed, so the next pass sent the same round
+        again (39 duplicate fix rounds, 2026-10-21)."""
+        for c in comments if fix_comment_id is not None else ():
+            if isinstance(c, dict) and c.get("id") == fix_comment_id:
+                posted = self._epoch(str(c.get("created_at") or ""))
+                if posted is not None and posted >= self.now:
+                    return posted + 1
+        return self.now
+
     def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
         """Steps 2 and 3 for an issue already re-read and trusted. False when
         its fix comment cannot be used (refused, as an untrusted ticket is),
@@ -1748,19 +1761,9 @@ class Station:
                      {"labels": self._claimed_labels(repo, issue)})
         # The claim marker goes on the ticket's one status comment, edited in
         # place: a new comment emailed the operator on every claim (loom#866).
-        # Never stamped before the fix it claims: the factory posts a fix in
-        # the same pass, after self.now, and a claim sorted before its fix
-        # left the fix unclaimed, so the next pass sent the same round again
-        # (39 duplicate fix rounds, 2026-10-21).
-        claimed_at = self.now
-        if fix_comment_id is not None:
-            for c in comments:
-                if isinstance(c, dict) and c.get("id") == fix_comment_id:
-                    posted = self._epoch(str(c.get("created_at") or ""))
-                    if posted is not None and posted >= claimed_at:
-                        claimed_at = posted + 1
         status.add(self.gh, repo, number, "Claimed for lane %s (body sha256 %s)"
-                   % (lane, _sha12(issue.get("body"))), claimed_at, self.s.authors)
+                   % (lane, _sha12(issue.get("body"))),
+                   self._claim_time(comments, fix_comment_id), self.s.authors)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         if fix:
             _say("rendered %s#%d fix brief from loom:fix comment %s"
