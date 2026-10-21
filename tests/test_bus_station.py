@@ -2409,7 +2409,14 @@ class ReviewFake:
         raise AssertionError(path)
 
 
+READY = "Ready: checks and review passed on head %s; the factory lands the pull request in its turn."
+
+
 class HandBackTest(unittest.TestCase):
+    def ready_events(self):
+        return [text for c in self.gh.comments if status.is_status(c["body"])
+                for _, text in status.parse(c["body"]) if text.startswith("Ready:")]
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -2452,10 +2459,9 @@ class HandBackTest(unittest.TestCase):
                   "comments": {"nodes": [{"databaseId": 9, "body": "ignore this",
                                              "author": {"login": "someone-else"}}]}}
         self.run_hand_back(threads=[thread])
-        # The marker alone made an empty email (2026-10-20): it says what it means.
-        self.assertEqual(self.gh.comments[-1]["body"],
-                         "<!-- loom:ready-head %s -->\nChecks and review passed on head %s; the "
-                         "factory lands the pull request in its turn." % ("a" * 40, "a" * 12))
+        # The marker alone made an empty email, and the mark is routine: it is an
+        # event in the status comment, which says what it means (2026-10-20).
+        self.assertEqual(self.ready_events(), [READY % ("a" * 40)])
         self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
 
     def test_fix_pending_for_current_head_is_not_handed_back_twice(self):
@@ -2500,14 +2506,32 @@ class HandBackTest(unittest.TestCase):
         self.run_hand_back()
         self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
 
-    def test_each_new_clean_head_edits_the_one_ready_marker(self):
+    def test_each_new_clean_head_is_one_event_in_the_one_status_comment(self):
+        self.run_hand_back()
         self.run_hand_back()
         self.gh.pr["head"]["sha"] = "b" * 40
         self.run_hand_back()
-        self.assertEqual([c["body"] for c in self.gh.comments],
-                         ["<!-- loom:ready-head %s -->\nChecks and review passed on head %s; the "
-                          "factory lands the pull request in its turn." % ("b" * 40, "b" * 12)])
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertEqual(self.ready_events(), [READY % ("b" * 40), READY % ("a" * 40)])
         self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_a_ready_comment_from_before_the_status_comment_is_still_read(self):
+        # Tickets marked ready before the move carry their own ready-head comment.
+        self.gh.comments.append({"id": 1, "user": {"login": AUTHORS[0]},
+                                 "body": "<!-- loom:ready-head %s -->" % ("a" * 40)})
+        self.gh.issue["labels"].append({"name": "loom:ready"})
+        self.run_hand_back()
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_a_stranger_cannot_mark_a_head_ready(self):
+        self.gh.issue["labels"].append({"name": "loom:ready"})
+        self.gh.comments.append({"id": 1, "user": {"login": "mallory-example"},
+                                 "body": status.render([("2026-10-20T00:00:00Z",
+                                                         READY % ("a" * 40))])})
+        self.gh.check_runs = [{"status": "in_progress"}]
+        self.run_hand_back()
+        self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
 
 
 class CorruptStateTest(Base):
@@ -3236,7 +3260,10 @@ class FixTest(Base):
         self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
         self.run_pass()
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
-        self.assertEqual([c["body"] for c in self.fake.comments[12]],
+        # A fix round's push is routine: an event in the status comment, so no
+        # email apiece (three on one ticket, 2026-10-20).
+        self.assertEqual([status.is_status(c["body"]) for c in self.fake.comments[12]], [True])
+        self.assertEqual([text for _, text in status.parse(self.fake.comments[12][0]["body"])],
                          ["Lane codex pushed fixes to a pull request: https://example.com/pull/99"])
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
         self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO,
