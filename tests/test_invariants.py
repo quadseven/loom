@@ -827,7 +827,7 @@ class FilerTest(unittest.TestCase):
         self.assertEqual(issue["state"], "closed")
         self.assertEqual(sum("cleared" in c.get("body", "") for c in self.gh.comments[(REPO, number)]), 2)
 
-    def test_quiet_triage_issue_closes_once_and_rewritten_issue_is_untouched(self):
+    def test_quiet_triage_issue_closes_once(self):
         self.file(self.breach(at=T0 - 7 * 3600), now=T0 - 7 * 3600)
         number = next(iter(self.gh.issues))
         issue = self.gh.issues[number]
@@ -840,10 +840,19 @@ class FilerTest(unittest.TestCase):
                          self.said.append).run([])
         self.assertEqual(sum("cleared" in c.get("body", "") for c in self.gh.comments[(REPO, number)]), 1)
 
-        issue.update(state="open", labels=[{"name": invariants.LABEL}, {"name": "loom:rewritten"}])
-        invariants.Filer(self.gh, REPO, GOAL, self.state, T0 + 2 * invariants.CHECK_EVERY,
+    def test_a_rewritten_issue_closes_after_the_clear_wait_like_a_triage_one(self):
+        self.file(self.breach(at=T0 - 7 * 3600), now=T0 - 7 * 3600)
+        number = next(iter(self.gh.issues))
+        issue = self.gh.issues[number]
+        issue.update(created_at=stamp(T0 - 7 * 3600),
+                     labels=[{"name": invariants.LABEL}, {"name": "loom:rewritten"}])
+        invariants.Filer(self.gh, REPO, GOAL, self.state, T0 - 2 * 3600,
                          self.said.append).run([])
         self.assertEqual(issue["state"], "open")
+        invariants.Filer(self.gh, REPO, GOAL, self.state, T0, self.said.append).run([])
+        self.assertEqual(issue["state"], "closed")
+        self.assertEqual(issue.get("state_reason"), "not_planned")
+        self.assertEqual(sum("cleared" in c.get("body", "") for c in self.gh.comments[(REPO, number)]), 1)
 
 
 class InvariantTest(unittest.TestCase):
@@ -1225,6 +1234,25 @@ class RollingLaneTest(unittest.TestCase):
         # An operator ask is not closed out from under the operator.
         self.assertEqual(self.gh.issues[asks_number]["state"], "open")
         self.assertNotIn((REPO, asks_number), self.gh.comments)
+
+    def test_a_rewritten_issue_is_folded_into_the_rolling_one_unless_it_asks_the_operator(self):
+        old = invariants.Breach("lane-held", "zen", "Lane zen held", ("x",), T0)
+        self.file([old])
+        (old_number,) = self.gh.issues
+        rewritten = [{"name": invariants.LABEL}, {"name": "loom:rewritten"}]
+        self.gh.issues[old_number].update(labels=rewritten)
+        asks = invariants.Breach("lane-held", "anthropic-4", "Lane anthropic-4 held", ("x",), T0)
+        self.file([asks])
+        asks_number = max(self.gh.issues)
+        self.gh.issues[asks_number].update(labels=rewritten + [{"name": "needs:example-operator"}])
+        later = T0 + 300
+        self.file(invariants.lane_held(lane_facts(("zen", "agy"), now=later)), now=later)
+        rolling = self.state[invariants.Breach("lane-held", invariants.LANES_SUBJECT, "t", (),
+                                               T0).key]
+        self.assertEqual(self.gh.issues[old_number]["state"], "closed")
+        (note,) = self.gh.comments[(REPO, old_number)]
+        self.assertIn("Folded into #%d" % rolling, note["body"])
+        self.assertEqual(self.gh.issues[asks_number]["state"], "open")
 
     def test_lane_no_success_stays_one_breach_per_lane(self):
         runs = [Run(lane, False, T0 - i * 60, "x") for lane in ("zen", "zai") for i in range(5)]
