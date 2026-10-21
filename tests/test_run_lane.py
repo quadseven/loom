@@ -1041,6 +1041,15 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("run the repo's full test suite", prompt)
         self.assertIn("cyclomatic complexity under 15", prompt)
 
+    def test_the_agent_is_told_never_to_write_another_repos_issue_ref(self):
+        # Lane agents wrote made-up OWNER/NAME references into test fixtures
+        # in public repos, and the leak scan refused the push (2026-10-21).
+        self.drop_brief()
+        self.run_lane()
+        prompt = self.log.read_text()
+        self.assertIn("never write a reference to another repo's issue", prompt)
+        self.assertIn("NAME#N", prompt)
+
     def test_pr_body_ends_with_refs_for_a_station_brief(self):
         self.drop_brief(text=BRIEF.replace("Lane: codex\n", "Lane: codex\nIssue: example/repo#42\n"))
         result = self.run_lane()
