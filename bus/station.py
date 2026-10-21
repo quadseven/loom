@@ -1748,8 +1748,19 @@ class Station:
                      {"labels": self._claimed_labels(repo, issue)})
         # The claim marker goes on the ticket's one status comment, edited in
         # place: a new comment emailed the operator on every claim (loom#866).
+        # Never stamped before the fix it claims: the factory posts a fix in
+        # the same pass, after self.now, and a claim sorted before its fix
+        # left the fix unclaimed, so the next pass sent the same round again
+        # (39 duplicate fix rounds, 2026-10-21).
+        claimed_at = self.now
+        if fix_comment_id is not None:
+            for c in comments:
+                if isinstance(c, dict) and c.get("id") == fix_comment_id:
+                    posted = self._epoch(str(c.get("created_at") or ""))
+                    if posted is not None and posted >= claimed_at:
+                        claimed_at = posted + 1
         status.add(self.gh, repo, number, "Claimed for lane %s (body sha256 %s)"
-                   % (lane, _sha12(issue.get("body"))), self.now, self.s.authors)
+                   % (lane, _sha12(issue.get("body"))), claimed_at, self.s.authors)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         if fix:
             _say("rendered %s#%d fix brief from loom:fix comment %s"

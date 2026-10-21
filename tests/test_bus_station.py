@@ -3295,6 +3295,25 @@ class FixTest(Base):
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running",
                                                "claim:alice-example"])
 
+    def test_a_claimed_fix_is_not_claimed_again_on_the_next_pass(self):
+        # The claim was stamped with the pass's start time, earlier than the
+        # fix comment the same pass had just posted, so the next pass read the
+        # fix as unclaimed and sent the same round again: 39 duplicate fix
+        # rounds, 30 on the paid lanes (2026-10-21). Here the fix comment is
+        # newer than the pass that claims it, as there.
+        self.fake.add(12)
+        self.comment(12, "Lane codex opened a pull request: https://example.com/pull/99")
+        self.comment(12, FIX_BODY)
+        self.run_pass()
+        self.assertIn("Fix-PR: 99\n", self.claimed_brief("example-owner.example-repo-12"))
+        os.remove(self.inbox("codex", "example-owner.example-repo-12.md"))
+        issue = self.fake.issues[12]
+        issue["labels"] = [x for x in issue["labels"] if x["name"] != "loom:running"] + [
+            {"name": "loom:briefed"}]
+        self.fake.version += 1
+        self.run_pass()
+        self.assertNotIn("Fix-PR", self.claimed_brief("example-owner.example-repo-12-r2"))
+
     def assert_plain_brief(self):
         text = self.claimed_brief()
         self.assertNotIn("Fix-PR", text)
