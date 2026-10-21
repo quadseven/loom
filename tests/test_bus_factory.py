@@ -211,7 +211,7 @@ class Base(unittest.TestCase):
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
-           down=()):
+           down=(), limit_until=None):
         def merge(gh, repo, number, ticket):
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes, lane=None, model=None):
@@ -230,7 +230,7 @@ class Base(unittest.TestCase):
                             merge=merge, fix=fix, move=move, close=close,
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
-                            silent=silent, down=down)
+                            silent=silent, down=down, limit_until=limit_until)
         f.run()
         return f
 
@@ -254,6 +254,46 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.merged, [])
         self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+
+    def unticked_ticket(self, lane="codex"):
+        criteria = ["A1 the cache is read once", "A2 a stale entry is dropped",
+                    "Live: observed after deploy"]
+        ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n" +
+                       "\n".join("- [ ] " + item for item in criteria) + "\n")
+        self.gh.ticket(5, "pr", body=ticket_body, lane=lane)
+        self.gh.pull(50, 5, body="## Acceptance criteria\n- [x] A1 the cache is read once\n"
+                                 "- [ ] A2 a stale entry is dropped\n- [ ] Live: observed after deploy\n")
+
+    def test_unticked_criteria_go_back_naming_each_one(self):
+        # 2026-10-20: the note said "failing checks, open review threads or a
+        # conflict" and listed none, so a lane had nothing to act on and the
+        # same green pull request came back six times.
+        self.unticked_ticket()
+        f = self.go()
+        self.assertEqual(self.merged, [])
+        self.assertIn(factory.UNTICKED_HEADING, f.notes)
+        self.assertIn("- A2 a stale entry is dropped", f.notes)
+        self.assertNotIn("A1 the cache is read once", f.notes)
+        self.assertNotIn("Live: observed", f.notes)
+        self.assertIn("not built: <reason>", f.notes)
+        self.assertEqual((self.lane(5), factory.rung_of(self.gh.comments[5])), ("codex", 0))
+
+    def test_a_criterion_the_text_check_refuses_still_goes_back_with_the_plain_note(self):
+        body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n"
+                "- [ ] Fixes #12 once the cache is read once\n")
+        self.gh.ticket(5, "pr", body=body, lane="codex")
+        self.gh.pull(50, 5, body="## Acceptance criteria\n- [ ] Fixes #12 once the cache is read once\n")
+        f = self.go()
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(f.notes, factory.FIX_NOTES)
+
+    def test_a_second_round_with_the_same_criteria_unticked_climbs(self):
+        self.unticked_ticket(lane="opencode-go")
+        self.gh.comments[5].append({"body": FIX_MARKER + "\n\n" + factory.UNTICKED_HEADING +
+                                    "\n\n- A2 a stale entry is dropped", "user": ME})
+        self.go()
+        self.assertEqual(self.merged, [])
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
 
     def test_a_pull_request_with_every_non_live_criterion_ticked_lands(self):
         criteria = ["A%d" % n for n in range(1, 6)] + ["Live: observed after deploy"]
@@ -1724,6 +1764,33 @@ class Tickets(Base):
                             for c in say.call_args_list), say.call_args_list)
         self.assertEqual(self.moved, [])
 
+    def tier_busy_on(self, lane, lifts_in):
+        """A medium ticket briefed on `lane`, at a limit that lifts in
+        `lifts_in` seconds, while every other lane of its tier is up and busy."""
+        self.gh.ticket(7, "briefed", lane=lane, body="Difficulty: medium\n\n## Why\nx\n")
+        self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                              "created_at": iso(60)}]
+        busy = [x for x in factory.lanes_of("medium", True) if x != lane]
+        for n, other in enumerate(busy, 20):
+            self.gh.ticket(n, "briefed", lane=other)
+        self.go(limited=[lane], available=busy, limit_until={lane: NOW + lifts_in})
+
+    def test_a_ticket_on_a_lane_limited_for_days_goes_back_to_the_queue(self):
+        # Two medium tickets sat 18 hours briefed to lanes at a monthly limit
+        # while the queue took every lane of their tier as it freed
+        # (loom#1224, 2026-10-20).
+        self.tier_busy_on("opencode-go-2", 11 * 86400)
+        self.assertIn("loom:queued", {x["name"] for x in self.gh.issues[7]["labels"]})
+        self.assertEqual({x["name"] for x in self.gh.issues[7]["labels"]} & {"loom:briefed", "lane:opencode-go-2"}, set())
+        note = self.gh.comments[7][-1]["body"]
+        self.assertIn("Not a failure (lane opencode-go-2 is at a limit until", note)
+        self.assertIn("goes back to the queue", note)
+
+    def test_a_ticket_whose_lane_frees_up_soon_keeps_waiting_for_it(self):
+        self.tier_busy_on("opencode-go-2", 30 * 60)
+        self.assertEqual(self.lane(7), "opencode-go-2")
+        self.assertIn("loom:briefed", {x["name"] for x in self.gh.issues[7]["labels"]})
+
     def test_a_limit_move_posts_no_rung_marker(self):
         self.limited_easy()
         self.assertFalse(any(factory.RUNG_RE.search(c["body"]) for c in self.gh.comments[7]))
@@ -1907,6 +1974,34 @@ class Tickets(Base):
         # The rung it left was not failed on, so it stays untried.
         self.assertEqual(self.moved, [])
 
+    def test_a_paid_rung_limited_longer_than_two_hours_uses_the_strongest_free_lane(self):
+        self.gh.private = False
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="claude", body=body)
+        self.go(model_limits={lane: {"claude-sonnet-5-5": NOW + 3 * 3600}
+                              for lane in factory.LADDER[0][0]})
+        self.assertEqual(self.lane(7), "free-ollama")
+        self.assertIsNone(self.model(7))
+        self.assertIn("Not a failure", self.gh.comments[7][-1]["body"])
+
+    def test_a_paid_rung_freeing_within_two_hours_is_still_waited_for(self):
+        self.gh.private = False
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="claude", body=body)
+        self.go(model_limits={lane: {"claude-sonnet-5-5": NOW + 90 * 60}
+                              for lane in factory.LADDER[0][0]})
+        self.assertEqual((self.lane(7), self.model(7)), ("claude", "claude-sonnet-5-5"))
+
+    def test_a_long_paid_wait_skips_free_lanes_the_ticket_already_tried(self):
+        self.gh.private = False
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="claude", body=body)
+        self.gh.comments[7].append({"body": "Claimed for lane free-ollama (body sha256 abcdef123456)",
+                                    "user": ME})
+        self.go(model_limits={lane: {"claude-sonnet-5-5": NOW + 3 * 3600}
+                              for lane in factory.LADDER[0][0]})
+        self.assertEqual(self.lane(7), "free-gemma")
+
     def test_a_ladder_ticket_at_a_limit_stays_on_its_rung(self):
         body = "Model: claude-opus-5-5\nDifficulty: easy\n\n## Why\nx\n"
         self.gh.ticket(7, "briefed", lane="claude", body=body)
@@ -1999,6 +2094,40 @@ class Tickets(Base):
             self.gh.ticket(n, "briefed", lane="claude")
         self.go()
         self.assertEqual([self.lane(n) for n in range(1, 6)], ["claude"] * 5)
+
+    def test_a_busy_claude_ticket_is_not_spread_to_opus_on_claude_while_anthropic_is_out(self):
+        # The anthropic slots out of credit hold no tickets, so rung 3 looked
+        # free, and a ticket waiting on a busy claude lane was "spread" to
+        # Opus on the same claude lane (2026-10-19).
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        for n in range(1, 6):
+            self.gh.ticket(n, "briefed", lane="claude", body=body)
+            self.gh.comments[n].append({"body": factory.RUNG_MARKER % 1, "user": ME})
+        for n, lane in ((11, "codex"), (12, "codex"), (13, "codex-2"), (14, "codex-2")):
+            self.gh.ticket(n, "briefed", lane=lane)
+        self.go(limited=factory.ANTHROPIC)
+        for n in range(1, 6):
+            self.assertNotEqual((self.lane(n), self.model(n)), ("claude", "claude-opus-5-5"))
+            self.assertFalse(any(factory.RUNG_MARKER % 3 in c["body"]
+                                 for c in self.gh.comments[n]))
+
+    def test_two_busy_rungs_do_not_ping_pong_a_ticket(self):
+        # One ticket flipped between rung 2 on codex-2 and rung 3 on claude 8
+        # times in 90 minutes, as each rung looked free by a lane that was
+        # out, and was never claimed (2026-10-20).
+        self.gh.ticket(1, "briefed", lane="claude",
+                       body="Model: claude-opus-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.gh.comments[1].append({"body": factory.RUNG_MARKER % 3, "user": ME})
+        for n in range(2, 8):
+            self.gh.ticket(n, "briefed", lane="claude")  # claude holds 7
+        for n in range(8, 13):
+            self.gh.ticket(n, "briefed", lane="codex-2")  # codex-2 holds 5
+        before = len(self.gh.comments[1])
+        for _ in range(2):
+            self.go(limited=("codex",) + factory.ANTHROPIC)
+            self.assertEqual((self.lane(1), self.model(1)), ("claude", "claude-opus-5-5"))
+        self.assertFalse(any(factory.RUNG_RE.search(c["body"])
+                             for c in self.gh.comments[1][before:]))
 
     def test_a_pass_stops_after_its_action_cap(self):
         for n in range(1, factory.MAX_ACTIONS + 5):
@@ -2106,6 +2235,16 @@ class Helpers(unittest.TestCase):
         self.assertEqual(factory.next_rung({1}, all_busy), 2)
         self.assertEqual(factory.next_rung(set(), dict(all_busy, claude=30)), 2)
         self.assertEqual(factory.next_rung({1}, dict(all_busy, agy=0)), 4)
+        # Only the lanes that may serve a rung now count: rung 3 is not free
+        # when only the busy claude lane serves it, however idle the rest.
+        # With every up rung busy it waits on the least loaded, rung 1, not on
+        # Opus on the same claude lane; a free codex lane takes rung 2.
+        up = {1: ("claude",), 2: ("codex", "codex-2"), 3: ("claude",)}
+        self.assertEqual(factory.next_rung(set(), busy, lanes=up), 1)
+        self.assertEqual(factory.next_rung(set(), dict(busy, codex=1), lanes=up), 2)
+        # A rung with no lane serving it now is passed over.
+        self.assertEqual(factory.next_rung(set(), {"claude": 2},
+                                           lanes={1: ("claude",), 2: (), 3: ("anthropic",)}), 3)
 
     def test_the_tiers_match_the_lane_choice_in_muse_md(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2206,7 +2345,7 @@ class Helpers(unittest.TestCase):
         class Fake:
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
-                         model_limits=None, silent=None, down=()):
+                         model_limits=None, silent=None, down=(), limit_until=None):
                 self.silent_running, self.silent = {}, silent
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))
@@ -2287,6 +2426,34 @@ class DeadLane(unittest.TestCase):
             "up the model ladder to rung 2, gpt-6-sol on lane codex.",
             "Claimed for lane codex (body sha256 0123456789ab)")
         self.assertEqual(factory.dead_lane(comments), "codex")
+
+    def test_a_retry_a_hold_and_a_stop_end_their_attempts_with_their_class(self):
+        # Since status events (loom#866) these endings do not start "Lane X
+        # failed:", and the runaway detector counted each claim as work.
+        comments = self.comments(
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "Automatic retry 1 of 2 (transient): moved from lane codex to lane "
+            "codex-2. Lane codex failed: [transient] agent exited 1",
+            "Claimed for lane codex-2 (body sha256 0123456789ab)",
+            "Lane codex-2 held: setup failed: could not check out the default branch; "
+            "factory incident quadseven/loom#99; the agent did not run. The ticket keeps "
+            "its rung and returns to the queue when the factory incident closes.",
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "Lane codex stopped: [limit] provider limit reached",
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "Lane codex stopped: [auth] the provider refused the key",
+            "Claimed for lane codex (body sha256 0123456789ab)")
+        reasons = [a[3] for a in factory.attempts(comments)]
+        self.assertEqual(reasons[0], "[transient] agent exited 1")
+        self.assertTrue(reasons[1].startswith("[factory] setup failed:"), reasons[1])
+        self.assertEqual(reasons[2:], ["[limit] provider limit reached",
+                                       "[auth] the provider refused the key", ""])
+
+    def test_a_stopped_line_without_a_class_is_not_an_ending(self):
+        comments = self.comments(
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "Lane codex stopped: [work] something else")
+        self.assertEqual([a[3] for a in factory.attempts(comments)], [""])
 
 
 class LaneKinds(unittest.TestCase):

@@ -106,6 +106,21 @@ class SignatureTest(unittest.TestCase):
         self.assertEqual(watch.signature(a),
                          "<time> brain: push of <hex> failed for <repo>#<n> (<id>, pid <n>) in <path>")
 
+    def test_a_station_stage_failure_folds_the_stage_name(self):
+        a = "[2026-10-20T01:45:00Z] station: run_factory failed: GET /repos/o/r/issues -> 404"
+        b = "station: settle_orphan_sources failed: GET /repos/o/r/issues -> 404"
+        self.assertEqual(watch.signature(a), watch.signature(b))
+        self.assertTrue(watch.signature(a).startswith("station: <stage> failed: GET "))
+        self.assertEqual(watch.stage(a), "run_factory")
+        self.assertEqual(watch.stage(b), "settle_orphan_sources")
+        # Other shapes keep their signatures: a repo before "failed", a
+        # stage not at the start, or a line that is not the station's.
+        for line in ("station: unwind_reverts example-owner/repo-a failed: GET /x -> 404",
+                     "station: could not scan: run_factory failed: boom",
+                     "brain: run_factory failed: boom"):
+            self.assertIsNone(watch.stage(line), line)
+            self.assertNotIn("<stage>", watch.signature(line), line)
+
     def test_which_lines_are_kept(self):
         for line in ("ValueError: bad", "push failed", "Connection refused",
                      "HTTP 502 from the API", "upstream said 404 Not Found"):
@@ -194,6 +209,37 @@ class FilingTest(WatchBase):
         self.run_at(T0 + 1260)
         self.assertEqual(len(self.gh.issues), 1)
         self.assertEqual(self.gh.comments, [])
+
+    def test_one_error_every_stage_hits_files_one_issue_naming_the_stages(self):
+        # 2026-10-20: one unreadable repo's 404 failed every pass stage and
+        # filed loom#1054-#1066 and loom#1087, one issue per stage.
+        stages = ("run_factory", "publish_lanes", "hand_back")
+        for _ in range(3):
+            self.append(*("[2026-10-20T01:45:0%dZ] station: %s failed: GET /repos/o/r/issues -> 404"
+                          % (i, stage) for i, stage in enumerate(stages)))
+        self.run_at(T0)
+        posts = [c for c in self.gh.calls if c == ("POST", "/repos/%s/issues" % LANES_REPO)]
+        self.assertEqual(len(posts), 1)
+        issue = self.gh.issues[1]
+        self.assertTrue(issue["title"].startswith("station: station: <stage> failed: "),
+                        issue["title"])
+        self.assertIn("Stages: hand_back, publish_lanes, run_factory", issue["body"])
+        self.assertIn("9 times in the last 30 minutes", issue["body"])
+        # A later stage on the same error is counted there and named.
+        self.append("station: assign_queued failed: GET /repos/o/r/issues -> 404")
+        self.run_at(T0 + 3600)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertIn("Stages: assign_queued, hand_back, publish_lanes, run_factory",
+                      self.gh.comments[0][1])
+
+    def test_two_errors_from_one_stage_file_two_issues(self):
+        self.append(*["station: run_factory failed: GET /repos/o/r/issues answered 403"] * 3)
+        self.append(*["station: run_factory failed: GET /repos/o/r/issues answered 502"] * 3)
+        self.run_at(T0)
+        self.assertEqual(len(self.gh.issues), 2)
+        self.assertEqual(sorted("403" in i["title"] for i in self.gh.issues.values()),
+                         [False, True])
 
     def test_the_brains_status_output_files_nothing(self):
         # loom#871-#877: one tick's report filed six issues, one per line.

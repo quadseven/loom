@@ -149,7 +149,8 @@ spark_brain() {
   token="${LOOM_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
   [ -n "$token" ] || token="$(gh auth token 2> /dev/null)"
   [ -n "$token" ] || { echo "no GitHub token for the spark brain" >&2; return 3; }
-  case "$token" in *[!A-Za-z0-9_]*) echo "the GitHub token has unexpected characters" >&2; return 3 ;; esac
+  # An App installation token is ghs_ and a JWT-like body with dots and dashes.
+  case "$token" in *[!A-Za-z0-9_.-]*) echo "the GitHub token has unexpected characters" >&2; return 3 ;; esac
   AGENT_HOME="$LOOM_HOME/run/brain-home"
   rm -rf "$AGENT_HOME" && mkdir -p "$AGENT_HOME" || return 3
   LANE=spark SKILLS="" API_KEY="" SPARK_URL="$LOOM_SPARK_URL"
@@ -212,7 +213,7 @@ if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
   [ "$MINUTES" -le 50 ] ||
     { say "LOOM_BRAIN_MINUTES must be 50 or less with a GitHub App: its token lasts an hour"; beat failed 1; exit 1; }
   unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN
-  if ! app_token="$(bus app token 2>> "$LOG")" || ! [[ "$app_token" =~ ^[A-Za-z0-9_]+$ ]]; then
+  if ! app_token="$(bus app token 2>> "$LOG")" || ! [[ "$app_token" =~ ^[A-Za-z0-9_.-]+$ ]]; then
     say "tick failed: could not mint the brain's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
     beat failed 1
     exit 1
@@ -260,7 +261,12 @@ step found or decided\" in place of the step \
 command MUSE.md gives; the wrapper records lock and unlock. LOOM_REPOS is \
 set in your environment. Work from \
 $WORK/loom. Read each goal's home issue and its rules before acting on that \
-goal. This replaces the 15-minute limit in MUSE.md: stop within \
+goal. Post each journal, and every other note or evidence a tick leaves on \
+an issue, with python3 -m bus journal OWNER/NAME#N --file FILE --holder \
+$HOLDER, which edits your journal of the day there instead of emailing the \
+issue's watchers with a new comment; evidence whose blocker kind has no issue \
+of exactly that kind goes to the goal home's journal, never the closest \
+issue. This replaces the 15-minute limit in MUSE.md: stop within \
 $((MINUTES - 5)) minutes; you are cut off at $MINUTES."
 if [ "$SCOPE" = live ]; then
   PROMPT="$PROMPT Muse does the GitHub steps, ships and rolls, and reads \

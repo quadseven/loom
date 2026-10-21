@@ -124,6 +124,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
@@ -300,7 +301,10 @@ FALLBACK: Dict[str, Tuple[str, ...]] = {"medium": ("hard", "easy")}
 PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4", "muse", "free-nvidia", "free-kilo", "free-groq")
 # A rung whose least-loaded lane already holds this many briefed or running
 # tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
-# than a wait behind a busy lane"). The last rung takes the work regardless.
+# than a wait behind a busy lane that is up"). Only lanes that are up and serve
+# the rung's model count: an idle lane at a limit made rung 3 look free while
+# its only up lane was the busy claude lane (2026-10-19). The last rung takes
+# the work regardless.
 RUNG_BUSY = 2
 # A ladder ticket whose rung has no lane serving its model for longer than
 # this (each lane down, or its model limited past it) climbs to the next
@@ -308,6 +312,9 @@ RUNG_BUSY = 2
 # rung's one lane for a day while two fix rounds and their open pull requests
 # waited on it (2026-10-19).
 RUNG_LIMIT_WAIT = 2 * 3600
+# A tier ticket briefed to a lane that is down, or at a limit lifting further
+# off than this, goes back to the queue when no lane of its tier is free.
+LIMIT_REQUEUE = 2 * 3600
 # A running ticket on a lane with no live heartbeat for this long moves off it.
 SILENT_MAX = 30 * 60
 RUNG_MARKER = "<!-- loom:rung %d -->"
@@ -323,6 +330,16 @@ NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
 # bus/station.py's note on a failed run, and the runner's reason when a run
 # committed nothing and its agent wrote no reason why (lanes/run_lane.sh).
 FAILED_RE = re.compile(r"^Lane \S+ failed: ")
+# Other endings of a claim, each read as a classed reason (loom#572): since
+# status events (loom#866) these lines do not start "Lane X failed:". An
+# automatic retry carries the failed lane's classed reason after its move; a
+# factory-incident hold is a [factory] ending; and bus/station.py's limit,
+# auth and branch-moved paths record "Lane X stopped: [class] ...", worded so
+# that no reader of FAILED_RE counts it as a failure.
+RETRY_ENDED_RE = re.compile(r"^Automatic retry [0-9]+ of [0-9]+ \([a-z]+\): moved from lane "
+                            r"\S+ to lane \S+\. Lane \S+ failed: ")
+HELD_RE = re.compile(r"^Lane \S+ held: ")
+STOPPED_RE = re.compile(r"^Lane \S+ stopped: (?=\[(?:limit|auth|transient)\] )")
 CLAIMED_RE = re.compile(r"Claimed for lane ([a-z0-9-]+) \(body sha256 [0-9a-f]{12}\)")
 # The runner's footer on a lane pull request (lanes/run_lane.sh pr_body,
 # rewritten by bus/pr_repair.py on each fix round): the lane and the model the
@@ -406,6 +423,25 @@ plain to the next reader, and say why in the commit message.
 - Keep the whole suite green, and change nothing the threads and checks do not \
 ask for."""
 
+# A green pull request that leaves ticket criteria unticked goes back with
+# each one named under this heading (2026-10-20: the generic note listed no
+# finding, so lanes had nothing to act on and one pull request came back six
+# times). stuck() climbs a ticket whose last round left a named one unticked.
+UNTICKED_HEADING = "### Acceptance criteria not ticked"
+
+
+def unticked_notes(missing: Sequence[str]) -> str:
+    """The fix note for criteria a lane pull request leaves unticked."""
+    return "\n".join([UNTICKED_HEADING, ""] + ["- " + c for c in missing] + [
+        "", "The factory sent this pull request back: its checks and review pass, "
+        "but the ticket criteria above are not ticked in its body.", "",
+        "- Build each criterion the change does not cover yet, with a test that fails "
+        "without it.",
+        "- Then tick each built criterion in the pull request body's ## Acceptance "
+        "criteria, or leave it unticked and end its line with \"; not built: <reason>\".",
+        "- Change nothing else."])
+
+
 TEST_NOTES = NO_TEST_HEADING + """
 
 The factory sent this pull request back: it changes code and no test file.
@@ -472,7 +508,7 @@ def last_climb(comments: Sequence[Dict[str, Any]]) -> float:
 
 def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
           checks_failing: bool, age: float, now: float = 0.0,
-          no_test: bool = False) -> bool:
+          no_test: bool = False, unticked: Sequence[str] = ()) -> bool:
     """Did the last fix round fail to move this pull request? True when a
     thread it was asked to fix is still open, when checks it was asked to fix
     still fail, when it was asked for a test and still has none, or when the
@@ -487,6 +523,8 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     if set(FIX_THREAD_RE.findall(last)) & set(open_threads):
         return True
     if no_test and NO_TEST_HEADING in last:
+        return True
+    if unticked and UNTICKED_HEADING in last and any("- " + c in last for c in unticked):
         return True
     return checks_failing and bool(FIX_CHECK_RE.search(last))
 
@@ -731,12 +769,24 @@ def issue_model(issue: Dict[str, Any]) -> str:
     return match.group(1) if match else "unspecified"
 
 
+def _ending(body: str) -> Optional[str]:
+    """The classed reason a comment ends the attempt before it with, or None
+    when it ends none: a "Lane X failed:" line or one of the other endings
+    (RETRY_ENDED_RE, HELD_RE, STOPPED_RE)."""
+    for rx in (FAILED_RE, RETRY_ENDED_RE, STOPPED_RE):
+        match = rx.match(body)
+        if match:
+            return body[match.end():]
+    held = HELD_RE.match(body)
+    return "[factory] " + body[held.end():] if held else None
+
+
 def _attempt_rows(comments: Sequence[Any], reset_at: Any = None) -> List[List[Any]]:
     """Each claim as [epoch, time, lane, reason it failed], oldest first, from
-    the claim and "Lane X failed:" comments. An attempt takes the failure that
-    followed it, or "" when none was recorded. With `reset_at` given, a
-    comment it matches starts a new segment: only the last segment's claims
-    are returned."""
+    the claim comments and the endings that followed them (_ending). An
+    attempt takes the first ending after it, or "" when none was recorded.
+    With `reset_at` given, a comment it matches starts a new segment: only the
+    last segment's claims are returned."""
     found: List[List[Any]] = []
     for comment in comments:
         body = str(comment.get("body") or "").strip() if isinstance(comment, dict) else ""
@@ -747,16 +797,16 @@ def _attempt_rows(comments: Sequence[Any], reset_at: Any = None) -> List[List[An
         at = _ts(comment.get("created_at")) if claim else 0.0
         if claim and at:
             found.append([int(at), str(comment["created_at"]), claim.group(1), ""])
-        failure = FAILED_RE.match(body)
-        if failure and found and not found[-1][3]:
-            found[-1][3] = body[failure.end():]
+        ending = _ending(body)
+        if ending and found and not found[-1][3]:
+            found[-1][3] = ending
     return found
 
 
 def attempts(comments: Sequence[Any], current: str = "") -> List[Tuple[int, str, str, str]]:
     """Each claim as (epoch, time, lane, reason it failed), oldest first, from
-    the claim and "Lane X failed:" comments. An attempt takes the failure that
-    followed it, or "" when none was recorded; with `current` given, the last
+    the claim comments and their endings (_attempt_rows). An attempt takes the
+    ending that followed it, or "" when none was recorded; with `current` given, the last
     attempt is the one being reported and takes that reason."""
     found = _attempt_rows(comments)
     if found and current:
@@ -845,16 +895,24 @@ def climb_rungs(tried: set, reached: int = 0) -> List[int]:
 
 
 def next_rung(tried: set, load: Dict[str, int], eligible: Optional[set] = None,
-              reached: int = 0) -> int:
+              reached: int = 0,
+              lanes: Optional[Dict[int, Tuple[str, ...]]] = None) -> int:
     """The lowest rung of climb_rungs with a lane under RUNG_BUSY
-    (docs/MUSE.md: a higher rung rather than a wait behind a busy lane), else
-    the one whose least-loaded lane holds the least, to wait there. 0 when
-    none is left. Waiting on the lowest rung instead queued 33 tickets on the
-    one claude lane on 2026-10-13 while six other ladder slots sat idle."""
-    untried = [n for n in climb_rungs(tried, reached) if eligible is None or n in eligible]
+    (docs/MUSE.md: a higher rung rather than a wait behind a busy lane that
+    is up), else the one whose least-loaded lane holds the least, to wait
+    there. 0 when none is left. Waiting on the lowest rung instead queued 33
+    tickets on the one claude lane on 2026-10-13 while six other ladder slots
+    sat idle. `lanes`, when given, maps each rung to the lanes that may serve
+    it now (Factory._up_lanes): only those count toward its load, and a rung
+    with none is passed over. Counting every CLIMB lane made rung 3 look free
+    through the idle anthropic slots while they were out of credit."""
+    untried = [n for n in climb_rungs(tried, reached)
+               if (eligible is None or n in eligible) and (lanes is None or lanes.get(n))]
     if not untried:
         return 0
-    least = {n: min(load.get(lane, 0) for lane in CLIMB[n - 1][0]) for n in untried}
+    least = {n: min(load.get(lane, 0)
+                    for lane in (CLIMB[n - 1][0] if lanes is None else lanes[n]))
+             for n in untried}
     free = [n for n in untried if least[n] < RUNG_BUSY]
     return free[0] if free else min(untried, key=lambda n: (least[n], n))
 
@@ -1080,7 +1138,8 @@ class Factory:
                  held: Sequence[str] = (),
                  model_limits: Optional[Dict[str, Dict[str, float]]] = None,
                  silent: Optional[Dict[str, float]] = None,
-                 down: Sequence[str] = ()) -> None:
+                 down: Sequence[str] = (),
+                 limit_until: Optional[Dict[str, float]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1098,6 +1157,8 @@ class Factory:
         # aside as from a limit. Left to the BRIEFED_STALL move, three tickets
         # waited two hours on lanes whose key had expired (2026-10-19).
         self.down = set(down)
+        # Lane -> epoch its limit lifts, from its heartbeat (retry_at).
+        self.limit_until = dict(limit_until or {})
         # Lane -> {model: epoch its limit lifts}: a lane with a model ladder
         # is up while one model is limited, but not for that model.
         self.model_limits = dict(model_limits or {})
@@ -1365,6 +1426,13 @@ class Factory:
             lanes = tuple(lane for lane in lanes if lane not in PUBLIC_ONLY)
         return lanes
 
+    def _up_lanes(self, repo: str) -> Dict[int, Tuple[str, ...]]:
+        """Each CLIMB rung's lanes that may serve it now for this repo: up,
+        not at a limit, and with no limit on the rung's model there."""
+        return {n: tuple(lane for lane in self._rung_lanes(repo, n)
+                         if self._up(lane) and self._serves(lane, CLIMB[n - 1][1]))
+                for n in range(1, len(CLIMB) + 1)}
+
     def _rungs_left(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
                     footer: Optional[Tuple[str, str]] = None) -> List[int]:
         """The rungs the ticket may still climb to that have a lane for its
@@ -1384,10 +1452,9 @@ class Factory:
         if RUNAWAY in _labels(issue):
             return None  # held until a brain clears the label
         tried, reached = self._tried(issue, comments, failed_here, footer)
-        up = {n: tuple(lane for lane in self._rung_lanes(repo, n)
-                       if self._up(lane) and self._serves(lane, CLIMB[n - 1][1]))
-              for n in range(1, len(CLIMB) + 1)}
-        rung = next_rung(tried | ({skip} - {0}), self.load, {n for n in up if up[n]}, reached)
+        up = self._up_lanes(repo)
+        rung = next_rung(tried | ({skip} - {0}), self.load, {n for n in up if up[n]}, reached,
+                         lanes=up)
         if not rung:
             return None
         lanes, model = up[rung], CLIMB[rung - 1][1]
@@ -1421,10 +1488,10 @@ class Factory:
     def _send_back(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
                    comments: List[Dict[str, Any]], why: str,
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
-                   no_test: bool = False) -> None:
+                   no_test: bool = False, unticked: Sequence[str] = ()) -> None:
         number = int(issue["number"])
         age = self.now - _ts(pr.get("created_at"))
-        if stuck(comments, open_threads, checks_failing, age, self.now, no_test):
+        if stuck(comments, open_threads, checks_failing, age, self.now, no_test, unticked):
             footer = self._footer(repo, pr)
             if self._climb(repo, issue, comments, why, footer=footer) is None:
                 if RUNAWAY in _labels(issue):
@@ -1449,12 +1516,20 @@ class Factory:
             lane, _ = self._tier_move(repo, issue, allow_remote=False)
             if lane is None:
                 lane = LADDER[0][0][0]
+        notes = TEST_NOTES if no_test else FIX_NOTES
+        if unticked:
+            try:
+                # Criteria are ticket text: one the written-text check refuses
+                # (a closing keyword, a path) must not stop the send-back.
+                brain._check_written_text(unticked_notes(unticked))
+                notes = unticked_notes(unticked)
+            except ValueError as err:
+                _say("%s#%d: unticked criteria not quoted in the fix note (%s)"
+                     % (repo, number, err))
         if lane is not None:
-            self.fix(self.gh, repo, int(pr["number"]), (repo, number),
-                     TEST_NOTES if no_test else FIX_NOTES, lane=lane)
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane)
         else:
-            self.fix(self.gh, repo, int(pr["number"]), (repo, number),
-                     TEST_NOTES if no_test else FIX_NOTES)
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes)
         self.actions += 1
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
 
@@ -1696,7 +1771,8 @@ class Factory:
         if missing:
             self._send_back(repo, full, issue, comments,
                             "unticked acceptance criteria; build these or mark each "
-                            "not built with a reason: " + "; ".join(missing))
+                            "not built with a reason: " + "; ".join(missing),
+                            unticked=missing)
         elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
@@ -2024,16 +2100,28 @@ class Factory:
 
     def _spread(self, repo: str, issue: Dict[str, Any]) -> bool:
         """A ladder ticket waiting behind more than RUNG_BUSY others on its
-        lane moves to an untried rung with a free lane. Not a failure; the
-        rung it leaves stays on its record. True when it moved."""
+        lane moves to an untried rung with a free lane that is up. Not a
+        failure; the rung it leaves stays on its record. True when it moved.
+        A lane down or at a limit holds no tickets, so counting it made a rung
+        look free whose only up lane was busy: one ticket flipped between
+        rung 2 on codex-2 and rung 3 on claude 8 times in 90 minutes and was
+        never claimed (2026-10-20). The target's least-loaded up lane must be
+        another lane holding fewer than this lane less one, so a move always
+        shortens the wait and the next pass cannot move it back."""
         here = current_rung(issue)
         old = _lane(issue)
-        if not here or self.load.get(old, 0) <= RUNG_BUSY:
+        waiting = self.load.get(old, 0)
+        if not here or waiting <= RUNG_BUSY:
             return False
         comments = self._comments(repo, int(issue["number"]))
         tried, reached = self._tried(issue, comments, failed_here=False)
-        if not any(min(self.load.get(lane, 0) for lane in CLIMB[n - 1][0]) < RUNG_BUSY
-                   for n in climb_rungs(tried | {here}, reached) if self._rung_lanes(repo, n)):
+        up = self._up_lanes(repo)
+
+        def shorter(lanes: Tuple[str, ...]) -> bool:
+            lane = pick_lane(lanes, self.load)
+            return lane != old and self.load.get(lane, 0) < min(RUNG_BUSY, waiting - 1)
+
+        if not any(shorter(up[n]) for n in climb_rungs(tried | {here}, reached) if up[n]):
             return False
         lane = self._climb(repo, issue, comments, "%d tickets wait on lane %s"
                            % (self.load.get(old, 0), old), head="Not a failure",
@@ -2044,6 +2132,13 @@ class Factory:
         self.actions += 1
         _say("moved %s#%d off busy lane %s to %s" % (repo, issue["number"], old, lane))
         return True
+
+    def _out_long(self, lane: str) -> bool:
+        """Whether the lane will take no work for over LIMIT_REQUEUE: down, or
+        at a limit whose heartbeat says it lifts past that."""
+        if lane in self.down and lane not in self.limited:
+            return True
+        return self.limit_until.get(lane, 0) > self.now + LIMIT_REQUEUE
 
     def _rung_waits_long(self, repo: str, rung: int) -> bool:
         """Whether no lane of the rung serves its model within RUNG_LIMIT_WAIT:
@@ -2074,7 +2169,34 @@ class Factory:
         else:
             lane, fallback = self._tier_move(repo, issue, old, allow_remote=False)
         if lane is None and rung and self._rung_waits_long(repo, rung):
-            climbed = self._climb(repo, issue, self._comments(repo, number),
+            comments = self._comments(repo, number)
+            tried_lanes = {match.group(1) for comment in comments
+                           for match in [CLAIMED_RE.match(str(comment.get("body") or ""))]
+                           if match}
+            free_lane = next((candidate for candidate in lanes_of(
+                difficulty_of(issue), self._is_private(repo))
+                if lane_kind(candidate) == "free" and candidate not in tried_lanes
+                and self._free(candidate)), None)
+            if free_lane is not None:
+                body = without_model(str(issue.get("body") or ""))
+                self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+                kept = [x for x in _labels(issue) if not x.startswith("lane:")] \
+                    + ["lane:" + free_lane]
+                self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": kept})
+                issue["body"] = body
+                issue["labels"] = [{"name": x} for x in kept]
+                self._status_note(repo, number,
+                                  "Not a failure (lane %s is %s for over %d hours): the factory "
+                                  "moved this ticket to free lane %s; its paid rung remains "
+                                  "untried." % (old, why, RUNG_LIMIT_WAIT // 3600, free_lane))
+                self.load[old] = self.load.get(old, 0) - 1
+                self.load[free_lane] = self.load.get(free_lane, 0) + 1
+                self.actions += 1
+                _say("moved %s#%d off lane %s to free lane %s" % (
+                    repo, number, old, free_lane))
+                return
+            climbed = self._climb(repo, issue, comments,
                                   "lane %s is %s for over %d hours" % (
                                       old, why, RUNG_LIMIT_WAIT // 3600),
                                   head="Not a failure", failed_here=False, skip=rung)
@@ -2083,6 +2205,23 @@ class Factory:
                 self.actions += 1
                 _say("climbed %s#%d off lane %s, %s, to %s" % (repo, number, old, why, climbed))
                 return
+        if lane is None and not rung and self._out_long(old):
+            # Briefed to a lane that will not take it for hours, it is in no
+            # queue: the queue took each lane of its tier as it freed, and two
+            # tickets sat 18 hours on lanes at a monthly limit (loom#1224).
+            until = self.limit_until.get(old)
+            self._status_note(repo, number, "Not a failure (lane %s is %s): no lane of its "
+                              "tier is free, so the ticket goes back to the queue and takes "
+                              "the next one in its turn." % (
+                                  old, "at a limit until %s" % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until))
+                                  if until else why))
+            kept = [x for x in brain._moved_labels(_labels(issue), "queued", None)
+                    if not x.startswith("lane:")]
+            self._relabel(repo, issue, kept)
+            self.load[old] = self.load.get(old, 0) - 1
+            self.actions += 1
+            _say("queued %s#%d off lane %s, %s" % (repo, number, old, why))
+            return
         if lane is None:
             _say("%s#%d waits on lane %s, %s: no free lane in its %s"
                  % (repo, number, old, why, "rung" if rung else "tier"))

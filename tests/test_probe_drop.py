@@ -69,6 +69,10 @@ class ProbeDropTest(unittest.TestCase):
                      "test_all.py": b'open(".test_fixture").read()\n'})
         self.assertEqual(self.probes(), [])
 
+    def test_github_file_is_never_a_probe(self):
+        self.commit({".github/.test_write": b"probe\n"})
+        self.assertEqual(self.probes(), [])
+
     def test_bin_file_is_not_a_probe_when_bin_already_exists(self):
         git("checkout", "-q", "-b", "with-bin", cwd=self.tree)
         self.commit({"bin/keep": b"#!/bin/sh\necho keep\n"}, message="base bin")

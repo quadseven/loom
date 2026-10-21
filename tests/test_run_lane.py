@@ -14,13 +14,14 @@ import threading
 import time
 import sys
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bus import hunt_plan, pr_repair, text, tickets  # noqa: E402
 from tests import sandbox_caps  # noqa: E402
+from tests.local_http import LocalHTTPServer  # noqa: E402
 
 RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
 INSTALL_LOCK = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "lock.sh"
@@ -98,6 +99,10 @@ if [ "$1 $2" = "pr edit" ]; then
   done
   exit 0
 fi
+if [ "$1 $2" = "pr comment" ] && [ -n "${FAKE_COMMENT:-}" ]; then
+  while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_COMMENT"; shift; done
+  exit 0
+fi
 if [ "$1 $2" = "pr create" ]; then
   [ -z "${FAKE_GH_CREATE_FAIL:-}" ] || { echo "pr create blew up" >&2; exit 1; }
   case " $* " in *" --label "*) [ -z "${FAKE_GH_NO_LABELS:-}" ] || { echo "could not add label: 'class:logic' not found" >&2; exit 1; } ;; esac
@@ -163,6 +168,16 @@ if [ "${FAKE_AGENT:-commit}" = private-ip ]; then
   printf 'contact %s\\n' "$(printf 'MTAuMjMuNC41' | base64 -d)" >> fix.txt
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = own-ref ]; then
+  echo "fixed" > fix.txt
+  echo "see repo#7 and example/repo#8" >> fix.txt  # leak-guard-allow: the case under test
+  exit 0
+fi
+if [ "${FAKE_AGENT:-commit}" = private-ref ]; then
+  echo "fixed" > fix.txt
+  echo "see repo-legacy-private#3 and example/repo#7" >> fix.txt
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = verify-file ]; then
   printf '{"missing": "the station log"}' > verify.json
   exit 0
@@ -187,6 +202,7 @@ fi
 [ -f vendor/sub/value.txt ] && echo "agent-saw submodule" >> "$FAKE_LOG"
 [ -z "${FAKE_AGENT_WEAKEN:-}" ] || { mkdir -p .loom; echo 'check: true' > .loom/validation.conf; }
 if [ -n "${FAKE_REPLIES:-}" ]; then mkdir -p .loom; printf '%s' "$FAKE_REPLIES" > .loom/replies.json; fi
+if [ -n "${FAKE_SUMMARY:-}" ]; then mkdir -p .loom; printf '%s\n' "$FAKE_SUMMARY" > .loom/summary.md; fi
 if [ "${FAKE_AGENT:-commit}" = replies-only ]; then exit 0; fi
 if [ "${FAKE_AGENT:-commit}" = probes ]; then
   printf '# test\\n' > .test_write
@@ -202,6 +218,24 @@ if [ "${FAKE_AGENT:-commit}" = stray ]; then
   printf '{"hooks": []}\n' > .agents/hooks.json
   printf 'scratch\nmore\n' > .loom/test.txt
   printf '#!/bin/sh\necho hook\n' > test_hook.sh
+  printf 'fixed\n' > fix.txt
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
+if [ "${FAKE_AGENT:-commit}" = scratch ]; then
+  mkdir -p build_test .loom
+  printf 'scratch\nmore\n' > test_debug.py
+  printf 'object\n' > build_test/overseer_decisions.o
+  printf 'probe\n' > .loom/test.txt
+  printf 'fixed\n' > fix.txt
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
+if [ "${FAKE_AGENT:-commit}" = github-stray ]; then
+  mkdir -p .github/workflows
+  printf 'on: push\n' > .github/workflows/extra.yml
   printf 'fixed\n' > fix.txt
   git add -A
   git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
@@ -339,6 +373,15 @@ printf '%s' "$answer"
 """
 
 
+# Fake mktemp for a lane's sandbox, where only the tree and the scratch home
+# are writable: a temp file in the default directory is denied, and only a
+# template under a writable directory works.
+FAKE_SANDBOXED_MKTEMP = """#!/usr/bin/env bash
+case "$*" in *XXXXXX*) exec /usr/bin/mktemp "$@" ;; esac
+echo "mktemp: mkstemp failed: Operation not permitted" >&2
+exit 1
+"""
+
 # Fake "become the lane user" command: runs its arguments as-is and records
 # that it was used. Production uses sudo to the dedicated macOS user.
 FAKE_RUNAS = """#!/usr/bin/env bash
@@ -463,7 +506,16 @@ class LaneRunnerTest(unittest.TestCase):
         self.scanner = root / "check_private_leaks.py"
         self.scanner.write_text("""#!/usr/bin/env python3
 import re, subprocess, sys
-mode, value = sys.argv[1:]
+args = sys.argv[1:]
+mode, value = args[0], args[1]
+# The real scanner's private-issue-ref rule: an issue reference to any repo
+# but the ones named with --allow-repo-ref may name a private repo.
+allowed = [args[i + 1] for i, a in enumerate(args) if a == '--allow-repo-ref']
+# As the real scanner builds it (infra-public PR 159): an OWNER/NAME entry
+# exempts exactly OWNER/NAME#N and NAME#N, checked before the optional owner.
+forms = set(allowed) | {a.split('/', 1)[1] for a in allowed if '/' in a}
+exempt = r'(?!(?:%s)#)' % '|'.join(map(re.escape, sorted(forms))) if forms else ''
+ref = re.compile(r'(?<![\\w/-])' + exempt + r'(?:[a-z0-9][a-z0-9._-]*/)?[a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9]#\\d+\\b', re.I)
 if mode == '--diff':
     text = subprocess.run(['git', 'diff', '-U0', value], capture_output=True,
                           text=True, check=True).stdout
@@ -476,6 +528,9 @@ for number, line in enumerate(text.splitlines(), 1):
         continue
     if re.search(r'\\b(?:10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|192\\.168\\.\\d{1,3}\\.\\d{1,3}|172\\.(?:1[6-9]|2[0-9]|3[01])\\.\\d{1,3}\\.\\d{1,3})\\b', line):
         print(f'BLOCKED: private identifier found\\n  {value}:{number} [rfc1918-ip] - a private-range IP address', file=sys.stderr)
+        sys.exit(1)
+    if ref.search(line):
+        print(f'BLOCKED: private identifier found\\n  {value}:{number} [private-issue-ref] - a cross-repo issue reference', file=sys.stderr)
         sys.exit(1)
 print('leak guard: clean (shape patterns only)')
 """)
@@ -493,8 +548,8 @@ print('leak guard: clean (shape patterns only)')
     def drop_brief(self, name="T042-fix-the-thing.md", text=BRIEF):
         (self.inbox / name).write_text(text)
 
-    def run_lane(self, lane="codex", **env):
-        return subprocess.run(["bash", str(RUNNER), lane], env=self.lane_env(**env),
+    def run_lane(self, lane="codex", cwd=None, **env):
+        return subprocess.run(["bash", str(RUNNER), lane], env=self.lane_env(**env), cwd=cwd,
                               capture_output=True, text=True, timeout=60)
 
     def lane_env(self, **env):
@@ -590,11 +645,29 @@ print('leak guard: clean (shape patterns only)')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertIn("failed: [work] commit refused: it adds files outside the brief's "
-                      "paths: .agents/hooks.json, .loom/test.txt, test_hook.sh; nothing pushed",
-                      self.run_log())
+                      "paths: .agents/hooks.json; nothing pushed; dropped scratch files: "
+                      ".loom/test.txt, test_hook.sh", self.run_log())
         heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_out_of_path_scratch_is_dropped_and_in_path_work_is_pushed(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="scratch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+        body = self.body.read_text()
+        for path in ("test_debug.py", "build_test/overseer_decisions.o", ".loom/test.txt"):
+            self.assertIn(path, body)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_out_of_path_github_file_is_still_refused(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="github-stray")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("commit refused: it adds files outside the brief's paths: "
+                      ".github/workflows/extra.yml; nothing pushed", self.run_log())
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
 
     def test_public_repo_private_ip_diff_is_refused_before_push(self):
@@ -608,6 +681,47 @@ print('leak guard: clean (shape patterns only)')
         self.assertNotIn("loom/T042-fix-the-thing", heads)
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_a_diff_citing_its_own_repos_issues_pushes(self):
+        # A lane change citing its own ticket (NAME#N in code or a test) was
+        # refused: four fix rounds on one public repo were discarded on
+        # 2026-10-20 until the scanner learned an exact own-repo exemption.
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="own-ref")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("leak scan failed", self.run_log())
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+
+    def test_a_diff_naming_a_private_repo_with_this_repos_name_in_it_is_refused(self):
+        # The body's own-repo Refs line is exempt, nothing else: private repos
+        # named NAME-legacy-private exist beside public NAME repos.
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="private-ref")
+        self.assertIn("[private-issue-ref]", self.run_log())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    TICKED = ("Fix the thing so it works\n\n## Acceptance criteria\n"
+              "- [x] The thing works\n- [x] A test covers the thing\n"
+              "- [ ] Nothing else changes; not built: out of reach")
+
+    def test_the_lanes_ticked_criteria_reach_the_pull_request_body(self):
+        # The runner moved .loom/summary.md out of the tree before it built
+        # the body, so every lane pull request carried the ticket's unticked
+        # criteria and went back for them however much it built; the ticks
+        # landed as Intent bullets instead (2026-10-20).
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY=self.TICKED)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        criteria = body.split("## Acceptance criteria\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(criteria, "- [x] The thing works\n- [x] A test covers the thing\n"
+                                   "- [ ] Nothing else changes; not built: out of reach")
+        intent = body.split("## Why", 1)[0]
+        self.assertIn("Fix the thing so it works", intent)
+        self.assertNotIn("Acceptance criteria", intent)
+        self.assertNotIn("[x]", intent)
+        self.assertEqual(body.count("## Acceptance criteria"), 1)
 
     def test_private_repo_does_not_run_leak_scan_and_pushes(self):
         self.drop_brief()
@@ -719,6 +833,33 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("agent made no commit and wrote no reason", log)
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertFalse((self.loom / "logs" / "codex" / "T042-fix-the-thing.answered").exists())
+
+    def test_a_denied_temp_directory_leaves_no_summary_in_the_working_directory(self):
+        # A lane agent runs this suite in its tree, inside a sandbox that
+        # denies the default temp directory. A failed mktemp handed cp an
+        # empty target, and macOS cp copied the summary into the working
+        # directory: the agent's tree, whose commit was then refused for
+        # T042-fix-the-thing.summary.md.
+        self.write_tool(self.bin / "mktemp", FAKE_SANDBOXED_MKTEMP)
+        cwd = Path(self._tmp.name) / "cwd"
+        cwd.mkdir()
+        self.drop_brief()
+        result = self.run_lane(cwd=cwd, FAKE_AGENT="no-change",
+                               FAKE_SUMMARY="nothing to change: the finding no longer holds")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(p.name for p in cwd.iterdir()), [])
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_denied_temp_directory_still_classes_the_change(self):
+        # The same failed mktemp left the change unclassed: the pull request
+        # lost its Intent class and file counts, sensitive paths included.
+        self.write_tool(self.bin / "mktemp", FAKE_SANDBOXED_MKTEMP)
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY="Fix the thing so it works")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        intent = self.body.read_text().split("## Why", 1)[0]
+        self.assertIn("Fix the thing so it works", intent)
+        self.assertIn("Files: 1", intent)
 
     def test_no_commit_with_a_nothing_to_change_summary_is_answered_not_failed(self):
         self.drop_brief()
@@ -972,9 +1113,27 @@ print('leak guard: clean (shape patterns only)')
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("-r2", heads)
         comment = [c for c in calls if c.startswith("gh pr comment")]
-        self.assertEqual(comment, ["gh pr comment 7 -R example/repo --body Lane codex pushed "
-                                   "fixes for: Check: lint; Thread PRRT_1 (comment 11) at a.py:3"])
+        # The call log keeps the comment's first line (the full text has its own test).
+        self.assertEqual(comment, ["gh pr comment 7 -R example/repo --body Lane codex "
+                                   "(gpt-test-default) pushed 1 commit for: Check: lint; "
+                                   "Thread PRRT_1 (comment 11) at a.py:3"])
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_comment_says_what_was_pushed_and_what_happens_next(self):
+        # 2026-10-20: "Lane claude pushed fixes for: the findings on the
+        # ticket" told the reader nothing about a round that merged main.
+        self.fix_brief()
+        comment = Path(self._tmp.name) / "comment.md"
+        self.run_lane(FAKE_GH_EXISTING="7", FAKE_COMMENT=str(comment))
+        head = self.remote_head(self.FIX_BRANCH)
+        text = comment.read_text()
+        self.assertTrue(text.startswith("Lane codex (gpt-test-default) pushed 1 commit for: "
+                                        "Check: lint; Thread PRRT_1 (comment 11) at a.py:3\n"), text)
+        subject = subprocess.run(["git", "--git-dir", str(self.remote), "log", "-1", "--format=%s",
+                                  head], capture_output=True, text=True, check=True).stdout.strip()
+        self.assertIn("- `%s` `%s`" % (head[:7], subject), text)
+        self.assertIn("CI and review run again on the new head; the factory lands the "
+                      "pull request once they pass.", text)
 
     def test_fix_runner_posts_and_resolves_agent_thread_replies_after_push(self):
         self.fix_brief()
@@ -1027,6 +1186,31 @@ print('leak guard: clean (shape patterns only)')
         self.run_lane()
         self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
         self.assertTrue((self.inbox / "T043-next.md").exists())
+
+    def test_a_timeout_whose_output_only_mentions_a_quota_is_not_a_limit(self):
+        # Three Spark lanes were held an hour as "provider limit reached": each
+        # agent timed out after printing git log, whose newest subject said "A
+        # lane at its quota is not a broken lane" (2026-10-20).
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_EXIT="124", FAKE_OUT=(
+            "4c48db6 A lane at its quota is not a broken lane, and a second close says why\n"
+            "Read docs/USAGE.md [limit=25, offset=626]"))
+        log = self.run_log()
+        self.assertNotIn("[limit]", log)
+        self.assertIn("[transient]", log)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertNotIn("limit", beat.get("reason") or "")
+
+    def test_provider_quota_messages_are_still_limits(self):
+        for out in ("429 RESOURCE_EXHAUSTED quota resets in 1 hours",
+                    "Error: You exceeded your current quota, please check your plan",
+                    "error: Individual quota reached. Resets in 2h",
+                    "quota exceeded for this project"):
+            with self.subTest(out=out):
+                self.drop_brief()
+                self.run_lane(FAKE_AGENT="say", FAKE_OUT=out)
+                self.assertIn("[limit]", self.run_log())
+                (self.loom / "state" / "usage" / "codex.json").unlink(missing_ok=True)
 
     def test_a_limited_ladder_model_falls_back_on_the_next_pass(self):
         models = "gpt-test-high gpt-test-low"
@@ -1490,17 +1674,55 @@ cat > /dev/null
         self.assertIn(before, self.parents(after))
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
+    def test_a_fix_round_that_merges_main_scans_only_what_the_pull_request_adds(self):
+        # The default branch may carry text the public repo scan flags in a
+        # lane's change (its own issue refs, which its own CI accepts); a fix
+        # round that merges it is not refused for them (2026-10-20).
+        name, before = self.fix_brief()
+        self.advance_main("main.txt", "see other#5\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("leak scan failed", self.run_log(name + ".log"))
+        after = self.remote_head(self.FIX_BRANCH)
+        self.assertEqual(self.remote_file(after, "main.txt"), "see other#5\n")
+        self.assertIn(before, self.parents(after))
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_that_merges_main_still_scans_the_agents_change(self):
+        name, before = self.fix_brief()
+        self.advance_main("main.txt", "main moved\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "echo 'see other#9' > first.txt\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("public repo leak scan failed", self.run_log(name + ".log"))
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+
     def test_a_fix_round_that_adds_a_stray_file_beside_a_merge_is_refused(self):
         # main.txt came in with the merge, so only the agent's file is named.
         name, before = self.fix_brief()
         self.advance_main("main.txt", "main moved\n")
-        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "echo hook > test_hook.sh\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
+                        "mkdir -p .agents; echo hook > .agents/hooks.json\n")
         result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("commit refused: it adds files outside the brief's paths: "
-                      "test_hook.sh; nothing pushed", self.run_log(name + ".log"))
+                      ".agents/hooks.json; nothing pushed", self.run_log(name + ".log"))
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
         self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+
+    def test_a_fix_round_names_dropped_scratch_in_its_pr_comment(self):
+        name, _ = self.fix_brief()
+        comment = Path(self._tmp.name) / "fix-comment.txt"
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
+                        "printf 'scratch\\n' > test_debug.py\n"
+                        "printf 'fixed again\\n' > first.txt\n")
+        result = self.run_lane(FAKE_COMMENT=str(comment))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Dropped scratch files: test_debug.py", comment.read_text())
+        self.assertEqual(self.remote_file(self.remote_head(self.FIX_BRANCH), "test_debug.py"), "")
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
     def test_a_conflict_goes_to_the_agent_and_the_runner_completes_the_merge(self):
         name, before = self.fix_brief()
@@ -1823,7 +2045,7 @@ cat > /dev/null
             def log_message(self, format, *args):
                 pass
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server = LocalHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
@@ -2402,6 +2624,53 @@ cat > /dev/null
     def spark_log(self):
         return (self.loom / "logs" / "spark" / "T042-fix-the-thing.log").read_text()
 
+    def test_spark_continues_a_text_only_final_step_and_succeeds(self):
+        self.write_tool(self.bin / "sandbox-exec", "#!/usr/bin/env bash\nshift 2\nexec \"$@\"\n")
+        self.write_tool(self.bin / "opencode", """#!/usr/bin/env bash
+[ "${1:-}" = --version ] && { echo "1.18.4"; exit 0; }
+args="$*"; args="${args//$'\\n'/ }"
+printf 'opencode %s\\n' "$args" >> "$TMPDIR/agent.log"
+if [[ " $* " == *" --continue "* ]]; then
+  echo fixed > fix.txt
+  printf '%s\\n' '{"type":"step_start","part":{"type":"step-start"}}' \
+    '{"type":"tool_use","part":{"type":"tool","tool":"edit"}}'
+else
+  printf '%s\\n' '{"type":"step_start","part":{"type":"step-start"}}' \
+    '{"type":"text","part":{"type":"text","text":"Let me read the build files."}}'
+fi
+""")
+        inbox = self.loom / "briefs" / "spark"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: spark"))
+        result = self.run_lane("spark", **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runs = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(runs), 2, runs)
+        self.assertIn("--continue", runs[1])
+        self.assertIn("Continue: carry out the step you just described", runs[1])
+        self.assertIn("Do not search the whole filesystem", runs[0])
+        self.assertIn("read the repository's build files", runs[0])
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_spark_stops_after_one_continue_of_a_text_only_step(self):
+        self.write_tool(self.bin / "sandbox-exec", "#!/usr/bin/env bash\nshift 2\nexec \"$@\"\n")
+        self.write_tool(self.bin / "opencode", """#!/usr/bin/env bash
+[ "${1:-}" = --version ] && { echo "1.18.4"; exit 0; }
+printf 'opencode %s\\n' "$*" >> "$TMPDIR/agent.log"
+printf '%s\\n' '{"type":"step_start","part":{"type":"step-start"}}' \
+  '{"type":"text","part":{"type":"text","text":"Let me inspect the build."}}'
+""")
+        inbox = self.loom / "briefs" / "spark"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: spark"))
+        result = self.run_lane("spark", **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runs = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(runs), 2, runs)
+        self.assertIn("--continue", runs[1])
+        self.assertIn("failed: [work] ended on a described step without taking it", self.spark_log())
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_spark_lane_runs_opencode_against_its_endpoint_and_takes_a_private_repo(self):
         # Visibility is checked for scanning; private repos skip the scan.
@@ -2594,7 +2863,7 @@ cat > /dev/null
             def log_message(self, format, *args):
                 pass
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server = LocalHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
@@ -2746,11 +3015,11 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         """Run the runner's re-check in a shell of its own and say what it did."""
         script = self.source_functions(
             "provider_at_limit", "provider_checked", "provider_limit_lifted",
-            "provider_recheck_due", "lift_provider_limit", "hold_provider_limit",
+            "provider_recheck_due", "provider_limit_source", "lift_provider_limit", "hold_provider_limit",
             "limit_until", "key_group", "write_beat", "limited_models_json", "utc",
             "setting_var", "lane_var", "lane_setting") + (
             'ssm_value() { printf "%s" "$FAKE_KEY"; }\n'
-            'LIMIT_RECHECK=1800 GO_LIMIT_ERROR=GoUsageLimitError\n'
+            'LIMIT_RECHECK=300 GO_LIMIT_ERROR=GoUsageLimitError\n'
             'SLOT=' + slot + ' LANE=opencode-go '
             'BEAT="$LOOM_HOME/state/usage/$SLOT.json"\n'
             'LIMIT_WHY="the provider monthly limit (429 GoUsageLimitError)"\n'
@@ -2794,6 +3063,31 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
             self.assertEqual(beat["reason"], "", slot)
         # The record of the refusal stays: it is the last 429 the Usage view shows.
         self.assertTrue((self.loom / "state/usage/opencode-go.provider-limit.json").exists())
+
+    def test_a_shared_slot_releases_within_five_minutes_when_the_provider_recovers(self):
+        self.hold_provider_limit_for("opencode-go")
+        usage = self.loom / "state" / "usage"
+        for slot in self.GROUP:
+            self.assertTrue((usage / (slot + ".provider-limit.json")).exists(), slot)
+            (usage / (slot + ".provider-check")).write_text(
+                "%d\n" % (int(time.time()) - 300))
+        result = self.provider_lift(slot="opencode-go-2", **self.fake_provider(status=200))
+        self.assertEqual(result.stdout.strip(), "rc=0", result.stderr)
+        for slot in self.GROUP:
+            self.assertTrue(self.beat(slot)["available"], slot)
+
+    def test_a_shared_slot_recovers_from_a_hold_written_before_group_records_were_shared(self):
+        self.hold_provider_limit_for("opencode-go")
+        usage = self.loom / "state" / "usage"
+        for slot in self.GROUP[1:]:
+            (usage / (slot + ".provider-limit.json")).unlink(missing_ok=True)
+            (usage / (slot + ".provider-check")).unlink(missing_ok=True)
+        (usage / "opencode-go.provider-check").write_text(
+            "%d\n" % (int(time.time()) - 300))
+        result = self.provider_lift(slot="opencode-go-2", **self.fake_provider(status=200))
+        self.assertEqual(result.stdout.strip(), "rc=0", result.stderr)
+        for slot in self.GROUP:
+            self.assertTrue(self.beat(slot)["available"], slot)
 
     def test_a_lane_asks_the_provider_again_only_after_the_recheck_window(self):
         self.hold_the_group(int(time.time()) - 60)
@@ -3250,11 +3544,13 @@ exit %d
         seen_agent = Path(self._tmp.name) / "agent-tokens"
         self.drop_brief()
         self.run_lane(LOOM_GITHUB_APP_ID="124",
-                      LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo ghs_lanes_token"),
+                      # Installation tokens carry dots and dashes (2026-10-20: 383
+                      # characters, ghs_ then a JWT-like body).
+                      LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo ghs_lanes.tok-en"),
                       GH_TOKEN="ghp_personal", FAKE_GH_TOKENS=str(seen_gh),
                       FAKE_AGENT_ENV=str(seen_agent))
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.calls())
-        self.assertEqual(set(seen_gh.read_text().split()), {"ghs_lanes_token"})
+        self.assertEqual(set(seen_gh.read_text().split()), {"ghs_lanes.tok-en"})
         # Nor the App's settings to mint one, nor git's helper to borrow one.
         self.assertEqual(seen_agent.read_text().split(), ["none", "none", "none"])
 

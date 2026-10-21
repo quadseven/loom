@@ -356,7 +356,7 @@ ticket on a local lane with no live heartbeat for 30 minutes (an unloaded or
 crashed lane, or a machine that is off) moves the same way, with a comment
 naming the lane and how long it was silent: to a free lane of its tier, or of
 its Model, else back to `loom:queued`. It is no failure and no retry, so it
-never climbs, and the station files a `silent-lane` invariant naming the lane.
+never climbs, and the station's `silent-lane` invariant lists the lane.
 A failed or stalled
 ticket climbs, and past the last rung it is left `loom:failed` for the brain. Landing
 keeps the default branch green: a ready pull request that is behind its base
@@ -558,7 +558,22 @@ to the lane's log folder as `<brief>.verify.json`, with the run's model
 beside it in `<brief>.verify.model`. The station checks a record with
 `bus/proof.py`, ticks the criteria and moves the ticket to verified with the
 proof, marked `"verified_by": "<lane>/<model>"` (`<lane>/unknown` when the
-run recorded no model). A refused record, a missing result or no
+run recorded no model). It refuses a record whose revision does not contain
+the merge commit of each linked pull request merged into the default branch
+(the compare API), or whose observed window starts before the newest of them
+merged: a stale build or evidence read before the fix proves nothing. A
+GitHub error on that check leaves the ticket shipped, and a ticket with no
+linked merged pull request is left to the close rule. The station also reads
+the merged pull requests again, as for the brief: a record whose criterion
+evidence says every check passed ("all checks passed", "checks green") while
+the newest run of a check on a merge commit concluded other than success or
+skipped is refused, and so is any record when GitHub cannot be read for
+them (the ticket is tried again after its cooldown). The proof comment then
+carries a `Checked by the station:` section, one line per merged pull
+request, the same sentence the done close writes (merged time, merge commit,
+each check that did not conclude success or skipped, whether the default
+branch contains it), stored in the record as `station_facts`; a record that
+brings its own `station_facts` is not believed. A refused record, a missing result or no
 `verify.json` leaves the ticket shipped with one note on it. The run is
 counted like any lane run, and the Spread line also shows how many were
 verify runs. The brain audits lane proofs (docs/BRAIN.md, Proof audits): a
@@ -766,8 +781,11 @@ Each invariant is one function returning breaches with evidence:
   for 90 minutes once one has been seen.
 - A `loom:metrics` line posted more than once for one day, or two
   `loom:report` comments within 90 minutes, on one goal home.
-- A lane with 5 or more runs in 24 hours and none done.
-- A lane held by a limit for over 2 hours while tickets of its tier are
+- A lane with 5 or more runs in 24 hours and none done (one issue per lane:
+  the station reads these to release a runaway a dead lane held).
+- Lanes whose newest 5 runs all failed after a success earlier in the day,
+  limits, expired keys and factory incidents aside.
+- Lanes held by a limit for over 2 hours while tickets of their tier are
   queued. Only truly queued tickets count: `loom:queued` is their only state
   label, and no other operator has claimed them. `LOOM_NO_TOPUP` names the
   provider lanes whose credit the operator never tops up (for example
@@ -791,6 +809,15 @@ Each invariant is one function returning breaches with evidence:
   command that unsticks it (`bus.brain move`, `bus.brain brief` as a
   re-ticket, `bus.brain fix`, or closing the pull request as superseded).
 - A remote lane whose newest heartbeat is older than its `beat_max`.
+- Lanes that held a running ticket while they sent no heartbeat
+  (`silent-lane`, above).
+
+The failing-streak, lane-held and silent-lane invariants are one rolling
+issue each, a line per lane, rewritten in place while the list changes, as
+the tickets-outside-an-epic issue is: one provider limit opened 9 lane-held
+issues in 6 minutes on 2026-10-15. An older per-lane issue of the same
+invariant is closed as folded into the rolling one, unless it carries a
+`needs:<login>` label, which leaves an operator's ask open on its own issue.
 
 Each breach files one issue labelled `loom:triage` and `loom:invariant` under
 the standing repairs epic (docs/BRAIN.md, Filing under an epic; the goal home

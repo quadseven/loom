@@ -440,10 +440,10 @@ class BrainTickTest(unittest.TestCase):
         self.usage("spark", True)
         run, calls = self.tick(LOOM_SPARK_MODEL="spark/coder",
                                LOOM_SPARK_URL="http://spark.invalid:8000/v1",
-                               LOOM_GITHUB_APP_ID="123", FAKE_APP_TOKEN="ghs_brain_token",
+                               LOOM_GITHUB_APP_ID="123", FAKE_APP_TOKEN="ghs_brain.tok-en",
                                GITHUB_TOKEN="ghp_personal")
         self.assertEqual(0, run.returncode)
-        self.assertIn("opencode env GH_TOKEN=ghs_brain_token GITHUB_TOKEN=ghs_brain_token "
+        self.assertIn("opencode env GH_TOKEN=ghs_brain.tok-en GITHUB_TOKEN=ghs_brain.tok-en "
                       "LOOM_REPOS=example/project HOME=%s/run/brain-home" % self.home, calls)
         self.assertNotIn("gh auth token", calls)
 
@@ -461,7 +461,7 @@ class BrainTickTest(unittest.TestCase):
         # An installation token lasts an hour; a 58-minute tick would outlive it.
         self.usage("codex", True)
         run, calls = self.tick(LOOM_BRAIN_LADDER="codex claude", LOOM_GITHUB_APP_ID="123",
-                               FAKE_APP_TOKEN="ghs_brain_token", LOOM_BRAIN_MINUTES="58")
+                               FAKE_APP_TOKEN="ghs_brain.tok-en", LOOM_BRAIN_MINUTES="58")
         self.assertEqual([], self.agent_calls(calls, "codex") + self.agent_calls(calls, "claude"))
         self.assertNotEqual(0, run.returncode)
 
