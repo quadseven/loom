@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, invariants, metrics, station  # noqa: E402
 from bus.github import GitHubError, Response  # noqa: E402
-from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run, SilentRun  # noqa: E402
+from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run, SilentRun, Wait  # noqa: E402
 
 REPO = "example-owner/factory"
 OTHER = "example-owner/hidden"
@@ -1044,6 +1044,29 @@ class InvariantTest(unittest.TestCase):
         self.assertEqual(invariants.silent_lane(Facts(T0)), [])
         old = run._replace(at=T0 - invariants.SILENT_KEEP - 1)
         self.assertEqual(invariants.silent_lane(Facts(T0, silent_runs=[old])), [])
+
+    def test_tickets_waiting_on_the_same_reason_for_hours_are_one_line(self):
+        # The factory logged "waits: no free lane in its rung" for six fix
+        # rounds every pass for nine hours, and nothing raised it (2026-10-21).
+        limit = invariants.WAIT_LIMIT
+        rung = "on lane agy, at a limit: no free lane in its rung"
+        waits = [Wait(Ref("%s#%d" % (REPO, n), "#%d" % n), rung, T0 - limit - n * 600) for n in (1, 2)]
+        waits.append(Wait(Ref("%s#3" % REPO, "#3"), "no free lane in tier medium", T0 - limit - 60))
+        waits.append(Wait(Ref("%s#4" % REPO, "#4"), "no free lane in tier hard", T0 - limit + 600))
+        (b,) = invariants.ticket_waiting(Facts(T0, waits=waits))
+        self.assertEqual((b.invariant, b.subject, b.rolling),
+                         ("ticket-waiting", invariants.TICKETS_SUBJECT, True))
+        self.assertEqual(b.title, "3 tickets waited over 6 hours for the same reason")
+        rung_line = next(x for x in b.evidence if x.startswith(rung))
+        self.assertIn("2 tickets, longest", rung_line)
+        self.assertIn("#1", rung_line)
+        self.assertIn("#2", rung_line)
+        self.assertFalse(any("#4" in x for x in b.evidence))
+
+    def test_no_long_wait_is_no_breach(self):
+        self.assertEqual(invariants.ticket_waiting(Facts(T0)), [])
+        short = [Wait(Ref("%s#1" % REPO, "#1"), "no free lane in tier medium", T0 - 60)]
+        self.assertEqual(invariants.ticket_waiting(Facts(T0, waits=short)), [])
 
     def test_unread_facts_break_nothing_and_a_raising_invariant_is_logged(self):
         said = []
