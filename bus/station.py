@@ -1328,6 +1328,10 @@ class Station:
         # This pass's closed pull requests and default branches, per repo:
         # the hand-revert scan reads the same pages as the ship checks.
         self._closed_cache: Dict[str, List[Dict[str, Any]]] = {}
+        # The claimed settle's re-review requests, by "repo#pull request", as
+        # saved in claimed.json, and how many it has written this run.
+        self._claimed_rereviews: Dict[str, Any] = {}
+        self._claimed_writes = 0
         self._branch_cache: Dict[str, str] = {}
         # Repos whose claim:<login> label this pass has made sure of.
         self._claim_labels: set = set()
@@ -6169,6 +6173,10 @@ class Station:
             return
         left = self.s.settle_claimed_max
         pacer = claimed.Pacer()
+        self._claimed_writes = 0
+        if not isinstance(state.get("rereview"), dict):
+            state["rereview"] = {}
+        self._claimed_rereviews = state["rereview"]
         # Stamped however the run ends, as settle_orphan_sources is.
         try:
             for repo in self._verify_repos():
@@ -6224,7 +6232,7 @@ class Station:
             return 0
         branch = self._default_branch(repo)
         try:
-            checked = self._claimed_pulls(repo, number, branch, pulls)
+            checked = self._claimed_pulls(repo, number, branch, pulls, pacer)
             if checked is None:
                 return 0
             return self._settle_claimed(repo, issue, branch, checked, pacer)
@@ -6235,9 +6243,11 @@ class Station:
             return 0
 
     def _claimed_pulls(self, repo: str, number: int, branch: str,
-                       pulls: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+                       pulls: List[Dict[str, Any]],
+                       pacer: "claimed.Pacer") -> Optional[List[Dict[str, Any]]]:
         """The issue's merged pull requests with their head's newest check
-        runs, or None when one does not prove it (said once, in the log)."""
+        runs, or None when one does not prove it (said once, in the log). A
+        review check that merged neutral earns a re-review (loom#1221)."""
         checked = []
         for pr in pulls:
             head = str((pr.get("head") or {}).get("sha") or "")
@@ -6251,9 +6261,87 @@ class Station:
             if why:
                 _say("settle-claimed: %s#%d stays open: PR #%d %s"
                      % (repo, number, int(pr.get("number") or 0), why))
+                case = claimed.rereview_case(pr, runs, self.s.review_check, branch)
+                if case:
+                    self._claimed_rereview(repo, number, pr, case, runs, pacer)
                 return None
             checked.append(dict(pr, runs=runs))
         return checked
+
+    def _claimed_rereview(self, repo: str, number: int, pr: Dict[str, Any], case: str,
+                          runs: List[Dict[str, Any]], pacer: "claimed.Pacer") -> None:
+        """Ask the review bot to review a pull request that merged with a
+        neutral review check again, once ever, then act on its next result: a
+        failure files the findings as a follow-up issue, once. A success
+        needs nothing here; the gate passes it. The request is recorded in
+        claimed.json and by a marker on the pull request, and at most
+        REREVIEW_PER_RUN requests and issues are written a run."""
+        key = "%s#%d" % (repo, int(pr["number"]))
+        held = self._claimed_rereviews.get(key)
+        run = claimed.review_run(runs, self.s.review_check)
+        stamp = verify_data._run_time(run)
+        if case == "neutral" and not isinstance(held, dict):
+            self._ask_rereview(repo, pr, key, stamp, pacer)
+        elif case == "failure" and isinstance(held, dict) and not held.get("followup") \
+                and held.get("run") != stamp:
+            self._file_rereview_findings(repo, number, pr, held, run, pacer)
+
+    def _ask_rereview(self, repo: str, pr: Dict[str, Any], key: str, stamp: str,
+                      pacer: "claimed.Pacer") -> None:
+        pull = int(pr["number"])
+        if self._claimed_writes >= claimed.REREVIEW_PER_RUN:
+            return
+        act = self.s.settle_claimed == "on"
+        self._claimed_writes += 1
+        if not act:
+            _say("settle-claimed: would ask the review bot to review %s#%d again" % (repo, pull))
+            return
+        url = "/repos/%s/issues/%d/comments" % (repo, pull)
+        # Anyone may comment on a public pull request: only a marker by one of
+        # ours (the trusted authors and this client's App login) counts.
+        ours = {author.lower() for author in self.s.authors}
+        own = getattr(self.gh, "_status_logins", None)
+        if callable(own):
+            ours |= {str(login).lower() for login in own()}
+        if not any(str(c.get("body") or "").startswith(claimed.REREVIEW_MARKER)
+                   and tickets._login(c.get("user")) in ours
+                   for c in self._paginate(url) if isinstance(c, dict)):
+            pacer.wait()
+            self.gh.rest("POST", url, {"body": "%s\n%s" % (
+                claimed.REREVIEW_MARKER, factory.review_again())})
+        self._claimed_rereviews[key] = {"at": self.now, "run": stamp}
+        _say("settle-claimed: asked the review bot to review %s#%d again, merged with a "
+             "neutral review" % (repo, pull))
+
+    def _file_rereview_findings(self, repo: str, number: int, pr: Dict[str, Any],
+                                held: Dict[str, Any], run: Dict[str, Any],
+                                pacer: "claimed.Pacer") -> None:
+        pull = int(pr["number"])
+        if self._claimed_writes >= claimed.REREVIEW_PER_RUN:
+            return
+        title = claimed.followup_title(pull)
+        body = claimed.followup_body(number, pr, run)
+        brain._check_written_text(title + "\n" + body)
+        self._claimed_writes += 1
+        if self.s.settle_claimed != "on":
+            _say("settle-claimed: would file the failed re-review of %s#%d as a follow-up"
+                 % (repo, pull))
+            return
+        pacer.wait()
+        made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+            "title": title, "body": body, "labels": [factory.DEFER_LABEL]}).data
+        filed = int(made.get("number") or 0) if isinstance(made, dict) else 0
+        if not filed:
+            raise GitHubError("no issue was created in %s" % repo)
+        held["followup"] = filed
+        pacer.wait()
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
+            "body": "%s\nThe review check failed on pull request #%d when the station asked "
+                    "the review bot to review it again. The findings are filed as #%d; this "
+                    "issue stays open until they are settled." % (
+                        claimed.REREVIEW_MARKER, pull, filed)})
+        _say("settle-claimed: filed %s#%d, the failed re-review of PR #%d for #%d"
+             % (repo, filed, pull, number))
 
     def _claimed_tests(self, repo: str, branch: str, pr: Dict[str, Any]) -> List[str]:
         """The test functions the pull request added that `branch` still

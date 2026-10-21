@@ -23,6 +23,16 @@ label, an epic, or one with no acceptance boxes is never touched. LOOM_SETTLE_CL
 unset or `dry` logs what it would do and writes nothing, `on` writes, `off`
 skips the step. LOOM_SETTLE_CLAIMED_MAX caps the issues settled per run, and
 writes are at least WRITE_GAP seconds apart.
+
+A pull request that merged with the review check neutral (the review degraded)
+can never pass that gate, so its issue stayed open with its work merged
+(loom#1221). Such a pull request, with every other check passing, gets one
+comment asking the review bot to review it again, recorded in the state file
+and by a marker on the pull request so it is never asked twice; at most
+REREVIEW_PER_RUN a run. A later success settles the issue by the usual rule. A
+later failure files the findings as a follow-up issue, once, and leaves the
+original open with a comment naming it. A second neutral result is left for a
+person.
 """
 from __future__ import annotations
 
@@ -39,6 +49,13 @@ from . import verify_data
 CLAIM_PREFIX = "claim:"
 LIVE_LABEL = "awaiting-live-check"
 MARKER = "<!-- loom:claimed-settle v1 -->"
+# On the comment that asks the review bot to review a merged pull request
+# again, and on the comment that names the follow-up issue it led to.
+REREVIEW_MARKER = "<!-- loom:claimed-rereview v1 -->"
+# Re-review requests and follow-up issues written per run.
+REREVIEW_PER_RUN = 3
+FINDING_LINES = 20
+FINDING_WIDTH = 300
 STATE_FILE = "claimed.json"
 EVERY = 3600
 PER_RUN = 10
@@ -165,6 +182,61 @@ def _checks_gap(runs: Sequence[Dict[str, Any]], review_check: str) -> str:
     if red:
         return "%s %s on its head" % red[0]
     return ""
+
+
+def review_run(runs: Sequence[Dict[str, Any]], review_check: str) -> Dict[str, Any]:
+    """The review check's run among `runs`, {} when it has none."""
+    want = verify_data._plain(review_check)
+    return next((run for run in runs if verify_data._plain(run.get("name")) == want), {})
+
+
+def rereview_case(pr: Dict[str, Any], runs: Sequence[Dict[str, Any]], review_check: str,
+                  branch: str) -> str:
+    """"neutral" or "failure" when the pull request merged into `branch` and
+    its review check concluded that on its head while every other check
+    passed, so a re-review could settle its issue; else "". """
+    if _merge_gap(pr, branch):
+        return ""
+    review = review_run(runs, review_check)
+    result = verify_data._run_result(review) if review else ""
+    others = [run for run in runs if run is not review]
+    if result not in ("neutral", "failure") or any(
+            verify_data._run_result(run) not in PASSING for run in others):
+        return ""
+    return result
+
+
+def findings(run: Dict[str, Any]) -> List[str]:
+    """The lines of the review run's output title and summary that pass the
+    text checks, clipped; a mention is defanged."""
+    output = run.get("output") if isinstance(run.get("output"), dict) else {}
+    raw = "\n".join(str(output.get(key) or "") for key in ("title", "summary"))
+    kept: List[str] = []
+    for line in raw.splitlines():
+        line = verify_data._clean(line).replace("@", "(at)").encode("ascii", "replace").decode()
+        if line and evidence.safe_line(line):
+            kept.append(line[:FINDING_WIDTH])
+    return kept[:FINDING_LINES]
+
+
+def followup_title(pr_number: int) -> str:
+    return "Review findings on merged pull request #%d" % pr_number
+
+
+def followup_body(issue: int, pr: Dict[str, Any], run: Dict[str, Any]) -> str:
+    """The follow-up issue for a failed re-review of a merged pull request."""
+    head = str((pr.get("head") or {}).get("sha") or "")[:12]
+    lines = findings(run)
+    return "\n".join([
+        "The review check concluded neutral on pull request #%d when it merged. The station "
+        "asked the review bot to review it again, and the check now concludes failure on "
+        "head %s. Issue #%d stays open until these findings are settled." % (
+            int(pr.get("number") or 0), head, issue),
+        "",
+        "Findings from the check:",
+        ""] + (["- " + line for line in lines] if lines else ["- none could be read"]) + [
+        "",
+        "Refs #%d" % issue])
 
 
 def added_tests(files: Iterable[Any]) -> List[Tuple[str, str]]:
