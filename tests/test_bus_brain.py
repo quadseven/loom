@@ -4139,3 +4139,46 @@ class StaleNeedsBrainTests(unittest.TestCase):
         gh = GitHub("t", transport=fake)
         stale = brain.stale_needs_brain(gh, [REPO], now, hours=4)
         self.assertEqual(len(stale), 0)
+
+    def test_stale_needs_brain_respects_timeout(self):
+        """When timeout is exceeded, stale_needs_brain raises TimeoutError."""
+        now = datetime(2030, 1, 5, 12, 0, tzinfo=timezone.utc)
+        issue1 = {
+            "number": 1, "title": "Stale brain review",
+            "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}],
+            "created_at": "2030-01-05T07:00:00Z",
+        }
+        issue2 = {
+            "number": 2, "title": "Another stale",
+            "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}],
+            "created_at": "2030-01-05T07:00:00Z",
+        }
+        events1 = [{
+            "event": "labeled",
+            "created_at": "2030-01-05T07:00:00Z",
+            "label": {"name": "needs-brain"}
+        }]
+        events2 = [{
+            "event": "labeled",
+            "created_at": "2030-01-05T07:00:00Z",
+            "label": {"name": "needs-brain"}
+        }]
+        fake = Fake(
+            reply(200, [issue1, issue2]),  # issues
+            reply(200, events1),             # events for issue 1
+            reply(200, events2),             # events for issue 2
+        )
+        gh = GitHub("t", transport=fake)
+        # Use a callable that returns incrementing values to avoid StopIteration
+        call_count = [0]
+        def mock_time():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return 1000.0  # deadline calc
+            elif call_count[0] == 2:
+                return 1000.0  # first check
+            else:
+                return 1001.0  # subsequent checks exceed deadline
+        with unittest.mock.patch("time.time", side_effect=mock_time):
+            with self.assertRaises(TimeoutError):
+                brain.stale_needs_brain(gh, [REPO], now, hours=4, timeout=0.001)

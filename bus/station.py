@@ -61,6 +61,7 @@ from .labels import REMOTE_LANES
 
 HEARTBEAT_MAX_AGE = 600
 STALE_BRAIN_CHECK = 1800  # 30 minutes
+STALE_BRAIN_TIMEOUT = 60  # seconds, prevents unbounded network walks (loom#1250)
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 RUNAWAY = "loom:runaway"
@@ -7602,8 +7603,8 @@ class Station:
             return
         state["checked"] = self.now
         try:
-            stale = brain.stale_needs_brain(self.gh, self.s.repos, datetime.fromtimestamp(self.now, timezone.utc))
-        except (GitHubError, OSError, ValueError) as err:
+            stale = brain.stale_needs_brain(self.gh, self.s.repos, datetime.fromtimestamp(self.now, timezone.utc), timeout=STALE_BRAIN_TIMEOUT)
+        except (GitHubError, OSError, ValueError, TimeoutError) as err:
             _say("check_stale_brain_tickets failed: %s" % err)
             return
         if stale:

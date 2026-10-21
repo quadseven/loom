@@ -762,18 +762,32 @@ def _needs_brain_since(gh: GitHub, repo: str, issue: Dict[str, Any]) -> Optional
 
 
 def stale_needs_brain(gh: GitHub, repos: Sequence[str], now: Optional[datetime] = None,
-                      hours: int = STALE_NEEDS_BRAIN_HOURS) -> List[Tuple[datetime, Dict[str, Any], str]]:
+                      hours: int = STALE_NEEDS_BRAIN_HOURS,
+                      timeout: Optional[float] = None) -> List[Tuple[datetime, Dict[str, Any], str]]:
     """Open tickets with needs-brain label that have had it for more than
     `hours` hours. Returns list of (since, issue, repo) tuples, oldest first.
-    This monitors the brain review queue for tickets waiting too long."""
+    This monitors the brain review queue for tickets waiting too long.
+
+    If `timeout` is set (seconds), the function raises TimeoutError if the
+    deadline is exceeded. This prevents unbounded network walks from stalling
+    the station pass (loom#1250)."""
     now = now or datetime.now(timezone.utc)
     limit = timedelta(hours=hours)
     cutoff = now - limit
+    deadline = time.time() + timeout if timeout is not None else None
+
+    def _check_deadline() -> None:
+        if deadline is not None and time.time() > deadline:
+            raise TimeoutError("stale_needs_brain exceeded timeout of %.1fs" % timeout)
+
     out = []
     for repo in repos:
+        _check_deadline()
         issues = _issues(gh, repo)
+        _check_deadline()
         needs_brain = [i for i in issues if "needs-brain" in _labels(i)]
         for issue in needs_brain:
+            _check_deadline()
             # Optimization: if the issue was updated after the cutoff,
             # it can't have had needs-brain for longer than the threshold
             # (adding the label updates the issue's updated_at).
@@ -781,6 +795,7 @@ def stale_needs_brain(gh: GitHub, repos: Sequence[str], now: Optional[datetime] 
             if updated and updated > cutoff:
                 continue
             since = _needs_brain_since(gh, repo, issue)
+            _check_deadline()
             if since and now - since > limit:
                 out.append((since, issue, repo))
     out.sort(key=lambda x: x[0])
