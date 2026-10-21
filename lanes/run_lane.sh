@@ -2258,6 +2258,20 @@ for BRIEF in "$INBOX"/*.md; do
   # The model: the brief's Model: line, else the lane default. Passed to the
   # CLI explicitly so the PR names what actually ran.
   PINNED_MODEL="$(field Model "$BRIEF" || true)"
+  # LOOM_<LANE>_ONLY_MODEL (codex, agy): the model family a lane runs. A pin to
+  # another model the lane's provider serves is dropped, and the lane runs its
+  # own model or ladder. The operator's rule (2026-10-21) is codex on
+  # gpt-6-luna and agy on gemini-3.8-flash: gpt-6-sol and gemini-4-argon pins
+  # spent both weekly limits in a day. A model of another family is still
+  # refused below.
+  ONLY_MODEL="$(lane_setting ONLY_MODEL)"
+  if [ -n "$ONLY_MODEL" ] && [ -n "$PINNED_MODEL" ] && [[ "$PINNED_MODEL" != "$ONLY_MODEL"* ]]; then
+    case "$LANE:$PINNED_MODEL" in
+      codex:gpt-*|agy:gemini-*|agy:claude-*|agy:gpt-oss-*)
+        echo "[$(date -u +%FT%TZ)] $TICKET ignores the brief's Model: $PINNED_MODEL: lane $SLOT runs $ONLY_MODEL models only" >> "$LOG"
+        PINNED_MODEL="" ;;
+    esac
+  fi
   MODEL="$PINNED_MODEL"
   if [ -z "$MODEL" ]; then
     MODEL="$(lane_setting MODEL)"
@@ -2282,15 +2296,6 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "limit: requested model $PINNED_MODEL limited until $(utc "$PINNED_UNTIL")" limit
       continue
     fi
-  fi
-  # LOOM_CODEX_ONLY_MODEL: the one model a codex lane runs, whatever gpt
-  # model the brief pins (unset: the pin runs as written). The operator's rule
-  # (2026-10-21) is gpt-6-luna: the ladder's gpt-6-sol pin ran 53 of 72 codex
-  # runs in a day and spent the weekly limit.
-  CODEX_ONLY="${LOOM_CODEX_ONLY_MODEL:-}"
-  if [ "$LANE" = codex ] && [ -n "$CODEX_ONLY" ] && [[ "$MODEL" == gpt-* ]] && [ "$MODEL" != "$CODEX_ONLY" ]; then
-    echo "[$(date -u +%FT%TZ)] $TICKET runs $CODEX_ONLY, not the brief's $MODEL: codex lanes run $CODEX_ONLY only" >> "$LOG"
-    MODEL="$CODEX_ONLY"
   fi
   if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:/@-]*$ ]]; then
     park "$BRIEF" "no usable model '$MODEL': set Model: in the brief or $(lane_var MODEL)"; continue
