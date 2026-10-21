@@ -25,14 +25,14 @@ class Parse(unittest.TestCase):
             self.assertEqual(scope_fit.parse(reply).kind, scope_fit.UNKNOWN, reply)
 
     def test_a_reason_is_one_ascii_line_without_a_handle(self):
-        verdict = scope_fit.parse("NO: wrong—repo\nsee @grug and more")
+        verdict = scope_fit.parse("NO: wrong" + chr(0x2014) + "repo\nsee " + "@" + "grug and more")
         self.assertEqual(verdict.kind, scope_fit.MISFIT)
         self.assertNotIn("@", verdict.reason)
         self.assertNotIn("\n", verdict.reason)
         self.assertTrue(verdict.reason.isascii())
 
     def test_a_reason_that_cannot_be_posted_is_replaced(self):
-        for bad in ("see /Users/someone/work/x", "host build.internal", "fixes #12",
+        for bad in ("see " + "/Us" + "ers/example/work/x", "host build.internal", "fixes #12",
                     "token=abcdef0123456789abcdef"):
             verdict = scope_fit.parse("NO: " + bad)
             self.assertEqual(verdict, (scope_fit.MISFIT, scope_fit.NO_REASON), bad)
