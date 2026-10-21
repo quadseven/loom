@@ -4188,3 +4188,70 @@ class StaleNeedsBrainTests(unittest.TestCase):
         with unittest.mock.patch("time.time", side_effect=mock_time):
             with self.assertRaises(TimeoutError):
                 brain.stale_needs_brain(gh, [REPO], now, hours=4, timeout=0.001)
+
+    def test_stale_needs_brain_filters_invalid_repos(self):
+        """Invalid repo names in the repos list are filtered out."""
+        now = datetime(2030, 1, 5, 12, 0, tzinfo=timezone.utc)
+        stale_issue = {
+            "number": 1, "title": "Stale brain review",
+            "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}],
+            "created_at": "2030-01-05T07:00:00Z",
+        }
+        # Valid repo gets issues call; invalid repos should be skipped
+        fake = Fake(
+            reply(200, [stale_issue]),  # issues for valid repo
+            reply(200, [{
+                "event": "labeled",
+                "created_at": "2030-01-05T07:00:00Z",
+                "label": {"name": "needs-brain"}
+            }]),
+        )
+        gh = GitHub("t", transport=fake)
+        # Mix of valid and invalid repo names
+        repos = [REPO, "invalid/repo/name", "not-a-repo", "owner/"]
+        stale = brain.stale_needs_brain(gh, repos, now, hours=4)
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0][1]["number"], 1)
+        self.assertEqual(stale[0][2], REPO)
+        # Only the valid repo should have been queried
+        issue_calls = [call for call in fake.calls if call[0] == "GET" and "/issues" in call[1] and "events" not in call[1]]
+        self.assertEqual(len(issue_calls), 1)
+        self.assertIn(REPO, issue_calls[0][1])
+
+    def test_needs_brain_since_validates_issue_number(self):
+        """_needs_brain_since validates issue number is an integer."""
+        now = datetime(2030, 1, 5, 12, 0, tzinfo=timezone.utc)
+        # Issue with missing number
+        issue_missing = {
+            "title": "No number",
+            "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}],
+        }
+        # Issue with non-integer number
+        issue_bad = {
+            "number": "not-a-number",
+            "title": "Bad number",
+            "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}],
+        }
+        # Issue with valid number
+        issue_valid = {
+            "number": 42,
+            "title": "Valid number",
+            "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}],
+        }
+        fake = Fake(
+            reply(200, [{
+                "event": "labeled",
+                "created_at": "2030-01-05T07:00:00Z",
+                "label": {"name": "needs-brain"}
+            }]),
+        )
+        gh = GitHub("t", transport=fake)
+        # Missing number should return None
+        result = brain._needs_brain_since(gh, REPO, issue_missing)
+        self.assertIsNone(result)
+        # Non-integer number should return None
+        result = brain._needs_brain_since(gh, REPO, issue_bad)
+        self.assertIsNone(result)
+        # Valid number should work
+        result = brain._needs_brain_since(gh, REPO, issue_valid)
+        self.assertIsNotNone(result)

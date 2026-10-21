@@ -7635,7 +7635,9 @@ class Station:
             return
         state["checked"] = self.now
         try:
-            stale = brain.stale_needs_brain(self.gh, self.s.repos, datetime.fromtimestamp(self.now, timezone.utc), timeout=STALE_BRAIN_TIMEOUT)
+            # Filter repos to valid owner/name format before querying GitHub
+            valid_repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
+            stale = brain.stale_needs_brain(self.gh, valid_repos, datetime.fromtimestamp(self.now, timezone.utc), timeout=STALE_BRAIN_TIMEOUT)
         except (GitHubError, OSError, ValueError, TimeoutError) as err:
             _say("check_stale_brain_tickets failed: %s" % err)
             return

@@ -755,7 +755,10 @@ STALE_NEEDS_BRAIN_HOURS = 4
 
 def _needs_brain_since(gh: GitHub, repo: str, issue: Dict[str, Any]) -> Optional[datetime]:
     """When the needs-brain label was added to this issue, or None if not found."""
-    events = gh.paginate("/repos/%s/issues/%s/events" % (repo, issue["number"]))
+    number = issue.get("number")
+    if not isinstance(number, int):
+        return None
+    events = gh.paginate("/repos/%s/issues/%s/events" % (repo, number))
     stamps = [_stamp(e.get("created_at")) for e in events
               if e.get("event") == "labeled"
               and (e.get("label") or {}).get("name") == "needs-brain"]
@@ -783,6 +786,8 @@ def stale_needs_brain(gh: GitHub, repos: Sequence[str], now: Optional[datetime] 
 
     out = []
     for repo in repos:
+        if not tickets.REPO_RE.fullmatch(repo):
+            continue
         _check_deadline()
         issues = _issues(gh, repo)
         _check_deadline()
