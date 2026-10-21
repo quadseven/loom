@@ -3822,7 +3822,7 @@ class Station:
                 break
         # A revert is never the pull request that ships a ticket, and a
         # ticket whose newest merged pull request is one stays merged
-        # (infra#5419 shipped through its own revert, 2026-10-21).
+        # (a ticket shipped through its own revert, 2026-10-21).
         found = {n: pr for n, pr in found.items() if not revert.looks_like_revert(pr)}
         for number in sorted(wanted - set(found))[:SHIP_PER_PASS]:
             pr = self._ticket_pull_beyond_window(repo, number)
