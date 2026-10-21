@@ -2405,6 +2405,25 @@ class Helpers(unittest.TestCase):
         self.assertEqual(factory.next_rung(set(), {"claude": 2},
                                            lanes={1: ("claude",), 2: (), 3: ("anthropic",)}), 3)
 
+    def test_a_pull_request_for_another_repos_ticket_has_no_ticket_and_no_log_line(self):
+        # 2026-10-20: an image-pin pull request ships another repo's ticket by
+        # design, and logged a refusal for it on every pass.
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        other = {"number": 50, "body": "## Why\nx\n\nRefs example-org/other-repo#5\n",  # leak-guard-allow
+                 "head": {"ref": "pin-image"}}
+        with mock.patch("bus.factory._say") as say:
+            self.assertIsNone(f._association(REPO, other))
+        say.assert_not_called()
+
+    def test_conflicting_ticket_references_still_log_their_line(self):
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        both = {"number": 50, "body": "Refs %s#5\nRefs %s#6\n" % (REPO, REPO),
+                "head": {"ref": "pin-image"}}
+        with mock.patch("bus.factory._say") as say:
+            self.assertIsNone(f._association(REPO, both))
+        say.assert_called_once_with(
+            "no ticket for %s#50: pull request has conflicting ticket references" % REPO)
+
     def test_the_tiers_match_the_lane_choice_in_muse_md(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(root, "docs", "MUSE.md")) as fh:
