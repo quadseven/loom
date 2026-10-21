@@ -107,6 +107,18 @@ default branch count (event `push`, head branch the default branch, head
 repository the repo itself): a pull request run, or a fork's, can sit at the
 same commit without deploying it. At most 20 move per repo a pass.
 
+A repo with many deploy workflows, each scoped to its own paths (one per
+stack, say), ships by path. List it in `LOOM_SHIP_PATH_WORKFLOWS` (space
+separated `OWNER/NAME`). Each pass, the station reads the `on.push.paths`
+filter of every workflow on the default branch that has one (once a pass), and
+the changed files of each open `loom:merged` ticket's pull request (kept in
+`ship_path_files.json`). The ticket moves to `loom:shipped` when, for every
+workflow whose filter matches a changed file, a successful push run on the
+default branch ran on the merge commit or a later run carries it. A pull
+request that changes no file a filter matches ships on merge. A `!` pattern
+excludes, as GitHub does; a workflow without a `paths` filter is not a deploy
+workflow here. Reverts and the 20 moves per pass limit apply as above.
+
 ### Shipping through a pin pull request
 
 A repo that deploys through a pull request in a deployment repo (a digest

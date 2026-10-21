@@ -1633,6 +1633,136 @@ PIN_MERGED = "2030-01-03T12:00:00Z"
 PIN_MERGED_AT = calendar.timegm((2030, 1, 3, 12, 0, 0))
 
 
+class ShipPathRuleTest(Base):
+    """A repo with many path-scoped deploy workflows (LOOM_SHIP_PATH_WORKFLOWS)
+    ships a merged ticket once each workflow its files trigger has deployed
+    the merge commit; a pull request touching no deployed path ships on merge."""
+
+    WORKFLOWS = {
+        "stack-a.yml": "name: a\non:\n  push:\n    branches: [main]\n    paths:\n"
+                       "      - 'stacks/a/**'\n      - '!stacks/a/docs/**'\njobs: {}\n",
+        "stack-b.yml": "name: b\non:\n  push:\n    paths: ['stacks/b/**']\njobs: {}\n",
+        "ci.yml": "name: ci\non:\n  push:\n    branches: [main]\njobs: {}\n",
+    }
+    merged = ShipRuleTest.merged
+    def setUp(self):
+        super().setUp()
+        self.settings.ship_path_workflows = [REPO]
+        self.runs = {}
+        self.pr_files = {}
+        self.carried = set()
+        self.requests = []
+
+    def run_for(self, workflow, sha, **kw):
+        ShipRuleTest.deploy_run(_Into(self.runs.setdefault(workflow, [])), sha, **kw)
+
+    def transport(self, method, url, headers, body):
+        parts = urlsplit(url)
+        self.requests.append(parts.path)
+        run = re.match(r"/repos/%s/actions/workflows/([\w.-]+)/runs$" % REPO, parts.path)
+        if run:
+            return reply(200, {"workflow_runs": self.runs.get(run.group(1), [])})
+        if parts.path == "/repos/%s/contents/.github/workflows" % REPO:
+            return reply(200, [{"name": n, "path": ".github/workflows/" + n}
+                               for n in sorted(self.WORKFLOWS)])
+        content = re.match(r"/repos/%s/contents/.github/workflows/([\w.-]+)$" % REPO, parts.path)
+        if content:
+            text = self.WORKFLOWS[content.group(1)]
+            return reply(200, {"content": base64.b64encode(text.encode()).decode()})
+        files = re.match(r"/repos/%s/pulls/(\d+)/files$" % REPO, parts.path)
+        if files:
+            return reply(200, [{"filename": f} for f in self.pr_files.get(int(files.group(1)), [])])
+        compare = re.match(r"/repos/%s/compare/([0-9a-f]+)\.\.\.([0-9A-Za-z_./-]+)$" % REPO,
+                           parts.path)
+        if compare:
+            return reply(200, {"status": "ahead" if compare.groups() in self.carried
+                               else "diverged"})
+        if method == "GET" and parts.path == "/repos/%s" % REPO:
+            return reply(200, {"full_name": REPO, "default_branch": "main"})
+        return self.fake(method, url, headers, body)
+
+    def ship(self):
+        st = station.Station(GitHub("token", transport=self.transport), self.settings)
+        st.ship_path_workflows()
+        return st
+
+    def test_a_ticket_ships_after_the_workflow_covering_its_path_deploys_it(self):
+        sha = self.merged(12, 99)
+        self.pr_files[99] = ["stacks/a/main.py"]
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.run_for("stack-a.yml", sha)
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+
+    def test_a_workflow_for_another_path_does_not_ship_it(self):
+        sha = self.merged(12, 99)
+        self.pr_files[99] = ["stacks/a/main.py"]
+        self.run_for("stack-b.yml", sha)
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_every_triggered_workflow_must_have_deployed(self):
+        sha = self.merged(12, 99)
+        self.pr_files[99] = ["stacks/a/main.py", "stacks/b/main.py"]
+        self.run_for("stack-a.yml", sha)
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.run_for("stack-b.yml", sha, ident=2)
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+
+    def test_a_later_run_carrying_the_merge_commit_ships_it(self):
+        sha = self.merged(12, 99)
+        self.pr_files[99] = ["stacks/b/x.yaml"]
+        self.run_for("stack-b.yml", "f" * 40, created="2030-01-02T03:00:00Z")
+        self.carried.add((sha, "f" * 40))
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+
+    def test_a_pull_request_touching_no_deployed_path_ships_on_merge(self):
+        # stacks/a/docs is excluded by a negated pattern; ci.yml has no paths.
+        self.merged(12, 99)
+        self.pr_files[99] = ["README.md", "stacks/a/docs/x.md"]
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+
+    def test_a_failed_run_does_not_ship(self):
+        sha = self.merged(12, 99)
+        self.pr_files[99] = ["stacks/a/main.py"]
+        self.run_for("stack-a.yml", sha, conclusion="failure")
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_workflows_and_files_are_read_once_per_pass(self):
+        self.merged(12, 99)
+        self.merged(13, 98)
+        self.pr_files[99] = self.pr_files[98] = ["README.md"]
+        self.ship()
+        self.assertEqual(self.requests.count("/repos/%s/contents/.github/workflows" % REPO), 1)
+        self.assertEqual(self.requests.count("/repos/%s/contents/.github/workflows/stack-a.yml" % REPO), 1)
+
+    def test_an_unlisted_repo_is_left_alone(self):
+        self.settings.ship_path_workflows = []
+        self.merged(12, 99)
+        self.pr_files[99] = ["README.md"]
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_the_rule_comes_from_the_environment(self):
+        env = {"LOOM_HOME": self.home, "LOOM_REPOS": REPO,
+               "LOOM_SHIP_PATH_WORKFLOWS": REPO + " example-owner/second"}
+        settings = station.Settings.from_env(env)
+        self.assertEqual(settings.ship_path_workflows, [REPO, "example-owner/second"])
+
+
+class _Into:
+    """Lets ShipRuleTest.deploy_run append to a chosen runs list."""
+
+    def __init__(self, runs):
+        self.runs = runs
+
+
 class ShipPinTest(Base):
     """A merged pin pull request in a deployment repo ships the merged
     tickets of the source revision its published-from comment names."""

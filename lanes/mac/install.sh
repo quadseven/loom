@@ -296,6 +296,8 @@ done
 # LOOM_SHIP_ON_MERGE and LOOM_SHIP_WORKFLOWS (repos whose merged tickets ship
 # at merge, and OWNER/NAME=WORKFLOW_FILE repos that ship when their deploy
 # workflow succeeds on the merge commit, docs/BRAIN.md), and
+# LOOM_SHIP_PATH_WORKFLOWS (repos with many path-scoped deploy workflows,
+# docs/BRAIN.md), and
 # LOOM_EVIDENCE_CMDS (private JSON map of repo to read-only log command for
 # verify briefs, docs/LANES.md Verify runs), and
 # LOOM_LOG_KEEP_DAYS and LOOM_DISK_FREE_MIN_GB (days a lane's logs are kept,
@@ -351,6 +353,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_PIN_SHIP_REPOS</key><string>$(xml "${LOOM_PIN_SHIP_REPOS:-}")</string>
     <key>LOOM_SHIP_ON_MERGE</key><string>$(xml "${LOOM_SHIP_ON_MERGE:-}")</string>
     <key>LOOM_SHIP_WORKFLOWS</key><string>$(xml "${LOOM_SHIP_WORKFLOWS:-}")</string>
+    <key>LOOM_SHIP_PATH_WORKFLOWS</key><string>$(xml "${LOOM_SHIP_PATH_WORKFLOWS:-}")</string>
     <key>LOOM_LOG_KEEP_DAYS</key><string>$(xml "${LOOM_LOG_KEEP_DAYS:-}")</string>
     <key>LOOM_DISK_FREE_MIN_GB</key><string>$(xml "${LOOM_DISK_FREE_MIN_GB:-}")</string>
     <key>LOOM_SETTLE_CLAIMED</key><string>$(xml "${LOOM_SETTLE_CLAIMED:-}")</string>
