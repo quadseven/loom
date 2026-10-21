@@ -19,8 +19,8 @@
 # A limit failure also holds this lane unavailable until the provider's reset
 # (else 60 minutes). The agent edits (and
 # may commit); this runner commits what is left, pushes, and opens the PR.
-# A commit that adds a file outside the brief's paths (bus/scope_check.py)
-# is refused before validation and push, and nothing is pushed.
+# Unreferenced scratch files added outside the brief's paths are dropped;
+# other added files outside those paths are refused before validation and push.
 # A repo with a validation contract (.loom/validation.conf) is prepared
 # before the agent and checked again on its commit; a failing check parks
 # the brief and keeps the edits on a side branch instead of opening a PR.
@@ -253,43 +253,40 @@ work_note() {
   printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
-# Lists the files the agent's commits added (BASE..HEAD) that only probe the
-# sandbox -- an empty or one-line added file named .test* or under a new
-# top-level bin/, referenced nowhere else in the diff -- and removes them
-# from the branch. A never-pushed branch is rebuilt without them so no
-# commit carries them; a fix round (already pushed, or mid-merge) gets a
+# Lists the sandbox probes and out-of-path scratch files the agent added
+# (BASE..HEAD), then removes them from the branch. A never-pushed branch is
+# rebuilt without them so no commit carries them; a fix round gets a
 # removal commit on top so the push stays fast-forward. Names each file
-# dropped on stdout and sets DROPPED_FILES to the newline-separated paths.
-# A helper failure is a no-op: the run continues and the review bot and
-# factory stay the backstop.
-drop_probe_files() {
-  local probes f stamp
+# dropped on stdout and sets DROPPED_FILES and DROPPED_SCRATCH_FILES.
+drop_agent_files() {
+  local probes scratch dropped f stamp
   DROPPED_FILES=""
-  probes="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.probe_drop "$TREE" "$BASE" HEAD 2>/dev/null)" || return 0
-  [ -n "$probes" ] || return 0
+  DROPPED_SCRATCH_FILES=""
+  probes="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.probe_drop "$TREE" "$BASE" HEAD 2>/dev/null)" || return 1
+  scratch="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.scope_check --scratch "$TREE" "$BASE" HEAD "$BRIEF" ${FIX_UPSTREAM:+"$FIX_UPSTREAM"})" || return 1
+  dropped="$(printf '%s\n%s\n' "$probes" "$scratch" | sed '/^$/d' | sort -u)"
+  [ -n "$dropped" ] || return 0
   stamp="$(date -u +%FT%TZ)"
   while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    rm -f "$TREE/$f"
-    printf '[%s] %s dropped sandbox probe file: %s\n' "$stamp" "$TICKET" "$f"
+    safe_git rm -q -f -- "$f" || return 1
+    if printf '%s\n' "$probes" | grep -Fxq -- "$f"; then
+      printf '[%s] %s dropped sandbox probe file: %s\n' "$stamp" "$TICKET" "$f"
+    else
+      printf '[%s] %s dropped scratch file: %s\n' "$stamp" "$TICKET" "$f"
+    fi
   done <<EOF
-$probes
+$dropped
 EOF
   DROPPED_FILES="$probes"
+  DROPPED_SCRATCH_FILES="$scratch"
   if [ -z "$FIX_PR" ] && [ -z "$CONFLICTS" ]; then
     safe_git reset -q --soft "$BASE" || return 1
     safe_git add -A || return 1
     safe_git diff --cached --quiet && return 0
     safe_git commit -qm "${TITLE:-$TICKET}" || return 1
   else
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      safe_git rm -q -r -- "$f" 2>/dev/null || true
-    done <<EOF
-$probes
-EOF
     safe_git diff --cached --quiet && return 0
-    safe_git commit -qm "Drop sandbox probe files: ${probes//$'\n'/, }" || return 1
+    safe_git commit -qm "Drop agent scratch files: ${dropped//$'\n'/, }" || return 1
   fi
 }
 
@@ -605,8 +602,12 @@ lane_app_token() {
 APP_TOKEN_WHY="could not mint the lane's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
 
 park() {
+  local reason="$2"
   [ -z "${REPLIES_FILE:-}" ] || rm -f "$REPLIES_FILE"
-  echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $2" | tee -a "$LOG" >&2
+  if [ -n "${DROPPED_SCRATCH_FILES:-}" ]; then
+    reason="$reason; dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+  fi
+  echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $reason" | tee -a "$LOG" >&2
   mv "$1" "$INBOX/failed/"
 }
 
@@ -2126,6 +2127,7 @@ fi
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
   PR_BODY=""
+  DROPPED_SCRATCH_FILES=""
   TICKET="$(basename "$BRIEF" .md)"
   REPO="$(field Repo "$BRIEF")"
   BRANCH="$(field Branch "$BRIEF")"
@@ -2495,12 +2497,11 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "could not check out $BRANCH after the agent run" transient; continue
   fi
   COMMITTED=0
-  # A lane pull request never carries the files its agent wrote to probe
-  # the sandbox. Before validation, push and PR, the runner drops those
-  # files from the agent's commits and names each one in the run log (and,
-  # for a new PR, in the Intent section).
-  if ! drop_probe_files >> "$LOG" 2>&1; then
-    park "$BRIEF" "could not drop sandbox probe files" transient; continue
+  # Before validation, push and PR, drop sandbox probes and qualifying
+  # out-of-path scratch files from the agent's commits and name each one
+  # in the run log and pull request text.
+  if ! drop_agent_files >> "$LOG" 2>&1; then
+    park "$BRIEF" "could not drop agent scratch files" transient; continue
   fi
   if ! BRANCH_HEAD="$(safe_git rev-parse "$BRANCH" 2>> "$LOG")" || [ -z "$BRANCH_HEAD" ]; then
     park "$BRIEF" "could not read the lane branch after validation" transient; continue
@@ -2549,6 +2550,10 @@ for BRIEF in "$INBOX"/*.md; do
       if [ -n "$DROPPED_FILES" ]; then
         INTENT_TEXT="${INTENT_TEXT}
 - Dropped sandbox probe files: ${DROPPED_FILES//$'\n'/, }"
+      fi
+      if [ -n "$DROPPED_SCRATCH_FILES" ]; then
+        INTENT_TEXT="${INTENT_TEXT}
+- Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
       fi
       PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
       PR_BODY="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
@@ -2665,6 +2670,11 @@ $CHECKED"
     else
       COMMENT="Lane $SLOT repaired the PR text for: ${ITEMS:-the findings on the ticket}"
     fi
+    if [ -n "$DROPPED_SCRATCH_FILES" ]; then
+      COMMENT="$COMMENT
+
+Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+    fi
     if ! timeout "$NET_TIMEOUT" gh pr comment "$FIX_PR" -R "$REPO" --body "$COMMENT" >> "$LOG" 2>&1; then
       echo "[$(date -u +%FT%TZ)] $TICKET: fixes are pushed but the comment on #$FIX_PR failed" >> "$LOG"
     fi
@@ -2682,6 +2692,10 @@ $CHECKED"
     INTENT_CLASS=""
     INTENT_TEXT=""
     prepare_intent "$BRIEF" >> "$LOG" 2>&1
+    if [ -n "$DROPPED_SCRATCH_FILES" ]; then
+      INTENT_TEXT="${INTENT_TEXT}
+- Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+    fi
   fi
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).

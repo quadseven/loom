@@ -223,6 +223,24 @@ if [ "${FAKE_AGENT:-commit}" = stray ]; then
   git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = scratch ]; then
+  mkdir -p build_test .loom
+  printf 'scratch\nmore\n' > test_debug.py
+  printf 'object\n' > build_test/overseer_decisions.o
+  printf 'probe\n' > .loom/test.txt
+  printf 'fixed\n' > fix.txt
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
+if [ "${FAKE_AGENT:-commit}" = github-stray ]; then
+  mkdir -p .github/workflows
+  printf 'on: push\n' > .github/workflows/extra.yml
+  printf 'fixed\n' > fix.txt
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = binref ]; then
   mkdir -p bin
   printf '#!/bin/sh\\n' > bin/tool
@@ -627,11 +645,29 @@ print('leak guard: clean (shape patterns only)')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertIn("failed: [work] commit refused: it adds files outside the brief's "
-                      "paths: .agents/hooks.json, .loom/test.txt, test_hook.sh; nothing pushed",
-                      self.run_log())
+                      "paths: .agents/hooks.json; nothing pushed; dropped scratch files: "
+                      ".loom/test.txt, test_hook.sh", self.run_log())
         heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_out_of_path_scratch_is_dropped_and_in_path_work_is_pushed(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="scratch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+        body = self.body.read_text()
+        for path in ("test_debug.py", "build_test/overseer_decisions.o", ".loom/test.txt"):
+            self.assertIn(path, body)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_out_of_path_github_file_is_still_refused(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="github-stray")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("commit refused: it adds files outside the brief's paths: "
+                      ".github/workflows/extra.yml; nothing pushed", self.run_log())
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
 
     def test_public_repo_private_ip_diff_is_refused_before_push(self):
@@ -1667,13 +1703,26 @@ cat > /dev/null
         # main.txt came in with the merge, so only the agent's file is named.
         name, before = self.fix_brief()
         self.advance_main("main.txt", "main moved\n")
-        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "echo hook > test_hook.sh\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
+                        "mkdir -p .agents; echo hook > .agents/hooks.json\n")
         result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("commit refused: it adds files outside the brief's paths: "
-                      "test_hook.sh; nothing pushed", self.run_log(name + ".log"))
+                      ".agents/hooks.json; nothing pushed", self.run_log(name + ".log"))
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
         self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+
+    def test_a_fix_round_names_dropped_scratch_in_its_pr_comment(self):
+        name, _ = self.fix_brief()
+        comment = Path(self._tmp.name) / "fix-comment.txt"
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
+                        "printf 'scratch\\n' > test_debug.py\n"
+                        "printf 'fixed again\\n' > first.txt\n")
+        result = self.run_lane(FAKE_COMMENT=str(comment))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Dropped scratch files: test_debug.py", comment.read_text())
+        self.assertEqual(self.remote_file(self.remote_head(self.FIX_BRANCH), "test_debug.py"), "")
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
     def test_a_conflict_goes_to_the_agent_and_the_runner_completes_the_merge(self):
         name, before = self.fix_brief()
