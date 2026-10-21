@@ -1041,6 +1041,8 @@ For a sensitive pull request that would otherwise be READY, status
 also checks the named review run on the head and blocks it unless that run
 completed with `success`. A tick takes that line as given instead of
 re-reading the review list. `bus.brain merge` keeps its own checks.
+When a trusted brain fix is still pending on the linked ticket, status adds
+`pending brain fix` to the blockers instead of marking the pull request READY.
 
 ## Merge by change class
 
