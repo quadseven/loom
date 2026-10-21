@@ -1314,6 +1314,16 @@ def adoption_comment(repo: str, ticket: int) -> str:
             % (ADOPTED_MARKER % (repo, ticket), ticket))
 
 
+# A ready mark: a status event naming the head whose checks and review passed.
+# Plain text, because a status event is shown to readers as it is written.
+READY_TEXT = ("Ready: checks and review passed on head %s; the factory lands the pull "
+              "request in its turn.")
+READY_RE = re.compile(r"Ready: checks and review passed on head ([0-9a-f]{40})\b")
+# A ticket marked ready before the status event kept a ready-head comment of
+# its own; it is still read.
+OLD_READY_RE = re.compile(r"<!-- loom:ready-head ([0-9a-f]+) -->")
+
+
 class Station:
     def __init__(self, gh: GitHub, settings: Settings,
                  now: Optional[float] = None,
@@ -4268,7 +4278,7 @@ class Station:
             return
         comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         names = _label_names(issue)
-        ready = self._ready_marker(comments)
+        ready = self._ready_head(comments)
         if brain._pending_brain_fix(comments, self.s.authors):
             self._move_fix_to_lane(repo, number, lane, names)
             return
@@ -4289,19 +4299,30 @@ class Station:
         self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
                                    comments, names, failed, threads, rounds)
 
-    def _ready_marker(self, comments: List[Any]) -> Optional[Tuple[Any, str]]:
-        # The ticket keeps one ready-head comment of ours, edited on each new clean
-        # head, so the markers never pile up; returns its id and the head it names.
+    def _ready_head(self, comments: List[Any]) -> Optional[str]:
+        """The head the newest ready mark of ours names. A mark is an event in
+        the status comment (raw, or expanded by the GitHub client); a ticket
+        marked before that keeps its own ready-head comment, read the same.
+        Ours means the logins status.add writes as: the trusted authors and
+        this client's own App login."""
         authors = {author.lower() for author in self.s.authors}
-        pattern = re.compile(r"<!-- loom:ready-head ([0-9a-f]+) -->")
-        found = None
+        own = getattr(self.gh, "_status_logins", None)
+        if callable(own):
+            authors |= {str(login).lower() for login in own()}
+        marks: List[Tuple[str, str]] = []
         for comment in comments:
             if not isinstance(comment, dict) or tickets._login(comment.get("user")) not in authors:
                 continue
-            match = pattern.search(str(comment.get("body") or ""))
-            if match:
-                found = (comment.get("id"), match.group(1))
-        return found
+            body = str(comment.get("body") or "")
+            if status.is_status(body):
+                events = status.parse(body)
+            else:
+                events = [(str(comment.get("created_at") or ""), body)]
+            for at, text in events:
+                match = READY_RE.match(text) or OLD_READY_RE.search(text)
+                if match:
+                    marks.append((at, match.group(1)))
+        return max(marks, key=lambda m: m[0])[1] if marks else None
 
     def _fix_pending(self, names: List[str], comments: List[Any], sha: str) -> bool:
         if "loom:briefed" not in names and "loom:running" not in names:
@@ -4314,8 +4335,8 @@ class Station:
                    and marker in str(comment.get("body") or "") for comment in comments)
 
     def _clear_stale_ready(self, repo: str, number: int, names: List[str],
-                           ready: Optional[Tuple[Any, str]], sha: str) -> None:
-        if "loom:ready" in names and (not ready or ready[1] != sha):
+                           ready: Optional[str], sha: str) -> None:
+        if "loom:ready" in names and ready != sha:
             self._remove_label(repo, number, "loom:ready")
             names.remove("loom:ready")
 
@@ -4340,16 +4361,13 @@ class Station:
             self._remove_label(repo, number, "loom:ready")
 
     def _mark_ready(self, repo: str, number: int, sha: str, names: List[str],
-                    ready: Optional[Tuple[Any, str]]) -> None:
+                    ready: Optional[str]) -> None:
         if "loom:ready" not in names:
             self._add_label(repo, number, "loom:ready")
-        # The marker alone posted an email with nothing in it (2026-10-20).
-        body = {"body": "<!-- loom:ready-head %s -->\nChecks and review passed on head %s; "
-                        "the factory lands the pull request in its turn." % (sha, sha[:12])}
-        if not ready:
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), body)
-        elif ready[1] != sha:
-            self.gh.rest("PATCH", "/repos/%s/issues/comments/%s" % (repo, ready[0]), body)
+        # Routine, so an event in the status comment rather than a comment of
+        # its own: a bare marker comment emailed a blank message (2026-10-20).
+        if ready != sha:
+            self._routine(repo, number, READY_TEXT % sha)
 
     @staticmethod
     def _fix_round_count(comments: List[Any], authors: set) -> int:
@@ -4450,8 +4468,13 @@ class Station:
             self._relabel(repo, number, "loom:pr")
             if self._field(text, "Fix-PR").isdigit():
                 self._post_answers(repo, int(self._field(text, "Fix-PR")), lane, name, text)
-            verb = "pushed fixes to" if self._field(text, "Fix-PR") else "opened"
-            self._comment(repo, number, "Lane %s %s a pull request: %s" % (lane, verb, url))
+            if self._field(text, "Fix-PR"):
+                # A fix round's push is routine (the pull request already
+                # exists and the lane comments on it): three of them emailed
+                # one ticket's author on 2026-10-20.
+                self._routine(repo, number, "Lane %s pushed fixes to a pull request: %s" % (lane, url))
+            else:
+                self._comment(repo, number, "Lane %s opened a pull request: %s" % (lane, url))
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
         if not self._report_failure(repo, number, lane, text, name):
@@ -4556,7 +4579,8 @@ class Station:
 
     def _routine(self, repo: str, number: int, text: str) -> None:
         """A lane failure, factory hold or stop the factory acts on by itself,
-        as an event in the ticket's status comment: an edit sends no email.
+        a fix round's push or a ready mark, as an event in the ticket's status
+        comment: an edit sends no email.
         Each one was a new comment, an email apiece (an infra ticket,
         2026-10-19). The GitHub client expands status events, so the attempt
         table still reads each "Lane X failed:", "held:" and "stopped:" line

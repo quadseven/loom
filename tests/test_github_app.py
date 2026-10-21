@@ -335,6 +335,18 @@ class DashboardAppTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(dash.TicketStore().auth, "token")
 
+    def test_a_token_dashboard_reads_the_trusted_writers_status_events(self):
+        # Without the writers, a token client showed a status comment as one
+        # opaque comment, so a pushed fix or a lane failure left the timeline.
+        from dashboard import github as dash
+        env = {"LOOM_REPOS": "example-owner/example-repo",
+               "LOOM_DASHBOARD_GITHUB_TOKEN": "dashboard-token",
+               "LOOM_BRIEF_AUTHORS": "Alice-Example,bob-example"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            store = dash.TicketStore()
+        self.assertEqual(store.auth, "token")
+        self.assertEqual(store.gh.status_authors, {"alice-example", "bob-example"})
+
     FILE_ENV = {"LOOM_REPOS": "example-owner/example-repo",
                 "LOOM_DASHBOARD_GITHUB_TOKEN": "dashboard-token",
                 "LOOM_GITHUB_APP_ID": "123", "LOOM_GITHUB_APP_INSTALLATION_ID": "456"}

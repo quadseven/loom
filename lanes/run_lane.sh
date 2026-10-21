@@ -315,11 +315,16 @@ stray_list() {
 # class, one line per behavior change, and the counts of files by class.
 # Sensitive globs come from SENSITIVE_FILE on the base revision; a missing
 # file means no sensitive class. Sets INTENT_CLASS and INTENT_TEXT.
+# The scratch files live under $LOOM_HOME/run, never the default temp
+# directory: a lane sandbox denies that one, and a failed mktemp handed cp
+# an empty target, which macOS cp takes as the working directory.
 prepare_intent() {
-  local brief="$1" files_tmp sens_tmp sum_tmp what_tmp out
+  local brief="$1" dir files_tmp sens_tmp sum_tmp what_tmp out
   INTENT_CLASS="logic"
   INTENT_TEXT=""
-  files_tmp="$(mktemp)" sens_tmp="$(mktemp)" sum_tmp="$(mktemp)" what_tmp="$(mktemp)"
+  dir="$(mktemp -d "$LOOM_HOME/run/$SLOT-intent.XXXXXX")" ||
+    { echo "intent: could not make a scratch directory; class stays $INTENT_CLASS" >&2; return 0; }
+  files_tmp="$dir/files" sens_tmp="$dir/sensitive" sum_tmp="$dir/summary" what_tmp="$dir/what"
   safe_git diff --name-only "$BASE" HEAD 2>/dev/null | sed '/^[[:space:]]*$/d' > "$files_tmp"
   safe_git cat-file blob "$BASE:$SENSITIVE_FILE" 2>/dev/null > "$sens_tmp"
   # Only the change lines before the summary's first heading: its
@@ -331,7 +336,7 @@ prepare_intent() {
   fi
   section What "$brief" > "$what_tmp" 2>/dev/null
   out="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.change_class --files "$files_tmp" --sensitive "$sens_tmp" --summary "$sum_tmp" --what "$what_tmp" 2>/dev/null)"
-  rm -f "$files_tmp" "$sens_tmp" "$sum_tmp" "$what_tmp"
+  rm -rf "$dir"
   [ -n "$out" ] || return 0
   INTENT_CLASS="$(printf '%s' "$out" | tail -1 | sed 's/^class://')"
   case "$INTENT_CLASS" in sensitive|logic|tests|docs) ;;
@@ -1133,9 +1138,45 @@ opencode_bin() {
   printf '%s' "${b:-opencode}"
 }
 
-# Usage: opencode_agent <key_var> <brief text>
+# Usage: opencode_agent <key_var> <run arguments...>
 opencode_agent() {
-  opencode_run "$1" "$(opencode_bin)" "$2"
+  local key_var="$1"
+  shift
+  opencode_run "$key_var" "$(opencode_bin)" "$@"
+}
+
+# OpenCode JSON events delimit assistant steps; only a final step containing
+# text and no tool is evidence that the model stopped on a described action.
+spark_described_step() {
+  python3 -I - "$1" <<'PY'
+import json
+import sys
+
+text = tool = False
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    try:
+        event = json.loads(line)
+    except ValueError:
+        continue
+    if not isinstance(event, dict):
+        continue
+    kind = event.get("type")
+    part = event.get("part") if isinstance(event.get("part"), dict) else {}
+    if kind == "step_start":
+        text = tool = False
+    elif kind == "text" and isinstance(part.get("text"), str) and part["text"].strip():
+        text = True
+    elif kind in ("tool_use", "tool") or part.get("type") == "tool":
+        tool = True
+sys.exit(0 if text and not tool else 1)
+PY
+}
+
+spark_has_no_work() {
+  local status
+  [ "$(safe_git rev-parse HEAD)" = "$BASE" ] || return 1
+  status="$(safe_git status --porcelain --untracked-files=all)" || return 1
+  ! printf '%s\n' "$status" | grep -v ' .loom/summary.md$' | grep -q .
 }
 
 # git in an agent's tree, run by the runner: never run hooks or an fsmonitor
@@ -1851,8 +1892,14 @@ markers_left() {
 }
 
 run_agent() {
-  local brief_text
+  local brief_text events status
   brief_text="$(cat "$1")$(work_note)$(validation_note)$(summary_note)"
+  if [ "$LANE" = spark ]; then
+    brief_text="$brief_text
+
+## Spark repository search
+Do not search the whole filesystem (for example, find /). Search within the checkout and read the repository's build files to learn how it builds and tests."
+  fi
   AGENT_EXTRA_ENV=""
   is_api_lane && fresh_agent_home
   case "$LANE" in
@@ -1860,7 +1907,26 @@ run_agent() {
     openrouter) opencode_agent OPENROUTER_API_KEY "$brief_text" ;;
     opencode-go) opencode_agent OPENCODE_API_KEY "$brief_text" ;;
     zen) opencode_agent - "$brief_text" ;;
-    spark|free) opencode_agent - "$brief_text" ;;
+    spark)
+      events="$WORKDIR/$TICKET.opencode-events"
+      opencode_agent - --format json "$brief_text" | tee "$events"
+      status=$?
+      [ "$status" -eq 0 ] || return "$status"
+      if spark_has_no_work &&
+         { [ ! -f "$TREE/$SUMMARY_FILE" ] ||
+           ! grep -qiE "$NO_CHANGE_RE" "$TREE/$SUMMARY_FILE"; } &&
+         spark_described_step "$events"; then
+        echo "[$(date -u +%FT%TZ)] $TICKET: continuing a text-only Spark step once"
+        opencode_agent - --format json --continue \
+          "Continue: carry out the step you just described, then commit or write .loom/summary.md" |
+          tee "$events"
+        status=$?
+        [ "$status" -eq 0 ] || return "$status"
+        if spark_has_no_work && spark_described_step "$events"; then
+          : > "$WORKDIR/$TICKET.described-step"
+        fi
+      fi ;;
+    free) opencode_agent - "$brief_text" ;;
     zai) opencode_agent ZHIPU_API_KEY "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_agent CLOUDFLARE_API_KEY "$brief_text" ;;
@@ -2188,6 +2254,7 @@ for BRIEF in "$INBOX"/*.md; do
 
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
+  rm -f "$WORKDIR/$TICKET.described-step" "$WORKDIR/$TICKET.opencode-events"
   rm -f "$LOGDIR/$TICKET.answered"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
@@ -2440,7 +2507,9 @@ for BRIEF in "$INBOX"/*.md; do
     # text that branch's own CI accepts and the scan of a lane's change flags.
     SCAN_RANGE="$BASE..HEAD"
     [ -n "$FIX_UPSTREAM" ] && SCAN_RANGE="$FIX_UPSTREAM...HEAD"
-    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$SCAN_RANGE" 2>&1)"; then
+    # The repo's own issue refs (OWNER/NAME#N and NAME#N in code or tests)
+    # name nothing private; the scanner exempts exactly this repo for them.
+    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$SCAN_RANGE" --allow-repo-ref "$REPO" 2>&1)"; then
       park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
       continue
     fi
@@ -2517,6 +2586,9 @@ for BRIEF in "$INBOX"/*.md; do
     # model rightly finding their one finding no longer held.
     if ! no_change_reason; then
       [ -z "$NO_CHANGE_WHY" ] || { park "$BRIEF" "agent made no commit and its reason was refused: $NO_CHANGE_WHY"; continue; }
+      if [ -f "$WORKDIR/$TICKET.described-step" ]; then
+        park "$BRIEF" "ended on a described step without taking it"; continue
+      fi
       park "$BRIEF" "$NO_REASON on $BRANCH"; continue
     fi
     if [[ ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
