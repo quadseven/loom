@@ -656,6 +656,28 @@ print('leak guard: clean (shape patterns only)')
         self.assertNotIn("leak scan failed", self.run_log())
         self.assertEqual(self.pushed_files(), ["fix.txt"])
 
+    def test_a_body_citing_its_own_repos_issues_bare_opens_the_pull_request(self):
+        # The body's scan copy turned only OWNER/NAME#N into #N, so a ticket
+        # whose Why cited NAME#N parked with nothing pushed (2026-10-21).
+        self.drop_brief(text=BRIEF.replace(
+            "The thing is broken for every user.",
+            "The thing is broken for every user, as repo#7 found."))  # leak-guard-allow: the case under test
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("leak scan failed", self.run_log())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_a_body_citing_a_private_repo_with_this_repos_name_in_it_never_names_it(self):
+        # A longer name is another repo: the posted body says so instead.
+        self.drop_brief(text=BRIEF.replace(
+            "The thing is broken for every user.",
+            "The thing is broken for every user, as repo-legacy-private#3 found."))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertNotIn("repo-legacy-private", body)
+        self.assertIn("issue 3 of another repo", body)
+
     def test_a_diff_naming_a_private_repo_with_this_repos_name_in_it_is_refused(self):
         # The body's own-repo Refs line is exempt, nothing else: private repos
         # named NAME-legacy-private exist beside public NAME repos.
