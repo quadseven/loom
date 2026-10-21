@@ -602,12 +602,27 @@ class SensitiveResumeTests(unittest.TestCase):
         last = brain.datetime(2030, 1, 1, 17, 0, tzinfo=brain.timezone.utc)
         due = last + brain.timedelta(seconds=brain.REPORT_EVERY)
         grace = brain.timedelta(seconds=brain.REPORT_GRACE)
-        for now, state in ((due - brain.timedelta(seconds=1), "ok"),
+        owed = due - brain.timedelta(seconds=brain.REPORT_OWED_EARLY)
+        for now, state in ((owed - brain.timedelta(seconds=1), "ok"),
+                           (owed, "due"),
                            (due, "due"),
                            (due + grace - brain.timedelta(seconds=1), "due"),
                            (due + grace, "overdue")):
             with self.subTest(now=now):
                 self.assertEqual(brain._report_deadline(last, now), (due, state))
+
+    def test_a_report_is_owed_to_the_brain_a_tick_before_the_station_writes_it(self):
+        # The station posts its data-only standup STANDUP_LEAD before a report
+        # is due, and its report restarts the clock; the brain saw "ok" until
+        # due, so every goal report on one goal home for a day and a half was
+        # the station's (2026-10-21). An hourly brain tick must see it owed
+        # with time to write it first.
+        from bus import station
+        last = brain.datetime(2030, 1, 1, 17, 0, tzinfo=brain.timezone.utc)
+        station_posts = (last + brain.timedelta(seconds=brain.REPORT_EVERY)
+                         - brain.timedelta(seconds=station.STANDUP_LEAD))
+        a_tick_earlier = station_posts - brain.timedelta(hours=1)
+        self.assertEqual(brain._report_deadline(last, a_tick_earlier)[1], "due")
 
     def test_merge_ready_names_each_blocker(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}
