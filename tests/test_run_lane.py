@@ -896,7 +896,7 @@ print('leak guard: clean (shape patterns only)')
     def test_a_final_message_that_fails_the_text_checks_keeps_the_no_reason_class(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0",
-                               FAKE_OUT="I gave up; see /Users/someone/work/notes for why.")
+                               FAKE_OUT="I gave up; see /Users/someone/work/notes for why.")  # leak-guard-allow: the case under test
         self.assertEqual(result.returncode, 0, result.stderr)
         line = self.failure_line()
         self.assertIn("agent made no commit and wrote no reason", line)
