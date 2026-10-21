@@ -215,7 +215,9 @@ steps on each tick:
 
 Claims expire after two hours without a heartbeat. A claim without a pull
 request expires after three hours and returns to `loom:queued` with a
-`[transient]` reason. The brain tick remains a separate process and follows
+`[transient]` reason. A ticket's heartbeat edits its claim comment in place (see
+"Lane comments edited in place" in BRAIN.md), so a beat adds no comment and
+sends no email. The brain tick remains a separate process and follows
 the regular brain instructions above.
 
 ## Handing off stage work

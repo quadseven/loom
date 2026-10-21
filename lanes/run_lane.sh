@@ -436,6 +436,50 @@ pushed_commits() {
     done
 }
 
+# One comment per subject, edited in place. A lane that repeats a fact (a fix
+# round on a pull request, a failure that is still failing) used to post a
+# comment each time, and every one emailed the ticket's author and
+# participants: about 60 a day on pull requests, 13 on one incident. This finds
+# the comment on issue or pull request $2 of $1 that starts with marker $3,
+# builds its next body with `python3 -m bus.sticky $4` from the old body and
+# the text on stdin (the remaining arguments are bus.sticky's), and edits that
+# comment, or posts it when there is none. A failed read posts nothing, so a
+# bad API answer cannot start a second comment; a failed write returns 1 for
+# the caller to log. Arguments: repo, number, marker, mode, bus.sticky's own.
+upsert_sticky_comment() {
+  local repo="$1" number="$2" marker="$3" mode="$4" listing id old_file new_file
+  shift 4
+  old_file="$(mktemp)" && new_file="$(mktemp)" || return 1
+  cat > "$old_file.text"
+  if ! listing="$(MARKER="$marker" timeout "$NET_TIMEOUT" gh api --paginate \
+        "repos/$repo/issues/$number/comments" \
+        --jq '.[] | select(.body | startswith(env.MARKER)) | .id' 2>> "$LOG")"; then
+    rm -f "$old_file" "$old_file.text" "$new_file"; return 1
+  fi
+  id="$(printf '%s\n' "$listing" | head -1 | tr -cd '0-9')"
+  : > "$old_file"
+  if [ -n "$id" ] && ! timeout "$NET_TIMEOUT" gh api "repos/$repo/issues/comments/$id" \
+        --jq .body > "$old_file" 2>> "$LOG"; then
+    rm -f "$old_file" "$old_file.text" "$new_file"; return 1
+  fi
+  if ! PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.sticky "$mode" --marker "$marker" \
+        --now "$(date -u +%FT%TZ)" --old "$old_file" "$@" < "$old_file.text" > "$new_file" 2>> "$LOG"; then
+    rm -f "$old_file" "$old_file.text" "$new_file"; return 1
+  fi
+  local ok=0
+  if [ -n "$id" ]; then
+    timeout "$NET_TIMEOUT" gh api -X PATCH "repos/$repo/issues/comments/$id" \
+      -F "body=@$new_file" >> "$LOG" 2>&1 || ok=1
+  else
+    timeout "$NET_TIMEOUT" gh api -X POST "repos/$repo/issues/$number/comments" \
+      -F "body=@$new_file" >> "$LOG" 2>&1 || ok=1
+  fi
+  rm -f "$old_file" "$old_file.text" "$new_file"
+  return "$ok"
+}
+# The marker on the one comment per pull request that lists a lane's fix rounds.
+ROUND_MARKER="<!-- loom:lane-round v1 -->"
+
 # Keep agent-authored review replies outside the commit. The agent cannot call
 # GitHub from its sandbox; only the runner posts these after the push succeeds.
 capture_replies() {
@@ -1164,9 +1208,10 @@ ask_renew_key() {
     "$KEY_ASK_MARKER" "$SLOT" "$param")"
   existing="$(open_issue "$title")"
   if [ -n "$existing" ]; then
-    gh issue comment --repo "$FACTORY_REPO" "$existing" \
-      --body "Lane $SLOT could not use the key again, at $(date -u +%FT%TZ)." >>"$LOG" 2>&1 ||
-      echo "could not comment on the open ask $FACTORY_REPO#$existing" >> "$LOG"
+    # One comment on the ask with a running count, never one per failure.
+    printf '' | upsert_sticky_comment "$FACTORY_REPO" "$existing" "$KEY_REPEAT_MARKER" repeat \
+      --headline "Could not use the key again" --items-label "Lanes seen" --item "$SLOT" ||
+      echo "could not update the open ask $FACTORY_REPO#$existing" >> "$LOG"
     return 0
   fi
   number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
@@ -1483,6 +1528,9 @@ FACTORY_REPO=quadseven/loom
 INCIDENT_MARKER="<!-- loom:factory-incident v1 -->"
 # The marker on the body of the needs-operator ask an expired key files.
 KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"
+# The markers on the one comment that counts repeats on an open ask or incident.
+KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"
+INCIDENT_REPEAT_MARKER="<!-- loom:incident-repeat v1 -->"
 # The number of the open issue on the factory repo whose title is exactly $1,
 # empty when there is none: one open issue per incident kind, per expired key.
 open_issue() {
@@ -1519,8 +1567,9 @@ file_factory_incident() {  # kind, detail
   existing="$(open_issue "$title")"
   if [ -n "$existing" ]; then
     number="$existing"
-    gh issue comment --repo "$FACTORY_REPO" "$number" \
-      --body "Still failing on $TICKET: $detail" >>"$LOG" 2>&1 || true
+    # One comment on the incident with a running count, never one per run.
+    printf '%s' "$detail" | upsert_sticky_comment "$FACTORY_REPO" "$number" "$INCIDENT_REPEAT_MARKER" repeat \
+      --headline "Still failing" --items-label "Tickets seen" --item "$TICKET" || true
   else
     number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
       --body "$body" --label loom:factory 2>>"$LOG" || \
@@ -3015,7 +3064,9 @@ $CHECKED"
 
 Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
     fi
-    if ! timeout "$NET_TIMEOUT" gh pr comment "$FIX_PR" -R "$REPO" --body "$COMMENT" >> "$LOG" 2>&1; then
+    # One comment per pull request, edited each round; the push and the body
+    # edit are already on the pull request's timeline.
+    if ! printf '%s' "$COMMENT" | upsert_sticky_comment "$REPO" "$FIX_PR" "$ROUND_MARKER" rounds; then
       echo "[$(date -u +%FT%TZ)] $TICKET: fixes are pushed but the comment on #$FIX_PR failed" >> "$LOG"
     fi
     if [ "$COMMITTED" -eq 1 ]; then

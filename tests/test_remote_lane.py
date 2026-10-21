@@ -170,6 +170,63 @@ class RemoteLaneTests(unittest.TestCase):
         lane._recover_and_count(gh, ["example/project"], "muse", 1000 + lane.PR_AGE + 1)
         self.assertIn("loom:queued", labels(gh))
 
+    def test_heartbeats_after_a_claim_post_nothing_and_edit_the_claim_comment(self):
+        # 2026-10-20: a new remote-claim comment every beat, six in 31 minutes
+        # on one ticket, each one emailed to its author.
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        for at in (1500, 2000, 2500):
+            lane.heartbeat(gh, "example/project", 4, now=at)
+        self.assertEqual(len(gh.comments[4]), 1)
+        posts = [c for c in gh.calls if c[0] == "POST" and c[1].endswith("/issues/4/comments")]
+        patches = [c for c in gh.calls if c[0] == "PATCH" and "/issues/comments/" in c[1]]
+        self.assertEqual((len(posts), len(patches)), (1, 3))
+        self.assertEqual(lane._claims(gh.comments[4], "muse"), [(0, 2500.0, 1000.0)])
+        # The claim expires from the newest beat, and the first claim time
+        # still bounds how long a claim without a pull request may last.
+        repos = ["example/project"]
+        self.assertEqual(lane._recover_and_count(gh, repos, "muse", 2500 + lane.CLAIM_AGE - 1), 1)
+        lane._recover_and_count(gh, repos, "muse", 2500 + lane.CLAIM_AGE + 1)
+        self.assertIn("loom:queued", labels(gh))
+
+    def test_a_heartbeat_edit_keeps_the_first_claim_time_for_the_pr_age_bound(self):
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        lane.heartbeat(gh, "example/project", 4, now=1000 + lane.CLAIM_AGE - 10)
+        lane.heartbeat(gh, "example/project", 4, now=1000 + lane.PR_AGE - 10)
+        self.assertEqual(len(gh.comments[4]), 1)
+        lane._recover_and_count(gh, ["example/project"], "muse", 1000 + lane.PR_AGE + 1)
+        self.assertIn("loom:queued", labels(gh))
+
+    def test_a_new_claim_after_a_hand_back_is_not_aged_by_the_old_one(self):
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        lane._recover_and_count(gh, ["example/project"], "muse", 1000 + lane.PR_AGE + 1)
+        self.assertIn("loom:queued", labels(gh))
+        gh.issues[4]["labels"].append({"name": "lane:muse"})  # the brain re-assigns the lane
+        later = 1000 + lane.PR_AGE + 100
+        self.assertIsNotNone(lane.claim(gh, ["example/project"], now=later))
+        self.assertEqual(lane._recover_and_count(gh, ["example/project"], "muse", later + 60), 1)
+        self.assertNotIn("loom:queued", labels(gh))
+
+    def test_three_heartbeats_with_no_claim_comment_post_one_and_edit_it_twice(self):
+        gh = FakeGitHub()
+        gh.issues[4]["labels"] = [{"name": "loom:running"}, {"name": "lane:muse"}]
+        for at in (1000, 1100, 1200):
+            lane.heartbeat(gh, "example/project", 4, now=at)
+        # Three beats on one claim: one comment posted, then edited twice.
+        self.assertEqual(len(gh.comments[4]), 1)
+        self.assertEqual([c[0] for c in gh.calls if "/comments" in c[1] and c[0] in ("POST", "PATCH")],
+                         ["POST", "PATCH", "PATCH"])
+        self.assertEqual(gh.comments[4][0]["body"], "<!-- loom:remote-claim v1 muse 4 1200.000 1000.000 -->")
+        gh.comments[4][0]["body"] = "<!-- loom:remote-claim v1 muse 4 1000.000 -->"
+        # A comment from before the edit-in-place form is read as a claim and
+        # edited into the new form on the next beat.
+        self.assertEqual(lane._claims(gh.comments[4], "muse"), [(0, 1000.0, 1000.0)])
+        lane.heartbeat(gh, "example/project", 4, now=2000)
+        self.assertEqual(len(gh.comments[4]), 1)
+        self.assertEqual(gh.comments[4][0]["body"], "<!-- loom:remote-claim v1 muse 4 2000.000 1000.000 -->")
+
     def test_the_lane_heartbeat_edits_one_comment(self):
         gh = FakeGitHub()
         lane.lane_heartbeat(gh, "example/project", now=1000)
