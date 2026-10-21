@@ -599,6 +599,17 @@ skips the step. `LOOM_SETTLE_CLAIMED_MAX` (default 10) caps the issues settled
 a run, and writes are at least 3 seconds apart. Turning writes on is the
 operator's call: set `LOOM_SETTLE_CLAIMED=on` and run the installer again.
 
+A pull request that merged with the review check neutral (the review degraded)
+can never pass that gate, so its issue would stay open with its work merged
+(loom#1221). When every other check on its head passed, the same step posts one
+comment on the merged pull request starting `<!-- loom:claimed-rereview v1 -->`
+and asking the review bot to review it again (`LOOM_REVIEW_AGAIN`). The request
+is recorded in `claimed.json` and by that marker, so it is never asked twice,
+and at most 3 requests and follow-up issues are written a run. A later
+review success settles the issue by the rule above. A later failure files its
+findings as a `loom:triage` issue, once, and comments on the original naming it;
+the original stays open. A second neutral result is left for a person.
+
 ### Proof audits
 
 A lane proof passed the shape check, which cannot tell evidence a lane read
@@ -640,7 +651,10 @@ labelled `claim:<login>`) still follows its pull request: an open pull
 request by that owner, on a branch of the repo, whose `Refs` line names a
 ticket a trusted login filed, moves it from `loom:queued` to `loom:pr`, and
 from there the closed pull request pass moves it to `loom:merged` on merge
-and shipping follows. It is never briefed or claimed this way, and a pull
+and shipping follows. A merge that leaves ticket criteria neither ticked nor
+marked `; not built: <reason>` in any merged pull request for it moves the
+ticket to `loom:queued` instead, with a status event naming them. It is never
+briefed or claimed this way, and a pull
 request by anyone who does not own the ticket moves nothing. So is a ticket assigned to a login outside
 `LOOM_BRIEF_AUTHORS` or labelled `claim:<login>` for one, or one under a goal home whose `Operator:` line names
 another login: another operator's Loom owns it (docs/LANES.md, "Two Looms on
@@ -686,7 +700,14 @@ lane as a `loom:fix` comment, using the same findings format as
 pushes fixes to the existing branch. `LOOM_FIX_ROUNDS` caps automatic rounds
 per ticket (default 3), after which the station adds `needs-brain`. A clean
 PR receives `loom:ready`; a later push removes that label until the new head
-has finished checks and review again.
+has finished checks and review again. A degraded or partial result of the
+review check (its summary says `Degraded review (...): not a verdict`, or its
+title carries a partial-review form such as `WARN Elder review low
+confidence`) is not sent back: a lane cannot fix it. The station leaves the
+ticket at `loom:pr` with no fix comment, no round counted and no
+`loom:ready`, and the factory asks the review bot to review the head again
+(`/grug improve`, once per head commit). Real failures beside it are sent
+back without it.
 
 When the station claims a ticket whose latest comment from an allowed login
 is such a fix comment, newer than its last claim, the brief keeps the pull

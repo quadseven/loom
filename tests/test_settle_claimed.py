@@ -52,6 +52,7 @@ class FakeGitHub:
         self.files = {}
         self.contents = {"tests/test_parser.py": TEST_SOURCE}
         self.writes = []
+        self.created = []
 
     def add_issue(self, number, labels=("claim:example-login",), body=CODE_BODY,
                   title="The parser reads the new field", **extra):
@@ -75,6 +76,13 @@ class FakeGitHub:
         self.files[pr] = [{"filename": "tests/test_parser.py", "patch": TEST_PATCH},
                           {"filename": "bus/parser.py", "patch": "+x = 1\n"}]
 
+    def set_review(self, head, conclusion, at, summary=""):
+        """The review check's newest run on `head`, as a re-review leaves it."""
+        for run in self.check_runs[head]:
+            if run["name"] == "Grug - Elder":
+                run.update(conclusion=conclusion, completed_at=at,
+                           output={"title": "Elder review", "summary": summary})
+
     def names(self, number):
         return [label["name"] for label in self.issues[number]["labels"]]
 
@@ -88,7 +96,8 @@ class FakeGitHub:
         rest = parts.path[len("/repos/%s/" % REPO):]
         issue = re.fullmatch(r"issues/(\d+)(?:/(\w+))?", rest)
         found = (self._issue(method, int(issue.group(1)), issue.group(2), data) if issue
-                 else self._read(rest, parse_qs(parts.query)) if method == "GET" else None)
+                 else self._read(rest, parse_qs(parts.query)) if method == "GET"
+                 else self._create(data) if (method, rest) == ("POST", "issues") else None)
         if found is None:
             raise AssertionError("unexpected call %s %s" % (method, url))
         return found
@@ -121,13 +130,20 @@ class FakeGitHub:
         return reply(200, {"encoding": "base64",
                            "content": base64.b64encode(source.encode()).decode()})
 
+    def _create(self, data):
+        number = 900 + len(self.created)
+        self.created.append(dict(data, number=number))
+        return reply(201, {"number": number})
+
     def _issue(self, method, n, sub, data):
+        self.comments.setdefault(n, [])
         if sub is None:
             if method == "PATCH":
                 self.issues[n].update(data)
             return reply(200, self.issues[n])
         if sub == "comments" and method == "POST":
-            self.comments[n].append({"body": data["body"], "user": {"login": "station"}})
+            self.comments[n].append({"body": data["body"],
+                                     "user": {"login": "example-login"}})
             return reply(201, self.comments[n][-1])
         if sub == "comments":
             return reply(200, self.comments[n])
@@ -226,13 +242,13 @@ class SettleClaimedTest(Base):
         self.assertEqual(self.fake.writes, [])
         self.assertTrue(all(i["state"] == "open" for i in self.fake.issues.values()))
 
-    def test_a_neutral_review_check_or_a_red_check_is_skipped(self):
-        self.fake.add_issue(7)
-        self.fake.add_merged(41, refs=7, elder="neutral")
+    def test_a_red_check_is_skipped(self):
         self.fake.add_issue(8)
         self.fake.add_merged(42, refs=8, others=("failure",), head="c3" * 20)
         self.fake.add_issue(9)
         self.fake.add_merged(43, refs=9, others=("success", "cancelled"), head="d4" * 20)
+        self.fake.add_issue(10)
+        self.fake.add_merged(44, refs=10, elder="neutral", others=("failure",), head="e5" * 20)
         self.settle()
         self.assertEqual(self.fake.writes, [])
 
@@ -335,6 +351,127 @@ class SettleClaimedTest(Base):
                                lambda s, *a: calls.append(a) or reply(500)):
             self.settle()
         self.assertEqual(calls, [])
+
+
+class RereviewTest(Base):
+    """A pull request that merged with the review check neutral gets one
+    re-review request, and its issue settles on the result (loom#1221)."""
+
+    def merged_neutral(self, issue=7, pr=41, head=HEAD_SHA, **extra):
+        self.fake.add_issue(issue, **extra)
+        self.fake.add_merged(pr, refs=issue, elder="neutral", head=head)
+
+    def saved(self, st):
+        with open(os.path.join(st.state, claimed.STATE_FILE)) as handle:
+            return json.load(handle)
+
+    def asks(self, pr=41):
+        return [c for c in self.fake.comments.get(pr, [])
+                if c["body"].startswith(claimed.REREVIEW_MARKER)]
+
+    def test_a_neutral_review_gets_one_request_recorded_so_it_is_not_asked_twice(self):
+        self.merged_neutral()
+        st = self.settle(now=5000.0)
+        self.assertEqual(len(self.asks()), 1)
+        self.assertEqual(self.asks()[0]["body"], claimed.REREVIEW_MARKER + "\n/grug improve")
+        self.assertEqual(self.fake.issues[7]["state"], "open")
+        self.assertEqual(self.fake.comments[7], [])
+        saved = self.saved(st)
+        self.assertIn("%s#41" % REPO, saved["rereview"])
+        self.settle(now=5000.0 + claimed.EVERY + 1)
+        self.settle(now=5000.0 + 5 * claimed.EVERY)
+        self.assertEqual(len(self.asks()), 1)
+
+    def test_two_passes_a_minute_apart_ask_once(self):
+        self.merged_neutral()
+        self.settle(now=5000.0)
+        writes = list(self.fake.writes)
+        self.settle(now=5060.0)
+        self.assertEqual(self.fake.writes, writes)
+        self.assertEqual(len(writes), 1)
+
+    def test_a_marker_on_the_pull_request_stops_a_second_ask_without_state(self):
+        self.merged_neutral()
+        st = self.settle(now=5000.0)
+        os.remove(os.path.join(st.state, claimed.STATE_FILE))
+        self.settle(now=9000.0)
+        self.assertEqual(len(self.asks()), 1)
+
+    def test_a_marker_from_an_untrusted_author_does_not_suppress_the_request(self):
+        self.merged_neutral()
+        self.fake.comments[41] = [{"body": claimed.REREVIEW_MARKER + "\n/grug improve",
+                                   "user": {"login": "a-stranger"}}]
+        self.settle(now=5000.0)
+        ours = [c for c in self.asks() if c["user"]["login"] == "example-login"]
+        self.assertEqual(len(ours), 1)
+
+    def test_a_successful_re_review_lets_the_issue_settle(self):
+        self.merged_neutral()
+        self.settle(now=5000.0)
+        self.fake.set_review(HEAD_SHA, "success", "2030-01-03T00:00:00Z")
+        self.settle(now=5000.0 + claimed.EVERY + 1)
+        self.assertEqual(self.fake.issues[7]["state"], "closed")
+        self.assertEqual(len(self.asks()), 1)
+        self.assertEqual(self.fake.created, [])
+
+    def test_a_failed_re_review_files_its_findings_once_and_leaves_the_issue(self):
+        self.merged_neutral()
+        self.settle(now=5000.0)
+        self.fake.set_review(HEAD_SHA, "failure", "2030-01-03T00:00:00Z",
+                             "high: bus/parser.py reads past the end\nlow: a name is unclear")
+        self.settle(now=5000.0 + claimed.EVERY + 1)
+        self.assertEqual(len(self.fake.created), 1)
+        made = self.fake.created[0]
+        self.assertEqual(made["labels"], ["loom:triage"])
+        self.assertIn("#41", made["title"])
+        self.assertIn("reads past the end", made["body"])
+        self.assertIn("Refs #7", made["body"])
+        self.assertEqual(self.fake.issues[7]["state"], "open")
+        self.assertIn("#900", self.fake.comments[7][0]["body"])
+        self.settle(now=5000.0 + 3 * claimed.EVERY)
+        self.assertEqual(len(self.fake.created), 1)
+        self.assertEqual(len(self.fake.comments[7]), 1)
+
+    def test_a_second_neutral_result_asks_nothing_more_and_files_nothing(self):
+        self.merged_neutral()
+        self.settle(now=5000.0)
+        self.fake.set_review(HEAD_SHA, "neutral", "2030-01-03T00:00:00Z")
+        self.settle(now=5000.0 + claimed.EVERY + 1)
+        self.assertEqual(len(self.asks()), 1)
+        self.assertEqual(self.fake.created, [])
+        self.assertEqual(self.fake.issues[7]["state"], "open")
+
+    def test_a_failure_nobody_asked_about_is_left_alone(self):
+        self.fake.add_issue(7)
+        self.fake.add_merged(41, refs=7, elder="failure")
+        self.settle()
+        self.assertEqual(self.fake.writes, [])
+
+    def test_a_red_check_or_open_pull_request_earns_no_request(self):
+        self.merged_neutral(8, 42, head="c3" * 20)
+        self.fake.check_runs["c3" * 20][1]["conclusion"] = "failure"
+        self.merged_neutral(9, 43, head="d4" * 20)
+        self.fake.open_pulls.append({"number": 52, "state": "open",
+                                     "body": "Refs #9\n", "head": {"ref": "y", "sha": "f" * 40}})
+        self.settle()
+        self.assertEqual(self.fake.writes, [])
+
+    def test_a_dry_run_writes_and_records_nothing(self):
+        self.merged_neutral()
+        self.settings.settle_claimed = "dry"
+        st = self.settle(now=5000.0)
+        self.assertEqual(self.fake.writes, [])
+        self.assertTrue(any("would ask" in line for line in self.said))
+        saved = self.saved(st)
+        self.assertNotIn("%s#41" % REPO, saved.get("rereview", {}))
+
+    def test_at_most_the_cap_of_requests_is_made_a_run(self):
+        for n in range(4):
+            self.merged_neutral(7 + n, 41 + n, head="%040x" % (n + 1))
+        self.settle(now=5000.0)
+        self.assertEqual(sum(len(self.asks(41 + n)) for n in range(4)), claimed.REREVIEW_PER_RUN)
+        self.settle(now=5000.0 + claimed.EVERY + 1)
+        self.assertEqual(sum(len(self.asks(41 + n)) for n in range(4)), 4)
 
 
 class LiveBoxTest(unittest.TestCase):

@@ -1,4 +1,4 @@
-"""Find the files a lane agent's commits add outside its ticket's brief.
+"""Find out-of-brief additions and scratch files in a lane agent's commits.
 
 A lane run must not push files that have nothing to do with its ticket (a
 hook config, a scratch file, a test script left in the workspace). A file
@@ -25,11 +25,17 @@ paths. As a script it prints one stray path per line, made printable::
 
     python3 -m bus.scope_check <tree> <base> <head> <brief> [<rev>...]
 
+With ``--scratch``, it prints only stray files safe to drop: unreferenced
+top-level test/debug files, object/build_test outputs, and .loom metadata
+other than the validation contract. New .github files are never dropped.
+
 It exits 2 on a usage error or when git cannot read a revision, so the
 runner never mistakes a failed check for a clean one.
 """
 from __future__ import annotations
 
+import fnmatch
+import os
 import re
 import subprocess
 import sys
@@ -49,10 +55,10 @@ class GitError(RuntimeError):
 
 def _git(tree: str, *args: str) -> str:
     proc = subprocess.run(["git", "-C", tree, "-c", "core.quotePath=false", *args],
-                          capture_output=True, text=True, check=False)
+                          capture_output=True, check=False)
     if proc.returncode != 0:
-        raise GitError("git %s: %s" % (" ".join(args), proc.stderr.strip()))
-    return proc.stdout
+        raise GitError("git %s: %s" % (" ".join(args), proc.stderr.decode(errors="replace").strip()))
+    return proc.stdout.decode(errors="surrogateescape")
 
 
 def _names(out: str) -> List[str]:
@@ -127,21 +133,58 @@ def stray_files(tree: str, base: str, head: str, brief_text: str,
     return stray
 
 
+def referenced_by_tracked_file(tree: str, head: str, path: str) -> bool:
+    """Whether a reference or ambiguous name prevents dropping this file."""
+    if not path.isprintable():
+        return True  # Control characters make pattern input and runner output ambiguous.
+    name = path.rsplit("/", 1)[-1]
+    patterns = os.fsencode(path) + b"\n" + os.fsencode(name) + b"\n"
+    proc = subprocess.run(["git", "-C", tree, "grep", "-I", "-l", "-z", "-F",
+                           "-f", "-", head, "--", "."],
+                          input=patterns, capture_output=True, check=False)
+    if proc.returncode not in (0, 1):
+        raise GitError("git grep failed: %s" % proc.stderr.decode(errors="replace").strip())
+    return any(found != (head + ":" + path).encode() for found in proc.stdout.split(b"\0") if found)
+
+
+def scratch_files(tree: str, base: str, head: str, brief_text: str,
+                  also: Sequence[str] = ()) -> List[str]:
+    """New out-of-path agent files safe to remove before the scope check."""
+    scratch = []
+    for path in stray_files(tree, base, head, brief_text, also):
+        if path.startswith(".github/"):
+            continue
+        if path.startswith(".loom/") and path != ".loom/validation.conf":
+            scratch.append(path)
+        elif path.startswith("build_test/") or path.endswith(".o"):
+            scratch.append(path)
+        elif "/" not in path and (fnmatch.fnmatchcase(path, "test_*") or
+                                  fnmatch.fnmatchcase(path, "*_debug*")):
+            if not referenced_by_tracked_file(tree, head, path):
+                scratch.append(path)
+    return scratch
+
+
 def printable(path: str) -> str:
     """The path with every character outside printable ASCII as '?'."""
     return "".join(c if " " <= c <= "~" else "?" for c in path)
 
 
 def main(argv: List[str]) -> int:
-    if len(argv) < 5:
-        print("usage: python3 -m bus.scope_check <tree> <base> <head> <brief> [<rev>...]",
+    args = argv[1:]
+    scratch = bool(args and args[0] == "--scratch")
+    if scratch:
+        args = args[1:]
+    if len(args) < 4:
+        print("usage: python3 -m bus.scope_check [--scratch] <tree> <base> <head> <brief> [<rev>...]",
               file=sys.stderr)
         return 2
-    tree, base, head, brief = argv[1:5]
+    tree, base, head, brief = args[:4]
     try:
         with open(brief, encoding="utf-8", errors="replace") as fh:
             text = fh.read()
-        paths: Iterable[str] = stray_files(tree, base, head, text, argv[5:])
+        find = scratch_files if scratch else stray_files
+        paths: Iterable[str] = find(tree, base, head, text, args[4:])
     except (OSError, GitError) as exc:
         print("scope_check: %s" % exc, file=sys.stderr)
         return 2

@@ -1704,8 +1704,9 @@ def _check_ticket_headers(full_body: str, written: Dict[str, Optional[str]]) -> 
 
 def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional[str]) -> None:
     """A brief the station must place needs a difficulty tier. Without one the
-    ticket gets no lane and waits for a brain to notice (2026-10-16: five
-    factory tickets briefed without --difficulty sat queued up to 17 hours).
+    ticket waited for a brain to notice (2026-10-16: five factory tickets
+    briefed without --difficulty sat queued up to 17 hours); the factory now
+    places it as factory.DEFAULT_DIFFICULTY, which may be the wrong tier.
     A brief with --lane is claimed by that lane, so it needs none."""
     if lane or difficulty:
         return
@@ -2401,9 +2402,10 @@ def prioritize(gh: GitHub, repo: str, number: int, priority: Optional[str],
                env: Optional[Dict[str, str]] = None,
                difficulty: Optional[str] = None) -> None:
     """Rank an open ticket, or set its Difficulty, requiring its author to be
-    trusted. A queued ticket with no Difficulty line gets no lane, and before
-    this a brain could only fix one by hand-editing the body (2026-10-16: five
-    factory tickets sat queued up to 17 hours)."""
+    trusted. A queued ticket with no Difficulty line runs in the default tier
+    (factory.DEFAULT_DIFFICULTY); before this a brain could only set its tier
+    by hand-editing the body (2026-10-16: five factory tickets sat queued up
+    to 17 hours)."""
     if priority is None and difficulty is None:
         raise ValueError("give a priority, a difficulty, or both")
     if priority is not None and priority not in tickets.PRIORITIES:
@@ -3246,11 +3248,36 @@ def _job_log_tail(gh: GitHub, repo: str, job_id: int) -> Optional[str]:
     return None if lines is None else log_excerpt(lines)
 
 
+def newest_check_runs(runs: Sequence[Any]) -> List[Dict[str, Any]]:
+    """The newest run of each check name by started_at (id breaks a tie): a
+    re-run replaces the run before it. The check-runs default filter can
+    still return an older failure after a later run of the same check passed,
+    so callers ask for filter=all and reduce here."""
+    newest: Dict[str, Dict[str, Any]] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        name = str(run.get("name") or "")
+        held = newest.get(name)
+        if held is None or _run_order(run) >= _run_order(held):
+            newest[name] = run
+    return list(newest.values())
+
+
+def _run_order(run: Dict[str, Any]) -> Tuple[str, int]:
+    try:
+        ident = int(run.get("id") or 0)
+    except (TypeError, ValueError):
+        ident = 0
+    return str(run.get("started_at") or ""), ident
+
+
 def _failing_checks(gh: GitHub, repo: str, sha: str) -> List[Tuple[str, str]]:
     """(name, last log lines or summary) for every failing check and status."""
     found: List[Tuple[str, str]] = []
-    runs = (gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data
-            or {}).get("check_runs") or []
+    runs = newest_check_runs((gh.rest(
+        "GET", "/repos/%s/commits/%s/check-runs?filter=all&per_page=100" % (repo, sha)).data
+        or {}).get("check_runs") or [])
     for run in runs:
         if run.get("conclusion") not in FAILED_CONCLUSIONS:
             continue

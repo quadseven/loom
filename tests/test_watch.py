@@ -43,6 +43,10 @@ class FakeGH:
             ident = int(path.rsplit("/", 1)[1])
             self.edits.append((ident, (body or {})["body"]))
             return Response(200, {"id": ident})
+        if method == "PATCH" and path.startswith("/repos/%s/issues/" % LANES_REPO):
+            number = int(path.rsplit("/", 1)[1])
+            self.issues[number].update(body or {})
+            return Response(200, self.issues[number])
         if method == "GET":
             number = int(path.rsplit("/", 1)[1])
             return Response(200, self.issues.get(number))
@@ -258,10 +262,14 @@ class FilingTest(WatchBase):
         self.assertEqual(len(self.gh.issues), 1)
         self.gh.issues[1].update(title="Scans of a private repo answer 403",
                                  labels=["loom:briefed"])
-        # The station passes every few minutes; the quiet day prunes the
-        # signature's record.
-        self.run_at(T0 + watch.DAY + 60)
-        self.assertEqual(self.saved()["sigs"], {})
+        # The quiet day passes with no write budget, so the issue is not
+        # closed; the signature's record is lost with the state (older state
+        # pruned it) and only the issue map remembers where it was filed.
+        self.run_at(T0 + watch.DAY + 60, write=False)
+        state = self.saved()
+        state["sigs"] = {}
+        with open(self.state, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
         self.append(LINE_403, LINE_403, LINE_403)
         self.run_at(T0 + 2 * watch.DAY)
         self.assertEqual(len(self.gh.issues), 1)
@@ -376,6 +384,47 @@ class FilingTest(WatchBase):
         self.run_at(T0 + 7200)
         self.assertEqual(self.gh.comments, [])
         self.assertEqual(len(self.gh.issues), 1)
+
+    def quiet_issue(self, hours):
+        """File an issue for LINE_403, then pass with it last seen hours ago."""
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0 - hours * 3600)
+        self.assertEqual(self.gh.issues[1]["state"], "open")
+        self.run_at(T0)
+
+    def test_an_issue_whose_signature_was_last_seen_25_hours_ago_closes_as_not_planned(self):
+        self.quiet_issue(25)
+        issue = self.gh.issues[1]
+        self.assertEqual(issue["state"], "closed")
+        self.assertEqual(issue["state_reason"], "not_planned")
+        (note,) = self.gh.comments
+        self.assertEqual(note[0], 1)
+        self.assertIn(watch.time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                          watch.time.gmtime(T0 - 25 * 3600)), note[1])
+        self.assertTrue(any(line.startswith("watch: closed quiet") for line in self.said))
+        self.run_at(T0 + 600)
+        self.assertEqual(len(self.gh.comments), 1)
+
+    def test_an_issue_whose_signature_was_last_seen_23_hours_ago_stays_open(self):
+        self.quiet_issue(23)
+        self.assertEqual(self.gh.issues[1]["state"], "open")
+        self.assertEqual(self.gh.comments, [])
+        self.assertFalse(any("closed quiet" in line for line in self.said))
+
+    def test_a_signature_that_returns_after_a_quiet_close_files_a_new_issue(self):
+        self.quiet_issue(25)
+        self.append(LINE_403, LINE_403_B, LINE_403)
+        self.run_at(T0 + 600)
+        self.assertEqual(len(self.gh.issues), 2)
+        self.assertEqual(self.gh.issues[2]["state"], "open")
+
+    def test_a_quiet_close_waits_while_the_pass_may_not_write(self):
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0 - 25 * 3600)
+        self.run_at(T0, write=False)
+        self.assertEqual(self.gh.issues[1]["state"], "open")
+        self.run_at(T0 + 600)
+        self.assertEqual(self.gh.issues[1]["state"], "closed")
 
     def test_an_open_issue_with_the_title_is_counted_not_filed_twice(self):
         title = "station: " + watch.signature(LINE_403)

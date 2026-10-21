@@ -675,6 +675,62 @@ class ReconcilePullRequestTest(Base):
         runner.reconcile_pull_requests()
         self.assertEqual(puts, len([call for call in self.fake.calls if call[0] == "PUT"]))
 
+    CRITERIA = "## Acceptance criteria\n\n- [ ] First works; test.\n- [ ] Second works.\n- [ ] Third works.\n"
+
+    def merged_with(self, pull_criteria, number=99, merged_at="2030-01-02T00:00:00Z"):
+        """Ticket 12 at loom:pr; a merged pull request whose body carries these criteria."""
+        if 12 not in self.fake.issues:
+            self.fake.add(12, state="pr", body=BODY + "\n" + self.CRITERIA)
+        body = "Refs %s#12\n\n## Acceptance criteria\n\n%s" % (REPO, pull_criteria)
+        self.fake.pulls.append({"number": number, "state": "closed", "merged_at": merged_at,
+                                "body": body, "head": {"ref": "loom/12-fix-the-thing"}})
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+
+    def requeued(self, at):
+        """The ticket goes back to loom:pr after a requeue at `at`."""
+        self.fake.events[12].append(dict(labeled("loom:queued", "alice-example"), created_at=at))
+        self.fake.issues[12]["labels"] = [{"name": "loom:pr" if n == "loom:queued" else n}
+                                          for n in self.fake.names(12)]
+
+    def test_a_merged_pr_that_ticks_every_criterion_moves_the_ticket_to_merged(self):
+        self.merged_with("- [x] First works; test.\n- [x] Second works.\n- [x] Third works.\n")
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:queued", self.fake.names(12))
+
+    def test_a_merged_pr_that_leaves_criteria_unbuilt_returns_the_ticket_to_the_queue(self):
+        self.merged_with("- [x] First works; test.\n- [ ] Second works.\n- [ ] Third works.\n")
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:pr", self.fake.names(12))
+        # The note is an event in the status comment, never a comment of its own.
+        self.assertEqual([status.is_status(c["body"]) for c in self.fake.comments[12]], [True])
+        note = [c["body"] for c in status.expand(self.fake.comments[12], AUTHORS)][0]
+        self.assertIn("#99", note)
+        self.assertIn("Second works.", note)
+        self.assertIn("Third works.", note)
+        self.assertNotIn("First works", note)
+
+    def test_a_criterion_marked_not_built_with_a_reason_counts_as_answered(self):
+        self.merged_with("- [x] First works; test.\n- [ ] Second works.; not built: needs a key\n"
+                         "- [x] Third works.\n")
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_a_pr_merged_before_the_requeue_does_not_requeue_the_ticket_again(self):
+        self.merged_with("- [x] First works; test.\n")
+        self.requeued("2030-01-03T00:00:00Z")
+        self.fake.calls.clear()
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertEqual(self.fake.paths("PUT"), [])
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertEqual(len(self.fake.comments[12]), 1)
+
+    def test_criteria_built_by_an_earlier_merged_pr_count_for_a_later_one(self):
+        self.merged_with("- [x] First works; test.\n- [x] Second works.\n", number=98)
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.requeued("2030-01-03T00:00:00Z")
+        self.merged_with("- [x] Third works.\n", number=99, merged_at="2030-01-04T00:00:00Z")
+        self.assertIn("loom:merged", self.fake.names(12))
+
     def test_a_failed_issues_fetch_is_logged_and_the_pass_survives(self):
         self.fake.add(12, state="pr")
         next_repo = "second-owner/second-repo"
@@ -2446,6 +2502,32 @@ class HandBackTest(unittest.TestCase):
         self.assertLess(len(body), 65536)
         self.assertIn("loom:fix-head " + "a" * 40, body)
 
+    def test_a_degraded_review_is_not_handed_back(self):
+        # The review bot's own "not a verdict" result: a lane cannot fix it, so
+        # the station leaves it at loom:pr for the factory's re-review.
+        self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK,
+                                    "WARN Elder review low confidence\n"
+                                    "Degraded review (low_confidence_review): not a verdict.")])
+        names = [x["name"] for x in self.gh.issue["labels"]]
+        self.assertFalse(any(str(c.get("body") or "").startswith(tickets.FIX_MARKER)
+                             for c in self.gh.comments))
+        self.assertIn("loom:pr", names)
+        for label in ("loom:briefed", "needs-brain", "loom:ready"):
+            self.assertNotIn(label, names)
+
+    def test_a_degraded_review_beside_a_real_failure_sends_only_the_real_one(self):
+        self.run_hand_back(checks=[
+            ("lint", "last log line"),
+            (factory.DEFAULT_REVIEW_CHECK,
+             "Living Hunt 3c63e18b..30d00ebb - WARN Elder review low confidence (deep append)\n"
+             "Degraded review (low_confidence_review): not a verdict.")])
+        body = self.gh.comments[0]["body"]
+        self.assertIn("lint", body)
+        self.assertIn("last log line", body)
+        self.assertNotIn("Degraded review", body)
+        self.assertNotIn(factory.DEFAULT_REVIEW_CHECK, body)
+        self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+
     def test_unresolved_review_bot_thread_is_sent_back(self):
         thread = {"id": "PRRT_fake", "path": "a.py", "line": 4,
                   "comments": {"nodes": [{"databaseId": 9, "body": "change this",
@@ -3281,10 +3363,23 @@ class FixTest(Base):
                 station.Station(GitHub("token", transport=self.fake), self.settings).run_pass()
         self.assertEqual(reasons, ["pre-roll findings without dispositions: F1"])
 
+    def test_a_finished_fix_that_pushed_no_commit_does_not_report_pushed_fixes(self):
+        self.fake.add(12, state="running")
+        fix = tickets.parse_fix(REPO, FIX_BODY)
+        name = tickets.ticket_name(REPO, 12, 2)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex", 2, fix))
+        self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
+        self.run_pass()
+        texts = [text for c in self.fake.comments[12] for _, text in status.parse(c["body"])]
+        self.assertEqual(texts, ["Lane codex made no code change for a fix to a pull request: "
+                                 "https://example.com/pull/99"])
+
     def test_a_finished_fix_reports_pushed_fixes(self):
         self.fake.add(12, state="running")
         fix = tickets.parse_fix(REPO, FIX_BODY)
         name = tickets.ticket_name(REPO, 12, 2)
+        self.write(os.path.join(self.home, "logs", "codex", name + ".pushed"), "")
         self.write(self.inbox("codex", "done", name + ".md"),
                    tickets.render_brief(REPO, self.fake.issues[12], "codex", 2, fix))
         self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
@@ -3950,6 +4045,28 @@ class SilentLaneTest(Base):
         st = self.station()
         st._record_silent({}, {})
         self.assertEqual(st._invariant_silent(), [])
+
+    def test_a_brief_left_in_a_silent_lanes_inbox_is_returned_when_its_ticket_moves(self):
+        # loom#1206: the factory moved #12 off silent lane codex, but its
+        # brief was still in codex's inbox; a revived runner would pick up
+        # the stale brief and work a ticket it no longer holds.
+        st = self.station()
+        self.write(self.inbox("codex", "example-owner.example-repo-12.md"), "brief")
+        self.write(self.inbox("codex", "example-owner.example-repo-12-r2.md"), "brief")
+        self.write(self.inbox("codex", "example-owner.example-repo-1.md"), "other ticket")
+        self.write(self.inbox("codex", "example-owner.example-repo-13.md"), "other ticket")
+        st._return_silent_briefs({"codex": [(REPO, 12)]})
+        self.assertEqual(self.listing("codex"),
+                         ["example-owner.example-repo-1.md",
+                          "example-owner.example-repo-13.md",
+                          "returned"])
+        self.assertEqual(sorted(os.listdir(self.inbox("codex", "returned"))),
+                         ["example-owner.example-repo-12-r2.md",
+                          "example-owner.example-repo-12.md"])
+
+    def test_returning_silent_briefs_tolerates_a_missing_inbox(self):
+        st = self.station()
+        st._return_silent_briefs({"codex": [(REPO, 12)]})  # no inbox dir: no crash
 
 
 class DeadLaneRunawayTest(Base):
