@@ -496,9 +496,9 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += body + "\n"
     if resume:
         text += ("\n## Earlier attempt\n\nAn earlier attempt timed out after editing, and the "
-                 "runner kept its edits on branch %s. Start from them: run `git fetch origin %s` "
-                 "and `git merge FETCH_HEAD`, check what is there, and finish the ticket instead "
-                 "of starting over.\n" % (resume, resume))
+                 "runner kept its edits on branch %s. The runner merges them into this tree "
+                 "before you start (the sandbox keeps .git read-only, so never fetch): check "
+                 "what is there and finish the ticket instead of starting over.\n" % resume)
     if fix:
         text += ("\n## Fix\n\nThis ticket already has pull request #%d on branch %s. "
                  "Fix what is listed below on that branch: change only what the findings "
