@@ -1676,6 +1676,7 @@ class ShipPathRuleTest(Base):
         self.pr_files = {}
         self.carried = set()
         self.requests = []
+        self.manual = None
 
     def run_for(self, workflow, sha, **kw):
         ShipRuleTest.deploy_run(_Into(self.runs.setdefault(workflow, [])), sha, **kw)
@@ -1695,6 +1696,10 @@ class ShipPathRuleTest(Base):
             if text is None:
                 return reply(200, {"type": "file", "encoding": "none"})
             return reply(200, {"content": base64.b64encode(text.encode()).decode()})
+        if parts.path == "/repos/%s/contents/.loom/manual-paths" % REPO:
+            if self.manual is None:
+                return reply(404, {"message": "Not Found"})
+            return reply(200, {"content": base64.b64encode(self.manual.encode()).decode()})
         files = re.match(r"/repos/%s/pulls/(\d+)/files$" % REPO, parts.path)
         if files:
             return reply(200, [f if isinstance(f, dict) else {"filename": f}
@@ -1798,6 +1803,58 @@ class ShipPathRuleTest(Base):
         self.pr_files[99] = [{"filename": "attic/main.py", "previous_filename": "stacks/a/main.py"}]
         self.ship()
         self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_a_helm_values_change_with_no_deploy_workflow_is_not_shipped_on_merge(self):
+        # loom#1349: a values file for a chart installed by hand deploys
+        # nothing on merge, and no workflow covers it.
+        self.merged(12, 99)
+        self.pr_files[99] = ["charts/runners/values.yaml"]
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+
+    def test_the_manual_step_is_named_once_on_the_held_ticket(self):
+        self.merged(12, 99)
+        self.pr_files[99] = ["pools/values-prod.yml"]
+        self.ship()
+        self.ship()
+        notes = [c["body"] for c in self.fake.comments.get(12, [])
+                 if "applied by hand" in c["body"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("pools/values-prod.yml", notes[0])
+        self.assertIn("pull request #99", notes[0])
+
+    def test_a_values_file_a_deploy_workflow_covers_still_ships_with_that_deploy(self):
+        sha = self.merged(12, 99)
+        self.pr_files[99] = ["stacks/b/values.yaml"]
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.run_for("stack-b.yml", sha)
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+
+    def test_a_manual_change_beside_a_deployed_one_waits_for_the_manual_step(self):
+        sha = self.merged(12, 99)
+        self.pr_files[99] = ["stacks/a/main.py", "charts/runners/values.yaml"]
+        self.run_for("stack-a.yml", sha)
+        self.ship()
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+
+    def test_a_path_the_contract_lists_as_manual_is_not_shipped_on_merge(self):
+        self.manual = "# applied with ansible\nplaybooks/**\n!playbooks/docs/**\n"
+        self.merged(12, 99)
+        self.merged(13, 98)
+        self.pr_files[99] = ["playbooks/site.yml"]
+        self.pr_files[98] = ["playbooks/docs/notes.md"]
+        self.ship()
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+        self.assertIn("loom:shipped", self.fake.names(13))
+
+    def test_a_file_merely_named_like_values_in_another_extension_ships_on_merge(self):
+        self.merged(12, 99)
+        self.pr_files[99] = ["docs/values.md", "src/revalues.yaml"]
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
 
     def test_an_unlisted_repo_is_left_alone(self):
         self.settings.ship_path_workflows = []

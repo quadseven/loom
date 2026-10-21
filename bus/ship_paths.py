@@ -11,6 +11,9 @@ import re
 from typing import Dict, List, Optional
 
 WORKFLOWS_DIR = ".github/workflows"
+MANUAL_PATHS_FILE = ".loom/manual-paths"
+# A Helm values file: a chart installed by hand deploys nothing when it merges.
+HELM_VALUES = re.compile(r"^values(?:[-_.][\w.-]*)?\.ya?ml$")
 _KEY = re.compile(r"""^(\s*)(?:"([^"]+)"|'([^']+)'|([\w-]+))\s*:\s*(.*)$""")
 
 
@@ -141,3 +144,21 @@ def scoped_workflows(files: Dict[str, str]) -> Dict[str, List[str]]:
         if patterns:
             found[name] = patterns
     return found
+
+
+def listed_manual(text: str) -> List[str]:
+    """The path patterns of a repo's .loom/manual-paths: one per line, blank
+    lines and # comments ignored. Paths the repo applies by hand."""
+    return [line.strip() for line in text.replace("\r\n", "\n").split("\n")
+            if line.strip() and not line.strip().startswith("#")]
+
+
+def manual_files(files: List[str], filters: Dict[str, List[str]],
+                 listed: List[str]) -> List[str]:
+    """The changed files that merging does not deploy: those the repo's
+    manual-paths list matches, and Helm values files no deploy workflow's
+    paths filter covers (the chart is installed by hand)."""
+    return sorted(f for f in files
+                  if (listed and matches(listed, f))
+                  or (HELM_VALUES.match(f.rsplit("/", 1)[-1])
+                      and not any(matches(pats, f) for pats in filters.values())))
