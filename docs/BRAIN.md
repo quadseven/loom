@@ -964,11 +964,13 @@ lines indented two spaces). That covers a lane given to a queued ticket, a
 claim, a stall, limit or heartbeat move, a rung climb, an equivalent-model
 move, an automatic retry, a lane failure or factory hold the factory acts on
 itself, a lane stop (a limit, an expired key, a moved branch), a fix round's
-push to its pull request, a ready mark (`Ready: checks and review passed on
-head <sha>`; loom#1244), and a build run's no-change answer with where it left
-the ticket (Claim and outcome). A new comment emails the operator; an edit does
-not (loom#866: zippie#264 carried 77 bot comments). Outcomes (a pull request
-opened, a failure, merged, shipped, verified, an ask, a runaway hold) and
+push to its pull request, a lane's first pull request (`Lane <lane> opened a
+pull request: <url>`; the pull request's `Refs #N` already cross-references the
+ticket and `loom:pr` is set, loom#1390), a ready mark (`Ready: checks and
+review passed on head <sha>`; loom#1244), and a build run's no-change answer
+with where it left the ticket (Claim and outcome). A new comment emails the
+operator; an edit does not (loom#866: zippie#264 carried 77 bot comments).
+Outcomes (a failure, merged, shipped, verified, an ask, a runaway hold) and
 `loom:fix` briefs stay new comments. The GitHub client
 (bus/github.py) expands a status comment in any issue-comment list into one
 comment per event, timed by its line, so every reader sees each event as the
@@ -1025,6 +1027,54 @@ that fails posts nothing, so a bad API answer cannot start a second comment.
   expired, edit one `<!-- loom:incident-repeat v1 -->` or
   `<!-- loom:key-repeat v1 -->` comment on the open issue: a running count, the
   first and last time, the tickets (or lanes) seen, and the latest detail.
+
+## Where a new comment is posted
+
+Every new comment on an issue or pull request goes through `notify.post` in
+`bus/notify.py` (loom#1390), which takes a `kind` from a closed set and refuses
+any other before it calls GitHub. Loom posted 9,738 new comments in the 7 days
+to 2026-10-21, and each one emails the operator, so a new kind of comment is a
+decision, not an accident. A routine event is not a kind: it is an event in the
+ticket's status comment (`status.add`; the station's `_routine`, the factory's
+`_status_note`).
+
+To post a new comment: call `notify.post(gh, repo, number, body, notify.KIND)`.
+To add a kind: first ask whether it is a routine event (then it is a status
+event, not a kind); if it is an outcome a person reads or a record Loom reads
+back, add the constant and its one-line meaning to `KINDS` in `bus/notify.py`
+and its row below. `tests/test_notify_gateway.py` fails when a kind has no row
+here, and when a module in `bus/`, `dashboard/`, `dispatch/` or `lanes/` posts
+to an issue's comments directly (a `POST` to `.../comments`, `gh issue comment`
+or `gh pr comment`) outside `bus/notify.py` and the test's allowlist. The
+allowlist lists the lane shell's own comments and may only shrink. A reply on a
+pull request's review thread is not a new issue comment and is not scanned.
+
+| Kind | What it is |
+| --- | --- |
+| `failure` | A red merge, a revert, or a lane's hand-back that a person may need to read. |
+| `ask` | The exact thing only a person can do (`loom:human`). |
+| `runaway` | A hold or release of a ticket that ran past its attempts. |
+| `proof-refused` | The station stops handing a ticket out to verify after refused proofs. |
+| `fix-brief` | A `loom:fix` brief that sends findings back to a lane (loom#866 and loom#821 own moving it). |
+| `merged` | A pull request merged, or a ticket moved to `loom:merged`. |
+| `shipped` | A ticket moved to `loom:shipped` (loom#866 and loom#821 own moving it). |
+| `verified` | A ticket moved to `loom:verified`. |
+| `proof` | The proof record of a verified or shipped move. |
+| `audit` | The result of a proof audit. |
+| `held` | A ticket held apart from open work, with what it waits for. |
+| `escalate` | A ticket moved up the model ladder by the brain (loom#866 and loom#821 own moving it). |
+| `closed` | Why an issue was closed. |
+| `reopened` | Why an issue was opened again. |
+| `source` | A note on the source issue of a rewritten ticket. |
+| `repair` | The factory edited text instead of sending a pull request back. |
+| `review-request` | A request to the review bot to review again. |
+| `report` | A goal's report to its author (loom#866 and loom#821 own moving it). |
+| `digest` | A digest page. |
+| `note` | A note the factory or brain writes with a change it makes. |
+| `journal` | A journal or report an agent writes to its goal. |
+| `evidence` | Evidence a scan adds to the issue it files. |
+| `status` | The first status comment of a ticket (later events edit it). |
+| `record` | A marker comment Loom reads back (a claim, a heartbeat, a handoff packet). |
 
 ## Polling budget
 

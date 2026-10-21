@@ -5407,8 +5407,9 @@ class OutcomeTest(Base):
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
         self.assertEqual(len(self.fake.comments[12]), 1)
         self.assertIn("https://example.com/pull/99", self.fake.comments[12][0]["body"])
-        # A pull request opened is an outcome: its own comment, not a status event.
-        self.assertFalse(status.is_status(self.fake.comments[12][0]["body"]))
+        # A first pull request is routine: its "Refs #N" already cross-references
+        # the ticket, so it is a status event, not its own comment (loom#1390).
+        self.assertTrue(status.is_status(self.fake.comments[12][0]["body"]))
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
         # Reconciliation reads the open pull requests (shared with PR
         # reviews) and one page of recently closed ones, never all of them.

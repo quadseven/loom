@@ -54,7 +54,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import urlsplit
 
-from . import brain, naming, text, tickets
+from . import brain, naming, notify, text, tickets
 from .github import GitHub, GitHubError, _OPENER
 
 EVERY = 900
@@ -573,8 +573,7 @@ class Intake:
                     raise
                 note_id = None
         if note_id is None:
-            made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                                {"body": body}).data
+            made = notify.post(self.gh, repo, number, body, notify.EVIDENCE).data
             note_id = made.get("id") if isinstance(made, dict) else None
         self.absent_noted["%s#%d" % (repo, number)] = {"noted": self.now, "id": note_id,
                                                        "count": count}
@@ -611,7 +610,7 @@ class Intake:
         if absent == 0.0 or self.now - max(absent, shipped) < PROVE_AFTER:
             return
         self._comment(source.repo, issue, proof_comment(
-            source.goal, _stamp(absent), _stamp(shipped), checked))
+            source.goal, _stamp(absent), _stamp(shipped), checked), notify.PROOF)
         for rec in recs:
             rec["proved"] = self.now
         self.say("health %s#%d: finding absent %d hours since the later of absence and ship; "
@@ -694,7 +693,8 @@ class Intake:
             if count > int(entry.get("posted") or 0) \
                     and self.now - float(entry.get("noted") or 0) >= RESEEN_EVERY:
                 self._comment(repo, issues[int(number)],
-                              reseen_comment(count, str(entry.get("last") or self.stamp)))
+                              reseen_comment(count, str(entry.get("last") or self.stamp)),
+                              notify.EVIDENCE)
                 entry.update(posted=count, noted=self.now)
 
     def _finding(self, source: Source, f: Finding, rec: Dict[str, Any],
@@ -717,7 +717,7 @@ class Intake:
         posted = [f.affected, f.evidence]
         if rec.get("posted") != posted and self.now - float(rec.get("commented") or 0) \
                 >= EVIDENCE_EVERY:
-            self._comment(source.repo, issue, evidence_comment(f, checked))
+            self._comment(source.repo, issue, evidence_comment(f, checked), notify.EVIDENCE)
             rec.update(posted=posted, commented=self.now)
         self._regression(source, f, rec, issue)
         return False
@@ -831,9 +831,8 @@ class Intake:
         issue["body"] = body
         self.say("health %s#%s: priority now %s" % (repo, issue["number"], band))
 
-    def _comment(self, repo: str, issue: Dict[str, Any], body: str) -> None:
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(issue["number"])),
-                     {"body": body})
+    def _comment(self, repo: str, issue: Dict[str, Any], body: str, kind: str) -> None:
+        notify.post(self.gh, repo, int(issue["number"]), body, kind)
 
 
 def _same_cause(by_cause: Dict[str, Dict[str, Any]], named: str) -> Optional[Dict[str, Any]]:

@@ -11,7 +11,7 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import change_class, hunt_plan, pr_repair, tickets
+from . import change_class, hunt_plan, notify, pr_repair, tickets
 from .github import GitHub, GitHubError, auth_from_env
 from .labels import REMOTE_LANES
 
@@ -60,8 +60,7 @@ def _hand_back(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
     labels = [x for x in _names(issue) if x not in ("loom:running", "lane:" + lane)]
     labels.append("loom:queued")
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-            {"body": "[transient] %s" % reason})
+    notify.post(gh, repo, number, "[transient] %s" % reason, notify.FAILURE)
 
 
 def _pull_for(gh: GitHub, repo: str, branch: str) -> Optional[Dict[str, Any]]:
@@ -193,8 +192,7 @@ def _take(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
     number = int(issue["number"])
     labels = [x for x in _names(issue) if x != "loom:queued"] + ["loom:running"]
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-            {"body": _claim_body(lane, number, now)})
+    notify.post(gh, repo, number, _claim_body(lane, number, now), notify.RECORD)
     info = gh.rest("GET", "/repos/%s" % repo).data
     default = str((info.get("default_branch") if isinstance(info, dict) else "") or "main")
     return {"repo": repo, "number": number, "base": default,
@@ -258,8 +256,7 @@ def heartbeat(gh: GitHub, repo: str, number: int, lane: str = "muse",
         gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(comments[index]["id"])),
                 {"body": _claim_body(lane, number, now, first)})
         return
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-            {"body": _claim_body(lane, number, now)})
+    notify.post(gh, repo, number, _claim_body(lane, number, now), notify.RECORD)
 
 
 def lane_heartbeat(gh: GitHub, repo: str, lane: str = "muse",
@@ -285,7 +282,7 @@ def lane_heartbeat(gh: GitHub, repo: str, lane: str = "muse",
             gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(comment["id"])),
                     {"body": body})
             return
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, issue["number"]), {"body": body})
+    notify.post(gh, repo, issue["number"], body, notify.RECORD)
 
 
 def _git(*args: str) -> str:

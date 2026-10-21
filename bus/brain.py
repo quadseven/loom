@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, RateLimited, _next_link, auth_from_env, rest_login, unreadable
-from . import audit, change_class, handoff, hunt_plan, journal, lock, pr_repair, proof, stale_claims, text, tickets
+from . import audit, change_class, handoff, hunt_plan, journal, lock, notify, pr_repair, proof, stale_claims, text, tickets
 from . import naming
 from .status import is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
@@ -1328,7 +1328,7 @@ def close_epic(gh: GitHub, repo: str, number: int, note: str) -> None:
     if still:
         raise ValueError("epic #%d still holds open tickets: %s" % (
             number, ", ".join("#%s" % t.get("number") for t in still[:5])))
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
+    notify.post(gh, repo, number, note, notify.CLOSED)
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
             {"state": "closed", "state_reason": "completed"})
 
@@ -1737,7 +1737,7 @@ def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
         note = ("%s\n#%s was admitted %s: it fixes a measured regression of shipped #%d. "
                 "Ordinary briefs wait until the goal is back under its cap.\n\nEvidence:\n%s"
                 % (REGRESSION_MARKER, made.get("number"), why, regressed, "\n".join(evidence)))
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, goal), {"body": note})
+        notify.post(gh, repo, goal, note, notify.RECORD)
     return str(made.get("html_url", ""))
 
 
@@ -1937,10 +1937,10 @@ def _filed_rewrite(gh: GitHub, repo: str, epic: int, title: str, body: str,
     if refs is not None:
         print("#%d is rewritten as a new ticket #%s: %s" % (refs, issue.get("number"), elsewhere),
               file=sys.stderr)
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, refs),
-                {"body": "%s\nRewritten as ticket #%d, which refs this issue. This issue "
-                         "closes as completed when that ticket is verified." % (
-                             TRIAGE_MARKER, issue["number"])})
+        notify.post(gh, repo, refs,
+                    "%s\nRewritten as ticket #%d, which refs this issue. This issue "
+                    "closes as completed when that ticket is verified." % (
+                        TRIAGE_MARKER, issue["number"]), notify.SOURCE)
         _remove_label(gh, repo, refs, "loom:triage")
         gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, refs),
                 {"labels": ["loom:rewritten"]})
@@ -2196,8 +2196,8 @@ def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
     names = _labels(_open_issue(gh, repo, number))
     if "loom:human" in names:
         raise ValueError("#%d is already loom:human" % number)
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-            {"body": "%s\n%s\nKind: %s" % (HUMAN_MARKER, ask, kind)})
+    notify.post(gh, repo, number, "%s\n%s\nKind: %s" % (HUMAN_MARKER, ask, kind),
+                notify.ASK)
     if "loom:triage" in names:
         _remove_label(gh, repo, number, "loom:triage")
     gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": ["loom:human"]})
@@ -2449,6 +2449,15 @@ def _prioritize_write(gh: GitHub, repo: str, number: int, method: str,
                           exc.status, exc.body) from exc
 
 
+def _prioritize_note(gh: GitHub, repo: str, number: int, note: str) -> None:
+    """The priority note, a new comment; a failure names the operation."""
+    try:
+        notify.post(gh, repo, number, note, notify.NOTE)
+    except GitHubError as exc:
+        raise GitHubError("prioritize note comment failed: %s" % exc,
+                          exc.status, exc.body) from exc
+
+
 def _prioritize_body(issue: Dict[str, Any], priority: Optional[str],
                      env: Optional[Dict[str, str]],
                      difficulty: Optional[str] = None) -> str:
@@ -2481,8 +2490,7 @@ def _write_priority(gh: GitHub, repo: str, number: int, body: str,
     _prioritize_write(gh, repo, number, "PATCH", path, {"body": body},
                       "ticket body update")
     if note is not None:
-        _prioritize_write(gh, repo, number, "POST", path + "/comments",
-                          {"body": note}, "note comment")
+        _prioritize_note(gh, repo, number, note)
 
 
 def prioritize(gh: GitHub, repo: str, number: int, priority: Optional[str],
@@ -2510,9 +2518,7 @@ def prioritize(gh: GitHub, repo: str, number: int, priority: Optional[str],
     if updated != body:
         _write_priority(gh, repo, number, updated, note)
     elif note is not None:
-        path = "/repos/%s/issues/%d/comments" % (repo, number)
-        _prioritize_write(gh, repo, number, "POST", path, {"body": note},
-                          "note comment")
+        _prioritize_note(gh, repo, number, note)
 
 
 def restate_live(gh: GitHub, repo: str, number: int, text: str,
@@ -2680,7 +2686,8 @@ def move(gh: GitHub, repo: str, number: int, state: str,
         _set_model(gh, repo, number, issue, model)
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
     if note is not None:
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
+        notify.post(gh, repo, number, note, {"merged": notify.MERGED, "shipped": notify.SHIPPED,
+                                             "verified": notify.VERIFIED}.get(state, notify.NOTE))
     if state == "verified":
         return settle_source(gh, repo, number, issue.get("body"), "completed", proof_url)
     return None
@@ -2691,8 +2698,7 @@ def _post_proof(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
     """Post the proof comment for a verified move; its link, or "" when
     GitHub gave none."""
     comment = _proof_comment(gh, repo, issue, dict(record, verified_by=verified_by), facts)
-    posted = gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                     {"body": comment}).data
+    posted = notify.post(gh, repo, number, comment, notify.PROOF).data
     return str(posted.get("html_url") or "") if isinstance(posted, dict) else ""
 
 
@@ -2745,8 +2751,7 @@ def merge(gh: GitHub, repo: str, number: int,
     if association:
         move(gh, association[0], association[1], "merged")
     if adopt:
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                {"body": ADOPT_COMMENT})
+        notify.post(gh, repo, number, ADOPT_COMMENT, notify.MERGED)
     return {"merged": True, "pull_request": (repo, number),
             "ticket": association, "head_sha": sha}
 
@@ -3089,7 +3094,7 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
     if reason == "completed":
         proof_url = _check_proven(gh, repo, number, issue, env)
     if note is not None:
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
+        notify.post(gh, repo, number, note, notify.CLOSED)
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
             {"state": "closed", "state_reason": reason})
     # After the close, so a refused close leaves the ticket's labels as they were.
@@ -3198,7 +3203,7 @@ def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
         if said is None or not said.startswith(marker):
             comment = "%s\n%s" % (marker, words)
             _check_written_text(comment)
-            gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, source), {"body": comment})
+            notify.post(gh, repo, source, comment, notify.SOURCE)
         elif outcome != "closed":
             return None
         if outcome == "closed":
@@ -3240,7 +3245,7 @@ def reopen_source(gh: GitHub, repo: str, number: int, body: Any) -> Optional[str
                    "that proof, is open again." % (reopened, number))
         _check_written_text(comment)
         gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, source), {"state": "open"})
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, source), {"body": comment})
+        notify.post(gh, repo, source, comment, notify.REOPENED)
         return "reopened source issue #%d" % source
     except RateLimited:
         raise
@@ -3281,7 +3286,7 @@ def audit_proof(gh: GitHub, repo: str, number: int, result: str, note: str,
     comment = _audit_comment(result, found[1], " ".join(note.split()))
     _check_written_text(comment)
     if result == "pass":
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
+        notify.post(gh, repo, number, comment, notify.AUDIT)
         return "audit of %s#%d passed" % (repo, number)
     if issue.get("state") != "open":
         gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"state": "open"})
@@ -3673,7 +3678,7 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     kept = _moved_labels(_labels(issue), "briefed", lane) if state in ("pr", "failed") else None
     if model is not None:
         _set_model(gh, ticket[0], ticket[1], issue, model)
-    posted = gh.rest("POST", "/repos/%s/issues/%d/comments" % ticket, {"body": body})
+    posted = notify.post(gh, ticket[0], ticket[1], body, notify.FIX_BRIEF)
     comment_id = posted.data.get("id") if isinstance(posted.data, dict) else None
     print("brain: posted loom:fix comment %s on %s#%d"
           % (comment_id if comment_id is not None else "with unknown id", ticket[0], ticket[1]),
@@ -4434,10 +4439,10 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     if not left:
         gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                 {"labels": sorted(set(names) | {"needs-brain", RUNAWAY})})
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
-                "Runaway: escalation after every rung was tried. Past the model ladder "
-                "(tried %s); %s. The ticket is held for brain review." % (
-                    ", ".join(history.tried), "; ".join(history.reasons))})
+        notify.post(gh, repo, number,
+                    "Runaway: escalation after every rung was tried. Past the model ladder "
+                    "(tried %s); %s. The ticket is held for brain review." % (
+                        ", ".join(history.tried), "; ".join(history.reasons)), notify.RUNAWAY)
         return "needs-brain"
     free = _available_lanes(gh, lanes_repo)
     choice = None
@@ -4461,7 +4466,7 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
         fix(gh, repo, pr, (repo, number), notes or comment.split("\n")[1], lane, model)
     else:
         move(gh, repo, number, "briefed", lane, None, None, model)
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
+    notify.post(gh, repo, number, comment, notify.ESCALATE)
     return "rung %d %s on %s" % (rung + 1, model, lane)
 
 

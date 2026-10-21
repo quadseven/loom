@@ -53,6 +53,7 @@ import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import handoff
+from . import notify
 from . import text as _text
 from . import transcripts
 from .github import GitHubError
@@ -1020,8 +1021,7 @@ class Watcher:
             except GitHubError as err:
                 if err.status != 404:
                     raise
-        made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, rec["issue"]),
-                            {"body": body}).data
+        made = notify.post(self.gh, self.repo, rec["issue"], body, notify.RECORD).data
         if isinstance(made, dict) and isinstance(made.get("id"), int):
             rec["count_comment"] = int(made["id"])
         self.writes += 1
@@ -1051,8 +1051,7 @@ class Watcher:
                 if self._is_open(int(number)):
                     body = self._quiet_body(rec)
                     _text.check(body)
-                    self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
-                                 {"body": body})
+                    notify.post(self.gh, self.repo, number, body, notify.CLOSED)
                     self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
                                  {"state": "closed", "state_reason": "not_planned"})
                     self.writes += 2
