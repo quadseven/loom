@@ -3327,8 +3327,15 @@ def _failing_checks(gh: GitHub, repo: str, sha: str) -> List[Tuple[str, str]]:
             tail = "\n".join(x for x in (out.get("title"), out.get("summary"), out.get("text")) if x)
         found.append((str(run.get("name") or "unnamed check"),
                       tail or "no log was available (conclusion %s)" % run.get("conclusion")))
-    statuses = (gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data
-                or {}).get("statuses") or []
+    try:
+        statuses = (gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data
+                    or {}).get("statuses") or []
+    except GitHubError as err:
+        if err.status not in (403, 404):
+            raise
+        print("brain: commit statuses were not readable for %s; continuing with check runs" % repo,
+              file=sys.stderr)
+        statuses = []
     for item in statuses:
         if item.get("state") in ("failure", "error"):
             found.append((str(item.get("context") or "unnamed status"),
