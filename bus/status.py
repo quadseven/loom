@@ -252,10 +252,8 @@ def _ours(issue: Any, allowed: set) -> bool:
 # -- the section in an issue body (loom#1341) ---------------------------------
 
 def _section(body: Any) -> Optional["re.Match[str]"]:
-    found = None
-    for found in _SECTION_RE.finditer(str(body or "").replace("\r\n", "\n")):
-        pass
-    return found
+    matches = list(_SECTION_RE.finditer(str(body or "").replace("\r\n", "\n")))
+    return matches[-1] if matches else None
 
 
 def body_events(body: Any) -> List[Tuple[str, str]]:
