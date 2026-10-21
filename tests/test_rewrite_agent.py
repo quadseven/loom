@@ -238,6 +238,28 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertEqual(config["model"], MODEL)
         self.assertEqual(config["small_model"], MODEL)
 
+    def test_a_free_gateway_model_runs_on_the_route_with_no_key_and_no_tools(self):
+        # Gemma's free tier answers small requests through the spark-gateway's
+        # free route (2026-10-21): the public rewriter tries it first, keyless,
+        # every tool denied. Private repos never get a free/ entry
+        # (bus/rewrite.command_for).
+        url = "https://gateway.invalid/free-public/gemini/v1"
+        result = self.run_wrapper(args=("-", "free/gemma-4-31b-it"),
+                                  env_overrides={"LOOM_REWRITE_FREE_URL": url})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(self.agent()["config"])
+        self.assertEqual(config["model"], "free/gemma-4-31b-it")
+        self.assertEqual(config["permission"], {"*": "deny"})
+        self.assertEqual(config["provider"]["free"]["options"]["baseURL"], url)
+        self.assertEqual(self.agent()["key"], "none")
+        self.assertNotIn("aws ssm", self.log.read_text() if self.log.exists() else "")
+
+    def test_a_free_model_with_no_route_set_falls_through_to_the_next(self):
+        result = self.run_wrapper("Rewrite this", args=("-", "free/gemma-4-31b-it,codex/test-model"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '{"action":"skip","reason":"fake"}\n')
+        self.assertIn("codex", self.lane_log.read_text())
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_failing_agent_exits_non_zero_and_prints_nothing(self):
         for mode in ("fail", "error", "notext"):
