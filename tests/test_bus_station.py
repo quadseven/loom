@@ -7575,7 +7575,10 @@ class ClaimDropTest(Base):
         self.fake.issues[12]["labels"] += [{"name": self.OURS}, {"name": self.THEIRS}]
         self.run_pass()
         names = self.fake.names(12)
-        self.assertIn("loom:failed", names)
+        # A transient ending with no retry left is queued (loom#1395); any
+        # other ending is loom:failed. Either way the run is over.
+        self.assertTrue({"loom:failed", "loom:queued"} & set(names))
+        self.assertNotIn("loom:running", names)
         self.assertNotIn(self.OURS, names)
         self.assertIn(self.THEIRS, names)
 
