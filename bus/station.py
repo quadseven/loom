@@ -7654,6 +7654,7 @@ class Station:
         if stale:
             _say("found %d ticket(s) stale in needs-brain" % len(stale))
             for since, issue, repo in stale:
+                assert since is not None, "since should not be None for stale ticket"
                 hours = int((self.now - since.timestamp()) // 3600)
                 _say("stale brain: %s#%d %s - needs-brain for %dh" % (repo, issue["number"], issue.get("title", ""), hours))
                 self._escalate_stale_brain(repo, issue, hours)

@@ -794,12 +794,6 @@ def stale_needs_brain(gh: GitHub, repos: Sequence[str], now: Optional[datetime] 
         needs_brain = [i for i in issues if "needs-brain" in _labels(i)]
         for issue in needs_brain:
             _check_deadline()
-            # Optimization: if the issue was updated after the cutoff,
-            # it can't have had needs-brain for longer than the threshold
-            # (adding the label updates the issue's updated_at).
-            updated = _stamp(issue.get("updated_at", ""))
-            if updated and updated > cutoff:
-                continue
             since = _needs_brain_since(gh, repo, issue)
             _check_deadline()
             if since and now - since > limit:
@@ -3893,13 +3887,16 @@ def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
     out = ["", "## Pull requests needing brain attention (oldest first)"]
     for item in ready:
         pr, ticket = item["pr"], item["ticket"]
-        title = str((gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}).get("title") or "")
+        # ticket is guaranteed non-None by _ready_sensitive; assert for defense
+        assert ticket is not None, "ticket should not be None in ready list"
+        ticket_repo, ticket_num = ticket
+        title = str((gh.rest("GET", "/repos/%s/issues/%d" % (ticket_repo, ticket_num)).data or {}).get("title") or "")
         threads = (item["details"].get("reviewThreads") or {}).get("nodes") or []
         open_threads = sum(1 for thread in threads if not thread.get("isResolved"))
         age_hours = _age(pr, now)
         kind = "sensitive" if item.get("is_sensitive") else "needs-brain"
         out.append("- resume %s %s#%s ticket %s#%s %s - %s - %dh old - %d open review threads" % (
-            kind, item["repo"], pr["number"], ticket[0], ticket[1], title,
+            kind, item["repo"], pr["number"], ticket_repo, ticket_num, title,
             pr.get("title", ""), age_hours, open_threads))
     return out if ready else out + ["- none"]
 

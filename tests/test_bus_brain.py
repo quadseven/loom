@@ -4255,3 +4255,36 @@ class StaleNeedsBrainTests(unittest.TestCase):
         # Valid number should work
         result = brain._needs_brain_since(gh, REPO, issue_valid)
         self.assertIsNotNone(result)
+
+    def test_stale_needs_brain_ignores_updated_at_for_staleness(self):
+        """A ticket with needs-brain added long ago but recently edited is still stale.
+        The bug was that updated_at (which changes on any edit) was used to skip
+        checking, causing genuinely stale tickets to be missed (loom#1250)."""
+        now = datetime(2030, 1, 5, 12, 0, tzinfo=timezone.utc)
+        # Issue created 12 hours ago, needs-brain added 10 hours ago,
+        # but updated 1 hour ago (e.g., a comment was added)
+        issue = {
+            "number": 1, "title": "Stale but recently edited",
+            "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}],
+            "created_at": "2030-01-05T00:00:00Z",
+            "updated_at": "2030-01-05T11:00:00Z",  # Updated 1 hour ago
+        }
+        # The needs-brain label was added 10 hours ago
+        fake = Fake(
+            reply(200, [issue]),
+            reply(200, [{
+                "event": "labeled",
+                "created_at": "2030-01-05T02:00:00Z",  # needs-brain added 10 hours ago
+                "label": {"name": "needs-brain"}
+            }]),
+        )
+        gh = GitHub("t", transport=fake)
+        # With 4 hour threshold, this should be found as stale
+        stale = brain.stale_needs_brain(gh, [REPO], now, hours=4)
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0][1]["number"], 1)
+        self.assertEqual(stale[0][2], REPO)
+
+
+if __name__ == "__main__":
+    unittest.main()
