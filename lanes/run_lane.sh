@@ -1472,21 +1472,20 @@ tracked_changes() {
   safe_git status --porcelain --untracked-files=no --ignore-submodules=dirty | head -5 | tr '\n' ' '
 }
 
-# The first submodule whose tracked files the agent changed or whose commit it
-# moved, as "path (file file ...)"; empty when there is none. A push of this
-# repo carries only the submodule's pinned commit, so a check run on those
-# edits passes on code CI never sees: a pull request passed its
+# The first submodule whose tracked files the agent changed, as "path (file
+# file ...)"; empty when there is none. A push of this repo carries only the
+# submodule's commit, never edits on top of it, so a check run on those edits
+# passes on code CI never sees: a pull request passed its
 # lane check and failed CI on the C++ it needed (2026-10-21).
 submodule_edits() {
   local line path files
   while read -r line; do
     path="$(printf '%s' "$line" | awk '{print $2}')"
-    case "$line" in
-      -*) continue ;;  # not checked out: git there would read this repo
-      +*|U*) files="its checked-out commit" ;;
-      *) files="$(safe_git -C "$path" status --porcelain --untracked-files=no 2>> "$LOG" |
-                  cut -c4- | head -3 | sed "s|^|$path/|" | tr '\n' ' ')" ;;
-    esac
+    # Not checked out: git in its empty directory would read this repo. A
+    # moved commit (a pin bump) is pushed and CI checks it out, so it passes.
+    case "$line" in -*) continue ;; esac
+    files="$(safe_git -C "$path" status --porcelain --untracked-files=no 2>> "$LOG" |
+             cut -c4- | head -3 | sed "s|^|$path/|" | tr '\n' ' ')"
     [ -z "$files" ] || { printf '%s (%s)' "$path" "${files% }"; return 0; }
   done < <(safe_git submodule status --recursive 2>> "$LOG")
 }
