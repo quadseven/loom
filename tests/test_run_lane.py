@@ -951,7 +951,7 @@ print('leak guard: clean (shape patterns only)')
         # A new ticket comment emailed the ticket's author for a routine
         # outcome (a watched repo's ticket, 2026-10-21): the station records the
         # reason as a status event and settles the ticket instead.
-        self.drop_brief(text=BRIEF.replace("Lane: codex", "Lane: codex\nIssue: example/repo#42"))
+        self.drop_brief(text=BRIEF.replace("Lane: codex", "Lane: codex\nIssue: example/repo#42"))  # leak-guard-allow: fixture repo
         result = self.run_lane(FAKE_AGENT="no-change",
                                FAKE_SUMMARY="nothing to change: the finding no longer holds")
         self.assertEqual(result.returncode, 0, result.stderr)
