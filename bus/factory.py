@@ -327,6 +327,9 @@ CLAIM_RE = re.compile(r"^Claimed for lane ")
 STALL_MOVE_RE = re.compile(r"^Not a failure \(briefed \d+ hours on lane ")
 # bus/station.py's note when a fix round ended without a commit.
 NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
+# Fix rounds in a row that end with no commit on one failing check before the
+# ticket goes to a person.
+NO_CHANGE_LIMIT = 2
 # bus/station.py's note on a failed run, and the runner's reason when a run
 # committed nothing and its agent wrote no reason why (lanes/run_lane.sh).
 FAILED_RE = re.compile(r"^Lane \S+ failed: ")
@@ -616,6 +619,28 @@ def no_change_at(comments: Sequence[Dict[str, Any]]) -> float:
         if NO_CHANGE_RE.match(body):
             return _ts(c.get("created_at"))
     return 0.0
+
+
+def no_change_rounds(comments: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    """Per check name, the fix rounds in a row that named it and ended with no
+    commit (a loom:fix comment, then a no-change note). A round that changed
+    something, or one that no longer names the check, ends its count."""
+    counts: Dict[str, int] = {}
+    asked: set = set()
+    answered = True
+    for c in comments:
+        body = str(c.get("body") or "")
+        if body.startswith(FIX_MARKER):
+            names = {n.strip() for n in re.findall(r"^### Check: (.*)$", body, re.M)}
+            if not answered:
+                counts = {}
+            counts = {n: v for n, v in counts.items() if n in names}
+            asked, answered = names, False
+        elif NO_CHANGE_RE.match(body) and not answered:
+            answered = True
+            for name in asked:
+                counts[name] = counts.get(name, 0) + 1
+    return counts
 
 
 def fixes_of(comments: Sequence[Dict[str, Any]]) -> int:
@@ -1139,7 +1164,8 @@ class Factory:
                  model_limits: Optional[Dict[str, Dict[str, float]]] = None,
                  silent: Optional[Dict[str, float]] = None,
                  down: Sequence[str] = (),
-                 limit_until: Optional[Dict[str, float]] = None) -> None:
+                 limit_until: Optional[Dict[str, float]] = None,
+                 human: Callable[..., Any] = brain.human) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1150,6 +1176,7 @@ class Factory:
         self.review_check = review_check
         self.review_bot = review_bot
         self.merge, self.fix, self.move = merge, fix, move
+        self.human = human
         self.close = close if close is not None else _default_close
         self.limited = set(limited)
         # Lanes whose fresh heartbeat says unavailable for another reason (an
@@ -1283,16 +1310,16 @@ class Factory:
         return None, ""
 
     def _check_runs(self, repo: str, sha: str) -> List[Dict[str, Any]]:
-        """Every check run on the commit, all pages."""
+        """The newest run of each check on the commit, all pages."""
         runs: List[Dict[str, Any]] = []
         for page in range(1, 11):
-            data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100&page=%d"
+            data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?filter=all&per_page=100&page=%d"
                                 % (repo, sha, page)).data or {}
             batch = [r for r in data.get("check_runs") or [] if isinstance(r, dict)]
             runs += batch
             if len(batch) < 100:
                 break
-        return runs
+        return brain.newest_check_runs(runs)
 
     def _files(self, repo: str, number: int) -> List[str]:
         """Every file path the pull request changes, all pages (GitHub lists
@@ -1490,6 +1517,10 @@ class Factory:
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
                    no_test: bool = False, unticked: Sequence[str] = ()) -> None:
         number = int(issue["number"])
+        if "loom:human" in _labels(issue):
+            return  # a person has it: no more rounds, no more comments
+        if checks_failing and self._past_no_change(repo, issue, comments):
+            return
         age = self.now - _ts(pr.get("created_at"))
         if stuck(comments, open_threads, checks_failing, age, self.now, no_test, unticked):
             footer = self._footer(repo, pr)
@@ -1532,6 +1563,27 @@ class Factory:
             self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes)
         self.actions += 1
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
+
+    def _past_no_change(self, repo: str, issue: Dict[str, Any],
+                        comments: Sequence[Dict[str, Any]]) -> bool:
+        """After NO_CHANGE_LIMIT fix rounds in a row that ended with no commit
+        on one failing check, hand the ticket to a person with one comment
+        naming the check (2026-10-19: 19 rounds, 19 emails, no fix). The
+        loom:human label stops every later round and comment."""
+        stalled = sorted(n for n, k in no_change_rounds(comments).items()
+                         if k >= NO_CHANGE_LIMIT)
+        if not stalled:
+            return False
+        number = int(issue["number"])
+        names = ", ".join("`%s`" % n for n in stalled)
+        self.human(self.gh, repo, number,
+                   "Kind: decision\n%d fix rounds in a row made no change for the failing %s "
+                   "%s, so another round would do the same. Decide whether the check is stale "
+                   "or what the lane should change." % (NO_CHANGE_LIMIT, "check" if len(stalled) == 1
+                                                         else "checks", names))
+        self.actions += 1
+        _say("%s#%d has gone to a person: no change for %s" % (repo, number, names))
+        return True
 
     def _ask_reviewer(self, repo: str, pr: Dict[str, Any]) -> bool:
         """Ask the review bot to judge a lane's answer on a pull request whose

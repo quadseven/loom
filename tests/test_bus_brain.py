@@ -1626,6 +1626,18 @@ class FixTests(unittest.TestCase):
              "body": "Claimed for lane codex (body sha256 0123456789ab)"}],
             ["alice-example"]))
 
+    def test_a_check_that_later_passed_is_not_a_failing_check(self):
+        runs = {"check_runs": [
+            {"id": 41, "name": "leak-scan", "conclusion": "failure", "started_at": "2030-01-01T00:29:00Z",
+             "output": {"title": "old failure"}},
+            {"id": 42, "name": "leak-scan", "conclusion": "success", "started_at": "2030-01-01T01:56:00Z"},
+            {"id": 43, "name": "lint", "conclusion": "failure", "started_at": "2030-01-01T01:00:00Z",
+             "output": {"title": "still red"}}]}
+        fake = Fake(reply(200, runs), reply(200, {"statuses": []}))
+        found = brain._failing_checks(GitHub("t", transport=fake), REPO, "abc123")
+        self.assertEqual([name for name, _ in found], ["lint"])
+        self.assertIn("filter=all", fake.calls[0][1])
+
     def test_fix_refuses_notes_the_brain_must_never_post(self):
         with self.assertRaises(ValueError):
             brain.fix(GitHub("t", transport=Fake()), REPO, 8, (REPO, 9), "This does not fix #9")

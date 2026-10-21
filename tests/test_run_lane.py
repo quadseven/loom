@@ -1144,7 +1144,7 @@ print('leak guard: clean (shape patterns only)')
     def test_a_fix_round_comment_says_what_was_pushed_and_what_happens_next(self):
         # 2026-10-20: "Lane claude pushed fixes for: the findings on the
         # ticket" told the reader nothing about a round that merged main.
-        self.fix_brief()
+        name, _ = self.fix_brief()
         comment = Path(self._tmp.name) / "comment.md"
         self.run_lane(FAKE_GH_EXISTING="7", FAKE_COMMENT=str(comment))
         head = self.remote_head(self.FIX_BRANCH)
@@ -1156,6 +1156,9 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("- `%s` `%s`" % (head[:7], subject), text)
         self.assertIn("CI and review run again on the new head; the factory lands the "
                       "pull request once they pass.", text)
+        # The station reads this marker to say a round pushed; without it the
+        # round is reported as a no-code-change round.
+        self.assertTrue((self.loom / "logs" / "codex" / (name + ".pushed")).exists())
 
     def test_fix_runner_posts_and_resolves_agent_thread_replies_after_push(self):
         self.fix_brief()

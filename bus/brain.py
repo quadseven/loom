@@ -3246,11 +3246,36 @@ def _job_log_tail(gh: GitHub, repo: str, job_id: int) -> Optional[str]:
     return None if lines is None else log_excerpt(lines)
 
 
+def newest_check_runs(runs: Sequence[Any]) -> List[Dict[str, Any]]:
+    """The newest run of each check name by started_at (id breaks a tie): a
+    re-run replaces the run before it. The check-runs default filter can
+    still return an older failure after a later run of the same check passed,
+    so callers ask for filter=all and reduce here."""
+    newest: Dict[str, Dict[str, Any]] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        name = str(run.get("name") or "")
+        held = newest.get(name)
+        if held is None or _run_order(run) >= _run_order(held):
+            newest[name] = run
+    return list(newest.values())
+
+
+def _run_order(run: Dict[str, Any]) -> Tuple[str, int]:
+    try:
+        ident = int(run.get("id") or 0)
+    except (TypeError, ValueError):
+        ident = 0
+    return str(run.get("started_at") or ""), ident
+
+
 def _failing_checks(gh: GitHub, repo: str, sha: str) -> List[Tuple[str, str]]:
     """(name, last log lines or summary) for every failing check and status."""
     found: List[Tuple[str, str]] = []
-    runs = (gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data
-            or {}).get("check_runs") or []
+    runs = newest_check_runs((gh.rest(
+        "GET", "/repos/%s/commits/%s/check-runs?filter=all&per_page=100" % (repo, sha)).data
+        or {}).get("check_runs") or [])
     for run in runs:
         if run.get("conclusion") not in FAILED_CONCLUSIONS:
             continue
