@@ -2059,6 +2059,28 @@ cat > /dev/null
         runs = [c for c in self.calls() if c.startswith("codex ")]
         self.assertIn("--model gpt-6-sol", runs[0])
 
+    def test_an_earlier_timed_out_attempts_edits_are_in_the_tree_before_the_agent(self):
+        # The brief told the agent to git fetch the timed-out branch, which the
+        # sandbox's read-only .git refuses: two codex runs on one ticket started
+        # over and ended with no commit (2026-10-21). The runner merges it.
+        side = "loom/T042-fix-the-thing-timedout-1792595837"
+        work = Path(self._tmp.name) / "side-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", side, cwd=work)
+        (work / "earlier.txt").write_text("from the timed-out run\n")
+        git("add", "earlier.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "WIP", cwd=work)
+        git("push", "-q", "origin", side, cwd=work)
+        self.drop_brief(text=BRIEF + "\n## Earlier attempt\n\nAn earlier attempt timed out after "
+                        "editing, and the runner kept its edits on branch %s.\n" % side)
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            "cat > /dev/null\n",
+            "cat > /dev/null\n[ -f earlier.txt ] && echo agent-saw-earlier >> \"$FAKE_LOG\"\n", 1))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent-saw-earlier", self.calls())
+        self.assertIn("merged the earlier attempt's branch %s" % side, self.lane_log())
+
     def test_a_model_from_another_lanes_family_is_refused(self):
         self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: claude-sonnet-4-5"))
         self.run_lane()

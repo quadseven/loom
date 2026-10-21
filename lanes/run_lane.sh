@@ -1931,6 +1931,27 @@ update_fix_branch() {
   return 0
 }
 
+# An earlier attempt that timed out after editing kept its edits on a side
+# branch, which the brief's Earlier attempt section names. The agent cannot
+# fetch it: the sandbox keeps .git read-only, and two codex runs on one ticket
+# started over and ended with no commit (2026-10-21). So the runner merges it
+# into the tree before the agent starts. A branch that will not fetch or merge
+# cleanly is left out and logged: the agent starts from the base, as before.
+resume_earlier_attempt() {
+  local side
+  [ -z "$FIX_PR" ] || return 0
+  side="$(grep -oE 'kept its edits on branch [A-Za-z0-9._/-]+-timedout-[0-9]+' "$BRIEF" | head -1 | awk '{print $NF}')"
+  [ -n "$side" ] || return 0
+  if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       fetch -q origin "+refs/heads/$side:refs/remotes/origin/$side" >> "$LOG" 2>&1 &&
+     safe_git merge --no-edit "origin/$side" >> "$LOG" 2>&1; then
+    echo "[$(date -u +%FT%TZ)] $TICKET: merged the earlier attempt's branch $side" >> "$LOG"
+    return 0
+  fi
+  safe_git merge --abort >> "$LOG" 2>&1 || true
+  echo "[$(date -u +%FT%TZ)] $TICKET: could not merge the earlier attempt's branch $side; the agent starts from the base" >> "$LOG"
+}
+
 # CONFLICTS (one path a line) as one comma-separated line.
 conflict_list() {
   printf '%s\n' "$CONFLICTS" | sed '/^$/d' | paste -sd ',' - | sed 's/,/, /g'
@@ -2423,6 +2444,7 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
     park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
   fi
+  resume_earlier_attempt
   LOG_START="$(wc -c < "$LOG" | tr -d ' ')"
 
   # The agent runs as a background job of a job-control subshell, which puts

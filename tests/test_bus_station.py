@@ -3773,7 +3773,7 @@ class RetryTest(Base):
             text = fh.read()
         self.assertIn("Branch: loom/12-fix-the-thing-r2\n", text)
         self.assertIn("## Earlier attempt", text)
-        self.assertIn("git fetch origin %s" % side, text)
+        self.assertIn("kept its edits on branch %s. The runner merges them" % side, text)
 
     def test_a_retry_after_a_timeout_that_kept_nothing_has_no_earlier_attempt(self):
         self.heartbeat("codex")
