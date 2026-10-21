@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, change_class, labels, naming, scope_fit, split, stale_claims, status, tickets
+from . import brain, change_class, labels, naming, notify, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -1736,8 +1736,8 @@ class Factory:
             return False  # this head was asked already
         if not answered_threads(self._threads(repo, number), self.trusted):
             return False  # nothing was answered: the finding stands on its own
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                     {"body": "%s\n\n%s" % (review_again(), marker)})
+        notify.post(self.gh, repo, number, "%s\n\n%s" % (review_again(), marker),
+                    notify.REVIEW_REQUEST)
         self.actions += 1
         return True
 
@@ -1981,7 +1981,7 @@ class Factory:
                     "to be split, and no fix round can split it, so it is closed and this "
                     "ticket is split into %s." % (
                         marker, number, ", ".join("#%d" % n for n in filed)))
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, ticket), {"body": done})
+            notify.post(self.gh, repo, ticket, done, notify.NOTE)
         names = ", ".join(re.findall(r"#\d+", done.partition("split into")[2])) or "new tickets"
         self.close(self.gh, repo, number,
                    "Closed by the station: the review asked for this change to be split and "
@@ -2024,11 +2024,12 @@ class Factory:
         title, body, changed = fixed
         self.gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number),
                      {"title": title, "body": body})
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(issue["number"])),
-                     {"body": "%s\nThe leak scan on #%d failed on its title and body only, "
-                              "which the runner writes from this ticket, so the factory "
-                              "edited the text instead of sending it back:\n%s"
-                              % (marker, number, "\n".join("- " + c for c in changed))})
+        notify.post(self.gh, repo, int(issue["number"]),
+                    "%s\nThe leak scan on #%d failed on its title and body only, "
+                    "which the runner writes from this ticket, so the factory "
+                    "edited the text instead of sending it back:\n%s"
+                    % (marker, number, "\n".join("- " + c for c in changed)),
+                    notify.REPAIR)
         self.actions += 1
         _say("rewrote %d flagged line(s) of %s#%d's text after a body-only leak scan"
              % (len(changed), repo, number))
@@ -2115,8 +2116,8 @@ class Factory:
                 "/repos/%s/issues/%d/comments" % (repo, number)):
             if marker in str(comment.get("body") or ""):
                 return False
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                     {"body": "%s\n%s" % (marker, REVIEW_AGAIN)})
+        notify.post(self.gh, repo, number, "%s\n%s" % (marker, REVIEW_AGAIN),
+                    notify.REVIEW_REQUEST)
         self.actions += 1
         _say("asked the review bot to review %s#%d again after a partial review"
              % (repo, number))
@@ -2182,12 +2183,12 @@ class Factory:
             return False
         if verdict.kind == scope_fit.FITS:
             return False
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": (
+        notify.post(self.gh, repo, number, (
             "%s\nHeld for the brain: a scope check asked whether this pull request's "
             "changed files fit the ticket's What section and the repos and resources "
             "it names, and the answer was no: %s\nThe check is advisory. The brain or "
             "a person reads the diff against the ticket and merges it, or sends it "
-            "back." % (marker, verdict.reason))})
+            "back." % (marker, verdict.reason)), notify.HELD)
         if "needs-brain" not in _labels(full):
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": ["needs-brain"]})
@@ -2342,12 +2343,12 @@ class Factory:
         if "needs-brain" in names:
             return
         number = int(issue["number"])
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
-            "Lane %s made no commit and wrote no reason, as a run on this ticket did "
-            "before. The factory climbed the model ladder once for that and does not "
-            "climb a second time for the same reason: the brain reads the run logs and "
-            "rewrites the brief, closes the ticket, or escalates it once more with its "
-            "reason." % _lane(issue)})
+        notify.post(self.gh, repo, number,
+                    "Lane %s made no commit and wrote no reason, as a run on this ticket did "
+                    "before. The factory climbed the model ladder once for that and does not "
+                    "climb a second time for the same reason: the brain reads the run logs and "
+                    "rewrites the brief, closes the ticket, or escalates it once more with its "
+                    "reason." % _lane(issue), notify.HELD)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": names + ["needs-brain"]})
         self.actions += 1
@@ -2422,10 +2423,9 @@ class Factory:
             _say("queued %s#%d: lane %s sent no heartbeat for %d minutes"
                  % (repo, number, old, silent // 60))
         else:
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-                "body": said + "the factory moved this ticket to lane %s, %s." % (
-                    lane, "in its difficulty tier" if model == "unspecified"
-                    else "which takes its model")})
+            self._status_note(repo, number, said + "the factory moved this ticket to lane "
+                              "%s, %s." % (lane, "in its difficulty tier"
+                                           if model == "unspecified" else "which takes its model"))
             kept = brain._moved_labels(_labels(issue), "briefed", lane)
             self._relabel(repo, issue, kept)
             self.load[lane] = self.load.get(lane, 0) + 1
@@ -2471,13 +2471,13 @@ class Factory:
         if not since or self.now - since < HOLD_STUCK:
             return
         waiting_for = ", ".join(a.short for a in waiting)
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
-            "Held %.0f hours by After: waiting for %s. The station never claims a "
-            "ticket whose After: tickets are not merged, so this one is not late and "
-            "not stuck: the brain checks that %s is still coming, re-briefs this "
-            "ticket without it, or closes it." % (
-                (self.now - since) / 3600, waiting_for,
-                waiting_for if len(waiting) == 1 else "they are")})
+        notify.post(self.gh, repo, number,
+                    "Held %.0f hours by After: waiting for %s. The station never claims a "
+                    "ticket whose After: tickets are not merged, so this one is not late and "
+                    "not stuck: the brain checks that %s is still coming, re-briefs this "
+                    "ticket without it, or closes it." % (
+                        (self.now - since) / 3600, waiting_for,
+                        waiting_for if len(waiting) == 1 else "they are"), notify.HELD)
         self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": ["needs-brain"]})
         self.actions += 1

@@ -42,6 +42,7 @@ from . import health
 from . import invariants
 from . import metrics
 from . import naming
+from . import notify
 from . import proof
 from . import rewrite
 from . import ship_paths
@@ -2437,7 +2438,7 @@ class Station:
                           "%s\nRunaway hold reviewed: every attempt since the last brief ran "
                           "on lane %s, which has an open runs-and-none-done invariant "
                           "(#%d); but no lane of its difficulty tier is free, so the hold "
-                          "stays." % (marker, lane, inv_number))
+                          "stays." % (marker, lane, inv_number), notify.RUNAWAY)
             _say("%s#%d stays held: its dead lane %s has no free tier lane"
                  % (repo, number, lane))
             return
@@ -2452,7 +2453,8 @@ class Station:
                       "%s\nRunaway hold released: every attempt since the last brief ran on "
                       "lane %s, which has an open runs-and-none-done invariant (#%d: %s). "
                       "This is not a failure: the ticket is briefed to lane %s, in its "
-                      "difficulty tier." % (marker, lane, inv_number, inv_title, target))
+                      "difficulty tier." % (marker, lane, inv_number, inv_title, target),
+                      notify.RUNAWAY)
         used.add(target)
         _say("released runaway %s#%d from dead lane %s to lane %s" % (repo, number, lane, target))
 
@@ -2941,13 +2943,13 @@ class Station:
             self._add_label(repo, number, brain.WAIT_LIVE_EVENT)
             self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
                          % (repo, number, quote(brain.AWAITING_EVIDENCE, safe="")), ok=(404,))
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
+            notify.post(self.gh, repo, number,
                 "%s\nNo log line has named this ticket's Live box in %d days since it shipped, "
                 "so it is held apart from open work (%s). It waits for this event: %s\n\n"
                 "The station keeps checking the log every %d hours and runs the verify again "
                 "as soon as a matching line appears; the ticket then closes on proof as usual."
                 % (LIVE_EVENT_MARKER, VERIFY_WAIT_DAYS, brain.WAIT_LIVE_EVENT,
-                   self._note_text(live), VERIFY_INTERVAL // 3600)})
+                   self._note_text(live), VERIFY_INTERVAL // 3600), notify.HELD)
         except RateLimited:
             raise
         except GitHubError as err:
@@ -3074,12 +3076,13 @@ class Station:
         if len(reasons) != VERIFY_REFUSAL_CAP:
             return
         if "needs-brain" not in names:
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
+            notify.post(self.gh, repo, number,
                 "<!-- loom:verify-refused v1 -->\n"
                 "The station stops handing this ticket out to verify: %d proofs were "
                 "refused. The brain reads the ticket and its live criterion, then proves "
                 "it or rewrites it.\n\n%s\n" % (
-                    len(reasons), "\n".join("- " + self._note_text(x) for x in reasons))})
+                    len(reasons), "\n".join("- " + self._note_text(x) for x in reasons)),
+                notify.PROOF_REFUSED)
             self._add_label(repo, number, "needs-brain")
         _say("%s#%d left the verify queue after %d refused proofs; left for the brain"
              % (repo, number, len(reasons)))
@@ -3278,10 +3281,10 @@ class Station:
         for dep in released:
             if str(dep.number) in said:
                 continue
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-                "body": "<!-- loom:after-release %d -->\nNot held by After: any more: "
+            notify.post(self.gh, repo, number,
+                        "<!-- loom:after-release %d -->\nNot held by After: any more: "
                         "%s was closed as not planned, so this ticket no longer waits "
-                        "for it." % (dep.number, dep.short)})
+                        "for it." % (dep.number, dep.short), notify.RECORD)
             _say("%s#%d is no longer held by %s, closed as not planned"
                  % (repo, number, dep.short))
 
@@ -3528,7 +3531,7 @@ class Station:
                 "ticket moved to loom:merged." % (
                     int(pr["number"]), str(pr.get("merged_at") or "").replace("T", " "),
                     str(pr.get("merge_commit_sha") or "")[:12]))
-        self._comment(repo, number, note)
+        self._comment(repo, number, note, notify.MERGED)
         if cleared:
             self._routine(repo, number,
                           "Pull request #%d merged, so this ticket's loom:runaway hold "
@@ -3676,7 +3679,8 @@ class Station:
         if "loom:merged" in _label_names(ticket):
             del unlinked[number]
             self._comment(repo, number, "Pull request #%d merged while this ticket was at %s, "
-                          "so it moved to loom:merged." % (int(pr["number"]), was))
+                          "so it moved to loom:merged." % (int(pr["number"]), was),
+                          notify.MERGED)
 
     def _contributor_ticket(self, repo: str, pr: Dict[str, Any],
                             author: str) -> Optional[Dict[str, Any]]:
@@ -3837,7 +3841,7 @@ class Station:
             # filing a second one.
             _say("adopted %s#%d, but GitHub named no ticket number to mark it with" % (repo, number))
             return
-        self._comment(repo, number, adoption_comment(repo, int(ticket)))
+        self._comment(repo, number, adoption_comment(repo, int(ticket)), notify.RECORD)
         _say("adopted %s#%d as ticket %s#%s" % (repo, number, repo, ticket))
 
     def _adoptable_pulls(self, repo: str) -> List[Dict[str, Any]]:
@@ -4369,7 +4373,7 @@ class Station:
                 "(for a chart, the helm upgrade) is run and the brain or an operator moves it "
                 "to loom:shipped." % (int(pr["number"]), shown, ship_paths.MANUAL_PATHS_FILE))
         try:
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
+            notify.post(self.gh, repo, number, body, notify.HELD)
         except RateLimited:
             raise
         except GitHubError as err:
@@ -4886,7 +4890,7 @@ class Station:
         if len(body) > MAX_FIX_BODY:  # the API rejects comments over 65536 characters
             body = body[:MAX_FIX_BODY].rstrip() + "\n\n(findings truncated)"
         body = body.rstrip() + marker
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
+        notify.post(self.gh, repo, number, body, notify.FIX_BRIEF)
 
     def _move_fix_to_lane(self, repo: str, number: int, lane: str,
                           names: List[str]) -> None:
@@ -4957,7 +4961,10 @@ class Station:
                     self._routine(repo, number, "Lane %s made no code change for a fix to a "
                                   "pull request: %s" % (lane, url))
             else:
-                self._comment(repo, number, "Lane %s opened a pull request: %s" % (lane, url))
+                # The pull request's "Refs #N" already cross-references the
+                # ticket, which sends no email, and loom:pr is set above: a new
+                # comment said it again, 55 a day (loom#1390).
+                self._routine(repo, number, "Lane %s opened a pull request: %s" % (lane, url))
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
         if not self._report_failure(repo, number, lane, text, name):
@@ -5113,7 +5120,7 @@ class Station:
         if skipped:
             body += ("\n\nNot counted as work attempts: %d that ended [transient], [limit], "
                      "[auth] or [factory]." % skipped)
-        self._comment(repo, number, body)
+        self._comment(repo, number, body, notify.RUNAWAY)
         return True
 
     def _retry(self, repo: str, number: int, lane: str, klass: str, reason: str) -> str:
@@ -5491,12 +5498,12 @@ class Station:
         except ValueError:
             body = ("Lane %s made no change for this fix; its explanation did not "
                     "pass the text checks and is in the lane log." % lane)
-        self._comment(repo, pr, body)
-        self._comment(repo, pr, factory.review_again())
+        self._comment(repo, pr, body, notify.NOTE)
+        self._comment(repo, pr, factory.review_again(), notify.REVIEW_REQUEST)
         self._relabel(repo, number, "loom:pr")
         self._comment(repo, number, "Lane %s made no change for the fix to #%d and said why "
                       "on the pull request; the review bot was asked to review it again."
-                      % (lane, pr))
+                      % (lane, pr), notify.NOTE)
         _say("reported %s#%d: no change for #%d; review requested" % (repo, number, pr))
 
     def _lane_said(self, lane: str, name: str) -> str:
@@ -5554,9 +5561,10 @@ class Station:
                      {"labels": want})
         issue["labels"] = [{"name": n} for n in want]
 
-    def _comment(self, repo: str, number: int, body: str) -> None:
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                     {"body": body})
+    def _comment(self, repo: str, number: int, body: str, kind: str) -> None:
+        """A new comment: an outcome or record of one of notify.KINDS. A routine
+        event is `_routine`, an edit of the status comment."""
+        notify.post(self.gh, repo, number, body, kind)
 
     # -- lane status ------------------------------------------------------
     @staticmethod
@@ -5668,8 +5676,7 @@ class Station:
                 self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(c["id"])),
                              {"body": body})
                 return int(c["id"])
-        made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                            {"body": body}).data
+        made = notify.post(self.gh, repo, number, body, notify.RECORD).data
         return int(made["id"]) if isinstance(made, dict) and "id" in made else None
 
     def publish_lanes(self) -> None:
@@ -6003,8 +6010,7 @@ class Station:
                 continue
             try:
                 number = self._digest_issue(repo)
-                made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                                    {"body": page["body"]}).data
+                made = notify.post(self.gh, repo, number, page["body"], notify.DIGEST).data
             except RateLimited:
                 raise
             except GitHubError as err:
@@ -7148,11 +7154,11 @@ class Station:
             raise GitHubError("no issue was created in %s" % repo)
         held["followup"] = filed
         pacer.wait()
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-            "body": "%s\nThe review check failed on pull request #%d when the station asked "
+        notify.post(self.gh, repo, number,
+                    "%s\nThe review check failed on pull request #%d when the station asked "
                     "the review bot to review it again. The findings are filed as #%d; this "
                     "issue stays open until they are settled." % (
-                        claimed.REREVIEW_MARKER, pull, filed)})
+                        claimed.REREVIEW_MARKER, pull, filed), notify.FAILURE)
         _say("settle-claimed: filed %s#%d, the failed re-review of PR #%d for #%d"
              % (repo, filed, pull, number))
 
@@ -7204,8 +7210,7 @@ class Station:
         if not any(str(c.get("body") or "").startswith(claimed.MARKER)
                    for c in comments if isinstance(c, dict)):
             pacer.wait()
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                         {"body": comment})
+            notify.post(self.gh, repo, number, comment, notify.CLOSED)
         ticked = proof.tick(body)
         if ticked != body:
             pacer.wait()
@@ -8091,8 +8096,7 @@ class Station:
             self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, previous),
                          {"body": body + "\n" + stamp % now.strftime("%Y-%m-%dT%H:%MZ")})
         else:
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                         {"body": body})
+            notify.post(self.gh, repo, number, body, notify.REPORT)
         state[key] = self.now
 
     @staticmethod
@@ -8538,8 +8542,8 @@ class Station:
                 "allowed_mentions": {"parse": []}})
             _say("operator message %s refused by the text checks" % msg_id)
             return
-        made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                            {"body": OPERATOR_MARKER % msg_id + "\n" + note}).data
+        made = notify.post(self.gh, repo, number, OPERATOR_MARKER % msg_id + "\n" + note,
+                           notify.RECORD).data
         link = str((made or {}).get("html_url") or "") if isinstance(made, dict) else ""
         link = link or goal_link
         _say("noted operator message %s on %s#%d" % (msg_id, repo, number))
@@ -8983,7 +8987,7 @@ class Station:
             made = self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (home[0], int(packet["id"])),
                                 {"body": body}, ok=(404,))
         if made is None or made.status == 404:
-            made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % home, {"body": body})
+            made = notify.post(self.gh, home[0], home[1], body, notify.RECORD)
             data = made.data if isinstance(made.data, dict) else {}
             packet = {"id": int(data["id"])} if "id" in data else None
         if packet is not None:

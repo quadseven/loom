@@ -43,7 +43,7 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, naming
+from . import brain, naming, notify
 from .factory import GREEN, REVERT_LABEL, Factory, _labels, _lane, _state, _ts
 from .github import GitHub, GitHubError
 from .tickets import DIFFICULTIES
@@ -566,8 +566,7 @@ class Reverts:
         note = "Fix-forward ticket #%d is briefed on lane %s for red merge %s." % (
             follow_up, lane, sha[:12])
         try:
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                         {"body": note})
+            notify.post(self.gh, repo, number, note, notify.FAILURE)
         except GitHubError as err:
             _say("%s: fix-forward #%d filed but could not link it from #%d: %s"
                  % (repo, follow_up, number, err))
@@ -686,7 +685,7 @@ class Reverts:
                 "redo the change on the new default branch."
                 % (branch, sha[:12], int(pr["number"]), _failing(names), revert))
         brain._check_written_text(note)
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
+        notify.post(self.gh, repo, number, note, notify.FAILURE)
 
     def _body(self, branch: str, sha: str, pr: Dict[str, Any], names: List[str],
               red_since: float, difficulty: str, number: int) -> str:
@@ -721,9 +720,10 @@ class Reverts:
         issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
         lane = _lane(issue)
         if issue.get("state") != "open" or not lane or "loom:ticket" not in _labels(issue):
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-                "body": "%s\nRevert #%d landed; this ticket is not an open ticket with a "
-                        "lane, so it is left for the brain to redo." % (marker, rnum)})
+            notify.post(self.gh, repo, number,
+                        "%s\nRevert #%d landed; this ticket is not an open ticket with a "
+                        "lane, so it is left for the brain to redo." % (marker, rnum),
+                        notify.FAILURE)
             _say("%s: revert #%d landed; #%d left for the brain" % (repo, rnum, number))
             return
         self.move(self.gh, repo, number, "briefed", lane=lane,

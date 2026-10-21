@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import quote
 from urllib.parse import urlsplit
 
-from . import brain, health
+from . import brain, health, notify
 from .github import GitHub
 
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
@@ -221,7 +221,7 @@ def _journal_build(gh: GitHub, goal: str, deploy: str, pr: dict[str, Any],
         return
     body = ("<!-- loom:journal v1 -->\n%s\nSource-pin pull request %s for module revision `%s` started build run %s."
             % (marker, pr["html_url"], revision, found["html_url"]))
-    gh.rest("POST", "/repos/%s/issues/%s/comments" % (goal_repo, number), {"body": body})
+    notify.post(gh, goal_repo, number, body, notify.JOURNAL)
 
 
 def _post_build(gh: GitHub, goal: str, deploy: str, pr: dict[str, Any], branch: str,

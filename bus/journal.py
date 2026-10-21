@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
 
+from . import notify as _notify
 from . import text as _text
 from .github import GitHub
 from .handoff import (EARLIER_CLOSE, EARLIER_OPEN, JOURNAL_MARKER as _MARKER, _TICK,
@@ -268,5 +269,4 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
     _text.check(text)
     if text.startswith(REPORT_MARKER):
         _check_report_gap(gh, repo, issue_number, now or datetime.now(timezone.utc), trusted)
-    return gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(issue_number)),
-                   {"body": text})
+    return _notify.post(gh, repo, issue_number, text, _notify.JOURNAL)
