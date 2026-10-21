@@ -3060,6 +3060,88 @@ printf '%s\\n' '{"type":"step_start","part":{"type":"step-start"}}' \
         self.assertIn("failed: [work] ended on a described step without taking it", self.spark_log())
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
+    # Every opencode lane gets the one continue for a described step (loom#1282).
+    PLAIN_LANES = (
+        ("zen", {"LOOM_ZEN_MODEL": "opencode/minimax-m3.1-flash-free"}),
+        ("free-ollama", {"LOOM_FREE_OLLAMA_URL": "http://gateway.example.invalid/free/ollama-cloud/v1",
+                         "LOOM_FREE_OLLAMA_MODEL": "free/ollama-cloud"}),
+    )
+
+    def fresh_fixture(self):
+        self._tmp.cleanup()
+        self.setUp()
+
+    def plain_lane_log(self, lane):
+        return (self.loom / "logs" / lane / "T042-fix-the-thing.log").read_text()
+
+    def plain_lane_run(self, lane, env, opencode_body):
+        self.write_tool(self.bin / "sandbox-exec", "#!/usr/bin/env bash\nshift 2\nexec \"$@\"\n")
+        self.write_tool(self.bin / "opencode", "#!/usr/bin/env bash\n"
+            "[ \"${1:-}\" = --version ] && { echo \"1.18.4\"; exit 0; }\n"
+            "[ \"${1:-}\" = models ] && exit 0\n"
+            "args=\"$*\"; args=\"${args//$'\\n'/ }\"\n"
+            "printf 'opencode %s\\n' \"$args\" >> \"$TMPDIR/agent.log\"\n" + opencode_body)
+        inbox = self.loom / "briefs" / lane
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", f"Lane: {lane}"))
+        return inbox, self.run_lane(lane, **env)
+
+    def test_every_opencode_lane_continues_a_described_step_once_and_succeeds(self):
+        body = """if [[ " $* " == *" --continue "* ]]; then
+  echo fixed > fix.txt
+  printf '%s\\n' '{"type":"step_start","part":{"type":"step-start"}}' \\
+    '{"type":"tool_use","part":{"type":"tool","tool":"edit"}}'
+else
+  printf '%s\\n' '{"type":"step_start","part":{"type":"step-start"}}' \\
+    '{"type":"text","part":{"type":"text","text":"Let me read the build files."}}'
+fi
+"""
+        for lane, env in self.PLAIN_LANES:
+            with self.subTest(lane=lane):
+                self.fresh_fixture()
+                inbox, result = self.plain_lane_run(lane, env, body)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                runs = [c for c in self.calls() if c.startswith("opencode ")]
+                self.assertEqual(len(runs), 2, runs)
+                self.assertIn("--format json", runs[0])
+                self.assertIn("--continue", runs[1])
+                self.assertIn("Continue: carry out the step you just described", runs[1])
+                self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_every_opencode_lane_stops_after_one_continue_of_a_described_step(self):
+        body = """printf '%s\\n' '{"type":"step_start","part":{"type":"step-start"}}' \\
+  '{"type":"text","part":{"type":"text","text":"Let me inspect the build."}}'
+"""
+        for lane, env in self.PLAIN_LANES:
+            with self.subTest(lane=lane):
+                self.fresh_fixture()
+                inbox, result = self.plain_lane_run(lane, env, body)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                runs = [c for c in self.calls() if c.startswith("opencode ")]
+                self.assertEqual(len(runs), 2, runs)
+                self.assertIn("failed: [work] ended on a described step without taking it",
+                              self.plain_lane_log(lane))
+                self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_opencode_lane_run_that_does_not_end_on_a_described_step_is_not_continued(self):
+        # A final message after a tool call is no described step, and the
+        # reason it gave still reaches the failure (loom#1362).
+        body = """printf '%s\\n' '{"type":"step_start","part":{"type":"step-start"}}' \\
+  '{"type":"tool_use","part":{"type":"tool","tool":"read"}}' \\
+  '{"type":"text","part":{"type":"text","text":"I could not find the module."}}'
+"""
+        for lane, env in self.PLAIN_LANES:
+            with self.subTest(lane=lane):
+                self.fresh_fixture()
+                inbox, result = self.plain_lane_run(lane, env, body)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                runs = [c for c in self.calls() if c.startswith("opencode ")]
+                self.assertEqual(len(runs), 1, runs)
+                log = self.plain_lane_log(lane)
+                self.assertNotIn("described step", log)
+                self.assertIn("agent made no commit; it said: I could not find the module.", log)
+                self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_spark_lane_runs_opencode_against_its_endpoint_and_takes_a_private_repo(self):
         # Visibility is checked for scanning; private repos skip the scan.

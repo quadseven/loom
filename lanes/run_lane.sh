@@ -1253,7 +1253,7 @@ opencode_agent() {
 
 # OpenCode JSON events delimit assistant steps; only a final step containing
 # text and no tool is evidence that the model stopped on a described action.
-spark_described_step() {
+opencode_described_step() {
   python3 -I - "$1" <<'PY'
 import json
 import sys
@@ -1278,7 +1278,74 @@ sys.exit(0 if text and not tool else 1)
 PY
 }
 
-spark_has_no_work() {
+# The lane log's view of an opencode run read as JSON events. "raw" keeps
+# the events (the spark lane's log has always held them). "text" keeps what a
+# plain run prints: the model's text as lines, and every line that is not a
+# work event (a provider error, opencode's own message) as it came, so the
+# failure classes and the final message a failure reason quotes (loom#1362)
+# read the same as before the lane ran as JSON.
+opencode_log_view() {
+  [ "$1" = raw ] && { cat; return; }
+  python3 -I -u -c '
+import json
+import sys
+
+WORK = ("tool_use", "tool", "reasoning", "step_start", "step_finish")
+for line in sys.stdin:
+    try:
+        event = json.loads(line)
+    except ValueError:
+        event = None
+    if not isinstance(event, dict):
+        sys.stdout.write(line)
+    elif event.get("type") == "text":
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+        if isinstance(part.get("text"), str):
+            print(part["text"])
+    elif event.get("type") not in WORK:
+        sys.stdout.write(line)
+'
+}
+
+# Usage: opencode_json_pass <key_var> <log view> <events file> <opencode run arguments...>
+# One opencode run as JSON events: the raw events to the events file, their
+# view to the lane log. Returns the agent's exit status.
+opencode_json_pass() {
+  local key_var="$1" view="$2" events="$3"
+  shift 3
+  opencode_agent "$key_var" --format json "$@" | tee "$events" | opencode_log_view "$view"
+  return "${PIPESTATUS[0]}"
+}
+
+# Every opencode lane gets one continue for a run that ends on a described
+# step: no tool call, no change, no reason (loom#1282). Free models answer
+# "Let me read the build files." and stop. A second such end is
+# marked for the runner to fail as "ended on a described step".
+# Usage: opencode_agent_continuing <key_var> <log view> <brief text>
+opencode_agent_continuing() {
+  local key_var="$1" view="$2" brief="$3" status
+  local events="$WORKDIR/$TICKET.opencode-events"
+  opencode_json_pass "$key_var" "$view" "$events" "$brief"
+  status=$?
+  [ "$status" -eq 0 ] || return "$status"
+  if opencode_has_no_work &&
+     { [ ! -f "$TREE/$SUMMARY_FILE" ] ||
+       ! grep -qiE "$NO_CHANGE_RE" "$TREE/$SUMMARY_FILE"; } &&
+     opencode_described_step "$events"; then
+    echo "[$(date -u +%FT%TZ)] $TICKET: continuing a text-only $LANE step once"
+    opencode_json_pass "$key_var" "$view" "$events" --continue \
+      "Continue: carry out the step you just described, then commit or write .loom/summary.md"
+    status=$?
+    # A failed continue is not swallowed: its exit status goes to the runner,
+    # which classes it (limit, auth, transient or work) from the run's output.
+    [ "$status" -eq 0 ] || return "$status"
+    if opencode_has_no_work && opencode_described_step "$events"; then
+      : > "$WORKDIR/$TICKET.described-step"
+    fi
+  fi
+}
+
+opencode_has_no_work() {
   local status
   [ "$(safe_git rev-parse HEAD)" = "$BASE" ] || return 1
   status="$(safe_git status --porcelain --untracked-files=all)" || return 1
@@ -2143,7 +2210,7 @@ markers_left() {
 }
 
 run_agent() {
-  local brief_text events status
+  local brief_text
   brief_text="$(cat "$1")$(work_note)$(validation_note)$(summary_note)"
   if [ "$LANE" = spark ]; then
     brief_text="$brief_text
@@ -2155,32 +2222,14 @@ Do not search the whole filesystem (for example, find /). Search within the chec
   is_api_lane && fresh_agent_home
   case "$LANE" in
     codex|claude) agent_cli "$LANE" lane "$brief_text" ;;
-    openrouter) opencode_agent OPENROUTER_API_KEY "$brief_text" ;;
-    opencode-go) opencode_agent OPENCODE_API_KEY "$brief_text" ;;
-    zen) opencode_agent - "$brief_text" ;;
-    spark)
-      events="$WORKDIR/$TICKET.opencode-events"
-      opencode_agent - --format json "$brief_text" | tee "$events"
-      status=$?
-      [ "$status" -eq 0 ] || return "$status"
-      if spark_has_no_work &&
-         { [ ! -f "$TREE/$SUMMARY_FILE" ] ||
-           ! grep -qiE "$NO_CHANGE_RE" "$TREE/$SUMMARY_FILE"; } &&
-         spark_described_step "$events"; then
-        echo "[$(date -u +%FT%TZ)] $TICKET: continuing a text-only Spark step once"
-        opencode_agent - --format json --continue \
-          "Continue: carry out the step you just described, then commit or write .loom/summary.md" |
-          tee "$events"
-        status=$?
-        [ "$status" -eq 0 ] || return "$status"
-        if spark_has_no_work && spark_described_step "$events"; then
-          : > "$WORKDIR/$TICKET.described-step"
-        fi
-      fi ;;
-    free) opencode_agent - "$brief_text" ;;
-    zai) opencode_agent ZHIPU_API_KEY "$brief_text" ;;
+    openrouter) opencode_agent_continuing OPENROUTER_API_KEY text "$brief_text" ;;
+    opencode-go) opencode_agent_continuing OPENCODE_API_KEY text "$brief_text" ;;
+    zen) opencode_agent_continuing - text "$brief_text" ;;
+    spark) opencode_agent_continuing - raw "$brief_text" ;;
+    free) opencode_agent_continuing - text "$brief_text" ;;
+    zai) opencode_agent_continuing ZHIPU_API_KEY text "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
-      opencode_agent CLOUDFLARE_API_KEY "$brief_text" ;;
+      opencode_agent_continuing CLOUDFLARE_API_KEY text "$brief_text" ;;
     anthropic) anthropic_agent "$brief_text" ;;
     agy) agy_agent "$brief_text" ;;
     copilot) api_agent COPILOT_GITHUB_TOKEN copilot -p "$brief_text" --allow-all-tools ;;
