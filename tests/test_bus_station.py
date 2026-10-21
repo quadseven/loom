@@ -7096,6 +7096,26 @@ class CloseDoneTest(Base):
         # Ticket 1 should remain open because the window is covered by the evidence source
         self.assertEqual(self.fake.issues[1]["state"], "open")
     
+    def test_a_shipped_ticket_with_a_still_open_time_window_remains_open(self):
+        # A Live window with no end date is still open, so a log that starts
+        # later than its start does not close the ticket.
+        self.fake.private = False
+        import time
+        log_dir = os.path.join(self.home, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "evidence.log")
+        with open(log_path, "w") as f:
+            f.write("")
+        stamp = time.mktime(time.struct_time((2026, 4, 1, 0, 0, 0, 0, 0, -1)))
+        os.utime(log_path, (stamp, stamp))
+        self.settings.evidence_cmds = {REPO: log_path}
+        open_window = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "prints `daily status ready` on or after 2026-01-01")
+        self.fake.add(1, lane="codex", body=open_window, state="shipped")
+        station.Station(GitHub("token", transport=self.fake), self.settings).close_done_tickets()
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+
     def test_a_shipped_ticket_with_no_time_window_remains_open(self):
         # A shipped ticket with no Live time window remains open as today.
         self.fake.private = False

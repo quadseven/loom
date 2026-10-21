@@ -495,7 +495,8 @@ def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
     
     This reads the log file's modification time as a proxy for when the log
     started being written. If the command is not configured for this repo or
-    the log file does not exist, return None. The log path must live inside
+    the log file does not exist, return None; any other filesystem error
+    (a permission or directory problem) is raised. The log path must live inside
     the configured log root.
     """
     command = evidence_cmds.get(repo)
@@ -507,7 +508,7 @@ def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
     try:
         mtime = os.path.getmtime(log_path)
         return datetime.fromtimestamp(mtime, tz=timezone.utc)
-    except (OSError, FileNotFoundError):
+    except (FileNotFoundError, NotADirectoryError):
         return None
 
 
@@ -6181,37 +6182,20 @@ class Station:
             for issue in self._tickets_open(repo):
                 if left <= 0:
                     return
-                why = self._done_reason(issue)
+                why = self._done_reason(issue, self._earliest_record(repo, issue, log_root))
                 if not why:
                     continue
-                number = int(issue["number"])
-                live = brain.live_criterion(issue.get("body"), limit=None)
-                time_window = _live_time_window(live)
-                if time_window:
-                    earliest_record = _earliest_evidence_record(
-                        self.s.evidence_cmds, repo, log_root)
-                    if earliest_record is not None:
-                        _, window_end = time_window
-                        if earliest_record > window_end:
-                            # The evidence source starts after the window ends.
-                            # Close the ticket with both times.
-                            close_reason = "shipped, its Live window ended %s but evidence started %s"
-                            close_reason = close_reason % (
-                                window_end.strftime("%Y-%m-%d"),
-                                earliest_record.strftime("%Y-%m-%d"))
-                            if self._close_done_ticket(repo, issue, close_reason):
-                                left -= 1
-                                _say("closed done %s#%d: %s" % (repo, number, close_reason))
-                            continue
-                    # If the evidence source starts before or during the window,
-                    # or has no record yet, do not close the ticket (it will stay
-                    # open for a verify run).
-                    continue
-                # Normal close for tickets without a time window or with an
-                # open window.
                 if self._close_done_ticket(repo, issue, why):
                     left -= 1
-                    _say("closed done %s#%d: %s" % (repo, number, why))
+                    _say("closed done %s#%d: %s" % (repo, int(issue["number"]), why))
+
+    def _earliest_record(self, repo: str, issue: Dict[str, Any],
+                         log_root: str) -> Optional[datetime]:
+        """The evidence source's earliest record, read only for a ticket
+        whose Live line names a time window; None otherwise."""
+        if not _live_time_window(brain.live_criterion(issue.get("body"), limit=None)):
+            return None
+        return _earliest_evidence_record(self.s.evidence_cmds, repo, log_root)
 
     def _close_done_ticket(self, repo: str, issue: Dict[str, Any],
                            reason: str) -> bool:
@@ -6585,8 +6569,12 @@ class Station:
         return found
 
     @staticmethod
-    def _done_reason(issue: Dict[str, Any]) -> str:
-        """Why the ticket is done and may close, or "" to leave it open."""
+    def _done_reason(issue: Dict[str, Any], earliest: Optional[datetime] = None) -> str:
+        """Why the ticket is done and may close, or "" to leave it open.
+
+        A Live line with a time window closes only when `earliest`, the
+        evidence source's first record, falls after the window's end; a window
+        still open, or one the source covers, stays open for a verify run."""
         labels = set(_label_names(issue))
         if issue.get("state") != "open" or labels & set(CLOSE_DONE_HOLDS):
             return ""
@@ -6594,7 +6582,11 @@ class Station:
             live = brain.live_criterion(issue.get("body"), limit=None)
             time_window = _live_time_window(live)
             if time_window:
-                return "shipped, its Live window ended before evidence started"
+                window_end = time_window[1]
+                if earliest is not None and earliest > window_end:
+                    return ("shipped, its Live window ended %s but evidence started %s" % (
+                        window_end.strftime("%Y-%m-%d"), earliest.strftime("%Y-%m-%d")))
+                return ""
             if not live_needles(issue.get("body")):
                 return "shipped, and its Live line names nothing a log search can find"
         return ""
