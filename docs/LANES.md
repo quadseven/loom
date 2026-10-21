@@ -211,7 +211,11 @@ own hourly budget, not the operator account's. The token is minted at run
 time: the key is read from SSM, an RS256 JWT is signed with the `openssl`
 CLI (key on stdin, never on the command line or on disk), and
 `POST /app/installations/<id>/access_tokens` returns a token kept in memory
-until 5 minutes before its `expires_at`. Mints count under `app token` in the
+until 5 minutes before its `expires_at`. The station runs one pass per process
+and GitHub's ETags differ per token, so it also keeps the token in
+`state/station/app-token.json` (mode 0600, the only place a token is written)
+and the next pass reuses it until 5 minutes before expiry; the ETags cached on
+the last pass then answer 304 (loom#1306). A 401 deletes the file. Mints count under `app token` in the
 requests line, and the budget line reads `GitHub App budget`. With any of the
 three unset, the token above is used as before. Instead of SSM, the station
 and the brain can read the key from a file: set `LOOM_GITHUB_APP_KEY_FILE` to
@@ -376,7 +380,20 @@ asking for a test that fails without the change, instead of landing; that
 round climbs only if the next one still adds no test. A repo with no test
 harness opts out in `LOOM_NO_TEST_REPOS` (space separated `OWNER/NAME`), and
 a ticket whose body has the line `Tests: none needed (<reason>)` skips the
-check. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
+check. Scope check (`bus/scope_fit.py`): with `LOOM_SCOPE_CHECK_URL` set to a
+keyless https chat-completions route (for example the gateway's free-public
+route for Gemma) and optionally `LOOM_SCOPE_CHECK_MODEL` (default
+`gemma-4-31b-it`), a ready pull request on a public repo is checked once
+before it lands: the model gets the ticket's `## What` section and the
+changed-file list and answers whether the files fit the ticket and the repos
+and resources it names. `YES` lands it as before. `NO: <reason>` holds it:
+`needs-brain` on the pull request, a comment with the reason and a hold marker
+(once per head commit, so a later pass does not ask again), and a note on the
+ticket; the brain or a person reads the diff and merges it or sends it back.
+No route, a limit, a timeout, a reply that is not `YES` or `NO: <reason>`, a
+ticket with no `## What` section or an unset URL lands it as before: the check
+is advisory and never blocks a merge on a dead route. A private repo is never
+asked. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
 
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`
@@ -592,6 +609,14 @@ verify runs. The brain audits lane proofs (docs/BRAIN.md, Proof audits): a
 lane whose proof failed its audit in the last 24 hours is handed no verify
 run, and the daily line's Throughput number splits the verified tickets into
 lane and brain proofs.
+
+A ticket whose proofs were refused `VERIFY_REFUSAL_CAP` times (3,
+`bus/station.py`; the count is kept in `state/station/verify-refused.json`)
+leaves the verify queue instead of coming back every 6 hours: the station
+posts one comment listing the refusals and adds `needs-brain`, and the brain
+proves the ticket or rewrites it. Every station log line starts with its UTC
+time (`[2026-10-21T08:29:40Z] station: ...`), so evidence that quotes a
+station log line can name when it was seen.
 
 ### Talking to the brain from Discord
 
@@ -835,6 +860,13 @@ the tickets-outside-an-epic issue is: one provider limit opened 9 lane-held
 issues in 6 minutes on 2026-10-15. An older per-lane issue of the same
 invariant is closed as folded into the rolling one, unless it carries a
 `needs:<login>` label, which leaves an operator's ask open on its own issue.
+
+The lane-held issue is also a standing one (loom#845): when no lane is held any
+more the station edits it in place to say "No lane is held by a limit now" with
+the time it went clear, and leaves it open; the next hold edits it back, so a
+hold that comes and goes never closes and reopens an issue (each reopen mailed
+the people watching it). The lanes it listed move into a "Hold log" in the body
+(a line per hold, newest first, the last 20).
 
 Each breach files one issue labelled `loom:triage` and `loom:invariant` under
 the standing repairs epic (docs/BRAIN.md, Filing under an epic; the goal home

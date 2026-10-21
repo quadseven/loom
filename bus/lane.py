@@ -73,6 +73,32 @@ def _open_or_merged_pull(gh: GitHub, repo: str, branch: str) -> Optional[Dict[st
     return None
 
 
+def _refs_line(repo: str, number: int) -> "re.Pattern[str]":
+    """A `Refs #N` or `Refs OWNER/NAME#N` line of a pull request body that
+    names this ticket in this repo (the form the station and the merge gate
+    read). A body that only mentions the number elsewhere does not match."""
+    return re.compile(r"^Refs (?:%s)?#%d\b" % (re.escape(repo), number), re.M)
+
+
+def _closed_pulls(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
+    """The most recently updated closed pull requests of the repo, one page,
+    the window the station's own reconciliation reads."""
+    data = gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated"
+                   "&direction=desc&per_page=100" % repo).data
+    return [p for p in data if isinstance(p, dict)] if isinstance(data, list) else []
+
+
+def _merged_pull_naming(repo: str, number: int,
+                        closed: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A merged pull request whose body carries a Refs line naming the ticket,
+    whatever its branch is called: work that lands from a non-ticket branch
+    (loom#412, loom#414) is invisible to the branch-name match."""
+    line = _refs_line(repo, number)
+    return next((p for p in closed
+                 if (p.get("merged_at") is not None or p.get("merged") is True)
+                 and line.search(str(p.get("body") or ""))), None)
+
+
 def _to_pr(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str) -> None:
     labels = [x for x in _names(issue) if x not in ("loom:running", "loom:queued")]
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
@@ -84,9 +110,13 @@ def _recover_and_count(gh: GitHub, repos: Sequence[str], lane: str,
     """Tickets the remote lane holds and still works on. A held ticket whose
     branch already has a pull request moves to loom:pr; one with no pull
     request goes back to the queue when its last heartbeat is older than
-    CLAIM_AGE or its first claim older than PR_AGE."""
+    CLAIM_AGE or its first claim older than PR_AGE. The branch name is the
+    primary match; when it finds nothing, a merged pull request whose body
+    names the ticket in a Refs line counts the same way, so work that landed
+    from another branch does not strand the ticket (loom#1149)."""
     active = 0
     for repo in repos:
+        closed: Optional[List[Dict[str, Any]]] = None
         found = gh.paginate("/repos/%s/issues?state=open&labels=loom:running,lane:%s"
                             % (repo, quote(lane, safe="")))
         for issue in found:
@@ -97,6 +127,11 @@ def _recover_and_count(gh: GitHub, repos: Sequence[str], lane: str,
                 continue
             branch = tickets.branch_for(int(issue["number"]), str(issue.get("title") or ""))
             if _pull_for(gh, repo, branch) is not None:
+                _to_pr(gh, repo, issue, lane)
+                continue
+            if closed is None:
+                closed = _closed_pulls(gh, repo)
+            if _merged_pull_naming(repo, int(issue["number"]), closed) is not None:
                 _to_pr(gh, repo, issue, lane)
                 continue
             if now - max(claims) > CLAIM_AGE or now - min(claims) > PR_AGE:

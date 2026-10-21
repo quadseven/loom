@@ -864,6 +864,44 @@ print('leak guard: clean (shape patterns only)')
         self.assertFalse(any(c.startswith("gh issue comment") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
 
+    def test_a_final_message_with_no_summary_becomes_the_failure_reason(self):
+        # loom#1362: a codex run said why it stopped in its final message and
+        # the record read "wrote no reason".
+        self.drop_brief()
+        said = "I could not complete the change. The worktree FETCH_HEAD is not writable."
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT=said)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertIn("[work] agent made no commit; it said: " + said, line)
+        self.assertNotIn("wrote no reason", line)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_a_multi_line_non_ascii_final_message_is_one_ascii_line(self):
+        self.drop_brief()
+        said = "Stopped: the fetch failed.\n\nNeeds the branch \u2014 and a writable tree."
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT=said)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertTrue(line.isascii(), line)
+        self.assertIn("it said: Stopped: the fetch failed. Needs the branch and a writable tree.", line)
+
+    def test_a_long_final_message_is_cut(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT="word " * 400)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertIn("it said: word word", line)
+        self.assertLess(len(line), 900)
+
+    def test_a_final_message_that_fails_the_text_checks_keeps_the_no_reason_class(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0",
+                               FAKE_OUT="I gave up; see /Users/someone/work/notes for why.")  # leak-guard-allow: the case under test
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertIn("agent made no commit and wrote no reason", line)
+        self.assertNotIn("Users", line)
+
     def test_a_summary_that_is_not_a_no_change_reason_is_still_a_failure(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="no-change", FAKE_SUMMARY="Make the thing work")

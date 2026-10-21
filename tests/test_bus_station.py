@@ -456,6 +456,31 @@ class Base(unittest.TestCase):
             return []
 
 
+class StationKeepsAppTokenTest(Base):
+    """One pass per process: the App token outlives the pass (loom#1306)."""
+
+    def app_gh(self, minted):
+        def transport(method, url, headers, body):
+            path = urlsplit(url).path
+            if method == "POST" and path.endswith("/access_tokens"):
+                minted.append(1)
+                expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+                return reply(201, {"token": "ghs_pass_token", "expires_at": expires})
+            if method == "GET" and path == "/app":
+                return reply(200, {"slug": "loom-test"})
+            return self.fake(method, url, headers, body)
+        app = AppToken("123", "456", lambda: "key", sign=lambda data, key: b"sig")
+        return GitHub(app, transport=transport)
+
+    def test_a_second_pass_reuses_the_token_the_first_pass_kept(self):
+        minted = []
+        for _ in range(2):
+            self.assertEqual(station.run(self.settings, self.app_gh(minted)), 0)
+        self.assertEqual(len(minted), 1)
+        kept = os.path.join(self.home, "state", "station", "app-token.json")
+        self.assertEqual(os.stat(kept).st_mode & 0o777, 0o600)
+
+
 class StationReadBudgetTest(Base):
     def reader(self):
         return station.Station(GitHub("token", transport=self.fake), self.settings)
@@ -1676,6 +1701,7 @@ class ShipPathRuleTest(Base):
         self.pr_files = {}
         self.carried = set()
         self.requests = []
+        self.manual = None
 
     def run_for(self, workflow, sha, **kw):
         ShipRuleTest.deploy_run(_Into(self.runs.setdefault(workflow, [])), sha, **kw)
@@ -1695,6 +1721,10 @@ class ShipPathRuleTest(Base):
             if text is None:
                 return reply(200, {"type": "file", "encoding": "none"})
             return reply(200, {"content": base64.b64encode(text.encode()).decode()})
+        if parts.path == "/repos/%s/contents/.loom/manual-paths" % REPO:
+            if self.manual is None:
+                return reply(404, {"message": "Not Found"})
+            return reply(200, {"content": base64.b64encode(self.manual.encode()).decode()})
         files = re.match(r"/repos/%s/pulls/(\d+)/files$" % REPO, parts.path)
         if files:
             return reply(200, [f if isinstance(f, dict) else {"filename": f}
@@ -1798,6 +1828,58 @@ class ShipPathRuleTest(Base):
         self.pr_files[99] = [{"filename": "attic/main.py", "previous_filename": "stacks/a/main.py"}]
         self.ship()
         self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_a_helm_values_change_with_no_deploy_workflow_is_not_shipped_on_merge(self):
+        # loom#1349: a values file for a chart installed by hand deploys
+        # nothing on merge, and no workflow covers it.
+        self.merged(12, 99)
+        self.pr_files[99] = ["charts/runners/values.yaml"]
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+
+    def test_the_manual_step_is_named_once_on_the_held_ticket(self):
+        self.merged(12, 99)
+        self.pr_files[99] = ["pools/values-prod.yml"]
+        self.ship()
+        self.ship()
+        notes = [c["body"] for c in self.fake.comments.get(12, [])
+                 if "applied by hand" in c["body"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("pools/values-prod.yml", notes[0])
+        self.assertIn("pull request #99", notes[0])
+
+    def test_a_values_file_a_deploy_workflow_covers_still_ships_with_that_deploy(self):
+        sha = self.merged(12, 99)
+        self.pr_files[99] = ["stacks/b/values.yaml"]
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.run_for("stack-b.yml", sha)
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+
+    def test_a_manual_change_beside_a_deployed_one_waits_for_the_manual_step(self):
+        sha = self.merged(12, 99)
+        self.pr_files[99] = ["stacks/a/main.py", "charts/runners/values.yaml"]
+        self.run_for("stack-a.yml", sha)
+        self.ship()
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+
+    def test_a_path_the_contract_lists_as_manual_is_not_shipped_on_merge(self):
+        self.manual = "# applied with ansible\nplaybooks/**\n!playbooks/docs/**\n"
+        self.merged(12, 99)
+        self.merged(13, 98)
+        self.pr_files[99] = ["playbooks/site.yml"]
+        self.pr_files[98] = ["playbooks/docs/notes.md"]
+        self.ship()
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+        self.assertIn("loom:shipped", self.fake.names(13))
+
+    def test_a_file_merely_named_like_values_in_another_extension_ships_on_merge(self):
+        self.merged(12, 99)
+        self.pr_files[99] = ["docs/values.md", "src/revalues.yaml"]
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
 
     def test_an_unlisted_repo_is_left_alone(self):
         self.settings.ship_path_workflows = []
@@ -7253,6 +7335,26 @@ class VerifyDueTest(unittest.TestCase):
         self.assertEqual([i["number"] for _, i in station.verify_due(
             [(REPO, missing), (REPO, exact)], {}, 99999)], [5])
 
+    def test_a_ticket_whose_proof_was_refused_the_cap_times_is_not_due(self):
+        def item(number):
+            return (REPO, {"number": number, "state": "open", "shipped_at": number,
+                           "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]})
+        refused = {"%s#1" % REPO: ["why"] * station.VERIFY_REFUSAL_CAP,
+                   "%s#2" % REPO: ["why"] * (station.VERIFY_REFUSAL_CAP - 1)}
+        found = station.verify_due([item(1), item(2), item(3)], {}, 99999, refused)
+        self.assertEqual([issue["number"] for _, issue in found], [2, 3])
+
+
+class StationLogTimeTest(unittest.TestCase):
+    def test_every_station_log_line_starts_with_a_utc_time(self):
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            station._say("handed ticket 1 to lane codex to verify")
+        self.assertRegex(out.getvalue(),
+                         r"^\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\] station: handed ticket 1 ")
+        # A quoted line now names a time, so the live-evidence check accepts it.
+        self.assertTrue(station._SEEN_AT.search(out.getvalue()))
+
 
 SHIPPED_BODY = ("Difficulty: easy\n\n## Why\nBecause.\n\n## Acceptance criteria\n"
                 "- [ ] A test passes\n- [ ] Live: prints `daily status ready`\n")
@@ -8143,6 +8245,40 @@ class VerifyResultTest(Base):
         self.assertEqual(len(facts), 1)
         self.assertIn("PR #31 merged 2029-12-31T00:00:00Z as %s" % sha[:12], facts[0])
         self.assertIn("main contains it: yes", facts[0])
+
+    def refuse_n(self, count):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=time.time())
+        for _ in range(count):
+            st._apply_proof("codex", REPO, 5, self.good(criteria=[]), "model-x")
+        return st
+
+    def test_a_ticket_refused_the_cap_times_goes_to_the_brain_once_with_the_refusals(self):
+        self.refuse_n(station.VERIFY_REFUSAL_CAP - 1)
+        self.assertEqual(self.fake.comments[5], [])
+        self.assertNotIn("needs-brain", self.fake.names(5))
+        st = self.refuse_n(1)
+        self.assertIn("needs-brain", self.fake.names(5))
+        self.assertIn("loom:shipped", self.fake.names(5))
+        self.assertEqual(len(self.fake.comments[5]), 1)
+        note = self.fake.comments[5][0]["body"]
+        self.assertEqual(note.count("- Its proof was refused"), station.VERIFY_REFUSAL_CAP)
+        # A late result from a run already out does not say it again.
+        self.refuse_n(1)
+        self.assertEqual(len(self.fake.comments[5]), 1)
+        # It is no longer due, though its cooldown is long over.
+        st.now = time.time() + 10 * station.VERIFY_INTERVAL
+        with mock.patch.object(st, "_shipped_stamp", return_value=1), \
+             mock.patch.object(st, "_proven", return_value=False):
+            pool, _ = st._verify_pool({})
+        self.assertNotIn(5, [issue["number"] for _, issue in pool])
+
+    def test_a_ticket_refused_fewer_times_stays_due(self):
+        st = self.refuse_n(station.VERIFY_REFUSAL_CAP - 1)
+        st.now = time.time() + 10 * station.VERIFY_INTERVAL
+        with mock.patch.object(st, "_shipped_stamp", return_value=1), \
+             mock.patch.object(st, "_proven", return_value=False):
+            pool, _ = st._verify_pool({})
+        self.assertIn(5, [issue["number"] for _, issue in pool])
 
     def test_an_invalid_proof_leaves_the_ticket_shipped_with_no_comment(self):
         self.result(self.good(criteria=[]))

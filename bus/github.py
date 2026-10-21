@@ -9,8 +9,11 @@ returns that answer: GitHub does not count a 304 against the hourly budget.
 With the GitHub App settings present (auth_from_env), requests carry an App
 installation token instead of a personal token, so they spend the
 installation's own hourly budget. The token is minted at run time from the
-App's private key, read from SSM, kept in memory only, and refreshed before
-it expires.
+App's private key, read from SSM, and refreshed before it expires. The key
+and the token are held in memory; a caller that runs one pass per process (the
+station) may also name a state file (AppToken.state_file, mode 0600) that keeps
+the token across passes, so the ETags cached on the last pass still match
+(GitHub's ETags differ per token; loom#1306). Nothing else is written to disk.
 """
 from __future__ import annotations
 
@@ -55,6 +58,8 @@ Transport = Callable[[str, str, Dict[str, str], Optional[bytes]],
 # programmatic close in the factory funnels through GitHub.rest, so this is
 # the choke point the close-completeness gate watches.
 _ISSUE_PATH = re.compile(r"^/repos/[^/]+/[^/]+/issues/[0-9]+$")
+# The repo and issue number of an issue-comment list path.
+_COMMENTS_OF = re.compile(r"/repos/([^/]+/[^/]+)/issues/([0-9]+)/comments(?:\?|$)")
 
 # Labels that let an issue close as completed with unchecked boxes, mirroring
 # the close-completeness guard's escape hatches.
@@ -315,8 +320,11 @@ class AppToken:
 
     The key is read through read_key each time a token is minted and dropped
     after signing; the token is kept in memory until APP_TOKEN_MARGIN seconds
-    before its expires_at. Neither is written to disk, and no error or log
-    line carries either. Thread safe: parallel reads share one token."""
+    before its expires_at. The key is never written to disk. The token is
+    written only to state_file, when one is set, as a 0600 file: a process
+    that lives for one pass then reuses the last pass's token and the ETags
+    cached under it answer 304 (loom#1306). No error or log line carries
+    either. Thread safe: parallel reads share one token."""
 
     def __init__(self, app_id: str, installation_id: str,
                  read_key: Callable[[], str],
@@ -333,6 +341,9 @@ class AppToken:
         self._token: Optional[str] = None
         self._expires = 0.0
         self.minted = 0
+        # Where the token is kept between processes (0600); None keeps it in
+        # memory only.
+        self.state_file: Optional[str] = None
         # Where the key is read from: "ssm" (the aws CLI) or "file".
         self.key_source = "ssm"
         self.key_file = ""
@@ -396,11 +407,14 @@ class AppToken:
         jwt) -> (token, expires_at) when none is held or it expires within
         APP_TOKEN_MARGIN seconds."""
         with self._lock:
+            if self._token is None:
+                self._load()
             if self._token is None or self._clock() >= self._expires - APP_TOKEN_MARGIN:
                 path = "/app/installations/%s/access_tokens" % self.installation_id
                 token, expires_at = mint(path, self.jwt())
                 self._token, self._expires = token, _expiry(expires_at)
                 self.minted += 1
+                self._save()
             return self._token
 
     def invalidate(self) -> None:
@@ -408,6 +422,54 @@ class AppToken:
         with self._lock:
             self._token = None
             self._expires = 0.0
+            self._forget()
+
+    def _load(self) -> None:
+        """Take the token the state file keeps, when it is this App's, not
+        yet within APP_TOKEN_MARGIN of expiring, and private to this user. A
+        missing or odd file only costs one mint."""
+        if not self.state_file:
+            return
+        try:
+            st = os.stat(self.state_file)
+            if st.st_uid != os.getuid() or st.st_mode & 0o077:
+                return
+            with open(self.state_file, encoding="utf-8") as fh:
+                kept = json.load(fh)
+            token, expires = kept["token"], float(kept["expires"])
+            same = kept["app_id"] == self.app_id and kept["installation_id"] == self.installation_id
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        if same and isinstance(token, str) and token.strip() \
+                and self._clock() < expires - APP_TOKEN_MARGIN:
+            self._token, self._expires = token.strip(), expires
+
+    def _save(self) -> None:
+        """Keep the token in the state file, created 0600 and replaced whole.
+        A failure only means the next process mints its own."""
+        if not self.state_file or self._token is None:
+            return
+        tmp = "%s.%d.tmp" % (self.state_file, os.getpid())
+        try:
+            os.makedirs(os.path.dirname(self.state_file) or ".", exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"app_id": self.app_id, "installation_id": self.installation_id,
+                           "token": self._token, "expires": self._expires}, fh)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.state_file)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def _forget(self) -> None:
+        if self.state_file:
+            try:
+                os.unlink(self.state_file)
+            except OSError:
+                pass
 
     def __repr__(self) -> str:
         return "AppToken(installation)"
@@ -438,6 +500,11 @@ class GitHub:
         # client's own App bot login is added on first use; a caller adds its
         # trusted writers (the station its LOOM_BRIEF_AUTHORS).
         self.status_authors: set = set()
+        # Whether this client keeps a ticket's routine events in the issue
+        # body's status section and reads them back (bus/status.py, loom#1341).
+        # The station, the brain and the dashboard turn it on, together: a
+        # client that does not read the section must not write into it.
+        self.status_in_body = False
         self._sleep = sleep
         self.api = api.rstrip("/")
         self.transport = transport or urllib_transport
@@ -472,6 +539,7 @@ class GitHub:
 
     def rest(self, method: str, path: str, body: Any = None,
              etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
+        body = self._keep_status_section(method, path, body)
         resp = self._rest(method, path, body, etag, ok)
         if method == "POST" and self.unsubscribe and self.app is None:
             self._leave_thread(path, resp.data)
@@ -479,9 +547,67 @@ class GitHub:
             # A ticket's status comment reads as one comment per event, so
             # every reader of those events sees them as before (loom#866).
             expanded = status.expand(resp.data, self._status_logins())
+            expanded = self._with_body_events(path, expanded)
             if expanded is not resp.data:
                 resp = Response(resp.status, expanded, resp.etag, resp.headers)
         return resp
+
+    def _with_body_events(self, path: str, items: Any) -> Any:
+        """The first page of a ticket's comments with the events of its issue
+        body's status section added, one pseudo-comment each (loom#1341). They
+        carry the issue author's login, trusted only when it is one of ours,
+        and a negative id: no comment holds them, so nothing can edit one."""
+        found = _COMMENTS_OF.search(path)
+        if not self.status_in_body or not found:
+            return items
+        allowed = self._status_logins()
+        if not allowed or _page_of(path) != 1 or not isinstance(items, list):
+            return items
+        try:
+            issue = self._rest("GET", "/repos/%s/issues/%s" % found.groups()).data
+        except GitHubError as err:
+            if err.status == 404:
+                return items  # the issue is gone or moved: no section to read
+            raise
+        if not isinstance(issue, dict) or "pull_request" in issue:
+            return items
+        user = issue.get("user")
+        if not isinstance(user, dict) or str(user.get("login") or "").lower() not in allowed:
+            return items
+        events = status.body_events(issue.get("body"))
+        if not events:
+            return items
+        ident = issue.get("id")
+        ident = -ident if isinstance(ident, int) and not isinstance(ident, bool) and ident else -1
+        extra = []
+        for at, text in reversed(events):
+            extra.append({"id": ident, "user": user, "body": text, "created_at": at,
+                          "updated_at": at, status.EXPANDED: True, status.FROM_BODY: True})
+        return status.resort(list(items) + extra)
+
+    def _keep_status_section(self, method: str, path: str, body: Any) -> Any:
+        """A PATCH that sets an issue's body keeps the status section the issue
+        has now: the caller read the body some time ago, and the station may
+        have added events since (loom#1341). The status writer's own PATCH
+        (status.OwnBody) is left as it is."""
+        if (method != "PATCH" or not _ISSUE_PATH.match(path) or not isinstance(body, dict)
+                or isinstance(body, status.OwnBody) or "body" not in body):
+            return body
+        allowed = self._status_logins() if self.status_in_body else set()
+        if not allowed:
+            return body
+        issue = self._rest("GET", path, etag=status.FRESH).data
+        user = issue.get("user") if isinstance(issue, dict) else None
+        if not isinstance(user, dict) or str(user.get("login") or "").lower() not in allowed:
+            return body
+        events = status.body_events(issue.get("body"))
+        if not events or status.body_events(body.get("body")) == events:
+            return body
+        try:
+            kept = status.with_body_events(str(body.get("body") or ""), events)
+        except ValueError:
+            return body
+        return dict(body, body=kept)
 
     def _rest(self, method: str, path: str, body: Any = None,
               etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:

@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from . import audit
 from . import brain_memory
 from . import claimed
+from . import scope_fit
 from . import stale_claims
 from . import factory
 from . import friction_intake
@@ -282,6 +283,7 @@ PIN_SHIP_LOOKBACK = 7 * 24 * 3600
 PIN_SHIP_SETTLE = 3600
 PIN_SHIPS_FILE = "pin_ships.json"
 SHIP_PATH_FILES = "ship_path_files.json"
+SHIP_PATH_MANUAL = "ship_path_manual.json"
 # The pull request files API returns at most this many files.
 PULL_FILES_MAX = 3000
 # Adopting open pull requests no ticket links (decision 0002, item 1): each
@@ -409,6 +411,12 @@ VERIFY_INTERVAL = 6 * 3600
 # loom:awaiting-evidence label: a reason, not a word.
 MISSING_MIN = 20
 VERIFY_FILE = "verify-runs.json"
+# A shipped ticket whose proof was refused this many times leaves the verify
+# queue and goes to the brain with the refusals listed (loom#1307): the
+# retries every VERIFY_INTERVAL had handed one ticket out 18 times.
+VERIFY_REFUSAL_CAP = 3
+# Per ticket, the reasons its proofs were refused.
+VERIFY_REFUSED_FILE = "verify-refused.json"
 # Per-lane transient verify failures and the holds they earn (loom#714).
 VERIFY_LANES_FILE = "verify-lanes.json"
 VERIFY_STRIKES = 2
@@ -445,8 +453,12 @@ NOTE_MAX = 1500
 
 
 def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
-               attempts: Dict[str, Any], now: float) -> List[Tuple[str, Dict[str, Any]]]:
-    """Shipped tickets without a proof, oldest ship event first, outside cooldown."""
+               attempts: Dict[str, Any], now: float,
+               refused: Optional[Dict[str, Any]] = None
+               ) -> List[Tuple[str, Dict[str, Any]]]:
+    """Shipped tickets without a proof, oldest ship event first, outside
+    cooldown. A ticket whose proof was refused VERIFY_REFUSAL_CAP times
+    (`refused`: ticket -> reasons) is left to the brain."""
     due = []
     for repo, issue in issues:
         labels = _label_names(issue)
@@ -460,6 +472,9 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
             continue
         last = attempts.get(key)
         if isinstance(last, (int, float)) and now - float(last) < VERIFY_INTERVAL:
+            continue
+        reasons = (refused or {}).get(key)
+        if isinstance(reasons, list) and len(reasons) >= VERIFY_REFUSAL_CAP:
             continue
         due.append((repo, issue))
     # A ticket the health pass has proved absent for 24 hours goes first: it
@@ -501,6 +516,8 @@ class Settings:
                  review_check: str = factory.DEFAULT_REVIEW_CHECK,
                  review_bot: str = factory.DEFAULT_REVIEW_BOT,
                  no_test_repos: Sequence[str] = (),
+                 scope_url: str = "",
+                 scope_model: str = "",
                  metrics_goal: str = "",
                  transcript_url: str = "",
                  transcript_token_ssm: str = "",
@@ -593,6 +610,10 @@ class Settings:
         self.review_check = review_check
         self.review_bot = review_bot
         self.no_test_repos = list(no_test_repos)
+        # The keyless chat route and model the scope check asks (bus/scope_fit.py);
+        # no URL, no check.
+        self.scope_url = scope_url
+        self.scope_model = scope_model
         self.metrics_goal = metrics_goal
         self.transcript_url = transcript_url
         self.transcript_token_ssm = transcript_token_ssm
@@ -659,6 +680,8 @@ class Settings:
                    review_bot=(env.get("LOOM_REVIEW_BOT", "").strip()
                                or factory.DEFAULT_REVIEW_BOT),
                    no_test_repos=words("LOOM_NO_TEST_REPOS"),
+                   scope_url=env.get("LOOM_SCOPE_CHECK_URL", "").strip(),
+                   scope_model=env.get("LOOM_SCOPE_CHECK_MODEL", "").strip(),
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
                    transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
@@ -974,7 +997,10 @@ def _snowflake(at: float) -> int:
 
 
 def _say(msg: str) -> None:
-    print("station: " + msg, file=sys.stderr)
+    # The UTC time leads the line, so evidence that quotes a station log line
+    # can name when it was seen (loom#1307).
+    print("[%s] station: %s" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg),
+          file=sys.stderr)
 
 
 class StateError(Exception):
@@ -1355,6 +1381,7 @@ class Station:
         self._branch_cache: Dict[str, str] = {}
         # Per pass: each path-scoped repo's workflow filters, and its deploy runs.
         self._path_filters: Dict[str, Dict[str, List[str]]] = {}
+        self._manual_listed: Dict[str, List[str]] = {}
         self._path_runs: Dict[Tuple[str, str], Optional[Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]]] = {}
         # Repos whose claim:<login> label this pass has made sure of.
         self._claim_labels: set = set()
@@ -2593,16 +2620,17 @@ class Station:
         if unsearchable:
             _say("skipped %d shipped tickets whose Live criterion names no exact string" %
                  unsearchable)
+        refused = self._verify_refused_ledger()
         # The cheap filters first: the events and comments of a ticket are
         # read only when its cooldown is over.
         found = []
-        for repo, issue in verify_due(shipped, attempts, self.now):
+        for repo, issue in verify_due(shipped, attempts, self.now, refused):
             issue["shipped_at"] = self._shipped_stamp(repo, issue)
             issue["has_proof"] = self._proven(repo, int(issue["number"]))
             issue["health_proof"] = health.proof_of(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))), self.s.authors)
             found.append((repo, issue))
-        return verify_due(found, attempts, self.now), held
+        return verify_due(found, attempts, self.now, refused), held
 
     def _audit_holds(self) -> Dict[str, float]:
         """The lanes a failed audit of their proof holds from verify runs,
@@ -2820,6 +2848,43 @@ class Station:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
         return True
 
+    def _verify_refused_ledger(self) -> Dict[str, Any]:
+        # One station pass runs at a time (run() holds station.lock) and applies
+        # verify results one after another, and _write_json replaces the file
+        # whole, so the ledger is never half written or updated by two writers.
+        data = _read_json(os.path.join(self.state, VERIFY_REFUSED_FILE), {}, strict=False)
+        return data if isinstance(data, dict) else {}
+
+    def _forget_refusals(self, repo: str, number: int) -> None:
+        data = self._verify_refused_ledger()
+        if data.pop("%s#%d" % (repo, number), None) is not None:
+            _write_json(os.path.join(self.state, VERIFY_REFUSED_FILE), data)
+
+    def _proof_refused(self, repo: str, number: int, lane: str, names: List[str],
+                       why: str) -> None:
+        """Log a refused proof and count it. At VERIFY_REFUSAL_CAP the ticket
+        leaves the verify queue (verify_due) and goes to the brain once: one
+        comment lists the refusals and the ticket gains needs-brain."""
+        self._verify_note(repo, number, lane, why)
+        data = self._verify_refused_ledger()
+        key = "%s#%d" % (repo, number)
+        reasons = data.get(key)
+        reasons = (reasons if isinstance(reasons, list) else []) + [why]
+        data[key] = reasons
+        _write_json(os.path.join(self.state, VERIFY_REFUSED_FILE), data)
+        if len(reasons) != VERIFY_REFUSAL_CAP:
+            return
+        if "needs-brain" not in names:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
+                "<!-- loom:verify-refused v1 -->\n"
+                "The station stops handing this ticket out to verify: %d proofs were "
+                "refused. The brain reads the ticket and its live criterion, then proves "
+                "it or rewrites it.\n\n%s\n" % (
+                    len(reasons), "\n".join("- " + self._note_text(x) for x in reasons))})
+            self._add_label(repo, number, "needs-brain")
+        _say("%s#%d left the verify queue after %d refused proofs; left for the brain"
+             % (repo, number, len(reasons)))
+
     def _forget_verify_attempt(self, repo: str, number: int) -> None:
         path = os.path.join(self.state, VERIFY_FILE)
         attempts = _read_json(path, {}, strict=False)
@@ -2945,22 +3010,22 @@ class Station:
         try:
             proof.check(record, ticked)
         except ValueError as err:
-            self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))
+            self._proof_refused(repo, number, lane, names, "Its proof was refused: %s." % self._note_text(err))
             return
         if _text.CREDENTIAL_RE.search(proof.render(record, ticked)):
-            self._verify_note(repo, number, lane, "Its proof holds text shaped like a credential.")
+            self._proof_refused(repo, number, lane, names, "Its proof holds text shaped like a credential.")
             return
         unseen = unseen_live_evidence(record)
         if unseen:
-            self._verify_note(repo, number, lane, "Its proof was refused: %s." % unseen)
+            self._proof_refused(repo, number, lane, names, "Its proof was refused: %s." % unseen)
             return
         refusal = self._merge_refusal(repo, issue, record)
         if refusal:
-            self._verify_note(repo, number, lane, refusal)
+            self._proof_refused(repo, number, lane, names, refusal)
             return
         contradiction, facts = self._proof_facts(repo, issue, record)
         if contradiction:
-            self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(
+            self._proof_refused(repo, number, lane, names, "Its proof was refused: %s." % self._note_text(
                 contradiction))
             return
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
@@ -2969,8 +3034,9 @@ class Station:
                                 verified_by="%s/%s" % (lane, model), facts=facts)
         except ValueError as err:
             self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
-            self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))
+            self._proof_refused(repo, number, lane, names, "Its proof was refused: %s." % self._note_text(err))
             return
+        self._forget_refusals(repo, number)
         _say("verified %s#%d from the proof lane %s gathered" % (repo, number, lane))
         if source:
             _say("%s#%d: %s" % (repo, number, source))
@@ -4049,6 +4115,10 @@ class Station:
         saved = _read_json(cache_path, {}, strict=False)
         known = saved if isinstance(saved, dict) else {}
         kept: Dict[str, Any] = {}
+        manual_path = os.path.join(self.state, SHIP_PATH_MANUAL)
+        noted = _read_json(manual_path, {}, strict=False)
+        told = noted if isinstance(noted, dict) else {}
+        listed = self._manual_listed_paths(repo)
         shipped = 0
         try:
             for _, number, pr in sorted((str(pr["merged_at"]), n, pr) for n, pr in latest.items()):
@@ -4061,6 +4131,10 @@ class Station:
                     if files is None:
                         continue
                 kept[key] = files
+                by_hand = ship_paths.manual_files(files, filters, listed)
+                if by_hand:
+                    self._note_by_hand(repo, number, pr, by_hand, told)
+                    continue
                 needed = sorted(w for w, pats in filters.items()
                                 if any(ship_paths.matches(pats, f) for f in files))
                 how, revision = self._path_cover(repo, pr, branch, needed)
@@ -4070,6 +4144,41 @@ class Station:
                     shipped += 1
         finally:
             _write_json(cache_path, {**{k: v for k, v in known.items() if k.split("#")[0] != repo}, **kept})
+            _write_json(manual_path, told)
+
+    def _manual_listed_paths(self, repo: str) -> List[str]:
+        """The path patterns the repo's .loom/manual-paths lists as applied by
+        hand, read once a pass; [] when the repo has no such file."""
+        if repo not in self._manual_listed:
+            text = self._contents_text(repo, ship_paths.MANUAL_PATHS_FILE)
+            self._manual_listed[repo] = ship_paths.listed_manual(text) if text else []
+        return self._manual_listed[repo]
+
+    def _note_by_hand(self, repo: str, number: int, pr: Dict[str, Any],
+                      files: List[str], told: Dict[str, Any]) -> None:
+        """Leave a ticket at loom:merged because its pull request changed
+        paths that are applied by hand, and name the manual step once on the
+        ticket (kept in ship_path_manual.json, so a pass never repeats it)."""
+        key = "%s#%d" % (repo, number)
+        if told.get(key) == int(pr["number"]):
+            return
+        shown = ", ".join("`%s`" % f for f in files[:5]) + (
+            " and %d more" % (len(files) - 5) if len(files) > 5 else "")
+        _say("%s stays merged: pull request #%d changed paths applied by hand: %s" % (
+            key, int(pr["number"]), ", ".join(files[:5])))
+        body = ("Not shipped on merge: pull request #%d changed %s, which merging does not "
+                "deploy (applied by hand: a Helm values file no deploy workflow covers, or a "
+                "path listed in `%s`). The ticket stays at loom:merged until the manual step "
+                "(for a chart, the helm upgrade) is run and the brain or an operator moves it "
+                "to loom:shipped." % (int(pr["number"]), shown, ship_paths.MANUAL_PATHS_FILE))
+        try:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not note the manual step on %s: %s" % (key, err))
+            return
+        told[key] = int(pr["number"])
 
     def _workflow_filters(self, repo: str, branch: str) -> Optional[Dict[str, List[str]]]:
         """Workflow file name to its on.push.paths filter, for the repo's
@@ -8239,6 +8348,9 @@ class Station:
 
     def _factory(self) -> factory.Factory:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
+        ask = scope_fit.asker(self.s.scope_url, self.s.scope_model)
+        # Passed only when the check is on, so the factory's default stays off.
+        extra = {"scope": ask} if ask is not None else {}
         return factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
                                briefers=self.s.briefers,
                                review_check=self.s.review_check,
@@ -8250,7 +8362,7 @@ class Station:
                                held=list(self._held_tickets()) + self._gate_held(),
                                silent=self._silent_lanes(),
                                down=self.down_lanes(),
-                               limit_until=self.limit_until())
+                               limit_until=self.limit_until(), **extra)
 
     def watch_default_branches(self) -> None:
         """Fix forward after a red lane merge, then revert if it stays red.
@@ -9013,10 +9125,16 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         if gh is None:
             from .github import auth_from_env
             gh = GitHub(auth_from_env())
+            gh.status_in_body = True
         _trust_app_login(settings, gh)
         if gh.cache_dir is None:
             # Every GET is conditional: a list re-read each pass costs a 304.
             gh.cache_dir = os.path.join(state, "station", "etags")
+        app = getattr(gh, "app", None)
+        if app is not None and getattr(app, "state_file", None) is None:
+            # GitHub's ETags differ per token: keep the App token across
+            # passes (0600) so last pass's ETags still answer 304 (loom#1306).
+            app.state_file = os.path.join(state, "station", "app-token.json")
         st = Station(gh, settings, **hooks)
         try:
             st.run_pass()

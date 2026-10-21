@@ -115,7 +115,14 @@ the changed files of each open `loom:merged` ticket's pull request (kept in
 `ship_path_files.json`). The ticket moves to `loom:shipped` when, for every
 workflow whose filter matches a changed file, a successful push run on the
 default branch ran on the merge commit or a later run carries it. A pull
-request that changes no file a filter matches ships on merge. A `!` pattern
+request that changes no file a filter matches ships on merge, unless it
+changed a path that is applied by hand: a Helm values file (`values.yaml`,
+`values-*.yaml`) that no workflow's filter covers, or a path matched by the
+repo's `.loom/manual-paths` (one pattern per line, `#` comments, `!` excludes,
+read from the default branch once a pass). Merging deploys none of those, so
+the ticket stays at `loom:merged` and the station comments once naming the
+files and the manual step (for a chart, the helm upgrade); the brain or an
+operator moves it to `loom:shipped` after. A `!` pattern
 excludes, as GitHub does; a workflow without a `paths` filter is not a deploy
 workflow here. Reverts and the 20 moves per pass limit apply as above.
 
@@ -753,9 +760,12 @@ When the runner finishes, the station finds the brief in `done/` or
   pull request is left.
 - Failed: label `loom:failed`, comment with the reason from the runner's
   log line, with local paths removed.
-  A run that committed nothing and gave no reason fails with `agent made no
-  commit and wrote no reason`. The factory climbs the model ladder once for
-  it; at the second such failure since the ladder last started it does not
+  A run that committed nothing and wrote no summary carries the end of what
+  the agent said (one ASCII line, at most 600 characters, through the same
+  text checks as an answer) in the reason: `agent made no commit; it said:
+  ...`. Only a run that said nothing, or whose words fail the checks, fails
+  with `agent made no commit and wrote no reason`. The factory climbs the
+  model ladder once for that; at the second such failure since the ladder last started it does not
   climb again but leaves the ticket failed with `needs-brain` and one
   comment saying why.
 - Limited (a reason starting `limit:` after its class, the spark lane's
@@ -843,6 +853,32 @@ opened, a failure, merged, shipped, verified, an ask, a runaway hold) and
 (bus/github.py) expands a status comment in any issue-comment list into one
 comment per event, timed by its line, so every reader sees each event as the
 comment it used to be. Only a trusted login's status comment is edited.
+
+The first routine event on a ticket used to post that comment, and so emailed
+the operator once per ticket (loom#1341). Where the client keeps events in the
+issue body (`GitHub.status_in_body`, on for the station, the brain and the
+dashboard), a ticket with no status comment gets its events in a section at the
+end of the issue body instead, between `<!-- loom:status-body v1 begin -->` and
+`<!-- loom:status-body v1 end -->`, same `- <UTC time> <text>` lines, newest
+first; a body edit sends no email. A ticket that already has a status comment
+keeps editing it. Rules:
+
+- Only an issue written by a trusted login or the App has its section written
+  or read; for any other issue the event goes to a comment as before.
+- The client reads the section into the first page of every comment list as one
+  comment per event, by the issue author's login and a negative id (no comment
+  holds it), so the readers (`factory.attempts`, the ready mark, the rung climb)
+  count them as before. That costs one conditional issue read per comment list.
+- The writer reads the body in full, merges its event into the section, reads
+  the body again just before the PATCH and starts over if it moved; after three
+  moves it posts a comment rather than overwrite an operator edit. GitHub has no
+  conditional issue write, so an edit landing inside the one request between
+  that second read and the PATCH can still be lost.
+- Any other body PATCH through the client keeps the section the issue has now
+  (the caller's copy may be older), so a rewrite, a model header change or a
+  regression note never drops events.
+- `tickets.parse` leaves the section out of the brief and `with_original` does
+  not quote it.
 
 ## Polling budget
 

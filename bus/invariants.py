@@ -125,6 +125,18 @@ WAIT_LIMIT = 6 * 3600
 # the body is compared, so an unchanged list writes nothing.
 LAST_SEEN = "Last seen by the station: %s."
 LINE_MAX = 300
+# Invariants kept as one standing issue (loom#845): when the cause clears the
+# issue says so in place and stays open, and the next breach edits it again,
+# so a hold that comes and goes never closes and reopens an issue (each reopen
+# mailed the people watching it).
+STANDING = ("lane-held",)
+STANDING_CLEAR_TITLE = "No lane is held by a limit now"
+CLEAR_SINCE = "Clear since %s."
+# What the body keeps of past holds: a line per hold, newest first.
+HOLD_LOG = "Hold log (newest first, last %d):"
+HOLD_LOG_MAX = 20
+HELD_LINE_RE = re.compile(r"^- ([A-Za-z0-9._-]+): held by a limit since (\S+?);", re.M)
+LOG_LINE_RE = re.compile(r"^- [A-Za-z0-9._-]+: held since \S+, cleared \S+$")
 WITHHELD = "(withheld: the line fails the written-text check)"
 
 Say = Callable[[str], None]
@@ -303,6 +315,12 @@ class Breach:
     @property
     def key(self) -> str:
         return "%s/%s" % (self.invariant, hashlib.sha256(self.subject.encode()).hexdigest()[:12])
+
+
+def _standing_keys() -> set:
+    """The keys of the standing issues: the rolling breach of each STANDING
+    invariant. An older per-lane issue of the same invariant is not one."""
+    return {Breach(inv, LANES_SUBJECT, "", (), 0.0).key for inv in STANDING}
 
 
 def utc(at: float) -> str:
@@ -958,24 +976,51 @@ class Filer:
                 self._repairs = self.goal
         return self._repairs
 
-    def _body(self, b: Breach) -> str:
+    def _body(self, b: Breach, log: Sequence[str] = ()) -> str:
         rolling = (["", "One rolling issue for this cause: the station rewrites this list "
                         "in place while it changes.", LAST_SEEN % utc(b.at)]
                    if b.rolling else [])
         return "\n".join(
             [MARKER % b.key,
              "The station found one of the factory's own invariants broken: %s." % b.title,
-             "", "Evidence:"] + self._evidence(b) + rolling +
+             "", "Evidence:"] + self._evidence(b) + rolling + self._log_block(log) +
             ["", "Invariant: `%s` (bus/invariants.py), checked every station pass. Filed "
                  "without a model: this says what broke, not why. Rewrite it as a ticket "
                  "that fixes the cause." % b.invariant,
              "", "Part of #%d" % self._home()])
 
+    @staticmethod
+    def _log_block(log: Sequence[str]) -> List[str]:
+        return ["", HOLD_LOG % HOLD_LOG_MAX] + list(log)[:HOLD_LOG_MAX] if log else []
+
+    @staticmethod
+    def _old_log(body: Any) -> List[str]:
+        """The hold log lines an issue body already carries."""
+        return [line.strip() for line in str(body or "").replace("\r\n", "\n").split("\n")
+                if LOG_LINE_RE.match(line.strip())]
+
+    def _log_for(self, issue: Dict[str, Any], still_held: Sequence[str], at: float
+                 ) -> List[str]:
+        """The log of the issue's body plus a line for each lane its list showed
+        held that is no longer held (still_held names the lanes that are)."""
+        body = str(issue.get("body") or "").replace("\r\n", "\n")
+        ended = ["- %s: held since %s, cleared %s" % (m.group(1), m.group(2), utc(at))
+                 for m in HELD_LINE_RE.finditer(body) if m.group(1) not in still_held]
+        return (list(reversed(ended)) + self._old_log(body))[:HOLD_LOG_MAX]
+
+    @staticmethod
+    def _held_lanes(b: Breach) -> List[str]:
+        return [m.group(1) for line in b.evidence for m in [HELD_LINE_RE.match("- " + line)]
+                if m]
+
     def _refresh(self, b: Breach, number: int, issue: Dict[str, Any]) -> None:
         """Rewrite a rolling breach's open issue when its title or list
         changed; the last-seen line alone is no reason to write."""
         title = naming.clip(b.title)
-        body = self._body(b)
+        log: Sequence[str] = ()
+        if b.invariant in STANDING:
+            log = self._log_for(issue, self._held_lanes(b), b.at)
+        body = self._body(b, log)
 
         def steady(text: Any) -> str:
             return "\n".join(line for line in str(text or "").replace("\r\n", "\n").split("\n")
@@ -1073,8 +1118,35 @@ class Filer:
                 if self.writes + 2 > WRITES_MAX:
                     return
                 self._fold(number, into, comments)
+            elif key in _standing_keys():
+                if self.writes >= WRITES_MAX:
+                    return
+                self._mark_clear(key, number, issue)
             elif not self._close_quiet(number, issue, labels, comments):
                 return
+
+    def _mark_clear(self, key: str, number: int, issue: Dict[str, Any]) -> None:
+        """A standing issue whose breach is gone says so in place and stays
+        open; what it listed moves into its hold log. Already clear: no write."""
+        title = naming.clip(STANDING_CLEAR_TITLE)
+        if issue.get("title") == title:
+            return
+        invariant = key.split("/", 1)[0]
+        body = "\n".join(
+            [MARKER % key,
+             "The station found no lane held by a limit for over %s while tickets of its "
+             "tier are queued." % _hours(HELD_MAX),
+             CLEAR_SINCE % utc(self.now), "",
+             "This is the one standing issue for the invariant: the station edits it in place "
+             "when a hold starts, changes or clears, and does not close it."] +
+            self._log_block(self._log_for(issue, (), self.now)) +
+            ["", "Invariant: `%s` (bus/invariants.py), checked every station pass." % invariant,
+             "", "Part of #%d" % self._home()])
+        _text.check(title + "\n" + body)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                     {"title": title, "body": body})
+        self.writes += 1
+        self.say("invariants: %s#%d is clear, left open: %s" % (self.repo, number, title))
 
     def _close_quiet(self, number: int, issue: Dict[str, Any], labels: List[str],
                      comments: List[Dict[str, Any]]) -> bool:
