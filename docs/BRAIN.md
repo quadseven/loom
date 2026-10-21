@@ -640,7 +640,10 @@ labelled `claim:<login>`) still follows its pull request: an open pull
 request by that owner, on a branch of the repo, whose `Refs` line names a
 ticket a trusted login filed, moves it from `loom:queued` to `loom:pr`, and
 from there the closed pull request pass moves it to `loom:merged` on merge
-and shipping follows. It is never briefed or claimed this way, and a pull
+and shipping follows. A merge that leaves ticket criteria neither ticked nor
+marked `; not built: <reason>` in any merged pull request for it moves the
+ticket to `loom:queued` instead, with a status event naming them. It is never
+briefed or claimed this way, and a pull
 request by anyone who does not own the ticket moves nothing. So is a ticket assigned to a login outside
 `LOOM_BRIEF_AUTHORS` or labelled `claim:<login>` for one, or one under a goal home whose `Operator:` line names
 another login: another operator's Loom owns it (docs/LANES.md, "Two Looms on

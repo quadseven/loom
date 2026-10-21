@@ -3115,7 +3115,8 @@ class Station:
             return "loom:closed-unmerged"
         return None
 
-    def _reconcile_pr_ticket(self, repo: str, pr: dict, tickets_by_number: dict) -> None:
+    def _reconcile_pr_ticket(self, repo: str, pr: dict, tickets_by_number: dict,
+                             landed: Sequence[dict] = ()) -> None:
         number = self._pr_ticket_number(repo, pr)
         ticket = tickets_by_number.get(number) if number is not None else None
         if ticket is None:
@@ -3130,6 +3131,15 @@ class Station:
             events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
             if tickets.merged_before_regression_requeue(ticket, pr.get("merged_at"), events):
                 return
+        left: List[str] = []
+        if target == "loom:merged":
+            left = self._unbuilt_criteria(ticket, [pr, *landed])
+            if left:
+                events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
+                if (tickets.merged_before_requeue(pr.get("merged_at"), events)
+                        or "loom:queued" in labels):
+                    return
+                target = "loom:queued"
         state_names = ("queued", "briefed", "running", "pr", "failed", "merged",
                        "shipped", "verified", "closed-unmerged")
         states = {"loom:" + state for state in state_names}
@@ -3138,6 +3148,25 @@ class Station:
         self.gh.rest("PUT", "/repos/%s/issues/%s/labels" % (repo, ticket["number"]),
                      {"labels": kept})
         ticket["labels"] = [{"name": name} for name in kept]
+        if left:
+            # Routine: the ticket goes back for the rest, and a comment would
+            # email the operator on each such merge.
+            self._routine(repo, number, "Pull request #%d merged and left ticket criteria "
+                          "unbuilt, so the ticket is back at loom:queued for the rest: %s"
+                          % (int(pr["number"]), "; ".join(left)))
+            _say("%s#%d: merged pull request #%d left %d criteria unbuilt, requeued"
+                 % (repo, number, int(pr["number"]), len(left)))
+
+    @staticmethod
+    def _unbuilt_criteria(ticket: dict, merged: Sequence[dict]) -> List[str]:
+        """The ticket's criteria that no merged pull request for it ticks or
+        marks "not built: <reason>" (the factory's own reading of a body)."""
+        body = str(ticket.get("body") or "")
+        left = factory.missing_criteria(body, str(merged[0].get("body") or ""))
+        for other in merged[1:]:
+            answered = set(left) - set(factory.missing_criteria(body, str(other.get("body") or "")))
+            left = [text for text in left if text not in answered]
+        return left
 
     def _reconcile_adoptions(self, repo: str, open_tickets: List[Dict[str, Any]]) -> None:
         """Move each open adoption ticket to loom:merged once the pull
@@ -3253,7 +3282,11 @@ class Station:
             if isinstance(pr, dict) and pr.get("state") == "closed":
                 merged = self._terminal_label(pr) == "loom:merged"
                 pool = tickets_by_number if merged else waiting
-                self._reconcile_pr_ticket(repo, pr, pool)
+                landed = [other for other in closed if other is not pr and isinstance(other, dict)
+                          and self._terminal_label(other) == "loom:merged"
+                          and self._pr_ticket_number(repo, other) == self._pr_ticket_number(repo, pr)
+                          ] if merged else []
+                self._reconcile_pr_ticket(repo, pr, pool, landed)
                 if merged:
                     self._deliver_unlinked(repo, pr, unlinked)
 
