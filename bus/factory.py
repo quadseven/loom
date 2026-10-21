@@ -1944,16 +1944,16 @@ class Factory:
             _say("brought %s#%d up to date with its base; it lands once its checks "
                  "and review pass on the new head" % (repo, number))
             return
-        if self._merge(repo, number, issue):
+        if self._merge(repo, number, issue, str((full.get("head") or {}).get("sha") or "")):
             self.landed.add(repo)
 
-    def _merge(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
+    def _merge(self, repo: str, number: int, issue: Dict[str, Any], sha: str = "") -> bool:
         ticket = (repo, int(issue["number"]))
         try:
             try:
                 self.merge(self.gh, repo, number, ticket)
             except GitHubError as err:
-                if err.status != 405 or not self._dismiss_bot_change_requests(repo, number):
+                if err.status != 405 or not self._dismiss_bot_change_requests(repo, number, sha):
                     raise
                 self.merge(self.gh, repo, number, ticket)
         except (ValueError, GitHubError) as err:
@@ -1963,28 +1963,37 @@ class Factory:
         _say("merged %s#%d for #%d" % (repo, number, issue["number"]))
         return True
 
-    def _dismiss_bot_change_requests(self, repo: str, number: int) -> bool:
-        """Dismiss a bot's standing change requests on a pull request whose
-        review check passed on its head (only a ready one reaches _merge), and
-        say whether any was. The review bot leaves the change request of a
-        failing review in place after its own later review of the same head
-        passes, and the merge was refused every pass (2026-10-21). A person's
-        change request is never dismissed."""
+    def _dismiss_bot_change_requests(self, repo: str, number: int, sha: str) -> bool:
+        """Dismiss the review bot's change requests that its own review check
+        superseded, and say whether any was: each one submitted before that
+        check last passed on the head commit `sha` (only a ready pull request
+        reaches _merge). The review bot leaves the change request of a failing
+        review in place after its own later review of the same head passes,
+        and the merge was refused every pass (2026-10-21). A person's change
+        request, another bot's, and one newer than the passing check stay."""
+        passed = [_ts(r.get("completed_at")) for r in self._runs.get(sha, [])
+                  if r.get("name") == self.review_check and r.get("conclusion") in GREEN]
+        if not sha or not passed:
+            return False
+        cleared = max(passed)
+        bot = {self.review_bot.lower(), self.review_bot.lower() + "[bot]"}
         dismissed = 0
         for review in self.gh.paginate("/repos/%s/pulls/%d/reviews" % (repo, number)):
             user = review.get("user") or {}
-            if review.get("state") != "CHANGES_REQUESTED" or user.get("type") != "Bot":
+            if (review.get("state") != "CHANGES_REQUESTED" or user.get("type") != "Bot"
+                    or str(user.get("login") or "").lower() not in bot
+                    or _ts(review.get("submitted_at")) >= cleared):
                 continue
             self.gh.rest("PUT", "/repos/%s/pulls/%d/reviews/%d/dismissals"
                          % (repo, number, int(review["id"])),
                          {"event": "DISMISS", "message":
                           "Superseded: %s passed on this head commit after this review. "
-                          "The factory dismisses a bot's change request that its own "
-                          "later review cleared." % self.review_check})
+                          "The factory dismisses the review bot's change request that "
+                          "its own later review cleared." % self.review_check})
             dismissed += 1
         if dismissed:
             self.actions += 1
-            _say("dismissed %d superseded bot change request(s) on %s#%d"
+            _say("dismissed %d superseded review-bot change request(s) on %s#%d"
                  % (dismissed, repo, number))
         return bool(dismissed)
 

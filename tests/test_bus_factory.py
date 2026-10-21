@@ -363,28 +363,38 @@ class PullRequests(Base):
         self.assertEqual(self.merged, [])
         self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
 
+    def blocked_by(self, login, user_type="Bot", submitted=600):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        # The review check passed 60s ago; the change request is older.
+        self.gh.runs["sha50"] = [{"name": "unittest", "status": "completed", "conclusion": "success"},
+                                 {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+                                  "conclusion": "success", "completed_at": iso(60)}]
+        self.gh.reviews[50] = [{"id": 7, "state": "CHANGES_REQUESTED", "submitted_at": iso(submitted),
+                                "user": {"login": login, "type": user_type}}]
+        self.go()
+        return [w for w in self.gh.writes if "/dismissals" in w[1]]
+
     def test_a_ready_pull_request_blocked_by_the_review_bots_old_change_request_lands(self):
         # The bot's failing review left a change request that its own later
         # green review on the same head never dismissed, and the merge was
         # refused every pass (2026-10-21).
-        self.gh.ticket(5, "pr")
-        self.gh.pull(50, 5)
-        self.gh.reviews[50] = [{"id": 7, "state": "CHANGES_REQUESTED",
-                                "user": {"login": "grug-tribe[bot]", "type": "Bot"}}]
-        self.go()
+        (dismissal,) = self.blocked_by("grug-tribe[bot]")
         self.assertEqual(self.merged, [(50, (REPO, 5))])
-        (dismissal,) = [w for w in self.gh.writes if w[1].endswith("/reviews/7/dismissals")]
+        self.assertTrue(dismissal[1].endswith("/reviews/7/dismissals"))
         self.assertEqual(dismissal[2]["event"], "DISMISS")
         self.assertIn(factory.DEFAULT_REVIEW_CHECK, dismissal[2]["message"])
 
-    def test_a_persons_change_request_is_never_dismissed(self):
-        self.gh.ticket(5, "pr")
-        self.gh.pull(50, 5)
-        self.gh.reviews[50] = [{"id": 8, "state": "CHANGES_REQUESTED",
-                                "user": {"login": "Alice-Example", "type": "User"}}]
-        self.go()
+    def test_a_persons_or_another_bots_change_request_is_never_dismissed(self):
+        for login, user_type in (("Alice-Example", "User"), ("security-scanner[bot]", "Bot")):
+            with self.subTest(login=login):
+                self.merged.clear()
+                self.assertEqual(self.blocked_by(login, user_type), [])
+                self.assertEqual(self.merged, [])
+
+    def test_a_change_request_newer_than_the_passing_review_stays(self):
+        self.assertEqual(self.blocked_by("grug-tribe[bot]", submitted=10), [])
         self.assertEqual(self.merged, [])
-        self.assertFalse([w for w in self.gh.writes if "/dismissals" in w[1]])
 
     def test_code_with_a_test_on_a_later_page_lands(self):
         self.gh.ticket(5, "pr")
