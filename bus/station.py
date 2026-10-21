@@ -2838,6 +2838,9 @@ class Station:
         return True
 
     def _verify_refused_ledger(self) -> Dict[str, Any]:
+        # One station pass runs at a time (run() holds station.lock) and applies
+        # verify results one after another, and _write_json replaces the file
+        # whole, so the ledger is never half written or updated by two writers.
         data = _read_json(os.path.join(self.state, VERIFY_REFUSED_FILE), {}, strict=False)
         return data if isinstance(data, dict) else {}
 

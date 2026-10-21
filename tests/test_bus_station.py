@@ -7267,9 +7267,9 @@ class StationLogTimeTest(unittest.TestCase):
     def test_every_station_log_line_starts_with_a_utc_time(self):
         out = io.StringIO()
         with contextlib.redirect_stderr(out):
-            station._say("handed example#1 to lane codex to verify")
+            station._say("handed ticket 1 to lane codex to verify")
         self.assertRegex(out.getvalue(),
-                         r"^\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\] station: handed example#1 ")
+                         r"^\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\] station: handed ticket 1 ")
         # A quoted line now names a time, so the live-evidence check accepts it.
         self.assertTrue(station._SEEN_AT.search(out.getvalue()))
 
