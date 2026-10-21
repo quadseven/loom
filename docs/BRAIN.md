@@ -801,10 +801,12 @@ newest event first, one `- <UTC time> <text>` line per event (continuation
 lines indented two spaces). That covers a lane given to a queued ticket, a
 claim, a stall, limit or heartbeat move, a rung climb, an equivalent-model
 move, an automatic retry, a lane failure or factory hold the factory acts on
-itself, and a lane stop (a limit, an expired key, a moved branch). A new comment emails the operator; an edit does
+itself, a lane stop (a limit, an expired key, a moved branch), a fix round's
+push to its pull request, and a ready mark (`Ready: checks and review passed on
+head <sha>`; loom#1244). A new comment emails the operator; an edit does
 not (loom#866: zippie#264 carried 77 bot comments). Outcomes (a pull request
-opened or pushed, a failure, merged, shipped, verified, an ask, a runaway
-hold) and `loom:fix` briefs stay new comments. The GitHub client
+opened, a failure, merged, shipped, verified, an ask, a runaway hold) and
+`loom:fix` briefs stay new comments. The GitHub client
 (bus/github.py) expands a status comment in any issue-comment list into one
 comment per event, timed by its line, so every reader sees each event as the
 comment it used to be. Only a trusted login's status comment is edited.
