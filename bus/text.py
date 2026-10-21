@@ -1,7 +1,9 @@
 """Checks on text the brain writes to GitHub."""
 from __future__ import annotations
 
+import os
 import re
+from typing import Iterable, Optional, Tuple
 
 # The review bot's login is grug-tribe[bot]. Its short name with an at-sign in
 # front is a real, unrelated GitHub user: each mention notifies and subscribes
@@ -35,6 +37,71 @@ CREDENTIAL_RE = re.compile(
     r"|\b[A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*\s*[=:]\s*\S+")
 # The same shapes plus long unbroken token runs.
 SECRET_RE = re.compile(CREDENTIAL_RE.pattern + r"|\b[A-Za-z0-9+/_-]{32,}={0,2}")
+# An at-sign followed by a login-shaped word is a GitHub mention wherever it
+# sits outside code: a Python decorator, a CSS at-rule and an npm scope all
+# look like one, and a real user or organization may own the name
+# (wow-overseer#921, #866). A word, a slash or a backtick in front means an
+# email address, a URL or a path, which GitHub does not turn into a mention.
+_MENTION = re.compile(
+    r"(?<![A-Za-z0-9_/`])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)"
+    r"(?:/[A-Za-z0-9_.-]*[A-Za-z0-9_])?")
+# A fence line: the opening or closing run of three or more backticks or
+# tildes, optionally indented or inside a quote.
+_FENCE = re.compile(r"^[ >]*(`{3,}|~{3,})")
+# An inline code span: a run of backticks closed by a run of the same length,
+# inside one paragraph.
+_SPAN = re.compile(r"(?<!`)(`+)(?!`)((?:(?!\n[ \t]*\n).)+?)(?<!`)\1(?!`)", re.DOTALL)
+# The logins Loom is meant to mention, comma separated. Nobody by default.
+MENTION_ALLOW_ENV = "LOOM_MENTION_ALLOW"
+
+
+def mention_allowlist() -> Tuple[str, ...]:
+    """The logins Loom may mention, lower case, from LOOM_MENTION_ALLOW."""
+    raw = os.environ.get(MENTION_ALLOW_ENV, "")
+    return tuple(w.lstrip("@").lower() for w in re.split(r"[\s,]+", raw) if w.lstrip("@"))
+
+
+def _wrap_mentions(prose: str, allow: Iterable[str]) -> str:
+    def wrap(m: "re.Match[str]") -> str:
+        return m.group(0) if m.group(1).lower() in allow else "`" + m.group(0) + "`"
+    return _MENTION.sub(wrap, prose)
+
+
+def _wrap_outside_spans(prose: str, allow: Iterable[str]) -> str:
+    out, at = [], 0
+    for span in _SPAN.finditer(prose):
+        out.append(_wrap_mentions(prose[at:span.start()], allow))
+        out.append(span.group(0))
+        at = span.end()
+    out.append(_wrap_mentions(prose[at:], allow))
+    return "".join(out)
+
+
+def scrub_mentions(text: str, allow: Optional[Iterable[str]] = None) -> str:
+    """The text with every would-be GitHub mention wrapped in backticks, so it
+    renders as code and notifies nobody. Code spans, fenced blocks and the
+    logins in `allow` (default: LOOM_MENTION_ALLOW) are left as they are."""
+    allowed = frozenset(w.lstrip("@").lower() for w in (
+        mention_allowlist() if allow is None else allow))
+    out: list = []
+    prose: list = []
+    fence = ""
+    for line in text.splitlines(keepends=True):
+        found = _FENCE.match(line)
+        if fence:
+            out.append(line)
+            if (found and found.group(1)[0] == fence[0] and len(found.group(1)) >= len(fence)
+                    and not line[found.end():].strip()):
+                fence = ""
+        elif found:
+            out.append(_wrap_outside_spans("".join(prose), allowed))
+            prose = []
+            out.append(line)
+            fence = found.group(1)
+        else:
+            prose.append(line)
+    out.append(_wrap_outside_spans("".join(prose), allowed))
+    return "".join(out)
 
 
 def scrub_paths(text: str) -> str:

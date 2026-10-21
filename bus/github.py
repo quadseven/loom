@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import calendar
+import copy
 import hashlib
 import http.client
 import json
@@ -33,7 +34,7 @@ from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from . import proof, status
+from . import proof, status, text as _text
 
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
@@ -539,6 +540,7 @@ class GitHub:
 
     def rest(self, method: str, path: str, body: Any = None,
              etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
+        body = self._without_mentions(method, body)
         body = self._keep_status_section(method, path, body)
         resp = self._rest(method, path, body, etag, ok)
         if method == "POST" and self.unsubscribe and self.app is None:
@@ -551,6 +553,29 @@ class GitHub:
             if expanded is not resp.data:
                 resp = Response(resp.status, expanded, resp.etag, resp.headers)
         return resp
+
+    @staticmethod
+    def _without_mentions(method: str, body: Any) -> Any:
+        """A write's text with every would-be mention wrapped in backticks. A
+        decorator or a CSS at-rule in plain text is a mention of whoever owns
+        that login, and a mention cannot be undone (wow-overseer#921). Every
+        comment, issue and pull request body the factory writes funnels through
+        rest(), so this is the one place that makes the accident impossible.
+        A GraphQL mutation's text is its "body" variable."""
+        if method == "GET" or not isinstance(body, dict):
+            return body
+        found = body
+        for holder in (body, body.get("variables")):
+            if isinstance(holder, dict) and isinstance(holder.get("body"), str):
+                clean = _text.scrub_mentions(holder["body"])
+                if clean != holder["body"]:
+                    if found is body:
+                        found = copy.copy(body)
+                    if holder is body:
+                        found["body"] = clean
+                    else:
+                        found["variables"] = dict(holder, body=clean)
+        return found
 
     def _with_body_events(self, path: str, items: Any) -> Any:
         """The first page of a ticket's comments with the events of its issue
