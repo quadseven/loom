@@ -4649,7 +4649,9 @@ class Station:
         comments = [c for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
                     if isinstance(c, dict) and tickets._login(c.get("user")).lower() in authors]
         attempts = factory.attempts(comments, reason)
-        work = [a for a in attempts if not a[3] or failure_class(a[3]) not in NOT_WORK]
+        def is_work(reason: str) -> bool:
+            return not reason or failure_class(reason) not in NOT_WORK
+        work = [a for a in attempts if is_work(a[3])]
         failures = [a[3] for a in work[:-1] if a[3]]
         reason_repeat = bool(failures) and failures[-1] == reason
         recent = [a for a in work if a[0] >= self.now - 6 * 3600]
@@ -4659,7 +4661,8 @@ class Station:
                      {"labels": sorted(set(_label_names(issue)) | {RUNAWAY})})
         trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
         body = factory.runaway_comment(
-            trigger, attempts, factory.issue_model(issue), factory.attempt_models(issue, comments))
+            trigger, attempts, factory.issue_model(issue), factory.attempt_models(issue, comments),
+            counted=is_work)
         skipped = len(attempts) - len(work)
         if skipped:
             body += ("\n\nNot counted as work attempts: %d that ended [transient], [limit], "

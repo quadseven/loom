@@ -3916,6 +3916,12 @@ class RetryTest(Base):
         self.assertIn("loom:runaway", self.fake.names(12))
         self.assertIn("Not counted as work attempts: 1 that ended [transient], [limit], [auth] or "
                       "[factory].", self.bodies()[-1])
+        # Each row says whether it counted: a brain read a limit row in the
+        # one table as a counted attempt and filed a factory ticket for a
+        # detector that was right (2026-10-21).
+        rows = [line for line in self.bodies()[-1].splitlines() if line.startswith("| 20")]
+        self.assertEqual(["no", "yes", "yes", "yes"], [row.rsplit("|", 2)[1].strip() for row in rows])
+        self.assertIn("| Time | Lane | Model | Reason | Counted |", self.bodies()[-1])
 
     def test_the_attempt_table_names_the_model_each_attempt_ran(self):
         # No Model: line: each claim ran its lane's configured model, a slot's

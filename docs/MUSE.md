@@ -41,6 +41,14 @@ Read and write GitHub only from the shell, through the Loom commands or the
 GitHub REST API with `LOOM_GITHUB_TOKEN`. Never use the web or browser tool
 for GitHub or anything else in a scheduled run: each new web request asks
 the operator for approval, and the run stops until someone answers.
+To read a file in a repo (a test, a script, a doc) without the web tool:
+
+    curl -fsS -H "Authorization: Bearer $LOOM_GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github.raw" \
+      "https://api.github.com/repos/OWNER/NAME/contents/PATH?ref=main"
+
+A scheduled run on 2026-10-21 asked the operator to approve a web fetch of
+one loom test file and stopped until the operator answered.
 
 ## Operate, do not report
 
