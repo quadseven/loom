@@ -983,7 +983,7 @@ class Filer:
                 continue
             labels = [str(x.get("name", "")) for x in issue.get("labels", [])
                       if isinstance(x, dict)]
-            if "loom:triage" not in labels:
+            if "loom:triage" not in labels and "loom:rewritten" not in labels:
                 continue
             comments = self._comments(number)
             into = self._rolled_into(key, current)
@@ -1001,7 +1001,7 @@ class Filer:
 
     def _close_quiet(self, number: int, issue: Dict[str, Any], labels: List[str],
                      comments: List[Dict[str, Any]]) -> bool:
-        """Close an open triage issue whose breach has been gone CLEAR_AFTER,
+        """Close an open triage or rewritten issue whose breach has been gone CLEAR_AFTER,
         or mark it loom:recurring when it broke 3 times in RECURRING_AFTER.
         False when the pass has no writes left for it."""
         breaches = [_epoch(issue.get("created_at"))]

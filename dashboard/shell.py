@@ -7,6 +7,7 @@ VIEWS = (
     ("floor", "Floor", "/"),
     ("backlog", "Backlog", "/backlog"),
     ("goals", "Goals", "/goals"),
+    ("tree", "Tree", "/tree"),
     ("tickets", "Tickets", "/tickets"),
     ("brain", "Brain", "/brain"),
     ("hot-spots", "Hot spots", "/hot-spots"),

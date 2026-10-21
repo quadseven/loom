@@ -692,6 +692,28 @@ print('leak guard: clean (shape patterns only)')
         self.assertNotIn("leak scan failed", self.run_log())
         self.assertEqual(self.pushed_files(), ["fix.txt"])
 
+    def test_a_body_citing_its_own_repos_issues_bare_opens_the_pull_request(self):
+        # The body's scan copy turned only OWNER/NAME#N into #N, so a ticket
+        # whose Why cited NAME#N parked with nothing pushed (2026-10-21).
+        self.drop_brief(text=BRIEF.replace(
+            "The thing is broken for every user.",
+            "The thing is broken for every user, as repo#7 found."))  # leak-guard-allow: the case under test
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("leak scan failed", self.run_log())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_a_body_citing_a_private_repo_with_this_repos_name_in_it_never_names_it(self):
+        # A longer name is another repo: the posted body says so instead.
+        self.drop_brief(text=BRIEF.replace(
+            "The thing is broken for every user.",
+            "The thing is broken for every user, as repo-legacy-private#3 found."))  # leak-guard-allow: the case under test
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertNotIn("repo-legacy-private", body)
+        self.assertIn("issue 3 of another repo", body)
+
     def test_a_diff_naming_a_private_repo_with_this_repos_name_in_it_is_refused(self):
         # The body's own-repo Refs line is exempt, nothing else: private repos
         # named NAME-legacy-private exist beside public NAME repos.
@@ -1200,6 +1222,28 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("[transient]", log)
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertNotIn("limit", beat.get("reason") or "")
+
+    def test_a_limit_word_in_a_tool_result_is_not_a_limit(self):
+        # Two Spark lanes were held an hour as "provider limit reached": each
+        # agent read code about rate limits and timed out, and the only match
+        # was in its JSON tool results (2026-10-21).
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_EXIT="124", FAKE_OUT=(
+            '{"type":"step_start","part":{}}\n'
+            '{"type":"tool_use","part":{"state":{"output":"a lane at its usage limit '
+            'waits; HTTP 429 means too many requests"}}}\n'
+            '{"type":"text","part":{"text":"The rate limit path is next."}}\n'
+            '{"type":"step_finish","part":{}}'))
+        log = self.run_log()
+        self.assertNotIn("[limit]", log)
+        self.assertIn("[transient]", log)
+
+    def test_a_provider_error_event_is_still_a_limit(self):
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            '{"type":"tool_use","part":{"state":{"output":"ok"}}}\n'
+            '{"type":"error","error":{"message":"429 Too Many Requests: usage limit reached"}}'))
+        self.assertIn("[limit]", self.run_log())
 
     def test_provider_quota_messages_are_still_limits(self):
         for out in ("429 RESOURCE_EXHAUSTED quota resets in 1 hours",
@@ -3141,6 +3185,21 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         env = {**self.lane_env(), "LOOM_HOME": str(self.loom), "SLOT": slot, "LANE": "opencode-go"}
         return subprocess.run(["bash", "-c", script, "bash"], env=env,
                               capture_output=True, text=True)
+
+    def test_a_failed_copy_into_a_group_slot_leaves_no_temp_file_behind(self):
+        self.write_provider_limit("opencode-go", "weekly", None)
+        script = self.source_functions("hold_provider_limit", "limit_until", "key_group",
+                                       "write_beat", "utc") + (
+            'mv() { case "$*" in *provider-limit.json) return 1;; esac; command mv "$@"; }\n'
+            'SLOT=opencode-go LANE=opencode-go LIMIT_WHY="the provider weekly limit"\n'
+            'hold_provider_limit; echo "rc=$?"\n')
+        env = {**self.lane_env(), "LOOM_HOME": str(self.loom), "SLOT": "opencode-go",
+               "LANE": "opencode-go"}
+        result = subprocess.run(["bash", "-c", script, "bash"], env=env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "rc=1", result.stderr)
+        leftovers = list((self.loom / "state" / "usage").glob("*.tmp"))
+        self.assertEqual(leftovers, [])
 
     GROUP = ["opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4"]
 
