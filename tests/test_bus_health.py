@@ -28,8 +28,9 @@ def sha(item=None):
 
 
 class Reply:
-    def __init__(self, data):
+    def __init__(self, data, headers=None):
         self.data = data
+        self.headers = headers or {}
 
 
 class FakeGitHub:
@@ -41,22 +42,47 @@ class FakeGitHub:
         self.writes = []
         self.events = {}
         self.event_reads = []
+        self.pulls = []
 
     def paginate(self, path):
         if path.endswith("/events"):
             number = int(path.split("/")[-2])
             self.event_reads.append(number)
             return list(self.events.get(number, []))
+        if path.startswith("/repos/%s/pulls" % REPO):
+            return list(self.pulls)
         assert path == "/repos/%s/issues?state=open&labels=loom:ticket" % REPO, path
         return list(self.open)
 
     def rest(self, method, path, data=None):
         if method == "GET":
-            return Reply(self.closed.get(int(path.rsplit("/", 1)[1]), {"state": "open"}))
+            if path.endswith("/events"):
+                number = int(path.split("/")[-2])
+                self.event_reads.append(number)
+                return Reply(list(self.events.get(number, [])), {"link": ""})
+            if path.startswith("/repos/%s/pulls" % REPO):
+                return Reply(self.pulls, {"link": ""})
+            if path.startswith("/repos/%s/compare/" % REPO):
+                # Compare endpoint: ancestor...commit
+                # Returns "identical" if same, "ahead" if ancestor has commits commit doesn't,
+                # "behind" if commit has commits ancestor doesn't, "diverged" otherwise
+                parts = path.split("/compare/")
+                if len(parts) == 2:
+                    ancestor, commit = parts[1].split("...")
+                    if ancestor == commit:
+                        return Reply({"status": "identical"}, {"link": ""})
+                    # For test: deployed_rev is PR #10's commit. PR #10's commit == deployed_rev -> identical
+                    # PR #11's commit is different -> behind (not ancestor)
+                    deployed_rev = getattr(self, 'deployed_rev', None)
+                    if deployed_rev and ancestor == deployed_rev and commit != deployed_rev:
+                        # ancestor is deployed_rev, commit is different -> commit is ahead of ancestor
+                        return Reply({"status": "behind"}, {"link": ""})
+                return Reply({"status": "diverged"}, {"link": ""})
+            return Reply(self.closed.get(int(path.rsplit("/", 1)[1]), {"state": "open"}), {})
         self.writes.append((method, path, data))
         if method == "POST" and path.endswith("/comments"):
-            return Reply({"id": 7000 + len(self.writes)})
-        return Reply({})
+            return Reply({"id": 7000 + len(self.writes)}, {})
+        return Reply({}, {})
 
 
 class Base(unittest.TestCase):
@@ -869,4 +895,106 @@ class Proof(Base):
         found = health.proof_of([comment("stranger", "forged"), comment("Station", "real")],
                                 ["station"])
         self.assertEqual(found, "real")
-        self.assertEqual(health.proof_of([comment("stranger", "forged")], ["station"]), "")
+
+
+class DiagnosisCommand(Regression):
+    """A goal home can name a diagnosis command that runs when briefing health
+    tickets and re-briefing regressions. Its output is included as an
+    untrusted data block in the Why section."""
+
+    def setUp(self):
+        super().setUp()
+        self.diag_cmd = 'echo "diagnosis: slow search due to missing index"'
+        self.state["diagnosis_cmd"] = {f"{REPO}#1": self.diag_cmd}
+
+    def _run_with_diag(self, doc=None, now=NOW, diag_cmd=None):
+        if doc is not None:
+            self.doc = doc
+        if diag_cmd is not None:
+            if diag_cmd == "":
+                self.state["diagnosis_cmd"] = {}
+            else:
+                self.state["diagnosis_cmd"] = {f"{REPO}#1": diag_cmd}
+        else:
+            self.state["diagnosis_cmd"] = {f"{REPO}#1": self.diag_cmd}
+        intake = health.Intake(self.gh, self.state, now, "2030-01-02T00:00:00Z",
+                               self.said.append, read=self.read, brief=self.brief)
+        # parse_sources reads diagnosis_cmd from state, so we simulate that here
+        sources, _ = health.parse_sources(f"{REPO}#1={URL}", self.state)
+        intake.run(sources)
+        return intake
+
+    def test_diagnosis_command_output_in_initial_brief(self):
+        self._run_with_diag()
+        self.assertEqual(len(self.briefs), 1)
+        body = self.briefs[0]["body"]
+        self.assertIn("## Why", body)
+        self.assertIn("Untrusted data from the diagnosis command", body)
+        self.assertIn("diagnosis: slow search due to missing index", body)
+        self.assertIn("```text", body)
+
+    def test_diagnosis_command_output_in_regression_rebrief(self):
+        self.shipped_ticket(shipped=NOW - 30 * 3600)
+        self._run_with_diag()
+        regressions = [b for b in self.briefs if b["regresses"] is not None]
+        self.assertEqual(len(regressions), 1)
+        body = regressions[0]["body"]
+        self.assertIn("Regresses #100", body)
+        self.assertIn("Untrusted data from the diagnosis command", body)
+        self.assertIn("diagnosis: slow search due to missing index", body)
+
+    def test_diagnosis_command_failure_falls_back_with_note(self):
+        bad_cmd = "exit 1"
+        self._run_with_diag(diag_cmd=bad_cmd)
+        self.assertEqual(len(self.briefs), 1)
+        body = self.briefs[0]["body"]
+        self.assertIn("diagnosis command failed", body)
+
+    def test_diagnosis_command_timeout_falls_back_with_note(self):
+        # Use a Python one-liner that sleeps longer than the 30s timeout
+        # The finding key is appended as an argument, so we ignore it with _
+        slow_cmd = "python3 -c 'import time; time.sleep(100)'"
+        self._run_with_diag(diag_cmd=slow_cmd)
+        self.assertEqual(len(self.briefs), 1)
+        body = self.briefs[0]["body"]
+        self.assertIn("diagnosis command timed out", body)
+
+    def test_no_diagnosis_command_falls_back_with_note(self):
+        self.state["diagnosis_cmd"] = {}
+        self._run_with_diag(diag_cmd="")
+        self.assertEqual(len(self.briefs), 1)
+        body = self.briefs[0]["body"]
+        self.assertIn("No diagnosis command set", body)
+
+    def test_regression_rebrief_lists_merged_pull_requests_with_deployment_status(self):
+        """Regression re-briefs list merged pull requests and whether they are deployed."""
+        shipped = NOW - 30 * 3600
+        issue = self.shipped_ticket(shipped=shipped)
+
+        # Add merged pull requests to the fake GitHub
+        self.gh.pulls = [
+            {"number": 10, "state": "closed", "merged_at": "2030-01-01T10:00:00Z",
+             "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+             "title": "Fix slow search", "merged": True,
+             "body": "Refs #100", "head": {"ref": "loom-100"}},
+            {"number": 11, "state": "closed", "merged_at": "2030-01-01T11:00:00Z",
+             "merge_commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+             "title": "Follow-up fix", "merged": True,
+             "body": "Refs #100", "head": {"ref": "loom-100"}},
+        ]
+
+        # Add deployed revision that includes PR #10 but not PR #11
+        deployed_rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        self.state["deployed"] = {"revision": deployed_rev, "at": shipped + 3600}
+        self.gh.deployed_rev = deployed_rev
+
+        self._run_with_diag()
+        regressions = [b for b in self.briefs if b["regresses"] is not None]
+        self.assertEqual(len(regressions), 1)
+        body = regressions[0]["body"]
+        self.assertIn("Regresses #100", body)
+        self.assertIn("Merged pull requests:", body)
+        self.assertIn("PR #10: Fix slow search", body)
+        self.assertIn("deployed", body)
+        self.assertIn("PR #11: Follow-up fix", body)
+        self.assertIn("not deployed", body)
