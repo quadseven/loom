@@ -1194,6 +1194,11 @@ message, its full list, grouped by goal, is a comment on the `loom:digest`
 issue in each ask's own repo, and the message links to it. To file an ask
 under its goal, name the goal home in its body (`Part of #N`).
 
+An ask about an outage dates it by its window, never by one time: the last
+good observation and the first failing one ("last good read 04:28Z, first
+failing read 09:02Z"). The last good read is not the start. Every text a
+`bus` command posts is checked for this (`bus/text.py`).
+
 Open `loom:human` issues are not asks: the station never posts one on its
 own. They are listed once a day under "Waiting on you" at the end of the
 same digest (the 15 newest, grouped by repo, each with the first line of

@@ -716,6 +716,10 @@ say-so alone:
   private repo names.
 - Put asks in a `needs-operator` issue with one exact ask. Use `loom:urgent`
   only for something breaking now.
+- Date an outage by its window: the last good observation and the first
+  failing one ("last good read 04:28Z, first failing read 09:02Z"). Never
+  write the last good read as the start ("down since 04:28Z"): `bus`
+  commands refuse that text.
 - Never retry a failed step in the same tick. Stop at 25 minutes.
 - Every note or piece of evidence a tick leaves on an issue, outside the
   comments a `bus` or `bus.brain` command writes itself, goes through

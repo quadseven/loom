@@ -51,6 +51,35 @@ _FENCE = re.compile(r"^[ >]*(`{3,}|~{3,})")
 # An inline code span: a run of backticks closed by a run of the same length,
 # inside one paragraph.
 _SPAN = re.compile(r"(?<!`)(`+)(?!`)((?:(?!\n[ \t]*\n).)+?)(?<!`)\1(?!`)", re.DOTALL)
+# An outage dated by one time ("unreachable since 04:28Z") reads as its
+# start, but a brain only knows its own reads: the last good one and the
+# first failing one, and the start lies between them. On 2026-10-22 journals
+# and an ask said a service was "down since ~04:28Z" when 04:28Z was the last
+# good read; the service went down at 08:02Z, and the next read, at 09:02Z,
+# was the first to fail. Text that dates an outage that way must name both.
+_TIME = r"~?\s*(?:\d{4}-\d{2}-\d{2}[ T])?\d{1,2}:\d{2}(?::\d{2})?Z?"
+_DOWN = r"(?:unreachable|down|unavailable|offline|failing|erroring|503)"
+# Within one sentence: a full stop ends it, a decimal point does not.
+_SAME_SENTENCE = r"(?:(?![.!?](?:\s|$))[^\n])"
+_OUTAGE_SINCE = re.compile(
+    r"\b%s\b%s{0,40}?\b(?:since|from|starting|around)\s+%s" % (_DOWN, _SAME_SENTENCE, _TIME)
+    + r"|\bsince\s+%s%s{0,120}?\b%s\b" % (_TIME, _SAME_SENTENCE, _DOWN)
+    + r"|\b(?:outage|downtime)\b%s{0,30}?\b(?:since|began|started|from)\s+(?:at\s+)?%s"
+    % (_SAME_SENTENCE, _TIME), re.I)
+_LAST_GOOD = re.compile(r"\blast (?:good|ok|healthy|successful|working)\b", re.I)
+_FIRST_BAD = re.compile(r"\bfirst (?:fail\w*|bad|error\w*|unhealthy|503)\b", re.I)
+
+
+def undated_outage(text: str) -> str:
+    """The phrase that dates an outage by one time when the text does not
+    also name the last good observation and the first failing one; "" when
+    the text is fine."""
+    found = _OUTAGE_SINCE.search(text)
+    if not found or (_LAST_GOOD.search(text) and _FIRST_BAD.search(text)):
+        return ""
+    return found.group(0)
+
+
 # The logins Loom is meant to mention, comma separated. Nobody by default.
 MENTION_ALLOW_ENV = "LOOM_MENTION_ALLOW"
 
@@ -119,3 +148,9 @@ def check(text: str) -> None:
         raise ValueError("text mentions the review bot's short name after an at-sign")
     if _CLOSING.search(text):
         raise ValueError("text contains a closing keyword with an issue reference")
+    outage = undated_outage(text)
+    if outage:
+        raise ValueError("text dates an outage by one time (%r): name the last good "
+                         "observation and the first failing one, for example \"last good "
+                         "read 04:28Z, first failing read 09:02Z\"; the last good read is "
+                         "not the start" % outage)
