@@ -1257,7 +1257,7 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def _merge_replies(self, changes=None):
         pr = {"state": "open", "draft": False, "body": "Refs %s#9" % REPO, "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": REPO}}, "base": {"repo": {"full_name": REPO}}, "mergeable": True}
-        details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work", "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": []}}
+        details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work", "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": []}, "files": {"totalCount": 1, "nodes": [{"path": "bus/a.py"}]}}
         if changes:
             pr.update(changes.get("pr", {}))
             details.update(changes.get("details", {}))

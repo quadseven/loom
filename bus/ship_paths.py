@@ -4,11 +4,17 @@ A repo that deploys through many workflows, each scoped to its own paths,
 has no single workflow whose success means "shipped". The station reads each
 workflow's `on.push.paths` filter and asks, per merged pull request, which
 workflows that pull request's files should have triggered.
+
+The same filters say which changed files merging deploys at once, so a lane
+pull request that changes where a workload runs (placement_lines) in such a
+file is held for the operator before it merges (bus/operator_hold.py).
 """
 from __future__ import annotations
 
+import base64
 import re
-from typing import Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import quote
 
 WORKFLOWS_DIR = ".github/workflows"
 MANUAL_PATHS_FILE = ".loom/manual-paths"
@@ -162,3 +168,111 @@ def manual_files(files: List[str], filters: Dict[str, List[str]],
                   if (listed and matches(listed, f))
                   or (HELM_VALUES.match(f.rsplit("/", 1)[-1])
                       and not any(matches(pats, f) for pats in filters.values())))
+
+
+def read_filters(gh: Any, repo: str, branch: str) -> Optional[Dict[str, List[str]]]:
+    """Workflow file name to its on.push.paths filter, for the repo's
+    workflows on `branch` that have one. None when the listing or any
+    workflow file cannot be read: with a filter missing, a changed file could
+    look as if no deploy covered it."""
+    listing = gh.rest("GET", "/repos/%s/contents/%s?ref=%s" % (
+        repo, WORKFLOWS_DIR, quote(branch, safe="")), ok=(404,)).data
+    if not isinstance(listing, list):
+        return None
+    texts: Dict[str, str] = {}
+    for item in listing:
+        name = str(item.get("name") or "") if isinstance(item, dict) else ""
+        if not re.fullmatch(r"[\w.-]+\.ya?ml", name):
+            continue
+        data = gh.rest("GET", "/repos/%s/contents/%s/%s?ref=%s" % (
+            repo, WORKFLOWS_DIR, name, quote(branch, safe="")), ok=(404,)).data
+        try:
+            texts[name] = base64.b64decode(data["content"]).decode("utf-8", "replace")
+        except (KeyError, TypeError, ValueError):
+            return None
+    return scoped_workflows(texts)
+
+
+def deployed_files(files: Iterable[str], filters: Dict[str, List[str]],
+                   listed: List[str]) -> List[str]:
+    """The changed files merging deploys: a deploy workflow's paths filter
+    matches them and they are not applied by hand (manual_files)."""
+    files = sorted(set(files))
+    by_hand = set(manual_files(files, filters, listed))
+    return [f for f in files if f not in by_hand
+            and any(matches(pats, f) for pats in filters.values())]
+
+
+# Keys that decide where a workload runs or what it mounts: a node pin, a
+# hostname pin (a JSON patch path spells "/" as "~1"), affinity, tolerations,
+# a host address, and volumes and their claims. A change to one moves pods,
+# and a local volume does not follow them (2026-10-22).
+PLACEMENT_RE = re.compile(
+    r"nodeSelector|nodeName|[aA]ffinity|tolerations|topologySpreadConstraints"
+    r"|kubernetes\.io(?:/|~1)hostname|hostIP|hostNetwork|\bvolumes\b"
+    r"|volumeClaimTemplates|persistentVolumeClaim|claimName|hostPath"
+    r"|storageClassName|local-path")
+MANIFEST_EXTS = (".yaml", ".yml", ".json")
+
+
+def _indent(text: str) -> int:
+    return len(text) - len(text.lstrip(" -"))
+
+
+def _code(text: str) -> str:
+    """A diff line's YAML without its comment; "" for a comment or blank."""
+    stripped = text.strip()
+    if not stripped or stripped.startswith("#"):
+        return ""
+    return re.sub(r"\s+#.*$", "", text)
+
+
+def _names_placement(line: str, before: List[str]) -> bool:
+    """Whether a changed line sets placement: its own key names it, an
+    enclosing key in the hunk does, or, for a JSON patch `value:`, the
+    `path:` beside it does."""
+    code = _code(line)
+    if not code:
+        return False
+    if PLACEMENT_RE.search(code):
+        return True
+    level = _indent(code)
+    own = level
+    is_value = code.strip().startswith("value:")
+    for prior in reversed(before):
+        prior = _code(prior)
+        if not prior:
+            continue
+        depth = _indent(prior)
+        sibling = depth == own == level and is_value and prior.strip().startswith("path:")
+        if depth < level or sibling:
+            if PLACEMENT_RE.search(prior):
+                return True
+            if depth < level:
+                level = depth
+        if level == 0:
+            break
+    return False
+
+
+def placement_lines(patch: str) -> List[str]:
+    """The added or removed lines of a unified diff that change placement
+    (PLACEMENT_RE), each read with the lines above it in its hunk on the
+    same side. A key outside the hunk's context is not seen."""
+    found: List[str] = []
+    old: List[str] = []
+    new: List[str] = []
+    for raw in (patch or "").splitlines():
+        if raw.startswith("@@"):
+            old, new = [], []
+            continue
+        kind, text = raw[:1], raw[1:]
+        if kind == "+" and _names_placement(text, new):
+            found.append(raw)
+        elif kind == "-" and _names_placement(text, old):
+            found.append(raw)
+        if kind in (" ", "-"):
+            old.append(text)
+        if kind in (" ", "+"):
+            new.append(text)
+    return found

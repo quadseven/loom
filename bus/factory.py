@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, change_class, labels, naming, notify, scope_fit, split, stale_claims, status, tickets
+from . import bench, brain, change_class, labels, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -2203,9 +2203,29 @@ class Factory:
         elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
-        elif not sensitive:
+        elif not sensitive and not self._operator_holds(repo, number, full, issue):
             self._file_criterion_follow_up(repo, number, issue, full)
             self._land(repo, number, full, issue, comments)
+
+    def _operator_holds(self, repo: str, number: int, full: Dict[str, Any],
+                        issue: Dict[str, Any]) -> bool:
+        """Whether the pull request waits for the operator instead of landing
+        (bus/operator_hold.py): it or its ticket declares operator steps
+        before merge, or merging deploys a placement change. The ticket goes
+        to loom:human with one exact ask, once; the pull request never lands
+        on the factory's say-so, whatever later passes find."""
+        why = operator_hold.reasons(self.gh, repo, full, str(issue.get("body") or ""),
+                                    self._files(repo, number))
+        if not why:
+            return False
+        outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, why,
+                                     self.human)
+        if outcome == "asked":
+            self.actions += 1
+            _say("held %s#%d for the operator: %s" % (repo, number, "; ".join(why)))
+        elif outcome != "already":
+            _say("held %s#%d for the operator, but %s" % (repo, number, outcome))
+        return True
 
     def _file_criterion_follow_up(self, repo: str, number: int,
                                   issue: Dict[str, Any], full: Dict[str, Any]) -> None:

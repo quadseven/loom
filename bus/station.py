@@ -4612,22 +4612,7 @@ class Station:
         filter missing, a pull request could look as if it touched no
         deployed path, so nothing in the repo ships this pass."""
         if repo not in self._path_filters:
-            listing = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s" % (
-                repo, ship_paths.WORKFLOWS_DIR, quote(branch, safe="")), ok=(404,)).data
-            texts: Optional[Dict[str, str]] = {} if isinstance(listing, list) else None
-            for item in listing if isinstance(listing, list) else []:
-                name = str(item.get("name") or "") if isinstance(item, dict) else ""
-                if not re.fullmatch(r"[\w.-]+\.ya?ml", name):
-                    continue
-                data = self.gh.rest("GET", "/repos/%s/contents/%s/%s?ref=%s" % (
-                    repo, ship_paths.WORKFLOWS_DIR, name, quote(branch, safe="")), ok=(404,)).data
-                try:
-                    texts[name] = base64.b64decode(data["content"]).decode("utf-8", "replace")
-                except (KeyError, TypeError, ValueError):
-                    texts = None
-                    break
-            self._path_filters[repo] = (
-                ship_paths.scoped_workflows(texts) if texts is not None else None)
+            self._path_filters[repo] = ship_paths.read_filters(self.gh, repo, branch)
         return self._path_filters[repo]
 
     def _pull_paths(self, repo: str, number: int) -> Optional[List[str]]:

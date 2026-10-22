@@ -275,13 +275,16 @@ INTENT_CLASS=""
 INTENT_TEXT=""
 SENSITIVE_FILE=.loom/sensitive-paths
 SUMMARY_FILE=.loom/summary.md
+# The section a lane fills with the steps a person takes before its change
+# merges, or "none" (bus/operator_hold.py holds a pull request that lists any).
+OPERATOR_SECTION="Operator steps before merge"
 
 # What the agent is told about the Intent summary: one line per behavior
 # change in .loom/summary.md, else the runner falls back to the ticket's
 # What section, or the reason a run changed nothing (no_change_reason). The
 # file itself is never committed.
 summary_note() {
-  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion built, leave Live criteria unticked, and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE"
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion built, leave Live criteria unticked, and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION"
 }
 
 # How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
@@ -384,7 +387,7 @@ prepare_intent() {
 }
 
 pr_body() {
-  local size issue refs="" criteria
+  local size issue refs="" criteria ops
   issue="$(field Issue "$1" || true)"
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
   # The size as the review bot's letter (Medium -> M), so its plan check
@@ -401,9 +404,16 @@ pr_body() {
   criteria="$(section 'Acceptance criteria' "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
   [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$TREE/$SUMMARY_FILE" 2>/dev/null)"
   [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$1")"
-  printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
+  # The lane's own word on operator steps, else the ticket's; a body with
+  # neither says so, and the factory's keyword backstop still reads both.
+  ops="$(section "$OPERATOR_SECTION" "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
+  [ -n "$ops" ] || ops="$(section "$OPERATOR_SECTION" "$TREE/$SUMMARY_FILE" 2>/dev/null)"
+  [ -n "$ops" ] || ops="$(section "$OPERATOR_SECTION" "$1")"
+  [ -n "$ops" ] || ops="none stated"
+  printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n## %s\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
     "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$criteria" \
-    "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL" "$validated" "$refs"
+    "$size" "$(section 'Out of scope' "$1")" "$OPERATOR_SECTION" "$ops" \
+    "$2" "$LANE" "$MODEL" "$validated" "$refs"
 }
 
 # A fix brief's PR must still be open on the brief's branch. Returns 1 with
