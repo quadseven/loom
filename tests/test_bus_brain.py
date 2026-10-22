@@ -4342,6 +4342,130 @@ class EpicFilingTests(unittest.TestCase):
                          [brain.EPIC_TICKET_CAP, brain.EPIC_TICKET_CAP + 4])
 
 
+class PlacementTests(unittest.TestCase):
+    """loom#951 and loom#1294: a ticket the factory files beside an issue goes
+    under an open epic with room, the goal's next intake epic when that epic
+    is full, so no epic passes 15 tickets and no ticket sits under its goal."""
+
+    def fake_with_epics(self, held):
+        """Open intake epics #60, #61, ... under goal #1, oldest first, each
+        holding the given number of tickets."""
+        fake = GoalRepo()
+        for i, count in enumerate(held):
+            number = 60 + i
+            fake.issues[number] = dict(item(number, body="Part of #1\n", labels=["epic"]),
+                                       title=brain.INTAKE_TITLE)
+            fake.subs[1].append(number)
+            fake.subs[number] = []
+            for t in range(count):
+                ticket = 100 * (i + 1) + t
+                fake.issues[ticket] = item(ticket, labels=["loom:ticket", "loom:merged"])
+                fake.subs[number].append(ticket)
+        return fake
+
+    def place(self, fake, named, room=1):
+        return brain.placement_epic(GitHub("t", transport=fake), REPO, named, room)
+
+    def test_an_epic_with_room_is_where_the_ticket_goes(self):
+        fake = self.fake_with_epics([3, 5])
+        self.assertEqual(self.place(fake, 60), 60)
+        self.assertEqual(fake.created(), [])
+
+    def test_a_full_epic_sends_the_ticket_to_the_goals_next_intake_epic(self):
+        fake = self.fake_with_epics([brain.EPIC_TICKET_CAP, 4])
+        self.assertEqual(self.place(fake, 60), 61)
+        self.assertEqual(fake.created(), [])
+
+    def test_a_full_epic_with_no_other_epic_open_opens_the_next(self):
+        fake = self.fake_with_epics([brain.EPIC_TICKET_CAP])
+        made = self.place(fake, 60)
+        self.assertNotEqual(made, 60)
+        self.assertEqual(fake.issues[made]["title"], brain.INTAKE_TITLE)
+        self.assertIn("Part of #1", fake.issues[made]["body"])
+
+    def test_the_parts_of_a_split_need_room_for_all_of_them(self):
+        fake = self.fake_with_epics([brain.EPIC_TICKET_CAP - 2, 1])
+        self.assertEqual(self.place(fake, 60, room=2), 60)
+        self.assertEqual(self.place(fake, 60, room=3), 61)
+
+    def test_a_closed_epic_sends_the_ticket_to_the_next_epic(self):
+        fake = self.fake_with_epics([3, 4])
+        fake.issues[60]["state"] = "closed"
+        self.assertEqual(self.place(fake, 60), 61)
+
+    def test_the_standing_repairs_epic_has_no_ticket_cap(self):
+        fake = GoalRepo()
+        fake.issues[EPIC]["title"] = brain.REPAIRS_TITLE
+        for n in range(300, 300 + brain.EPIC_TICKET_CAP + 5):
+            fake.issues[n] = item(n, labels=["loom:ticket", "loom:merged"])
+            fake.subs[EPIC].append(n)
+        self.assertEqual(self.place(fake, EPIC), EPIC)
+
+    def test_a_goal_home_resolves_to_its_intake_epic(self):
+        fake = self.fake_with_epics([2])
+        self.assertEqual(self.place(fake, 1), 60)
+
+    def test_a_ticket_resolves_through_its_parent_epic(self):
+        fake = self.fake_with_epics([brain.EPIC_TICKET_CAP, 2])
+        fake.issues[500] = item(500, body="## Why\nx\n\nPart of #60\n",
+                                labels=["loom:ticket", "loom:merged"])
+        self.assertEqual(self.place(fake, 500), 61)
+
+    def test_an_issue_that_leads_to_no_goal_is_refused(self):
+        fake = GoalRepo()
+        fake.issues[500] = item(500, body="no parent\n", labels=["loom:ticket"])
+        for named in (500, 9999):
+            with self.assertRaisesRegex(ValueError, "no epic or goal home"):
+                self.place(fake, named)
+
+    def test_intake_keeps_room_for_the_whole_batch(self):
+        fake = self.fake_with_epics([brain.EPIC_TICKET_CAP - 1])
+        gh = GitHub("t", transport=fake)
+        self.assertEqual(brain.intake_epic(gh, REPO, 1), 60)
+        self.assertNotEqual(brain.intake_epic(gh, REPO, 1, room=2), 60)
+        with self.assertRaisesRegex(ValueError, "do not fit one epic"):
+            brain.intake_epic(gh, REPO, 1, room=brain.EPIC_TICKET_CAP + 1)
+
+
+class MoveFromGoalTests(unittest.TestCase):
+    """loom#951: GitHub refuses a second parent, so a ticket that was a
+    direct child of its goal stayed under the goal when it was filed under
+    an epic. The link now replaces the goal as the parent."""
+
+    GOAL_URL = "https://api.github.com/repos/%s/issues/1" % REPO
+
+    def sub_issue_posts(self, calls):
+        return [c for c in calls if c[0] == "POST" and c[1].endswith("/sub_issues")]
+
+    def test_triage_moves_a_direct_child_of_the_goal_under_the_intake_epic(self):
+        routes = Routes([item(5, parent_issue_url=self.GOAL_URL)])
+        with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
+                unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
+            brain.triage(GitHub("t", transport=routes), REPO, 1, 25)
+        self.assertEqual([c[2] for c in self.sub_issue_posts(routes.calls)],
+                         [{"sub_issue_id": 1005, "replace_parent": True}])
+
+    def test_triage_does_not_take_an_issue_out_of_another_parent(self):
+        other = "https://api.github.com/repos/%s/issues/77" % REPO
+        routes = Routes([item(5, parent_issue_url=other), item(6)])
+        with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
+                unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
+            brain.triage(GitHub("t", transport=routes), REPO, 1, 25)
+        self.assertEqual([c[2] for c in self.sub_issue_posts(routes.calls)],
+                         [{"sub_issue_id": 1005}, {"sub_issue_id": 1006}])
+
+    def test_a_rewrite_in_place_moves_a_direct_child_of_the_goal_under_the_epic(self):
+        source = item(6, labels=["loom:triage", "needs-brain"], title="Slow page",
+                      body="## Problem\nSlow.\n", user={"login": "example-brain"},
+                      html_url="https://example.com/6", parent_issue_url=self.GOAL_URL)
+        fake = Fake(reply(200, source), reply(200, goal()), reply(200, []), reply(200, {}),
+                    reply(200, []), reply(201, {}), reply(200, []), reply(200, []))
+        brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, refs=6, env=TRUSTED)
+        fake.assert_all_used()
+        self.assertEqual([c[2] for c in self.sub_issue_posts(fake.calls)],
+                         [{"sub_issue_id": 1006, "replace_parent": True}])
+
+
 class CloseEpicTests(unittest.TestCase):
     """loom#638: the brain closes a finished epic with a one-line note."""
 

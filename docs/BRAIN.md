@@ -392,6 +392,16 @@ rewrites and health intake find"): the newest open one holding fewer than 15
 tickets. One is opened by `bus.brain onboard`, and again whenever no open
 intake epic has room.
 
+Every other path that files a ticket under a goal does the same
+(`brain.placement_epic`): the parts of a split pull request and the follow-up
+ticket for criteria a lane pull request marked not built go under the epic
+their ticket names while it is open with room for them, else under the goal's
+next intake epic, and are linked as its sub-issues. A rewritten or triaged
+issue that is a direct child of its goal moves to the epic (the sub-issue link
+replaces the goal as parent), so it does not stay under the goal and in no
+epic. The `ticket-outside-epic` and `epic-over-cap` invariants fire only for
+tickets that were placed before this, or by hand.
+
 The station assigns queued tickets to free lanes on each pass. A brain that
 wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
 a readable Difficulty line appear in the goal's next station standup as
