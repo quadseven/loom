@@ -303,6 +303,13 @@ class BrainTests(unittest.TestCase):
 class SensitiveResumeTests(unittest.TestCase):
     NOW = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
 
+    def setUp(self):
+        # These merges test the merge path's other rules, read in a fixed
+        # order; the risk tier has its own tests (test_merge_tier.py).
+        tier = unittest.mock.patch.object(brain, "_refuse_risk_tier")
+        tier.start()
+        self.addCleanup(tier.stop)
+
     def make_gh(self, entries):
         prs = []
         details = {}
