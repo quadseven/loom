@@ -4488,6 +4488,147 @@ class MoveFromGoalTests(unittest.TestCase):
                          [{"sub_issue_id": 1006, "replace_parent": True}])
 
 
+class OutsideEpicRepo:
+    """Goal #1 with the tickets of its own, its open intake epics and the
+    tickets they hold. A sub-issue link that replaces the parent moves the
+    ticket, the way GitHub does."""
+
+    def __init__(self):
+        self.issues = {1: goal()}
+        self.subs = {1: []}
+        self.epics = []
+        self.open_tickets = []
+        self.calls = []
+
+    def __call__(self, method, url, headers, body):
+        payload = json.loads(body) if body else None
+        path = url.split("api.github.com")[1]
+        self.calls.append((method, path, payload))
+        return self._read(path) if method == "GET" else self._write(path, payload)
+
+    def _read(self, path):
+        found = re.match(r"/repos/%s/issues/(\d+)/sub_issues" % re.escape(REPO), path)
+        if found:
+            kids = self.subs.get(int(found.group(1)), [])
+            return reply(200, [self.issues[n] for n in kids])
+        if path.startswith("/repos/%s/issues?labels=loom:ticket&state=open" % REPO):
+            return reply(200, self.open_tickets)
+        if path.startswith("/repos/%s/issues?labels=epic&state=all" % REPO):
+            return reply(200, self.epics)
+        if path == "/repos/%s/issues/1" % REPO:
+            return reply(200, self.issues[1])
+        raise AssertionError("unexpected read %s" % path)
+
+    def _write(self, path, payload):
+        if path.endswith("/sub_issues"):
+            parent = int(path.split("/issues/")[1].split("/")[0])
+            child = payload["sub_issue_id"] - 1000
+            if payload.get("replace_parent"):
+                for kids in self.subs.values():
+                    if child in kids:
+                        kids.remove(child)
+            self.subs.setdefault(parent, []).append(child)
+            return reply(201, {})
+        if path == "/repos/%s/issues" % REPO:
+            made = 200 + len(self.issues)
+            self.issues[made] = dict(item(made, payload["body"], payload["labels"]),
+                                     title=payload["title"])
+            return reply(201, self.issues[made])
+        found = re.match(r"/repos/%s/issues/(\d+)$" % re.escape(REPO), path)
+        if found:
+            number = int(found.group(1))
+            self.issues[number].update(payload)
+            return reply(200, self.issues[number])
+        raise AssertionError("unexpected write %s" % path)
+
+    def writes(self):
+        return [c for c in self.calls if c[0] != "GET"]
+
+
+class MoveOutsideEpicTests(unittest.TestCase):
+    """loom#951: a ticket that is a goal's own sub-issue and sits under no
+    epic moves into an open intake epic of that goal, oldest ticket first."""
+
+    GOAL_URL = "https://api.github.com/repos/%s/issues/1" % REPO
+
+    def ticket(self, number, labels=("loom:ticket",), **extra):
+        """An open ticket of the goal's own: its parent is the goal."""
+        out = item(number, body="## Why\nwhy\n\nPart of #1\n", labels=labels,
+                   created_at="2030-01-01T00:00:00Z", parent_issue_url=self.GOAL_URL)
+        out.update(extra)
+        return out
+
+    def repo(self, tickets=(), epics=()):
+        """Goal #1 with the given tickets of its own and open intake epics
+        (number, the tickets they hold)."""
+        fake = OutsideEpicRepo()
+        for number, held in epics:
+            epic = dict(item(number, body="Part of #1\n", labels=("epic",)),
+                        title=brain.INTAKE_TITLE)
+            fake.issues[number] = epic
+            fake.subs[1].append(number)
+            fake.subs[number] = []
+            for t in range(held):
+                inside = number * 100 + t
+                fake.issues[inside] = item(inside, labels=("loom:ticket",))
+                fake.subs[number].append(inside)
+        for ticket in tickets:
+            fake.issues[ticket["number"]] = ticket
+            fake.subs[1].append(ticket["number"])
+        return fake
+
+    def move(self, fake):
+        return brain.move_outside_tickets(GitHub("t", transport=fake), REPO, 1)
+
+    def test_a_ticket_under_no_epic_moves_into_the_intake_epic_with_room(self):
+        # The epic holds 14 of its 15: one ticket fits, the rest need a new one.
+        fake = self.repo(tickets=[self.ticket(10, created_at="2030-01-01T00:00:00Z"),
+                                  self.ticket(11, created_at="2030-01-02T00:00:00Z"),
+                                  self.ticket(12, created_at="2030-01-03T00:00:00Z")],
+                         epics=[(60, brain.EPIC_TICKET_CAP - 1)])
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (3, 0))
+        # The oldest ticket took the room the epic had left.
+        self.assertEqual(fake.subs[60][-1], 10)
+        self.assertEqual(len(fake.subs[60]), brain.EPIC_TICKET_CAP)
+        # A new intake epic took the other two, oldest first.
+        opened = [n for n in fake.subs[1] if n != 60]
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(fake.issues[opened[0]]["title"], brain.INTAKE_TITLE)
+        self.assertIn("Part of #1", fake.issues[opened[0]]["body"])
+        self.assertEqual(fake.subs[opened[0]], [11, 12])
+        # Every move replaced the goal as the parent, oldest ticket first.
+        moves = [c[2] for c in fake.writes()
+                 if c[1].endswith("/sub_issues") and c[2].get("replace_parent")]
+        self.assertEqual(moves, [{"sub_issue_id": 1010, "replace_parent": True},
+                                 {"sub_issue_id": 1011, "replace_parent": True},
+                                 {"sub_issue_id": 1012, "replace_parent": True}])
+
+    def test_a_goal_at_its_epic_cap_moves_nothing(self):
+        fake = self.repo(tickets=[self.ticket(10), self.ticket(11), self.ticket(12)],
+                         epics=[(60 + n, brain.EPIC_TICKET_CAP) for n in range(6)])
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (0, 3))
+        self.assertEqual(fake.writes(), [])
+        self.assertEqual(fake.subs[1], [60, 61, 62, 63, 64, 65, 10, 11, 12])
+
+    def test_an_epic_an_ask_and_a_closed_issue_are_never_moved(self):
+        epic = dict(item(20, body="Part of #1\n", labels=("epic",)), title="Epic: the work")
+        ask = self.ticket(30, labels=("loom:ticket", "needs-operator"))
+        closed = self.ticket(40, state="closed")
+        live = self.ticket(50)
+        fake = self.repo(tickets=[epic, ask, closed, live], epics=[(60, 1)])
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (1, 0))
+        self.assertEqual(fake.subs[1], [60, 20, 30, 40])
+        self.assertEqual(fake.subs[60][-1], 50)
+
+    def test_the_moved_tickets_part_of_line_names_the_epic(self):
+        fake = self.repo(tickets=[self.ticket(10)], epics=[(60, 1)])
+        self.move(fake)
+        self.assertEqual(fake.issues[10]["body"], "## Why\nwhy\n\nPart of #60\n")
+
+
 class CloseEpicTests(unittest.TestCase):
     """loom#638: the brain closes a finished epic with a one-line note."""
 

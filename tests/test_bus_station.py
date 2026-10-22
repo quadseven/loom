@@ -9593,6 +9593,53 @@ class AskDigestEpicTest(Base):
         self.assertIn("- #8 Loose ask", page.split("## Not filed under a goal")[1])
 
 
+class OutsideEpicTest(Base):
+    """The station's pass moves the tickets that sit under a goal home and
+    under no epic into an open intake epic of that goal (loom#951)."""
+
+    GOAL_URL = "https://api.github.com/repos/%s/issues/1" % REPO
+
+    def goal_with_a_ticket(self):
+        """Goal #1 with an open intake epic #60 and one ticket of its own."""
+        self.fake.add_goal(1)
+        self.fake.issues[1]["id"] = 101
+        epic = {"number": 60, "id": 1060, "state": "open", "title": brain.INTAKE_TITLE,
+                "body": "Done when: done.\n\nSize: at most 15 tickets.\n\nPart of #1\n",
+                "labels": [{"name": "epic"}]}
+        self.fake.issues[60] = epic
+        self.fake.epics = [epic]
+        ticket = {"number": 10, "id": 1010, "state": "open", "title": "A ticket",
+                  "body": "## Why\nwhy\n\nPart of #1\n",
+                  "created_at": "2030-01-01T00:00:00Z",
+                  "labels": [{"name": "loom:ticket"}],
+                  "parent_issue_url": self.GOAL_URL}
+        self.fake.issues[10] = ticket
+        self.fake.sub_issues[1] = [epic, ticket]
+        self.fake.sub_issues[60] = []
+
+    def run_pass_quiet(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            runner.move_outside_tickets()
+        return out.getvalue()
+
+    def test_the_ticket_moves_under_the_intake_epic_and_the_log_says_so(self):
+        self.goal_with_a_ticket()
+        log = self.run_pass_quiet()
+        self.assertEqual([i["number"] for i in self.fake.sub_issues[60]], [10])
+        self.assertIn("Part of #60", self.fake.issues[10]["body"])
+        self.assertRegex(log, r"outside-epic: moved 1, left 0 for goal #1 in %s" % REPO)
+
+    def test_the_pass_waits_an_hour_between_runs(self):
+        self.goal_with_a_ticket()
+        self.run_pass_quiet()
+        self.fake.sub_issues[60] = []
+        log = self.run_pass_quiet()
+        self.assertEqual(self.fake.sub_issues[60], [])
+        self.assertNotIn("outside-epic: moved", log)
+
+
 class TwoLoomsTest(Base):
     """An issue or goal another operator owns is left alone (loom#649)."""
 
