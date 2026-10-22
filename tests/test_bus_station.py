@@ -4012,6 +4012,78 @@ class RetryTest(Base):
         self.assertNotIn("loom:runaway", self.fake.names(12))
         self.assertNotIn("loom:runaway", self.fake.names(13))
 
+    def timeout_history(self, endings, number=12):
+        """The ticket's earlier claims, each followed by its ending, then the
+        claim being reported (the one failed() reports)."""
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        who = {"created_at": at, "user": {"login": "alice-example"}}
+        claim = "Claimed for lane codex (body sha256 0123456789ab)"
+        rows = []
+        for ending in endings:
+            rows += [dict({"body": claim}, **who), dict({"body": ending}, **who)]
+        self.fake.comments[number][:] = rows + [dict({"body": claim}, **who)]
+
+    def test_a_first_agent_timeout_is_still_transient_and_costs_no_rung(self):
+        # loom#1395: one timeout is a slow provider, not the ticket's doing.
+        self.failed(body=BODY, reason="[transient] agent exited 124")
+        self.timeout_history([])
+        self.run_pass()
+        self.assertNotIn("loom:failed", self.fake.names(12))
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertTrue(any(b.startswith("Lane codex stopped: [transient] agent exited 124")
+                            for b in self.bodies()))
+
+    def test_a_second_agent_timeout_in_a_row_counts_as_a_failure(self):
+        # loom#1419: a ticket that always times out burned runs for ever,
+        # because every ending was [transient] and none cost a rung.
+        self.failed(body=BODY, reason="[transient] agent exited 124; the edits are on branch "
+                                      "loom/12-fix-the-thing-timedout-1234")
+        self.timeout_history([
+            "Automatic retry 1 of 2 (transient): moved from lane a to lane codex. "
+            "Lane a failed: [transient] agent exited 124"])
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
+        failed = [b for b in self.bodies() if b.startswith("Lane codex failed:")]
+        self.assertEqual(len(failed), 1)
+        self.assertTrue(failed[0].startswith("Lane codex failed: [work] agent exited 124; the "
+                                             "edits are on branch loom/12-fix-the-thing-timedout-1234"))
+        self.assertIn("timed out again on this ticket", failed[0])
+        # The next attempt still finds the kept edits.
+        self.assertEqual(tickets.timedout_branch([failed[0]]), "loom/12-fix-the-thing-timedout-1234")
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+
+    def test_a_timeout_after_another_kind_of_ending_stays_transient(self):
+        self.failed(body=BODY, reason="[transient] agent exited 124")
+        self.timeout_history(["Lane codex stopped: [transient] could not mint a GitHub App token",
+                              "Lane codex failed: [limit] agent exited 1: provider limit reached"])
+        self.run_pass()
+        self.assertNotIn("loom:failed", self.fake.names(12))
+        self.assertIn("loom:queued", self.fake.names(12))
+
+    def test_a_third_agent_timeout_in_a_row_flags_the_ticket(self):
+        self.failed(body=BODY, reason="[transient] agent exited 124; the edits are on branch "
+                                      "loom/12-fix-the-thing-timedout-3")
+        self.timeout_history([
+            "Lane codex stopped: [transient] agent exited 124; the edits are on branch "
+            "loom/12-fix-the-thing-timedout-1",
+            "Lane codex failed: [work] agent exited 124; the edits are on branch "
+            "loom/12-fix-the-thing-timedout-2; timed out again on this ticket, so it counts "
+            "as a failure"])
+        self.run_pass()
+        self.assertIn("loom:runaway", self.fake.names(12))
+        self.assertIn("loom:failed", self.fake.names(12))
+
+    def test_a_second_agent_timeout_on_a_fix_round_counts_as_a_failure(self):
+        fix = tickets.parse_fix(REPO, FIX_BODY)
+        self.failed(reason="[transient] agent exited 124", attempt=2, fix=fix)
+        self.timeout_history(["Lane codex stopped: [transient] agent exited 124"])
+        self.run_pass()
+        # A failed fix round waits at loom:failed with the pull request unchanged.
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertIn("This was a fix round on pull request #99; the ticket is back at "
+                      "loom:failed", self.bodies()[-1])
+
     def test_a_limit_with_no_other_lane_to_retry_on_is_not_a_failure(self):
         # On 2026-10-18 such a limit went to loom:failed and the factory
         # climbed the ticket a rung of the model ladder for it.

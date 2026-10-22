@@ -964,6 +964,15 @@ second one.
   <reason>. Not retried: <why>` ends the claim (a limit ending likewise waits
   `loom:briefed`). It never goes to `loom:failed`, and the factory gives the
   queued ticket a lane again (loom#1395).
+- A timeout (the agent exiting 124) is transient once. The station reads it
+  against the ticket's earlier claims: when the claim before it also ended at
+  a timeout, the ending is reclassed `[work]` and says `timed out again on this
+  ticket, so it counts as a failure`, so the ticket goes to `loom:failed` and
+  the factory climbs the ladder. A third timeout in a row is the same repeated
+  reason and flags the ticket `loom:runaway`, which stops the retries. The
+  kept `-timedout-` branch stays in the reason, so the next attempt still
+  starts from the edits. A timeout after any other ending is transient as
+  before (`factory.TIMEOUT_STRIKES`; loom#1419).
 - Any other failure is reported as failed above. The factory climbs the model
   ladder for a `loom:failed` ticket only when the class of its newest ending
   is `[work]` (or none). A ticket whose newest claim ended `[transient]`,
