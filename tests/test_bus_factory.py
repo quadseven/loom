@@ -167,7 +167,7 @@ class FakeGitHub:
         if path.endswith("/update-branch"):
             return Response(self.update_status, {})
         if method == "POST" and path.endswith("/issues"):
-            made = dict(body, number=900 + len(self.filed), user=ME)
+            made = dict(body, number=900 + len(self.filed), id=5000 + len(self.filed), user=ME)
             self.filed.append(made)
             return Response(201, made)
         m = re.search(r"/issues/(\d+)(/labels|/comments)?$", path)
@@ -338,6 +338,26 @@ class PullRequests(Base):
         self.assertEqual(self.merged, [(50, (REPO, 5))])
         self.assertEqual(len(self.gh.filed), 1)
         self.assertIn("- [ ] A5", self.gh.filed[0]["body"])
+
+    def test_a_criterion_follow_up_is_filed_under_an_epic_not_under_its_ticket(self):
+        # loom#951: it said "Part of" the ticket it came from, which is no
+        # epic, so it sat in none.
+        criteria = ["A%d" % n for n in range(1, 6)] + ["Live: observed after deploy"]
+        ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n" +
+                       "\n".join("- [ ] " + item for item in criteria) + "\n\nPart of #7\n")
+        pr_criteria = ("\n".join("- [x] " + item for item in criteria[:4]) +
+                       "\n- [ ] A5; not built: requires a later integration\n" +
+                       "- [ ] " + criteria[5] + "\n")
+        self.gh.ticket(5, "pr", body=ticket_body)
+        self.gh.pull(50, 5, body="## Acceptance criteria\n" + pr_criteria)
+        with mock.patch.object(factory.brain, "placement_epic",
+                                        return_value=60) as placed:
+            self.go()
+        self.assertEqual(placed.call_args[0][2:], (7, 1))
+        self.assertEqual(len(self.gh.filed), 1)
+        self.assertTrue(self.gh.filed[0]["body"].rstrip().endswith("Part of #60"))
+        self.assertIn(("POST", "/repos/%s/issues/60/sub_issues" % REPO, {"sub_issue_id": 5000}),
+                      self.gh.writes)
 
     def test_a_ready_pull_request_is_merged(self):
         self.gh.ticket(5, "pr")
@@ -1067,6 +1087,34 @@ class PullRequests(Base):
         self.assertEqual(self.gh.issues[5]["state"], "closed")
         self.assertIn("loom:closed-unmerged", [x["name"] for x in self.gh.issues[5]["labels"]])
         self.assertEqual(len([c for c in self.gh.comments[5] if "loom:split pr=50" in c["body"]]), 1)
+
+    def sub_issue_links(self):
+        return [(w[1].split("/issues/")[1].split("/")[0], w[2]) for w in self.gh.writes
+                if w[0] == "POST" and w[1].endswith("/sub_issues")]
+
+    def test_the_parts_of_a_split_go_under_an_epic_with_room_for_all_of_them(self):
+        # loom#1294: the parts named the ticket's epic whatever it held, and
+        # took it past 15 tickets.
+        self.split_ticket()
+        with mock.patch.object(factory.brain, "placement_epic",
+                                        return_value=60) as placed:
+            self.go()
+        self.assertEqual(placed.call_args[0][2:], (7, 2))
+        self.assertEqual(len(self.gh.filed), 2)
+        for made in self.gh.filed:
+            self.assertTrue(made["body"].rstrip().endswith("Part of #60"))
+            self.assertNotIn("Part of #7", made["body"])
+        self.assertEqual(self.sub_issue_links(), [("60", {"sub_issue_id": 5000}),
+                                                  ("60", {"sub_issue_id": 5001})])
+
+    def test_the_parts_of_a_split_stay_with_their_epic_when_no_goal_is_found(self):
+        self.split_ticket()
+        with mock.patch.object(factory.brain, "placement_epic",
+                                        side_effect=ValueError("no goal")):
+            self.go()
+        self.assertEqual(len(self.gh.filed), 2)
+        self.assertTrue(all(m["body"].rstrip().endswith("Part of #7") for m in self.gh.filed))
+        self.assertEqual(self.sub_issue_links(), [])
 
     def test_a_split_that_filed_but_did_not_close_is_not_filed_twice(self):
         self.split_ticket()

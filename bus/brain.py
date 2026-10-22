@@ -1371,23 +1371,68 @@ def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
     return made
 
 
-def intake_epic(gh: GitHub, repo: str, goal: int) -> int:
-    """The goal's newest open intake epic holding fewer than EPIC_TICKET_CAP
-    tickets, opened (within the epic cap) when none has room: where triage,
-    rewrites, health intake, validation contracts and adoption file their
-    tickets. The newest, so intake never refills an older epic that tickets
-    may since have been moved into (2026-10-19: one held 19)."""
+def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1) -> int:
+    """The goal's newest open intake epic with room for `room` more tickets
+    (EPIC_TICKET_CAP is the most one holds), opened (within the epic cap) when
+    none has room: where triage, rewrites, health intake, validation
+    contracts and adoption file their tickets. The newest, so intake never
+    refills an older epic that tickets may since have been moved into
+    (2026-10-19: one held 19). room is how many tickets the caller files at
+    once (the parts of a split)."""
+    if not 1 <= room <= EPIC_TICKET_CAP:
+        raise ValueError("%d tickets do not fit one epic (cap %d)" % (room, EPIC_TICKET_CAP))
     _, tree = goal_tree(gh, repo, goal)
     roomy = [int(found["number"]) for found, held in tree
              if found.get("state", "open") == "open"
              and str(found.get("title") or "") == INTAKE_TITLE
-             and len(held) < EPIC_TICKET_CAP]  # goal_tree already read its tickets
+             and len(held) + room <= EPIC_TICKET_CAP]  # goal_tree already read its tickets
     if roomy:
         return max(roomy)
     made = file_epic(gh, repo, goal, INTAKE_TITLE, INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP))
     if not made.get("number"):
         raise ValueError("GitHub named no number for the new intake epic of goal #%d" % goal)
     return int(made["number"])
+
+
+def placement_epic(gh: GitHub, repo: str, named: int, room: int = 1) -> int:
+    """The open epic with room for `room` more tickets where a ticket filed
+    beside issue `named` belongs (loom#951, loom#1294). `named` is what the
+    new ticket's text points at: an epic, a goal home, or a ticket (its
+    parent is followed). An open epic with room, or the standing repairs
+    epic, is that epic; a full or closed one sends the ticket to the next
+    epic of its goal, the goal's intake epic (intake_epic), opened when none
+    has room. ValueError when `named` leads to no goal. Tickets filed under a
+    bare Part of line named an epic that was already full, or a ticket that
+    is in none, and left an epic at 16 tickets and tickets directly under
+    their goals."""
+    number = named
+    seen = set()
+    while number not in seen and len(seen) < 4:
+        seen.add(number)
+        try:
+            issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+        except GitHubError as exc:
+            if exc.status in (404, 410):
+                break
+            raise
+        if not isinstance(issue, dict) or "pull_request" in issue:
+            break
+        if _epic_label(issue):
+            if issue.get("state", "open") == "open" and (
+                    standing_epic(issue)
+                    or len(_epic_tickets(gh, repo, number)) + room <= EPIC_TICKET_CAP):
+                return number
+            parent = _issue_goal(issue)
+            if parent is None or parent == number:
+                break
+            return intake_epic(gh, repo, parent, room)
+        if "loom:goal" in _labels(issue):
+            return intake_epic(gh, repo, number, room)
+        parent = _issue_goal(issue)
+        if parent is None:
+            break
+        number = parent
+    raise ValueError("#%d leads to no epic or goal home to file under" % named)
 
 
 def repo_goal(gh: GitHub, repo: str) -> Optional[int]:
@@ -1434,14 +1479,26 @@ def brief_intake(gh: GitHub, repo: str, goal: int, title: str, body: str,
     return brief(gh, repo, None, title, body, *args, intake_of=goal, **kwargs)
 
 
-def _link_to_goal(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any]) -> bool:
+def _parent_number(issue: Dict[str, Any]) -> Optional[int]:
+    """The number of the issue's sub-issue parent, from parent_issue_url."""
+    match = re.search(r"/issues/(\d+)(?:[/?#]|$)", str(issue.get("parent_issue_url") or ""))
+    return int(match.group(1)) if match else None
+
+
+def _link_to_goal(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any],
+                  under: Optional[int] = None) -> bool:
     """Add the issue as a sub-issue of the goal, best effort. False when GitHub
     refuses it (for example a goal already at its 100 sub-issue limit): the
     refusal is logged and the Part of line is then the only link, which
-    goal_children reads."""
+    goal_children reads. With under (the epic's goal), an issue that is a
+    direct child of that goal moves to the epic: GitHub refuses a second
+    parent unless it is told to replace the first, and the issue then stayed
+    under its goal and in no epic (loom#951)."""
+    payload: Dict[str, Any] = {"sub_issue_id": issue["id"]}
+    if under is not None and _parent_number(issue) == under:
+        payload["replace_parent"] = True
     try:
-        gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
-                {"sub_issue_id": issue["id"]})
+        gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal), payload)
     except GitHubError as exc:
         print("#%s: GitHub refused the sub-issue link to goal #%d (%s)"
               % (issue.get("number"), goal, exc), file=sys.stderr)
@@ -1670,7 +1727,8 @@ def _in_place_refusal(source: Dict[str, Any], env: Optional[Dict[str, str]]) -> 
 
 
 def _rewrite_in_place(gh: GitHub, repo: str, source: Dict[str, Any], epic: int,
-                      title: str, body: str, lane: Optional[str]) -> Dict[str, Any]:
+                      title: str, body: str, lane: Optional[str],
+                      goal: Optional[int] = None) -> Dict[str, Any]:
     """Make the rewritten issue the ticket: the brief's title and body, its
     original title and text kept below (tickets.with_original), the labels a
     new ticket gets, and a sub-issue link to the epic. No comment is posted.
@@ -1682,7 +1740,7 @@ def _rewrite_in_place(gh: GitHub, repo: str, source: Dict[str, Any], epic: int,
     names = _ticket_labels(gh, repo, new, lane)
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"title": title, "body": new})
     gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": names})
-    if not _link_to_goal(gh, repo, epic, source):
+    if not _link_to_goal(gh, repo, epic, source, under=goal):
         print("#%d is linked to epic #%d by its Part of line" % (number, epic), file=sys.stderr)
     for name in ("loom:triage", "needs-brain"):
         if name in _labels(source):
@@ -1899,7 +1957,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     if epic is None:
         epic = intake_epic(gh, repo, goal)
     issue = _brief_issue(gh, repo, epic, title, _with_part_of(full_body, epic), lane,
-                         source, elsewhere)
+                         source, elsewhere, goal)
     url = str(issue.get("html_url", ""))
     if done:
         _journal_brief_done(gh, repo, goal, str(holder), done, url)
@@ -1918,11 +1976,11 @@ def _rewrite_source(gh: GitHub, repo: str, refs: Optional[int],
 
 def _brief_issue(gh: GitHub, repo: str, epic: int, title: str, body: str,
                  lane: Optional[str], source: Optional[Dict[str, Any]],
-                 elsewhere: Optional[str]) -> Dict[str, Any]:
+                 elsewhere: Optional[str], goal: Optional[int] = None) -> Dict[str, Any]:
     """The ticket a brief makes: the rewritten source itself when it can be
     (_rewrite_in_place), else a new issue (_filed_rewrite)."""
     if source is not None and elsewhere is None:
-        return _rewrite_in_place(gh, repo, source, epic, title, body, lane)
+        return _rewrite_in_place(gh, repo, source, epic, title, body, lane, goal)
     refs = int(source["number"]) if source is not None else None
     return _filed_rewrite(gh, repo, epic, title, body, lane, refs, elsewhere)
 
@@ -2148,7 +2206,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
             if intake is None or intake[1] >= EPIC_TICKET_CAP:
                 found = intake_epic(gh, repo, goal)
                 intake = (found, len(_epic_tickets(gh, repo, found)))
-            if not _link_to_goal(gh, repo, intake[0], issue):
+            if not _link_to_goal(gh, repo, intake[0], issue, under=goal):
                 # GitHub refused the sub-issue link: the Part of line links it
                 # instead.
                 gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),

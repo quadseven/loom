@@ -1968,7 +1968,10 @@ class Factory:
             _say("%s#%d: the review asks for a split but names nothing to split on"
                  % (repo, number))
             return None
-        headers, epic = split.header_lines(body), split.epic_of(body, ticket)
+        headers = split.header_lines(body)
+        named = split.epic_of(body, ticket)
+        placed = self._epic_with_room(repo, named, len(parts))
+        epic = placed or named
         drafts = []
         for index, part in enumerate(parts, start=1):
             name = "%s (part %d of %d)" % (str(issue.get("title") or "").strip(),
@@ -1983,9 +1986,33 @@ class Factory:
             # nor leave half the parts filed; the usual fix round handles it.
             _say("%s#%d: split ticket text refused (%s)" % (repo, number, err))
             return None
-        return [int((self.gh.rest("POST", "/repos/%s/issues" % repo, {
-            "title": name, "body": text, "labels": ["loom:ticket", "loom:queued"]}).data
-            or {})["number"]) for name, text in drafts]
+        numbers = []
+        for name, text in drafts:
+            made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+                "title": name, "body": text, "labels": ["loom:ticket", "loom:queued"]}).data or {}
+            if placed:
+                self._link_filed(repo, placed, made, text)
+            numbers.append(int(made["number"]))
+        return numbers
+
+    def _epic_with_room(self, repo: str, named: int, room: int) -> Optional[int]:
+        """The epic a ticket filed beside issue `named` belongs under: that
+        epic while it is open with room for `room` more tickets, else the
+        goal's next epic (loom#951, loom#1294). None when no goal can be
+        found: the filing still goes ahead, under the issue it names."""
+        try:
+            return brain.placement_epic(self.gh, repo, named, room)
+        except (GitHubError, ValueError) as err:
+            _say("%s: no epic with room beside #%d, filing under it: %s" % (repo, named, err))
+            return None
+
+    def _link_filed(self, repo: str, epic: int, made: Dict[str, Any], text: str) -> None:
+        """Link a ticket the factory just filed as the epic's sub-issue, best
+        effort: its Part of line already names the epic."""
+        try:
+            brain.file_under_epic(self.gh, repo, epic, dict(made, body=text))
+        except GitHubError as err:
+            _say("%s#%s: not linked to epic #%d: %s" % (repo, made.get("number"), epic, err))
 
     def _split_pr(self, repo: str, number: int, full: Dict[str, Any],
                   issue: Dict[str, Any], comments: List[Dict[str, Any]], sha: str) -> bool:
@@ -2093,13 +2120,18 @@ class Factory:
         if any(isinstance(found, dict) and found.get("title") == title
                for found in self.gh.paginate("/repos/%s/issues?labels=loom:ticket" % repo)):
             return
+        number = int(issue["number"])
+        named = split.epic_of(str(issue.get("body") or ""), number)
+        placed = self._epic_with_room(repo, named, 1)
+        epic = placed or named
         body = ("Difficulty: medium\n\n## Why\nThe lane pull request marked these ticket criteria as not built.\n\n"
                 "## What\nComplete the remaining acceptance criteria.\n\n## Acceptance criteria\n" +
                 "\n".join("- [ ] " + item for item in criteria) +
-                "\n\n## Size\nS\n\n## Out of scope\n- None\n\nPart of #%d\n" %
-                int(issue["number"]))
-        self.gh.rest("POST", "/repos/%s/issues" % repo, {
-            "title": title, "body": body, "labels": ["loom:ticket", "loom:queued"]})
+                "\n\n## Size\nS\n\n## Out of scope\n- None\n\nPart of #%d\n" % epic)
+        made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+            "title": title, "body": body, "labels": ["loom:ticket", "loom:queued"]}).data or {}
+        if placed:
+            self._link_filed(repo, placed, made, body)
 
     def _run_again(self, repo: str, number: int, sha: str) -> bool:
         """Re-run the failed Actions jobs on this commit once. False when a
