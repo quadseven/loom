@@ -2863,7 +2863,23 @@ class HandBackTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
             self.run_hand_back(checks=[("lint", "failed")])
         self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
-        self.assertEqual(len(self.gh.comments), 3)
+        fixes = [c for c in self.gh.comments if str(c["body"]).startswith(tickets.FIX_MARKER)]
+        self.assertEqual(len(fixes), 3)
+
+    def cap_events(self):
+        return [text for c in self.gh.comments if status.is_status(c["body"])
+                for _, text in status.parse(c["body"]) if text.startswith("The fix round cap")]
+
+    def test_fix_round_cap_says_so_once_in_the_status_comment(self):
+        self.gh.comments.extend({"user": {"login": "alice-example"},
+                                 "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % (str(i) * 40)}
+                                for i in range(1, 4))
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
+            self.run_hand_back(checks=[("lint", "failed")])
+            self.assertEqual(self.cap_events(), [station.FIX_CAP_TEXT % 3])
+            # The ticket is held now; the next pass writes no second event.
+            self.run_hand_back(checks=[("lint", "failed")])
+        self.assertEqual(len(self.cap_events()), 1)
 
     def test_markerless_fix_comments_do_not_consume_rounds(self):
         self.gh.comments.extend({"user": {"login": "alice-example"}, "body": tickets.FIX_MARKER}

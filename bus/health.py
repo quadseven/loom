@@ -26,7 +26,9 @@ station reads each endpoint and, per finding:
 - when the finding is still reported REGRESS_AFTER after its open ticket
   shipped, the fix did not work: the ticket is re-briefed as a regression
   through brain brief --regresses, at most once per ticket per
-  REGRESS_EVERY. A ticket still in a build state is left to that work.
+  REGRESS_EVERY, and at most LOOM_REGRESSION_REBRIEFS times in all: past that
+  the brief holds the ticket for the brain (needs-brain) and the intake leaves
+  it alone. A ticket still in a build state is left to that work.
 
 An endpoint that answers with an error, a redirect, too much data or a
 document outside the contract's shapes is "not looked": nothing is filed,
@@ -733,6 +735,10 @@ class Intake:
             return
         ticket = "%s#%d" % (source.repo, number)
         if ticket in self.regressed:
+            return
+        if "needs-brain" in brain._labels(issue):
+            # Held for the brain, by the re-brief cap or by anything else: the
+            # brain decides what is different this time (loom#1418).
             return
         cached = rec.get("shipped")
         if isinstance(cached, list) and len(cached) == 2 and cached[0] == number:

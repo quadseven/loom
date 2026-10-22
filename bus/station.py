@@ -158,6 +158,8 @@ DIGEST_MARKER = "<!-- loom:digest v1 -->"
 MENTION_ROOM = 40
 ASK_GOAL_REF_RE = re.compile(r"(?<![\w/])#([0-9]+)\b")
 FIX_ROUNDS_DEFAULT = 3
+FIX_CAP_TEXT = ("The fix round cap (%d) is reached, so this ticket is held for the brain "
+                "(needs-brain) and gets no further fix rounds.")
 REPORT_MARKER = "<!-- loom:report v1 -->"
 # The last line of a quiet standup the station edits in place, and of a
 # standup that repeats an earlier one word for word.
@@ -4988,6 +4990,8 @@ class Station:
     def _escalate_fix(self, repo: str, number: int, names: List[str]) -> None:
         if "needs-brain" not in names:
             self._add_label(repo, number, "needs-brain")
+            # One status event (an edit, no email), on the pass that holds it.
+            self._routine(repo, number, FIX_CAP_TEXT % _fix_round_limit())
 
     def _post_fix_comment(self, repo: str, number: int, pr_number: int,
                           detail: Dict[str, Any], sha: str, failed: List[Any],

@@ -707,6 +707,15 @@ class Regression(Base):
         self.assertEqual(len([s for s in self.said if "regression slot is held" in s]), 1)
 
 
+    def test_a_shipped_ticket_held_for_the_brain_is_not_re_briefed(self):
+        issue = self.shipped_ticket()
+        issue["labels"].append({"name": "needs-brain"})
+        self.run_once()
+        self.run_once(NOW + health.REGRESS_EVERY + 60)
+        self.assertEqual(self.briefs, [])
+        self.assertEqual(self.gh.event_reads, [])
+
+
 class RegressionThroughBrain(unittest.TestCase):
     """The intake's regression brief through the real brain brief: the
     shipped ticket itself goes back to the queue with loom:regression."""
