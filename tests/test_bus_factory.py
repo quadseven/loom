@@ -3408,7 +3408,7 @@ class LaneKinds(unittest.TestCase):
 
 class ForbiddenModels(unittest.TestCase):
     """The operator's rule of 2026-10-21: codex runs gpt-6-luna only and agy
-    the gemini-3.8-flash family only. infra#5704's status read "Escalated to
+    the gemini-3.8-flash family only. A ticket's status read "Escalated to
     rung 2 of 4: gpt-6-sol on lane codex", and tickets carried Model: lines
     naming gpt-6-sol and gemini-4-argon-high."""
 
