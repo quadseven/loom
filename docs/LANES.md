@@ -661,7 +661,10 @@ writes `verify.json`: a proof record (`bus/proof.py`),
 ahead of a build, the `unmet` answer described below. The runner copies it
 to the lane's log folder as `<brief>.verify.json`, with the run's model
 beside it in `<brief>.verify.model`. The station checks a record with
-`bus/proof.py`, ticks the criteria and moves the ticket to verified with the
+`bus/proof.py`, refuses it when it passes a live or operator criterion the
+station has no evidence for (docs/BRAIN.md, Verify before ship: a verify run
+has no network, so its word is not evidence), ticks the criteria and moves
+the ticket to verified with the
 proof, marked `"verified_by": "<lane>/<model>"` (`<lane>/unknown` when the
 run recorded no model). It refuses a record whose revision does not contain
 the merge commit of each linked pull request merged into the default branch

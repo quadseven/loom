@@ -112,6 +112,7 @@ yet and cites the open ticket that tracks it.
 - **Stage handoff journaling**: `bus/journal.py` writes the goal journal and `bus/handoff.py` reads its defer and done markers, so a peer finishes stage work a stopped brain left behind (#103).
 - **A failed lane run retries on another lane, and a lane at its provider limit stops taking work**: `bus/station.py` counts the retry lines on the ticket, caps them at `LOOM_RETRY_MAX`, and moves the ticket to the next lane in the brain's order (#112).
 - **Deploy health vigilance**: a failed deploy or a 5xx endpoint stops the line; `dispatch/ship.py` is the one shipper and honors the deploy caps and roll windows on the goal home, and `dispatch/verify.py` closes a shipped ticket only on live proof.
+- **Verify before ship**: a ticket closes only when every acceptance criterion has evidence; `bus/criteria_gate.py` classes each as code, live or operator, the station runs the live checks it can and sends the rest to the operator, and a tick or a verify lane's word is never evidence (#1501).
 - **Proof-based closure**: a ticket closes on a proof record checked against its own acceptance criteria; `bus/proof.py` checks the record and `bus/brain.py` posts the `<!-- loom:proof v1 -->` comment before closing.
 
 ### Planned principles

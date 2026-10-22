@@ -1437,6 +1437,42 @@ The same day it merged a lane pull request for a ticket of host checks
 only, which replaced the deployment repo's root README with a write-up of
 the ticket; the station then closed that ticket as shipped.
 
+## Verify before ship
+
+A ticket closes only when every acceptance criterion has evidence
+(`bus/criteria_gate.py`). An audit of 2026-10-22 found at least 12 tickets of
+the private deployment repo closed as completed on green CI with their live
+criteria never checked (a roller "enabled" while paused, a run-rate
+"recorded" by a runbook that says the run never happened, a verdict from a
+simulated run), and lanes ticking live boxes with nothing running. Each
+criterion is one of three kinds:
+
+- code: met by the merged change (a test, a file, a behavior in the code);
+  the shipped merge is its evidence.
+- live: met only on a running system: a `Live:` line, a host or network
+  check, a box that names live, deployed or production behavior, a time
+  window or an observed event, an imperative verify or measure, a result
+  recorded on the ticket, a round trip, a reboot. Its evidence is a passing
+  station check, or, for a `Live:` line with log strings, the station's own
+  log search that dispatched the verify run.
+- operator: something only a person does (signs off, approves, acts by
+  hand, checks a handset). Loom never closes it.
+
+A tick is nobody's evidence: not the ticket's, not the lane's pull request
+body's. The station's done close leaves a shipped ticket open while a live
+or operator criterion has no evidence. A live criterion that names a check
+Loom can run gets one, at most 5 a pass, again after 6 hours when it fails:
+an `https://` URL fetched with GET, a `gh api <path>` read through the
+station's GitHub client, or a read-only `kubectl get` / `kubectl rollout
+status` (never a secret, `exec` or another cluster's credentials). The
+criterion's other backticked or double-quoted strings must be in the answer.
+Each result is kept in the station's `live-checks.json` and written to the
+ticket's status; the answer itself is never written. A criterion with no
+runnable check, a failed check, or an operator criterion sends the ticket to
+`loom:human` with one ask (`Kind: decision`), once, and at most 4 such asks
+an hour. A verify lane's proof that passes a live or operator criterion
+without station evidence is refused.
+
 ## Pull requests without a ticket
 
 A pull request with no ticket (no `Refs` line and no `loom/` branch) that a

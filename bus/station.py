@@ -58,6 +58,7 @@ from . import verify_data
 from . import text as _text
 from . import tickets
 from . import transcripts
+from . import criteria_gate
 from . import watch
 from . import labels
 from .brain import HUMAN_MARKER
@@ -229,6 +230,15 @@ SETTLE_PER_RUN = 25
 REPO_ACCESS_EVERY = 3600
 REPO_ACCESS_FILE = "repo_access.json"
 SOURCES_FILE = "sources.json"
+# The station's live checks of shipped tickets' criteria (bus/criteria_gate.py):
+# ticket -> criterion key -> {"result", "at", "seen"}. A failed or missing
+# check runs again after LIVE_CHECK_RETRY; at most LIVE_CHECKS_PER_PASS run
+# a pass.
+LIVE_CHECKS_FILE = "live-checks.json"
+LIVE_CHECK_RETRY = 6 * 3600
+LIVE_CHECKS_PER_PASS = 5
+# Asks for unverified criteria are emails: at most this many an hour.
+LIVE_ASKS_PER_HOUR = 4
 SETTLE_LANDED = ("loom:merged", "loom:shipped", "loom:verified")
 REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 CLOSE_DONE_HOLDS = ("loom:regression", "loom:urgent", RUNAWAY)
@@ -1473,6 +1483,7 @@ class Station:
         if isinstance(writers, set):
             writers |= {a.lower() for a in settings.authors}
         self.s = settings
+        self._live_budget = LIVE_CHECKS_PER_PASS
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
         self.upload = upload or post_transcript
@@ -3380,6 +3391,16 @@ class Station:
             return
         if _text.CREDENTIAL_RE.search(proof.render(record, ticked)):
             self._proof_refused(repo, number, lane, names, "Its proof holds text shaped like a credential.")
+            return
+        unproven = criteria_gate.unverified(body, self._live_passed(repo, number, body))
+        if unproven:
+            # A verify lane runs with no network: its word that a live check
+            # passed, or that the operator acted, is not evidence (2026-10-22
+            # audit). The station's own check, or the operator, decides.
+            self._proof_refused(repo, number, lane, names, (
+                "Its proof was refused: a verify lane may not pass a live or operator "
+                "criterion without a passing station check: %s." % self._note_text(
+                    "; ".join(_clip(" ".join(t.split()), 120) for _, t in unproven[:3]))))
             return
         unseen = unseen_live_evidence(record)
         if unseen:
@@ -7035,17 +7056,20 @@ class Station:
         source keeps the ticket open for a verify run, and a verified
         ticket closes through brain.close on the verify path, which checks
         its criteria. Done tickets never closed: 199 sat shipped and the
-        backlog grew all week though the work was finished."""
+        backlog grew all week though the work was finished. Since 2026-10-22
+        no done ticket closes while a live or operator criterion has no
+        evidence (_evidence_holds, bus/criteria_gate.py)."""
         if self._deferred():
             return
         left = CLOSE_DONE_PER_PASS
+        self._live_budget = LIVE_CHECKS_PER_PASS
         log_root = os.path.join(self.s.home, "logs")
         for repo in self._verify_repos():
             for issue in self._tickets_open(repo):
                 if left <= 0:
                     return
                 why = self._done_reason(issue, self._earliest_record(repo, issue, log_root))
-                if not why:
+                if not why or self._evidence_holds(repo, issue):
                     continue
                 if self._close_done_ticket(repo, issue, why):
                     left -= 1
@@ -7058,6 +7082,93 @@ class Station:
         if not _live_time_window(brain.live_criterion(issue.get("body"), limit=None)):
             return None
         return _earliest_evidence_record(self.s.evidence_cmds, repo, log_root)
+
+    def _live_checks(self) -> Dict[str, Any]:
+        found = _read_json(os.path.join(self.state, LIVE_CHECKS_FILE), {}, strict=False)
+        return found if isinstance(found, dict) else {}
+
+    def _live_passed(self, repo: str, number: int, body: str = "") -> List[str]:
+        """The keys of the ticket's criteria the station has evidence for:
+        its live checks that passed, and the Live line when it names log
+        strings (a verify run is dispatched only once the station's own log
+        command found them, _no_live_evidence)."""
+        mine = self._live_checks().get("%s#%d" % (repo, number))
+        keys = [k for k, v in (mine.items() if isinstance(mine, dict) else [])
+                if isinstance(v, dict) and v.get("result") == "pass"]
+        if live_needles(body):
+            keys.append(criteria_gate.key(brain.live_criterion(body, limit=None)))
+        return keys
+
+    def _run_live_checks(self, repo: str, number: int,
+                         gaps: Sequence[Tuple[str, str]]) -> Dict[str, str]:
+        """Run the runnable checks of the ticket's unverified live criteria
+        that are due, record each result in the station's state and the
+        ticket's status, and return what each failed one saw, by key."""
+        state = self._live_checks()
+        mine = state.setdefault("%s#%d" % (repo, number), {})
+        failed: Dict[str, str] = {}
+        for found, text in gaps:
+            check = criteria_gate.check_of(text) if found == criteria_gate.LIVE else None
+            k = criteria_gate.key(text)
+            last = mine.get(k) if isinstance(mine.get(k), dict) else {}
+            if check is None:
+                continue
+            due = not isinstance(last.get("at"), (int, float)) \
+                or self.now - last["at"] >= LIVE_CHECK_RETRY
+            if due and self._live_budget > 0:
+                self._live_budget -= 1
+                passed, seen = criteria_gate.run(check, self.gh)
+                last = mine[k] = {"result": "pass" if passed else "fail", "at": self.now,
+                                  "seen": seen}
+                _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
+                self._routine(repo, number, "Live check %s: `%s` (%s) for: %s" % (
+                    last["result"], check.target, seen, _clip(" ".join(text.split()), 160)))
+            if last.get("result") == "fail":
+                failed[k] = "its check failed: %s" % last.get("seen")
+        return failed
+
+    def _live_ask_room(self) -> bool:
+        """Whether another unverified-criteria ask fits this hour; takes it."""
+        state = self._live_checks()
+        asks = [t for t in state.get("_asks") or []
+                if isinstance(t, (int, float)) and 0 <= self.now - t < 3600]
+        if len(asks) >= LIVE_ASKS_PER_HOUR:
+            return False
+        state["_asks"] = asks + [self.now]
+        _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
+        return True
+
+    def _evidence_holds(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether a done ticket stays open because a live or operator
+        criterion has no evidence (bus/criteria_gate.py): a live one with a
+        check Loom can run gets the check; one with none, a failed check, or
+        an operator action sends the ticket to loom:human with one ask, once.
+        2026-10-22 audit: at least 12 tickets of the private deployment repo
+        closed shipped on green CI with live criteria never checked."""
+        number = int(issue["number"])
+        body = str(issue.get("body") or "")
+        gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
+        if not gaps:
+            return False
+        failed = self._run_live_checks(repo, number, gaps)
+        gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
+        if not gaps:
+            return False
+        waiting = [t for k, t in gaps if k == criteria_gate.LIVE
+                   and criteria_gate.check_of(t) is not None
+                   and criteria_gate.key(t) not in failed]
+        if waiting or "loom:human" in _label_names(issue) or not self._live_ask_room():
+            return True
+        try:
+            brain.human(self.gh, repo, number, criteria_gate.ask(gaps, failed))
+        except RateLimited:
+            raise
+        except (ValueError, GitHubError) as err:
+            _say("could not ask about the unverified criteria of %s#%d: %s" % (repo, number, err))
+            return True
+        _say("held done %s#%d for the operator: %d criteria have no evidence"
+             % (repo, number, len(gaps)))
+        return True
 
     def _close_done_ticket(self, repo: str, issue: Dict[str, Any],
                            reason: str) -> bool:
