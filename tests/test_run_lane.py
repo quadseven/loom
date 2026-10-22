@@ -96,15 +96,15 @@ if [ "$1" = api ]; then
       printf '%s %s' "${where%/issues/*}" "${where##*/}" > "$store/$id.on"
       cp "${6#body=@}" "$store/$id"; exit 0 ;;
   esac
-  # A review thread's pull request: every thread is on example/repo#7 except
+  # A review thread's pull request: every thread is on example/repo#7 except  # leak-guard-allow: fixture repo
   # the ids listed in $FAKE_GH_FOREIGN_THREADS, which are on another one.
   case "$*" in
     "api graphql -f query=query("*"node(id:"*)
       thread=""
       for arg in "$@"; do case "$arg" in threadId=*) thread="${arg#threadId=}" ;; esac; done
       case " ${FAKE_GH_FOREIGN_THREADS:-} " in
-        *" $thread "*) echo "example/other#3" ;;
-        *) echo "example/repo#7" ;;
+        *" $thread "*) echo "example/other#3" ;;  # leak-guard-allow: fixture repo
+        *) echo "example/repo#7" ;;  # leak-guard-allow: fixture repo
       esac
       exit 0 ;;
   esac
