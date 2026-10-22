@@ -5,7 +5,8 @@ Three forms are in use (2026-10-16):
 - key: value lines (interpreter, submodules, setup, check), which pass
   through unchanged;
 - one "<kind> | <command> | <workflow> | <step>" line per command;
-- "[kind]" or "[kind.name]" tables with a command = "..." key.
+- "[kind]" or "[kind.name]" tables, or "[[kind]]" array tables (one per
+  command), with a command = "..." key.
 For the last two the commands, in lint, format, type, test order, become one
 check joined with " && ", and the interpreter is uv when a command starts
 with uv or uvx (the check sandbox reads only the interpreter's directory
@@ -23,7 +24,7 @@ from typing import List, Tuple
 
 KINDS = ("lint", "format", "type", "test")
 LEGACY = re.compile(r"^(interpreter|submodules|setup|check)\s*:")
-TABLE = re.compile(r"^\[([a-z]+)(?:\.[A-Za-z0-9_-]+)*\]$")
+TABLE = re.compile(r"^(?:\[([a-z]+)(?:\.[A-Za-z0-9_-]+)*\]|\[\[([a-z]+)(?:\.[A-Za-z0-9_-]+)*\]\])$")
 COMMAND = re.compile(r'^command\s*=\s*"((?:[^"\\]|\\.)*)"$')
 
 
@@ -66,7 +67,7 @@ def _from_tables(lines: List[str]) -> List[Tuple[str, str]]:
     for line in lines:
         table = TABLE.match(line)
         if table:
-            kind = table.group(1)
+            kind = table.group(1) or table.group(2)
             continue
         cmd = COMMAND.match(line)
         if cmd and kind:

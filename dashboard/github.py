@@ -15,11 +15,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
-from bus import brain, handoff, labels, tickets
+from bus import brain, handoff, labels, status, tickets
 from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
-from . import free_view, goals, needs_you, operators, tiers_sources, transcripts, views
+from . import bench_store, free_view, goals, needs_you, operators, tiers_sources, transcripts, views
 
 
 READ_WORKERS = 8
@@ -283,6 +283,7 @@ class TicketStore:
             # brain and the station read them (bus/status.py): on a token, not
             # only an App, the timeline still shows each push and failure.
             gh.status_authors |= {a.lower() for a in brain.trusted_authors()}
+            gh.status_in_body = True  # events in the issue body too (loom#1341)
         self.gh = gh
         self.budget_floor = (int(os.environ.get("LOOM_DASHBOARD_BUDGET_FLOOR", "500"))
                              if budget_floor is None else budget_floor)
@@ -315,6 +316,9 @@ class TicketStore:
         # The Tiers and allowances page's sources (the gateway, Grug, run
         # outcomes), read once a pass below, never by a page request.
         self.tier_sources = tiers_sources.TierSources(runs_store=self._runs_store)
+        # The models benched for everyone (loom#969), decided each pass from
+        # the gateway's call records.
+        self.bench = bench_store.BenchStore.from_env()
 
     def _snapshot_get(self, key):
         return self._snapshot[key]
@@ -801,7 +805,12 @@ class TicketStore:
         try:
             found = _unique_by_id(self.gh.paginate_parallel(
                 "/repos/%s/issues/comments?since=%s&per_page=100" % (path, since), workers=READ_WORKERS))
-            issues = [comment_record(c, repo) for c in found if _by_trusted(c, trusted)]
+            # A ticket's routine events are edited into one status comment,
+            # so the feed reads each as its own comment at its own time, as
+            # the station's client does for one ticket (loom#866). Only this
+            # Loom's logins are expanded: a stranger's events would be forged.
+            found = status.expand([c for c in found if _by_trusted(c, trusted)], trusted)
+            issues = [comment_record(c, repo) for c in found]
             found = _unique_by_id(self.gh.paginate_parallel(
                 "/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since), workers=READ_WORKERS))
             reviews = [comment_record(c, repo) for c in found]
@@ -1045,6 +1054,7 @@ class TicketStore:
                 self._read_operator_asks(snapshot, previous_items)
             self._read_latest_runs(snapshot)
             self.tier_sources.refresh()
+            self.bench.update(self.tier_sources.snapshot())
             now = time.time()
             self._refresh_waits(snapshot, now)
             self._read_open_issues(now)

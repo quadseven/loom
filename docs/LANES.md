@@ -63,6 +63,12 @@ prepares the tree (a venv, locked dependencies, a pinned linter) and `check`
 is the required check. Point the repo's CI at the same two scripts so the
 lane and CI cannot drift apart. Unknown lines are refused.
 
+The runner's reader (`bus/contract.py`) also accepts a list of
+`<kind> | <command>` lines, or `[kind]`, `[kind.name]` and `[[kind]]` tables
+with a `command = "..."` key, for the kinds lint, format, type and test. It
+joins the commands, in that order, into one `check`. List only commands that
+run on a lane machine with no secrets, simulators or unset variables.
+
 - The runner reads the file from the base revision before the agent starts
   (on a fix run, from the base branch, not the pull request's branch);
   what the agent edits never changes what is checked. `setup` and `check`
@@ -75,6 +81,13 @@ lane and CI cannot drift apart. Unknown lines are refused.
   it). What setup leaves untracked goes into `.git/info/exclude`, so it is
   never committed.
 - The agent is told the check and how it did on the base.
+- A lane change that adds or edits `.loom/validation.conf` must read and pass
+  under itself. Before the push the runner reads the committed file with the
+  same reader and runs its `check` (and its `setup`, when that differs from
+  the base's) on the lane's tree. A file the reader refuses, a check that
+  exits non-zero or changes tracked files, or a missing interpreter parks the
+  brief as `commit refused: ...; nothing pushed`. The records are the
+  `contract-setup` and `contract-check` phases.
 - After the agent: the runner commits, then runs `check` on that commit. It
   passes only with exit 0 and no tracked file changed (a formatter that has
   to rewrite the agent's files is a failure). Only then is the branch pushed
@@ -91,7 +104,7 @@ lane and CI cannot drift apart. Unknown lines are refused.
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
 - `logs/<lane>/<ticket>.validation.jsonl` holds one line per step: phase
-  (`prepare`, `setup`, `baseline`, `final`), command, exit code, tree
+  (`prepare`, `setup`, `baseline`, `contract-setup`, `contract-check`, `final`), command, exit code, tree
   revision, `ok` and detail (the interpreter's version, the submodule
   revisions).
 - A repo without the file is not validated by the runner; CI still is.
@@ -139,6 +152,10 @@ no model set, or a name with no runner, is passed over. agy has no rung:
 its CLI runs only as the agy lane user, which cannot read the brain's
 checkout or GitHub sign-in, and run as the operator it would read the login
 keychain. The `tick start` line in `brain.log` names the lane and model.
+A tool call a rung's sandbox refuses (the spark rung's opencode denies paths
+outside the checkout) reaches the agent as a tool error and the tick goes
+on; the log watch counts it on the tick and files it only when it hurt the
+tick or keeps coming back (Log watch).
 Each tick resets the checkout to origin's head with hooks and fsmonitor
 off and removes untracked and ignored files, nested repositories included;
 a checkout that still is not clean is cloned again, so nothing a run left
@@ -178,7 +195,8 @@ The station turns trusted
 ticket, with local paths removed from failure reasons; the runner adds
 `Refs <owner/name>#<number>` to the pull request. A limit or transient
 failure moves the ticket to another available lane as a new attempt, at most
-`LOOM_RETRY_MAX` times (default 2). A run that exits 124 after editing pushes
+`LOOM_RETRY_MAX` times (default 2); one with no retry left goes back to
+`loom:queued` on its rung, never to `loom:failed` (loom#1395). A run that exits 124 after editing pushes
 its edits to a side branch `<branch>-timedout-<time>` and names it in the
 failure reason; the retry's brief tells the next attempt to start from that
 branch. A fix round that fails transiently goes
@@ -211,7 +229,11 @@ own hourly budget, not the operator account's. The token is minted at run
 time: the key is read from SSM, an RS256 JWT is signed with the `openssl`
 CLI (key on stdin, never on the command line or on disk), and
 `POST /app/installations/<id>/access_tokens` returns a token kept in memory
-until 5 minutes before its `expires_at`. Mints count under `app token` in the
+until 5 minutes before its `expires_at`. The station runs one pass per process
+and GitHub's ETags differ per token, so it also keeps the token in
+`state/station/app-token.json` (mode 0600, the only place a token is written)
+and the next pass reuses it until 5 minutes before expiry; the ETags cached on
+the last pass then answer 304 (loom#1306). A 401 deletes the file. Mints count under `app token` in the
 requests line, and the budget line reads `GitHub App budget`. With any of the
 three unset, the token above is used as before. Instead of SSM, the station
 and the brain can read the key from a file: set `LOOM_GITHUB_APP_KEY_FILE` to
@@ -306,14 +328,14 @@ pull request is over 6 hours old and has not climbed in 6 hours (a review that f
 conflict alone, never climbs). Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
-starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
-`claude-opus-5-5`, then `gemini-4-argon-high` on agy for a public repo), each
+starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
+`claude-opus-5-5`), each
 climb recorded as a `<!-- loom:rung N -->` comment.
 A climb takes the lowest rung the ticket has not run on since its ladder
 last started; a rung whose lanes each already hold 2 briefed or running
 tickets is passed over for the next untried one, and stays untried. Once it
-ran on Opus or past it, only the untried strong models are left
-(`gpt-6-sol`, `gemini-4-argon-high`). A ticket that failed on a ladder model
+ran on Opus, no stronger model is left (gpt-6-sol and gemini-4-argon are
+forbidden since 2026-10-21). A ticket that failed on a ladder model
 has tried that rung: the model a claim ran is its `Model:` line, else its
 pull request's runner footer, else the lane's `LOOM_<LANE>_MODEL`. With no
 lane of its next rung up, the ticket waits and the factory posts nothing; it
@@ -360,6 +382,13 @@ crashed lane, or a machine that is off) moves the same way, with a comment
 naming the lane and how long it was silent: to a free lane of its tier, or of
 its Model, else back to `loom:queued`. It is no failure and no retry, so it
 never climbs, and the station's `silent-lane` invariant lists the lane.
+A lane deep in a run is not silent: its runner writes the heartbeat between
+runs, so while it lives it also stamps `state/usage/<lane>.alive` with the time
+every `LOOM_KEEPALIVE_SECONDS` (default 60), and the station counts a lane
+with a stamp under five minutes old, like one whose runner holds its lock with
+a live pid, as running. The stamp says nothing of availability. When the
+factory does find a lane silent with a running ticket, the station log names
+what it saw of the runner (its lock and the stamp's age).
 A failed or stalled
 ticket climbs, and past the last rung it is left `loom:failed` for the brain. Landing
 keeps the default branch green: a ready pull request that is behind its base
@@ -376,7 +405,32 @@ asking for a test that fails without the change, instead of landing; that
 round climbs only if the next one still adds no test. A repo with no test
 harness opts out in `LOOM_NO_TEST_REPOS` (space separated `OWNER/NAME`), and
 a ticket whose body has the line `Tests: none needed (<reason>)` skips the
-check. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
+check. Scope check (`bus/scope_fit.py`): with `LOOM_SCOPE_CHECK_URL` set to a
+keyless https chat-completions route (for example the gateway's free-public
+route for Gemma) and optionally `LOOM_SCOPE_CHECK_MODEL` (default
+`gemma-4-31b-it`), a ready pull request on a public repo is checked once
+before it lands: the model gets the ticket's `## What` section and the
+changed-file list and answers whether the files fit the ticket and the repos
+and resources it names. `YES` lands it as before. `NO: <reason>` holds it:
+`needs-brain` on the pull request, a comment with the reason and a hold marker
+(once per head commit, so a later pass does not ask again), and a note on the
+ticket; the brain or a person reads the diff and merges it or sends it back.
+No route, a limit, a timeout, a reply that is not `YES` or `NO: <reason>`, a
+ticket with no `## What` section or an unset URL lands it as before: the check
+is advisory and never blocks a merge on a dead route. A private repo is never
+asked. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
+
+Merged first (`bus/fabric.py`, loom#1437): before a briefed ticket goes to a
+build lane, a pull request already merged into the default branch for it sends
+it to a verify run instead. A linked pull request counts (a Refs line or a
+`loom/<number>` branch). With `LOOM_FABRIC_KEY_SSM` naming the SSM parameter
+that holds the Fabric workspace key, a ticket nothing links is also asked
+about once: the station asks Fabric's whole-library chat which merged pull
+requests already do the work, and each cited pull request must be of this
+repo, merged into the default branch, and carry the cited card's title. At
+most 2 questions a pass and 3 citations each; the key is read for each call
+and only asks, never writes. Fabric unset, down, slow or silent builds the
+ticket as before.
 
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`
@@ -450,6 +504,34 @@ only what is its own, and adding an operator is configuration:
   routing and pull request pass, `bus.brain move`, the station's claim, pull
   request adoption and the verify picker all skip one assigned to anyone
   else. The station logs each skip once (`state/station/owned.json`).
+- A claim is not forever. Once an hour the station reads each open issue
+  another operator claims (a `claim:<login>` label not its own, or an
+  assignment to a `LOOM_TRUSTED_BRIEFERS` login). When neither the claim nor
+  any act of the claimer's on it (a comment, a label, an assignment, a
+  reference from their issue or pull request) is newer than
+  `LOOM_CLAIM_IDLE_HOURS` (default 24; 0 is off), and no open pull request of
+  theirs names it, the station removes the claim label and unassigns them,
+  at most 20 issues a run (`bus/stale_claims.py`). The issue is then this
+  Loom's like any unowned one. A label removal sends no email.
+- A Loom's own claim lapses too. The same hourly step reads each open ticket
+  carrying this Loom's `claim:<login>` label and a Loom label (`loom:*`,
+  `wait:*` or `needs-brain`). When it is not `loom:running`, nothing on its
+  timeline is newer than `LOOM_CLAIM_IDLE_HOURS`, and no open pull request
+  naming it (a `Refs` line) was updated within that time, the station removes
+  the claim label, unassigns this operator, and adds a status note saying why,
+  so another operator's Loom may take the ticket by the rules above. A wait
+  label does not keep a claim alive: a ticket held only by a model limit, a
+  brain or a runaway hold lapses once it has been quiet that long. A claim
+  with no Loom label is an operator's own session's and is left to the
+  claimed-issue settle (`bus/stale_claims.py`). The station's own relabels
+  (events by this Loom's App logins) are not activity for this lapse, so a
+  ticket that moves between lanes and the brain still lapses; only the claim
+  label's own putting-on, a person's act, or a pull request update count.
+- The claim marks a run, not a ticket's whole life. Any station or brain move
+  out of `loom:running` (a retry, a limit, a failure, a pull request opened, a
+  merge) removes this Loom's own `claim:<login>` label in the same labels
+  write, and so does any close of a ticket. A `claim:<login>` label of another
+  login is never touched. The next claim adds it again.
 - When the station claims a ticket, it assigns the issue to its operator
   login, the first `LOOM_BRIEF_AUTHORS` login that is not an app (`[bot]`),
   before it relabels it, and adds `claim:<that login>` with the relabel
@@ -531,6 +613,11 @@ one), is free, and has no build work (no briefed ticket claimed for it and no
 queued ticket of its tier or model) is handed one verify run instead of
 idling: the oldest shipped ticket without a proof, at most once per 6 hours
 per ticket, on a public repo only. The brief carries `Deliverable: verify`.
+A shipped ticket that has waited 2 hours since its ship does not wait for an
+idle slot: every 30 minutes at most, one free slot that may verify is taken
+from build work for the oldest such ticket (queued work of the slot's tier does
+not hold it back; a failed proof audit still does), so a factory with build
+work for every lane still verifies what it ships.
 When `LOOM_EVIDENCE_CMDS` is set in the station plist, it is a JSON map from
 `owner/repo` to a read-only shell command. The command receives each eligible
 backticked string from the ticket's Live criterion in
@@ -538,7 +625,19 @@ backticked string from the ticket's Live criterion in
 fixed-string match (see `.env.example`). The station runs it once per string,
 with a 60-second timeout, then quotes up to 20 matching lines per string in
 the verify brief. It accepts at most five ASCII strings of at most 120
-characters. Lines containing credentials, private hosts, IP addresses or
+characters.
+A Live criterion that needs its strings to be absent ("no `X` line appears",
+"never logs `X`", "`X` does not appear", every string so worded) is verified on an
+empty answer: when every command run answered and no line named any string, the
+ticket is handed a verify run and the brief carries a `## Absence check, station
+data` section naming the zero count and the hours of log searched
+(`LOOM_EVIDENCE_WINDOW_HOURS`, default 24; a command may print
+`loom-evidence-window-hours: N` to report the log it really read, as a pod restart
+cuts it short). When the criterion states a span ("over 24h", "for 3 days") longer
+than that window, absence is not proven: the station logs the missing hours, labels
+the ticket `loom:awaiting-evidence` and tries again after its cooldown. A command
+error or timeout proves nothing either way. A criterion that needs a string present
+still waits for a line. Lines containing credentials, private hosts, IP addresses or
 local paths are dropped and counted. A timeout or command error is stated in
 the brief without quoting its output. Repos without a command run none.
 Verify lanes have no network, so every verify brief also carries a
@@ -555,8 +654,9 @@ log lines and are dropped and counted when they do not.
 The agent changes no code, opens no pull request and moves no label; it reads
 the ticket's Live criterion and judges each criterion against those two
 sections, then
-writes `verify.json`: a proof record (`bus/proof.py`) or
-`{"missing": "<the evidence that does not exist yet>"}`. The runner copies it
+writes `verify.json`: a proof record (`bus/proof.py`),
+`{"missing": "<the evidence that does not exist yet>"}` or, for a ticket sent
+ahead of a build, the `unmet` answer described below. The runner copies it
 to the lane's log folder as `<brief>.verify.json`, with the run's model
 beside it in `<brief>.verify.model`. The station checks a record with
 `bus/proof.py`, ticks the criteria and moves the ticket to verified with the
@@ -583,6 +683,23 @@ verify runs. The brain audits lane proofs (docs/BRAIN.md, Proof audits): a
 lane whose proof failed its audit in the last 24 hours is handed no verify
 run, and the daily line's Throughput number splits the verified tickets into
 lane and brain proofs.
+
+A ticket the station sent to verification before any build (a merged pull
+request already covers it; docs/BRAIN.md, Claim and outcome) gets one more
+section in its brief, `## Sent to verification before any build`, and one more
+possible answer: `{"unmet": "<which criteria the merged change does not meet
+and why>"}`. The station then moves the ticket back to `loom:queued` for a
+build, with the reason as a status event, and does not send that pull request
+to a verify run again. An `unmet` answer on any other ticket, or one that says
+nothing, only leaves the ticket shipped.
+
+A ticket whose proofs were refused `VERIFY_REFUSAL_CAP` times (3,
+`bus/station.py`; the count is kept in `state/station/verify-refused.json`)
+leaves the verify queue instead of coming back every 6 hours: the station
+posts one comment listing the refusals and adds `needs-brain`, and the brain
+proves the ticket or rewrites it. Every station log line starts with its UTC
+time (`[2026-10-21T08:29:40Z] station: ...`), so evidence that quotes a
+station log line can name when it was seen.
 
 ### Talking to the brain from Discord
 
@@ -727,7 +844,9 @@ Each station pass reads the lines each component added to its log since the
 last pass: by default `logs/station.log` (as `station`), `logs/brain.log`
 (`brain`) and each lane's `logs/<lane>-service.log` (named after the lane).
 `LOOM_WATCH` replaces that list with lines of `name=path`, a relative path
-being under `$LOOM_HOME`. A line counts when it says `error`, `failed`,
+being under `$LOOM_HOME`. Each line first loses its terminal escape codes
+(colours and the like, raw or shown in caret notation as `^[[91m`) and other
+control characters. A line counts when it says `error`, `failed`,
 `Traceback` or `refused`, or carries an HTTP 4xx or 5xx; a Python traceback
 counts once, as its exception line. A line of a GitHub Actions job log that
 an agent echoed (a seven-digit-fraction timestamp, after the job and step
@@ -743,11 +862,56 @@ times, numbers, hex ids and SHAs, long mixed ids, repos and issue numbers,
 paths, addresses and mentions become placeholders, so a 403 on two repos is
 one signature (the status code is kept).
 
+An agent CLI's sandbox or permission refusal is not an error and never a
+signature: opencode's `The user has specified a rule which prevents you from
+using this specific tool call` (a lane or the spark brain rung reaching
+outside its tree, which `lanes/agent_sandbox.sh` denies on purpose) or `The
+user rejected permission to use this specific tool call`, claude's `Claude
+requested permissions to ... but you haven't granted it yet` and `Permission
+to use ... has been denied`, codex's `rejected by user approval settings`
+patch refusals and gemini's `Tool execution ... denied by policy`. The agent
+gets it as a tool error and carries on (loom#202). The watcher counts each
+refusal on its run, keyed by the tool and the denied path; the line opencode
+prints right before it (`<cross> Read <path> failed`) names both and is not a
+signature either. A run is what the log marks between a start and an end:
+the brain's `tick start (lane <rung>, ...)` and `tick end (exit <n>)`, or a
+lane run's `<ticket> start, lane <slot>` and its `done, ...` or `failed:
+[<class>] ...` line. Refusals outside a marked run settle at the end of the
+pass as one run of unknown outcome.
+
+When a run ends its refusals go into `watch.json` (the day's runs and
+counts per refusal) and the hourly summary line (`N agent refusals (M that
+hurt a run)`). A refusal files an issue only when it hurt:
+
+- the run failed (a non-zero tick exit, or a lane failure not classed
+  `[transient]` or `[limit]`) or made no change (`made no commit`,
+  `nothing to change`);
+- it repeated 5 times in that one run (`REFUSAL_REPEAT`); or
+- it came back in 5 runs within 24 hours (`REFUSAL_RUNS`), even when each
+  carried on: a brief or prompt that keeps steering the agent outside its tree.
+
+Then it files or counts one `loom:triage` issue per component (with the
+brain's rung or the lane), tool and denied path, titled `<component>/<lane>:
+sandbox refused <tool> <path>` (`brain/spark: sandbox refused Read
+~/.config/gh/hosts.yml`). It names the CLI, the denied path, the rule (for
+opencode the last deny rule it lists, `external_directory * deny`), how often
+in the last run and the last 24 hours, and the effect, so a person decides:
+widen the sandbox for that path or teach the brief to stay inside it. The
+watcher never loosens the sandbox. The path is shown with the home directory
+as `~`, a temp directory as `<tmp>`, a goal repo's name (any `LOOM_REPOS`
+repo but the lanes repo) as `<repo>`, and numbers and ids as placeholders, so
+one path is one issue; a path that still fails the written-text check (an
+absolute path outside home and temp) is withheld. The issue then rolls like a
+signature's: one count comment an hour while the refusal recurs, edited in
+place, also for runs it did not hurt, and a quiet close after 24 hours.
+
 A signature seen 3 or more times within 30 minutes, and not seen in the 24
 hours before, files one `loom:triage` issue in `LOOM_STATUS_REPO` titled
 `<component>: <signature>`, with the count and the first and last example
-lines. The examples have paths, credential shapes, mail addresses, mentions,
-private hosts, IP addresses and repo names replaced, and each must pass the
+lines. An example keeps the whole line up to 2000 characters; a longer one
+keeps its start and its end around ` ... `. The examples have paths,
+credential shapes, mail addresses, mentions, private hosts, IP addresses and
+repo names replaced, and each must pass the
 written-text check (`bus/text.py`) or is withheld. An open `loom:triage` issue
 with the same title is counted instead of filed again. While the signature
 keeps repeating its open issue gets a count comment at most once an hour,
@@ -814,6 +978,11 @@ Each invariant is one function returning breaches with evidence:
 - A remote lane whose newest heartbeat is older than its `beat_max`.
 - Lanes that held a running ticket while they sent no heartbeat
   (`silent-lane`, above).
+- Goal homes whose body names a roll (the word `roll` or `rolls`) that no
+  `LOOM_ROLL_SHIP_DOCS` entry names (`roll-pin-off`, one rolling issue for
+  every such goal): the station opens no source-pin pull request when their
+  module changes merge (README.md, Roll source pins). The issue says when
+  the setting is empty, which turns the pass off.
 
 The failing-streak, lane-held and silent-lane invariants are one rolling
 issue each, a line per lane, rewritten in place while the list changes, as
@@ -821,6 +990,13 @@ the tickets-outside-an-epic issue is: one provider limit opened 9 lane-held
 issues in 6 minutes on 2026-10-15. An older per-lane issue of the same
 invariant is closed as folded into the rolling one, unless it carries a
 `needs:<login>` label, which leaves an operator's ask open on its own issue.
+
+The lane-held issue is also a standing one (loom#845): when no lane is held any
+more the station edits it in place to say "No lane is held by a limit now" with
+the time it went clear, and leaves it open; the next hold edits it back, so a
+hold that comes and goes never closes and reopens an issue (each reopen mailed
+the people watching it). The lanes it listed move into a "Hold log" in the body
+(a line per hold, newest first, the last 20).
 
 Each breach files one issue labelled `loom:triage` and `loom:invariant` under
 the standing repairs epic (docs/BRAIN.md, Filing under an epic; the goal home
@@ -830,8 +1006,15 @@ itself when that epic cannot be read) of the invariant goal home
 goal home that is not a backlog), as a sub-issue and with a `Part of #N`
 line, carrying the evidence. A hidden marker holds a hash of the invariant
 and its subject: an open issue for the same breach files nothing, and a
-closed one is reopened with a comment only for evidence newer than its
-close. Issues and pull requests in a private repo are named in words, and
+closed one is reopened only for evidence newer than its close, at most once
+while the breach stands (it stays closed if something closes it again before
+the breach clears; the station logs that and says nothing on the issue). The
+reopen is one "Broken again" note on the issue, edited with a count and the last
+time, never a new comment each time. An issue that carries `loom:ticket` (an
+invariant issue rewritten into work) is no longer the breach's issue: it is
+never reopened, rewritten or commented on, and a breach that outlives a closed
+ticket gets one separate invariant issue that refs the ticket (loom#1223
+flipped 18 times in a day before this). Issues and pull requests in a private repo are named in words, and
 failure reasons have repos, paths and credentials replaced. One pass files
 or reopens at most 5, and below the GitHub budget floor files nothing.
 `python3 -m bus.brain status` lists the open ones under "Invariants broken"
@@ -856,10 +1039,11 @@ the machine (the uploads above do). API-lane agents run on the same machine, so 
 loopback connection outside their provider's port (443, and the spark endpoint's on the spark lane); they
 cannot query the viewer or any other local service.
 
-## API lanes: openrouter, opencode-go, anthropic (and zen, zai below)
+## API lanes: openrouter, opencode-go, anthropic, copilot (and zen, zai below)
 
 - `openrouter` (free models via opencode), `opencode-go` (subscription models
-  via opencode) and `anthropic` (API credits via the official Claude Code CLI).
+  via opencode), `anthropic` (API credits via the official Claude Code CLI),
+  and `copilot` (GitHub Copilot CLI with its Free allowance).
 - The provider key is read from SSM at run time (`LOOM_<LANE>_KEY_SSM`, set at
   install, never in this repo) and exported to the agent, never passed in
   argv, in an otherwise empty environment with a scratch HOME and TMPDIR.
@@ -887,6 +1071,11 @@ cannot query the viewer or any other local service.
 - Otherwise: fresh clone, the lane's official CLI with the brief, then the
   runner (not the agent) pushes the branch and opens the PR in the format
   the Chief check requires.
+- `copilot` reads its token from `LOOM_COPILOT_KEY_SSM` and exports it only as
+  `COPILOT_GITHUB_TOKEN`. It invokes one `copilot -p` prompt with
+  `--allow-all-tools`; the run output, including any CLI usage details, is
+  retained in the lane log. Monthly usage-limit messages hold the lane until
+  the next UTC month begins.
 - Any step that fails moves the brief to `failed/` with the reason in
   `logs/<lane>/<ticket>.log`. Failed briefs are never retried; the
   orchestrator re-briefs.
@@ -1028,6 +1217,7 @@ lookup leaves the brief for the next pass. The rule covers:
 - the `zen` lane (several OpenCode Zen free models may train on prompts;
   Nemotron free models are NVIDIA trial endpoints),
 - the `zai` lane (Z.ai free Flash models),
+- the `copilot` lane (Free allowance; public repositories only),
 - `opencode-go` runs of a Muse Spark Contributor model (it trains Meta's
   models); other Go models keep 0 to 30 days and take any repo.
 
@@ -1110,6 +1300,19 @@ holds only that slot for 15 minutes as a limit, so the station can assign the
 ticket elsewhere without counting it as a work failure. Ollama and Gemma
 accept private repos; the other three accept public repos only. The routes
 need your own gateway and provider configuration.
+
+## opencode lanes: one continue for a described step
+
+Every opencode lane (openrouter, opencode-go, zen, zai, workersai, spark and
+the free slots) runs `opencode run --format json`. A model that answers with
+a described step ("Let me read the build files.") and then stops, with no
+tool call, no commit, and no "nothing to change" summary, gets one more
+run with `--continue` asking it to carry out that step. A second such end
+fails the ticket as "ended on a described step without taking it". The spark
+lane's log keeps the raw events; every other lane's log keeps what a plain run
+printed (the model's text and any non-event line, such as a provider error),
+so its failure classes and the final message quoted in a failure reason are
+unchanged for a run that did not end on a described step.
 
 ## spark: a local vLLM coder, one stream at a time
 

@@ -176,6 +176,19 @@ class UnprovenWork(unittest.TestCase):
         self.assertEqual(card["unproven"], 1)
         self.assertEqual(card["unproven_limit"], 30)
 
+    def test_a_ticket_held_for_a_live_event_is_counted_apart(self):
+        rows = self.rows("shipped", "shipped", "shipped")
+        rows[1]["labels"] = ["loom:shipped", "wait:live-event"]
+        rows[2]["labels"] = ["loom:shipped", "wait:live-event"]
+        card = goals.goal_context(rows, [], {}, [], None, NOW)[REPO + "#30"]
+        self.assertEqual(card["unproven"], 1)
+        self.assertEqual(card["live_event_held"], 2)
+        note = server._goal_unproven_html(card)
+        self.assertIn("unproven work 1/30", note)
+        self.assertIn("2 more held for a rare live event, counted apart from open work", note)
+        self.assertEqual(goals.goal_context(self.rows("shipped"), [], {}, [], None, NOW)[
+            REPO + "#30"]["live_event_held"], 0)
+
     def test_a_goal_card_shows_the_count_against_the_limit(self):
         from dashboard.github import ticket_record
 

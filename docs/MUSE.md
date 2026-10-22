@@ -41,6 +41,14 @@ Read and write GitHub only from the shell, through the Loom commands or the
 GitHub REST API with `LOOM_GITHUB_TOKEN`. Never use the web or browser tool
 for GitHub or anything else in a scheduled run: each new web request asks
 the operator for approval, and the run stops until someone answers.
+To read a file in a repo (a test, a script, a doc) without the web tool:
+
+    curl -fsS -H "Authorization: Bearer $LOOM_GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github.raw" \
+      "https://api.github.com/repos/OWNER/NAME/contents/PATH?ref=main"
+
+A scheduled run on 2026-10-21 asked the operator to approve a web fetch of
+one loom test file and stopped until the operator answered.
 
 ## Operate, do not report
 
@@ -207,7 +215,9 @@ steps on each tick:
 
 Claims expire after two hours without a heartbeat. A claim without a pull
 request expires after three hours and returns to `loom:queued` with a
-`[transient]` reason. The brain tick remains a separate process and follows
+`[transient]` reason. A ticket's heartbeat edits its claim comment in place (see
+"Lane comments edited in place" in BRAIN.md), so a beat adds no comment and
+sends no email. The brain tick remains a separate process and follows
 the regular brain instructions above.
 
 ## Handing off stage work
@@ -283,9 +293,10 @@ this tick"; a step with no note shows nothing there.
    for each goal, its latest journal, report, measurement and completed
    action, and its report deadline. Every goal under "Reports owed before
    unlock" gets its report in the report step this tick, in every scope,
-   including live. If the brain cannot write it, the station posts the
-   data-only report once the last report is 1 hour 45 minutes old, so no
-   goal's report passes 2 hours; never hand an owed report to another brain.
+   including live. A report is owed from 3 hours 45 minutes after the last
+   one. If the brain has not written it, the station posts the data-only
+   report once the last report is 5 hours 45 minutes old, so no goal's
+   report passes 6 hours; never hand an owed report to another brain.
    A goal listed as `report HELD` already has a report under 90 minutes old
    (the station's included): skip it this tick. Each lane
    pull request's line ends in `READY`
@@ -315,8 +326,10 @@ this tick"; a step with no note shows nothing there.
    Spend at most a third of the tick on them; defer what is left again.
    Sensitive pull requests listed by resume are also yours to handle, even
    when another brain journaled in the last 2 hours. They are open,
-   needs-brain, older than 2 hours, green and passed the review check. Read
-   the ticket and diff, answer or resolve each review thread, then run
+   needs-brain, older than 2 hours, green and passed the review check. Resume
+   lists these oldest first, before other deferred work. Review the oldest
+   sensitive pull request before any other merge work: read the ticket and
+   diff, answer or resolve each review thread, then run
    `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N` when ready.
    Do not wait for the other brain's next tick.
    `resume` then lists up to 5 verify-due tickets (open `loom:shipped`, no
@@ -538,7 +551,7 @@ on hard work):
   route on the spark-gateway, each waiting out its own provider's reset
   (free-ollama is Ollama Cloud and free-gemma is Gemma, both on any repo); else a
   free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
-  opencode-go-4, muse, free-nvidia, free-kilo and free-groq on public repos only
+  opencode-go-4, muse, copilot, free-nvidia, free-kilo and free-groq on public repos only
   (opencode-go-4 is Muse Spark, which trains on prompts; free-nvidia to free-groq
   are NVIDIA NIM, Kilo and Groq).
   Never anthropic or claude for an easy ticket.
@@ -549,18 +562,19 @@ on hard work):
   operator wants every free tier used up, 2026-10-19); then codex or opencode-go (opencode-go-4 on public repos only); an
   anthropic slot only when every spark, codex and opencode-go slot already
   holds work.
-- Hard: a spark slot first, then anthropic, claude, agy (Gemini 4 Argon,
-  public repos only) or codex, never a free lane. A hard ticket a spark
+- Hard: a spark slot first, then anthropic, claude, agy (public repos only)
+  or codex, never a free lane. A hard ticket a spark
   fails climbs the model ladder. Keep the anthropic slots busy with hard work
   while the credit lasts. Tiers follow the Artificial Analysis Intelligence
   Index: a lane's model goes in the tier its score supports.
 
-A hard ticket with no `Model:` line runs its lane's strongest model, not the
-lane default: gpt-6-sol on codex and gemini-4-argon-high on agy (the table
-`HARD_MODELS` next to `TIERS` in bus/factory.py). A ticket pinned to
-claude-opus-5-5 on a public repo goes to agy with gemini-4-argon-high when
-every Anthropic lane is at a limit or down, never when they are merely busy
-(the table `EQUIVALENTS`), and its claim records Argon as the model it ran.
+Codex runs gpt-6-luna only and agy the gemini-3.8-flash family only (the
+operator, 2026-10-21). A hard ticket with no `Model:` line runs its lane's
+default; the table `HARD_MODELS` next to `TIERS` in bus/factory.py is empty,
+and so is `EQUIVALENTS`: a ticket pinned to claude-opus-5-5 waits for an
+Anthropic lane and never goes to agy. A `Model:` line naming gpt-6-sol or a
+gemini-4-argon model reads as gpt-6-luna or gemini-3.8-flash-high, and the
+brain writes the same stand-in (`FORBIDDEN_MODELS` in bus/tickets.py).
 
 When no lane of a ticket's tier is up (every one at a limit or down), the
 factory's tier moves (a ticket off a lane at a limit, a queued ticket getting
@@ -571,7 +585,12 @@ easy: claude when it is free, else spark or a free lane. Easy and hard have
 no fallback, for the rules above. A fallback move says so in its note
 ("fallback: no medium lane is up"); the ticket keeps its `Difficulty:` line,
 so its next move takes its own tier again once a lane of it is up. A tier
-with a lane up but busy is waited for, not fallen back from.
+with a lane up but busy is waited for, not fallen back from, and so is a
+tier whose lanes are down or at a limit but one of them lifts within two
+hours (`LIMIT_REQUEUE`); a lane at a limit with no known end counts as out
+for hours. A move off a lane at a limit names when it lifts in its note. A
+ticket marked `needs-brain` or `loom:runaway` is held for the brain, and no
+such move touches it.
 A ticket briefed to a lane that is down, or at a limit lifting more than
 two hours off (`LIMIT_REQUEUE`), does not wait on it when no lane of its
 tier is free: it goes back to `loom:queued` with no lane, and takes the next
@@ -612,18 +631,22 @@ rather than a wait behind a busy lane that is up), never the model that
 already failed it, and never a free lane:
 
 1. the claude lane with `claude-sonnet-5-5`;
-2. the codex lane (or codex-2) with `gpt-6-sol`;
-3. `claude-opus-5-5` on the claude lane, else an anthropic slot;
-4. `gemini-4-argon-high` on agy, public repos only (the Opus equivalent and
-   agy's hard-tier model, bus/factory.py EQUIVALENTS and HARD_MODELS).
+2. the codex lane (or codex-2) with `gpt-6-luna`;
+3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
+
+A rung with one lane up holds a bounded few waiting tickets: past
+`ONE_LANE_MAX` (4), the overflow climbs to an untried rung whose least-loaded
+lane holds three or more fewer, even though that lane is not free. A stall the
+factory cannot move (no other lane of the rung or tier) is said once, when the
+ticket starts waiting for that reason, and then shows as a wait the station times.
 
 A rung counts as tried once the ticket was claimed on its model. The model a
 claim ran is what ran: the `Model:` line in force (the ticket's own before the
 ladder started, then the ladder's moves), else the model the runner footer of
 its lane's pull request names (`lane <lane>, model <model>`), else the lane's
 configured setting (`LOOM_<LANE>_MODEL`), never a fixed lane-to-model map.
-Once a ticket ran on Opus or past it, it climbs only to the untried strong
-models (`gpt-6-sol`, `gemini-4-argon-high`), never back to Sonnet. When no
+Once a ticket ran on Opus, no stronger model is left: it never goes back to
+luna or Sonnet, and the factory gives up on it. When no
 lane of its next rung is up, it waits with no comment; the factory says it
 tried every rung only once every rung with a lane for its repo was tried. The
 one exception is a pull request whose open thread carries a lane's answer: the

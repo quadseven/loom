@@ -115,8 +115,21 @@ rung_ready() {
   fi
   [[ "$beat" =~ \"at\":\ *([0-9]+) ]] || { RUNG_WHY="usage heartbeat has no time"; return 1; }
   at="${BASH_REMATCH[1]}" now="$(date +%s)"
-  [ $((now - at)) -le 600 ] && [ $((at - now)) -le 60 ] ||
+  [ $((at - now)) -le 60 ] || { RUNG_WHY="usage heartbeat is from the future"; return 1; }
+  [ $((now - at)) -le 600 ] || { [ $((now - at)) -le 7200 ] && lane_running "$lane"; } ||
     { RUNG_WHY="usage heartbeat is $((now - at)) seconds old"; return 1; }
+}
+
+# Whether lane $1's runner holds its lock with a live process. A runner
+# writes its heartbeat between runs, not during one, so a lane mid-run looked
+# like one with no usage: at 11:04Z on 2026-10-21 the claude lane was 30
+# minutes into a run and the spark lane 40, and the tick skipped. The beat's
+# age is capped at 2 hours (a run's agent and check timeouts) above, so a
+# recycled pid cannot keep a dead lane's heartbeat alive.
+lane_running() {
+  local pid
+  pid="$(cat "$LOOM_HOME/run/$1.lock/pid" 2>/dev/null)" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
 }
 
 # Whether any rung can take the tick; when none can, LADDER_WHY holds every
@@ -137,7 +150,7 @@ ladder_open() {
 BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_TRUSTED_BRIEFERS
   LOOM_REPO_OWNERS LOOM_HOME
   LOOM_BRAIN_SCOPE LOOM_BRAIN_HOLDER LOOM_REVIEW_CHECK LOOM_REVIEW_BOT LOOM_GOAL_CAP
-  LOOM_UNVERIFIED_LIMIT LOOM_REPAIR_EPICS LOOM_MERGE_SETTLE_SECONDS)
+  LOOM_UNVERIFIED_LIMIT LOOM_REPAIR_EPICS LOOM_MERGE_SETTLE_SECONDS LOOM_GITHUB_LOGIN)
 
 # The spark rung runs as the spark lane does: opencode inside the shared
 # sandbox, with an emptied environment and a scratch home. Its tree is the
@@ -220,6 +233,13 @@ if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
   fi
   export GH_TOKEN="$app_token" GITHUB_TOKEN="$app_token" LOOM_GITHUB_TOKEN="$app_token"
   unset app_token
+  # GET /user refuses an installation token, so the agent's journal is told
+  # the App's login; without it the journal fails, not the tick.
+  if app_login="$(bus app login 2>> "$LOG")" && [[ "$app_login" =~ ^[A-Za-z0-9-]+\[bot\]$ ]]; then
+    export LOOM_GITHUB_LOGIN="$app_login"
+  else
+    say "could not read the brain's GitHub App login; its journal may not post"
+  fi
 fi
 
 # A rung may have changed the checkout (a hook, a config, an edited

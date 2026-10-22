@@ -98,6 +98,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "wait:incident": {"color": "fef2c0", "description": "Waiting: held for an open factory incident"},
     "wait:after": {"color": "fef2c0", "description": "Waiting: another ticket must merge first (After:)"},
     "wait:window": {"color": "fef2c0", "description": "Waiting: a deploy or roll window"},
+    "wait:live-event": {"color": "fef2c0", "description": "Waiting: its Live box needs a rare event the log has not shown; held apart from open work"},
 }
 for _lane in LANES:
     LABELS["lane:" + _lane] = {"color": "bfdadc",

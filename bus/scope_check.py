@@ -26,8 +26,10 @@ paths. As a script it prints one stray path per line, made printable::
     python3 -m bus.scope_check <tree> <base> <head> <brief> [<rev>...]
 
 With ``--scratch``, it prints only stray files safe to drop: unreferenced
-top-level test/debug files, object/build_test outputs, and .loom metadata
-other than the validation contract. New .github files are never dropped.
+top-level test/debug files, object files and build output (BUILD_OUTPUT_DIRS),
+top-level shell here-document temp files (``sh-thd-*``) and ``*.patch`` files,
+and .loom metadata other than the validation contract. New .github files are
+never dropped.
 
 It exits 2 on a usage error or when git cannot read a revision, so the
 runner never mistakes a failed check for a clean one.
@@ -44,6 +46,12 @@ from typing import Iterable, List, Sequence, Set
 # Characters that may sit inside a path token in the brief's prose.
 _PATH_CHAR = r"[\w./-]"
 
+
+# Build and tool output an agent's own commands leave in the tree: a stray file
+# under one of these is dropped, never refused (ten refusals on 2026-10-21/22
+# were a Gradle daemon cache, a build/ output and the like). A folder the base
+# tracks is in scope, so it is never stray and never dropped.
+BUILD_OUTPUT_DIRS = ("build_test/", "build/", ".gradle/")
 
 # Hidden directories whose new files GitHub runs: never in scope unnamed.
 RUNNABLE_DIRS = (".github/workflows/", ".github/actions/")
@@ -156,7 +164,9 @@ def scratch_files(tree: str, base: str, head: str, brief_text: str,
             continue
         if path.startswith(".loom/") and path != ".loom/validation.conf":
             scratch.append(path)
-        elif path.startswith("build_test/") or path.endswith(".o"):
+        elif path.startswith(BUILD_OUTPUT_DIRS) or path.endswith(".o"):
+            scratch.append(path)
+        elif "/" not in path and (path.startswith("sh-thd-") or path.endswith(".patch")):
             scratch.append(path)
         elif "/" not in path and (fnmatch.fnmatchcase(path, "test_*") or
                                   fnmatch.fnmatchcase(path, "*_debug*")):
