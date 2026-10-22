@@ -7443,7 +7443,7 @@ class Station:
         last = state.get("last")
         if isinstance(last, (int, float)) and 0 <= self.now - last < self.s.health_every:
             return
-        sources, problems = health.parse_sources(self.s.health_urls)
+        sources, problems = health.parse_sources(self.s.health_urls, state)
         for problem in problems:
             _say("ignoring a LOOM_HEALTH_URLS entry: %s" % problem)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now))
