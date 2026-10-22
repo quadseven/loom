@@ -165,6 +165,29 @@ class MeasurementHold(unittest.TestCase):
                 self.assertEqual(len(why), 1)
                 self.assertIn("changes the health read or a bound", why[0])
 
+    def test_a_file_whose_patch_is_missing_cut_or_renamed_from_the_read_is_held(self):
+        # Security review: a binary or very large file has no patch, a long
+        # patch is cut, and a rename was judged by its new name only.
+        for entries in ([{"filename": "data/fund.bin"}],
+                        [{"filename": "app/refunds.py", "additions": 400, "deletions": 3,
+                          "patch": "@@ -1 +1 @@\n-pay(owed)\n+pay(owed, once=True)"}],
+                        [{"filename": "app/fund_report.py", "previous_filename": "api/health.py",
+                          "patch": "@@ -1 +1 @@\n-x = 1\n+x = 2"}]):
+            with self.subTest(entries=entries[0]["filename"]):
+                self.assertEqual(len(self.reasons(entries)), 1)
+
+    def test_a_file_list_that_cannot_be_read_in_full_is_held(self):
+        fake = Route({"/repos/%s/contents/.github/workflows" % REPO: []})
+        fake.routes["/repos/%s/pulls/8/files" % REPO] = []
+        fake.fail.add("/repos/%s/pulls/8/files" % REPO)
+        why = operator_hold.measurement_reason(GitHub("t", transport=fake), REPO, {"number": 8},
+                                               HEALTH_INTAKE, [{"filename": "app/a.py"}])
+        self.assertIn("could not be read", why)
+        many = [{"filename": "app/f%d.py" % n, "patch": "@@ -1 +1 @@\n-a\n+b"}
+                for n in range(operator_hold.FILES_CAP)]
+        self.assertIn("or more files", operator_hold.measurement_reason(
+            GitHub("t", transport=fake), REPO, {"number": 8}, HEALTH_INTAKE, many))
+
     def test_a_fix_of_the_cause_and_a_non_health_ticket_are_not(self):
         self.assertEqual(self.reasons(self.APP), [])
         self.assertEqual(self.reasons(self.HEALTH_READ, body=STALE_REWRITE), [])
@@ -220,13 +243,20 @@ class Stale(unittest.TestCase):
         self.assertEqual(got.key, "pr-%s#31" % OTHER)
 
     def test_a_linked_pull_request_merged_after_the_ticket_was_filed(self):
-        said = [comment("Shipping it in https://github.com/%s/pull/45 instead." % OTHER,
-                        login="a-reviewer")]
+        said = [comment("Shipping it in https://github.com/%s/pull/45 instead." % OTHER)]
         self.fake.routes["/repos/%s/pulls/45" % OTHER] = {"merged_at": iso(3600), "title": "x"}
         self.assertEqual(self.check(comments=said).key, "pr-%s#45" % OTHER)
         # Merged before the ticket was filed: context, not the work.
         self.fake.routes["/repos/%s/pulls/45" % OTHER] = {"merged_at": iso(90000), "title": "x"}
         self.assertIsNone(self.check(comments=said))
+
+    def test_a_strangers_link_decides_nothing(self):
+        # Security review: anyone can comment on a public ticket, and a
+        # link to any merged pull request held it as shipped.
+        said = [comment("Done in https://github.com/%s/pull/45" % OTHER, login="a-stranger")]
+        self.fake.routes["/repos/%s/pulls/45" % OTHER] = {"merged_at": iso(3600), "title": "x"}
+        self.assertIsNone(self.check(comments=said))
+        self.assertNotIn("/repos/%s/pulls/45" % OTHER, self.fake.reads)
 
     def test_evidence_the_operator_was_asked_about_holds_it_once(self):
         self.fake.routes["/repos/%s/issues/124" % REPO] = {

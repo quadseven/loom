@@ -184,17 +184,35 @@ def health_hold(issue: Mapping[str, Any]) -> bool:
     return health_verdict(str(issue.get("body") or "")) is not None
 
 
+def _patch_complete(entry: Mapping[str, Any]) -> bool:
+    """Whether GitHub sent the entry's whole patch: it has one, and when it
+    gives the line counts, the patch holds every added and removed line
+    (GitHub drops or cuts the patch of a binary or very large file)."""
+    if not isinstance(entry.get("patch"), str) or not entry.get("patch"):
+        return False
+    lines = [line for line in str(entry["patch"]).splitlines()
+             if line[:1] in "+-" and not line.startswith(("+++", "---"))]
+    counted = [entry.get(k) for k in ("additions", "deletions")]
+    if all(isinstance(n, int) for n in counted):
+        return len(lines) >= sum(counted)
+    return True
+
+
 def measurement_files(entries: Sequence[Mapping[str, Any]]) -> List[str]:
-    """The changed files that edit the health read itself, or a bound (a
-    threshold, floor, ceiling or cutoff) in any file. An entry with no patch
-    is judged by its path alone."""
+    """The changed files that edit the health read itself (by the new path
+    or, for a rename or delete, the old one), or a bound (a threshold,
+    floor, ceiling or cutoff) in any file. An entry whose patch is missing or
+    cut short cannot show it moves no bound, so it counts: the check fails
+    closed."""
     found = []
     for entry in entries:
         path = str(entry.get("filename") or "")
+        paths = [path, str(entry.get("previous_filename") or "")]
         patch = str(entry.get("patch") or "")
         changed = [line[1:] for line in patch.splitlines()
                    if line[:1] in "+-" and not line.startswith(("+++", "---"))]
-        if HEALTH_PATH_RE.search(path) or any(BOUND_LINE_RE.search(x) for x in changed):
+        if (any(p and HEALTH_PATH_RE.search(p) for p in paths) or not _patch_complete(entry)
+                or any(BOUND_LINE_RE.search(x) for x in changed)):
             found.append(path)
     return found
 
@@ -293,12 +311,14 @@ def _links(texts: Iterable[str]) -> List[Tuple[str, int]]:
 
 def _person_texts(issue: Mapping[str, Any], comments: Sequence[Mapping[str, Any]],
                   trusted: Iterable[str]) -> List[str]:
-    """The ticket's body and the comments a person wrote: not one of Loom's
-    own Apps, and no other bot."""
-    apps = {t.lower() for t in trusted if t.lower().endswith("[bot]")}
+    """The ticket's body and the comments a trusted person wrote (a
+    LOOM_BRIEF_AUTHORS login that is no App: the operator). Anyone can
+    comment on a public ticket, so a stranger's link never decides that its
+    work shipped; Loom's own Apps write links to merges they made."""
+    people = {t.lower() for t in trusted if not t.lower().endswith("[bot]")}
     return [str(issue.get("body") or "")] + [
         str(c.get("body") or "") for c in comments
-        if _login(c).lower() not in apps and (c.get("user") or {}).get("type") != "Bot"]
+        if _login(c).lower() in people and (c.get("user") or {}).get("type") != "Bot"]
 
 
 def _merged_at(gh: Any, where: str, number: int) -> str:
