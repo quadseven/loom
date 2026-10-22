@@ -43,6 +43,10 @@ class FakeGH:
             ident = int(path.rsplit("/", 1)[1])
             self.edits.append((ident, (body or {})["body"]))
             return Response(200, {"id": ident})
+        if method == "PATCH" and path.startswith("/repos/%s/issues/" % LANES_REPO):
+            number = int(path.rsplit("/", 1)[1])
+            self.issues[number].update(body or {})
+            return Response(200, self.issues[number])
         if method == "GET":
             number = int(path.rsplit("/", 1)[1])
             return Response(200, self.issues.get(number))
@@ -55,6 +59,9 @@ class FakeGH:
 
 
 class WatchBase(unittest.TestCase):
+    COMPONENT = "station"
+    PRIVATE = ()
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -74,8 +81,8 @@ class WatchBase(unittest.TestCase):
                 fh.write(line + "\n")
 
     def run_at(self, now, write=True):
-        watch.Watcher(self.gh, LANES_REPO, [("station", self.log)], self.state,
-                      now, self.said.append, write=write).run()
+        watch.Watcher(self.gh, LANES_REPO, [(self.COMPONENT, self.log)], self.state,
+                      now, self.said.append, write=write, private=self.PRIVATE).run()
 
     def saved(self):
         with open(self.state, encoding="utf-8") as fh:
@@ -105,6 +112,21 @@ class SignatureTest(unittest.TestCase):
         self.assertEqual(watch.signature(a), watch.signature(b))
         self.assertEqual(watch.signature(a),
                          "<time> brain: push of <hex> failed for <repo>#<n> (<id>, pid <n>) in <path>")
+
+    def test_a_station_stage_failure_folds_the_stage_name(self):
+        a = "[2026-10-20T01:45:00Z] station: run_factory failed: GET /repos/o/r/issues -> 404"
+        b = "station: settle_orphan_sources failed: GET /repos/o/r/issues -> 404"
+        self.assertEqual(watch.signature(a), watch.signature(b))
+        self.assertTrue(watch.signature(a).startswith("station: <stage> failed: GET "))
+        self.assertEqual(watch.stage(a), "run_factory")
+        self.assertEqual(watch.stage(b), "settle_orphan_sources")
+        # Other shapes keep their signatures: a repo before "failed", a
+        # stage not at the start, or a line that is not the station's.
+        for line in ("station: unwind_reverts example-owner/repo-a failed: GET /x -> 404",
+                     "station: could not scan: run_factory failed: boom",
+                     "brain: run_factory failed: boom"):
+            self.assertIsNone(watch.stage(line), line)
+            self.assertNotIn("<stage>", watch.signature(line), line)
 
     def test_which_lines_are_kept(self):
         for line in ("ValueError: bad", "push failed", "Connection refused",
@@ -195,6 +217,37 @@ class FilingTest(WatchBase):
         self.assertEqual(len(self.gh.issues), 1)
         self.assertEqual(self.gh.comments, [])
 
+    def test_one_error_every_stage_hits_files_one_issue_naming_the_stages(self):
+        # 2026-10-20: one unreadable repo's 404 failed every pass stage and
+        # filed loom#1054-#1066 and loom#1087, one issue per stage.
+        stages = ("run_factory", "publish_lanes", "hand_back")
+        for _ in range(3):
+            self.append(*("[2026-10-20T01:45:0%dZ] station: %s failed: GET /repos/o/r/issues -> 404"
+                          % (i, stage) for i, stage in enumerate(stages)))
+        self.run_at(T0)
+        posts = [c for c in self.gh.calls if c == ("POST", "/repos/%s/issues" % LANES_REPO)]
+        self.assertEqual(len(posts), 1)
+        issue = self.gh.issues[1]
+        self.assertTrue(issue["title"].startswith("station: station: <stage> failed: "),
+                        issue["title"])
+        self.assertIn("Stages: hand_back, publish_lanes, run_factory", issue["body"])
+        self.assertIn("9 times in the last 30 minutes", issue["body"])
+        # A later stage on the same error is counted there and named.
+        self.append("station: assign_queued failed: GET /repos/o/r/issues -> 404")
+        self.run_at(T0 + 3600)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertIn("Stages: assign_queued, hand_back, publish_lanes, run_factory",
+                      self.gh.comments[0][1])
+
+    def test_two_errors_from_one_stage_file_two_issues(self):
+        self.append(*["station: run_factory failed: GET /repos/o/r/issues answered 403"] * 3)
+        self.append(*["station: run_factory failed: GET /repos/o/r/issues answered 502"] * 3)
+        self.run_at(T0)
+        self.assertEqual(len(self.gh.issues), 2)
+        self.assertEqual(sorted("403" in i["title"] for i in self.gh.issues.values()),
+                         [False, True])
+
     def test_the_brains_status_output_files_nothing(self):
         # loom#871-#877: one tick's report filed six issues, one per line.
         for i in range(5):
@@ -212,10 +265,14 @@ class FilingTest(WatchBase):
         self.assertEqual(len(self.gh.issues), 1)
         self.gh.issues[1].update(title="Scans of a private repo answer 403",
                                  labels=["loom:briefed"])
-        # The station passes every few minutes; the quiet day prunes the
-        # signature's record.
-        self.run_at(T0 + watch.DAY + 60)
-        self.assertEqual(self.saved()["sigs"], {})
+        # The quiet day passes with no write budget, so the issue is not
+        # closed; the signature's record is lost with the state (older state
+        # pruned it) and only the issue map remembers where it was filed.
+        self.run_at(T0 + watch.DAY + 60, write=False)
+        state = self.saved()
+        state["sigs"] = {}
+        with open(self.state, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
         self.append(LINE_403, LINE_403, LINE_403)
         self.run_at(T0 + 2 * watch.DAY)
         self.assertEqual(len(self.gh.issues), 1)
@@ -289,6 +346,22 @@ class FilingTest(WatchBase):
                 self.assertFalse(watch.keep(line))
         self.assertTrue(watch.keep("[2026-10-18T22:50:36Z] example.repo-3 failed: [work] tests failed"))
 
+    def test_a_verify_run_the_station_already_handled_is_never_a_signature(self):
+        # loom#463: a failed verify run costs its ticket a cooldown (or nothing,
+        # when transient); the station says so in its log, which is status.
+        for line in (
+                "[2026-10-18T22:50:36Z] station: verify run example.repo-3-verify-1 failed [work]: "
+                "no verify.json written; loom#3 stays shipped and is tried again after 6 hours",
+                "[2026-10-18T22:50:36Z] station: verify run example.repo-3-verify-1 failed [transient]; "
+                "loom#3 is due again now",
+                "[2026-10-18T22:50:36Z] station: verify run example.repo-3-verify-1 failed; "
+                "loom#3 stays shipped"):
+            with self.subTest(line=line):
+                self.assertFalse(watch.keep(line))
+        self.assertTrue(watch.keep("[2026-10-18T22:50:36Z] station: verify failed: boom"))
+        self.assertTrue(watch.keep("[2026-10-18T22:50:36Z] brain: verify run x failed; error"
+                                   " writing state"))
+
     def test_a_relayed_ci_log_line_is_never_a_signature(self):
         # loom#880-#904: a brain agent read a CI run's log ("gh run view
         # --log": job, step and a seven-digit timestamp before each line)
@@ -330,6 +403,47 @@ class FilingTest(WatchBase):
         self.run_at(T0 + 7200)
         self.assertEqual(self.gh.comments, [])
         self.assertEqual(len(self.gh.issues), 1)
+
+    def quiet_issue(self, hours):
+        """File an issue for LINE_403, then pass with it last seen hours ago."""
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0 - hours * 3600)
+        self.assertEqual(self.gh.issues[1]["state"], "open")
+        self.run_at(T0)
+
+    def test_an_issue_whose_signature_was_last_seen_25_hours_ago_closes_as_not_planned(self):
+        self.quiet_issue(25)
+        issue = self.gh.issues[1]
+        self.assertEqual(issue["state"], "closed")
+        self.assertEqual(issue["state_reason"], "not_planned")
+        (note,) = self.gh.comments
+        self.assertEqual(note[0], 1)
+        self.assertIn(watch.time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                          watch.time.gmtime(T0 - 25 * 3600)), note[1])
+        self.assertTrue(any(line.startswith("watch: closed quiet") for line in self.said))
+        self.run_at(T0 + 600)
+        self.assertEqual(len(self.gh.comments), 1)
+
+    def test_an_issue_whose_signature_was_last_seen_23_hours_ago_stays_open(self):
+        self.quiet_issue(23)
+        self.assertEqual(self.gh.issues[1]["state"], "open")
+        self.assertEqual(self.gh.comments, [])
+        self.assertFalse(any("closed quiet" in line for line in self.said))
+
+    def test_a_signature_that_returns_after_a_quiet_close_files_a_new_issue(self):
+        self.quiet_issue(25)
+        self.append(LINE_403, LINE_403_B, LINE_403)
+        self.run_at(T0 + 600)
+        self.assertEqual(len(self.gh.issues), 2)
+        self.assertEqual(self.gh.issues[2]["state"], "open")
+
+    def test_a_quiet_close_waits_while_the_pass_may_not_write(self):
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0 - 25 * 3600)
+        self.run_at(T0, write=False)
+        self.assertEqual(self.gh.issues[1]["state"], "open")
+        self.run_at(T0 + 600)
+        self.assertEqual(self.gh.issues[1]["state"], "closed")
 
     def test_an_open_issue_with_the_title_is_counted_not_filed_twice(self):
         title = "station: " + watch.signature(LINE_403)
@@ -416,6 +530,203 @@ class ExampleTextTest(WatchBase):
         self.assertNotIn("@" + text.REVIEW_BOT_SHORT_NAME, body)
 
 
+# loom#1265: the spark brain rung's opencode printed its sandbox refusal in
+# colour, and the watcher filed it with the escape codes in and the denied
+# path cut off. These are the lines opencode 2.x run prints for a file tool
+# its external_directory rule denies: the failed tool, then the error.
+ESC = "\x1b"
+REFUSAL_LINE = (
+    ESC + "[91m" + ESC + "[1mError: " + ESC + "[0mThe user has specified a rule which prevents "
+    "you from using this specific tool call. Here are some of the relevant rules "
+    '[{"permission":"*","action":"allow","pattern":"*"},'
+    '{"permission":"external_directory","pattern":"*","action":"ask"},'
+    '{"permission":"external_directory","pattern":"/Users/example-user/.local/share/opencode/'
+    'tool-output/*","action":"allow"},'
+    '{"permission":"external_directory","pattern":"*","action":"deny"}]')
+TOOL_FAILED_LINE = (ESC + "[0m\u2717 " + ESC + "[0mRead /Users/example-user/.config/gh/hosts.yml failed")
+# The issue's own text shows the escapes in caret notation.
+CARET_LINE = REFUSAL_LINE.replace(ESC, "^[")
+TICK_START = "[2026-10-21T10:00:00Z] brain: tick start (lane spark, model spark/example-model, scope live)"
+TICK_END = "[2026-10-21T10:20:00Z] brain: tick end (exit %d)"
+REFUSAL_TITLE = "brain/spark: sandbox refused Read ~/.config/gh/hosts.yml"
+
+
+class CleanLineTest(unittest.TestCase):
+    def test_escape_codes_are_stripped_raw_or_in_caret_notation(self):
+        for line in (REFUSAL_LINE, CARET_LINE):
+            out = watch.clean(line)
+            self.assertNotIn(ESC, out)
+            self.assertNotIn("^[", out)
+            self.assertTrue(out.startswith("Error: The user has specified a rule"), out)
+        self.assertEqual(watch.clean(TOOL_FAILED_LINE),
+                         "\u2717 Read /Users/example-user/.config/gh/hosts.yml failed")
+
+    def test_a_coloured_error_has_the_plain_lines_signature(self):
+        plain = "Error: push failed for 3 repos"
+        coloured = ESC + "[91m" + ESC + "[1mError: " + ESC + "[0mpush failed for 3 repos"
+        self.assertEqual(watch.signature(coloured), watch.signature(plain))
+        self.assertEqual(watch.signature(coloured), "Error: push failed for <n> repos")
+
+    def test_a_long_example_keeps_its_end(self):
+        line = "error: " + "word " * 600 + "and the cause comes last: tail-marker"
+        out = watch.redact(line)
+        self.assertTrue(out.startswith("error: word word"), out[:20])
+        self.assertTrue(out.endswith("the cause comes last: tail-marker"), out[-40:])
+        self.assertLessEqual(len(out), watch.EXAMPLE_MAX)
+
+
+class LongLineTest(WatchBase):
+    def test_a_filed_example_keeps_the_whole_line(self):
+        line = ("[2026-10-13T10:00:01Z] error: " + "word " * 120
+                + "and the cause comes last: tail-marker")
+        self.append(line, line, line)
+        self.run_at(T0)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.assertIn("the cause comes last: tail-marker", self.gh.issues[1]["body"])
+
+
+class RefusalTest(unittest.TestCase):
+    def test_each_lane_clis_refusal_is_recognised(self):
+        cases = [
+            (watch.clean(REFUSAL_LINE), watch.clean(TOOL_FAILED_LINE),
+             ("opencode", "Read", "~/.config/gh/hosts.yml", "external_directory * deny")),
+            ("Claude requested permissions to write to /Users/example-user/notes.txt, but you "
+             "haven't granted it yet.", "", ("claude", "Write", "~/notes.txt", None)),
+            ("Permission to use Bash with command cat /etc/hosts has been denied.", "",
+             ("claude", "Bash", None, None)),
+            ("patch rejected: writing outside of the project; rejected by user approval settings",
+             "", ("codex", "patch", None, "writing outside of the project")),
+            ('Tool execution for "WebFetch" denied by policy.', "",
+             ("gemini", "WebFetch", None, None)),
+        ]
+        for line, prev, (cli, tool, path, rule) in cases:
+            found = watch.refusal(line, prev)
+            self.assertIsNotNone(found, line)
+            self.assertEqual(found["cli"], cli, line)
+            self.assertEqual(found["tool"], tool, line)
+            if path is not None:
+                self.assertEqual(found["path"], path, line)
+            if rule is not None:
+                self.assertEqual(found["rule"], rule, line)
+            text.check(found["path"] + " " + found["rule"])
+
+    def test_an_ordinary_error_is_no_refusal(self):
+        for line in ("Error: push failed", "Connection refused", "HTTP 403 from the API",
+                     "permission denied (publickey)"):
+            self.assertIsNone(watch.refusal(line, ""), line)
+
+
+class AgentRefusalTest(WatchBase):
+    COMPONENT = "brain"
+
+    def tick(self, now, refusals=1, exit_code=0, start=True):
+        lines = [TICK_START] if start else []
+        for _ in range(refusals):
+            lines += [TOOL_FAILED_LINE, REFUSAL_LINE]
+        self.append(*(lines + [TICK_END % exit_code]))
+        self.run_at(now)
+
+    def test_a_refusal_the_run_recovered_from_files_nothing(self):
+        # Three refusals in one tick that ended well: the sandbox did its job.
+        self.tick(T0, refusals=3, exit_code=0)
+        self.assertEqual(self.gh.issues, {})
+        state = self.saved()
+        self.assertEqual(state["sigs"], {})
+        self.assertEqual(state["refusals"][REFUSAL_TITLE]["total"], 3)
+
+    def test_loom_1265s_lines_file_nothing(self):
+        # The lines loom#1265 was filed for, three times in 30 minutes.
+        for i in range(3):
+            self.append(CARET_LINE)
+            self.run_at(T0 + 600 * i)
+        self.assertEqual(self.gh.issues, {})
+
+    def test_a_refusal_in_a_failed_run_files_one_issue_naming_the_path(self):
+        self.tick(T0, refusals=1, exit_code=1)
+        self.assertEqual(len(self.gh.issues), 1)
+        issue = self.gh.issues[1]
+        self.assertEqual(issue["title"], REFUSAL_TITLE)
+        body = issue["body"]
+        text.check(issue["title"] + "\n" + body)
+        for want in ("~/.config/gh/hosts.yml", "external_directory * deny", "opencode",
+                     "Read", "exit 1"):
+            self.assertIn(want, body)
+        self.assertNotIn("example-user", issue["title"] + body)
+        self.assertNotIn(ESC, body)
+        # The same refusal breaking later runs updates that one issue: one
+        # count comment, then edited in place.
+        self.tick(T0 + 3700, refusals=1, exit_code=1)
+        self.tick(T0 + 7400, refusals=1, exit_code=1)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertEqual(len(self.gh.edits), 1)
+        self.assertIn("~/.config/gh/hosts.yml", self.gh.edits[0][1])
+
+    def test_a_refusal_repeated_in_one_run_files_one_issue(self):
+        self.tick(T0, refusals=watch.REFUSAL_REPEAT - 1, exit_code=0)
+        self.assertEqual(self.gh.issues, {})
+        self.tick(T0 + 600, refusals=watch.REFUSAL_REPEAT, exit_code=0)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.assertEqual(self.gh.issues[1]["title"], REFUSAL_TITLE)
+        self.assertIn("%d times in one run" % watch.REFUSAL_REPEAT, self.gh.issues[1]["body"])
+
+    def test_a_refusal_across_runs_in_a_day_files_one_issue(self):
+        for i in range(watch.REFUSAL_RUNS - 1):
+            self.tick(T0 + 3600 * i, refusals=1, exit_code=0)
+        self.assertEqual(self.gh.issues, {})
+        self.tick(T0 + 3600 * watch.REFUSAL_RUNS, refusals=1, exit_code=0)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.assertIn("in %d runs" % watch.REFUSAL_RUNS, self.gh.issues[1]["body"])
+        self.tick(T0 + 3600 * (watch.REFUSAL_RUNS + 1), refusals=1, exit_code=0)
+        self.assertEqual(len(self.gh.issues), 1)
+
+    def test_the_failed_tool_line_before_a_refusal_is_no_signature(self):
+        self.tick(T0, refusals=1)
+        self.tick(T0 + 60, refusals=1)
+        self.tick(T0 + 120, refusals=1)
+        self.assertEqual(self.saved()["sigs"], {})
+
+    def test_a_lane_run_that_made_no_change_after_a_refusal_files_one_issue(self):
+        self.append("[2026-10-21T10:00:00Z] T042 start, lane spark",
+                    TOOL_FAILED_LINE, REFUSAL_LINE,
+                    "[2026-10-21T10:10:00Z] T042 failed: [work] agent made no commit")
+        self.run_at(T0)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.assertIn("no change", self.gh.issues[1]["body"])
+
+    def test_run_marks(self):
+        self.assertEqual(watch.run_mark(TICK_START), ("start", "spark"))
+        self.assertEqual(watch.run_mark(TICK_END % 0), ("end", "ok"))
+        self.assertEqual(watch.run_mark(TICK_END % 124), ("end", "failed (exit 124)"))
+        for line, outcome in (("T042 done", "ok"), ("T042 done, answer posted", "ok"),
+                              ("T042 done, answered: nothing to change", "no change"),
+                              ("T042 failed: [transient] agent exited 124",
+                               "ended early ([transient])"),
+                              ("T042 failed: [work] tests failed", "failed ([work])")):
+            self.assertEqual(watch.run_mark("[2026-10-21T10:10:00Z] " + line), ("end", outcome))
+        self.assertIsNone(watch.run_mark("station: reported o/r#5 failed: [work] x"))
+
+    def test_a_run_cut_short_by_a_limit_is_not_hurt_by_its_refusal(self):
+        self.append("[2026-10-21T10:00:00Z] T042 start, lane spark",
+                    TOOL_FAILED_LINE, REFUSAL_LINE,
+                    "[2026-10-21T10:10:00Z] T042 failed: [limit] usage limit reached")
+        self.run_at(T0)
+        self.assertEqual(self.gh.issues, {})
+
+
+class PrivateRefusalPathTest(WatchBase):
+    COMPONENT = "brain"
+    PRIVATE = ("secret-repo",)
+
+    def test_a_private_repo_name_in_a_denied_path_is_hidden(self):
+        tool = TOOL_FAILED_LINE.replace(".config/gh/hosts.yml", "loom/work/secret-repo/a.py")
+        self.append(TICK_START, tool, REFUSAL_LINE, TICK_END % 1)
+        self.run_at(T0)
+        issue = self.gh.issues[1]
+        self.assertEqual(issue["title"], "brain/spark: sandbox refused Read ~/loom/work/<repo>/a.py")
+        self.assertNotIn("secret-repo", issue["title"] + issue["body"])
+
+
 class OffsetTest(WatchBase):
     def test_the_first_scan_starts_at_the_end_of_each_log(self):
         os.remove(self.state)
@@ -486,6 +797,16 @@ class StationTest(WatchBase):
             st.watch_logs()
         self.assertEqual(self.gh.issues, {})
         self.assertEqual(self.saved()["logs"]["station"]["offset"], os.path.getsize(self.log))
+
+    def test_the_station_hides_its_goal_repos_names_in_a_denied_path(self):
+        tool = TOOL_FAILED_LINE.replace(".config/gh/hosts.yml", "loom/work/repo-a/a.py")
+        self.append(TICK_START, tool, REFUSAL_LINE, TICK_END % 1)
+        st = self.station(LANES_REPO)
+        with mock.patch.object(st, "_deferred", return_value=False):
+            st.watch_logs()
+        title = self.gh.issues[1]["title"]
+        self.assertIn("~/loom/work/<repo>/a.py", title)
+        self.assertNotIn("repo-a", title + self.gh.issues[1]["body"])
 
     def test_no_lanes_repo_watches_nothing(self):
         self.append(LINE_403, LINE_403_B, LINE_403)

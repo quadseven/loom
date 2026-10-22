@@ -112,6 +112,30 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(h["User-Agent"], "loom-bus")
         self.assertEqual(json.loads(t.calls[1][3]), {"k": "v"})
 
+    def test_written_bodies_never_mention_a_user_by_accident(self):
+        # A decorator in a proof table notified a stranger (loom#1394).
+        t = Scripted(*[reply(201, {}) for _ in range(5)])
+        gh = GitHub("tok", transport=t)
+        gh.rest("POST", "/repos/%s/issues/1/comments" % REPO, {"body": "uses @property"})
+        gh.rest("PATCH", "/repos/%s/issues/1" % REPO, {"title": "@media", "body": "@types/node"})
+        gh.rest("POST", "/repos/%s/issues" % REPO, {"title": "t", "body": "see @dataclass"})
+        gh.rest("PATCH", "/repos/%s/pulls/2" % REPO, {"body": "`@kept` and @media"})
+        gh.graphql("mutation { x }", {"id": "N", "body": "reply @property"})
+        sent = [json.loads(call[3]) for call in t.calls]
+        self.assertEqual(sent[0]["body"], "uses `@property`")
+        self.assertEqual(sent[1], {"title": "@media", "body": "`@types/node`"})
+        self.assertEqual(sent[2]["body"], "see `@dataclass`")
+        self.assertEqual(sent[3]["body"], "`@kept` and `@media`")
+        self.assertEqual(sent[4]["variables"], {"id": "N", "body": "reply `@property`"})
+
+    def test_a_read_and_a_non_text_write_are_sent_as_given(self):
+        t = Scripted(reply(200, {}), reply(200, {}))
+        gh = GitHub("tok", transport=t)
+        gh.rest("GET", "/repos/%s/issues?labels=@x" % REPO)
+        gh.rest("PUT", "/repos/%s/issues/1/labels" % REPO, {"labels": ["@x"]})
+        self.assertEqual(json.loads(t.calls[1][3]), {"labels": ["@x"]})
+        self.assertIsNone(t.calls[0][3])
+
     def test_etag_and_304(self):
         t = Scripted(reply(304))
         gh = GitHub("tok", transport=t)

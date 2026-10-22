@@ -2,7 +2,7 @@
 # Loom lane runner: one pass over a lane's inbox, one brief at a time.
 #
 #   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
-#                               | zen | zai | workersai | agy | spark
+#                               | zen | zai | workersai | agy | spark | copilot
 #                               | <lane>-<n> (an extra slot of that lane)
 #
 # A slot such as anthropic-2 is a second copy of the anthropic lane: its own
@@ -19,8 +19,8 @@
 # A limit failure also holds this lane unavailable until the provider's reset
 # (else 60 minutes). The agent edits (and
 # may commit); this runner commits what is left, pushes, and opens the PR.
-# A commit that adds a file outside the brief's paths (bus/scope_check.py)
-# is refused before validation and push, and nothing is pushed.
+# Unreferenced scratch files added outside the brief's paths are dropped;
+# other added files outside those paths are refused before validation and push.
 # A repo with a validation contract (.loom/validation.conf) is prepared
 # before the agent and checked again on its commit; a failing check parks
 # the brief and keeps the edits on a side branch instead of opening a PR.
@@ -71,6 +71,7 @@ LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_ROOT/../infra-public/.github/scripts/check_private_leaks.py}"
 INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
 
@@ -120,13 +121,54 @@ echo $$ > "$LOCK/pid"
 # built its caches) goes with the runner, before the lock is let go, so run/
 # holds one only while its lane is running (loom#643).
 drop_check_home() { [ -z "${CHECK_HOME:-}" ] || rm -rf "$CHECK_HOME"; }
-trap 'drop_check_home; rm -rf "$LOCK"' EXIT
+# The runner writes its usage heartbeat between runs, not during one, and a
+# run can take over an hour (loom#1281). While this runner lives, a background
+# loop stamps state/usage/<slot>.alive with the time every
+# LOOM_KEEPALIVE_SECONDS, so the station reads a lane deep in a run as alive
+# whatever its heartbeat's age or its lock says. The loop ends when this
+# runner's pid is gone (a killed runner), and the stamp goes with the runner;
+# a stamp left by a runner killed hard goes stale after the station's window.
+# The stamp is no heartbeat: it says nothing of availability, so a busy lane
+# is not offered more work and no limit or hold is hidden.
+ALIVE="$LOOM_HOME/state/usage/$SLOT.alive"
+KEEPALIVE_PID=""
+keepalive_loop() {
+  local parent="$1" every="${LOOM_KEEPALIVE_SECONDS:-60}" tmp="$ALIVE.$1"
+  [[ "$every" =~ ^[1-9][0-9]*$ ]] || every=60
+  while kill -0 "$parent" 2>/dev/null; do
+    date +%s > "$tmp" 2>/dev/null && mv -f "$tmp" "$ALIVE" 2>/dev/null
+    sleep "$every"
+  done
+  rm -f "$tmp"
+}
+stop_keepalive() {
+  [ -z "$KEEPALIVE_PID" ] || { pkill -P "$KEEPALIVE_PID" 2>/dev/null; kill "$KEEPALIVE_PID" 2>/dev/null; }
+  rm -f "$ALIVE"
+}
+mkdir -p "$LOOM_HOME/state/usage"
+keepalive_loop $$ > /dev/null 2>&1 &
+KEEPALIVE_PID=$!
+trap 'drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
 CHECK_TIMEOUT="${LOOM_CHECK_TIMEOUT:-1800}"
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
-CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
+# A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
+# writes as that App, never as the operator (loom#1142): lanes opened 58 pull
+# requests as the operator in a day. It clones over https, and each run mints
+# an installation token for gh and git (lane_app_token); the agent never gets
+# it, its settings or git's helper. LOOM_APP_TOKEN_CMD, when set, is the command
+# that prints the token in place of `python3 -m bus app token`.
+if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
+  CLONE_BASE="${LOOM_CLONE_BASE:-https://github.com/}"
+  # git asks gh for github.com credentials, and gh answers with GH_TOKEN.
+  export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.https://github.com.helper \
+    GIT_CONFIG_VALUE_0="" GIT_CONFIG_KEY_1=credential.https://github.com.helper \
+    GIT_CONFIG_VALUE_1="!gh auth git-credential"
+else
+  CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
+fi
 WORKDIR="$LOOM_HOME/worktrees"
 LOGDIR="$LOOM_HOME/logs/$SLOT"
 # The agy lane's agent runs as a dedicated macOS user (default "loom") that
@@ -152,9 +194,20 @@ field() { grep -m1 "^$1:" "$2" | cut -d' ' -f2-; }
 setting_var() { printf 'LOOM_%s_%s' "$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')" "$2"; }
 lane_var() { setting_var "$LANE" "$1"; }
 lane_setting() {
-  local s v
+  local s v value route
   s="$(setting_var "$SLOT" "$1")" v="$(lane_var "$1")"
-  printf '%s' "${!s:-${!v:-}}"
+  value="${!s:-${!v:-}}"
+  if [ -z "$value" ] && [ "$LANE" = free ] && [ "$1" = URL ] && [ -n "${LOOM_FREE_GATEWAY_URL:-}" ]; then
+    case "$SLOT" in
+      free-ollama) route=/free/ollama-cloud/v1 ;;
+      free-gemma) route=/free/gemini/v1 ;;
+      free-nvidia) route=/free-public/nvidia-nim/v1 ;;
+      free-kilo) route=/free-public/kilo/v1 ;;
+      free-groq) route=/free-public/groq/v1 ;;
+    esac
+    value="${LOOM_FREE_GATEWAY_URL%/}$route"
+  fi
+  printf '%s' "$value"
 }
 
 # Each pass records whether this lane can take work. The dispatcher routes
@@ -249,53 +302,53 @@ SUMMARY_FILE=.loom/summary.md
 # What section, or the reason a run changed nothing (no_change_reason). The
 # file itself is never committed.
 summary_note() {
-  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and the runner posts it on the ticket as the answer.\n' "$SUMMARY_FILE"
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion built, leave Live criteria unticked, and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE"
 }
 
 # How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
 # tickets took six or more rounds: no lane ran a test before opening its pull
 # request, and most fix rounds answered review findings a checklist covers.
+# On 2026-10-22 a lane test imported a package the repo's CI does not install
+# (its AGENTS.md rules), and another redid work its operator notes said had
+# shipped in other repos.
 work_note() {
-  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
+  printf '\n\n## How to work\n- Before you change anything, read the repo'"'"'s AGENTS.md and CLAUDE.md and the docs they point to: they state rules its CI enforces, such as which packages a test may import.\n- When the Operator notes or a merged pull request under Linked pull requests show the work is already done or belongs elsewhere, change nothing and say why in the Intent summary.\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line. In a public repo, never write a reference to another repo'"'"'s issue in the OWNER/NAME#<number> or NAME#<number> shape, not even a made-up one in a test fixture: write NAME#N, or add leak-guard-allow to that line when the shape is what the test is about.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
-# Lists the files the agent's commits added (BASE..HEAD) that only probe the
-# sandbox -- an empty or one-line added file named .test* or under a new
-# top-level bin/, referenced nowhere else in the diff -- and removes them
-# from the branch. A never-pushed branch is rebuilt without them so no
-# commit carries them; a fix round (already pushed, or mid-merge) gets a
+# Lists the sandbox probes and out-of-path scratch files the agent added
+# (BASE..HEAD), then removes them from the branch. A never-pushed branch is
+# rebuilt without them so no commit carries them; a fix round gets a
 # removal commit on top so the push stays fast-forward. Names each file
-# dropped on stdout and sets DROPPED_FILES to the newline-separated paths.
-# A helper failure is a no-op: the run continues and the review bot and
-# factory stay the backstop.
-drop_probe_files() {
-  local probes f stamp
+# dropped on stdout and sets DROPPED_FILES and DROPPED_SCRATCH_FILES.
+drop_agent_files() {
+  local probes scratch dropped f stamp
   DROPPED_FILES=""
-  probes="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.probe_drop "$TREE" "$BASE" HEAD 2>/dev/null)" || return 0
-  [ -n "$probes" ] || return 0
+  DROPPED_SCRATCH_FILES=""
+  probes="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.probe_drop "$TREE" "$BASE" HEAD 2>/dev/null)" || return 1
+  scratch="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.scope_check --scratch "$TREE" "$BASE" HEAD "$BRIEF" ${FIX_UPSTREAM:+"$FIX_UPSTREAM"})" || return 1
+  dropped="$(printf '%s\n%s\n' "$probes" "$scratch" | sed '/^$/d' | sort -u)"
+  [ -n "$dropped" ] || return 0
   stamp="$(date -u +%FT%TZ)"
   while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    rm -f "$TREE/$f"
-    printf '[%s] %s dropped sandbox probe file: %s\n' "$stamp" "$TICKET" "$f"
+    safe_git rm -q -f -- "$f" || return 1
+    if printf '%s\n' "$probes" | grep -Fxq -- "$f"; then
+      printf '[%s] %s dropped sandbox probe file: %s\n' "$stamp" "$TICKET" "$f"
+    else
+      printf '[%s] %s dropped scratch file: %s\n' "$stamp" "$TICKET" "$f"
+    fi
   done <<EOF
-$probes
+$dropped
 EOF
   DROPPED_FILES="$probes"
+  DROPPED_SCRATCH_FILES="$scratch"
   if [ -z "$FIX_PR" ] && [ -z "$CONFLICTS" ]; then
     safe_git reset -q --soft "$BASE" || return 1
     safe_git add -A || return 1
     safe_git diff --cached --quiet && return 0
     safe_git commit -qm "${TITLE:-$TICKET}" || return 1
   else
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      safe_git rm -q -r -- "$f" 2>/dev/null || true
-    done <<EOF
-$probes
-EOF
     safe_git diff --cached --quiet && return 0
-    safe_git commit -qm "Drop sandbox probe files: ${probes//$'\n'/, }" || return 1
+    safe_git commit -qm "Drop agent scratch files: ${dropped//$'\n'/, }" || return 1
   fi
 }
 
@@ -321,21 +374,28 @@ stray_list() {
 # class, one line per behavior change, and the counts of files by class.
 # Sensitive globs come from SENSITIVE_FILE on the base revision; a missing
 # file means no sensitive class. Sets INTENT_CLASS and INTENT_TEXT.
+# The scratch files live under $LOOM_HOME/run, never the default temp
+# directory: a lane sandbox denies that one, and a failed mktemp handed cp
+# an empty target, which macOS cp takes as the working directory.
 prepare_intent() {
-  local brief="$1" files_tmp sens_tmp sum_tmp what_tmp out
+  local brief="$1" dir files_tmp sens_tmp sum_tmp what_tmp out
   INTENT_CLASS="logic"
   INTENT_TEXT=""
-  files_tmp="$(mktemp)" sens_tmp="$(mktemp)" sum_tmp="$(mktemp)" what_tmp="$(mktemp)"
+  dir="$(mktemp -d "$LOOM_HOME/run/$SLOT-intent.XXXXXX")" ||
+    { echo "intent: could not make a scratch directory; class stays $INTENT_CLASS" >&2; return 0; }
+  files_tmp="$dir/files" sens_tmp="$dir/sensitive" sum_tmp="$dir/summary" what_tmp="$dir/what"
   safe_git diff --name-only "$BASE" HEAD 2>/dev/null | sed '/^[[:space:]]*$/d' > "$files_tmp"
   safe_git cat-file blob "$BASE:$SENSITIVE_FILE" 2>/dev/null > "$sens_tmp"
+  # Only the change lines before the summary's first heading: its
+  # ## Acceptance criteria checklist goes to the body's own section.
   if [ -f "$WORKDIR/$TICKET.summary.md" ]; then
-    cp "$WORKDIR/$TICKET.summary.md" "$sum_tmp"
+    awk '/^#+ /{exit} {print}' "$WORKDIR/$TICKET.summary.md" > "$sum_tmp"
   elif [ -f "$TREE/$SUMMARY_FILE" ]; then
-    cat "$TREE/$SUMMARY_FILE" > "$sum_tmp" 2>/dev/null
+    awk '/^#+ /{exit} {print}' "$TREE/$SUMMARY_FILE" > "$sum_tmp" 2>/dev/null
   fi
   section What "$brief" > "$what_tmp" 2>/dev/null
   out="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.change_class --files "$files_tmp" --sensitive "$sens_tmp" --summary "$sum_tmp" --what "$what_tmp" 2>/dev/null)"
-  rm -f "$files_tmp" "$sens_tmp" "$sum_tmp" "$what_tmp"
+  rm -rf "$dir"
   [ -n "$out" ] || return 0
   INTENT_CLASS="$(printf '%s' "$out" | tail -1 | sed 's/^class://')"
   case "$INTENT_CLASS" in sensitive|logic|tests|docs) ;;
@@ -345,7 +405,7 @@ prepare_intent() {
 }
 
 pr_body() {
-  local size issue refs=""
+  local size issue refs="" criteria
   issue="$(field Issue "$1" || true)"
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
   # The size as the review bot's letter (Medium -> M), so its plan check
@@ -356,8 +416,14 @@ pr_body() {
   local validated=""
   [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$VALIDATED" "$CONTRACT_FILE")"
   [ -n "$INTENT_TEXT" ] || prepare_intent "$1"
+  # The lane's checklist, from the summary the runner moved out of the tree
+  # before committing: read from the tree, every lane pull request carried
+  # the ticket's unticked criteria and went back for them (2026-10-20).
+  criteria="$(section 'Acceptance criteria' "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
+  [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$TREE/$SUMMARY_FILE" 2>/dev/null)"
+  [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$1")"
   printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
-    "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$(section 'Acceptance criteria' "$1")" \
+    "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$criteria" \
     "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL" "$validated" "$refs"
 }
 
@@ -383,6 +449,59 @@ fix_items() {
         on && n && /^Fixed$/ {out = out " [fixed]"}
         END {print out}' "$1" | cut -c1-500
 }
+
+# A fix round's commits for its PR comment: at most ten, each hash and
+# subject in a code span, so nothing a subject says renders or mentions anyone.
+pushed_commits() {
+  safe_git log --format='%h%x09%s' "$BASE..HEAD" 2>> "$LOG" | head -10 |
+    while IFS=$'\t' read -r sha subject; do
+      subject="$(printf '%s' "$subject" | tr -d '`[:cntrl:]' | cut -c1-120)"
+      printf -- '- `%s` `%s`\n' "$sha" "$subject"
+    done
+}
+
+# One comment per subject, edited in place. A lane that repeats a fact (a fix
+# round on a pull request, a failure that is still failing) used to post a
+# comment each time, and every one emailed the ticket's author and
+# participants: about 60 a day on pull requests, 13 on one incident. This finds
+# the comment on issue or pull request $2 of $1 that starts with marker $3,
+# builds its next body with `python3 -m bus.sticky $4` from the old body and
+# the text on stdin (the remaining arguments are bus.sticky's), and edits that
+# comment, or posts it when there is none. A failed read posts nothing, so a
+# bad API answer cannot start a second comment; a failed write returns 1 for
+# the caller to log. Arguments: repo, number, marker, mode, bus.sticky's own.
+upsert_sticky_comment() {
+  local repo="$1" number="$2" marker="$3" mode="$4" listing id old_file new_file input_file ok=0
+  shift 4
+  old_file="$(mktemp)" && new_file="$(mktemp)" && input_file="$(mktemp)" || return 1
+  cat > "$input_file"
+  if ! listing="$(MARKER="$marker" timeout "$NET_TIMEOUT" gh api --paginate \
+        "repos/$repo/issues/$number/comments" \
+        --jq '.[] | select(.body | startswith(env.MARKER)) | .id' 2>> "$LOG")"; then
+    rm -f "$old_file" "$input_file" "$new_file"; return 1
+  fi
+  id="$(printf '%s\n' "$listing" | head -1 | tr -cd '0-9')"
+  : > "$old_file"
+  if [ -n "$id" ] && ! timeout "$NET_TIMEOUT" gh api "repos/$repo/issues/comments/$id" \
+        --jq .body > "$old_file" 2>> "$LOG"; then
+    rm -f "$old_file" "$input_file" "$new_file"; return 1
+  fi
+  if ! PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.sticky "$mode" --marker "$marker" \
+        --now "$(date -u +%FT%TZ)" --old "$old_file" "$@" < "$input_file" > "$new_file" 2>> "$LOG"; then
+    rm -f "$old_file" "$input_file" "$new_file"; return 1
+  fi
+  if [ -n "$id" ]; then
+    timeout "$NET_TIMEOUT" gh api -X PATCH "repos/$repo/issues/comments/$id" \
+      -F "body=@$new_file" >> "$LOG" 2>&1 || ok=1
+  else
+    timeout "$NET_TIMEOUT" gh api -X POST "repos/$repo/issues/$number/comments" \
+      -F "body=@$new_file" >> "$LOG" 2>&1 || ok=1
+  fi
+  rm -f "$old_file" "$input_file" "$new_file"
+  return "$ok"
+}
+# The marker on the one comment per pull request that lists a lane's fix rounds.
+ROUND_MARKER="<!-- loom:lane-round v1 -->"
 
 # Keep agent-authored review replies outside the commit. The agent cannot call
 # GitHub from its sandbox; only the runner posts these after the push succeeds.
@@ -451,8 +570,10 @@ post_replies() {
 # outside those sections. Scope changes are logged with old/new body hashes.
 # Exit: 0 = updated, 1 = no change needed, 2 = refused, 3 = gh/helper error.
 repair_pr_text() {
+  local summary=()
+  [ -f "$WORKDIR/$TICKET.summary.md" ] && summary=(--summary "$WORKDIR/$TICKET.summary.md")
   NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -m bus.pr_repair \
-    --apply "$FIX_PR" --repo "$REPO" "$BRIEF" "$LANE" "$MODEL" "$TICKET"
+    --apply "$FIX_PR" --repo "$REPO" ${summary[@]+"${summary[@]}"} "$BRIEF" "$LANE" "$MODEL" "$TICKET"
 }
 
 # Prints the text of file $1 when it is fit for a ticket comment: at most
@@ -485,6 +606,29 @@ NO_CHANGE_RE='nothing (left )?to (change|fix|do)|no (code )?change (is )?needed|
 # and its agent gave no such reason.
 NO_REASON="agent made no commit and wrote no reason"
 
+# The longest final message a failure reason carries, in characters.
+FINAL_SAID_MAX=600
+
+# What the agent said last, for a run that committed nothing and wrote no
+# summary (loom#1362): the end of the run's output, without the provider's
+# work events (RUN_OUTPUT), as one ASCII line cut to FINAL_SAID_MAX, through
+# checked_text. Sets FINAL_SAID, empty when the agent said nothing or its words
+# were refused. The agent CLI's own log lines and the runner's timestamped
+# lines are left out: retried stream errors once filled the whole quote.
+FINAL_SAID_SKIP_RE='^timestamp=[^ ]+ level=[A-Z]+ |^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z\] '
+final_said() {
+  local file="$WORKDIR/$TICKET.final-message" line
+  FINAL_SAID=""
+  line="$(printf '%s\n' "$RUN_OUTPUT" | { grep -vE "$FINAL_SAID_SKIP_RE" || true; } | tail -n 20 | LC_ALL=C tr -cd '\11\12\40-\176' |
+          tr -s ' \t\n' ' ' | sed 's/^ //; s/ $//')"
+  [ -n "$line" ] || return 0
+  [ "${#line}" -le "$FINAL_SAID_MAX" ] || line="${line:0:FINAL_SAID_MAX}..."
+  printf '%s\n' "$line" > "$file"
+  FINAL_SAID="$(checked_text "$file" 2>> "$LOG")" || FINAL_SAID=""
+  rm -f "$file"
+  FINAL_SAID="${FINAL_SAID%$'\n'}"
+}
+
 # A run that committed nothing is an answer, not a failure, when its agent
 # said why: an Intent summary that the work is already done or no longer
 # applies, or an answer to a thread kept aside by keep_answers. Sets
@@ -514,15 +658,25 @@ no_change_reason() {
   [ -z "$NO_CHANGE_WHY" ]
 }
 
-# Post an answered run's reason on its ticket, label the ticket
-# loom:answered for the brain, and hand its thread answers to the station,
-# which posts each on the pull request the ticket names. Says what failed.
+# Hand an answered run's reason and its thread answers to whoever reports
+# it. The reason goes into the .answered marker. A station brief (an `Issue:
+# OWNER/NAME#N` line) is reported by the station, which records the reason as
+# an event in the ticket's status comment and settles the ticket
+# (docs/BRAIN.md, Claim and outcome): a new comment here emailed the ticket's
+# author for a routine outcome (a watched repo's ticket, 2026-10-21). Any other
+# brief has no reporter, so the runner posts the reason on its ticket and
+# labels it loom:answered itself. Says what failed.
 post_no_change() {
-  if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$NO_CHANGE_TEXT" >> "$LOG" 2>&1; then
-    echo "answer comment failed"; return 1
+  if ! printf '%s\n' "$NO_CHANGE_TEXT" > "$LOGDIR/$TICKET.answered.tmp"; then
+    echo "answer could not be written"; return 1
   fi
-  if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
-    echo "answer posted but ticket label update failed"; return 1
+  if ! [[ "$ISSUE_REF" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]]; then
+    if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$NO_CHANGE_TEXT" >> "$LOG" 2>&1; then
+      echo "answer comment failed"; return 1
+    fi
+    if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
+      echo "answer posted but ticket label update failed"; return 1
+    fi
   fi
   if [ -d "$WORKDIR/$TICKET.answers" ]; then
     rm -rf "$INBOX/answers/$TICKET"
@@ -546,7 +700,7 @@ TRANSIENT_REST=1800
 TRANSIENT_FILE="$LOOM_HOME/state/usage/$SLOT.transient"
 transient_rest_until() {
   local count until
-  read -r count until < "$TRANSIENT_FILE" 2>/dev/null || return 1
+  read -r count until 2>/dev/null < "$TRANSIENT_FILE" || return 1
   [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] && printf '%s' "$until"
 }
 # Count one transient run; prints the epoch the lane rests until once the
@@ -554,7 +708,7 @@ transient_rest_until() {
 transient_strike() {
   local count until now
   now="$(date +%s)"
-  read -r count until < "$TRANSIENT_FILE" 2>/dev/null || count=0
+  read -r count until 2>/dev/null < "$TRANSIENT_FILE" || count=0
   [[ "$count" =~ ^[0-9]+$ ]] || count=0
   count=$((count + 1))
   if [ "$count" -ge "$TRANSIENT_STRIKES" ]; then
@@ -567,9 +721,31 @@ transient_strike() {
 }
 transient_clear() { rm -f "$TRANSIENT_FILE"; }
 
+# Mint this run's App token into GH_TOKEN. A personal token in the
+# environment is dropped first, so a failed mint leaves gh with nothing to
+# post as. Installation tokens last an hour: a run mints again after its agent.
+lane_app_token() {
+  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
+  local token
+  unset GH_TOKEN GITHUB_TOKEN
+  if [ -n "${LOOM_APP_TOKEN_CMD:-}" ]; then
+    token="$("$LOOM_APP_TOKEN_CMD" 2>> "$LOG")" || return 1
+  else
+    token="$(cd "$LOOM_ROOT" && timeout "$NET_TIMEOUT" python3 -B -m bus app token 2>> "$LOG")" || return 1
+  fi
+  # Installation tokens are ghs_ and a JWT-like body: letters, digits, _ . -
+  [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  export GH_TOKEN="$token"
+}
+APP_TOKEN_WHY="could not mint the lane's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
+
 park() {
+  local reason="$2"
   [ -z "${REPLIES_FILE:-}" ] || rm -f "$REPLIES_FILE"
-  echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $2" | tee -a "$LOG" >&2
+  if [ -n "${DROPPED_SCRATCH_FILES:-}" ]; then
+    reason="$reason; dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+  fi
+  echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $reason" | tee -a "$LOG" >&2
   mv "$1" "$INBOX/failed/"
 }
 
@@ -701,6 +877,8 @@ SPARK_URL="$(lane_setting URL)"
 SPARK_PROBE_TIMEOUT=15
 LIMITED=""
 LIMIT_WHY=""
+# Whether the provider answered the last probe at all (provider_at_limit).
+PROBE_ANSWERED=0
 # An expired key holds a lane with no retry time, so its reason is the whole
 # of it: "API key expired: renew <the SSM parameter, or the lane sign-in>".
 AUTH_HELD=""
@@ -762,11 +940,29 @@ spark_ready() {
 # The key goes to curl as a config file on stdin, written by the printf
 # builtin, so it reaches no process's argv and no log.
 PROBE_TIMEOUT=20
+# How long a lane waits before it asks the provider again whether the limit
+# has lifted. The provider's allowance refills while the lane sleeps (OpenCode
+# Go refills 20% of a model's allowance every 5 hours), so a lane that waited
+# out the whole window sat idle for days while the provider served it again
+# (opencode-go, 2026-10-20: the lane-held invariant fired and the tier's
+# tickets waited behind a lane the provider had long since freed). Other
+# providers retain their existing recheck interval.
+LIMIT_RECHECK=1800
+[ "$LANE" = opencode-go ] && LIMIT_RECHECK=300
+
+# The provider's own word for a usage limit. It is in the body the provider
+# answers with and in the reason the heartbeat carries, so a lane that asks
+# the provider again can tell a hold the probe took from a hold the agent CLI
+# recorded (a model it no longer offers, an expired key, a spent allowance).
+GO_LIMIT_ERROR="GoUsageLimitError"
 
 # 0 with LIMIT_WHY set when the provider answers 429 GoUsageLimitError for
 # MODEL; 1 for any other answer, no answer, or no probe configured.
+# PROBE_ANSWERED says the provider answered at all, so a lane that asks it
+# again can tell a provider that serves it from one it cannot reach.
 provider_at_limit() {
   local url header session model body out code limit_name headers retry_after stamp
+  PROBE_ANSWERED=0
   url="$(lane_setting PROBE_URL)" header="$(lane_setting PROBE_HEADER)"
   [ -n "$url" ] && [ -n "$API_KEY" ] || return 1
   [[ "$url" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] || return 1
@@ -786,24 +982,109 @@ provider_at_limit() {
       -H 'Content-Type: application/json' ${header:+-H "$header: $session"} \
       --data-binary "$body" "$url" 2>/dev/null)"; then
     rm -f "$headers"
+    provider_checked
     return 1
   fi
+  PROBE_ANSWERED=1
+  provider_checked
   code="${out##*$'\n'}" body="${out%$'\n'*}"
-  if [ "$code" != 429 ] || [[ "$body" != *GoUsageLimitError* ]]; then
+  if [ "$code" != 429 ] || [[ "$body" != *"$GO_LIMIT_ERROR"* ]]; then
     rm -f "$headers"
     return 1
   fi
   limit_name="$(printf '%s' "$body" | sed -nE 's/.*"limitName" *: *"([A-Za-z0-9_-]+)".*/\1/p' | head -1)"
-  retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); value=$0} END{print value}' "$headers" 2>/dev/null)"
+  # The provider's Retry-After header, in any case: the awk on the lane
+  # machine has no IGNORECASE, so a case-sensitive match never read it and
+  # every limit fell back to the window name (2026-10-20).
+  retry_after="$(awk 'tolower($0) ~ /^retry-after:/ {sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); value=$0} END{print value}' "$headers" 2>/dev/null)"
   rm -f "$headers"
   retry_after="$(printf '%s' "$retry_after" | tr -cd '[:alnum:], :-')"
   stamp="$(date +%s)"
   [[ "$retry_after" =~ ^[0-9]+$ ]] && retry_after=$((stamp + retry_after))
-  printf '{"at": %s, "limit_name": "%s", "retry_after": "%s"}\n' \
-    "$stamp" "${limit_name:-unknown}" "${retry_after//\"/}" > "$LOOM_HOME/state/usage/$SLOT.provider-limit.json.tmp" &&
+  printf '{"at": %s, "limit_name": "%s", "retry_after": "%s", "model": "%s"}\n' \
+    "$stamp" "${limit_name:-unknown}" "${retry_after//\"/}" "$model" \
+    > "$LOOM_HOME/state/usage/$SLOT.provider-limit.json.tmp" &&
     mv -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json.tmp" "$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
-  LIMIT_WHY="the provider's ${limit_name:-usage} limit (429 GoUsageLimitError)"
+  LIMIT_WHY="the provider's ${limit_name:-usage} limit (429 $GO_LIMIT_ERROR)"
   return 0
+}
+
+# When the provider was last asked whether it is at a limit: the epoch, one
+# line. A lane held by a limit asks it again every LIMIT_RECHECK seconds
+# (provider_limit_lifted), so the hold ends when the provider serves it.
+provider_checked() {
+  mkdir -p "$LOOM_HOME/state/usage"
+  printf '%s\n' "$(date +%s)" > "$LOOM_HOME/state/usage/$SLOT.provider-check"
+}
+
+# Older shared holds recorded the provider answer only on the slot that saw
+# it. Use that answer when another slot in the group wakes first.
+provider_limit_source() {
+  local slot
+  if [ -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json" ]; then
+    printf '%s' "$SLOT"
+    return 0
+  fi
+  for slot in $(key_group); do
+    if [ -f "$LOOM_HOME/state/usage/$slot.provider-limit.json" ]; then
+      printf '%s' "$slot"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Whether the lane asks the provider again: the last probe was at least
+# LIMIT_RECHECK seconds ago, and the hold in force is the one the probe took
+# (its reason names the provider's limit; no other hold carries that).
+provider_recheck_due() {
+  local at reason source
+  source="$(provider_limit_source)" || return 1
+  reason="$(sed -nE 's/.*"reason": *"([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+  case "$reason" in *"$GO_LIMIT_ERROR"*) ;; *) return 1 ;; esac
+  at="$(cat "$LOOM_HOME/state/usage/$source.provider-check" 2>/dev/null)"
+  [[ "$at" =~ ^[0-9]+$ ]] || return 1
+  [ "$(( $(date +%s) - at ))" -ge "$LIMIT_RECHECK" ]
+}
+
+# Whether the provider serves this lane again. The provider is asked at most
+# once every LIMIT_RECHECK seconds, and only for a hold the probe itself took:
+# a hold the agent CLI recorded (a model it no longer offers, a spent
+# allowance) stands, for no probe says otherwise. A provider that cannot be
+# reached is not a provider that serves the lane: the hold stands.
+provider_limit_lifted() {
+  local model key_ssm source
+  provider_recheck_due || return 1
+  source="$(provider_limit_source)" || return 1
+  [ -n "$(lane_setting PROBE_URL)" ] || return 1
+  key_ssm="$(lane_setting KEY_SSM)"
+  [ -n "$key_ssm" ] || return 1
+  API_KEY="$(ssm_value "$key_ssm")"
+  [ -n "$API_KEY" ] || return 1
+  # The model the probe found at a limit: the provider's answer is about that
+  # model, so that is the model to ask about again.
+  model="$(sed -nE 's/.*"model": *"([A-Za-z0-9._:/@-]+)".*/\1/p' \
+    "$LOOM_HOME/state/usage/$source.provider-limit.json" 2>/dev/null | head -1)"
+  [ -n "$model" ] || model="$(lane_setting MODEL)"
+  [ -n "$model" ] || return 1
+  MODEL="$model"
+  if provider_at_limit; then
+    hold_provider_limit
+    return 1
+  fi
+  [ "${PROBE_ANSWERED:-0}" = 1 ] || return 1
+  lift_provider_limit
+  return 0
+}
+
+# The provider serves the group again: the hold is over for every slot that
+# shares the account. The record of the refusal stays: it is the last 429 the
+# Usage view shows.
+lift_provider_limit() {
+  local slot
+  for slot in $(key_group); do
+    write_beat "$slot" true ""
+  done
 }
 
 # A free lane whose provider has a read-only meter (openrouter: the key's
@@ -861,10 +1142,21 @@ limit_until() {
 # Hold every slot in this slot's group until the provider's reset, and
 # hand on every brief still in the inbox this pass.
 hold_provider_limit() {
-  local until slot
+  local until slot source checked tmp
   until="$(limit_until)" || return 0
   LIMITED=1
+  source="$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
+  checked="$(date +%s)"
   for slot in $(key_group); do
+    if [ "$slot" != "$SLOT" ]; then
+      tmp="$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp"
+      if ! cp "$source" "$tmp" \
+        || ! mv -f "$tmp" "$LOOM_HOME/state/usage/$slot.provider-limit.json"; then
+        rm -f "$tmp"
+        return 1
+      fi
+    fi
+    printf '%s\n' "$checked" > "$LOOM_HOME/state/usage/$slot.provider-check" || return 1
     write_beat "$slot" false "limit: $LIMIT_WHY; unavailable until $(utc "$until")" "$until"
   done
 }
@@ -951,9 +1243,10 @@ ask_renew_key() {
     "$KEY_ASK_MARKER" "$SLOT" "$param")"
   existing="$(open_issue "$title")"
   if [ -n "$existing" ]; then
-    gh issue comment --repo "$FACTORY_REPO" "$existing" \
-      --body "Lane $SLOT could not use the key again, at $(date -u +%FT%TZ)." >>"$LOG" 2>&1 ||
-      echo "could not comment on the open ask $FACTORY_REPO#$existing" >> "$LOG"
+    # One comment on the ask with a running count, never one per failure.
+    printf '' | upsert_sticky_comment "$FACTORY_REPO" "$existing" "$KEY_REPEAT_MARKER" repeat \
+      --headline "Could not use the key again" --items-label "Lanes seen" --item "$SLOT" ||
+      echo "could not update the open ask $FACTORY_REPO#$existing" >> "$LOG"
     return 0
   fi
   number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
@@ -1016,9 +1309,127 @@ opencode_bin() {
   printf '%s' "${b:-opencode}"
 }
 
-# Usage: opencode_agent <key_var> <brief text>
+# Whether the agent CLI lists a model: 0 when it does, 1 when its list for the
+# model's provider lacks it. Only opencode lanes are asked (the other CLIs
+# have no list command here); a list that cannot be read (command error,
+# timeout, empty answer) is unknown, and unknown counts as listed, so a
+# broken probe never holds a lane for good.
+model_listed() {
+  local model="$1" provider list
+  case "$LANE" in openrouter|opencode-go|zen|zai|workersai|spark|free) ;; *) return 0 ;; esac
+  provider="${model%%/*}"
+  [ "$provider" != "$model" ] || return 0
+  list="$(timeout "$NET_TIMEOUT" "$(opencode_bin)" models "$provider" 2>/dev/null < /dev/null)" || return 0
+  [ -n "$list" ] || return 0
+  printf '%s\n' "$list" | tr -d '\r' | grep -qxF -- "$model"
+}
+
+# Usage: opencode_agent <key_var> <run arguments...>
 opencode_agent() {
-  opencode_run "$1" "$(opencode_bin)" "$2"
+  local key_var="$1"
+  shift
+  opencode_run "$key_var" "$(opencode_bin)" "$@"
+}
+
+# OpenCode JSON events delimit assistant steps; only a final step containing
+# text and no tool is evidence that the model stopped on a described action.
+opencode_described_step() {
+  python3 -I - "$1" <<'PY'
+import json
+import sys
+
+text = tool = False
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    try:
+        event = json.loads(line)
+    except ValueError:
+        continue
+    if not isinstance(event, dict):
+        continue
+    kind = event.get("type")
+    part = event.get("part") if isinstance(event.get("part"), dict) else {}
+    if kind == "step_start":
+        text = tool = False
+    elif kind == "text" and isinstance(part.get("text"), str) and part["text"].strip():
+        text = True
+    elif kind in ("tool_use", "tool") or part.get("type") == "tool":
+        tool = True
+sys.exit(0 if text and not tool else 1)
+PY
+}
+
+# The lane log's view of an opencode run read as JSON events. "raw" keeps
+# the events (the spark lane's log has always held them). "text" keeps what a
+# plain run prints: the model's text as lines, and every line that is not a
+# work event (a provider error, opencode's own message) as it came, so the
+# failure classes and the final message a failure reason quotes (loom#1362)
+# read the same as before the lane ran as JSON.
+opencode_log_view() {
+  [ "$1" = raw ] && { cat; return; }
+  python3 -I -u -c '
+import json
+import sys
+
+WORK = ("tool_use", "tool", "reasoning", "step_start", "step_finish")
+for line in sys.stdin:
+    try:
+        event = json.loads(line)
+    except ValueError:
+        event = None
+    if not isinstance(event, dict):
+        sys.stdout.write(line)
+    elif event.get("type") == "text":
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+        if isinstance(part.get("text"), str):
+            print(part["text"])
+    elif event.get("type") not in WORK:
+        sys.stdout.write(line)
+'
+}
+
+# Usage: opencode_json_pass <key_var> <log view> <events file> <opencode run arguments...>
+# One opencode run as JSON events: the raw events to the events file, their
+# view to the lane log. Returns the agent's exit status.
+opencode_json_pass() {
+  local key_var="$1" view="$2" events="$3"
+  shift 3
+  opencode_agent "$key_var" --format json "$@" | tee "$events" | opencode_log_view "$view"
+  return "${PIPESTATUS[0]}"
+}
+
+# Every opencode lane gets one continue for a run that ends on a described
+# step: no tool call, no change, no reason (loom#1282). Free models answer
+# "Let me read the build files." and stop. A second such end is
+# marked for the runner to fail as "ended on a described step".
+# Usage: opencode_agent_continuing <key_var> <log view> <brief text>
+opencode_agent_continuing() {
+  local key_var="$1" view="$2" brief="$3" status
+  local events="$WORKDIR/$TICKET.opencode-events"
+  opencode_json_pass "$key_var" "$view" "$events" "$brief"
+  status=$?
+  [ "$status" -eq 0 ] || return "$status"
+  if opencode_has_no_work &&
+     { [ ! -f "$TREE/$SUMMARY_FILE" ] ||
+       ! grep -qiE "$NO_CHANGE_RE" "$TREE/$SUMMARY_FILE"; } &&
+     opencode_described_step "$events"; then
+    echo "[$(date -u +%FT%TZ)] $TICKET: continuing a text-only $LANE step once"
+    opencode_json_pass "$key_var" "$view" "$events" --continue \
+      "Continue: carry out the step you just described, then commit or write .loom/summary.md"
+    status=$?
+    # A failed continue is not swallowed: its exit status goes to the runner,
+    # which classes it (limit, auth, transient or work) from the run's output.
+    [ "$status" -eq 0 ] || return "$status"
+    if opencode_has_no_work && opencode_described_step "$events"; then
+      : > "$WORKDIR/$TICKET.described-step"
+    fi
+  fi
+}
+
+opencode_has_no_work() {
+  local status
+  [ "$(safe_git rev-parse HEAD)" = "$BASE" ] || return 1
+  status="$(safe_git status --porcelain --untracked-files=all)" || return 1
+  ! printf '%s\n' "$status" | grep -v ' .loom/summary.md$' | grep -q .
 }
 
 # git in an agent's tree, run by the runner: never run hooks or an fsmonitor
@@ -1042,28 +1453,12 @@ safe_git() {
 # an agent edits changes what is checked. A repo without the file is not
 # validated by the runner (its CI still is).
 CONTRACT_FILE=.loom/validation.conf
-load_contract() {
-  local rev="$BASE" mode line key val canon
-  HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK=""
-  if [ -n "$FIX_PR" ] && ! { timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
-       -c core.fsmonitor=false fetch -q --depth 1 origin "${BASE_BRANCH:-HEAD}" >> "$LOG" 2>&1 &&
-       rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
-    HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
-    note_factory_incident environment "could not fetch the base branch for $CONTRACT_FILE" SETUP_REASON
-    return 1
-  fi
-  mode="$(safe_git ls-tree "$rev" -- "$CONTRACT_FILE" | cut -d' ' -f1)"
-  [ -n "$mode" ] || return 0
-  HAS_CONTRACT=1
-  [ "$mode" = 100644 ] || [ "$mode" = 100755 ] || { SETUP_REASON="$CONTRACT_FILE is not a regular file"; return 1; }
-  # bus/contract.py reads every contract form repos use and prints the
-  # key: value lines below; a form it cannot read is a factory incident:
-  # the runner's reader is behind the repos, not the ticket's work.
-  canon="$(safe_git cat-file blob "$rev:$CONTRACT_FILE" | PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.contract)" || {
-    SETUP_REASON="$CONTRACT_FILE ${canon:0:120}"
-    note_factory_incident contract "contract: $canon" SETUP_REASON
-    return 1
-  }
+# Read the key: value lines bus.contract printed into C_INTERP, C_SUBMODULES,
+# C_SETUP and C_CHECK. Returns 1 with SETUP_REASON when a line, the check,
+# submodules, the interpreter or a command is unusable.
+parse_contract() {
+  local canon="$1" line key val
+  C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK=""
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     key="${line%%:*}" val="${line#*:}"
@@ -1086,6 +1481,44 @@ load_contract() {
   done
 }
 
+# A fix round's base branch, fetched into the shallow tree for its contract.
+# Tried a second time after a pause: two fetches on one shallow tree race
+# ("shallow file has changed since we read it"), and the first such failure
+# filed a factory incident while nothing was wrong (2026-10-22).
+fetch_base_for_contract() {
+  local try
+  for try in 1 2; do
+    timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+      fetch -q --depth 1 origin "${BASE_BRANCH:-HEAD}" >> "$LOG" 2>&1 && return 0
+    [ "$try" -eq 2 ] || sleep 3
+  done
+  return 1
+}
+
+load_contract() {
+  local rev="$BASE" mode canon
+  HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK=""
+  if [ -n "$FIX_PR" ] && ! { fetch_base_for_contract &&
+       rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
+    HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
+    note_factory_incident environment "could not fetch the base branch for $CONTRACT_FILE" SETUP_REASON
+    return 1
+  fi
+  mode="$(safe_git ls-tree "$rev" -- "$CONTRACT_FILE" | cut -d' ' -f1)"
+  [ -n "$mode" ] || return 0
+  HAS_CONTRACT=1
+  [ "$mode" = 100644 ] || [ "$mode" = 100755 ] || { SETUP_REASON="$CONTRACT_FILE is not a regular file"; return 1; }
+  # bus/contract.py reads every contract form repos use and prints the
+  # key: value lines below; a form it cannot read is a factory incident:
+  # the runner's reader is behind the repos, not the ticket's work.
+  canon="$(safe_git cat-file blob "$rev:$CONTRACT_FILE" | PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.contract)" || {
+    SETUP_REASON="$CONTRACT_FILE ${canon:0:120}"
+    note_factory_incident contract "contract: $canon" SETUP_REASON
+    return 1
+  }
+  parse_contract "$canon"
+}
+
 # setup and check are shell by design (like a CI run: step), so their content
 # is trusted as the base branch's. Shell syntax is allowed because the base
 # branch authors control these CI commands. The guard requires one line of
@@ -1097,6 +1530,25 @@ load_contract() {
 # right before bash -c, so no caller can hand it an unchecked string.
 contract_command_ok() {
   [ "${#1}" -le 1000 ] && [ "$1" = "$(printf '%s' "$1" | LC_ALL=C tr -cd ' -~')" ]
+}
+
+# Remove untracked virtual environments left by the agent before the final
+# check. Their interpreter symlinks can point outside the check sandbox.
+# A .venv containing any tracked path is retained intact.
+remove_untracked_venvs() {
+  local candidate relative tracked
+  while IFS= read -r -d '' candidate; do
+    relative="${candidate#"$TREE"/}"
+    tracked="$(safe_git ls-files -- "$relative")" || return 1
+    [ -z "$tracked" ] || continue
+    rm -rf -- "$candidate" || return 1
+  done < <(find "$TREE" -type d -name .venv -prune -print0)
+}
+
+validation_interpreter_denied() {
+  local status="$1" output="$2"
+  [ "$status" -ne 0 ] && [[ "$output" == *"Failed to query Python interpreter"* &&
+    "$output" == *"Operation not permitted"* ]]
 }
 
 # One line of $RECORD per step: phase, command, exit code, the tree revision
@@ -1124,6 +1576,9 @@ FACTORY_REPO=quadseven/loom
 INCIDENT_MARKER="<!-- loom:factory-incident v1 -->"
 # The marker on the body of the needs-operator ask an expired key files.
 KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"
+# The markers on the one comment that counts repeats on an open ask or incident.
+KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"
+INCIDENT_REPEAT_MARKER="<!-- loom:incident-repeat v1 -->"
 # The number of the open issue on the factory repo whose title is exactly $1,
 # empty when there is none: one open issue per incident kind, per expired key.
 open_issue() {
@@ -1160,8 +1615,9 @@ file_factory_incident() {  # kind, detail
   existing="$(open_issue "$title")"
   if [ -n "$existing" ]; then
     number="$existing"
-    gh issue comment --repo "$FACTORY_REPO" "$number" \
-      --body "Still failing on $TICKET: $detail" >>"$LOG" 2>&1 || true
+    # One comment on the incident with a running count, never one per run.
+    printf '%s' "$detail" | upsert_sticky_comment "$FACTORY_REPO" "$number" "$INCIDENT_REPEAT_MARKER" repeat \
+      --headline "Still failing" --items-label "Tickets seen" --item "$TICKET" || true
   else
     number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
       --body "$body" --label loom:factory 2>>"$LOG" || \
@@ -1237,6 +1693,24 @@ tracked_changes() {
   safe_git status --porcelain --untracked-files=no --ignore-submodules=dirty | head -5 | tr '\n' ' '
 }
 
+# The first submodule whose tracked files the agent changed, as "path (file
+# file ...)"; empty when there is none. A push of this repo carries only the
+# submodule's commit, never edits on top of it, so a check run on those edits
+# passes on code CI never sees: a pull request passed its
+# lane check and failed CI on the C++ it needed (2026-10-21).
+submodule_edits() {
+  local line path files
+  while read -r line; do
+    path="$(printf '%s' "$line" | awk '{print $2}')"
+    # Not checked out: git in its empty directory would read this repo. A
+    # moved commit (a pin bump) is pushed and CI checks it out, so it passes.
+    case "$line" in -*) continue ;; esac
+    files="$(safe_git -C "$path" status --porcelain --untracked-files=no 2>> "$LOG" |
+             cut -c4- | head -3 | sed "s|^|$path/|" | tr '\n' ' ')"
+    [ -z "$files" ] || { printf '%s (%s)' "$path" "${files% }"; return 0; }
+  done < <(safe_git submodule status --recursive 2>> "$LOG")
+}
+
 # Check the trusted default branch in its own worktree when a fix branch is
 # red or has merge conflicts. The merged branch and its setup files remain
 # available for the agent. DEFAULT_EXIT is the default branch's check result.
@@ -1253,7 +1727,9 @@ check_default_branch() {
   # takes the real origin, so relative submodule URLs still resolve. The fix
   # tree is shallow, so git ignores --local and copies only its branches:
   # the fetch brings origin's default branch across, which a conflicting
-  # round has not merged (2026-10-20).
+  # round has not merged (2026-10-20). A checkout that still fails is the
+  # runner's fault, not the ticket's: a factory incident, so the round
+  # spends no ladder attempt and never counts toward the runaway hold.
   if ! { timeout "$NET_TIMEOUT" git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
            clone -q --local --no-checkout "$branch_tree" "$default_tree" >> "$LOG" 2>&1 &&
          timeout "$NET_TIMEOUT" git -C "$default_tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
@@ -1263,7 +1739,9 @@ check_default_branch() {
          git -C "$default_tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
            checkout -q --detach "$DEFAULT_REV" >> "$LOG" 2>&1; }; then
     rm -rf "$default_tree"
-    SETUP_REASON="could not check out the default branch for validation"; return 1
+    SETUP_REASON="could not check out the default branch for validation"
+    note_factory_incident environment "could not check out $FIX_DEFAULT at $DEFAULT_REV for validation" SETUP_REASON
+    return 1
   fi
   TREE="$default_tree" CHECK_HOME="$branch_home-default"
   if ! mkdir -p "$CHECK_HOME/tmp"; then
@@ -1407,7 +1885,21 @@ final_validation() {
   VALIDATION_REASON=""
   safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
   rev="$(safe_git rev-parse HEAD)"
+  if ! remove_untracked_venvs; then
+    VALIDATION_REASON="validation environment unavailable: could not remove untracked virtual environments"
+    note_factory_incident environment "$VALIDATION_REASON" VALIDATION_REASON
+    record final "$C_CHECK" 125 "$rev" false "$VALIDATION_REASON"
+    drop_check_home
+    return 1
+  fi
   contract_run "$C_CHECK"; rc=$?
+  if validation_interpreter_denied "$rc" "$(tail -c +$((LOG_START + 1)) "$LOG")"; then
+    VALIDATION_REASON="validation environment unavailable: Python interpreter query was denied by the sandbox"
+    note_factory_incident environment "$VALIDATION_REASON" VALIDATION_REASON
+    record final "$C_CHECK" "$rc" "$rev" false "$VALIDATION_REASON"
+    drop_check_home
+    return 1
+  fi
   changed="$(tracked_changes)"
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
@@ -1427,17 +1919,143 @@ final_validation() {
   VALIDATED="check exited 0 at ${rev:0:12}"
 }
 
-# A run that failed validation keeps its edits: they are committed and pushed
-# to a side branch, never to the ticket's branch or an open pull request.
-preserve_unvalidated() {
-  local side
-  side="$BRANCH-unvalidated-$(date +%s)"
+# Run the check of the contract the lane commits (C_* hold it) on the lane's
+# own tree, in the check sandbox. Its setup runs only when it differs from
+# the base setup in $1, which prepare_validation already ran. Sets CONTRACT_REFUSAL
+# and returns 1 when the interpreter is missing, a step fails or the check
+# changes tracked files; 2 when the runner cannot run a check at all.
+run_committed_contract() {
+  local base_setup="$1" rc changed rev
+  command -v sandbox-exec > /dev/null || { CONTRACT_REFUSAL="sandbox-exec not available"; return 2; }
+  if [ -n "$C_INTERP" ] && ! command -v "$C_INTERP" > /dev/null; then
+    CONTRACT_REFUSAL="the contract names interpreter $C_INTERP, which is not on the lane machine's PATH"
+    return 1
+  fi
+  CHECK_CLI="${C_INTERP:-bash}"
+  mkdir -p "$CHECK_HOME/tmp" || { CONTRACT_REFUSAL="could not prepare the check home"; return 2; }
+  rev="$(safe_git rev-parse HEAD)"
+  if [ -n "$C_SETUP" ] && [ "$C_SETUP" != "$base_setup" ]; then
+    contract_run "$C_SETUP"; rc=$?
+    record contract-setup "$C_SETUP" "$rc" "$rev" "$([ "$rc" -eq 0 ] && echo true || echo false)"
+    [ "$rc" -eq 0 ] || { CONTRACT_REFUSAL="the setup in $CONTRACT_FILE exited $rc on the lane's own tree"; return 1; }
+  fi
+  contract_run "$C_CHECK"; rc=$?
+  changed="$(tracked_changes)"
+  record contract-check "$C_CHECK" "$rc" "$rev" "$([ "$rc" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
+    "${changed:+changed tracked files: $changed}"
+  if [ "$rc" -ne 0 ]; then
+    CONTRACT_REFUSAL="the check in $CONTRACT_FILE exited $rc on the lane's own tree"
+  elif [ -n "$changed" ]; then
+    CONTRACT_REFUSAL="the check in $CONTRACT_FILE changed tracked files on the lane's own tree ($changed)"
+  fi
+  [ -z "$CONTRACT_REFUSAL" ]
+}
+
+# A lane change that adds or edits the validation contract must read and
+# pass under itself (loom#1290): the runner checks a change against the
+# base's contract, so a contract the lane wrote was never read or run before
+# it merged, and a broken one failed every later lane run on the repo. When
+# the lane's commits (the pull request's own changes on a fix round) touch
+# the file, the runner reads the committed blob with bus.contract and runs
+# its check on the lane's tree. Returns 0 when the file is untouched, gone or
+# good, 1 with CONTRACT_REFUSAL when it is not, 2 when the check could not
+# run. The base contract's settings are restored either way.
+check_contract_change() {
+  local range="$BASE..HEAD" touched mode canon rc=0
+  local b_interp="$C_INTERP" b_subs="$C_SUBMODULES" b_setup="$C_SETUP" b_check="$C_CHECK" b_cli="${CHECK_CLI:-}"
+  CONTRACT_REFUSAL=""
+  [ -z "$FIX_UPSTREAM" ] || range="$FIX_UPSTREAM...HEAD"
+  touched="$(safe_git diff --name-only "$range" -- "$CONTRACT_FILE" 2>> "$LOG")" ||
+    { CONTRACT_REFUSAL="could not read the lane's changes"; return 2; }
+  [ -n "$touched" ] || return 0
+  mode="$(safe_git ls-tree HEAD -- "$CONTRACT_FILE" | cut -d' ' -f1)"
+  [ -n "$mode" ] || return 0
+  if [ "$mode" != 100644 ] && [ "$mode" != 100755 ]; then
+    CONTRACT_REFUSAL="$CONTRACT_FILE is not a regular file"; return 1
+  fi
+  if ! canon="$(safe_git cat-file blob "HEAD:$CONTRACT_FILE" | PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.contract)"; then
+    CONTRACT_REFUSAL="$CONTRACT_FILE is one the runner cannot read: ${canon:0:160}"; return 1
+  fi
+  if ! parse_contract "$canon"; then
+    CONTRACT_REFUSAL="$CONTRACT_FILE is one the runner cannot use: ${SETUP_REASON#"$CONTRACT_FILE "}"; rc=1
+  else
+    run_committed_contract "$b_setup" || rc=$?
+  fi
+  C_INTERP="$b_interp" C_SUBMODULES="$b_subs" C_SETUP="$b_setup" C_CHECK="$b_check" CHECK_CLI="$b_cli"
+  [ -n "$HAS_CONTRACT" ] || drop_check_home
+  return "$rc"
+}
+
+# Push a commit of the lane tree to a side branch of the ticket's branch and
+# say where the edits are. Never touches the ticket's branch or an open pull
+# request.
+push_side() {
+  local from="$1" side="$2"
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-       push -q origin "$BRANCH:refs/heads/$side" >> "$LOG" 2>&1; then
+       push -q origin "$from:refs/heads/$side" >> "$LOG" 2>&1; then
     printf 'the edits are on branch %s' "$side"
   else
     printf 'the push of %s failed; the edits are committed in the lane tree' "$side"
   fi
+}
+
+# A run that failed validation keeps its edits: they are committed and pushed
+# to a side branch, never to the ticket's branch or an open pull request.
+preserve_unvalidated() {
+  push_side "$BRANCH" "$BRANCH-unvalidated-$(date +%s)"
+}
+
+# A run that timed out, or hit a limit, after editing keeps its edits the same
+# way, on a -timedout- branch the station names to the next attempt. The agent's tree
+# may hold uncommitted files, so they are committed first.
+preserve_timedout() {
+  local tree_status
+  if ! rm -f "$TREE/$SUMMARY_FILE" 2>> "$LOG"; then
+    printf 'the lane tree could not be prepared; the edits were not preserved'
+    return 1
+  fi
+  if ! tree_status="$(safe_git status --porcelain 2>> "$LOG")"; then
+    printf 'could not read the lane tree; the edits were not preserved'
+    return 1
+  fi
+  if [ -n "$tree_status" ] &&
+     ! { safe_git add -A && safe_git commit -qm "$TICKET: edits before the timeout"; } >> "$LOG" 2>&1; then
+    printf 'the edits could not be committed in the lane tree'
+    return 1
+  fi
+  if ! drop_stray_from_kept >> "$LOG" 2>&1; then
+    printf 'the edits hold files outside the brief'"'"'s paths that could not be left out, so no branch was kept'
+    return 1
+  fi
+  push_side HEAD "$BRANCH-timedout-$(date +%s)"
+}
+
+# The next attempt merges the kept branch, and its commit is refused for any
+# file the brief does not allow, so those files are left off the branch.
+# A scope check that cannot run keeps every file: nothing is known wrong, and
+# the later refusal still guards the push. Fails, logged, when a stray file
+# cannot be removed or the removal committed: a branch that still holds it
+# would only get the next attempt refused, so it is not pushed.
+drop_stray_from_kept() {
+  local f stamp
+  stamp="$(date -u +%FT%TZ)"
+  if ! check_scope "$BRIEF"; then
+    echo "[$stamp] $TICKET: could not check the kept edits against the brief; the kept branch keeps every file"
+    return 0
+  fi
+  [ -n "$STRAY_FILES" ] || return 0
+  while IFS= read -r f; do
+    [ -z "$f" ] || safe_git rm -q -f -- "$f" && continue
+    echo "[$stamp] $TICKET: could not remove $f from the kept edits"
+    return 1
+  done <<EOF
+$STRAY_FILES
+EOF
+  if ! safe_git commit -qm "$TICKET: leave out files outside the brief's paths"; then
+    echo "[$stamp] $TICKET: could not commit the removal of $(stray_list) from the kept edits"
+    return 1
+  fi
+  echo "[$stamp] $TICKET: left off the kept branch: $(stray_list)"
 }
 
 # What the agent is told about the contract, after its brief.
@@ -1445,6 +2063,7 @@ validation_note() {
   [ -n "$HAS_CONTRACT" ] || return 0
   printf '\n\n## Validation environment\nThe runner prepared this tree from %s (interpreter: %s, submodules: %s, setup: %s). After you finish it runs the check below on your committed tree; the pull request opens only if it exits 0 and changes no tracked file. On the base it exited %s.\n\n    %s\n' \
     "$CONTRACT_FILE" "${C_INTERP:-any}" "$C_SUBMODULES" "${C_SETUP:-none}" "$BASELINE_EXIT" "$C_CHECK"
+  [ "$C_SUBMODULES" != yes ] || printf '\nNever edit files inside a submodule: the push carries only its pinned commit, so the runner refuses a run that does and pushes nothing.\n'
 }
 
 # Keep the agent's session transcripts (Claude Code .jsonl; opencode's SQLite
@@ -1465,6 +2084,8 @@ archive_transcripts() {
     (
       cd "$home_real/$parent" 2> /dev/null || exit 0
       [ "$(pwd -P)" = "$home_real/$parent" ] || exit 0
+      # No such leaf (an opencode run's .claude holds only skills): nothing to keep.
+      [ -e "$leaf" ] || [ -L "$leaf" ] || exit 0
       mkdir -p "$dest/$parent"
       if ! rsync -a --no-links --prune-empty-dirs --include='*/' --include='*.json' \
           --include='*.jsonl' --include='opencode.db' --include='opencode.db-wal' \
@@ -1568,7 +2189,7 @@ agy_skills() {
 # Lanes and models whose provider may train on prompts (docs/LANES.md lists
 # them). Their briefs must name a public repo.
 trains_on_prompts() {
-  case "$LANE:$MODEL" in zen:*|zai:*|agy:*|opencode-go:*muse-spark*contributor*) return 0 ;; esac
+  case "$LANE:$MODEL" in zen:*|zai:*|agy:*|copilot:*|opencode-go:*muse-spark*contributor*) return 0 ;; esac
   # Free provider slots that may train on prompts (bus/factory.py PUBLIC_ONLY;
   # tests/test_bus_station.py keeps the two lists equal).
   case "$SLOT" in free-nvidia|free-kilo|free-groq) return 0 ;; esac
@@ -1577,7 +2198,7 @@ trains_on_prompts() {
 
 # Lanes whose agent runs sandboxed in a fresh scratch home (api_agent).
 is_api_lane() {
-  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark|free) return 0 ;; esac
+  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark|free|copilot) return 0 ;; esac
   return 1
 }
 
@@ -1609,7 +2230,12 @@ update_fix_branch() {
   fi
   timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
     merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
-  FIX_UPSTREAM="origin/$default"
+  # The commit, not the ref: the scope check and the leak scan read it after
+  # the agent ran.
+  if ! FIX_UPSTREAM="$(git -C "$TREE" rev-parse --verify -q "origin/$default^{commit}")" ||
+     [ -z "$FIX_UPSTREAM" ]; then
+    UPDATE_REASON="could not read origin/$default"; return 1
+  fi
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        merge --no-edit "origin/$default" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] $TICKET: merged $default into $BRANCH" >> "$LOG"
@@ -1623,6 +2249,27 @@ update_fix_branch() {
   fi
   echo "[$(date -u +%FT%TZ)] $TICKET: merging $default conflicts in $(conflict_list); the agent resolves it" >> "$LOG"
   return 0
+}
+
+# An earlier attempt that timed out or hit a limit after editing kept its
+# edits on a side branch, which the brief's Earlier attempt section names. The agent cannot
+# fetch it: the sandbox keeps .git read-only, and two codex runs on one ticket
+# started over and ended with no commit (2026-10-21). So the runner merges it
+# into the tree before the agent starts. A branch that will not fetch or merge
+# cleanly is left out and logged: the agent starts from the base, as before.
+resume_earlier_attempt() {
+  local side
+  [ -z "$FIX_PR" ] || return 0
+  side="$(grep -oE 'kept its edits on branch [A-Za-z0-9._/-]+-timedout-[0-9]+' "$BRIEF" | head -1 | awk '{print $NF}')"
+  [ -n "$side" ] || return 0
+  if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       fetch -q origin "+refs/heads/$side:refs/remotes/origin/$side" >> "$LOG" 2>&1 &&
+     safe_git merge --no-edit "origin/$side" >> "$LOG" 2>&1; then
+    echo "[$(date -u +%FT%TZ)] $TICKET: merged the earlier attempt's branch $side" >> "$LOG"
+    return 0
+  fi
+  safe_git merge --abort >> "$LOG" 2>&1 || true
+  echo "[$(date -u +%FT%TZ)] $TICKET: could not merge the earlier attempt's branch $side; the agent starts from the base" >> "$LOG"
 }
 
 # CONFLICTS (one path a line) as one comma-separated line.
@@ -1694,19 +2341,27 @@ markers_left() {
 run_agent() {
   local brief_text
   brief_text="$(cat "$1")$(work_note)$(validation_note)$(summary_note)"
+  if [ "$LANE" = spark ]; then
+    brief_text="$brief_text
+
+## Spark repository search
+Do not search the whole filesystem (for example, find /). Search within the checkout and read the repository's build files to learn how it builds and tests."
+  fi
   AGENT_EXTRA_ENV=""
   is_api_lane && fresh_agent_home
   case "$LANE" in
     codex|claude) agent_cli "$LANE" lane "$brief_text" ;;
-    openrouter) opencode_agent OPENROUTER_API_KEY "$brief_text" ;;
-    opencode-go) opencode_agent OPENCODE_API_KEY "$brief_text" ;;
-    zen) opencode_agent - "$brief_text" ;;
-    spark|free) opencode_agent - "$brief_text" ;;
-    zai) opencode_agent ZHIPU_API_KEY "$brief_text" ;;
+    openrouter) opencode_agent_continuing OPENROUTER_API_KEY text "$brief_text" ;;
+    opencode-go) opencode_agent_continuing OPENCODE_API_KEY text "$brief_text" ;;
+    zen) opencode_agent_continuing - text "$brief_text" ;;
+    spark) opencode_agent_continuing - raw "$brief_text" ;;
+    free) opencode_agent_continuing - text "$brief_text" ;;
+    zai) opencode_agent_continuing ZHIPU_API_KEY text "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
-      opencode_agent CLOUDFLARE_API_KEY "$brief_text" ;;
+      opencode_agent_continuing CLOUDFLARE_API_KEY text "$brief_text" ;;
     anthropic) anthropic_agent "$brief_text" ;;
     agy) agy_agent "$brief_text" ;;
+    copilot) api_agent COPILOT_GITHUB_TOKEN copilot -p "$brief_text" --allow-all-tools ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
 }
@@ -1757,7 +2412,8 @@ lane_ready() {
     return
   fi
   case "$LANE" in
-    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai|spark|free) cli="$(opencode_bin)" ;;
+    codex) cli=codex ;; claude|anthropic) cli=claude ;; copilot) cli=copilot ;;
+    openrouter|opencode-go|zen|zai|workersai|spark|free) cli="$(opencode_bin)" ;;
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
@@ -1830,8 +2486,28 @@ CONFIGURED_MODELS="$(lane_setting MODELS)"
 if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
   HELD_REASON="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
   case "$HELD_REASON" in limit:*) ;; *) HELD_REASON="provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" ;; esac
-  heartbeat false "$HELD_REASON" "$LIMIT_UNTIL"
-  exit 0
+  # The provider's allowance refills while the lane sleeps, so the lane asks
+  # it again rather than waiting out the whole window (opencode-go,
+  # 2026-10-20: the lane sat idle for days while the provider served it).
+  if ! provider_limit_lifted; then
+    # The re-check may have found a reset of its own: the beat the group hold
+    # wrote says how long the lane waits now.
+    NEW_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+    [ -n "$NEW_UNTIL" ] && LIMIT_UNTIL="$NEW_UNTIL"
+    heartbeat false "$HELD_REASON" "$LIMIT_UNTIL"
+    exit 0
+  fi
+fi
+
+# A model-gone hold that has run out: the lane claims again only when the agent
+# CLI lists the model, else it holds another LIMIT_WAIT with no ticket round.
+if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -le "$(date +%s)" ]; then
+  GONE_MODEL="$(sed -nE 's/.*"reason": *"limit: model ([A-Za-z0-9._:\/@-]+) not found by the agent CLI.*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+  if [ -n "$GONE_MODEL" ] && ! model_listed "$GONE_MODEL"; then
+    GONE_UNTIL=$(( $(date +%s) + LIMIT_WAIT ))
+    heartbeat false "limit: model $GONE_MODEL not found by the agent CLI; lane waits until $(utc "$GONE_UNTIL")" "$GONE_UNTIL"
+    exit 0
+  fi
 fi
 
 AGENT_HOME="$LOOM_HOME/run/$SLOT-home"
@@ -1863,6 +2539,8 @@ fi
 
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
+  PR_BODY=""
+  DROPPED_SCRATCH_FILES=""
   TICKET="$(basename "$BRIEF" .md)"
   REPO="$(field Repo "$BRIEF")"
   BRANCH="$(field Branch "$BRIEF")"
@@ -1882,6 +2560,7 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   if [ -n "$LIMITED" ]; then park "$BRIEF" "limit: $LIMIT_WHY" limit; continue; fi
   if [ -n "$AUTH_HELD" ]; then park "$BRIEF" "$AUTH_WHY" auth; continue; fi
+  if ! lane_app_token; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
   # Briefs are input: the runner only ever pushes a loom-owned branch.
   if ! [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$BRANCH" =~ ^loom/[A-Za-z0-9._/-]+$ ]]; then
     park "$BRIEF" "brief needs Repo: owner/name and Branch: loom/..."; continue
@@ -1902,9 +2581,24 @@ for BRIEF in "$INBOX"/*.md; do
   # The model: the brief's Model: line, else the lane default. Passed to the
   # CLI explicitly so the PR names what actually ran.
   PINNED_MODEL="$(field Model "$BRIEF" || true)"
+  # LOOM_<LANE>_ONLY_MODEL (codex, agy): the model family a lane runs. A pin to
+  # another model the lane's provider serves is dropped, and the lane runs its
+  # own model or ladder. The operator's rule (2026-10-21) is codex on
+  # gpt-6-luna and agy on gemini-3.8-flash: gpt-6-sol and gemini-4-argon pins
+  # spent both weekly limits in a day. A model of another family is still
+  # refused below.
+  ONLY_MODEL="$(lane_setting ONLY_MODEL)"
+  if [ -n "$ONLY_MODEL" ] && [ -n "$PINNED_MODEL" ] && [[ "$PINNED_MODEL" != "$ONLY_MODEL"* ]]; then
+    case "$LANE:$PINNED_MODEL" in
+      codex:gpt-*|agy:gemini-*|agy:claude-*|agy:gpt-oss-*)
+        echo "[$(date -u +%FT%TZ)] $TICKET ignores the brief's Model: $PINNED_MODEL: lane $SLOT runs $ONLY_MODEL models only" >> "$LOG"
+        PINNED_MODEL="" ;;
+    esac
+  fi
   MODEL="$PINNED_MODEL"
   if [ -z "$MODEL" ]; then
     MODEL="$(lane_setting MODEL)"
+    [ -n "$MODEL" ] || { [ "$LANE" = copilot ] && MODEL="copilot-free"; }
     if [ -n "$CONFIGURED_MODELS" ]; then
       MODEL=""
       for candidate in $CONFIGURED_MODELS; do
@@ -1944,6 +2638,7 @@ for BRIEF in "$INBOX"/*.md; do
     zai:zai/glm-4.7-flash|zai:zai/glm-4.5-flash) ;;
     zai:*) park "$BRIEF" "zai lane runs the free Flash models only (zai/glm-4.7-flash, zai/glm-4.5-flash), not $MODEL"; continue ;;
     workersai:cloudflare-workers-ai/@cf/*) ;;
+    copilot:*) ;;
     spark:spark/?*) ;;
     spark:*) park "$BRIEF" "model $MODEL is not a spark model (spark/...)"; continue ;;
     free:free/?*) ;;
@@ -1967,16 +2662,20 @@ for BRIEF in "$INBOX"/*.md; do
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
     park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue
   fi
+  if ! REPO_PRIVATE="$(timeout "$NET_TIMEOUT" gh api "repos/$REPO" --jq .private)"; then
+    echo "$TICKET: gh api repos/$REPO failed; will retry next pass" >&2; continue
+  fi
+  case "$REPO_PRIVATE" in
+    true|false) ;;
+    *) echo "$TICKET: unexpected privacy answer '$REPO_PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
+  esac
   # Providers that train on prompts take public repos only. Asked before the
   # clone; a failed lookup proves nothing, so the brief waits for the next pass.
   if trains_on_prompts; then
-    if ! PRIVATE="$(timeout "$NET_TIMEOUT" gh api "repos/$REPO" --jq .private)"; then
-      echo "$TICKET: gh api repos/$REPO failed; will retry next pass" >&2; continue
-    fi
-    case "$PRIVATE" in
+    case "$REPO_PRIVATE" in
       false) ;;
       true) park "$BRIEF" "$REPO is private; lane $LANE with $MODEL trains on prompts and takes public repos only"; continue ;;
-      *) echo "$TICKET: unexpected privacy answer '$PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
+      *) echo "$TICKET: unexpected privacy answer '$REPO_PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
     esac
   fi
 
@@ -2014,7 +2713,8 @@ for BRIEF in "$INBOX"/*.md; do
 
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
-  rm -f "$LOGDIR/$TICKET.answered"
+  rm -f "$WORKDIR/$TICKET.described-step" "$WORKDIR/$TICKET.opencode-events"
+  rm -f "$LOGDIR/$TICKET.answered" "$LOGDIR/$TICKET.answered.tmp" "$LOGDIR/$TICKET.pushed"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
          { [ -n "$FIX_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
@@ -2046,6 +2746,7 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
     park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
   fi
+  resume_earlier_attempt
   LOG_START="$(wc -c < "$LOG" | tr -d ' ')"
 
   # The agent runs as a background job of a job-control subshell, which puts
@@ -2054,12 +2755,14 @@ for BRIEF in "$INBOX"/*.md; do
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
   ( set -m
-    (cd "$TREE" && run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
+    (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
+      run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
     wait $! ) &
   wait $!
   STATUS=$?
   is_api_lane && archive_transcripts
+  if ! lane_app_token; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
@@ -2082,22 +2785,34 @@ for BRIEF in "$INBOX"/*.md; do
   # The whole run output (from LOG_START), for the limit and credit patterns;
   # the short tail (its last five non-blank lines), kept for the reason shown
   # to people and for the auth/transient patterns (loom#934).
-  RUN_OUTPUT="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$')"
+  # The limit patterns read only what the provider said (provider_text).
+  RUN_OUTPUT="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$' | provider_text)"
   FAILURE_OUT="$(printf '%s\n' "$RUN_OUTPUT" | tail -n 5)"
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
+  fi
+  # A timeout after editing keeps its edits whatever the failure is classed as,
+  # and so does a run cut short by a limit, an expired key or a transient error
+  # (a free pool runs dry 20 minutes in): every park below names the branch.
+  # A work failure keeps nothing, so its next rung starts from the base.
+  TIMEDOUT_NOTE=""
+  if [ -n "$EDITED" ] && { [ "$STATUS" -eq 124 ] ||
+       { [ "$STATUS" -ne 0 ] && [ "$FAIL_CLASS" != work ]; }; }; then
+    TIMEDOUT_NOTE="; $(preserve_timedout)"
   fi
   if [ "$FAIL_CLASS" != transient ]; then
     transient_clear
   elif REST_UNTIL="$(transient_strike)"; then
     heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
-    park "$BRIEF" "agent exited $STATUS" transient
+    park "$BRIEF" "agent exited $STATUS$TIMEDOUT_NOTE" transient
     break
   fi
   if [ "$FAIL_CLASS" = limit ]; then
     # Unavailable before the brief is parked, so the station never sends
     # this lane the retry. The rest of the inbox waits for the reset.
-    if [[ "$(printf '%s' "$RUN_OUTPUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
+    LIMIT_REASON="provider limit reached"
+    [[ "$RUN_OUTPUT" =~ $MODEL_GONE_RE ]] && LIMIT_REASON="model $MODEL not found by the agent CLI"
+    if [ -n "$OUT_OF_CREDIT" ]; then
       LIMIT_REASON="out of credit"
       hold_shared_credit "$RETRY_AT"
       heartbeat false "limit: out of credit; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
@@ -2109,7 +2824,6 @@ for BRIEF in "$INBOX"/*.md; do
       done
       heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     elif [ -n "$CONFIGURED_MODELS" ]; then
-      LIMIT_REASON="provider limit reached"
       record_model_limit "$MODEL" "$RETRY_AT" "$LIMIT_REASON"
       WHY="$(ladder_reason "$CONFIGURED_MODELS")"
       MAX_UNTIL="$(awk 'BEGIN{m=0} {if ($2>m)m=$2} END{print m}' "$MODEL_LIMIT_FILE")"
@@ -2123,10 +2837,9 @@ for BRIEF in "$INBOX"/*.md; do
         heartbeat false "limit: all models limited: $WHY" "$MAX_UNTIL"
       fi
     else
-      LIMIT_REASON="provider limit reached"
       heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     fi
-    park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")" limit
+    park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")$TIMEDOUT_NOTE" limit
     break
   fi
   if [ "$FAIL_CLASS" = auth ]; then
@@ -2141,10 +2854,10 @@ for BRIEF in "$INBOX"/*.md; do
       hold_expired_key "$AUTH_WHY"
     fi
     ask_renew_key "$AUTH_WHY"
-    park "$BRIEF" "agent exited $STATUS: $AUTH_WHY" auth
+    park "$BRIEF" "agent exited $STATUS: $AUTH_WHY$TIMEDOUT_NOTE" auth
     break
   fi
-  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS" "$FAIL_CLASS"; continue; fi
+  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS$TIMEDOUT_NOTE" "$FAIL_CLASS"; continue; fi
   if [ "$DELIVERABLE" = verify ]; then
     # The station reads the result from the log folder and applies it; the
     # runner moves no label and opens no pull request.
@@ -2200,6 +2913,10 @@ for BRIEF in "$INBOX"/*.md; do
   else
     rm -f "$TREE/$SUMMARY_FILE"
   fi
+  SUBMODULE_EDITS="$(submodule_edits)"
+  if [ -n "$SUBMODULE_EDITS" ]; then
+    park "$BRIEF" "the change edits files inside submodule $SUBMODULE_EDITS, which a push of this repo does not carry; that repo needs the change first. nothing pushed"; continue
+  fi
   # During a merge the branch is already checked out, and the commit
   # completes the merge.
   if [ -n "$(safe_git status --porcelain)" ] || [ -n "$CONFLICTS" ]; then
@@ -2224,12 +2941,11 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "could not check out $BRANCH after the agent run" transient; continue
   fi
   COMMITTED=0
-  # A lane pull request never carries the files its agent wrote to probe
-  # the sandbox. Before validation, push and PR, the runner drops those
-  # files from the agent's commits and names each one in the run log (and,
-  # for a new PR, in the Intent section).
-  if ! drop_probe_files >> "$LOG" 2>&1; then
-    park "$BRIEF" "could not drop sandbox probe files" transient; continue
+  # Before validation, push and PR, drop sandbox probes and qualifying
+  # out-of-path scratch files from the agent's commits and name each one
+  # in the run log and pull request text.
+  if ! drop_agent_files >> "$LOG" 2>&1; then
+    park "$BRIEF" "could not drop agent scratch files" transient; continue
   fi
   if ! BRANCH_HEAD="$(safe_git rev-parse "$BRANCH" 2>> "$LOG")" || [ -z "$BRANCH_HEAD" ]; then
     park "$BRIEF" "could not read the lane branch after validation" transient; continue
@@ -2247,12 +2963,71 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "commit refused: it adds files outside the brief's paths: $(stray_list); nothing pushed"; continue
     fi
   fi
+  # A contract the lane adds or edits must read and pass under itself before
+  # anything is pushed (loom#1290).
+  if [ "$COMMITTED" -eq 1 ]; then
+    check_contract_change; CONTRACT_RC=$?
+    case "$CONTRACT_RC" in
+      0) ;;
+      1) park "$BRIEF" "commit refused: $CONTRACT_REFUSAL; nothing pushed"; continue ;;
+      *) park "$BRIEF" "could not check the committed validation contract: $CONTRACT_REFUSAL" transient; continue ;;
+    esac
+  fi
   # An agent's exit code is not evidence: only a passing check on the
   # committed head hands the work on.
   if [ -n "$HAS_CONTRACT" ] && ! final_validation; then
     HANDOFF="no pull request opened"
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
+  fi
+  if [ "$REPO_PRIVATE" = false ]; then
+    if [ ! -f "$LEAK_SCANNER" ]; then
+      park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed" transient
+      continue
+    fi
+    # A fix round that merged the default branch scans what the pull request
+    # adds to it: BASE..HEAD would hold all the default branch gained since,
+    # text that branch's own CI accepts and the scan of a lane's change flags.
+    SCAN_RANGE="$BASE..HEAD"
+    [ -n "$FIX_UPSTREAM" ] && SCAN_RANGE="$FIX_UPSTREAM...HEAD"
+    # The repo's own issue refs (OWNER/NAME#N and NAME#N in code or tests)
+    # name nothing private; the scanner exempts exactly this repo for them.
+    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$SCAN_RANGE" --allow-repo-ref "$REPO" 2>&1)"; then
+      park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
+      continue
+    fi
+    printf '%s\n' "$LEAK_OUT" >> "$LOG"
+    if [ -z "$FIX_PR" ]; then
+      INTENT_CLASS=""
+      INTENT_TEXT=""
+      prepare_intent "$BRIEF" >> "$LOG" 2>&1
+      if [ -n "$DROPPED_FILES" ]; then
+        INTENT_TEXT="${INTENT_TEXT}
+- Dropped sandbox probe files: ${DROPPED_FILES//$'\n'/, }"
+      fi
+      if [ -n "$DROPPED_SCRATCH_FILES" ]; then
+        INTENT_TEXT="${INTENT_TEXT}
+- Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+      fi
+      PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+      PR_BODY="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
+        'import sys; from bus.factory import SCAN_REF_RE; owner, name = sys.argv[1].lower().split("/", 1); f = lambda m: m.group(0) if m.group(2).lower() == name and (m.group(1) or owner).lower() == owner else "issue %s of another repo" % m.group(3); print("\n".join(SCAN_REF_RE.sub(f, x) for x in sys.stdin.read().splitlines()))' "$REPO")" || {
+        park "$BRIEF" "could not prepare public repo PR text; nothing pushed" transient; continue
+      }
+      BODY_FILE="$(mktemp "$LOOM_HOME/run/$SLOT-leak-body.XXXXXX")"
+      # The body cites its own repo's tickets ("Refs OWNER/NAME#N", and NAME#N
+      # from the ticket text), which name nothing private. An OWNER/NAME
+      # --allow-repo-ref exempts exactly those two forms, as for the diff:
+      # rewriting only OWNER/NAME#N to #N left NAME#N flagged (2026-10-21).
+      printf '%s\n' "$PR_BODY" > "$BODY_FILE"
+      if ! LEAK_OUT="$(timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$BODY_FILE" --allow-repo-ref "$REPO" 2>&1)"; then
+        rm -f "$BODY_FILE"
+        park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $LEAK_OUT"
+        continue
+      fi
+      rm -f "$BODY_FILE"
+      printf '%s\n' "$LEAK_OUT" >> "$LOG"
+    fi
   fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
@@ -2297,14 +3072,23 @@ for BRIEF in "$INBOX"/*.md; do
     # model rightly finding their one finding no longer held.
     if ! no_change_reason; then
       [ -z "$NO_CHANGE_WHY" ] || { park "$BRIEF" "agent made no commit and its reason was refused: $NO_CHANGE_WHY"; continue; }
+      if [ -f "$WORKDIR/$TICKET.described-step" ]; then
+        park "$BRIEF" "ended on a described step without taking it"; continue
+      fi
+      final_said
+      if [ -n "$FINAL_SAID" ]; then
+        park "$BRIEF" "agent made no commit; it said: $FINAL_SAID (on $BRANCH)"; continue
+      fi
       park "$BRIEF" "$NO_REASON on $BRANCH"; continue
     fi
     if [[ ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
       park "$BRIEF" "agent made no commit and its reason has no ticket number to go on"; continue
     fi
-    if ! WHY="$(post_no_change)"; then park "$BRIEF" "$WHY" transient; continue; fi
+    if ! WHY="$(post_no_change)"; then
+      rm -f "$LOGDIR/$TICKET.answered.tmp"; park "$BRIEF" "$WHY" transient; continue
+    fi
     # The station reads this marker, not the log, which carries agent output.
-    : > "$LOGDIR/$TICKET.answered"
+    mv "$LOGDIR/$TICKET.answered.tmp" "$LOGDIR/$TICKET.answered"
     echo "[$(date -u +%FT%TZ)] $TICKET done, answered: nothing to change" >> "$LOG"
     mv "$BRIEF" "$INBOX/done/"
     continue
@@ -2322,21 +3106,54 @@ for BRIEF in "$INBOX"/*.md; do
           park "$BRIEF" "branch moved: $BRANCH is at ${NOW_HEAD:0:12} on the remote, not ${BASE:0:12} as when the run started"; continue
         fi
       fi
+      # GitHub refuses an App's push that touches .github/workflows unless
+      # the App holds the workflows permission. No lane or model can change
+      # that: retried as [transient], five runs climbed to claude on it
+      # (2026-10-21). The ticket keeps its rung until the incident closes.
+      # shellcheck disable=SC2016 # GitHub's literal backquotes
+      if REFUSED="$(printf '%s\n' "$PUSH_OUT" | grep -m1 'without `workflows` permission')"; then
+        PUSH_REASON="push refused: the GitHub App has no workflows permission"
+        # The agent names the workflow file, so only a path-safe, capped
+        # copy of it reaches the public incident, never a mention or Markdown.
+        REFUSED="$(printf '%s' "$REFUSED" | sed -n 's/.*workflow `\([^`]*\)`.*/\1/p' | tr -cd 'A-Za-z0-9._/-' | cut -c1-120)"
+        note_factory_incident workflows-permission "The push of $BRANCH was refused: it changes \`${REFUSED:-a workflow file}\`, and the lanes' GitHub App has no workflows permission.
+
+Grant the lanes' GitHub App the workflows permission (read and write), or land the workflow change from an operator session, then close this issue. Its held tickets return to the queue when it closes." PUSH_REASON
+        park "$BRIEF" "$PUSH_REASON" "$PARK_CLASS"; continue
+      fi
       park "$BRIEF" "push failed" transient; continue
     fi
     [ -z "$PUSH_OUT" ] || printf '%s\n' "$PUSH_OUT" >> "$LOG"
+    # The station reads this marker, not the log, to say the round pushed.
+    : > "$LOGDIR/$TICKET.pushed"
   fi
   if [ -n "$FIX_PR" ]; then
     post_replies
     ITEMS="$(fix_items "$BRIEF")"
     if [ "$COMMITTED" -eq 1 ]; then
-      COMMENT="Lane $SLOT pushed fixes for: ${ITEMS:-the findings on the ticket}"
+      # 2026-10-20: "pushed fixes for: the findings on the ticket" told the
+      # reader nothing; the comment says what went up and what happens next.
+      PUSHED="$(safe_git rev-list --count "$BASE..HEAD" 2>> "$LOG")"
+      CHECKED="CI and review run again on the new head; the factory lands the pull request once they pass."
+      [ -n "$VALIDATED" ] && CHECKED="The repo's check passed at ${VALIDATED##* }. $CHECKED"
+      COMMENT="Lane $SLOT ($MODEL) pushed ${PUSHED:-the} commit$([ "$PUSHED" = 1 ] || echo s) for: ${ITEMS:-the fix round on the ticket}
+
+$(pushed_commits)
+
+$CHECKED"
     elif [ "$METADATA_CHANGED" -eq 0 ]; then
       COMMENT="Lane $SLOT answered the review threads for: ${ITEMS:-the findings on the ticket}"
     else
       COMMENT="Lane $SLOT repaired the PR text for: ${ITEMS:-the findings on the ticket}"
     fi
-    if ! timeout "$NET_TIMEOUT" gh pr comment "$FIX_PR" -R "$REPO" --body "$COMMENT" >> "$LOG" 2>&1; then
+    if [ -n "$DROPPED_SCRATCH_FILES" ]; then
+      COMMENT="$COMMENT
+
+Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+    fi
+    # One comment per pull request, edited each round; the push and the body
+    # edit are already on the pull request's timeline.
+    if ! printf '%s' "$COMMENT" | upsert_sticky_comment "$REPO" "$FIX_PR" "$ROUND_MARKER" rounds; then
       echo "[$(date -u +%FT%TZ)] $TICKET: fixes are pushed but the comment on #$FIX_PR failed" >> "$LOG"
     fi
     if [ "$COMMITTED" -eq 1 ]; then
@@ -2349,17 +3166,18 @@ for BRIEF in "$INBOX"/*.md; do
     mv "$BRIEF" "$INBOX/done/"
     continue
   fi
-  INTENT_CLASS=""
-  INTENT_TEXT=""
-  prepare_intent "$BRIEF" >> "$LOG" 2>&1
-  # Name every sandbox probe file the runner dropped, per the ticket.
-  if [ -n "$DROPPED_FILES" ]; then
-    INTENT_TEXT="${INTENT_TEXT}
-- Dropped sandbox probe files: ${DROPPED_FILES//$'\n'/, }"
+  if [ "$REPO_PRIVATE" = true ]; then
+    INTENT_CLASS=""
+    INTENT_TEXT=""
+    prepare_intent "$BRIEF" >> "$LOG" 2>&1
+    if [ -n "$DROPPED_SCRATCH_FILES" ]; then
+      INTENT_TEXT="${INTENT_TEXT}
+- Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+    fi
   fi
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
-  PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+  [ -n "${PR_BODY:-}" ] || PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
   # Briefs are checked when filed, so this only fires on a brief filed
   # before that check or edited by hand: the PR still opens (the work is
   # done), and the log names what the review bot will hold it for.

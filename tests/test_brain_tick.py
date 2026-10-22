@@ -25,6 +25,17 @@ if [ "$2" = bus.brain_memory ]; then
   printf '%s\\n' "${FAKE_PACKET:-}"
   exit "${FAKE_PACKET_EXIT:-0}"
 fi
+if [ "$3 $4" = "app token" ]; then
+  # FAKE_APP_TOKEN: the Brain App's installation token; unset, minting fails.
+  [ -n "${FAKE_APP_TOKEN:-}" ] || { echo "no App key" >&2; exit 2; }
+  printf '%s\\n' "$FAKE_APP_TOKEN"
+  exit 0
+fi
+if [ "$3 $4" = "app login" ]; then
+  [ -n "${FAKE_APP_LOGIN:-}" ] || { echo "no App key" >&2; exit 2; }
+  printf '%s\\n' "$FAKE_APP_LOGIN"
+  exit 0
+fi
 if [ "$3" = lock ]; then
   # FAKE_LOCK_FREE_AFTER=n: the lock is held for the first n tries.
   if [ -n "${FAKE_LOCK_FREE_AFTER:-}" ]; then
@@ -54,6 +65,7 @@ FAKE_LOG=@LOG@
 printf 'opencode %s\\n' "$*" >> "$FAKE_LOG"
 printf 'opencode env GH_TOKEN=%s GITHUB_TOKEN=%s LOOM_REPOS=%s HOME=%s\\n' \\
   "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" "${LOOM_REPOS:-}" "$HOME" >> "$FAKE_LOG"
+printf 'opencode login %s\\n' "${LOOM_GITHUB_LOGIN:-none}" >> "$FAKE_LOG"
 printf 'opencode cwd %s\\n' "$PWD" >> "$FAKE_LOG"
 env | grep -E '^(LOOM_|SSL_CERT_FILE=)' | sed 's/^/opencode setting /' >> "$FAKE_LOG"
 exit "${FAKE_OPENCODE_EXIT:-0}"
@@ -340,6 +352,25 @@ class BrainTickTest(unittest.TestCase):
         self.assertEqual([], self.agent_calls(calls, "claude"))
         self.assertEqual(1, len(self.agent_calls(calls, "codex")))
 
+    def test_a_lane_mid_run_keeps_its_usage_though_its_heartbeat_aged(self):
+        # A runner writes its heartbeat between runs, not during one: at 11:04Z
+        # on 2026-10-21 the claude lane was 30 minutes into a run and the spark
+        # lane 40, so the tick skipped with "no brain lane has usage".
+        self.usage("claude", True, age=1800)
+        lock = self.home / "run" / "claude.lock"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text("%d\n" % os.getpid())
+        _, calls = self.tick()
+        self.assertEqual(1, len(self.agent_calls(calls, "claude")))
+
+    def test_a_dead_runners_lock_does_not_keep_an_aged_heartbeat(self):
+        self.usage("claude", True, age=1800)
+        lock = self.home / "run" / "claude.lock"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text("999999\n")
+        _, calls = self.tick()
+        self.assertEqual([], self.agent_calls(calls, "claude"))
+
     def test_a_limit_failure_moves_the_tick_to_the_next_rung_once(self):
         for lane in ("codex", "spark"):
             self.usage(lane, True)
@@ -427,6 +458,48 @@ class BrainTickTest(unittest.TestCase):
                       "LOOM_REPOS=example/project HOME=%s/run/brain-home" % self.home, calls)
         last, _ = self.beat()
         self.assertEqual(("ok", "spark", "spark/coder"), (last["outcome"], last["lane"], last["model"]))
+
+    def test_with_its_app_settings_the_tick_writes_as_the_brain_app_not_the_operator(self):
+        # loom#1142: the brain's rungs used the operator's own GitHub token.
+        self.usage("claude", False, "limit: provider limit reached")
+        self.usage("spark", True)
+        run, calls = self.tick(LOOM_SPARK_MODEL="spark/coder",
+                               LOOM_SPARK_URL="http://spark.invalid:8000/v1",
+                               LOOM_GITHUB_APP_ID="123", FAKE_APP_TOKEN="ghs_brain.tok-en",
+                               GITHUB_TOKEN="ghp_personal")
+        self.assertEqual(0, run.returncode)
+        self.assertIn("opencode env GH_TOKEN=ghs_brain.tok-en GITHUB_TOKEN=ghs_brain.tok-en "
+                      "LOOM_REPOS=example/project HOME=%s/run/brain-home" % self.home, calls)
+        self.assertNotIn("gh auth token", calls)
+
+    def test_the_brains_agent_is_told_its_app_login(self):
+        # GET /user refuses an installation token, so the agent's journal
+        # needs the App's login handed to it (2026-10-21).
+        self.usage("claude", False, "limit: provider limit reached")
+        self.usage("spark", True)
+        _, calls = self.tick(LOOM_SPARK_MODEL="spark/coder",
+                             LOOM_SPARK_URL="http://spark.invalid:8000/v1",
+                             LOOM_GITHUB_APP_ID="123", FAKE_APP_TOKEN="ghs_brain.tok-en",
+                             FAKE_APP_LOGIN="loom-brain[bot]")
+        self.assertIn("opencode login loom-brain[bot]", calls)
+
+    def test_a_tick_whose_app_token_cannot_be_minted_runs_no_rung(self):
+        self.usage("codex", True)
+        run, calls = self.tick(LOOM_BRAIN_LADDER="codex claude", LOOM_GITHUB_APP_ID="123",
+                               GITHUB_TOKEN="ghp_personal")
+        self.assertEqual([], self.agent_calls(calls, "codex") + self.agent_calls(calls, "claude"))
+        self.assertTrue(any(" unlock " in c for c in calls), calls)
+        last, ok = self.beat()
+        self.assertEqual("failed", last["outcome"])
+        self.assertFalse(ok)
+
+    def test_a_tick_longer_than_its_app_token_lasts_runs_no_rung(self):
+        # An installation token lasts an hour; a 58-minute tick would outlive it.
+        self.usage("codex", True)
+        run, calls = self.tick(LOOM_BRAIN_LADDER="codex claude", LOOM_GITHUB_APP_ID="123",
+                               FAKE_APP_TOKEN="ghs_brain.tok-en", LOOM_BRAIN_MINUTES="58")
+        self.assertEqual([], self.agent_calls(calls, "codex") + self.agent_calls(calls, "claude"))
+        self.assertNotEqual(0, run.returncode)
 
     def spark_tick(self, **env):
         self.usage("claude", False, "limit: provider limit reached")

@@ -1,10 +1,12 @@
 """The journal and report comment formats from docs/BRAIN.md."""
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
 
+from . import notify as _notify
 from . import text as _text
 from .github import GitHub
 from .handoff import (EARLIER_CLOSE, EARLIER_OPEN, JOURNAL_MARKER as _MARKER, _TICK,
@@ -123,14 +125,47 @@ def with_tick(text: str, holder: Optional[str], now: Optional[datetime] = None) 
         if holder is not None and found.group(1) != holder:
             raise ValueError("the journal's Tick line names %s, not %s" % (found.group(1), holder))
         return text
+    rest = text[len(JOURNAL_MARKER):].lstrip("\r\n")
+    loose = _LOOSE_TICK.match(rest)
+    if loose:
+        # A tick header the brain wrote by hand ("Tick 2026-10-20 23:07Z,
+        # muse") is replaced, never stacked under the canonical line
+        # (loom#1241: a project issue, 2026-10-20 23:12Z).
+        named = loose.group(1)
+        if named and holder is not None and named != holder:
+            raise ValueError("the journal's Tick line names %s, not %s" % (named, holder))
+        holder = holder if holder is not None else named
+        rest = rest[loose.end():].lstrip("\r\n")
     if holder is None:
         raise ValueError("a journal needs the line \"Tick <UTC time>, <holder>\" after the "
                          "marker, or pass --holder to add it (docs/BRAIN.md)")
     if not re.fullmatch(r"[A-Za-z0-9._-]+", holder):
         raise ValueError("holder must be letters, digits, dot, dash or underscore")
-    rest = text[len(JOURNAL_MARKER):].lstrip("\r\n")
     tick = "Tick %s, %s" % (_when(now or datetime.now(timezone.utc)), holder)
     return "%s\n%s\n%s" % (JOURNAL_MARKER, tick, rest)
+
+
+# A first line that reads as a tick header but is not the canonical one:
+# "Tick" and a time with a space in it, or no holder. Group 1 is the holder
+# it names. Prose that only starts with the word ("Tick evidence: ...") is
+# not a header.
+_LOOSE_TICK = re.compile(r"Tick[ \t]+\d[^\n]*?(?:,[ \t]*([A-Za-z0-9._-]+))?[ \t]*(?:\r?\n|$)")
+
+
+def as_journal(text: str, holder: Optional[str]) -> str:
+    """`text` as a journal tick: a loom journal, report or reply comes back
+    unchanged; plain prose gets the journal marker, so tick evidence edits
+    the holder's journal of the day instead of becoming one more comment
+    that emails the issue's watchers (loom#1241). Plain
+    prose needs a holder, and any other HTML-comment marker is refused."""
+    if text.startswith((JOURNAL_MARKER, REPORT_MARKER)) or REPLY_RE.match(text):
+        return text
+    if text.lstrip().startswith("<!--"):
+        raise ValueError("comment must start with a loom journal, report or reply marker")
+    if holder is None:
+        raise ValueError("a comment with no loom marker is posted as a journal tick, which "
+                         "needs --holder for its Tick line (docs/BRAIN.md)")
+    return "%s\n%s" % (JOURNAL_MARKER, text.lstrip("\r\n"))
 
 
 def _check_report_gap(gh: GitHub, repo: str, issue_number: int, now: datetime,
@@ -167,9 +202,11 @@ def merged(new: str, old: str, limit: int = JOURNAL_MAX) -> str:
 
 
 def _self_login(gh: GitHub) -> str:
-    """The login this client posts as: the App's bot login, else the token's
-    user (read once and kept on the client)."""
-    login = gh.app_login()
+    """The login this client posts as: the App's bot login, else
+    LOOM_GITHUB_LOGIN (brain.sh sets it for an agent that holds only an
+    installation token, which GET /user refuses), else the token's user (read
+    once and kept on the client)."""
+    login = gh.app_login() or os.environ.get("LOOM_GITHUB_LOGIN", "").strip()
     if login:
         return login
     if getattr(gh, "_journal_login", None) is None:
@@ -215,11 +252,11 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
     """Post a journal, report or reply. A journal edits this holder's journal
     of the same UTC day in place, newest tick first, and is posted new only
     for the day's first tick: each new comment emails the operator
-    (2026-10-18). A report is refused with ReportTooSoon, and nothing posted,
-    when another report went out on the same goal home within REPORT_GAP
-    (report_hold says whose count)."""
-    if not (text.startswith((JOURNAL_MARKER, REPORT_MARKER)) or REPLY_RE.match(text)):
-        raise ValueError("comment must start with a loom journal, report or reply marker")
+    (2026-10-18). Plain prose with a holder is a journal tick (as_journal).
+    A report is refused with ReportTooSoon, and nothing posted, when another
+    report went out on the same goal home within REPORT_GAP (report_hold
+    says whose count)."""
+    text = as_journal(text, holder)
     if text.startswith(JOURNAL_MARKER):
         text = with_tick(text, holder)
         _text.check(text)
@@ -232,5 +269,4 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
     _text.check(text)
     if text.startswith(REPORT_MARKER):
         _check_report_gap(gh, repo, issue_number, now or datetime.now(timezone.utc), trusted)
-    return gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(issue_number)),
-                   {"body": text})
+    return _notify.post(gh, repo, issue_number, text, _notify.JOURNAL)

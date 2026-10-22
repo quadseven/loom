@@ -25,19 +25,31 @@ Template: `.github/ISSUE_TEMPLATE/ticket.md`.
 Each lane polls its inbox in `briefs/<lane>/`, does the work in a fresh
 worktree, and opens a PR. Lanes never merge.
 
-`lanes/run_lane.sh` runs these lanes:
+`lanes/run_lane.sh` runs these lanes (the arms of its `run_agent()`; a
+slot such as anthropic-2 runs its lane's agent):
 
-- `codex/` - scoped implementation, CI repairs, and review passes.
-- `claude/` - deep root-cause work and hard refactors.
-- `openrouter/` - free models via opencode.
-- `opencode-go/` - subscription models via opencode.
-- `anthropic/` - API-credit models via the official Claude Code CLI.
-- `zen/` - OpenCode Zen free models via opencode; public repos only.
-- `zai/` - Z.ai free GLM Flash models via opencode; public repos only.
+- `codex` - scoped implementation, CI repairs, and review passes.
+- `claude` - deep root-cause work and hard refactors.
+- `anthropic` - API-credit models via the official Claude Code CLI.
+- `agy` - Google's Antigravity CLI on the operator's Google plan, run as a
+  separate macOS user.
+- `openrouter` - free models via opencode.
+- `opencode-go` - subscription models via opencode.
+- `zen` - OpenCode Zen free models via opencode; public repos only.
+- `copilot` - GitHub Copilot Free CLI with a scoped token; public repos only.
+- `zai` - Z.ai free GLM Flash models via opencode; public repos only.
+- `workersai` - Cloudflare Workers AI models via opencode, within the
+  account's free daily allowance.
+- `spark` - a self-hosted vLLM coder via opencode, one stream at a time.
+- `free` - one free OpenAI-compatible provider per slot (free-kilo,
+  free-groq, ...) via opencode, sharing the spark lane's endpoint handling.
 
 API-lane agents run sandboxed without credentials; the runner pushes the
-branch and opens the PR. The `sparks/` lane is deferred until the Sparks
-overhaul.
+branch and opens the PR. The directories under `lanes/` are support, not
+lanes: `agy/` holds the agy lane's settings, `opencode/` the opencode
+config, `sparks/` the workshop's test-farm scripts (compute, not a model
+lane), `mac/` the launchd ticks, and `evidence/` and `viewer/` the evidence
+and transcript servers.
 
 Lane contracts: `docs/LANES.md`.
 

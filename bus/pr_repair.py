@@ -86,12 +86,74 @@ def _brief_title(brief: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _render_generated(brief: str, lane: str, model: str, ticket: str) -> str:
+_CRITERION = re.compile(r"^- \[([ xX])\] (.*?)(?:; not built: (.*))?$")
+# A lane's "not built" reason goes into a public pull request body that no
+# leak scan reads on a fix round, so only plain words and punctuation pass:
+# no digits, so no address, version, token or issue number (security review).
+_REASON = re.compile(r"[A-Za-z ,.'()-]{1,200}")
+
+
+def _criteria_text(section: str) -> list:
+    """The criteria of a checklist without their ticks and not-built
+    reasons, to tell whether two checklists name the same criteria."""
+    return [m.group(2).strip() if m else line.strip()
+            for line in section.split("\n") if line.strip()
+            for m in [_CRITERION.match(line.strip())]]
+
+
+def _lane_ticks(ticket: str, lane: str) -> str:
+    """The ticket's checklist with the lane's tick, or its plain-worded
+    "not built" reason, on each criterion the lane names word for word;
+    any other lane line is ignored, so the lane can tick but never rewrite
+    what the ticket asks or add text a public body must not carry."""
+    marks = {}
+    for line in lane.split("\n"):
+        m = _CRITERION.match(line.strip())
+        if not m:
+            continue
+        reason = (m.group(3) or "").strip()
+        if reason and not _REASON.fullmatch(reason):
+            continue
+        marks[m.group(2).strip()] = (m.group(1).lower() == "x", reason)
+    out = []
+    for line in ticket.split("\n"):
+        m = _CRITERION.match(line.strip())
+        mark = marks.get(m.group(2).strip()) if m else None
+        if not mark:
+            out.append(line)
+            continue
+        ticked, reason = mark
+        out.append("- [%s] %s%s" % ("x" if ticked else " ", m.group(2).strip(),
+                                    "; not built: %s" % reason if reason and not ticked else ""))
+    return "\n".join(out)
+
+
+def _checklist(brief: str, current_body: str, summary: str) -> str:
+    """The body's acceptance checklist: the ticket's, with the lane's ticks
+    from its summary when it wrote any, else the pull request's own when it
+    names the ticket's criteria (so a round keeps earlier ticks). Rendering
+    the ticket's every round dropped every tick a lane made (2026-10-20)."""
+    ticket = _brief_section(brief, "Acceptance criteria")
+    lane = _brief_section(summary, "Acceptance criteria") if summary else ""
+    if lane:
+        return _lane_ticks(ticket, lane)
+    # The body's section runs on to its Size: line; its checklist is the
+    # "- [" lines.
+    current = "\n".join(line for line in _brief_section(current_body, "Acceptance criteria")
+                         .split("\n") if line.startswith("- ["))
+    if current and _criteria_text(current) == _criteria_text(ticket):
+        return _lane_ticks(ticket, current)
+    return ticket
+
+
+def _render_generated(brief: str, lane: str, model: str, ticket: str,
+                      acceptance: Optional[str] = None) -> str:
     """Render the generated sections the way lanes/run_lane.sh::pr_body does."""
     _check_footer_fields(ticket, lane, model)
     why = _brief_section(brief, "Why")
     summary = _brief_section(brief, "What")
-    acceptance = _brief_section(brief, "Acceptance criteria")
+    if acceptance is None:
+        acceptance = _brief_section(brief, "Acceptance criteria")
     size = _brief_size(brief)
     out_of_scope = _brief_section(brief, "Out of scope")
     issue = _field(brief, "Issue")
@@ -157,7 +219,8 @@ def _split_current(body: str) -> Tuple[str, str, str]:
 
 
 def reconcile(brief_path: str, current_title: str, current_body: str,
-              lane: str, model: str, ticket: str) -> Dict[str, object]:
+              lane: str, model: str, ticket: str,
+              summary_path: Optional[str] = None) -> Dict[str, object]:
     """Return new title/body and hashes, or a reason why it cannot be done.
 
     The returned dict has keys:
@@ -184,8 +247,18 @@ def reconcile(brief_path: str, current_title: str, current_body: str,
         result["reason"] = "cannot read brief: %s" % err
         return result
 
+    summary = ""
+    if summary_path:
+        try:
+            with open(summary_path, encoding="utf-8") as fh:
+                summary = _normalise(fh.read())
+        except OSError:
+            summary = ""
+
     try:
-        desired_generated = _render_generated(brief, lane, model, ticket)
+        desired_generated = _render_generated(
+            brief, lane, model, ticket,
+            _checklist(brief, _normalise(current_body), summary))
         new_hash = _sha12(_normalise(desired_generated))
         result["new_hash"] = new_hash
         old_hash = _hash_generated(current_body)
@@ -248,7 +321,7 @@ def _gh_pr_view(repo: str, number: int) -> Dict[str, object]:
 
 def _gh_pr_edit(repo: str, number: int, title: str, body: str) -> None:
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as fh:
-        fh.write(body)
+        fh.write(text.scrub_mentions(body))
         body_file = fh.name
     try:
         out = subprocess.run(
@@ -274,6 +347,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("lane", help="lane name")
     parser.add_argument("model", help="model id")
     parser.add_argument("ticket", help="ticket id used in the PR footer")
+    parser.add_argument("--summary",
+                        help="the lane's Intent summary, whose ## Acceptance criteria "
+                             "checklist goes in the body")
     args = parser.parse_args(argv)
 
     if args.apply and not args.repo:
@@ -299,7 +375,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     current_body = str(pr.get("body") or "")
 
     result = reconcile(args.brief, current_title, current_body,
-                       args.lane, args.model, args.ticket)
+                       args.lane, args.model, args.ticket, args.summary)
 
     if not args.apply:
         print(json.dumps(result))

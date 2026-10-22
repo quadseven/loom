@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import quote
 from urllib.parse import urlsplit
 
-from . import brain, health
+from . import brain, health, notify
 from .github import GitHub
 
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
@@ -17,6 +17,13 @@ SHA = re.compile(r"[0-9a-f]{40}\Z")
 KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 BLOCK = re.compile(r"(?ms)^```loom-roll-pins\s*\n(.*?)\n```\s*$")
 MARKER = "<!-- loom:roll-pin "
+# A goal home whose body names a roll ("roll" or "rolls", not "rolling" or
+# "rollback") ships through one, so it needs a roll ship document.
+ROLL_WORD = re.compile(r"(?i)\brolls?\b")
+
+
+def ships_by_roll(body: str) -> bool:
+    return bool(ROLL_WORD.search(body))
 
 
 def specs_from_env(raw: str) -> list[dict[str, str]]:
@@ -214,7 +221,7 @@ def _journal_build(gh: GitHub, goal: str, deploy: str, pr: dict[str, Any],
         return
     body = ("<!-- loom:journal v1 -->\n%s\nSource-pin pull request %s for module revision `%s` started build run %s."
             % (marker, pr["html_url"], revision, found["html_url"]))
-    gh.rest("POST", "/repos/%s/issues/%s/comments" % (goal_repo, number), {"body": body})
+    notify.post(gh, goal_repo, number, body, notify.JOURNAL)
 
 
 def _post_build(gh: GitHub, goal: str, deploy: str, pr: dict[str, Any], branch: str,
@@ -381,7 +388,7 @@ def _gate_alert(gh: GitHub, goal: str, deploy: str, pr: dict[str, Any]) -> None:
     body = ("<!-- loom:journal v1 -->\n%s\nFamily gate is open; source-pin pull "
             "request %s#%d needs a brain merge review. Its merge checks or review "
             "rules did not pass." % (marker, deploy, int(pr["number"])))
-    gh.rest("POST", path, {"body": body})
+    notify.post(gh, repo, number, body, notify.JOURNAL)
 
 
 def run(gh: GitHub, documents: list[dict[str, str]],

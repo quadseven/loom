@@ -5,13 +5,13 @@ import sys
 import tempfile
 import threading
 import unittest
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from lanes.evidence.serve import _capped_payload, _safe_items, make_handler
 from tests import sandbox_caps
+from tests.local_http import LocalHTTPServer
 
 
 class EvidenceTextSafetyTest(unittest.TestCase):
@@ -52,7 +52,7 @@ class EvidenceEndpointTest(unittest.TestCase):
             }},
         }
         handler = make_handler(self.config, "test-bearer", logging.getLogger("evidence-test"))
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.server = LocalHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = "http://127.0.0.1:%d" % self.server.server_port
@@ -116,7 +116,7 @@ class EvidenceEndpointTest(unittest.TestCase):
         calls = []
         handler = make_handler(self.config, "test-bearer", logging.getLogger("evidence-audit"),
                                audit_logger=lambda *args: calls.append(args))
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server = LocalHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:

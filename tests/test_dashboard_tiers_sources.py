@@ -8,13 +8,14 @@ import sys
 import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dashboard import tiers_sources  # noqa: E402
 from tests import sandbox_caps  # noqa: E402
+from tests.local_http import LocalHTTPServer  # noqa: E402
 
 STATS = {"window": "24h", "generated_at": 1792421800,
          "ledger": {"enabled": True, "queued": 0, "written": 9, "dropped": 0,
@@ -59,7 +60,7 @@ class Upstream:
             def log_message(self, fmt, *args):
                 pass
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server = LocalHTTPServer(("127.0.0.1", 0), Handler)
         self.base = "http://127.0.0.1:%d" % self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         self.thread.start()

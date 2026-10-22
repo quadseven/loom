@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, invariants, metrics, station  # noqa: E402
 from bus.github import GitHubError, Response  # noqa: E402
-from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run, SilentRun  # noqa: E402
+from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run, SilentRun, Wait  # noqa: E402
 
 REPO = "example-owner/factory"
 OTHER = "example-owner/hidden"
@@ -120,13 +120,21 @@ class FakeGH:
         if m and method == "PATCH":
             self.issues[int(m.group(1))].update(body)
             return Response(200, {})
+        m = re.fullmatch(r"/repos/[^/]+/[^/]+/issues/comments/(\d+)", path)
+        if method == "PATCH" and m:
+            for notes in self.comments.values():
+                for note in notes:
+                    if note.get("id") == int(m.group(1)):
+                        note["body"] = body["body"]
+            return Response(200, {})
         if method == "POST" and path.endswith("/comments"):
             m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/comments", path)
             if m:
+                self.next_comment = getattr(self, "next_comment", 500) + 1
                 self.comments.setdefault((m.group(1), int(m.group(2))), []).append(
-                    {"body": body["body"], "created_at": stamp(T0 + 10),
+                    {"id": self.next_comment, "body": body["body"], "created_at": stamp(T0 + 10),
                      "user": {"login": AUTHOR}})
-            return Response(201, {"id": 1})
+            return Response(201, {"id": getattr(self, "next_comment", 1)})
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls\?state=open&per_page=100", path)
         if m:
             return Response(200, self.pulls.get(m.group(1), []))
@@ -403,10 +411,10 @@ class StationTest(StationBase):
                 {"lane": lane, "at": at, "available": False,
                  "reason": "limit: out of credit; unavailable until %s" % stamp(at + DAY_S)}))
 
-    def queued_ticket(self, number, *labels, author=AUTHOR):
+    def queued_ticket(self, number, *labels, author=AUTHOR, difficulty="hard"):
         self.gh.tickets.setdefault(REPO, []).append(
             {"number": number, "state": "open", "user": {"login": author},
-             "body": "Difficulty: hard\n\n## Why\nx\n",
+             "body": "Difficulty: %s\n\n## Why\nx\n" % difficulty,
              "labels": [{"name": n} for n in ("loom:ticket",) + labels]})
 
     def held_out_of_credit(self):
@@ -419,8 +427,10 @@ class StationTest(StationBase):
 
     def test_an_out_of_credit_lane_held_while_its_tier_waits_files_by_default(self):
         self.held_out_of_credit()
-        self.assertEqual(sorted(b["title"].split(" held")[0] for b in self.breaches()),
-                         ["Lane anthropic", "Lane anthropic-2"])
+        (filed,) = self.breaches()
+        self.assertIn("2 lanes held by a limit", filed["title"])
+        for lane in ("anthropic", "anthropic-2"):
+            self.assertIn("- %s: held by a limit since" % lane, filed["body"])
 
     def test_no_topup_skips_lanes_held_out_of_credit_on_that_account(self):
         self.settings.no_topup = ["anthropic"]
@@ -438,7 +448,48 @@ class StationTest(StationBase):
                                           "reason": "limit: rate limited"}))
             self.run_at(at)
         (filed,) = self.breaches()
-        self.assertIn("Lane anthropic-3 held", filed["title"])
+        self.assertIn("1 lane held by a limit", filed["title"])
+        self.assertIn("- anthropic-3: held by a limit since", filed["body"])
+
+    def test_a_lane_whose_limit_hold_expired_is_not_held(self):
+        # A hold whose time has passed is no hold: the lane is free again and
+        # the lane-held invariant stops firing, as the Usage view reads the
+        # same heartbeat the same way. 2026-10-20: a lane held by a limit the
+        # provider had already lifted stayed held for days.
+        self.queued_ticket(653, "loom:queued", difficulty="medium")
+        usage = os.path.join(self.home, "state", "usage", "opencode-go.json")
+        for at in (T0, T0 + 3 * 3600):
+            self.write(usage, json.dumps(
+                {"lane": "opencode-go", "at": at, "available": False,
+                 "reason": "limit: the provider's monthly limit (429 GoUsageLimitError)",
+                 "retry_at": at - 3600}))
+            self.run_at(at)
+        self.assertEqual(self.breaches(), [])
+
+    def test_a_lane_held_by_a_limit_that_has_not_expired_is_held(self):
+        self.queued_ticket(653, "loom:queued", difficulty="medium")
+        usage = os.path.join(self.home, "state", "usage", "opencode-go.json")
+        for at in (T0, T0 + 3 * 3600):
+            self.write(usage, json.dumps(
+                {"lane": "opencode-go", "at": at, "available": False,
+                 "reason": "limit: the provider's monthly limit (429 GoUsageLimitError)",
+                 "retry_at": at + 7 * 86400}))
+            self.run_at(at)
+        (filed,) = self.breaches()
+        self.assertIn("- opencode-go: held by a limit since", filed["body"])
+
+    def test_a_lane_held_by_a_limit_with_no_end_is_held(self):
+        # A hold with no known end (an expired key, a limit the provider gave
+        # no reset for) is held until the lane says otherwise.
+        self.queued_ticket(653, "loom:queued", difficulty="medium")
+        usage = os.path.join(self.home, "state", "usage", "opencode-go.json")
+        for at in (T0, T0 + 3 * 3600):
+            self.write(usage, json.dumps(
+                {"lane": "opencode-go", "at": at, "available": False,
+                 "reason": "limit: the provider's monthly limit (429 GoUsageLimitError)"}))
+            self.run_at(at)
+        (filed,) = self.breaches()
+        self.assertIn("- opencode-go: held by a limit since", filed["body"])
 
     def test_a_ticket_queued_beside_a_later_state_or_claimed_elsewhere_is_not_counted(self):
         self.queued_ticket(653, "loom:queued", "loom:shipped")
@@ -449,8 +500,7 @@ class StationTest(StationBase):
             self.out_of_credit(("anthropic",), at)
             self.run_at(at)
         (filed,) = self.breaches()
-        self.assertIn("while 1 tickets", filed["title"])
-        self.assertIn("Queued for its tier: #41", filed["body"])
+        self.assertIn("1 tickets of its tier queued: #41\n", filed["body"])
         for shipped in ("#653", "#629", "#609"):
             self.assertNotIn(shipped, filed["body"])
 
@@ -677,7 +727,8 @@ class FilerTest(unittest.TestCase):
         (old_number,) = self.gh.issues
         self.gh.issues[old_number].update(labels=[{"name": x} for x in invariants.LABELS])
         # Another invariant's quiet issue is left to the usual clear rule.
-        other = invariants.Breach("lane-held", "zen", "Lane zen held", ("x",), T0)
+        other = invariants.Breach("lane-no-success", "zen", "Lane zen: 5 runs and none done",
+                                  ("x",), T0)
         self.file(other)
         other_number = max(self.gh.issues)
         self.gh.issues[other_number].update(labels=[{"name": x} for x in invariants.LABELS])
@@ -727,6 +778,94 @@ class FilerTest(unittest.TestCase):
         self.assertEqual(len(self.gh.issues), 1)
         self.assertTrue(any(w[1].endswith("/%d/comments" % number) for w in self.gh.writes))
 
+    def test_a_closed_ticket_is_never_reopened_patched_or_commented_on(self):
+        # loom#1223: an invariant issue rewritten into a ticket was reopened by
+        # the filer and closed by the ticket path 18 times in one day.
+        self.file(self.breach())
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(
+            state="closed", closed_at=stamp(T0 + 60), state_reason="completed",
+            labels=[{"name": x} for x in ("loom:ticket", "loom:invariant", "loom:rewritten")],
+            body=self.gh.issues[number]["body"] + "\nA ticket brief now.")
+        before = dict(self.gh.issues[number])
+        self.gh.writes.clear()
+        self.file(self.breach(at=T0 + 120), now=T0 + 120)
+        self.assertFalse([w for w in self.gh.writes if "/issues/%d" % number in w[1]
+                          and w[0] in ("PATCH", "POST")], self.gh.writes)
+        self.assertEqual(self.gh.issues[number], before)
+        self.assertNotIn((REPO, number), self.gh.comments)
+        # The breach stands, so one separate invariant issue refs the ticket.
+        (other,) = [n for n in self.gh.issues if n != number]
+        self.assertIn("Refs #%d" % number, self.gh.issues[other]["body"])
+        self.assertRegex(self.gh.issues[other]["body"], invariants.MARKER_RE)
+        self.assertEqual(self.state[self.breach().key], other)
+        # Later passes use that issue, not the ticket and not a third one.
+        self.file(self.breach(at=T0 + 240), now=T0 + 240)
+        self.assertEqual(sorted(self.gh.issues), sorted([number, other]))
+
+    def test_an_open_ticket_is_not_rewritten_back_to_the_invariant_text(self):
+        self.file(self.rolling("1 open tickets sit under no epic across 1 goal homes",
+                               ("Goal home #30: 1 open, #7",)))
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(
+            labels=[{"name": x} for x in ("loom:ticket", "loom:invariant")],
+            title="Ship the intake epic", body=self.gh.issues[number]["body"] + "\nbrief")
+        self.gh.writes.clear()
+        self.file(self.rolling("2 open tickets sit under no epic across 1 goal homes",
+                               ("Goal home #30: 2 open, #7, #8",), at=T0 + 600), now=T0 + 600)
+        self.assertEqual(self.gh.writes, [])
+        self.assertEqual(self.gh.issues[number]["title"], "Ship the intake epic")
+
+    def test_a_plain_invariant_issue_beside_a_ticket_is_the_breachs_issue(self):
+        self.file(self.breach())
+        (ticket,) = self.gh.issues
+        self.gh.issues[ticket].update(state="closed", closed_at=stamp(T0 + 60),
+                                      labels=[{"name": "loom:ticket"}, {"name": "loom:invariant"}])
+        self.file(self.breach(at=T0 + 120), now=T0 + 120)
+        (plain,) = [n for n in self.gh.issues if n != ticket]
+        self.state.clear()
+        self.gh.issues[plain].update(labels=[{"name": x} for x in invariants.LABELS])
+        self.file(self.breach(at=T0 + 180), now=T0 + 180)
+        self.assertEqual(sorted(self.gh.issues), sorted([ticket, plain]))
+        self.assertEqual(self.state[self.breach().key], plain)
+
+    def test_a_breach_that_keeps_standing_reopens_its_issue_once_over_ten_passes(self):
+        self.file(self.breach())
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(labels=[{"name": x} for x in invariants.LABELS])
+        self.gh.writes.clear()
+        for i in range(1, 11):
+            at = T0 + 100 * i
+            # Whatever closes it (the ticket path, a person) closes it again.
+            if self.gh.issues[number]["state"] == "open" and i > 1:
+                self.gh.issues[number].update(state="closed", closed_at=stamp(at - 50))
+            elif i == 1:
+                self.gh.issues[number].update(state="closed", closed_at=stamp(at - 50))
+            self.file(self.breach(at=at), now=at)
+        reopens = [w for w in self.gh.writes if w[2] == {"state": "open"}]
+        self.assertEqual(len(reopens), 1)
+        notes = self.gh.comments[(REPO, number)]
+        self.assertEqual(len(notes), 1)
+        self.assertLessEqual(len([w for w in self.gh.writes if w[1].endswith("/comments")]), 1)
+        self.assertTrue(any("not reopened" in line for line in self.said))
+
+    def test_a_breach_that_clears_and_returns_edits_the_one_broken_again_note(self):
+        self.file(self.breach(at=T0 - 7 * 3600), now=T0 - 7 * 3600)
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(state="closed", closed_at=stamp(T0 - 6 * 3600),
+                                      labels=[{"name": x} for x in invariants.LABELS])
+        self.file(self.breach(at=T0 - 5 * 3600), now=T0 - 5 * 3600)
+        self.assertEqual(self.gh.issues[number]["state"], "open")
+        self.gh.comments[(REPO, number)].append(
+            {"id": 900, "body": "The invariant cleared by x; its last breach was observed earlier.",
+             "created_at": stamp(T0 - 3 * 3600)})
+        self.gh.issues[number].update(state="closed", closed_at=stamp(T0 - 3 * 3600))
+        self.file(self.breach(at=T0), now=T0)
+        self.assertEqual(self.gh.issues[number]["state"], "open")
+        notes = [c for c in self.gh.comments[(REPO, number)] if invariants.BROKEN_MARKER in c["body"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Reopened 2 times; last at %s" % invariants.utc(T0), notes[0]["body"])
+
     def test_lost_state_finds_the_issue_by_its_marker(self):
         self.file(self.breach())
         self.state.clear()
@@ -768,7 +907,23 @@ class FilerTest(unittest.TestCase):
                                           for label in issue["labels"]])
         self.assertEqual(sum("cleared" in c.get("body", "") for c in self.gh.comments[(REPO, number)]), 0)
 
-    def test_quiet_triage_issue_closes_once_and_rewritten_issue_is_untouched(self):
+    def test_a_quiet_issue_closed_and_broken_again_says_why_it_closes_the_second_time(self):
+        # loom#651 closed a second time with no word: the first close's note
+        # counted as the explanation (2026-10-20).
+        self.file(self.breach(at=T0 - 7 * 3600), now=T0 - 7 * 3600)
+        number = next(iter(self.gh.issues))
+        issue = self.gh.issues[number]
+        issue.update(created_at=stamp(T0 - 3 * 86400), labels=[{"name": x} for x in invariants.LABELS])
+        self.gh.comments[(REPO, number)] = [
+            {"body": "The invariant cleared by then; its last breach was observed earlier.",
+             "created_at": stamp(T0 - 2 * 86400)},
+            {"body": "Broken again after this was closed: evidence", "created_at": stamp(T0 - 7 * 3600)},
+        ]
+        invariants.Filer(self.gh, REPO, GOAL, self.state, T0, self.said.append).run([])
+        self.assertEqual(issue["state"], "closed")
+        self.assertEqual(sum("cleared" in c.get("body", "") for c in self.gh.comments[(REPO, number)]), 2)
+
+    def test_quiet_triage_issue_closes_once(self):
         self.file(self.breach(at=T0 - 7 * 3600), now=T0 - 7 * 3600)
         number = next(iter(self.gh.issues))
         issue = self.gh.issues[number]
@@ -781,10 +936,29 @@ class FilerTest(unittest.TestCase):
                          self.said.append).run([])
         self.assertEqual(sum("cleared" in c.get("body", "") for c in self.gh.comments[(REPO, number)]), 1)
 
-        issue.update(state="open", labels=[{"name": invariants.LABEL}, {"name": "loom:rewritten"}])
-        invariants.Filer(self.gh, REPO, GOAL, self.state, T0 + 2 * invariants.CHECK_EVERY,
+    def test_a_closed_issue_in_the_listing_is_never_read_again(self):
+        # 131 of 146 invariant issues were closed, and each was read every pass.
+        self.file(self.breach(at=T0 - 7 * 3600), now=T0 - 7 * 3600)
+        number = next(iter(self.gh.issues))
+        self.gh.issues[number].update(state="closed")
+        self.gh.calls.clear()
+        invariants.Filer(self.gh, REPO, GOAL, self.state, T0 + invariants.CHECK_EVERY,
+                         self.said.append).run([])
+        self.assertNotIn(("GET", "/repos/%s/issues/%d" % (REPO, number)), self.gh.calls)
+
+    def test_a_rewritten_issue_closes_after_the_clear_wait_like_a_triage_one(self):
+        self.file(self.breach(at=T0 - 7 * 3600), now=T0 - 7 * 3600)
+        number = next(iter(self.gh.issues))
+        issue = self.gh.issues[number]
+        issue.update(created_at=stamp(T0 - 7 * 3600),
+                     labels=[{"name": invariants.LABEL}, {"name": "loom:rewritten"}])
+        invariants.Filer(self.gh, REPO, GOAL, self.state, T0 - 2 * 3600,
                          self.said.append).run([])
         self.assertEqual(issue["state"], "open")
+        invariants.Filer(self.gh, REPO, GOAL, self.state, T0, self.said.append).run([])
+        self.assertEqual(issue["state"], "closed")
+        self.assertEqual(issue.get("state_reason"), "not_planned")
+        self.assertEqual(sum("cleared" in c.get("body", "") for c in self.gh.comments[(REPO, number)]), 1)
 
 
 class InvariantTest(unittest.TestCase):
@@ -853,12 +1027,39 @@ class InvariantTest(unittest.TestCase):
         runs.append(Run("zen", False, T0, "x"))
         self.assertEqual(invariants.lane_no_success(Facts(T0, runs=runs)), [])
 
+    def test_runs_that_ended_at_a_limit_an_expired_key_or_a_factory_incident_are_no_breach(self):
+        # Every run agy made for a day ended at its plan's quota; the lane was
+        # out of quota, which lane_held reports, not broken (loom#651, 2026-10-20).
+        for reason in ("[limit] limit: all models limited: gemini until tomorrow",
+                       "[auth] API key expired", "[factory] setup failed: base check exited 1"):
+            with self.subTest(reason=reason):
+                runs = [Run("agy", False, T0 - i * 600, reason) for i in range(34)]
+                self.assertEqual(invariants.lane_no_success(Facts(T0, runs=runs)), [])
+        runs = [Run("agy", False, T0 - i * 600, "[limit] provider limit") for i in range(30)]
+        runs += [Run("agy", False, T0 - i * 600 - 300, "[work] agent made no commit") for i in range(5)]
+        (b,) = invariants.lane_no_success(Facts(T0, runs=runs))
+        self.assertEqual(b.title, "Lane agy: 5 runs in 24 hours and none done")
+
+    def test_briefs_parked_unrun_are_no_breach(self):
+        # A fix brief whose pull request merged or closed, or whose branch
+        # moved, is parked before the agent runs: the lane did nothing, so
+        # nothing about the lane is shown (loom#736, 2026-10-20).
+        for reason in ("[work] pull request #1228 is no longer open on loom/736-x (MERGED loom/736-x)",
+                       "[work] pull request #9 is no longer open on loom/9-y (CLOSED loom/9-y)",
+                       "[work] branch moved: loom/5-z is at 0123456789ab on the remote, not ba9876543210"):
+            with self.subTest(reason=reason):
+                runs = [Run("zen", False, T0 - i * 600, reason) for i in range(6)]
+                self.assertEqual(invariants.lane_no_success(Facts(T0, runs=runs)), [])
+                runs.insert(0, Run("zen", True, T0 - 9 * 3600, ""))
+                self.assertEqual(invariants.lane_failing_streak(Facts(T0, runs=runs)), [])
+
     def test_a_lane_failing_its_last_runs_after_an_earlier_success_is_a_breach(self):
         runs = [Run("zen", True, T0 - 9 * 3600, "")]
         runs += [Run("zen", False, T0 - i * 600, "[transient] agent exited 1") for i in range(5)]
         (b,) = invariants.lane_failing_streak(Facts(T0, runs=runs))
-        self.assertEqual((b.invariant, b.subject), ("lane-failing-streak", "zen"))
-        self.assertIn("last 5 runs failed", b.title)
+        self.assertEqual((b.invariant, b.subject), ("lane-failing-streak", invariants.LANES_SUBJECT))
+        self.assertEqual(b.title, "1 lane failed its last 5 runs")
+        self.assertTrue(any(line.startswith("zen: 5 runs in a row failed") for line in b.evidence))
         self.assertEqual(invariants.lane_no_success(Facts(T0, runs=runs)), [])
 
     def test_limits_expired_keys_a_recent_success_or_no_success_make_no_streak(self):
@@ -881,14 +1082,14 @@ class InvariantTest(unittest.TestCase):
         f = Facts(T0, held={"anthropic": T0 - 3 * 3600, "anthropic-2": T0 - 3 * 3600},
                   queued=[(ticket, ("anthropic", "anthropic-2"))], no_topup=("anthropic-2",))
         (b,) = invariants.lane_held(f)
-        self.assertEqual(b.subject, "anthropic")
+        self.assertEqual([line.split(":")[0] for line in b.evidence[1:]], ["anthropic"])
 
     def test_a_lane_held_over_two_hours_while_its_tier_waits(self):
         ticket = Ref("%s#5" % REPO, "#5")
         f = Facts(T0, held={"agy": T0 - 3 * 3600, "zen": T0 - 600},
                   queued=[(ticket, ("agy", "zen"))])
         (b,) = invariants.lane_held(f)
-        self.assertEqual(b.subject, "agy")
+        self.assertEqual([line.split(":")[0] for line in b.evidence[1:]], ["agy"])
         self.assertIn("#5", " ".join(b.evidence))
 
     def test_the_four_epic_shapes(self):
@@ -943,11 +1144,35 @@ class InvariantTest(unittest.TestCase):
     def test_a_lane_that_held_a_running_ticket_while_silent_is_named(self):
         run = SilentRun("codex", 31 * 60, (Ref("%s#1" % REPO, "#1"),), T0 - 60)
         (b,) = invariants.silent_lane(Facts(T0, silent_runs=[run]))
-        self.assertIn("codex", b.title)
+        self.assertEqual(b.title, "1 lane held a running ticket while silent")
+        self.assertTrue(any(line.startswith("codex: silent for 0.5 hours") for line in b.evidence))
         self.assertIn("#1", " ".join(b.evidence))
         self.assertEqual(invariants.silent_lane(Facts(T0)), [])
         old = run._replace(at=T0 - invariants.SILENT_KEEP - 1)
         self.assertEqual(invariants.silent_lane(Facts(T0, silent_runs=[old])), [])
+
+    def test_tickets_waiting_on_the_same_reason_for_hours_are_one_line(self):
+        # The factory logged "waits: no free lane in its rung" for six fix
+        # rounds every pass for nine hours, and nothing raised it (2026-10-21).
+        limit = invariants.WAIT_LIMIT
+        rung = "on lane agy, at a limit: no free lane in its rung"
+        waits = [Wait(Ref("%s#%d" % (REPO, n), "#%d" % n), rung, T0 - limit - n * 600) for n in (1, 2)]
+        waits.append(Wait(Ref("%s#3" % REPO, "#3"), "no free lane in tier medium", T0 - limit - 60))
+        waits.append(Wait(Ref("%s#4" % REPO, "#4"), "no free lane in tier hard", T0 - limit + 600))
+        (b,) = invariants.ticket_waiting(Facts(T0, waits=waits))
+        self.assertEqual((b.invariant, b.subject, b.rolling),
+                         ("ticket-waiting", invariants.TICKETS_SUBJECT, True))
+        self.assertEqual(b.title, "3 tickets waited over 6 hours for the same reason")
+        rung_line = next(x for x in b.evidence if x.startswith(rung))
+        self.assertIn("2 tickets, longest", rung_line)
+        self.assertIn("#1", rung_line)
+        self.assertIn("#2", rung_line)
+        self.assertFalse(any("#4" in x for x in b.evidence))
+
+    def test_no_long_wait_is_no_breach(self):
+        self.assertEqual(invariants.ticket_waiting(Facts(T0)), [])
+        short = [Wait(Ref("%s#1" % REPO, "#1"), "no free lane in tier medium", T0 - 60)]
+        self.assertEqual(invariants.ticket_waiting(Facts(T0, waits=short)), [])
 
     def test_unread_facts_break_nothing_and_a_raising_invariant_is_logged(self):
         said = []
@@ -1047,6 +1272,211 @@ if __name__ == "__main__":
     unittest.main()
 
 
+def lane_facts(lanes, now=T0):
+    """Facts in which every lane of `lanes` breaks all three per-lane rolling
+    invariants at once: held by a limit for three hours while a ticket of its
+    tier waits, its last runs failed after a success, and it held a running
+    ticket while silent."""
+    ticket = Ref("%s#5" % REPO, "#5")
+    runs, silent = [], []
+    for n, lane in enumerate(lanes):
+        runs.append(Run(lane, True, now - 9 * 3600, ""))
+        runs += [Run(lane, False, now - i * 600 - n, "[transient] agent exited 1")
+                 for i in range(invariants.FAILING_STREAK)]
+        silent.append(SilentRun(lane, 31 * 60, (Ref("%s#%d" % (REPO, 10 + n), "#%d" % (10 + n)),),
+                                now - 60 - n))
+    return Facts(now, held={lane: now - 3 * 3600 for lane in lanes},
+                 queued=[(ticket, tuple(lanes))], runs=runs, silent_runs=silent)
+
+
+ROLLING_LANES = (("lane-held", "lane_held"), ("lane-failing-streak", "lane_failing_streak"),
+                 ("silent-lane", "silent_lane"))
+
+
+class RollingLaneTest(unittest.TestCase):
+    """lane-held, lane-failing-streak and silent-lane alarm in bursts with one
+    shared cause: one provider limit opened 9 lane-held issues in 6 minutes
+    (2026-10-15), and 6 failing-streak issues opened in 27 minutes
+    (2026-10-20). Each is one rolling issue, a line per lane."""
+
+    def setUp(self):
+        self.gh = FakeGH()
+        self.said = []
+        self.state = {}
+
+    def file(self, breaches, now=T0):
+        invariants.Filer(self.gh, REPO, GOAL, self.state, now, self.said.append).run(breaches)
+
+    def test_three_lanes_are_one_rolling_breach_with_a_line_per_lane(self):
+        lanes = ("agy", "zen", "codex")
+        for invariant, name in ROLLING_LANES:
+            with self.subTest(invariant=invariant):
+                (b,) = getattr(invariants, name)(lane_facts(lanes))
+                self.assertEqual(b.invariant, invariant)
+                self.assertTrue(b.rolling)
+                self.assertEqual(b.subject, invariants.LANES_SUBJECT)
+                self.assertIn("3 lanes", b.title)
+                self.assertLessEqual(len(b.title), 72)
+                for lane in lanes:
+                    self.assertEqual(len([line for line in b.evidence
+                                          if line.startswith(lane + ":")]), 1, b.evidence)
+                # The same key whatever the lanes: a new lane joins the one issue.
+                (alone,) = getattr(invariants, name)(lane_facts(lanes[:1]))
+                self.assertEqual(alone.key, b.key)
+                self.assertIn("1 lane ", alone.title)
+
+    def test_a_fourth_lane_rewrites_the_one_issue_and_files_no_second(self):
+        for invariant, name in ROLLING_LANES:
+            with self.subTest(invariant=invariant):
+                self.setUp()
+                self.file(getattr(invariants, name)(lane_facts(("agy", "zen", "codex"))))
+                (number,) = self.gh.issues
+                later = T0 + 600
+                (b,) = getattr(invariants, name)(
+                    lane_facts(("agy", "zen", "codex", "spark"), now=later))
+                self.file([b], now=later)
+                self.assertEqual(list(self.gh.issues), [number])
+                issue = self.gh.issues[number]
+                self.assertIn("4 lanes", issue["title"])
+                self.assertIn("- spark:", issue["body"])
+                self.assertIn("Last seen by the station: %s" % invariants.utc(b.at),
+                              issue["body"])
+
+    def test_an_old_per_lane_issue_folds_into_the_rolling_one_unless_it_asks_the_operator(self):
+        old = invariants.Breach("lane-held", "zen", "Lane zen held", ("x",), T0)
+        self.file([old])
+        (old_number,) = self.gh.issues
+        self.gh.issues[old_number].update(labels=[{"name": x} for x in invariants.LABELS])
+        asks = invariants.Breach("lane-held", "anthropic-4", "Lane anthropic-4 held", ("x",), T0)
+        self.file([asks])
+        asks_number = max(self.gh.issues)
+        self.gh.issues[asks_number].update(labels=[{"name": x} for x in invariants.LABELS]
+                                           + [{"name": "needs:example-operator"}])
+        later = T0 + 300
+        self.file(invariants.lane_held(lane_facts(("zen", "agy"), now=later)), now=later)
+        rolling = self.state[invariants.Breach("lane-held", invariants.LANES_SUBJECT, "t", (),
+                                               T0).key]
+        self.assertEqual(self.gh.issues[old_number]["state"], "closed")
+        (note,) = self.gh.comments[(REPO, old_number)]
+        self.assertIn("Folded into #%d" % rolling, note["body"])
+        self.assertEqual(self.gh.issues[rolling]["state"], "open")
+        # An operator ask is not closed out from under the operator.
+        self.assertEqual(self.gh.issues[asks_number]["state"], "open")
+        self.assertNotIn((REPO, asks_number), self.gh.comments)
+
+    def test_a_rewritten_issue_is_folded_into_the_rolling_one_unless_it_asks_the_operator(self):
+        old = invariants.Breach("lane-held", "zen", "Lane zen held", ("x",), T0)
+        self.file([old])
+        (old_number,) = self.gh.issues
+        rewritten = [{"name": invariants.LABEL}, {"name": "loom:rewritten"}]
+        self.gh.issues[old_number].update(labels=rewritten)
+        asks = invariants.Breach("lane-held", "anthropic-4", "Lane anthropic-4 held", ("x",), T0)
+        self.file([asks])
+        asks_number = max(self.gh.issues)
+        self.gh.issues[asks_number].update(labels=rewritten + [{"name": "needs:example-operator"}])
+        later = T0 + 300
+        self.file(invariants.lane_held(lane_facts(("zen", "agy"), now=later)), now=later)
+        rolling = self.state[invariants.Breach("lane-held", invariants.LANES_SUBJECT, "t", (),
+                                               T0).key]
+        self.assertEqual(self.gh.issues[old_number]["state"], "closed")
+        (note,) = self.gh.comments[(REPO, old_number)]
+        self.assertIn("Folded into #%d" % rolling, note["body"])
+        self.assertEqual(self.gh.issues[asks_number]["state"], "open")
+
+    def test_lane_no_success_stays_one_breach_per_lane(self):
+        runs = [Run(lane, False, T0 - i * 60, "x") for lane in ("zen", "zai") for i in range(5)]
+        found = invariants.lane_no_success(Facts(T0, runs=runs))
+        self.assertEqual(sorted(b.key for b in found), sorted(
+            "lane-no-success/%s" % hashlib.sha256(lane.encode()).hexdigest()[:12]
+            for lane in ("zen", "zai")))
+        self.assertFalse(any(b.rolling for b in found))
+
+
+class StandingLaneHeldTest(unittest.TestCase):
+    """loom#845: the lane-held issue is a standing one. A hold that clears
+    updates it in place to say so, and the next hold edits it again; it is
+    never closed and reopened (every reopen sent a notification email)."""
+
+    def setUp(self):
+        self.gh = FakeGH()
+        self.said = []
+        self.state = {}
+
+    def file(self, breaches, now=T0):
+        invariants.Filer(self.gh, REPO, GOAL, self.state, now, self.said.append).run(breaches)
+
+    def held(self, lanes, now):
+        return invariants.lane_held(lane_facts(lanes, now=now))
+
+    def test_a_second_hold_edits_the_standing_issue_instead_of_reopening_a_closed_one(self):
+        self.file(self.held(("zen",), T0), now=T0)
+        (number,) = self.gh.issues
+        cleared = T0 + 7 * 3600
+        self.file([], now=cleared)
+        again = T0 + 2 * DAY_S
+        writes = len(self.gh.writes)
+        self.file(self.held(("zen",), again), now=again)
+        self.assertEqual(list(self.gh.issues), [number])
+        issue = self.gh.issues[number]
+        self.assertEqual(issue["state"], "open")
+        self.assertIn("1 lane held by a limit", issue["title"])
+        self.assertIn("- zen: held by a limit since %s" % invariants.utc(again - 3 * 3600),
+                      issue["body"])
+        # An edit, not a reopen: no state change and no comment (a comment mails people).
+        for method, _path, body in self.gh.writes[writes:]:
+            self.assertEqual(method, "PATCH")
+            self.assertNotIn("state", body)
+        self.assertNotIn((REPO, number), self.gh.comments)
+
+    def test_a_cleared_hold_is_marked_clear_in_place_and_not_closed(self):
+        self.file(self.held(("zen",), T0), now=T0)
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(labels=[{"name": x} for x in invariants.LABELS])
+        cleared = T0 + 7 * 3600
+        self.file([], now=cleared)
+        issue = self.gh.issues[number]
+        self.assertEqual(issue["state"], "open")
+        self.assertIn("No lane is held by a limit now", issue["title"])
+        self.assertIn("Clear since %s." % invariants.utc(cleared), issue["body"])
+        self.assertRegex(issue["body"], invariants.MARKER_RE)
+        self.assertNotIn((REPO, number), self.gh.comments)
+        # The hold goes to the log in the body, not to a new issue.
+        self.assertIn("- zen: held since %s, cleared %s"
+                      % (invariants.utc(T0 - 3 * 3600), invariants.utc(cleared)), issue["body"])
+        # Another clear pass writes nothing.
+        writes = len(self.gh.writes)
+        self.file([], now=cleared + 600)
+        self.assertEqual(len(self.gh.writes), writes)
+
+    def test_the_hold_log_survives_the_next_hold(self):
+        self.file(self.held(("zen",), T0), now=T0)
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(labels=[{"name": x} for x in invariants.LABELS])
+        cleared = T0 + 7 * 3600
+        self.file([], now=cleared)
+        again = T0 + 2 * DAY_S
+        self.file(self.held(("agy",), again), now=again)
+        body = self.gh.issues[number]["body"]
+        self.assertIn("- agy: held by a limit since", body)
+        self.assertIn("- zen: held since %s, cleared %s"
+                      % (invariants.utc(T0 - 3 * 3600), invariants.utc(cleared)), body)
+        # A lane that drops out while another stays held is logged too.
+        later = again + 3600
+        self.file(self.held(("agy", "codex"), later), now=later)
+        self.file(self.held(("codex",), later + 600), now=later + 600)
+        body = self.gh.issues[number]["body"]
+        self.assertIn("- agy: held since", body)
+        self.assertEqual(self.gh.issues[number]["state"], "open")
+
+    def test_an_old_per_lane_issue_is_still_closed_when_cleared(self):
+        old = invariants.Breach("lane-held", "zen", "Lane zen held", ("x",), T0)
+        self.file([old], now=T0)
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(labels=[{"name": x} for x in invariants.LABELS])
+        self.file([], now=T0 + 7 * 3600)
+        self.assertEqual(self.gh.issues[number]["state"], "closed")
+
+
 class StandingEpicTest(unittest.TestCase):
     def test_the_repairs_epic_is_exempt_from_both_caps(self):
         goal = Ref("%s#%d" % (REPO, GOAL), "#30")
@@ -1056,3 +1486,49 @@ class StandingEpicTest(unittest.TestCase):
         f = Facts(T0, shapes=[invariants.GoalShape(goal, 6, epics + (repairs,), ())])
         self.assertEqual(invariants.epic_over_cap(f), [])
         self.assertEqual(invariants.goal_epics_over_cap(f), [])
+
+
+class RollPinOffTest(StationBase):
+    """A goal home whose ship rules name a roll, with no roll ship document
+    naming it: its merged module changes get no source-pin pull request, and
+    the station said nothing about it (loom#528)."""
+
+    def roll_goal(self, repo=REPO, number=GOAL):
+        self.gh.goal_issues[repo] = [{
+            "number": number, "title": "A server goal", "labels": [{"name": "loom:goal"}],
+            "body": "Ship rules: at most one server roll per hour."}]
+
+    def test_the_invariant_names_each_roll_goal_in_one_rolling_breach(self):
+        goals = [Ref("%s#%d" % (REPO, GOAL), "#%d" % GOAL),
+                 Ref("%s#3" % OTHER, "issue 3 of a private repo")]
+        self.assertEqual(invariants.roll_pin_off(Facts(T0)), [])  # not read
+        self.assertEqual(invariants.roll_pin_off(Facts(T0, roll_goals=[])), [])
+        (b,) = invariants.roll_pin_off(Facts(T0, roll_goals=goals))
+        self.assertTrue(b.rolling)
+        self.assertEqual(b.subject, invariants.ROLL_SUBJECT)
+        self.assertIn("2 goal homes", b.title)
+        self.assertTrue(any("LOOM_ROLL_SHIP_DOCS is empty" in line for line in b.evidence))
+        self.assertTrue(any("issue 3 of a private repo" in line for line in b.evidence))
+        (named,) = invariants.roll_pin_off(Facts(T0, roll_goals=goals[:1], roll_docs=1))
+        self.assertEqual(named.key, b.key)
+        self.assertFalse(any("is empty" in line for line in named.evidence))
+
+    def test_a_roll_goal_with_the_pass_configured_off_files_a_finding(self):
+        self.roll_goal()
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertIn("roll-pin-off", filed["body"])
+        self.assertIn("#%d" % GOAL, filed["body"])
+        self.assertIn("LOOM_ROLL_SHIP_DOCS", filed["body"])
+
+    def test_a_roll_goal_its_ship_document_names_files_nothing(self):
+        self.roll_goal()
+        self.settings.roll_ship_docs = [{"goal": "%s#%d" % (REPO, GOAL), "repo": REPO,
+                                         "path": "docs/ship.md"}]
+        self.run_at(T0)
+        self.assertEqual(self.breaches(), [])
+
+    def test_a_goal_that_ships_without_a_roll_files_nothing(self):
+        self.gh.goal_issues[REPO][0]["body"] = "Ship rules: rolling deploys, with rollback."
+        self.run_at(T0)
+        self.assertEqual(self.breaches(), [])

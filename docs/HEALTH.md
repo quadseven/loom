@@ -114,12 +114,25 @@ Per finding, on each read:
   through `bus.brain brief --regresses`, with the line "Regresses #N", the
   hours since the ship, the numbers and the quoted finding. The ticket goes
   back to the queue with `loom:regression`, inside the goal's regression
-  slot rules, at most once per ticket every 48 hours. A ticket still in a
+  slot rules, at most once per ticket every 48 hours, and at most
+  `LOOM_REGRESSION_REBRIEFS` times in all (default 3). Past that the brief
+  holds the ticket for the brain (`needs-brain`, one comment) and the intake
+  leaves any ticket that carries `needs-brain` alone. A ticket still in a
   build state (queued to merged) gets only the updates above.
 - The finding is gone and its ticket is open: one comment, "finding absent
   since <time>". That is the evidence the brain verifies against. A ticket
-  that carries several findings gets it once all of them are gone. The
+  that carries several findings gets it once all of them are gone. A finding
+  that flaps (gone, back, gone) leaves that one note: a flip inside 24 hours of
+  the note writes nothing, a later one edits the note with a count. The
   station never closes a ticket.
+- The finding is gone, its ticket is `loom:shipped` and the finding has
+  stayed gone 24 hours counted from the later of the absent stamp and the
+  ship: one proof comment naming the absent stamp, the ship time, the last
+  `checked_at` read and the goal (never the URL). A finding that went absent
+  before the ship counts from the ship, and the comment says so; one that
+  returns restarts the window. The next verify run takes such a ticket first
+  and quotes the comment in its brief; the station ticks no criterion, so
+  the pull request criteria are still judged by the verifier.
 - The finding's last ticket was closed as not planned: it is not filed
   again. The station remembers a finding's ticket for 30 days after the
   ticket closed and the finding went quiet, so a finding that comes back
