@@ -3201,9 +3201,13 @@ def _validate_adopt_pr(gh: GitHub, repo: str, pr: Dict[str, Any],
     for ok, reason in rules:
         if not ok:
             raise ValueError(reason)
+    # A neutral review is a degraded or partial one. It passes only for the
+    # classes whose merge rule needs no more than a review pass (docs, tests;
+    # loom#509). A logic, sensitive or unlabeled pull request needs success:
+    # an operator's or brain's ticketless pull request carries no class label.
     if not sha or not _review_check_passed(
             gh, repo, sha, review_check_name(env),
-            allow_neutral=change_class.class_of(pr) != "sensitive"):
+            allow_neutral=change_class.class_of(pr) in ("docs", "tests")):
         raise ValueError("the review check has not passed on the head commit")
 
 
