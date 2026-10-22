@@ -274,6 +274,37 @@ class ChokePointTest(ShadowCase):
         self.assertEqual(fake.sent, [])
 
 
+class LedgerFailureTest(ShadowCase):
+    """Review: a ledger write that fails in a way other than OSError must
+    still hold the action, as a ShadowHeld every caller handles."""
+
+    def test_a_ledger_it_cannot_decode_still_holds_the_merge(self):
+        os.makedirs(os.path.dirname(self.ledger), exist_ok=True)
+        with open(self.ledger, "wb") as fh:
+            fh.write(b"\xff\xfe not utf-8\n")
+        fake = Recorder()
+        with self.assertRaises(ShadowHeld):
+            GitHub("t", transport=fake).rest("PUT", "/repos/%s/pulls/8/merge" % REPO, {})
+        self.assertEqual(fake.sent, [])
+        # The line it cannot read is skipped, and the merge is still recorded.
+        self.assertEqual([e["action"] for e in self.entries()], [shadow.MERGE])
+
+    def test_a_record_that_raises_anything_still_holds_the_request(self):
+        fake = Recorder({"/repos/%s/issues/9" % REPO: issue(9, ("loom:ticket",))})
+        with mock.patch.object(shadow, "record", side_effect=TypeError("bad entry")), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            for method, path, body in (
+                    ("PUT", "/repos/%s/pulls/8/merge" % REPO, {}),
+                    ("POST", "/repos/%s/issues/9/labels" % REPO, {"labels": ["ready-to-land"]})):
+                with self.subTest(path=path):
+                    with self.assertRaises(ShadowHeld) as caught:
+                        GitHub("t", transport=fake).rest(method, path, body)
+                    self.assertIn(caught.exception.entry["action"], (shadow.MERGE, shadow.LABEL))
+            self.assertEqual(shadow.main(["gh-guard", os.getcwd(), "pr", "merge", "8",
+                                          "-R", REPO]), 1)
+        self.assertEqual(fake.sent, [])
+
+
 class CallSiteTest(ShadowCase):
     """The real merge and close paths, end to end on a fake GitHub."""
 

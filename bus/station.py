@@ -7253,7 +7253,7 @@ class Station:
         number = int(issue["number"])
         if shadow.active(repo):
             # Before the status note and the force-close label.
-            held = shadow.record(shadow.CLOSE, repo, number, "issue", source="station done close",
+            held = shadow.record_held(shadow.CLOSE, repo, number, "issue", source="station done close",
                                  reason=reason, gates=["shipped", "every criterion has evidence"])
             if held["new"]:
                 _say("shadow mode: would close done %s#%d (%s)" % (repo, number, reason))
@@ -7759,7 +7759,7 @@ class Station:
             return 1
         if shadow.active(repo):
             # Before the evidence comment: a held close must not say it closed.
-            held = shadow.record(shadow.CLOSE, repo, number, "issue",
+            held = shadow.record_held(shadow.CLOSE, repo, number, "issue",
                                  source="station settle-claimed",
                                  reason="claimed issue merged as PR %s" % shown,
                                  gates=["every box proven by the merged pull requests"])

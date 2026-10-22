@@ -738,8 +738,8 @@ class GitHub:
         action, new_labels = held
         reason = "%s %s%s" % (str(method).upper(), shadow.api_path(text),
                               " (%s)" % found.detail if found.detail else "")
-        entries = [shadow.record(action, found.repo, found.number, found.kind,
-                                 reason=reason, label=label, source=shadow.caller())
+        entries = [shadow.record_held(action, found.repo, found.number, found.kind,
+                                      reason=reason, label=label, source=shadow.caller())
                    for label in (new_labels or [""])]
         raise ShadowHeld(shadow.held_error_text(action, new_labels, found), entries[0])
 

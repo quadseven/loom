@@ -573,7 +573,7 @@ class BrainTickTest(unittest.TestCase):
         # No switch at all is shadow: the merge never reaches gh.
         run, calls = gh("pr", "merge", "5", "-R", "example/project", "--squash")
         self.assertEqual(1, run.returncode, run.stderr)
-        self.assertIn("shadow mode: would merge example/project#5", run.stderr)
+        self.assertIn("shadow mode: would merge %s#%d" % ("example/project", 5), run.stderr)
         self.assertNotIn("gh pr merge 5 -R example/project --squash", calls)
         self.assertEqual("brain rung gh", json.loads(ledger.read_text())["source"])
         run, calls = gh("pr", "view", "5", "-R", "example/project")

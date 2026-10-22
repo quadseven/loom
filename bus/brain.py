@@ -1382,7 +1382,7 @@ def close_epic(gh: GitHub, repo: str, number: int, note: str) -> None:
         raise ValueError("epic #%d still holds open tickets: %s" % (
             number, ", ".join("#%s" % t.get("number") for t in still[:5])))
     if shadow.active(repo):
-        entry = shadow.record(shadow.CLOSE, repo, number, "issue", reason="epic done: " + note,
+        entry = shadow.record_held(shadow.CLOSE, repo, number, "issue", reason="epic done: " + note,
                               gates=["open epic", "every ticket closed"],
                               source="bus.brain close-epic")
         raise ShadowHeld("shadow mode: would close epic %s#%d; recorded in the shadow ledger "
@@ -3045,7 +3045,7 @@ def _shadow_merge(repo: str, number: int, sha: str, ticket: Optional[Tuple[str, 
         gates.append("risk tier %s: review check passed, no blocking finding, under the cap"
                      % (tier or "revert"))
     reason = ("ticket %s#%d" % ticket) if ticket else ("adopted" if adopt else "")
-    entry = shadow.record(shadow.MERGE, repo, number, "pr", tier=tier, gates=gates,
+    entry = shadow.record_held(shadow.MERGE, repo, number, "pr", tier=tier, gates=gates,
                           reason=reason, sha=sha, source="bus.brain merge")
     raise ShadowHeld("shadow mode: would merge %s#%d at %s (tier %s); recorded in the shadow "
                      "ledger and left open for the operator"
@@ -3489,7 +3489,7 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
         # Before the note: a held close must not say it closed.
         gates = ["open loom:ticket"] + (["loom:verified", "proof matches every criterion"]
                                         if reason == "completed" else [])
-        entry = shadow.record(shadow.CLOSE, repo, number, "issue", gates=gates,
+        entry = shadow.record_held(shadow.CLOSE, repo, number, "issue", gates=gates,
                               reason="close as %s%s" % (reason, (": " + note) if note else ""),
                               source="bus.brain close")
         raise ShadowHeld("shadow mode: would close %s#%d as %s; recorded in the shadow ledger "
@@ -3600,7 +3600,7 @@ def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
             words = ("Ticket #%d, rewritten from this issue, is verified (%s), so this issue "
                      "closes as completed." % (number, _proof_words(number, proof_url)))
         if outcome == "closed" and shadow.active(repo):
-            shadow.record(shadow.CLOSE, repo, source, "issue",
+            shadow.record_held(shadow.CLOSE, repo, source, "issue",
                           reason="source issue of ticket #%d (%s)" % (number, outcome),
                           gates=["ticket #%d %s" % (number, "closed" if unproven else "verified")],
                           source="bus.brain settle_source")

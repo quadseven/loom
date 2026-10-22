@@ -434,8 +434,8 @@ def record(action: str, repo: str, number: int, kind: str, *, tier: str = "",
            now: Optional[float] = None) -> Dict[str, Any]:
     """Append one would-action to the ledger, once per (action, repo, number,
     head SHA, label), and return it, with "new" set when this call wrote it.
-    A write failure is said on stderr and never raised: the caller holds the
-    action either way."""
+    A failure to read or write the ledger, of any kind, is said on stderr
+    and never raised: the caller holds the action either way."""
     entry = {"time": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                    time.gmtime(time.time() if now is None else now)),
              "repo": repo or "", "number": int(number or 0), "kind": kind,
@@ -451,17 +451,32 @@ def record(action: str, repo: str, number: int, kind: str, *, tier: str = "",
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, sort_keys=True) + "\n")
-    except OSError as err:
+    except Exception as err:  # noqa: BLE001 - the hold never depends on the record
         print("shadow: could not write the ledger %s (%s); the action is held anyway"
               % (path, type(err).__name__), file=sys.stderr)
     return dict(entry, new=True)
 
 
+def record_held(action: str, repo: str, number: int, kind: str, **fields: Any) -> Dict[str, Any]:
+    """record(), for a request that is held whatever happens to its record:
+    if recording raises anything at all, the entry is made up from what is
+    known and the failure said on stderr, so the caller still refuses the
+    request with ShadowHeld."""
+    try:
+        return record(action, repo, number, kind, **fields)
+    except Exception as err:  # noqa: BLE001 - the hold never depends on the record
+        print("shadow: could not record %s %s#%s (%s); the action is held anyway"
+              % (action, repo, number, type(err).__name__), file=sys.stderr)
+        return {"action": action, "repo": repo or "", "number": number, "kind": kind,
+                "label": str(fields.get("label") or ""), "new": True}
+
+
 def read(path: str, since: float = 0.0, repo: str = "") -> List[Dict[str, Any]]:
     """The ledger's entries at or after `since` (epoch seconds), for `repo`
-    when given. A missing ledger is empty; an unreadable line is skipped."""
+    when given. A missing ledger is empty; an unreadable line is skipped
+    (bytes that are not UTF-8 included)."""
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             lines = fh.read().splitlines()
     except FileNotFoundError:
         return []
@@ -729,8 +744,8 @@ def gh_guard(cwd: str, argv: Sequence[str]) -> int:
         return 0
     reason = "gh %s" % " ".join(argv)[:300]
     for label in found.labels or ("",):
-        record(found.action, found.repo, found.number, found.kind, reason=reason,
-               label=label, source="brain rung gh")
+        record_held(found.action, found.repo, found.number, found.kind, reason=reason,
+                    label=label, source="brain rung gh")
     print("shadow mode: would %s %s; recorded in the shadow ledger, not sent. Merge and "
           "close only through python3 -m bus.brain merge and close, which record them "
           "(docs/MUSE.md)." % (found.action, "%s#%d" % (found.repo, found.number)
