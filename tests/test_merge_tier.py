@@ -159,6 +159,31 @@ class Findings(unittest.TestCase):
         self.assertEqual(merge_tier.blocking_findings([deferred, fixed], HEAD_AT, by_bot),
                          ["medium dead-code"])
 
+    def test_every_lane_work_rule_the_review_bot_posts_blocks(self):
+        # Replay cases weakened-tests-01 and -02 (assay suites/loom_gates):
+        # the review bot posts a medium weakened-test finding, the lane
+        # resolves it with no fix, and the merge went through.
+        for rule, category in (("weakened-test", "test fidelity"),
+                               ("removed-verification-layer", "security"),
+                               ("fabricated-result", "requirements"),
+                               ("symptom-only", "requirements"),
+                               ("destructive-edit", "correctness")):
+            body = ("\U0001f7e0 medium | _%s_ | `%s` | \u26a1 quick win\n\n"
+                    "**What Elder sees**\n\nIt deletes a pinned test." % (category, rule))
+            with self.subTest(rule=rule):
+                self.assertTrue(merge_tier.bad_work(body))
+                resolved = thread(body, resolved=True, created="2030-01-02T11:00:00Z")
+                self.assertEqual(merge_tier.blocking_findings([resolved], HEAD_AT, by_bot),
+                                 ["medium %s" % rule])
+
+    def test_a_claim_or_hygiene_finding_is_not_bad_work(self):
+        # A ticked box with no output, a scratch file, a doc that drifted
+        # from the code: the lane answers them; the close rule, not the
+        # merge, decides a ticked live box (bus/criteria_gate.py).
+        for rule in ("unbacked-claim", "stray-file", "doc-code-claim-drift"):
+            body = "\U0001f7e0 medium | _requirements_ | `%s` | \u26a1 quick win" % rule
+            self.assertFalse(merge_tier.bad_work(body), rule)
+
     def test_the_factory_never_defers_a_bad_work_finding(self):
         threads = [{"id": "T1", "isResolved": False,
                     "root": {"nodes": [{"author": {"__typename": "Bot", "login": BOT},

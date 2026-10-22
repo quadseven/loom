@@ -744,7 +744,9 @@ An auto tier still merges only when it is clean:
 - no high or critical review-bot finding, and no finding from a bad-work rule
   at any severity, is open, or was resolved with no commit after it. The
   bad-work rules are the review bot's `intent-mismatch`, `unmet-criterion`,
-  `dead-code` and the rules named in `merge_tier.BAD_WORK_RULES`, any rule in
+  `dead-code`, its lane-work rules (`weakened-test`,
+  `removed-verification-layer`, `fabricated-result`, `symptom-only`,
+  `destructive-edit`) and the rules named in `merge_tier.BAD_WORK_RULES`, any rule in
   `LOOM_ELDER_BLOCKING_RULES`, and any finding whose category is `bad-work`.
   The factory never defers such a finding as minor: it goes back to the lane;
 - fewer than `LOOM_AUTO_MERGE_PER_REPO_HOUR` (default 2) `loom/` pull requests

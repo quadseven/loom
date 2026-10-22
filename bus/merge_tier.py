@@ -118,7 +118,14 @@ HIGH_SEVERITIES = ("critical", "high")
 BAD_WORK_RULES = ("intent-mismatch", "unmet-criterion", "dead-code", "claims-not-delivered",
                   "claimed-not-delivered", "measurement-change", "metric-not-cause",
                   "fabricated-evidence", "simulated-evidence", "stale-rework",
-                  "ticked-unverified", "inert-mechanism", "doc-rewrite")
+                  "ticked-unverified", "inert-mechanism", "doc-rewrite",
+                  # The names the review bot's lane-work checks post under
+                  # (its personas/code_reviewer/lane_work.py). The names above
+                  # missed them, so a medium weakened-test finding a lane
+                  # resolved with no fix let a pull request that deleted a
+                  # pinned test merge (replay cases weakened-tests-01 and -02).
+                  "weakened-test", "removed-verification-layer", "fabricated-result",
+                  "symptom-only", "destructive-edit")
 BAD_WORK_CATEGORY = "bad-work"
 
 
