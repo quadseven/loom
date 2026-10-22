@@ -24,6 +24,7 @@ from bus import brain as bus_brain
 from bus import bench as bench_lib
 from bus import tickets as bus_tickets
 from bus import metrics as bus_metrics
+from bus import scorecard
 from bus.naming import strip_kind
 
 from .github import TicketStore
@@ -1451,4 +1452,13 @@ def _lane_view_data(payload, tickets, state=None):
     lanes = [_lane_card(item, tickets, newest_pr_for_lane, usage_records)
              for item in _merge_lane_rows(payload.get("lanes", []))]
     return {"lanes": lanes, "scoreboard": views.build_scoreboard(_scoreboard_rows(prs, tickets)),
-            "anthropic_share": _anthropic_share(payload)}
+            "anthropic_share": _anthropic_share(payload),
+            "scorecard": _scorecard_rows(payload.get("lanes", []))}
+
+
+def _scorecard_rows(comments):
+    """The lane scorecard (bus/scorecard.py) from the newest lane status
+    comment."""
+    status_comments = [c for c in comments if str(c.get("body") or "").startswith(views.LANES_MARKER)]
+    latest = max(status_comments, key=lambda c: str(c.get("created_at") or ""), default=None)
+    return scorecard.parse_rows(latest.get("body") if latest else "")

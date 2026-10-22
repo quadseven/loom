@@ -243,7 +243,7 @@ class Base(unittest.TestCase):
         self.placed = []
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
-           down=(), limit_until=None, scope=None, known_waits=None):
+           down=(), limit_until=None, scope=None, known_waits=None, demoted=None):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
@@ -275,7 +275,7 @@ class Base(unittest.TestCase):
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
                             silent=silent, down=down, limit_until=limit_until, scope=scope,
-                            known_waits=known_waits)
+                            known_waits=known_waits, demoted=demoted)
         f.run()
         return f
 
@@ -3283,7 +3283,7 @@ class Helpers(unittest.TestCase):
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
                          model_limits=None, silent=None, down=(), limit_until=None,
-                         benched=(), known_waits=None, plan_check=None):
+                         benched=(), known_waits=None, plan_check=None, demoted=None):
                 self.silent_running, self.silent, self.waits = {}, silent, {}
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))

@@ -520,6 +520,10 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .results-table th, .results-table td { text-align: left; padding: 0.55rem 0.6rem; border-bottom: 1px solid var(--line, rgba(127,127,127,0.25)); min-height: 44px; }
 .results-table td { font-variant-numeric: tabular-nums; }
 .results-table td.not-looked { color: var(--muted, #888); font-style: normal; }
+/* Lanes page scorecard (bus/scorecard.py): wide, so it scrolls on a phone. */
+.scorecard-scroll { overflow-x: auto; }
+.scorecard th, .scorecard td { white-space: nowrap; }
+.scorecard tr.scorecard-demoted th { font-weight: 600; }
 
 /* Backlog page (loom#607): one dense epics table, the "Outside any epic"
    list, and collapsed groups for empty epics, overflow ranks and checks. */
