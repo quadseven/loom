@@ -1567,6 +1567,18 @@ class SensitiveResumeTests(unittest.TestCase):
                         adopt=True, env=self.TRUSTED)
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
+    def test_adopt_refuses_a_logic_or_unlabeled_pr_with_a_neutral_review(self):
+        # Neutral is a degraded review: only docs and tests may land on it
+        # (loom#509). An unlabeled ticketless pull request is refused too.
+        runs = [{"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]
+        for labels in ([{"name": "class:logic"}], []):
+            with self.subTest(labels=labels):
+                fake = Fake(*self._adopt_replies({"pr": {"labels": labels}, "runs": runs}))
+                with self.assertRaisesRegex(ValueError, "review check has not passed"):
+                    brain.merge(GitHub("t", transport=fake), REPO, 8,
+                                adopt=True, env=self.TRUSTED)
+                self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
     def test_adopt_refuses_a_pull_request_that_already_has_a_ticket(self):
         fake = Fake(*self._adopt_replies({"pr": {"body": "Refs %s#9" % REPO}}))
         with self.assertRaises(ValueError):
