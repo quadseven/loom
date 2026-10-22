@@ -5581,38 +5581,52 @@ class Station:
         the cited card's; the verify run then judges the ticket against its
         criteria. Asked once per ticket body, at most FABRIC_ASKS a pass;
         Fabric unset, down or silent leaves the ticket to build."""
-        if not self.s.fabric_key_ssm or self._fabric_asks >= FABRIC_ASKS:
+        if not self._fabric_may_ask(repo, issue):
             return []
-        number = int(issue["number"])
         body = str(issue.get("body") or "")
+        criteria = "\n".join("- %s" % text for _, text in proof.criteria(body)) or body[:1500]
+        answer = fabric.ask(FABRIC_QUESTION % (repo, issue.get("title") or "", criteria),
+                            self.s.fabric_key_ssm, self.s.region)
+        found = self._checked_citations(repo, fabric.cited_pulls(answer)[:FABRIC_CITES])
+        if found:
+            _say("%s#%d: Fabric cites merged pull request #%d for its work"
+                 % (repo, int(issue["number"]), int(found[0]["number"])))
+        return found
+
+    def _fabric_may_ask(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether this pass may ask Fabric about the ticket: a key is set, the
+        pass has a question left, and the ticket's body was not asked about
+        before. A True answer records the ask."""
+        if not self.s.fabric_key_ssm or self._fabric_asks >= FABRIC_ASKS:
+            return False
         path = os.path.join(self.state, FABRIC_ASKED_FILE)
         asked = _read_json(path, {}, strict=False)
         if not isinstance(asked, dict):
             asked = {}
-        key = "%s#%d" % (repo, number)
-        stamp = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+        key = "%s#%d" % (repo, int(issue["number"]))
+        stamp = hashlib.sha256(str(issue.get("body") or "").encode("utf-8")).hexdigest()[:16]
         if asked.get(key) == stamp:
-            return []
+            return False
         self._fabric_asks += 1
         asked[key] = stamp
         _write_json(path, asked)
-        criteria = "\n".join("- %s" % text for _, text in proof.criteria(body)) or body[:1500]
-        answer = fabric.ask(FABRIC_QUESTION % (repo, issue.get("title") or "", criteria),
-                            self.s.fabric_key_ssm, self.s.region)
+        return True
+
+    def _checked_citations(self, repo: str,
+                           cited: List[Tuple[int, str]]) -> List[Dict[str, Any]]:
+        """The cited pull requests that are of this repo, merged into the
+        default branch, and titled as their cited cards; one read each."""
         branch = self._default_branch(repo)
         found = []
-        for cited, title in fabric.cited_pulls(answer)[:FABRIC_CITES]:
+        for number, title in cited:
             try:
-                pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, cited)).data
+                pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
             except GitHubError:
                 continue
             if (isinstance(pr, dict) and pr.get("merged_at") and pr.get("merge_commit_sha")
                     and str((pr.get("base") or {}).get("ref") or "") == branch
                     and fabric.same_title(title, pr.get("title") or "")):
                 found.append(pr)
-        if found:
-            _say("%s: Fabric cites merged pull request #%d for its work"
-                 % (key, int(found[0]["number"])))
         return found
 
     def _merged_linked(self, repo: str, issue: Dict[str, Any]) -> List[Dict[str, Any]]:

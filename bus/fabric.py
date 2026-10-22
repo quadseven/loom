@@ -43,10 +43,10 @@ def ask(question: str, key_ssm: str, region: str, timeout: float = TIMEOUT) -> s
         return ""
     body = json.dumps({"scope": "user",
                        "history": [{"role": "user", "content": question}]}).encode()
-    req = urllib.request.Request(CHAT_URL, data=body, method="POST", headers={
+    req = urllib.request.Request(CHAT_URL, data=body, method="POST", headers={  # noqa: S310 - fixed https URL
         "X-Api-Key": key, "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - CHAT_URL is a fixed https constant
             return resp.read().decode("utf-8", "replace")
     except (urllib.error.URLError, OSError, ValueError):
         return ""
