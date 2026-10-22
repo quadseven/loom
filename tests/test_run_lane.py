@@ -5109,6 +5109,28 @@ echo fixed > fix.txt
         self.assertNotIn("failed: [work]", log)
         self.assertIn("validation environment unavailable: the check exited 127", log)
 
+    def test_a_final_check_stopped_by_a_signal_is_a_factory_incident(self):
+        # A check that a signal stopped (143: SIGTERM) never said whether the
+        # agent's work was good, so the environment took the check away. The
+        # same exit on the base check is a factory incident
+        # (prepare_validation), and the final one is too: the ticket keeps its
+        # rung and the lane's failing streak does not grow.
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        contract = ("interpreter: loom-test-python\n"
+                    "check: grep -q todo fix.txt || kill -TERM $$\n")
+        self.contract_repo(contract=contract)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = self.lane_log()
+        self.assertIn("failed: [factory]", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertIn("validation environment unavailable: the check was stopped by "
+                      "signal 15 (exit 143)", log)
+        self.assertIn("factory incident quadseven/loom#99", log)
+        self.assertEqual([r["exit"] for r in self.records() if r["phase"] == "final"], [143])
+
     def test_a_contract_command_with_a_control_or_non_ascii_byte_is_a_setup_failure(self):
         self.contract_repo(contract=CONTRACT + "setup: true\x1b[2K; echo hidden\n")
         self.drop_brief()

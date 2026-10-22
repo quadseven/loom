@@ -1873,6 +1873,16 @@ final_validation() {
       VALIDATION_REASON="validation environment unavailable: the check exited $rc"
       note_factory_incident environment "check: $C_CHECK (exit $rc)" VALIDATION_REASON
       ;;
+    12[9]|1[3-9][0-9]|2[0-9][0-9])
+      # A check that a signal stopped (143: SIGTERM) never said whether the
+      # agent's work was good, so the environment took the check away, the
+      # same way a missing interpreter does. The same exit on the base check
+      # is a factory incident (prepare_validation), and the final one is the
+      # same kind of failure: the ticket keeps its rung and the lane's
+      # failing streak does not grow on a check the machine killed.
+      VALIDATION_REASON="validation environment unavailable: the check was stopped by signal $((rc - 128)) (exit $rc)"
+      note_factory_incident environment "check: $C_CHECK (stopped by signal $((rc - 128)))" VALIDATION_REASON
+      ;;
     *) VALIDATION_REASON="validation failed: the check exited $rc" ;;
   esac
   record final "$C_CHECK" "$rc" "$rev" "$ok" "${changed:+changed tracked files: $changed}"

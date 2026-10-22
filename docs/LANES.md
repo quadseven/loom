@@ -93,10 +93,14 @@ run on a lane machine with no secrets, simulators or unset variables.
   to rewrite the agent's files is a failure). Only then is the branch pushed
   and the pull request opened, with a `Validation:` line naming the commit.
 - A failed check parks the brief as `validation failed: ...` (exit 125 to
-  127 as `validation environment unavailable: ...`), opens no pull request
+  127, and any exit a signal stopped (129 to 255), as
+  `validation environment unavailable: ...`), opens no pull request
   and pushes nothing to the ticket's branch or an open pull request. The
   edits go to a side branch `<branch>-unvalidated-<time>` so they can be
-  recovered.
+  recovered. A check a signal stopped (143: SIGTERM) never said whether the
+  agent's work was good, so the runner files it as a factory incident and
+  parks the brief as `[factory]`: the ticket keeps its rung and the lane's
+  failing streak does not grow on a check the machine killed.
 - Every step runs like an API-lane agent: an emptied environment, a scratch
   HOME (`run/<lane>-check`), under `sandbox-exec`, with no access to the
   runner's HOME, but with the network and the writes outside HOME a step's
