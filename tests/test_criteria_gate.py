@@ -2,7 +2,7 @@
 
 The fixtures are acceptance criteria of tickets an audit of 2026-10-22 found
 closed as completed with their live criteria never checked, with names made
-generic: a realm roller "enabled" while it stayed paused, a cost run-rate
+generic: a release roller "enabled" while it stayed paused, a cost run-rate
 "recorded" by a runbook that says the run never happened, a model verdict
 from a simulated run, an RBAC check against a service account that does not
 exist, a gateway hint nobody tried on a long thread, a connector whose round
@@ -30,7 +30,7 @@ REPO = tbs.REPO
 
 # Criteria of the audit's wrongly closed tickets: each needed a live system.
 AUDIT_LIVE = (
-    "A queued release rolls within the window only when the family, guild and 60-minute "
+    "A queued release rolls within the window only when the stated 60-minute "
     "interval gates pass.",
     "The first automatic roll's gate readings at merge time, running image digest, and "
     "verification evidence are recorded in the ticket.",
