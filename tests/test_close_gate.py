@@ -17,6 +17,7 @@ import json
 import unittest
 
 from bus.github import GitHub, GitHubError
+from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 
 def reply(status=200, body=None):

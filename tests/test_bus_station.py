@@ -28,6 +28,7 @@ from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
 from bus import labels as labels_module  # noqa: E402
 from bus.github import AppToken, GitHub, GitHubError  # noqa: E402
+from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 REPO = "example-owner/example-repo"
 AUTHORS = ["alice-example", "bob-example"]

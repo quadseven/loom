@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bus import deploy_watch, station  # noqa: E402
 from bus.github import GitHub  # noqa: E402
+from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 REPO = "example-owner/example-deploy"
 NOW = 2_000_000_000.0

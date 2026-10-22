@@ -16,6 +16,18 @@ comments there send them no email; an @mention still does. Use `muse` as your lo
 holder (the lane machine's tick uses its own name and takes the lock for
 you). The lock lives in `quadseven/loom`.
 
+Shadow mode (docs/BRAIN.md, Shadow mode): set `LOOM_SHADOW=1` and
+`LOOM_SHADOW_REPOS` to the same values as the station. Unset, the brain is in
+shadow for every repo. In shadow, `bus.brain merge` and `bus.brain close` run
+every gate and then stop with "shadow mode: would ..."; that is the expected
+result, not a failure to retry or work around. Name each such pull request or
+ticket in the journal as "would merge" or "would close". Never merge or close
+a pull request or issue any other way (curl, `gh pr merge`, `gh issue close`,
+the web), in shadow or out of it. In shadow, also never approve a pull
+request, add `ready-to-land` or `loom:shipped` by hand, or write onto a branch
+Loom does not own, by any route: `bus.brain move` records a ship instead of
+taking it, and the tick's `gh` refuses the rest and records them.
+
 ## What Muse does and leaves
 
 Muse reads live data through REST APIs on the tailnet, through its proxy,

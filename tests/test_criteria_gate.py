@@ -26,6 +26,7 @@ from bus import criteria_gate, factory, station  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 import test_bus_factory as tbs_factory  # noqa: E402
 import test_bus_station as tbs  # noqa: E402
+from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 REPO = tbs.REPO
 

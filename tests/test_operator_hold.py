@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 from bus import brain, factory, merge_tier, operator_hold, ship_paths  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 from test_bus_factory import Base, FakeGitHub, NOW, REPO as FACTORY_REPO  # noqa: E402
+from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 PR_BODY = """## Intent
 Class: logic

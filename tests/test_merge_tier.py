@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bus import brain, factory, merge_tier  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 from test_bus_factory import Base, REPO as REPO_F  # noqa: E402
+from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 REPO = "example-owner/example-repo"
 BOT = "grug-tribe"
