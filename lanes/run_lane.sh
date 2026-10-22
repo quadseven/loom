@@ -589,11 +589,13 @@ FINAL_SAID_MAX=600
 # summary (loom#1362): the end of the run's output, without the provider's
 # work events (RUN_OUTPUT), as one ASCII line cut to FINAL_SAID_MAX, through
 # checked_text. Sets FINAL_SAID, empty when the agent said nothing or its words
-# were refused.
+# were refused. The agent CLI's own log lines and the runner's timestamped
+# lines are left out: retried stream errors once filled the whole quote.
+FINAL_SAID_SKIP_RE='^timestamp=[^ ]+ level=[A-Z]+ |^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z\] '
 final_said() {
   local file="$WORKDIR/$TICKET.final-message" line
   FINAL_SAID=""
-  line="$(printf '%s\n' "$RUN_OUTPUT" | tail -n 20 | LC_ALL=C tr -cd '\11\12\40-\176' |
+  line="$(printf '%s\n' "$RUN_OUTPUT" | { grep -vE "$FINAL_SAID_SKIP_RE" || true; } | tail -n 20 | LC_ALL=C tr -cd '\11\12\40-\176' |
           tr -s ' \t\n' ' ' | sed 's/^ //; s/ $//')"
   [ -n "$line" ] || return 0
   [ "${#line}" -le "$FINAL_SAID_MAX" ] || line="${line:0:FINAL_SAID_MAX}..."

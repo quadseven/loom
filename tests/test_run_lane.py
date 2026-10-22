@@ -928,6 +928,29 @@ print('leak guard: clean (shape patterns only)')
         self.assertTrue(line.isascii(), line)
         self.assertIn("it said: Stopped: the fetch failed. Needs the branch and a writable tree.", line)
 
+    def test_a_final_message_leaves_out_the_cli_log_lines(self):
+        # A zai run said the work was already done, but opencode's retried
+        # stream errors filled the end of its output and the reason quoted
+        # them instead (2026-10-21).
+        self.drop_brief()
+        err = ('timestamp=2026-10-21T21:19:12.765Z level=ERROR run=bf50fe65 '
+               'message="stream error" providerID=zai')
+        said = "The feature is already implemented and all tests pass."
+        out = "\n".join([err] * 3 + [said] + [err] * 25)
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT=out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertIn("it said: " + said, line)
+        self.assertNotIn("level=ERROR", line)
+
+    def test_cli_log_lines_alone_are_no_reason(self):
+        self.drop_brief()
+        out = "\n".join('timestamp=2026-10-21T21:%02d:00.000Z level=ERROR run=bf50fe65 '
+                        'message="stream error"' % i for i in range(5))
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT=out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent made no commit and wrote no reason", self.failure_line())
+
     def test_a_long_final_message_is_cut(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT="word " * 400)
