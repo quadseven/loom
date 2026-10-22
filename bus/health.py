@@ -386,7 +386,9 @@ def quoted(f: Finding) -> str:
 
 def _run_diagnosis_cmd(cmd: str, key: str, timeout: int = 30) -> str:
     """Run the diagnosis command with the finding's key as an argument.
-    Returns the output or an error message. Output is capped at 40 lines."""
+    The output is cleaned like finding text (markdown and HTML control turned to
+    spaces, leaks refused) and capped at 40 lines. Returns the cleaned output,
+    a refusal note, or an error/timeout note."""
     try:
         result = subprocess.run(
             cmd + " " + key,
@@ -400,10 +402,18 @@ def _run_diagnosis_cmd(cmd: str, key: str, timeout: int = 30) -> str:
                 result.returncode, result.stderr.strip()[:200])
         output = result.stdout.strip()
         lines = output.splitlines()
-        if len(lines) > 40:
-            lines = lines[:40]
-            lines.append("[output truncated to 40 lines]")
-        return "\n".join(lines)
+        cleaned = []
+        for line in lines:
+            for what, pattern in _LEAKS:
+                if pattern.search(line):
+                    return "diagnosis output refused: looks like it names %s" % what
+            cleaned.append(" ".join(_PLAIN_OUT.sub(" ", line).split()))
+        if not cleaned:
+            return "diagnosis command produced no output"
+        if len(cleaned) > 40:
+            cleaned = cleaned[:40]
+            cleaned.append("[output truncated to 40 lines]")
+        return "\n".join(cleaned)
     except subprocess.TimeoutExpired:
         return "diagnosis command timed out after %d seconds" % timeout
     except Exception as err:

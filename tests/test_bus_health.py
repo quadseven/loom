@@ -764,6 +764,8 @@ class RegressionThroughBrain(unittest.TestCase):
                                           if i["number"] != 1 and i["state"] == "open"]))
 
         def rest(self, method, path, data=None, ok=()):
+            if "/pulls" in path:
+                return Reply([], {"link": ""})
             number = int(path.split("/issues/")[1].split("/")[0])
             issue = self.issues[number]
             if method == "PATCH":
@@ -998,3 +1000,44 @@ class DiagnosisCommand(Regression):
         self.assertIn("deployed", body)
         self.assertIn("PR #11: Follow-up fix", body)
         self.assertIn("not deployed", body)
+
+    def test_diagnosis_command_output_is_capped_at_40_lines(self):
+        """A command that prints more than 40 lines is capped, with a truncation note."""
+        cmd = "python3 -c 'for i in range(50): print(\"line %d\" % i)'"
+        self._run_with_diag(diag_cmd=cmd)
+        self.assertEqual(len(self.briefs), 1)
+        body = self.briefs[0]["body"]
+        output = self._diagnosis_output(body)
+        self.assertIn("line 0", output)
+        self.assertIn("line 39", output)
+        self.assertNotIn("line 49", output)
+        self.assertIn("[output truncated to 40 lines]", output)
+
+    def test_diagnosis_command_output_is_cleaned_of_markup(self):
+        """Backticks and angle brackets in diagnosis output are turned to spaces."""
+        cmd = "python3 -c 'print(\"line with `backticks` and <tag>\")'"
+        self._run_with_diag(diag_cmd=cmd)
+        self.assertEqual(len(self.briefs), 1)
+        body = self.briefs[0]["body"]
+        output = self._diagnosis_output(body)
+        self.assertNotIn("`", output)
+        self.assertNotIn("<tag>", output)
+        self.assertIn("line with backticks and tag", output)
+
+    def test_diagnosis_command_leak_is_refused_not_leaked(self):
+        """A diagnosis command that prints a URL is refused, not leaked into the ticket."""
+        cmd = "python3 -c 'print(\"see https://example.com/x\")'"
+        self._run_with_diag(diag_cmd=cmd)
+        self.assertEqual(len(self.briefs), 1)
+        body = self.briefs[0]["body"]
+        output = self._diagnosis_output(body)
+        self.assertNotIn("https://example.com", output)
+        self.assertIn("diagnosis output refused", output)
+
+    def _diagnosis_output(self, body):
+        """The text inside the second ```text fenced block (the diagnosis output)."""
+        marker = "```text\n"
+        first = body.find(marker)
+        second = body.find(marker, first + 1)
+        self.assertGreater(second, first)
+        return body[second + len(marker):].split("```")[0]
