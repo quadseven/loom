@@ -34,7 +34,9 @@ from . import ship_paths
 SECTION = "Operator steps before merge"
 _HEADING = re.compile(r"^#{2,3}\s*(.+?)\s*#*\s*$")
 _RULE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
-_NONE = re.compile(r"^(?:none|n/a|no operator steps?|nothing)\b", re.I)
+# The whole section must be one of these to say "no steps": "None, but
+# first grow the VM" is a step.
+_NONE = re.compile(r"(?:none|none stated|n/a|no operator steps?|nothing)\.?", re.I)
 _BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?")
 # Text that is not the lane's or the ticket's own words: HTML comments
 # (markers) and the status section Loom keeps on a ticket.
@@ -85,7 +87,7 @@ def section_steps(body: str) -> Optional[List[str]]:
             continue
         if found is not None and line.strip():
             found.append(_BULLET.sub("", line).strip())
-    if found and _NONE.match(found[0]) and len(found) == 1:
+    if found and _NONE.fullmatch(" ".join(found).strip()):
         return []
     return found
 
@@ -143,24 +145,39 @@ def _manual_listed(gh: Any, repo: str, branch: str) -> List[str]:
         return []
 
 
+# Paths that decide what a merge deploys: a pull request that changes them
+# and a placement manifest could exempt the manifest from the hold, so the
+# base branch's reading of them does not stand.
+DEPLOY_RULES = (ship_paths.WORKFLOWS_DIR + "/", ship_paths.MANUAL_PATHS_FILE)
+
+
 def placement_files(gh: Any, repo: str, pr: Dict[str, Any],
                     files: Optional[List[Dict[str, Any]]] = None) -> List[str]:
-    """The manifest files of the pull request that merging deploys and that
-    change placement. A manifest GitHub sends no patch for counts as
-    changing it, and so does every one when the workflows cannot be read:
-    an unread deploy never passes as no deploy."""
+    """The manifest files of the pull request that change placement and are
+    not listed in the base branch's .loom/manual-paths. Fails closed: a
+    manifest GitHub sends no patch for counts as changing placement, a file
+    no deploy workflow covers still counts, and when the pull request also
+    changes a workflow or .loom/manual-paths nothing is exempt."""
     number = int(pr.get("number") or 0)
     entries = pull_files(gh, repo, number) if files is None else files
+    names = [str(f.get("filename") or "") for f in entries]
     moved = sorted({str(f.get("filename") or "") for f in entries
                     if manifest_paths([str(f.get("filename") or "")])
                     and (not f.get("patch") or ship_paths.placement_lines(str(f["patch"])))})
-    if not moved:
-        return []
-    branch = str((pr.get("base") or {}).get("ref") or "main")
-    filters = ship_paths.read_filters(gh, repo, branch)
-    if filters is None:
+    if not moved or any(n.startswith(DEPLOY_RULES[0]) or n == DEPLOY_RULES[1] for n in names):
         return moved
-    return ship_paths.deployed_files(moved, filters, _manual_listed(gh, repo, branch))
+    branch = str((pr.get("base") or {}).get("ref") or "main")
+    return ship_paths.unlisted(moved, _manual_listed(gh, repo, branch))
+
+
+def _deployers(gh: Any, repo: str, pr: Dict[str, Any], moved: Sequence[str]) -> str:
+    """Which push workflows on the base branch deploy the files, for the ask."""
+    branch = str((pr.get("base") or {}).get("ref") or "main")
+    texts = ship_paths.read_workflows(gh, repo, branch)
+    if texts is None:
+        return "the deploy workflows could not be read"
+    found = ship_paths.covering(moved, ship_paths.push_filters(texts))
+    return ("merging runs " + ", ".join(found)) if found else "no push workflow covers it"
 
 
 def reasons(gh: Any, repo: str, pr: Dict[str, Any], ticket_body: str,
@@ -177,8 +194,9 @@ def reasons(gh: Any, repo: str, pr: Dict[str, Any], ticket_body: str,
         if moved:
             shown = ", ".join(moved[:FILES_SHOWN]) + (
                 " and %d more" % (len(moved) - FILES_SHOWN) if len(moved) > FILES_SHOWN else "")
-            out.append("merging deploys a change to where workloads run or what they "
-                       "mount (node pins, affinity, tolerations, volumes) in " + shown)
+            out.append("it changes where workloads run or what they mount (node pins, "
+                       "affinity, tolerations, volumes) in %s (%s)"
+                       % (shown, _deployers(gh, repo, pr, moved)))
     return out
 
 

@@ -170,11 +170,9 @@ def manual_files(files: List[str], filters: Dict[str, List[str]],
                       and not any(matches(pats, f) for pats in filters.values())))
 
 
-def read_filters(gh: Any, repo: str, branch: str) -> Optional[Dict[str, List[str]]]:
-    """Workflow file name to its on.push.paths filter, for the repo's
-    workflows on `branch` that have one. None when the listing or any
-    workflow file cannot be read: with a filter missing, a changed file could
-    look as if no deploy covered it."""
+def read_workflows(gh: Any, repo: str, branch: str) -> Optional[Dict[str, str]]:
+    """Workflow file name to its text, for the repo's workflows on
+    `branch`. None when the listing or any workflow file cannot be read."""
     listing = gh.rest("GET", "/repos/%s/contents/%s?ref=%s" % (
         repo, WORKFLOWS_DIR, quote(branch, safe="")), ok=(404,)).data
     if not isinstance(listing, list):
@@ -190,17 +188,58 @@ def read_filters(gh: Any, repo: str, branch: str) -> Optional[Dict[str, List[str
             texts[name] = base64.b64decode(data["content"]).decode("utf-8", "replace")
         except (KeyError, TypeError, ValueError):
             return None
-    return scoped_workflows(texts)
+    return texts
 
 
-def deployed_files(files: Iterable[str], filters: Dict[str, List[str]],
-                   listed: List[str]) -> List[str]:
-    """The changed files merging deploys: a deploy workflow's paths filter
-    matches them and they are not applied by hand (manual_files)."""
-    files = sorted(set(files))
-    by_hand = set(manual_files(files, filters, listed))
-    return [f for f in files if f not in by_hand
-            and any(matches(pats, f) for pats in filters.values())]
+def read_filters(gh: Any, repo: str, branch: str) -> Optional[Dict[str, List[str]]]:
+    """Workflow file name to its on.push.paths filter, for the repo's
+    workflows on `branch` that have one. None when the listing or any
+    workflow file cannot be read: with a filter missing, a changed file could
+    look as if no deploy covered it."""
+    texts = read_workflows(gh, repo, branch)
+    return scoped_workflows(texts) if texts is not None else None
+
+
+def pushes(workflow: str) -> bool:
+    """Whether a push runs the workflow: `on: push`, `on: [push, ...]`, or a
+    push key under `on:`."""
+    lines = workflow.splitlines()
+    on_at = next((i for i, indent, line in _content(lines, 0)
+                  if not indent and _name(line)[0] in ("on", "true")), None)
+    if on_at is None:
+        return False
+    rest = _name(lines[on_at])[1]
+    inline = _inline_list(rest)
+    if "push" in (inline if inline is not None else [_strip(rest)]):
+        return True
+    return _child(lines, on_at, 0, ("push",)) is not None
+
+
+def push_filters(texts: Dict[str, str]) -> Dict[str, List[str]]:
+    """Workflow file name to the paths a push to it covers, for every
+    push-triggered workflow: its paths filter, or every path ("**") when it
+    has none, since such a workflow runs on any change."""
+    found = {}
+    for name, text in texts.items():
+        patterns = push_paths(text)
+        if patterns:
+            found[name] = patterns
+        elif pushes(text):
+            found[name] = ["**"]
+    return found
+
+
+def covering(files: Iterable[str], filters: Dict[str, List[str]]) -> List[str]:
+    """The workflows whose filter matches any of the files."""
+    files = list(files)
+    return sorted(w for w, pats in filters.items() if any(matches(pats, f) for f in files))
+
+
+def unlisted(files: Iterable[str], listed: List[str]) -> List[str]:
+    """The files the repo's .loom/manual-paths does not list as applied by
+    hand. A file no workflow covers still counts: an unscoped deploy is never
+    taken for no deploy."""
+    return sorted(f for f in set(files) if not (listed and matches(listed, f)))
 
 
 # Keys that decide where a workload runs or what it mounts: a node pin, a

@@ -153,6 +153,15 @@ class OperatorSteps(unittest.TestCase):
         self.assertIsNone(operator_hold.section_steps("## Why\nx"))
         self.assertEqual(operator_hold.operator_steps(body), ["Scale the app to zero"])
 
+    def test_a_section_that_starts_with_none_but_names_a_step_is_a_step(self):
+        # Security review: "None, but ..." read as no steps.
+        body = PLAIN_BODY.replace("## Operator steps before merge\nnone",
+                                  "## Operator steps before merge\nNone, but first grow the disk")
+        self.assertEqual(operator_hold.section_steps(body), ["None, but first grow the disk"])
+        for said in ("none", "None.", "none stated", "N/A"):
+            self.assertEqual(operator_hold.section_steps(
+                PLAIN_BODY.replace("\nnone\n", "\n%s\n" % said)), [], said)
+
     def test_a_refactors_cut_over_and_a_loom_status_block_are_not_steps(self):
         body = ("## Summary\nThe old chain's lookups stay until cut-over.\n"
                 "<!-- loom:status-body v1 begin -->\n- leave it to the operator\n"
@@ -171,11 +180,21 @@ class Placement(unittest.TestCase):
                          ["+      tolerations:", "+        - key: x"])
         self.assertEqual(ship_paths.placement_lines(RESOURCES_PATCH), [])
 
-    def test_only_files_a_deploy_workflow_covers_are_deployed(self):
-        filters = {"sync.yml": ["production/oke/manifests/**"]}
-        self.assertEqual(ship_paths.deployed_files([MANIFEST, "charts/x/values.yaml"],
-                                                   filters, []), [MANIFEST])
-        self.assertEqual(ship_paths.deployed_files([MANIFEST], filters, ["production/**"]), [])
+    def test_a_push_workflow_without_a_paths_filter_covers_every_path(self):
+        # Security review: a push workflow with no paths filter deploys
+        # every path, and was left out of the filters.
+        texts = {"sync.yml": SYNC_WORKFLOW, "all.yml": "on: push\njobs: {}\n",
+                 "list.yml": "on: [push, pull_request]\n", "pr.yml": "on:\n  pull_request:\n"}
+        filters = ship_paths.push_filters(texts)
+        self.assertEqual(filters, {"sync.yml": ["production/oke/manifests/**"],
+                                   "all.yml": ["**"], "list.yml": ["**"]})
+        self.assertEqual(ship_paths.covering(["charts/x/deploy.yaml"], filters),
+                         ["all.yml", "list.yml"])
+
+    def test_only_a_manual_paths_listing_exempts_a_file(self):
+        self.assertEqual(ship_paths.unlisted([MANIFEST, "charts/x/a.yaml"], []),
+                         ["charts/x/a.yaml", MANIFEST])
+        self.assertEqual(ship_paths.unlisted([MANIFEST], ["production/**"]), [])
 
 
 class Route:
@@ -304,14 +323,38 @@ class FactoryHold(Base):
         self.assertEqual(self.merged, [])
         self.assertIn("node pins", self.humans[0][1])
 
-    def test_a_placement_change_no_deploy_covers_and_a_plain_body_land(self):
+    def test_a_placement_change_no_workflow_covers_is_still_held(self):
+        # Security review: a manifest no workflow scopes is not "not deployed".
         self.gh.contents[".github/workflows/sync.yml"] = SYNC_WORKFLOW.replace(
             "production/oke/manifests/**", "other/**")
         self.gh.patches[MANIFEST] = PIN_PATCH
         self.ready(PLAIN_BODY, files=(MANIFEST, "tests/test_a.py"))
         self.go()
+        self.assertEqual(self.merged, [])
+        self.assertIn("no push workflow covers it", self.humans[0][1])
+
+    def test_a_manual_paths_listing_lets_a_placement_change_land(self):
+        self.gh.contents[".loom/manual-paths"] = "production/oke/manifests/app-dev/**\n"
+        self.gh.contents[".github/workflows/sync.yml"] = SYNC_WORKFLOW
+        self.gh.patches[MANIFEST] = PIN_PATCH
+        self.ready(PLAIN_BODY, files=(MANIFEST, "tests/test_a.py"))
+        self.go()
         self.assertEqual(self.merged, [(50, (FACTORY_REPO, 5))])
         self.assertEqual(self.humans, [])
+
+    def test_a_change_to_the_deploy_rules_beside_a_placement_change_is_held(self):
+        # Security review: the base branch's listing cannot stand when the
+        # pull request edits it or a workflow.
+        for rules in (".loom/manual-paths", ".github/workflows/sync.yml"):
+            with self.subTest(rules=rules):
+                self.setUp()
+                self.gh.contents[".loom/manual-paths"] = "production/oke/manifests/app-dev/**\n"
+                self.gh.contents[".github/workflows/sync.yml"] = SYNC_WORKFLOW
+                self.gh.patches[MANIFEST] = PIN_PATCH
+                self.ready(PLAIN_BODY, files=(MANIFEST, rules, "tests/test_a.py"))
+                self.go()
+                self.assertEqual(self.merged, [])
+                self.assertEqual(len(self.humans), 1)
 
 
 if __name__ == "__main__":

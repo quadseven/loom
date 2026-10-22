@@ -1388,14 +1388,17 @@ review, when either holds (`bus/operator_hold.py`):
   step (anything but `none`), or, as a backstop, its body or its ticket's
   body names one in words: "leave X to the operator", an operator task, step
   or prerequisite, a data migration, a live cutover, a VM or disk resize.
-- **Placement.** A manifest (`.yaml`, `.yml`, `.json`) that merging deploys
-  changes where a workload runs or what it mounts: `nodeSelector`, a
+- **Placement.** A manifest (`.yaml`, `.yml`, `.json`) changes where a
+  workload runs or what it mounts: `nodeSelector`, a
   `kubernetes.io/hostname` pin, affinity, tolerations, `hostIP`, volumes and
-  their claims, `hostPath`, a storage class. "Merging deploys" is the test
-  `LOOM_SHIP_PATH_WORKFLOWS` ships by: a deploy workflow's `on.push.paths`
-  filter on the default branch matches the file, and `.loom/manual-paths`
-  does not list it. When the workflows cannot be read, every placement
-  change counts as deployed.
+  their claims, `hostPath`, a storage class. The hold fails closed: only a
+  listing in the base branch's `.loom/manual-paths` (the file
+  `LOOM_SHIP_PATH_WORKFLOWS` ships by) exempts a manifest, a manifest no
+  deploy workflow covers is still held, a manifest GitHub sends no patch for
+  counts as a placement change, and a pull request that also changes
+  `.github/workflows/` or `.loom/manual-paths` exempts nothing. The ask names
+  the push workflows on the base branch that cover the files (a push
+  workflow with no paths filter covers every path).
 
 The factory checks before it lands a pull request, and `bus.brain merge`
 checks before it merges one, so whichever reaches it first holds it. The
