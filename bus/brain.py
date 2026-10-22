@@ -1426,6 +1426,104 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1) -> int:
     return int(made["number"])
 
 
+def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
+    """Move the goal's own open tickets that sit under no epic into an open
+    intake epic of the goal, oldest ticket first.
+
+    A ticket that is a goal's own sub-issue and belongs to no epic breaks
+    decision 0003 (every ticket belongs to an epic). Each moves to an open
+    intake epic of the goal with room; when no intake epic has room and the
+    goal is under its open epic cap, a new intake epic opens the way triage
+    opens one; otherwise the rest stay where they are. An epic, an ask and a
+    closed issue are never moved. Returns (moved, left)."""
+    loose, tree = goal_tree(gh, repo, goal)
+    tickets = _outside_tickets(loose, goal)
+    if not tickets:
+        return (0, 0)
+    moved = 0
+    epic, held = _intake_with_room(tree)
+    for ticket in tickets:
+        if epic is None or held >= EPIC_TICKET_CAP:
+            opened = _open_intake_epic(gh, repo, goal)
+            if opened is None:
+                break
+            epic, held = opened
+        if _move_to_epic(gh, repo, epic, ticket, goal):
+            moved += 1
+            held += 1
+    return (moved, len(tickets) - moved)
+
+
+def _outside_tickets(loose: List[Dict[str, Any]], goal: int) -> List[Dict[str, Any]]:
+    """The goal's own open tickets that sit under no epic, oldest first: its
+    direct children that are not epics, that carry the loom:ticket label, and
+    whose parent is the goal itself or nobody."""
+    found: List[Dict[str, Any]] = []
+    for issue in loose:
+        if issue.get("state") != "open" or "pull_request" in issue:
+            continue
+        names = _labels(issue)
+        if "loom:ticket" not in names or "epic" in names or "needs-operator" in names:
+            continue
+        if not issue.get("id"):
+            # GitHub names every issue an id; one read without it cannot be
+            # linked as a sub-issue, so it stays where it is.
+            continue
+        parent = _sub_issue_parent(issue)
+        if parent is not None and parent != goal:
+            continue
+        found.append(issue)
+    found.sort(key=lambda issue: (str(issue.get("created_at") or ""),
+                                  int(issue.get("number") or 0)))
+    return found
+
+
+def _intake_with_room(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
+                      ) -> Tuple[Optional[int], int]:
+    """The goal's newest open intake epic that has room, and the tickets it
+    holds; (None, 0) when no intake epic has room."""
+    roomy = [(int(epic["number"]), len(held)) for epic, held in tree
+             if epic.get("state", "open") == "open"
+             and str(epic.get("title") or "") == INTAKE_TITLE
+             and len(held) < EPIC_TICKET_CAP]
+    return max(roomy) if roomy else (None, 0)
+
+
+def _open_intake_epic(gh: GitHub, repo: str, goal: int) -> Optional[Tuple[int, int]]:
+    """The goal's newest open intake epic with room, opened when none has
+    room and the goal is under its open epic cap, and the tickets it holds;
+    (None, 0) when the goal is at its cap and no intake epic has room."""
+    try:
+        number = intake_epic(gh, repo, goal)
+    except ValueError as err:
+        print("goal #%d: no intake epic has room and none may open (%s)" % (goal, err),
+              file=sys.stderr)
+        return None
+    return (number, len(_epic_tickets(gh, repo, number)))
+
+
+def _move_to_epic(gh: GitHub, repo: str, epic: int, ticket: Dict[str, Any], goal: int) -> bool:
+    """Move the ticket under the epic: the epic's sub-issue link replaces the
+    goal as its parent, and the ticket's Part of line names the epic. False
+    when GitHub refuses the link."""
+    parent = _sub_issue_parent(ticket)
+    if not _link_to_goal(gh, repo, epic, ticket, under=goal if parent == goal else None):
+        return False
+    body = str(ticket.get("body") or "")
+    named = _reparented_body(body, goal, epic)
+    if named != body:
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, int(ticket["number"])),
+                {"body": named})
+    return True
+
+
+def _reparented_body(body: str, goal: int, epic: int) -> str:
+    """The ticket's body with its Part of line naming the epic, not the goal
+    (decision 0003: a ticket's Part of line names its epic)."""
+    out = re.sub(r"^Part of #%d[ \t]*$" % goal, "Part of #%d" % epic, body, flags=re.M)
+    return _with_part_of(out, epic)
+
+
 def placement_epic(gh: GitHub, repo: str, named: int, room: int = 1) -> int:
     """The open epic with room for `room` more tickets where a ticket filed
     beside issue `named` belongs (loom#951, loom#1294). `named` is what the

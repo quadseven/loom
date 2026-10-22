@@ -69,6 +69,9 @@ HEARTBEAT_MAX_AGE = 600
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 RUNAWAY = "loom:runaway"
+# How often the station moves the tickets that sit under a goal home and
+# under no epic into an open intake epic of that goal (decision 0003).
+OUTSIDE_EPIC_EVERY = 3600
 # The marker on the comment the station posts when it reviews a runaway hold
 # caused by one dead lane (loom#565): the release, or why the hold stays.
 DEAD_LANE_MARKER = "<!-- loom:runaway-dead-lane v1 lane=%s -->"
@@ -7539,6 +7542,39 @@ class Station:
         watch.Watcher(self.gh, repo, self.s.watched, os.path.join(self.state, "watch.json"),
                       self.now, _say, write=not self._deferred(), private=private).run()
 
+    # -- tickets under no epic ---------------------------------------------
+    def move_outside_tickets(self) -> None:
+        """Move each goal home's own open tickets that sit under no epic into
+        an open intake epic of that goal, at most every OUTSIDE_EPIC_EVERY
+        seconds (decision 0003). One log line per goal."""
+        path = os.path.join(self.state, "outside-epic.json")
+        state = _read_json(path, {}, strict=False)
+        if not isinstance(state, dict):
+            state = {}
+        checked = state.get("checked")
+        if self._num(checked) and 0 <= self.now - checked < OUTSIDE_EPIC_EVERY:
+            return
+        try:
+            homes = self._goal_homes()
+        except RateLimited:
+            raise
+        except (GitHubError, OSError) as err:
+            _say("outside-epic: could not read the goal homes: %s" % err)
+            return
+        for repo, goal in homes:
+            number = int(goal["number"])
+            try:
+                moved, left = brain.move_outside_tickets(self.gh, repo, number)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("outside-epic: goal #%d in %s failed: %s" % (number, repo, err))
+                continue
+            _say("outside-epic: moved %d, left %d for goal #%d in %s"
+                 % (moved, left, number, repo))
+        state["checked"] = self.now
+        _write_json(path, state)
+
     # -- invariants -------------------------------------------------------
     def check_invariants(self) -> None:
         """Check the factory's own invariants on what the station reads
@@ -9637,7 +9673,10 @@ class Station:
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
-                     self.watch_default_branches, self.refresh_bench, self.run_factory, self.check_invariants,
+                     self.watch_default_branches, self.refresh_bench, self.run_factory,
+                     # The move first, so the invariants read a goal whose
+                     # tickets sit under an epic.
+                     self.move_outside_tickets, self.check_invariants,
                      self.release_factory_held):
             if self._deferred():
                 break
