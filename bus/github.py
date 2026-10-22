@@ -732,36 +732,26 @@ class GitHub:
         found = shadow.classify(method, text, body)
         if found is None or not shadow.active(found.repo or None):
             return
-        item: Any = None
-        if found.check:
-            try:
-                item = self._rest("GET", "/repos/%s/issues/%d" % (found.repo, found.number)).data
-            except Exception:  # noqa: BLE001 - any failed read holds the action
-                item = None
-        action = found.action
-        if found.check == "close" and shadow.close_let_through(item):
-            if not found.labels:
-                return
-            action = shadow.LABEL   # the close may go; the labels with it decide
-        # Each merge or ship label the request adds that the item does not
-        # already have (every one when its labels cannot be read): held if any.
-        new_labels: List[str] = []
-        if action == shadow.LABEL:
-            new_labels = list(found.labels)
-            have = shadow.labels_of(item)
-            if found.labels and have is not None:
-                new_labels = [n for n in found.labels if shadow.label_is_new(n, have)]
-                if not new_labels:
-                    return
+        held = shadow.held_after_read(found, self._shadow_item(found))
+        if held is None:
+            return
+        action, new_labels = held
         reason = "%s %s%s" % (str(method).upper(), shadow.api_path(text),
                               " (%s)" % found.detail if found.detail else "")
         entries = [shadow.record(action, found.repo, found.number, found.kind,
                                  reason=reason, label=label, source=shadow.caller())
                    for label in (new_labels or [""])]
-        what = "add %s to" % ", ".join(new_labels) if new_labels else action
-        raise ShadowHeld("shadow mode: would %s %s; recorded in the shadow ledger, not sent"
-                         % (what, "%s#%d" % (found.repo, found.number)
-                            if found.number else (found.repo or found.detail)), entries[0])
+        raise ShadowHeld(shadow.held_error_text(action, new_labels, found), entries[0])
+
+    def _shadow_item(self, found: "shadow.Request") -> Any:
+        """The issue or pull request a held request's exemption reads; None
+        when it needs none or the read failed in any way (held)."""
+        if not found.check:
+            return None
+        try:
+            return self._rest("GET", "/repos/%s/issues/%d" % (found.repo, found.number)).data
+        except Exception:  # noqa: BLE001 - any failed read holds the action
+            return None
 
     def _refuse_incomplete_close(self, method: str, path: str, body: Any) -> None:
         """Refuse a PATCH that would close an issue as completed while its
