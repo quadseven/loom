@@ -213,6 +213,39 @@ class ChokePointTest(ShadowCase):
         gh.rest("POST", "/repos/%s/issues/30/labels" % REPO, {"labels": ["loom:merged"]})
         self.assertEqual(len(fake.sent), 3)
 
+    def test_a_new_merge_label_after_one_already_on_is_still_held(self):
+        # Security review: only the first merge or ship label was checked, so
+        # one already on, listed first, let a new one through.
+        items = {"/repos/%s/issues/32" % REPO: issue(32, ("loom:ticket", "loom:shipped"))}
+        for method, body in (("POST", {"labels": ["loom:shipped", "ready-to-land"]}),
+                             ("PUT", {"labels": [{"name": "loom:shipped"}, "Ready-To-Land"]})):
+            with self.subTest(method=method):
+                fake = Recorder(items)
+                with self.assertRaisesRegex(ShadowHeld, "would add ready-to-land to"):
+                    GitHub("t", transport=fake).rest(
+                        method, "/repos/%s/issues/32/labels" % REPO, body)
+                self.assertEqual(fake.sent, [])
+        self.assertEqual([(e["action"], e["label"]) for e in self.entries()],
+                         [("label", "ready-to-land")])
+
+    def test_every_new_merge_label_is_recorded(self):
+        fake = Recorder({"/repos/%s/issues/33" % REPO: issue(33, ("loom:ticket",))})
+        with self.assertRaises(ShadowHeld):
+            GitHub("t", transport=fake).rest("POST", "/repos/%s/issues/33/labels" % REPO,
+                                             {"labels": ["ready-to-land", "loom:shipped"]})
+        self.assertEqual(sorted(e["label"] for e in self.entries()),
+                         ["loom:shipped", "ready-to-land"])
+
+    def test_a_label_list_it_cannot_read_is_held(self):
+        for body in ({"labels": "ready-to-land"}, {"labels": [["ready-to-land"]]},
+                     {"labels": [{"name": None}]}):
+            with self.subTest(body=body):
+                fake = Recorder({"/repos/%s/issues/34" % REPO: issue(34)})
+                with self.assertRaises(ShadowHeld):
+                    GitHub("t", transport=fake).rest(
+                        "POST", "/repos/%s/issues/34/labels" % REPO, body)
+                self.assertEqual(fake.sent, [])
+
     def test_the_brain_lock_branch_is_loom_own_and_may_be_deleted(self):
         self.assertTrue(lock.LOCK_BRANCH.startswith(shadow.OWN_BRANCH_PREFIX))
         fake = Recorder()

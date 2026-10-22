@@ -735,18 +735,24 @@ class GitHub:
                 item = None
             if found.check == "close" and shadow.close_let_through(item):
                 return
-            if found.check == "label" and isinstance(item, dict) and not shadow.label_is_new(
-                    found.detail, [str((x or {}).get("name") or "") for x in
-                                   item.get("labels") or [] if isinstance(x, dict)]):
+        # Each merge or ship label the request adds that the item does not
+        # already have (all of them when the item could not be read): held if any.
+        new_labels = list(found.labels)
+        if found.check == "label" and isinstance(item, dict):
+            have = [str((x or {}).get("name") or "") for x in item.get("labels") or []
+                    if isinstance(x, dict)]
+            new_labels = [n for n in found.labels if shadow.label_is_new(n, have)]
+            if not new_labels:
                 return
-        entry = shadow.record(found.action, found.repo, found.number, found.kind,
-                              reason="%s %s%s" % (method, path.split("?", 1)[0],
-                                                  " (%s)" % found.detail if found.detail else ""),
-                              label=found.detail if found.action == shadow.LABEL else "",
-                              source=shadow.caller())
+        reason = "%s %s%s" % (method, path.split("?", 1)[0],
+                              " (%s)" % found.detail if found.detail else "")
+        entries = [shadow.record(found.action, found.repo, found.number, found.kind,
+                                 reason=reason, label=label, source=shadow.caller())
+                   for label in (new_labels or [""])]
+        what = "add %s to" % ", ".join(new_labels) if new_labels else found.action
         raise ShadowHeld("shadow mode: would %s %s; recorded in the shadow ledger, not sent"
-                         % (found.action, "%s#%d" % (found.repo, found.number)
-                            if found.number else (found.repo or found.detail)), entry)
+                         % (what, "%s#%d" % (found.repo, found.number)
+                            if found.number else (found.repo or found.detail)), entries[0])
 
     def _refuse_incomplete_close(self, method: str, path: str, body: Any) -> None:
         """Refuse a PATCH that would close an issue as completed while its

@@ -48,7 +48,7 @@ import re
 import sys
 import time
 import traceback
-from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 SWITCH = "LOOM_SHADOW"
 REPOS = "LOOM_SHADOW_REPOS"
@@ -93,8 +93,9 @@ class Request(NamedTuple):
     repo: str          # "" for a GraphQL mutation (it names no repo in the path)
     number: int        # 0 when the request names none
     kind: str          # "pr", "issue" or "branch"
-    detail: str        # the label added, the branch deleted, or the mutation
+    detail: str        # the labels added, the branch deleted, or the mutation
     check: str         # "" (always held), "close" or "label": github.py reads the item
+    labels: Tuple[str, ...] = ()   # every merge or ship label the request adds
 
 
 def _env(env: Optional[Mapping[str, str]]) -> Mapping[str, str]:
@@ -158,17 +159,17 @@ def classify(method: str, path: str, body: Any) -> Optional[Request]:
         if found and isinstance(body, dict) and str(body.get("state") or "").lower() == "closed":
             return Request(CLOSE, found.group(1), int(found.group(2)), "issue",
                            str(body.get("state_reason") or "completed"), "close")
-        if found and isinstance(body, dict) and isinstance(body.get("labels"), list):
-            added = _merge_label(body["labels"])
-            if added:
-                return Request(LABEL, found.group(1), int(found.group(2)), "issue", added, "label")
+        if found and isinstance(body, dict) and "labels" in body:
+            held = _label_request(found.group(1), int(found.group(2)), body["labels"])
+            if held:
+                return held
     if method in ("POST", "PUT"):
         found = _LABELS_PATH.match(path)
         if found:
-            labels = body.get("labels") if isinstance(body, dict) else body
-            added = _merge_label(labels if isinstance(labels, list) else [])
-            if added:
-                return Request(LABEL, found.group(1), int(found.group(2)), "issue", added, "label")
+            held = _label_request(found.group(1), int(found.group(2)),
+                                  body.get("labels") if isinstance(body, dict) else body)
+            if held:
+                return held
     if method == "DELETE":
         found = _REF_PATH.match(path)
         if found and not found.group(2).startswith(OWN_BRANCH_PREFIX):
@@ -187,13 +188,20 @@ def classify(method: str, path: str, body: Any) -> Optional[Request]:
     return None
 
 
-def _merge_label(labels: Iterable[Any]) -> str:
-    for item in labels:
+def _label_request(repo: str, number: int, labels: Any) -> Optional[Request]:
+    """The label write as a held Request when it adds any merge or ship label,
+    naming every one of them; github.py then holds it if any is new. A label
+    list of a shape this cannot read is held as it stands (fails closed)."""
+    names = []
+    for item in labels if isinstance(labels, list) else [None]:
         name = item.get("name") if isinstance(item, dict) else item
-        if str(name or "").lower() in MERGE_LABELS:
-            return str(name).lower()
-    return ""
-
+        if not isinstance(name, str):
+            return Request(LABEL, repo, number, "issue", "unreadable label list", "")
+        names.append(name.strip().lower())
+    found = tuple(dict.fromkeys(n for n in names if n in MERGE_LABELS))
+    if not found:
+        return None
+    return Request(LABEL, repo, number, "issue", ", ".join(found), "label", found)
 
 def label_is_new(label: str, have: Sequence[str]) -> bool:
     """Whether adding `label` to an item that has `have` is a new grant."""
