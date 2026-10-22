@@ -79,7 +79,12 @@ def _run(cmd: List[str]) -> str:
 
 
 def _http_json(url: str, headers: Mapping[str, str]) -> Any:
-    """A GET returning parsed JSON, one seam the tests replace."""
+    """A GET returning parsed JSON, one seam the tests replace.
+    
+    Only HTTPS URLs are permitted to prevent arbitrary file access.
+    """
+    if not url.startswith("https://"):
+        raise ValueError("only https URLs are allowed")
     req = urllib.request.Request(url, headers=dict(headers))
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode("utf-8", "replace"))
