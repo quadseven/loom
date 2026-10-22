@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import json
 import sys
 import tempfile
@@ -251,6 +252,33 @@ class StationStep(unittest.TestCase):
         quiet(st.score_lanes)
         self.assertEqual(scorecard.Scorecard(st.state, NOW).data["refreshed"], refreshed)
         self.assertIn("| scorecard lane | model |", "\n".join(st._scorecard_lines()))
+
+
+class FailClosed(unittest.TestCase):
+    def test_a_scorecard_file_that_cannot_be_read_demotes_every_lane(self):
+        from bus import station
+        home = tempfile.mkdtemp()
+        settings = station.Settings(home, [REPO], [LANES_LOGIN], ["example-owner"],
+                                    factory_on=True)
+        st = station.Station(GitHub("t", transport=Route({}, {})), settings, now=NOW)
+        os.makedirs(st.state, exist_ok=True)
+        with open(os.path.join(st.state, scorecard.FILE), "w") as fh:
+            fh.write('{"demoted": {"codex"')
+        demoted = quiet(st.demoted_lanes)
+        self.assertIn("zen", demoted)
+        self.assertIn("cannot be read", demoted["codex-2"])
+        with self.assertRaises(ValueError):
+            scorecard.Scorecard(st.state, NOW).save()
+
+    def test_a_review_that_cannot_be_read_records_nothing_yet(self):
+        fake = Route({"/repos/%s/pulls?state=closed" % REPO: [lane_pr(1)]}, {})
+        got = card()
+
+        def broken(*args, **kw):
+            raise ValueError("could not read every review thread")
+        with mock.patch("bus.merge_tier.review_threads", broken):
+            quiet(got.refresh, GitHub("t", transport=fake), [REPO], [LANES_LOGIN], BOT, {}, {})
+        self.assertEqual(got.data["records"], {})
 
 
 class FactoryStepAside(FactoryBase):

@@ -9387,9 +9387,13 @@ class Station:
         return [lane for lane in free if lane not in demoted]
 
     def demoted_lanes(self) -> Dict[str, str]:
-        """Each lane slot the scorecard demoted, and why."""
-        return scorecard.demoted_slots(scorecard.Scorecard(self.state, self.now).demoted(),
-                                       LANES)
+        """Each lane slot the scorecard demoted, and why. A scorecard file
+        that cannot be read demotes every lane: its demotions are unknown."""
+        card = scorecard.Scorecard(self.state, self.now)
+        if card.unreadable:
+            _say("every lane takes no build ticket: %s" % card.unreadable)
+            return {lane: card.unreadable for lane in LANES}
+        return scorecard.demoted_slots(card.demoted(), LANES)
 
     def benched_pairs(self) -> List[Tuple[str, str]]:
         """The (provider, model) pairs the bench list holds benched now."""

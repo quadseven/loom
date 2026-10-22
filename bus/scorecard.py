@@ -36,7 +36,8 @@ before it. Verify runs are not build tickets: a demoted lane still takes
 them.
 
 A read that fails keeps the last scorecard and every demotion: nothing is
-cleared by an error. The scorecard lives in the station's `scorecard.json`,
+cleared by an error. A scorecard file that is there but cannot be read
+demotes every lane until the operator repairs or removes it. The scorecard lives in the station's `scorecard.json`,
 and its table goes on the lane status comment the dashboard reads.
 """
 from __future__ import annotations
@@ -164,17 +165,27 @@ class Scorecard:
         self.env = dict(os.environ if env is None else env)
         self.data: Dict[str, Any] = {"records": {}, "audits": {}, "demoted": {},
                                      "cleared": {}, "refreshed": 0}
+        # A file that is there but cannot be read: its demotions are unknown,
+        # so every lane counts as demoted until the operator repairs or
+        # removes it, and nothing is written over it.
+        self.unreadable = ""
+        kept: Any = {}
         try:
             with open(self.path) as fh:
                 kept = json.load(fh)
-        except (OSError, ValueError):
-            kept = None
-        if isinstance(kept, dict):
-            for key in self.data:
-                if isinstance(kept.get(key), type(self.data[key])):
-                    self.data[key] = kept[key]
+        except FileNotFoundError:
+            kept = {}
+        except (OSError, ValueError) as err:
+            self.unreadable = "%s cannot be read (%s)" % (FILE, type(err).__name__)
+        if not self.unreadable and not isinstance(kept, dict):
+            self.unreadable = "%s does not hold an object" % FILE
+        for key in self.data:
+            if isinstance(kept, dict) and isinstance(kept.get(key), type(self.data[key])):
+                self.data[key] = kept[key]
 
     def save(self) -> None:
+        if self.unreadable:
+            raise ValueError("%s; the scorecard is not written over it" % self.unreadable)
         records = self.data["records"]
         if len(records) > KEEP:
             for key in sorted(records, key=lambda k: float(records[k].get("at") or 0))[
@@ -223,14 +234,17 @@ class Scorecard:
                     or _ts(pr.get("closed_at")) < since or revert.looks_like_revert(pr)):
                 continue
             key = "%s#%d" % (repo, int(pr["number"]))
-            record = self.data["records"].setdefault(key, {
-                "lane": labels.base_lane(ran[0]), "model": ran[1],
-                "at": _ts(pr.get("merged_at") or pr.get("closed_at"))})
+            record = self.data["records"].get(key)
+            if record is None:
+                # Kept only once its review is read: a record with no review
+                # would count as clean.
+                record = {"lane": labels.base_lane(ran[0]), "model": ran[1],
+                          "at": _ts(pr.get("merged_at") or pr.get("closed_at"))}
+                self._first_read(gh, repo, pr, record, bot)
+                self.data["records"][key] = record
             record["merged"] = bool(pr.get("merged_at"))
             record["reverted"] = bool(record.get("reverted")) or (
                 record["merged"] and any(revert.undoes(r, pr) for r in reverts))
-            if "review" not in record:
-                self._first_read(gh, repo, pr, record, bot)
 
     def _first_read(self, gh: Any, repo: str, pr: Dict[str, Any], record: Dict[str, Any],
                     bot: str) -> None:
@@ -392,6 +406,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             cmd.add_argument("lane")
     args = parser.parse_args(argv)
     card = Scorecard(args.state, datetime.now(timezone.utc).timestamp())
+    if card.unreadable:
+        print("%s: repair or remove it; until then every lane takes no build ticket"
+              % card.unreadable, file=sys.stderr)
+        return 1
     if args.command == "clear":
         was = card.clear(labels.base_lane(args.lane))
         card.save()
