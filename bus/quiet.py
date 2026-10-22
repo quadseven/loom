@@ -132,40 +132,53 @@ def _metric_moved(found: List[Dict[str, Any]], since: datetime) -> Optional[str]
     return None
 
 
+def _news(issue: Dict[str, Any], since: datetime) -> List[str]:
+    """What happened to one ticket after `since`: opened, closed, or a
+    MOVED_LABELS ticket updated."""
+    n, names = issue.get("number"), _labels(issue)
+    created, closed = _at(issue.get("created_at")), _at(issue.get("closed_at"))
+    updated = _at(issue.get("updated_at"))
+    out = []
+    if created is not None and created > since:
+        out.append("#%s opened" % n)
+    if closed is not None and closed > since:
+        out.append("#%s closed" % n)
+    hit = [x for x in MOVED_LABELS if x in names]
+    if hit and updated is not None and updated > since:
+        out.append("#%s %s" % (n, hit[0][len("loom:"):]))
+    return out
+
+
+def _standing(issue: Dict[str, Any], now: datetime, stuck_age: float) -> List[str]:
+    """What one open ticket still holds: a breach, an ask, a stuck state.
+    A closed ticket holds nothing."""
+    if issue.get("state", "open") != "open":
+        return []
+    n, names = issue.get("number"), _labels(issue)
+    out = []
+    if INVARIANT_LABEL in names:
+        out.append("invariant breach #%s is open" % n)
+    if names & set(ASK_LABELS):
+        out.append("#%s asks the operator" % n)
+    stuck = [x for x in STUCK_LABELS if x in names]
+    created = _at(issue.get("created_at"))
+    if stuck:
+        out.append("#%s is %s" % (n, stuck[0]))
+    elif "loom:pr" in names and created is not None \
+            and (now - created).total_seconds() > stuck_age:
+        out.append("#%s is stuck in loom:pr" % n)
+    return out
+
+
 def moved(children: Iterable[Any], breaches: Iterable[Any], found: List[Dict[str, Any]],
           since: datetime, now: datetime) -> List[str]:
     """Each reason the goal is not quiet since `since`, empty when it is."""
     from .factory import STUCK_AGE  # factory imports brain, which imports this module
-    out = []
-    for issue in breaches:
-        if isinstance(issue, dict):
-            out.append("invariant breach #%s is open" % issue.get("number"))
+    out = ["invariant breach #%s is open" % issue.get("number") for issue in breaches
+           if isinstance(issue, dict) and issue.get("state", "open") == "open"]
     for issue in children:
-        if not isinstance(issue, dict):
-            continue
-        n, names = issue.get("number"), _labels(issue)
-        is_open = issue.get("state", "open") == "open"
-        created, closed = _at(issue.get("created_at")), _at(issue.get("closed_at"))
-        updated = _at(issue.get("updated_at"))
-        if created is not None and created > since:
-            out.append("#%s opened" % n)
-        if closed is not None and closed > since:
-            out.append("#%s closed" % n)
-        hit = [x for x in MOVED_LABELS if x in names]
-        if hit and updated is not None and updated > since:
-            out.append("#%s %s" % (n, hit[0][len("loom:"):]))
-        if not is_open:
-            continue
-        if INVARIANT_LABEL in names:
-            out.append("invariant breach #%s is open" % n)
-        if names & set(ASK_LABELS):
-            out.append("#%s asks the operator" % n)
-        stuck = [x for x in STUCK_LABELS if x in names]
-        if stuck:
-            out.append("#%s is %s" % (n, stuck[0]))
-        elif "loom:pr" in names and created is not None \
-                and (now - created).total_seconds() > STUCK_AGE:
-            out.append("#%s is stuck in loom:pr" % n)
+        if isinstance(issue, dict):
+            out += _news(issue, since) + _standing(issue, now, STUCK_AGE)
     metric = _metric_moved(found, since)
     if metric:
         out.append(metric)
@@ -198,6 +211,8 @@ def quiet(comments: Iterable[Any], children: Iterable[Any], breaches: Iterable[A
 
 def heartbeat(text: str, now: datetime) -> str:
     """A report's text with the heartbeat line, for an edit in place."""
+    if not isinstance(text, str) or not isinstance(now, datetime):
+        raise TypeError("heartbeat needs the report text and a datetime")
     kept = [line for line in text.rstrip("\n").splitlines()
             if not line.startswith(HEARTBEAT_STAMP.split("%")[0])]
     return "\n".join(kept) + "\n" + HEARTBEAT_STAMP % now.strftime("%Y-%m-%dT%H:%MZ")

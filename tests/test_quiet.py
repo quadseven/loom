@@ -156,6 +156,14 @@ class QuietRuleTest(unittest.TestCase):
             ticket(41, "loom:merged", state="closed", updated_at=ago(8), closed_at=ago(8)),
             ticket(42, "loom:pr", created_at=ago(4))]))
 
+    def test_a_closed_ticket_or_breach_holds_nothing_open(self):
+        # A closed ticket that still carries an ask or a failed label, or a
+        # closed breach, is not news once it closed before the report.
+        closed = dict(ticket(41, "loom:human", "loom:failed", "loom:invariant",
+                             state="closed", created_at=ago(30), closed_at=ago(20)))
+        breach = {"number": 9, "state": "closed", "labels": [{"name": "loom:invariant"}]}
+        self.assertIsNotNone(self.quiet([report_comment(1, ago(7))], [closed], [breach]))
+
     def test_the_metric_line_counts_only_when_its_numbers_change(self):
         before = journal_comment(1, ago(9), "3/9 pass as of 2030-01-08T03:00Z")
         report = report_comment(2, ago(7))
@@ -180,6 +188,8 @@ class QuietRuleTest(unittest.TestCase):
         self.assertEqual(text.splitlines()[-1],
                          quiet.HEARTBEAT_STAMP % "2030-01-08T12:00Z")
         self.assertNotIn("2030-01-01T00:00Z", text)
+        with self.assertRaises(TypeError):
+            quiet.heartbeat(None, NOW)
 
 
 class StatusTest(unittest.TestCase):

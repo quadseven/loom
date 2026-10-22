@@ -340,10 +340,26 @@ def goal_quiet(gh: GitHub, repo: str, goal: int, authors: Optional[Sequence[str]
                        now or datetime.now(timezone.utc), authors)
 
 
-def _heartbeat_line(issue: Dict[str, Any], still: quiet.Quiet) -> str:
-    return ("- #%s report HEARTBEAT: quiet since %s and its last report was touched %s; "
+def _quiet_lines(still: Optional[quiet.Quiet]) -> List[str]:
+    """A quiet goal's line under it in status, else none."""
+    if still is None:
+        return []
+    return ["  - quiet since %s: no report owed; heartbeat from %s"
+            % (_iso(still.since), _iso(still.next_heartbeat()))]
+
+
+def _owed_lines(issue: Dict[str, Any], led: Dict[str, Any], comments: List[Dict[str, Any]],
+                now: datetime, authors: Optional[Sequence[str]],
+                still: Optional[quiet.Quiet]) -> List[str]:
+    """A due or overdue goal's line under "Reports owed before unlock": none
+    for a quiet goal, a HEARTBEAT line once it has been quiet a week."""
+    if still is None:
+        return [_owed_line(issue, led, comments, now, authors)]
+    if not still.heartbeat_due(now):
+        return []
+    return ["- #%s report HEARTBEAT: quiet since %s and its last report was touched %s; "
             "`journal` edits the report in place, no new comment" % (
-                issue["number"], _iso(still.since), _iso(still.touched)))
+                issue["number"], _iso(still.since), _iso(still.touched))]
 
 
 def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime,
@@ -384,14 +400,9 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
             # one emailed its author "nothing moved" four times a day.
             still = quiet.quiet(comments, _flatten(loose, tree),
                                 goal_breaches(issues, int(issue["number"])), now, authors)
-            if still is not None:
-                lines.append("  - quiet since %s: no report owed; heartbeat from %s"
-                             % (_iso(still.since), _iso(still.next_heartbeat())))
+            lines += _quiet_lines(still)
         if led["state"] != "ok":
-            if still is None:
-                owed.append(_owed_line(issue, led, comments, now, authors))
-            elif still.heartbeat_due(now):
-                owed.append(_heartbeat_line(issue, still))
+            owed += _owed_lines(issue, led, comments, now, authors, still)
         found = handoff.journals(
             [{"body": c.get("body"), "at": c.get("createdAt"),
               "login": rest_login(c.get("author"))} for c in comments], authors or ())

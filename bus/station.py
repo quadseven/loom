@@ -8732,16 +8732,8 @@ class Station:
                                           breaches, gate_hold=hold,
                                           finished=brain.finished_epics(tree))
         brain._check_written_text(body)
-        still = None if hold is not None else quiet_rule.quiet(
-            comments, children, named, now, authors)
-        if still is not None:
-            # loom#1534: a goal where nothing moved is owed no report. Its
-            # weekly heartbeat edits the station's last standup in place,
-            # which emails no one; with none to edit, nothing is posted.
-            mine = self._last_standup(comments, authors)
-            if still.heartbeat_due(now) and mine is not None:
-                self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, mine),
-                             {"body": quiet_rule.heartbeat(body, now)})
+        if hold is None and self._quiet_standup(repo, comments, children, named, body,
+                                                authors, now):
             state[key] = self.now - (brain.REPORT_EVERY - STANDUP_LEAD) + QUIET_RECHECK
             return
         quiet = hold is None and body == self._overdue_standup_body(
@@ -8757,6 +8749,22 @@ class Station:
         else:
             notify.post(self.gh, repo, number, body, notify.REPORT)
         state[key] = self.now
+
+    def _quiet_standup(self, repo: str, comments: List[Any], children: List[Any],
+                       named: List[Dict[str, Any]], body: str, authors: List[str],
+                       now: Any) -> bool:
+        """True when the goal is quiet since its last report (loom#1534): it
+        is owed no standup. Its weekly heartbeat edits the station's last
+        standup in place, which emails no one; with none to edit, nothing is
+        posted."""
+        still = quiet_rule.quiet(comments, children, named, now, authors)
+        if still is None:
+            return False
+        mine = self._last_standup(comments, authors)
+        if still.heartbeat_due(now) and mine is not None:
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, mine),
+                         {"body": quiet_rule.heartbeat(body, now)})
+        return True
 
     @staticmethod
     def _last_standup(comments: List[Any], authors: List[str]) -> Optional[int]:
