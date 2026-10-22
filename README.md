@@ -78,6 +78,16 @@ home and its ship document. The document must contain one fenced
 {"deployment_repo":"YOUR_OWNER/YOUR_DEPLOY_REPO","build_workflow":"build-image.yml","sources":[{"repo":"YOUR_OWNER/YOUR_MODULE_REPO","pins":[{"path":"config/source.env","key":"MODULE_SHA"},{"path":"modules/your-module","kind":"gitlink"},{"path":"scripts/drift.py","kind":"dict_dev","entry":"MODULE"}]}]}
 ```
 
+Example for the three goal homes that ship by roll:
+
+```json
+[
+  {"goal":"quadseven/wow-overseer#512","repo":"quadseven/wow-overseer","path":"docs/ship.md"},
+  {"goal":"quadseven/mod-overseer#919","repo":"quadseven/mod-overseer","path":"docs/ship.md"},
+  {"goal":"quadseven/mod-dungeon-clear#22","repo":"quadseven/mod-dungeon-clear","path":"docs/ship.md"}
+]
+```
+
 An env pin names one `KEY=<40-character SHA>` line; optional quotes are kept.
 A `gitlink` pin names a submodule path. A `dict_dev` pin names a Python
 dictionary entry with a `dev` SHA field; its `deployed_dev` value is left for
