@@ -103,13 +103,15 @@ class Tiers(unittest.TestCase):
         gitlink = entries(("modules/engine",),
                           {"modules/engine": "-Subproject commit 4a424cda\n+Subproject commit ff14f90f"})
         self.assertEqual(merge_tier.classify(REPO, gitlink)[0], merge_tier.CROSS_REPO)
-        ticket = "## What\nAlso change example-owner/other-repo's deploy to match.\n\nRefs example-owner/third#2\n"
+        # A Refs line in the cross-repo shape is what this test is about.
+        cite = "Refs example-owner/third#2\n"  # leak-guard-allow
+        ticket = "## What\nAlso change example-owner/other-repo's deploy to match.\n\n" + cite
         got, why = merge_tier.classify(REPO, entries(APP_CHANGE), ticket)
         self.assertEqual((got, why), (merge_tier.CROSS_REPO,
                                       "its ticket names another repo (example-owner/other-repo)"))
         # A citation line alone names no change in another repo.
         self.assertEqual(merge_tier.classify(REPO, entries(APP_CHANGE),
-                                             "Refs example-owner/third#2\n")[0], merge_tier.APP_CODE)
+                                             cite)[0], merge_tier.APP_CODE)
 
     def test_a_test_or_doc_named_deploy_file_is_never_low_risk(self):
         # Security review: docs and tests were matched before deploy rules.
