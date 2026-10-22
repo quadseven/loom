@@ -1987,9 +1987,20 @@ check_contract_change() {
 
 # Push a commit of the lane tree to a side branch of the ticket's branch and
 # say where the edits are. Never touches the ticket's branch or an open pull
-# request.
+# request. A side branch on a public repo is as public as a pull request, so
+# the same leak scan runs first, and any repo not known to be private counts
+# as public; a refused or unavailable scan keeps no branch.
 push_side() {
-  local from="$1" side="$2"
+  local from="$1" side="$2" range
+  if [ "${REPO_PRIVATE:-}" != true ]; then
+    range="$BASE..$from"
+    [ -n "${FIX_UPSTREAM:-}" ] && range="$FIX_UPSTREAM...$from"
+    if [ ! -f "$LEAK_SCANNER" ] || ! (cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" \
+         --diff "$range" --allow-repo-ref "$REPO") >> "$LOG" 2>&1; then
+      printf 'the public repo leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree'
+      return 1
+    fi
+  fi
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        push -q origin "$from:refs/heads/$side" >> "$LOG" 2>&1; then
     printf 'the edits are on branch %s' "$side"

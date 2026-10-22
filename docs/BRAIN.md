@@ -1403,8 +1403,9 @@ ticketless pull request when all of these hold:
   merge that without `--adopt`);
 - its head commit's check rollup is `SUCCESS`;
 - the review check (`LOOM_REVIEW_CHECK`, else `Grug - Elder`) completed
-  with `success` or `neutral` on the head commit. A sensitive-class pull
-  request still requires `success`;
+  with `success` on the head commit, or `neutral` for a `class:docs` or
+  `class:tests` pull request only. A logic, sensitive or unlabeled pull
+  request requires `success`;
 - every review thread is resolved.
 
 It pins the head SHA in the squash merge, deletes the branch only after
