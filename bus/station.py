@@ -47,6 +47,7 @@ from . import metrics
 from . import naming
 from . import notify
 from . import proof
+from . import quiet as quiet_rule
 from . import rewrite
 from . import operator_hold
 from . import ship_paths
@@ -175,7 +176,7 @@ FIX_CAP_TEXT = ("The fix round cap (%d) is reached, so this ticket is held for t
 REPORT_MARKER = "<!-- loom:report v1 -->"
 # The last line of a quiet standup the station edits in place, and of a
 # standup that repeats an earlier one word for word.
-QUIET_STAMP = "Still quiet as of %s; this report is edited in place until something moves."
+QUIET_STAMP = quiet_rule.HEARTBEAT_STAMP
 SAME_STAMP = "Unchanged as of %s; this report is edited in place until something changes."
 # Reports come every REPORT_EVERY (6 hours), so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
@@ -186,6 +187,12 @@ REPORT_CHECK = 300
 # grace) left every report 2.0 to 2.4 hours old before the next one, so the
 # visibility number (each goal report at most 2 hours old) could never pass.
 STANDUP_LEAD = 15 * 60
+# A goal quiet since its last report (bus/quiet.py) is owed no standup; it is
+# read again this often, so a standup still goes out soon after it moves.
+QUIET_RECHECK = 3600
+# The last line of every station standup, which is how the station finds its
+# own report to edit for a quiet goal's heartbeat.
+STANDUP_FOOTER = "Written by the station from ticket data, because no brain reported in time."
 # The operator's two reading times (2026-10-14: "Twice a day. Morning and
 # evening. 10am and 9pm"): one digest of every goal's reports each, instead of
 # each report as it is posted. LOOM_REPORT_DIGEST_TIMES="" turns it off.
@@ -6686,7 +6693,10 @@ class Station:
                 continue
             sent = False
             author = str((comment.get("user") or {}).get("login") or "").lower()
-            if author in allowed:
+            if author in allowed and self._quiet_report(repo, issue, comment):
+                _say("report %s#%s not pushed: the goal was quiet since its last report"
+                     % (repo, issue.get("number")))
+            elif author in allowed:
                 if not secret_checked:
                     send = self._report_sender()
                     secret_checked = True
@@ -6707,6 +6717,28 @@ class Station:
                 # The whole file is written atomically by _write_json.
                 _write_json(path, ledger)
         return True
+
+    def _quiet_report(self, repo: str, issue: Dict[str, Any], comment: Dict[str, Any]) -> bool:
+        """Whether the goal was quiet since its report before this one
+        (bus/quiet.py): such a report is never pushed to the operator's
+        phone, as no report is owed for it (loom#1534). A read that fails
+        pushes it: a report is never lost to a failed read."""
+        number, ident = int(issue["number"]), self._report_id(comment)
+        try:
+            earlier = [c for c in self._paginate("/repos/%s/issues/%d/comments?per_page=100"
+                                                 % (repo, number))
+                       if isinstance(c, dict) and self._report_id(c) < ident]
+            children = brain.goal_children(self.gh, repo, number)
+            named = self._open_breaches(repo, number)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("report %s#%d: could not read whether the goal was quiet, so it is pushed: %s"
+                 % (repo, number, err))
+            return False
+        now = brain.datetime.fromtimestamp(self.now, brain.timezone.utc)
+        return quiet_rule.quiet(earlier, children, named, now,
+                                [a.lower() for a in self.s.authors]) is not None
 
     def _report_window(self, checked: Any) -> Optional[str]:
         """The time to read reports from, or None when the last read is too
@@ -6750,6 +6782,9 @@ class Station:
                     top = max(top, ident)
             quiet += len(issues) - len(latest)
             for issue, comment in latest.values():
+                if self._quiet_report(repo, issue, comment):
+                    quiet += 1
+                    continue
                 body = self._report_body(comment)
                 first = next((x.lstrip("#").strip() for x in body.splitlines()
                               if x.lstrip("#").strip()), "")
@@ -8690,13 +8725,25 @@ class Station:
             return
         loose, tree = brain.goal_tree(self.gh, repo, number)
         children = brain._flatten(loose, tree)
-        breaches = (self._open_breaches(repo, number)
-                    if (repo, number) == self._invariant_goal() else None)
+        named = self._open_breaches(repo, number)
+        breaches = named if (repo, number) == self._invariant_goal() else None
         hold = self._gate_hold_for(repo, number)
         body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")),
                                           breaches, gate_hold=hold,
                                           finished=brain.finished_epics(tree))
         brain._check_written_text(body)
+        still = None if hold is not None else quiet_rule.quiet(
+            comments, children, named, now, authors)
+        if still is not None:
+            # loom#1534: a goal where nothing moved is owed no report. Its
+            # weekly heartbeat edits the station's last standup in place,
+            # which emails no one; with none to edit, nothing is posted.
+            mine = self._last_standup(comments, authors)
+            if still.heartbeat_due(now) and mine is not None:
+                self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, mine),
+                             {"body": quiet_rule.heartbeat(body, now)})
+            state[key] = self.now - (brain.REPORT_EVERY - STANDUP_LEAD) + QUIET_RECHECK
+            return
         quiet = hold is None and body == self._overdue_standup_body(
             [], None, None if breaches is None else [])
         previous = self._last_same_report(comments, authors, body)
@@ -8710,6 +8757,17 @@ class Station:
         else:
             notify.post(self.gh, repo, number, body, notify.REPORT)
         state[key] = self.now
+
+    @staticmethod
+    def _last_standup(comments: List[Any], authors: List[str]) -> Optional[int]:
+        """The id of the goal's newest station standup by `authors`, else None."""
+        for comment in reversed(comments):
+            text = str(comment.get("body") or "") if isinstance(comment, dict) else ""
+            if (isinstance(comment.get("id") if isinstance(comment, dict) else None, int)
+                    and tickets._login(comment.get("user")).lower() in authors
+                    and text.startswith(REPORT_MARKER) and STANDUP_FOOTER in text):
+                return comment["id"]
+        return None
 
     @staticmethod
     def _last_same_report(comments: List[Any], authors: List[str], body: str) -> Optional[int]:
@@ -8786,7 +8844,7 @@ class Station:
                 % rows(finished)] if finished else [])
             + ["",
             "### Needs you", "Open asks: %s." % rows(groups["asks"]), "",
-            "Written by the station from ticket data, because no brain reported in time."])
+            STANDUP_FOOTER])
 
     def _standup_ticket_groups(self, children: List[Any], since: Optional[float] = None
                                ) -> Dict[str, List[Dict[str, Any]]]:

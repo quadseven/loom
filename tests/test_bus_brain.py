@@ -70,6 +70,12 @@ class Fake:
         assert not self.replies, "unused replies: %s" % self.replies
 
 
+# An open invariant breach on goal #2: a goal with one is never quiet
+# (bus/quiet.py), so its report stays owed (loom#1534).
+BREACH_ON_2 = {"number": 9, "title": "Breach", "state": "open", "body": "Part of #2",
+               "labels": [{"name": "loom:invariant"}]}
+
+
 def goal():
     return {"number": 1, "id": 101, "state": "open", "title": "Goal", "labels": [{"name": "loom:goal"}]}
 
@@ -607,7 +613,7 @@ class SensitiveResumeTests(unittest.TestCase):
         g2 = [{"body": "<!-- loom:journal v1 -->\n- Shipped: none", "createdAt": "2030-01-01T19:50:00Z", "author": bot},
               {"body": "<!-- loom:report v1 -->\nold", "createdAt": "2030-01-01T10:26:00Z", "author": bot}]
         gh = GitHub("t", transport=Fake(
-            reply(200, goals), reply(200, []),
+            reply(200, goals + [BREACH_ON_2]), reply(200, []),
             reply(200, {"data": {"repository": {"g1": {"comments": {"nodes": g1}}, "g2": {"comments": {"nodes": g2}}}}}),
             reply(200, []), reply(200, []),
             reply(200, [])))
@@ -633,7 +639,7 @@ class SensitiveResumeTests(unittest.TestCase):
               {"body": "<!-- loom:report v1 -->\nNothing moved since the last report.",
                "createdAt": "2030-01-01T19:52:00Z", "author": app}]
         gh = GitHub("t", transport=Fake(
-            reply(200, goals), reply(200, []),
+            reply(200, goals + [BREACH_ON_2]), reply(200, []),
             reply(200, {"data": {"repository": {"g2": {"comments": {"nodes": g2}}}}}),
             reply(200, []), reply(200, []), reply(200, [])))
         report = brain.status(gh, [REPO], REPO, env=TRUSTED, now=now, authors=["brain-bot"])

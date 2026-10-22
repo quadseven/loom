@@ -1810,7 +1810,8 @@ ticket naming what evidence is missing.
 
 Every 6 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
-flight, blocked, next.
+flight, blocked, next. A goal quiet since its last report gets none (Quiet
+goals, below).
 
 ### Handoff packet
 
@@ -1857,7 +1858,8 @@ valid report, a measurement (a journal or report with a `Measure:` line that
 is not none) and a completed action (a `Shipped:` line that is not none),
 and its report state: ok, due (2 hours past), or overdue (one more tick,
 30 minutes, past that). Due and overdue goals are listed under "Reports
-owed before unlock"; the tick posts those reports before it unlocks.
+owed before unlock"; the tick posts those reports before it unlocks. A due
+or overdue goal that is quiet (below) is not listed there.
 
 Two reports on one goal home stay at least 90 minutes apart (the
 `report-cadence` invariant). A due or overdue goal with a report under 90
@@ -1871,3 +1873,48 @@ otherwise a person outside the list cannot hold a goal's reports back. An
 overdue report is a missed deadline only: it is separate from a report the
 station could not forward and from a brain that stopped ticking, which the
 station reports on its own.
+
+### Quiet goals
+
+Every new comment on a goal home emails the goal's author, so a goal where
+nothing happened is owed no report (loom#1534: a goal home got "nothing
+moved, nothing needs you" by email every few hours). `bus/quiet.py` holds the
+rule, and it reads only data `status` already has, never a report's prose.
+A goal is quiet since its newest valid report when all of these hold:
+
+- no ticket in its scope (the tickets `goal_tree` walks) was opened or
+  closed after that report, and none carrying `loom:merged`, `loom:shipped`,
+  `loom:verified` or `loom:failed` was updated after it;
+- no open `loom:invariant` issue names the goal (`Part of #N`) or sits in
+  its scope;
+- no open ticket in its scope asks the operator (`loom:human`,
+  `needs-operator`);
+- nothing in its scope is stuck: no open ticket carries `loom:failed`,
+  `loom:runaway`, `loom:regression` or `needs-brain`, and none has sat in
+  `loom:pr` past the stuck age (6 hours);
+- the numbers on its newest `Measure:` line (journal ticks and reports, with
+  dates and clock times left out) are the numbers it had when that report
+  went out.
+
+A goal with no report yet is never quiet. `status` prints a quiet goal's
+`quiet since <time>` line under it and leaves it out of "Reports owed before
+unlock". Once its last report was touched (posted or edited) 7 days ago, it
+is listed there as `report HEARTBEAT`: the next report is that week's
+heartbeat, and `python3 -m bus journal` edits it into this login's newest
+report on the goal home, with a `Still quiet as of <time>` line, instead of
+posting a new comment (an edit sends no email). Any other report for a quiet
+goal is refused like one inside 90 minutes: `journal` posts nothing, prints
+`not posted: quiet since <time>` and exits 0. Refusing, rather than editing
+the last report each time, keeps the last report saying what it said when it
+went out, and needs no write at all; a brain cannot edit another login's
+report anyway.
+
+The station follows the same rule. It posts no standup for a quiet goal and
+reads it again an hour later (`QUIET_RECHECK`); its weekly heartbeat edits
+its own last standup in place and, with none on the goal home, posts
+nothing. Its push of reports to the operator's phone, each report on its own
+or in the digest, skips a report whose goal was quiet since the report
+before it (counted quiet in the digest); a heartbeat is an edit, never a new
+comment, so it is never pushed. A read that fails pushes the report. The
+daily Visibility number counts a quiet goal as current: its last report is
+owed no successor.

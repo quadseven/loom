@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import audit, brain, factory, invariants, proof, spend, station, status, tickets  # noqa: E402
+from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
 from bus import labels as labels_module  # noqa: E402
@@ -6612,6 +6613,22 @@ class ReportDigestTest(Base):
         self.assertIn("Loom evening digest", self.sent[1]["content"])
         self.assertIn("No goal moved since the last digest.", self.sent[1]["content"])
 
+    def test_a_report_on_a_quiet_goal_is_counted_quiet_not_listed(self):
+        # loom#1534: a report whose goal was quiet since the one before it
+        # is not news, whatever its first line says.
+        self.goal(40, "Goal forty")
+        self.at(9, 0)
+        self.report(40, 99, "Earlier report.")
+        self.report(40, 100, "Intake is empty: no open tickets.")
+        for comment, hour in zip(self.fake.comments[40], (2, 9)):
+            comment["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                  time.gmtime(self.base + hour * 3600))
+        self.at(10, 1)
+        text = self.sent[0]["content"]
+        self.assertNotIn("Intake is empty", text)
+        self.assertIn("No goal moved since the last digest.", text)
+        self.assertIn("Quiet: 1 goal, nothing moved.", text)
+
     def test_the_digest_reports_each_bench_and_return_since_the_last_digest(self):
         # loom#969: every bench and un-bench is told once, in the digest.
         self.goal(40, "Goal forty")
@@ -6693,6 +6710,13 @@ class ReportsTest(Base):
         self.fake.issues[number]["labels"] = [{"name": "loom:goal"}]
         return self.fake.comments[number]
 
+    @staticmethod
+    def ago(seconds):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds))
+
+    def recent(self):
+        return self.ago(60)
+
     def comment(self, number, ident, body, author="alice-example"):
         self.fake.comments[number].append({"id": ident, "body": body,
             "user": {"login": author}, "html_url": "https://github.com/%s/issues/%d#issuecomment-%d" % (REPO, number, ident)})
@@ -6731,6 +6755,27 @@ class ReportsTest(Base):
         self.assertEqual(self.sent[0]["content"], "Goal title\nFive report lines\nhttps://github.com/%s/issues/40#issuecomment-100" % REPO)
         self.assertEqual(self.sent[0]["allowed_mentions"], {"parse": []})
         self.assertEqual(self.sent[0]["flags"], station.SUPPRESS_EMBEDS)
+
+    def test_a_report_on_a_quiet_goal_is_not_pushed_to_the_phone(self):
+        # loom#1534: the push follows the quiet rule. A report on a goal
+        # where nothing moved since the report before it is not sent.
+        self.add_goal()
+        self.comment(40, 90, station.REPORT_MARKER + "\nEarlier report")
+        self.fake.comments[40][0]["created_at"] = self.ago(7 * 3600)
+        self.go()
+        self.sent.clear()
+        self.comment(40, 100, station.REPORT_MARKER + "\nIntake is empty: no open tickets.")
+        self.fake.comments[40][-1]["created_at"] = self.ago(60)
+        self.go()
+        self.assertEqual(self.sent, [])
+        # A ticket opened since that report: the next report is pushed.
+        self.fake.sub_issues[40] = [{"number": 41, "title": "New", "state": "open",
+                                     "created_at": self.ago(30), "labels": []}]
+        self.comment(40, 110, station.REPORT_MARKER + "\nOne ticket opened.")
+        self.fake.comments[40][-1]["created_at"] = self.ago(10)
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("One ticket opened.", self.sent[0]["content"])
 
     def test_untrusted_and_journal_comments_are_ignored(self):
         self.prime()
@@ -6881,7 +6926,9 @@ class ReportsTest(Base):
             time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
         self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
         self.fake.comments[40][0]["created_at"] = old
-        ticket = lambda n, title: {"number": n, "title": title, "state": "open",
+        # Opened since the last report, so the goal is not quiet (loom#1534).
+        ticket = lambda n, title: {"number": n, "title": title, "state": "open",  # noqa: E731
+                                   "created_at": self.recent(),
                                    "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         self.fake.sub_issues[40] = [
             ticket(42, "Direct task"),
@@ -6930,6 +6977,7 @@ class ReportsTest(Base):
         epic = lambda n, title: {"number": n, "title": title, "state": "open",  # noqa: E731
                                  "labels": [{"name": "epic"}]}
         done = lambda n: {"number": n, "title": "Done %d" % n, "state": "closed",  # noqa: E731
+                          "updated_at": self.recent(),
                           "labels": [{"name": "loom:ticket"}, {"name": "loom:verified"}]}
         self.fake.sub_issues[40] = [epic(50, "Epic: all done"), epic(60, "Epic: still going")]
         self.fake.sub_issues[50] = [done(51), done(52)]
@@ -6953,35 +7001,46 @@ class ReportsTest(Base):
         self.fake.comments[40][0]["created_at"] = old
         self.fake.sub_issues[40] = [
             {"number": 41, "title": "Merged long ago", "state": "closed", "updated_at": older,
-             "labels": [{"name": "loom:ticket"}, {"name": "loom:merged"}]}]
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:merged"}]},
+            # Opened since the last report, so the goal is not quiet (loom#1534).
+            {"number": 42, "title": "New and unlabelled", "state": "open",
+             "created_at": self.recent(), "labels": [{"name": "loom:ticket"}]}]
         station.Station(GitHub("token", transport=self.fake), self.settings,
                         now=time.time()).post_overdue_standups()
         body = self.fake.comments[40][-1]["body"]
         self.assertNotIn("Merged long ago", body)
         self.assertEqual(body.splitlines()[1], "Nothing moved since the last report.")
 
-    def test_a_quiet_standup_edits_the_last_quiet_report_instead_of_posting(self):
+    def test_a_quiet_goal_gets_no_standup_until_its_weekly_heartbeat_edits_one(self):
+        # loom#1534: a goal home got "nothing moved, nothing needs you" by
+        # email every few hours. A quiet goal is owed no report; once its last
+        # report is a week old the station edits its own standup in place.
         self.add_goal()
-        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
-            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
                              now=time.time())
         quiet = st._overdue_standup_body([], None)
         self.comment(40, 5, quiet + "\n" + station.QUIET_STAMP % "2026-01-01T00:00Z")
-        self.fake.comments[40][0]["created_at"] = old
+        self.fake.comments[40][0]["created_at"] = self.ago(
+            brain.REPORT_EVERY + brain.REPORT_GRACE + 60)
         st.post_overdue_standups()
         self.assertEqual(len(self.fake.comments[40]), 1)  # nothing posted, so no email
+        self.assertEqual(self.fake.edits, [])
+        self.fake.comments[40][0]["created_at"] = self.ago(quiet_rule.HEARTBEAT_EVERY + 60)
+        st.post_overdue_standups()  # read again only after REPORT_CHECK and QUIET_RECHECK
+        self.assertEqual(self.fake.edits, [])
+        self.standup_fresh()
+        self.assertEqual(len(self.fake.comments[40]), 1)
         self.assertEqual(len(self.fake.edits), 1)
         self.assertTrue(self.fake.edits[0].startswith(quiet + "\n"))
+        self.assertIn("Still quiet as of", self.fake.edits[0])
         self.assertNotIn("2026-01-01T00:00Z", self.fake.edits[0])
 
-    def test_a_quiet_standup_edits_its_quiet_report_past_a_brain_report(self):
+    def test_a_quiet_heartbeat_edits_its_quiet_report_past_a_brain_report(self):
         # gemini-plugin-cc, 2026-10-20: the brain reported between the
         # station's quiet reports, so each one was the newest report only
         # until the next, and every "Nothing moved" went out as a new email.
         self.add_goal()
-        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
-            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        old = self.ago(quiet_rule.HEARTBEAT_EVERY + 60)
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
                              now=time.time())
         quiet = st._overdue_standup_body([], None)
@@ -6998,9 +7057,10 @@ class ReportsTest(Base):
         self.add_goal()
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
             time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        # A failed ticket is stuck, so the goal is not quiet (loom#1534).
         self.fake.sub_issues[40] = [
             {"number": 41, "title": "Waiting its turn", "state": "open", "updated_at": old,
-             "created_at": old, "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}]}]
+             "created_at": old, "labels": [{"name": "loom:ticket"}, {"name": "loom:failed"}]}]
         self.comment(40, 1, station.REPORT_MARKER + "\nold report")
         self.fake.comments[40][0]["created_at"] = old
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
@@ -7018,18 +7078,73 @@ class ReportsTest(Base):
         self.assertTrue(self.fake.edits[0].startswith(first + "\n"))
         self.assertIn("Unchanged as of", self.fake.edits[0])
 
-    def test_a_standup_after_a_report_that_was_not_quiet_is_posted(self):
+    def test_a_goal_quiet_since_a_report_that_was_not_quiet_gets_no_standup(self):
+        # loom#1534: whatever the last report said, a goal where nothing moved
+        # since is owed no new one, by the brain or the station.
         self.add_goal()
-        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
-            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
         self.comment(40, 5, station.REPORT_MARKER + "\n1 merged since the last report.")
-        self.fake.comments[40][0]["created_at"] = old
+        self.fake.comments[40][0]["created_at"] = self.ago(
+            brain.REPORT_EVERY + brain.REPORT_GRACE + 60)
+        self.fake.sub_issues[40] = [
+            {"number": 41, "title": "Merged before it", "state": "closed",
+             "updated_at": self.ago(brain.REPORT_EVERY * 2),
+             "closed_at": self.ago(brain.REPORT_EVERY * 2),
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:merged"}]},
+            {"number": 42, "title": "Waiting its turn", "state": "open",
+             "created_at": self.ago(brain.REPORT_EVERY * 2),
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}]}]
         station.Station(GitHub("token", transport=self.fake), self.settings,
                         now=time.time()).post_overdue_standups()
-        self.assertEqual(len(self.fake.comments[40]), 2)
-        self.assertEqual(self.fake.comments[40][-1]["body"].splitlines()[1],
-                         "Nothing moved since the last report.")
+        self.assertEqual(len(self.fake.comments[40]), 1)
         self.assertEqual(self.fake.edits, [])
+
+    def test_a_goal_that_moved_since_its_last_report_still_gets_a_standup(self):
+        # loom#1534: each thing that ends the quiet keeps the standup owed.
+        moves = {
+            "opened": {"state": "open", "created_at": self.recent(), "labels": []},
+            "closed": {"state": "closed", "closed_at": self.recent(), "labels": []},
+            "merged": {"state": "closed", "updated_at": self.recent(),
+                       "labels": [{"name": "loom:merged"}]},
+            "shipped": {"state": "closed", "updated_at": self.recent(),
+                        "labels": [{"name": "loom:shipped"}]},
+            "failed": {"state": "open", "labels": [{"name": "loom:failed"}]},
+            "asks": {"state": "open", "labels": [{"name": "loom:human"}]},
+            "stuck": {"state": "open", "created_at": self.ago(station.factory.STUCK_AGE + 60),
+                      "labels": [{"name": "loom:pr"}]},
+        }
+        for word, ticket in moves.items():
+            with self.subTest(word):
+                self.fake = FakeGitHub()
+                self.add_goal()
+                self.comment(40, 5, station.REPORT_MARKER + "\nNothing moved since the last report.")
+                self.fake.comments[40][0]["created_at"] = self.ago(
+                    brain.REPORT_EVERY + brain.REPORT_GRACE + 60)
+                self.standup_fresh()
+                self.assertEqual(len(self.fake.comments[40]), 1)  # quiet without the move
+                ticket = dict(ticket, number=41, title="A ticket")
+                ticket["labels"] = [{"name": "loom:ticket"}] + ticket["labels"]
+                self.fake.sub_issues[40] = [ticket]
+                self.standup_fresh()
+                self.assertEqual(len(self.fake.comments[40]), 2)
+        with self.subTest("breach"):
+            self.fake = FakeGitHub()
+            self.add_goal()
+            self.comment(40, 5, station.REPORT_MARKER + "\nNothing moved since the last report.")
+            self.fake.comments[40][0]["created_at"] = self.ago(
+                brain.REPORT_EVERY + brain.REPORT_GRACE + 60)
+            self.fake.add(50, title="Lane spark: none done", body="Part of #40", state="triage")
+            self.fake.issues[50]["labels"].append({"name": "loom:invariant"})
+            self.standup_fresh()
+            self.assertEqual(len(self.fake.comments[40]), 2)
+
+    def standup_fresh(self):
+        """One standup pass with no earlier standup state."""
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        path = os.path.join(st.state, "standups.json")
+        if os.path.exists(path):
+            os.remove(path)
+        st.post_overdue_standups()
 
     def test_station_standup_still_stuck_names_a_goal_the_gate_is_holding(self):
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
@@ -7054,6 +7169,9 @@ class ReportsTest(Base):
             time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
         self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
         self.fake.comments[40][0]["created_at"] = old
+        # Closed since the last report, so the goal is not quiet (loom#1534).
+        self.fake.sub_issues[40] = [{"number": 41, "title": "Dropped", "state": "closed",
+                                     "closed_at": self.recent(), "labels": []}]
         station.Station(GitHub("token", transport=self.fake), self.settings,
                         now=time.time()).post_overdue_standups()
         self.assertIn("In flight: none.", self.fake.comments[40][-1]["body"])
@@ -7066,6 +7184,7 @@ class ReportsTest(Base):
         self.fake.comments[40][0]["created_at"] = old
         self.fake.sub_issues[40] = [
             {"number": 41, "title": "Needs a tier", "state": "open", "body": "## Why\nx",
+             "created_at": self.recent(),
              "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}]},
             {"number": 42, "title": "Has a tier", "state": "open",
              "body": "Difficulty: medium\n\n## Why\nx",
@@ -7141,6 +7260,9 @@ class ReportsTest(Base):
 
     def report_aged(self, seconds):
         self.add_goal()
+        # Opened since the last report, so the goal is not quiet (loom#1534).
+        self.fake.sub_issues[40] = [{"number": 41, "title": "New", "state": "open",
+                                     "created_at": self.recent(), "labels": []}]
         self.comment(40, 1, "<!-- loom:report v1 -->\nearlier report")
         self.fake.comments[40][0]["created_at"] = time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds))
