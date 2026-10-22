@@ -40,7 +40,8 @@ import json
 import re
 import shlex
 import subprocess
-import urllib.request
+import http.client
+import urllib.parse
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import claimed, operator_hold, proof, tickets
@@ -170,13 +171,19 @@ def _command(span: str) -> Optional[Check]:
 
 
 def _fetch(url: str, timeout: int) -> Tuple[int, str]:
-    """GET an https URL; any other scheme (file:, a custom one) is refused."""
-    if not url.lower().startswith("https://"):
+    """GET an https URL over an HTTPS connection; any other scheme (file:,
+    http:, a custom one) is refused, and redirects are not followed."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() != "https" or not parts.hostname:
         raise ValueError("a live check fetches https URLs only")
-    request = urllib.request.Request(url, headers={"User-Agent": "loom-live-check"})
-    # The scheme is checked above: only https reaches urlopen.
-    with urllib.request.urlopen(request, timeout=timeout) as answer:  # noqa: S310
+    path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+    conn = http.client.HTTPSConnection(parts.hostname, parts.port, timeout=timeout)
+    try:
+        conn.request("GET", path, headers={"User-Agent": "loom-live-check"})
+        answer = conn.getresponse()
         return int(answer.status), answer.read(BODY_LIMIT).decode("utf-8", "replace")
+    finally:
+        conn.close()
 
 
 def run(check: Check, gh: Any, fetch: Optional[Callable[[str, int], Tuple[int, str]]] = None,
@@ -198,7 +205,8 @@ def run(check: Check, gh: Any, fetch: Optional[Callable[[str, int], Tuple[int, s
                           timeout=CHECK_TIMEOUT, check=False)
             text, ok = str(done.stdout or ""), done.returncode == 0
             seen = "exit %d" % done.returncode
-    except (OSError, ValueError, subprocess.SubprocessError, GitHubError) as err:
+    except (OSError, ValueError, http.client.HTTPException, subprocess.SubprocessError,
+            GitHubError) as err:
         # A check that cannot run is a failed check, said on the ticket by
         # its kind only: the message may hold a private address.
         return False, "the check could not run (%s)" % type(err).__name__

@@ -130,6 +130,11 @@ class Checks(unittest.TestCase):
             raise OSError("no route to 192.0.2.7")
         self.assertEqual(criteria_gate.run(check, None, fetch=broken),
                          (False, "the check could not run (OSError)"))
+
+        def garbled(url, timeout):
+            raise criteria_gate.http.client.BadStatusLine("x")
+        self.assertEqual(criteria_gate.run(check, None, fetch=garbled),
+                         (False, "the check could not run (BadStatusLine)"))
         gh = SimpleNamespace(rest=lambda m, p: SimpleNamespace(data={"value": "false"}))
         gh_check = criteria_gate.check_of("`gh api repos/o/r/actions/variables/X` shows `false`")
         self.assertEqual(criteria_gate.run(gh_check, gh), (True, "GitHub answered, found `false`"))
