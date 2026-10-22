@@ -160,7 +160,8 @@ fi
 # makes none but writes $FAKE_SUMMARY to the Intent summary and
 # $FAKE_THREAD_ANSWER as an answer to thread PRRT_9 ($FAKE_AGENT=no-change),
 # exits non-zero ($FAKE_AGENT=fail), or prints $FAKE_OUT and exits
-# $FAKE_EXIT, editing a file first when $FAKE_EDIT is set ($FAKE_AGENT=say).
+# $FAKE_EXIT, editing a file first when $FAKE_EDIT is set and writing a hook
+# config the brief never names when $FAKE_HOOK is set ($FAKE_AGENT=say).
 # $FAKE_AGENT=stray also commits files no brief here names (a hook config,
 # a scratch file under .loom/, a top-level test script).
 # $FAKE_AGENT=contract-edit commits $FAKE_CONTRACT_TEXT as the validation
@@ -173,6 +174,7 @@ cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = say ]; then
   [ -z "${FAKE_EDIT:-}" ] || echo partial > fix.txt
+  if [ -n "${FAKE_HOOK:-}" ]; then mkdir -p .agents && echo '{}' > .agents/hooks.json; fi
   printf '%s\\n' "$FAKE_OUT"
   exit "${FAKE_EXIT:-1}"
 fi
@@ -927,6 +929,29 @@ print('leak guard: clean (shape patterns only)')
         line = self.failure_line()
         self.assertTrue(line.isascii(), line)
         self.assertIn("it said: Stopped: the fetch failed. Needs the branch and a writable tree.", line)
+
+    def test_a_final_message_leaves_out_the_cli_log_lines(self):
+        # A zai run said the work was already done, but opencode's retried
+        # stream errors filled the end of its output and the reason quoted
+        # them instead (2026-10-21).
+        self.drop_brief()
+        err = ('timestamp=2026-10-21T21:19:12.765Z level=ERROR run=bf50fe65 '
+               'message="stream error" providerID=zai')
+        said = "The feature is already implemented and all tests pass."
+        out = "\n".join([err] * 3 + [said] + [err] * 25)
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT=out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertIn("it said: " + said, line)
+        self.assertNotIn("level=ERROR", line)
+
+    def test_cli_log_lines_alone_are_no_reason(self):
+        self.drop_brief()
+        out = "\n".join('timestamp=2026-10-21T21:%02d:00.000Z level=ERROR run=bf50fe65 '
+                        'message="stream error"' % i for i in range(5))
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT=out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent made no commit and wrote no reason", self.failure_line())
 
     def test_a_long_final_message_is_cut(self):
         self.drop_brief()
@@ -1697,6 +1722,51 @@ print('leak guard: clean (shape patterns only)')
         self.assertEqual(kept, "partial\n")
         self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", heads)
 
+    def test_a_kept_branch_leaves_out_files_the_brief_does_not_allow(self):
+        # An agy run wrote .agents/hooks.json before it timed out; the next
+        # lane merged the kept branch and its commit was refused for a file
+        # it never wrote (2026-10-21).
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EDIT="1",
+                      FAKE_HOOK="1", FAKE_EXIT="124")
+        reason = self.failure_line()
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-timedout-" in h]
+        self.assertEqual(len(side), 1, heads)
+        self.assertIn("the edits are on branch " + side[0], reason)
+        files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r",
+                                "--name-only", side[0]],
+                               capture_output=True, text=True, check=True).stdout.split()
+        self.assertIn("fix.txt", files)
+        self.assertNotIn(".agents/hooks.json", files)
+
+    def kept_branch_with_failing_git(self, refuse):
+        self.write_tool(self.bin / "git", """#!/usr/bin/env bash
+if [[ " $* " == *" %s "* ]]; then echo 'refused' >&2; exit 1; fi
+exec /usr/bin/git "$@"
+""" % refuse)
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EDIT="1",
+                      FAKE_HOOK="1", FAKE_EXIT="124")
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-timedout-", heads)
+        reason = self.failure_line()
+        self.assertIn("could not be left out, so no branch was kept", reason)
+        self.assertNotIn("the edits are on branch", reason)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertNotIn("left off the kept branch", log)
+        return log
+
+    def test_a_stray_file_that_cannot_be_removed_keeps_no_branch(self):
+        log = self.kept_branch_with_failing_git("rm -q -f -- .agents/hooks.json")
+        self.assertIn("could not remove .agents/hooks.json from the kept edits", log)
+
+    def test_a_removal_that_cannot_be_committed_keeps_no_branch(self):
+        log = self.kept_branch_with_failing_git("leave out files outside the brief's paths")
+        self.assertIn("could not commit the removal of .agents/hooks.json from the kept edits", log)
+
     def test_a_limited_timeout_after_editing_still_keeps_the_edits(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         self.run_lane(FAKE_AGENT="say", FAKE_OUT="429 RESOURCE_EXHAUSTED quota resets in 1 hours",
@@ -1708,6 +1778,31 @@ print('leak guard: clean (shape patterns only)')
         self.assertEqual(len(side), 1, heads)
         self.assertTrue(reason.startswith("[limit] "), reason)
         self.assertIn("the edits are on branch " + side[0], reason)
+
+    def test_a_limit_ending_after_editing_keeps_the_edits(self):
+        # A free pool that runs dry 20 minutes into a run ends it with exit 1
+        # and a limit; the next attempt starts from these edits, not the base.
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="429 RESOURCE_EXHAUSTED quota resets in 1 hours",
+                      FAKE_EDIT="1", FAKE_EXIT="1")
+        reason = self.failure_line()
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-timedout-" in h]
+        self.assertEqual(len(side), 1, heads)
+        self.assertTrue(reason.startswith("[limit] "), reason)
+        self.assertIn("the edits are on branch " + side[0], reason)
+        kept = subprocess.run(["git", "--git-dir", str(self.remote), "show", side[0] + ":fix.txt"],
+                              capture_output=True, text=True, check=True).stdout
+        self.assertEqual(kept, "partial\n")
+
+    def test_a_work_failure_after_editing_pushes_no_side_branch(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="I could not finish", FAKE_EDIT="1", FAKE_EXIT="1")
+        self.assertTrue(self.failure_line().startswith("[work] "), self.failure_line())
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-timedout-", heads)
 
     def test_a_failed_status_read_never_names_an_uncommitted_timeout_branch(self):
         self.write_tool(self.bin / "git", """#!/usr/bin/env bash

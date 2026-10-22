@@ -38,6 +38,7 @@ from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Se
 from . import brain
 from . import journal
 from . import naming
+from . import notify
 from . import text as _text
 from . import watch
 from .github import GitHubError
@@ -1144,8 +1145,7 @@ class Filer:
             self.gh.rest("PATCH", "/repos/%s/issues/comments/%s" % (self.repo, note["id"]),
                          {"body": body})
         else:
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
-                         {"body": body})
+            notify.post(self.gh, self.repo, number, body, notify.REOPENED)
         self.writes += 1
         self.say("invariants: reopened %s#%d: %s" % (self.repo, number, b.title))
 
@@ -1171,8 +1171,7 @@ class Filer:
                 "this subject with the others and is updated in place." % into)
         if not any(("Folded into #%d" % into) in str(c.get("body", "")) for c in comments):
             _text.check(body)
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
-                         {"body": body})
+            notify.post(self.gh, self.repo, number, body, notify.CLOSED)
             self.writes += 1
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
                      {"state": "closed", "state_reason": "not_planned"})
@@ -1259,8 +1258,7 @@ class Filer:
                                 for c in comments)
         if not already_explained:
             _text.check(body)
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
-                         {"body": body})
+            notify.post(self.gh, self.repo, number, body, notify.CLOSED)
             self.writes += 1
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
                      {"state": "closed", "state_reason": "not_planned"})

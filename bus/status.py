@@ -26,6 +26,8 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, Any, Iterable, List, Optional, Tuple
 
+from . import notify
+
 MARKER = "<!-- loom:status v1 -->"
 HEAD = ("Loom status for this ticket, newest first. Routine events are edited in "
         "here instead of posted as new comments.")
@@ -198,8 +200,7 @@ def add(gh: Any, repo: str, number: int, text: str, now: float,
     if found is None:
         if _add_to_body(gh, repo, number, at, text, logins(gh, trusted)):
             return
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                {"body": render([(at, text)])})
+        notify.post(gh, repo, number, render([(at, text)]), notify.STATUS)
         return
     ident, events = found
     gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, ident),

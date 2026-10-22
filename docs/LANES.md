@@ -613,7 +613,19 @@ backticked string from the ticket's Live criterion in
 fixed-string match (see `.env.example`). The station runs it once per string,
 with a 60-second timeout, then quotes up to 20 matching lines per string in
 the verify brief. It accepts at most five ASCII strings of at most 120
-characters. Lines containing credentials, private hosts, IP addresses or
+characters.
+A Live criterion that needs its strings to be absent ("no `X` line appears",
+"never logs `X`", "`X` does not appear", every string so worded) is verified on an
+empty answer: when every command run answered and no line named any string, the
+ticket is handed a verify run and the brief carries a `## Absence check, station
+data` section naming the zero count and the hours of log searched
+(`LOOM_EVIDENCE_WINDOW_HOURS`, default 24; a command may print
+`loom-evidence-window-hours: N` to report the log it really read, as a pod restart
+cuts it short). When the criterion states a span ("over 24h", "for 3 days") longer
+than that window, absence is not proven: the station logs the missing hours, labels
+the ticket `loom:awaiting-evidence` and tries again after its cooldown. A command
+error or timeout proves nothing either way. A criterion that needs a string present
+still waits for a line. Lines containing credentials, private hosts, IP addresses or
 local paths are dropped and counted. A timeout or command error is stated in
 the brief without quoting its output. Repos without a command run none.
 Verify lanes have no network, so every verify brief also carries a
@@ -630,8 +642,9 @@ log lines and are dropped and counted when they do not.
 The agent changes no code, opens no pull request and moves no label; it reads
 the ticket's Live criterion and judges each criterion against those two
 sections, then
-writes `verify.json`: a proof record (`bus/proof.py`) or
-`{"missing": "<the evidence that does not exist yet>"}`. The runner copies it
+writes `verify.json`: a proof record (`bus/proof.py`),
+`{"missing": "<the evidence that does not exist yet>"}` or, for a ticket sent
+ahead of a build, the `unmet` answer described below. The runner copies it
 to the lane's log folder as `<brief>.verify.json`, with the run's model
 beside it in `<brief>.verify.model`. The station checks a record with
 `bus/proof.py`, ticks the criteria and moves the ticket to verified with the
@@ -658,6 +671,15 @@ verify runs. The brain audits lane proofs (docs/BRAIN.md, Proof audits): a
 lane whose proof failed its audit in the last 24 hours is handed no verify
 run, and the daily line's Throughput number splits the verified tickets into
 lane and brain proofs.
+
+A ticket the station sent to verification before any build (a merged pull
+request already covers it; docs/BRAIN.md, Claim and outcome) gets one more
+section in its brief, `## Sent to verification before any build`, and one more
+possible answer: `{"unmet": "<which criteria the merged change does not meet
+and why>"}`. The station then moves the ticket back to `loom:queued` for a
+build, with the reason as a status event, and does not send that pull request
+to a verify run again. An `unmet` answer on any other ticket, or one that says
+nothing, only leaves the ticket shipped.
 
 A ticket whose proofs were refused `VERIFY_REFUSAL_CAP` times (3,
 `bus/station.py`; the count is kept in `state/station/verify-refused.json`)

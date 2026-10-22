@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, change_class, labels, naming, scope_fit, split, stale_claims, status, tickets
+from . import brain, change_class, labels, naming, notify, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -157,6 +157,8 @@ REVIEW_GRACE = 1800
 # At most this many merges, send-backs and climbs per pass.
 MAX_ACTIONS = 12
 DEFAULT_REVIEW_CHECK = "Grug - Elder"
+# The review bot's plan check (same default as bus/invariants.py).
+DEFAULT_PLAN_CHECK = "Grug - Chief"
 # The review bot's login as GraphQL reports it (an app, without "[bot]").
 DEFAULT_REVIEW_BOT = "grug-tribe"
 BOT_FIXED_PREFIX = "Fixed in "
@@ -444,6 +446,11 @@ NOT_BUILT_RE = re.compile(r"\s*;\s*not built:\s*\S.+$", re.I)
 SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
                          r"([a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9])#(\d+)\b", re.I)
 BODY_LEAK_MARKER = "<!-- loom:body-leak-repaired %s -->"
+# On the ticket: the station put it under an epic for this head commit.
+EPIC_REPAIR_MARKER = "<!-- loom:epic-repaired %s -->"
+# The plan check's summary table names this row for a ticket under no epic.
+EPIC_ROW = "which epic"
+_ORPHAN_NUMBER_RE = re.compile(r"#(\d+)")
 # On the pull request: the scope check held this head commit (bus/scope_fit.py).
 SCOPE_HOLD_MARKER = "<!-- loom:scope-hold %s -->"
 MODEL_LINE = re.compile(r"^Model:[^\n]*\n?", re.M)
@@ -462,6 +469,18 @@ fails without the fix where the finding is about behavior.
 plain to the next reader, and say why in the commit message.
 - Keep the whole suite green, and change nothing the threads and checks do not \
 ask for."""
+
+# A ticket with either label is never sent back: a person or the brain has it.
+SEND_BACK_HOLDS = frozenset(("loom:human", "needs-brain"))
+
+# The note for a ticket whose lane run failed with its pull request open: the
+# failed run is the finding, so it is not the stock FIX_NOTES that brain.fix
+# refuses to send alone.
+FAILED_RUN_NOTES = """The lane's last run on this ticket failed before it finished. The \
+open pull request holds the work so far.
+
+- Read the pull request's branch and finish the ticket on it.
+- Keep the whole suite green, and change nothing the ticket does not ask for."""
 
 # A green pull request that leaves ticket criteria unticked goes back with
 # each one named under this heading (2026-10-20: the generic note listed no
@@ -892,6 +911,30 @@ GAVE_UP = "The factory tried every rung of the model ladder"
 ENDING_CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
 
 
+# An agent run cut off at the agent timeout (lanes/agent_cli.sh classes exit 124
+# [transient]). The class may be missing (an older reason) or [work] (the
+# station's own reclassing of a repeated timeout, below), never [limit].
+TIMEOUT_RE = re.compile(r"^(?:\[(?:transient|work)\] )?agent exited 124(?!\d)")
+# Two runs in a row cut off on one ticket are the ticket's doing, not a lane's.
+TIMEOUT_STRIKES = 2
+
+
+def is_timeout(reason: str) -> bool:
+    """Whether a classed failure reason is an agent timeout (exit 124)."""
+    return bool(TIMEOUT_RE.match(reason))
+
+
+def timeouts_in_a_row(rows: Sequence[Tuple[int, str, str, str]]) -> int:
+    """How many of the newest `rows` (attempts, oldest first) ended at an
+    agent timeout, counting back until one ended any other way."""
+    count = 0
+    for row in reversed(rows):
+        if not is_timeout(row[3]):
+            break
+        count += 1
+    return count
+
+
 def newest_ending_class(comments: Sequence[Any]) -> str:
     """The class of the ending that closed the ticket's newest claim: limit,
     transient, factory, auth or work. A reason with no class, and a newest
@@ -1029,11 +1072,32 @@ def next_rung(tried: set, load: Dict[str, int], eligible: Optional[set] = None,
     return free[0] if free else min(untried, key=lambda n: (least[n], n))
 
 
-def pr_faults(details: Dict[str, Any], full: Dict[str, Any]) -> List[str]:
-    """What keeps a pull request from landing, in words for its ticket."""
-    return [w for bad, w in ((not brain._checks_green(details), "failing checks"),
+def pr_faults(details: Dict[str, Any], full: Dict[str, Any],
+              runs: Sequence[Dict[str, Any]] = ()) -> List[str]:
+    """What keeps a pull request from landing, in words for its ticket. A
+    failing check is a red rollup or a failed run among `runs`, the newest
+    run of each check (brain.newest_check_runs), which is what the fix brief
+    quotes, so the factory and the brief name the same failures."""
+    failed = any(r.get("conclusion") in brain.FAILED_CONCLUSIONS for r in runs)
+    return [w for bad, w in ((failed or not brain._checks_green(details), "failing checks"),
                              (not brain._threads_resolved(details), "open review threads"),
                              (full.get("mergeable") is False, "a conflict")) if bad]
+
+
+def chief_orphans(summary: str) -> Optional[List[int]]:
+    """The tickets the plan check's `which epic` row says belong to no epic,
+    when that row is the only one failing in its summary table; else None.
+    A table row reads `| which epic | fail | #5, #9 belong to no epic - ... |`
+    (services/_shared/personas/tpm/persona.py in the review bot's repo)."""
+    failing = []
+    for line in str(summary or "").splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) >= 3 and cells[1].lower() == "fail":
+            failing.append((cells[0].lower(), "|".join(cells[2:])))
+    if len(failing) != 1 or failing[0][0] != EPIC_ROW:
+        return None
+    named = failing[0][1].partition(" belong to no epic")[0]
+    return [int(n) for n in _ORPHAN_NUMBER_RE.findall(named)] or None
 
 
 def acceptance_criteria(body: str) -> List[str]:
@@ -1270,6 +1334,8 @@ class Factory:
                  limit_until: Optional[Dict[str, float]] = None,
                  known_waits: Optional[Dict[str, str]] = None,
                  human: Callable[..., Any] = brain.human,
+                 place: Callable[..., Any] = brain.place_under_epic,
+                 plan_check: str = DEFAULT_PLAN_CHECK,
                  scope: Optional[scope_fit.Ask] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
@@ -1282,6 +1348,9 @@ class Factory:
         self.review_bot = review_bot
         self.merge, self.fix, self.move = merge, fix, move
         self.human = human
+        # Puts a ticket that sits under no epic under one (brain.place_under_epic).
+        self.place = place
+        self.plan_check = plan_check
         self.close = close if close is not None else _default_close
         self.limited = set(limited)
         # Lanes whose fresh heartbeat says unavailable for another reason (an
@@ -1415,6 +1484,11 @@ class Factory:
         lane = next((x for x in own if self._free(x)), None)
         if lane is not None or any(self._up(x) for x in own):
             return lane, ""
+        whole = own + ([old] if old in lanes_of(difficulty, private) and old not in own else [])
+        if not all(self._out_hours(x) for x in whole):
+            # A lane of the tier lifts within LIMIT_REQUEUE: wait for it
+            # rather than leave the tier (loom#1224).
+            return None, ""
         for tier in FALLBACK.get(difficulty, ()):
             fallback_lanes = [x for x in lanes_of(tier, private)
                               if x != old and (allow_remote or x not in REMOTE_LANES)
@@ -1648,8 +1722,14 @@ class Factory:
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
                    no_test: bool = False, unticked: Sequence[str] = ()) -> None:
         number = int(issue["number"])
-        if "loom:human" in _labels(issue):
-            return  # a person has it: no more rounds, no more comments
+        held = SEND_BACK_HOLDS & set(_labels(issue))
+        if held:
+            # A person has it (no more rounds, no more comments), or the round
+            # cap, a hold or a past-the-ladder give-up put it with the brain:
+            # another round is a comment nobody asked for.
+            _say("%s#%d is held (%s); not sent back for %s"
+                 % (repo, number, ", ".join(sorted(held)), why))
+            return
         if checks_failing and self._past_no_change(repo, issue, comments):
             return
         age = self.now - _ts(pr.get("created_at"))
@@ -1693,9 +1773,14 @@ class Factory:
                 _say("%s#%d: unticked criteria not quoted in the fix note (%s)"
                      % (repo, number, err))
         if lane is not None:
-            self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane)
+            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane)
         else:
-            self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes)
+            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes)
+        if sent is False:
+            # brain.fix found nothing new to say and wrote nothing.
+            _say("%s#%d not sent back for #%d (%s): the brief would add nothing"
+                 % (repo, pr["number"], number, why))
+            return
         self.actions += 1
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
 
@@ -1736,8 +1821,8 @@ class Factory:
             return False  # this head was asked already
         if not answered_threads(self._threads(repo, number), self.trusted):
             return False  # nothing was answered: the finding stands on its own
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                     {"body": "%s\n\n%s" % (review_again(), marker)})
+        notify.post(self.gh, repo, number, "%s\n\n%s" % (review_again(), marker),
+                    notify.REVIEW_REQUEST)
         self.actions += 1
         return True
 
@@ -1891,7 +1976,8 @@ class Factory:
         sha = str((full.get("head") or {}).get("sha") or "")
         self._resolve_bot_fixed(repo, number)
         details = brain._pr_graphql(self.gh, repo, number)
-        faults = pr_faults(details, full)
+        runs = self._runs.get(sha, [])
+        faults = pr_faults(details, full, runs)
         # Medium and low findings never send a pull request back on their own
         # (2026-10-14: 64% of 361 fix rounds were review threads, most of them
         # medium; "high-complexity" alone was 220 of ~1000 findings). They go
@@ -1901,10 +1987,11 @@ class Factory:
                 and self._defer_minor(repo, number, int(issue["number"]), sha, comments,
                                       True)):
             details = brain._pr_graphql(self.gh, repo, number)
-            faults = pr_faults(details, full)
+            faults = pr_faults(details, full, runs)
         if faults == ["failing checks"] and (
                 self._split_pr(repo, number, full, issue, comments, sha)
                 or self._repair_body_leak(repo, number, full, issue, comments, sha)
+                or self._repair_ticket_epic(repo, number, issue, comments, sha)
                 or self._run_again(repo, number, sha)
                 or self._review_again(repo, number, full, sha)):
             return
@@ -1939,7 +2026,10 @@ class Factory:
             _say("%s#%d: the review asks for a split but names nothing to split on"
                  % (repo, number))
             return None
-        headers, epic = split.header_lines(body), split.epic_of(body, ticket)
+        headers = split.header_lines(body)
+        named = split.epic_of(body, ticket)
+        placed = self._epic_with_room(repo, named, len(parts))
+        epic = placed or named
         drafts = []
         for index, part in enumerate(parts, start=1):
             name = "%s (part %d of %d)" % (str(issue.get("title") or "").strip(),
@@ -1954,9 +2044,33 @@ class Factory:
             # nor leave half the parts filed; the usual fix round handles it.
             _say("%s#%d: split ticket text refused (%s)" % (repo, number, err))
             return None
-        return [int((self.gh.rest("POST", "/repos/%s/issues" % repo, {
-            "title": name, "body": text, "labels": ["loom:ticket", "loom:queued"]}).data
-            or {})["number"]) for name, text in drafts]
+        numbers = []
+        for name, text in drafts:
+            made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+                "title": name, "body": text, "labels": ["loom:ticket", "loom:queued"]}).data or {}
+            if placed:
+                self._link_filed(repo, placed, made, text)
+            numbers.append(int(made["number"]))
+        return numbers
+
+    def _epic_with_room(self, repo: str, named: int, room: int) -> Optional[int]:
+        """The epic a ticket filed beside issue `named` belongs under: that
+        epic while it is open with room for `room` more tickets, else the
+        goal's next epic (loom#951, loom#1294). None when no goal can be
+        found: the filing still goes ahead, under the issue it names."""
+        try:
+            return brain.placement_epic(self.gh, repo, named, room)
+        except (GitHubError, ValueError) as err:
+            _say("%s: no epic with room beside #%d, filing under it: %s" % (repo, named, err))
+            return None
+
+    def _link_filed(self, repo: str, epic: int, made: Dict[str, Any], text: str) -> None:
+        """Link a ticket the factory just filed as the epic's sub-issue, best
+        effort: its Part of line already names the epic."""
+        try:
+            brain.file_under_epic(self.gh, repo, epic, dict(made, body=text))
+        except GitHubError as err:
+            _say("%s#%s: not linked to epic #%d: %s" % (repo, made.get("number"), epic, err))
 
     def _split_pr(self, repo: str, number: int, full: Dict[str, Any],
                   issue: Dict[str, Any], comments: List[Dict[str, Any]], sha: str) -> bool:
@@ -1981,7 +2095,7 @@ class Factory:
                     "to be split, and no fix round can split it, so it is closed and this "
                     "ticket is split into %s." % (
                         marker, number, ", ".join("#%d" % n for n in filed)))
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, ticket), {"body": done})
+            notify.post(self.gh, repo, ticket, done, notify.NOTE)
         names = ", ".join(re.findall(r"#\d+", done.partition("split into")[2])) or "new tickets"
         self.close(self.gh, repo, number,
                    "Closed by the station: the review asked for this change to be split and "
@@ -2024,14 +2138,50 @@ class Factory:
         title, body, changed = fixed
         self.gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number),
                      {"title": title, "body": body})
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(issue["number"])),
-                     {"body": "%s\nThe leak scan on #%d failed on its title and body only, "
-                              "which the runner writes from this ticket, so the factory "
-                              "edited the text instead of sending it back:\n%s"
-                              % (marker, number, "\n".join("- " + c for c in changed))})
+        notify.post(self.gh, repo, int(issue["number"]),
+                    "%s\nThe leak scan on #%d failed on its title and body only, "
+                    "which the runner writes from this ticket, so the factory "
+                    "edited the text instead of sending it back:\n%s"
+                    % (marker, number, "\n".join("- " + c for c in changed)),
+                    notify.REPAIR)
         self.actions += 1
         _say("rewrote %d flagged line(s) of %s#%d's text after a body-only leak scan"
              % (len(changed), repo, number))
+        return True
+
+    def _repair_ticket_epic(self, repo: str, number: int, issue: Dict[str, Any],
+                            comments: List[Dict[str, Any]], sha: str) -> bool:
+        """Put the ticket under an epic when the plan check fails only on its
+        `which epic` row for this pull request's own ticket. The missing epic
+        is on the ticket, which a lane cannot edit, so a fix round would loop
+        with nothing to change. Once per head commit; after that the pull
+        request waits for the plan check to read the ticket again, still with
+        no lane round. True whenever the failure is that row alone, so the
+        usual paths never see it."""
+        failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
+        if len(failed) != 1 or failed[0].get("name") != self.plan_check:
+            return False
+        ticket = int(issue["number"])
+        if chief_orphans(str((failed[0].get("output") or {}).get("summary") or "")) != [ticket]:
+            return False
+        marker = EPIC_REPAIR_MARKER % sha
+        if any(marker in str(c.get("body") or "") for c in comments):
+            _say("%s#%d waits: its ticket #%d was put under an epic and %s has not read it again"
+                 % (repo, number, ticket, self.plan_check))
+            return True
+        try:
+            epic = int(self.place(self.gh, repo, issue))
+        except (GitHubError, ValueError) as err:
+            _say("%s#%d: ticket #%d could not be put under an epic (%s); held, no lane round"
+                 % (repo, number, ticket, err))
+            return True
+        notify.post(self.gh, repo, ticket,
+                    "%s\n%s failed on pull request #%d only because this ticket belonged to no "
+                    "epic, which a lane cannot fix, so the factory put it under epic #%d instead "
+                    "of sending the pull request back." % (marker, self.plan_check, number, epic),
+                    notify.REPAIR)
+        self.actions += 1
+        _say("put %s#%d under epic #%d after %s held #%d" % (repo, ticket, epic, self.plan_check, number))
         return True
 
     def _land_or_ask_test(self, repo: str, number: int, full: Dict[str, Any],
@@ -2063,13 +2213,18 @@ class Factory:
         if any(isinstance(found, dict) and found.get("title") == title
                for found in self.gh.paginate("/repos/%s/issues?labels=loom:ticket" % repo)):
             return
+        number = int(issue["number"])
+        named = split.epic_of(str(issue.get("body") or ""), number)
+        placed = self._epic_with_room(repo, named, 1)
+        epic = placed or named
         body = ("Difficulty: medium\n\n## Why\nThe lane pull request marked these ticket criteria as not built.\n\n"
                 "## What\nComplete the remaining acceptance criteria.\n\n## Acceptance criteria\n" +
                 "\n".join("- [ ] " + item for item in criteria) +
-                "\n\n## Size\nS\n\n## Out of scope\n- None\n\nPart of #%d\n" %
-                int(issue["number"]))
-        self.gh.rest("POST", "/repos/%s/issues" % repo, {
-            "title": title, "body": body, "labels": ["loom:ticket", "loom:queued"]})
+                "\n\n## Size\nS\n\n## Out of scope\n- None\n\nPart of #%d\n" % epic)
+        made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+            "title": title, "body": body, "labels": ["loom:ticket", "loom:queued"]}).data or {}
+        if placed:
+            self._link_filed(repo, placed, made, body)
 
     def _run_again(self, repo: str, number: int, sha: str) -> bool:
         """Re-run the failed Actions jobs on this commit once. False when a
@@ -2115,8 +2270,8 @@ class Factory:
                 "/repos/%s/issues/%d/comments" % (repo, number)):
             if marker in str(comment.get("body") or ""):
                 return False
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                     {"body": "%s\n%s" % (marker, REVIEW_AGAIN)})
+        notify.post(self.gh, repo, number, "%s\n%s" % (marker, REVIEW_AGAIN),
+                    notify.REVIEW_REQUEST)
         self.actions += 1
         _say("asked the review bot to review %s#%d again after a partial review"
              % (repo, number))
@@ -2182,12 +2337,12 @@ class Factory:
             return False
         if verdict.kind == scope_fit.FITS:
             return False
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": (
+        notify.post(self.gh, repo, number, (
             "%s\nHeld for the brain: a scope check asked whether this pull request's "
             "changed files fit the ticket's What section and the repos and resources "
             "it names, and the answer was no: %s\nThe check is advisory. The brain or "
             "a person reads the diff against the ticket and merges it, or sends it "
-            "back." % (marker, verdict.reason))})
+            "back." % (marker, verdict.reason)), notify.HELD)
         if "needs-brain" not in _labels(full):
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": ["needs-brain"]})
@@ -2281,7 +2436,7 @@ class Factory:
             # Back to loom:pr so the fix brief reuses its open pull request.
             kept = [x for x in _labels(issue) if x != "loom:failed"] + ["loom:pr"]
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
-            self.fix(self.gh, repo, int(pr["number"]), (repo, number), FIX_NOTES)
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number), FAILED_RUN_NOTES)
         else:
             self.move(self.gh, repo, number, "briefed", lane=lane)
         self.actions += 1
@@ -2342,12 +2497,12 @@ class Factory:
         if "needs-brain" in names:
             return
         number = int(issue["number"])
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
-            "Lane %s made no commit and wrote no reason, as a run on this ticket did "
-            "before. The factory climbed the model ladder once for that and does not "
-            "climb a second time for the same reason: the brain reads the run logs and "
-            "rewrites the brief, closes the ticket, or escalates it once more with its "
-            "reason." % _lane(issue)})
+        notify.post(self.gh, repo, number,
+                    "Lane %s made no commit and wrote no reason, as a run on this ticket did "
+                    "before. The factory climbed the model ladder once for that and does not "
+                    "climb a second time for the same reason: the brain reads the run logs and "
+                    "rewrites the brief, closes the ticket, or escalates it once more with its "
+                    "reason." % _lane(issue), notify.HELD)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": names + ["needs-brain"]})
         self.actions += 1
@@ -2422,10 +2577,9 @@ class Factory:
             _say("queued %s#%d: lane %s sent no heartbeat for %d minutes"
                  % (repo, number, old, silent // 60))
         else:
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-                "body": said + "the factory moved this ticket to lane %s, %s." % (
-                    lane, "in its difficulty tier" if model == "unspecified"
-                    else "which takes its model")})
+            self._status_note(repo, number, said + "the factory moved this ticket to lane "
+                              "%s, %s." % (lane, "in its difficulty tier"
+                                           if model == "unspecified" else "which takes its model"))
             kept = brain._moved_labels(_labels(issue), "briefed", lane)
             self._relabel(repo, issue, kept)
             self.load[lane] = self.load.get(lane, 0) + 1
@@ -2471,13 +2625,13 @@ class Factory:
         if not since or self.now - since < HOLD_STUCK:
             return
         waiting_for = ", ".join(a.short for a in waiting)
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
-            "Held %.0f hours by After: waiting for %s. The station never claims a "
-            "ticket whose After: tickets are not merged, so this one is not late and "
-            "not stuck: the brain checks that %s is still coming, re-briefs this "
-            "ticket without it, or closes it." % (
-                (self.now - since) / 3600, waiting_for,
-                waiting_for if len(waiting) == 1 else "they are")})
+        notify.post(self.gh, repo, number,
+                    "Held %.0f hours by After: waiting for %s. The station never claims a "
+                    "ticket whose After: tickets are not merged, so this one is not late and "
+                    "not stuck: the brain checks that %s is still coming, re-briefs this "
+                    "ticket without it, or closes it." % (
+                        (self.now - since) / 3600, waiting_for,
+                        waiting_for if len(waiting) == 1 else "they are"), notify.HELD)
         self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": ["needs-brain"]})
         self.actions += 1
@@ -2609,6 +2763,13 @@ class Factory:
         _say("moved %s#%d off busy lane %s to %s" % (repo, issue["number"], old, lane))
         return True
 
+    def _out_hours(self, lane: str) -> bool:
+        """Whether the lane takes no work for hours: not available, down, or
+        at a limit that lifts past LIMIT_REQUEUE or has no known end."""
+        if lane in self.limited:
+            return self.limit_until.get(lane, 0) == 0 or self._out_long(lane)
+        return lane in self.down or (self.available is not None and lane not in self.available)
+
     def _out_long(self, lane: str) -> bool:
         """Whether the lane will take no work for over LIMIT_REQUEUE: down, or
         at a limit whose heartbeat says it lifts past that."""
@@ -2640,6 +2801,8 @@ class Factory:
         climbs to its next untried rung instead. With none free it stays where
         it is, for the lane to take once it is back."""
         number = int(issue["number"])
+        if RUNAWAY in _labels(issue) or "needs-brain" in _labels(issue):
+            return  # held for the brain: it moves nothing (loom#1224)
         old = _lane(issue)
         why = "down" if old in self.down and old not in self.limited else "at a limit"
         rung = current_rung(issue)
@@ -2717,6 +2880,8 @@ class Factory:
         kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         issue["labels"] = [{"name": x} for x in kept]
+        if why == "at a limit" and self.limit_until.get(old):
+            why += " until " + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.limit_until[old]))
         self._status_note(repo, number,
                           "Not a failure (lane %s is %s): the factory moved this "
                           "ticket to lane %s, %s." % (

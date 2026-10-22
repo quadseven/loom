@@ -53,6 +53,7 @@ import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import handoff
+from . import notify
 from . import text as _text
 from . import transcripts
 from .github import GitHubError
@@ -136,6 +137,12 @@ TRACEBACK = "Traceback (most recent call last)"
 # fault to file. loom#467 counted zen's "[transient] agent exited 124" lines
 # 26 times, one emailed comment each (2026-10-18).
 CLASSED_RE = re.compile(r"\bfailed: \[(?:transient|limit)\]")
+# The station's note that a verify run failed (bus/station.py _report_verify):
+# the ticket stays shipped and is tried again after its cooldown, or at once
+# when the run never looked at it, so it costs nothing worth a ticket. The
+# line names the class and the reason, so the log carries the diagnosis
+# (loom#463 counted it 150 times as if it were a station fault).
+VERIFY_RUN_RE = re.compile(r"station: verify run \S+ failed(?: \[[a-z-]+\])?[:;] .*")
 # A line of a GitHub Actions job log that an agent read and echoed: "gh run
 # view --log" puts the job and the step before each line's timestamp, which
 # has seven fraction digits (the raw step log has the stamp alone). It is
@@ -461,13 +468,16 @@ def _effects(outcome: str, n: int, runs: int) -> List[str]:
 def keep(line: str) -> bool:
     """A line worth a signature: it names an error or an HTTP 4xx/5xx. The
     station's hold line is status, whatever state word it names, so is the
-    brain's own status output (brain_status), and a relayed CI log line is
-    the run's output (CI_LOG_RE)."""
+    brain's own status output (brain_status), the station's note of a failed
+    verify run (VERIFY_RUN_RE), and a relayed CI log line is the run's output
+    (CI_LOG_RE)."""
     if HOLD_RE.fullmatch(_LEAD_RE.sub("", line).rstrip("\r\n")):
         return False
     if brain_status(line):
         return False
     if CLASSED_RE.search(line):
+        return False
+    if VERIFY_RUN_RE.fullmatch(_LEAD_RE.sub("", line).rstrip("\r\n")):
         return False
     if CI_LOG_RE.match(_LEAD_RE.sub("", line)):
         return False
@@ -1020,8 +1030,7 @@ class Watcher:
             except GitHubError as err:
                 if err.status != 404:
                     raise
-        made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, rec["issue"]),
-                            {"body": body}).data
+        made = notify.post(self.gh, self.repo, rec["issue"], body, notify.RECORD).data
         if isinstance(made, dict) and isinstance(made.get("id"), int):
             rec["count_comment"] = int(made["id"])
         self.writes += 1
@@ -1051,8 +1060,7 @@ class Watcher:
                 if self._is_open(int(number)):
                     body = self._quiet_body(rec)
                     _text.check(body)
-                    self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
-                                 {"body": body})
+                    notify.post(self.gh, self.repo, number, body, notify.CLOSED)
                     self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
                                  {"state": "closed", "state_reason": "not_planned"})
                     self.writes += 2

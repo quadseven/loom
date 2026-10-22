@@ -114,7 +114,10 @@ Per finding, on each read:
   through `bus.brain brief --regresses`, with the line "Regresses #N", the
   hours since the ship, the numbers and the quoted finding. The ticket goes
   back to the queue with `loom:regression`, inside the goal's regression
-  slot rules, at most once per ticket every 48 hours. A ticket still in a
+  slot rules, at most once per ticket every 48 hours, and at most
+  `LOOM_REGRESSION_REBRIEFS` times in all (default 3). Past that the brief
+  holds the ticket for the brain (`needs-brain`, one comment) and the intake
+  leaves any ticket that carries `needs-brain` alone. A ticket still in a
   build state (queued to merged) gets only the updates above.
 - The finding is gone and its ticket is open: one comment, "finding absent
   since <time>". That is the evidence the brain verifies against. A ticket
