@@ -1718,6 +1718,27 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("fix.txt", files)
         self.assertNotIn(".agents/hooks.json", files)
 
+    def test_a_kept_branch_whose_stray_files_cannot_be_removed_is_kept_and_says_so(self):
+        self.write_tool(self.bin / "git", """#!/usr/bin/env bash
+if [[ " $* " == *" rm -q -f -- .agents/hooks.json "* ]]; then echo 'rm refused' >&2; exit 1; fi
+exec /usr/bin/git "$@"
+""")
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EDIT="1",
+                      FAKE_HOOK="1", FAKE_EXIT="124")
+        self.assertIn("the edits are on branch ", self.failure_line())
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("could not remove .agents/hooks.json from the kept edits", log)
+        self.assertNotIn("left off the kept branch", log)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-timedout-" in h]
+        self.assertEqual(len(side), 1, heads)
+        files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r",
+                                "--name-only", side[0]],
+                               capture_output=True, text=True, check=True).stdout.split()
+        self.assertIn("fix.txt", files)
+
     def test_a_limited_timeout_after_editing_still_keeps_the_edits(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         self.run_lane(FAKE_AGENT="say", FAKE_OUT="429 RESOURCE_EXHAUSTED quota resets in 1 hours",
