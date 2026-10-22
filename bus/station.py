@@ -33,6 +33,7 @@ from . import audit
 from . import bench
 from . import brain_memory
 from . import claimed
+from . import fabric
 from . import scope_fit
 from . import stale_claims
 from . import factory
@@ -69,6 +70,9 @@ HEARTBEAT_MAX_AGE = 600
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 RUNAWAY = "loom:runaway"
+# How often the station moves the tickets that sit under a goal home and
+# under no epic into an open intake epic of that goal (decision 0003).
+OUTSIDE_EPIC_EVERY = 3600
 # The marker on the comment the station posts when it reviews a runaway hold
 # caused by one dead lane (loom#565): the release, or why the hold stays.
 DEAD_LANE_MARKER = "<!-- loom:runaway-dead-lane v1 lane=%s -->"
@@ -348,7 +352,10 @@ RETRY_ORDER = ["anthropic", "anthropic-2", "anthropic-3", "anthropic-4",
 # Free lanes take only easy tickets on public repos.
 FREE_LANES = ["openrouter", "zen", "zai", "workersai"]
 # The model families each lane's runner accepts (lanes/run_lane.sh); codex
-# takes any model outside the claude family.
+# takes any model outside the claude family. agy takes gemini-3.8-flash only:
+# its runner drops any other gemini, claude or gpt-oss pin and runs flash
+# (LOOM_AGY_ONLY_MODEL, the operator's rule of 2026-10-21), so a ticket
+# pinned to Opus routed to agy ran flash, not Opus.
 CLAUDE_MODELS = ["claude*", "opus*", "sonnet*", "haiku*", "fable*"]
 LANE_MODELS = {
     "claude": CLAUDE_MODELS,
@@ -360,7 +367,7 @@ LANE_MODELS = {
     "workersai": ["cloudflare-workers-ai/@cf/*"],
     "spark": ["spark/?*"],
     "free": ["free/?*"],
-    "agy": ["gemini-*", "claude-*", "gpt-oss-*"],
+    "agy": ["gemini-3.8-flash*"],
 }
 # Operator messages in the Discord channel become notes on a goal home, and
 # the brain's replies go back to the channel (docs/LANES.md, "Talking to the
@@ -440,6 +447,20 @@ VERIFY_REFUSED_FILE = "verify-refused.json"
 VERIFY_RESERVE_AFTER = 2 * 3600
 VERIFY_RESERVE_EVERY = 1800
 VERIFY_RESERVE_FILE = "verify-reserve.json"
+# The Fabric lead for a ticket's merged work (loom#1437): at most FABRIC_ASKS
+# questions a pass, each up to bus/fabric.py's TIMEOUT, and the first
+# FABRIC_CITES cited pull requests checked against GitHub. FABRIC_ASKED_FILE
+# keeps the body each ticket was asked about, so a ticket is asked once.
+FABRIC_ASKS = 2
+FABRIC_CITES = 3
+FABRIC_ASKED_FILE = "fabric-asked.json"
+FABRIC_QUESTION = (
+    "A ticket in the GitHub repo %s is about to be built.\n\nTitle: %s\n\n"
+    "Acceptance criteria:\n%s\n\n"
+    "Which merged pull requests in that repo already do this work? Cite only "
+    "pull request cards you can see, each as a link to its card. If none does, "
+    "answer: none.")
+
 # Per-lane transient verify failures and the holds they earn (loom#714).
 VERIFY_LANES_FILE = "verify-lanes.json"
 VERIFY_STRIKES = 2
@@ -543,6 +564,7 @@ class Settings:
                  scope_model: str = "",
                  metrics_goal: str = "",
                  transcript_url: str = "",
+                 fabric_key_ssm: str = "",
                  transcript_token_ssm: str = "",
                  watched: Optional[List[Tuple[str, str]]] = None,
                  rewrite_cmd: str = "",
@@ -644,6 +666,8 @@ class Settings:
         self.scope_model = scope_model
         self.metrics_goal = metrics_goal
         self.transcript_url = transcript_url
+        # SSM name of the Fabric workspace key (bus/fabric.py); empty, no question.
+        self.fabric_key_ssm = fabric_key_ssm
         self.transcript_token_ssm = transcript_token_ssm
         # (component, log path) pairs bus/watch.py reads each pass.
         self.watched = watch.components(home) if watched is None else watched
@@ -712,6 +736,7 @@ class Settings:
                    scope_model=env.get("LOOM_SCOPE_CHECK_MODEL", "").strip(),
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
+                   fabric_key_ssm=env.get("LOOM_FABRIC_KEY_SSM", "").strip(),
                    transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
                    watched=watched,
                    rewrite_cmd=env.get("LOOM_REWRITE_CMD", "").strip(),
@@ -1389,6 +1414,7 @@ class Station:
         self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         self.now = time.time() if now is None else now
         self.state = os.path.join(settings.home, "state", "station")
+        self._fabric_asks = 0  # Fabric questions this pass (FABRIC_ASKS)
         self.event_log = os.path.join(settings.home, "logs", "events.jsonl")
         self._spend: Optional[spend.Summary] = None
         # This pass's repo scans: the repos due, what was read of each, and
@@ -1839,9 +1865,7 @@ class Station:
             self._refuse(repo, issue, str(err))
             return False
         fix, fix_comment_id = fix_source if fix_source else (None, None)
-        refusal = self._fix_refusal(fix)
-        if refusal:
-            self._refuse(repo, issue, refusal)
+        if self._fix_blocks(repo, issue, fix):
             return False
 
         earlier = sum(1 for c in comments
@@ -1852,7 +1876,11 @@ class Station:
         name = tickets.ticket_name(repo, number, attempt)
         has_contract, checks = self._validation_checks(repo)
         text = tickets.render_brief(repo, issue, lane, attempt, fix, checks, has_contract,
-                                    None if fix else self._timedout_branch(comments))
+                                    None if fix else self._timedout_branch(comments),
+                                    notes=tickets.operator_notes(
+                                        comments, list(self.s.authors) + list(self.s.briefers)
+                                        + list(self.s.owners)),
+                                    linked=self._linked_pulls(repo, number))
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
@@ -1875,6 +1903,13 @@ class Station:
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
+
+    def _linked_pulls(self, repo: str, number: int) -> List[str]:
+        """The pull requests in any repo that reference the ticket, from the
+        first page of its timeline (tickets.linked_pulls). _verify_before_build
+        sees only this repo's merges; a merge elsewhere reaches the lane here."""
+        return tickets.linked_pulls(self.gh.rest(
+            "GET", "/repos/%s/issues/%d/timeline?per_page=100" % (repo, number)).data)
 
     def _timedout_branch(self, comments: List[Any]) -> Optional[str]:
         """The side branch a timed-out attempt kept its edits on, as the
@@ -3426,7 +3461,7 @@ class Station:
         if set(names) & {REGRESSION, factory.REVERT_LABEL} or live_needles(issue.get("body")) == []:
             return False
         number = int(issue["number"])
-        merged = self._merged_linked(repo, issue)
+        merged = self._merged_linked(repo, issue) or self._merged_cited(repo, issue)
         if not merged:
             return False
         texts = self._status_texts(repo, number)
@@ -5460,6 +5495,46 @@ class Station:
         self._routine(repo, number,
                       "Lane %s stopped: [%s] %s" % (lane, klass, CLASS_RE.sub("", reason)))
 
+    def _fix_blocks(self, repo: str, issue: Dict[str, Any],
+                    fix: Optional[tickets.Fix]) -> bool:
+        """Whether the ticket's fix round must not be briefed: its findings are
+        refused (the ticket is refused, as an untrusted one is), or its pull
+        request already merged."""
+        refusal = self._fix_refusal(fix)
+        if refusal:
+            self._refuse(repo, issue, refusal)
+            return True
+        return self._fix_already_merged(repo, issue, fix)
+
+    def _fix_already_merged(self, repo: str, issue: Dict[str, Any],
+                            fix: Optional[tickets.Fix]) -> bool:
+        """Whether the fix round's pull request merged after its loom:fix
+        comment, so the round would only fix a closed pull request: three such
+        rounds ran in two hours, one on a paid lane (2026-10-22). The ticket
+        goes to loom:pr, where reconcile moves it on to loom:merged; one
+        already merged or later keeps its labels."""
+        if fix is None or not self._pull_merged(repo, fix.pr):
+            return False
+        number = int(issue["number"])
+        if tickets.ticket_state(issue) not in tickets.MERGED_STATES:
+            states = {"loom:" + state for state in brain.STATES}
+            labels = [n for n in _label_names(issue)
+                      if n not in states and not n.startswith(WAIT)] + ["loom:pr"]
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+            issue["labels"] = [{"name": n} for n in labels]
+        _say("%s#%d: pull request #%d merged before its fix round; no fix brief"
+             % (repo, number, fix.pr))
+        return True
+
+    def _pull_merged(self, repo: str, pr: int) -> bool:
+        """Whether pull request `pr` has merged; a read that fails says no,
+        so the round is briefed as before and the runner's own check stands."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr)).data
+        except GitHubError:
+            return False
+        return isinstance(data, dict) and bool(data.get("merged_at"))
+
     def _fix_pr_merged(self, repo: str, number: int, lane: str, pr: int) -> None:
         """A fix brief the runner parked unrun because its pull request merged
         first. Nothing ran and the work landed, so no rung is spent and no
@@ -5552,6 +5627,62 @@ class Station:
                     "again." % ("This is a regression or revert ticket" if undoes else
                                 "No merged pull request references this ticket"))
         self._routine(repo, number, "%s\n\n%s" % (said, note))
+
+    def _merged_cited(self, repo: str, issue: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Merged pull requests the Fabric workspace cites as already doing
+        the ticket's work, when nothing links one (loom#1437): work often
+        merges under another ticket or none. Each citation must name a pull
+        request of this repo, merged into the default branch, whose title is
+        the cited card's; the verify run then judges the ticket against its
+        criteria. Asked once per ticket body, at most FABRIC_ASKS a pass;
+        Fabric unset, down or silent leaves the ticket to build."""
+        if not self._fabric_may_ask(repo, issue):
+            return []
+        body = str(issue.get("body") or "")
+        criteria = "\n".join("- %s" % text for _, text in proof.criteria(body)) or body[:1500]
+        answer = fabric.ask(FABRIC_QUESTION % (repo, issue.get("title") or "", criteria),
+                            self.s.fabric_key_ssm, self.s.region)
+        found = self._checked_citations(repo, fabric.cited_pulls(answer)[:FABRIC_CITES])
+        if found:
+            _say("%s#%d: Fabric cites merged pull request #%d for its work"
+                 % (repo, int(issue["number"]), int(found[0]["number"])))
+        return found
+
+    def _fabric_may_ask(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether this pass may ask Fabric about the ticket: a key is set, the
+        pass has a question left, and the ticket's body was not asked about
+        before. A True answer records the ask."""
+        if not self.s.fabric_key_ssm or self._fabric_asks >= FABRIC_ASKS:
+            return False
+        path = os.path.join(self.state, FABRIC_ASKED_FILE)
+        asked = _read_json(path, {}, strict=False)
+        if not isinstance(asked, dict):
+            asked = {}
+        key = "%s#%d" % (repo, int(issue["number"]))
+        stamp = hashlib.sha256(str(issue.get("body") or "").encode("utf-8")).hexdigest()[:16]
+        if asked.get(key) == stamp:
+            return False
+        self._fabric_asks += 1
+        asked[key] = stamp
+        _write_json(path, asked)
+        return True
+
+    def _checked_citations(self, repo: str,
+                           cited: List[Tuple[int, str]]) -> List[Dict[str, Any]]:
+        """The cited pull requests that are of this repo, merged into the
+        default branch, and titled as their cited cards; one read each."""
+        branch = self._default_branch(repo)
+        found = []
+        for number, title in cited:
+            try:
+                pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+            except GitHubError:
+                continue
+            if (isinstance(pr, dict) and pr.get("merged_at") and pr.get("merge_commit_sha")
+                    and str((pr.get("base") or {}).get("ref") or "") == branch
+                    and fabric.same_title(title, pr.get("title") or "")):
+                found.append(pr)
+        return found
 
     def _merged_linked(self, repo: str, issue: Dict[str, Any]) -> List[Dict[str, Any]]:
         """The ticket's pull requests merged into the default branch, linked
@@ -7538,6 +7669,39 @@ class Station:
                           if isinstance(r, str) and "/" in r} - {own})
         watch.Watcher(self.gh, repo, self.s.watched, os.path.join(self.state, "watch.json"),
                       self.now, _say, write=not self._deferred(), private=private).run()
+
+    # -- tickets under no epic ---------------------------------------------
+    def move_outside_tickets(self) -> None:
+        """Move each goal home's own open tickets that sit under no epic into
+        an open intake epic of that goal, at most every OUTSIDE_EPIC_EVERY
+        seconds (decision 0003). One log line per goal."""
+        path = os.path.join(self.state, "outside-epic.json")
+        state = _read_json(path, {}, strict=False)
+        if not isinstance(state, dict):
+            state = {}
+        checked = state.get("checked")
+        if self._num(checked) and 0 <= self.now - checked < OUTSIDE_EPIC_EVERY:
+            return
+        try:
+            homes = self._goal_homes()
+        except RateLimited:
+            raise
+        except (GitHubError, OSError) as err:
+            _say("outside-epic: could not read the goal homes: %s" % err)
+            return
+        for repo, goal in homes:
+            number = int(goal["number"])
+            try:
+                moved, left = brain.move_outside_tickets(self.gh, repo, number)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("outside-epic: goal #%d in %s failed: %s" % (number, repo, err))
+                continue
+            _say("outside-epic: moved %d, left %d for goal #%d in %s"
+                 % (moved, left, number, repo))
+        state["checked"] = self.now
+        _write_json(path, state)
 
     # -- invariants -------------------------------------------------------
     def check_invariants(self) -> None:
@@ -9637,7 +9801,10 @@ class Station:
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
-                     self.watch_default_branches, self.refresh_bench, self.run_factory, self.check_invariants,
+                     self.watch_default_branches, self.refresh_bench, self.run_factory,
+                     # The move first, so the invariants read a goal whose
+                     # tickets sit under an epic.
+                     self.move_outside_tickets, self.check_invariants,
                      self.release_factory_held):
             if self._deferred():
                 break
