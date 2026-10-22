@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, change_class, labels, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
+from . import bench, brain, change_class, criteria_gate, labels, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -1113,7 +1113,9 @@ def acceptance_criteria(body: str) -> List[str]:
 
 
 def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
-    """Ticket criteria that a lane PR leaves unticked, excluding Live checks."""
+    """Ticket criteria that a lane PR leaves unticked, excluding live checks
+    and operator actions (bus/criteria_gate.py): only the station's verifier
+    or the operator can meet those, so a lane is never asked to tick them."""
     ticket = acceptance_criteria(ticket_body)
     pull = acceptance_criteria(pull_body)
     states = {}
@@ -1124,7 +1126,7 @@ def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
     missing = []
     for criterion in ticket:
         _, _, text = criterion.partition(" ")
-        if text.casefold().startswith("live:"):
+        if criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE:
             continue
         clean = NOT_BUILT_RE.sub("", text).strip().casefold()
         checked, not_built = states.get(clean, (False, False))
