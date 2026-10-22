@@ -26,6 +26,7 @@ class FakeGitHub:
                                {"name": "lane:muse"}], "state": "open"}}
         self.comments = {4: [], 9: []}
         self.pulls = []
+        self.closed = []
         self.calls = []
 
     def rest(self, method, path, body=None, **kwargs):
@@ -50,6 +51,8 @@ class FakeGitHub:
                         comment["body"] = body["body"]
         if path.endswith("/contents/.loom/sensitive-paths"):
             return type("Response", (), {"data": {"content": base64.b64encode(b"secret/*").decode()}})()
+        if method == "GET" and "/pulls?state=closed" in path:
+            return type("Response", (), {"data": list(self.closed)})()
         if path.endswith("/pulls") and method == "POST":
             return type("Response", (), {"data": {"number": 9, "html_url": "https://example.com/pr/9"}})()
         return type("Response", (), {"data": {}})()
@@ -110,6 +113,54 @@ class RemoteLaneTests(unittest.TestCase):
         # The lookup names the branch instead of listing every pull request.
         self.assertTrue(lane._pull_for(gh, "example/project", "loom/4-add-a-feature"))
 
+    def stranded(self, closed):
+        # A ticket held by the lane whose work merged from a branch that is not
+        # the ticket branch (loom#412 merged by #413, loom#414 by #415).
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        gh.closed = closed
+        return gh
+
+    def merged(self, body, ref="fix/other-branch", number=13, merged=True):
+        return {"number": number, "state": "closed", "body": body,
+                "merged_at": "2026-10-20T10:00:00Z" if merged else None,
+                "head": {"ref": ref}}
+
+    def test_a_merged_pull_request_on_another_branch_naming_the_ticket_advances_it(self):
+        # The full form is built, not written, so the diff holds no cross-repo ref.
+        for line in ("Refs #4", "Refs " + "example/project" + "#4", "Refs #4 and more words"):
+            gh = self.stranded([self.merged("## Why\nx\n\n%s\n" % line)])
+            active = lane._recover_and_count(gh, ["example/project"], "muse", 1001)
+            self.assertEqual(active, 0, line)
+            self.assertIn("loom:pr", labels(gh), line)
+            self.assertNotIn("loom:running", labels(gh), line)
+            self.assertFalse(any(x["body"].startswith("[transient]") for x in gh.comments[4]))
+
+    def test_a_stranded_ticket_is_advanced_not_handed_back_when_its_claim_expired(self):
+        gh = self.stranded([self.merged("Refs #4")])
+        lane._recover_and_count(gh, ["example/project"], "muse", 1000 + lane.PR_AGE + 1)
+        self.assertIn("loom:pr", labels(gh))
+        self.assertNotIn("loom:queued", labels(gh))
+
+    def test_a_mention_or_another_ticket_or_an_unmerged_pull_does_not_claim_the_ticket(self):
+        for pull in (self.merged("This follows up #4 but is its own change"),
+                     self.merged("See ticket #4.\nRefs #44\nRefs #5"),
+                     self.merged("Refs " + "other/project" + "#4"),
+                     self.merged("Refs #4", merged=False),
+                     self.merged("not Refs #4 at the start of a line")):
+            gh = self.stranded([pull])
+            active = lane._recover_and_count(gh, ["example/project"], "muse", 1001)
+            self.assertEqual(active, 1, pull["body"])
+            self.assertIn("loom:running", labels(gh), pull["body"])
+            self.assertNotIn("loom:pr", labels(gh), pull["body"])
+
+    def test_the_branch_match_stays_primary_and_reads_no_closed_pulls(self):
+        gh = self.stranded([])
+        gh.pulls = [{"number": 9, "head": {"ref": "loom/4-add-a-feature"}}]
+        lane._recover_and_count(gh, ["example/project"], "muse", 1001)
+        self.assertIn("loom:pr", labels(gh))
+        self.assertFalse([c for c in gh.calls if "state=closed" in c[1]])
+
     def test_a_heartbeat_keeps_a_claim_and_a_claim_with_no_pr_expires_after_pr_age(self):
         gh = FakeGitHub()
         lane.claim(gh, ["example/project"], now=1000)
@@ -118,6 +169,63 @@ class RemoteLaneTests(unittest.TestCase):
             gh, ["example/project"], "muse", 1000 + lane.CLAIM_AGE + 10), 1)
         lane._recover_and_count(gh, ["example/project"], "muse", 1000 + lane.PR_AGE + 1)
         self.assertIn("loom:queued", labels(gh))
+
+    def test_heartbeats_after_a_claim_post_nothing_and_edit_the_claim_comment(self):
+        # 2026-10-20: a new remote-claim comment every beat, six in 31 minutes
+        # on one ticket, each one emailed to its author.
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        for at in (1500, 2000, 2500):
+            lane.heartbeat(gh, "example/project", 4, now=at)
+        self.assertEqual(len(gh.comments[4]), 1)
+        posts = [c for c in gh.calls if c[0] == "POST" and c[1].endswith("/issues/4/comments")]
+        patches = [c for c in gh.calls if c[0] == "PATCH" and "/issues/comments/" in c[1]]
+        self.assertEqual((len(posts), len(patches)), (1, 3))
+        self.assertEqual(lane._claims(gh.comments[4], "muse"), [(0, 2500.0, 1000.0)])
+        # The claim expires from the newest beat, and the first claim time
+        # still bounds how long a claim without a pull request may last.
+        repos = ["example/project"]
+        self.assertEqual(lane._recover_and_count(gh, repos, "muse", 2500 + lane.CLAIM_AGE - 1), 1)
+        lane._recover_and_count(gh, repos, "muse", 2500 + lane.CLAIM_AGE + 1)
+        self.assertIn("loom:queued", labels(gh))
+
+    def test_a_heartbeat_edit_keeps_the_first_claim_time_for_the_pr_age_bound(self):
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        lane.heartbeat(gh, "example/project", 4, now=1000 + lane.CLAIM_AGE - 10)
+        lane.heartbeat(gh, "example/project", 4, now=1000 + lane.PR_AGE - 10)
+        self.assertEqual(len(gh.comments[4]), 1)
+        lane._recover_and_count(gh, ["example/project"], "muse", 1000 + lane.PR_AGE + 1)
+        self.assertIn("loom:queued", labels(gh))
+
+    def test_a_new_claim_after_a_hand_back_is_not_aged_by_the_old_one(self):
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        lane._recover_and_count(gh, ["example/project"], "muse", 1000 + lane.PR_AGE + 1)
+        self.assertIn("loom:queued", labels(gh))
+        gh.issues[4]["labels"].append({"name": "lane:muse"})  # the brain re-assigns the lane
+        later = 1000 + lane.PR_AGE + 100
+        self.assertIsNotNone(lane.claim(gh, ["example/project"], now=later))
+        self.assertEqual(lane._recover_and_count(gh, ["example/project"], "muse", later + 60), 1)
+        self.assertNotIn("loom:queued", labels(gh))
+
+    def test_three_heartbeats_with_no_claim_comment_post_one_and_edit_it_twice(self):
+        gh = FakeGitHub()
+        gh.issues[4]["labels"] = [{"name": "loom:running"}, {"name": "lane:muse"}]
+        for at in (1000, 1100, 1200):
+            lane.heartbeat(gh, "example/project", 4, now=at)
+        # Three beats on one claim: one comment posted, then edited twice.
+        self.assertEqual(len(gh.comments[4]), 1)
+        self.assertEqual([c[0] for c in gh.calls if "/comments" in c[1] and c[0] in ("POST", "PATCH")],
+                         ["POST", "PATCH", "PATCH"])
+        self.assertEqual(gh.comments[4][0]["body"], "<!-- loom:remote-claim v1 muse 4 1200.000 1000.000 -->")
+        gh.comments[4][0]["body"] = "<!-- loom:remote-claim v1 muse 4 1000.000 -->"
+        # A comment from before the edit-in-place form is read as a claim and
+        # edited into the new form on the next beat.
+        self.assertEqual(lane._claims(gh.comments[4], "muse"), [(0, 1000.0, 1000.0)])
+        lane.heartbeat(gh, "example/project", 4, now=2000)
+        self.assertEqual(len(gh.comments[4]), 1)
+        self.assertEqual(gh.comments[4][0]["body"], "<!-- loom:remote-claim v1 muse 4 2000.000 1000.000 -->")
 
     def test_the_lane_heartbeat_edits_one_comment(self):
         gh = FakeGitHub()
@@ -266,7 +374,7 @@ class FakeGitDatabase:
             self.refs[branch] = body["sha"]
             return type("Response", (), {"data": {}})()
         if method == "PATCH" and "/git/refs/heads/" in path:
-            branch = path.split("/git/refs/heads/", 1)[1]
+            branch = unquote(path.split("/git/refs/heads/", 1)[1])
             self.refs[branch] = body["sha"]
             return type("Response", (), {"data": {}})()
         raise AssertionError("unexpected API call: %s %s" % (method, path))
@@ -428,6 +536,124 @@ class PushBranchTests(unittest.TestCase):
                     lane.push_branch(gh_issue, "example/project", 4)
             finally:
                 os.chdir(old)
+
+    def _push_one_commit(self, change, remote_head=None, refs_post_status=None):
+        """Make the branch's one commit with `change(git, work)` instead of
+        the default edit, then push it. Returns (sha, the fake, the local
+        commit SHA)."""
+        import os
+        import subprocess
+        import tempfile
+        from bus import lane
+        from bus.github import GitHubError
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        with tempfile.TemporaryDirectory() as tmp:
+            work = _make_repo(tmp)
+
+            def git(*args):
+                return subprocess.run(["git", *args], capture_output=True,
+                                      text=True, check=True, cwd=work,
+                                      env=env).stdout.strip()
+            git("reset", "--hard", "main")
+            change(git, work)
+            git("commit", "-m", "the change")
+            gh = FakeGitDatabase(tree_sha=git("rev-parse", "HEAD^{tree}"))
+            if remote_head:
+                # The remote branch already holds main's commit.
+                gh.refs["loom/4-add-a-feature"] = git("rev-parse", "main")
+            if refs_post_status:
+                inner = gh.rest
+
+                def refusing(method, path, body=None, **kwargs):
+                    if method == "POST" and path.endswith("/git/refs"):
+                        gh.calls.append((method, path))
+                        raise GitHubError("POST %s -> %d" % (path, refs_post_status),
+                                          refs_post_status, "")
+                    return inner(method, path, body, **kwargs)
+                gh.rest = refusing
+            gh_issue = FakeGitHub()
+
+            class Combined:
+                def rest(self, method, path, body=None, **kwargs):
+                    if "/git/" in path:
+                        return gh.rest(method, path, body, **kwargs)
+                    return gh_issue.rest(method, path, body, **kwargs)
+            old = os.getcwd()
+            os.chdir(work)
+            try:
+                sha = lane.push_branch(Combined(), "example/project", 4)
+            finally:
+                os.chdir(old)
+            return sha, gh, git("rev-parse", "HEAD")
+
+    @staticmethod
+    def _tree_entries(gh):
+        trees = [b for m, p, b in gh.bodies if m == "POST" and p.endswith("/git/trees")]
+        return {entry["path"]: entry for entry in trees[0]["tree"]}
+
+    def test_a_renamed_file_is_pushed_as_a_delete_and_a_new_blob(self):
+        # git diff detects renames by default and prints R100<TAB>old<TAB>new;
+        # read naively, the path was "old<TAB>new" and rev-parse failed.
+        sha, gh, _ = self._push_one_commit(
+            lambda git, work: git("mv", "file.txt", "moved.txt"))
+        self.assertEqual(sha, gh.commit_sha)
+        entries = self._tree_entries(gh)
+        self.assertEqual(sorted(entries), ["file.txt", "moved.txt"])
+        self.assertIsNone(entries["file.txt"]["sha"])
+        self.assertEqual(entries["moved.txt"]["mode"], "100644")
+        self.assertIsNotNone(entries["moved.txt"]["sha"])
+
+    def test_a_file_with_a_non_ascii_name_is_pushed(self):
+        # core.quotePath writes this name as "caf\303\251.txt" in a
+        # line-based diff; the NUL-separated read gets the real path.
+        name = "caf\u00e9.txt"
+
+        def add(git, work):
+            import os
+            with open(os.path.join(work, name), "w") as f:
+                f.write("new\n")
+            git("add", name)
+        sha, gh, _ = self._push_one_commit(add)
+        self.assertEqual(sha, gh.commit_sha)
+        self.assertIn(name, self._tree_entries(gh))
+
+    def test_an_existing_remote_branch_is_moved_with_a_non_forced_patch(self):
+        def edit(git, work):
+            import os
+            with open(os.path.join(work, "file.txt"), "w") as f:
+                f.write("again\n")
+            git("add", "file.txt")
+        sha, gh, _ = self._push_one_commit(edit, remote_head=True)
+        self.assertEqual(sha, gh.commit_sha)
+        self.assertNotIn(("POST", "/repos/example/project/git/refs"), gh.calls)
+        patches = [b for m, p, b in gh.bodies if m == "PATCH"]
+        self.assertEqual(patches, [{"sha": gh.commit_sha, "force": False}])
+        self.assertEqual(gh.refs["loom/4-add-a-feature"], gh.commit_sha)
+
+    def test_a_refs_post_that_answers_422_falls_back_to_a_patch(self):
+        # The branch appeared between the read and the create (another push
+        # won the race): the ref is moved instead, still without force.
+        def edit(git, work):
+            import os
+            with open(os.path.join(work, "file.txt"), "w") as f:
+                f.write("again\n")
+            git("add", "file.txt")
+        sha, gh, _ = self._push_one_commit(edit, refs_post_status=422)
+        self.assertEqual(sha, gh.commit_sha)
+        self.assertIn(("POST", "/repos/example/project/git/refs"), gh.calls)
+        patches = [b for m, p, b in gh.bodies if m == "PATCH"]
+        self.assertEqual(patches, [{"sha": gh.commit_sha, "force": False}])
+
+    def test_a_refs_post_that_fails_otherwise_is_raised(self):
+        from bus.github import GitHubError
+        def edit(git, work):
+            import os
+            with open(os.path.join(work, "file.txt"), "w") as f:
+                f.write("again\n")
+            git("add", "file.txt")
+        with self.assertRaises(GitHubError):
+            self._push_one_commit(edit, refs_post_status=500)
 
 
 if __name__ == "__main__":

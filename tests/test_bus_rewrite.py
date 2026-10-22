@@ -219,6 +219,21 @@ class RewriteIssueTest(Base):
         self.fake.triage[7]["labels"] = [{"name": "loom:triage"}, {"name": "needs-brain"}]
         self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
 
+    def test_work_that_is_not_for_a_lane_is_not_a_candidate(self):
+        # loom#34, a wayfinder decision question labelled loom:triage before
+        # triage skipped wayfinder issues, became a ticket that churned for
+        # 34 hours. The rewriter applies the same skips as triage.
+        marker = "<!-- loom:factory-incident v1 -->"
+        for number, extra in ((8, {"labels": [{"name": "loom:triage"}, {"name": "wayfinder:grilling"}]}),
+                              (9, {"labels": [{"name": "loom:triage"}, {"name": "awaiting-live-check"}]}),
+                              (10, {"body": marker + "\nKind: environment\n"}),
+                              (11, {"sub_issues_summary": {"total": 2, "completed": 0}}),
+                              (12, {"labels": [{"name": "loom:triage"}, {"name": "epic"}]})):
+            self.fake.add_triage(number)
+            self.fake.triage[number].update(extra)
+        self.fake.add_triage(7)
+        self.assertEqual([i["number"] for i in rewrite.candidates(self.gh(), REPO)], [7])
+
     def test_a_human_answer_without_a_person_only_kind_writes_nothing(self):
         # 2026-10-18: a free model parked "Using GitHub credentials, locate the
         # 25 tickets..." and "Diagnose the station's 403..." as waiting on the
@@ -279,6 +294,17 @@ class RewriteIssueTest(Base):
                                   "%s -c 'raise SystemExit(3)'" % shlex.quote(sys.executable))
         self.assertEqual(self.fake.writes_to(7), [])
 
+    def test_a_successful_command_logs_which_model_answered(self):
+        # The rewriter tries Gemma's free tier first, then OpenRouter, then
+        # codex (2026-10-21); without the answering model in the station log,
+        # nobody could tell how much work the free tier took.
+        cmd = ("%s -c 'import sys; print(\"rewrite_agent: answered by free/gemma-4-31b-it\", "
+               "file=sys.stderr); print(\"{}\")'" % shlex.quote(sys.executable))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(rewrite.run_agent(cmd, "prompt", 30).strip(), "{}")
+        self.assertIn("rewrite: answered by free/gemma-4-31b-it", err.getvalue())
+
     def test_a_failing_command_includes_its_last_stderr_line(self):
         self.fake.add_triage(7)
         cmd = "%s -c 'import sys; print(\"diagnostic reason\", file=sys.stderr); raise SystemExit(3)'" % shlex.quote(sys.executable)
@@ -310,6 +336,16 @@ class StationRewriteTest(Base):
         err = self.run_station(self.station(cmd=self.agent(BRIEF)))
         self.assertEqual(len(self.fake.created), 1)
         self.assertIn("rewrite %s#7: brief" % REPO, err)
+
+    def test_a_goal_at_its_ticket_cap_runs_no_agent(self):
+        # 17 of 72 rewrites ran the model only for intake to refuse the brief
+        # at the goal's in-flight cap (2026-10-21).
+        self.fake.add_triage(7)
+        with mock.patch.object(brain, "_goal_in_flight", return_value=brain.goal_cap()):
+            err = self.run_station(self.station(cmd=self.agent(BRIEF)))
+        self.assertFalse(os.path.exists(self.prompt_file))
+        self.assertEqual(self.fake.created, [])
+        self.assertIn("tickets in flight", err)
 
     def test_a_private_repo_with_an_empty_private_command_is_skipped(self):
         self.fake.private = True

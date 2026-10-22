@@ -43,7 +43,7 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, naming
+from . import brain, naming, notify
 from .factory import GREEN, REVERT_LABEL, Factory, _labels, _lane, _state, _ts
 from .github import GitHub, GitHubError
 from .tickets import DIFFICULTIES
@@ -74,8 +74,12 @@ HAND_REVERT_WINDOW = 7 * 86400
 # One marker per revert pull request on the ticket it undoes: the station
 # moves the ticket back once for each revert pull request.
 HAND_REVERT_MARKER = "<!-- loom:hand-revert %d -->"
-REVERT_TITLE_RE = re.compile(r'^Revert "')
-REVERT_NUM_TITLE_RE = re.compile(r"^Revert #(\d+)\b")
+# A title may lead with a "[scope] " or a "scope: " / "fix(x): " prefix, and
+# "revert" is any case; a title that only mentions the word later does not
+# count.
+_TITLE_LEAD = r"^(?:\[[^\]]+\]\s*|[\w./-]+(?:\([^)]*\))?!?:\s+)?revert"
+REVERT_TITLE_RE = re.compile(_TITLE_LEAD + r'\s+"', re.I)
+REVERT_NUM_TITLE_RE = re.compile(_TITLE_LEAD + r"[\s:]+#(\d+)\b", re.I)
 GIT_REVERT_RE = re.compile(r"\bgit revert (?:--no-edit )?([0-9a-f]{7,40})\b")
 REVERTS_NUM_RE = re.compile(r"\bReverts\s+(?:[\w.-]+/[\w.-]+)?#(\d+)\b")
 
@@ -91,9 +95,16 @@ def is_hand_revert(pr: Dict[str, Any], now: float, default_branch: str) -> bool:
         return False
     if now - _ts(str(pr.get("merged_at") or "")) > HAND_REVERT_WINDOW:
         return False
-    return bool(REVERT_TITLE_RE.match(str(pr.get("title") or ""))
-                or REVERT_NUM_TITLE_RE.match(str(pr.get("title") or ""))
-                or GIT_REVERT_RE.search(str(pr.get("body") or "")))
+    return looks_like_revert(pr)
+
+
+def looks_like_revert(pr: Dict[str, Any]) -> bool:
+    """The pull request is a revert by its title or body, whatever its age
+    or base: such a pull request is never the one that ships a ticket."""
+    return bool(isinstance(pr, dict)
+                and (REVERT_TITLE_RE.match(str(pr.get("title") or ""))
+                     or REVERT_NUM_TITLE_RE.match(str(pr.get("title") or ""))
+                     or GIT_REVERT_RE.search(str(pr.get("body") or ""))))
 
 
 def reverted_keys(pr: Dict[str, Any]) -> List[str]:
@@ -108,8 +119,9 @@ def reverted_keys(pr: Dict[str, Any]) -> List[str]:
     m = REVERT_NUM_TITLE_RE.match(title)
     if m:
         keys.append("pr:" + m.group(1))
-    if REVERT_TITLE_RE.match(title):
-        keys.append("title:" + " ".join(title[len('Revert "'):].rstrip('"').split()))
+    m = REVERT_TITLE_RE.match(title)
+    if m:
+        keys.append("title:" + " ".join(title[m.end():].rstrip('"').split()))
     return keys
 
 
@@ -554,8 +566,7 @@ class Reverts:
         note = "Fix-forward ticket #%d is briefed on lane %s for red merge %s." % (
             follow_up, lane, sha[:12])
         try:
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                         {"body": note})
+            notify.post(self.gh, repo, number, note, notify.FAILURE)
         except GitHubError as err:
             _say("%s: fix-forward #%d filed but could not link it from #%d: %s"
                  % (repo, follow_up, number, err))
@@ -674,7 +685,7 @@ class Reverts:
                 "redo the change on the new default branch."
                 % (branch, sha[:12], int(pr["number"]), _failing(names), revert))
         brain._check_written_text(note)
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
+        notify.post(self.gh, repo, number, note, notify.FAILURE)
 
     def _body(self, branch: str, sha: str, pr: Dict[str, Any], names: List[str],
               red_since: float, difficulty: str, number: int) -> str:
@@ -709,9 +720,10 @@ class Reverts:
         issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
         lane = _lane(issue)
         if issue.get("state") != "open" or not lane or "loom:ticket" not in _labels(issue):
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-                "body": "%s\nRevert #%d landed; this ticket is not an open ticket with a "
-                        "lane, so it is left for the brain to redo." % (marker, rnum)})
+            notify.post(self.gh, repo, number,
+                        "%s\nRevert #%d landed; this ticket is not an open ticket with a "
+                        "lane, so it is left for the brain to redo." % (marker, rnum),
+                        notify.FAILURE)
             _say("%s: revert #%d landed; #%d left for the brain" % (repo, rnum, number))
             return
         self.move(self.gh, repo, number, "briefed", lane=lane,

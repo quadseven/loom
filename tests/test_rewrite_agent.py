@@ -6,6 +6,7 @@ import re
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -49,6 +50,7 @@ printf '%s' "$prompt" > "$log.stdin"
 case "$prompt" in
   *MODE=rate-first*) case "$*" in *"@RATE_MODEL@"*) printf '%s\n' '{"type":"error","error":{"name":"RateLimitError","data":{"message":"temporarily rate limited"}}}'; exit 0 ;; esac ;;
   *MODE=fail*) echo "connection reset" >&2; exit 3 ;;
+  *MODE=hang*) case "$*" in *free/*) sleep 30 ;; esac ;;
   *MODE=error*) printf '{"type":"error","error":{"name":"APIError","data":{"message":"bad key %s"}}}\n' "$key"; exit 0 ;;
   *MODE=notext*) printf '%s\n' '{"type":"step_start","part":{"type":"step-start"}}'; exit 0 ;;
   *MODE=leak*) printf '{"type":"text","part":{"type":"text","text":"the key is %s"}}\n' "$key"; exit 0 ;;
@@ -204,7 +206,7 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertEqual(result.stdout, ANSWER + "\n")
         self.assertEqual(Path(str(self.agent_log) + ".stdin").read_text(), prompt.rstrip("\n"))
         argv = self.agent()["argv"]
-        self.assertEqual(argv, f"run -m {MODEL} --format json")
+        self.assertEqual(argv, f"run -m {MODEL} --print-logs --log-level ERROR --format json")
         self.assertNotIn("Rewrite this", argv)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
@@ -237,6 +239,57 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertEqual(config["permission"], {"*": "deny"})
         self.assertEqual(config["model"], MODEL)
         self.assertEqual(config["small_model"], MODEL)
+
+    def test_a_free_gateway_model_runs_on_the_route_with_no_key_and_no_tools(self):
+        # Gemma's free tier answers small requests through the spark-gateway's
+        # free route (2026-10-21): the public rewriter tries it first, keyless,
+        # every tool denied. Private repos never get a free/ entry
+        # (bus/rewrite.command_for).
+        url = "https://gateway.invalid/free-public/gemini/v1"
+        result = self.run_wrapper(args=("-", "free/gemma-4-31b-it"),
+                                  env_overrides={"LOOM_REWRITE_FREE_URL": url})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(self.agent()["config"])
+        self.assertEqual(config["model"], "free/gemma-4-31b-it")
+        self.assertEqual(config["permission"], {"*": "deny"})
+        self.assertEqual(config["provider"]["free"]["options"]["baseURL"], url)
+        self.assertEqual(self.agent()["key"], "none")
+        self.assertIn("rewrite_agent: answered by free/gemma-4-31b-it", result.stderr)
+        self.assertNotIn("aws ssm", self.log.read_text() if self.log.exists() else "")
+
+    def test_a_free_model_that_hangs_gives_way_within_its_own_timeout(self):
+        # The gateway answers a cooled-down free pool with 503 and a
+        # retry-after, and opencode keeps retrying: one rewrite hung its whole
+        # 480 seconds, which a station pass would wait out (2026-10-21).
+        started = time.time()
+        result = self.run_wrapper("MODE=hang", args=("-", "free/gemma-4-31b-it,codex/test-model"),
+                                  env_overrides={"LOOM_REWRITE_FREE_URL": "https://gateway.invalid/v1",
+                                                 "LOOM_REWRITE_FREE_TIMEOUT": "3"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.time() - started, 25)
+        self.assertIn("codex", self.lane_log.read_text())
+
+    def test_a_free_model_that_failed_is_passed_over_while_its_pool_cools(self):
+        # The gateway cools a free pool for about 5 minutes after a refusal;
+        # every rewrite in a burst then spent its 90 seconds on Gemma before the
+        # next model answered (2026-10-21). The first failure starts a
+        # cooldown; the rewrites after it skip the free entry at once.
+        env = {"LOOM_REWRITE_FREE_URL": "https://gateway.invalid/v1", "LOOM_REWRITE_FREE_TIMEOUT": "3"}
+        first = self.run_wrapper("MODE=hang", args=("-", "free/gemma-4-31b-it,codex/test-model"),
+                                 env_overrides=env)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        started = time.time()
+        second = self.run_wrapper("MODE=hang", args=("-", "free/gemma-4-31b-it,codex/test-model"),
+                                  env_overrides=env)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertLess(time.time() - started, 2.5)
+        self.assertIn("cooling down", second.stderr)
+
+    def test_a_free_model_with_no_route_set_falls_through_to_the_next(self):
+        result = self.run_wrapper("Rewrite this", args=("-", "free/gemma-4-31b-it,codex/test-model"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '{"action":"skip","reason":"fake"}\n')
+        self.assertIn("codex", self.lane_log.read_text())
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_failing_agent_exits_non_zero_and_prints_nothing(self):
@@ -287,7 +340,7 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertEqual(result.stdout, ANSWER + "\n")
         self.assertIn(first, result.stderr)
         self.assertIn("rate", result.stderr.lower())
-        self.assertIn(f"run -m {second} --format json", self.agent()["argv"])
+        self.assertIn(f"run -m {second} --print-logs --log-level ERROR --format json", self.agent()["argv"])
 
     def test_bad_entry_in_model_list_is_refused_before_any_run(self):
         result = self.run_wrapper(args=("loom/test/key", MODEL + ",someprovider/model"))
@@ -309,7 +362,7 @@ class RewriteAgentTest(unittest.TestCase):
         result = self.run_wrapper()
         self.assertEqual(result.returncode, 0, result.stderr)
         argv = self.agent()["argv"]
-        self.assertRegex(argv, rf"^run --server http://127\.0\.0\.1:\d+ --auto -m {re.escape(MODEL)} --format json$")
+        self.assertRegex(argv, rf"^run --server http://127\.0\.0\.1:\d+ --auto -m {re.escape(MODEL)} --print-logs --log-level ERROR --format json$")
         self.assertNotIn("--standalone", argv)
 
     def test_the_lanes_and_the_rewriter_share_one_sandbox(self):

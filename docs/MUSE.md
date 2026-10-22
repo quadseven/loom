@@ -2,11 +2,17 @@
 
 At the start of each tick, run `git -C loom pull`. Clone
 `https://github.com/quadseven/loom` into `loom` first if it is not present.
-Run every command from that checkout. Set `LOOM_GITHUB_TOKEN`,
-`LOOM_REPOS` (space separated `OWNER/NAME` values) and `LOOM_BRIEF_AUTHORS`
-(the login or logins that brief tickets and post proofs, the same value the
-station uses). Without it `prioritize`, `close`, verified moves and merges
-refuse every ticket as untrusted. Use `muse` as your lock
+Run every command from that checkout. Set the Loom Brain App's
+`LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
+`LOOM_GITHUB_APP_KEY_SSM` (or `LOOM_GITHUB_APP_KEY_FILE`), so every write is the
+brain's and none is the operator's (loom#1142); `LOOM_GITHUB_TOKEN` is only
+for a Muse without them. Set `LOOM_REPOS` (space separated `OWNER/NAME`
+values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
+post proofs, the same value the station uses). Without it `prioritize`,
+`close`, verified moves and merges refuse every ticket as untrusted. With a
+personal `LOOM_GITHUB_TOKEN`, every issue a `bus` or `bus.brain` command opens
+or comments on is unsubscribed for that person afterwards, so later bot
+comments there send them no email; an @mention still does. Use `muse` as your lock
 holder (the lane machine's tick uses its own name and takes the lock for
 you). The lock lives in `quadseven/loom`.
 
@@ -35,6 +41,14 @@ Read and write GitHub only from the shell, through the Loom commands or the
 GitHub REST API with `LOOM_GITHUB_TOKEN`. Never use the web or browser tool
 for GitHub or anything else in a scheduled run: each new web request asks
 the operator for approval, and the run stops until someone answers.
+To read a file in a repo (a test, a script, a doc) without the web tool:
+
+    curl -fsS -H "Authorization: Bearer $LOOM_GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github.raw" \
+      "https://api.github.com/repos/OWNER/NAME/contents/PATH?ref=main"
+
+A scheduled run on 2026-10-21 asked the operator to approve a web fetch of
+one loom test file and stopped until the operator answered.
 
 ## Operate, do not report
 
@@ -201,7 +215,9 @@ steps on each tick:
 
 Claims expire after two hours without a heartbeat. A claim without a pull
 request expires after three hours and returns to `loom:queued` with a
-`[transient]` reason. The brain tick remains a separate process and follows
+`[transient]` reason. A ticket's heartbeat edits its claim comment in place (see
+"Lane comments edited in place" in BRAIN.md), so a beat adds no comment and
+sends no email. The brain tick remains a separate process and follows
 the regular brain instructions above.
 
 ## Handing off stage work
@@ -277,9 +293,10 @@ this tick"; a step with no note shows nothing there.
    for each goal, its latest journal, report, measurement and completed
    action, and its report deadline. Every goal under "Reports owed before
    unlock" gets its report in the report step this tick, in every scope,
-   including live. If the brain cannot write it, the station posts the
-   data-only report once the last report is 1 hour 45 minutes old, so no
-   goal's report passes 2 hours; never hand an owed report to another brain.
+   including live. A report is owed from 3 hours 45 minutes after the last
+   one. If the brain has not written it, the station posts the data-only
+   report once the last report is 5 hours 45 minutes old, so no goal's
+   report passes 6 hours; never hand an owed report to another brain.
    A goal listed as `report HELD` already has a report under 90 minutes old
    (the station's included): skip it this tick. Each lane
    pull request's line ends in `READY`
@@ -324,7 +341,9 @@ this tick"; a step with no note shows nothing there.
    fault (file a factory ticket and keep the runaway hold), brief problem
    (rewrite the brief, then clear `loom:runaway`), or model limit (escalate
    once with the reason, then clear `loom:runaway`). Do not clear a factory
-   fault hold until its fix ships.
+   fault hold until its fix ships. A held ticket is `loom:failed`, never a
+   live claim: its last run has ended, and once the hold is cleared the
+   factory moves it up the model ladder.
 3. First run `python3 -m bus.brain step merge --holder muse`. The station hands failed checks and unresolved review-bot threads back to
    the authoring lane automatically, up to `LOOM_FIX_ROUNDS` (default 3).
    The factory pass (bus/factory.py) moves stuck and failed tickets up the
@@ -423,8 +442,9 @@ this tick"; a step with no note shows nothing there.
    lane of its Difficulty tier, by priority, then oldest queued first. Use `--lane LANE`
    when the brain needs to choose the lane itself. `brief` refuses a brief
    with neither `--lane` nor `--difficulty`. A queued ticket without a
-   readable Difficulty line stays queued and appears in the goal's next
-   station standup as needing a difficulty; set one in the same tick with
+   readable Difficulty line (or one naming no tier) takes a medium lane, and
+   appears in the goal's next station standup as needing a difficulty; set
+   the right one in the same tick with
    `python3 -m bus.brain prioritize OWNER/NAME#N --difficulty easy|medium|hard`. A brief named but not written this
    tick is deferred with the `brief` stage (`defer OWNER/NAME#GOAL --stage brief --holder muse --note "one-line problem statement"`),
    never only in journal prose.
@@ -435,16 +455,16 @@ this tick"; a step with no note shows nothing there.
    default limit of 25 issues a run, oldest first. It skips pull requests,
    epics, asks and anything with a `loom:` label; a ready issue (every brief
    section, checkboxes under Acceptance criteria) becomes a `loom:queued`
-   ticket under the goal's intake epic, the rest get `loom:triage` and one comment naming
-   what is missing. Where the station has `LOOM_REWRITE_CMD` set it rewrites
+   ticket under the goal's intake epic, the rest get `loom:triage` (no comment;
+   the printed line names what is missing). Where the station has `LOOM_REWRITE_CMD` set it rewrites
    `loom:triage` issues itself (docs/BRAIN.md, Agent rewrites); the brain
    takes what is left (the `needs-brain` ones first: the station's rewrite
    model judged them person-only, and you decide), and only rewrites
    `loom:triage` issues: take up to
    5 per tick and, for each, either write the ticket with
    `python3 -m bus.brain brief OWNER/NAME --epic E --title TITLE --file BODY.md --refs M`
-   (M is the original; the ticket names it, the original gets
-   `loom:rewritten` and closes as completed when the ticket is verified) or, when only a person can do it, run
+   (M is the original, which becomes the ticket itself with its text kept
+   below, and no comment; see docs/BRAIN.md, Rewrites in place) or, when only a person can do it, run
    `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file starts
    with a line `Kind: K` (one of money, hardware, account, credential,
    physical, decision) and then names the exact thing needed. A credential is
@@ -529,7 +549,7 @@ on hard work):
   route on the spark-gateway, each waiting out its own provider's reset
   (free-ollama is Ollama Cloud and free-gemma is Gemma, both on any repo); else a
   free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
-  opencode-go-4, muse, free-nvidia, free-kilo and free-groq on public repos only
+  opencode-go-4, muse, copilot, free-nvidia, free-kilo and free-groq on public repos only
   (opencode-go-4 is Muse Spark, which trains on prompts; free-nvidia to free-groq
   are NVIDIA NIM, Kilo and Groq).
   Never anthropic or claude for an easy ticket.
@@ -540,18 +560,19 @@ on hard work):
   operator wants every free tier used up, 2026-10-19); then codex or opencode-go (opencode-go-4 on public repos only); an
   anthropic slot only when every spark, codex and opencode-go slot already
   holds work.
-- Hard: a spark slot first, then anthropic, claude, agy (Gemini 4 Argon,
-  public repos only) or codex, never a free lane. A hard ticket a spark
+- Hard: a spark slot first, then anthropic, claude, agy (public repos only)
+  or codex, never a free lane. A hard ticket a spark
   fails climbs the model ladder. Keep the anthropic slots busy with hard work
   while the credit lasts. Tiers follow the Artificial Analysis Intelligence
   Index: a lane's model goes in the tier its score supports.
 
-A hard ticket with no `Model:` line runs its lane's strongest model, not the
-lane default: gpt-6-sol on codex and gemini-4-argon-high on agy (the table
-`HARD_MODELS` next to `TIERS` in bus/factory.py). A ticket pinned to
-claude-opus-5-5 on a public repo goes to agy with gemini-4-argon-high when
-every Anthropic lane is at a limit or down, never when they are merely busy
-(the table `EQUIVALENTS`), and its claim records Argon as the model it ran.
+Codex runs gpt-6-luna only and agy the gemini-3.8-flash family only (the
+operator, 2026-10-21). A hard ticket with no `Model:` line runs its lane's
+default; the table `HARD_MODELS` next to `TIERS` in bus/factory.py is empty,
+and so is `EQUIVALENTS`: a ticket pinned to claude-opus-5-5 waits for an
+Anthropic lane and never goes to agy. A `Model:` line naming gpt-6-sol or a
+gemini-4-argon model reads as gpt-6-luna or gemini-3.8-flash-high, and the
+brain writes the same stand-in (`FORBIDDEN_MODELS` in bus/tickets.py).
 
 When no lane of a ticket's tier is up (every one at a limit or down), the
 factory's tier moves (a ticket off a lane at a limit, a queued ticket getting
@@ -562,7 +583,17 @@ easy: claude when it is free, else spark or a free lane. Easy and hard have
 no fallback, for the rules above. A fallback move says so in its note
 ("fallback: no medium lane is up"); the ticket keeps its `Difficulty:` line,
 so its next move takes its own tier again once a lane of it is up. A tier
-with a lane up but busy is waited for, not fallen back from.
+with a lane up but busy is waited for, not fallen back from, and so is a
+tier whose lanes are down or at a limit but one of them lifts within two
+hours (`LIMIT_REQUEUE`); a lane at a limit with no known end counts as out
+for hours. A move off a lane at a limit names when it lifts in its note. A
+ticket marked `needs-brain` or `loom:runaway` is held for the brain, and no
+such move touches it.
+A ticket briefed to a lane that is down, or at a limit lifting more than
+two hours off (`LIMIT_REQUEUE`), does not wait on it when no lane of its
+tier is free: it goes back to `loom:queued` with no lane, and takes the next
+free lane of its tier in the queue's order (priority, then age). A ladder
+ticket keeps its rung's rules.
 
 An anthropic slot whose heartbeat says "out of credit" is unavailable. Do not
 brief, re-brief, move a limit-held ticket, or climb the ladder onto it until
@@ -594,27 +625,37 @@ failed twice; review sent it back twice; it sat briefed with no lane signal
 for 2 hours twice; or it has been stuck, failed or unmerged for more than 6
 hours. This covers every Loom task, fix briefs included. Its next attempt
 takes the lowest rung it has not tried whose lane is free (a higher rung
-rather than a wait behind a busy lane), never the model that already failed
-it, and never a free lane:
+rather than a wait behind a busy lane that is up), never the model that
+already failed it, and never a free lane:
 
 1. the claude lane with `claude-sonnet-5-5`;
-2. the codex lane (or codex-2) with `gpt-6-sol`;
-3. `claude-opus-5-5` on the claude lane, else an anthropic slot;
-4. `gemini-4-argon-high` on agy, public repos only (the Opus equivalent and
-   agy's hard-tier model, bus/factory.py EQUIVALENTS and HARD_MODELS).
+2. the codex lane (or codex-2) with `gpt-6-luna`;
+3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
+
+A rung with one lane up holds a bounded few waiting tickets: past
+`ONE_LANE_MAX` (4), the overflow climbs to an untried rung whose least-loaded
+lane holds three or more fewer, even though that lane is not free. A stall the
+factory cannot move (no other lane of the rung or tier) is said once, when the
+ticket starts waiting for that reason, and then shows as a wait the station times.
 
 A rung counts as tried once the ticket was claimed on its model. The model a
 claim ran is what ran: the `Model:` line in force (the ticket's own before the
 ladder started, then the ladder's moves), else the model the runner footer of
 its lane's pull request names (`lane <lane>, model <model>`), else the lane's
 configured setting (`LOOM_<LANE>_MODEL`), never a fixed lane-to-model map.
-Once a ticket ran on Opus or past it, it climbs only to the untried strong
-models (`gpt-6-sol`, `gemini-4-argon-high`), never back to Sonnet. When no
+Once a ticket ran on Opus, no stronger model is left: it never goes back to
+luna or Sonnet, and the factory gives up on it. When no
 lane of its next rung is up, it waits with no comment; the factory says it
-tried every rung only once every rung with a lane for its repo was tried. A green, reviewed pull request is not escalated: a ticket
+tried every rung only once every rung with a lane for its repo was tried. The
+one exception is a pull request whose open thread carries a lane's answer: the
+factory asks the review bot to judge that answer (`/grug improve` on the pull
+request, once per head commit) instead of waiting with nothing to move it
+(docs/LANES.md). A green, reviewed pull request is not escalated: a ticket
 whose open pull request has nothing to fix (its head is green, the review
 check passed on that head, and no review thread is open) is landed, whatever
-its fix rounds.
+its fix rounds. When GitHub refuses that merge because a bot's change request
+from an earlier failing review still stands, the factory dismisses the bot's
+change request and merges; a person's change request is never dismissed.
 
 The factory applies this ladder on its own (bus/factory.py, recorded as
 `<!-- loom:rung N -->` comments). For work the factory cannot see, such as a
@@ -676,6 +717,17 @@ say-so alone:
 - Put asks in a `needs-operator` issue with one exact ask. Use `loom:urgent`
   only for something breaking now.
 - Never retry a failed step in the same tick. Stop at 25 minutes.
+- Every note or piece of evidence a tick leaves on an issue, outside the
+  comments a `bus` or `bus.brain` command writes itself, goes through
+  `python3 -m bus journal OWNER/NAME#N --file FILE --holder NAME`: it edits
+  your journal of the day on that issue in place (a file with no marker is
+  journaled as a tick), and a new comment emails everyone watching the
+  issue. Write the evidence only; the command adds the `Tick` line. Never
+  `gh issue comment` or a raw API comment for it. Evidence whose blocker kind
+  has no issue of exactly that kind goes to the goal home's journal, never to
+  the closest open issue: a comment there emails people about an issue the
+  evidence does not belong to (loom#1241, 2026-10-20). A new
+  kind gets its own issue when the goal's rules say so.
 - Never open a pull request for an issue that is not a Loom ticket. To get
   code written, brief a ticket and let a lane take it. The station lands,
   sends back and reconciles only pull requests linked to a ticket, so a pull

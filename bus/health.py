@@ -16,11 +16,19 @@ station reads each endpoint and, per finding:
 - on the open ticket, moves the Priority line when the band changes and
   posts the new numbers at most every EVIDENCE_EVERY;
 - once the finding is gone, posts one "finding absent since" comment, the
-  evidence the brain verifies against. It never closes a ticket;
+  evidence the brain verifies against. A finding that flaps edits that one
+  note (at most once every RESEEN_EVERY) and posts no second one. It never
+  closes a ticket;
+- once a shipped ticket's finding has stayed absent PROVE_AFTER, counted from
+  the later of the absent stamp and the ship, posts one proof comment naming
+  both times: the station's evidence for the Live criterion, which a verify
+  run quotes (loom#585). It ticks nothing;
 - when the finding is still reported REGRESS_AFTER after its open ticket
   shipped, the fix did not work: the ticket is re-briefed as a regression
   through brain brief --regresses, at most once per ticket per
-  REGRESS_EVERY. A ticket still in a build state is left to that work.
+  REGRESS_EVERY, and at most LOOM_REGRESSION_REBRIEFS times in all: past that
+  the brief holds the ticket for the brain (needs-brain) and the intake leaves
+  it alone. A ticket still in a build state is left to that work.
 
 An endpoint that answers with an error, a redirect, too much data or a
 document outside the contract's shapes is "not looked": nothing is filed,
@@ -48,7 +56,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import urlsplit
 
-from . import brain, naming, text, tickets
+from . import brain, naming, notify, text, tickets
 from .github import GitHub, GitHubError, _OPENER
 
 EVERY = 900
@@ -75,6 +83,10 @@ MARKER = "<!-- loom:health key=%s -->"
 MARKER_RE = re.compile(r"<!-- loom:health key=([0-9a-f]{40}) -->")
 EVIDENCE_MARKER = "<!-- loom:health-evidence -->"
 ABSENT_MARKER = "<!-- loom:health-absent -->"
+PROOF_MARKER = "<!-- loom:health-proof -->"
+# A finding absent this long since the later of its absent stamp and its
+# ticket's ship has met the ticket's Live criterion (loom#585).
+PROVE_AFTER = 24 * 3600
 RESEEN_MARKER = "<!-- loom:health-reseen -->"
 # "<who> is <state>: <what>" and "<n> members are <state>: <what>" name one
 # cause, "<state>: <what>", whoever it hits.
@@ -374,9 +386,45 @@ def reseen_comment(count: int, last: str) -> str:
             "ticket." % (RESEEN_MARKER, count, "" if count == 1 else "s", last))
 
 
-def absent_comment(when: str) -> str:
+def absent_comment(when: str, count: int = 1) -> str:
+    """The ticket's one absent note; count is how many times the finding went
+    absent, so a flap edits this note and does not post another."""
+    again = "" if count <= 1 else " The finding has gone absent %d times." % count
     return ("%s\nThe health endpoint no longer reports this finding: finding absent since "
-            "%s. It verifies once it has stayed absent for 24 hours." % (ABSENT_MARKER, when))
+            "%s. It verifies once it has stayed absent for 24 hours.%s"
+            % (ABSENT_MARKER, when, again))
+
+
+def proof_comment(goal: int, absent: str, shipped: str, checked: str) -> str:
+    """The Live criterion's evidence, from the station's own reads. It never
+    carries the endpoint URL."""
+    note = ""
+    if absent < shipped:
+        note = (" The finding went absent before the ticket shipped, so the 24 hours count "
+                "from the ship.")
+    return ("%s\nLive criterion evidence for goal #%d's health endpoint: finding absent since "
+            "%s; ticket shipped %s; last checked_at read in the window %s; absent for 24 "
+            "hours counted from %s.%s The other criteria (the cause named in the pull request, "
+            "the test) are for the verifier to check."
+            % (PROOF_MARKER, goal, absent, shipped, checked, max(absent, shipped), note))
+
+
+def proof_of(comments: Any, authors: List[str]) -> str:
+    """The newest proof comment a trusted author posted on the ticket (its
+    text after the marker), or "": the station's evidence for the Live
+    criterion, which the verify run quotes."""
+    allowed = {a.lower() for a in authors}
+    found = ""
+    for c in comments:
+        body = str(c.get("body") or "") if isinstance(c, dict) else ""
+        login = str(((c.get("user") or {}) if isinstance(c, dict) else {}).get("login") or "")
+        if body.startswith(PROOF_MARKER) and login.lower() in allowed:
+            found = body[len(PROOF_MARKER):].strip()
+    return found
+
+
+def _stamp(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
 
 class Intake:
@@ -411,6 +459,12 @@ class Intake:
         self.reseen = {k: v for k, v in (reseen.items() if isinstance(reseen, dict) else ())
                        if isinstance(v, dict)}
         self.state["reseen"] = self.reseen
+        # "owner/name#N" -> {"noted": when its absent note was last written,
+        # "id": that comment, "count": how often the finding went absent}.
+        noted = self.state.get("absent_noted")
+        self.absent_noted = {k: v for k, v in (noted.items() if isinstance(noted, dict) else ())
+                             if isinstance(v, dict)}
+        self.state["absent_noted"] = self.absent_noted
         for stale in [k for k in list(looked) + list(keys) if k not in {s.key for s in sources}]:
             looked.pop(stale, None)
             keys.pop(stale, None)
@@ -444,6 +498,7 @@ class Intake:
         current = {f.digest for f in found} | set(refused)
         issues = self._absent(source.repo, open_by_digest, current, ledger,
                               checked or self.stamp)
+        self._prove_absent(source, ledger, open_by_digest, checked or self.stamp)
         for digest in [d for d in ledger if d not in current and d not in open_by_digest]:
             rec = ledger[digest]
             if isinstance(rec.get("ticket"), int) \
@@ -451,6 +506,10 @@ class Intake:
                 continue
             del ledger[digest]
         self._post_reseen(source.repo, issues)
+        prefix = source.repo + "#"
+        for key in [k for k in self.absent_noted if k.startswith(prefix)]:
+            if not key[len(prefix):].isdigit() or int(key[len(prefix):]) not in issues:
+                del self.absent_noted[key]
 
     def _update(self, source: Source, found: List[Finding], ledger: Dict[str, Any],
                 checked: str) -> Dict[str, Dict[str, Any]]:
@@ -489,10 +548,75 @@ class Intake:
                 continue
             recs = [ledger.setdefault(d, {"ticket": number}) for d in digests]
             if not all(r.get("absent") for r in recs):
-                self._comment(repo, issues[number], absent_comment(when))
+                self._note_absent(repo, issues[number], when)
                 for r in recs:
                     r.setdefault("absent", when)
         return issues
+
+    def _note_absent(self, repo: str, issue: Dict[str, Any], when: str) -> None:
+        """The ticket's one absent note. A finding that flaps (absent, back,
+        absent) must not post a note per flip (loom#1204 got 7 in 18 hours): the
+        first flip posts, a flip inside RESEEN_EVERY of the last note writes
+        nothing, a later one edits that note."""
+        number = int(issue["number"])
+        entry = self.absent_noted.get("%s#%d" % (repo, number))
+        count = int((entry or {}).get("count") or 0) + 1
+        if entry is not None and 0 <= self.now - float(entry.get("noted") or 0) < RESEEN_EVERY:
+            entry["count"] = count
+            return
+        body = absent_comment(when, count)
+        note_id = (entry or {}).get("id")
+        if note_id is not None:
+            try:
+                self.gh.rest("PATCH", "/repos/%s/issues/comments/%s" % (repo, note_id),
+                             {"body": body})
+            except GitHubError as err:
+                if err.status not in (404, 410):
+                    raise
+                note_id = None
+        if note_id is None:
+            made = notify.post(self.gh, repo, number, body, notify.EVIDENCE).data
+            note_id = made.get("id") if isinstance(made, dict) else None
+        self.absent_noted["%s#%d" % (repo, number)] = {"noted": self.now, "id": note_id,
+                                                       "count": count}
+
+    def _prove_absent(self, source: Source, ledger: Dict[str, Any],
+                      open_by_digest: Dict[str, Dict[str, Any]], checked: str) -> None:
+        """Post the proof comment on each shipped ticket whose findings are
+        all gone and have stayed gone PROVE_AFTER since the later of their
+        absent stamp and the ship. A finding that came back lost its stamp,
+        so its ticket waits for a fresh window."""
+        by_ticket: Dict[int, Tuple[Dict[str, Any], List[Dict[str, Any]]]] = {}
+        for digest, issue in open_by_digest.items():
+            by_ticket.setdefault(int(issue["number"]), (issue, []))[1].append(
+                ledger.setdefault(digest, {}))
+        for number, (issue, recs) in sorted(by_ticket.items()):
+            if tickets.ticket_state(issue) != "shipped":
+                continue
+            if all(r.get("absent") for r in recs) and not any(r.get("proved") for r in recs):
+                self._prove(source, number, issue, recs, checked)
+
+    def _prove(self, source: Source, number: int, issue: Dict[str, Any],
+               recs: List[Dict[str, Any]], checked: str) -> None:
+        absent = max(_epoch(r["absent"]) or 0.0 for r in recs)
+        cached = recs[0].get("shipped")
+        if isinstance(cached, list) and len(cached) == 2 and cached[0] == number:
+            shipped: Optional[float] = float(cached[1])
+        else:
+            shipped = self._shipped_at(source.repo, number)
+            if shipped is None:
+                self.say("health %s#%d: no loom:shipped label event, so its ship time is "
+                         "unknown; no proof posted" % (source.repo, number))
+                return
+            recs[0]["shipped"] = [number, shipped]
+        if absent == 0.0 or self.now - max(absent, shipped) < PROVE_AFTER:
+            return
+        self._comment(source.repo, issue, proof_comment(
+            source.goal, _stamp(absent), _stamp(shipped), checked), notify.PROOF)
+        for rec in recs:
+            rec["proved"] = self.now
+        self.say("health %s#%d: finding absent %d hours since the later of absence and ship; "
+                 "proof posted" % (source.repo, number, PROVE_AFTER // 3600))
 
     def _refused(self, source: Source, refused: Dict[str, str],
                  ledger: Dict[str, Any]) -> None:
@@ -571,7 +695,8 @@ class Intake:
             if count > int(entry.get("posted") or 0) \
                     and self.now - float(entry.get("noted") or 0) >= RESEEN_EVERY:
                 self._comment(repo, issues[int(number)],
-                              reseen_comment(count, str(entry.get("last") or self.stamp)))
+                              reseen_comment(count, str(entry.get("last") or self.stamp)),
+                              notify.EVIDENCE)
                 entry.update(posted=count, noted=self.now)
 
     def _finding(self, source: Source, f: Finding, rec: Dict[str, Any],
@@ -579,6 +704,7 @@ class Intake:
         """Update the finding's open ticket, or file one. True when a ticket
         was briefed."""
         back = rec.pop("absent", None)
+        rec.pop("proved", None)
         rec.pop("refused", None)
         rec.pop("gone", None)
         if issue is None:
@@ -593,7 +719,7 @@ class Intake:
         posted = [f.affected, f.evidence]
         if rec.get("posted") != posted and self.now - float(rec.get("commented") or 0) \
                 >= EVIDENCE_EVERY:
-            self._comment(source.repo, issue, evidence_comment(f, checked))
+            self._comment(source.repo, issue, evidence_comment(f, checked), notify.EVIDENCE)
             rec.update(posted=posted, commented=self.now)
         self._regression(source, f, rec, issue)
         return False
@@ -609,6 +735,10 @@ class Intake:
             return
         ticket = "%s#%d" % (source.repo, number)
         if ticket in self.regressed:
+            return
+        if "needs-brain" in brain._labels(issue):
+            # Held for the brain, by the re-brief cap or by anything else: the
+            # brain decides what is different this time (loom#1418).
             return
         cached = rec.get("shipped")
         if isinstance(cached, list) and len(cached) == 2 and cached[0] == number:
@@ -707,9 +837,8 @@ class Intake:
         issue["body"] = body
         self.say("health %s#%s: priority now %s" % (repo, issue["number"], band))
 
-    def _comment(self, repo: str, issue: Dict[str, Any], body: str) -> None:
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(issue["number"])),
-                     {"body": body})
+    def _comment(self, repo: str, issue: Dict[str, Any], body: str, kind: str) -> None:
+        notify.post(self.gh, repo, int(issue["number"]), body, kind)
 
 
 def _same_cause(by_cause: Dict[str, Dict[str, Any]], named: str) -> Optional[Dict[str, Any]]:

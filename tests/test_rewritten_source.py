@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import audit, brain, proof  # noqa: E402
+from bus import audit, brain, proof, tickets  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
@@ -124,6 +124,16 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(brain.rewritten_from(ticket_body("Refs #7")), 7)
         self.assertIsNone(brain.rewritten_from("Part of #2\nSee issue 6 and #7.\n"))
         self.assertIsNone(brain.rewritten_from(None))
+
+    def test_rewritten_from_ignores_the_text_an_in_place_rewrite_kept(self):
+        # loom#1229: an issue rewritten in place keeps its original text below
+        # the ticket; a Refs line there is the author's, not a source.
+        kept = tickets.with_original(ticket_body("Size: S"), {"title": "Old",
+                                                            "body": "Refs #7\n"})
+        self.assertIn("> Refs #7", kept)
+        self.assertIsNone(brain.rewritten_from(kept))
+        unquoted = kept.replace("> Refs #7", "Refs #7")
+        self.assertIsNone(brain.rewritten_from(unquoted))
 
     def test_verifying_the_ticket_closes_its_source_naming_the_ticket_and_proof(self):
         self.given()
