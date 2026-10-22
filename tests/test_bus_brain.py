@@ -2426,6 +2426,24 @@ class EscalateTests(unittest.TestCase):
         self.assertIn("failed 2 times", note)
         self.assertIn("Rung: 2 gpt-6-sol codex", note)
 
+    def test_escalate_edits_the_status_comment_and_posts_no_comment(self):
+        status_comment = {"id": 77, "user": {"login": "example-brain"}, "created_at": OLD,
+                          "body": "<!-- loom:status v1 -->\nLoom status.\n\n"
+                                  "- 2030-01-01T00:05:00Z Claimed for lane claude (body sha256 0123456789ab)\n"}
+        routes = ticket_routes(stuck_ticket("failed"), TWICE,
+                               [claim("2030-01-01T00:11:00Z"), status_comment])
+        fake = Routed(routes)
+        gh = GitHub("t", transport=fake)
+        gh.status_authors |= {"example-brain"}
+        with unittest.mock.patch.dict(os.environ, TRUSTED):
+            outcome = brain.escalate(gh, REPO, 9)
+        self.assertEqual(outcome, "rung 2 gpt-6-sol on codex")
+        self.assertEqual(fake.sent("POST", "/issues/9/comments"), [])
+        edit = fake.sent("PATCH", "/issues/comments/77")[0]["body"]
+        self.assertIn("<!-- loom:escalate v1 -->", edit)
+        self.assertIn("Rung: 2 gpt-6-sol codex", edit)
+        self.assertIn("Claimed for lane claude", edit)
+
     def test_escalate_skips_a_busy_lane_for_a_higher_rung(self):
         fake, outcome = self.run_escalate(ticket_routes(
             stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")], free=("claude", "anthropic-2")))
@@ -2454,7 +2472,11 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(outcome, "rung 2 gpt-6-sol on codex")
         comments = [b["body"] for b in fake.sent("POST", "/issues/9/comments")]
         self.assertTrue(comments[0].startswith("<!-- loom:fix v1 -->\nPull request: %s#8, branch loom/9-work" % REPO))
-        self.assertTrue(comments[1].startswith("<!-- loom:escalate v1 -->"))
+        # With no status comment to edit yet, the event opens it: a status
+        # comment, not an escalate comment.
+        self.assertTrue(comments[1].startswith("<!-- loom:status v1 -->"))
+        self.assertIn("- 20", comments[1])
+        self.assertIn("<!-- loom:escalate v1 -->", comments[1])
         self.assertEqual(fake.sent("PUT", "/issues/9/labels"),
                          [{"labels": ["loom:ticket", "loom:briefed", "lane:codex"]}])
         self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: gpt-6-sol\n\n" + BODY}])
@@ -2506,8 +2528,8 @@ class EscalateTests(unittest.TestCase):
                     os.environ, {"LOOM_REVIEW_CHECK": "", "LOOM_BRIEF_AUTHORS": "trusted"}):
                 fake, outcome = self.run_escalate(self.finished_pr_routes(**state))
                 self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
-                self.assertTrue(fake.sent("POST", "/issues/9/comments")[-1]["body"]
-                                .startswith("<!-- loom:escalate v1 -->"))
+                self.assertIn("<!-- loom:escalate v1 -->",
+                              fake.sent("POST", "/issues/9/comments")[-1]["body"])
 
     def test_a_fork_pull_request_is_never_reported_as_finished(self):
         # fix() refuses a fork on its own; the point is that the finished-pull-
