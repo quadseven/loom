@@ -4806,6 +4806,29 @@ echo fixed > fix.txt
         self.assertEqual(records[-1]["command"], "test -f .prepared && loom-test-python check.py")
         self.assertFalse(records[-1]["ok"])
 
+    def test_a_base_branch_fetch_that_races_another_fetch_is_tried_again(self):
+        # "fatal: shallow file has changed since we read it": two fetches on
+        # one shallow tree raced, and a fix round was filed as a factory
+        # incident without its agent running (grug, 2026-10-22).
+        self.contract_repo()
+        name, _ = self.fix_brief()
+        count = Path(self._tmp.name) / "fetch-count"
+        self.write_tool(self.bin / "git", """#!/usr/bin/env bash
+if [[ " $* " == *" fetch -q --depth 1 origin "* ]]; then
+  n=$(cat "$FAKE_FETCH_COUNT" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_FETCH_COUNT"
+  if [ "$n" -eq 1 ]; then echo 'fatal: shallow file has changed since we read it' >&2; exit 128; fi
+fi
+exec /usr/bin/git "$@"
+""")
+        result = self.run_contract_lane(FAKE_AGENT_TEXT="broken", FAKE_FETCH_COUNT=str(count))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(count.read_text().strip(), "2")
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertNotIn("could not fetch the base branch", log)
+        path = self.loom / "logs" / "codex" / (name + ".validation.jsonl")
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(records[-1]["command"], "test -f .prepared && loom-test-python check.py")
+
     def contract_edit_lane(self, text):
         self.contract_repo()
         self.drop_brief()
