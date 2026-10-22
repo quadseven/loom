@@ -56,6 +56,7 @@ from . import text as _text
 from . import tickets
 from . import transcripts
 from . import watch
+from . import labels
 from .brain import HUMAN_MARKER
 from . import brain
 from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, unreadable
@@ -9522,11 +9523,30 @@ class Station:
             except health.NotLooked as err:
                 raise GitHubError("roll family gate could not be read: %s" % err) from err
 
+    @staticmethod
+    def label_digest() -> str:
+        payload = json.dumps(labels.LABELS, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def sync_labels(self) -> None:
+        """Sync every registered repo when the desired label set changes."""
+        path = os.path.join(self.state, "labels.json")
+        digest = self.label_digest()
+        saved = _read_json(path, {}, strict=False)
+        if isinstance(saved, dict) and saved.get("digest") == digest:
+            return
+        for repo in self.s.repos:
+            changed = labels.ensure_labels(self.gh, repo)
+            if changed:
+                _say("labels changed in %s: %s" % (repo, ", ".join(changed)))
+        _write_json(path, {"digest": digest})
+
     def run_pass(self) -> None:
         if self._budget_exhausted():
             return
         if not self.check_repo_access():
             return
+        self.sync_labels()
         self.finish_claims()
         self.report_outcomes()
         if not self._deferred():

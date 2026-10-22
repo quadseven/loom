@@ -26,6 +26,7 @@ from bus import __main__ as cli  # noqa: E402
 from bus import audit, brain, factory, invariants, proof, spend, station, status, tickets  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
+from bus import labels as labels_module  # noqa: E402
 from bus.github import AppToken, GitHub, GitHubError  # noqa: E402
 
 REPO = "example-owner/example-repo"
@@ -198,6 +199,10 @@ class FakeGitHub:
                                           for l in i.get("labels", []))])
             return reply(200, self.factory_incidents)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
+        if method == "GET" and rest == "labels":
+            return reply(200, [{"name": name, "color": value["color"],
+                                "description": value["description"]}
+                               for name, value in labels_module.LABELS.items()])
         if rest == "issues/900/comments" and method == "POST":
             return self._post_page(data)
         if rest == "issues" or re.match(r"issues/comments/\d+$", rest) \
@@ -455,6 +460,28 @@ class Base(unittest.TestCase):
             return sorted(os.listdir(self.inbox(lane)))
         except OSError:
             return []
+
+
+class StationLabelSyncTest(Base):
+    def test_changed_label_digest_syncs_every_repo_and_records_digest(self):
+        repos = ["example-owner/first", "example-owner/second"]
+        settings = station.Settings(self.home, repos, list(AUTHORS), list(OWNERS))
+        runner = station.Station(GitHub("token", transport=self.fake), settings)
+        ledger = os.path.join(runner.state, "labels.json")
+        self.write(ledger, json.dumps({"digest": "old-digest"}))
+        with mock.patch.object(labels_module, "ensure_labels", return_value=["loom:ticket"]) as ensure:
+            runner.sync_labels()
+        self.assertEqual([call.args[1] for call in ensure.call_args_list], repos)
+        with open(ledger, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["digest"], runner.label_digest())
+
+    def test_unchanged_label_digest_makes_no_label_calls(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        ledger = os.path.join(runner.state, "labels.json")
+        self.write(ledger, json.dumps({"digest": runner.label_digest()}))
+        with mock.patch.object(labels_module, "ensure_labels") as ensure:
+            runner.sync_labels()
+        ensure.assert_not_called()
 
 
 class StationKeepsAppTokenTest(Base):
@@ -2973,8 +3000,9 @@ class CorruptStateTest(Base):
         # scan's merged and shipped lists, and the invariant check's read of
         # open pull requests (their plan checks) still run, and so does
         # reconciliation's read of the open tickets (loom#784) and the
-        # done-ticket close step's, and the hourly read of rewritten sources.
-        self.assertEqual(self.run_pass().requests, 11)
+        # done-ticket close step's, the hourly read of rewritten sources, and
+        # the changed label-set sync.
+        self.assertEqual(self.run_pass().requests, 12)
 
 
 class TicketsTest(unittest.TestCase):
