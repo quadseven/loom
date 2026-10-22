@@ -82,6 +82,7 @@ def _http_json(url: str, headers: Mapping[str, str]) -> Any:
     """A GET returning parsed JSON, one seam the tests replace."""
     req = urllib.request.Request(url, headers=dict(headers))
     with urllib.request.urlopen(req, timeout=15) as resp:
+        socket.setdefaulttimeout(15)
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
