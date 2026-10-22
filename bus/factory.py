@@ -1432,6 +1432,11 @@ class Factory:
         lane = next((x for x in own if self._free(x)), None)
         if lane is not None or any(self._up(x) for x in own):
             return lane, ""
+        whole = own + ([old] if old in lanes_of(difficulty, private) and old not in own else [])
+        if not all(self._out_hours(x) for x in whole):
+            # A lane of the tier lifts within LIMIT_REQUEUE: wait for it
+            # rather than leave the tier (loom#1224).
+            return None, ""
         for tier in FALLBACK.get(difficulty, ()):
             fallback_lanes = [x for x in lanes_of(tier, private)
                               if x != old and (allow_remote or x not in REMOTE_LANES)
@@ -2638,6 +2643,13 @@ class Factory:
         _say("moved %s#%d off busy lane %s to %s" % (repo, issue["number"], old, lane))
         return True
 
+    def _out_hours(self, lane: str) -> bool:
+        """Whether the lane takes no work for hours: not available, down, or
+        at a limit that lifts past LIMIT_REQUEUE or has no known end."""
+        if lane in self.limited:
+            return self.limit_until.get(lane, 0) == 0 or self._out_long(lane)
+        return lane in self.down or (self.available is not None and lane not in self.available)
+
     def _out_long(self, lane: str) -> bool:
         """Whether the lane will take no work for over LIMIT_REQUEUE: down, or
         at a limit whose heartbeat says it lifts past that."""
@@ -2669,6 +2681,8 @@ class Factory:
         climbs to its next untried rung instead. With none free it stays where
         it is, for the lane to take once it is back."""
         number = int(issue["number"])
+        if RUNAWAY in _labels(issue) or "needs-brain" in _labels(issue):
+            return  # held for the brain: it moves nothing (loom#1224)
         old = _lane(issue)
         why = "down" if old in self.down and old not in self.limited else "at a limit"
         rung = current_rung(issue)
@@ -2746,6 +2760,8 @@ class Factory:
         kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         issue["labels"] = [{"name": x} for x in kept]
+        if why == "at a limit" and self.limit_until.get(old):
+            why += " until " + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.limit_until[old]))
         self._status_note(repo, number,
                           "Not a failure (lane %s is %s): the factory moved this "
                           "ticket to lane %s, %s." % (

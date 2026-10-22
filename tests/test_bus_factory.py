@@ -2368,6 +2368,56 @@ class Tickets(Base):
         self.assertIn("Not a failure (lane opencode-go-2 is at a limit until", note)
         self.assertIn("goes back to the queue", note)
 
+    def whole_tier_limited(self, lifts, labels=()):
+        """A medium ticket briefed on codex while every medium lane is at a
+        limit that lifts at the seconds from now `lifts` names (a lane per
+        entry, or one value for all)."""
+        self.gh.ticket(7, "briefed", lane="codex", body="Difficulty: medium\n\n## Why\nx\n")
+        self.gh.issues[7]["labels"].extend({"name": x} for x in labels)
+        until = {lane: NOW + (lifts[lane] if isinstance(lifts, dict) else lifts)
+                 for lane in factory.TIERS["medium"]}
+        self.go(limited=factory.TIERS["medium"], limit_until=until)
+
+    def test_a_ticket_whose_whole_tier_is_limited_for_days_moves_to_a_lane_up(self):
+        # loom#1224: seven tickets sat briefed to agy, whose plan resets in days.
+        self.whole_tier_limited(5 * 86400)
+        self.assertEqual(self.lane(7), "claude")
+        note = self.gh.comments[7][-1]["body"]
+        self.assertIn("Not a failure (lane codex is at a limit until", note)
+        self.assertIn("fallback: no medium lane is up", note)
+
+    def test_a_ticket_whose_whole_tier_frees_up_within_two_hours_keeps_waiting(self):
+        self.whole_tier_limited(30 * 60)
+        self.assertEqual(self.lane(7), "codex")
+
+    def test_one_tier_lane_freeing_up_soon_keeps_the_ticket_waiting(self):
+        lifts = {lane: 5 * 86400 for lane in factory.TIERS["medium"]}
+        lifts["codex-2"] = 30 * 60
+        self.whole_tier_limited(lifts)
+        # Its own lane is out for days, so it goes back to the queue for the
+        # lane that frees up (loom#1226); it does not leave its tier.
+        self.assertIn("loom:queued", {x["name"] for x in self.gh.issues[7]["labels"]})
+        self.assertNotEqual(self.lane(7), "claude")
+
+    def test_a_ticket_held_for_the_brain_or_a_runaway_is_not_moved(self):
+        for label in ("needs-brain", factory.RUNAWAY):
+            with self.subTest(label=label):
+                self.setUp()
+                self.whole_tier_limited(5 * 86400, labels=(label,))
+                self.assertEqual(self.lane(7), "codex")
+                self.assertEqual(self.gh.comments.get(7, []), [])
+                self.setUp()
+                self.gh.ticket(7, "briefed", lane="opencode-go-2",
+                               body="Difficulty: medium\n\n## Why\nx\n")
+                self.gh.issues[7]["labels"].append({"name": label})
+                busy = [x for x in factory.lanes_of("medium", True) if x != "opencode-go-2"]
+                for n, other in enumerate(busy, 20):
+                    self.gh.ticket(n, "briefed", lane=other)
+                self.go(limited=["opencode-go-2"], available=busy,
+                        limit_until={"opencode-go-2": NOW + 11 * 86400})
+                self.assertEqual(self.lane(7), "opencode-go-2")
+                self.assertNotIn("loom:queued", {x["name"] for x in self.gh.issues[7]["labels"]})
+
     def test_a_ticket_whose_lane_frees_up_soon_keeps_waiting_for_it(self):
         self.tier_busy_on("opencode-go-2", 30 * 60)
         self.assertEqual(self.lane(7), "opencode-go-2")
