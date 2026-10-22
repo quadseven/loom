@@ -1460,11 +1460,24 @@ parse_contract() {
   done
 }
 
+# A fix round's base branch, fetched into the shallow tree for its contract.
+# Tried a second time after a pause: two fetches on one shallow tree race
+# ("shallow file has changed since we read it"), and the first such failure
+# filed a factory incident while nothing was wrong (2026-10-22).
+fetch_base_for_contract() {
+  local try
+  for try in 1 2; do
+    timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+      fetch -q --depth 1 origin "${BASE_BRANCH:-HEAD}" >> "$LOG" 2>&1 && return 0
+    [ "$try" -eq 2 ] || sleep 3
+  done
+  return 1
+}
+
 load_contract() {
   local rev="$BASE" mode canon
   HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK=""
-  if [ -n "$FIX_PR" ] && ! { timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
-       -c core.fsmonitor=false fetch -q --depth 1 origin "${BASE_BRANCH:-HEAD}" >> "$LOG" 2>&1 &&
+  if [ -n "$FIX_PR" ] && ! { fetch_base_for_contract &&
        rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
     HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
     note_factory_incident environment "could not fetch the base branch for $CONTRACT_FILE" SETUP_REASON
