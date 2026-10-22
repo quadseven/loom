@@ -90,4 +90,6 @@ it the title is the ticket id.
 
 The runner uses the `Why`, `What`, `Acceptance criteria`, `Size`, and `Out of
 scope` sections when it builds the pull request body. Keep these headings
-exactly as written.
+exactly as written. The body carries the standard Acceptance criteria bullets
+when the ticket states fewer than the three the review bot's plan check
+wants, so a ticket with one criterion still opens a body the check accepts.

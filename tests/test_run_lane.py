@@ -1231,6 +1231,20 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("\nSize: S\n", body)
         self.assertEqual(hunt_plan.problems(body), [])
 
+    def test_pr_body_carries_the_bullets_the_gate_wants_for_a_thin_brief(self):
+        # The gate counts three bullets under Acceptance criteria. A ticket
+        # that states fewer (the factory files a follow-up ticket with the one
+        # criterion a lane left not built) still opens a body it accepts: a
+        # body it refuses holds the pull request.
+        self.drop_brief(text=BRIEF.replace(
+            "- [ ] The thing works\n- [ ] A test covers the thing\n"
+            "- [ ] Nothing else changes", "- [ ] The thing works"))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertEqual(hunt_plan.problems(body), [])
+        self.assertIn("- [ ] The thing works", body)
+
     def test_pr_body_has_no_refs_without_an_issue_line(self):
         self.drop_brief()
         self.run_lane()

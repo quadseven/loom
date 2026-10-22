@@ -8,7 +8,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import pr_repair, text  # noqa: E402
+from bus import hunt_plan, pr_repair, text  # noqa: E402
 
 
 BRIEF = """# Brief: example-owner.example-repo-42
@@ -56,6 +56,29 @@ RUNNER_BODY = (
 BRIEF_CORRECTED = BRIEF.replace(
     "- [ ] A test covers the thing",
     "- [ ] A test covers the thing\n- [ ] The edge case is handled")
+
+# A ticket with one acceptance criterion: the factory files a follow-up
+# ticket with the one criterion a lane left not built.
+THIN_BRIEF = BRIEF.replace(
+    "- [ ] The thing works\n- [ ] A test covers the thing\n- [ ] Nothing else changes",
+    "- [ ] The thing works")
+
+
+class ThinBriefTest(unittest.TestCase):
+    """The gate counts three bullets under Acceptance criteria. A ticket that
+    states fewer still yields a body it accepts, or it holds the pull
+    request until the plan-check invariant fires."""
+
+    def test_a_one_criterion_brief_yields_a_body_the_gate_accepts(self):
+        body = pr_repair._render_generated(THIN_BRIEF, "codex", "gpt-test", "T42")
+        self.assertEqual(hunt_plan.problems(body), [])
+        section = body.split("## Acceptance criteria\n", 1)[1].split("\n\nSize:", 1)[0]
+        self.assertEqual(len(hunt_plan.bullets(section)), hunt_plan.MIN_BULLETS)
+        self.assertIn("- [ ] The thing works", section)
+
+    def test_a_brief_with_the_gate_s_bullets_is_unchanged(self):
+        body = pr_repair._render_generated(BRIEF, "codex", "gpt-test", "T42")
+        self.assertEqual(body, RUNNER_BODY)
 
 
 class ReconcileTest(unittest.TestCase):
