@@ -49,6 +49,7 @@ RUNNER_BODY = (
     "- [ ] Nothing else changes\n\n"
     "Size: S\n\n"
     "## Out of scope\n- Other things\n\n"
+    "## Operator steps before merge\nnone stated\n\n"
     "---\n"
     "Loom ticket T42, lane codex, model gpt-test.\n"
     "Refs example-owner/example-repo#42")
@@ -180,6 +181,23 @@ class ReconcileTest(unittest.TestCase):
         result = pr_repair.reconcile(self.brief, "Fix the thing", "no headings here", "codex", "gpt-test", "T42")
         self.assertFalse(result["changed"])
         self.assertTrue(result["reason"].startswith("cannot reconcile"))
+
+    def test_a_declared_operator_step_survives_a_repair_round(self):
+        # The factory holds a body whose section lists a step
+        # (bus/operator_hold.py): a fix round must not reset it to none.
+        body = RUNNER_BODY.replace("none stated", "- Grow the VM disk first")
+        self.write_brief(BRIEF_CORRECTED)
+        result = pr_repair.reconcile(self.brief, "Fix the thing", body, "codex", "gpt-test", "T42")
+        self.assertTrue(result["changed"], result)
+        self.assertIn("## Operator steps before merge\n- Grow the VM disk first\n\n---",
+                      result["body"])
+
+    def test_a_body_from_before_the_operator_section_is_repaired_to_carry_it(self):
+        old = RUNNER_BODY.replace("## Operator steps before merge\nnone stated\n\n", "")
+        self.write_brief(BRIEF)
+        result = pr_repair.reconcile(self.brief, "Fix the thing", old, "codex", "gpt-test", "T42")
+        self.assertEqual(result["reason"], "")
+        self.assertEqual(result["body"], RUNNER_BODY)
 
     def test_refuses_body_with_footer_rule_before_generated_sections(self):
         # A leading rule line is not a footer for the generated sections.

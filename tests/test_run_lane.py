@@ -819,6 +819,26 @@ print('leak guard: clean (shape patterns only)')
         self.assertNotIn("[x]", intent)
         self.assertEqual(body.count("## Acceptance criteria"), 1)
 
+    def test_the_lanes_operator_steps_reach_the_pull_request_body(self):
+        # A lane pull request whose deploy needed a VM resize and a data
+        # migration merged on green checks (2026-10-22): the body now carries
+        # the lane's declaration, which bus/operator_hold.py holds on.
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY=self.TICKED + "\n\n## Operator steps before merge\n"
+                               "- Grow the VM disk to 40 GiB")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("\n## Operator steps before merge\n- Grow the VM disk to 40 GiB\n\n---\n",
+                      body)
+        self.assertIn("## Operator steps before merge", self.log.read_text())
+        self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_a_body_without_a_declaration_says_none_was_stated(self):
+        self.drop_brief()
+        self.run_lane()
+        self.assertIn("\n## Operator steps before merge\nnone stated\n\n---\n",
+                      self.body.read_text())
+
     def test_private_repo_does_not_run_leak_scan_and_pushes(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="private-ip", FAKE_GH_PRIVATE="true")

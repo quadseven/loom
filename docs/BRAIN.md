@@ -1386,6 +1386,59 @@ decides merge-ready, so consequence decides the rule:
   critical finding is open on the head commit.
 - A pull request with no class label keeps the `logic` rule.
 
+## Operator holds
+
+A lane pull request waits for the operator, whatever its class, checks and
+review, when either holds (`bus/operator_hold.py`):
+
+- **Operator steps.** Its `## Operator steps before merge` section lists a
+  step (anything but `none`), or, as a backstop, its body or its ticket's
+  body names one in words: "leave X to the operator", an operator task, step
+  or prerequisite, a data migration, a live cutover, a VM or disk resize.
+- **Placement.** A manifest (`.yaml`, `.yml`, `.json`) changes where a
+  workload runs or what it mounts: `nodeSelector`, a
+  `kubernetes.io/hostname` pin, affinity, tolerations, `hostIP`, volumes and
+  their claims, `hostPath`, a storage class. The hold fails closed: only a
+  listing in the base branch's `.loom/manual-paths` (the file
+  `LOOM_SHIP_PATH_WORKFLOWS` ships by) exempts a manifest, a manifest no
+  deploy workflow covers is still held, a manifest GitHub sends no patch for
+  counts as a placement change, and a pull request that also changes
+  `.github/workflows/` or `.loom/manual-paths` exempts nothing. The ask names
+  the push workflows on the base branch that cover the files (a push
+  workflow with no paths filter covers every path).
+
+- **Rewrite.** It deletes, renames away, or replaces at least half of, a
+  doc its ticket does not name: a top-level file whose name starts with
+  `README`, `AGENTS.md` or `CLAUDE.md` at any size, any other `.md` file from
+  10 lines. A doc whose base cannot be read counts as replaced, and a doc
+  renamed away counts as removed (`bus.brain merge` reads the REST file list
+  for the old path whenever GraphQL reports a rename).
+
+The factory checks before it lands a pull request, and `bus.brain merge`
+checks before it merges one, so whichever reaches it first holds it. The
+ticket goes to `loom:human` with one exact ask (`Kind: decision`): do the
+steps, or check that the placement is safe for the data and the nodes it
+lands on, then merge the pull request by hand. Loom never merges it, and the
+ask is posted once. `bus.brain status` marks a pull request whose body
+declares steps `blocked: held for the operator`.
+
+A ticket whose every acceptance criterion is a check on a live host or
+network (a command run on a host, a reach test from a network, a port, a
+firewall or ACL rule, a check across the hosts, or a Live line, and none
+naming a test) gets no lane: the factory puts it to `loom:human` with one
+ask instead of giving it one, and `bus.brain brief` refuses it. The
+station's close of a shipped ticket whose Live line names nothing to search
+leaves it open while an unticked criterion is such a host or network check:
+a merge proves none of them.
+
+On 2026-10-22 the brain merged a lane pull request whose body said "Leave VM
+resizing and the live data migration to the operator", on green checks and a
+passing review; its deploy moved every workload of a service off the node
+that held its local volumes, and the service was down for about four hours.
+The same day it merged a lane pull request for a ticket of host checks
+only, which replaced the deployment repo's root README with a write-up of
+the ticket; the station then closed that ticket as shipped.
+
 ## Pull requests without a ticket
 
 A pull request with no ticket (no `Refs` line and no `loom/` branch) that a

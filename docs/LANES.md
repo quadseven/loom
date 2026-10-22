@@ -1477,3 +1477,14 @@ One class covers the whole pull request, highest wins:
 The pull request carries exactly one `class:<name>` label, created like
 the other labels by `bus/labels.py`. Classification never changes merge
 rules; it only tells the reader how risky the change is.
+
+## Operator steps before merge
+
+Every lane pull request body also carries an `## Operator steps before
+merge` section, after `## Out of scope`: each step a person must take
+before the change can merge and deploy (a data migration, a cutover, a VM
+or disk resize, scaling a workload down), one per line, or the single word
+`none`. The agent writes it in `.loom/summary.md`; without one the runner
+copies the ticket's section of that name, else writes `none stated`.
+A pull request that lists a step is never merged by Loom (docs/BRAIN.md,
+Operator holds).
