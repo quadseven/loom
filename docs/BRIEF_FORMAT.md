@@ -38,6 +38,16 @@ The ticket's `Not before:`, `After:` and `Priority:` lines decide when and in
 what order the station claims it (docs/BRAIN.md); they stay on the ticket and
 are not written into the brief.
 
+After the ticket body, a station brief carries two sections when they have
+anything to say. `## Operator notes` quotes the ticket's newest five comments
+by the operator's own logins and trusted briefers (never a `[bot]` login, a
+factory marker comment or a claim line), oldest first, each clipped to 1500
+characters, every line prefixed `> `. `## Linked pull requests` lists the
+pull requests, in any repo, that reference the ticket on its timeline, merged
+or open, one `owner/name#N, merged YYYY-MM-DD: title` line each. The lane is
+told a note outranks the ticket where they disagree, and to change nothing
+when a note or a merged pull request shows the work is done.
+
 The agent edits files in the checked-out repository and leaves the result on
 the requested branch. The runner commits any remaining changes, pushes that
 branch, and opens the pull request. Lanes never merge pull requests.
