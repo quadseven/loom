@@ -289,6 +289,27 @@ def _base_lines(gh: Any, repo: str, branch: str, path: str) -> Optional[int]:
         return None
 
 
+def _rewritten(gh: Any, repo: str, branch: str, entry: Dict[str, Any],
+               ticket_body: str) -> str:
+    """The guarded doc this one file entry deletes, renames away or mostly
+    replaces, or ""."""
+    path = str(entry.get("filename") or "")
+    old = str(entry.get("previous_filename") or "")
+    status = str(entry.get("status") or "").lower()
+    if status == "renamed" and old and old != path:
+        # A guarded doc renamed away is gone from its path: removed.
+        return old if _guarded_doc(old) and not _named(old, ticket_body) else ""
+    deleted = int(entry.get("deletions") or 0)
+    if not deleted or not _guarded_doc(path) or _named(path, ticket_body):
+        return ""
+    if status in _GONE:
+        return path
+    lines = _base_lines(gh, repo, branch, path)
+    floor = 1 if _top_doc(path) else REWRITE_MIN_LINES
+    replaced = lines is None or (lines >= floor and deleted >= REWRITE_SHARE * lines)
+    return path if replaced else ""
+
+
 def rewritten_docs(gh: Any, repo: str, pr: Dict[str, Any], entries: Sequence[Dict[str, Any]],
                    ticket_body: str) -> List[str]:
     """The docs the pull request deletes, renames away, or replaces at least
@@ -297,27 +318,8 @@ def rewritten_docs(gh: Any, repo: str, pr: Dict[str, Any], entries: Sequence[Dic
     REWRITE_MIN_LINES lines, and a doc whose base cannot be read counts as
     replaced. A renamed entry is read by its previous_filename."""
     branch = str((pr.get("base") or {}).get("ref") or "main")
-    out = []
-    for entry in entries:
-        path = str(entry.get("filename") or "")
-        old = str(entry.get("previous_filename") or "")
-        status = str(entry.get("status") or "").lower()
-        if status == "renamed" and old and old != path:
-            # A guarded doc renamed away is gone from its path: removed.
-            if _guarded_doc(old) and not _named(old, ticket_body):
-                out.append(old)
-            continue
-        deleted = int(entry.get("deletions") or 0)
-        if not deleted or not _guarded_doc(path) or _named(path, ticket_body):
-            continue
-        if status in _GONE:
-            out.append(path)
-            continue
-        lines = _base_lines(gh, repo, branch, path)
-        floor = 1 if _top_doc(path) else REWRITE_MIN_LINES
-        if lines is None or (lines >= floor and deleted >= REWRITE_SHARE * lines):
-            out.append(path)
-    return sorted(out)
+    found = (_rewritten(gh, repo, branch, entry, ticket_body) for entry in entries)
+    return sorted(path for path in found if path)
 
 
 def _shown(paths: Sequence[str]) -> str:

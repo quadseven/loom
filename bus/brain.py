@@ -910,6 +910,17 @@ def _check_model(model: Optional[str]) -> None:
         raise ValueError("model is not a model id")
 
 
+def _check_laneable(body: str) -> None:
+    """Refuse a brief no lane can meet: every acceptance criterion is a check
+    on a live host or network (operator_hold.host_only). 2026-10-22: such a
+    ticket was laned; the lane replaced a README to have a diff, and it
+    merged."""
+    if operator_hold.host_only(body):
+        raise ValueError("every acceptance criterion is a check on a live host or network: "
+                         "no lane can meet it; file it as a needs-operator ask, or add a "
+                         "criterion a pull request can meet")
+
+
 def _check_brief_args(title: str, body: str, lane: Optional[str],
                       model: Optional[str], base: Optional[str]) -> None:
     if lane is not None and lane not in LANES:
@@ -2110,13 +2121,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         # A forbidden model is written as its stand-in (tickets.allowed_model).
         model = tickets.allowed_model(model)
     _check_brief_args(title, body, lane, model, base)
-    if operator_hold.host_only(body):
-        # 2026-10-22: a ticket whose criteria were all host checks (a version
-        # on a host, a closed port, an ACL) was laned; the lane replaced a
-        # README to have a diff, and it merged.
-        raise ValueError("every acceptance criterion is a check on a live host or network: "
-                         "no lane can meet it; file it as a needs-operator ask, or add a "
-                         "criterion a pull request can meet")
+    _check_laneable(body)
     if not_before is not None and not tickets.NOT_BEFORE_RE.fullmatch(not_before):
         raise ValueError("not-before is not a UTC time like 2026-10-13T17:00:00Z")
     if after is not None:

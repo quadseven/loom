@@ -2976,10 +2976,8 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
-        if self.now < held_until(issue):
+        if self.now < held_until(issue) or self._host_only(repo, issue):
             return "%s is held" % ref
-        if self._host_only(repo, issue):
-            return "%s is with a person: no pull request can meet its criteria" % ref
         # A ticket held by After: is never briefed: the station refuses the
         # claim each pass, and the lane it was given counts it as load and
         # sits idle until the other ticket merges (2026-10-22).
