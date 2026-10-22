@@ -2125,18 +2125,38 @@ cat > /dev/null
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
         self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
 
-    def test_a_fix_round_that_adds_a_stray_file_beside_a_merge_is_refused(self):
-        # main.txt came in with the merge, so only the agent's file is named.
+    def test_a_fix_round_that_adds_a_stray_file_beside_a_merge_is_removed_and_pushed(self):
+        # A fix round no longer retries the identical refusal: the stray file
+        # the agent added outside the brief's paths is removed and the work is
+        # pushed (loom#1476).
         name, before = self.fix_brief()
         self.advance_main("main.txt", "main moved\n")
         self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
                         "mkdir -p .agents; echo hook > .agents/hooks.json\n")
         result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("commit refused: it adds files outside the brief's paths: "
-                      ".agents/hooks.json; nothing pushed", self.run_log(name + ".log"))
-        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
-        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertNotIn("commit refused", self.run_log(name + ".log"))
+        after = self.remote_head(self.FIX_BRANCH)
+        self.assertNotEqual(after, before)
+        self.assertEqual(self.remote_file(after, "main.txt"), "main moved\n")
+        self.assertEqual(self.remote_file(after, ".agents/hooks.json"), "")
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_removes_out_of_brief_files_and_pushes_the_work(self):
+        # A lane's session scratch file (sh-thd-*) sits outside the brief's
+        # paths beside its real fix: the round removes the stray and pushes.
+        name, before = self.fix_brief()
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
+                        "printf 'session scratch\\n' > sh-thd-3211296841\n"
+                        "printf 'fixed\\n' > fix.txt\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("commit refused", self.run_log(name + ".log"))
+        after = self.remote_head(self.FIX_BRANCH)
+        self.assertNotEqual(after, before)
+        self.assertEqual(self.remote_file(after, "fix.txt"), "fixed\n")
+        self.assertEqual(self.remote_file(after, "sh-thd-3211296841"), "")
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
     def test_a_fix_round_names_dropped_scratch_in_its_pr_comment(self):
         name, _ = self.fix_brief()
