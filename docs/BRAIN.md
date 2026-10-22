@@ -1400,10 +1400,12 @@ review, when either holds (`bus/operator_hold.py`):
   the push workflows on the base branch that cover the files (a push
   workflow with no paths filter covers every path).
 
-- **Rewrite.** It deletes, or replaces at least half of, a doc its ticket
-  does not name: a top-level `README`, `AGENTS.md` or `CLAUDE.md` at any
-  size, any other `.md` file from 10 lines. A doc whose base cannot be read
-  counts as replaced.
+- **Rewrite.** It deletes, renames away, or replaces at least half of, a
+  doc its ticket does not name: a top-level file whose name starts with
+  `README`, `AGENTS.md` or `CLAUDE.md` at any size, any other `.md` file from
+  10 lines. A doc whose base cannot be read counts as replaced, and a doc
+  renamed away counts as removed (`bus.brain merge` reads the REST file list
+  for the old path whenever GraphQL reports a rename).
 
 The factory checks before it lands a pull request, and `bus.brain merge`
 checks before it merges one, so whichever reaches it first holds it. The
