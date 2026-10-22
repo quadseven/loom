@@ -33,7 +33,6 @@ VERIFIED = "verified"
 PROOF = "proof"
 AUDIT = "audit"
 HELD = "held"
-ESCALATE = "escalate"
 CLOSED = "closed"
 REOPENED = "reopened"
 SOURCE = "source"
@@ -60,7 +59,6 @@ KINDS = {
     PROOF: "the proof record of a verified or shipped move",
     AUDIT: "the result of a proof audit",
     HELD: "a ticket held apart from open work, with what it waits for",
-    ESCALATE: "a ticket moved up the model ladder by the brain",
     CLOSED: "why an issue was closed",
     REOPENED: "why an issue was opened again",
     SOURCE: "a note on the source issue of a rewritten ticket",

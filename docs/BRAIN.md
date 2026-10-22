@@ -1113,7 +1113,6 @@ pull request's review thread is not a new issue comment and is not scanned.
 | `proof` | The proof record of a verified or shipped move. |
 | `audit` | The result of a proof audit. |
 | `held` | A ticket held apart from open work, with what it waits for. |
-| `escalate` | A ticket moved up the model ladder by the brain (loom#866 and loom#821 own moving it). |
 | `closed` | Why an issue was closed. |
 | `reopened` | Why an issue was opened again. |
 | `source` | A note on the source issue of a rewritten ticket. |

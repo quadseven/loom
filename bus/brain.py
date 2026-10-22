@@ -17,7 +17,7 @@ from urllib.parse import quote
 from .github import GitHub, GitHubError, RateLimited, _next_link, auth_from_env, rest_login, unreadable
 from . import audit, change_class, handoff, hunt_plan, journal, lock, notify, pr_repair, proof, stale_claims, text, tickets
 from . import naming
-from .status import is_status as is_status_comment, parse as parse_status_events
+from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
@@ -4604,7 +4604,8 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
         fix(gh, repo, pr, (repo, number), notes or comment.split("\n")[1], lane, model)
     else:
         move(gh, repo, number, "briefed", lane, None, None, model)
-    notify.post(gh, repo, number, comment, notify.ESCALATE)
+    # A routine event: the status comment's event list, not a new comment (loom#866).
+    add_status_event(gh, repo, number, comment, time.time(), trusted_authors())
     return "rung %d %s on %s" % (rung + 1, model, lane)
 
 
