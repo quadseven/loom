@@ -4,6 +4,9 @@ Verify lanes run with no network, so the station reads the facts a verifier
 needs (the ticket's merged pull requests, the checks on each merge commit,
 whether the default branch carries it, the files and added tests) and writes
 them into the brief. Every line passes the log section's text checks.
+The same reads give the done close's sentences (close_facts), the facts a
+lane proof's comment carries (proof_facts), and the checks a lane's evidence
+may not call passed (failing_checks).
 """
 from __future__ import annotations
 
@@ -134,3 +137,117 @@ def _pull_lines(branch: str, pr: Dict[str, Any]) -> List[Line]:
         len(tests), ", the first %d shown" % MAX_TESTS if len(tests) > MAX_TESTS else ""), ""))
     lines.extend(_name_line("        - ", name) for name in tests[:MAX_TESTS])
     return lines
+
+
+# The conclusions the done close may call green. The merge gate lets a
+# non-sensitive pull request land with the review check neutral, so a close
+# that said "green checks" was wrong whenever Elder, Guard or Chief concluded
+# neutral (a verifier flagged it in 9 of 15 closing comments, 2026-10-20).
+GREEN_CONCLUSIONS = ("success", "skipped")
+NAME_MAX = 60
+
+
+def _plain(value: Any) -> str:
+    """A GitHub-supplied name made safe for a status line: ASCII, no
+    mention, clipped."""
+    text = _clean(value).replace("@", "(at)").encode("ascii", "replace").decode()
+    return text[:NAME_MAX]
+
+
+def newest_runs(runs: Iterable[Any]) -> List[Dict[str, Any]]:
+    """One run per check name, the newest by completed_at (started_at for a
+    run not finished), in first-seen order: a re-run replaces its earlier
+    result."""
+    newest: Dict[str, Dict[str, Any]] = {}
+    for item in runs:
+        if not isinstance(item, dict):
+            continue
+        name = _plain(item.get("name")) or "unnamed"
+        held = newest.get(name)
+        if held is None or _run_time(item) >= _run_time(held):
+            newest[name] = item
+    return list(newest.values())
+
+
+def _run_time(run: Dict[str, Any]) -> str:
+    return str(run.get("completed_at") or run.get("started_at") or "")
+
+
+def _run_result(run: Dict[str, Any]) -> str:
+    if run.get("status") not in (None, "completed"):
+        return "in progress"
+    return _plain(run.get("conclusion")) or "with no conclusion"
+
+
+def _checks_fact(runs: List[Dict[str, Any]]) -> str:
+    if not runs:
+        return "no check runs on it"
+    results = [(_plain(run.get("name")) or "unnamed", _run_result(run)) for run in runs]
+    other = [(name, result) for name, result in results if result not in GREEN_CONCLUSIONS]
+    if not other:
+        return "checks on it: green, %s success or skipped" % _runs(len(runs))
+    rest = len(results) - len(other)
+    return "checks on it: %s%s" % (
+        ", ".join("%s %s" % pair for pair in other),
+        "; the rest (%s) success or skipped" % _runs(rest) if rest else "")
+
+
+def _runs(count: int) -> str:
+    return "%d run%s" % (count, "" if count == 1 else "s")
+
+
+def _close_fact(branch: str, pr: Dict[str, Any]) -> str:
+    sha = str(pr.get("merge_commit_sha") or "")
+    on_branch: Optional[bool] = pr.get("on_branch")
+    return "PR #%d merged %s as %s; %s; %s contains it: %s." % (
+        int(pr.get("number") or 0), _clean(pr.get("merged_at")) or "at an unknown time",
+        sha[:12] if COMMIT_RE.fullmatch(sha) else "an unknown commit",
+        _checks_fact(newest_runs(pr.get("check_runs") or [])),
+        branch or "the default branch",
+        {True: "yes", False: "no"}.get(on_branch, "unknown"))
+
+
+def failing_checks(pulls: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Each check on a read pull request's merge commit whose newest run
+    concluded other than success or skipped, or has not finished, with that
+    result: what a lane's evidence may not call passed (proof.contradicts)."""
+    found: Dict[str, str] = {}
+    for pr in pulls:
+        if not isinstance(pr, dict) or "check_runs" not in pr:
+            continue
+        for run in newest_runs(pr.get("check_runs") or []):
+            result = _run_result(run)
+            if result not in GREEN_CONCLUSIONS:
+                found.setdefault(_plain(run.get("name")) or "unnamed", result)
+    return found
+
+
+def _close_sentences(branch: str, pulls: List[Dict[str, Any]], error: str = "") -> List[str]:
+    pulls = sorted(pulls, key=lambda pr: str(pr.get("merged_at") or ""), reverse=True)
+    read = [pr for pr in pulls if "check_runs" in pr][:MAX_PULLS]
+    sentences = [_close_fact(branch, pr) for pr in read]
+    if len(pulls) > len(read):
+        sentences.append("%d more merged pull requests were not read."
+                         % (len(pulls) - len(read)))
+    if error:
+        sentences.append("The checks could not be read (%s)." % _plain(error))
+    elif not pulls:
+        sentences.append("No merged pull request names this ticket.")
+    return sentences
+
+
+def proof_facts(branch: str, pulls: List[Dict[str, Any]]) -> List[str]:
+    """The close_facts sentences as the lines a lane proof's comment carries
+    under "Checked by the station:"; a line that fails the text checks is
+    dropped rather than refusing the proof."""
+    return [line for line in _close_sentences(branch, pulls) if evidence.safe_line(line)]
+
+
+def close_facts(branch: str, pulls: List[Dict[str, Any]], error: str = "") -> str:
+    """The done close's sentences about the ticket's merged pull requests,
+    from the same pull dicts section() takes, newest first. "green" appears
+    only for a pull request whose every check run concluded success or
+    skipped; any other run is named with its conclusion. error, when set, is
+    the GitHub failure that stopped the reads: it is said, never read as
+    green."""
+    return " ".join(_close_sentences(branch, pulls, error))

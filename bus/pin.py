@@ -156,7 +156,9 @@ def pin_one(gh: GitHub, source: str, revision: str, spec: dict[str, str],
                   ok=(404,))
     exists = ref.status != 404
     current_text, file_sha = content(gh, repo, path, branch) if exists else (old_text, "")
-    if value(current_text, spec["revision_var"]) == revision and (active or old_text == current_text):
+    current = value(current_text, spec["revision_var"])
+    mergeable_state = active.get("mergeable_state") if active else None
+    if current == revision and mergeable_state in (None, "clean"):
         return
     watch = spec.get("watch", DEFAULT_WATCH)
     compared = compare(gh, source, old, revision)
@@ -165,15 +167,21 @@ def pin_one(gh: GitHub, source: str, revision: str, spec: dict[str, str],
             % (repo, watch, old[:12]))
         return
     digest = get_digest()
-    updated = replace(replace(current_text, spec["revision_var"], revision),
+    # Rebuild the pin branch from the default branch's head on every update so
+    # its pull request never goes dirty when the default branch moves. The pin
+    # file is computed from the default branch's text, not the branch's.
+    head = gh.rest("GET", "/repos/%s/git/ref/heads/%s" % (repo, quote(base, safe=""))).data
+    if exists:
+        gh.rest("PATCH", "/repos/%s/git/ref/heads/%s" % (repo, quote(branch, safe="")),
+                {"sha": head["object"]["sha"], "force": True})
+    else:
+        gh.rest("POST", "/repos/%s/git/refs" % repo,
+                {"ref": "refs/heads/" + branch, "sha": head["object"]["sha"]})
+    _, file_sha = content(gh, repo, path, branch)
+    updated = replace(replace(old_text, spec["revision_var"], revision),
                       spec["sha256_var"], digest)
     title = "Pin Loom dashboard to %s" % revision[:12]
     plan = body(source, revision, merged_titles(gh, source, old, revision, compared), digest)
-    if not exists:
-        head = gh.rest("GET", "/repos/%s/git/ref/heads/%s" % (repo, quote(base, safe=""))).data
-        gh.rest("POST", "/repos/%s/git/refs" % repo,
-                {"ref": "refs/heads/" + branch, "sha": head["object"]["sha"]})
-        _, file_sha = content(gh, repo, path, branch)
     gh.rest("PUT", "/repos/%s/contents/%s" % (repo, quote(path, safe="/")),
             {"message": title, "content": base64.b64encode(updated.encode()).decode(),
              "sha": file_sha, "branch": branch})

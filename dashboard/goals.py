@@ -243,17 +243,27 @@ def _latest_measure(notes: Sequence[Dict[str, Any]]) -> Optional[str]:
     return found[-1] if found else None
 
 
-def _unproven(tickets: Sequence[str], states: Dict[str, str]) -> int:
+def _unproven(tickets: Sequence[str], states: Dict[str, str],
+              held: Sequence[str] = ()) -> int:
     """The goal's tickets at merged or shipped: unproven work still waiting on
-    a live check, against the limit the station and the brain enforce."""
-    return sum(1 for ref in tickets if states.get(ref) in UNPROVEN_STATES)
+    a live check, against the limit the station and the brain enforce. A
+    ticket held for a rare live event (wait:live-event, loom#1220) is counted
+    apart, not here."""
+    return sum(1 for ref in tickets if states.get(ref) in UNPROVEN_STATES and ref not in held)
+
+
+def _live_event_held(tickets: Sequence[str], states: Dict[str, str],
+                     held: Sequence[str]) -> int:
+    """The goal's shipped tickets held apart from open work for a live event."""
+    return sum(1 for ref in tickets if states.get(ref) in UNPROVEN_STATES and ref in held)
 
 
 def _goal_record(title: Optional[str], notes: Sequence[Dict[str, Any]], tickets: Sequence[str],
                  states: Dict[str, str], proofs: Dict[str, List[str]],
                  limit: int, now: datetime, unread_notes: Optional[str] = None,
                  unread_proofs: Optional[str] = None, in_flight: int = 0,
-                 parent: Optional[str] = None) -> Dict[str, Any]:
+                 parent: Optional[str] = None,
+                 live_held: Sequence[str] = ()) -> Dict[str, Any]:
     ordered = sorted(notes, key=lambda c: str(c.get("created_at") or ""))
     reports = [c for c in ordered if str(c.get("body") or "").startswith(REPORT_MARKER)]
     newest = reports[-1] if reports else None
@@ -269,7 +279,8 @@ def _goal_record(title: Optional[str], notes: Sequence[Dict[str, Any]], tickets:
         "measure": _latest_measure(ordered),
         "metric": str(sum(history)), "unit": "verified with proof, last 7 days",
         "previous": str(before), "history": history, "scale": None,
-        "unproven": _unproven(tickets, states), "unproven_limit": limit,
+        "unproven": _unproven(tickets, states, live_held), "unproven_limit": limit,
+        "live_event_held": _live_event_held(tickets, states, live_held),
     }
     if unread_proofs:
         # A count missing some of the goal's proof records would understate
@@ -297,12 +308,15 @@ def goal_context(rows: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, An
     parents, unread = dict(parents or {}), dict(unread or {})
     by_goal: Dict[str, List[str]] = {}
     states: Dict[str, str] = {}
+    live_held: set = set()
     flying: Dict[str, int] = {}
     for row in rows:
         if row.get("goal"):
             ref = "%s#%s" % (row.get("repo"), row.get("number"))
             by_goal.setdefault(row["goal"], []).append(ref)
             states[ref] = str(row.get("state") or "")
+            if brain.WAIT_LIVE_EVENT in (row.get("labels") or []) and row.get("open", True):
+                live_held.add(ref)
             if row.get("open", True) and row.get("state") in IN_FLIGHT_STATES:
                 flying[row["goal"]] = flying.get(row["goal"], 0) + 1
     for goal in list(by_goal):
@@ -321,7 +335,7 @@ def goal_context(rows: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, An
     out = {goal: _goal_record(titles.get(goal), notes.get(goal, []), tickets, states,
                              proofs, limit, now, unread_notes=unread_for([goal]),
                              unread_proofs=unread_for(tickets), in_flight=flying.get(goal, 0),
-                             parent=parents.get(goal))
+                             parent=parents.get(goal), live_held=live_held)
            for goal, tickets in by_goal.items()}
     for goal, record in out.items():
         record["epics"] = epic_rows(goal, rows, epics or {})

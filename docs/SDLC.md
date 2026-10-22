@@ -44,6 +44,7 @@ The `review` stage involves automated and/or human review of the pull request. T
 **Code involved:**
 - `bus/brain.py` - `review` function monitors PR comments and review threads
 - `bus/station.py` - review bot integration (`/grug improve` trigger)
+- `bus/factory.py` - asks the review bot to judge an answered thread (`/grug improve` trigger)
 - `bus/handoff.py` - logs `merge` stage handoff before moving to PR
 
 The review stage ends when all review comments are addressed and the PR is approved.
@@ -104,7 +105,7 @@ yet and cites the open ticket that tracks it.
 - **Merge rules follow the change class**: `bus/factory.py` lands a docs or tests pull request on checks and a review pass alone, and marks a sensitive one `needs-brain` for the brain instead (#228).
 - **The default branch is judged after every merge**: CI runs on it, and a red it did not see coming is bisected back to the merge that caused it; `bus/revert.py` files that revert as a ticket, which lands before other work (#229).
 - **A goal home's `Trunk:` line names the branch its briefs and pull requests target**: `bus/brain.py` reads the line, targets it, and warns when work is headed somewhere else (#230).
-- **One watcher per component log**: `bus/watch.py` reduces the lines a log gained into signatures and files one ticket per new repeated error (#231).
+- **One watcher per component log**: `bus/watch.py` reduces the lines a log gained into signatures and files one ticket per new repeated error (#231). An agent's sandbox refusal is counted on its run, not signed, and files one standing issue per lane, tool and denied path only when it hurt a run or keeps coming back (#1265).
 - **The factory checks its own invariants**: `bus/invariants.py` reads what the station already has each pass and files one `loom:invariant` issue per breach on the factory's goal home, reopening it when a fixed breach comes back (#320).
 - **A leak-scan failure in a lane pull request's text is repaired in the text**: `bus/factory.py` rewrites each flagged line of the title and body instead of sending the change back as code (#232).
 - **Stage handoff journaling**: `bus/journal.py` writes the goal journal and `bus/handoff.py` reads its defer and done markers, so a peer finishes stage work a stopped brain left behind (#103).

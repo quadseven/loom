@@ -177,6 +177,125 @@ class AppTokenClientTests(unittest.TestCase):
                 auth_from_env()
 
 
+class TokenKeptAcrossPassesTests(unittest.TestCase):
+    """The station runs one pass per process; a token kept in a 0600 state
+    file lets the next pass reuse it, so last pass's ETags answer 304
+    (loom#1306)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.state = os.path.join(self._tmp.name, "station", "app-token.json")
+        self.cache = os.path.join(self._tmp.name, "etags")
+
+    def pass_client(self, tokens, clock, transport):
+        """A fresh client, as a new process builds one."""
+        app = AppToken("123", "456", lambda: KEY, sign=fake_sign([]), clock=clock)
+        app.state_file = self.state
+        return GitHub(app, transport=transport, cache_dir=self.cache), app
+
+    def test_a_second_pass_inside_the_lifetime_mints_no_token(self):
+        clock = Clock()
+        fake = FakeGitHub(["ghs_first", "ghs_second"], clock=clock)
+        gh1, app1 = self.pass_client(None, clock, fake)
+        gh1.rest("GET", "/rate_limit")
+        clock.now = START + 600
+        gh2, app2 = self.pass_client(None, clock, fake)
+        gh2.rest("GET", "/rate_limit")
+        self.assertEqual(fake.bearers("GET"), ["Bearer ghs_first"] * 2)
+        self.assertEqual((app1.minted, app2.minted), (1, 0))
+        self.assertEqual(gh2.kinds.get("app token", 0), 0)
+
+    def test_a_token_near_expiry_or_of_another_app_is_not_reused(self):
+        clock = Clock()
+        fake = FakeGitHub(["ghs_first", "ghs_second", "ghs_third"], clock=clock)
+        gh1, _ = self.pass_client(None, clock, fake)
+        gh1.rest("GET", "/rate_limit")
+        clock.now = START + 3600 - 299
+        gh2, app2 = self.pass_client(None, clock, fake)
+        gh2.rest("GET", "/rate_limit")
+        self.assertEqual(fake.bearers("GET")[-1], "Bearer ghs_second")
+        self.assertEqual(app2.minted, 1)
+        other = AppToken("123", "999", lambda: KEY, sign=fake_sign([]), clock=clock)
+        other.state_file = self.state
+        GitHub(other, transport=fake).rest("GET", "/rate_limit")
+        self.assertEqual(fake.bearers("GET")[-1], "Bearer ghs_third")
+
+    def test_a_refused_token_is_dropped_from_the_state_file(self):
+        clock = Clock()
+        fake = FakeGitHub(["ghs_first", "ghs_second"], clock=clock)
+        gh, app = self.pass_client(None, clock, fake)
+        gh.rest("GET", "/rate_limit")
+        self.assertTrue(os.path.exists(self.state))
+        gh._check_status("GET", "/x", 401, "", (401,))
+        self.assertFalse(os.path.exists(self.state))
+        gh3, _ = self.pass_client(None, clock, fake)
+        gh3.rest("GET", "/rate_limit")
+        self.assertEqual(fake.bearers("GET")[-1], "Bearer ghs_second")
+
+    def test_a_cached_etag_from_the_last_pass_is_sent_and_a_304_is_not_counted(self):
+        clock = Clock()
+        seen = []
+
+        def transport(method, url, headers, body):
+            if method == "POST":
+                return FakeGitHub(["ghs_first"], clock=clock)(method, url, headers, body)
+            seen.append(headers.get("If-None-Match"))
+            # GitHub's ETags belong to the token that read them.
+            tag = '"etag-for-%s"' % headers["Authorization"][len("Bearer "):]
+            if headers.get("If-None-Match") == tag:
+                return 304, {"ETag": tag}, b""
+            return 200, {"ETag": tag}, json.dumps([{"number": 7}]).encode()
+
+        gh1, _ = self.pass_client(None, clock, transport)
+        self.assertEqual(gh1.rest("GET", "/repos/o/r/issues/7").data, [{"number": 7}])
+        gh2, _ = self.pass_client(None, clock, transport)
+        answer = gh2.rest("GET", "/repos/o/r/issues/7")
+        self.assertEqual(seen, [None, '"etag-for-ghs_first"'])
+        self.assertEqual(answer.status, 304)
+        self.assertEqual(answer.data, [{"number": 7}])
+        self.assertEqual(gh2.not_modified, 1)
+        self.assertEqual(gh2.kinds, {})
+
+    def test_the_token_is_written_only_to_a_0600_state_file(self):
+        clock = Clock()
+        fake = FakeGitHub(["ghs_secret_token"], clock=clock)
+        gh, app = self.pass_client(None, clock, fake)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            gh.rest("GET", "/rate_limit")
+            repr(app)
+        self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o600)
+        self.assertNotIn("ghs_secret_token", buf.getvalue() + repr(app))
+        holders = []
+        for root, _, names in os.walk(self._tmp.name):
+            for name in names:
+                with open(os.path.join(root, name), errors="replace") as fh:
+                    if "ghs_secret_token" in fh.read():
+                        holders.append(os.path.join(root, name))
+        self.assertEqual(holders, [self.state])
+        with open(self.state) as fh:
+            self.assertNotIn(KEY_MARK, fh.read())
+
+    def test_a_state_file_open_to_others_is_ignored(self):
+        clock = Clock()
+        fake = FakeGitHub(["ghs_first", "ghs_second"], clock=clock)
+        gh1, _ = self.pass_client(None, clock, fake)
+        gh1.rest("GET", "/rate_limit")
+        os.chmod(self.state, 0o644)
+        gh2, app2 = self.pass_client(None, clock, fake)
+        gh2.rest("GET", "/rate_limit")
+        self.assertEqual(fake.bearers("GET")[-1], "Bearer ghs_second")
+        self.assertEqual(app2.minted, 1)
+
+    def test_without_a_state_file_nothing_is_written(self):
+        clock = Clock()
+        gh, fake, app = app_client(["ghs_first"], clock)
+        gh.rest("GET", "/rate_limit")
+        self.assertIsNone(app.state_file)
+        self.assertFalse(os.path.exists(self.state))
+
+
 class KeyNeverLeaksTests(unittest.TestCase):
     def _capture(self, run):
         """Every exception text, stdout, stderr and log line from run()."""
@@ -335,6 +454,18 @@ class DashboardAppTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(dash.TicketStore().auth, "token")
 
+    def test_a_token_dashboard_reads_the_trusted_writers_status_events(self):
+        # Without the writers, a token client showed a status comment as one
+        # opaque comment, so a pushed fix or a lane failure left the timeline.
+        from dashboard import github as dash
+        env = {"LOOM_REPOS": "example-owner/example-repo",
+               "LOOM_DASHBOARD_GITHUB_TOKEN": "dashboard-token",
+               "LOOM_BRIEF_AUTHORS": "Alice-Example,bob-example"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            store = dash.TicketStore()
+        self.assertEqual(store.auth, "token")
+        self.assertEqual(store.gh.status_authors, {"alice-example", "bob-example"})
+
     FILE_ENV = {"LOOM_REPOS": "example-owner/example-repo",
                 "LOOM_DASHBOARD_GITHUB_TOKEN": "dashboard-token",
                 "LOOM_GITHUB_APP_ID": "123", "LOOM_GITHUB_APP_INSTALLATION_ID": "456"}
@@ -393,6 +524,76 @@ class DashboardAppTests(unittest.TestCase):
             self.assertEqual(store.auth, "token")
             self.assertIn(secret, logged.output[0])
             self.assertNotIn(KEY_MARK, "\n".join(logged.output))
+
+
+class ReadSsmProxyTests(unittest.TestCase):
+    """read_ssm passes only https_proxy to the AWS CLI."""
+
+    def _capture_env(self, env_vars):
+        """Run read_ssm with mocked subprocess and capture the env passed."""
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["env"] = kwargs.get("env")
+            captured["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, "fake-value", "")
+
+        with mock.patch.dict(os.environ, env_vars, clear=True), \
+                mock.patch.object(github.subprocess, "run", fake_run):
+            github.read_ssm("/test/param", "us-east-1")
+        return captured["env"]
+
+    def test_only_https_proxy_is_passed_when_all_proxies_set(self):
+        env = {
+            "http_proxy": "http://192.0.2.1:3128",
+            "HTTP_PROXY": "http://192.0.2.1:3128",
+            "https_proxy": "http://192.0.2.2:3128",
+            "HTTPS_PROXY": "http://192.0.2.2:3128",
+            "all_proxy": "socks5://192.0.2.3:1080",
+            "ALL_PROXY": "socks5://192.0.2.3:1080",
+        }
+        passed_env = self._capture_env(env)
+        # Only https_proxy (lowercase) should be present
+        self.assertIn("https_proxy", passed_env)
+        self.assertEqual(passed_env["https_proxy"], "http://192.0.2.2:3128")
+        self.assertNotIn("http_proxy", passed_env)
+        self.assertNotIn("HTTP_PROXY", passed_env)
+        self.assertNotIn("HTTPS_PROXY", passed_env)
+        self.assertNotIn("all_proxy", passed_env)
+        self.assertNotIn("ALL_PROXY", passed_env)
+
+    def test_only_HTTPS_PROXY_is_passed_when_only_uppercase_set(self):
+        env = {
+            "HTTPS_PROXY": "http://192.0.2.2:3128",
+        }
+        passed_env = self._capture_env(env)
+        self.assertIn("HTTPS_PROXY", passed_env)
+        self.assertEqual(passed_env["HTTPS_PROXY"], "http://192.0.2.2:3128")
+        self.assertNotIn("https_proxy", passed_env)
+
+    def test_no_proxy_vars_when_none_set(self):
+        env = {"PATH": "/usr/bin", "HOME": "/home/user"}
+        passed_env = self._capture_env(env)
+        self.assertNotIn("http_proxy", passed_env)
+        self.assertNotIn("HTTP_PROXY", passed_env)
+        self.assertNotIn("https_proxy", passed_env)
+        self.assertNotIn("HTTPS_PROXY", passed_env)
+        self.assertNotIn("all_proxy", passed_env)
+        self.assertNotIn("ALL_PROXY", passed_env)
+        # Other env vars should still be passed
+        self.assertEqual(passed_env["PATH"], "/usr/bin")
+        self.assertEqual(passed_env["HOME"], "/home/user")
+
+    def test_https_proxy_lowercase_preferred_when_both_set(self):
+        env = {
+            "https_proxy": "http://192.0.2.2:3128",
+            "HTTPS_PROXY": "http://198.51.100.2:3128",
+        }
+        passed_env = self._capture_env(env)
+        # Lowercase should win
+        self.assertIn("https_proxy", passed_env)
+        self.assertEqual(passed_env["https_proxy"], "http://192.0.2.2:3128")
+        self.assertNotIn("HTTPS_PROXY", passed_env)
 
 
 if __name__ == "__main__":

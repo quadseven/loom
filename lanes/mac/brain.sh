@@ -115,8 +115,21 @@ rung_ready() {
   fi
   [[ "$beat" =~ \"at\":\ *([0-9]+) ]] || { RUNG_WHY="usage heartbeat has no time"; return 1; }
   at="${BASH_REMATCH[1]}" now="$(date +%s)"
-  [ $((now - at)) -le 600 ] && [ $((at - now)) -le 60 ] ||
+  [ $((at - now)) -le 60 ] || { RUNG_WHY="usage heartbeat is from the future"; return 1; }
+  [ $((now - at)) -le 600 ] || { [ $((now - at)) -le 7200 ] && lane_running "$lane"; } ||
     { RUNG_WHY="usage heartbeat is $((now - at)) seconds old"; return 1; }
+}
+
+# Whether lane $1's runner holds its lock with a live process. A runner
+# writes its heartbeat between runs, not during one, so a lane mid-run looked
+# like one with no usage: at 11:04Z on 2026-10-21 the claude lane was 30
+# minutes into a run and the spark lane 40, and the tick skipped. The beat's
+# age is capped at 2 hours (a run's agent and check timeouts) above, so a
+# recycled pid cannot keep a dead lane's heartbeat alive.
+lane_running() {
+  local pid
+  pid="$(cat "$LOOM_HOME/run/$1.lock/pid" 2>/dev/null)" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
 }
 
 # Whether any rung can take the tick; when none can, LADDER_WHY holds every
@@ -137,7 +150,7 @@ ladder_open() {
 BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_TRUSTED_BRIEFERS
   LOOM_REPO_OWNERS LOOM_HOME
   LOOM_BRAIN_SCOPE LOOM_BRAIN_HOLDER LOOM_REVIEW_CHECK LOOM_REVIEW_BOT LOOM_GOAL_CAP
-  LOOM_UNVERIFIED_LIMIT LOOM_REPAIR_EPICS LOOM_MERGE_SETTLE_SECONDS)
+  LOOM_UNVERIFIED_LIMIT LOOM_REPAIR_EPICS LOOM_MERGE_SETTLE_SECONDS LOOM_GITHUB_LOGIN)
 
 # The spark rung runs as the spark lane does: opencode inside the shared
 # sandbox, with an emptied environment and a scratch home. Its tree is the
@@ -149,7 +162,8 @@ spark_brain() {
   token="${LOOM_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
   [ -n "$token" ] || token="$(gh auth token 2> /dev/null)"
   [ -n "$token" ] || { echo "no GitHub token for the spark brain" >&2; return 3; }
-  case "$token" in *[!A-Za-z0-9_]*) echo "the GitHub token has unexpected characters" >&2; return 3 ;; esac
+  # An App installation token is ghs_ and a JWT-like body with dots and dashes.
+  case "$token" in *[!A-Za-z0-9_.-]*) echo "the GitHub token has unexpected characters" >&2; return 3 ;; esac
   AGENT_HOME="$LOOM_HOME/run/brain-home"
   rm -rf "$AGENT_HOME" && mkdir -p "$AGENT_HOME" || return 3
   LANE=spark SKILLS="" API_KEY="" SPARK_URL="$LOOM_SPARK_URL"
@@ -203,6 +217,31 @@ bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
 brain() { (cd "$REPO_ROOT" && python3 -m bus.brain "$@"); }
 brain step lock --holder "$HOLDER" --lock-repo "$LOCK_REPO" >> "$LOG" 2>&1 || say "could not record lock step"
 
+# With GitHub App settings (the Loom Brain App) the tick writes as that App,
+# never as the operator (loom#1142): every rung's gh and GitHub API calls get
+# the App's installation token, which lasts an hour, longer than a tick. A
+# personal token in the environment is dropped first, so a failed mint runs
+# no rung at all.
+if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
+  [ "$MINUTES" -le 50 ] ||
+    { say "LOOM_BRAIN_MINUTES must be 50 or less with a GitHub App: its token lasts an hour"; beat failed 1; exit 1; }
+  unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN
+  if ! app_token="$(bus app token 2>> "$LOG")" || ! [[ "$app_token" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    say "tick failed: could not mint the brain's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
+    beat failed 1
+    exit 1
+  fi
+  export GH_TOKEN="$app_token" GITHUB_TOKEN="$app_token" LOOM_GITHUB_TOKEN="$app_token"
+  unset app_token
+  # GET /user refuses an installation token, so the agent's journal is told
+  # the App's login; without it the journal fails, not the tick.
+  if app_login="$(bus app login 2>> "$LOG")" && [[ "$app_login" =~ ^[A-Za-z0-9-]+\[bot\]$ ]]; then
+    export LOOM_GITHUB_LOGIN="$app_login"
+  else
+    say "could not read the brain's GitHub App login; its journal may not post"
+  fi
+fi
+
 # A rung may have changed the checkout (a hook, a config, an edited
 # docs/MUSE.md the next tick would follow). Each tick starts from origin's
 # head: fetched and reset with hooks and fsmonitor off, and untracked and
@@ -242,7 +281,12 @@ step found or decided\" in place of the step \
 command MUSE.md gives; the wrapper records lock and unlock. LOOM_REPOS is \
 set in your environment. Work from \
 $WORK/loom. Read each goal's home issue and its rules before acting on that \
-goal. This replaces the 15-minute limit in MUSE.md: stop within \
+goal. Post each journal, and every other note or evidence a tick leaves on \
+an issue, with python3 -m bus journal OWNER/NAME#N --file FILE --holder \
+$HOLDER, which edits your journal of the day there instead of emailing the \
+issue's watchers with a new comment; evidence whose blocker kind has no issue \
+of exactly that kind goes to the goal home's journal, never the closest \
+issue. This replaces the 15-minute limit in MUSE.md: stop within \
 $((MINUTES - 5)) minutes; you are cut off at $MINUTES."
 if [ "$SCOPE" = live ]; then
   PROMPT="$PROMPT Muse does the GitHub steps, ships and rolls, and reads \

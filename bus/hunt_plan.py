@@ -43,8 +43,8 @@ _TOO_BIG = {"xl", "extra large", "extra-large", "huge"}
 # "Size: S" (any case, optionally bold: "**Size:** S", "**Size: S**").
 _SIZE_HEADING = re.compile(r"^##[ \t]+size[ \t#]*$", re.IGNORECASE)
 _SIZE_LINE = re.compile(r"^[ \t]*(?:\*\*|__)?size(?:\*\*|__)?[ \t]*:[ \t]*(?:\*\*|__)?"
-                        r"[ \t]*(XS|S|M|L)[ \t]*(?:\*\*|__)?[ \t]*$", re.IGNORECASE)
-SIZE_FORMS = "a ## Size section or a Size: XS|S|M|L line"
+                        r"[ \t]*(\S+?)[ \t]*(?:\*\*|__)?[ \t]*$", re.IGNORECASE)
+SIZE_FORMS = "a ## Size section or a Size: XS|S|M|L line (or Small, Medium, Large)"
 
 
 def size_letter(text: str) -> str:
@@ -84,7 +84,10 @@ def stated_size(body: str) -> Optional[str]:
     for line in lines:
         m = _SIZE_LINE.match(line)
         if m:
-            return m.group(1)
+            try:
+                return size_letter(m.group(1))
+            except ValueError:
+                continue
     return None
 
 
