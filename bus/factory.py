@@ -904,6 +904,30 @@ GAVE_UP = "The factory tried every rung of the model ladder"
 ENDING_CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
 
 
+# An agent run cut off at the agent timeout (lanes/agent_cli.sh classes exit 124
+# [transient]). The class may be missing (an older reason) or [work] (the
+# station's own reclassing of a repeated timeout, below), never [limit].
+TIMEOUT_RE = re.compile(r"^(?:\[(?:transient|work)\] )?agent exited 124(?!\d)")
+# Two runs in a row cut off on one ticket are the ticket's doing, not a lane's.
+TIMEOUT_STRIKES = 2
+
+
+def is_timeout(reason: str) -> bool:
+    """Whether a classed failure reason is an agent timeout (exit 124)."""
+    return bool(TIMEOUT_RE.match(reason))
+
+
+def timeouts_in_a_row(rows: Sequence[Tuple[int, str, str, str]]) -> int:
+    """How many of the newest `rows` (attempts, oldest first) ended at an
+    agent timeout, counting back until one ended any other way."""
+    count = 0
+    for row in reversed(rows):
+        if not is_timeout(row[3]):
+            break
+        count += 1
+    return count
+
+
 def newest_ending_class(comments: Sequence[Any]) -> str:
     """The class of the ending that closed the ticket's newest claim: limit,
     transient, factory, auth or work. A reason with no class, and a newest

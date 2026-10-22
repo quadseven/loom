@@ -5107,6 +5107,12 @@ class Station:
         if fix_pr_merged(fix_pr, reason):
             self._fix_pr_merged(repo, number, lane, int(fix_pr))
             return True
+        if klass == "transient" and self._timed_out_again(repo, number, reason):
+            # One timeout is a slow provider; the run before it also timing
+            # out is the ticket (too large, a hung test): counted as work, it
+            # climbs the ladder and a third flags it (loom#1419).
+            reason = "[work] %s; timed out again on this ticket, so it counts as a failure" % bare
+            klass, bare = "work", CLASS_RE.sub("", reason)
         if self._flag_repeated_failure(repo, number, lane, reason):
             # The run is over, so the held ticket waits failed, as any work
             # failure does. Left loom:running on a lane with no brief, it read
@@ -5193,6 +5199,18 @@ class Station:
         as the ending of the claim before it (factory.attempts)."""
         status.add(self.gh, repo, number, text, self.now, self.s.authors)
 
+    def _timed_out_again(self, repo: str, number: int, reason: str) -> bool:
+        """Whether `reason`, the newest run's timeout, follows enough timeouts
+        in a row on the ticket (factory.TIMEOUT_STRIKES) to count as a failure."""
+        if not factory.is_timeout(reason):
+            return False
+        authors = {author.lower() for author in self.s.authors}
+        comments = [c for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+                    if isinstance(c, dict) and tickets._login(c.get("user")).lower() in authors]
+        # The newest claim is the run being reported: the ones before it ended.
+        earlier = factory.attempts(comments, reason)[:-1]
+        return factory.timeouts_in_a_row(earlier) + 1 >= factory.TIMEOUT_STRIKES
+
     def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
         """Hold a ticket after the same consecutive failure or three attempts in
         six hours, and record its attempt table."""
@@ -5218,7 +5236,10 @@ class Station:
             return not reason or failure_class(reason) not in NOT_WORK
         work = [a for a in attempts if is_work(a[3])]
         failures = [a[3] for a in work[:-1] if a[3]]
-        reason_repeat = bool(failures) and failures[-1] == reason
+        # Timeouts name their kept branch, which differs each run: one reason.
+        def same(a: str, b: str) -> bool:
+            return a == b or (factory.is_timeout(a) and factory.is_timeout(b))
+        reason_repeat = bool(failures) and same(failures[-1], reason)
         recent = [a for a in work if a[0] >= self.now - 6 * 3600]
         if not reason_repeat and len(recent) < 3:
             return False
