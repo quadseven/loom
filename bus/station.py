@@ -1839,9 +1839,7 @@ class Station:
             self._refuse(repo, issue, str(err))
             return False
         fix, fix_comment_id = fix_source if fix_source else (None, None)
-        refusal = self._fix_refusal(fix)
-        if refusal:
-            self._refuse(repo, issue, refusal)
+        if self._fix_blocks(repo, issue, fix):
             return False
 
         earlier = sum(1 for c in comments
@@ -5459,6 +5457,46 @@ class Station:
         failures."""
         self._routine(repo, number,
                       "Lane %s stopped: [%s] %s" % (lane, klass, CLASS_RE.sub("", reason)))
+
+    def _fix_blocks(self, repo: str, issue: Dict[str, Any],
+                    fix: Optional[tickets.Fix]) -> bool:
+        """Whether the ticket's fix round must not be briefed: its findings are
+        refused (the ticket is refused, as an untrusted one is), or its pull
+        request already merged."""
+        refusal = self._fix_refusal(fix)
+        if refusal:
+            self._refuse(repo, issue, refusal)
+            return True
+        return self._fix_already_merged(repo, issue, fix)
+
+    def _fix_already_merged(self, repo: str, issue: Dict[str, Any],
+                            fix: Optional[tickets.Fix]) -> bool:
+        """Whether the fix round's pull request merged after its loom:fix
+        comment, so the round would only fix a closed pull request: three such
+        rounds ran in two hours, one on a paid lane (2026-10-22). The ticket
+        goes to loom:pr, where reconcile moves it on to loom:merged; one
+        already merged or later keeps its labels."""
+        if fix is None or not self._pull_merged(repo, fix.pr):
+            return False
+        number = int(issue["number"])
+        if tickets.ticket_state(issue) not in tickets.MERGED_STATES:
+            states = {"loom:" + state for state in brain.STATES}
+            labels = [n for n in _label_names(issue)
+                      if n not in states and not n.startswith(WAIT)] + ["loom:pr"]
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+            issue["labels"] = [{"name": n} for n in labels]
+        _say("%s#%d: pull request #%d merged before its fix round; no fix brief"
+             % (repo, number, fix.pr))
+        return True
+
+    def _pull_merged(self, repo: str, pr: int) -> bool:
+        """Whether pull request `pr` has merged; a read that fails says no,
+        so the round is briefed as before and the runner's own check stands."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr)).data
+        except GitHubError:
+            return False
+        return isinstance(data, dict) and bool(data.get("merged_at"))
 
     def _fix_pr_merged(self, repo: str, number: int, lane: str, pr: int) -> None:
         """A fix brief the runner parked unrun because its pull request merged
