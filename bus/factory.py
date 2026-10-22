@@ -157,6 +157,8 @@ REVIEW_GRACE = 1800
 # At most this many merges, send-backs and climbs per pass.
 MAX_ACTIONS = 12
 DEFAULT_REVIEW_CHECK = "Grug - Elder"
+# The review bot's plan check (same default as bus/invariants.py).
+DEFAULT_PLAN_CHECK = "Grug - Chief"
 # The review bot's login as GraphQL reports it (an app, without "[bot]").
 DEFAULT_REVIEW_BOT = "grug-tribe"
 BOT_FIXED_PREFIX = "Fixed in "
@@ -444,6 +446,11 @@ NOT_BUILT_RE = re.compile(r"\s*;\s*not built:\s*\S.+$", re.I)
 SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
                          r"([a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9])#(\d+)\b", re.I)
 BODY_LEAK_MARKER = "<!-- loom:body-leak-repaired %s -->"
+# On the ticket: the station put it under an epic for this head commit.
+EPIC_REPAIR_MARKER = "<!-- loom:epic-repaired %s -->"
+# The plan check's summary table names this row for a ticket under no epic.
+EPIC_ROW = "which epic"
+_ORPHAN_NUMBER_RE = re.compile(r"#(\d+)")
 # On the pull request: the scope check held this head commit (bus/scope_fit.py).
 SCOPE_HOLD_MARKER = "<!-- loom:scope-hold %s -->"
 MODEL_LINE = re.compile(r"^Model:[^\n]*\n?", re.M)
@@ -1077,6 +1084,22 @@ def pr_faults(details: Dict[str, Any], full: Dict[str, Any],
                              (full.get("mergeable") is False, "a conflict")) if bad]
 
 
+def chief_orphans(summary: str) -> Optional[List[int]]:
+    """The tickets the plan check's `which epic` row says belong to no epic,
+    when that row is the only one failing in its summary table; else None.
+    A table row reads `| which epic | fail | #5, #9 belong to no epic - ... |`
+    (services/_shared/personas/tpm/persona.py in the review bot's repo)."""
+    failing = []
+    for line in str(summary or "").splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) >= 3 and cells[1].lower() == "fail":
+            failing.append((cells[0].lower(), "|".join(cells[2:])))
+    if len(failing) != 1 or failing[0][0] != EPIC_ROW:
+        return None
+    named = failing[0][1].partition(" belong to no epic")[0]
+    return [int(n) for n in _ORPHAN_NUMBER_RE.findall(named)] or None
+
+
 def acceptance_criteria(body: str) -> List[str]:
     """Checkbox criteria in the Acceptance criteria section."""
     found = []
@@ -1311,6 +1334,8 @@ class Factory:
                  limit_until: Optional[Dict[str, float]] = None,
                  known_waits: Optional[Dict[str, str]] = None,
                  human: Callable[..., Any] = brain.human,
+                 place: Callable[..., Any] = brain.place_under_epic,
+                 plan_check: str = DEFAULT_PLAN_CHECK,
                  scope: Optional[scope_fit.Ask] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
@@ -1323,6 +1348,9 @@ class Factory:
         self.review_bot = review_bot
         self.merge, self.fix, self.move = merge, fix, move
         self.human = human
+        # Puts a ticket that sits under no epic under one (brain.place_under_epic).
+        self.place = place
+        self.plan_check = plan_check
         self.close = close if close is not None else _default_close
         self.limited = set(limited)
         # Lanes whose fresh heartbeat says unavailable for another reason (an
@@ -1963,6 +1991,7 @@ class Factory:
         if faults == ["failing checks"] and (
                 self._split_pr(repo, number, full, issue, comments, sha)
                 or self._repair_body_leak(repo, number, full, issue, comments, sha)
+                or self._repair_ticket_epic(repo, number, issue, comments, sha)
                 or self._run_again(repo, number, sha)
                 or self._review_again(repo, number, full, sha)):
             return
@@ -2091,6 +2120,41 @@ class Factory:
         self.actions += 1
         _say("rewrote %d flagged line(s) of %s#%d's text after a body-only leak scan"
              % (len(changed), repo, number))
+        return True
+
+    def _repair_ticket_epic(self, repo: str, number: int, issue: Dict[str, Any],
+                            comments: List[Dict[str, Any]], sha: str) -> bool:
+        """Put the ticket under an epic when the plan check fails only on its
+        `which epic` row for this pull request's own ticket. The missing epic
+        is on the ticket, which a lane cannot edit, so a fix round would loop
+        with nothing to change. Once per head commit; after that the pull
+        request waits for the plan check to read the ticket again, still with
+        no lane round. True whenever the failure is that row alone, so the
+        usual paths never see it."""
+        failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
+        if len(failed) != 1 or failed[0].get("name") != self.plan_check:
+            return False
+        ticket = int(issue["number"])
+        if chief_orphans(str((failed[0].get("output") or {}).get("summary") or "")) != [ticket]:
+            return False
+        marker = EPIC_REPAIR_MARKER % sha
+        if any(marker in str(c.get("body") or "") for c in comments):
+            _say("%s#%d waits: its ticket #%d was put under an epic and %s has not read it again"
+                 % (repo, number, ticket, self.plan_check))
+            return True
+        try:
+            epic = int(self.place(self.gh, repo, issue))
+        except (GitHubError, ValueError) as err:
+            _say("%s#%d: ticket #%d could not be put under an epic (%s); held, no lane round"
+                 % (repo, number, ticket, err))
+            return True
+        notify.post(self.gh, repo, ticket,
+                    "%s\n%s failed on pull request #%d only because this ticket belonged to no "
+                    "epic, which a lane cannot fix, so the factory put it under epic #%d instead "
+                    "of sending the pull request back." % (marker, self.plan_check, number, epic),
+                    notify.REPAIR)
+        self.actions += 1
+        _say("put %s#%d under epic #%d after %s held #%d" % (repo, ticket, epic, self.plan_check, number))
         return True
 
     def _land_or_ask_test(self, repo: str, number: int, full: Dict[str, Any],

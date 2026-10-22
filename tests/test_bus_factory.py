@@ -220,6 +220,7 @@ class Base(unittest.TestCase):
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
         self.humans = []
+        self.placed = []
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
            down=(), limit_until=None, scope=None, known_waits=None):
@@ -240,12 +241,17 @@ class Base(unittest.TestCase):
         def close(gh, repo, number, comment):
             self.closed.append((number, comment))
             factory._default_close(gh, repo, number, comment)
+        def place(gh, repo, issue):
+            # As brain.place_under_epic does: the ticket ends up under an epic.
+            self.placed.append(issue["number"])
+            gh.issues[issue["number"]]["body"] += "\nPart of #77\n"
+            return 77
         def human(gh, repo, number, ask):
             self.humans.append((number, ask))
             gh.comments[number].append({"body": brain.HUMAN_MARKER + "\n" + ask, "user": ME})
             gh.issues[number]["labels"].append({"name": "loom:human"})
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
-                            merge=merge, fix=fix, move=move, close=close, human=human,
+                            merge=merge, fix=fix, move=move, close=close, human=human, place=place,
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
                             silent=silent, down=down, limit_until=limit_until, scope=scope,
@@ -1320,6 +1326,108 @@ class LeakScanText(Base):
     def test_a_log_that_is_not_a_leak_scan_is_not_read_as_one(self):
         self.assertIsNone(factory.body_leak_hits(["FAILED (errors=1)"]))
         self.assertIsNone(factory.body_leak_hits(leak_log().split("\n")))
+
+
+CHIEF = factory.DEFAULT_PLAN_CHECK
+
+
+def chief_summary(rows):
+    """A Grug - Chief check-run summary table; rows are (check, status, detail)."""
+    return "\n".join(["| Check | Status | Detail |", "|---|---|---|"] +
+                     ["| %s | %s | %s |" % row for row in rows])
+
+
+EPIC_FAIL = ("which epic", "fail", "#5 belong to no epic - add each as a sub-issue of an epic, "
+             "or write `Part of #<epic>` in its body")
+BODY_PASS = ("why hunt", "pass", "## Why has 64 words")
+
+
+class OrphanTicketEpic(Base):
+    """A pull request held by Chief only because the ticket it names sits under
+    no epic is repaired on the ticket by the station; a lane cannot edit it."""
+
+    def held(self, rows, extra_runs=()):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": CHIEF, "status": "completed", "conclusion": "failure",
+             "output": {"title": "Hunt Plan hold", "summary": chief_summary(rows)}},
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+             "conclusion": "success"}] + list(extra_runs)
+
+    def test_a_which_epic_only_failure_puts_the_ticket_under_an_epic_and_sends_nothing(self):
+        self.held([BODY_PASS, EPIC_FAIL])
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.placed, [5])
+        self.assertIn("Part of #77", self.gh.issues[5]["body"])
+        note = self.gh.comments[5][-1]["body"]
+        self.assertIn(factory.EPIC_REPAIR_MARKER % "sha50", note)
+        self.assertIn("#77", note)
+
+    def test_a_failing_body_row_still_goes_back_to_the_lane(self):
+        self.held([("what good look like", "fail", "0 bullets"), EPIC_FAIL])
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.placed, [])
+
+    def test_another_failing_check_goes_back_to_the_lane(self):
+        self.held([EPIC_FAIL], extra_runs=[
+            {"name": "unittest", "status": "completed", "conclusion": "failure"}])
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.placed, [])
+
+    def test_a_ticket_the_pull_request_names_besides_its_own_is_left_to_the_lane(self):
+        self.held([("which epic", "fail", "#5, #9 belong to no epic - add each")])
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.placed, [])
+
+    def test_the_repair_runs_once_per_head_and_the_lane_is_still_not_asked(self):
+        self.held([EPIC_FAIL])
+        self.go()
+        self.go()
+        self.assertEqual(self.placed, [5])
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(len([c for c in self.gh.comments[5]
+                              if factory.EPIC_REPAIR_MARKER % "sha50" in c["body"]]), 1)
+
+    def test_a_ticket_with_no_epic_to_go_under_is_held_without_a_lane_round(self):
+        self.held([EPIC_FAIL])
+        with mock.patch.object(factory, "_say"):
+            f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
+                                fix=lambda *a, **k: self.fixed.append(a),
+                                place=mock.Mock(side_effect=ValueError("no open goal home")))
+            f.run()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.gh.comments[5], [])
+
+    def test_the_summary_reader_names_the_tickets_of_a_lone_which_epic_failure(self):
+        self.assertEqual(factory.chief_orphans(chief_summary([BODY_PASS, EPIC_FAIL])), [5])
+        self.assertEqual(factory.chief_orphans(chief_summary(
+            [("which epic", "fail", "#5, #9 belong to no epic - add")])), [5, 9])
+        self.assertIsNone(factory.chief_orphans(chief_summary(
+            [("how big", "fail", "no Size"), EPIC_FAIL])))
+        self.assertIsNone(factory.chief_orphans(chief_summary([BODY_PASS])))
+        self.assertIsNone(factory.chief_orphans(chief_summary(
+            [("which epic", "warn", "#5 belong to no epic")])))
+        self.assertIsNone(factory.chief_orphans(""))
+
+    def test_place_under_epic_files_the_ticket_under_the_goals_intake_epic(self):
+        issue = {"number": 5, "id": 55, "body": "x"}
+        with mock.patch.object(brain, "repo_goal", return_value=30) as goal, \
+                mock.patch.object(brain, "intake_epic", return_value=77) as intake, \
+                mock.patch.object(brain, "file_under_epic") as file:
+            self.assertEqual(brain.place_under_epic(self.gh, REPO, issue), 77)
+        goal.assert_called_once_with(self.gh, REPO)
+        intake.assert_called_once_with(self.gh, REPO, 30)
+        file.assert_called_once_with(self.gh, REPO, 77, issue)
+
+    def test_place_under_epic_refuses_a_repo_with_no_goal(self):
+        with mock.patch.object(brain, "repo_goal", return_value=None):
+            with self.assertRaises(ValueError):
+                brain.place_under_epic(self.gh, REPO, {"number": 5})
 
 
 BOT = {"__typename": "Bot", "login": "grug-tribe"}
@@ -3096,7 +3204,7 @@ class Helpers(unittest.TestCase):
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
                          model_limits=None, silent=None, down=(), limit_until=None,
-                         known_waits=None):
+                         known_waits=None, plan_check=None):
                 self.silent_running, self.silent, self.waits = {}, silent, {}
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))

@@ -822,6 +822,17 @@ the parts, one each. A note that leaves nothing to split on, a blocking
 finding or another failing check sends the pull request back for a fix round as
 before.
 
+A plan check that failed only on its `which epic` row, for the pull request's
+own ticket, is not sent back either: the missing epic is on the ticket, which a
+lane cannot edit. The factory puts the ticket under its repo goal's intake
+epic (`brain.place_under_epic`, `Factory._repair_ticket_epic`: a sub-issue
+link, else a `Part of` line) and writes one `repair` comment on the ticket
+(`<!-- loom:epic-repaired SHA -->`, once per head commit). Until the plan
+check reads the ticket again the pull request waits with no lane round. A
+repo with no open goal home, a plan check that fails on any other row or
+check, or a `which epic` row that names another ticket goes to a fix round as
+before.
+
 A send-back needs something new to fix. `python3 -m bus.brain fix` (the
 factory's send-back and the brain's) posts nothing, changes no label and says
 why on stderr when the pull request has no failing check, no open review

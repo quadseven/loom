@@ -1457,6 +1457,18 @@ def file_under_epic(gh: GitHub, repo: str, epic: int, issue: Dict[str, Any]) -> 
                     {"body": _with_part_of(body, epic)})
 
 
+def place_under_epic(gh: GitHub, repo: str, issue: Dict[str, Any]) -> int:
+    """Put a ticket that sits under no epic under its repo goal's intake epic
+    (linked as a sub-issue, else a Part of line) and return that epic's
+    number; ValueError when the repo has no open goal home."""
+    goal = repo_goal(gh, repo)
+    if goal is None:
+        raise ValueError("%s has no open goal home to put the ticket under" % repo)
+    epic = intake_epic(gh, repo, goal)
+    file_under_epic(gh, repo, epic, issue)
+    return epic
+
+
 def brief_intake(gh: GitHub, repo: str, goal: int, title: str, body: str,
                  *args: Any, **kwargs: Any) -> str:
     """brief under the goal's intake epic (intake_epic): the filing path for
