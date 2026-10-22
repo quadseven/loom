@@ -1581,22 +1581,68 @@ resolve_factory_incidents() {
     number="$(tr -cd '0-9' < "$file")"
     if [ -n "$number" ]; then
       gh issue close --repo "$FACTORY_REPO" "$number" \
-        --comment "Cleared: the check passed on the unmodified base in $TICKET." >>"$LOG" 2>&1 || continue
+        --comment "Cleared: the check passed on the unmodified base in $(incident_ticket)." >>"$LOG" 2>&1 || continue
     fi
     rm -f "$file"
   done
 }
+# The factory repo is public, and an incident for a private repo once put
+# that repo's name, ticket and check command in it (loom#1040, loom#1273).
+# Only a repo known to be public (REPO_PRIVATE=false) is named; any other is
+# "private repo <alias>", where the alias is a random id this machine keeps
+# per repo, so its incidents still dedupe by title and close on their own.
+# Its ticket and failing line stay in the lane log and on the ticket.
+INCIDENT_WITHHELD="withheld: the lane log and the ticket have the detail"
+repo_is_public() { [ "${REPO_PRIVATE:-}" = false ]; }
+incident_ticket() {
+  if repo_is_public; then printf '%s' "$TICKET"; else printf 'a private repo ticket'; fi
+}
+incident_subject() {
+  local file alias
+  if repo_is_public; then printf '%s' "$REPO"; return 0; fi
+  file="$INCIDENT_DIR/$(printf '%s' "$REPO" | tr '/' '_').alias"
+  if [ ! -s "$file" ]; then
+    mkdir -p "$INCIDENT_DIR" && od -An -N4 -tx1 /dev/urandom | tr -cd '0-9a-f' > "$file" || return 1
+  fi
+  alias="$(tr -cd '0-9a-f' < "$file")"
+  [ "${#alias}" -eq 8 ] || return 1
+  printf 'private repo %s' "$alias"
+}
+# The public repo leak scan over a public repo's incident detail, the one
+# part of the text a check or contract supplies. A refused or unavailable
+# scan withholds it: the rest is fixed text, the repo and the ticket id.
+incident_text_clean() {  # text
+  local text_file rc=0
+  text_file="$(mktemp "${TMPDIR:-/tmp}/loom-incident.XXXXXX")" || return 1
+  printf '%s\n' "$1" > "$text_file"
+  [ -f "$LEAK_SCANNER" ] && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$text_file" \
+    --allow-repo-ref "$FACTORY_REPO" --allow-repo-ref "$REPO" >> "$LOG" 2>&1 || rc=1
+  rm -f "$text_file"
+  return "$rc"
+}
 file_factory_incident() {  # kind, detail
-  local kind="$1" detail="$2" title body number existing
-  title="Factory incident: $REPO validation $kind"
+  local kind="$1" detail="$2" title body number existing subject ticket
+  if ! subject="$(incident_subject)"; then
+    echo "could not name the incident for a private repo; nothing filed" >> "$LOG"
+    printf 'factory incident filing failed'
+    return 0
+  fi
+  ticket="$(incident_ticket)"
+  if ! repo_is_public; then
+    detail="$INCIDENT_WITHHELD"
+  elif ! incident_text_clean "$detail"; then
+    echo "the incident detail failed the public repo leak scan; it was withheld" >> "$LOG"
+    detail="$INCIDENT_WITHHELD"
+  fi
+  title="Factory incident: $subject validation $kind"
   body="$(printf '%s\n\nRepo: %s\nKind: %s\nTicket: %s\n\n%s\n' \
-    "$INCIDENT_MARKER" "$REPO" "$kind" "$TICKET" "$detail")"
+    "$INCIDENT_MARKER" "$subject" "$kind" "$ticket" "$detail")"
   existing="$(open_issue "$title")"
   if [ -n "$existing" ]; then
     number="$existing"
     # One comment on the incident with a running count, never one per run.
     printf '%s' "$detail" | upsert_sticky_comment "$FACTORY_REPO" "$number" "$INCIDENT_REPEAT_MARKER" repeat \
-      --headline "Still failing" --items-label "Tickets seen" --item "$TICKET" || true
+      --headline "Still failing" --items-label "Tickets seen" --item "$ticket" || true
   else
     number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
       --body "$body" --label loom:factory 2>>"$LOG" || \
