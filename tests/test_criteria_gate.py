@@ -121,15 +121,31 @@ class Checks(unittest.TestCase):
 
     def test_a_check_passes_only_with_every_expected_string(self):
         check = criteria_gate.check_of("Live: `https://status.example.com/` serves `ok` and `v2`")
-        self.assertEqual(criteria_gate.run(check, None, fetch=lambda u, t: (200, "ok v2")),
+        self.assertEqual(criteria_gate.run(check, None, fetch=lambda u, t: (200, "ok v2", "")),
                          (True, "HTTP 200, found `ok`, `v2`"))
-        self.assertEqual(criteria_gate.run(check, None, fetch=lambda u, t: (200, "ok")),
+        self.assertEqual(criteria_gate.run(check, None, fetch=lambda u, t: (200, "ok", "")),
                          (False, "HTTP 200, missing `v2`"))
 
         def broken(url, timeout):
             raise OSError("no route to 192.0.2.7")
         self.assertEqual(criteria_gate.run(check, None, fetch=broken),
                          (False, "the check could not run (OSError)"))
+
+        # Security review: a redirect is not followed, so a 3xx (a login or
+        # error page behind it) never passes unless the criterion names it.
+        for status in (301, 302):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    criteria_gate.run(check, None, fetch=lambda u, t: (
+                        status, "ok v2", "https://login.example.com/")),
+                    (False, "HTTP %d (redirect not followed)" % status))
+        named = criteria_gate.check_of("Live: `https://old.example.com/` answers `301` to "
+                                       "`https://new.example.com/`")
+        self.assertEqual(criteria_gate.run(named, None, fetch=lambda u, t: (
+            301, "", "https://new.example.com/")),
+            (True, "HTTP 301, found `301`, `https://new.example.com/`"))
+        self.assertFalse(criteria_gate.run(named, None, fetch=lambda u, t: (
+            302, "", "https://new.example.com/"))[0])
 
         def garbled(url, timeout):
             raise criteria_gate.http.client.BadStatusLine("x")
@@ -191,7 +207,7 @@ class DoneClose(tbs.Base):
         for n, text in enumerate(bodies, 1):
             self.fake.add(n, lane="codex", body=text, state="shipped")
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
-        with mock.patch.object(criteria_gate, "_fetch", fetch or (lambda u, t: (200, "ok"))):
+        with mock.patch.object(criteria_gate, "_fetch", fetch or (lambda u, t: (200, "ok", ""))):
             st.close_done_tickets()
         return st
 
@@ -223,7 +239,7 @@ class DoneClose(tbs.Base):
                                             station.LIVE_CHECKS_FILE)))
         self.assertEqual(state["%s#1" % REPO][criteria_gate.key(live)]["result"], "pass")
         self.setUp()
-        self.close(body(AUDIT_CODE[1], live), fetch=lambda u, t: (503, "down"))
+        self.close(body(AUDIT_CODE[1], live), fetch=lambda u, t: (503, "down", ""))
         self.assertEqual(self.fake.issues[1]["state"], "open")
         self.assertIn("its check failed: HTTP 503, missing `ok`", self.asks(1)[0])
 

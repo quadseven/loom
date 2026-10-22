@@ -1466,6 +1466,9 @@ an `https://` URL fetched with GET, a `gh api <path>` read through the
 station's GitHub client, or a read-only `kubectl get` / `kubectl rollout
 status` (never a secret, `exec` or another cluster's credentials). The
 criterion's other backticked or double-quoted strings must be in the answer.
+Only a 2xx passes a URL check: a redirect is not followed, so a 3xx (a login
+or error page behind it) fails as "redirect not followed", unless every
+expected string names that exact status or Location.
 Each result is kept in the station's `live-checks.json` and written to the
 ticket's status; the answer itself is never written. A criterion with no
 runnable check, a failed check, or an operator criterion sends the ticket to

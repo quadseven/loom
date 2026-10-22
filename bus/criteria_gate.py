@@ -145,7 +145,7 @@ def check_of(text: str) -> Optional[Check]:
     for span in spans:
         found = _command(span.strip())
         if found is not None:
-            rest = tuple(s for s in spans if s != span and not URL_RE.fullmatch(s.strip()))
+            rest = tuple(s for s in spans if s != span)
             return found._replace(expects=rest)
     url = URL_RE.search(text or "")
     if url:
@@ -170,9 +170,10 @@ def _command(span: str) -> Optional[Check]:
     return None
 
 
-def _fetch(url: str, timeout: int) -> Tuple[int, str]:
-    """GET an https URL over an HTTPS connection; any other scheme (file:,
-    http:, a custom one) is refused, and redirects are not followed."""
+def _fetch(url: str, timeout: int) -> Tuple[int, str, str]:
+    """(status, body, Location header) of a GET of an https URL over an
+    HTTPS connection; any other scheme (file:, http:, a custom one) is
+    refused, and redirects are not followed."""
     parts = urllib.parse.urlsplit(url)
     if parts.scheme.lower() != "https" or not parts.hostname:
         raise ValueError("a live check fetches https URLs only")
@@ -181,12 +182,35 @@ def _fetch(url: str, timeout: int) -> Tuple[int, str]:
     try:
         conn.request("GET", path, headers={"User-Agent": "loom-live-check"})
         answer = conn.getresponse()
-        return int(answer.status), answer.read(BODY_LIMIT).decode("utf-8", "replace")
+        return (int(answer.status), answer.read(BODY_LIMIT).decode("utf-8", "replace"),
+                str(answer.getheader("Location") or ""))
     finally:
         conn.close()
 
 
-def run(check: Check, gh: Any, fetch: Optional[Callable[[str, int], Tuple[int, str]]] = None,
+def _status_named(expect: str, status: int, location: str) -> bool:
+    """Whether an expected string names this exact status or Location."""
+    return expect in (str(status), "HTTP %d" % status) or bool(location and expect == location)
+
+
+def _url_result(check: Check, status: int, text: str, location: str) -> Tuple[bool, str]:
+    """(passed, seen) for a fetched URL. Only a 2xx passes: a redirect is not
+    followed, so a 3xx (a login or error page behind it) fails, unless every
+    expected string names that exact status or Location."""
+    seen = "HTTP %d" % status
+    if 300 <= status < 400:
+        if check.expects and all(_status_named(e, status, location) for e in check.expects):
+            return True, seen + ", found %s" % ", ".join("`%s`" % e for e in check.expects)
+        return False, seen + " (redirect not followed)"
+    missing = [e for e in check.expects if e not in text and not _status_named(e, status, "")]
+    if missing:
+        return False, "%s, missing %s" % (seen, ", ".join("`%s`" % m for m in missing))
+    found = ", found %s" % ", ".join("`%s`" % e for e in check.expects) if check.expects else ""
+    return 200 <= status < 300, seen + found
+
+
+def run(check: Check, gh: Any,
+        fetch: Optional[Callable[[str, int], Tuple[int, str, str]]] = None,
         runner: Optional[Callable[..., Any]] = None) -> Tuple[bool, str]:
     """(passed, what was seen) for one check. What was seen names the status
     or exit code and the strings found or missing, never the answer itself:
@@ -195,9 +219,8 @@ def run(check: Check, gh: Any, fetch: Optional[Callable[[str, int], Tuple[int, s
     runner = runner or subprocess.run
     try:
         if check.kind == "url":
-            status, text = fetch(check.target, CHECK_TIMEOUT)
-            seen, ok = "HTTP %d" % status, 200 <= status < 400
-        elif check.kind == "gh":
+            return _url_result(check, *fetch(check.target, CHECK_TIMEOUT))
+        if check.kind == "gh":
             text = json.dumps(gh.rest("GET", check.target).data)
             seen, ok = "GitHub answered", True
         else:
