@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
-from bus import brain, handoff, labels, tickets
+from bus import brain, handoff, labels, status, tickets
 from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
@@ -805,7 +805,12 @@ class TicketStore:
         try:
             found = _unique_by_id(self.gh.paginate_parallel(
                 "/repos/%s/issues/comments?since=%s&per_page=100" % (path, since), workers=READ_WORKERS))
-            issues = [comment_record(c, repo) for c in found if _by_trusted(c, trusted)]
+            # A ticket's routine events are edited into one status comment,
+            # so the feed reads each as its own comment at its own time, as
+            # the station's client does for one ticket (loom#866). Only this
+            # Loom's logins are expanded: a stranger's events would be forged.
+            found = status.expand([c for c in found if _by_trusted(c, trusted)], trusted)
+            issues = [comment_record(c, repo) for c in found]
             found = _unique_by_id(self.gh.paginate_parallel(
                 "/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since), workers=READ_WORKERS))
             reviews = [comment_record(c, repo) for c in found]

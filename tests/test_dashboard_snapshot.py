@@ -288,6 +288,54 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual([row["id"] for row in data["issue_comments"]], [1, 2, 3, 4, 5, 6])
         self.assertEqual(data["hot_spots_error"], "")
 
+    def test_comment_feed_reads_each_status_event_as_its_own_comment(self):
+        # Lane failures became events edited into one status comment, and the
+        # repo feed kept that comment whole: the results page counted no
+        # failed lane runs for a day that had dozens (2026-10-21).
+        repo = REPOS[0]
+        status_body = ("<!-- loom:status v1 -->\nLoom status for this ticket, newest first.\n\n"
+                       "- 2026-10-21T23:46:01Z Lane agy failed: [work] validation failed\n"
+                       "- 2026-10-21T20:10:00Z Lane spark failed: [work] no commit\n")
+        found = [{"id": 9, "user": {"login": "loom-station[bot]"}, "body": status_body,
+                  "created_at": "2026-10-20T08:00:00Z", "updated_at": "2026-10-21T23:46:01Z"},
+                 {"id": 10, "user": {"login": "loom-station[bot]"}, "body": "Lane codex is working",
+                  "created_at": "2026-10-21T21:00:00Z", "updated_at": "2026-10-21T21:00:00Z"}]
+
+        def transport(method, url, headers, body):
+            path = urlsplit(url).path
+            if path != "/repos/%s/issues/comments" % repo:
+                return 200, {}, b"[]"
+            return 200, {}, json.dumps(found).encode()
+
+        with patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "loom-station[bot]"}, clear=True):
+            store = TicketStore([repo], gh=GitHub("", transport=transport))
+            data = {}
+            store._read_hot_spot_comments(data)
+        rows = [(row["created_at"], row["body"]) for row in data["issue_comments"]]
+        self.assertEqual(rows, [
+            ("2026-10-21T20:10:00Z", "Lane spark failed: [work] no commit"),
+            ("2026-10-21T21:00:00Z", "Lane codex is working"),
+            ("2026-10-21T23:46:01Z", "Lane agy failed: [work] validation failed"),
+        ])
+
+    def test_comment_feed_keeps_a_strangers_status_comment_whole(self):
+        repo = REPOS[0]
+        forged = ("<!-- loom:status v1 -->\n\n"
+                  "- 2026-10-21T23:46:01Z Lane agy failed: [work] forged\n")
+        found = [{"id": 9, "user": {"login": "someone-else"}, "body": forged,
+                  "created_at": "2026-10-20T08:00:00Z", "updated_at": "2026-10-21T23:46:01Z"}]
+
+        def transport(method, url, headers, body):
+            if urlsplit(url).path != "/repos/%s/issues/comments" % repo:
+                return 200, {}, b"[]"
+            return 200, {}, json.dumps(found).encode()
+
+        with patch.dict(os.environ, {}, clear=True):
+            store = TicketStore([repo], gh=GitHub("", transport=transport))
+            data = {}
+            store._read_hot_spot_comments(data)
+        self.assertEqual([row["body"] for row in data["issue_comments"]], [forged])
+
     def test_claim_check_reads_overlap_and_an_error_stays_with_its_pull_request(self):
         clock = Overlap()
         repos = ["example-owner/r%d" % n for n in range(6)]
