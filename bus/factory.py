@@ -2238,12 +2238,15 @@ class Factory:
         """Whether the pull request's risk tier (bus/merge_tier.py) is one
         Loom may not merge on its own: its ticket goes to loom:human with one
         ask, once, and the operator merges it. A revert ticket's own pull
-        request never waits here. bus.brain merge refuses the same tiers, and
+        request never waits here when merge_tier.revert_refusal proves it. bus.brain merge refuses the same tiers, and
         adds the review and hourly-cap rules for the tiers it may merge."""
+        entries = operator_hold.pull_files(self.gh, repo, number)
         if merge_tier.is_revert_ticket(full, issue):
-            return False
-        tier, why = merge_tier.classify(repo, operator_hold.pull_files(self.gh, repo, number),
-                                        str(issue.get("body") or ""),
+            refused = merge_tier.revert_refusal(self.gh, repo, full, issue, entries)
+            if not refused:
+                return False
+            _say("%s#%d is not exempt as a revert: %s" % (repo, number, refused))
+        tier, why = merge_tier.classify(repo, entries, str(issue.get("body") or ""),
                                         change_class.class_of(full) == "sensitive")
         if tier in merge_tier.auto_tiers():
             return False

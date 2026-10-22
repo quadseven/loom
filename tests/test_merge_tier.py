@@ -57,11 +57,6 @@ def thread(body, resolved=False, created="2030-01-02T09:00:00Z", bot=True):
             "comments": {"nodes": [{"author": author, "body": body, "createdAt": created}]}}
 
 
-def details(threads=()):
-    return {"commits": {"nodes": [{"commit": {"committedDate": HEAD_AT}}]},
-            "reviewThreads": {"nodes": list(threads)}}
-
-
 def by_bot(comment):
     return brain.by_bot(dict(comment), BOT)
 
@@ -99,7 +94,7 @@ class Tiers(unittest.TestCase):
                            ("requirements.txt", merge_tier.DEPLOY_CONFIG),
                            ("package.json", merge_tier.DEPLOY_CONFIG),
                            ("Dockerfile", merge_tier.DEPLOY_CONFIG),
-                           ("tests/test_auth.py", merge_tier.DOCS_TESTS),
+                           ("tests/test_auth.py", merge_tier.SECURITY),
                            ("README.md", merge_tier.DOCS_TESTS)):
             with self.subTest(path=path):
                 self.assertEqual(merge_tier.file_tier(path), tier)
@@ -115,6 +110,20 @@ class Tiers(unittest.TestCase):
         # A citation line alone names no change in another repo.
         self.assertEqual(merge_tier.classify(REPO, entries(APP_CHANGE),
                                              "Refs example-owner/third#2\n")[0], merge_tier.APP_CODE)
+
+    def test_a_test_or_doc_named_deploy_file_is_never_low_risk(self):
+        # Security review: docs and tests were matched before deploy rules.
+        for path in ("tests/manifests/app/deployment.yaml", "tests/main.tf",
+                     "production/oke/manifests/app/test_values.yaml", "docs/Dockerfile",
+                     "tests/fixtures/requirements.txt", "docs/charts/app/values.yaml"):
+            with self.subTest(path=path):
+                self.assertNotEqual(merge_tier.file_tier(path), merge_tier.DOCS_TESTS)
+
+    def test_a_rename_takes_the_higher_tier_of_its_two_paths(self):
+        # Security review: a manifest renamed under tests/ read as a test.
+        moved = [{"filename": "tests/fixtures/values.txt", "patch": PLAIN_HUNK,
+                  "previous_filename": "production/manifests/runner-pool-a/values.yaml"}]
+        self.assertEqual(merge_tier.classify(REPO, moved)[0], merge_tier.DEPLOY_CONFIG)
 
     def test_a_sensitive_class_or_unread_files_never_read_as_docs(self):
         self.assertEqual(merge_tier.classify(REPO, entries(DOCS_CHANGE), sensitive=True)[0],
@@ -137,14 +146,14 @@ class Findings(unittest.TestCase):
         self.assertFalse(merge_tier.bad_work(self.STYLE))
         self.assertTrue(merge_tier.bad_work(self.STYLE, {"LOOM_ELDER_BLOCKING_RULES": "naming"}))
         self.assertTrue(merge_tier.bad_work("\U0001f7e2 low | _bad-work_ | `new-rule` | small"))
-        found = merge_tier.blocking_findings(details([thread(self.DEAD), thread(self.STYLE),
-                                                      thread(self.INTENT, bot=False)]), by_bot)
+        found = merge_tier.blocking_findings([thread(self.DEAD), thread(self.STYLE),
+                                              thread(self.INTENT, bot=False)], HEAD_AT, by_bot)
         self.assertEqual(found, ["medium dead-code"])
 
     def test_a_finding_resolved_with_no_fix_after_it_still_blocks(self):
         deferred = thread(self.DEAD, resolved=True, created="2030-01-02T11:00:00Z")
         fixed = thread(self.INTENT, resolved=True, created="2030-01-02T09:00:00Z")
-        self.assertEqual(merge_tier.blocking_findings(details([deferred, fixed]), by_bot),
+        self.assertEqual(merge_tier.blocking_findings([deferred, fixed], HEAD_AT, by_bot),
                          ["medium dead-code"])
 
     def test_the_factory_never_defers_a_bad_work_finding(self):
@@ -198,7 +207,17 @@ class Route:
     def __call__(self, method, url, headers, body):
         path = url.split("api.github.com")[-1]
         if path == "/graphql":
-            return 200, {}, json.dumps(self.routes["/graphql"]).encode()
+            query = json.loads(body)
+            if "pageInfo" not in query["query"]:
+                return 200, {}, json.dumps(self.routes["/graphql"]).encode()
+            # merge_tier.review_threads: one page per cursor.
+            pages = self.routes["threads"]
+            at = int(query["variables"].get("after") or 0)
+            if pages is None:
+                return 200, {}, json.dumps({"errors": [{"message": "no"}]}).encode()
+            info = {"hasNextPage": at + 1 < len(pages), "endCursor": str(at + 1)}
+            return 200, {}, json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": info, "nodes": pages[at]}}}}}).encode()
         if method != "GET":
             self.writes.append((method, path, json.loads(body) if body else None))
             return 200, {}, json.dumps({"merged": path.endswith("/merge")}).encode()
@@ -209,7 +228,8 @@ class Route:
 
 
 def routes(files, conclusion="success", threads=(), merged_last_hour=0, ticket_labels=(),
-           title="Keep the build cache warm", body="## Summary\nx\n"):
+           title="Keep the build cache warm", body="## Summary\nx\n", pages=None,
+           labeler="loom-station[bot]", commit_files=None, carried="ahead", patches=None):
     pr = {"number": 8, "state": "open", "draft": False, "title": title,
           "body": body + "\nRefs %s#9" % REPO,
           "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": REPO}},
@@ -218,16 +238,22 @@ def routes(files, conclusion="success", threads=(), merged_last_hour=0, ticket_l
              "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO},
              "commits": {"nodes": [{"commit": {"committedDate": HEAD_AT,
                                                "statusCheckRollup": {"state": "SUCCESS"}}}]},
-             "reviewThreads": {"nodes": list(threads)},
+             "reviewThreads": {"nodes": list(threads or ())},
              "files": {"totalCount": len(files), "nodes": [{"path": f} for f in files]}}
     ticket = {"number": 9, "state": "open", "body": "## What\nx\n",
               "labels": [{"name": n} for n in ("loom:ticket", "loom:pr") + tuple(ticket_labels)]}
     return {
-        "/repos/%s/pulls/8/files" % REPO: entries(files),
+        "/repos/%s/pulls/8/files" % REPO: entries(files, patches),
         "/repos/%s/pulls/8" % REPO: pr,
         "/graphql": {"data": {"repository": {"pullRequest": graph}}},
         "/repos/%s/issues/9/comments" % REPO: [],
+        "/repos/%s/issues/9/events" % REPO: [
+            {"event": "labeled", "label": {"name": "loom:revert"}, "actor": {"login": labeler}}],
         "/repos/%s/issues/9" % REPO: ticket,
+        "threads": pages if pages is not None else (None if threads is None
+                                                     else [list(threads)]),
+        "/repos/%s/compare/abc1234...main" % REPO: {"status": carried},
+        "/repos/%s/commits/abc1234" % REPO: {"files": commit_files or []},
         "/repos/%s/commits/checked/check-runs" % REPO: {"check_runs": [
             {"name": "Grug - Elder", "status": "completed", "conclusion": conclusion}]},
         "/search/issues": {"total_count": merged_last_hour},
@@ -237,7 +263,8 @@ def routes(files, conclusion="success", threads=(), merged_last_hour=0, ticket_l
 
 
 class BrainMerge(unittest.TestCase):
-    ENV = {"LOOM_MERGE_SETTLE_SECONDS": "0", "LOOM_REVIEW_BOT": BOT}
+    ENV = {"LOOM_MERGE_SETTLE_SECONDS": "0", "LOOM_REVIEW_BOT": BOT,
+           "LOOM_BRIEF_AUTHORS": "loom-station[bot] loom-lanes[bot]"}
 
     def merge(self, **kw):
         fake = Route(routes(**kw))
@@ -276,17 +303,50 @@ class BrainMerge(unittest.TestCase):
                 self.assertIn(why, refused)
                 self.assertFalse(self.merged(fake))
 
-    def test_a_revert_tickets_own_pull_request_is_exempt(self):
-        fake, refused = self.merge(files=BUILD_WORKFLOW, ticket_labels=("loom:revert",),
-                                   title="Revert abc1234: Use the shared build socket",
-                                   body="## Summary\ngit revert --no-edit abc1234\n",
-                                   merged_last_hour=9)
+    # The merged commit a revert undoes, and its exact inverse.
+    FORWARD = "@@ -1 +1 @@\n-buildctl-daemonless.sh build\n+buildctl --addr unix:///sock build"
+    INVERSE = "@@ -1 +1 @@\n-buildctl --addr unix:///sock build\n+buildctl-daemonless.sh build"
+
+    def revert(self, **kw):
+        args = dict(files=BUILD_WORKFLOW, ticket_labels=("loom:revert",),
+                    title="Revert abc1234: Use the shared build socket",
+                    body="## Summary\ngit revert --no-edit abc1234\n", merged_last_hour=9,
+                    patches={BUILD_WORKFLOW[0]: self.INVERSE},
+                    commit_files=[{"filename": BUILD_WORKFLOW[0], "patch": self.FORWARD}])
+        args.update(kw)
+        return self.merge(**args)
+
+    def test_a_proven_revert_is_exempt_from_tier_and_caps(self):
+        fake, refused = self.revert()
         self.assertEqual(refused, "")
         self.assertTrue(self.merged(fake))
-        # A lane cannot claim the exemption by its title alone.
-        fake, refused = self.merge(files=BUILD_WORKFLOW, title="Revert abc1234: x",
-                                   body="## Summary\ngit revert --no-edit abc1234\n")
-        self.assertIn("held for the operator", refused)
+
+    def test_an_unproven_revert_takes_the_normal_gates(self):
+        # Security review: the label and the title alone exempted it.
+        for kw in ({"ticket_labels": ()},
+                   {"labeler": "loom-lanes[bot]"},
+                   {"labeler": "someone-else"},
+                   {"patches": {BUILD_WORKFLOW[0]: self.FORWARD}},
+                   {"commit_files": [{"filename": "other.py", "patch": self.FORWARD}]},
+                   {"carried": "diverged"},
+                   {"body": "## Summary\nRevert it.\n"}):
+            with self.subTest(kw=kw):
+                fake, refused = self.revert(**kw)
+                self.assertIn("held for the operator", refused)
+                self.assertFalse(self.merged(fake))
+
+    def test_a_finding_on_a_later_page_of_threads_blocks(self):
+        # Security review: only the first page of review threads was read.
+        dead = thread(Findings.DEAD)
+        fake, refused = self.merge(files=APP_CHANGE, pages=[[thread(Findings.STYLE, resolved=True)]
+                                                            for _ in range(2)] + [[dead]])
+        self.assertIn("medium dead-code", refused)
+        self.assertFalse(self.merged(fake))
+
+    def test_threads_that_cannot_be_read_in_full_refuse(self):
+        fake, refused = self.merge(files=APP_CHANGE, pages=None, threads=None)
+        self.assertIn("could not read the review threads", refused)
+        self.assertFalse(self.merged(fake))
 
 
 class FactoryHold(Base):

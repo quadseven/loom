@@ -384,7 +384,7 @@ def brain_routes(body, files, patches):
     details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work",
                "headRefOid": "checked", "headRepository": {"nameWithOwner": BRAIN_REPO},
                "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
-               "reviewThreads": {"nodes": []},
+               "reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": False}},
                "files": {"totalCount": len(files), "nodes": [{"path": f} for f in files]}}
     ticket = {"number": 9, "state": "open", "body": TICKET_BODY if "Leave" in body else "x",
               "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
