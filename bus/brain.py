@@ -1479,7 +1479,7 @@ def brief_intake(gh: GitHub, repo: str, goal: int, title: str, body: str,
     return brief(gh, repo, None, title, body, *args, intake_of=goal, **kwargs)
 
 
-def _parent_number(issue: Dict[str, Any]) -> Optional[int]:
+def _sub_issue_parent(issue: Dict[str, Any]) -> Optional[int]:
     """The number of the issue's sub-issue parent, from parent_issue_url."""
     match = re.search(r"/issues/(\d+)(?:[/?#]|$)", str(issue.get("parent_issue_url") or ""))
     return int(match.group(1)) if match else None
@@ -1495,7 +1495,7 @@ def _link_to_goal(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any],
     parent unless it is told to replace the first, and the issue then stayed
     under its goal and in no epic (loom#951)."""
     payload: Dict[str, Any] = {"sub_issue_id": issue["id"]}
-    if under is not None and _parent_number(issue) == under:
+    if under is not None and _sub_issue_parent(issue) == under:
         payload["replace_parent"] = True
     try:
         gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal), payload)
