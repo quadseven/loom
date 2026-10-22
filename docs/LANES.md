@@ -475,7 +475,9 @@ line and a link; a count of the goal homes where nothing moved; and the
 factory's daily numbers, which then no longer go out on their own. Each time
 is sent once, and a failed send is tried again on the next pass. Switching
 the digest on sends nothing until the next digest time. Setting
-`LOOM_REPORT_DIGEST_TIMES` empty forwards each report as below.
+`LOOM_REPORT_DIGEST_TIMES` empty forwards each report as below. Neither
+pushes a report whose goal was quiet since the report before it
+(docs/BRAIN.md, Quiet goals); the digest counts that goal as quiet.
 
 Each report on its own: the station also reads comments on open `loom:goal`
 issues in each `LOOM_REPOS` repo. On first run it records the newest report comment per repo

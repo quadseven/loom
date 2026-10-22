@@ -312,7 +312,14 @@ this tick"; a step with no note shows nothing there.
    report once the last report is 5 hours 45 minutes old, so no goal's
    report passes 6 hours; never hand an owed report to another brain.
    A goal listed as `report HELD` already has a report under 90 minutes old
-   (the station's included): skip it this tick. Each lane
+   (the station's included): skip it this tick. A goal whose line says
+   `quiet since <time>` is quiet since its last report (no ticket opened,
+   merged, shipped, verified, failed or closed, no breach, no ask, nothing
+   stuck, the same metric numbers; docs/BRAIN.md, Quiet goals): it is owed
+   no report and is not listed, so write none for it. A goal listed as
+   `report HEARTBEAT` has been quiet for a week: write its report as usual,
+   and `journal` edits it into your last report there instead of posting a
+   new one. Each lane
    pull request's line ends in `READY`
    or `blocked:` and its blockers; take that verdict as given rather than
    re-deriving it from the review list.
@@ -509,8 +516,9 @@ this tick"; a step with no note shows nothing there.
    the step's name from the list above (lock, status, merge, verify, failed,
    asks, brief, triage, journal, unlock): the station files a ticket when one
    brain's two ticks in a row carry such a line (docs/LANES.md, Invariants).
-   Every 6 hours per goal (when status lists the goal as due or overdue),
-   also post the report: a separate comment on the goal
+   Every 6 hours per goal (when status lists the goal under "Reports owed
+   before unlock" as due, overdue or heartbeat; a quiet goal is not
+   listed and gets no report), also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line
    `<!-- loom:report v1 -->` followed by the report itself, written as a
    standup the operator can read in thirty seconds on a phone:
@@ -538,7 +546,10 @@ this tick"; a step with no note shows nothing there.
    posts no report within 90 minutes of another report on the same goal
    home, the Loom App's included: it prints `not posted:` with that
    report's author and time and exits 0. The goal is reported; that is not
-   a failed step.
+   a failed step. It also posts no report for a goal quiet since its last
+   report: it prints `not posted: quiet since <time>` and exits 0, also not
+   a failed step, since every new report emails the goal's author. A
+   heartbeat (once a quiet week) is edited into the last report in place.
 10. First run `python3 -m bus.brain step unlock --holder muse`. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
     failure as well.
 11. End the tick's chat reply in the same standup shape as the reports

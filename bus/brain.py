@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
-from . import audit, change_class, handoff, hunt_plan, journal, lock, notify, pr_repair, proof, stale_claims, text, tickets
+from . import audit, change_class, handoff, hunt_plan, journal, lock, notify, pr_repair, proof, quiet, stale_claims, text, tickets
 from . import merge_tier, naming, operator_hold, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
@@ -159,7 +159,8 @@ def _status_goal_fields(goal_ids: Sequence[int]) -> List[str]:
     """GraphQL aliases for the latest comments on each goal issue."""
     # __typename: GraphQL names the Loom App "<slug>" without "[bot]", and
     # only a Bot author gains the suffix that LOOM_BRIEF_AUTHORS carries.
-    return ["g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt"
+    # updatedAt: a quiet goal's heartbeat edits its last report (bus/quiet.py).
+    return ["g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt updatedAt"
             " author { __typename login } } } }" % (n, n)
             for n in goal_ids]
 
@@ -320,15 +321,58 @@ def _owed_line(issue: Dict[str, Any], led: Dict[str, Any], comments: List[Dict[s
         issue["number"], led["state"].upper(), led["due"] or "an unknown time")
 
 
+def goal_breaches(issues: Sequence[Dict[str, Any]], goal: int) -> List[Dict[str, Any]]:
+    """The open loom:invariant issues among `issues` that name the goal."""
+    return [i for i in issues if isinstance(i, dict) and "pull_request" not in i
+            and i.get("state", "open") == "open" and quiet.INVARIANT_LABEL in _labels(i)
+            and _names_goal(i.get("body"), goal)]
+
+
+def goal_quiet(gh: GitHub, repo: str, goal: int, authors: Optional[Sequence[str]] = None,
+               now: Optional[datetime] = None) -> Optional[quiet.Quiet]:
+    """Whether the goal is quiet since its last report (bus/quiet.py), read
+    the way status reads it: its comments, its tickets and the open breaches
+    that name it. `python3 -m bus journal` asks this before a report."""
+    comments = gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, goal))
+    breaches = goal_breaches(gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                         % (repo, quiet.INVARIANT_LABEL)), goal)
+    return quiet.quiet(comments, goal_children(gh, repo, goal), breaches,
+                       now or datetime.now(timezone.utc), authors)
+
+
+def _quiet_lines(still: Optional[quiet.Quiet]) -> List[str]:
+    """A quiet goal's line under it in status, else none."""
+    if still is None:
+        return []
+    return ["  - quiet since %s: no report owed; heartbeat from %s"
+            % (_iso(still.since), _iso(still.next_heartbeat()))]
+
+
+def _owed_lines(issue: Dict[str, Any], led: Dict[str, Any], comments: List[Dict[str, Any]],
+                now: datetime, authors: Optional[Sequence[str]],
+                still: Optional[quiet.Quiet]) -> List[str]:
+    """A due or overdue goal's line under "Reports owed before unlock": none
+    for a quiet goal, a HEARTBEAT line once it has been quiet a week."""
+    if still is None:
+        return [_owed_line(issue, led, comments, now, authors)]
+    if not still.heartbeat_due(now):
+        return []
+    return ["- #%s report HEARTBEAT: quiet since %s and its last report was touched %s; "
+            "`journal` edits the report in place, no new comment" % (
+                issue["number"], _iso(still.since), _iso(still.touched))]
+
+
 def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime,
                 authors: Optional[Sequence[str]] = None, gh: Optional[GitHub] = None,
-                repo: str = "") -> List[str]:
+                repo: str = "", issues: Sequence[Dict[str, Any]] = ()) -> List[str]:
     lines = ["### Goals"]
     owed = []
     limit = unverified_limit()
     for issue in goals:
         node = data["goals"].get(int(issue["number"])) or {}
         led = goal_ledger(issue, node, now, authors)
+        comments = (node.get("comments") or {}).get("nodes") or []
+        still: Optional[quiet.Quiet] = None
         lines.append("- #%s %s - latest journal %s, report %s, measure %s, action %s"
                      " - report %s (due %s)" % (
                          issue["number"], issue.get("title", ""),
@@ -352,9 +396,13 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
             if held > limit:
                 lines.append("  - OVER LIMIT: the station claims no new build ticket and the "
                              "brain files no ordinary brief for this goal until it is back under")
-        comments = (node.get("comments") or {}).get("nodes") or []
+            # loom#1534: a goal where nothing moved is owed no report; each
+            # one emailed its author "nothing moved" four times a day.
+            still = quiet.quiet(comments, _flatten(loose, tree),
+                                goal_breaches(issues, int(issue["number"])), now, authors)
+            lines += _quiet_lines(still)
         if led["state"] != "ok":
-            owed.append(_owed_line(issue, led, comments, now, authors))
+            owed += _owed_lines(issue, led, comments, now, authors, still)
         found = handoff.journals(
             [{"body": c.get("body"), "at": c.get("createdAt"),
               "login": rest_login(c.get("author"))} for c in comments], authors or ())
@@ -744,7 +792,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     warn = _trunk_warning(goals, data)
     if warn:
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
-    lines += _goal_lines(goals, data, now, authors, gh, repo) + [""]
+    lines += _goal_lines(goals, data, now, authors, gh, repo, issues) + [""]
     lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
