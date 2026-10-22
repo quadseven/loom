@@ -1308,6 +1308,14 @@ re-reading the review list. `bus.brain merge` keeps its own checks.
 When a trusted brain fix is still pending on the linked ticket, status adds
 `pending brain fix` to the blockers instead of marking the pull request READY.
 
+Status also prints a "Waiting on the brain" section: every open lane pull
+request whose ticket carries `needs-brain`, oldest first, with its ticket,
+its age in hours and its merge-ready line. The factory sets `needs-brain`
+when a ticket runs out of fix rounds as well as for a sensitive change, and a
+logic pull request with failing checks appeared in no other section, so it
+waited until the `lane-pr-stalled` invariant filed it (loom#1411). The brain
+takes these first: merge it, or send it back with `bus.brain fix`.
+
 ## Merge by change class
 
 Every lane pull request carries one change class (`class:<name>`, set by the

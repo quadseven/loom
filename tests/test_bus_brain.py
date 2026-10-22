@@ -534,6 +534,44 @@ class SensitiveResumeTests(unittest.TestCase):
         lines_pure = brain._pull_request_lines(no_authors, REPO, [pr], data, bot)
         self.assertEqual(lines_pure, ["### Pull requests", "- #4 PR - READY"])
 
+    def test_status_lists_a_needs_brain_lane_pr_that_is_not_sensitive(self):
+        # loom#1411: a logic-class pull request whose ticket ran out of fix
+        # rounds (needs-brain) with failing checks was in no status section.
+        ticket = {"number": 7, "title": "Wall", "created_at": "2020-01-01T00:00:00Z",
+                  "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}, {"name": "needs-brain"}]}
+        pr = {"number": 9, "title": "Wall chat", "head": {"ref": "loom/7-wall", "sha": "h"},
+              "created_at": "2020-01-01T00:00:00Z", "labels": [{"name": "class:logic"}]}
+        node = reply(200, {"data": {"repository": {"p9": ready_node(checks="FAILURE")}}})
+
+        def transport(method, url, headers, body):
+            if "/graphql" in url:
+                return node
+            return reply(200, [pr] if "/pulls" in url else [ticket] if url.endswith(
+                "/issues?state=open&per_page=100") or "/issues?" in url else [])
+
+        report = brain.status(GitHub("t", transport=transport), [REPO], REPO, env={}, authors=())
+        lines = report.splitlines()
+        at = lines.index("### Waiting on the brain")
+        self.assertRegex(lines[at + 1],
+                         r"^- #9 Wall chat - ticket #7 - \d+h old - blocked: checks failure$")
+
+    def test_waiting_brain_lines_skip_tickets_without_the_label_or_a_pr(self):
+        now = datetime(2030, 1, 1, 5, 0, 0, tzinfo=timezone.utc)
+        waiting = {"number": 7, "labels": [{"name": "needs-brain"}]}
+        plain = {"number": 8, "labels": [{"name": "loom:pr"}]}
+        no_pr = {"number": 10, "labels": [{"name": "needs-brain"}]}
+        old = {"number": 9, "title": "Old", "created_at": "2030-01-01T00:00:00Z"}
+        newer = {"number": 6, "title": "New", "created_at": "2030-01-01T03:00:00Z"}
+        pr_of = {7: newer, 8: {"number": 5, "title": "Plain", "created_at": "2030-01-01T00:00:00Z"},
+                 11: old}
+        both = [waiting, plain, no_pr, {"number": 11, "labels": [{"name": "needs-brain"}]}]
+        lines = brain._waiting_brain_lines(both, pr_of, {"prs": {}}, now, "bot")
+        self.assertEqual(lines[0], "### Waiting on the brain")
+        self.assertEqual([l.split(" - ")[0] for l in lines[1:]], ["- #9 Old", "- #6 New"])
+        self.assertIn("5h old", lines[1])
+        self.assertEqual(brain._waiting_brain_lines([plain], pr_of, {"prs": {}}, now, "bot"),
+                         ["### Waiting on the brain", "- none"])
+
     def test_sensitive_pr_lines_helper(self):
         sensitive_pr = {"number": 4, "title": "Sensitive", "labels": [{"name": "class:sensitive"}]}
         ordinary_pr = {"number": 5, "title": "Ordinary", "labels": []}
