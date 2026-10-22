@@ -52,7 +52,7 @@ class AgentSandboxTest(unittest.TestCase):
 
     def bash(self, script, *args, lane="opencode-go", **env):
         full = dict(os.environ, HOME=str(self.home), AGENT_HOME=str(self.scratch), LANE=lane,
-                    SKILLS=str(self.root / "no-skills"), **env)
+                    AGY_HOME=str(self.scratch), SKILLS=str(self.root / "no-skills"), **env)
         return subprocess.run(["bash", "-c", '. "$1"; shift; ' + script, "bash", str(SANDBOX),
                                str(self.tree), *args],
                               capture_output=True, text=True, env=full, timeout=60)
@@ -116,6 +116,7 @@ class AgentSandboxTest(unittest.TestCase):
                            profile.index(NET_DENY))
         self.assertIn('(deny mach-lookup (global-name "com.apple.SecurityServer")', profile)
         self.assertIn('(literal "/usr/bin/security")', profile)
+        self.assertIn(f'(deny file-read* (subpath "{self.scratch}/Library/Keychains"))', profile)
         # An arbitrary port on an arbitrary host is not allowed.
         self.assertNotIn('(allow network-outbound (remote ip "*:80"))', profile)
 

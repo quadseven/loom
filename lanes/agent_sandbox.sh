@@ -88,7 +88,7 @@ sandbox_profile() {
     *) echo "refusing sandbox: unknown mode $3" >&2; return 1 ;;
   esac
   [ "$LANE" = agy ] && [ "${3:-}" != check ] && { api_network="$(api_rules network)" || return 1; agy_lane=1; }
-  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule=""
+  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule="" agy_keychain_deny=""
   if [ -n "${4:-}" ]; then
     [[ "$4" =~ ^[0-9]+$ ]] && [ "$4" -ge 49152 ] && [ "$4" -le 65535 ] ||
       { echo "refusing sandbox: loopback port $4 is not in 49152-65535" >&2; return 1; }
@@ -96,6 +96,9 @@ sandbox_profile() {
   fi
   home="$(cd "$HOME" && pwd -P)"
   tree="$(cd "$1" && pwd -P)"
+  if [ "$LANE" = agy ] && [ -n "${AGY_HOME:-}" ]; then
+    agy_keychain_deny="(deny file-read* (subpath \"$(cd "$AGY_HOME" && pwd -P)/Library/Keychains\"))"
+  fi
   [ -d "$SKILLS" ] && skills="$(cd "$SKILLS" && pwd -P)"
   cli_link="$(command -v "$2")" && [ -n "$cli_link" ] || { echo "refusing sandbox: $2 not on PATH" >&2; return 1; }
   cli_real="$(realpath "$cli_link")" && [ -n "$cli_real" ] || { echo "refusing sandbox: cannot resolve $cli_link" >&2; return 1; }
@@ -142,6 +145,7 @@ sandbox_profile() {
   [ -n "$agy_lane" ] && agy_rules="$(agy_write_rules "$allow_rw")"
   printf '(version 1)\n(allow default)\n%s(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n%s(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su") (literal "/usr/bin/security"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n%s%s\n' \
     "$api_writes" "$home" "$allow_rw" "$agy_rules" "$tree" "$allow_ro" "$skills_rules" "$meta" "$keychain_deny" "$api_network" "$loopback_rule"
+  [ -z "$agy_keychain_deny" ] || printf '%s\n' "$agy_keychain_deny"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
