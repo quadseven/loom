@@ -351,11 +351,11 @@ class FilingTest(WatchBase):
         # when transient); the station says so in its log, which is status.
         for line in (
                 "[2026-10-18T22:50:36Z] station: verify run example.repo-3-verify-1 failed [work]: "
-                "no verify.json written; example/repo#3 stays shipped and is tried again after 6 hours",
+                "no verify.json written; loom#3 stays shipped and is tried again after 6 hours",
                 "[2026-10-18T22:50:36Z] station: verify run example.repo-3-verify-1 failed [transient]; "
-                "example/repo#3 is due again now",
+                "loom#3 is due again now",
                 "[2026-10-18T22:50:36Z] station: verify run example.repo-3-verify-1 failed; "
-                "example/repo#3 stays shipped"):
+                "loom#3 stays shipped"):
             with self.subTest(line=line):
                 self.assertFalse(watch.keep(line))
         self.assertTrue(watch.keep("[2026-10-18T22:50:36Z] station: verify failed: boom"))
