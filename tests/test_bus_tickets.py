@@ -461,7 +461,7 @@ class VerifyBriefLiveEvidenceTest(unittest.TestCase):
 
 class BriefContextTest(unittest.TestCase):
     """A brief carries the operator's newest comments and the pull requests,
-    in any repo, that reference the ticket (infra#5502, 2026-10-22: a lane
+    in any repo, that reference the ticket (2026-10-22: a lane
     redid a wrong target the operator had named in a comment, while the real
     fix had merged in two other repos)."""
 
@@ -500,18 +500,18 @@ class BriefContextTest(unittest.TestCase):
                       "number": 8, "repository": {"full_name": "example-owner/x"}}}},
                   {"event": "labeled"}]
         self.assertEqual(tickets.linked_pulls(events),
-                         ["example-owner/other#5, merged 2030-01-03: Real fix",
-                          "example-owner/third#6, open: In progress"])
+                         ["example-owner/other#5, merged 2030-01-03: Real fix",  # leak-guard-allow
+                          "example-owner/third#6, open: In progress"])  # leak-guard-allow
         self.assertEqual(tickets.linked_pulls({"message": "Not Found"}), [])
 
     def test_the_brief_quotes_each_note_and_lists_the_linked_pulls(self):
         notes = [("operator-one", "2030-01-02T00:00:00Z", "Model: x\nwrong target; the fix is elsewhere")]
         text = render_brief(REPO, self.ISSUE, "codex", notes=notes,
-                            linked=["example-owner/other#5, merged 2030-01-03: Real fix"])
+                            linked=["example-owner/other#5, merged 2030-01-03: Real fix"])  # leak-guard-allow
         self.assertIn("## Operator notes", text)
         self.assertIn("operator-one, 2030-01-02T00:00:00Z:\n> Model: x\n> wrong target; the fix is elsewhere\n", text)
         self.assertIn("## Linked pull requests", text)
-        self.assertIn("- example-owner/other#5, merged 2030-01-03: Real fix\n", text)
+        self.assertIn("- example-owner/other#5, merged 2030-01-03: Real fix\n", text)  # leak-guard-allow
         # No quoted line can read as a brief header the runner looks up.
         self.assertFalse([line for line in text.split("\n") if line.startswith("Model:")])
 

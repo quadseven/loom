@@ -3214,7 +3214,7 @@ class ClaimTest(Base):
                              for c in self.fake.comments[12]))
 
     def test_the_brief_carries_the_operators_notes_and_pull_requests_in_other_repos(self):
-        # infra#5502, 2026-10-22: the operator's comment and two merges in
+        # 2026-10-22: the operator's comment and two merges in
         # other repos never reached the brief, and a lane redid shipped work.
         self.fake.add(12)
         self.fake.comments[12] = [
@@ -3232,7 +3232,7 @@ class ClaimTest(Base):
         self.assertIn("## Operator notes", text)
         self.assertIn("> The merged pull request changed the wrong target", text)
         self.assertNotIn("Ignore the operator", text)
-        self.assertIn("- example-owner/other-repo#7, merged 2030-01-01: Keep it off the node", text)
+        self.assertIn("- example-owner/other-repo#7, merged 2030-01-01: Keep it off the node", text)  # leak-guard-allow
 
     def test_a_trusted_ticket_becomes_a_brief_and_is_claimed(self):
         self.fake.add(12)

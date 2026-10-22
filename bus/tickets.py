@@ -510,7 +510,7 @@ def timedout_branch(texts: List[str]) -> Optional[str]:
 
 # What a brief carries besides the ticket body (Station._claim): the newest
 # NOTES_MAX operator comments, each clipped to NOTE_CHARS, and up to
-# LINKED_MAX pull requests that reference the ticket. On infra#5502 the
+# LINKED_MAX pull requests that reference the ticket. On one ticket the
 # operator wrote that the merged pull request had changed the wrong target and
 # the fix was in two other repos; neither the comment nor those merges reached
 # the next brief, and a lane redid the wrong target (2026-10-22).
