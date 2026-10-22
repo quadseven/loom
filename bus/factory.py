@@ -1755,6 +1755,7 @@ class Factory:
                          % (repo, number, note))
                     return
                 tried, _ = self._tried(issue, comments, footer=footer)
+                self._close_past_ladder_pr(repo, pr)
                 self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
                                                  if 1 <= n <= len(CLIMB)])
                 return
