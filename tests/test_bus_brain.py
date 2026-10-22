@@ -2555,6 +2555,18 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual([c for c in fake.calls if c[0] in ("PUT", "PATCH")
                           or (c[0] == "POST" and "/graphql" not in c[1])], [])
 
+    def test_escalate_moves_a_finished_pull_request_with_a_pending_brain_fix(self):
+        routes = self.finished_pr_routes()
+        routes[("GET", "/issues/9/comments")] = reply(200, [
+            claim("2030-01-01T00:10:00Z", "codex"), fixc("2030-01-01T00:20:00Z"),
+            claim("2030-01-01T00:25:00Z", "codex"), fixc("2030-01-01T00:30:00Z"),
+            {"body": "<!-- loom:fix v1 -->\n<!-- loom:brain-fix v1 --> unmet criterion",
+             "user": {"login": "trusted"}, "created_at": "2030-01-01T00:40:00Z"}])
+        fake = Routed(routes)
+        with unittest.mock.patch.dict(os.environ, {"LOOM_REVIEW_CHECK": "", "LOOM_BRIEF_AUTHORS": "trusted"}):
+            outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+
     def test_escalate_still_sends_back_a_pull_request_with_something_to_fix(self):
         # An outsider's pull request (a fork, or an author outside
         # LOOM_BRIEF_AUTHORS) that merely matches the ticket by branch name is

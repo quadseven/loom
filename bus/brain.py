@@ -4656,7 +4656,10 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     if not history.reasons:
         raise ValueError("ticket is not repeatedly stuck")
     open_pr = int(found_pr["number"]) if found_pr is not None else None
-    finished = _nothing_to_fix(gh, repo, open_pr) if open_pr is not None else None
+    pending_brain_fix = open_pr is not None and _pending_brain_fix(
+        gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)), trusted_authors())
+    finished = (_nothing_to_fix(gh, repo, open_pr)
+                if open_pr is not None and not pending_brain_fix else None)
     if finished:
         raise ValueError("ticket is not escalated: %s; land it instead" % finished)
     private: List[bool] = []
