@@ -1355,7 +1355,8 @@ class Factory:
                  human: Callable[..., Any] = brain.human,
                  place: Callable[..., Any] = brain.place_under_epic,
                  plan_check: str = DEFAULT_PLAN_CHECK,
-                 scope: Optional[scope_fit.Ask] = None) -> None:
+                 scope: Optional[scope_fit.Ask] = None,
+                 demoted: Optional[Dict[str, str]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1377,6 +1378,10 @@ class Factory:
         # aside as from a limit. Left to the BRIEFED_STALL move, three tickets
         # waited two hours on lanes whose key had expired (2026-10-19).
         self.down = set(down)
+        # Lane slots demoted for bad work (bus/scorecard.py), and why: down
+        # for build tickets until the operator clears them.
+        self.demoted = dict(demoted or {})
+        self.down |= set(self.demoted)
         # Lane -> epoch its limit lifts, from its heartbeat (retry_at).
         self.limit_until = dict(limit_until or {})
         # Lane -> {model: epoch its limit lifts}: a lane with a model ladder
@@ -2890,6 +2895,13 @@ class Factory:
             or self.model_limits.get(lane, {}).get(model, 0) > later
             for lane in lanes)
 
+    def _aside_why(self, lane: str) -> str:
+        """Why a ticket steps off the lane: demoted (bus/scorecard.py), down,
+        or at a limit."""
+        if lane in self.demoted:
+            return "demoted (%s; the operator clears it)" % self.demoted[lane]
+        return "down" if lane in self.down and lane not in self.limited else "at a limit"
+
     def _step_aside(self, repo: str, issue: Dict[str, Any]) -> None:
         """Move a ticket off a lane at a limit (or down) to the first free lane of its
         difficulty tier (or of a FALLBACK tier when none of its tier is up),
@@ -2901,7 +2913,7 @@ class Factory:
         if RUNAWAY in _labels(issue) or "needs-brain" in _labels(issue):
             return  # held for the brain: it moves nothing (loom#1224)
         old = _lane(issue)
-        why = "down" if old in self.down and old not in self.limited else "at a limit"
+        why = self._aside_why(old)
         rung = current_rung(issue)
         fallback = ""
         if rung:

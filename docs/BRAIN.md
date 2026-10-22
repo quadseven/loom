@@ -1558,6 +1558,31 @@ failed signal and both pull requests; with no webhook set up, the message
 goes on the merged ticket. A revert is never watched, so Loom never reverts
 a revert. Each merge's watch is kept in the station's `deploy-watch.json`.
 
+## Lane scorecard
+
+Each lane and model keeps a scorecard (`bus/scorecard.py`), and a lane that
+ships bad work is demoted. Once an hour the station reads each repo's newest
+closed lane pull requests (a `loom/` branch, a trusted author, and the
+runner's footer naming the lane and model) and records per pull request its
+review outcome (clean, findings, or bad-work: a finding from
+`bus/merge_tier.py`'s bad-work rules), its send-backs (the fix briefs on its
+ticket), whether it merged, whether a merged revert undid it, and whether the
+post-merge watch found its deploy failed. Failed proof audits count against
+the lane that made the proof. The 2026-10-22 audit's verdicts seed the
+scorecard, aggregated per lane and model.
+
+A bad outcome is a bad-work finding, a revert, a failed deploy, a failed
+proof audit or a damaging audit verdict. A lane (all its slots) whose bad
+outcomes over the last `LOOM_LANE_DEMOTE_DAYS` days (default 7) reach
+`LOOM_LANE_DEMOTE_AT` (default 3) is demoted: it claims no build ticket, its
+briefed tickets step aside to other lanes with a status event naming the
+demotion and its counts, and it stays demoted until the operator runs
+`python3 -m bus.scorecard clear <lane>` (`show` prints the table). Clearing
+forgets the outcomes before it. A demoted lane still takes verify runs. A
+repo that cannot be read keeps its records, and nothing is cleared by an
+error. The table goes on the lane status comment, and the dashboard's Lanes
+page shows it as Scorecard.
+
 ## Pull requests without a ticket
 
 A pull request with no ticket (no `Refs` line and no `loom/` branch) that a

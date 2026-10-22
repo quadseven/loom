@@ -249,11 +249,12 @@ class LaneSectionsTest(unittest.TestCase):
     def test_sections_come_in_order_each_with_a_heading_and_a_note(self):
         order = [self.html.index(marker) for marker in (
             'class="section lanes-summary"', 'class="section lanes-now"',
-            'class="section lanes-routing"', 'class="section lanes-models"')]
+            'class="section lanes-routing"', 'class="section lanes-scorecard"',
+            'class="section lanes-models"')]
         self.assertEqual(order, sorted(order))
-        for title in ("Lanes now", "How tickets are routed", "Pull requests by model"):
+        for title in ("Lanes now", "How tickets are routed", "Scorecard", "Pull requests by model"):
             self.assertIn('">%s</h2>' % title, self.html)
-        self.assertEqual(self.html.count('<p class="section-note">'), 3)
+        self.assertEqual(self.html.count('<p class="section-note">'), 4)
         self.assertTrue(self.html.isascii())
 
     def test_summary_counts_each_state_and_shows_the_anthropic_share(self):

@@ -258,11 +258,14 @@ minutes: ... counted (by kind), ... not modified").
 `/lanes` reads top to bottom. A summary strip counts the lanes held, working
 and ready, shows the Anthropic share of lane runs against its 50% cap, and
 lists the held lanes grouped by their reason under "Needs attention". Then
-three sections, each with a one-line note: "Lanes now" (one card per lane,
+four sections, each with a one-line note: "Lanes now" (one card per lane,
 held first, then working, then ready, in slot order), "How tickets are
 routed" (the `bus/factory.py` tiers and model ladder, each lane marked with
-its state now) and "Pull requests by model" (lane pull requests counted by
-footer model, easy to hard).
+its state now), "Scorecard" (per lane and model: review outcomes,
+send-backs, merges, reverts, failed deploys, failed proof audits and the
+audit's verdicts, demoted lanes first, read from the scorecard table on the
+station's lane status comment, `bus/scorecard.py`) and "Pull requests by
+model" (lane pull requests counted by footer model, easy to hard).
 
 A lane's hold reason comes from its last heartbeat, which the lane rewrites
 only on its next pass. A hold whose until-time has passed is read as ended

@@ -612,6 +612,43 @@ def _lane_summary(lanes, share):
             % ("".join(tiles), attention))
 
 
+# The scorecard columns shown, by the station's column name (bus/scorecard.py).
+SCORECARD_SHOWN = (("prs", "PRs"), ("clean", "clean"), ("findings", "findings"),
+                   ("bad-work", "bad work"), ("sent back", "sent back"), ("merged", "merged"),
+                   ("reverted", "reverted"), ("deploy failed", "deploy failed"),
+                   ("audit failed", "proof audit failed"), ("audit damaging", "audit damaging"))
+
+
+def _scorecard_section(rows):
+    """Per lane and model: review outcomes, send-backs, reverts, failed
+    deploys and audit verdicts, with the demoted lanes first."""
+    esc = html.escape
+    if not rows:
+        return _section("scorecard", "Scorecard",
+                        "Each lane and model's review outcomes, send-backs, reverts, failed "
+                        "deploys and audit verdicts.",
+                        '<p class="empty-state">Scorecard is missing: the lane status comment '
+                        'holds no scorecard table.</p>')
+    order = sorted(rows, key=lambda r: (not r["demoted"], r["lane"], r["model"]))
+    head = "".join("<th>%s</th>" % esc(word) for _, word in SCORECARD_SHOWN)
+    body = "".join(
+        '<tr class="%s"><th scope="row">%s%s</th><td>%s</td>%s</tr>' % (
+            "scorecard-demoted" if r["demoted"] else "", esc(r["lane"]),
+            ' <span class="machine-fact">demoted</span>' if r["demoted"] else "",
+            esc(r["model"] if r["model"] != "-" else "any"),
+            "".join("<td>%d</td>" % int(r["counts"].get(key, 0)) for key, _ in SCORECARD_SHOWN))
+        for r in order)
+    demoted = sorted({r["lane"] for r in rows if r["demoted"]})
+    table = ('<div class="scorecard-scroll"><table class="results-table scorecard"><thead><tr><th>lane</th>'
+             '<th>model</th>%s</tr></thead><tbody>%s</tbody></table></div>' % (head, body))
+    return _section("scorecard", "Scorecard",
+                    "Each lane and model's lane pull requests over the station's window: review "
+                    "outcome, send-backs, merges, reverts and failed deploys, failed proof audits, "
+                    "and the 2026-10-22 audit's verdicts. A demoted lane takes no build ticket "
+                    "until the operator clears it.",
+                    table, "%d demoted" % len(demoted) if demoted else "none demoted")
+
+
 def render_lanes(data):
     lanes = list(data.get("lanes") or [])
     states = {lane["lane"]: lane_state(lane) for lane in lanes}
@@ -647,6 +684,7 @@ def render_lanes(data):
                 % "".join(_tier_card(tier, board[tier]) for tier in order))
     else:
         body = '<p class="empty-state">Scoreboard is missing: no lane pull requests matched the runner footer.</p>'
+    parts.append(_scorecard_section(data.get("scorecard") or []))
     parts.append(_section("models", "Pull requests by model",
                           "Lane pull requests counted by the model their footer names, by ticket difficulty, "
                           "most first. Bars share one scale within a difficulty.",

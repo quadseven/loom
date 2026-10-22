@@ -61,6 +61,7 @@ from . import transcripts
 from . import brief_check
 from . import criteria_gate
 from . import deploy_watch
+from . import scorecard
 from . import watch
 from . import labels
 from .brain import HUMAN_MARKER
@@ -2468,6 +2469,7 @@ class Station:
         self._release_dead_lane_runaways(free)
         # A starved shipped ticket takes one free lane ahead of build work.
         free = self._reserve_verify(free)
+        free = self._not_demoted(free)
         if not free:
             self._claim_candidates([])
             self._record_slot_sample(False)
@@ -6040,8 +6042,14 @@ class Station:
             + ["| %s | %s | %s |" % row for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
+            + self._scorecard_lines()
             + (["", summary.line()] if summary is not None else []))
         return body
+
+    def _scorecard_lines(self) -> List[str]:
+        """The lane scorecard's table, for the lane status comment the
+        dashboard's Lanes page reads."""
+        return scorecard.Scorecard(self.state, self.now).markdown()
 
     def _remote_claim_count(self, lane: str) -> int:
         saved = _read_json(os.path.join(self.state, "remote-status.json"), {}, strict=False)
@@ -6105,6 +6113,9 @@ class Station:
             # for the hourly republish.
             values["anthropic spend"] = "%d runs, $%.2f, budget %s" % (
                 summary.runs, summary.spent, self.s.anthropic.usd)
+        # A changed scorecard (bus/scorecard.py) republishes too.
+        values["scorecard"] = hashlib.sha256("\n".join(
+            self._scorecard_lines()).encode("utf-8")).hexdigest()[:16]
         if self._lanes_unchanged(repo, values):
             return
         number = self._lanes_issue(repo)
@@ -9350,6 +9361,40 @@ class Station:
     def _bench_list(self) -> Any:
         return _read_json(os.path.join(self.state, "bench.json"), None, strict=False)
 
+    def score_lanes(self) -> None:
+        """Refresh the lane scorecard once an hour and demote the lanes whose
+        bad outcomes reach LOOM_LANE_DEMOTE_AT (bus/scorecard.py). Runs with
+        the factory; LOOM_FACTORY=0 turns it off."""
+        card = scorecard.Scorecard(self.state, self.now)
+        if not self.s.factory_on or not card.due():
+            return
+        repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
+        try:
+            failed = audit.held(self.gh, self._verify_repos(), self.s.authors, self.now)
+        except GitHubError as err:
+            _say("scorecard: the failed proof audits could not be read: %s" % err)
+            failed = {}
+        ledger = _read_json(os.path.join(self.state, deploy_watch.LEDGER), {}, strict=False)
+        merges = ledger.get("merges") if isinstance(ledger, dict) else None
+        card.refresh(self.gh, repos, self.s.authors, self.s.review_bot, failed,
+                     merges if isinstance(merges, dict) else {})
+        card.save()
+
+    def _not_demoted(self, free: List[str]) -> List[str]:
+        """The free lanes that may claim a build ticket: a demoted lane
+        takes none (bus/scorecard.py)."""
+        demoted = self.demoted_lanes()
+        return [lane for lane in free if lane not in demoted]
+
+    def demoted_lanes(self) -> Dict[str, str]:
+        """Each lane slot the scorecard demoted, and why. A scorecard file
+        that cannot be read demotes every lane: its demotions are unknown."""
+        card = scorecard.Scorecard(self.state, self.now)
+        if card.unreadable:
+            _say("every lane takes no build ticket: %s" % card.unreadable)
+            return {lane: card.unreadable for lane in LANES}
+        return scorecard.demoted_slots(card.demoted(), LANES)
+
     def benched_pairs(self) -> List[Tuple[str, str]]:
         """The (provider, model) pairs the bench list holds benched now."""
         return bench.benched_pairs(self._bench_list(), self.now)
@@ -9378,6 +9423,7 @@ class Station:
                                held=list(self._held_tickets()) + self._gate_held(),
                                silent=self._silent_lanes(),
                                down=self.down_lanes() + self.benched_lanes(pairs),
+                               demoted=self.demoted_lanes(),
                                benched=pairs,
                                limit_until=self.limit_until(),
                                known_waits=self._saved_waits(), **extra)
@@ -10083,7 +10129,7 @@ class Station:
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
-                     self.watch_default_branches, self.watch_deploys,
+                     self.watch_default_branches, self.watch_deploys, self.score_lanes,
                      self.refresh_bench, self.run_factory,
                      # The move first, so the invariants read a goal whose
                      # tickets sit under an epic.
