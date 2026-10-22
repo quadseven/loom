@@ -402,11 +402,17 @@ class HardModelBriefTest(unittest.TestCase):
         issue = {"number": 9, "title": "T", "body": body}
         return render_brief(REPO, issue, lane).split("# T9")[0]
 
-    def test_a_hard_ticket_on_codex_renders_gpt_6_sol(self):
-        self.assertIn("\nModel: gpt-6-sol\n", self.head("Difficulty: hard\n\nWhy\n", "codex"))
-        self.assertIn("\nModel: gpt-6-sol\n", self.head("Difficulty: hard\n\nWhy\n", "codex-2"))
-        self.assertIn("\nModel: gemini-4-argon-high\n",
-                      self.head("Difficulty: hard\n\nWhy\n", "agy"))
+    def test_a_hard_ticket_on_codex_or_agy_keeps_the_lane_default(self):
+        # Until 2026-10-21 these pinned gpt-6-sol and gemini-4-argon-high,
+        # which the operator forbids (tickets.FORBIDDEN_MODELS).
+        for lane in ("codex", "codex-2", "agy"):
+            self.assertNotIn("Model:", self.head("Difficulty: hard\n\nWhy\n", lane))
+
+    def test_a_forbidden_model_line_renders_its_allowed_stand_in(self):
+        self.assertIn("\nModel: gpt-6-luna\n",
+                      self.head("Model: gpt-6-sol\nDifficulty: hard\n\nWhy\n", "codex"))
+        self.assertIn("\nModel: gemini-3.8-flash-high\n",
+                      self.head("Model: gemini-4-argon-high\nDifficulty: hard\n\nWhy\n", "agy"))
 
     def test_a_medium_ticket_keeps_the_lane_default(self):
         self.assertNotIn("Model:", self.head("Difficulty: medium\n\nWhy\n", "codex"))

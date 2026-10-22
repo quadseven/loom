@@ -477,7 +477,7 @@ example:
 
 ```sh
 LOOM_REWRITE_CMD="lanes/rewrite_agent.sh <key-ssm> opencode-go/deepseek-v4.1-flash"
-LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh - codex/gpt-6-sol,claude/claude-opus-5-5"
+LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh - codex/gpt-6-luna,claude/claude-opus-5-5"
 ```
 
 `<key-ssm>` is the parameter the opencode-go lanes read

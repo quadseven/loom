@@ -2097,6 +2097,9 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
 
     When the goal home names a Trunk branch and no explicit --base is given,
     the ticket uses that branch as its base."""
+    if model:
+        # A forbidden model is written as its stand-in (tickets.allowed_model).
+        model = tickets.allowed_model(model)
     _check_brief_args(title, body, lane, model, base)
     if not_before is not None and not tickets.NOT_BEFORE_RE.fullmatch(not_before):
         raise ValueError("not-before is not a UTC time like 2026-10-13T17:00:00Z")
@@ -2642,7 +2645,7 @@ def _with_model(body: str, model: str) -> str:
     header = 0
     while header < len(lines) and HEADER_RE.fullmatch(lines[header].rstrip()):
         header += 1
-    line = "Model: " + model
+    line = "Model: " + tickets.allowed_model(model)
     for i in range(header):
         if lines[i].startswith("Model:"):
             lines[i] = line

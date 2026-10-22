@@ -206,10 +206,13 @@ ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
 # run_lane.sh reads this set (`python3 -m bus.factory credit-slots`).
 SHARED_CREDIT = ANTHROPIC
 # The operator's ladder, 2026-10-12: "sonnet 5.5, or codex sol or opus 5.5
-# worst case". Each rung lists the lanes that serve it, best first.
+# worst case"; since 2026-10-21 codex runs gpt-6-luna only (gpt-6-sol pins
+# spent the weekly codex limit in a day), so the codex rung is luna. Each
+# rung lists the lanes that serve it, best first. No rung, hard-tier pin or
+# equivalent may name a tickets.FORBIDDEN_MODELS model.
 LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
     (("claude",), "claude-sonnet-5-5"),
-    (("codex", "codex-2"), "gpt-6-sol"),
+    (("codex", "codex-2"), "gpt-6-luna"),
     (("claude",) + ANTHROPIC, "claude-opus-5-5"),
 )
 # The lanes a ticket may move to when its lane is at a limit, by its
@@ -246,10 +249,9 @@ TIERS: Dict[str, Tuple[str, ...]] = {
     "medium": SPARKS + ("muse", "agy") + FREE_POOL + ("openrouter", "workersai", "zen", "zai")
               + ("codex", "codex-2", "opencode-go", "opencode-go-2",
                  "opencode-go-3", "opencode-go-4") + ANTHROPIC,
-    # agy runs Gemini 4 Argon on the operator's Google plan since 2026-10-15:
-    # Artificial Analysis Intelligence Index 53 at high effort, beside Claude
-    # Opus 5.5 high (54) and GPT-6.1 Sol high (50), so it takes hard work on
-    # public repos (agy stays public only).
+    # agy takes hard work on public repos (agy stays public only); since
+    # 2026-10-21 it runs its gemini-3.8-flash default there, as codex runs
+    # gpt-6-luna (tickets.FORBIDDEN_MODELS).
     "hard": SPARKS + ANTHROPIC + ("claude", "agy", "codex", "codex-2"),
 }
 # What a lane costs, for the dashboard's Tiers and allowances page (loom#968):
@@ -274,22 +276,16 @@ def lane_kind(lane: str) -> Optional[str]:
     return LANE_KINDS.get(labels.base_lane(lane))
 # The strongest model each lane has, for a hard ticket with no Model: line
 # (bus/tickets.py render_brief writes it into the brief, so run_lane.sh runs
-# it instead of the lane default). Artificial Analysis Intelligence Index at
-# high effort: Gemini 4 Argon 53, GPT-6.1 Sol 50; the codex lanes default to
-# gpt-6-luna, so a hard ticket on codex ran luna until 2026-10-17. Medium and
-# easy tickets keep the lane default.
-HARD_MODELS: Dict[str, str] = {"codex": "gpt-6-sol", "codex-2": "gpt-6-sol",
-                               "agy": "gemini-4-argon-high"}
+# it instead of the lane default). Empty since 2026-10-21: the codex and agy
+# pins were gpt-6-sol and gemini-4-argon-high, both tickets.FORBIDDEN_MODELS, so a
+# hard ticket runs each lane's default model.
+HARD_MODELS: Dict[str, str] = {}
 # A model pin another lane may serve with an equivalent model while every
 # lane of the pin is at a limit or down (not merely busy): the lanes, the
-# model they run, and why it is equivalent. Public repos only, as agy is.
-# On 2026-10-17 every Anthropic lane was out of credit for hours while five
-# tickets pinned to claude-opus-5-5 (index 54) waited; Gemini 4 Argon high
-# is 53.
-EQUIVALENTS: Dict[str, Tuple[Tuple[str, ...], str, str]] = {
-    "claude-opus-5-5": (("agy",), "gemini-4-argon-high",
-                        "Gemini 4 Argon high, index 53, while every Anthropic lane is out"),
-}
+# model they run, and why it is equivalent. Empty since 2026-10-21: the one
+# entry moved claude-opus-5-5 work to agy on gemini-4-argon-high, a
+# tickets.FORBIDDEN_MODELS model, and gemini-3.8-flash is no Opus equivalent.
+EQUIVALENTS: Dict[str, Tuple[Tuple[str, ...], str, str]] = {}
 
 
 def _climb_rungs() -> Tuple[Tuple[Tuple[str, ...], str], ...]:
@@ -307,9 +303,8 @@ def _climb_rungs() -> Tuple[Tuple[Tuple[str, ...], str], ...]:
     return LADDER + tuple((tuple(dict.fromkeys(lanes)), model) for model, lanes in extra.items())
 
 
-# The ladder's rungs and then Gemini 4 Argon high on agy (rung 4, public repos
-# only, as agy is). On 2026-10-17 a ticket Opus had failed five times was
-# given up on while gpt-6-sol and Gemini 4 Argon were never tried.
+# The ladder's rungs, then a rung for each EQUIVALENTS or HARD_MODELS model
+# the ladder lacks (none since 2026-10-21).
 CLIMB = _climb_rungs()
 # The strong models: the ladder's last rung, each lane's hard-tier model and
 # each equivalent. A ticket that ran on the last rung or past it climbs only
@@ -1041,8 +1036,8 @@ def climb_rungs(tried: set, reached: int = 0) -> List[int]:
     """The rungs of CLIMB a ticket may still climb to, in order: each one not
     in `tried` above `reached`, the highest rung the ladder itself moved it
     to. Once it ran on the ladder's last rung or past it, every untried
-    STRONG one instead: a ticket Opus failed goes on to gpt-6-sol and Gemini 4
-    Argon high, never back to claude-sonnet-5-5."""
+    STRONG one instead, never back to a weaker model: with Opus the only
+    strong model since 2026-10-21, a ticket Opus failed has none left."""
     if any(n >= len(LADDER) for n in tried | {reached}):
         return [n for n in range(1, len(CLIMB) + 1)
                 if n not in tried and CLIMB[n - 1][1] in STRONG]
@@ -1252,7 +1247,9 @@ def landing_order(prs: List[Dict[str, Any]], tickets: Dict[int, Dict[str, Any]],
 
 
 def with_model(body: str, model: str) -> str:
-    """The ticket body with its Model: header line set to `model`."""
+    """The ticket body with its Model: header line set to `model`, or to its
+    stand-in when it is forbidden (tickets.allowed_model)."""
+    model = tickets.allowed_model(model)
     head, sep, rest = body.partition("\n\n")
     if MODEL_LINE.search(head + "\n"):
         return MODEL_LINE.sub("Model: %s\n" % model, head + "\n", count=1).rstrip("\n") + sep + rest

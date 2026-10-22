@@ -155,7 +155,8 @@ class TierList(unittest.TestCase):
             for entry in tier["entries"]:
                 self.assertEqual(entry["kind"], factory.lane_kind(entry["lane"]))
         hard = {e["lane"]: e for e in listed[2]["entries"]}
-        self.assertEqual(hard["codex"]["model"], factory.HARD_MODELS["codex"])
+        # No hard-tier pin since 2026-10-21: codex runs its gpt-6-luna setting.
+        self.assertEqual(hard["codex"]["model"], "gpt-6-luna")
         easy = {e["lane"]: e for e in listed[0]["entries"]}
         medium = {e["lane"]: e for e in listed[1]["entries"]}
         # A lane's own setting, or its provider's for a numbered slot.

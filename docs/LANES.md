@@ -328,14 +328,14 @@ pull request is over 6 hours old and has not climbed in 6 hours (a review that f
 conflict alone, never climbs). Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
-starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
-`claude-opus-5-5`, then `gemini-4-argon-high` on agy for a public repo), each
+starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
+`claude-opus-5-5`), each
 climb recorded as a `<!-- loom:rung N -->` comment.
 A climb takes the lowest rung the ticket has not run on since its ladder
 last started; a rung whose lanes each already hold 2 briefed or running
 tickets is passed over for the next untried one, and stays untried. Once it
-ran on Opus or past it, only the untried strong models are left
-(`gpt-6-sol`, `gemini-4-argon-high`). A ticket that failed on a ladder model
+ran on Opus, no stronger model is left (gpt-6-sol and gemini-4-argon are
+forbidden since 2026-10-21). A ticket that failed on a ladder model
 has tried that rung: the model a claim ran is its `Model:` line, else its
 pull request's runner footer, else the lane's `LOOM_<LANE>_MODEL`. With no
 lane of its next rung up, the ticket waits and the factory posts nothing; it

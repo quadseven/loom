@@ -21,6 +21,28 @@ from . import proof, status
 
 # The runner's own patterns (lanes/run_lane.sh).
 MODEL_RE = re.compile(r"[A-Za-z0-9._:][A-Za-z0-9._:/@-]*")
+# The models the operator forbids on every lane (2026-10-21), each with the
+# model its provider's lane runs instead: codex runs gpt-6-luna only and agy
+# the gemini-3.8-flash family only (gpt-6-sol and gemini-4-argon pins spent
+# both weekly limits in a day). A prefix covers every effort suffix. parse
+# reads a forbidden Model: line as its stand-in, and the brain writes the
+# stand-in, so no ticket, rung or brief runs one (lanes/run_lane.sh drops such
+# a pin too, LOOM_<LANE>_ONLY_MODEL).
+FORBIDDEN_MODELS: Tuple[Tuple[str, str], ...] = (
+    ("gpt-6-sol", "gpt-6-luna"),
+    ("gemini-4-argon", "gemini-3.8-flash-high"),
+)
+
+
+def allowed_model(model: str) -> str:
+    """The model a lane may run for `model`: the stand-in of a
+    FORBIDDEN_MODELS model, else `model` itself."""
+    for prefix, stand_in in FORBIDDEN_MODELS:
+        if model.startswith(prefix):
+            return stand_in
+    return model
+
+
 BASE_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 DIFFICULTIES = ("easy", "medium", "hard")
@@ -220,6 +242,10 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
             # ticket read as having no tier and no lane ever claimed it
             # (2026-10-16).
             value = value.lower()
+        if key == "Model":
+            # A ticket written before the operator's rule (grug#1189 named
+            # gemini-4-argon-high) runs the allowed model instead.
+            value = allowed_model(value)
         if key in headers:
             if headers[key] == value:
                 # The same line twice (a brief whose file repeated the header
