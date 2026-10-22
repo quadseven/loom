@@ -328,14 +328,14 @@ pull request is over 6 hours old and has not climbed in 6 hours (a review that f
 conflict alone, never climbs). Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
-starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
-`claude-opus-5-5`, then `gemini-4-argon-high` on agy for a public repo), each
+starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
+`claude-opus-5-5`), each
 climb recorded as a `<!-- loom:rung N -->` comment.
 A climb takes the lowest rung the ticket has not run on since its ladder
 last started; a rung whose lanes each already hold 2 briefed or running
 tickets is passed over for the next untried one, and stays untried. Once it
-ran on Opus or past it, only the untried strong models are left
-(`gpt-6-sol`, `gemini-4-argon-high`). A ticket that failed on a ladder model
+ran on Opus, no stronger model is left (gpt-6-sol and gemini-4-argon are
+forbidden since 2026-10-21). A ticket that failed on a ladder model
 has tried that rung: the model a claim ran is its `Model:` line, else its
 pull request's runner footer, else the lane's `LOOM_<LANE>_MODEL`. With no
 lane of its next rung up, the ticket waits and the factory posts nothing; it
@@ -419,6 +419,18 @@ No route, a limit, a timeout, a reply that is not `YES` or `NO: <reason>`, a
 ticket with no `## What` section or an unset URL lands it as before: the check
 is advisory and never blocks a merge on a dead route. A private repo is never
 asked. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
+
+Merged first (`bus/fabric.py`, loom#1437): before a briefed ticket goes to a
+build lane, a pull request already merged into the default branch for it sends
+it to a verify run instead. A linked pull request counts (a Refs line or a
+`loom/<number>` branch). With `LOOM_FABRIC_KEY_SSM` naming the SSM parameter
+that holds the Fabric workspace key, a ticket nothing links is also asked
+about once: the station asks Fabric's whole-library chat which merged pull
+requests already do the work, and each cited pull request must be of this
+repo, merged into the default branch, and carry the cited card's title. At
+most 2 questions a pass and 3 citations each; the key is read for each call
+and only asks, never writes. Fabric unset, down, slow or silent builds the
+ticket as before.
 
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`

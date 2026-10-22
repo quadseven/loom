@@ -141,6 +141,12 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn('<key>LOOM_PIN_TARGETS</key><string>[{"repo":"example-owner/deploy"}]</string>', plist)
 
+    def test_the_fabric_key_parameter_is_written_to_station_plist(self):
+        result = self.run_install(LOOM_FABRIC_KEY_SSM="/example/fabric/key")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", plist)
+
     def test_roll_ship_documents_are_written_to_station_plist(self):
         documents = '[{"goal":"example-owner/project#12","repo":"example-owner/project","path":"docs/ship.md"}]'
         result = self.run_install(LOOM_ROLL_SHIP_DOCS=documents)

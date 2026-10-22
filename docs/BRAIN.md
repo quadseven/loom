@@ -402,6 +402,16 @@ replaces the goal as parent), so it does not stay under the goal and in no
 epic. The `ticket-outside-epic` and `epic-over-cap` invariants fire only for
 tickets that were placed before this, or by hand.
 
+The station moves the tickets that break this rule itself, at most every hour
+(`Station.move_outside_tickets`, `brain.move_outside_tickets`): for each goal
+home, the tickets that are the goal's own sub-issues and sit under no epic
+move, oldest first, into an open intake epic of that goal with room. The
+epic's sub-issue link replaces the goal as the parent and the ticket's `Part
+of` line names the epic. When no intake epic has room and the goal is under
+its open epic cap, a new intake epic opens the way triage opens one; otherwise
+the rest stay where they are. An epic, an ask and a closed issue are never
+moved. The station log names each goal: `outside-epic: moved N, left M`.
+
 The station assigns queued tickets to free lanes on each pass. A brain that
 wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
 a readable Difficulty line appear in the goal's next station standup as
@@ -467,7 +477,7 @@ example:
 
 ```sh
 LOOM_REWRITE_CMD="lanes/rewrite_agent.sh <key-ssm> opencode-go/deepseek-v4.1-flash"
-LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh - codex/gpt-6-sol,claude/claude-opus-5-5"
+LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh - codex/gpt-6-luna,claude/claude-opus-5-5"
 ```
 
 `<key-ssm>` is the parameter the opencode-go lanes read
@@ -1113,7 +1123,6 @@ pull request's review thread is not a new issue comment and is not scanned.
 | `proof` | The proof record of a verified or shipped move. |
 | `audit` | The result of a proof audit. |
 | `held` | A ticket held apart from open work, with what it waits for. |
-| `escalate` | A ticket moved up the model ladder by the brain (loom#866 and loom#821 own moving it). |
 | `closed` | Why an issue was closed. |
 | `reopened` | Why an issue was opened again. |
 | `source` | A note on the source issue of a rewritten ticket. |

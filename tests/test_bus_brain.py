@@ -2134,13 +2134,13 @@ class ModelFlagTests(unittest.TestCase):
         issue = {"state": "open", "body": "Model: old\n\n" + BODY,
                  "labels": [{"name": "loom:ticket"}, {"name": "loom:failed"}, {"name": "lane:claude"}]}
         fake = Fake(reply(200, issue), reply(200, {}), reply(200, []))
-        brain.move(GitHub("t", transport=fake), REPO, 8, "briefed", "codex", model="gpt-6-sol")
+        brain.move(GitHub("t", transport=fake), REPO, 8, "briefed", "codex", model="gpt-6-luna")
         self.assertEqual([c[0] for c in fake.calls], ["GET", "PATCH", "PUT"])
-        self.assertEqual(fake.calls[1][2], {"body": "Model: gpt-6-sol\n\n" + BODY})
+        self.assertEqual(fake.calls[1][2], {"body": "Model: gpt-6-luna\n\n" + BODY})
         self.assertEqual(fake.calls[2][2], {"labels": ["loom:ticket", "loom:briefed", "lane:codex"]})
 
     def test_move_model_refusals(self):
-        for state, model in (("failed", "gpt-6-sol"), ("briefed", "bad model"), ("briefed", "x\nRepo: a/b")):
+        for state, model in (("failed", "gpt-6-luna"), ("briefed", "bad model"), ("briefed", "x\nRepo: a/b")):
             fake = Fake()
             with self.assertRaises(ValueError):
                 brain.move(GitHub("t", transport=fake), REPO, 8, state, model=model)
@@ -2358,7 +2358,7 @@ def lane_models(**models):
 
 
 # The lane settings that match the ladder's first two rungs.
-LADDER_LANES = {"claude": "claude-sonnet-5-5", "codex": "gpt-6-sol"}
+LADDER_LANES = {"claude": "claude-sonnet-5-5", "codex": "gpt-6-luna"}
 
 
 class EscalateTests(unittest.TestCase):
@@ -2426,7 +2426,7 @@ class EscalateTests(unittest.TestCase):
         self.assertIn("failed 2 times", report)
         self.assertIn("attempts 3", report)
         self.assertIn("tried claude-sonnet-5-5", report)
-        self.assertIn("next rung 2 gpt-6-sol", report)
+        self.assertIn("next rung 2 gpt-6-luna", report)
 
     def test_an_equivalent_move_records_the_model_that_ran(self):
         claim_body = "Claimed for lane agy (body sha256 0123456789ab)"
@@ -2455,14 +2455,32 @@ class EscalateTests(unittest.TestCase):
     def test_escalate_moves_a_failed_ticket_to_the_next_rung(self):
         fake, outcome = self.run_escalate(ticket_routes(
             stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")]))
-        self.assertEqual(outcome, "rung 2 gpt-6-sol on codex")
-        self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: gpt-6-sol\n\n" + BODY}])
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
+        self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: gpt-6-luna\n\n" + BODY}])
         self.assertEqual(fake.sent("PUT", "/issues/9/labels"),
                          [{"labels": ["loom:ticket", "loom:briefed", "lane:codex"]}])
         note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
-        self.assertIn("rung 2 of 4", note)
+        self.assertIn("rung 2 of 3", note)
         self.assertIn("failed 2 times", note)
-        self.assertIn("Rung: 2 gpt-6-sol codex", note)
+        self.assertIn("Rung: 2 gpt-6-luna codex", note)
+
+    def test_escalate_edits_the_status_comment_and_posts_no_comment(self):
+        status_comment = {"id": 77, "user": {"login": "example-brain"}, "created_at": OLD,
+                          "body": "<!-- loom:status v1 -->\nLoom status.\n\n"
+                                  "- 2030-01-01T00:05:00Z Claimed for lane claude (body sha256 0123456789ab)\n"}
+        routes = ticket_routes(stuck_ticket("failed"), TWICE,
+                               [claim("2030-01-01T00:11:00Z"), status_comment])
+        fake = Routed(routes)
+        gh = GitHub("t", transport=fake)
+        gh.status_authors |= {"example-brain"}
+        with unittest.mock.patch.dict(os.environ, TRUSTED):
+            outcome = brain.escalate(gh, REPO, 9)
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
+        self.assertEqual(fake.sent("POST", "/issues/9/comments"), [])
+        edit = fake.sent("PATCH", "/issues/comments/77")[0]["body"]
+        self.assertIn("<!-- loom:escalate v1 -->", edit)
+        self.assertIn("Rung: 2 gpt-6-luna codex", edit)
+        self.assertIn("Claimed for lane claude", edit)
 
     def test_escalate_skips_a_busy_lane_for_a_higher_rung(self):
         fake, outcome = self.run_escalate(ticket_routes(
@@ -2473,10 +2491,10 @@ class EscalateTests(unittest.TestCase):
     def test_escalate_uses_the_codex_standin_and_anthropic_slot(self):
         _, outcome = self.run_escalate(ticket_routes(
             stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")], free=("codex-2",)))
-        self.assertEqual(outcome, "rung 2 gpt-6-sol on codex-2")
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex-2")
         history = [claim("2030-01-01T00:11:00Z"), claim("2030-01-01T00:30:00Z", "codex")]
         _, outcome = self.run_escalate(ticket_routes(
-            stuck_ticket("failed", body="Model: gpt-6-sol\n\n" + BODY), TWICE, history, free=("anthropic-2",)))
+            stuck_ticket("failed", body="Model: gpt-6-luna\n\n" + BODY), TWICE, history, free=("anthropic-2",)))
         self.assertEqual(outcome, "rung 3 claude-opus-5-5 on anthropic-2")
 
     def test_escalate_refuses_when_no_untried_rung_has_a_free_lane(self):
@@ -2489,18 +2507,22 @@ class EscalateTests(unittest.TestCase):
         issue = stuck_ticket("pr")
         fake, outcome = self.run_escalate(ticket_routes(
             issue, [], [fixc("2030-01-01T00:20:00Z"), claim("2030-01-01T00:25:00Z"), fixc("2030-01-01T00:30:00Z")]))
-        self.assertEqual(outcome, "rung 2 gpt-6-sol on codex")
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
         comments = [b["body"] for b in fake.sent("POST", "/issues/9/comments")]
         self.assertTrue(comments[0].startswith("<!-- loom:fix v1 -->\nPull request: %s#8, branch loom/9-work" % REPO))
-        self.assertTrue(comments[1].startswith("<!-- loom:escalate v1 -->"))
+        # With no status comment to edit yet, the event opens it: a status
+        # comment, not an escalate comment.
+        self.assertTrue(comments[1].startswith("<!-- loom:status v1 -->"))
+        self.assertIn("- 20", comments[1])
+        self.assertIn("<!-- loom:escalate v1 -->", comments[1])
         self.assertEqual(fake.sent("PUT", "/issues/9/labels"),
                          [{"labels": ["loom:ticket", "loom:briefed", "lane:codex"]}])
-        self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: gpt-6-sol\n\n" + BODY}])
+        self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: gpt-6-luna\n\n" + BODY}])
 
     def finished_pr_routes(self, green=True, review="success", resolved=True,
                            author="trusted", fork=False):
         """Two fix rounds on lane codex, and pull request #8 in the given state."""
-        issue = stuck_ticket("pr", body="Model: gpt-6-sol\n\n" + BODY)
+        issue = stuck_ticket("pr", body="Model: gpt-6-luna\n\n" + BODY)
         history = [claim("2030-01-01T00:10:00Z", "codex"), fixc("2030-01-01T00:20:00Z"),
                    claim("2030-01-01T00:25:00Z", "codex"), fixc("2030-01-01T00:30:00Z")]
         routes = ticket_routes(issue, [], history)
@@ -2544,8 +2566,8 @@ class EscalateTests(unittest.TestCase):
                     os.environ, {"LOOM_REVIEW_CHECK": "", "LOOM_BRIEF_AUTHORS": "trusted"}):
                 fake, outcome = self.run_escalate(self.finished_pr_routes(**state))
                 self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
-                self.assertTrue(fake.sent("POST", "/issues/9/comments")[-1]["body"]
-                                .startswith("<!-- loom:escalate v1 -->"))
+                self.assertIn("<!-- loom:escalate v1 -->",
+                              fake.sent("POST", "/issues/9/comments")[-1]["body"])
 
     def test_a_fork_pull_request_is_never_reported_as_finished(self):
         # fix() refuses a fork on its own; the point is that the finished-pull-
@@ -2594,20 +2616,22 @@ class EscalateTests(unittest.TestCase):
     def test_escalate_tracks_the_rewritten_model_per_claim(self):
         # Sonnet claimed, escalated to codex and claimed again: the next rung is the last.
         history = [claim("2030-01-01T00:11:00Z"),
-                   {"body": "<!-- loom:escalate v1 -->\nRung: 2 gpt-6-sol codex", "created_at": "2030-01-01T00:20:00Z"},
+                   {"body": "<!-- loom:escalate v1 -->\nRung: 2 gpt-6-luna codex", "created_at": "2030-01-01T00:20:00Z"},
                    claim("2030-01-01T00:21:00Z", "codex")]
-        issue = stuck_ticket("failed", body="Model: gpt-6-sol\n\n" + BODY)
+        issue = stuck_ticket("failed", body="Model: gpt-6-luna\n\n" + BODY)
         _, outcome = self.run_escalate(ticket_routes(issue, TWICE, history))
         self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
 
-    def test_escalate_past_opus_takes_an_untried_strong_model_never_sonnet(self):
+    def test_escalate_past_opus_never_climbs_down_to_luna_or_sonnet(self):
+        # Until 2026-10-21 it went to gpt-6-sol, then a strong rung; the codex
+        # rung is gpt-6-luna now, weaker than Opus, so the brain decides.
         history = [claim("2030-01-01T00:11:00Z"),
                    rung_marker(3), rung_claim()]
         issue = stuck_ticket("failed", body="Model: claude-opus-5-5\n\n" + BODY)
         with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-brain"}):
             fake, outcome = self.run_escalate(ticket_routes(issue, TWICE, history))
-        self.assertEqual(outcome, "rung 2 gpt-6-sol on codex")
-        self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: gpt-6-sol\n\n" + BODY}])
+        self.assertEqual(outcome, "needs-brain")
+        self.assertFalse([b for b in fake.sent("PATCH", "/issues/9") if "Model:" in str(b.get("body"))])
 
     def test_runs_on_a_lane_set_to_opus_are_recorded_as_opus_and_never_escalated_to_it(self):
         # 2026-10-17: lane claude ran claude-opus-5-5 (its setting and its
@@ -2630,10 +2654,9 @@ class EscalateTests(unittest.TestCase):
             routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [pr])
             return routes
         with lane_models(), unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "trusted"}):
-            fake = Routed(footer_routes("trusted", free=("claude", "anthropic-2")))
-            with self.assertRaisesRegex(ValueError, "no untried rung has an available lane"):
-                brain.escalate(GitHub("t", transport=fake), REPO, 9)
-            self.assertFalse(fake.sent("PATCH", "/issues/9"))
+            fake, outcome = self.run_escalate(footer_routes("trusted", free=("claude", "anthropic-2")))
+            self.assertEqual(outcome, "needs-brain")
+            self.assertFalse([b for b in fake.sent("PATCH", "/issues/9") if "Model:" in str(b.get("body"))])
             # A stranger's or a fork's pull request footer names nothing that
             # ran, and neither does a footer naming a model Loom never runs.
             _, outcome = self.run_escalate(footer_routes("stranger", free=("claude", "anthropic-2")))
@@ -2651,7 +2674,8 @@ class EscalateTests(unittest.TestCase):
         routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [dict(fix_pr(body=footer), number=8)])
         with lane_models(claude="claude-opus-5-5"):
             _, outcome = self.run_escalate(routes)
-        self.assertEqual(outcome, "rung 2 gpt-6-sol on codex")
+        # Past Opus no stronger rung is left (gpt-6-luna is weaker).
+        self.assertEqual(outcome, "needs-brain")
 
 
 
@@ -4464,6 +4488,147 @@ class MoveFromGoalTests(unittest.TestCase):
         fake.assert_all_used()
         self.assertEqual([c[2] for c in self.sub_issue_posts(fake.calls)],
                          [{"sub_issue_id": 1006, "replace_parent": True}])
+
+
+class OutsideEpicRepo:
+    """Goal #1 with the tickets of its own, its open intake epics and the
+    tickets they hold. A sub-issue link that replaces the parent moves the
+    ticket, the way GitHub does."""
+
+    def __init__(self):
+        self.issues = {1: goal()}
+        self.subs = {1: []}
+        self.epics = []
+        self.open_tickets = []
+        self.calls = []
+
+    def __call__(self, method, url, headers, body):
+        payload = json.loads(body) if body else None
+        path = url.split("api.github.com")[1]
+        self.calls.append((method, path, payload))
+        return self._read(path) if method == "GET" else self._write(path, payload)
+
+    def _read(self, path):
+        found = re.match(r"/repos/%s/issues/(\d+)/sub_issues" % re.escape(REPO), path)
+        if found:
+            kids = self.subs.get(int(found.group(1)), [])
+            return reply(200, [self.issues[n] for n in kids])
+        if path.startswith("/repos/%s/issues?labels=loom:ticket&state=open" % REPO):
+            return reply(200, self.open_tickets)
+        if path.startswith("/repos/%s/issues?labels=epic&state=all" % REPO):
+            return reply(200, self.epics)
+        if path == "/repos/%s/issues/1" % REPO:
+            return reply(200, self.issues[1])
+        raise AssertionError("unexpected read %s" % path)
+
+    def _write(self, path, payload):
+        if path.endswith("/sub_issues"):
+            parent = int(path.split("/issues/")[1].split("/")[0])
+            child = payload["sub_issue_id"] - 1000
+            if payload.get("replace_parent"):
+                for kids in self.subs.values():
+                    if child in kids:
+                        kids.remove(child)
+            self.subs.setdefault(parent, []).append(child)
+            return reply(201, {})
+        if path == "/repos/%s/issues" % REPO:
+            made = 200 + len(self.issues)
+            self.issues[made] = dict(item(made, payload["body"], payload["labels"]),
+                                     title=payload["title"])
+            return reply(201, self.issues[made])
+        found = re.match(r"/repos/%s/issues/(\d+)$" % re.escape(REPO), path)
+        if found:
+            number = int(found.group(1))
+            self.issues[number].update(payload)
+            return reply(200, self.issues[number])
+        raise AssertionError("unexpected write %s" % path)
+
+    def writes(self):
+        return [c for c in self.calls if c[0] != "GET"]
+
+
+class MoveOutsideEpicTests(unittest.TestCase):
+    """loom#951: a ticket that is a goal's own sub-issue and sits under no
+    epic moves into an open intake epic of that goal, oldest ticket first."""
+
+    GOAL_URL = "https://api.github.com/repos/%s/issues/1" % REPO
+
+    def ticket(self, number, labels=("loom:ticket",), **extra):
+        """An open ticket of the goal's own: its parent is the goal."""
+        out = item(number, body="## Why\nwhy\n\nPart of #1\n", labels=labels,
+                   created_at="2030-01-01T00:00:00Z", parent_issue_url=self.GOAL_URL)
+        out.update(extra)
+        return out
+
+    def repo(self, tickets=(), epics=()):
+        """Goal #1 with the given tickets of its own and open intake epics
+        (number, the tickets they hold)."""
+        fake = OutsideEpicRepo()
+        for number, held in epics:
+            epic = dict(item(number, body="Part of #1\n", labels=("epic",)),
+                        title=brain.INTAKE_TITLE)
+            fake.issues[number] = epic
+            fake.subs[1].append(number)
+            fake.subs[number] = []
+            for t in range(held):
+                inside = number * 100 + t
+                fake.issues[inside] = item(inside, labels=("loom:ticket",))
+                fake.subs[number].append(inside)
+        for ticket in tickets:
+            fake.issues[ticket["number"]] = ticket
+            fake.subs[1].append(ticket["number"])
+        return fake
+
+    def move(self, fake):
+        return brain.move_outside_tickets(GitHub("t", transport=fake), REPO, 1)
+
+    def test_a_ticket_under_no_epic_moves_into_the_intake_epic_with_room(self):
+        # The epic holds 14 of its 15: one ticket fits, the rest need a new one.
+        fake = self.repo(tickets=[self.ticket(10, created_at="2030-01-01T00:00:00Z"),
+                                  self.ticket(11, created_at="2030-01-02T00:00:00Z"),
+                                  self.ticket(12, created_at="2030-01-03T00:00:00Z")],
+                         epics=[(60, brain.EPIC_TICKET_CAP - 1)])
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (3, 0))
+        # The oldest ticket took the room the epic had left.
+        self.assertEqual(fake.subs[60][-1], 10)
+        self.assertEqual(len(fake.subs[60]), brain.EPIC_TICKET_CAP)
+        # A new intake epic took the other two, oldest first.
+        opened = [n for n in fake.subs[1] if n != 60]
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(fake.issues[opened[0]]["title"], brain.INTAKE_TITLE)
+        self.assertIn("Part of #1", fake.issues[opened[0]]["body"])
+        self.assertEqual(fake.subs[opened[0]], [11, 12])
+        # Every move replaced the goal as the parent, oldest ticket first.
+        moves = [c[2] for c in fake.writes()
+                 if c[1].endswith("/sub_issues") and c[2].get("replace_parent")]
+        self.assertEqual(moves, [{"sub_issue_id": 1010, "replace_parent": True},
+                                 {"sub_issue_id": 1011, "replace_parent": True},
+                                 {"sub_issue_id": 1012, "replace_parent": True}])
+
+    def test_a_goal_at_its_epic_cap_moves_nothing(self):
+        fake = self.repo(tickets=[self.ticket(10), self.ticket(11), self.ticket(12)],
+                         epics=[(60 + n, brain.EPIC_TICKET_CAP) for n in range(6)])
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (0, 3))
+        self.assertEqual(fake.writes(), [])
+        self.assertEqual(fake.subs[1], [60, 61, 62, 63, 64, 65, 10, 11, 12])
+
+    def test_an_epic_an_ask_and_a_closed_issue_are_never_moved(self):
+        epic = dict(item(20, body="Part of #1\n", labels=("epic",)), title="Epic: the work")
+        ask = self.ticket(30, labels=("loom:ticket", "needs-operator"))
+        closed = self.ticket(40, state="closed")
+        live = self.ticket(50)
+        fake = self.repo(tickets=[epic, ask, closed, live], epics=[(60, 1)])
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (1, 0))
+        self.assertEqual(fake.subs[1], [60, 20, 30, 40])
+        self.assertEqual(fake.subs[60][-1], 50)
+
+    def test_the_moved_tickets_part_of_line_names_the_epic(self):
+        fake = self.repo(tickets=[self.ticket(10)], epics=[(60, 1)])
+        self.move(fake)
+        self.assertEqual(fake.issues[10]["body"], "## Why\nwhy\n\nPart of #60\n")
 
 
 class CloseEpicTests(unittest.TestCase):

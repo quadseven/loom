@@ -1185,6 +1185,16 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("run the repo's full test suite", prompt)
         self.assertIn("cyclomatic complexity under 15", prompt)
 
+    def test_the_agent_is_told_to_read_the_repo_rules_and_the_operator_notes_first(self):
+        # A lane test imported a package the repo's CI never installs, and a
+        # lane redid work the ticket's operator said had shipped (2026-10-22).
+        self.drop_brief()
+        self.run_lane()
+        prompt = self.log.read_text()
+        self.assertIn("read the repo's AGENTS.md and CLAUDE.md", prompt)
+        self.assertIn("When the Operator notes or a merged pull request under Linked pull "
+                      "requests show the work is already done", prompt)
+
     def test_the_agent_is_told_never_to_write_another_repos_issue_ref(self):
         # Lane agents wrote made-up OWNER/NAME references into test fixtures
         # in public repos, and the leak scan refused the push (2026-10-21).
