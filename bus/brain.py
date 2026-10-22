@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import GitHub, GitHubError, RateLimited, _next_link, auth_from_env, rest_login, unreadable
 from . import audit, change_class, handoff, hunt_plan, journal, lock, notify, pr_repair, proof, stale_claims, text, tickets
-from . import naming, operator_hold
+from . import merge_tier, naming, operator_hold
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -2999,6 +2999,7 @@ def merge(gh: GitHub, repo: str, number: int,
         association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
         _refuse_pending_fix(gh, association, env)
         _refuse_operator_hold(gh, repo, number, pr, details, association, issue)
+        _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
@@ -3052,6 +3053,46 @@ def _refuse_operator_hold(gh: GitHub, repo: str, number: int, pr: Dict[str, Any]
         outcome = operator_hold.hold(gh, ticket[0], ticket[1], number, why, human)
         asked = "" if outcome in ("asked", "already") else " (%s)" % outcome
     raise ValueError("held for the operator: %s%s" % ("; ".join(why), asked))
+
+
+def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
+                      details: Dict[str, Any], ticket: Optional[Tuple[str, int]],
+                      issue: Dict[str, Any], env: Optional[Dict[str, str]]) -> None:
+    """Refuse a lane pull request Loom may not merge on its own
+    (bus/merge_tier.py): a tier outside LOOM_AUTO_MERGE_TIERS (deploy-config,
+    security and cross-repo by default) goes to the operator with one ask on
+    its ticket; an auto tier needs the review check to have succeeded on its
+    head, no open high, critical or bad-work finding, and room under the
+    hourly caps. A revert ticket's own pull request is exempt. From
+    2026-10-19, 16 of 22 lane pull requests the Apps merged unattended in the
+    private deployment repo were damaging or useless, most of them deploy and
+    CI changes the change class called logic."""
+    if merge_tier.is_revert_ticket(pr, issue):
+        return
+    tier, why = merge_tier.classify(repo, operator_hold.pull_files(gh, repo, number),
+                                    str(issue.get("body") or ""),
+                                    change_class.class_of(pr) == "sensitive")
+    if tier not in merge_tier.auto_tiers(env):
+        reason = merge_tier.operator_why(tier, why, env)
+        asked = ""
+        if ticket is not None:
+            outcome = operator_hold.hold(gh, ticket[0], ticket[1], number, [reason], human)
+            asked = "" if outcome in ("asked", "already") else " (%s)" % outcome
+        raise ValueError("held for the operator: %s%s" % (reason, asked))
+    sha = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
+    check = review_check_name(env)
+    if not sha or not _review_check_passed(gh, repo, sha, check):
+        raise ValueError("a %s change merges on its own only when the review check %s "
+                         "succeeded on its head commit" % (tier, check))
+    from . import factory
+    bot = (env if env is not None else os.environ).get("LOOM_REVIEW_BOT", "").strip() \
+        or factory.DEFAULT_REVIEW_BOT
+    blocking = merge_tier.blocking_findings(details, lambda c: by_bot(dict(c), bot), env)
+    if blocking:
+        raise ValueError("open review findings hold the merge: %s" % ", ".join(blocking))
+    capped = merge_tier.cap_refusal(gh, repo, env)
+    if capped:
+        raise ValueError("the auto-merge cap holds the merge: %s" % capped)
 
 
 def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
