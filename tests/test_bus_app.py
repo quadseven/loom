@@ -229,6 +229,18 @@ class Token(unittest.TestCase):
             ("POST", "https://api.github.com/app/installations/77/access_tokens")])
         self.assertNotIn(KEY_MARK, out + err)
 
+    def test_prints_the_apps_bot_login_for_the_brains_agent(self):
+        def fake(method, url, headers, body):
+            self.minted.append((method, url))
+            return 200, {}, json.dumps({"slug": "loom-brain"}).encode()
+        env = {"LOOM_GITHUB_APP_ID": "124", "LOOM_GITHUB_APP_INSTALLATION_ID": "77",
+               "LOOM_GITHUB_APP_KEY_FILE": self.key}
+        with mock.patch.dict(os.environ, env, clear=True):
+            code, out, err = run(["app", "login"], app_transport=fake,
+                                 app_sign=lambda data, key: b"sig")
+        self.assertEqual((code, out), (0, "loom-brain[bot]\n"))
+        self.assertEqual(self.minted, [("GET", "https://api.github.com/app")])
+
     def test_without_the_app_settings_it_prints_nothing_and_fails(self):
         with mock.patch("bus.github.token_from_env", side_effect=AssertionError("personal token read")):
             code, out, err = self.token({"GITHUB_TOKEN": "ghp_personal"})

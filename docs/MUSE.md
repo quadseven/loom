@@ -41,6 +41,14 @@ Read and write GitHub only from the shell, through the Loom commands or the
 GitHub REST API with `LOOM_GITHUB_TOKEN`. Never use the web or browser tool
 for GitHub or anything else in a scheduled run: each new web request asks
 the operator for approval, and the run stops until someone answers.
+To read a file in a repo (a test, a script, a doc) without the web tool:
+
+    curl -fsS -H "Authorization: Bearer $LOOM_GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github.raw" \
+      "https://api.github.com/repos/OWNER/NAME/contents/PATH?ref=main"
+
+A scheduled run on 2026-10-21 asked the operator to approve a web fetch of
+one loom test file and stopped until the operator answered.
 
 ## Operate, do not report
 
@@ -207,7 +215,9 @@ steps on each tick:
 
 Claims expire after two hours without a heartbeat. A claim without a pull
 request expires after three hours and returns to `loom:queued` with a
-`[transient]` reason. The brain tick remains a separate process and follows
+`[transient]` reason. A ticket's heartbeat edits its claim comment in place (see
+"Lane comments edited in place" in BRAIN.md), so a beat adds no comment and
+sends no email. The brain tick remains a separate process and follows
 the regular brain instructions above.
 
 ## Handing off stage work
@@ -283,9 +293,10 @@ this tick"; a step with no note shows nothing there.
    for each goal, its latest journal, report, measurement and completed
    action, and its report deadline. Every goal under "Reports owed before
    unlock" gets its report in the report step this tick, in every scope,
-   including live. If the brain cannot write it, the station posts the
-   data-only report once the last report is 1 hour 45 minutes old, so no
-   goal's report passes 2 hours; never hand an owed report to another brain.
+   including live. A report is owed from 3 hours 45 minutes after the last
+   one. If the brain has not written it, the station posts the data-only
+   report once the last report is 5 hours 45 minutes old, so no goal's
+   report passes 6 hours; never hand an owed report to another brain.
    A goal listed as `report HELD` already has a report under 90 minutes old
    (the station's included): skip it this tick. Each lane
    pull request's line ends in `READY`
@@ -538,7 +549,7 @@ on hard work):
   route on the spark-gateway, each waiting out its own provider's reset
   (free-ollama is Ollama Cloud and free-gemma is Gemma, both on any repo); else a
   free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
-  opencode-go-4, muse, free-nvidia, free-kilo and free-groq on public repos only
+  opencode-go-4, muse, copilot, free-nvidia, free-kilo and free-groq on public repos only
   (opencode-go-4 is Muse Spark, which trains on prompts; free-nvidia to free-groq
   are NVIDIA NIM, Kilo and Groq).
   Never anthropic or claude for an easy ticket.
@@ -571,7 +582,12 @@ easy: claude when it is free, else spark or a free lane. Easy and hard have
 no fallback, for the rules above. A fallback move says so in its note
 ("fallback: no medium lane is up"); the ticket keeps its `Difficulty:` line,
 so its next move takes its own tier again once a lane of it is up. A tier
-with a lane up but busy is waited for, not fallen back from.
+with a lane up but busy is waited for, not fallen back from, and so is a
+tier whose lanes are down or at a limit but one of them lifts within two
+hours (`LIMIT_REQUEUE`); a lane at a limit with no known end counts as out
+for hours. A move off a lane at a limit names when it lifts in its note. A
+ticket marked `needs-brain` or `loom:runaway` is held for the brain, and no
+such move touches it.
 A ticket briefed to a lane that is down, or at a limit lifting more than
 two hours off (`LIMIT_REQUEUE`), does not wait on it when no lane of its
 tier is free: it goes back to `loom:queued` with no lane, and takes the next
@@ -616,6 +632,12 @@ already failed it, and never a free lane:
 3. `claude-opus-5-5` on the claude lane, else an anthropic slot;
 4. `gemini-4-argon-high` on agy, public repos only (the Opus equivalent and
    agy's hard-tier model, bus/factory.py EQUIVALENTS and HARD_MODELS).
+
+A rung with one lane up holds a bounded few waiting tickets: past
+`ONE_LANE_MAX` (4), the overflow climbs to an untried rung whose least-loaded
+lane holds three or more fewer, even though that lane is not free. A stall the
+factory cannot move (no other lane of the rung or tier) is said once, when the
+ticket starts waiting for that reason, and then shows as a wait the station times.
 
 A rung counts as tried once the ticket was claimed on its model. The model a
 claim ran is what ran: the `Model:` line in force (the ticket's own before the

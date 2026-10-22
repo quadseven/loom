@@ -11,8 +11,8 @@ Filer files each breach as one loom:invariant issue on the factory's goal
 home, deduplicated by invariant and subject: a breach whose issue is open
 files nothing, and one whose issue was closed reopens it only for evidence
 newer than the close. A rolling breach (ticket-outside-epic, lane-held,
-lane-failing-streak, silent-lane) is one issue for its whole cause, a line per
-goal home or lane, and its open issue is rewritten in place whenever what it
+lane-failing-streak, silent-lane, roll-pin-off) is one issue for its whole
+cause, a line per goal home or lane, and its open issue is rewritten in place whenever what it
 lists changes; an older open issue of the same invariant is folded into it.
 lane-no-success stays one issue per lane: the station reads its per-lane keys
 to release runaways a dead lane held. Adding an invariant is one function in
@@ -38,6 +38,7 @@ from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Se
 from . import brain
 from . import journal
 from . import naming
+from . import notify
 from . import text as _text
 from . import watch
 from .github import GitHubError
@@ -95,6 +96,17 @@ STEP_RE = re.compile(r"(?im)^[ \t]*[-*]?[ \t]*(?:step[ \t]+)?(%s)(?:[ \t]+step)?
 LABEL = "loom:invariant"
 LABELS = ["loom:triage", LABEL]
 MARKER = "<!-- loom:invariant v1 key=%s -->"
+# The one note an issue carries for every time its breach came back, edited
+# with a count and the last time (never a new comment per reopen).
+BROKEN_MARKER = "<!-- loom:broken-again -->"
+BROKEN_TEXT = "Broken again after this was closed:"
+BROKEN_TIMES_RE = re.compile(r"<!-- loom:broken-again times=([0-9,]*) -->")
+BROKEN_LAST_RE = re.compile(r"last at ([0-9T:Z-]+)")
+BROKEN_COUNT_RE = re.compile(r"Reopened (\d+) time")
+# Times kept in the note: enough for the 3-in-RECURRING_AFTER count.
+BROKEN_TIMES_MAX = 12
+CLEARED_TEXT = "The invariant cleared by "
+TICKET_LABEL = "loom:ticket"
 MARKER_RE = re.compile(r"<!-- loom:invariant v1 key=([a-z-]+/[0-9a-f]{12}) -->")
 # Issues filed plus issues reopened in one pass.
 WRITES_MAX = 5
@@ -113,6 +125,9 @@ LANES_SUBJECT = "every lane"
 # factory gives for a ticket's wait is a line in one issue, so a lane outage
 # that holds forty tickets is one line, not forty issues.
 TICKETS_SUBJECT = "every ticket"
+# The one subject of the rolling roll-pin-off breach: each goal home that
+# ships by roll with no roll ship document is a line in one issue.
+ROLL_SUBJECT = "every roll goal"
 # How long a ticket may wait for one reason the factory repeats every pass
 # before it is raised: six fix rounds waited nine hours on a lane at a limit
 # above the last rung of the ladder, logged every pass and raised by nothing
@@ -122,6 +137,18 @@ WAIT_LIMIT = 6 * 3600
 # the body is compared, so an unchanged list writes nothing.
 LAST_SEEN = "Last seen by the station: %s."
 LINE_MAX = 300
+# Invariants kept as one standing issue (loom#845): when the cause clears the
+# issue says so in place and stays open, and the next breach edits it again,
+# so a hold that comes and goes never closes and reopens an issue (each reopen
+# mailed the people watching it).
+STANDING = ("lane-held",)
+STANDING_CLEAR_TITLE = "No lane is held by a limit now"
+CLEAR_SINCE = "Clear since %s."
+# What the body keeps of past holds: a line per hold, newest first.
+HOLD_LOG = "Hold log (newest first, last %d):"
+HOLD_LOG_MAX = 20
+HELD_LINE_RE = re.compile(r"^- ([A-Za-z0-9._-]+): held by a limit since (\S+?);", re.M)
+LOG_LINE_RE = re.compile(r"^- [A-Za-z0-9._-]+: held since \S+, cleared \S+$")
 WITHHELD = "(withheld: the line fails the written-text check)"
 
 Say = Callable[[str], None]
@@ -279,6 +306,10 @@ class Facts:
     label_refusals: Optional[Dict[str, int]] = None
     # Last, so no positional construction shifts.
     waits: Optional[List[Wait]] = None
+    # The goal homes whose body names a roll that no LOOM_ROLL_SHIP_DOCS
+    # entry names, and how many entries there are.
+    roll_goals: Optional[List[Ref]] = None
+    roll_docs: int = 0
 
 
 @dataclass(frozen=True)
@@ -296,6 +327,12 @@ class Breach:
     @property
     def key(self) -> str:
         return "%s/%s" % (self.invariant, hashlib.sha256(self.subject.encode()).hexdigest()[:12])
+
+
+def _standing_keys() -> set:
+    """The keys of the standing issues: the rolling breach of each STANDING
+    invariant. An older per-lane issue of the same invariant is not one."""
+    return {Breach(inv, LANES_SUBJECT, "", (), 0.0).key for inv in STANDING}
 
 
 def utc(at: float) -> str:
@@ -775,6 +812,24 @@ def gate_hold(f: Facts) -> List[Breach]:
     return out
 
 
+def roll_pin_off(f: Facts) -> List[Breach]:
+    """Goal homes that ship by roll with no roll ship document: the station
+    opens no source-pin pull request when their module changes merge."""
+    if not f.roll_goals:
+        return []
+    why = ("No LOOM_ROLL_SHIP_DOCS entry names them" if f.roll_docs else
+           "LOOM_ROLL_SHIP_DOCS is empty, so the station's roll source-pin pass is off")
+    return [Breach("roll-pin-off", ROLL_SUBJECT,
+                   ("1 goal home ships" if len(f.roll_goals) == 1 else
+                    "%d goal homes ship" % len(f.roll_goals)) + " by roll with no source-pin pass",
+                   ("Goal homes whose body names a roll: %s" % _refs(f.roll_goals),
+                    why + "; their merged module changes wait for a brain to bump the pins",
+                    "Give each ship document a loom-roll-pins block and add an entry for its "
+                    "goal home to LOOM_ROLL_SHIP_DOCS in the station environment "
+                    "(README.md, Roll source pins)"),
+                   f.now, rolling=True)]
+
+
 def _decision(kind: str) -> str:
     """The decision an event kind reports on: rewrite_failed, rewrite_skipped
     and rewrite_succeeded all report on rewrite."""
@@ -842,7 +897,7 @@ INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
     plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
     repeated_failure, ticket_waiting,
-    untrusted_labeler)
+    untrusted_labeler, roll_pin_off)
 
 
 def check(facts: Facts, say: Say,
@@ -888,6 +943,11 @@ class Filer:
         self.write = write
         self.writes = 0
         self._listed: Optional[Dict[str, int]] = None
+        # Issue numbers the listing found closed: clearing skips them unread.
+        self._listed_closed: set = set()
+        # Issue numbers the listing found carrying loom:ticket: a ticket is
+        # the work, no longer the breach's own issue.
+        self._ticketed: set = set()
         # Rolling breach key -> its issue, once this pass has it open.
         self._rolling_open: Dict[str, int] = {}
 
@@ -901,9 +961,25 @@ class Filer:
                 if not isinstance(issue, dict) or "pull_request" in issue:
                     continue
                 m = MARKER_RE.search(str(issue.get("body") or ""))
-                if m and m.group(1) not in self._listed:
-                    self._listed[m.group(1)] = int(issue["number"])
+                if not m:
+                    continue
+                number = int(issue["number"])
+                ticket = TICKET_LABEL in self._label_names(issue)
+                if ticket:
+                    self._ticketed.add(number)
+                if issue.get("state") == "closed":
+                    self._listed_closed.add(number)
+                held = self._listed.get(m.group(1))
+                # The first issue of a key wins, but a plain invariant issue
+                # replaces a ticket: the ticket is not where a breach lives.
+                if held is None or (held in self._ticketed and not ticket):
+                    self._listed[m.group(1)] = number
         return self._listed
+
+    @staticmethod
+    def _label_names(issue: Dict[str, Any]) -> List[str]:
+        return [str(x.get("name", "")) if isinstance(x, dict) else str(x)
+                for x in issue.get("labels") or []]
 
     def _issue(self, number: int) -> Optional[Dict[str, Any]]:
         try:
@@ -929,24 +1005,51 @@ class Filer:
                 self._repairs = self.goal
         return self._repairs
 
-    def _body(self, b: Breach) -> str:
+    def _body(self, b: Breach, log: Sequence[str] = ()) -> str:
         rolling = (["", "One rolling issue for this cause: the station rewrites this list "
                         "in place while it changes.", LAST_SEEN % utc(b.at)]
                    if b.rolling else [])
         return "\n".join(
             [MARKER % b.key,
              "The station found one of the factory's own invariants broken: %s." % b.title,
-             "", "Evidence:"] + self._evidence(b) + rolling +
+             "", "Evidence:"] + self._evidence(b) + rolling + self._log_block(log) +
             ["", "Invariant: `%s` (bus/invariants.py), checked every station pass. Filed "
                  "without a model: this says what broke, not why. Rewrite it as a ticket "
                  "that fixes the cause." % b.invariant,
              "", "Part of #%d" % self._home()])
 
+    @staticmethod
+    def _log_block(log: Sequence[str]) -> List[str]:
+        return ["", HOLD_LOG % HOLD_LOG_MAX] + list(log)[:HOLD_LOG_MAX] if log else []
+
+    @staticmethod
+    def _old_log(body: Any) -> List[str]:
+        """The hold log lines an issue body already carries."""
+        return [line.strip() for line in str(body or "").replace("\r\n", "\n").split("\n")
+                if LOG_LINE_RE.match(line.strip())]
+
+    def _log_for(self, issue: Dict[str, Any], still_held: Sequence[str], at: float
+                 ) -> List[str]:
+        """The log of the issue's body plus a line for each lane its list showed
+        held that is no longer held (still_held names the lanes that are)."""
+        body = str(issue.get("body") or "").replace("\r\n", "\n")
+        ended = ["- %s: held since %s, cleared %s" % (m.group(1), m.group(2), utc(at))
+                 for m in HELD_LINE_RE.finditer(body) if m.group(1) not in still_held]
+        return (list(reversed(ended)) + self._old_log(body))[:HOLD_LOG_MAX]
+
+    @staticmethod
+    def _held_lanes(b: Breach) -> List[str]:
+        return [m.group(1) for line in b.evidence for m in [HELD_LINE_RE.match("- " + line)]
+                if m]
+
     def _refresh(self, b: Breach, number: int, issue: Dict[str, Any]) -> None:
         """Rewrite a rolling breach's open issue when its title or list
         changed; the last-seen line alone is no reason to write."""
         title = naming.clip(b.title)
-        body = self._body(b)
+        log: Sequence[str] = ()
+        if b.invariant in STANDING:
+            log = self._log_for(issue, self._held_lanes(b), b.at)
+        body = self._body(b, log)
 
         def steady(text: Any) -> str:
             return "\n".join(line for line in str(text or "").replace("\r\n", "\n").split("\n")
@@ -959,11 +1062,15 @@ class Filer:
         self.writes += 1
         self.say("invariants: updated %s#%d: %s" % (self.repo, number, title))
 
-    def _file(self, b: Breach) -> None:
+    def _file(self, b: Breach, ticket: Optional[int] = None) -> None:
         # The body quotes the whole breach; the title is clipped to the
-        # naming standard's TITLE_MAX.
+        # naming standard's TITLE_MAX. ticket names the closed ticket this
+        # breach outlived: it is left alone and referenced.
         title = naming.clip(b.title)
         body = self._body(b)
+        if ticket is not None:
+            body = body.replace("\n\nPart of #", "\n\nThe breach outlived #%d, a ticket for "
+                                "it that is closed; Refs #%d.\n\nPart of #" % (ticket, ticket))
         _text.check(title + "\n" + body)
         made = self.gh.rest("POST", "/repos/%s/issues" % self.repo,
                             {"title": title, "body": body, "labels": LABELS}).data
@@ -980,13 +1087,65 @@ class Filer:
                      % (self.repo, number, self._home(), err))
         self.say("invariants: filed %s#%d: %s" % (self.repo, number, title))
 
-    def _reopen(self, b: Breach, number: int) -> None:
-        body = "\n".join([MARKER % b.key,
-                          "Broken again after this was closed: %s." % b.title,
+    @staticmethod
+    def _broken_note(comment: Dict[str, Any]) -> Optional[float]:
+        """When a broken-again note was last written: its "last at" time, else
+        its creation (a note from before there was one note per issue)."""
+        body = str(comment.get("body", ""))
+        if BROKEN_MARKER not in body and BROKEN_TEXT not in body:
+            return None
+        m = BROKEN_LAST_RE.search(body)
+        return (_epoch(m.group(1)) if m else None) or _epoch(comment.get("created_at"))
+
+    def _broken_times(self, comments: List[Dict[str, Any]]) -> List[float]:
+        """Every time an issue's breach came back, from its one note's list
+        and from any older note of its own."""
+        times: List[float] = []
+        for c in comments:
+            body = str(c.get("body", ""))
+            m = BROKEN_TIMES_RE.search(body)
+            if m:
+                times += [float(t) for t in m.group(1).split(",") if t]
+            elif BROKEN_TEXT in body:
+                at = _epoch(c.get("created_at"))
+                if at is not None:
+                    times.append(at)
+        return sorted(set(times))
+
+    def _already_reopened(self, comments: List[Dict[str, Any]]) -> bool:
+        """True when the breach has already reopened this issue and not
+        cleared since: a breach that stands reopens its issue once."""
+        noted = [t for t in (self._broken_note(c) for c in comments) if t is not None]
+        if not noted:
+            return False
+        cleared = [t for t in (_epoch(c.get("created_at")) for c in comments
+                               if CLEARED_TEXT in str(c.get("body", ""))) if t is not None]
+        return not cleared or max(noted) >= max(cleared)
+
+    def _reopen(self, b: Breach, number: int, comments: List[Dict[str, Any]]) -> None:
+        """Reopen the issue and say so in its one broken-again note: a count
+        and the last time, edited in place (a new comment each time mailed
+        everyone watching, loom#1223)."""
+        mine = [c for c in comments if BROKEN_MARKER in str(c.get("body", ""))]
+        note = mine[-1] if mine else None
+        times = (self._broken_times(comments) + [self.now])[-BROKEN_TIMES_MAX:]
+        count = 1
+        if note is not None:
+            m = BROKEN_COUNT_RE.search(str(note.get("body", "")))
+            count = (int(m.group(1)) if m else 1) + 1
+        body = "\n".join([BROKEN_MARKER,
+                          "<!-- loom:broken-again times=%s -->" % ",".join(str(int(t)) for t in times),
+                          "%s %s." % (BROKEN_TEXT, b.title),
+                          "Reopened %d time%s; last at %s." % (count, "" if count == 1 else "s",
+                                                                utc(self.now)),
                           "", "Evidence:"] + self._evidence(b))
         _text.check(body)
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number), {"state": "open"})
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number), {"body": body})
+        if note is not None and note.get("id") is not None:
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%s" % (self.repo, note["id"]),
+                         {"body": body})
+        else:
+            notify.post(self.gh, self.repo, number, body, notify.REOPENED)
         self.writes += 1
         self.say("invariants: reopened %s#%d: %s" % (self.repo, number, b.title))
 
@@ -1012,8 +1171,7 @@ class Filer:
                 "this subject with the others and is updated in place." % into)
         if not any(("Folded into #%d" % into) in str(c.get("body", "")) for c in comments):
             _text.check(body)
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
-                         {"body": body})
+            notify.post(self.gh, self.repo, number, body, notify.CLOSED)
             self.writes += 1
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
                      {"state": "closed", "state_reason": "not_planned"})
@@ -1024,7 +1182,7 @@ class Filer:
         for key, number in self._listing().items():
             if self.writes >= WRITES_MAX:
                 return
-            if key in current:
+            if key in current or number in self._listed_closed:
                 continue
             issue = self._issue(number)
             if issue is None or issue.get("state") != "open":
@@ -1044,17 +1202,42 @@ class Filer:
                 if self.writes + 2 > WRITES_MAX:
                     return
                 self._fold(number, into, comments)
+            elif key in _standing_keys():
+                if self.writes >= WRITES_MAX:
+                    return
+                self._mark_clear(key, number, issue)
             elif not self._close_quiet(number, issue, labels, comments):
                 return
+
+    def _mark_clear(self, key: str, number: int, issue: Dict[str, Any]) -> None:
+        """A standing issue whose breach is gone says so in place and stays
+        open; what it listed moves into its hold log. Already clear: no write."""
+        title = naming.clip(STANDING_CLEAR_TITLE)
+        if issue.get("title") == title:
+            return
+        invariant = key.split("/", 1)[0]
+        body = "\n".join(
+            [MARKER % key,
+             "The station found no lane held by a limit for over %s while tickets of its "
+             "tier are queued." % _hours(HELD_MAX),
+             CLEAR_SINCE % utc(self.now), "",
+             "This is the one standing issue for the invariant: the station edits it in place "
+             "when a hold starts, changes or clears, and does not close it."] +
+            self._log_block(self._log_for(issue, (), self.now)) +
+            ["", "Invariant: `%s` (bus/invariants.py), checked every station pass." % invariant,
+             "", "Part of #%d" % self._home()])
+        _text.check(title + "\n" + body)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                     {"title": title, "body": body})
+        self.writes += 1
+        self.say("invariants: %s#%d is clear, left open: %s" % (self.repo, number, title))
 
     def _close_quiet(self, number: int, issue: Dict[str, Any], labels: List[str],
                      comments: List[Dict[str, Any]]) -> bool:
         """Close an open triage or rewritten issue whose breach has been gone CLEAR_AFTER,
         or mark it loom:recurring when it broke 3 times in RECURRING_AFTER.
         False when the pass has no writes left for it."""
-        breaches = [_epoch(issue.get("created_at"))]
-        breaches += [_epoch(c.get("created_at")) for c in comments
-                     if "Broken again after this was closed:" in str(c.get("body", ""))]
+        breaches = [_epoch(issue.get("created_at"))] + self._broken_times(comments)
         times = [at for at in breaches if at is not None]
         if not times or self.now - max(times) < CLEAR_AFTER:
             return True
@@ -1070,13 +1253,12 @@ class Filer:
         body = ("The invariant cleared by %s; its last breach was observed at %s, "
                 "more than 6 hours earlier." % (utc(self.now), utc(max(times))))
         # A note from an earlier close does not explain this one (loom#651).
-        already_explained = any("The invariant cleared by " in str(c.get("body", ""))
+        already_explained = any(CLEARED_TEXT in str(c.get("body", ""))
                                 and (_epoch(c.get("created_at")) or 0) >= max(times)
                                 for c in comments)
         if not already_explained:
             _text.check(body)
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
-                         {"body": body})
+            notify.post(self.gh, self.repo, number, body, notify.CLOSED)
             self.writes += 1
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
                      {"state": "closed", "state_reason": "not_planned"})
@@ -1096,6 +1278,28 @@ class Filer:
                 self._rolling_open[b.key] = self.state[b.key]
             return
         self.state[b.key] = number
+        if TICKET_LABEL in self._label_names(issue):
+            # A ticket (an invariant issue rewritten into work) is no longer
+            # the breach's own issue: it is never reopened or rewritten back to
+            # the invariant text (loom#1223 flipped 18 times).
+            if issue.get("state") == "open":
+                if b.rolling:
+                    self._rolling_open[b.key] = number
+                return
+            closed = _epoch(issue.get("closed_at"))
+            if closed is not None and b.at <= closed:
+                return
+            plain = self._listing().get(b.key)
+            if plain is not None and plain != number and plain not in self._ticketed:
+                # The breach already has its own invariant issue beside the ticket.
+                self.state[b.key] = plain
+                self._one(b)
+                return
+            self.state.pop(b.key, None)
+            self._file(b, ticket=number)
+            if b.rolling:
+                self._rolling_open[b.key] = self.state[b.key]
+            return
         if issue.get("state") == "open":
             if b.rolling:
                 self._rolling_open[b.key] = number
@@ -1103,7 +1307,14 @@ class Filer:
             return
         closed = _epoch(issue.get("closed_at"))
         if closed is None or b.at > closed:
-            self._reopen(b, number)
+            comments = self._comments(number)
+            if self._already_reopened(comments):
+                # Reopened once for this breach and closed again while it still
+                # stands: say so in the log, do not reopen it again.
+                self.say("invariants: %s#%d was closed again while its breach stands; not "
+                         "reopened: %s" % (self.repo, number, b.title))
+                return
+            self._reopen(b, number, comments)
             if b.rolling:
                 self._rolling_open[b.key] = number
                 if self.writes < WRITES_MAX:

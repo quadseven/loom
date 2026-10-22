@@ -31,7 +31,7 @@ import re
 import time
 from typing import Any, Callable, Dict, FrozenSet, List, NamedTuple, Optional, Tuple
 
-from . import brain, handoff, naming
+from . import brain, handoff, naming, notify
 from .friction import fingerprint, friction_lines, jaccard, words
 from .github import GitHub
 
@@ -366,8 +366,7 @@ class Intake:
         if not self.write:
             self.say("friction %s: would add %d journal%s to #%d" % (repo, len(new), plural, number))
             return
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                     {"body": evidence_comment(new)})
+        notify.post(self.gh, repo, number, evidence_comment(new), notify.EVIDENCE)
         rec.update(cited=sorted(cited | {j.id for j, _ in new}), commented=self.now)
         ledger[key] = rec
         self.say("friction %s: added %d journal%s to #%d" % (repo, len(new), plural, number))

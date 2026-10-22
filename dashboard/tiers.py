@@ -19,6 +19,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+from bus import bench as bench_lib
 from bus import factory, labels
 from bus.brain import lane_model
 
@@ -109,6 +110,32 @@ def _stale_allowance(states: Sequence[SourceState]) -> Dict[str, Any]:
     return dict(UNKNOWN, text="unknown (stale since %s)" % since)
 
 
+# -- the bench (loom#969) ---------------------------------------------------
+
+def _benched(bench: Optional[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """The pairs the bench list holds benched, each with its return time as
+    a datetime (None when it names none)."""
+    out = []
+    for item in (bench or {}).get("benched") or []:
+        if isinstance(item, dict) and item.get("provider") and item.get("model"):
+            until = _time(item.get("until"))
+            out.append(dict(item, until=until))
+    return out
+
+
+def _bench_allowance(item: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+    until = item["until"]
+    when = ", back %s (%s)" % (usage.clock(until), usage.time_until(until, now)) if until else ""
+    return {"state": "benched", "until": until,
+            "text": "benched for everyone: %s%s" % (_text(item.get("reason") or "repeated failure"), when)}
+
+
+def _bench_for(benched: Sequence[Dict[str, Any]], model: str, slots: Sequence[str]) -> Optional[Dict[str, Any]]:
+    """The benched pair for this model on any of these lanes or targets."""
+    return next((b for b in benched if _text(b["model"]) == model
+                 and any(bench_lib.matches(_text(b["provider"]), slot) for slot in slots)), None)
+
+
 # -- gateway rows -----------------------------------------------------------
 
 def _gateway_cell(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -182,16 +209,20 @@ def _gateway_allowance(target: str, model: str, day: SourceState, week: SourceSt
     return {"state": "cooling", "until": latest["until"], "window": "breaker", "text": _breaker_text(latest, now)}
 
 
-def gateway_rows(day: SourceState, week: SourceState, now: datetime) -> List[Dict[str, Any]]:
-    """The gateway's calls per target and model."""
+def gateway_rows(day: SourceState, week: SourceState, now: datetime,
+                 benched: Sequence[Dict[str, Any]] = ()) -> List[Dict[str, Any]]:
+    """The gateway's calls per target and model; a pair on the bench list
+    reads benched whatever the gateway's breakers say."""
     day_rows, week_rows = _gateway_index(day.data), _gateway_index(week.data)
     out = []
     for key in dict.fromkeys(list(day_rows) + list(week_rows)):
         target, model = key
         sample = day_rows.get(key) or week_rows.get(key) or {}
+        held = _bench_for(benched, model, [target])
         out.append({"provider": target, "model": model, "source": "gateway", "unit": "calls",
                     "kind": GATEWAY_KINDS.get(str(sample.get("kind") or "")),
-                    "allowance": _gateway_allowance(target, model, day, week, now),
+                    "allowance": _bench_allowance(held, now) if held else _gateway_allowance(
+                        target, model, day, week, now),
                     "w24": _gateway_cell(day_rows.get(key)) if isinstance(day.data, dict) else None,
                     "w7d": _gateway_cell(week_rows.get(key)) if isinstance(week.data, dict) else None})
     return out
@@ -286,7 +317,8 @@ def _tier_slots() -> Dict[str, List[str]]:
 
 
 def loom_rows(runs: SourceState, readings: SourceState, now: datetime,
-              env: Optional[Mapping[str, str]] = None) -> List[Dict[str, Any]]:
+              env: Optional[Mapping[str, str]] = None,
+              benched: Sequence[Dict[str, Any]] = ()) -> List[Dict[str, Any]]:
     """Loom's runs per lane and model: a row for every lane the tiers name,
     with no runs too (its allowance is what matters then), and for any other
     lane that ran. Cells are unknown when the run outcomes have no answer."""
@@ -305,27 +337,39 @@ def loom_rows(runs: SourceState, readings: SourceState, now: datetime,
         allowance = _usage_allowance(slots, readings, now)
         base = {"provider": lane, "source": "loom", "unit": "runs", "kind": factory.lane_kind(lane),
                 "slots": slots, "allowance": allowance}
+
+        def held_for(model: Optional[str], lane: str = lane, slots: List[str] = slots) -> Optional[Dict[str, Any]]:
+            """The bench entry that holds this model on the lane, if any."""
+            return _bench_for(benched, model or "", [lane] + slots) if model else None
+
         if not models:
             empty = _runs_cell([], "24h") if answered else None
-            out.append(dict(base, model="", configured_model=lane_model(lane, env), no_runs=answered,
-                            w24=empty, w7d=empty and dict(empty)))
+            configured = lane_model(lane, env)
+            held = held_for(configured)
+            out.append(dict(base, model="", configured_model=configured, no_runs=answered,
+                            w24=empty, w7d=empty and dict(empty),
+                            **({"allowance": _bench_allowance(held, now)} if held else {})))
         for model, groups in sorted(models.items()):
+            held = held_for(model)
             out.append(dict(base, model=model, no_runs=False,
+                            **({"allowance": _bench_allowance(held, now)} if held else {}),
                             w24=_runs_cell(groups, "24h"), w7d=_runs_cell(groups, "7d")))
     return out
 
 
 def model_rows(gateway_24h: SourceState, gateway_7d: SourceState, loom_runs: SourceState,
-               readings: SourceState, now: datetime, env: Optional[Mapping[str, str]] = None) -> List[Dict[str, Any]]:
+               readings: SourceState, now: datetime, env: Optional[Mapping[str, str]] = None,
+               bench: Optional[Mapping[str, Any]] = None) -> List[Dict[str, Any]]:
     """Every provider and model row: the gateway's (source "gateway", calls
     per target and model) and Loom's (source "loom", runs per lane and
     model). Each has {provider, model, source, unit, kind, allowance:
     {state, text, until}, w24, w7d}; a window cell is None when its source
     has no answer."""
     order = {kind: n for n, kind in enumerate(factory.KINDS)}
-    gateway = sorted(gateway_rows(gateway_24h, gateway_7d, now),
+    benched = _benched(bench)
+    gateway = sorted(gateway_rows(gateway_24h, gateway_7d, now, benched),
                      key=lambda r: (order.get(r["kind"], len(order)), r["provider"], r["model"]))
-    return gateway + loom_rows(loom_runs, readings, now, env)
+    return gateway + loom_rows(loom_runs, readings, now, env, benched)
 
 
 # -- live now ---------------------------------------------------------------
@@ -376,12 +420,14 @@ def live_now(station_runs: SourceState, gateway_state: SourceState, grug: Source
 SOURCE_NAMES = ("gateway_24h", "gateway_7d", "gateway_state", "grug", "loom_runs", "usage", "station")
 
 
-def build(sources: Mapping[str, SourceState], now: datetime, env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
+def build(sources: Mapping[str, SourceState], now: datetime, env: Optional[Mapping[str, str]] = None,
+          bench: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """The page's data from every source's SourceState (SOURCE_NAMES); a
-    source left out counts as not read yet."""
+    source left out counts as not read yet. `bench` is the bench list
+    (bus.bench.snapshot), None when the dashboard keeps none."""
     get = {name: sources.get(name) or SourceState.not_read(name) for name in SOURCE_NAMES}
-    rows = model_rows(get["gateway_24h"], get["gateway_7d"], get["loom_runs"], get["usage"], now, env)
-    return {"now": now, "tiers": tier_list(env), "grug_order": grug_order(get["grug"]), "grug": get["grug"],
+    rows = model_rows(get["gateway_24h"], get["gateway_7d"], get["loom_runs"], get["usage"], now, env, bench)
+    return {"now": now, "bench": bench, "tiers": tier_list(env), "grug_order": grug_order(get["grug"]), "grug": get["grug"],
             "gateway_rows": [r for r in rows if r["source"] == "gateway"],
             "loom_rows": [r for r in rows if r["source"] == "loom"],
             "gateway_sources": [get["gateway_24h"], get["gateway_7d"]],
@@ -450,6 +496,54 @@ def _tiers_html(data: Dict[str, Any], now: datetime) -> str:
                     "Loom tries a ticket's lanes in this order, by its difficulty, and a stuck ticket climbs the "
                     "model ladder. Each lane is marked free, own hardware, subscription or never paid (a prepaid "
                     "credit that is not topped up).", '<div class="tiers-grid">%s</div>' % "".join(parts))
+
+
+_EVENT_WORDS = {"bench": "benched", "rebench": "benched again", "trial": "on trial", "return": "back"}
+
+
+def _bench_html(data: Dict[str, Any], now: datetime) -> str:
+    """The Benched models section: each pair benched or on trial with its
+    reason and return time, and the recent bench and un-bench events."""
+    esc = html.escape
+    bench = data.get("bench")
+    note = ("A provider and model whose calls fail (errors, timeouts, unparseable or empty answers) over "
+            "a minimum sample is benched for everyone, Loom and Grug alike, for a cooldown that doubles "
+            "on each repeat. A limit refusal is allowance, not failure, and never counts. When the "
+            "cooldown ends, one trial call decides whether it returns or stays benched for twice as long.")
+    if bench is None:
+        return _section("bench", "Benched models", note,
+                        '<p class="tiers-note">The bench list is not kept by this dashboard.</p>')
+    rows = []
+    for item in bench.get("benched") or []:
+        until = _time(item.get("until"))
+        rows.append((item, "benched", "back %s (%s)" % (usage.clock(until), usage.time_until(until, now))
+                     if until else "return time unknown"))
+    for item in bench.get("trial") or []:
+        rows.append((item, "on trial", "one trial call decides"))
+    if rows:
+        body = ('<div class="tiers-table-wrap"><table class="tiers-table tiers-bench"><thead><tr>'
+                '<th>Provider</th><th>Model</th><th>State</th><th>Return</th><th>Level</th><th>Reason</th></tr></thead><tbody>%s</tbody></table></div>'
+                % "".join('<tr class="tiers-row tiers-%s" data-row="bench %s %s"><th scope="row" data-label="Provider">%s</th>'
+                          '<td data-label="Model">%s</td><td data-label="State">%s</td><td data-label="Return">%s</td>'
+                          '<td class="num" data-label="Level">%s</td><td data-label="Reason">%s</td></tr>'
+                          % ("benched" if word == "benched" else "cooling", esc(_text(item.get("provider"))),
+                             esc(_text(item.get("model"))), esc(_text(item.get("provider"))),
+                             esc(_text(item.get("model"))), word, esc(back), esc(str(_count(item.get("level")) or 1)),
+                             esc(_text(item.get("reason") or "")))
+                          for item, word, back in rows))
+    else:
+        body = '<p class="empty-state">No model is benched.</p>'
+    events = []
+    for event in reversed(bench.get("events") or []):
+        at = _time(event.get("at")) if isinstance(event, dict) else None
+        if at is None or event.get("kind") not in _EVENT_WORDS:
+            continue
+        events.append('<li><span class="tiers-lane">%s</span> <span class="tiers-model">%s</span> %s '
+                      '<span class="machine-fact">%s</span></li>'
+                      % (esc(_text(event.get("provider"))), esc(_text(event.get("model"))),
+                         _EVENT_WORDS[event["kind"]], esc(usage.time_ago(at, now))))
+    log = '<h3>Recent changes</h3><ul class="tiers-live-list">%s</ul>' % "".join(events[:20]) if events else ""
+    return _section("bench", "Benched models", note, body + log, "%d benched" % len(bench.get("benched") or []))
 
 
 def _fraction_pct(value: float) -> str:
@@ -604,4 +698,4 @@ def render(data: Dict[str, Any]) -> str:
     return ('<p class="page-lede">The whole tier system, each provider and model\'s allowance and how well it '
             'answers, and what runs now in Loom, the gateway and Grug. Figures are from the last background '
             'read; a source that does not answer shows as stale, never as zero.</p>'
-            + _tiers_html(data, now) + _rows_html(data, now) + _live_html(data, now))
+            + _tiers_html(data, now) + _bench_html(data, now) + _rows_html(data, now) + _live_html(data, now))

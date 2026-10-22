@@ -177,6 +177,125 @@ class AppTokenClientTests(unittest.TestCase):
                 auth_from_env()
 
 
+class TokenKeptAcrossPassesTests(unittest.TestCase):
+    """The station runs one pass per process; a token kept in a 0600 state
+    file lets the next pass reuse it, so last pass's ETags answer 304
+    (loom#1306)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.state = os.path.join(self._tmp.name, "station", "app-token.json")
+        self.cache = os.path.join(self._tmp.name, "etags")
+
+    def pass_client(self, tokens, clock, transport):
+        """A fresh client, as a new process builds one."""
+        app = AppToken("123", "456", lambda: KEY, sign=fake_sign([]), clock=clock)
+        app.state_file = self.state
+        return GitHub(app, transport=transport, cache_dir=self.cache), app
+
+    def test_a_second_pass_inside_the_lifetime_mints_no_token(self):
+        clock = Clock()
+        fake = FakeGitHub(["ghs_first", "ghs_second"], clock=clock)
+        gh1, app1 = self.pass_client(None, clock, fake)
+        gh1.rest("GET", "/rate_limit")
+        clock.now = START + 600
+        gh2, app2 = self.pass_client(None, clock, fake)
+        gh2.rest("GET", "/rate_limit")
+        self.assertEqual(fake.bearers("GET"), ["Bearer ghs_first"] * 2)
+        self.assertEqual((app1.minted, app2.minted), (1, 0))
+        self.assertEqual(gh2.kinds.get("app token", 0), 0)
+
+    def test_a_token_near_expiry_or_of_another_app_is_not_reused(self):
+        clock = Clock()
+        fake = FakeGitHub(["ghs_first", "ghs_second", "ghs_third"], clock=clock)
+        gh1, _ = self.pass_client(None, clock, fake)
+        gh1.rest("GET", "/rate_limit")
+        clock.now = START + 3600 - 299
+        gh2, app2 = self.pass_client(None, clock, fake)
+        gh2.rest("GET", "/rate_limit")
+        self.assertEqual(fake.bearers("GET")[-1], "Bearer ghs_second")
+        self.assertEqual(app2.minted, 1)
+        other = AppToken("123", "999", lambda: KEY, sign=fake_sign([]), clock=clock)
+        other.state_file = self.state
+        GitHub(other, transport=fake).rest("GET", "/rate_limit")
+        self.assertEqual(fake.bearers("GET")[-1], "Bearer ghs_third")
+
+    def test_a_refused_token_is_dropped_from_the_state_file(self):
+        clock = Clock()
+        fake = FakeGitHub(["ghs_first", "ghs_second"], clock=clock)
+        gh, app = self.pass_client(None, clock, fake)
+        gh.rest("GET", "/rate_limit")
+        self.assertTrue(os.path.exists(self.state))
+        gh._check_status("GET", "/x", 401, "", (401,))
+        self.assertFalse(os.path.exists(self.state))
+        gh3, _ = self.pass_client(None, clock, fake)
+        gh3.rest("GET", "/rate_limit")
+        self.assertEqual(fake.bearers("GET")[-1], "Bearer ghs_second")
+
+    def test_a_cached_etag_from_the_last_pass_is_sent_and_a_304_is_not_counted(self):
+        clock = Clock()
+        seen = []
+
+        def transport(method, url, headers, body):
+            if method == "POST":
+                return FakeGitHub(["ghs_first"], clock=clock)(method, url, headers, body)
+            seen.append(headers.get("If-None-Match"))
+            # GitHub's ETags belong to the token that read them.
+            tag = '"etag-for-%s"' % headers["Authorization"][len("Bearer "):]
+            if headers.get("If-None-Match") == tag:
+                return 304, {"ETag": tag}, b""
+            return 200, {"ETag": tag}, json.dumps([{"number": 7}]).encode()
+
+        gh1, _ = self.pass_client(None, clock, transport)
+        self.assertEqual(gh1.rest("GET", "/repos/o/r/issues/7").data, [{"number": 7}])
+        gh2, _ = self.pass_client(None, clock, transport)
+        answer = gh2.rest("GET", "/repos/o/r/issues/7")
+        self.assertEqual(seen, [None, '"etag-for-ghs_first"'])
+        self.assertEqual(answer.status, 304)
+        self.assertEqual(answer.data, [{"number": 7}])
+        self.assertEqual(gh2.not_modified, 1)
+        self.assertEqual(gh2.kinds, {})
+
+    def test_the_token_is_written_only_to_a_0600_state_file(self):
+        clock = Clock()
+        fake = FakeGitHub(["ghs_secret_token"], clock=clock)
+        gh, app = self.pass_client(None, clock, fake)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            gh.rest("GET", "/rate_limit")
+            repr(app)
+        self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o600)
+        self.assertNotIn("ghs_secret_token", buf.getvalue() + repr(app))
+        holders = []
+        for root, _, names in os.walk(self._tmp.name):
+            for name in names:
+                with open(os.path.join(root, name), errors="replace") as fh:
+                    if "ghs_secret_token" in fh.read():
+                        holders.append(os.path.join(root, name))
+        self.assertEqual(holders, [self.state])
+        with open(self.state) as fh:
+            self.assertNotIn(KEY_MARK, fh.read())
+
+    def test_a_state_file_open_to_others_is_ignored(self):
+        clock = Clock()
+        fake = FakeGitHub(["ghs_first", "ghs_second"], clock=clock)
+        gh1, _ = self.pass_client(None, clock, fake)
+        gh1.rest("GET", "/rate_limit")
+        os.chmod(self.state, 0o644)
+        gh2, app2 = self.pass_client(None, clock, fake)
+        gh2.rest("GET", "/rate_limit")
+        self.assertEqual(fake.bearers("GET")[-1], "Bearer ghs_second")
+        self.assertEqual(app2.minted, 1)
+
+    def test_without_a_state_file_nothing_is_written(self):
+        clock = Clock()
+        gh, fake, app = app_client(["ghs_first"], clock)
+        gh.rest("GET", "/rate_limit")
+        self.assertIsNone(app.state_file)
+        self.assertFalse(os.path.exists(self.state))
+
+
 class KeyNeverLeaksTests(unittest.TestCase):
     def _capture(self, run):
         """Every exception text, stdout, stderr and log line from run()."""

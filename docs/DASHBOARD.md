@@ -10,6 +10,13 @@ agent `com.loom.dashboard` (restarted if it exits, logging to
 environment; `LOOM_DASHBOARD=0` removes it. With no `LOOM_DB_PASSWORD` the
 agent sets `LOOM_TRANSCRIPTS_MEMORY=1`, so it starts with transcripts kept in
 memory, and its log says so.
+Check it from a second device on the private network, not from the lane
+machine itself: `curl -sS -o /dev/null -w '%{http_code}\n'
+http://192.0.2.10:8080/readyz` answers 503 until the first snapshot has read
+a repository and 200 after it, while `/livez` answers 200 as soon as the
+server is up. With `LOOM_DASHBOARD_HOST` set, the port is closed on the
+machine's other interfaces, so the same command against another address of
+that machine is refused (`curl: (7) Failed to connect`).
 Set `LOOM_DASHBOARD_PORT` to change the port and `LOOM_REPOS` to a
 space-separated list of `OWNER/NAME` repositories. Set
 `LOOM_DASHBOARD_GITHUB_TOKEN` to provide a read-only GitHub token; without it,
@@ -176,6 +183,10 @@ providers:
   its done and failed counts, rather than a rate that counts limits as
   failures.
 
+The page also has "Benched models" (loom#969), and a benched pair reads
+"benched for everyone" with its reason and return time in the allowance cell
+of its gateway and Loom rows. See "The bench" below.
+
 A stale source makes no current claim: when the gateway stats (both
 windows) or the usage snapshot are stale, the allowance cells they feed read
 "unknown (stale since <time>)", never "available". "Live now" lists the
@@ -258,3 +269,47 @@ only on its next pass. A hold whose until-time has passed is read as ended
 (loom#809): `/usage` counts that lane free and asks nothing about it, and
 `/lanes` says the hold ended and that no heartbeat has come since, instead of
 a past "until" read as a live hold.
+
+## The bench (loom#969)
+
+A provider and model that keeps failing is benched for everyone, so Loom and
+Grug stop picking it. The decision (`bus/bench.py`, `evaluate`) is pure and
+runs on the dashboard each background pass over the gateway's 24 hour stats
+(`dashboard/bench_store.py`), because the dashboard is where the shared call
+records are read.
+
+- Failure: a call that was neither ok nor a limit refusal (an error, a
+  timeout, an unparseable or empty answer). A limit refusal is allowance, not
+  failure, and counts toward neither calls nor failures.
+- Bench: at least `LOOM_BENCH_MIN_SAMPLE` calls (default 10) that were not
+  limits, of which at least `LOOM_BENCH_THRESHOLD` (default 0.5) failed.
+- Cooldown: `LOOM_BENCH_COOLDOWN_SECONDS` (default 3600), doubled each time
+  the pair is benched again, up to `LOOM_BENCH_MAX_COOLDOWN_SECONDS` (default
+  86400). A pair that stayed back for longer than the maximum starts again at
+  the first cooldown.
+- Trial: when the cooldown ends the pair is on trial. It is not benched, so
+  it can be picked. The calls made after the trial starts decide: all ok
+  returns the pair, and it is forgiven the failures already in the window;
+  any failure benches it again for twice as long. A gateway with no current
+  answer decides nothing: only the clock moves a benched pair to its trial.
+- Report: every bench, trial start, return and re-bench is an event. The
+  Tiers page lists the pairs benched or on trial with their reason and
+  return time, and the recent events. The station's report digest adds a line
+  for each event since the last digest.
+- Publish: `GET /api/bench` (the read-only `LOOM_HANDOFF_TOKEN` or the upload
+  token, as `/api/usage`) answers `{generated_at, benched, trial, events}`.
+  Loom's station reads it each pass into `state/station/bench.json` and
+  ignores a list older than 6 hours. Grug and the gateway read the same
+  endpoint; wiring them is their repos' work, not Loom's.
+
+Loom's side: a benched pair is skipped by the factory's model choice
+(`Factory.benched`, `_serves`): the ladder rungs, a ticket's pinned model
+and the equivalents all pass through it. A pair matches a Loom lane by the
+gateway target's name (the lane, or the lane a numbered slot belongs to). A
+lane whose configured model (`LOOM_<LANE>_MODEL` in the station's
+environment) is benched on it steps aside like a lane that is down. Loom's
+own run outcomes do not feed the decision: a stored run does not say whether
+a failure was a limit. `LOOM_BENCH_STATE_FILE` keeps the dashboard's bench
+state across a restart; without it a restart starts empty and benches again
+from the window's failures.
+
