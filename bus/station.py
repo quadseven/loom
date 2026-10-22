@@ -2751,7 +2751,9 @@ class Station:
         if not lane:
             return
         model = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
-        if not model or lane_takes_model(lane, model.group(1)):
+        # The model the ticket runs, as tickets.parse reads it: a retired pin
+        # runs its stand-in, which its labelled lane may well take.
+        if not model or lane_takes_model(lane, tickets.allowed_model(model.group(1))):
             return
         if free:
             by_lane[free[0]].append((repo, issue))
@@ -3488,8 +3490,12 @@ class Station:
             _say("%s#%s changed since it was checked; next pass" % (repo, issue["number"]))
             return False
         model = headers.get("Model", "")
-        if model and labelled_lane and not lane_takes_model(labelled_lane, model):
-            lane = self._route_model_claim(repo, fresh, labelled_lane, model, free)
+        # The claiming lane must take the model too: a ticket handed to a free
+        # lane as a mismatch was claimed there although that lane's runner
+        # refuses the model, and the refusal cost a rung (loom#1470).
+        if model and not (lane_takes_model(lane, model) and
+                          (not labelled_lane or lane_takes_model(labelled_lane, model))):
+            lane = self._route_model_claim(repo, fresh, labelled_lane or lane, model, free)
             if lane is None:
                 return False
         if self._model_waits(repo, issue, lane, headers):
