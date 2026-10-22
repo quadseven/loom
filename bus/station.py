@@ -451,7 +451,7 @@ VERIFY_SKIP = ("anthropic", "claude")
 # page, with the time it was seen. A lane that read the code and wrote what
 # the logs "would show" proved nothing (2026-10-15: a lane proof passed a
 # live criterion that way and was moved back by hand).
-_LIVE_CRITERION = re.compile(r"^\s*live\b", re.I)
+_LIVE_CRITERION = tickets.LIVE_CRITERION_RE
 _SEEN_AT = re.compile(r"\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d|\b\d\d:\d\d(?::\d\d)?Z\b")
 _HYPOTHETICAL = re.compile(
     r"\b(would|should|will|expected|expects?|could|might|once deployed|when deployed)\b", re.I)

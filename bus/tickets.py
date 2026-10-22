@@ -590,6 +590,10 @@ top of your work directory. It holds exactly one of:
    data section shows, or a later commit on the default branch, and
    observed.start must not be before that pull request merged: the station
    refuses a proof of a stale build or of evidence seen before the merge.
+   For a criterion that starts with "Live", the evidence quotes what was seen
+   (a log line, a response, a page) and names the UTC time it was seen, like
+   2030-01-01T00:00:00Z; never what "would" or "should" happen. The station
+   refuses live evidence without that time.
 2. {"missing": "<the evidence that does not exist yet>"} when you cannot
    prove every criterion. Name the evidence precisely; do not guess.
 
@@ -607,6 +611,11 @@ A runtime proof template with every required key and these criteria filled in
 """
 
 
+# A criterion a live observation proves: the station refuses its evidence
+# unless it names the time it was seen (station.unseen_live_evidence).
+LIVE_CRITERION_RE = re.compile(r"^\s*live\b", re.I)
+
+
 def verify_template(criteria: List[str]) -> str:
     """The runtime proof skeleton a verify brief shows (loom#714): lanes that
     built the record from prose alone left out observed or environment, and
@@ -619,7 +628,9 @@ def verify_template(criteria: List[str]) -> str:
         "observed": {"start": "<UTC time like 2030-01-01T00:00:00Z>",
                      "end": "<UTC time like 2030-01-01T01:00:00Z>"},
         "sources": ["<a reference to each piece of evidence>"],
-        "criteria": [{"criterion": text, "result": "pass", "evidence": "<what shows it>"}
+        "criteria": [{"criterion": text, "result": "pass",
+                      "evidence": ("<what you saw, quoted, and the UTC time you saw it>"
+                                   if LIVE_CRITERION_RE.match(text) else "<what shows it>")}
                      for text in criteria],
         "measure": {"name": "<what you measured>", "baseline": "<before>",
                     "target": "<the goal>", "after": "<after>"},
