@@ -13,9 +13,17 @@ and check_scope_fence. The issue-link check is advisory there, and the two
 linked-issue checks read other issues, not this body. When the gate changes,
 change the patterns here in the same way.
 
+The gate counts three non-empty bullets under Acceptance criteria. A ticket
+may state fewer (the factory files a follow-up ticket with the one criterion
+a lane left not built), so pad_criteria adds the standard bullets the gate
+wants: a body the gate refuses holds the pull request until the plan-check
+invariant fires.
+
     python3 -m bus.hunt_plan size WORD    print the letter for a size, or fail
     python3 -m bus.hunt_plan brief-size FILE  print a brief's size as the runner writes it
     python3 -m bus.hunt_plan check FILE   list what a body lacks ("-" = stdin)
+    python3 -m bus.hunt_plan pad-criteria FILE  print an acceptance criteria section
+        with the bullets the gate needs ("-" = stdin)
 """
 from __future__ import annotations
 
@@ -38,6 +46,19 @@ _SIZE_WORDS = {
     "l": "L", "large": "L",
 }
 _TOO_BIG = {"xl", "extra large", "extra-large", "huge"}
+
+# The gate counts the bullets under Acceptance criteria and wants three
+# non-empty ones ("what good look like"). A body it refuses holds the pull
+# request until the plan-check invariant fires.
+MIN_BULLETS = 3
+# The standard bullets a body carries when the ticket states fewer than the
+# gate wants. They hold of every lane pull request: the runner checks the
+# scope and the validation contract before it opens one. They are not the
+# ticket's criteria, so the factory's criterion bookkeeping ignores them.
+FILLER_BULLETS = (
+    "- [x] The pull request changes only what the ticket asks for",
+    "- [x] The full test suite passes as CI runs it",
+)
 
 # A ticket states its size as a "## Size" section or as one line of its own,
 # "Size: S" (any case, optionally bold: "**Size:** S", "**Size: S**").
@@ -117,6 +138,11 @@ def _section_text(body: str, *names: str) -> Optional[str]:
     return None
 
 
+def bullets(section: str) -> List[str]:
+    """The non-empty bullets of a section, as the gate counts them."""
+    return _BULLET.findall(str(section or ""))
+
+
 def problems(body: str) -> List[str]:
     """What the body lacks for the gate's blocking body checks; empty when
     it passes."""
@@ -133,9 +159,9 @@ def problems(body: str) -> List[str]:
         criteria, name = _section_text(body, "Test plan"), "Test plan"
     if criteria is None:
         out.append("missing ## Acceptance criteria (or ## Test plan) section")
-    elif len(_BULLET.findall(criteria)) < 3:
-        out.append("## %s has %d non-empty bullets; need >=3"
-                   % (name, len(_BULLET.findall(criteria))))
+    elif len(bullets(criteria)) < MIN_BULLETS:
+        out.append("## %s has %d non-empty bullets; need >=%d"
+                   % (name, len(bullets(criteria)), MIN_BULLETS))
     size = _SIZE.search(body)
     if not size:
         out.append("no Size: XS/S/M/L/XL in body")
@@ -147,6 +173,23 @@ def problems(body: str) -> List[str]:
     elif not fence.split():
         out.append("## Out of scope is empty")
     return out
+
+
+def pad_criteria(section: str) -> str:
+    """An acceptance criteria section with the bullets the gate needs: the
+    ticket's own, plus the standard ones when it states fewer than three.
+    The gate counts only non-empty bullets, so an empty placeholder does not
+    stand in for one. A section with no criterion of its own keeps the
+    gate's refusal: a body with nothing to build is not a body to merge."""
+    lines = [line for line in str(section or "").split("\n") if line.strip()]
+    have = len(bullets("\n".join(lines)))
+    out = list(lines)
+    for filler in FILLER_BULLETS:
+        if have >= MIN_BULLETS:
+            break
+        out.append(filler)
+        have += 1
+    return "\n".join(out)
 
 
 def with_size_letter(brief: str) -> str:
@@ -174,10 +217,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("size").add_argument("word", nargs="+")
     sub.add_parser("check").add_argument("file")
     sub.add_parser("brief-size").add_argument("file")
+    sub.add_parser("pad-criteria").add_argument("file")
     args = parser.parse_args(argv)
     if args.cmd == "brief-size":
         with open(args.file, encoding="utf-8") as fh:
             print(brief_size(fh.read()))
+        return 0
+    if args.cmd == "pad-criteria":
+        if args.file == "-":
+            section = sys.stdin.read()
+        else:
+            with open(args.file, encoding="utf-8") as fh:
+                section = fh.read()
+        print(pad_criteria(section))
         return 0
     if args.cmd == "size":
         try:

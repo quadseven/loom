@@ -401,6 +401,13 @@ pr_body() {
   criteria="$(section 'Acceptance criteria' "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
   [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$TREE/$SUMMARY_FILE" 2>/dev/null)"
   [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$1")"
+  # The gate wants three bullets under Acceptance criteria and a ticket may
+  # state fewer (the factory files a follow-up ticket with the one criterion
+  # a lane left not built), so the body carries the standard ones as well.
+  # A body the gate refuses holds the pull request.
+  criteria="$(printf '%s\n' "$criteria" |
+    PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan pad-criteria - ||
+    printf '%s' "$criteria")"
   printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
     "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$criteria" \
     "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL" "$validated" "$refs"

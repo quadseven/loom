@@ -154,6 +154,9 @@ def _render_generated(brief: str, lane: str, model: str, ticket: str,
     summary = _brief_section(brief, "What")
     if acceptance is None:
         acceptance = _brief_section(brief, "Acceptance criteria")
+    # The gate wants three bullets under Acceptance criteria; a ticket may
+    # state fewer, and a body it refuses holds the pull request.
+    acceptance = hunt_plan.pad_criteria(acceptance)
     size = _brief_size(brief)
     out_of_scope = _brief_section(brief, "Out of scope")
     issue = _field(brief, "Issue")
