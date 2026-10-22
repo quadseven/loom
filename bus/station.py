@@ -1858,7 +1858,11 @@ class Station:
         name = tickets.ticket_name(repo, number, attempt)
         has_contract, checks = self._validation_checks(repo)
         text = tickets.render_brief(repo, issue, lane, attempt, fix, checks, has_contract,
-                                    None if fix else self._timedout_branch(comments))
+                                    None if fix else self._timedout_branch(comments),
+                                    notes=tickets.operator_notes(
+                                        comments, list(self.s.authors) + list(self.s.briefers)
+                                        + list(self.s.owners)),
+                                    linked=self._linked_pulls(repo, number))
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
@@ -1881,6 +1885,13 @@ class Station:
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
+
+    def _linked_pulls(self, repo: str, number: int) -> List[str]:
+        """The pull requests in any repo that reference the ticket, from the
+        first page of its timeline (tickets.linked_pulls). _verify_before_build
+        sees only this repo's merges; a merge elsewhere reaches the lane here."""
+        return tickets.linked_pulls(self.gh.rest(
+            "GET", "/repos/%s/issues/%d/timeline?per_page=100" % (repo, number)).data)
 
     def _timedout_branch(self, comments: List[Any]) -> Optional[str]:
         """The side branch a timed-out attempt kept its edits on, as the

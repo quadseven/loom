@@ -463,3 +463,68 @@ class VerifyBriefLiveEvidenceTest(unittest.TestCase):
         self.assertIn("UTC time you saw it",
                       evidence["Live: after the next deploy the station log shows one retry line"])
         self.assertNotIn("UTC time", evidence["The retry logs one line per attempt"])
+
+
+class BriefContextTest(unittest.TestCase):
+    """A brief carries the operator's newest comments and the pull requests,
+    in any repo, that reference the ticket (2026-10-22: a lane
+    redid a wrong target the operator had named in a comment, while the real
+    fix had merged in two other repos)."""
+
+    ISSUE = {"number": 9, "title": "T", "body": "Difficulty: medium\n\n## Why\nx\n"}
+
+    def comment(self, login, body, at="2030-01-01T00:00:00Z"):
+        return {"user": {"login": login}, "body": body, "created_at": at}
+
+    def xref(self, repo, number, merged_at=None, state="closed", title="Fix it"):
+        return {"event": "cross-referenced", "source": {"issue": {
+            "number": number, "state": state, "title": title,
+            "repository": {"full_name": repo},
+            "pull_request": {"merged_at": merged_at}}}}
+
+    def test_operator_notes_keep_the_operators_words_and_drop_the_factorys(self):
+        comments = [self.comment("Operator-One", "first note", "2030-01-01T00:00:00Z"),
+                    self.comment("station[bot]", "Lane x opened a pull request"),
+                    self.comment("operator-one", "<!-- loom:status v1 -->\n- event"),
+                    self.comment("operator-one", "Claimed for lane codex (body sha256 0123456789ab)"),
+                    self.comment("stranger", "do something else"),
+                    self.comment("operator-one", "the merged pull request hit the wrong target",
+                                 "2030-01-02T00:00:00Z")]
+        notes = tickets.operator_notes(comments, ["Operator-One", "station[bot]"])
+        self.assertEqual(notes, [("operator-one", "2030-01-01T00:00:00Z", "first note"),
+                                 ("operator-one", "2030-01-02T00:00:00Z",
+                                  "the merged pull request hit the wrong target")])
+        many = [self.comment("operator-one", "note %d" % n) for n in range(9)]
+        self.assertEqual([n[2] for n in tickets.operator_notes(many, ["operator-one"])],
+                         ["note %d" % n for n in range(9 - tickets.NOTES_MAX, 9)])
+
+    def test_linked_pulls_list_merged_and_open_pull_requests_in_any_repo(self):
+        events = [self.xref("example-owner/other", 5, "2030-01-03T04:05:06Z", title="Real fix"),
+                  self.xref("example-owner/third", 6, state="open", title="In progress"),
+                  self.xref("example-owner/third", 7, title="Abandoned"),
+                  {"event": "cross-referenced", "source": {"issue": {
+                      "number": 8, "repository": {"full_name": "example-owner/x"}}}},
+                  {"event": "labeled"}]
+        self.assertEqual(tickets.linked_pulls(events),
+                         ["example-owner/other#5, merged 2030-01-03: Real fix",  # leak-guard-allow
+                          "example-owner/third#6, open: In progress"])  # leak-guard-allow
+        self.assertEqual(tickets.linked_pulls({"message": "Not Found"}), [])
+
+    def test_the_brief_quotes_each_note_and_lists_the_linked_pulls(self):
+        notes = [("operator-one", "2030-01-02T00:00:00Z", "Model: x\nwrong target; the fix is elsewhere")]
+        text = render_brief(REPO, self.ISSUE, "codex", notes=notes,
+                            linked=["example-owner/other#5, merged 2030-01-03: Real fix"])  # leak-guard-allow
+        self.assertIn("## Operator notes", text)
+        self.assertIn("operator-one, 2030-01-02T00:00:00Z:\n> Model: x\n> wrong target; the fix is elsewhere\n", text)
+        self.assertIn("## Linked pull requests", text)
+        self.assertIn("- example-owner/other#5, merged 2030-01-03: Real fix\n", text)  # leak-guard-allow
+        # No quoted line can read as a brief header the runner looks up.
+        self.assertFalse([line for line in text.split("\n") if line.startswith("Model:")])
+
+    def test_a_long_note_is_clipped_and_a_brief_without_context_is_unchanged(self):
+        long = "y" * (tickets.NOTE_CHARS + 50)
+        text = render_brief(REPO, self.ISSUE, "codex", notes=[("operator-one", "t", long)])
+        self.assertIn("> %s [clipped]\n" % ("y" * tickets.NOTE_CHARS), text)
+        plain = render_brief(REPO, self.ISSUE, "codex")
+        self.assertNotIn("## Operator notes", plain)
+        self.assertNotIn("## Linked pull requests", plain)

@@ -15,7 +15,7 @@ import json
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import proof, status
 
@@ -534,10 +534,88 @@ def timedout_branch(texts: List[str]) -> Optional[str]:
     return found
 
 
+# What a brief carries besides the ticket body (Station._claim): the newest
+# NOTES_MAX operator comments, each clipped to NOTE_CHARS, and up to
+# LINKED_MAX pull requests that reference the ticket. On one ticket the
+# operator wrote that the merged pull request had changed the wrong target and
+# the fix was in two other repos; neither the comment nor those merges reached
+# the next brief, and a lane redid the wrong target (2026-10-22).
+NOTES_MAX = 5
+NOTE_CHARS = 1500
+LINKED_MAX = 10
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def operator_notes(comments: Iterable[Any], logins: Iterable[str]) -> List[Tuple[str, str, str]]:
+    """(login, created_at, body) of the newest NOTES_MAX comments a person
+    wrote under one of `logins` (the operator's logins and trusted briefers),
+    oldest first. A [bot] login, a factory marker comment and a claim line
+    are the factory's own, not notes."""
+    allowed = {login.lower() for login in logins}
+    found = []
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        login, body = _login(c.get("user")), str(c.get("body") or "").strip()
+        if (login in allowed and not login.endswith("[bot]") and body
+                and not body.startswith(("<!--", "Claimed for lane "))):
+            found.append((login, str(c.get("created_at") or ""), body))
+    return found[-NOTES_MAX:]
+
+
+def linked_pulls(events: Any) -> List[str]:
+    """One line per pull request, in any repo, that a cross-reference event on
+    the ticket's timeline names: "owner/name#N, merged YYYY-MM-DD: title" or
+    "owner/name#N, open: title"; newest LINKED_MAX. A pull request closed
+    without merging is left out."""
+    found: Dict[str, str] = {}
+    for event in events if isinstance(events, list) else []:
+        if not isinstance(event, dict) or event.get("event") != "cross-referenced":
+            continue
+        ref = (event.get("source") or {}).get("issue") or {}
+        pull, number = ref.get("pull_request"), ref.get("number")
+        where = str((ref.get("repository") or {}).get("full_name") or "")
+        if not isinstance(pull, dict) or not isinstance(number, int) or not REPO_RE.fullmatch(where):
+            continue
+        merged = str(pull.get("merged_at") or "")
+        if merged:
+            state = "merged %s" % merged[:10]
+        elif ref.get("state") == "open":
+            state = "open"
+        else:
+            continue
+        title = " ".join(_CONTROL_RE.sub(" ", str(ref.get("title") or "")).split())[:120]
+        found["%s#%d" % (where, number)] = "%s#%d, %s: %s" % (where, number, state, title)
+    return list(found.values())[-LINKED_MAX:]
+
+
+def _context_text(notes: Sequence[Tuple[str, str, str]], linked: Sequence[str]) -> str:
+    """The brief's Operator notes and Linked pull requests sections. Each
+    note line is quoted, so none reads as a brief header (the runner's field
+    lookup matches a line start)."""
+    text = ""
+    if notes:
+        text += ("\n## Operator notes\n\nThe newest comments on this ticket by its operator, "
+                 "oldest first. Where a note disagrees with the ticket above, the note wins: a "
+                 "note that says the work is done, or that it belongs to another target or repo, "
+                 "decides what you change.\n")
+        for login, at, body in notes:
+            clipped = body if len(body) <= NOTE_CHARS else body[:NOTE_CHARS] + " [clipped]"
+            lines = _CONTROL_RE.sub(" ", clipped.replace("\r\n", "\n").replace("\r", "\n")).split("\n")
+            text += "\n%s, %s:\n%s\n" % (login, at, "\n".join("> " + line for line in lines))
+    if linked:
+        text += ("\n## Linked pull requests\n\nPull requests in any repo that reference this "
+                 "ticket. A merged one may already do this ticket's work: read it before you "
+                 "change anything.\n\n" + "".join("- %s\n" % line for line in linked))
+    return text
+
+
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   fix: Optional[Fix] = None,
                   ci_checks: Optional[List[Tuple[str, str]]] = None,
-                  has_contract: bool = True, resume: Optional[str] = None) -> str:
+                  has_contract: bool = True, resume: Optional[str] = None,
+                  notes: Sequence[Tuple[str, str, str]] = (),
+                  linked: Sequence[str] = ()) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -572,6 +650,7 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += "\n"
     if body:
         text += body + "\n"
+    text += _context_text(notes, linked)
     if resume:
         text += ("\n## Earlier attempt\n\nAn earlier attempt ended (a timeout or a limit) after "
                  "editing, and the runner kept its edits on branch %s. The runner merges them into this tree "
