@@ -6458,6 +6458,29 @@ class ReportDigestTest(Base):
         self.assertIn("Loom evening digest", self.sent[1]["content"])
         self.assertIn("No goal moved since the last digest.", self.sent[1]["content"])
 
+    def test_the_digest_reports_each_bench_and_return_since_the_last_digest(self):
+        # loom#969: every bench and un-bench is told once, in the digest.
+        self.goal(40, "Goal forty")
+        self.at(9, 0)
+        path = os.path.join(self.home, "state", "station", "bench.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        event = lambda kind, minute, reason="": {  # noqa: E731
+            "at": int(self.base + 9 * 3600 + minute * 60), "kind": kind, "provider": "free-kilo",
+            "model": "kilo-coder", "reason": reason, "until": None, "level": 1}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": self.base + 9 * 3600 + 1800, "benched": [], "trial": [],
+                       "events": [event("bench", -600, "old, before the window"),
+                                  event("bench", 10, "failed 12 of 20 calls (60%), threshold 50%"),
+                                  event("return", 40)]}, fh)
+        self.at(10, 1)
+        text = self.sent[0]["content"]
+        self.assertIn("Benched and returned models (2):", text)
+        self.assertIn("- free-kilo kilo-coder: benched (failed 12 of 20 calls (60%), threshold 50%)", text)
+        self.assertIn("- free-kilo kilo-coder: back", text)
+        self.assertNotIn("before the window", text)
+        self.at(21, 5)
+        self.assertNotIn("Benched and returned", self.sent[1]["content"])
+
     def test_a_goal_with_only_work_in_flight_counts_as_quiet(self):
         # 2026-10-18: every goal reported "N in flight since the last report",
         # so the digest listed all 18 goals as moving.

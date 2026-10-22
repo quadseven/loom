@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, change_class, labels, naming, notify, scope_fit, split, stale_claims, status, tickets
+from . import bench, brain, change_class, labels, naming, notify, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -1332,6 +1332,7 @@ class Factory:
                  silent: Optional[Dict[str, float]] = None,
                  down: Sequence[str] = (),
                  limit_until: Optional[Dict[str, float]] = None,
+                 benched: Sequence[Tuple[str, str]] = (),
                  known_waits: Optional[Dict[str, str]] = None,
                  human: Callable[..., Any] = brain.human,
                  place: Callable[..., Any] = brain.place_under_epic,
@@ -1363,6 +1364,10 @@ class Factory:
         # Lane -> {model: epoch its limit lifts}: a lane with a model ladder
         # is up while one model is limited, but not for that model.
         self.model_limits = dict(model_limits or {})
+        # (provider, model) pairs benched for everyone after repeated failure
+        # (bus/bench.py, loom#969): a lane of the provider does not run that
+        # model, whatever the ticket pins, until the bench list lets it back.
+        self.benched = [(str(p), str(m)) for p, m in benched]
         # Lanes whose heartbeat says available; None trusts every lane not
         # at a limit.
         self.available = None if available is None else set(available)
@@ -1461,8 +1466,10 @@ class Factory:
         return lane not in self.limited and (self.available is None or lane in self.available)
 
     def _serves(self, lane: str, model: str) -> bool:
-        """Whether the lane can run this model now: no limit on it there."""
-        return model not in self.model_limits.get(lane, {})
+        """Whether the lane can run this model now: no limit on it there and
+        not benched for failing."""
+        return (model not in self.model_limits.get(lane, {})
+                and not bench.is_benched(self.benched, lane, model))
 
     def _free(self, lane: str) -> bool:
         """A lane that is up, not at a limit, and holds no briefed or
