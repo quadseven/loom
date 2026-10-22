@@ -59,6 +59,7 @@ from . import text as _text
 from . import tickets
 from . import transcripts
 from . import criteria_gate
+from . import deploy_watch
 from . import watch
 from . import labels
 from .brain import HUMAN_MARKER
@@ -9346,6 +9347,26 @@ class Station:
                        review_check=self.s.review_check, lanes=self._factory,
                        state_dir=self.state).run()
 
+    def watch_deploys(self) -> None:
+        """Watch the deploy of each Loom auto-merge for LOOM_POST_MERGE_WATCH
+        minutes and revert one whose deploy fails (bus/deploy_watch.py).
+        Runs with the factory; LOOM_FACTORY=0 turns it off."""
+        if not self.s.factory_on:
+            return
+        repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
+        deploy_watch.Watch(self.gh, repos, self.now, trusted=self.s.authors,
+                           state_dir=self.state, page=self._page_operator).run()
+
+    def _page_operator(self, message: str) -> Optional[bool]:
+        """Send one message to the operator, with the mention: True when it
+        went out, False to try again next pass, None with no webhook set."""
+        if not self.s.webhook_ssm:
+            return None
+        url = self._webhook()
+        if url is None:
+            return False
+        return self._send(url, message, mention=True)
+
     def _dated_metrics(self, path: str) -> Dict[str, Tuple[int, int]]:
         dated = {}
         allowed = {author.lower() for author in self.s.authors}
@@ -10010,7 +10031,8 @@ class Station:
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
-                     self.watch_default_branches, self.refresh_bench, self.run_factory,
+                     self.watch_default_branches, self.watch_deploys,
+                     self.refresh_bench, self.run_factory,
                      # The move first, so the invariants read a goal whose
                      # tickets sit under an epic.
                      self.move_outside_tickets, self.check_invariants,
