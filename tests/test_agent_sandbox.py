@@ -1,6 +1,8 @@
 """The API-lane agent's Seatbelt profile (lanes/agent_sandbox.sh): outbound
 connections only to its provider's port, writes only to its tree and scratch
-home. The agy lane and the validation run keep their own rules (Refs #575)."""
+home. The agy lane is bounded the same way (its model endpoint's port is open,
+keychain and /usr/bin/security denied), and the validation run keeps its own
+rules."""
 
 import os
 import socket
@@ -24,6 +26,14 @@ w "$AGENT_HOME/tmp/scratch.txt" scratch
 w "$2" outside
 w /dev/null devnull
 if /usr/bin/nc -z -w 1 127.0.0.1 "$3" > /dev/null 2>&1; then echo lo=reachable; else echo lo=denied; fi
+"""
+
+# Run inside the agy (default) profile: try a connection to a documentation
+# range address on a port the profile does not allow, and try to run
+# /usr/bin/security, and print what happened. $1 is the tree.
+AGY_PROBE = r"""
+if /usr/bin/nc -z -w 1 192.0.2.1 80 > /dev/null 2>&1; then echo net=reachable; else echo net=denied; fi
+if /usr/bin/security --help > /dev/null 2>&1; then echo security=ran; else echo security=denied; fi
 """
 
 
@@ -88,13 +98,36 @@ class AgentSandboxTest(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertIn("refusing sandbox: no usable port in the spark URL", result.stderr)
 
-    def test_the_agy_lane_and_the_validation_run_keep_their_rules(self):
-        for mode in ("", "check"):
-            with self.subTest(mode=mode):
-                profile = self.profile(mode)
-                self.assertNotIn(WRITE_DENY, profile)
-                self.assertNotIn(NET_DENY, profile)
-                self.assertIn('(deny network-outbound (remote ip "localhost:*"))', profile)
+    def test_the_validation_run_keeps_its_rules(self):
+        profile = self.profile("check")
+        self.assertNotIn(WRITE_DENY, profile)
+        self.assertNotIn(NET_DENY, profile)
+        self.assertIn('(deny network-outbound (remote ip "localhost:*"))', profile)
+
+    def test_the_agy_lane_is_bounded_by_the_outer_profile(self):
+        profile = self.profile("", lane="agy")
+        self.assertIn(NET_DENY, profile)
+        allows = [line for line in profile.splitlines()
+                  if line.startswith("(allow network-outbound (remote ip")]
+        self.assertEqual(allows, ['(allow network-outbound (remote ip "*:443"))'])
+        self.assertIn(NET_DENY, profile)
+        # The allow for 443 comes after the blanket deny.
+        self.assertGreater(profile.index('(allow network-outbound (remote ip "*:443"))'),
+                           profile.index(NET_DENY))
+        self.assertIn('(deny mach-lookup (global-name "com.apple.SecurityServer")', profile)
+        self.assertIn('(literal "/usr/bin/security")', profile)
+        # An arbitrary port on an arbitrary host is not allowed.
+        self.assertNotIn('(allow network-outbound (remote ip "*:80"))', profile)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_inside_the_agy_profile_connections_and_security_stay_confined(self):
+        result = self.bash(
+            'p="$(sandbox_profile "$1" bash "")" || exit 9\n'
+            'sandbox-exec -p "$p" /bin/bash -c "$2"',
+            AGY_PROBE, lane="agy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(),
+                         ["net=denied", "security=denied"])
 
     def test_an_unknown_mode_is_refused(self):
         result = self.bash('sandbox_profile "$1" bash agent')
