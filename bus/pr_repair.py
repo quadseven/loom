@@ -19,7 +19,11 @@ from . import hunt_plan, text
 
 # Headings the runner injects into the PR body, in order.
 GENERATED_HEADINGS = ("## Why", "## Summary", "## Acceptance criteria",
-                      "## Out of scope")
+                      "## Out of scope", "## Operator steps before merge")
+# lanes/run_lane.sh::OPERATOR_SECTION, and what pr_body writes when neither
+# the lane nor the ticket filled it.
+OPERATOR_SECTION = "Operator steps before merge"
+OPERATOR_NONE = "none stated"
 FOOTER_RULE = "---"
 FOOTER_PREFIX = "Loom"
 _REFS_LINE = re.compile(r"^Refs [A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+[ \t]*$", re.M)
@@ -146,8 +150,23 @@ def _checklist(brief: str, current_body: str, summary: str) -> str:
     return ticket
 
 
+def _operator_steps(brief: str, current_body: str, summary: str) -> str:
+    """The operator steps section, as pr_body fills it: the lane's summary,
+    else the pull request's own (so a round keeps an earlier declaration),
+    else the ticket's, else OPERATOR_NONE."""
+    for source in (summary, current_body, brief):
+        found = _brief_section(source, OPERATOR_SECTION) if source else ""
+        # A body's last section runs on into its footer: stop at the rule.
+        found = found.split("\n" + FOOTER_RULE + "\n", 1)[0]
+        found = "" if found == FOOTER_RULE else found.removesuffix("\n" + FOOTER_RULE)
+        if found:
+            return found
+    return OPERATOR_NONE
+
+
 def _render_generated(brief: str, lane: str, model: str, ticket: str,
-                      acceptance: Optional[str] = None) -> str:
+                      acceptance: Optional[str] = None,
+                      operator_steps: str = OPERATOR_NONE) -> str:
     """Render the generated sections the way lanes/run_lane.sh::pr_body does."""
     _check_footer_fields(ticket, lane, model)
     why = _brief_section(brief, "Why")
@@ -162,9 +181,9 @@ def _render_generated(brief: str, lane: str, model: str, ticket: str,
         refs = "\nRefs %s" % issue
     return (
         "## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\n"
-        "Size: %s\n\n## Out of scope\n%s\n\n%s\n%s ticket %s, lane %s, "
+        "Size: %s\n\n## Out of scope\n%s\n\n## %s\n%s\n\n%s\n%s ticket %s, lane %s, "
         "model %s.%s" % (
-            why, summary, acceptance, size, out_of_scope,
+            why, summary, acceptance, size, out_of_scope, OPERATOR_SECTION, operator_steps,
             FOOTER_RULE, FOOTER_PREFIX, ticket, lane, model, refs))
 
 
@@ -173,9 +192,19 @@ def _find_heading(body: str, heading: str) -> int:
     return m.start() if m else -1
 
 
+def _generated_start(body: str) -> int:
+    """Where the generated sections start, or -1 when a required heading is
+    missing. The operator steps heading is optional: a body written before
+    the runner added it lacks it, and the repair adds it."""
+    found = {h: _find_heading(body, h) for h in GENERATED_HEADINGS}
+    if any(at < 0 for h, at in found.items() if h != "## " + OPERATOR_SECTION):
+        return -1
+    return min(at for at in found.values() if at >= 0)
+
+
 def _hash_generated(body: str) -> str:
     body = _normalise(body)
-    start = min((_find_heading(body, h) for h in GENERATED_HEADINGS), default=-1)
+    start = _generated_start(body)
     if start < 0:
         raise ValueError("generated headings missing")
     if body.find("\n" + FOOTER_RULE + "\n", start) < 0:
@@ -191,7 +220,7 @@ def _split_current(body: str) -> Tuple[str, str, str]:
     suffix is reviewer text after the generated footer, if any.
     """
     body = _normalise(body)
-    start = min((_find_heading(body, h) for h in GENERATED_HEADINGS), default=-1)
+    start = _generated_start(body)
     if start < 0:
         raise ValueError("generated headings missing")
     prefix = body[:start].strip()
@@ -258,7 +287,8 @@ def reconcile(brief_path: str, current_title: str, current_body: str,
     try:
         desired_generated = _render_generated(
             brief, lane, model, ticket,
-            _checklist(brief, _normalise(current_body), summary))
+            _checklist(brief, _normalise(current_body), summary),
+            _operator_steps(brief, _normalise(current_body), summary))
         new_hash = _sha12(_normalise(desired_generated))
         result["new_hash"] = new_hash
         old_hash = _hash_generated(current_body)

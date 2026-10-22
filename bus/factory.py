@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, change_class, labels, naming, notify, scope_fit, split, stale_claims, status, tickets
+from . import bench, brain, change_class, labels, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -2203,9 +2203,30 @@ class Factory:
         elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
-        elif not sensitive:
+        elif not sensitive and not self._operator_holds(repo, number, full, issue):
             self._file_criterion_follow_up(repo, number, issue, full)
             self._land(repo, number, full, issue, comments)
+
+    def _operator_holds(self, repo: str, number: int, full: Dict[str, Any],
+                        issue: Dict[str, Any]) -> bool:
+        """Whether the pull request waits for the operator instead of landing
+        (bus/operator_hold.py): it or its ticket declares operator steps
+        before merge, it changes placement, or it deletes or mostly replaces
+        a doc its ticket does not name. The ticket goes
+        to loom:human with one exact ask, once; the pull request never lands
+        on the factory's say-so, whatever later passes find."""
+        why = operator_hold.reasons(self.gh, repo, full, str(issue.get("body") or ""),
+                                    operator_hold.pull_files(self.gh, repo, number))
+        if not why:
+            return False
+        outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, why,
+                                     self.human)
+        if outcome == "asked":
+            self.actions += 1
+            _say("held %s#%d for the operator: %s" % (repo, number, "; ".join(why)))
+        elif outcome != "already":
+            _say("held %s#%d for the operator, but %s" % (repo, number, outcome))
+        return True
 
     def _file_criterion_follow_up(self, repo: str, number: int,
                                   issue: Dict[str, Any], full: Dict[str, Any]) -> None:
@@ -2955,7 +2976,7 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
-        if self.now < held_until(issue):
+        if self.now < held_until(issue) or self._host_only(repo, issue):
             return "%s is held" % ref
         # A ticket held by After: is never briefed: the station refuses the
         # claim each pass, and the lane it was given counts it as load and
@@ -2986,6 +3007,30 @@ class Factory:
             self._waiting(repo, issue["number"], "giving it a lane failed")
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
+
+    def _host_only(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether every acceptance criterion of the queued ticket is a check
+        on a live host or network (operator_hold.host_only): it gets no lane
+        and goes to loom:human with one ask, once. 2026-10-22: such a ticket
+        was laned, the lane replaced a README to have a diff, and it merged."""
+        criteria = operator_hold.host_only(str(issue.get("body") or ""))
+        if not criteria:
+            return False
+        if "loom:human" in _labels(issue):
+            return True
+        try:
+            self.human(self.gh, repo, int(issue["number"]), operator_hold.host_only_ask(criteria))
+        except ValueError as err:
+            # The ask was refused (its quoted criteria, say); the ticket still
+            # gets no lane, and the log says why it waits with no ask.
+            _say("held queued %s#%s for a person, but the ask was refused: %s"
+                 % (repo, issue["number"], err))
+            return True
+        issue["labels"] = list(issue.get("labels") or []) + [{"name": "loom:human"}]
+        self.actions += 1
+        _say("held queued %s#%s for a person: every criterion is a host check"
+             % (repo, issue["number"]))
+        return True
 
     def _assign_queued_model(self, repo: str, issue: Dict[str, Any], model: str) -> str:
         """Give a queued ticket pinned to `model` a lane that takes it, or an

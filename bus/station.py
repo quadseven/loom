@@ -47,6 +47,7 @@ from . import naming
 from . import notify
 from . import proof
 from . import rewrite
+from . import operator_hold
 from . import ship_paths
 from . import roll_pin
 from . import revert
@@ -574,6 +575,14 @@ def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
         return datetime.fromtimestamp(mtime, tz=timezone.utc)
     except (FileNotFoundError, NotADirectoryError):
         return None
+
+
+def _unproven_host_checks(body: Any) -> List[str]:
+    """The ticket's unticked criteria that only a check on a live host or
+    network can meet (operator_hold.network_check): a merge proves none of
+    them. A Live line keeps its own close rule (_done_reason)."""
+    return [text for checked, text in proof.criteria(str(body or ""))
+            if not checked and operator_hold.network_check(text)]
 
 
 def _live_time_window(live: str) -> Optional[Tuple[Optional[datetime], Optional[datetime]]]:
@@ -4612,22 +4621,7 @@ class Station:
         filter missing, a pull request could look as if it touched no
         deployed path, so nothing in the repo ships this pass."""
         if repo not in self._path_filters:
-            listing = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s" % (
-                repo, ship_paths.WORKFLOWS_DIR, quote(branch, safe="")), ok=(404,)).data
-            texts: Optional[Dict[str, str]] = {} if isinstance(listing, list) else None
-            for item in listing if isinstance(listing, list) else []:
-                name = str(item.get("name") or "") if isinstance(item, dict) else ""
-                if not re.fullmatch(r"[\w.-]+\.ya?ml", name):
-                    continue
-                data = self.gh.rest("GET", "/repos/%s/contents/%s/%s?ref=%s" % (
-                    repo, ship_paths.WORKFLOWS_DIR, name, quote(branch, safe="")), ok=(404,)).data
-                try:
-                    texts[name] = base64.b64decode(data["content"]).decode("utf-8", "replace")
-                except (KeyError, TypeError, ValueError):
-                    texts = None
-                    break
-            self._path_filters[repo] = (
-                ship_paths.scoped_workflows(texts) if texts is not None else None)
+            self._path_filters[repo] = ship_paths.read_filters(self.gh, repo, branch)
         return self._path_filters[repo]
 
     def _pull_paths(self, repo: str, number: int) -> Optional[List[str]]:
@@ -7616,6 +7610,11 @@ class Station:
                 if window_end is not None and earliest is not None and earliest > window_end:
                     return ("shipped, its Live window ended %s but evidence started %s" % (
                         window_end.strftime("%Y-%m-%d"), earliest.strftime("%Y-%m-%d")))
+                return ""
+            if _unproven_host_checks(issue.get("body")):
+                # 2026-10-22: a ticket whose criteria were all host checks
+                # (a version on a host, a closed port) closed as shipped on
+                # a merge that could not meet them. They wait for evidence.
                 return ""
             if not live_needles(issue.get("body")):
                 return "shipped, and its Live line names nothing a log search can find"

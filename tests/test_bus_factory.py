@@ -1,5 +1,6 @@
 """The factory pass (bus/factory.py) with a fake GitHub and recorded actions."""
 
+import base64
 import os
 import re
 import tempfile
@@ -56,6 +57,8 @@ class FakeGitHub:
         self.attempts = {}
         self.update_status = 202
         self.files = {}
+        self.patches = {}
+        self.contents = {}
         self.filed = []
         self.private = True
         self.logs = {}
@@ -136,7 +139,9 @@ class FakeGitHub:
         if m:
             page = int(m.group(2))
             names = self.files[int(m.group(1))][(page - 1) * 100:page * 100]
-            return Response(200, [{"filename": n} for n in names])
+            # A one-line change, unless the test gave the file its own patch.
+            return Response(200, [{"filename": n, "patch": self.patches.get(
+                n, "@@ -1 +1 @@\n-old\n+new")} for n in names])
         m = re.search(r"/commits/(\w+)/check-runs", path)
         if m:
             return Response(200, {"check_runs": self.runs[m.group(1)]})
@@ -145,6 +150,16 @@ class FakeGitHub:
             return Response(200, {"behind_by": self.behind.get(int(m.group(1)), 0)})
         if path == "/repos/%s" % REPO:
             return Response(200, {"private": self.private})
+        m = re.search(r"/contents/(.+?)\?ref=", path)
+        if m:
+            # A folder lists the files under it; a file comes back encoded.
+            name = m.group(1)
+            if name in self.contents:
+                return Response(200, {"content": base64.b64encode(
+                    self.contents[name].encode()).decode()})
+            listed = [{"name": k.rsplit("/", 1)[1]} for k in self.contents
+                      if k.rsplit("/", 1)[0] == name]
+            return Response(200, listed) if listed else Response(404, None)
         m = re.search(r"/actions/runs/(\d+)$", path)
         if m:
             return Response(200, {"run_attempt": self.attempts.get(m.group(1), 1)})

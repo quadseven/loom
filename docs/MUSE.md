@@ -82,7 +82,9 @@ not looked hard enough yet. Each tick the brain:
   ticket it with the evidence.
 - Finishes before it starts: each tick merges every lane pull request that
   `bus.brain status` marks `READY` (the merge-ready signal in
-  docs/BRAIN.md) before it briefs anything new.
+  docs/BRAIN.md) before it briefs anything new. A pull request held for
+  the operator (docs/BRAIN.md, Operator holds) is not merged: `bus.brain
+  merge` refuses it and asks the operator on its ticket.
 - In the brief step, rank up to 5 open tickets that have no `Priority:` line
   with `python3 -m bus.brain prioritize OWNER/NAME#N --priority P0|P1|P2|P3
   --note "REASON"`. Choose highest goal cost first, and make each note one

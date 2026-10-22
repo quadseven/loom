@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import GitHub, GitHubError, RateLimited, _next_link, auth_from_env, rest_login, unreadable
 from . import audit, change_class, handoff, hunt_plan, journal, lock, notify, pr_repair, proof, stale_claims, text, tickets
-from . import naming
+from . import naming, operator_hold
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -641,10 +641,19 @@ def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
         if ticket is not None and authors:
             comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
             if _pending_brain_fix(comments, authors):
-                line = (line.removesuffix("READY") + "blocked: pending brain fix"
-                        if line.endswith(" - READY") else line + ", pending brain fix")
+                line = _add_blocker(line, "pending brain fix")
+        if operator_hold.operator_steps(str(pr.get("body") or "")):
+            # bus.brain merge refuses it and asks the operator; status says
+            # so first, from the body it already holds (2026-10-22).
+            line = _add_blocker(line, "held for the operator: operator steps before merge")
         lines.append(line)
     return lines
+
+
+def _add_blocker(line: str, blocker: str) -> str:
+    """A merge-ready line with one more blocker."""
+    return (line.removesuffix("READY") + "blocked: " + blocker
+            if line.endswith(" - READY") else line + ", " + blocker)
 
 
 def _sensitive_pr_lines(prs: List[Dict[str, Any]]) -> List[str]:
@@ -899,6 +908,17 @@ def _health_lines(env: Dict[str, str]) -> List[str]:
 def _check_model(model: Optional[str]) -> None:
     if model is not None and not MODEL_RE.fullmatch(model):
         raise ValueError("model is not a model id")
+
+
+def _check_laneable(body: str) -> None:
+    """Refuse a brief no lane can meet: every acceptance criterion is a check
+    on a live host or network (operator_hold.host_only). 2026-10-22: such a
+    ticket was laned; the lane replaced a README to have a diff, and it
+    merged."""
+    if operator_hold.host_only(body):
+        raise ValueError("every acceptance criterion is a check on a live host or network: "
+                         "no lane can meet it; file it as a needs-operator ask, or add a "
+                         "criterion a pull request can meet")
 
 
 def _check_brief_args(title: str, body: str, lane: Optional[str],
@@ -2101,6 +2121,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         # A forbidden model is written as its stand-in (tickets.allowed_model).
         model = tickets.allowed_model(model)
     _check_brief_args(title, body, lane, model, base)
+    _check_laneable(body)
     if not_before is not None and not tickets.NOT_BEFORE_RE.fullmatch(not_before):
         raise ValueError("not-before is not a UTC time like 2026-10-13T17:00:00Z")
     if after is not None:
@@ -2948,6 +2969,7 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
              ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
              ' reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes {'
              ' databaseId author { __typename login } body createdAt } } } }'
+             ' files(first:100) { totalCount nodes { path deletions changeType } }'
              ' } } }') % (_gql(owner), _gql(name), number)
     data = gh.graphql(query) or {}
     return ((data.get("repository") or {}).get("pullRequest") or {})
@@ -2974,8 +2996,9 @@ def merge(gh: GitHub, repo: str, number: int,
             bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
                    or factory.DEFAULT_REVIEW_BOT)
             _validate_sensitive_merge(gh, repo, details, bot, review_check_name(env))
-        association = _validate_ticket_association(gh, repo, number, pr, ticket, "pr")
+        association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
         _refuse_pending_fix(gh, association, env)
+        _refuse_operator_hold(gh, repo, number, pr, details, association, issue)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
@@ -2993,6 +3016,42 @@ def merge(gh: GitHub, repo: str, number: int,
         notify.post(gh, repo, number, ADOPT_COMMENT, notify.MERGED)
     return {"merged": True, "pull_request": (repo, number),
             "ticket": association, "head_sha": sha}
+
+
+def _changed_files(details: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """The changed files from the merge read, as the REST files API names
+    them (filename, deletions, status), or None when it does not hold them
+    all (more than one page), so the caller reads them from REST."""
+    files = details.get("files")
+    if not isinstance(files, dict):
+        return None
+    nodes = [n for n in files.get("nodes") or [] if isinstance(n, dict)]
+    if int(files.get("totalCount") or 0) > len(nodes):
+        return None
+    if any(str(n.get("changeType") or "").upper() == "RENAMED" for n in nodes):
+        return None  # GraphQL gives no old path: REST names it (previous_filename)
+    return [{"filename": str(n.get("path") or ""), "deletions": int(n.get("deletions") or 0),
+             "status": str(n.get("changeType") or "").lower()} for n in nodes]
+
+
+def _refuse_operator_hold(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
+                          details: Dict[str, Any], ticket: Optional[Tuple[str, int]],
+                          issue: Dict[str, Any]) -> None:
+    """Refuse a lane pull request that waits for the operator
+    (bus/operator_hold.py): it declares operator steps before merge, changes
+    placement, or deletes or mostly replaces a doc its ticket does not name. Its ticket goes to loom:human with
+    one exact ask. On 2026-10-22 the brain merged one whose body left a VM
+    resize and a data migration to the operator, and the deploy took the
+    service down."""
+    why = operator_hold.reasons(gh, repo, dict(pr, number=number),
+                                str(issue.get("body") or ""), _changed_files(details))
+    if not why:
+        return
+    asked = ""
+    if ticket is not None:
+        outcome = operator_hold.hold(gh, ticket[0], ticket[1], number, why, human)
+        asked = "" if outcome in ("asked", "already") else " (%s)" % outcome
+    raise ValueError("held for the operator: %s%s" % ("; ".join(why), asked))
 
 
 def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
@@ -3725,20 +3784,28 @@ def _ticket_association(repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, in
 def _validate_ticket_association(gh: GitHub, repo: str, number: int,
                                  pr: Dict[str, Any], supplied: Optional[Tuple[str, int]],
                                  expected_state: str) -> Optional[Tuple[str, int]]:
+    return _validated_ticket(gh, repo, number, pr, supplied, expected_state)[0]
+
+
+def _validated_ticket(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
+                      supplied: Optional[Tuple[str, int]], expected_state: str
+                      ) -> Tuple[Optional[Tuple[str, int]], Dict[str, Any]]:
+    """The pull request's ticket and the ticket issue as read ({} when it
+    has none), after the checks _validate_ticket_association names."""
     association = _ticket_association(repo, pr)
     if supplied is not None and supplied != association:
         raise ValueError("supplied ticket does not match pull request")
     if association is None:
         if supplied is not None:
             raise ValueError("pull request is not linked to the supplied ticket")
-        return None
+        return None, {}
     issue = gh.rest("GET", "/repos/%s/issues/%d" % association).data or {}
     names = _labels(issue)
     if issue.get("state") != "open" or "loom:ticket" not in names:
         raise ValueError("ticket is not an open loom:ticket")
     if "loom:" + expected_state not in names:
         raise ValueError("ticket is not loom:" + expected_state)
-    return association
+    return association, issue
 
 
 def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
