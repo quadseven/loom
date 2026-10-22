@@ -3191,6 +3191,19 @@ class ClaimTest(Base):
         self.assertIn("lane:claude", self.fake.names(12))
         self.assertIn("Claimed for lane claude", self.fake.comments[12][-1]["body"])
 
+    def test_a_retired_model_pin_is_never_claimed_on_a_lane_that_refuses_it(self):
+        # A ticket (lane:agy, Model: gemini-4-argon-high) was handed
+        # to free spark-2 as a mismatch on its raw Model: line, then claimed
+        # there because its parsed stand-in suits agy; the spark runner
+        # refused the model and the refusal cost a rung (2026-10-22).
+        self.heartbeat("spark")
+        body = BODY.replace("Model: model-x", "Model: gemini-4-argon-high")
+        self.fake.add(12, lane="agy", body=body)
+        self.write(self.inbox("agy", "other.md"), "busy\n")
+        self.run_pass()
+        self.assertEqual(self.listing("spark"), [])
+        self.assertNotIn("loom:running", self.fake.names(12))
+
     def test_a_mismatched_model_waits_queued_without_a_free_compatible_lane(self):
         self.heartbeat("opencode-go-3")
         body = BODY.replace("Model: model-x", "Model: claude-sonnet-5-5")
