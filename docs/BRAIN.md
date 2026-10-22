@@ -1483,6 +1483,52 @@ runnable check, a failed check, or an operator criterion sends the ticket to
 an hour. A verify lane's proof that passes a live or operator criterion
 without station evidence is refused.
 
+## Post-merge watch
+
+After a Loom auto-merge (a `loom/` lane pull request merged by a Loom App,
+not by a person), the station watches its deploy for `LOOM_POST_MERGE_WATCH`
+minutes (default 60) and reverts it when the deploy fails
+(`bus/deploy_watch.py`). `bus/revert.py` reverts only a red default branch,
+and most damage an audit of 2026-10-22 found never turned CI red: a build
+workflow that failed on the other build nodes, a config roll that
+crash-looped a StatefulSet, a backup hub left unpinned.
+
+Every signal answers healthy, failed or pending, with a reason; the merge is
+failed when any signal failed and healthy when all are. A repo names its
+deploy workflow in `.loom/deploy-signal` on its default branch, one signal a
+line:
+
+```
+# .loom/deploy-signal
+workflow sync.manifests.yml production/manifests/**
+```
+
+The workflow's run for the merge commit is read. A Rollout reports one
+annotation with a fixed title: `rollout-healthy` is healthy, and
+`rollout-aborted`, `rollout-degraded`, `rollout-paused`, `rollout-timeout`
+and `rollout-unreadable` are failed. A workload that is not a Rollout is
+judged by the run, which fails when its rollout or readiness wait fails. A
+merge that changes nothing under the globs is healthy. The ticket's live
+check (`bus/criteria_gate.py`), when it has one, is a signal too: healthy
+once it passes, failed if it still fails when the window ends. Another kind
+of signal is a new entry in `SIGNAL_KINDS`.
+
+Every read fails closed: an unreadable file, run or annotation list, a
+cancelled run, or an unknown signal kind is pending, never healthy. A merge
+still pending when the window ends is not reverted; the operator is paged
+that Loom could not tell.
+
+A failed merge gets a `loom:revert` ticket and GitHub's own revert pull
+request of it. That revert is the only change the watch merges, and only
+when `merge_tier.revert_refusal` finds nothing (the station applied the
+label, the body names the one reverted commit, which the base carries, and
+the diff is its exact inverse) and `bus.brain merge` passes it. A revert
+whose checks fail, that is refused, or that has not merged in 60 minutes is
+left for the operator. Either way the operator gets one page naming the
+failed signal and both pull requests; with no webhook set up, the message
+goes on the merged ticket. A revert is never watched, so Loom never reverts
+a revert. Each merge's watch is kept in the station's `deploy-watch.json`.
+
 ## Pull requests without a ticket
 
 A pull request with no ticket (no `Refs` line and no `loom/` branch) that a
