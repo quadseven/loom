@@ -2959,6 +2959,15 @@ class Factory:
         ref = "%s#%s" % (repo, issue["number"])
         if self.now < held_until(issue):
             return "%s is held" % ref
+        # A ticket held by After: is never briefed: the station refuses the
+        # claim each pass, and the lane it was given counts it as load and
+        # sits idle until the other ticket merges (2026-10-22).
+        waiting = self.held_by(repo, issue) if re.search(
+            r"^After:", str(issue.get("body") or ""), re.M) else []
+        if waiting:
+            reason = "waits for %s to merge (After:)" % ", ".join(a.short for a in waiting)
+            self._waiting(repo, issue["number"], reason)
+            return "%s %s" % (ref, reason)
         model_match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
         if model_match:
             return self._assign_queued_model(repo, issue, model_match.group(1))

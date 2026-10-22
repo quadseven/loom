@@ -3285,16 +3285,18 @@ class ClaimTest(Base):
         self.fake.add(5, title="Land the package", state="pr")
         self.fake.add(12, state="queued", body="After: #5\n" + BODY)
         self.run_pass()
-        self.assertIn("loom:briefed", self.fake.names(12))
-        self.run_pass()  # its dependency has not merged, so no lane takes it
+        # Its dependency has not merged, so it is never briefed: a briefed
+        # ticket held the lane it was given while the station refused it.
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.run_pass()
         self.assertEqual(self.listing(), [])
-        self.assertIn("loom:briefed", self.fake.names(12))
-        # The dependency merges: the next pass claims the ticket.
+        self.assertIn("loom:queued", self.fake.names(12))
+        # The dependency merges: the next pass gives the ticket a lane.
         self.fake.issues[5]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:merged"},
                                           {"name": "lane:codex"}]
         self.run_pass()
-        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
-        self.assertIn("loom:running", self.fake.names(12))
+        self.assertIn("loom:briefed", self.fake.names(12))
+        self.assertIn("lane:codex", self.fake.names(12))
 
     def test_a_ticket_already_briefed_waits_too(self):
         self.fake.add(5, title="Land the package", state="pr")

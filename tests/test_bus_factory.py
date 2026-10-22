@@ -1873,6 +1873,24 @@ class Queued(Base):
             "%s#8" % REPO: "no free lane in tier medium",
             "%s#10" % REPO: "no free lane takes model (its Model: line names no model id)"})
 
+    def test_a_queued_ticket_held_by_after_gets_no_lane_and_the_next_one_does(self):
+        # The factory briefed a queued ticket whose After: ticket had not
+        # merged; the station never claimed it, and the lane it reserved sat
+        # idle for hours with that one ticket counted against it (2026-10-22).
+        self.gh.ticket(5, "pr")
+        self.queued(7, body="After: #5\nDifficulty: medium\n\n## Why\nx\n", age=7200)
+        self.queued(8, age=0)
+        worker = self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertEqual(worker.waits["%s#7" % REPO], "waits for #5 to merge (After:)")
+        self.assertEqual((factory._state(self.gh.issues[8]), self.lane(8)), ("briefed", "codex"))
+
+    def test_a_queued_ticket_whose_after_ticket_merged_gets_a_lane(self):
+        self.gh.ticket(5, "merged")
+        self.queued(7, body="After: #5\nDifficulty: medium\n\n## Why\nx\n")
+        self.assign(available=["codex"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "codex"))
+
     def first_label_ticket(self, number, label="loom:regression", model="gpt-6-sol"):
         self.queued(number, body="Model: %s\nDifficulty: medium\n\n## Why\nx\n" % model)
         self.gh.issues[number]["labels"].append({"name": label})
