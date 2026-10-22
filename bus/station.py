@@ -3049,7 +3049,14 @@ class Station:
                         "verify failures in a row" % (lane, VERIFY_STRIKES) if held else ""))
                 return True
             self._verify_clear(lane)
-            _say("verify run %s failed; %s#%d stays shipped" % (name, repo, number))
+            # Status, not a fault: the ticket waits its cooldown. The line
+            # names the class and the reason the runner recorded, which it
+            # once left out, so a repeat could not be diagnosed (loom#463);
+            # the log watcher reads it as status (watch.VERIFY_RUN_RE).
+            reason = self._failure_reason(lane, name)
+            _say("verify run %s failed [%s]: %s; %s#%d stays shipped and is tried again "
+                 "after %d hours" % (name, klass, CLASS_RE.sub("", reason), repo, number,
+                                     VERIFY_INTERVAL // 3600))
             return True
         self._verify_clear(lane)
         result, why = self._read_verify(lane, name)

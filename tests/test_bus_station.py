@@ -8770,6 +8770,14 @@ class VerifyResultTest(Base):
         self.verify_failed("[work] no verify.json written")
         self.assertIn("%s#5" % REPO, self.verify_runs())
 
+    def test_a_failed_verify_run_logs_its_class_and_reason(self):
+        # loom#463: the line said only "failed", so nobody could tell why.
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            self.verify_failed("[work] no verify.json written")
+        self.assertIn("verify run %s failed [work]: no verify.json written; %s#5 stays shipped"
+                      % (self.name, REPO), buf.getvalue())
+
     def test_two_transient_verify_failures_in_a_row_hold_the_lane_for_an_hour(self):
         now = time.time()
         self.verify_failed("[transient] agent exited 1", name="a-verify-1", now=now)

@@ -346,6 +346,22 @@ class FilingTest(WatchBase):
                 self.assertFalse(watch.keep(line))
         self.assertTrue(watch.keep("[2026-10-18T22:50:36Z] example.repo-3 failed: [work] tests failed"))
 
+    def test_a_verify_run_the_station_already_handled_is_never_a_signature(self):
+        # loom#463: a failed verify run costs its ticket a cooldown (or nothing,
+        # when transient); the station says so in its log, which is status.
+        for line in (
+                "[2026-10-18T22:50:36Z] station: verify run example.repo-3-verify-1 failed [work]: "
+                "no verify.json written; example/repo#3 stays shipped and is tried again after 6 hours",
+                "[2026-10-18T22:50:36Z] station: verify run example.repo-3-verify-1 failed [transient]; "
+                "example/repo#3 is due again now",
+                "[2026-10-18T22:50:36Z] station: verify run example.repo-3-verify-1 failed; "
+                "example/repo#3 stays shipped"):
+            with self.subTest(line=line):
+                self.assertFalse(watch.keep(line))
+        self.assertTrue(watch.keep("[2026-10-18T22:50:36Z] station: verify failed: boom"))
+        self.assertTrue(watch.keep("[2026-10-18T22:50:36Z] brain: verify run x failed; error"
+                                   " writing state"))
+
     def test_a_relayed_ci_log_line_is_never_a_signature(self):
         # loom#880-#904: a brain agent read a CI run's log ("gh run view
         # --log": job, step and a seven-digit timestamp before each line)
