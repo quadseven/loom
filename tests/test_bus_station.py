@@ -8046,8 +8046,9 @@ class ClaimDropTest(Base):
 
     def test_closing_a_done_ticket_removes_its_state_and_our_claim(self):
         self.fake.private = False
-        self.fake.add(1, lane="codex", body=SHIPPED_BODY.replace(
-            "prints `daily status ready`", "the daily line shows it"), state="shipped")
+        # A code-only ticket: its merge is its evidence (bus/criteria_gate.py).
+        self.fake.add(1, lane="codex", body="Difficulty: easy\n\n## Acceptance criteria\n"
+                      "- [ ] A test passes\n", state="shipped")
         self.fake.issues[1]["labels"] += [
             {"name": x} for x in ("loom:running", "loom:ready", "wait:gate", "needs-brain",
                                   self.OURS, self.THEIRS)]
@@ -8104,16 +8105,22 @@ class CloseDoneTest(Base):
         self.fake.issues[3]["labels"].append({"name": "loom:regression"})
         self.fake.add(4, lane="codex", body="Difficulty: easy\n\n## Acceptance criteria\n- [ ] x\n",
                       state="shipped")
+        self.fake.add(5, lane="codex", body="Difficulty: easy\n\n## Acceptance criteria\n"
+                      "- [ ] A test passes\n", state="shipped")
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         st.close_done_tickets()
-        self.assertEqual(self.fake.issues[1]["state"], "closed")
-        self.assertEqual(self.fake.issues[1]["state_reason"], "completed")
+        # A Live line with nothing to search is still a live criterion with no
+        # evidence (bus/criteria_gate.py, 2026-10-22): it goes to the operator.
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assertIn("loom:human", self.fake.names(1))
         self.assertEqual(self.fake.issues[2]["state"], "open")   # window still open or covered by evidence
         self.assertEqual(self.fake.issues[3]["state"], "open")   # a regression stays for the brain
-        self.assertEqual(self.fake.issues[4]["state"], "closed") # no Live line at all
-        self.assertIn("force-close", self.fake.names(1))
+        self.assertEqual(self.fake.issues[4]["state"], "closed") # no Live line, code only
+        self.assertEqual(self.fake.issues[5]["state"], "closed")
+        self.assertEqual(self.fake.issues[5]["state_reason"], "completed")
+        self.assertIn("force-close", self.fake.names(5))
         self.assertNotIn("force-close", self.fake.names(2))
-        plain = [c["body"] for c in self.fake.comments[1] if not status.is_status(c.get("body"))]
+        plain = [c["body"] for c in self.fake.comments[5] if not status.is_status(c.get("body"))]
         self.assertEqual(plain, [])
 
     def test_a_shipped_ticket_of_unproven_host_checks_stays_open(self):
@@ -8133,7 +8140,9 @@ class CloseDoneTest(Base):
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         st.close_done_tickets()
         self.assertEqual(self.fake.issues[1]["state"], "open")
-        self.assertEqual(self.fake.issues[2]["state"], "closed")   # ticked: evidence given
+        # A tick is nobody's evidence: only a station check or the operator
+        # closes a ticket of live criteria (bus/criteria_gate.py).
+        self.assertEqual(self.fake.issues[2]["state"], "open")
 
     def close_text(self, number):
         return "\n".join(c["body"] for c in self.fake.comments[number]

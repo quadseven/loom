@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, change_class, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
+from . import bench, brain, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -493,6 +493,21 @@ def unticked_notes(missing: Sequence[str]) -> str:
         "without it.",
         "- Then tick each built criterion in the pull request body's ## Acceptance "
         "criteria, or leave it unticked and end its line with \"; not built: <reason>\".",
+        "- Change nothing else."])
+
+
+TICKED_HEADING = "### Live or operator criteria ticked by the lane"
+
+
+def ticked_notes(ticked: Sequence[str]) -> str:
+    """The fix note for live or operator criteria a lane ticked in its pull
+    request body (bus/criteria_gate.py): only the verifier ticks those."""
+    return "\n".join([TICKED_HEADING, ""] + ["- " + c for c in ticked] + [
+        "", "The factory sent this pull request back: these criteria are met only on a "
+        "running system or by a person, and the body ticks them.", "",
+        "- Untick each one in the pull request body's ## Acceptance criteria. The "
+        "station's verifier ticks a live criterion once its own check passes, and the "
+        "operator ticks an operator one.",
         "- Change nothing else."])
 
 
@@ -1117,7 +1132,9 @@ def acceptance_criteria(body: str) -> List[str]:
 
 
 def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
-    """Ticket criteria that a lane PR leaves unticked, excluding Live checks."""
+    """Ticket criteria that a lane PR leaves unticked, excluding live checks
+    and operator actions (bus/criteria_gate.py): only the station's verifier
+    or the operator can meet those, so a lane is never asked to tick them."""
     ticket = acceptance_criteria(ticket_body)
     pull = acceptance_criteria(pull_body)
     states = {}
@@ -1128,7 +1145,7 @@ def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
     missing = []
     for criterion in ticket:
         _, _, text = criterion.partition(" ")
-        if text.casefold().startswith("live:"):
+        if criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE:
             continue
         clean = NOT_BUILT_RE.sub("", text).strip().casefold()
         checked, not_built = states.get(clean, (False, False))
@@ -1728,7 +1745,8 @@ class Factory:
     def _send_back(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
                    comments: List[Dict[str, Any]], why: str,
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
-                   no_test: bool = False, unticked: Sequence[str] = ()) -> None:
+                   no_test: bool = False, unticked: Sequence[str] = (),
+                   ticked: Sequence[str] = ()) -> None:
         number = int(issue["number"])
         held = SEND_BACK_HOLDS & set(_labels(issue))
         if held:
@@ -1780,6 +1798,13 @@ class Factory:
                 notes = unticked_notes(unticked)
             except ValueError as err:
                 _say("%s#%d: unticked criteria not quoted in the fix note (%s)"
+                     % (repo, number, err))
+        if ticked:
+            try:
+                brain._check_written_text(ticked_notes(ticked))
+                notes = ticked_notes(ticked)
+            except ValueError as err:
+                _say("%s#%d: ticked criteria not quoted in the fix note (%s)"
                      % (repo, number, err))
         if lane is not None:
             sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane)
@@ -2199,7 +2224,15 @@ class Factory:
         """Land a clean, reviewed pull request, or send it back when it
         changes code without a test. A clean sensitive one waits for the brain."""
         missing = missing_criteria(str(issue.get("body") or ""), str(full.get("body") or ""))
-        if missing:
+        ticked = criteria_gate.lane_ticks(str(issue.get("body") or ""), str(full.get("body") or ""))
+        if ticked:
+            # Only the station's verifier or the operator ticks a live or
+            # operator criterion (bus/criteria_gate.py): a lane's tick on one
+            # read as evidence it had been checked (2026-10-22 audit).
+            self._send_back(repo, full, issue, comments,
+                            "a live or operator criterion is ticked; only the verifier "
+                            "ticks it: " + "; ".join(ticked), ticked=ticked)
+        elif missing:
             self._send_back(repo, full, issue, comments,
                             "unticked acceptance criteria; build these or mark each "
                             "not built with a reason: " + "; ".join(missing),
