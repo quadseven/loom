@@ -63,7 +63,8 @@ api_rules() {
 # holding the CLI's binary, plus read-only access to the skill snapshot. In
 # api mode also no writes anywhere outside the worktree and the scratch home,
 # and outbound connections only to the provider's port (api_rules); the agy
-# lane and a validation run keep the network and the writes outside HOME.
+# lane is bounded the same way (its model endpoint's port is open), and a
+# validation run keeps the network and the writes outside HOME.
 # Inside the worktree, .git stays readable (git diff and git log need it; a
 # fresh clone holds no credentials) but not writable: a planted hook or config
 # would run when the runner commits. Also no keychain, no Unix sockets except
@@ -76,17 +77,18 @@ api_rules() {
 # metadata-only literals so getcwd and realpath still work without making
 # HOME listable.
 sandbox_profile() {
-  # The agy lane reaches the keychain server: it runs as the lane user, whose
-  # only keychain is its own. Every other lane is denied it, and so is a
-  # validation run ($3 = check), whichever lane it serves.
+  # The runner unlocks the agy lane's keychain outside the sandbox (agy_unlock),
+  # so the agent never needs it: every lane, including agy, is denied the
+  # keychain server, and so is a validation run ($3 = check), whichever lane it
+  # serves.
   local keychain_deny='(global-name "com.apple.SecurityServer") ' agy_lane="" api_writes="" api_network=""
   case "${3:-}" in
     "" | check) ;;
     api) api_writes="$(api_rules writes)"$'\n' && api_network="$(api_rules network)"$'\n' || return 1 ;;
     *) echo "refusing sandbox: unknown mode $3" >&2; return 1 ;;
   esac
-  [ "$LANE" = agy ] && [ "${3:-}" != check ] && { keychain_deny=""; agy_lane=1; }
-  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule=""
+  [ "$LANE" = agy ] && [ "${3:-}" != check ] && { api_network="$(api_rules network)" || return 1; agy_lane=1; }
+  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule="" agy_keychain_deny=""
   if [ -n "${4:-}" ]; then
     [[ "$4" =~ ^[0-9]+$ ]] && [ "$4" -ge 49152 ] && [ "$4" -le 65535 ] ||
       { echo "refusing sandbox: loopback port $4 is not in 49152-65535" >&2; return 1; }
@@ -94,6 +96,9 @@ sandbox_profile() {
   fi
   home="$(cd "$HOME" && pwd -P)"
   tree="$(cd "$1" && pwd -P)"
+  if [ "$LANE" = agy ] && [ -n "${AGY_HOME:-}" ]; then
+    agy_keychain_deny="(deny file-read* (subpath \"$(cd "$AGY_HOME" && pwd -P)/Library/Keychains\"))"
+  fi
   [ -d "$SKILLS" ] && skills="$(cd "$SKILLS" && pwd -P)"
   cli_link="$(command -v "$2")" && [ -n "$cli_link" ] || { echo "refusing sandbox: $2 not on PATH" >&2; return 1; }
   cli_real="$(realpath "$cli_link")" && [ -n "$cli_real" ] || { echo "refusing sandbox: cannot resolve $cli_link" >&2; return 1; }
@@ -138,8 +143,9 @@ sandbox_profile() {
     done
   done
   [ -n "$agy_lane" ] && agy_rules="$(agy_write_rules "$allow_rw")"
-  printf '(version 1)\n(allow default)\n%s(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n%s(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n%s%s\n' \
+  printf '(version 1)\n(allow default)\n%s(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n%s(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su") (literal "/usr/bin/security"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n%s%s\n' \
     "$api_writes" "$home" "$allow_rw" "$agy_rules" "$tree" "$allow_ro" "$skills_rules" "$meta" "$keychain_deny" "$api_network" "$loopback_rule"
+  [ -z "$agy_keychain_deny" ] || printf '%s\n' "$agy_keychain_deny"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
