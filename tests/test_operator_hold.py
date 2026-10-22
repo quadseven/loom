@@ -342,6 +342,17 @@ class FactoryHold(Base):
         self.assertEqual(self.merged, [(50, (FACTORY_REPO, 5))])
         self.assertEqual(self.humans, [])
 
+    def test_an_unreadable_manual_paths_listing_exempts_nothing(self):
+        # Review finding: a bad read of .loom/manual-paths must not let a
+        # placement change land. No content, or content that is not base64,
+        # reads as no listing, so the change stays held.
+        for answer in ({"content": "%%% not base64 %%%"}, {"type": "dir"}, [], None):
+            with self.subTest(answer=answer):
+                class GH:
+                    def rest(self, method, path, body=None, ok=()):
+                        return type("R", (), {"data": answer})()
+                self.assertEqual(operator_hold._manual_listed(GH(), "o/r", "main"), [])
+
     def test_a_change_to_the_deploy_rules_beside_a_placement_change_is_held(self):
         # Security review: the base branch's listing cannot stand when the
         # pull request edits it or a workflow.

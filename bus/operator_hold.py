@@ -135,20 +135,42 @@ def manifest_paths(paths: Sequence[str]) -> List[str]:
 
 
 def _manual_listed(gh: Any, repo: str, branch: str) -> List[str]:
-    """The repo's .loom/manual-paths patterns; [] when it has none."""
+    """The repo's .loom/manual-paths patterns. [] (nothing exempt, so every
+    placement change stays held) when the repo has no such file, and when
+    GitHub's answer holds no decodable content: an unread listing never
+    exempts a file."""
     data = gh.rest("GET", "/repos/%s/contents/%s?ref=%s" % (
         repo, ship_paths.MANUAL_PATHS_FILE, quote(branch, safe="")), ok=(404,)).data
-    try:
-        return ship_paths.listed_manual(
-            base64.b64decode(data["content"]).decode("utf-8", "replace"))
-    except (KeyError, TypeError, ValueError):
+    content = data.get("content") if isinstance(data, dict) else None
+    if not isinstance(content, str):
         return []
+    try:
+        raw = base64.b64decode(content)
+    except ValueError:
+        return []  # not base64: read as no listing, which holds more, never less
+    return ship_paths.listed_manual(raw.decode("utf-8", "replace"))
 
 
 # Paths that decide what a merge deploys: a pull request that changes them
 # and a placement manifest could exempt the manifest from the hold, so the
 # base branch's reading of them does not stand.
 DEPLOY_RULES = (ship_paths.WORKFLOWS_DIR + "/", ship_paths.MANUAL_PATHS_FILE)
+
+
+def _placement_manifests(entries: Sequence[Dict[str, Any]]) -> List[str]:
+    """The manifests whose diff changes placement; one GitHub sends no patch
+    for counts as changing it."""
+    out = set()
+    for entry in entries:
+        name, patch = str(entry.get("filename") or ""), entry.get("patch")
+        if manifest_paths([name]) and (not patch or ship_paths.placement_lines(str(patch))):
+            out.add(name)
+    return sorted(out)
+
+
+def _touches_deploy_rules(entries: Sequence[Dict[str, Any]]) -> bool:
+    names = [str(f.get("filename") or "") for f in entries]
+    return any(n.startswith(DEPLOY_RULES[0]) or n == DEPLOY_RULES[1] for n in names)
 
 
 def placement_files(gh: Any, repo: str, pr: Dict[str, Any],
@@ -158,13 +180,9 @@ def placement_files(gh: Any, repo: str, pr: Dict[str, Any],
     manifest GitHub sends no patch for counts as changing placement, a file
     no deploy workflow covers still counts, and when the pull request also
     changes a workflow or .loom/manual-paths nothing is exempt."""
-    number = int(pr.get("number") or 0)
-    entries = pull_files(gh, repo, number) if files is None else files
-    names = [str(f.get("filename") or "") for f in entries]
-    moved = sorted({str(f.get("filename") or "") for f in entries
-                    if manifest_paths([str(f.get("filename") or "")])
-                    and (not f.get("patch") or ship_paths.placement_lines(str(f["patch"])))})
-    if not moved or any(n.startswith(DEPLOY_RULES[0]) or n == DEPLOY_RULES[1] for n in names):
+    entries = pull_files(gh, repo, int(pr.get("number") or 0)) if files is None else files
+    moved = _placement_manifests(entries)
+    if not moved or _touches_deploy_rules(entries):
         return moved
     branch = str((pr.get("base") or {}).get("ref") or "main")
     return ship_paths.unlisted(moved, _manual_listed(gh, repo, branch))
