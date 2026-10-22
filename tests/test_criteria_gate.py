@@ -136,8 +136,8 @@ class Checks(unittest.TestCase):
         for status in (301, 302):
             with self.subTest(status=status):
                 self.assertEqual(
-                    criteria_gate.run(check, None, fetch=lambda u, t: (
-                        status, "ok v2", "https://login.example.com/")),
+                    criteria_gate.run(check, None, fetch=lambda u, t, code=status: (
+                        code, "ok v2", "https://login.example.com/")),
                     (False, "HTTP %d (redirect not followed)" % status))
         named = criteria_gate.check_of("Live: `https://old.example.com/` answers `301` to "
                                        "`https://new.example.com/`")
