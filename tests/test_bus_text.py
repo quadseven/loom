@@ -99,5 +99,31 @@ class ScrubMentionsTest(unittest.TestCase):
         text.check(text.scrub_mentions("run /%s improve" % text.REVIEW_BOT_SHORT_NAME))
 
 
+class OutageWindowTest(unittest.TestCase):
+    # On 2026-10-22 an ask and three journals dated an outage from 04:28Z,
+    # the last good read; the service went down at 08:02Z.
+    WRITTEN = (
+        "Since ~04:28Z (~6.6h, observed across 4 brain ticks) the service has been "
+        "unreachable: both endpoints return 503.",
+        "The service has been down since ~04:28Z; the ask sits with the operator.",
+        "the service has been unreachable since ~04:28Z today (0 stuck then), about 5 hours.",
+        "the service went unreachable around 10:02Z, so nothing live could be measured.",
+    )
+
+    def test_an_outage_dated_by_one_time_is_refused(self):
+        for written in self.WRITTEN:
+            with self.subTest(written=written):
+                with self.assertRaisesRegex(ValueError, "last good observation and the first"):
+                    text.check(written)
+
+    def test_an_outage_with_its_window_or_a_plain_observation_passes(self):
+        text.check("Unreachable: last good read 04:28Z (0 stuck), first failing read "
+                   "09:02Z; it went down between them.")
+        text.check("Both endpoints answered 503 at 11:10Z (retried, same body); this is new "
+                   "since the 04:28Z read.")
+        text.check("3 runs in a row failed since 2026-10-22T07:00Z; the last at 08:00Z.")
+        text.check("Pre-flight: unchanged since the last journal at 07:41Z.")
+
+
 if __name__ == "__main__":
     unittest.main()
