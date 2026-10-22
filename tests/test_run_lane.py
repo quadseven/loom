@@ -160,7 +160,8 @@ fi
 # makes none but writes $FAKE_SUMMARY to the Intent summary and
 # $FAKE_THREAD_ANSWER as an answer to thread PRRT_9 ($FAKE_AGENT=no-change),
 # exits non-zero ($FAKE_AGENT=fail), or prints $FAKE_OUT and exits
-# $FAKE_EXIT, editing a file first when $FAKE_EDIT is set ($FAKE_AGENT=say).
+# $FAKE_EXIT, editing a file first when $FAKE_EDIT is set and writing a hook
+# config the brief never names when $FAKE_HOOK is set ($FAKE_AGENT=say).
 # $FAKE_AGENT=stray also commits files no brief here names (a hook config,
 # a scratch file under .loom/, a top-level test script).
 # $FAKE_AGENT=contract-edit commits $FAKE_CONTRACT_TEXT as the validation
@@ -173,6 +174,7 @@ cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = say ]; then
   [ -z "${FAKE_EDIT:-}" ] || echo partial > fix.txt
+  if [ -n "${FAKE_HOOK:-}" ]; then mkdir -p .agents && echo '{}' > .agents/hooks.json; fi
   printf '%s\\n' "$FAKE_OUT"
   exit "${FAKE_EXIT:-1}"
 fi
@@ -1696,6 +1698,25 @@ print('leak guard: clean (shape patterns only)')
                               capture_output=True, text=True, check=True).stdout
         self.assertEqual(kept, "partial\n")
         self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", heads)
+
+    def test_a_kept_branch_leaves_out_files_the_brief_does_not_allow(self):
+        # An agy run wrote .agents/hooks.json before it timed out; the next
+        # lane merged the kept branch and its commit was refused for a file
+        # it never wrote (2026-10-21).
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EDIT="1",
+                      FAKE_HOOK="1", FAKE_EXIT="124")
+        reason = self.failure_line()
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-timedout-" in h]
+        self.assertEqual(len(side), 1, heads)
+        self.assertIn("the edits are on branch " + side[0], reason)
+        files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r",
+                                "--name-only", side[0]],
+                               capture_output=True, text=True, check=True).stdout.split()
+        self.assertIn("fix.txt", files)
+        self.assertNotIn(".agents/hooks.json", files)
 
     def test_a_limited_timeout_after_editing_still_keeps_the_edits(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
