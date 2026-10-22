@@ -1428,7 +1428,9 @@ review, when either holds (`bus/operator_hold.py`):
 - **Operator steps.** Its `## Operator steps before merge` section lists a
   step (anything but `none`), or, as a backstop, its body or its ticket's
   body names one in words: "leave X to the operator", an operator task, step
-  or prerequisite, a data migration, a live cutover, a VM or disk resize.
+  or prerequisite, a data migration, a live cutover, a VM or disk resize, or
+  a sentence that opens with a merge hold ("Do not merge until ...", "Merge
+  only after ...").
 - **Placement.** A manifest (`.yaml`, `.yml`, `.json`) changes where a
   workload runs or what it mounts: `nodeSelector`, a
   `kubernetes.io/hostname` pin, affinity, tolerations, `hostIP`, volumes and
