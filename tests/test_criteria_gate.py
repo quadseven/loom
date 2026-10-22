@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from bus import criteria_gate, factory, station  # noqa: E402
 from bus.github import GitHub  # noqa: E402
+import test_bus_factory as tbs_factory  # noqa: E402
 import test_bus_station as tbs  # noqa: E402
 
 REPO = tbs.REPO
@@ -148,6 +149,33 @@ class FactoryTicks(unittest.TestCase):
     def test_a_lane_is_not_asked_to_tick_a_live_or_operator_criterion(self):
         ticket = body(AUDIT_LIVE[6], AUDIT_OPERATOR[1], AUDIT_CODE[1])
         self.assertEqual(factory.missing_criteria(ticket, body(AUDIT_CODE[1])), [AUDIT_CODE[1]])
+
+
+class FactoryLaneTicks(tbs_factory.Base):
+    def test_a_lane_that_ticks_a_live_criterion_is_sent_back(self):
+        # 2026-10-22 audit: lane bodies ticked live boxes nothing had checked.
+        ticket = body(AUDIT_LIVE[6], AUDIT_CODE[1])
+        self.gh.ticket(5, "pr", body=ticket)
+        self.gh.pull(50, 5, body=body(AUDIT_LIVE[6], AUDIT_CODE[1], ticked=True),
+                     files=("bus/a.py", "tests/test_a.py"))
+        f = self.go()
+        self.assertEqual(self.merged, [])
+        self.assertIn(factory.TICKED_HEADING + "\n\n- " + AUDIT_LIVE[6], f.notes)
+        self.assertIn("Untick each one", f.notes)
+        self.setUp()
+        self.gh.ticket(5, "pr", body=ticket)
+        self.gh.pull(50, 5, body=body(AUDIT_CODE[1], ticked=True) + "- [ ] " + AUDIT_LIVE[6] + "\n",
+                     files=("bus/a.py", "tests/test_a.py"))
+        self.go()
+        self.assertEqual(len(self.merged), 1)
+
+
+class Fetch(unittest.TestCase):
+    def test_only_https_is_fetched(self):
+        for url in ("file:///etc/passwd", "http://192.0.2.1/", "ftp://example.com/x"):
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError):
+                    criteria_gate._fetch(url, 1)
 
 
 class DoneClose(tbs.Base):
