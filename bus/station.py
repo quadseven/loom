@@ -548,9 +548,9 @@ def _evidence_log_path(repo: str, command: str, log_root: str) -> Optional[str]:
         return None
     root = os.path.realpath(log_root)
     path = os.path.realpath(command)
-    if path != root and not path.startswith(root + os.sep):
+    if not path.startswith(root + os.sep):
         return None
-    return command
+    return path
 
 
 def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
@@ -576,15 +576,12 @@ def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
         return None
 
 
-def _live_time_window(live: str) -> Optional[Tuple[datetime, datetime]]:
+def _live_time_window(live: str) -> Optional[Tuple[Optional[datetime], Optional[datetime]]]:
     """Extract the time window from a Live criterion, or None when none exists.
     
-    Returns (window_start, window_end) as datetime objects, or None when the
-    criterion has no time window (e.g., "Live: prints `foo`").
+    Returns (window_start, window_end) as datetime objects (either may be None),
+    or None when the criterion has no time window (e.g., "Live: prints `foo`").
     """
-    import re
-    
-    # Pattern to match time expressions like "on or after 2026-01-01" and "before 2026-03-01"
     after_pattern = re.compile(r"on\s+or\s+after\s+(\d{4}-\d\d-\d\d)", re.I)
     before_pattern = re.compile(r"before\s+(\d{4}-\d\d-\d\d)", re.I)
     
@@ -595,8 +592,10 @@ def _live_time_window(live: str) -> Optional[Tuple[datetime, datetime]]:
         return None
     
     try:
-        window_start = datetime.fromisoformat(after_match.group(1) if after_match else "2000-01-01").replace(tzinfo=timezone.utc)
-        window_end = datetime.fromisoformat(before_match.group(1) if before_match else "2100-01-01").replace(tzinfo=timezone.utc)
+        window_start = (datetime.fromisoformat(after_match.group(1)).replace(tzinfo=timezone.utc)
+                        if after_match else None)
+        window_end = (datetime.fromisoformat(before_match.group(1)).replace(tzinfo=timezone.utc)
+                      if before_match else None)
         return window_start, window_end
     except ValueError:
         return None
@@ -7608,7 +7607,7 @@ class Station:
             time_window = _live_time_window(live)
             if time_window:
                 window_end = time_window[1]
-                if earliest is not None and earliest > window_end:
+                if window_end is not None and earliest is not None and earliest > window_end:
                     return ("shipped, its Live window ended %s but evidence started %s" % (
                         window_end.strftime("%Y-%m-%d"), earliest.strftime("%Y-%m-%d")))
                 return ""

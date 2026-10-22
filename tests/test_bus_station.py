@@ -8084,7 +8084,9 @@ class CloseDoneTest(Base):
         self.fake.private = False
         no_needle = SHIPPED_BODY.replace("prints `daily status ready`", "the daily line shows it")
         self.fake.add(1, lane="codex", body=no_needle, state="shipped")
-        self.fake.add(2, lane="codex", body=SHIPPED_BODY, state="shipped")
+        self.fake.add(2, lane="codex", body=SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "prints `daily status ready` on or after 2026-01-01 and before 2026-12-31"), state="shipped")
         self.fake.add(3, lane="codex", body=no_needle, state="shipped")
         self.fake.issues[3]["labels"].append({"name": "loom:regression"})
         self.fake.add(4, lane="codex", body="Difficulty: easy\n\n## Acceptance criteria\n- [ ] x\n",
@@ -8093,7 +8095,7 @@ class CloseDoneTest(Base):
         st.close_done_tickets()
         self.assertEqual(self.fake.issues[1]["state"], "closed")
         self.assertEqual(self.fake.issues[1]["state_reason"], "completed")
-        self.assertEqual(self.fake.issues[2]["state"], "open")   # evidence can find its string
+        self.assertEqual(self.fake.issues[2]["state"], "open")   # window still open or covered by evidence
         self.assertEqual(self.fake.issues[3]["state"], "open")   # a regression stays for the brain
         self.assertEqual(self.fake.issues[4]["state"], "closed") # no Live line at all
         self.assertIn("force-close", self.fake.names(1))
@@ -8236,6 +8238,35 @@ class CloseDoneTest(Base):
         # The log is outside the logs root, so the window-end check cannot run
         # and the ticket stays open for a verify run.
         self.assertEqual(self.fake.issues[1]["state"], "open")
+
+    def test_evidence_log_path_rejects_paths_outside_log_root(self):
+        log_root = os.path.join(self.home, "logs")
+        self.assertIsNone(station._evidence_log_path(REPO, "/etc/passwd", log_root))
+        self.assertIsNone(station._evidence_log_path(REPO, "cat logs/foo.log", log_root))
+        self.assertIsNone(station._evidence_log_path(REPO, log_root, log_root))
+        outside = os.path.join(os.path.dirname(self.home), "other.log")
+        self.assertIsNone(station._evidence_log_path(REPO, outside, log_root))
+        inside = os.path.join(log_root, "sub", "app.log")
+        self.assertEqual(os.path.realpath(inside),
+                         station._evidence_log_path(REPO, inside, log_root))
+
+    def test_live_time_window_parsing(self):
+        self.assertIsNone(station._live_time_window("prints `foo`"))
+        w = station._live_time_window("prints `foo` on or after 2026-01-01 and before 2026-03-01")
+        self.assertIsNotNone(w)
+        self.assertIsNotNone(w[0])
+        self.assertIsNotNone(w[1])
+        self.assertEqual(w[0].strftime("%Y-%m-%d"), "2026-01-01")
+        self.assertEqual(w[1].strftime("%Y-%m-%d"), "2026-03-01")
+        open_w = station._live_time_window("prints `foo` on or after 2026-01-01")
+        self.assertIsNotNone(open_w)
+        self.assertIsNotNone(open_w[0])
+        self.assertIsNone(open_w[1])
+        before_w = station._live_time_window("prints `foo` before 2026-03-01")
+        self.assertIsNotNone(before_w)
+        self.assertIsNone(before_w[0])
+        self.assertIsNotNone(before_w[1])
+        self.assertEqual(before_w[1].strftime("%Y-%m-%d"), "2026-03-01")
 
     def test_the_done_close_names_a_neutral_review_check(self):
         # The merge gate lets a non-sensitive pull request land with the
