@@ -19,8 +19,17 @@ and by `bus.brain merge` before it merges one:
   filter matches it, the filters LOOM_SHIP_PATH_WORKFLOWS ships by) changes
   where a workload runs or what it mounts (ship_paths.placement_lines).
 
+- Rewrite. The pull request deletes, or replaces most of, a doc the ticket
+  does not name: a top-level README, AGENTS or CLAUDE file, or any Markdown
+  file (2026-10-22: a lane replaced a deployment repo's root README with a
+  write-up of its ticket, and the brain merged it).
+
 A held pull request is never merged by Loom. Its ticket goes to loom:human
 with one exact ask, and the operator merges it by hand after the steps.
+
+A ticket whose every acceptance criterion is a check on a live host or
+network (host_only) is never given a lane: no pull request can meet it, and
+a lane given one writes something else to have a diff.
 """
 from __future__ import annotations
 
@@ -29,7 +38,7 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Sequence
 from urllib.parse import quote
 
-from . import ship_paths
+from . import proof, ship_paths
 
 SECTION = "Operator steps before merge"
 _HEADING = re.compile(r"^#{2,3}\s*(.+?)\s*#*\s*$")
@@ -198,31 +207,139 @@ def _deployers(gh: Any, repo: str, pr: Dict[str, Any], moved: Sequence[str]) -> 
     return ("merging runs " + ", ".join(found)) if found else "no push workflow covers it"
 
 
+# A criterion that only a live host or network can meet: a command run on a
+# host, a reach test from a network, a port, a firewall or ACL rule, a check
+# across the hosts. A criterion that names a test is code, whatever else it
+# says.
+HOST_CHECK_RE = re.compile(
+    r"`[^`\n]+`\s+(?:on|from|against|at)\s+[\w.-]+"
+    r"|\bfrom (?:an?|the|any)\b[^.\n]{0,60}\b(?:address|host|device|vlan|network|subnet"
+    r"|machine)\b"
+    r"|\bports?\s+\d+"
+    r"|\b(?:acl|firewall|security group|iptables|nftables)\b[^.\n]{0,60}"
+    r"\b(?:lets|allows|blocks|denies|permits|only)\b"
+    r"|\b(?:on|across) (?:both|all|each|every) (?:hosts?|servers?|nodes?|machines?|devices?)\b",
+    re.I)
+_TEST_RE = re.compile(r"\btests?\b|\btest_\w+", re.I)
+_LIVE_RE = re.compile(r"^\W*live\b", re.I)
+
+
+def network_check(criterion: str) -> bool:
+    """Whether a criterion is a HOST_CHECK_RE check on a host or network that
+    names no test."""
+    text = criterion.strip()
+    return not _TEST_RE.search(text) and bool(HOST_CHECK_RE.search(text))
+
+
+def host_check(criterion: str) -> bool:
+    """Whether a criterion is met on a live system, not in a repo: a Live
+    line, or a network_check."""
+    text = criterion.strip()
+    return network_check(text) or (not _TEST_RE.search(text) and bool(_LIVE_RE.match(text)))
+
+
+def host_only(body: str) -> List[str]:
+    """The ticket's criteria when every one is a host check; [] when any is
+    something a pull request can meet, or it has none."""
+    found = [text for _, text in proof.criteria(_prose(body))]
+    return found if found and all(host_check(t) for t in found) else []
+
+
+def host_only_ask(criteria: Sequence[str]) -> str:
+    """The one exact ask for a ticket no lane can meet."""
+    return ("Kind: decision\nEvery acceptance criterion of this ticket is a check on a live "
+            "host or network (%s), so no pull request can meet it and no lane takes it. Do it "
+            "by hand and close the ticket, or rewrite it with a criterion a repo change can "
+            "meet." % "; ".join(c[:STEP_MAX] for c in criteria[:ASK_STEPS]))
+
+
+# Docs a lane must not delete or mostly replace unless its ticket names them.
+TOP_DOCS = ("readme", "readme.md", "agents.md", "claude.md")
+REWRITE_SHARE = 0.5
+REWRITE_MIN_LINES = 10
+
+
+def _named(path: str, ticket_body: str) -> bool:
+    body = ticket_body.lower()
+    return path.lower() in body or path.rsplit("/", 1)[-1].lower() in body
+
+
+def _guarded_doc(path: str) -> bool:
+    return path.lower() in TOP_DOCS or path.lower().endswith(".md")
+
+
+def _base_lines(gh: Any, repo: str, branch: str, path: str) -> Optional[int]:
+    """The file's line count on the base branch; None when it cannot be read."""
+    data = gh.rest("GET", "/repos/%s/contents/%s?ref=%s" % (
+        repo, quote(path), quote(branch, safe="")), ok=(404,)).data
+    content = data.get("content") if isinstance(data, dict) else None
+    if not isinstance(content, str):
+        return None
+    try:
+        return base64.b64decode(content).decode("utf-8", "replace").count("\n") + 1
+    except ValueError:
+        return None
+
+
+def rewritten_docs(gh: Any, repo: str, pr: Dict[str, Any], entries: Sequence[Dict[str, Any]],
+                   ticket_body: str) -> List[str]:
+    """The docs the pull request deletes, or replaces at least REWRITE_SHARE
+    of, that its ticket does not name. A top-level README, AGENTS or CLAUDE
+    file counts at any size, another doc from REWRITE_MIN_LINES lines, and a
+    doc whose base cannot be read counts as replaced."""
+    branch = str((pr.get("base") or {}).get("ref") or "main")
+    out = []
+    for entry in entries:
+        path = str(entry.get("filename") or "")
+        deleted = int(entry.get("deletions") or 0)
+        if not deleted or not _guarded_doc(path) or _named(path, ticket_body):
+            continue
+        if str(entry.get("status") or "").lower() in ("removed", "deleted"):
+            out.append(path)
+            continue
+        lines = _base_lines(gh, repo, branch, path)
+        floor = 1 if path.lower() in TOP_DOCS else REWRITE_MIN_LINES
+        if lines is None or (lines >= floor and deleted >= REWRITE_SHARE * lines):
+            out.append(path)
+    return sorted(out)
+
+
+def _shown(paths: Sequence[str]) -> str:
+    return ", ".join(paths[:FILES_SHOWN]) + (
+        " and %d more" % (len(paths) - FILES_SHOWN) if len(paths) > FILES_SHOWN else "")
+
+
 def reasons(gh: Any, repo: str, pr: Dict[str, Any], ticket_body: str,
-            paths: Optional[Sequence[str]] = None) -> List[str]:
+            entries: Optional[List[Dict[str, Any]]] = None) -> List[str]:
     """Why the pull request waits for the operator; [] when it may merge.
-    `paths`, when given, are its changed files: the patches are read only
-    when one is a manifest."""
+    `entries`, when given, are its changed files (filename, deletions,
+    status): the patches are read only when one is a manifest."""
     out: List[str] = []
     steps = operator_steps(str(pr.get("body") or ""), ticket_body)
     if steps:
         out.append("it declares operator steps before merge: " + "; ".join(steps[:ASK_STEPS]))
-    if paths is None or manifest_paths(paths):
-        moved = placement_files(gh, repo, pr)
+    if entries is None:
+        entries = pull_files(gh, repo, int(pr.get("number") or 0))
+    rewritten = rewritten_docs(gh, repo, pr, entries, ticket_body)
+    if rewritten:
+        out.append("it deletes or mostly replaces %s, which its ticket does not name"
+                   % _shown(rewritten))
+    if manifest_paths([str(e.get("filename") or "") for e in entries]):
+        moved = placement_files(gh, repo, pr, entries if all("patch" in e for e in entries)
+                                else None)
         if moved:
-            shown = ", ".join(moved[:FILES_SHOWN]) + (
-                " and %d more" % (len(moved) - FILES_SHOWN) if len(moved) > FILES_SHOWN else "")
             out.append("it changes where workloads run or what they mount (node pins, "
                        "affinity, tolerations, volumes) in %s (%s)"
-                       % (shown, _deployers(gh, repo, pr, moved)))
+                       % (_shown(moved), _deployers(gh, repo, pr, moved)))
     return out
 
 
 def ask(number: int, why: Sequence[str]) -> str:
     """The one exact ask for the ticket."""
     return ("Kind: decision\nPull request #%d waits for you: Loom will not merge it, because "
-            "%s. Do the operator steps (or check that the placement change is safe for the "
-            "data and the nodes it lands on), then merge #%d yourself."
+            "%s. Do or check each of these (the operator steps, whether a placement change "
+            "is safe for the data and the nodes it lands on, whether a replaced doc should "
+            "be), then merge #%d yourself, or close it if it should not land."
             % (number, "; and ".join(why), number))
 
 

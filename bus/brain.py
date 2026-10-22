@@ -2110,6 +2110,13 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         # A forbidden model is written as its stand-in (tickets.allowed_model).
         model = tickets.allowed_model(model)
     _check_brief_args(title, body, lane, model, base)
+    if operator_hold.host_only(body):
+        # 2026-10-22: a ticket whose criteria were all host checks (a version
+        # on a host, a closed port, an ACL) was laned; the lane replaced a
+        # README to have a diff, and it merged.
+        raise ValueError("every acceptance criterion is a check on a live host or network: "
+                         "no lane can meet it; file it as a needs-operator ask, or add a "
+                         "criterion a pull request can meet")
     if not_before is not None and not tickets.NOT_BEFORE_RE.fullmatch(not_before):
         raise ValueError("not-before is not a UTC time like 2026-10-13T17:00:00Z")
     if after is not None:
@@ -2957,7 +2964,7 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
              ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
              ' reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes {'
              ' databaseId author { __typename login } body createdAt } } } }'
-             ' files(first:100) { totalCount nodes { path } }'
+             ' files(first:100) { totalCount nodes { path deletions changeType } }'
              ' } } }') % (_gql(owner), _gql(name), number)
     data = gh.graphql(query) or {}
     return ((data.get("repository") or {}).get("pullRequest") or {})
@@ -3006,29 +3013,31 @@ def merge(gh: GitHub, repo: str, number: int,
             "ticket": association, "head_sha": sha}
 
 
-def _changed_paths(details: Dict[str, Any]) -> Optional[List[str]]:
-    """The changed files from the merge read, or None when it does not hold
-    them all (more than one page), so the caller reads them from REST."""
+def _changed_files(details: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """The changed files from the merge read, as the REST files API names
+    them (filename, deletions, status), or None when it does not hold them
+    all (more than one page), so the caller reads them from REST."""
     files = details.get("files")
     if not isinstance(files, dict):
         return None
     nodes = [n for n in files.get("nodes") or [] if isinstance(n, dict)]
     if int(files.get("totalCount") or 0) > len(nodes):
         return None
-    return [str(n.get("path") or "") for n in nodes]
+    return [{"filename": str(n.get("path") or ""), "deletions": int(n.get("deletions") or 0),
+             "status": str(n.get("changeType") or "").lower()} for n in nodes]
 
 
 def _refuse_operator_hold(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
                           details: Dict[str, Any], ticket: Optional[Tuple[str, int]],
                           issue: Dict[str, Any]) -> None:
     """Refuse a lane pull request that waits for the operator
-    (bus/operator_hold.py): it declares operator steps before merge, or
-    merging deploys a placement change. Its ticket goes to loom:human with
+    (bus/operator_hold.py): it declares operator steps before merge, changes
+    placement, or deletes or mostly replaces a doc its ticket does not name. Its ticket goes to loom:human with
     one exact ask. On 2026-10-22 the brain merged one whose body left a VM
     resize and a data migration to the operator, and the deploy took the
     service down."""
     why = operator_hold.reasons(gh, repo, dict(pr, number=number),
-                                str(issue.get("body") or ""), _changed_paths(details))
+                                str(issue.get("body") or ""), _changed_files(details))
     if not why:
         return
     asked = ""

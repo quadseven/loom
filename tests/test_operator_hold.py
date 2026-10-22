@@ -17,9 +17,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-from bus import brain, operator_hold, ship_paths  # noqa: E402
+from bus import brain, factory, operator_hold, ship_paths  # noqa: E402
 from bus.github import GitHub  # noqa: E402
-from test_bus_factory import Base, REPO as FACTORY_REPO  # noqa: E402
+from test_bus_factory import Base, FakeGitHub, NOW, REPO as FACTORY_REPO  # noqa: E402
 
 PR_BODY = """## Intent
 Class: logic
@@ -109,6 +109,50 @@ none
 Loom ticket T1, lane codex, model gpt-test.
 Refs #9"""
 
+# The second lane pull request the brain merged on 2026-10-22, at 12:04Z:
+# every criterion of its ticket is a check on a live host, so the lane
+# replaced the repo's 129-line root README (101 lines deleted) with a
+# write-up of the ticket and added an unused script. Hosts, addresses and
+# product names are replaced; the criteria are as written.
+PR_5814_BODY = """## Intent
+Class: logic
+- The PHP flaw Fix Implementation Summary
+Files: 1 logic, 1 docs
+
+## Why
+The PHP flaw (two CVEs) is a critical PHP core RCE, fixed in PHP 8.4.27 on 2026-10-21. Details leaked a day early, and mass exploitation is expected. Sweep 2026-10-21 (read-only):
+- **host-a** (NAS OS 7.3.1, PHP 8.4.21): the web GUI (nginx + php-fpm, ports 80 and 8443) listens on 192.0.2.30, the IoT VLAN address 198.51.100.114 and its tailnet address. Any IoT-VLAN device can reach it.
+- **host-b** (NAS OS 7.3.1, PHP 8.4.21): GUI on ports 80 and 443 at 192.0.2.40 and its tailnet address.
+- No router port forward reaches either GUI (live `rest/portforward` read). There is no Tailscale serve or funnel, and the vendor cloud remote access is off.
+- Both hosts are also behind NAS OS 7.3.2 (2026-07-08), which fixed a WebGUI path-traversal RCE (a CVE).
+- No other PHP runs in the fleet or the cluster.
+
+## Summary
+1. Now: block the GUI ports on host-a's IoT interface (br0.150). Restrict tailnet access to ports 80/443/8443 on both hosts to admin devices.
+2. Update both hosts to the newest NAS OS release, then to the release that carries PHP 8.4.27 or later when the vendor ships it. Each update reboots the host: drain the k8s worker first (the database, the media server) and roll with the service.
+
+## Acceptance criteria
+- [ ] `php -v` on host-a and host-b reports 8.4.27 or later.
+- [ ] From an IoT-VLAN address, ports 80, 443 and 8443 on 198.51.100.114 are closed.
+- [ ] The tailnet ACL lets only admin devices reach the GUI ports on both hosts.
+
+Size: S
+
+## Out of scope
+The host-a Proxmox rebuild (#5777), which removes the NAS OS GUI entirely.
+Part of #1423.
+Part of #5785
+
+---
+Loom ticket example-owner.deploy-5783-r3, lane codex, model gpt-6-luna.
+Refs #5783
+Validation: check exited 0 at 1e0433a843eb (.loom/validation.conf).
+Refs #5783"""
+TICKET_5783 = "Difficulty: medium\n\n## Why\n" + PR_5814_BODY.split(
+    "\n## Why\n", 1)[1].split("\n---\n", 1)[0].replace("## Summary", "## What")
+README_ENTRY = {"filename": "README.md", "status": "modified", "additions": 87, "deletions": 101}
+README_BASE = "".join("Homelab overview line %d\n" % n for n in range(1, 129)) + "end"
+
 MANIFEST = "production/oke/manifests/app-dev/kustomization.yaml"
 # The hostname pin hunk of the same pull request, in the JSON patch form a
 # kustomization carries: the changed line is the value, the key is on the
@@ -167,6 +211,75 @@ class OperatorSteps(unittest.TestCase):
                 "<!-- loom:status-body v1 begin -->\n- leave it to the operator\n"
                 "<!-- loom:status-body v1 end -->")
         self.assertEqual(operator_hold.operator_steps(body), [])
+
+
+class HostOnly(unittest.TestCase):
+    def test_a_ticket_of_host_checks_only_is_host_only(self):
+        self.assertEqual(len(operator_hold.host_only(TICKET_5783)), 3)
+
+    def test_a_ticket_with_one_criterion_a_pull_request_can_meet_is_not(self):
+        for body in (TICKET_5783.replace("## Acceptance criteria\n",
+                                         "## Acceptance criteria\n- [ ] A test covers the "
+                                         "port check script\n"),
+                     PLAIN_BODY, TICKET_BODY, "## Why\nx"):
+            self.assertEqual(operator_hold.host_only(body), [], body[:60])
+
+    def test_the_brain_refuses_to_brief_a_ticket_no_lane_can_meet(self):
+        with self.assertRaisesRegex(ValueError, "live host or network"):
+            brain.brief(GitHub("t", transport=Route({})), BRAIN_REPO, 2,
+                        "Patch the PHP flaw on both hosts", TICKET_5783)
+
+    def test_a_queued_ticket_of_host_checks_gets_no_lane_and_one_ask(self):
+        gh = FakeGitHub()
+        gh.ticket(7, "queued", body=TICKET_5783)
+        gh.issues[7]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"}]
+        asked = []
+
+        def human(gh, repo, number, ask):
+            asked.append((number, ask))
+            gh.issues[number]["labels"].append({"name": "loom:human"})
+        for _ in range(2):
+            worker = factory.Factory(gh, [FACTORY_REPO], NOW, trusted=["alice-example"],
+                                     available=["codex"], human=human)
+            worker.assign_queued()
+        self.assertEqual(factory._state(gh.issues[7]), "queued")
+        self.assertFalse(factory._lane(gh.issues[7]))
+        self.assertEqual(len(asked), 1)
+        self.assertIn("no pull request can meet it", asked[0][1])
+
+
+class Rewrite(unittest.TestCase):
+    class Contents:
+        def __init__(self, text):
+            self.text, self.reads = text, 0
+
+        def rest(self, method, path, body=None, ok=()):
+            self.reads += 1
+            data = ({"content": base64.b64encode(self.text.encode()).decode()}
+                    if self.text is not None else None)
+            return type("R", (), {"data": data})()
+
+    def test_replacing_most_of_the_root_readme_the_ticket_does_not_name_is_a_rewrite(self):
+        gh = self.Contents(README_BASE)
+        self.assertEqual(operator_hold.rewritten_docs(gh, "o/r", {}, [README_ENTRY],
+                                                      TICKET_5783), ["README.md"])
+
+    def test_a_named_a_small_or_an_unreadable_doc_change(self):
+        named = TICKET_5783 + "\nUpdate README.md with the new port table.\n"
+        self.assertEqual(operator_hold.rewritten_docs(
+            self.Contents(README_BASE), "o/r", {}, [README_ENTRY], named), [])
+        small = dict(README_ENTRY, deletions=3)
+        self.assertEqual(operator_hold.rewritten_docs(
+            self.Contents(README_BASE), "o/r", {}, [small], TICKET_5783), [])
+        code = dict(README_ENTRY, filename="bus/a.py")
+        self.assertEqual(operator_hold.rewritten_docs(
+            self.Contents(README_BASE), "o/r", {}, [code], TICKET_5783), [])
+        # A base that cannot be read counts as replaced: the hold fails closed.
+        self.assertEqual(operator_hold.rewritten_docs(
+            self.Contents(None), "o/r", {}, [README_ENTRY], TICKET_5783), ["README.md"])
+        removed = {"filename": "docs/GUIDE.md", "status": "removed", "deletions": 40}
+        self.assertEqual(operator_hold.rewritten_docs(
+            self.Contents(None), "o/r", {}, [removed], TICKET_5783), ["docs/GUIDE.md"])
 
 
 class Placement(unittest.TestCase):
@@ -281,6 +394,21 @@ class BrainMerge(unittest.TestCase):
                 self.assertEqual(refused, "")
                 self.assertTrue(self.merged(fake))
 
+    def test_the_readme_replacing_pull_request_is_refused(self):
+        # 2026-10-22 12:04Z: merged on green checks and passing reviews.
+        routes = brain_routes(PR_5814_BODY, ["README.md", "production/scripts/check.py"], {})
+        routes["/graphql"]["data"]["repository"]["pullRequest"]["files"] = {
+            "totalCount": 2, "nodes": [
+                {"path": "README.md", "deletions": 101, "changeType": "MODIFIED"},
+                {"path": "production/scripts/check.py", "deletions": 0, "changeType": "ADDED"}]}
+        routes["/repos/%s/contents/README.md" % BRAIN_REPO] = {
+            "content": base64.b64encode(README_BASE.encode()).decode()}
+        fake = Route(routes)
+        with self.assertRaisesRegex(ValueError, "mostly replaces README.md"):
+            brain.merge(GitHub("t", transport=fake), BRAIN_REPO, 8, (BRAIN_REPO, 9),
+                        env={"LOOM_MERGE_SETTLE_SECONDS": "0"})
+        self.assertFalse(self.merged(fake))
+
     def test_status_marks_the_merged_body_blocked(self):
         pr = {"number": 8, "title": "Move", "body": PR_BODY, "labels": [],
               "head": {"ref": "loom/9-work", "sha": "checked"}}
@@ -314,6 +442,22 @@ class FactoryHold(Base):
         self.assertEqual(self.merged, [])
         self.assertEqual(len(self.humans), 1)
         self.assertIn("Leave VM resizing", self.humans[0][1])
+
+    def test_a_pull_request_replacing_the_root_readme_is_held(self):
+        self.gh.contents["README.md"] = README_BASE
+        self.ready(PLAIN_BODY, files=("README.md", "tests/test_a.py"))
+        real = self.gh._get
+
+        def with_deletions(path):
+            found = real(path)
+            if "/pulls/50/files" in path:
+                found.data = [dict(e, **README_ENTRY) if e["filename"] == "README.md" else e
+                              for e in found.data]
+            return found
+        self.gh._get = with_deletions
+        self.go()
+        self.assertEqual(self.merged, [])
+        self.assertIn("mostly replaces README.md", self.humans[0][1])
 
     def test_a_placement_change_merging_deploys_is_held(self):
         self.gh.contents[".github/workflows/sync.yml"] = SYNC_WORKFLOW

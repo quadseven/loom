@@ -8116,6 +8116,25 @@ class CloseDoneTest(Base):
         plain = [c["body"] for c in self.fake.comments[1] if not status.is_status(c.get("body"))]
         self.assertEqual(plain, [])
 
+    def test_a_shipped_ticket_of_unproven_host_checks_stays_open(self):
+        # 2026-10-22: a ticket whose criteria were all host checks closed as
+        # shipped on a merge that replaced a README; no merge proves them.
+        self.fake.private = False
+        body = ("Difficulty: medium\n\n## Why\nThe PHP flaw.\n\n## Acceptance criteria\n"
+                "- [ ] `php -v` on host-a and host-b reports 8.4.27 or later.\n"
+                "- [ ] From an IoT-VLAN address, ports 80, 443 and 8443 on 198.51.100.114 "
+                "are closed.\n"
+                "- [ ] The tailnet ACL lets only admin devices reach the GUI ports on both "
+                "hosts.\n")
+        self.fake.add(1, lane="codex", body=body, state="shipped")
+        self.fake.add(2, lane="codex", body=body.replace("- [ ] `php", "- [x] `php").replace(
+            "- [ ] From", "- [x] From").replace("- [ ] The tailnet", "- [x] The tailnet"),
+            state="shipped")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assertEqual(self.fake.issues[2]["state"], "closed")   # ticked: evidence given
+
     def close_text(self, number):
         return "\n".join(c["body"] for c in self.fake.comments[number]
                          if status.is_status(c.get("body")))

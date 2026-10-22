@@ -47,6 +47,7 @@ from . import naming
 from . import notify
 from . import proof
 from . import rewrite
+from . import operator_hold
 from . import ship_paths
 from . import roll_pin
 from . import revert
@@ -574,6 +575,14 @@ def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
         return datetime.fromtimestamp(mtime, tz=timezone.utc)
     except (FileNotFoundError, NotADirectoryError):
         return None
+
+
+def _unproven_host_checks(body: Any) -> List[str]:
+    """The ticket's unticked criteria that only a check on a live host or
+    network can meet (operator_hold.network_check): a merge proves none of
+    them. A Live line keeps its own close rule (_done_reason)."""
+    return [text for checked, text in proof.criteria(str(body or ""))
+            if not checked and operator_hold.network_check(text)]
 
 
 def _live_time_window(live: str) -> Optional[Tuple[Optional[datetime], Optional[datetime]]]:
@@ -7601,6 +7610,11 @@ class Station:
                 if window_end is not None and earliest is not None and earliest > window_end:
                     return ("shipped, its Live window ended %s but evidence started %s" % (
                         window_end.strftime("%Y-%m-%d"), earliest.strftime("%Y-%m-%d")))
+                return ""
+            if _unproven_host_checks(issue.get("body")):
+                # 2026-10-22: a ticket whose criteria were all host checks
+                # (a version on a host, a closed port) closed as shipped on
+                # a merge that could not meet them. They wait for evidence.
                 return ""
             if not live_needles(issue.get("body")):
                 return "shipped, and its Live line names nothing a log search can find"

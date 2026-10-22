@@ -1400,6 +1400,11 @@ review, when either holds (`bus/operator_hold.py`):
   the push workflows on the base branch that cover the files (a push
   workflow with no paths filter covers every path).
 
+- **Rewrite.** It deletes, or replaces at least half of, a doc its ticket
+  does not name: a top-level `README`, `AGENTS.md` or `CLAUDE.md` at any
+  size, any other `.md` file from 10 lines. A doc whose base cannot be read
+  counts as replaced.
+
 The factory checks before it lands a pull request, and `bus.brain merge`
 checks before it merges one, so whichever reaches it first holds it. The
 ticket goes to `loom:human` with one exact ask (`Kind: decision`): do the
@@ -1408,10 +1413,22 @@ lands on, then merge the pull request by hand. Loom never merges it, and the
 ask is posted once. `bus.brain status` marks a pull request whose body
 declares steps `blocked: held for the operator`.
 
+A ticket whose every acceptance criterion is a check on a live host or
+network (a command run on a host, a reach test from a network, a port, a
+firewall or ACL rule, a check across the hosts, or a Live line, and none
+naming a test) gets no lane: the factory puts it to `loom:human` with one
+ask instead of giving it one, and `bus.brain brief` refuses it. The
+station's close of a shipped ticket whose Live line names nothing to search
+leaves it open while an unticked criterion is such a host or network check:
+a merge proves none of them.
+
 On 2026-10-22 the brain merged a lane pull request whose body said "Leave VM
 resizing and the live data migration to the operator", on green checks and a
 passing review; its deploy moved every workload of a service off the node
 that held its local volumes, and the service was down for about four hours.
+The same day it merged a lane pull request for a ticket of host checks
+only, which replaced the deployment repo's root README with a write-up of
+the ticket; the station then closed that ticket as shipped.
 
 ## Pull requests without a ticket
 

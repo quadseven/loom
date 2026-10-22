@@ -2211,11 +2211,12 @@ class Factory:
                         issue: Dict[str, Any]) -> bool:
         """Whether the pull request waits for the operator instead of landing
         (bus/operator_hold.py): it or its ticket declares operator steps
-        before merge, or merging deploys a placement change. The ticket goes
+        before merge, it changes placement, or it deletes or mostly replaces
+        a doc its ticket does not name. The ticket goes
         to loom:human with one exact ask, once; the pull request never lands
         on the factory's say-so, whatever later passes find."""
         why = operator_hold.reasons(self.gh, repo, full, str(issue.get("body") or ""),
-                                    self._files(repo, number))
+                                    operator_hold.pull_files(self.gh, repo, number))
         if not why:
             return False
         outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, why,
@@ -2977,6 +2978,8 @@ class Factory:
         ref = "%s#%s" % (repo, issue["number"])
         if self.now < held_until(issue):
             return "%s is held" % ref
+        if self._host_only(repo, issue):
+            return "%s is with a person: no pull request can meet its criteria" % ref
         # A ticket held by After: is never briefed: the station refuses the
         # claim each pass, and the lane it was given counts it as load and
         # sits idle until the other ticket merges (2026-10-22).
@@ -3006,6 +3009,22 @@ class Factory:
             self._waiting(repo, issue["number"], "giving it a lane failed")
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
+
+    def _host_only(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether every acceptance criterion of the queued ticket is a check
+        on a live host or network (operator_hold.host_only): it gets no lane
+        and goes to loom:human with one ask, once. 2026-10-22: such a ticket
+        was laned, the lane replaced a README to have a diff, and it merged."""
+        criteria = operator_hold.host_only(str(issue.get("body") or ""))
+        if not criteria:
+            return False
+        if "loom:human" not in _labels(issue):
+            self.human(self.gh, repo, int(issue["number"]), operator_hold.host_only_ask(criteria))
+            issue["labels"] = list(issue.get("labels") or []) + [{"name": "loom:human"}]
+            self.actions += 1
+            _say("held queued %s#%s for a person: every criterion is a host check"
+                 % (repo, issue["number"]))
+        return True
 
     def _assign_queued_model(self, repo: str, issue: Dict[str, Any], model: str) -> str:
         """Give a queued ticket pinned to `model` a lane that takes it, or an
