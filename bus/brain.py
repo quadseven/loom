@@ -63,6 +63,11 @@ DEFAULT_UNVERIFIED_LIMIT = 30
 # a goal admits one such ticket at a time (its regression slot).
 REGRESSION = "loom:regression"
 REGRESSION_MARKER = "<!-- loom:regression v1 -->"
+# A shipped ticket is re-briefed in place as a regression at most this many
+# times (LOOM_REGRESSION_REBRIEFS). A fix that never holds would otherwise
+# cycle re-brief, build, ship, re-brief for ever, a round of comments and
+# emails each time. Past the cap the ticket is held for the brain.
+REGRESSION_REBRIEFS_DEFAULT = 3
 SECTIONS = ("## Why", "## What", "## Acceptance criteria", "## Size", "## Out of scope")
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 REPORT_MARKER = "<!-- loom:report v1 -->"
@@ -1606,6 +1611,39 @@ def _regressed_ticket(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     return issue
 
 
+def regression_rebrief_cap(env: Optional[Dict[str, str]] = None) -> int:
+    """In-place regression re-briefs per ticket: LOOM_REGRESSION_REBRIEFS, a
+    whole number of at least 1, else REGRESSION_REBRIEFS_DEFAULT."""
+    raw = (os.environ if env is None else env).get("LOOM_REGRESSION_REBRIEFS", "")
+    return int(raw) if raw.isdigit() and int(raw) >= 1 else REGRESSION_REBRIEFS_DEFAULT
+
+
+def _regression_rebriefs(issue: Dict[str, Any]) -> int:
+    """How often the ticket was re-briefed in place already: each re-brief
+    leaves one "Regresses #N" line in its body (_rebrief_regressed)."""
+    marker = "Regresses #%d" % int(issue["number"])
+    return sum(1 for line in _lines(str(issue.get("body") or "")) if line.strip() == marker)
+
+
+def _hold_over_rebriefed(gh: GitHub, repo: str, issue: Dict[str, Any], count: int,
+                         cap: int) -> str:
+    """Hold a ticket that was re-briefed as a regression cap times for the
+    brain: needs-brain and one comment, written once however often it is
+    asked again. Returns why, for the caller's refusal."""
+    number = int(issue["number"])
+    why = ("#%d was re-briefed as a regression %d times (cap %d, LOOM_REGRESSION_REBRIEFS) and "
+           "the finding came back each time, so it is held for the brain" % (number, count, cap))
+    if "needs-brain" not in _labels(issue):
+        gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                {"labels": ["needs-brain"]})
+        notify.post(gh, repo, number,
+                    "Held for the brain: %s. The fix did not hold; the brain reads the "
+                    "Regression sections above, decides what is different this time, and "
+                    "re-briefs it by hand or files a new ticket that links this one." % why,
+                    notify.HELD)
+    return why
+
+
 def _regression_slot(children: List[Dict[str, Any]], cap: int) -> Optional[str]:
     """None while the goal is under its cap; past it, why a regression may still
     be admitted: through the goal's one regression slot, refused while another
@@ -1727,6 +1765,9 @@ def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
     why = _regression_slot(children, goal_cap())
     ours = any(int(c.get("number") or 0) == regressed for c in children)
     if issue.get("state") == "open" and ours:
+        count, cap = _regression_rebriefs(issue), regression_rebrief_cap()
+        if count >= cap:
+            raise ValueError(_hold_over_rebriefed(gh, repo, issue, count, cap))
         made = _rebrief_regressed(gh, repo, issue, title, evidence, lane, model)
     else:
         if epic is None:

@@ -794,7 +794,8 @@ and unresolved threads started by `grug-tribe[bot]` are sent back to the same
 lane as a `loom:fix` comment, using the same findings format as
 `python3 -m bus.brain fix`. The ticket returns to `loom:briefed`; the runner
 pushes fixes to the existing branch. `LOOM_FIX_ROUNDS` caps automatic rounds
-per ticket (default 3), after which the station adds `needs-brain`. A clean
+per ticket (default 3), after which the station adds `needs-brain` and records
+one status event saying the cap was reached. A clean
 PR receives `loom:ready`; a later push removes that label until the new head
 has finished checks and review again. A degraded or partial result of the
 review check (its summary says `Degraded review (...): not a verdict`, or its
@@ -1203,6 +1204,12 @@ fixes a measured regression of ticket M:
   (or `loom:queued` with no lane). Otherwise a new ticket is filed under N.
   Either way it carries `loom:regression`, so the station claims it, and
   the factory lands it, before other tickets.
+- A ticket is re-briefed in place at most `LOOM_REGRESSION_REBRIEFS` times
+  (default 3; each re-brief leaves one `Regresses #M` line in its body). The
+  next `--regresses` for it is refused: the ticket gains `needs-brain` and one
+  held comment saying how often it was re-briefed, and asking again writes
+  nothing more. A fix that never holds goes to the brain, which decides what
+  is different this time; it does not cycle.
 - Under the cap it is admitted like any brief. At or past the cap it is
   admitted through the goal's one regression slot, and a comment on goal N
   (marked `<!-- loom:regression v1 -->`) records why: the regressed ticket,

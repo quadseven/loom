@@ -3558,6 +3558,10 @@ class GoalRepo:
         self.comments.append((number, payload["body"]))
         return reply(201, {})
 
+    def _post_labels(self, number, payload):
+        self.issues[number]["labels"] += [{"name": n} for n in payload["labels"]]
+        return reply(200, [])
+
     def names(self, number):
         return [x["name"] for x in self.issues[number]["labels"]]
 
@@ -3667,6 +3671,49 @@ class RegressionSlotTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "17 tickets in flight"):
             self.brief(fake)
         self.assertEqual(len(fake.created()), 1)
+
+    def rebriefed(self, times):
+        """A shipped ticket whose body shows `times` earlier in-place re-briefs."""
+        body = BODY + "".join("\n## Regression\n\nTicket\n\nRegresses #5\nround %d\n" % i
+                             for i in range(times))
+        return GoalRepo([item(5, body=body, labels=["loom:ticket", "loom:shipped", "lane:claude"])])
+
+    def test_a_ticket_re_briefed_the_cap_times_is_held_for_the_brain_once(self):
+        cap = brain.regression_rebrief_cap()
+        fake = self.rebriefed(cap)
+        before = fake.issues[5]["body"]
+        with self.assertRaisesRegex(ValueError, "re-briefed as a regression %d times .* held "
+                                                "for the brain" % cap):
+            self.brief(fake, evidenced(5), regresses=5)
+        self.assertEqual(fake.issues[5]["body"], before)
+        self.assertEqual(sorted(fake.names(5)),
+                         ["lane:claude", "loom:shipped", "loom:ticket", "needs-brain"])
+        self.assertEqual(len(fake.comments), 1)
+        self.assertEqual(fake.comments[0][0], 5)
+        self.assertIn("Held for the brain", fake.comments[0][1])
+        self.assertEqual(fake.created(), [])
+        # Asked again: still refused, with no second label write or comment.
+        writes = len([c for c in fake.calls if c[0] != "GET"])
+        with self.assertRaisesRegex(ValueError, "held for the brain"):
+            self.brief(fake, evidenced(5, "measured again"), regresses=5)
+        self.assertEqual(len([c for c in fake.calls if c[0] != "GET"]), writes)
+        self.assertEqual(len(fake.comments), 1)
+
+    def test_a_ticket_under_the_re_brief_cap_is_still_re_briefed(self):
+        fake = self.rebriefed(brain.regression_rebrief_cap() - 1)
+        self.brief(fake, evidenced(5), regresses=5)
+        self.assertIn("loom:regression", fake.names(5))
+        self.assertNotIn("needs-brain", fake.names(5))
+        self.assertEqual(fake.issues[5]["body"].count("Regresses #5\n"),
+                         brain.regression_rebrief_cap())
+        self.assertEqual(fake.comments, [])
+
+    def test_the_re_brief_cap_is_an_environment_setting(self):
+        self.assertEqual(brain.regression_rebrief_cap({}), brain.REGRESSION_REBRIEFS_DEFAULT)
+        self.assertEqual(brain.regression_rebrief_cap({"LOOM_REGRESSION_REBRIEFS": "5"}), 5)
+        for bad in ("0", "-1", "x", ""):
+            self.assertEqual(brain.regression_rebrief_cap({"LOOM_REGRESSION_REBRIEFS": bad}),
+                             brain.REGRESSION_REBRIEFS_DEFAULT)
 
     def test_under_the_cap_a_regression_is_labelled_and_records_nothing(self):
         fake = GoalRepo([item(5, labels=["loom:ticket", "loom:verified"])])
