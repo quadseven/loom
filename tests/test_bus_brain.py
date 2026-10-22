@@ -1257,7 +1257,7 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def _merge_replies(self, changes=None):
         pr = {"state": "open", "draft": False, "body": "Refs %s#9" % REPO, "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": REPO}}, "base": {"repo": {"full_name": REPO}}, "mergeable": True}
-        details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work", "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": []}}
+        details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work", "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": []}, "files": {"totalCount": 1, "nodes": [{"path": "bus/a.py"}]}}
         if changes:
             pr.update(changes.get("pr", {}))
             details.update(changes.get("details", {}))
@@ -1566,6 +1566,18 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.merge(GitHub("t", transport=fake), REPO, 8,
                         adopt=True, env=self.TRUSTED)
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_adopt_refuses_a_logic_or_unlabeled_pr_with_a_neutral_review(self):
+        # Neutral is a degraded review: only docs and tests may land on it
+        # (loom#509). An unlabeled ticketless pull request is refused too.
+        runs = [{"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]
+        for labels in ([{"name": "class:logic"}], []):
+            with self.subTest(labels=labels):
+                fake = Fake(*self._adopt_replies({"pr": {"labels": labels}, "runs": runs}))
+                with self.assertRaisesRegex(ValueError, "review check has not passed"):
+                    brain.merge(GitHub("t", transport=fake), REPO, 8,
+                                adopt=True, env=self.TRUSTED)
+                self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
     def test_adopt_refuses_a_pull_request_that_already_has_a_ticket(self):
         fake = Fake(*self._adopt_replies({"pr": {"body": "Refs %s#9" % REPO}}))

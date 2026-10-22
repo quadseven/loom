@@ -78,6 +78,9 @@ Deliverable: answer (optional; the station also writes verify; any other value p
 ## Out of scope
 - <work this brief does not include>
 
+## Operator steps before merge
+<optional: steps a person takes before the change deploys, or none>
+
 ## Definition of done
 - [ ] Acceptance criteria are met
 - [ ] Changes are left on the requested branch for the runner
@@ -88,6 +91,9 @@ Deliverable: answer (optional; the station also writes verify; any other value p
 The `# T0001: <short title>` heading becomes the pull request title; without
 it the title is the ticket id.
 
-The runner uses the `Why`, `What`, `Acceptance criteria`, `Size`, and `Out of
-scope` sections when it builds the pull request body. Keep these headings
-exactly as written.
+The runner uses the `Why`, `What`, `Acceptance criteria`, `Size`, `Out of
+scope` and `Operator steps before merge` sections when it builds the pull
+request body. Keep these headings exactly as written. A brief whose change
+needs a person first (a data migration, a cutover, a VM resize) names those
+steps in `Operator steps before merge`: the pull request is then held for
+the operator instead of merging (docs/BRAIN.md, Operator holds).

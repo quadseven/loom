@@ -199,7 +199,9 @@ failure moves the ticket to another available lane as a new attempt, at most
 `loom:queued` on its rung, never to `loom:failed` (loom#1395). A run that exits 124 after editing pushes
 its edits to a side branch `<branch>-timedout-<time>` and names it in the
 failure reason; the retry's brief tells the next attempt to start from that
-branch. A fix round that fails transiently goes
+branch. On a public repo that side branch, like a `-unvalidated-` one, is
+pushed only after the public repo leak scan passes on its edits; otherwise no
+branch is kept. A fix round that fails transiently goes
 back to `loom:pr`, and one that fails its work goes to `loom:failed`, so the
 factory climbs the ladder and sends the fix to the next rung; a lane that hit its provider limit stays unavailable until the
 provider's reset (else 60 minutes; delete its heartbeat file in
@@ -1475,3 +1477,14 @@ One class covers the whole pull request, highest wins:
 The pull request carries exactly one `class:<name>` label, created like
 the other labels by `bus/labels.py`. Classification never changes merge
 rules; it only tells the reader how risky the change is.
+
+## Operator steps before merge
+
+Every lane pull request body also carries an `## Operator steps before
+merge` section, after `## Out of scope`: each step a person must take
+before the change can merge and deploy (a data migration, a cutover, a VM
+or disk resize, scaling a workload down), one per line, or the single word
+`none`. The agent writes it in `.loom/summary.md`; without one the runner
+copies the ticket's section of that name, else writes `none stated`.
+A pull request that lists a step is never merged by Loom (docs/BRAIN.md,
+Operator holds).
