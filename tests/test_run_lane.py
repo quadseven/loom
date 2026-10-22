@@ -96,6 +96,18 @@ if [ "$1" = api ]; then
       printf '%s %s' "${where%/issues/*}" "${where##*/}" > "$store/$id.on"
       cp "${6#body=@}" "$store/$id"; exit 0 ;;
   esac
+  # A review thread's pull request: every thread is on example/repo#7 except  # leak-guard-allow: fixture repo
+  # the ids listed in $FAKE_GH_FOREIGN_THREADS, which are on another one.
+  case "$*" in
+    "api graphql -f query=query("*"node(id:"*)
+      thread=""
+      for arg in "$@"; do case "$arg" in threadId=*) thread="${arg#threadId=}" ;; esac; done
+      case " ${FAKE_GH_FOREIGN_THREADS:-} " in
+        *" $thread "*) echo "example/other#3" ;;  # leak-guard-allow: fixture repo
+        *) echo "example/repo#7" ;;  # leak-guard-allow: fixture repo
+      esac
+      exit 0 ;;
+  esac
   [ "$*" = "api repos/example/repo --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
   exit 0
 fi
@@ -1387,6 +1399,27 @@ print('leak guard: clean (shape patterns only)')
         files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only", "HEAD"],
                                capture_output=True, text=True, check=True).stdout.split()
         self.assertNotIn(".loom/replies.json", files)
+
+    def test_fix_runner_never_replies_to_or_resolves_a_thread_on_another_pull_request(self):
+        self.fix_brief()
+        replies = ('[{"thread":"PRRT_elsewhere","reply":"Addressed","resolve":true},'
+                   '{"thread":"PRRT_fake","reply":"Addressed","resolve":true}]')
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES=replies,
+                               FAKE_GH_FOREIGN_THREADS="PRRT_elsewhere")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertFalse(any(("addPullRequestReviewThreadReply" in c or "resolveReviewThread" in c)
+                             and "PRRT_elsewhere" in c for c in calls))
+        self.assertTrue(any("resolveReviewThread" in c and "PRRT_fake" in c for c in calls))
+
+    def test_fix_runner_skips_a_reply_the_text_check_refuses(self):
+        self.fix_brief()
+        # Not ASCII, so bus/text.py and checked_text refuse it.
+        replies = json.dumps([{"thread": "PRRT_fake", "reply": "Addressed \u2014 done", "resolve": True}])
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES=replies)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("addPullRequestReviewThreadReply" in c or "resolveReviewThread" in c
+                             for c in self.calls()))
 
     def test_fix_runner_ignores_invalid_replies_file(self):
         self.fix_brief()

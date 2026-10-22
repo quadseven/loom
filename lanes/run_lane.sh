@@ -532,13 +532,33 @@ PY
 
 # The reply text reaches gh as a -f field value (a GraphQL variable), never
 # spliced into the query or a shell command line, so it cannot inject anything.
+# The agent names the thread ids, so each one is checked first: a thread on
+# any pull request but this round's own ($REPO#$FIX_PR) is skipped, and so is
+# a reply bus/text.py refuses. Resolving a thread is a merge gate input; an
+# agent must never answer or resolve one on another pull request.
 post_replies() {
-  local entry thread body resolve
+  local entry thread body resolve owner text_file
   [ -n "$REPLIES_FILE" ] && [ -f "$REPLIES_FILE" ] || return 0
   while IFS= read -r entry; do
     thread="$(jq -r '.thread' <<< "$entry")"
     body="$(jq -r '.reply' <<< "$entry")"
     resolve="$(jq -r '.resolve' <<< "$entry")"
+    owner="$(timeout "$NET_TIMEOUT" gh api graphql \
+         -f 'query=query($threadId:ID!){node(id:$threadId){... on PullRequestReviewThread{pullRequest{number repository{nameWithOwner}}}}}' \
+         -f "threadId=$thread" \
+         --jq '.data.node.pullRequest | "\(.repository.nameWithOwner)#\(.number)"' 2>> "$LOG")" || owner=""
+    if [ "$owner" != "$REPO#$FIX_PR" ]; then
+      echo "review thread $thread is not on $REPO#$FIX_PR; its reply was skipped" >> "$LOG"
+      continue
+    fi
+    text_file="$(mktemp "${TMPDIR:-/tmp}/loom-reply.XXXXXX")" || continue
+    printf '%s' "$body" > "$text_file"
+    if ! body="$(checked_text "$text_file" 2>> "$LOG")"; then
+      rm -f "$text_file"
+      echo "the reply to review thread $thread was refused; it was skipped" >> "$LOG"
+      continue
+    fi
+    rm -f "$text_file"
     if ! timeout "$NET_TIMEOUT" gh api graphql \
          -f 'query=mutation($threadId:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){comment{id}}}' \
          -f "threadId=$thread" -f "body=$body" >> "$LOG" 2>&1; then
