@@ -2,7 +2,7 @@
 
 An audit of 2026-10-22 found at least 12 tickets in the private deployment
 repo, and many more in other repos, closed as completed with live criteria
-never checked: a realm roller "enabled" while it stayed paused, a cost
+never checked: a release roller "enabled" while it stayed paused, a cost
 run-rate "recorded" by a runbook that says the run never happened, a model
 verdict produced by a simulated run, an RBAC check against a service account
 that does not exist. Two paths closed them: the station's done close (a
