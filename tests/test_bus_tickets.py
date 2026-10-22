@@ -1,4 +1,5 @@
 """Test the Finding class and related functions in bus.tickets."""
+import json
 import unittest
 from datetime import datetime, timezone
 
@@ -431,3 +432,28 @@ class RegressionRequeueTest(unittest.TestCase):
                    "created_at": "2030-01-02T01:00:00Z"}]
         merged_at = datetime(2030, 1, 2, 2, tzinfo=timezone.utc)
         self.assertFalse(tickets.merged_before_regression_requeue(issue, merged_at, events))
+
+
+class VerifyBriefLiveEvidenceTest(unittest.TestCase):
+    # The station refuses a live criterion's evidence that names no time it
+    # was seen or says what would happen (station.unseen_live_evidence). The
+    # brief never said so: 11 proofs were refused for it before 2026-10-22.
+    BODY = ("## Acceptance criteria\n\n"
+            "- [ ] The retry logs one line per attempt\n"
+            "- [ ] Live: after the next deploy the station log shows one retry line\n")
+
+    def brief(self):
+        issue = {"number": 7, "title": "Retry logs", "body": self.BODY}
+        return tickets.render_verify_brief("example-owner/example-repo", issue, "zen", 1, "x")
+
+    def test_the_brief_states_the_rule_the_station_checks_live_evidence_by(self):
+        text = self.brief()
+        self.assertIn("names the UTC time it was seen", text)
+        self.assertIn('never what "would" or "should" happen', text)
+
+    def test_the_template_asks_a_live_criterion_for_the_time_it_was_seen(self):
+        template = json.loads(self.brief().split("```json\n", 1)[1].split("\n```", 1)[0])
+        evidence = {c["criterion"]: c["evidence"] for c in template["criteria"]}
+        self.assertIn("UTC time you saw it",
+                      evidence["Live: after the next deploy the station log shows one retry line"])
+        self.assertNotIn("UTC time", evidence["The retry logs one line per attempt"])

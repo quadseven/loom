@@ -5,6 +5,7 @@ import json
 import os
 import unittest
 from types import SimpleNamespace
+from urllib.parse import quote
 
 from bus import hunt_plan, pin
 from bus.github import GitHubError
@@ -15,6 +16,7 @@ OLD = "a" * 40
 NEW = "b" * 40
 NEXT = "c" * 40
 PATH = "dashboard/pin.env"
+BRANCH = "loom/pin-" + hashlib.sha256(PATH.encode()).hexdigest()[:12]
 SPEC = {"repo": TARGET, "path": PATH, "revision_var": "LOOM_REVISION",
         "sha256_var": "LOOM_SHA256"}
 
@@ -34,7 +36,9 @@ def refused(method, path, *errors):
 class FakeGitHub:
     def __init__(self):
         self.base = 'LOOM_REVISION="%s"\nLOOM_SHA256="%s"\n' % (OLD, "0" * 64)
+        self.base_sha = "d" * 40
         self.branch = None
+        self.branch_sha = None
         self.pull = None
         self.created = 0
         self.calls = []
@@ -52,7 +56,7 @@ class FakeGitHub:
         if path.startswith("/repos/%s/contents/" % TARGET):
             return self.contents(method, path, body)
         if path.startswith("/repos/%s/git/ref/heads/" % TARGET) or path == "/repos/%s/git/refs" % TARGET:
-            return self.refs(path)
+            return self.refs(method, path, body)
         if "/compare/" in path:
             return SimpleNamespace(data={"commits": [{"sha": "e" * 40}], "files": self.files})
         if path == "/repos/%s/issues/7/labels" % TARGET and method == "POST":
@@ -72,15 +76,21 @@ class FakeGitHub:
         self.branch = base64.b64decode(body["content"]).decode()
         return SimpleNamespace(data={})
 
-    def refs(self, path):
+    def refs(self, method, path, body=None):
         if path == "/repos/%s/git/ref/heads/main" % TARGET:
-            return SimpleNamespace(data={"object": {"sha": "d" * 40}})
+            return SimpleNamespace(data={"object": {"sha": self.base_sha}})
         if path.startswith("/repos/%s/git/ref/heads/" % TARGET):
-            return SimpleNamespace(status=200 if self.branch else 404,
-                                   data={"object": {"sha": "d" * 40}} if self.branch else None)
-        if path == "/repos/%s/git/refs" % TARGET:
+            if self.branch_sha is None:
+                return SimpleNamespace(status=404, data=None)
+            if method == "PATCH":
+                self.branch_sha = body.get("sha", self.branch_sha)
+                return SimpleNamespace(data={"object": {"sha": self.branch_sha}})
+            return SimpleNamespace(status=200, data={"object": {"sha": self.branch_sha}})
+        if path == "/repos/%s/git/refs" % TARGET and method == "POST":
             self.branch = self.base
+            self.branch_sha = self.base_sha
             return SimpleNamespace(data={})
+        raise AssertionError((method, path, body))
 
     def pulls(self, method, path, body):
         if path == "/repos/%s/pulls?state=open&per_page=100" % TARGET:
@@ -198,6 +208,65 @@ class PinTest(unittest.TestCase):
         gh = FakeGitHub()
         pin.run(gh, SOURCE, NEW, "unittest", [spec], lambda _: b"archive", lambda _: None)
         self.assertEqual(gh.created, 0)
+
+
+class PinRebuildTest(unittest.TestCase):
+    """The pin branch is rebuilt from the default branch's head on every
+    update so its pull request never goes stale when the default branch moves."""
+
+    def pin_text(self, revision):
+        return 'LOOM_REVISION="%s"\nLOOM_SHA256="%s"\n' % (revision, "0" * 64)
+
+    def ref_path(self):
+        return "/repos/%s/git/ref/heads/%s" % (TARGET, quote(BRANCH, safe=""))
+
+    def assert_rebuilt(self, gh, revision):
+        patches = [c for c in gh.calls if c[0] == "PATCH" and c[1] == self.ref_path()]
+        self.assertEqual(len(patches), 1, gh.calls)
+        self.assertEqual(patches[0][2], {"sha": "d" * 40, "force": True})
+        puts = [c for c in gh.calls if c[0] == "PUT" and "/contents/" in c[1]
+                and c[2].get("branch") == BRANCH]
+        self.assertEqual(len(puts), 1, gh.calls)
+        self.assertLess(gh.calls.index(patches[0]), gh.calls.index(puts[0]))
+        content = base64.b64decode(puts[0][2]["content"]).decode()
+        self.assertIn('LOOM_REVISION="%s"' % revision, content)
+
+    def test_rebuilds_branch_when_its_base_is_behind_default(self):
+        gh = FakeGitHub()
+        gh.base = self.pin_text(NEW)          # default branch moved on
+        gh.branch = self.pin_text(OLD)        # pin branch still names the old revision
+        gh.base_sha = "d" * 40
+        gh.branch_sha = "e" * 40
+        gh.pull = {"number": 7, "head": {"ref": BRANCH},
+                   "mergeable_state": "dirty", "body": ""}
+        pin.pin_one(gh, SOURCE, NEXT, SPEC, lambda: "digest", lambda _: None)
+        self.assert_rebuilt(gh, NEXT)
+
+    def test_rebuilds_when_pull_request_is_dirty(self):
+        gh = FakeGitHub()
+        gh.base = self.pin_text(NEXT)
+        gh.branch = self.pin_text(NEXT)
+        gh.base_sha = "d" * 40
+        gh.branch_sha = "d" * 40
+        gh.pull = {"number": 7, "head": {"ref": BRANCH},
+                   "mergeable_state": "dirty", "body": ""}
+        pin.pin_one(gh, SOURCE, NEXT, SPEC, lambda: "digest", lambda _: None)
+        self.assert_rebuilt(gh, NEXT)
+
+    def test_returns_when_pull_request_is_clean(self):
+        gh = FakeGitHub()
+        gh.base = self.pin_text(NEXT)
+        gh.branch = self.pin_text(NEXT)
+        gh.base_sha = "d" * 40
+        gh.branch_sha = "d" * 40
+        gh.pull = {"number": 7, "head": {"ref": BRANCH},
+                   "mergeable_state": "clean", "body": ""}
+        before = len([c for c in gh.calls if c[0] in ("PUT", "PATCH", "POST")])
+        pin.pin_one(gh, SOURCE, NEXT, SPEC, lambda: "digest", lambda _: None)
+        after = len([c for c in gh.calls if c[0] in ("PUT", "PATCH", "POST")])
+        self.assertEqual(after, before)
+        self.assertFalse(any(c[0] == "PATCH" and "git/ref/heads" in c[1] for c in gh.calls))
+        self.assertFalse(any(c[0] == "PUT" and "/contents/" in c[1] for c in gh.calls))
 
 
 class PinAuthTest(unittest.TestCase):

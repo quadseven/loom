@@ -126,6 +126,25 @@ class OneSizeParserTest(unittest.TestCase):
     def test_the_heading_wins_over_an_inline_line(self):
         self.assertEqual(hunt_plan.stated_size((BRIEF % "Large") + "\nSize: S\n"), "Large")
 
+    def test_inline_word_size_is_read_as_the_gate_letter(self):
+        # A brief that states its size as a word on an inline Size: line
+        # (not a ## Size section) still yields a body the gate accepts.
+        for word in ("Medium", "Small", "Large", "medium", "small"):
+            with self.subTest(word=word):
+                body = (BRIEF % "S").replace("## Size\n\nS\n", "Size: %s\n" % word)
+                self.assertEqual(hunt_plan.stated_size(body), hunt_plan.size_letter(word))
+                self.assertEqual(hunt_plan.brief_size(body), hunt_plan.size_letter(word))
+                self.assertEqual(brain.plan_problems(body), [])
+                generated = pr_repair._render_generated(body, "lane", "model", "T1")
+                self.assertIn("\nSize: %s\n" % hunt_plan.size_letter(word), generated)
+                self.assertEqual(hunt_plan.problems(generated), [])
+
+    def test_inline_xl_size_is_refused(self):
+        # XL on an inline Size: line is still too big: stated_size skips it.
+        body = (BRIEF % "S").replace("## Size\n\nS\n", "Size: XL\n")
+        self.assertIsNone(hunt_plan.stated_size(body))
+        self.assertTrue(brain.plan_problems(body))
+
 
 if __name__ == "__main__":
     unittest.main()

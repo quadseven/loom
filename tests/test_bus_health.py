@@ -54,6 +54,8 @@ class FakeGitHub:
         if method == "GET":
             return Reply(self.closed.get(int(path.rsplit("/", 1)[1]), {"state": "open"}))
         self.writes.append((method, path, data))
+        if method == "POST" and path.endswith("/comments"):
+            return Reply({"id": 7000 + len(self.writes)})
         return Reply({})
 
 
@@ -187,6 +189,41 @@ class Intake(Base):
         self.assertEqual(method, "POST")
         self.assertIn("finding absent since 2030-01-02T00:00:00Z", data["body"])
         self.assertFalse(any(w[0] == "PATCH" for w in self.gh.writes))
+
+    def test_a_finding_that_flaps_five_times_in_a_day_leaves_one_absent_note(self):
+        # wow-overseer#1204 got 7 absent notes in 18 hours: every return cleared
+        # the absent stamp, so every next absence posted again.
+        digest = sha()
+        self.open_ticket(100, digest)
+        now = NOW
+        for _ in range(5):
+            self.doc["findings"] = []
+            self.run_once(now)
+            now += 1800
+            self.doc["findings"] = [finding()]
+            self.run_once(now)
+            now += 1800
+        absent = [w for w in self.gh.writes if health.ABSENT_MARKER in (w[2] or {}).get("body", "")]
+        self.assertEqual([w[0] for w in absent], ["POST"])
+        # A day later the one note is edited, not repeated.
+        now += health.RESEEN_EVERY
+        self.doc["findings"] = []
+        self.run_once(now)
+        absent = [w for w in self.gh.writes if health.ABSENT_MARKER in (w[2] or {}).get("body", "")]
+        self.assertEqual([w[0] for w in absent], ["POST", "PATCH"])
+        self.assertIn("/issues/comments/", absent[1][1])
+        self.assertIn("gone absent 6 times", absent[1][2]["body"])
+        self.assertEqual(len(self.state["absent_noted"]), 1)
+
+    def test_a_closed_ticket_forgets_its_absent_note(self):
+        digest = sha()
+        issue = self.open_ticket(100, digest)
+        self.doc["findings"] = []
+        self.run_once()
+        self.assertIn(REPO + "#100", self.state["absent_noted"])
+        self.gh.open.remove(issue)
+        self.run_once(NOW + 900)
+        self.assertEqual(self.state["absent_noted"], {})
 
     def test_not_looked_files_nothing_and_logs_the_reason_once(self):
         digest = sha()
@@ -668,6 +705,15 @@ class Regression(Base):
         self.run_once(NOW + 900)
         self.assertEqual(len(calls), 2)
         self.assertEqual(len([s for s in self.said if "regression slot is held" in s]), 1)
+
+
+    def test_a_shipped_ticket_held_for_the_brain_is_not_re_briefed(self):
+        issue = self.shipped_ticket()
+        issue["labels"].append({"name": "needs-brain"})
+        self.run_once()
+        self.run_once(NOW + health.REGRESS_EVERY + 60)
+        self.assertEqual(self.briefs, [])
+        self.assertEqual(self.gh.event_reads, [])
 
 
 class RegressionThroughBrain(unittest.TestCase):

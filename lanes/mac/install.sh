@@ -31,6 +31,11 @@ LOOM_CODEX_MODEL="${LOOM_CODEX_MODEL:-$(sed -nE 's/^[[:space:]]*model[[:space:]]
 if [ -z "${LOOM_REWRITE_PRIVATE_CMD:-}" ] && [ -n "$LOOM_CODEX_MODEL" ]; then
   LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh - codex/$LOOM_CODEX_MODEL"
 fi
+# The model family the codex and agy lanes run, whatever model a brief pins
+# (lanes/run_lane.sh): the operator's rule since 2026-10-21. Set one empty to
+# let pins run as written.
+LOOM_CODEX_ONLY_MODEL="${LOOM_CODEX_ONLY_MODEL-gpt-6-luna}"
+LOOM_AGY_ONLY_MODEL="${LOOM_AGY_ONLY_MODEL-gemini-3.8-flash}"
 LOOM_CLAUDE_MODEL="${LOOM_CLAUDE_MODEL:-claude-opus-5-5}"
 LOOM_MUSE_MODEL="${LOOM_MUSE_MODEL:-muse-spark-1.3}"
 LOOM_OPENROUTER_MODEL="${LOOM_OPENROUTER_MODEL:-openrouter/cohere/north-mini-code:free}"
@@ -57,6 +62,7 @@ LOOM_SPARK_4_URL="${LOOM_SPARK_4_URL:-}"
 # (/free/<provider>/v1 for free-ollama and free-gemma, /free-public/<provider>/v1
 # for the rest); each model names its provider for the dashboard. The free
 # models serve about 128K, so the lane's window is smaller than a Spark's.
+LOOM_FREE_GATEWAY_URL="${LOOM_FREE_GATEWAY_URL:-}"
 LOOM_FREE_OLLAMA_URL="${LOOM_FREE_OLLAMA_URL:-}"
 LOOM_FREE_OLLAMA_MODEL="${LOOM_FREE_OLLAMA_MODEL:-free/ollama-cloud}"
 LOOM_FREE_GEMMA_URL="${LOOM_FREE_GEMMA_URL:-}"
@@ -73,10 +79,10 @@ LOOM_SPARK_MODEL="${LOOM_SPARK_MODEL:-}"
 # The context and output window the spark endpoint serves (lanes/agent_sandbox.sh).
 LOOM_SPARK_CONTEXT="${LOOM_SPARK_CONTEXT:-32768}"
 LOOM_SPARK_OUTPUT="${LOOM_SPARK_OUTPUT:-4096}"
-export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_OPENCODE_GO_3_MODEL LOOM_OPENCODE_GO_4_MODEL \
+export LOOM_CODEX_MODEL LOOM_CODEX_ONLY_MODEL LOOM_AGY_ONLY_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_OPENCODE_GO_3_MODEL LOOM_OPENCODE_GO_4_MODEL \
   LOOM_OPENCODE_GO_PROBE_URL LOOM_OPENCODE_GO_PROBE_HEADER LOOM_ANTHROPIC_MODEL \
   LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL LOOM_AGY_EFFORT LOOM_SPARK_URL LOOM_SPARK_2_URL LOOM_SPARK_3_URL LOOM_SPARK_4_URL LOOM_SPARK_MODEL \
-  LOOM_FREE_OLLAMA_URL LOOM_FREE_OLLAMA_MODEL LOOM_FREE_GEMMA_URL LOOM_FREE_GEMMA_MODEL LOOM_FREE_NVIDIA_URL LOOM_FREE_NVIDIA_MODEL LOOM_FREE_KILO_URL LOOM_FREE_KILO_MODEL LOOM_FREE_GROQ_URL LOOM_FREE_GROQ_MODEL LOOM_FREE_CONTEXT LOOM_FREE_OUTPUT \
+  LOOM_FREE_GATEWAY_URL LOOM_FREE_OLLAMA_URL LOOM_FREE_OLLAMA_MODEL LOOM_FREE_GEMMA_URL LOOM_FREE_GEMMA_MODEL LOOM_FREE_NVIDIA_URL LOOM_FREE_NVIDIA_MODEL LOOM_FREE_KILO_URL LOOM_FREE_KILO_MODEL LOOM_FREE_GROQ_URL LOOM_FREE_GROQ_MODEL LOOM_FREE_CONTEXT LOOM_FREE_OUTPUT \
   LOOM_SPARK_CONTEXT LOOM_SPARK_OUTPUT
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
@@ -295,6 +301,8 @@ done
 # LOOM_SHIP_ON_MERGE and LOOM_SHIP_WORKFLOWS (repos whose merged tickets ship
 # at merge, and OWNER/NAME=WORKFLOW_FILE repos that ship when their deploy
 # workflow succeeds on the merge commit, docs/BRAIN.md), and
+# LOOM_SHIP_PATH_WORKFLOWS (repos with many path-scoped deploy workflows,
+# docs/BRAIN.md), and
 # LOOM_EVIDENCE_CMDS (private JSON map of repo to read-only log command for
 # verify briefs, docs/LANES.md Verify runs), and
 # LOOM_LOG_KEEP_DAYS and LOOM_DISK_FREE_MIN_GB (days a lane's logs are kept,
@@ -350,6 +358,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_PIN_SHIP_REPOS</key><string>$(xml "${LOOM_PIN_SHIP_REPOS:-}")</string>
     <key>LOOM_SHIP_ON_MERGE</key><string>$(xml "${LOOM_SHIP_ON_MERGE:-}")</string>
     <key>LOOM_SHIP_WORKFLOWS</key><string>$(xml "${LOOM_SHIP_WORKFLOWS:-}")</string>
+    <key>LOOM_SHIP_PATH_WORKFLOWS</key><string>$(xml "${LOOM_SHIP_PATH_WORKFLOWS:-}")</string>
     <key>LOOM_LOG_KEEP_DAYS</key><string>$(xml "${LOOM_LOG_KEEP_DAYS:-}")</string>
     <key>LOOM_DISK_FREE_MIN_GB</key><string>$(xml "${LOOM_DISK_FREE_MIN_GB:-}")</string>
     <key>LOOM_SETTLE_CLAIMED</key><string>$(xml "${LOOM_SETTLE_CLAIMED:-}")</string>

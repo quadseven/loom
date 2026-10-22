@@ -93,6 +93,9 @@ deployment repository exposes a build run for the pull request's head commit,
 the station comments with the run link on the goal home. The repository
 configuration must give the station token read access to the ship document
 and write access to the deployment repository and goal home.
+A goal home whose body names a roll, but that no `LOOM_ROLL_SHIP_DOCS` entry
+names, gets a `roll-pin-off` invariant issue (docs/LANES.md, Invariants), so
+a pass left unconfigured is raised instead of skipped in silence.
 
 For a roll held by a family gate, set `gate_url` on its
 `LOOM_ROLL_SHIP_DOCS` entry. Keep the real endpoint in the station's private

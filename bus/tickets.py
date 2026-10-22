@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
-from . import proof
+from . import proof, status
 
 # The runner's own patterns (lanes/run_lane.sh).
 MODEL_RE = re.compile(r"[A-Za-z0-9._:][A-Za-z0-9._:/@-]*")
@@ -61,6 +61,50 @@ def merged_before_requeue(merged_at: Any, events: Iterable[Dict[str, Any]]) -> b
     return bool(requeues) and max(requeues) > _utc_timestamp(merged_at)
 
 
+# Status events the station writes about a merged pull request it has already
+# judged for a ticket, before any build lane runs (loom#1385). The texts are
+# the record: the next pass reads them back, so a pull request is judged once.
+UNBUILT_NOTE = ("Pull request #%d merged and left ticket criteria unbuilt, so the ticket "
+                "is back at loom:queued for the rest: %s")
+MERGED_FIRST_NOTE = ("Pull request #%d (merged %s, merge commit %s) may already carry this "
+                     "ticket's work, so the ticket goes to a verify run before any build.")
+REFUTED_NOTE = ("A verify run found that pull request #%d does not meet this ticket's "
+                "criteria: %s. The ticket is back at loom:queued for a build, and that "
+                "pull request is not checked again.")
+_UNBUILT_RE = re.compile(r"^Pull request #(\d+) merged and left ticket criteria unbuilt")
+_MERGED_FIRST_RE = re.compile(r"^Pull request #(\d+) \(merged [^)]*\) may already carry this "
+                              r"ticket's work")
+_REFUTED_RE = re.compile(r"^A verify run found that pull request #(\d+) does not meet")
+
+
+def judged_pulls(texts: Iterable[str]) -> List[int]:
+    """The pull requests the station has already judged for a ticket, from the
+    texts of its status events: one that left criteria unbuilt (the ticket was
+    sent back for the rest) or one sent to a verify run before a build. A
+    judged pull request is not sent to a verify run again."""
+    return sorted({int(m.group(1)) for text in texts for rx in (_UNBUILT_RE, _MERGED_FIRST_RE)
+                   for m in [rx.match(str(text))] if m})
+
+
+def pending_verifies(texts: Iterable[str]) -> List[int]:
+    """The pull requests sent to a verify run before a build whose verify run
+    has not yet found them wanting."""
+    texts = [str(t) for t in texts]
+    sent = {int(m.group(1)) for t in texts for m in [_MERGED_FIRST_RE.match(t)] if m}
+    refuted = {int(m.group(1)) for t in texts for m in [_REFUTED_RE.match(t)] if m}
+    return sorted(sent - refuted)
+
+
+REWRITTEN_FROM_RE = re.compile(r"^Rewritten from issue (\d+)\.[ \t]*$", re.M)
+
+
+def rewritten_source(body: Any) -> Optional[int]:
+    """The issue a ticket names with its "Rewritten from issue M." line, or
+    None. Only that line: a bare Refs line may name a goal or an unrelated issue."""
+    found = REWRITTEN_FROM_RE.search(without_original(str(body or "")))
+    return int(found.group(1)) if found else None
+
+
 HEADER_RE = re.compile(r"(Difficulty|Priority|Model|Base|Not before|After|Deliverable):[ \t]*(.*)")
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
 # earlier than that UTC time, and the brain does not brief it before then.
@@ -83,13 +127,19 @@ ORIGINAL_HEADING = "## Original issue"
 
 def with_original(body: str, issue: Dict[str, Any]) -> str:
     """The ticket body followed by the issue's original title and text,
-    quoted in a collapsed section."""
-    text = str(issue.get("body") or "").replace("\r\n", "\n").replace("\r", "\n")
+    quoted in a collapsed section. The issue's status section (loom#1341)
+    is not quoted: it stays at the end as a live section."""
+    kept = status.body_events(issue.get("body"))
+    text = status.strip_body(issue.get("body")).replace("\r\n", "\n").replace("\r", "\n")
     lines = ["Original title: %s" % " ".join(str(issue.get("title") or "").split()), ""]
     lines += text.rstrip("\n").split("\n")
     quoted = "\n".join(("> " + line) if line.strip() else ">" for line in lines)
-    return "%s\n\n%s\n\n<details><summary>Original issue</summary>\n\n%s\n\n</details>\n" % (
+    out = "%s\n\n%s\n\n<details><summary>Original issue</summary>\n\n%s\n\n</details>\n" % (
         body.rstrip("\n"), ORIGINAL_HEADING, quoted)
+    try:
+        return status.with_body_events(out, kept) if kept else out
+    except ValueError:
+        return out
 
 
 def without_original(body: str) -> str:
@@ -155,7 +205,9 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
     ValueError for a value the runner would refuse, a repeated header, or a
     later body line the runner would mistake for a header.
     """
-    lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    # The status section the station keeps at the end of the body (loom#1341)
+    # is not the ticket's text.
+    lines = status.strip_body(body).replace("\r\n", "\n").replace("\r", "\n").split("\n")
     headers: Dict[str, str] = {}
     i = 0
     while i < len(lines):
@@ -441,10 +493,25 @@ ANSWER_NOTE = (
     "finding on a strong model's round; anything else still needs a fix.")
 
 
+# Where a run that timed out or hit a limit after editing left its edits (lanes/run_lane.sh
+# preserve_timedout), as the failure reason names it.
+TIMEDOUT_RE = re.compile(r"the edits are on branch ([A-Za-z0-9._/-]+-timedout-[0-9]+)")
+
+
+def timedout_branch(texts: List[str]) -> Optional[str]:
+    """The newest timed-out branch any of `texts` (oldest first) names."""
+    found = None
+    for text in texts:
+        match = TIMEDOUT_RE.search(text)
+        if match:
+            found = match.group(1)
+    return found
+
+
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   fix: Optional[Fix] = None,
                   ci_checks: Optional[List[Tuple[str, str]]] = None,
-                  has_contract: bool = True) -> str:
+                  has_contract: bool = True, resume: Optional[str] = None) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -479,6 +546,11 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += "\n"
     if body:
         text += body + "\n"
+    if resume:
+        text += ("\n## Earlier attempt\n\nAn earlier attempt ended (a timeout or a limit) after "
+                 "editing, and the runner kept its edits on branch %s. The runner merges them into this tree "
+                 "before you start (the sandbox keeps .git read-only, so never fetch): check "
+                 "what is there and finish the ticket instead of starting over.\n" % resume)
     if fix:
         text += ("\n## Fix\n\nThis ticket already has pull request #%d on branch %s. "
                  "Fix what is listed below on that branch: change only what the findings "
@@ -518,6 +590,10 @@ top of your work directory. It holds exactly one of:
    data section shows, or a later commit on the default branch, and
    observed.start must not be before that pull request merged: the station
    refuses a proof of a stale build or of evidence seen before the merge.
+   For a criterion that starts with "Live", the evidence quotes what was seen
+   (a log line, a response, a page) and names the UTC time it was seen, like
+   2030-01-01T00:00:00Z; never what "would" or "should" happen. The station
+   refuses live evidence without that time.
 2. {"missing": "<the evidence that does not exist yet>"} when you cannot
    prove every criterion. Name the evidence precisely; do not guess.
 
@@ -535,6 +611,11 @@ A runtime proof template with every required key and these criteria filled in
 """
 
 
+# A criterion a live observation proves: the station refuses its evidence
+# unless it names the time it was seen (station.unseen_live_evidence).
+LIVE_CRITERION_RE = re.compile(r"^\s*live\b", re.I)
+
+
 def verify_template(criteria: List[str]) -> str:
     """The runtime proof skeleton a verify brief shows (loom#714): lanes that
     built the record from prose alone left out observed or environment, and
@@ -547,7 +628,9 @@ def verify_template(criteria: List[str]) -> str:
         "observed": {"start": "<UTC time like 2030-01-01T00:00:00Z>",
                      "end": "<UTC time like 2030-01-01T01:00:00Z>"},
         "sources": ["<a reference to each piece of evidence>"],
-        "criteria": [{"criterion": text, "result": "pass", "evidence": "<what shows it>"}
+        "criteria": [{"criterion": text, "result": "pass",
+                      "evidence": ("<what you saw, quoted, and the UTC time you saw it>"
+                                   if LIVE_CRITERION_RE.match(text) else "<what shows it>")}
                      for text in criteria],
         "measure": {"name": "<what you measured>", "baseline": "<before>",
                     "target": "<the goal>", "after": "<after>"},
@@ -557,6 +640,20 @@ def verify_template(criteria: List[str]) -> str:
 def verify_name(repo: str, number: int, stamp: int) -> str:
     """The name of a verify brief; the stamp keeps each run's name its own."""
     return "%s-verify-%d" % (ticket_name(repo, number), stamp)
+
+
+def merged_first_section(pulls: Iterable[int]) -> str:
+    """The verify brief's section for a ticket sent to verification before any
+    build: it tells the lane the one extra answer it may give."""
+    names = ", ".join("#%d" % n for n in pulls)
+    return ("\n## Sent to verification before any build\n\n"
+            "The station found merged pull request %s linked to this ticket before any "
+            "build lane ran, so it asks whether that change already does the ticket's "
+            "work. Judge each acceptance criterion against the merged pull request's "
+            "facts as usual. When the merged change does not meet one or more of them, "
+            "write verify.json as {\"unmet\": \"<which criteria it does not meet and "
+            "why>\"} instead: the station then queues the ticket for a build and does not "
+            "send that pull request to a verify run again.\n" % names)
 
 
 def render_verify_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
@@ -645,16 +742,18 @@ def _is_ticket(issue: Dict[str, Any]) -> bool:
 
 
 def brief_author_trusted(issue: Dict[str, Any], authors: Iterable[str],
-                         briefers: Iterable[str] = ()) -> bool:
+                         briefers: Iterable[str] = (), as_ticket: bool = False) -> bool:
     """Whether the issue's author may brief this Loom: a LOOM_BRIEF_AUTHORS
     login, or a LOOM_TRUSTED_BRIEFERS login on a loom:ticket (a brief is the
-    hand-off). Every briefing trust check asks this, so they cannot drift."""
+    hand-off). as_ticket asks about the issue as it will be once a brief has
+    made it the ticket. Every briefing trust check asks this, so they cannot
+    drift."""
     author = _login(issue.get("user"))
     if not author:
         return False
     if author in {a.lower() for a in authors}:
         return True
-    return author in {b.lower() for b in briefers} and _is_ticket(issue)
+    return author in {b.lower() for b in briefers} and (as_ticket or _is_ticket(issue))
 
 
 def trusted(issue: Dict[str, Any], events: List[Dict[str, Any]],

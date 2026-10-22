@@ -36,6 +36,7 @@ slot such as anthropic-2 runs its lane's agent):
 - `openrouter` - free models via opencode.
 - `opencode-go` - subscription models via opencode.
 - `zen` - OpenCode Zen free models via opencode; public repos only.
+- `copilot` - GitHub Copilot Free CLI with a scoped token; public repos only.
 - `zai` - Z.ai free GLM Flash models via opencode; public repos only.
 - `workersai` - Cloudflare Workers AI models via opencode, within the
   account's free daily allowance.
