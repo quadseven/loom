@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
+from . import bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -3047,17 +3047,9 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
-        if self.now < held_until(issue) or self._host_only(repo, issue):
-            return "%s is held" % ref
-        # A ticket held by After: is never briefed: the station refuses the
-        # claim each pass, and the lane it was given counts it as load and
-        # sits idle until the other ticket merges (2026-10-22).
-        waiting = self.held_by(repo, issue) if re.search(
-            r"^After:", str(issue.get("body") or ""), re.M) else []
-        if waiting:
-            reason = "waits for %s to merge (After:)" % ", ".join(a.short for a in waiting)
-            self._waiting(repo, issue["number"], reason)
-            return "%s %s" % (ref, reason)
+        held = self._queued_hold(repo, issue)
+        if held:
+            return "%s %s" % (ref, held)
         model_match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
         if model_match:
             return self._assign_queued_model(repo, issue, model_match.group(1))
@@ -3078,6 +3070,37 @@ class Factory:
             self._waiting(repo, issue["number"], "giving it a lane failed")
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
+
+    def _queued_hold(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why a queued ticket gets no lane this pass, or ""."""
+        if self.now < held_until(issue) or self._host_only(repo, issue):
+            return "is held"
+        held = self._brief_wait(repo, issue)
+        if held:
+            return "waits: " + held
+        # A ticket held by After: is never briefed: the station refuses the
+        # claim each pass, and the lane it was given counts it as load and
+        # sits idle until the other ticket merges (2026-10-22).
+        waiting = self.held_by(repo, issue) if re.search(
+            r"^After:", str(issue.get("body") or ""), re.M) else []
+        if waiting:
+            reason = "waits for %s to merge (After:)" % ", ".join(a.short for a in waiting)
+            self._waiting(repo, issue["number"], reason)
+            return reason
+        return ""
+
+    def _brief_wait(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why a queued ticket gets no lane, or "": a stale ticket waits for
+        the operator's answer (loom:human), and a health ticket for its cause
+        (bus/brief_check.py). Reads nothing."""
+        if "loom:human" in _labels(issue):
+            reason = "waits for a person (loom:human)"
+        elif brief_check.health_hold(issue):
+            reason = "health ticket names no cause"
+        else:
+            return ""
+        self._waiting(repo, issue["number"], reason)
+        return reason
 
     def _host_only(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether every acceptance criterion of the queued ticket is a check

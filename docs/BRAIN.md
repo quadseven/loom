@@ -805,6 +805,35 @@ station already judged for the ticket (one it sent back for unbuilt criteria
 after that merge, or one a verify run found wanting). The status events are
 the record; the station keeps no other state for it.
 
+Then the station checks the brief itself (`bus/brief_check.py`). A ticket
+is stale when the operator's newest comment says its work is done or
+superseded, when the issue it was rewritten from is already closed as
+completed, when a pull request in another repo of the owner that names it in
+full has merged, when a pull request a person linked in it or its comments
+merged after it was filed, or when every file its criteria ask to add already
+exists on the default branch. A stale ticket goes back to `loom:queued` with
+`loom:human` and one ask (`Kind: decision`) naming the evidence; the factory
+gives a queued `loom:human` ticket no lane. Each piece of evidence holds it
+once: once the operator removes `loom:human`, the same evidence does not hold
+it again. The audit of 2026-10-22 found a rewrite of an issue whose leak-scan
+caller and deny-list layer had shipped weeks before; the lane read "out of
+scope" as "must be absent" and deleted the working deny-list layer, in two
+repos.
+
+A health ticket (one health intake filed, or one whose Why names a health
+finding) gets no lane until its body names the cause, on a `Cause:` line or
+under `## Cause`. A cause whose subject is the measurement (the health read,
+a threshold or floor, a miscount) is refused, and so is a What whose every
+step changes the measurement. Naming a cause is diagnosis: the ticket goes
+back to `loom:queued` with `needs-brain` and a status event, and the factory
+gives it no lane until the cause is named. At merge, a lane change on a
+health ticket that edits the health read itself or a bound (a threshold,
+floor, ceiling or cutoff) waits for the operator (`bus/operator_hold.py`). The
+audit's health ticket was met by a health read that began counting money the
+fund's holder carried, so the finding vanished while every affected member
+stayed affected, and by a sibling that held refunds back to stay above the
+floor. A read the check needs that fails holds the ticket for the next pass.
+
 A ticket briefed again after `loom:failed` gets a fresh branch:
 `loom/<number>-<slug>-r<attempt>`, where the attempt is one more than the
 station's earlier claim comments on it.
