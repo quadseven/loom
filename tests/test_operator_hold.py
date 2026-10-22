@@ -248,6 +248,24 @@ class HostOnly(unittest.TestCase):
         self.assertIn("no pull request can meet it", asked[0][1])
 
 
+class HostOnlyRefusedAsk(unittest.TestCase):
+    def test_a_refused_ask_still_gives_the_ticket_no_lane(self):
+        # Review finding: a failed ask must not crash the queue pass or
+        # read as an asked ticket.
+        gh = FakeGitHub()
+        gh.ticket(7, "queued", body=TICKET_5783)
+        gh.issues[7]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"}]
+
+        def human(gh, repo, number, ask):
+            raise ValueError("text contains a private hostname")
+        worker = factory.Factory(gh, [FACTORY_REPO], NOW, trusted=["alice-example"],
+                                 available=["codex"], human=human)
+        worker.assign_queued()
+        self.assertEqual(factory._state(gh.issues[7]), "queued")
+        self.assertFalse(factory._lane(gh.issues[7]))
+        self.assertNotIn("loom:human", factory._labels(gh.issues[7]))
+
+
 class Rewrite(unittest.TestCase):
     class Contents:
         def __init__(self, text):

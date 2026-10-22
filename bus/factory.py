@@ -3016,12 +3016,20 @@ class Factory:
         criteria = operator_hold.host_only(str(issue.get("body") or ""))
         if not criteria:
             return False
-        if "loom:human" not in _labels(issue):
+        if "loom:human" in _labels(issue):
+            return True
+        try:
             self.human(self.gh, repo, int(issue["number"]), operator_hold.host_only_ask(criteria))
-            issue["labels"] = list(issue.get("labels") or []) + [{"name": "loom:human"}]
-            self.actions += 1
-            _say("held queued %s#%s for a person: every criterion is a host check"
-                 % (repo, issue["number"]))
+        except ValueError as err:
+            # The ask was refused (its quoted criteria, say); the ticket still
+            # gets no lane, and the log says why it waits with no ask.
+            _say("held queued %s#%s for a person, but the ask was refused: %s"
+                 % (repo, issue["number"], err))
+            return True
+        issue["labels"] = list(issue.get("labels") or []) + [{"name": "loom:human"}]
+        self.actions += 1
+        _say("held queued %s#%s for a person: every criterion is a host check"
+             % (repo, issue["number"]))
         return True
 
     def _assign_queued_model(self, repo: str, issue: Dict[str, Any], model: str) -> str:
