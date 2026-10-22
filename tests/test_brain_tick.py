@@ -523,6 +523,14 @@ class BrainTickTest(unittest.TestCase):
         self.assertFalse(any("LOOM_OPENCODE_GO_KEY_SSM" in c for c in settings))
         self.assertFalse(any("LOOM_SPARK_URL" in c for c in settings))
 
+    def test_the_shadow_switch_reaches_the_sandboxed_brain(self):
+        # bus/shadow.py: the brain's own merges and closes honor the same
+        # switch and repo list as the station's.
+        _, calls = self.spark_tick(LOOM_SHADOW="1", LOOM_SHADOW_REPOS="example/project")
+        settings = [c for c in calls if c.startswith("opencode setting ")]
+        self.assertIn("opencode setting LOOM_SHADOW=1", settings)
+        self.assertIn("opencode setting LOOM_SHADOW_REPOS=example/project", settings)
+
     def test_the_spark_sandbox_keeps_the_checkout_git_dir_read_only(self):
         # Found by the automated security review: with the tree at the brain
         # folder, the checkout's .git (one level down) was writable.

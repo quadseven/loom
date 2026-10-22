@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, journal, proof, text, tickets
 from bus.github import GitHub, GitHubError
+from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 # status refuses to run with no trusted login (loom#783).
 TRUSTED = {"LOOM_BRIEF_AUTHORS": "example-brain"}

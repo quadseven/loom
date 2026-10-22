@@ -14,9 +14,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from .github import GitHub, GitHubError, RateLimited, _next_link, auth_from_env, rest_login, unreadable
+from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
+                     rest_login, unreadable)
 from . import audit, change_class, handoff, hunt_plan, journal, lock, notify, pr_repair, proof, stale_claims, text, tickets
-from . import merge_tier, naming, operator_hold
+from . import merge_tier, naming, operator_hold, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -1380,6 +1381,12 @@ def close_epic(gh: GitHub, repo: str, number: int, note: str) -> None:
     if still:
         raise ValueError("epic #%d still holds open tickets: %s" % (
             number, ", ".join("#%s" % t.get("number") for t in still[:5])))
+    if shadow.active(repo):
+        entry = shadow.record(shadow.CLOSE, repo, number, "issue", reason="epic done: " + note,
+                              gates=["open epic", "every ticket closed"],
+                              source="bus.brain close-epic")
+        raise ShadowHeld("shadow mode: would close epic %s#%d; recorded in the shadow ledger "
+                         "and left open" % (repo, number), entry)
     notify.post(gh, repo, number, note, notify.CLOSED)
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
             {"state": "closed", "state_reason": "completed"})
@@ -2982,6 +2989,7 @@ def merge(gh: GitHub, repo: str, number: int,
         raise ValueError("--adopt merges a pull request that has no ticket")
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     details = _pr_graphql(gh, repo, number)
+    tier = ""
     if adopt:
         if not _ticketless(repo, pr):
             raise ValueError("pull request is linked to a ticket; merge it without --adopt")
@@ -2999,10 +3007,14 @@ def merge(gh: GitHub, repo: str, number: int,
         association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
         _refuse_pending_fix(gh, association, env)
         _refuse_operator_hold(gh, repo, number, pr, details, association, issue)
-        _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env)
+        tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
+    if shadow.active(repo):
+        _shadow_merge(repo, number, str(sha), association, adopt,
+                      "" if adopt else tier,
+                      change_class.class_of(pr) == "sensitive")
     result = gh.rest("PUT", "/repos/%s/pulls/%d/merge" % (repo, number),
                      {"merge_method": "squash", "sha": sha}).data or {}
     if result.get("merged") is not True:
@@ -3017,6 +3029,27 @@ def merge(gh: GitHub, repo: str, number: int,
         notify.post(gh, repo, number, ADOPT_COMMENT, notify.MERGED)
     return {"merged": True, "pull_request": (repo, number),
             "ticket": association, "head_sha": sha}
+
+
+def _shadow_merge(repo: str, number: int, sha: str, ticket: Optional[Tuple[str, int]],
+                  adopt: bool, tier: str, sensitive: bool) -> None:
+    """Record the merge every gate allowed and refuse it: `repo` is in shadow
+    mode (bus/shadow.py). The pull request stays open for the operator."""
+    if adopt:
+        gates = ["ticketless adopt checks"]
+    else:
+        gates = ["settled", "checks green and mergeable", "ticket linked and trusted",
+                 "no pending brain fix", "no operator hold"]
+        if sensitive:
+            gates.append("sensitive review")
+        gates.append("risk tier %s: review check passed, no blocking finding, under the cap"
+                     % (tier or "revert"))
+    reason = ("ticket %s#%d" % ticket) if ticket else ("adopted" if adopt else "")
+    entry = shadow.record(shadow.MERGE, repo, number, "pr", tier=tier, gates=gates,
+                          reason=reason, sha=sha, source="bus.brain merge")
+    raise ShadowHeld("shadow mode: would merge %s#%d at %s (tier %s); recorded in the shadow "
+                     "ledger and left open for the operator"
+                     % (repo, number, sha[:12], tier or ("adopt" if adopt else "revert")), entry)
 
 
 def _changed_files(details: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
@@ -3057,7 +3090,7 @@ def _refuse_operator_hold(gh: GitHub, repo: str, number: int, pr: Dict[str, Any]
 
 def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
                       details: Dict[str, Any], ticket: Optional[Tuple[str, int]],
-                      issue: Dict[str, Any], env: Optional[Dict[str, str]]) -> None:
+                      issue: Dict[str, Any], env: Optional[Dict[str, str]]) -> str:
     """Refuse a lane pull request Loom may not merge on its own
     (bus/merge_tier.py): a tier outside LOOM_AUTO_MERGE_TIERS (deploy-config,
     security and cross-repo by default) goes to the operator with one ask on
@@ -3068,7 +3101,8 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     and the diff is the exact inverse of a commit the base carries. From
     2026-10-19, 16 of 22 lane pull requests the Apps merged unattended in the
     private deployment repo were damaging or useless, most of them deploy and
-    CI changes the change class called logic."""
+    CI changes the change class called logic. Returns the tier ("revert" for
+    an exempt revert), which a shadow-mode record names."""
     try:
         entries = operator_hold.pull_files(gh, repo, number)
     except GitHubError as err:
@@ -3078,7 +3112,7 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     if merge_tier.is_revert_ticket(pr, issue):
         refused = merge_tier.revert_refusal(gh, repo, pr, issue, entries, env)
         if not refused:
-            return
+            return merge_tier.REVERT
         print("brain: %s#%d is not exempt as a revert: %s" % (repo, number, refused),
               file=sys.stderr)
     tier, why = merge_tier.classify(repo, entries, str(issue.get("body") or ""),
@@ -3107,6 +3141,7 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     capped = merge_tier.cap_refusal(gh, repo, env)
     if capped:
         raise ValueError("the auto-merge cap holds the merge: %s" % capped)
+    return tier
 
 
 def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
@@ -3450,6 +3485,15 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
     proof_url = ""
     if reason == "completed":
         proof_url = _check_proven(gh, repo, number, issue, env)
+    if shadow.active(repo):
+        # Before the note: a held close must not say it closed.
+        gates = ["open loom:ticket"] + (["loom:verified", "proof matches every criterion"]
+                                        if reason == "completed" else [])
+        entry = shadow.record(shadow.CLOSE, repo, number, "issue", gates=gates,
+                              reason="close as %s%s" % (reason, (": " + note) if note else ""),
+                              source="bus.brain close")
+        raise ShadowHeld("shadow mode: would close %s#%d as %s; recorded in the shadow ledger "
+                         "and left open" % (repo, number, reason), entry)
     if note is not None:
         notify.post(gh, repo, number, note, notify.CLOSED)
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
@@ -3555,6 +3599,12 @@ def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
             outcome = "closed"
             words = ("Ticket #%d, rewritten from this issue, is verified (%s), so this issue "
                      "closes as completed." % (number, _proof_words(number, proof_url)))
+        if outcome == "closed" and shadow.active(repo):
+            shadow.record(shadow.CLOSE, repo, source, "issue",
+                          reason="source issue of ticket #%d (%s)" % (number, outcome),
+                          gates=["ticket #%d %s" % (number, "closed" if unproven else "verified")],
+                          source="bus.brain settle_source")
+            return "shadow mode: would close source issue #%d; recorded, left open" % source
         marker = _source_marker(number, outcome)
         said = _said_for(comments, number)
         if said is None or not said.startswith(marker):

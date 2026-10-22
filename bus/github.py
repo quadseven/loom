@@ -34,7 +34,7 @@ from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from . import proof, status, text as _text
+from . import proof, shadow, status, text as _text
 
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
@@ -74,6 +74,17 @@ class GitHubError(Exception):
         super().__init__(message)
         self.status = status
         self.body = body
+
+
+class ShadowHeld(GitHubError, ValueError):
+    """A merge, close, ship label or branch deletion shadow mode recorded
+    instead of sending (bus/shadow.py). Both a GitHubError and a ValueError,
+    so every caller that handles a refused write or a refused gate handles it
+    the same way: logged, and tried again (and recorded once) next pass."""
+
+    def __init__(self, message: str, entry: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message, 0, "")
+        self.entry = entry or {}
 
 
 class RateLimited(GitHubError):
@@ -636,6 +647,7 @@ class GitHub:
 
     def _rest(self, method: str, path: str, body: Any = None,
               etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
+        self._hold_in_shadow(method, path, body)
         self._refuse_incomplete_close(method, path, body)
         url = self._url(path)
         # A caller's own ETag means the caller keeps the answer; otherwise
@@ -703,6 +715,38 @@ class GitHub:
                 self.issue_writes.add((owner.group(1), int(owner.group(2))))
             else:
                 self.comment_edits = True
+
+    def _hold_in_shadow(self, method: str, path: str, body: Any) -> None:
+        """Record and refuse a merge, close, ship or merge label, or branch
+        deletion in a repo in shadow mode (bus/shadow.py). Every Python write
+        to GitHub passes through here, whichever caller sent it. An exemption
+        (a signal issue's close, a label the item already has) needs the item
+        read: a read that fails holds the action."""
+        if method == "GET":
+            return
+        found = shadow.classify(method, path, body)
+        if found is None or not shadow.active(found.repo or None):
+            return
+        item: Any = None
+        if found.check:
+            try:
+                item = self._rest("GET", "/repos/%s/issues/%d" % (found.repo, found.number)).data
+            except GitHubError:
+                item = None
+            if found.check == "close" and shadow.close_let_through(item):
+                return
+            if found.check == "label" and isinstance(item, dict) and not shadow.label_is_new(
+                    found.detail, [str((x or {}).get("name") or "") for x in
+                                   item.get("labels") or [] if isinstance(x, dict)]):
+                return
+        entry = shadow.record(found.action, found.repo, found.number, found.kind,
+                              reason="%s %s%s" % (method, path.split("?", 1)[0],
+                                                  " (%s)" % found.detail if found.detail else ""),
+                              label=found.detail if found.action == shadow.LABEL else "",
+                              source=shadow.caller())
+        raise ShadowHeld("shadow mode: would %s %s; recorded in the shadow ledger, not sent"
+                         % (found.action, "%s#%d" % (found.repo, found.number)
+                            if found.number else (found.repo or found.detail)), entry)
 
     def _refuse_incomplete_close(self, method: str, path: str, body: Any) -> None:
         """Refuse a PATCH that would close an issue as completed while its

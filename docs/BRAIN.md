@@ -1475,6 +1475,65 @@ The same day it merged a lane pull request for a ticket of host checks
 only, which replaced the deployment repo's root README with a write-up of
 the ticket; the station then closed that ticket as shipped.
 
+## Shadow mode
+
+Loom resumes in shadow mode (`bus/shadow.py`, loom#1515). The station, the
+brain and the lanes run as usual: tickets are claimed, pull requests opened,
+fix rounds run, and every merge gate is checked as above. At the point Loom
+would act, it records the decision instead and leaves the item for the
+operator:
+
+- a pull request merge (the factory, `bus.brain merge` on the lane machine or
+  Muse, the deploy-watch revert path, the roll pin);
+- an issue close (a done or verified ticket, an epic, a rewritten source
+  issue, an operator-claimed issue) and a move to `loom:shipped`;
+- a label that grants a merge (`ready-to-land`);
+- a branch deletion after a merge.
+
+Closing a pull request without merging it still happens (it can be reopened
+and its branch stays), and so do the closes of Loom's own signal issues (an
+invariant breach, a factory incident, a health signature) that carry no work
+label.
+
+`bus/github.py` checks every request at its one choke point and refuses a
+held one with `ShadowHeld`, whichever code sent it; `bus.brain merge`,
+`bus.brain close` and the station's closes check first, so their record names
+the risk tier and the gates that passed. Each decision is one line of an
+append-only JSONL ledger, `LOOM_SHADOW_LEDGER` or
+`$LOOM_HOME/state/shadow/ledger.jsonl`: time, repo, number, action, tier,
+gates passed, reason, head SHA, caller and link, written once per action and
+head. Each report digest adds what was held since the last one, and
+
+    python3 -m bus.shadow report --since 24h      # or 7d, or an ISO date or UTC time
+    python3 -m bus.shadow status                  # which repos are in shadow
+
+lists each would-action with its link, for the operator's review.
+
+The switch fails closed. `LOOM_SHADOW` turns shadow off only when it reads
+`0` (or `false`, `off`, `no`); unset, empty, any other value, or a value that
+cannot be read is shadow. A Muse whose environment never names the switch is
+in shadow. `LOOM_SHADOW_REPOS` lists the repos still in shadow (`OWNER/NAME`,
+space or comma separated); empty, `*`, or an entry that is not `OWNER/NAME`
+means every repo. A repo not listed has graduated. The station plist is
+written with `LOOM_SHADOW=1` unless the installer is told otherwise. A repo
+added to `LOOM_REPOS` after the list was narrowed is not in it: add it to
+`LOOM_SHADOW_REPOS` first.
+
+Graduation is the operator's act, never Loom's. A repo leaves shadow only
+when the operator removes it from `LOOM_SHADOW_REPOS` (on the station and on
+Muse alike), and only after the operator's own review of the same pull
+requests and tickets finds:
+
+- at least N would-merges in the repo (20 for `docs-tests` and `app-code` by
+  default), with zero damaging ones: a would-merge the operator did not merge
+  as it was, or merged and later reverted;
+- zero would-closes of a ticket with an unmet criterion.
+
+Lowest risk tier first: `docs-tests`, then `app-code`; `deploy-config`,
+`security` and `cross-repo` stay with the operator (`LOOM_AUTO_MERGE_TIERS`).
+A damaging would-merge resets the repo's count. `LOOM_SHADOW=0` ends shadow
+for every repo at once.
+
 ## Verify before ship
 
 A ticket closes only when every acceptance criterion has evidence

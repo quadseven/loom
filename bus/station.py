@@ -35,6 +35,7 @@ from . import brain_memory
 from . import claimed
 from . import fabric
 from . import scope_fit
+from . import shadow
 from . import stale_claims
 from . import factory
 from . import friction_intake
@@ -6776,6 +6777,16 @@ class Station:
         passed, streak = dated[day]
         return "Factory %s: %d/9 numbers pass; streak %d of 7." % (day, passed, streak)
 
+    def _digest_shadow_lines(self, since: float) -> List[str]:
+        """What shadow mode held since the last digest (bus/shadow.py): at
+        most two lines, the counts and the command that lists each with its
+        link. An unreadable ledger says so rather than reading as empty."""
+        path = shadow.ledger_path(dict(os.environ, LOOM_HOME=self.s.home))
+        try:
+            return shadow.digest_lines(since, self.now, path)
+        except OSError as err:
+            return ["Shadow ledger %s could not be read (%s)." % (path, type(err).__name__)]
+
     def _digest_send(self, text: str) -> bool:
         """Every chunk of the digest to the channel, as the bot or through
         the webhook; False when any chunk failed or the secret is unreadable."""
@@ -6840,6 +6851,7 @@ class Station:
         factory_line = self._digest_factory_line()
         if factory_line:
             lines.append(factory_line)
+        lines += self._digest_shadow_lines(start)
         if not self._digest_send("\n".join(lines)):
             _say("report digest %s not sent; next pass tries again" % slot)
             return
@@ -7239,6 +7251,13 @@ class Station:
         """Close one done ticket with `reason`; True when the close writes
         landed, False when GitHub refused and the run moves on."""
         number = int(issue["number"])
+        if shadow.active(repo):
+            # Before the status note and the force-close label.
+            held = shadow.record(shadow.CLOSE, repo, number, "issue", source="station done close",
+                                 reason=reason, gates=["shipped", "every criterion has evidence"])
+            if held["new"]:
+                _say("shadow mode: would close done %s#%d (%s)" % (repo, number, reason))
+            return False
         branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
         if error:
             _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
@@ -7737,6 +7756,16 @@ class Station:
         shown = ", ".join("#%d" % int(pr.get("number") or 0) for pr in pulls)
         if not act:
             _say("settle-claimed: would close %s#%d, merged as PR %s" % (repo, number, shown))
+            return 1
+        if shadow.active(repo):
+            # Before the evidence comment: a held close must not say it closed.
+            held = shadow.record(shadow.CLOSE, repo, number, "issue",
+                                 source="station settle-claimed",
+                                 reason="claimed issue merged as PR %s" % shown,
+                                 gates=["every box proven by the merged pull requests"])
+            if held["new"]:
+                _say("settle-claimed: shadow mode, would close %s#%d, merged as PR %s"
+                     % (repo, number, shown))
             return 1
         comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         if not any(str(c.get("body") or "").startswith(claimed.MARKER)
