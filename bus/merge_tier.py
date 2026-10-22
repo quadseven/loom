@@ -219,7 +219,8 @@ def classify(repo: str, entries: Sequence[Mapping[str, Any]], ticket_body: str =
         elif tier == best:
             files.append(path)
     if not entries:
-        best = APP_CODE
+        # No file list proves nothing about risk: the operator merges it.
+        best = SECURITY
     if sensitive and _rank(SECURITY) > _rank(best):
         return SECURITY, "it carries class:sensitive"
     repos = other_repos(repo, ticket_body)

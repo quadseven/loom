@@ -3069,7 +3069,12 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     2026-10-19, 16 of 22 lane pull requests the Apps merged unattended in the
     private deployment repo were damaging or useless, most of them deploy and
     CI changes the change class called logic."""
-    entries = operator_hold.pull_files(gh, repo, number)
+    try:
+        entries = operator_hold.pull_files(gh, repo, number)
+    except GitHubError as err:
+        # No file list, no tier: the gate fails closed.
+        raise ValueError("held: the changed files could not be read to set the risk tier "
+                         "(%s)" % err) from err
     if merge_tier.is_revert_ticket(pr, issue):
         refused = merge_tier.revert_refusal(gh, repo, pr, issue, entries, env)
         if not refused:

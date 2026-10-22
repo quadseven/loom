@@ -130,7 +130,8 @@ class Tiers(unittest.TestCase):
     def test_a_sensitive_class_or_unread_files_never_read_as_docs(self):
         self.assertEqual(merge_tier.classify(REPO, entries(DOCS_CHANGE), sensitive=True)[0],
                          merge_tier.SECURITY)
-        self.assertEqual(merge_tier.classify(REPO, [])[0], merge_tier.APP_CODE)
+        self.assertEqual(merge_tier.classify(REPO, []),
+                         (merge_tier.SECURITY, "its changed files could not be read"))
 
     def test_the_operator_narrows_the_auto_tiers(self):
         self.assertEqual(merge_tier.auto_tiers({"LOOM_AUTO_MERGE_TIERS": "docs-tests, bogus"}),
@@ -349,6 +350,25 @@ class BrainMerge(unittest.TestCase):
         fake, refused = self.merge(files=APP_CHANGE, pages=None, threads=None)
         self.assertIn("could not read the review threads", refused)
         self.assertFalse(self.merged(fake))
+
+
+class Unreadable(unittest.TestCase):
+    def test_a_file_list_github_will_not_send_refuses_the_merge(self):
+        # Review finding: the read raised out of the gate unexplained.
+        fake = Route(routes(files=APP_CHANGE))
+
+        def transport(method, url, headers, body):
+            if "/pulls/8/files" in url:
+                return 422, {}, b'{"message": "too many files"}'
+            return fake(method, url, headers, body)
+        with self.assertRaisesRegex(ValueError, "changed files could not be read"):
+            brain.merge(GitHub("t", transport=transport), REPO, 8, (REPO, 9),
+                        env=dict(BrainMerge.ENV))
+        self.assertFalse(BrainMerge.merged(fake))
+
+    def test_revert_refusal_reads_the_labelers_from_the_environment(self):
+        with mock.patch.dict(os.environ, {"LOOM_REVERT_LABELERS": "a-bot[bot]"}):
+            self.assertEqual(merge_tier.revert_labelers(None), ["a-bot[bot]"])
 
 
 class FactoryHold(Base):

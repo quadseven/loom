@@ -2240,7 +2240,13 @@ class Factory:
         ask, once, and the operator merges it. A revert ticket's own pull
         request never waits here when merge_tier.revert_refusal proves it. bus.brain merge refuses the same tiers, and
         adds the review and hourly-cap rules for the tiers it may merge."""
-        entries = operator_hold.pull_files(self.gh, repo, number)
+        try:
+            entries = operator_hold.pull_files(self.gh, repo, number)
+        except GitHubError as err:
+            # No file list, no tier: it waits for the next pass, unmerged.
+            _say("%s#%d waits: its changed files could not be read for the risk tier (%s)"
+                 % (repo, number, err))
+            return True
         if merge_tier.is_revert_ticket(full, issue):
             refused = merge_tier.revert_refusal(self.gh, repo, full, issue, entries)
             if not refused:
