@@ -1090,6 +1090,11 @@ that fails posts nothing, so a bad API answer cannot start a second comment.
   expired, edit one `<!-- loom:incident-repeat v1 -->` or
   `<!-- loom:key-repeat v1 -->` comment on the open issue: a running count, the
   first and last time, the tickets (or lanes) seen, and the latest detail.
+- A factory incident is filed on the public factory repo, so it names only a
+  repo known to be public. Any other repo is `private repo <alias>` (a random
+  id the lane machine keeps per repo), and its ticket and failing line are
+  withheld; they stay in the lane log and on the ticket. A public repo's
+  detail that fails the public repo leak scan is withheld the same way.
 
 ## Where a new comment is posted
 

@@ -4986,6 +4986,52 @@ exec /usr/bin/git "$@"
         self.assertIn("Still failing: 1 times since ", note)
         self.assertIn("Tickets seen: T042-fix-the-thing", note)
 
+    def incident_titles(self):
+        return re.findall(r"--title (Factory incident: .*?) --body", self.log.read_text())
+
+    def test_a_private_repo_incident_names_no_repo_ticket_or_check(self):
+        # The factory repo is public: an incident for a private repo put its
+        # name, ticket and check in it (loom#1040, loom#1273).
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("factory incident quadseven/loom#99", self.lane_log())
+        body = Path(f"{self.body}.issue").read_text()
+        [title] = self.incident_titles()
+        self.assertRegex(title, r"^Factory incident: private repo [0-9a-f]{8} validation contract$")
+        for text in (title, body):
+            self.assertNotIn("example/repo", text)
+            self.assertNotIn("T042", text)
+            self.assertNotIn("python: 3.12", text)
+        self.assertIn("Ticket: a private repo ticket", body)
+        self.assertIn("withheld", body)
+        # The same repo files under the same title next time, so a repeat
+        # updates its open incident instead of opening another.
+        self.drop_brief()
+        self.assertEqual(self.run_contract_lane(FAKE_GH_PRIVATE="true").returncode, 0)
+        self.assertEqual(len(set(self.incident_titles())), 1)
+
+    def test_a_private_repo_incident_repeat_names_no_ticket(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_GH_PRIVATE="true", FAKE_GH_SEARCH="7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [note] = self.sticky_bodies()
+        self.assertNotIn("T042", note)
+        self.assertNotIn("python: 3.12", note)
+
+    def test_a_public_repo_incident_detail_the_leak_scan_refuses_is_withheld(self):
+        address = ".".join(["10", "23", "4", "5"])
+        self.contract_repo(contract=CONTRACT + "python: %s\n" % address)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = Path(f"{self.body}.issue").read_text()
+        self.assertNotIn(address, body)
+        self.assertIn("Repo: example/repo", body)
+        self.assertIn("withheld", body)
+
     def test_a_second_still_failing_edits_the_existing_incident_comment(self):
         self.contract_repo(contract=CONTRACT + "python: 3.12\n")
         self.drop_brief()
