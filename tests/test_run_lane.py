@@ -4806,6 +4806,7 @@ echo fixed > fix.txt
         self.assertEqual(records[-1]["command"], "test -f .prepared && loom-test-python check.py")
         self.assertFalse(records[-1]["ok"])
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_base_branch_fetch_that_races_another_fetch_is_tried_again(self):
         # "fatal: shallow file has changed since we read it": two fetches on
         # one shallow tree raced, and a fix round was filed as a factory
