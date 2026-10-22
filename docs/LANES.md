@@ -420,6 +420,18 @@ ticket with no `## What` section or an unset URL lands it as before: the check
 is advisory and never blocks a merge on a dead route. A private repo is never
 asked. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
 
+Merged first (`bus/fabric.py`, loom#1437): before a briefed ticket goes to a
+build lane, a pull request already merged into the default branch for it sends
+it to a verify run instead. A linked pull request counts (a Refs line or a
+`loom/<number>` branch). With `LOOM_FABRIC_KEY_SSM` naming the SSM parameter
+that holds the Fabric workspace key, a ticket nothing links is also asked
+about once: the station asks Fabric's whole-library chat which merged pull
+requests already do the work, and each cited pull request must be of this
+repo, merged into the default branch, and carry the cited card's title. At
+most 2 questions a pass and 3 citations each; the key is read for each call
+and only asks, never writes. Fabric unset, down, slow or silent builds the
+ticket as before.
+
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`
 labeller are in `LOOM_BRIEF_AUTHORS` to a Discord webhook whose URL it reads

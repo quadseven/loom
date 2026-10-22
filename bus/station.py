@@ -33,6 +33,7 @@ from . import audit
 from . import bench
 from . import brain_memory
 from . import claimed
+from . import fabric
 from . import scope_fit
 from . import stale_claims
 from . import factory
@@ -446,6 +447,20 @@ VERIFY_REFUSED_FILE = "verify-refused.json"
 VERIFY_RESERVE_AFTER = 2 * 3600
 VERIFY_RESERVE_EVERY = 1800
 VERIFY_RESERVE_FILE = "verify-reserve.json"
+# The Fabric lead for a ticket's merged work (loom#1437): at most FABRIC_ASKS
+# questions a pass, each up to bus/fabric.py's TIMEOUT, and the first
+# FABRIC_CITES cited pull requests checked against GitHub. FABRIC_ASKED_FILE
+# keeps the body each ticket was asked about, so a ticket is asked once.
+FABRIC_ASKS = 2
+FABRIC_CITES = 3
+FABRIC_ASKED_FILE = "fabric-asked.json"
+FABRIC_QUESTION = (
+    "A ticket in the GitHub repo %s is about to be built.\n\nTitle: %s\n\n"
+    "Acceptance criteria:\n%s\n\n"
+    "Which merged pull requests in that repo already do this work? Cite only "
+    "pull request cards you can see, each as a link to its card. If none does, "
+    "answer: none.")
+
 # Per-lane transient verify failures and the holds they earn (loom#714).
 VERIFY_LANES_FILE = "verify-lanes.json"
 VERIFY_STRIKES = 2
@@ -549,6 +564,7 @@ class Settings:
                  scope_model: str = "",
                  metrics_goal: str = "",
                  transcript_url: str = "",
+                 fabric_key_ssm: str = "",
                  transcript_token_ssm: str = "",
                  watched: Optional[List[Tuple[str, str]]] = None,
                  rewrite_cmd: str = "",
@@ -650,6 +666,8 @@ class Settings:
         self.scope_model = scope_model
         self.metrics_goal = metrics_goal
         self.transcript_url = transcript_url
+        # SSM name of the Fabric workspace key (bus/fabric.py); empty, no question.
+        self.fabric_key_ssm = fabric_key_ssm
         self.transcript_token_ssm = transcript_token_ssm
         # (component, log path) pairs bus/watch.py reads each pass.
         self.watched = watch.components(home) if watched is None else watched
@@ -718,6 +736,7 @@ class Settings:
                    scope_model=env.get("LOOM_SCOPE_CHECK_MODEL", "").strip(),
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
+                   fabric_key_ssm=env.get("LOOM_FABRIC_KEY_SSM", "").strip(),
                    transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
                    watched=watched,
                    rewrite_cmd=env.get("LOOM_REWRITE_CMD", "").strip(),
@@ -1395,6 +1414,7 @@ class Station:
         self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         self.now = time.time() if now is None else now
         self.state = os.path.join(settings.home, "state", "station")
+        self._fabric_asks = 0  # Fabric questions this pass (FABRIC_ASKS)
         self.event_log = os.path.join(settings.home, "logs", "events.jsonl")
         self._spend: Optional[spend.Summary] = None
         # This pass's repo scans: the repos due, what was read of each, and
@@ -3443,7 +3463,7 @@ class Station:
         if set(names) & {REGRESSION, factory.REVERT_LABEL} or live_needles(issue.get("body")) == []:
             return False
         number = int(issue["number"])
-        merged = self._merged_linked(repo, issue)
+        merged = self._merged_linked(repo, issue) or self._merged_cited(repo, issue)
         if not merged:
             return False
         texts = self._status_texts(repo, number)
@@ -5569,6 +5589,62 @@ class Station:
                     "again." % ("This is a regression or revert ticket" if undoes else
                                 "No merged pull request references this ticket"))
         self._routine(repo, number, "%s\n\n%s" % (said, note))
+
+    def _merged_cited(self, repo: str, issue: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Merged pull requests the Fabric workspace cites as already doing
+        the ticket's work, when nothing links one (loom#1437): work often
+        merges under another ticket or none. Each citation must name a pull
+        request of this repo, merged into the default branch, whose title is
+        the cited card's; the verify run then judges the ticket against its
+        criteria. Asked once per ticket body, at most FABRIC_ASKS a pass;
+        Fabric unset, down or silent leaves the ticket to build."""
+        if not self._fabric_may_ask(repo, issue):
+            return []
+        body = str(issue.get("body") or "")
+        criteria = "\n".join("- %s" % text for _, text in proof.criteria(body)) or body[:1500]
+        answer = fabric.ask(FABRIC_QUESTION % (repo, issue.get("title") or "", criteria),
+                            self.s.fabric_key_ssm, self.s.region)
+        found = self._checked_citations(repo, fabric.cited_pulls(answer)[:FABRIC_CITES])
+        if found:
+            _say("%s#%d: Fabric cites merged pull request #%d for its work"
+                 % (repo, int(issue["number"]), int(found[0]["number"])))
+        return found
+
+    def _fabric_may_ask(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether this pass may ask Fabric about the ticket: a key is set, the
+        pass has a question left, and the ticket's body was not asked about
+        before. A True answer records the ask."""
+        if not self.s.fabric_key_ssm or self._fabric_asks >= FABRIC_ASKS:
+            return False
+        path = os.path.join(self.state, FABRIC_ASKED_FILE)
+        asked = _read_json(path, {}, strict=False)
+        if not isinstance(asked, dict):
+            asked = {}
+        key = "%s#%d" % (repo, int(issue["number"]))
+        stamp = hashlib.sha256(str(issue.get("body") or "").encode("utf-8")).hexdigest()[:16]
+        if asked.get(key) == stamp:
+            return False
+        self._fabric_asks += 1
+        asked[key] = stamp
+        _write_json(path, asked)
+        return True
+
+    def _checked_citations(self, repo: str,
+                           cited: List[Tuple[int, str]]) -> List[Dict[str, Any]]:
+        """The cited pull requests that are of this repo, merged into the
+        default branch, and titled as their cited cards; one read each."""
+        branch = self._default_branch(repo)
+        found = []
+        for number, title in cited:
+            try:
+                pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+            except GitHubError:
+                continue
+            if (isinstance(pr, dict) and pr.get("merged_at") and pr.get("merge_commit_sha")
+                    and str((pr.get("base") or {}).get("ref") or "") == branch
+                    and fabric.same_title(title, pr.get("title") or "")):
+                found.append(pr)
+        return found
 
     def _merged_linked(self, repo: str, issue: Dict[str, Any]) -> List[Dict[str, Any]]:
         """The ticket's pull requests merged into the default branch, linked
