@@ -8938,6 +8938,9 @@ class Station:
         ask = scope_fit.asker(self.s.scope_url, self.s.scope_model)
         # Passed only when the check is on, so the factory's default stays off.
         extra = {"scope": ask} if ask is not None else {}
+        times = self._saved_wait_times()
+        if times:
+            extra["wait_since"] = times
         pairs = self.benched_pairs()
         return factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
                                briefers=self.s.briefers,
@@ -8961,6 +8964,13 @@ class Station:
         return {str(key): info["reason"] for key, info in
                 (saved.items() if isinstance(saved, dict) else [])
                 if isinstance(info, dict) and isinstance(info.get("reason"), str)}
+
+    def _saved_wait_times(self) -> Dict[str, float]:
+        """Each ticket's wait start as the last pass recorded it (_record_waits)."""
+        saved = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
+        return {str(key): float(info["since"]) for key, info in
+                (saved.items() if isinstance(saved, dict) else [])
+                if isinstance(info, dict) and self._num(info.get("since"))}
 
     def watch_default_branches(self) -> None:
         """Fix forward after a red lane merge, then revert if it stays red.

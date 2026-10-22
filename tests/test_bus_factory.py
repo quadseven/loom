@@ -2101,6 +2101,50 @@ class Queued(Base):
         # medium work (2026-10-19), so with claude taken there is no fallback.
         self.assertEqual(factory._state(self.gh.issues[8]), "queued")
 
+    def test_a_queued_ticket_waiting_past_capacity_limit_takes_a_busy_up_lane(self):
+        # 25 medium tickets waited over 6 hours because all tier lanes were busy (loom#1312).
+        self.queued(7, age=3 * 3600)
+        medium_lanes = factory.lanes_of("medium", True)
+        for n, lane in enumerate(medium_lanes, 20):
+            self.gh.ticket(n, "briefed", lane=lane)
+        worker = self.assign(available=list(medium_lanes))
+        self.assertEqual(factory._state(self.gh.issues[7]), "briefed")
+        self.assertIn(self.lane(7), medium_lanes)
+
+    def test_a_queued_hard_ticket_waiting_past_capacity_limit_falls_back_on_private_repo(self):
+        # 4 hard tickets on private repos waited over 17 hours (loom#1312).
+        self.gh.private = True
+        self.queued(7, body="Difficulty: hard\n\n## Why\nx\n", age=3 * 3600)
+        hard_private = factory.lanes_of("hard", True)
+        for n, lane in enumerate(hard_private, 20):
+            self.gh.ticket(n, "briefed", lane=lane)
+        worker = self.assign(available=list(hard_private) + ["openrouter"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "briefed")
+        self.assertEqual(self.lane(7), "openrouter")
+        self.assertIn("fallback:", self.gh.comments[7][-1]["body"])
+
+    def test_a_pinned_model_ticket_waiting_past_capacity_limit_takes_an_up_busy_lane(self):
+        self.queued(7, body="Model: gpt-6-sol\nDifficulty: medium\n\n## Why\nx\n", age=3 * 3600)
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        worker = self.assign(available=["codex", "codex-2"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "briefed")
+        self.assertIn(self.lane(7), ("codex", "codex-2"))
+
+    def test_a_pinned_opus_ticket_on_private_repo_waiting_past_capacity_limit_takes_supported_equivalent(self):
+        self.gh.private = True
+        self.queued(7, body=self.OPUS, age=3 * 3600)
+        worker = self.assign(limited=self.OUT, available=["codex", "codex-2"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7), self.model(7)),
+                         ("briefed", "codex", "gpt-6-sol"))
+        self.assertIn("equivalent:", self.gh.comments[7][-1]["body"])
+
+    def test_a_pinned_model_ticket_drops_model_header_after_capacity_wait_when_no_lane_serves_it(self):
+        self.queued(7, body="Model: custom-unknown-model\nDifficulty: medium\n\n## Why\nx\n", age=3 * 3600)
+        self.assign(available=["codex"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "codex"))
+        self.assertNotIn("Model:", self.gh.issues[7]["body"])
+
 
 class Tickets(Base):
     def test_a_failed_ticket_without_a_pull_request_is_rebriefed_a_rung_up(self):
@@ -3270,7 +3314,7 @@ class Helpers(unittest.TestCase):
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
                          model_limits=None, silent=None, down=(), limit_until=None,
-                         benched=(), known_waits=None, plan_check=None):
+                         benched=(), known_waits=None, plan_check=None, wait_since=None):
                 self.silent_running, self.silent, self.waits = {}, silent, {}
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))
