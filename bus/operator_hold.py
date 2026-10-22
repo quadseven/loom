@@ -253,10 +253,13 @@ def host_only_ask(criteria: Sequence[str]) -> str:
             "meet." % "; ".join(c[:STEP_MAX] for c in criteria[:ASK_STEPS]))
 
 
-# Docs a lane must not delete or mostly replace unless its ticket names them.
-TOP_DOCS = ("readme", "readme.md", "agents.md", "claude.md")
+# Docs a lane must not delete or mostly replace unless its ticket names them:
+# a top-level README (any extension), AGENTS.md or CLAUDE.md at any size,
+# any other Markdown file from REWRITE_MIN_LINES lines.
+TOP_DOCS = ("agents.md", "claude.md")
 REWRITE_SHARE = 0.5
 REWRITE_MIN_LINES = 10
+_GONE = ("removed", "deleted")
 
 
 def _named(path: str, ticket_body: str) -> bool:
@@ -264,8 +267,13 @@ def _named(path: str, ticket_body: str) -> bool:
     return path.lower() in body or path.rsplit("/", 1)[-1].lower() in body
 
 
+def _top_doc(path: str) -> bool:
+    name = path.lower()
+    return "/" not in name and (name.startswith("readme") or name in TOP_DOCS)
+
+
 def _guarded_doc(path: str) -> bool:
-    return path.lower() in TOP_DOCS or path.lower().endswith(".md")
+    return _top_doc(path) or path.lower().endswith(".md")
 
 
 def _base_lines(gh: Any, repo: str, branch: str, path: str) -> Optional[int]:
@@ -283,22 +291,30 @@ def _base_lines(gh: Any, repo: str, branch: str, path: str) -> Optional[int]:
 
 def rewritten_docs(gh: Any, repo: str, pr: Dict[str, Any], entries: Sequence[Dict[str, Any]],
                    ticket_body: str) -> List[str]:
-    """The docs the pull request deletes, or replaces at least REWRITE_SHARE
-    of, that its ticket does not name. A top-level README, AGENTS or CLAUDE
-    file counts at any size, another doc from REWRITE_MIN_LINES lines, and a
-    doc whose base cannot be read counts as replaced."""
+    """The docs the pull request deletes, renames away, or replaces at least
+    REWRITE_SHARE of, that its ticket does not name. A top-level README,
+    AGENTS or CLAUDE file counts at any size, another doc from
+    REWRITE_MIN_LINES lines, and a doc whose base cannot be read counts as
+    replaced. A renamed entry is read by its previous_filename."""
     branch = str((pr.get("base") or {}).get("ref") or "main")
     out = []
     for entry in entries:
         path = str(entry.get("filename") or "")
+        old = str(entry.get("previous_filename") or "")
+        status = str(entry.get("status") or "").lower()
+        if status == "renamed" and old and old != path:
+            # A guarded doc renamed away is gone from its path: removed.
+            if _guarded_doc(old) and not _named(old, ticket_body):
+                out.append(old)
+            continue
         deleted = int(entry.get("deletions") or 0)
         if not deleted or not _guarded_doc(path) or _named(path, ticket_body):
             continue
-        if str(entry.get("status") or "").lower() in ("removed", "deleted"):
+        if status in _GONE:
             out.append(path)
             continue
         lines = _base_lines(gh, repo, branch, path)
-        floor = 1 if path.lower() in TOP_DOCS else REWRITE_MIN_LINES
+        floor = 1 if _top_doc(path) else REWRITE_MIN_LINES
         if lines is None or (lines >= floor and deleted >= REWRITE_SHARE * lines):
             out.append(path)
     return sorted(out)

@@ -282,6 +282,32 @@ class Rewrite(unittest.TestCase):
             self.Contents(None), "o/r", {}, [removed], TICKET_5783), ["docs/GUIDE.md"])
 
 
+class RenamedAway(unittest.TestCase):
+    def test_a_root_readme_renamed_away_is_removed(self):
+        # Security review: renaming README.md away and adding a new file
+        # escaped the hold, which read only the new filename.
+        renamed = {"filename": "docs/old-overview.txt", "previous_filename": "README.md",
+                   "status": "renamed", "deletions": 0}
+        added = {"filename": "README.md", "status": "added", "deletions": 0}
+        self.assertEqual(operator_hold.rewritten_docs(
+            Rewrite.Contents(README_BASE), "o/r", {}, [renamed, added], TICKET_5783),
+            ["README.md"])
+
+    def test_any_top_level_readme_agents_or_claude_is_guarded(self):
+        for path in ("README", "Readme.rst", "readme.txt", "AGENTS.md", "CLAUDE.md"):
+            entry = {"filename": path, "status": "removed", "deletions": 3}
+            self.assertEqual(operator_hold.rewritten_docs(
+                Rewrite.Contents(None), "o/r", {}, [entry], "## Why\nx"), [path])
+        nested = {"filename": "src/readme.txt", "status": "removed", "deletions": 3}
+        self.assertEqual(operator_hold.rewritten_docs(
+            Rewrite.Contents(None), "o/r", {}, [nested], "## Why\nx"), [])
+
+    def test_a_graphql_rename_falls_back_to_rest_for_the_old_path(self):
+        details = {"files": {"totalCount": 1, "nodes": [
+            {"path": "docs/old-overview.txt", "deletions": 0, "changeType": "RENAMED"}]}}
+        self.assertIsNone(brain._changed_files(details))
+
+
 class Placement(unittest.TestCase):
     def test_a_hostname_pin_value_is_a_placement_change(self):
         self.assertEqual(ship_paths.placement_lines(PIN_PATCH),
@@ -403,6 +429,22 @@ class BrainMerge(unittest.TestCase):
                 {"path": "production/scripts/check.py", "deletions": 0, "changeType": "ADDED"}]}
         routes["/repos/%s/contents/README.md" % BRAIN_REPO] = {
             "content": base64.b64encode(README_BASE.encode()).decode()}
+        fake = Route(routes)
+        with self.assertRaisesRegex(ValueError, "mostly replaces README.md"):
+            brain.merge(GitHub("t", transport=fake), BRAIN_REPO, 8, (BRAIN_REPO, 9),
+                        env={"LOOM_MERGE_SETTLE_SECONDS": "0"})
+        self.assertFalse(self.merged(fake))
+
+    def test_a_readme_renamed_away_is_refused_through_the_rest_file_list(self):
+        routes = brain_routes(PLAIN_BODY, ["docs/old-overview.txt", "README.md"], {})
+        routes["/graphql"]["data"]["repository"]["pullRequest"]["files"] = {
+            "totalCount": 2, "nodes": [
+                {"path": "docs/old-overview.txt", "deletions": 0, "changeType": "RENAMED"},
+                {"path": "README.md", "deletions": 0, "changeType": "ADDED"}]}
+        routes["/repos/%s/pulls/8/files" % BRAIN_REPO] = [
+            {"filename": "docs/old-overview.txt", "previous_filename": "README.md",
+             "status": "renamed", "deletions": 0, "patch": ""},
+            {"filename": "README.md", "status": "added", "deletions": 0, "patch": "+x"}]
         fake = Route(routes)
         with self.assertRaisesRegex(ValueError, "mostly replaces README.md"):
             brain.merge(GitHub("t", transport=fake), BRAIN_REPO, 8, (BRAIN_REPO, 9),

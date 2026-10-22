@@ -3023,6 +3023,8 @@ def _changed_files(details: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
     nodes = [n for n in files.get("nodes") or [] if isinstance(n, dict)]
     if int(files.get("totalCount") or 0) > len(nodes):
         return None
+    if any(str(n.get("changeType") or "").upper() == "RENAMED" for n in nodes):
+        return None  # GraphQL gives no old path: REST names it (previous_filename)
     return [{"filename": str(n.get("path") or ""), "deletions": int(n.get("deletions") or 0),
              "status": str(n.get("changeType") or "").lower()} for n in nodes]
 
