@@ -1986,7 +1986,39 @@ preserve_timedout() {
     printf 'the edits could not be committed in the lane tree'
     return 1
   fi
+  if ! drop_stray_from_kept >> "$LOG" 2>&1; then
+    printf 'the edits hold files outside the brief'"'"'s paths that could not be left out, so no branch was kept'
+    return 1
+  fi
   push_side HEAD "$BRANCH-timedout-$(date +%s)"
+}
+
+# The next attempt merges the kept branch, and its commit is refused for any
+# file the brief does not allow, so those files are left off the branch.
+# A scope check that cannot run keeps every file: nothing is known wrong, and
+# the later refusal still guards the push. Fails, logged, when a stray file
+# cannot be removed or the removal committed: a branch that still holds it
+# would only get the next attempt refused, so it is not pushed.
+drop_stray_from_kept() {
+  local f stamp
+  stamp="$(date -u +%FT%TZ)"
+  if ! check_scope "$BRIEF"; then
+    echo "[$stamp] $TICKET: could not check the kept edits against the brief; the kept branch keeps every file"
+    return 0
+  fi
+  [ -n "$STRAY_FILES" ] || return 0
+  while IFS= read -r f; do
+    [ -z "$f" ] || safe_git rm -q -f -- "$f" && continue
+    echo "[$stamp] $TICKET: could not remove $f from the kept edits"
+    return 1
+  done <<EOF
+$STRAY_FILES
+EOF
+  if ! safe_git commit -qm "$TICKET: leave out files outside the brief's paths"; then
+    echo "[$stamp] $TICKET: could not commit the removal of $(stray_list) from the kept edits"
+    return 1
+  fi
+  echo "[$stamp] $TICKET: left off the kept branch: $(stray_list)"
 }
 
 # What the agent is told about the contract, after its brief.
