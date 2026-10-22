@@ -8862,6 +8862,7 @@ class Station:
                                briefers=self.s.briefers,
                                review_check=self.s.review_check,
                                review_bot=self.s.review_bot,
+                               plan_check=self.s.plan_check,
                                limited=self.limited_lanes(),
                                model_limits=self.model_limits(),
                                no_test_repos=self.s.no_test_repos,
