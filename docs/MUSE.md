@@ -560,18 +560,19 @@ on hard work):
   operator wants every free tier used up, 2026-10-19); then codex or opencode-go (opencode-go-4 on public repos only); an
   anthropic slot only when every spark, codex and opencode-go slot already
   holds work.
-- Hard: a spark slot first, then anthropic, claude, agy (Gemini 4 Argon,
-  public repos only) or codex, never a free lane. A hard ticket a spark
+- Hard: a spark slot first, then anthropic, claude, agy (public repos only)
+  or codex, never a free lane. A hard ticket a spark
   fails climbs the model ladder. Keep the anthropic slots busy with hard work
   while the credit lasts. Tiers follow the Artificial Analysis Intelligence
   Index: a lane's model goes in the tier its score supports.
 
-A hard ticket with no `Model:` line runs its lane's strongest model, not the
-lane default: gpt-6-sol on codex and gemini-4-argon-high on agy (the table
-`HARD_MODELS` next to `TIERS` in bus/factory.py). A ticket pinned to
-claude-opus-5-5 on a public repo goes to agy with gemini-4-argon-high when
-every Anthropic lane is at a limit or down, never when they are merely busy
-(the table `EQUIVALENTS`), and its claim records Argon as the model it ran.
+Codex runs gpt-6-luna only and agy the gemini-3.8-flash family only (the
+operator, 2026-10-21). A hard ticket with no `Model:` line runs its lane's
+default; the table `HARD_MODELS` next to `TIERS` in bus/factory.py is empty,
+and so is `EQUIVALENTS`: a ticket pinned to claude-opus-5-5 waits for an
+Anthropic lane and never goes to agy. A `Model:` line naming gpt-6-sol or a
+gemini-4-argon model reads as gpt-6-luna or gemini-3.8-flash-high, and the
+brain writes the same stand-in (`FORBIDDEN_MODELS` in bus/tickets.py).
 
 When no lane of a ticket's tier is up (every one at a limit or down), the
 factory's tier moves (a ticket off a lane at a limit, a queued ticket getting
@@ -628,10 +629,8 @@ rather than a wait behind a busy lane that is up), never the model that
 already failed it, and never a free lane:
 
 1. the claude lane with `claude-sonnet-5-5`;
-2. the codex lane (or codex-2) with `gpt-6-sol`;
-3. `claude-opus-5-5` on the claude lane, else an anthropic slot;
-4. `gemini-4-argon-high` on agy, public repos only (the Opus equivalent and
-   agy's hard-tier model, bus/factory.py EQUIVALENTS and HARD_MODELS).
+2. the codex lane (or codex-2) with `gpt-6-luna`;
+3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
 
 A rung with one lane up holds a bounded few waiting tickets: past
 `ONE_LANE_MAX` (4), the overflow climbs to an untried rung whose least-loaded
@@ -644,8 +643,8 @@ claim ran is what ran: the `Model:` line in force (the ticket's own before the
 ladder started, then the ladder's moves), else the model the runner footer of
 its lane's pull request names (`lane <lane>, model <model>`), else the lane's
 configured setting (`LOOM_<LANE>_MODEL`), never a fixed lane-to-model map.
-Once a ticket ran on Opus or past it, it climbs only to the untried strong
-models (`gpt-6-sol`, `gemini-4-argon-high`), never back to Sonnet. When no
+Once a ticket ran on Opus, no stronger model is left: it never goes back to
+luna or Sonnet, and the factory gives up on it. When no
 lane of its next rung is up, it waits with no comment; the factory says it
 tried every rung only once every rung with a lane for its repo was tried. The
 one exception is a pull request whose open thread carries a lane's answer: the

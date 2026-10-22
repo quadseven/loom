@@ -348,7 +348,10 @@ RETRY_ORDER = ["anthropic", "anthropic-2", "anthropic-3", "anthropic-4",
 # Free lanes take only easy tickets on public repos.
 FREE_LANES = ["openrouter", "zen", "zai", "workersai"]
 # The model families each lane's runner accepts (lanes/run_lane.sh); codex
-# takes any model outside the claude family.
+# takes any model outside the claude family. agy takes gemini-3.8-flash only:
+# its runner drops any other gemini, claude or gpt-oss pin and runs flash
+# (LOOM_AGY_ONLY_MODEL, the operator's rule of 2026-10-21), so a ticket
+# pinned to Opus routed to agy ran flash, not Opus.
 CLAUDE_MODELS = ["claude*", "opus*", "sonnet*", "haiku*", "fable*"]
 LANE_MODELS = {
     "claude": CLAUDE_MODELS,
@@ -360,7 +363,7 @@ LANE_MODELS = {
     "workersai": ["cloudflare-workers-ai/@cf/*"],
     "spark": ["spark/?*"],
     "free": ["free/?*"],
-    "agy": ["gemini-*", "claude-*", "gpt-oss-*"],
+    "agy": ["gemini-3.8-flash*"],
 }
 # Operator messages in the Discord channel become notes on a goal home, and
 # the brain's replies go back to the channel (docs/LANES.md, "Talking to the
