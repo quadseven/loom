@@ -170,8 +170,12 @@ def _command(span: str) -> Optional[Check]:
 
 
 def _fetch(url: str, timeout: int) -> Tuple[int, str]:
+    """GET an https URL; any other scheme (file:, a custom one) is refused."""
+    if not url.lower().startswith("https://"):
+        raise ValueError("a live check fetches https URLs only")
     request = urllib.request.Request(url, headers={"User-Agent": "loom-live-check"})
-    with urllib.request.urlopen(request, timeout=timeout) as answer:  # noqa: S310 - https only
+    # The scheme is checked above: only https reaches urlopen.
+    with urllib.request.urlopen(request, timeout=timeout) as answer:  # noqa: S310
         return int(answer.status), answer.read(BODY_LIMIT).decode("utf-8", "replace")
 
 
