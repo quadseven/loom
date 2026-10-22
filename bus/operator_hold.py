@@ -24,6 +24,12 @@ and by `bus.brain merge` before it merges one:
   file (2026-10-22: a lane replaced a deployment repo's root README with a
   write-up of its ticket, and the brain merged it).
 
+- Measurement. On a health ticket (bus/brief_check.py), the pull request
+  edits the health read itself or a bound (a threshold, floor, ceiling or
+  cutoff): 2026-10-15, a health read began counting money the fund's holder
+  carried so its finding vanished, and a sibling held refunds back to stay
+  above the floor.
+
 A held pull request is never merged by Loom. Its ticket goes to loom:human
 with one exact ask, and the operator merges it by hand after the steps.
 
@@ -38,7 +44,7 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Sequence
 from urllib.parse import quote
 
-from . import proof, ship_paths
+from . import brief_check, proof, ship_paths
 
 SECTION = "Operator steps before merge"
 _HEADING = re.compile(r"^#{2,3}\s*(.+?)\s*#*\s*$")
@@ -353,6 +359,9 @@ def reasons(gh: Any, repo: str, pr: Dict[str, Any], ticket_body: str,
     if rewritten:
         out.append("it deletes or mostly replaces %s, which its ticket does not name"
                    % _shown(rewritten))
+    measured = measurement_reason(gh, repo, pr, ticket_body, entries)
+    if measured:
+        out.append(measured)
     if manifest_paths([str(e.get("filename") or "") for e in entries]):
         moved = placement_files(gh, repo, pr, entries if all("patch" in e for e in entries)
                                 else None)
@@ -361,6 +370,23 @@ def reasons(gh: Any, repo: str, pr: Dict[str, Any], ticket_body: str,
                        "affinity, tolerations, volumes) in %s (%s)"
                        % (_shown(moved), _deployers(gh, repo, pr, moved)))
     return out
+
+
+def measurement_reason(gh: Any, repo: str, pr: Dict[str, Any], ticket_body: str,
+                       entries: List[Dict[str, Any]]) -> str:
+    """Why a lane change on a health ticket waits: it edits the health read
+    or a bound (bus/brief_check.py); "" otherwise. The patches decide a
+    bound, so a list read without them is read again."""
+    if not brief_check.is_health(ticket_body):
+        return ""
+    patched = entries if all("patch" in e for e in entries) else pull_files(
+        gh, repo, int(pr.get("number") or 0))
+    touched = brief_check.measurement_files(patched)
+    if not touched:
+        return ""
+    return ("its ticket is a health ticket and it changes the health read or a bound "
+            "(threshold, floor, ceiling or cutoff) in %s: a fix makes the affected fewer, "
+            "not the measurement" % _shown(touched))
 
 
 def ask(number: int, why: Sequence[str]) -> str:

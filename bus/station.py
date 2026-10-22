@@ -58,6 +58,7 @@ from . import verify_data
 from . import text as _text
 from . import tickets
 from . import transcripts
+from . import brief_check
 from . import criteria_gate
 from . import deploy_watch
 from . import watch
@@ -1950,7 +1951,7 @@ class Station:
             self._refuse(repo, issue, str(err))
             return False
         fix, fix_comment_id = fix_source if fix_source else (None, None)
-        if self._fix_blocks(repo, issue, fix):
+        if self._held_before_claim(repo, issue, fix, comments):
             return False
 
         earlier = sum(1 for c in comments
@@ -3583,6 +3584,57 @@ class Station:
             int(pr["number"]), pr.get("merged_at"), str(pr["merge_commit_sha"])[:12]))
         _say("%s#%d: merged pull request #%d may already do its work; verifying before any build"
              % (repo, number, int(pr["number"])))
+        return True
+
+    def _held_before_claim(self, repo: str, issue: Dict[str, Any], fix: Any,
+                           comments: List[Any]) -> bool:
+        """A fix round its pull request blocks, or a new build the brief
+        check holds (a fix round's brief is the ticket's own, so it is not
+        checked again)."""
+        return (self._fix_blocks(repo, issue, fix)
+                or (fix is None and self._brief_holds(repo, issue, comments)))
+
+    def _brief_holds(self, repo: str, issue: Dict[str, Any], comments: List[Any]) -> bool:
+        """Whether the ticket goes to no build lane (bus/brief_check.py): a
+        health ticket whose cause is missing or names only the measurement
+        goes back to the queue with needs-brain; a stale or already-shipped
+        one goes back to the queue with loom:human and one ask. A read the
+        check needs that fails holds the ticket for the next pass. A
+        regression or revert ticket is checked for its cause only: its merged
+        pull request is why it exists."""
+        number = int(issue["number"])
+        names = _label_names(issue)
+        body = str(issue.get("body") or "")
+        found = brief_check.health_verdict(body)
+        if found is None and not set(names) & {REGRESSION, factory.REVERT_LABEL}:
+            try:
+                found = brief_check.check(self.gh, repo, issue,
+                                          [c for c in comments if isinstance(c, dict)],
+                                          self.s.authors, self._default_branch(repo))
+            except brief_check.Unread as err:
+                _say("%s#%d waits: the stale-ticket check could not read (%s)"
+                     % (repo, number, err))
+                return True
+        if found is None:
+            return False
+        try:
+            brain.move(self.gh, repo, number, "queued")
+            if found.kind == brief_check.HEALTH:
+                # Added, not put: the label list read before the move is stale.
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": ["needs-brain"]})
+                self._routine(repo, number, brief_check.HEALTH_NOTE % (
+                    found.reason, "A lane gets it once its body names the cause on a "
+                    "`Cause:` line: why the affected are affected, not what the health read "
+                    "counts."))
+            else:
+                brain.human(self.gh, repo, number, brief_check.ask(found))
+        except ValueError as err:
+            _say("%s#%d gets no lane (%s), but holding it failed: %s"
+                 % (repo, number, found.reason, err))
+            return True
+        _say("%s#%d gets no lane: %s" % (repo, number, found.reason))
+        self._event("not_claiming", found.reason, "%s#%d" % (repo, number))
         return True
 
     def _model_waits(self, repo: str, issue: Dict[str, Any], lane: str,
