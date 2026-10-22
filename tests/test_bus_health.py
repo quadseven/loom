@@ -946,7 +946,7 @@ class DiagnosisCommand(Regression):
         self.assertIn("diagnosis: slow search due to missing index", body)
 
     def test_diagnosis_command_failure_falls_back_with_note(self):
-        bad_cmd = "exit 1"
+        bad_cmd = "python3 -c 'import sys; sys.exit(1)'"
         self._run_with_diag(diag_cmd=bad_cmd)
         self.assertEqual(len(self.briefs), 1)
         body = self.briefs[0]["body"]

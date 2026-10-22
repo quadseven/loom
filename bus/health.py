@@ -50,6 +50,7 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import time
 import urllib.error
@@ -142,6 +143,21 @@ def _is_ancestor(gh: GitHub, repo: str, ancestor: str, commit: str) -> bool:
         return False
 
 
+def _pr_references_ticket(pr: Dict[str, Any], repo: str, ticket_number: int) -> bool:
+    """Whether a merged pull request references this ticket: a Refs line in
+    its body, or its branch named loom-NNN."""
+    if not isinstance(pr, dict) or not pr.get("merged_at"):
+        return False
+    sha = str(pr.get("merge_commit_sha") or "")
+    if not COMMIT_RE.fullmatch(sha):
+        return False
+    body = str(pr.get("body") or "")
+    branch = str(pr.get("head", {}).get("ref") or "")
+    return (("Refs #%d" % ticket_number) in body
+            or ("Refs %s#%d" % (repo, ticket_number)) in body
+            or branch == "loom-%d" % ticket_number)
+
+
 def _fetch_merged_pulls(gh: GitHub, repo: str, ticket_number: int) -> List[Dict[str, Any]]:
     """Fetch merged pull requests that reference the ticket, newest first."""
     pulls: List[Dict[str, Any]] = []
@@ -153,16 +169,10 @@ def _fetch_merged_pulls(gh: GitHub, repo: str, ticket_number: int) -> List[Dict[
         except GitHubError:
             break
         for pr in resp.data if isinstance(resp.data, list) else []:
-            if not isinstance(pr, dict) or not pr.get("merged_at") \
-                    or not COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or "")):
-                continue
-            # Check if PR references this ticket via Refs line or branch name
-            body = str(pr.get("body") or "")
-            branch = str(pr.get("head", {}).get("ref") or "")
-            if ("Refs #%d" % ticket_number) in body \
-                    or ("Refs %s#%d" % (repo, ticket_number)) in body \
-                    or branch == "loom-%d" % ticket_number:
+            if _pr_references_ticket(pr, repo, ticket_number):
                 pulls.append(pr)
+            if len(pulls) >= MAX_REGRESSION_PULLS:
+                break
         url = _next_link(resp.headers.get("link", ""))
         if not url or len(pulls) >= MAX_REGRESSION_PULLS:
             break
@@ -390,9 +400,10 @@ def _run_diagnosis_cmd(cmd: str, key: str, timeout: int = 30) -> str:
     spaces, leaks refused) and capped at 40 lines. Returns the cleaned output,
     a refusal note, or an error/timeout note."""
     try:
+        argv = shlex.split(cmd) + [key]
         result = subprocess.run(
-            cmd + " " + key,
-            shell=True,
+            argv,
+            shell=False,
             capture_output=True,
             text=True,
             timeout=timeout,
