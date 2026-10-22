@@ -148,10 +148,12 @@ def review_outcome(threads: Sequence[Mapping[str, Any]],
     return FINDINGS if found else CLEAN
 
 
-def bad_count(record: Mapping[str, Any]) -> int:
-    """The bad outcomes one pull request's record holds."""
-    return (int(record.get("review") == BAD_WORK) + int(bool(record.get("reverted")))
-            + int(bool(record.get("deploy_failed"))))
+def _lane_pull(pr: Mapping[str, Any], allowed: set, since: float) -> bool:
+    """A lane pull request a trusted login opened on a loom/ branch, closed
+    in the window, that is no revert."""
+    return (str((pr.get("head") or {}).get("ref") or "").startswith("loom/")
+            and str((pr.get("user") or {}).get("login") or "").lower() in allowed
+            and _ts(pr.get("closed_at")) >= since and not revert.looks_like_revert(dict(pr)))
 
 
 class Scorecard:
@@ -229,22 +231,25 @@ class Scorecard:
         since = self.now - window(self.env)
         for pr in pulls:
             ran = footer(pr.get("body"))
-            if (ran is None or not str((pr.get("head") or {}).get("ref") or "").startswith("loom/")
-                    or str((pr.get("user") or {}).get("login") or "").lower() not in allowed
-                    or _ts(pr.get("closed_at")) < since or revert.looks_like_revert(pr)):
+            if ran is None or not _lane_pull(pr, allowed, since):
                 continue
-            key = "%s#%d" % (repo, int(pr["number"]))
-            record = self.data["records"].get(key)
-            if record is None:
-                # Kept only once its review is read: a record with no review
-                # would count as clean.
-                record = {"lane": labels.base_lane(ran[0]), "model": ran[1],
-                          "at": _ts(pr.get("merged_at") or pr.get("closed_at"))}
-                self._first_read(gh, repo, pr, record, bot)
-                self.data["records"][key] = record
-            record["merged"] = bool(pr.get("merged_at"))
-            record["reverted"] = bool(record.get("reverted")) or (
-                record["merged"] and any(revert.undoes(r, pr) for r in reverts))
+            self._record(gh, repo, pr, ran, reverts, bot)
+
+    def _record(self, gh: Any, repo: str, pr: Dict[str, Any], ran: Tuple[str, str],
+                reverts: List[Dict[str, Any]], bot: str) -> None:
+        """Add or update one lane pull request's record."""
+        key = "%s#%d" % (repo, int(pr["number"]))
+        record = self.data["records"].get(key)
+        if record is None:
+            # Kept only once its review is read: a record with no review
+            # would count as clean.
+            record = {"lane": labels.base_lane(ran[0]), "model": ran[1],
+                      "at": _ts(pr.get("merged_at") or pr.get("closed_at"))}
+            self._first_read(gh, repo, pr, record, bot)
+            self.data["records"][key] = record
+        record["merged"] = bool(pr.get("merged_at"))
+        record["reverted"] = bool(record.get("reverted")) or (
+            record["merged"] and any(revert.undoes(r, pr) for r in reverts))
 
     def _first_read(self, gh: Any, repo: str, pr: Dict[str, Any], record: Dict[str, Any],
                     bot: str) -> None:
