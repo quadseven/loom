@@ -754,9 +754,17 @@ An auto tier still merges only when it is clean:
   merged by hand counts too, and a count GitHub will not give refuses the
   merge.
 
-A revert ticket's own pull request (`loom:revert`, filed only by
-`bus/revert.py`, whose pull request says it is a revert) is exempt from the
-tier and the caps: undoing a merge is always allowed. The adopt path
+A revert ticket's own pull request is exempt from the tier, the review rule
+and the caps only when it is proven: its ticket carries `loom:revert` applied
+by a revert labeler (`LOOM_REVERT_LABELERS`, else the `LOOM_BRIEF_AUTHORS`
+logins that are not a lane's), its body names one commit (`git revert <sha>`)
+its base branch carries, and its diff is that commit's exact inverse. A
+revert that fails any of these takes the normal gates.
+
+Higher tiers are read first, so a test-named manifest, IaC under `tests/`
+or a Dockerfile under `docs/` is never `docs-tests`, and a rename takes the
+higher tier of its old and new paths. Every review thread is read, all
+pages, and a list that cannot be read in full refuses the merge. The adopt path
 (`--adopt`, a ticketless pull request a trusted login opened) is not tiered.
 
 ## Rules

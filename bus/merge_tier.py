@@ -12,7 +12,9 @@ weighed what the change can break.
 
 Each pull request gets one tier, the highest of its files and its ticket:
 
-- docs-tests: only documentation and test files.
+- docs-tests: only documentation and test files that no higher rule
+  matches (a test-named manifest or IaC file is still deploy-config). A
+  renamed file takes the higher tier of its old and new paths.
 - app-code: application code and anything not named below.
 - deploy-config: what deploys or configures a running system: manifests,
   Helm values, Dockerfiles, IaC (Pulumi, Terraform, Ansible), systemd units,
@@ -30,12 +32,17 @@ merged by Loom: the factory holds them for the operator with one ask, and
 `bus.brain merge` refuses them. LOOM_AUTO_MERGE_TIERS lists the tiers Loom
 may merge on its own (default "docs-tests,app-code"); every other tier waits
 for the operator. A revert ticket's own pull request (bus/revert.py,
-loom:revert) is exempt from tier and caps: undoing a merge is always allowed.
+loom:revert) is exempt from tier, review and caps only when it is proven
+(revert_refusal): a revert labeler, not a lane, applied the label, the body
+names one commit the base branch carries, and the diff is that commit's exact
+inverse. Otherwise the normal gates apply to it.
 
-An auto tier merges only when it is clean (`auto_merge_refusal`): the review
-check succeeded on the head commit (neutral is not enough), no high or
-critical review-bot finding is open, and no finding from a BAD_WORK rule (the
-review bot's unmet-criterion and intent detectors, at any severity) is open.
+An auto tier merges only when it is clean (bus.brain merge): the review check
+succeeded on the head commit (neutral is not enough), and no high or critical
+review-bot finding, and no finding from a BAD_WORK rule (the review bot's
+unmet-criterion and intent detectors, at any severity), is open or was
+resolved with no commit after it. Every review thread is read, all pages; a
+list that cannot be read in full refuses the merge.
 Such a finding is never deferred as minor (bus/factory.py). Auto-merges are
 also capped: at most LOOM_AUTO_MERGE_PER_HOUR (default 4) loom/ pull
 requests merged in the last hour across the owner, and at most
@@ -143,23 +150,36 @@ def _name_matches(name: str, globs: Sequence[str]) -> bool:
 
 
 def file_tier(path: str) -> str:
-    """The tier of one changed file."""
+    """The tier of one changed file. The higher tiers are read first: a file
+    is docs-tests only when no deploy, security or pin rule matches, so a
+    test-named manifest, an IaC file under tests/ or a doc under a deploy
+    directory is never low risk."""
     lowered = (path or "").strip().lower()
     lowered = lowered[2:] if lowered.startswith("./") else lowered
     name = lowered.rsplit("/", 1)[-1]
-    if name in _DEPENDENCY_NAMES or name.startswith("requirements"):
-        return DEPLOY_CONFIG
-    if lowered.startswith(_SECURITY_PATHS) or name in _SECURITY_NAMES:
-        return SECURITY
     if _name_matches(name, _PIN_GLOBS):
         return CROSS_REPO
+    if (lowered.startswith(_SECURITY_PATHS) or name in _SECURITY_NAMES
+            or _SECURITY_WORD.search(lowered)):
+        return SECURITY
+    if (name in _DEPENDENCY_NAMES or name.startswith("requirements")
+            or _DEPLOY_DIRS & set(lowered.split("/")[:-1]) or _name_matches(name, _DEPLOY_GLOBS)):
+        return DEPLOY_CONFIG
     if change_class.is_test(lowered) or change_class.is_docs(lowered):
         return DOCS_TESTS
-    if _SECURITY_WORD.search(lowered):
-        return SECURITY
-    if _DEPLOY_DIRS & set(lowered.split("/")[:-1]) or _name_matches(name, _DEPLOY_GLOBS):
-        return DEPLOY_CONFIG
     return APP_CODE
+
+
+def entry_tier(entry: Mapping[str, Any]) -> str:
+    """The tier of one changed-file entry: the higher of its path and, for a
+    rename, the path it had (moving a manifest under tests/ is still a
+    manifest change), and cross-repo for a submodule gitlink."""
+    if GITLINK_RE.search(str(entry.get("patch") or "")):
+        return CROSS_REPO
+    paths = [str(entry.get("filename") or "")]
+    if entry.get("previous_filename"):
+        paths.append(str(entry["previous_filename"]))
+    return max((file_tier(p) for p in paths), key=_rank)
 
 
 def other_repos(repo: str, ticket_body: str) -> List[str]:
@@ -193,7 +213,7 @@ def classify(repo: str, entries: Sequence[Mapping[str, Any]], ticket_body: str =
     files: List[str] = []
     for entry in entries:
         path = str(entry.get("filename") or "")
-        tier = CROSS_REPO if GITLINK_RE.search(str(entry.get("patch") or "")) else file_tier(path)
+        tier = entry_tier(entry)
         if _rank(tier) > _rank(best):
             best, files = tier, [path]
         elif tier == best:
@@ -211,13 +231,95 @@ def classify(repo: str, entries: Sequence[Mapping[str, Any]], ticket_body: str =
 
 
 def is_revert_ticket(pr: Mapping[str, Any], ticket: Optional[Mapping[str, Any]]) -> bool:
-    """The pull request is a revert ticket's own: its ticket carries
-    loom:revert, which only the station's revert pass (bus/revert.py)
-    applies, and the pull request says it is a revert."""
+    """The pull request says it is a revert and its ticket carries
+    loom:revert. Neither proves it: see revert_exempt."""
     from . import revert
     names = {str((l or {}).get("name") if isinstance(l, dict) else l)
              for l in (ticket or {}).get("labels") or []}
     return REVERT_LABEL in names and revert.looks_like_revert(dict(pr))
+
+
+def revert_labelers(env: Optional[Mapping[str, str]] = None) -> List[str]:
+    """The logins whose loom:revert label is believed: LOOM_REVERT_LABELERS,
+    else this Loom's trusted logins (LOOM_BRIEF_AUTHORS) other than a lane's
+    (a login with "lane" in it): the lane that wrote the change must not be
+    able to exempt it."""
+    raw = _env(env).get("LOOM_REVERT_LABELERS")
+    if raw is not None:
+        return raw.replace(",", " ").split()
+    authors = str(_env(env).get("LOOM_BRIEF_AUTHORS", "")).replace(",", " ").split()
+    return [a for a in authors if "lane" not in a.lower()]
+
+
+def _patch_lines(patch: str) -> Tuple[List[str], List[str]]:
+    """(added, removed) lines of a unified diff hunk text, sorted."""
+    lines = (patch or "").splitlines()
+    added = sorted(l[1:] for l in lines if l.startswith("+") and not l.startswith("+++"))
+    removed = sorted(l[1:] for l in lines if l.startswith("-") and not l.startswith("---"))
+    return added, removed
+
+
+def exact_inverse(entries: Sequence[Mapping[str, Any]],
+                  commit_files: Sequence[Mapping[str, Any]]) -> bool:
+    """Whether the pull request's files are the commit's files, each with
+    the commit's added lines removed and its removed lines added. A rename,
+    or a file GitHub sent no patch for, is not proven."""
+    mine = {str(e.get("filename") or ""): e for e in entries}
+    theirs = {str(f.get("filename") or ""): f for f in commit_files}
+    if not mine or set(mine) != set(theirs):
+        return False
+    for name, entry in mine.items():
+        other = theirs[name]
+        if (entry.get("previous_filename") or other.get("previous_filename")
+                or "patch" not in entry or "patch" not in other):
+            return False
+        added, removed = _patch_lines(str(entry["patch"]))
+        if (added, removed) != tuple(reversed(_patch_lines(str(other["patch"])))):
+            return False
+    return True
+
+
+def _labeled_by(gh: Any, repo: str, number: int) -> str:
+    """Who last applied loom:revert to the ticket, from its events."""
+    who = ""
+    for event in gh.paginate("/repos/%s/issues/%d/events" % (repo, number)):
+        if (isinstance(event, dict) and event.get("event") == "labeled"
+                and (event.get("label") or {}).get("name") == REVERT_LABEL):
+            who = str((event.get("actor") or {}).get("login") or "")
+    return who
+
+
+def revert_refusal(gh: Any, repo: str, pr: Mapping[str, Any], ticket: Mapping[str, Any],
+                   entries: Sequence[Mapping[str, Any]],
+                   env: Optional[Mapping[str, str]] = None) -> str:
+    """"" when the pull request is exempt from tier, review and caps as a
+    revert, else why not. Exempt means all of: it says it is a revert and its
+    ticket carries loom:revert (is_revert_ticket); a revert labeler
+    (revert_labelers) applied that label; its body names exactly one commit
+    (`git revert <sha>`), which the pull request's base branch carries; and its
+    diff is that commit's exact inverse. Anything that cannot be read is not
+    exempt, and the normal gates apply."""
+    from . import revert
+    if not is_revert_ticket(pr, ticket):
+        return "it is not a revert ticket's pull request"
+    try:
+        who = _labeled_by(gh, repo, int(ticket.get("number") or 0))
+        if who.lower() not in {l.lower() for l in revert_labelers(env)}:
+            return "loom:revert was applied by %s, not by the station" % (who or "nobody")
+        shas = [k[4:] for k in revert.reverted_keys(dict(pr)) if k.startswith("sha:")]
+        if len(set(shas)) != 1:
+            return "its body does not name exactly one reverted commit"
+        base = str((pr.get("base") or {}).get("ref") or "")
+        compared = gh.rest("GET", "/repos/%s/compare/%s...%s"
+                           % (repo, shas[0], quote(base, safe=""))).data or {}
+        if not base or compared.get("status") not in ("ahead", "identical"):
+            return "%s does not carry the reverted commit %s" % (base or "its base", shas[0])
+        commit = gh.rest("GET", "/repos/%s/commits/%s" % (repo, shas[0])).data or {}
+    except (GitHubError, ValueError, TypeError) as err:
+        return "its revert could not be checked (%s)" % err
+    if not exact_inverse(entries, [f for f in commit.get("files") or [] if isinstance(f, dict)]):
+        return "its diff is not the exact inverse of %s" % shas[0]
+    return ""
 
 
 def operator_why(tier: str, why: str, env: Optional[Mapping[str, str]] = None) -> str:
@@ -243,19 +345,53 @@ def bad_work(body: str, env: Optional[Mapping[str, str]] = None) -> bool:
     return bool(found) and (found[2] in blocking_rules(env) or BAD_WORK_CATEGORY in found[1])
 
 
-def blocking_findings(details: Mapping[str, Any], by_bot: Callable[[Mapping[str, Any]], bool],
+THREADS_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!,$after:String) {"
+    " repository(owner:$owner,name:$name) { pullRequest(number:$number) {"
+    " reviewThreads(first:100,after:$after) { pageInfo { hasNextPage endCursor }"
+    " nodes { isResolved comments(first:1) { nodes {"
+    " author { __typename login } body createdAt } } } } } } }")
+THREAD_PAGES = 20
+
+
+def review_threads(gh: Any, repo: str, number: int) -> List[Mapping[str, Any]]:
+    """Every review thread of the pull request, all pages. Raises ValueError
+    when the whole list cannot be read: a finding past a page the read
+    missed would let the merge through."""
+    owner, _, name = repo.partition("/")
+    threads: List[Mapping[str, Any]] = []
+    after = None
+    for _ in range(THREAD_PAGES):
+        try:
+            data = gh.graphql(THREADS_QUERY, {"owner": owner, "name": name,
+                                              "number": number, "after": after}) or {}
+        except GitHubError as err:
+            raise ValueError("could not read the review threads (%s)" % err) from err
+        page = (((data.get("repository") or {}).get("pullRequest") or {})
+                .get("reviewThreads") or {})
+        info = page.get("pageInfo")
+        if not isinstance(info, dict) or not isinstance(page.get("nodes"), list):
+            raise ValueError("could not read every review thread")
+        threads += [t for t in page["nodes"] if isinstance(t, dict)]
+        if not info.get("hasNextPage"):
+            return threads
+        after = info.get("endCursor")
+        if not after:
+            raise ValueError("could not read every review thread")
+    raise ValueError("more than %d pages of review threads" % THREAD_PAGES)
+
+
+def blocking_findings(threads: Sequence[Mapping[str, Any]], committed: str,
+                      by_bot: Callable[[Mapping[str, Any]], bool],
                       env: Optional[Mapping[str, str]] = None) -> List[str]:
     """The review-bot findings that hold an auto-merge: high or critical, or
     from a bad-work rule, whose thread is open or was resolved with no commit
-    after it (deferred, or resolved by hand without a fix). `details` is the
-    merge read's GraphQL pull request (reviewThreads with each thread's first
-    comment, and the head commit's committedDate); `by_bot` says whether a
-    comment is the review bot's. A missing time cannot show a fix followed."""
-    commits = (details.get("commits") or {}).get("nodes") or []
-    committed = str(((commits[-1] or {}).get("commit") or {}).get("committedDate") or "") \
-        if commits else ""
+    after it (deferred, or resolved by hand without a fix). `threads` are
+    every review thread (review_threads), `committed` the head commit's
+    committedDate, and `by_bot` says whether a comment is the review bot's.
+    A missing time cannot show a fix followed."""
     out = []
-    for thread in (details.get("reviewThreads") or {}).get("nodes") or []:
+    for thread in threads:
         comments = (thread.get("comments") or {}).get("nodes") or []
         root = (comments[0] if comments else None) or {}
         body = str(root.get("body") or "")

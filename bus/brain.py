@@ -3063,14 +3063,20 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     security and cross-repo by default) goes to the operator with one ask on
     its ticket; an auto tier needs the review check to have succeeded on its
     head, no open high, critical or bad-work finding, and room under the
-    hourly caps. A revert ticket's own pull request is exempt. From
+    hourly caps. A revert ticket's own pull request is exempt only when
+    merge_tier.revert_refusal finds nothing: the station applied loom:revert
+    and the diff is the exact inverse of a commit the base carries. From
     2026-10-19, 16 of 22 lane pull requests the Apps merged unattended in the
     private deployment repo were damaging or useless, most of them deploy and
     CI changes the change class called logic."""
+    entries = operator_hold.pull_files(gh, repo, number)
     if merge_tier.is_revert_ticket(pr, issue):
-        return
-    tier, why = merge_tier.classify(repo, operator_hold.pull_files(gh, repo, number),
-                                    str(issue.get("body") or ""),
+        refused = merge_tier.revert_refusal(gh, repo, pr, issue, entries, env)
+        if not refused:
+            return
+        print("brain: %s#%d is not exempt as a revert: %s" % (repo, number, refused),
+              file=sys.stderr)
+    tier, why = merge_tier.classify(repo, entries, str(issue.get("body") or ""),
                                     change_class.class_of(pr) == "sensitive")
     if tier not in merge_tier.auto_tiers(env):
         reason = merge_tier.operator_why(tier, why, env)
@@ -3087,7 +3093,10 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     from . import factory
     bot = (env if env is not None else os.environ).get("LOOM_REVIEW_BOT", "").strip() \
         or factory.DEFAULT_REVIEW_BOT
-    blocking = merge_tier.blocking_findings(details, lambda c: by_bot(dict(c), bot), env)
+    blocking = merge_tier.blocking_findings(
+        merge_tier.review_threads(gh, repo, number),
+        str(_head_commit(details).get("committedDate") or ""),
+        lambda c: by_bot(dict(c), bot), env)
     if blocking:
         raise ValueError("open review findings hold the merge: %s" % ", ".join(blocking))
     capped = merge_tier.cap_refusal(gh, repo, env)
