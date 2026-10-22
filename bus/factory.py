@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, change_class, labels, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
+from . import bench, brain, change_class, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -645,12 +645,16 @@ def deferrable(threads: Sequence[Dict[str, Any]], bot: str, asked: set,
     thread is a medium or low finding the review bot opened that a fix round
     asked for, or the pull request has had DEFER_AFTER fix rounds. With
     `immediate` (a docs or tests change) any such finding defers at once,
-    with no fix round."""
+    with no fix round. A bad-work finding never defers."""
     still = [t for t in threads if not t.get("isResolved")]
 
     def minor(t: Dict[str, Any]) -> bool:
         root = _end(t, "root", 0)
-        return (brain.by_bot(root, bot) and bool(MINOR_RE.match(str(root.get("body") or "")))
+        body = str(root.get("body") or "")
+        # A bad-work finding (bus/merge_tier.py) says the change does not do
+        # what it claims: it goes back to the lane at any severity.
+        return (brain.by_bot(root, bot) and bool(MINOR_RE.match(body))
+                and not merge_tier.bad_work(body)
                 and (immediate or str(t.get("id")) in asked or rounds >= DEFER_AFTER))
     return still if still and all(minor(t) for t in still) else []
 
@@ -2203,7 +2207,8 @@ class Factory:
         elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
-        elif not sensitive and not self._operator_holds(repo, number, full, issue):
+        elif (not sensitive and not self._operator_holds(repo, number, full, issue)
+              and not self._risk_holds(repo, number, full, issue)):
             self._file_criterion_follow_up(repo, number, issue, full)
             self._land(repo, number, full, issue, comments)
 
@@ -2224,6 +2229,30 @@ class Factory:
         if outcome == "asked":
             self.actions += 1
             _say("held %s#%d for the operator: %s" % (repo, number, "; ".join(why)))
+        elif outcome != "already":
+            _say("held %s#%d for the operator, but %s" % (repo, number, outcome))
+        return True
+
+    def _risk_holds(self, repo: str, number: int, full: Dict[str, Any],
+                    issue: Dict[str, Any]) -> bool:
+        """Whether the pull request's risk tier (bus/merge_tier.py) is one
+        Loom may not merge on its own: its ticket goes to loom:human with one
+        ask, once, and the operator merges it. A revert ticket's own pull
+        request never waits here. bus.brain merge refuses the same tiers, and
+        adds the review and hourly-cap rules for the tiers it may merge."""
+        if merge_tier.is_revert_ticket(full, issue):
+            return False
+        tier, why = merge_tier.classify(repo, operator_hold.pull_files(self.gh, repo, number),
+                                        str(issue.get("body") or ""),
+                                        change_class.class_of(full) == "sensitive")
+        if tier in merge_tier.auto_tiers():
+            return False
+        reason = merge_tier.operator_why(tier, why)
+        outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, [reason],
+                                     self.human)
+        if outcome == "asked":
+            self.actions += 1
+            _say("held %s#%d for the operator: %s" % (repo, number, reason))
         elif outcome != "already":
             _say("held %s#%d for the operator, but %s" % (repo, number, outcome))
         return True

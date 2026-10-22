@@ -8,7 +8,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-from bus import brain, factory, labels, station, status, tickets
+from bus import brain, factory, labels, merge_tier, station, status, tickets
 from bus.github import GitHubError, Response
 from bus.tickets import FIX_MARKER
 
@@ -232,6 +232,11 @@ class FakeGitHub:
 
 class Base(unittest.TestCase):
     def setUp(self):
+        # Every risk tier may merge here: these tests are about the other
+        # merge rules; bus/merge_tier.py has its own (test_merge_tier.py).
+        tiers = mock.patch.dict(os.environ, {"LOOM_AUTO_MERGE_TIERS": ",".join(merge_tier.TIERS)})
+        tiers.start()
+        self.addCleanup(tiers.stop)
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
         self.humans = []

@@ -707,6 +707,57 @@ say-so alone:
   review check passed and no high or critical finding is open on the head
   commit.
 - A pull request with no class label keeps the `logic` rule.
+- A medium or low finding from a bad-work rule is never deferred (below).
+
+## Merge by risk tier
+
+The change class says how a change is reviewed; the risk tier says who may
+merge it (`bus/merge_tier.py`). From 2026-10-19, when the station and brain
+Apps merged unattended, 16 of 22 lane pull requests in the private deployment
+repo were damaging or useless, most of them CI and deploy changes the class
+called `logic`; the lane pull requests the operator merged by hand the week
+before were all good. Each lane pull request gets the highest tier of its files
+and its ticket:
+
+- `docs-tests`: documentation and tests only.
+- `app-code`: application code and anything not named below.
+- `deploy-config`: manifests, Helm values, Dockerfiles, IaC (Pulumi,
+  Terraform, Ansible), systemd units, runtime config files, dependency
+  manifests, and anything under a deploy, production, infra or similar
+  directory.
+- `security`: CI workflows and actions, CODEOWNERS, `.loom/`, a
+  `class:sensitive` pull request, and paths that name auth, secrets, tokens,
+  credentials, permissions, policy, sandboxing, TLS or the leak scan.
+- `cross-repo`: a submodule gitlink, `.gitmodules`, a `pin.env` or `*PINS*`
+  file, or a ticket whose own words name another repo of the owner.
+
+Loom merges on its own only the tiers in `LOOM_AUTO_MERGE_TIERS` (default
+`docs-tests,app-code`). Any other tier is held for the operator: the factory
+puts its ticket to `loom:human` with one ask (`Kind: decision`, posted once),
+and `bus.brain merge` refuses it with "held for the operator". The operator
+merges it by hand.
+
+An auto tier still merges only when it is clean:
+
+- the review check (`LOOM_REVIEW_CHECK`) concluded success on the head
+  commit; neutral is not enough;
+- no high or critical review-bot finding, and no finding from a bad-work rule
+  at any severity, is open, or was resolved with no commit after it. The
+  bad-work rules are the review bot's `intent-mismatch`, `unmet-criterion`,
+  `dead-code` and the rules named in `merge_tier.BAD_WORK_RULES`, any rule in
+  `LOOM_ELDER_BLOCKING_RULES`, and any finding whose category is `bad-work`.
+  The factory never defers such a finding as minor: it goes back to the lane;
+- fewer than `LOOM_AUTO_MERGE_PER_REPO_HOUR` (default 2) `loom/` pull requests
+  merged in the repo in the last hour, and fewer than `LOOM_AUTO_MERGE_PER_HOUR`
+  (default 4) across the owner. GitHub's search gives the counts, so every
+  brain and station sees the same numbers; a `loom/` branch the operator
+  merged by hand counts too, and a count GitHub will not give refuses the
+  merge.
+
+A revert ticket's own pull request (`loom:revert`, filed only by
+`bus/revert.py`, whose pull request says it is a revert) is exempt from the
+tier and the caps: undoing a merge is always allowed. The adopt path
+(`--adopt`, a ticketless pull request a trusted login opened) is not tiered.
 
 ## Rules
 
