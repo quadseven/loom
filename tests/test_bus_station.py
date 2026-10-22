@@ -5556,6 +5556,70 @@ class VerifyBeforeBuildTest(Base):
                 for lane in ("codex",):
                     shutil.rmtree(self.inbox(lane), ignore_errors=True)
 
+    def fabric_cites(self, answer, *, key="/example/fabric/key"):
+        """Run a pass with Fabric configured and answering `answer`; the
+        mock of bus.fabric.ask, to read what was asked."""
+        self.settings.fabric_key_ssm = key
+        with mock.patch("bus.fabric.ask", return_value=answer) as ask:
+            self.run_pass()
+        return ask
+
+    CITE_77 = ("It merged in [#77 [PR] Make the thing work end to end](fabric://"
+               "c1a485b6-36a8-498b-bd3f-8911bf1a63b3).")
+
+    def unlinked(self, title="Make the thing work end to end"):
+        """Ticket 12, briefed, and pull request 77 that merged its work but
+        names no ticket, so no Refs line or branch links them."""
+        self.fake.add(12, state="briefed")
+        self.merged(body="A fix.", title=title)
+
+    def test_a_merged_pull_request_fabric_cites_sends_the_ticket_to_verify(self):
+        # loom#1437: the work merged without a link to the ticket, and a lane
+        # would build it again.
+        self.unlinked()
+        ask = self.fabric_cites(self.CITE_77)
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertFalse(self.built())
+        self.assertIn("Pull request #77", self.events()[0])
+        question = ask.call_args.args[0]
+        self.assertIn(REPO, question)
+        self.assertEqual(ask.call_args.args[1:], ("/example/fabric/key", "us-east-1"))
+
+    def test_a_citation_whose_title_is_not_the_pull_requests_is_ignored(self):
+        self.unlinked(title="Something else entirely, not this ticket")
+        self.fabric_cites(self.CITE_77)
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertTrue(self.built())
+
+    def test_without_a_fabric_key_nothing_is_asked(self):
+        self.unlinked()
+        ask = self.fabric_cites(self.CITE_77, key="")
+        ask.assert_not_called()
+        self.assertTrue(self.built())
+
+    def test_no_answer_builds_as_before(self):
+        self.unlinked()
+        ask = self.fabric_cites("")
+        self.assertEqual(ask.call_count, 1)
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertTrue(self.built())
+
+    def test_a_ticket_is_asked_once_per_body_and_a_pass_asks_at_most_its_cap(self):
+        self.settings.fabric_key_ssm = "/example/fabric/key"
+        for n in (12, 13, 14):
+            self.fake.add(n, state="briefed")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch("bus.fabric.ask", return_value="") as ask:
+            for n in (12, 12, 13, 14):
+                st._merged_cited(REPO, self.fake.issues[n])
+        self.assertEqual(ask.call_count, station.FABRIC_ASKS)
+        later = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch("bus.fabric.ask", return_value="") as ask:
+            later._merged_cited(REPO, self.fake.issues[12])
+            self.fake.issues[12]["body"] += "\nOne more criterion.\n"
+            later._merged_cited(REPO, self.fake.issues[12])
+        self.assertEqual(ask.call_count, 1, "a changed body is asked again; the same is not")
+
     def sent(self):
         """Ticket 12 shipped after the station sent pull request 77 to verify."""
         self.fake.private = False
