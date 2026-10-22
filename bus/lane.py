@@ -310,7 +310,9 @@ def _push_commit(gh: GitHub, repo: str, local_sha: str, local_parent: str,
     # and paths unquoted, so a tab or non-ASCII byte in a name stays intact.
     fields = _git("diff", "--name-status", "--no-renames", "-z",
                   local_parent, local_sha).split("\0")
-    for status, path in zip(fields[0::2], fields[1::2]):
+    # strict=False: the output ends with a NUL, so the split leaves one empty
+    # trailing field and the two slices differ in length by one.
+    for status, path in zip(fields[0::2], fields[1::2], strict=False):
         if status.startswith("D"):
             tree_updates.append({"path": path, "mode": "100644",
                                  "type": "blob", "sha": None})
