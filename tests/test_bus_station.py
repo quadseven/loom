@@ -8084,7 +8084,9 @@ class CloseDoneTest(Base):
         self.fake.private = False
         no_needle = SHIPPED_BODY.replace("prints `daily status ready`", "the daily line shows it")
         self.fake.add(1, lane="codex", body=no_needle, state="shipped")
-        self.fake.add(2, lane="codex", body=SHIPPED_BODY, state="shipped")
+        self.fake.add(2, lane="codex", body=SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "prints `daily status ready` on or after 2026-01-01 and before 2026-12-31"), state="shipped")
         self.fake.add(3, lane="codex", body=no_needle, state="shipped")
         self.fake.issues[3]["labels"].append({"name": "loom:regression"})
         self.fake.add(4, lane="codex", body="Difficulty: easy\n\n## Acceptance criteria\n- [ ] x\n",
@@ -8093,7 +8095,7 @@ class CloseDoneTest(Base):
         st.close_done_tickets()
         self.assertEqual(self.fake.issues[1]["state"], "closed")
         self.assertEqual(self.fake.issues[1]["state_reason"], "completed")
-        self.assertEqual(self.fake.issues[2]["state"], "open")   # evidence can find its string
+        self.assertEqual(self.fake.issues[2]["state"], "open")   # window still open or covered by evidence
         self.assertEqual(self.fake.issues[3]["state"], "open")   # a regression stays for the brain
         self.assertEqual(self.fake.issues[4]["state"], "closed") # no Live line at all
         self.assertIn("force-close", self.fake.names(1))
@@ -8104,6 +8106,167 @@ class CloseDoneTest(Base):
     def close_text(self, number):
         return "\n".join(c["body"] for c in self.fake.comments[number]
                          if status.is_status(c.get("body")))
+
+    def test_a_shipped_ticket_with_a_time_window_earlier_than_the_log_start_closes(self):
+        # A shipped ticket whose Live line names a time window that ended before
+        # the evidence source's earliest record closes as done. The window and
+        # the earliest record time are mentioned in the close comment.
+        self.fake.private = False
+        # Create a log file with a modification time of 2026-04-01 (after the window ends)
+        import time
+        log_dir = os.path.join(self.home, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "evidence.log")
+        with open(log_path, "w") as f:
+            f.write("")
+        # Set the modification time to 2026-04-01
+        log_timestamp = time.mktime(time.struct_time((2026, 4, 1, 0, 0, 0, 0, 0, -1)))
+        os.utime(log_path, (log_timestamp, log_timestamp))
+        # Update settings to use this log file
+        self.settings.evidence_cmds = {REPO: log_path}
+        
+        # Live line with a time window that ended before the log starts
+        with_window = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "prints `daily status ready` on or after 2026-01-01 and before 2026-03-01"
+        )
+        self.fake.add(1, lane="codex", body=with_window, state="shipped")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        # Ticket 1 should be closed because the window ended before the log
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+        self.assertEqual(self.fake.issues[1]["state_reason"], "completed")
+        # The close comment should mention both the window end and the log start
+        text = self.close_text(1)
+        self.assertIn("2026-03-01", text)
+        self.assertIn("2026-04-01", text)
+    
+    def test_a_shipped_ticket_with_a_time_window_covered_by_evidence_remains_open(self):
+        # A shipped ticket whose Live line names a time window that is covered by
+        # the evidence source remains open because the Live line can still find evidence.
+        self.fake.private = False
+        # Create a log file with a modification time of 2026-02-15 (inside the window)
+        import time
+        log_dir = os.path.join(self.home, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "evidence.log")
+        with open(log_path, "w") as f:
+            f.write("")
+        # Set the modification time to 2026-02-15 (inside the window)
+        log_timestamp = time.mktime(time.struct_time((2026, 2, 15, 0, 0, 0, 0, 0, -1)))
+        os.utime(log_path, (log_timestamp, log_timestamp))
+        # Update settings to use this log file
+        self.settings.evidence_cmds = {REPO: log_path}
+        
+        # Live line with a time window that is covered by the log
+        with_window = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "prints `daily status ready` on or after 2026-01-01 and before 2026-03-01"
+        )
+        self.fake.add(1, lane="codex", body=with_window, state="shipped")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        # Ticket 1 should remain open because the window is covered by the evidence source
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+    
+    def test_a_shipped_ticket_with_a_still_open_time_window_remains_open(self):
+        # A Live window with no end date is still open, so a log that starts
+        # later than its start does not close the ticket.
+        self.fake.private = False
+        import time
+        log_dir = os.path.join(self.home, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "evidence.log")
+        with open(log_path, "w") as f:
+            f.write("")
+        stamp = time.mktime(time.struct_time((2026, 4, 1, 0, 0, 0, 0, 0, -1)))
+        os.utime(log_path, (stamp, stamp))
+        self.settings.evidence_cmds = {REPO: log_path}
+        open_window = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "prints `daily status ready` on or after 2026-01-01")
+        self.fake.add(1, lane="codex", body=open_window, state="shipped")
+        station.Station(GitHub("token", transport=self.fake), self.settings).close_done_tickets()
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+
+    def test_a_shipped_ticket_with_no_time_window_remains_open(self):
+        # A shipped ticket with no Live time window remains open as today.
+        self.fake.private = False
+        # Create a log file
+        import time
+        log_dir = os.path.join(self.home, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "evidence.log")
+        with open(log_path, "w") as f:
+            f.write("")
+        # Set the modification time to 2026-04-01
+        log_timestamp = time.mktime(time.struct_time((2026, 4, 1, 0, 0, 0, 0, 0, -1)))
+        os.utime(log_path, (log_timestamp, log_timestamp))
+        # Update settings to use this log file
+        self.settings.evidence_cmds = {REPO: log_path}
+        
+        # Live line with no time window at all
+        with_window = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "prints `daily status ready`"
+        )
+        self.fake.add(1, lane="codex", body=with_window, state="shipped")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        # Ticket 1 should remain open because there's no time window to check
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+
+    def test_a_shipped_ticket_whose_evidence_log_lives_outside_logs_stays_open(self):
+        # An evidence command pointing outside the configured log root is
+        # rejected, so no earliest record is read and the ticket stays open.
+        self.fake.private = False
+        import time
+        outside = os.path.join(os.path.dirname(self.home), "evidence.outside.log")
+        with open(outside, "w") as f:
+            f.write("")
+        stamp = time.mktime(time.struct_time((2026, 4, 1, 0, 0, 0, 0, 0, -1)))
+        os.utime(outside, (stamp, stamp))
+        self.settings.evidence_cmds = {REPO: outside}
+
+        with_window = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "prints `daily status ready` on or after 2026-01-01 and before 2026-03-01"
+        )
+        self.fake.add(1, lane="codex", body=with_window, state="shipped")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        # The log is outside the logs root, so the window-end check cannot run
+        # and the ticket stays open for a verify run.
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+
+    def test_evidence_log_path_rejects_paths_outside_log_root(self):
+        log_root = os.path.join(self.home, "logs")
+        self.assertIsNone(station._evidence_log_path(REPO, "/etc/passwd", log_root))
+        self.assertIsNone(station._evidence_log_path(REPO, "cat logs/foo.log", log_root))
+        self.assertIsNone(station._evidence_log_path(REPO, log_root, log_root))
+        outside = os.path.join(os.path.dirname(self.home), "other.log")
+        self.assertIsNone(station._evidence_log_path(REPO, outside, log_root))
+        inside = os.path.join(log_root, "sub", "app.log")
+        self.assertEqual(os.path.realpath(inside),
+                         station._evidence_log_path(REPO, inside, log_root))
+
+    def test_live_time_window_parsing(self):
+        self.assertIsNone(station._live_time_window("prints `foo`"))
+        w = station._live_time_window("prints `foo` on or after 2026-01-01 and before 2026-03-01")
+        self.assertIsNotNone(w)
+        self.assertIsNotNone(w[0])
+        self.assertIsNotNone(w[1])
+        self.assertEqual(w[0].strftime("%Y-%m-%d"), "2026-01-01")
+        self.assertEqual(w[1].strftime("%Y-%m-%d"), "2026-03-01")
+        open_w = station._live_time_window("prints `foo` on or after 2026-01-01")
+        self.assertIsNotNone(open_w)
+        self.assertIsNotNone(open_w[0])
+        self.assertIsNone(open_w[1])
+        before_w = station._live_time_window("prints `foo` before 2026-03-01")
+        self.assertIsNotNone(before_w)
+        self.assertIsNone(before_w[0])
+        self.assertIsNotNone(before_w[1])
+        self.assertEqual(before_w[1].strftime("%Y-%m-%d"), "2026-03-01")
 
     def test_the_done_close_names_a_neutral_review_check(self):
         # The merge gate lets a non-sensitive pull request land with the
