@@ -1900,6 +1900,24 @@ class Queued(Base):
         worker.assign_queued()
         self.assertEqual(self.lane(7), "codex-2")
 
+    def test_a_first_label_model_ticket_skips_lanes_where_the_model_is_benched(self):
+        # loom#969: a model benched for repeated failure is not picked, and a
+        # bench of another provider's model does not touch these lanes.
+        self.first_label_ticket(7)
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["codex", "codex-2"],
+                                 benched=[("codex", "gpt-6-sol")])
+        worker.assign_queued()
+        self.assertEqual(worker.waits["%s#7" % REPO], "no free lane takes model gpt-6-sol")
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["codex", "codex-2"],
+                                 benched=[("codex-2", "gpt-6-sol")])
+        worker.assign_queued()
+        self.assertEqual(self.lane(7), "codex")
+
     def test_a_first_label_model_ticket_waits_when_its_lanes_are_limited_or_down(self):
         self.first_label_ticket(7)
         self.busy(8, "codex")
@@ -3252,7 +3270,7 @@ class Helpers(unittest.TestCase):
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
                          model_limits=None, silent=None, down=(), limit_until=None,
-                         known_waits=None, plan_check=None):
+                         benched=(), known_waits=None, plan_check=None):
                 self.silent_running, self.silent, self.waits = {}, silent, {}
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))

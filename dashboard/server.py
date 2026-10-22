@@ -21,6 +21,7 @@ from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, build_opener
 
 from bus import brain as bus_brain
+from bus import bench as bench_lib
 from bus import tickets as bus_tickets
 from bus import metrics as bus_metrics
 from bus.naming import strip_kind
@@ -904,6 +905,19 @@ def _handle_usage_get(handler, state):
     return handler.send_json(200, store.snapshot())
 
 
+def _handle_bench_get(handler, state):
+    """The bench list (loom#969): the provider and model pairs benched for
+    everyone, those on trial, and the recent events. Read by Loom's station,
+    Grug and the gateway with the read-only brain token or the upload token,
+    as the usage snapshot."""
+    if not _authorized(handler, BRAIN_READERS):
+        return handler.send_json(401, {"error": "unauthorized"})
+    store = getattr(state, "bench", None)
+    if store is None:
+        return handler.send_json(200, bench_lib.snapshot(None, time.time()))
+    return handler.send_json(200, store.snapshot())
+
+
 def _handle_usage_post(handler, state):
     if not _authorized(handler):
         return handler.send_json(401, {"error": "unauthorized"})
@@ -1152,6 +1166,8 @@ def _dispatch_basic(handler, state, path):
         return _handle_brain(handler, state)
     if path == "/api/usage":
         return _handle_usage_get(handler, state)
+    if path == "/api/bench":
+        return _handle_bench_get(handler, state)
     return handler.send_text(404, "not found")
 
 
@@ -1222,7 +1238,9 @@ def _dispatch_tiers(handler, state):
     background = getattr(state, "tier_sources", None)
     snapshot = background.snapshot() if background is not None else tiers_sources.empty_snapshot()
     sources = dict(snapshot, usage=_tiers_usage(state, now), station=_tiers_station(state, payload))
-    body = tiers.render(tiers.build(sources, now))
+    store = getattr(state, "bench", None)
+    listed = store.snapshot(now.timestamp()) if store is not None else None
+    body = tiers.render(tiers.build(sources, now, bench=listed))
     return handler.send_page(page("Tiers and allowances", "tiers", body,
                                   status="stale" if payload.get("stale") else "live"))
 

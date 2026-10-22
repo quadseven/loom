@@ -6486,6 +6486,29 @@ class ReportDigestTest(Base):
         self.assertIn("Loom evening digest", self.sent[1]["content"])
         self.assertIn("No goal moved since the last digest.", self.sent[1]["content"])
 
+    def test_the_digest_reports_each_bench_and_return_since_the_last_digest(self):
+        # loom#969: every bench and un-bench is told once, in the digest.
+        self.goal(40, "Goal forty")
+        self.at(9, 0)
+        path = os.path.join(self.home, "state", "station", "bench.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        event = lambda kind, minute, reason="": {  # noqa: E731
+            "at": int(self.base + 9 * 3600 + minute * 60), "kind": kind, "provider": "free-kilo",
+            "model": "kilo-coder", "reason": reason, "until": None, "level": 1}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": self.base + 9 * 3600 + 1800, "benched": [], "trial": [],
+                       "events": [event("bench", -600, "old, before the window"),
+                                  event("bench", 10, "failed 12 of 20 calls (60%), threshold 50%"),
+                                  event("return", 40)]}, fh)
+        self.at(10, 1)
+        text = self.sent[0]["content"]
+        self.assertIn("Benched and returned models (2):", text)
+        self.assertIn("- free-kilo kilo-coder: benched (failed 12 of 20 calls (60%), threshold 50%)", text)
+        self.assertIn("- free-kilo kilo-coder: back", text)
+        self.assertNotIn("before the window", text)
+        self.at(21, 5)
+        self.assertNotIn("Benched and returned", self.sent[1]["content"])
+
     def test_a_goal_with_only_work_in_flight_counts_as_quiet(self):
         # 2026-10-18: every goal reported "N in flight since the last report",
         # so the digest listed all 18 goals as moving.
@@ -8066,6 +8089,42 @@ class CloseDoneTest(Base):
         self.assertEqual(len(asks), 1)
         self.assertIn("needs-operator", asks[0]["labels"])
         self.assertIn(second, asks[0]["title"])
+
+    def test_operator_ask_missing_number_raises(self):
+        second = "example-owner/second-repo"
+        self.settings.repos.append(second)
+        self.settings.status_repo = REPO
+
+        def request(method, url, headers, body):
+            path = urlsplit(url).path
+            if path == "/repos/" + second:
+                return reply(404, {"message": "Not Found"})
+            if method == "POST" and path == "/repos/%s/issues" % REPO:
+                return reply(201, {"ok": True})
+            return self.fake(method, url, headers, body)
+
+        st = station.Station(GitHub("token", transport=request), self.settings, now=10000)
+        with self.assertRaisesRegex(GitHubError, "no operator access ask was created"):
+            st.check_repo_access()
+
+    def test_operator_ask_skipped_when_no_status_repo(self):
+        second = "example-owner/second-repo"
+        self.settings.repos.append(second)
+        self.settings.status_repo = None
+        posts = []
+
+        def request(method, url, headers, body):
+            path = urlsplit(url).path
+            if path == "/repos/" + second:
+                return reply(404, {"message": "Not Found"})
+            if method == "POST":
+                posts.append(path)
+            return self.fake(method, url, headers, body)
+
+        st = station.Station(GitHub("token", transport=request), self.settings, now=10000)
+        self.assertTrue(st.check_repo_access())
+        self.assertNotIn(second, self.settings.repos)
+        self.assertEqual(posts, [])
 
     def test_401_abort_still_persists_operator_ask(self):
         second = "example-owner/second-repo"

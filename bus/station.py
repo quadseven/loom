@@ -30,6 +30,7 @@ from urllib.parse import quote
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from . import audit
+from . import bench
 from . import brain_memory
 from . import claimed
 from . import scope_fit
@@ -6552,6 +6553,10 @@ class Station:
             lines.append("No goal moved since the last digest.")
         if quiet:
             lines.append("Quiet: %d goal%s, nothing moved." % (quiet, "" if quiet == 1 else "s"))
+        benched = bench.digest_lines(self._bench_list(), start, self.now)
+        if benched:
+            lines.append("Benched and returned models (%d):" % len(benched))
+            lines += benched
         factory_line = self._digest_factory_line()
         if factory_line:
             lines.append(factory_line)
@@ -8886,11 +8891,55 @@ class Station:
                                        info["reason"], info["since"]))
         return out
 
+    def refresh_bench(self) -> None:
+        """Read the dashboard's bench list (GET /api/bench, loom#969) with the
+        transcript upload settings and token, and keep it in state/station/
+        bench.json stamped with the time read. A dashboard that does not
+        answer leaves the last list, which stops counting after
+        bench.LIST_TTL, so an unreachable dashboard never benches a model for
+        ever. A change is logged."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return
+        token = self._transcript_token()
+        if token is None:
+            return
+        try:
+            listed = self.fetch(brain_memory.dashboard_url(self.s.transcript_url, bench.LIST_PATH), token)
+        # fetch's errors never carry the URL or the token.
+        except OSError as err:
+            _say("bench list: the dashboard did not answer (%s); keeping the last list" % err)
+            return
+        if not isinstance(listed.get("benched"), list):
+            _say("bench list: the dashboard's answer holds no benched list; keeping the last list")
+            return
+        path = os.path.join(self.state, "bench.json")
+        before = set(self.benched_pairs())
+        _write_json(path, dict(listed, fetched_at=self.now))
+        after = set(self.benched_pairs())
+        for provider, model in sorted(after - before):
+            _say("benched for everyone: %s %s" % (provider, model))
+        for provider, model in sorted(before - after):
+            _say("no longer benched: %s %s" % (provider, model))
+
+    def _bench_list(self) -> Any:
+        return _read_json(os.path.join(self.state, "bench.json"), None, strict=False)
+
+    def benched_pairs(self) -> List[Tuple[str, str]]:
+        """The (provider, model) pairs the bench list holds benched now."""
+        return bench.benched_pairs(self._bench_list(), self.now)
+
+    def benched_lanes(self, pairs: Sequence[Tuple[str, str]]) -> List[str]:
+        """The lanes whose configured model (LOOM_<LANE>_MODEL in this
+        process) is benched on them: a ticket with no Model: line runs that
+        model, so these lanes step aside like a lane that is down."""
+        return [lane for lane in LANES if bench.is_benched(pairs, lane, brain.lane_model(lane))]
+
     def _factory(self) -> factory.Factory:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
         ask = scope_fit.asker(self.s.scope_url, self.s.scope_model)
         # Passed only when the check is on, so the factory's default stays off.
         extra = {"scope": ask} if ask is not None else {}
+        pairs = self.benched_pairs()
         return factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
                                briefers=self.s.briefers,
                                review_check=self.s.review_check,
@@ -8902,7 +8951,8 @@ class Station:
                                available=[x for x in LANES if self._heartbeat_ok(x)],
                                held=list(self._held_tickets()) + self._gate_held(),
                                silent=self._silent_lanes(),
-                               down=self.down_lanes(),
+                               down=self.down_lanes() + self.benched_lanes(pairs),
+                               benched=pairs,
                                limit_until=self.limit_until(),
                                known_waits=self._saved_waits(), **extra)
 
@@ -9587,7 +9637,7 @@ class Station:
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
-                     self.watch_default_branches, self.run_factory, self.check_invariants,
+                     self.watch_default_branches, self.refresh_bench, self.run_factory, self.check_invariants,
                      self.release_factory_held):
             if self._deferred():
                 break
