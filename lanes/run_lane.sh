@@ -2950,7 +2950,7 @@ for BRIEF in "$INBOX"/*.md; do
     if [ ! -f "$LEAK_SCANNER" ]; then
       REASON="public repo leak scanner is missing; nothing pushed"
       note_factory_incident leak-scanner "$REASON" REASON
-      park "$BRIEF" "$REASON" "$PARK_CLASS"
+      park "$BRIEF" "$REASON" hold
       continue
     fi
     # A fix round that merged the default branch scans what the pull request

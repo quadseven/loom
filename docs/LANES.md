@@ -40,10 +40,10 @@ lane runner uses infra-public's `check_private_leaks.py` in shape-only mode on
 the diff and generated pull request body. The station keeps infra-public at
 `$LOOM_HOME/infra-public`, cloning it when missing and fast-forwarding it at
 most once an hour. Set `LOOM_LEAK_SCANNER` to override the scanner path. A
-missing scanner files a factory incident and holds the ticket; a scan hit
-blocks the push. Private repositories skip this scan. Test IP addresses in
-public changes must use the documentation ranges `192.0.2.0/24`,
-`198.51.100.0/24`, or
+missing scanner files a factory incident and holds the ticket instead of
+parking it as transient; a scan hit blocks the push. Private repositories
+skip this scan. Test IP addresses in public changes must use the documentation
+ranges `192.0.2.0/24`, `198.51.100.0/24`, or
 `203.0.113.0/24`; add `leak-guard-allow` on a line only when a deliberate
 range bound must appear.
 
