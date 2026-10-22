@@ -3657,6 +3657,31 @@ class FixTest(Base):
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running",
                                                "claim:alice-example"])
 
+    def test_a_fix_for_a_pull_request_that_merged_is_never_briefed(self):
+        # Three fix rounds in two hours were briefed for pull requests that
+        # had already merged, one on the claude lane; each ran for nothing
+        # (2026-10-22).
+        self.fake.add(12)
+        self.comment(12, "Lane codex opened a pull request: https://example.com/pull/99")
+        self.comment(12, FIX_BODY)
+        self.fake.pulls.append({"number": 99, "state": "closed",
+                                "merged_at": "2030-01-02T12:00:00Z",
+                                "merge_commit_sha": "%040x" % 99, "base": {"ref": "main"},
+                                "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
+
+    def test_a_fix_for_an_open_pull_request_is_briefed(self):
+        self.fake.add(12)
+        self.comment(12, "Lane codex opened a pull request: https://example.com/pull/99")
+        self.comment(12, FIX_BODY)
+        self.fake.pulls.append({"number": 99, "state": "open", "merged_at": None,
+                                "base": {"ref": "main"}, "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        self.assertIn("Fix-PR: 99\n", self.claimed_brief("example-owner.example-repo-12"))
+
     def test_a_claimed_fix_is_not_claimed_again_on_the_next_pass(self):
         # The claim was stamped with the pass's start time, earlier than the
         # fix comment the same pass had just posted, so the next pass read the
