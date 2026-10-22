@@ -14,7 +14,9 @@ and by `bus.brain merge` before it merges one:
   section (the lane writes it, or the single word none) lists a step, or, as
   a backstop, the pull request's body or its ticket's body names one in words:
   "leave X to the operator", an operator task or prerequisite, a data
-  migration, a cutover, a VM or disk resize.
+  migration, a cutover, a VM or disk resize, or a sentence that tells the
+  reader not to merge until something is done ("Do not merge until renewal
+  is proven on a handset").
 - Placement. A file that merging deploys (a deploy workflow's on.push.paths
   filter matches it, the filters LOOM_SHIP_PATH_WORKFLOWS ships by) changes
   where a workload runs or what it mounts (ship_paths.placement_lines).
@@ -74,6 +76,14 @@ BACKSTOP = (
                r"|\b(?:operator|runbook)\b[^.\n]{0,60}\bcut-?over\b", re.I),
     re.compile(r"\b(?:resize|resizes|resizing|grow|grows|growing)\b[^.\n]{0,40}?"
                r"\b(?:VM|virtual machine|disk|volume)\b|\bVM resiz\w*", re.I),
+    # A merge hold in the imperative, as the sentence's own opening: "Do
+    # not merge until renewal is proven on a real handset", "Merge only
+    # after the operator confirms". A sentence that describes code ("the
+    # brain never merges until ...") does not open with the order.
+    re.compile(r"^\W*(?:please\s+)?(?:do not|don't|dont|never)\s+merge\b[^.\n]{0,160}?"
+               r"\b(?:until|before|unless)\b"
+               r"|^\W*(?:please\s+)?(?:only\s+)?merge\s+(?:this\s+|it\s+)?(?:only\s+)?"
+               r"(?:after|once|when)\b", re.I),
 )
 STEP_MAX = 160
 ASK_STEPS = 4

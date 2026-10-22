@@ -206,6 +206,29 @@ class OperatorSteps(unittest.TestCase):
             self.assertEqual(operator_hold.section_steps(
                 PLAIN_BODY.replace("\nnone\n", "\n%s\n" % said)), [], said)
 
+    def test_a_merge_hold_in_the_imperative_is_a_step(self):
+        # Replay case operator-step-02 (assay suites/loom_gates): the lane
+        # wrote this section and the brain merged it.
+        body = PLAIN_BODY.replace(
+            "## Operator steps before merge\nnone",
+            "## Merge hold\n\nDo not merge until renewal is proven on a real handset "
+            "(issue 22). The operator confirms that step.")
+        self.assertEqual(operator_hold.operator_steps(body),
+                         ["Do not merge until renewal is proven on a real handset (issue 22)."])
+        for said in ("Don't merge this before the backup finishes.",
+                     "Please do not merge it unless the operator signs off.",
+                     "Merge only after the operator rotates the key.",
+                     "Merge this once the DNS record exists."):
+            self.assertTrue(operator_hold.named_steps(said), said)
+
+    def test_a_sentence_about_merging_that_gives_no_order_is_not_a_step(self):
+        for said in ("The brain never merges until the review check passes.",
+                     "Loom will not merge a pull request until its review passes.",
+                     "This fixes the merge until-loop in the station.",
+                     "## Do not merge until\nnone",
+                     "After the merge, the station closes the ticket once it ships."):
+            self.assertEqual(operator_hold.named_steps(said), [], said)
+
     def test_a_refactors_cut_over_and_a_loom_status_block_are_not_steps(self):
         body = ("## Summary\nThe old chain's lookups stay until cut-over.\n"
                 "<!-- loom:status-body v1 begin -->\n- leave it to the operator\n"
@@ -432,6 +455,17 @@ class BrainMerge(unittest.TestCase):
         self.assertIn("Kind: decision", asked[0]["body"])
         labels = [b for m, p, b in fake.writes if p.endswith("/issues/9/labels")]
         self.assertEqual(labels, [{"labels": ["loom:human"]}])
+
+    def test_a_body_that_says_do_not_merge_until_is_refused(self):
+        # Replay case operator-step-02: on main this merged on green checks.
+        body = PLAIN_BODY.replace(
+            "## Operator steps before merge\nnone",
+            "## Merge hold\n\nDo not merge until renewal is proven on a real handset "
+            "(issue 22). The operator confirms that step.")
+        fake, refused = self.merge(body)
+        self.assertIn("held for the operator", refused)
+        self.assertIn("Do not merge until renewal", refused)
+        self.assertFalse(self.merged(fake))
 
     def test_a_deployed_placement_change_is_refused(self):
         fake, refused = self.merge(PLAIN_BODY, (MANIFEST,), {MANIFEST: PIN_PATCH})
