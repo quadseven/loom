@@ -138,23 +138,21 @@ def _bench(provider: str, model: str, level: int, reason: str, now: float, cfg: 
             "seen_calls": calls, "seen_failed": failed, "trial_calls": 0, "trial_failed": 0}
 
 
-def evaluate(rows: Optional[Sequence[Any]], state: Optional[Mapping[str, Any]], now: float,
-             cfg: Optional[Config] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """(new state, the events of this pass). `rows` are the gateway's rows
-    for one window ({target, model, hits, ok, limit}); None when the gateway
-    has no current answer, when only the clock moves a benched pair to its
-    trial. The input state is not changed."""
-    cfg = cfg or Config()
-    new = copy.deepcopy(dict(state)) if state else empty_state()
+def _clean(new: Dict[str, Any]) -> Dict[str, Any]:
+    """The state with every section the passes read present and shaped."""
     for name in ("models", "forgiven", "history"):
         if not isinstance(new.get(name), dict):
             new[name] = {}
     if not isinstance(new.get("events"), list):
         new["events"] = []
-    seen = _index(rows) if rows is not None else None
-    events: List[Dict[str, Any]] = []
-    models, forgiven, history = new["models"], new["forgiven"], new["history"]
+    return new
 
+
+def _trial_pass(state: Dict[str, Any], seen: Optional[Mapping[str, Tuple[str, str, int, int]]],
+                now: float, cfg: Config) -> List[Dict[str, Any]]:
+    """Move each benched pair whose cooldown ended to its trial, and decide
+    each pair on trial from the calls made since the trial began."""
+    models, events = state["models"], []
     for key in list(models):
         entry = models[key]
         if entry.get("status") == BENCHED and now >= entry.get("until", 0):
@@ -178,39 +176,58 @@ def evaluate(rows: Optional[Sequence[Any]], state: Optional[Mapping[str, Any]], 
             level = entry.get("level", 1) + 1
             reason = "failed its trial call (%d of %d failed)" % (entry["trial_failed"], entry["trial_calls"])
             models[key] = _bench(entry["provider"], entry["model"], level, reason, now, cfg, calls, failed)
-            history[key] = {"level": level, "at": int(now)}
+            state["history"][key] = {"level": level, "at": int(now)}
             events.append(_event("rebench", models[key], now))
         elif entry["trial_calls"] > 0:
-            forgiven[key] = {"calls": calls, "failed": failed}
-            history[key] = {"level": entry.get("level", 1), "at": int(now)}
+            state["forgiven"][key] = {"calls": calls, "failed": failed}
+            state["history"][key] = {"level": entry.get("level", 1), "at": int(now)}
             events.append(_event("return", dict(entry, reason="its trial call succeeded"), now))
             del models[key]
+    return events
 
+
+def _bench_pass(state: Dict[str, Any], seen: Mapping[str, Tuple[str, str, int, int]], now: float,
+                cfg: Config) -> List[Dict[str, Any]]:
+    """Bench each pair whose calls since it last returned fail over the
+    threshold."""
+    models, forgiven, history, events = state["models"], state["forgiven"], state["history"], []
+    for key, (provider, model, calls, failed) in seen.items():
+        # A forgiven pair is judged on calls made since it returned; the
+        # forgiven mark follows a window that shrank.
+        past = forgiven.get(key) or {"calls": 0, "failed": 0}
+        past = {"calls": min(past["calls"], calls), "failed": min(past["failed"], failed)}
+        if past["calls"] or past["failed"]:
+            forgiven[key] = past
+        else:
+            forgiven.pop(key, None)
+        if key in models:
+            continue
+        fresh_calls, fresh_failed = calls - past["calls"], failed - past["failed"]
+        if fresh_calls < cfg.min_sample or fresh_failed < cfg.threshold * fresh_calls:
+            continue
+        last = history.get(key) or {}
+        repeat = bool(last) and now - last.get("at", 0) < cfg.max_cooldown
+        level = last.get("level", 0) + 1 if repeat else 1
+        reason = "failed %d of %d calls (%s), threshold %s" % (
+            fresh_failed, fresh_calls, _percent(fresh_failed, fresh_calls), "%d%%" % round(100 * cfg.threshold))
+        models[key] = _bench(provider, model, level, reason, now, cfg, calls, failed)
+        history[key] = {"level": level, "at": int(now)}
+        events.append(_event("bench", models[key], now))
+    return events
+
+
+def evaluate(rows: Optional[Sequence[Any]], state: Optional[Mapping[str, Any]], now: float,
+             cfg: Optional[Config] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """(new state, the events of this pass). `rows` are the gateway's rows
+    for one window ({target, model, hits, ok, limit}); None when the gateway
+    has no current answer, when only the clock moves a benched pair to its
+    trial. The input state is not changed."""
+    cfg = cfg or Config()
+    new = _clean(copy.deepcopy(dict(state)) if state else empty_state())
+    seen = _index(rows) if rows is not None else None
+    events = _trial_pass(new, seen, now, cfg)
     if seen is not None:
-        for key, (provider, model, calls, failed) in seen.items():
-            # A forgiven pair is judged on calls made since it returned; the
-            # forgiven mark follows a window that shrank.
-            past = forgiven.get(key) or {"calls": 0, "failed": 0}
-            past = {"calls": min(past["calls"], calls), "failed": min(past["failed"], failed)}
-            if past["calls"] or past["failed"]:
-                forgiven[key] = past
-            else:
-                forgiven.pop(key, None)
-            if key in models:
-                continue
-            fresh_calls, fresh_failed = calls - past["calls"], failed - past["failed"]
-            if fresh_calls < cfg.min_sample or fresh_failed < cfg.threshold * fresh_calls:
-                continue
-            last = history.get(key) or {}
-            repeat = bool(last) and now - last.get("at", 0) < cfg.max_cooldown
-            level = last.get("level", 0) + 1 if repeat else 1
-            reason = "failed %d of %d calls (%s), threshold %s" % (
-                fresh_failed, fresh_calls, _percent(fresh_failed, fresh_calls),
-                "%d%%" % round(100 * cfg.threshold))
-            models[key] = _bench(provider, model, level, reason, now, cfg, calls, failed)
-            history[key] = {"level": level, "at": int(now)}
-            events.append(_event("bench", models[key], now))
-
+        events += _bench_pass(new, seen, now, cfg)
     new["events"] = (new["events"] + events)[-EVENTS_KEPT:]
     return new, events
 
