@@ -3737,15 +3737,7 @@ def _validate_ticket_association(gh: GitHub, repo: str, number: int,
     if issue.get("state") != "open" or "loom:ticket" not in names:
         raise ValueError("ticket is not an open loom:ticket")
     if "loom:" + expected_state not in names:
-        # Self-heal: a ticket with an open PR that never left loom:running
-        # (lane crashed after opening the PR, or opened it without bus.lane pr)
-        # is moved to loom:pr instead of blocking the merge forever.
-        if expected_state == "pr" and bool({"loom:running", "loom:briefed"} & set(names)):
-            healed = [n for n in names if n not in ("loom:running", "loom:briefed", "loom:queued")]
-            healed.append("loom:pr")
-            gh.rest("PUT", "/repos/%s/issues/%d/labels" % association, {"labels": healed})
-        else:
-            raise ValueError("ticket is not loom:" + expected_state)
+        raise ValueError("ticket is not loom:" + expected_state)
     return association
 
 
