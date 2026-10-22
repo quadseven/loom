@@ -148,12 +148,12 @@ def review_outcome(threads: Sequence[Mapping[str, Any]],
     return FINDINGS if found else CLEAN
 
 
-def _lane_pull(pr: Mapping[str, Any], allowed: set, since: float) -> bool:
+def _lane_pull(pr: Dict[str, Any], allowed: set, since: float) -> bool:
     """A lane pull request a trusted login opened on a loom/ branch, closed
     in the window, that is no revert."""
     return (str((pr.get("head") or {}).get("ref") or "").startswith("loom/")
             and str((pr.get("user") or {}).get("login") or "").lower() in allowed
-            and _ts(pr.get("closed_at")) >= since and not revert.looks_like_revert(dict(pr)))
+            and _ts(pr.get("closed_at")) >= since and not revert.looks_like_revert(pr))
 
 
 class Scorecard:
