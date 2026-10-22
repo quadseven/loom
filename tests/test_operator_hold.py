@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-from bus import brain, factory, operator_hold, ship_paths  # noqa: E402
+from bus import brain, factory, merge_tier, operator_hold, ship_paths  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 from test_bus_factory import Base, FakeGitHub, NOW, REPO as FACTORY_REPO  # noqa: E402
 
@@ -384,7 +384,7 @@ def brain_routes(body, files, patches):
     details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work",
                "headRefOid": "checked", "headRepository": {"nameWithOwner": BRAIN_REPO},
                "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
-               "reviewThreads": {"nodes": []},
+               "reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": False}},
                "files": {"totalCount": len(files), "nodes": [{"path": f} for f in files]}}
     ticket = {"number": 9, "state": "open", "body": TICKET_BODY if "Leave" in body else "x",
               "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
@@ -398,6 +398,11 @@ def brain_routes(body, files, patches):
         "/repos/%s/contents/.github/workflows/sync.yml" % BRAIN_REPO: {
             "content": base64.b64encode(SYNC_WORKFLOW.encode()).decode()},
         "/repos/%s/contents/.github/workflows" % BRAIN_REPO: [{"name": "sync.yml"}],
+        # bus/merge_tier.py: the review check passed on the head, and no
+        # loom/ pull request merged in the last hour.
+        "/repos/%s/commits/checked/check-runs" % BRAIN_REPO: {"check_runs": [
+            {"name": "Grug - Elder", "status": "completed", "conclusion": "success"}]},
+        "/search/issues": {"total_count": 0},
     }
 
 
@@ -406,7 +411,9 @@ class BrainMerge(unittest.TestCase):
         fake = Route(brain_routes(body, list(files), patches or {}))
         try:
             brain.merge(GitHub("t", transport=fake), BRAIN_REPO, 8, (BRAIN_REPO, 9),
-                        env={"LOOM_MERGE_SETTLE_SECONDS": "0"})
+                        env={"LOOM_MERGE_SETTLE_SECONDS": "0",
+                             # The risk tier has its own tests (test_merge_tier.py).
+                             "LOOM_AUTO_MERGE_TIERS": ",".join(merge_tier.TIERS)})
         except ValueError as err:
             return fake, str(err)
         return fake, ""
