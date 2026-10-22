@@ -23,7 +23,10 @@ every gate and then stop with "shadow mode: would ..."; that is the expected
 result, not a failure to retry or work around. Name each such pull request or
 ticket in the journal as "would merge" or "would close". Never merge or close
 a pull request or issue any other way (curl, `gh pr merge`, `gh issue close`,
-the web), in shadow or out of it.
+the web), in shadow or out of it. In shadow, also never approve a pull
+request, add `ready-to-land` or `loom:shipped` by hand, or write onto a branch
+Loom does not own, by any route: `bus.brain move` records a ship instead of
+taking it, and the tick's `gh` refuses the rest and records them.
 
 ## What Muse does and leaves
 

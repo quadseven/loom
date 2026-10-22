@@ -13,13 +13,24 @@ Held while a repo is in shadow:
   request without merging it is let through: it can be reopened, its branch
   stays, and the factory closes superseded lane pull requests so lanes do
   not work twice;
-- a label that grants a merge or marks a ticket shipped (MERGE_LABELS);
+- a label that grants a merge or marks a ticket shipped (MERGE_LABELS), and
+  a GraphQL label write, whose label ids it cannot read;
+- an approving pull request review (REST or GraphQL);
+- a write straight onto a branch Loom does not own (a ref moved, a file
+  committed or deleted through the contents API, a merge-queue entry, a fork
+  sync): code landed with no pull request is a merge;
 - a branch deletion (DELETE .../git/refs/heads/B) other than Loom's own lock.
+
+A request the hold cannot read (a label list, the item's current labels, a
+body of an unknown shape, a read that failed in any way) is held as the
+worst request it could be.
 
 bus/github.py checks every request against classify() at its one choke point
 (GitHub._rest) and raises ShadowHeld instead of sending a held one; `bus.brain
 merge`, `bus.brain close` and the station's closes check active() first, so
-their record carries the risk tier and the gates that passed.
+their record carries the risk tier and the gates that passed. The brain's
+model rung holds a GitHub token of its own: lanes/mac/brain.sh puts a gh in
+front of it that asks gh_guard() first (`python3 -m bus.shadow gh-guard`).
 
 The switch fails closed. LOOM_SHADOW turns shadow off only when it reads
 exactly 0, false, off or no; unset, empty, any other value, or an error while
@@ -37,6 +48,7 @@ through: the hold does not depend on the record.
     python3 -m bus.shadow report [--since 24h|7d|2026-10-22[T10:00:00Z]]
                                  [--repo OWNER/NAME] [--json]
     python3 -m bus.shadow status
+    python3 -m bus.shadow gh-guard CWD GH-ARGS...   # exit 1: held
 """
 from __future__ import annotations
 
@@ -49,6 +61,7 @@ import sys
 import time
 import traceback
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from urllib.parse import unquote
 
 SWITCH = "LOOM_SHADOW"
 REPOS = "LOOM_SHADOW_REPOS"
@@ -57,8 +70,9 @@ LEDGER = "LOOM_SHADOW_LEDGER"
 OFF = ("0", "false", "off", "no")
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
-MERGE, CLOSE, LABEL, DELETE_BRANCH = "merge", "close", "label", "delete-branch"
-ACTIONS = (MERGE, CLOSE, LABEL, DELETE_BRANCH)
+MERGE, CLOSE, LABEL, DELETE_BRANCH, APPROVE = (
+    "merge", "close", "label", "delete-branch", "approve")
+ACTIONS = (MERGE, CLOSE, LABEL, DELETE_BRANCH, APPROVE)
 
 # Labels whose addition grants a merge or ships a ticket, each with the labels
 # that mean the ticket is already past it (a verified ticket moved back to
@@ -73,18 +87,39 @@ WORK_LABELS = ("loom:ticket", "loom:goal", "loom:backlog", "loom:rewritten")
 # invariant that healed, a factory incident whose check passed again, a health
 # signature not seen for a day. Holding those would hold the tickets they
 # block. Only an issue with one of these and no work label is let through.
-SIGNAL_LABELS = ("loom:invariant", "loom:factory", "loom:triage", "loom:recurring")
+SIGNAL_LABELS = ("loom:invariant", "loom:factory", "loom:recurring")
+# loom:triage is on every open issue that is not yet a ticket, a person's
+# too, so it marks a signal issue only on a health signature the watcher
+# filed: its body carries the watcher's marker (bus/watch.py MARKER).
+TRIAGE_LABEL = "loom:triage"
+WATCH_MARKER = "<!-- loom:watch v1 -->"
 # Loom's own coordination branches (bus/lock.py LOCK_BRANCH), never a PR head.
 OWN_BRANCH_PREFIX = "loom-lock/"
+# The branches Loom writes itself: lane, pin and roll pin work branches
+# (bus/tickets.py branch_for, bus/pin.py, bus/roll_pin.py) and the lock. A
+# write onto any other branch, the default branch above all, is a merge.
+OWN_WRITE_PREFIXES = ("loom/", OWN_BRANCH_PREFIX)
+_BRANCH_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
 
-_GRAPHQL_HELD = re.compile(
-    r"\b(mergePullRequest|enablePullRequestAutoMerge|mergeBranch|closeIssue|deleteRef)\b")
+# GraphQL mutations held whatever their input says: each merges, closes,
+# deletes a branch, writes onto a branch, or adds labels it names by id.
+_GRAPHQL_ACTIONS = {
+    "mergePullRequest": MERGE, "enablePullRequestAutoMerge": MERGE,
+    "enqueuePullRequest": MERGE, "mergeBranch": MERGE, "updateRef": MERGE,
+    "updateRefs": MERGE, "createCommitOnBranch": MERGE, "closeIssue": CLOSE,
+    "deleteRef": DELETE_BRANCH, "addLabelsToLabelable": LABEL,
+}
+_GRAPHQL_HELD = re.compile(r"\b(%s)\b" % "|".join(_GRAPHQL_ACTIONS))
 _GRAPHQL_UPDATE = re.compile(r"\bupdateIssue\b")
+_GRAPHQL_LABEL_IDS = re.compile(r"\b(updateIssue|updatePullRequest)\b[\s\S]*\blabelIds\b")
+_GRAPHQL_REVIEW = re.compile(r"\b(addPullRequestReview|submitPullRequestReview)\b")
 _MERGE_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/pulls/([0-9]+)/merge$")
-_MERGES_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/merges$")
+_MERGES_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/(merges|merge-upstream)$")
 _ISSUE_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/issues/([0-9]+)$")
 _LABELS_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/issues/([0-9]+)/labels$")
 _REF_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/git/refs/heads/(.+)$")
+_CONTENTS_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/contents/(.+)$")
+_REVIEW_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/pulls/([0-9]+)/reviews(?:/[0-9]+/events)?$")
 
 
 class Request(NamedTuple):
@@ -140,29 +175,58 @@ def describe(env: Optional[Mapping[str, str]] = None) -> str:
     return "shadow mode on for %s: merges and closes are recorded, not taken" % which
 
 
+def api_path(path: Any) -> str:
+    """A request path as GitHub routes it: no scheme, host, query or
+    fragment, percent-escapes decoded, runs of slashes and a trailing slash
+    gone. Every pattern here matches this form, so a path spelled another way
+    is the same request."""
+    path = str(path or "")
+    if "://" in path:
+        path = "/" + path.split("://", 1)[1].partition("/")[2]
+    path = unquote(path.split("#", 1)[0].split("?", 1)[0])
+    return re.sub(r"/{2,}", "/", path).rstrip("/")
+
+
+def _own_branch(name: str, prefixes: Tuple[str, ...]) -> bool:
+    """Whether `name` is a plain branch name under one of Loom's prefixes."""
+    return (name.startswith(prefixes) and ".." not in name
+            and _BRANCH_NAME.fullmatch(name) is not None)
+
+
 def classify(method: str, path: str, body: Any) -> Optional[Request]:
     """The held action a REST or GraphQL request is, or None. Pure: the
     exemptions that need the item (a signal issue's close, a label already
-    on) are github.py's, named by Request.check."""
+    on) are github.py's, named by Request.check. A body of a shape it cannot
+    read is held when the path takes a body that could be held."""
     method = str(method or "").upper()
-    path = str(path or "").split("?", 1)[0].rstrip("/")
-    if "://" in path:
-        path = "/" + path.split("://", 1)[1].split("/", 1)[-1]
+    path = api_path(path)
     if method == "PUT":
         found = _MERGE_PATH.match(path)
         if found:
             return Request(MERGE, found.group(1), int(found.group(2)), "pr", "", "")
     if method == "POST" and _MERGES_PATH.match(path):
-        return Request(MERGE, _MERGES_PATH.match(path).group(1), 0, "branch", "merge API", "")
+        found = _MERGES_PATH.match(path)
+        return Request(MERGE, found.group(1), 0, "branch", found.group(2) + " API", "")
     if method == "PATCH":
         found = _ISSUE_PATH.match(path)
-        if found and isinstance(body, dict) and str(body.get("state") or "").lower() == "closed":
-            return Request(CLOSE, found.group(1), int(found.group(2)), "issue",
-                           str(body.get("state_reason") or "completed"), "close")
-        if found and isinstance(body, dict) and "labels" in body:
-            held = _label_request(found.group(1), int(found.group(2)), body["labels"])
-            if held:
-                return held
+        if found and isinstance(body, dict):
+            repo, number = found.group(1), int(found.group(2))
+            labels = (_label_request(repo, number, body["labels"]) if "labels" in body
+                      else None)
+            if labels is not None and not labels.check:
+                return labels   # a label list it cannot read
+            if str(body.get("state") or "").strip().lower() == "closed":
+                # A close that may go (a signal issue, a pull request) still
+                # holds a merge or ship label added in the same request.
+                return Request(CLOSE, repo, number, "issue",
+                               str(body.get("state_reason") or "completed"), "close",
+                               labels.labels if labels else ())
+            if labels is not None:
+                return labels
+        found = _REF_PATH.match(path)
+        if found and not _own_branch(found.group(2), OWN_WRITE_PREFIXES):
+            return Request(MERGE, found.group(1), 0, "branch",
+                           "ref update of " + found.group(2), "")
     if method in ("POST", "PUT"):
         found = _LABELS_PATH.match(path)
         if found:
@@ -170,21 +234,46 @@ def classify(method: str, path: str, body: Any) -> Optional[Request]:
                                   body.get("labels") if isinstance(body, dict) else body)
             if held:
                 return held
+    if method in ("PUT", "DELETE"):
+        found = _CONTENTS_PATH.match(path)
+        if found:
+            branch = str(body.get("branch") or "") if isinstance(body, dict) else ""
+            if not _own_branch(branch, OWN_WRITE_PREFIXES):
+                return Request(MERGE, found.group(1), 0, "branch", "%s of %s on %s" % (
+                    "write" if method == "PUT" else "delete", found.group(2),
+                    branch or "the default branch"), "")
+    if method == "POST":
+        found = _REVIEW_PATH.match(path)
+        if found and (not isinstance(body, dict)
+                      or str(body.get("event") or "").strip().upper() == "APPROVE"):
+            return Request(APPROVE, found.group(1), int(found.group(2)), "pr",
+                           "approving review", "")
     if method == "DELETE":
         found = _REF_PATH.match(path)
-        if found and not found.group(2).startswith(OWN_BRANCH_PREFIX):
+        if found and not _own_branch(found.group(2), (OWN_BRANCH_PREFIX,)):
             return Request(DELETE_BRANCH, found.group(1), 0, "branch", found.group(2), "")
-    if method == "POST" and path.endswith("/graphql") and isinstance(body, dict):
-        text = str(body.get("query") or "")
-        held = _GRAPHQL_HELD.search(text)
-        if held:
-            name = held.group(1)
-            action = (MERGE if "erge" in name else DELETE_BRANCH if name == "deleteRef"
-                      else CLOSE)
-            return Request(action, "", 0, "pr" if action == MERGE else "issue", name, "")
-        if _GRAPHQL_UPDATE.search(text) and "CLOSED" in (
-                text + json.dumps(body.get("variables") or {})):
-            return Request(CLOSE, "", 0, "issue", "update to CLOSED", "")
+    if method == "POST" and path.endswith("/graphql"):
+        return _graphql_request(body)
+    return None
+
+
+def _graphql_request(body: Any) -> Optional[Request]:
+    if not isinstance(body, dict):
+        return Request(MERGE, "", 0, "pr", "unreadable GraphQL request", "")
+    text = str(body.get("query") or "")
+    words = text + json.dumps(body.get("variables") or {}, default=str)
+    held = _GRAPHQL_HELD.search(text)
+    if held:
+        name = held.group(1)
+        action = _GRAPHQL_ACTIONS[name]
+        kind = {MERGE: "pr", LABEL: "issue", CLOSE: "issue"}.get(action, "branch")
+        return Request(action, "", 0, kind, name, "")
+    if _GRAPHQL_LABEL_IDS.search(text):
+        return Request(LABEL, "", 0, "issue", "label ids in a GraphQL update", "")
+    if _GRAPHQL_REVIEW.search(text) and "APPROVE" in words:
+        return Request(APPROVE, "", 0, "pr", "approving review (GraphQL)", "")
+    if _GRAPHQL_UPDATE.search(text) and "CLOSED" in words:
+        return Request(CLOSE, "", 0, "issue", "update to CLOSED", "")
     return None
 
 
@@ -203,9 +292,23 @@ def _label_request(repo: str, number: int, labels: Any) -> Optional[Request]:
         return None
     return Request(LABEL, repo, number, "issue", ", ".join(found), "label", found)
 
+
+def labels_of(item: Any) -> Optional[List[str]]:
+    """The label names of an item as read, lower case; None when the item or
+    its label list cannot be read (so nothing counts as already on)."""
+    if not isinstance(item, dict) or not isinstance(item.get("labels"), list):
+        return None
+    names = []
+    for x in item["labels"]:
+        name = x.get("name") if isinstance(x, dict) else x
+        if isinstance(name, str):
+            names.append(name.strip().lower())
+    return names
+
+
 def label_is_new(label: str, have: Sequence[str]) -> bool:
     """Whether adding `label` to an item that has `have` is a new grant."""
-    have_l = {str(h).lower() for h in have}
+    have_l = {str(h).strip().lower() for h in have}
     return label not in have_l and not any(x in have_l for x in MERGE_LABELS.get(label, ()))
 
 
@@ -213,14 +316,18 @@ def close_let_through(issue: Any) -> bool:
     """Whether a close of `issue` (as read just now; None when the read
     failed) goes through in shadow: a pull request (closed unmerged, it can
     be reopened), or Loom's own signal issue closing on its rule (a signal
-    label and no work label)."""
+    label, or a watcher's health signature, and no work label). An issue
+    whose labels cannot be read is held."""
     if not isinstance(issue, dict):
         return False
     if "pull_request" in issue:
         return True
-    names = {str((x or {}).get("name") or "").lower() if isinstance(x, dict) else str(x).lower()
-             for x in issue.get("labels") or []}
-    return bool(names & set(SIGNAL_LABELS)) and not names & set(WORK_LABELS)
+    names = labels_of(issue)
+    if names is None or set(names) & set(WORK_LABELS):
+        return False
+    if set(names) & set(SIGNAL_LABELS):
+        return True
+    return TRIAGE_LABEL in names and WATCH_MARKER in str(issue.get("body") or "")
 
 
 def ledger_path(env: Optional[Mapping[str, str]] = None) -> str:
@@ -332,7 +439,7 @@ def parse_since(text: str, now: float) -> float:
 
 def _counts(entries: Sequence[Mapping[str, Any]]) -> str:
     words = {MERGE: "merge", CLOSE: "close", LABEL: "ship or merge label",
-             DELETE_BRANCH: "branch deletion"}
+             DELETE_BRANCH: "branch deletion", APPROVE: "approving review"}
     parts = []
     for action in ACTIONS:
         n = sum(1 for e in entries if e.get("action") == action)
@@ -394,7 +501,149 @@ def report_lines(entries: Sequence[Mapping[str, Any]], since: float, path: str) 
     return lines
 
 
+# -- the brain rung's gh ------------------------------------------------------
+# lanes/mac/brain.sh runs the brain's model with a GitHub token, so the model
+# could merge or close with gh itself. Its gh asks gh_guard() first.
+
+# The worst body a write could carry: a body the guard cannot read is held
+# whenever that path holds any body.
+_WORST_BODY = {"state": "closed", "labels": [None], "event": "APPROVE"}
+# gh api flags that take a value (the rest are switches).
+_GH_API_VALUE_FLAGS = ("-X", "--method", "-H", "--header", "-f", "--raw-field", "-F",
+                       "--field", "--input", "-q", "--jq", "-t", "--template", "--cache",
+                       "-p", "--preview", "--hostname")
+_PR_URL = re.compile(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:pull|issues)/([0-9]+)")
+
+
+def _flag_values(args: Sequence[str], *names: str) -> List[str]:
+    """Every value given to one of the flags `names` (--x v, --x=v, -Xv)."""
+    out = []
+    for i, arg in enumerate(args):
+        for name in names:
+            if arg == name and i + 1 < len(args):
+                out.append(args[i + 1])
+            elif name.startswith("--") and arg.startswith(name + "="):
+                out.append(arg[len(name) + 1:])
+            elif len(name) == 2 and arg.startswith(name) and len(arg) > 2 and not arg.startswith("--"):
+                out.append(arg[2:])
+    return out
+
+
+def _gh_target(args: Sequence[str]) -> Tuple[str, int]:
+    """The repo (-R/--repo or a URL) and number a gh pr or issue command names."""
+    repo = (_flag_values(args, "-R", "--repo") or [""])[-1]
+    number = 0
+    for arg in args:
+        url = _PR_URL.search(arg)
+        if url:
+            repo, number = repo or url.group(1), int(url.group(2))
+        elif arg.isdigit() and not number:
+            number = int(arg)
+    return repo, number
+
+
+def _gh_api_request(args: Sequence[str], cwd: str) -> Optional[Request]:
+    method, path, fields, unreadable = "", "", {}, False   # type: str, str, Dict[str, Any], bool
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        name, eq, inline = arg.partition("=")
+        if arg.startswith("-X") and len(arg) > 2:
+            method = arg[2:]
+        elif name in _GH_API_VALUE_FLAGS:
+            value = inline if eq else (args[i + 1] if i + 1 < len(args) else "")
+            i += 0 if eq else 1
+            if name in ("-X", "--method"):
+                method = value
+            elif name in ("-f", "--raw-field", "-F", "--field"):
+                key, _, val = value.partition("=")
+                if name in ("-F", "--field") and val.startswith("@"):
+                    unreadable = True
+                if key.endswith("[]"):
+                    fields.setdefault(key[:-2], []).append(val)
+                else:
+                    fields[key] = val
+            elif name == "--input":
+                try:
+                    with open(os.path.join(cwd, value), encoding="utf-8") as fh:
+                        loaded = json.load(fh)
+                    fields = loaded if isinstance(loaded, dict) else {"": loaded}
+                    unreadable = not isinstance(loaded, dict)
+                except (OSError, ValueError):
+                    unreadable = True   # stdin ("-") included: the guard cannot read it
+                method = method or "POST"
+        elif not arg.startswith("-") and not path:
+            path = arg
+        i += 1
+    method = (method or ("POST" if fields or unreadable else "GET")).upper()
+    if method == "GET":
+        return None
+    path = path if path.startswith("/") else "/" + path
+    if unreadable:
+        # The worst body that path takes; a GraphQL body unread is held as is.
+        body: Any = None if path.rstrip("/").endswith("/graphql") else _WORST_BODY
+    else:
+        body = fields
+    found = classify(method, path, body)
+    if found and "{" in found.repo:
+        found = found._replace(repo="")   # gh fills in {owner}/{repo}: any repo
+    return found
+
+
+def gh_request(argv: Sequence[str], cwd: str = ".") -> Optional[Request]:
+    """The held action a gh command line (its arguments after `gh`) is, or
+    None. It reads no item, so it holds what the choke point would hold
+    before its exemptions: the brain merges and closes through bus.brain."""
+    args = [str(a) for a in argv]
+    group, sub = (args + ["", ""])[:2]
+    rest = args[2:]
+    if group == "api":
+        return _gh_api_request(args[1:], cwd)
+    repo, number = _gh_target(rest)
+    if group == "pr" and sub == "merge":
+        return Request(MERGE, repo, number, "pr", "gh pr merge", "")
+    if group == "issue" and sub == "close":
+        return Request(CLOSE, repo, number, "issue", "gh issue close", "")
+    if group == "pr" and sub == "review" and any(a in ("-a", "--approve") for a in rest):
+        return Request(APPROVE, repo, number, "pr", "gh pr review --approve", "")
+    if group in ("pr", "issue") and sub == "edit":
+        added = [n.strip().lower() for v in _flag_values(rest, "--add-label")
+                 for n in v.split(",")]
+        found = tuple(dict.fromkeys(n for n in added if n in MERGE_LABELS))
+        if found:
+            return Request(LABEL, repo, number, "issue", ", ".join(found), "label", found)
+    return None
+
+
+def gh_guard(cwd: str, argv: Sequence[str]) -> int:
+    """0 when the gh command may run; 1, after recording it, when shadow mode
+    holds it. Any doubt holds it."""
+    try:
+        found = gh_request(argv, cwd)
+    except Exception as err:  # noqa: BLE001 - a command it cannot read is held
+        found = Request(MERGE, "", 0, "pr", "unreadable gh command (%s)" % type(err).__name__, "")
+    if found is None or not active(found.repo or None):
+        return 0
+    reason = "gh %s" % " ".join(argv)[:300]
+    for label in found.labels or ("",):
+        record(found.action, found.repo, found.number, found.kind, reason=reason,
+               label=label, source="brain rung gh")
+    print("shadow mode: would %s %s; recorded in the shadow ledger, not sent. Merge and "
+          "close only through python3 -m bus.brain merge and close, which record them "
+          "(docs/MUSE.md)." % (found.action, "%s#%d" % (found.repo, found.number)
+                               if found.number else (found.repo or found.detail)),
+          file=sys.stderr)
+    return 1
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["gh-guard"]:
+        # Before argparse: gh's own flags are not this command's.
+        if len(argv) < 2:
+            print("usage: python3 -m bus.shadow gh-guard CWD GH-ARGS...", file=sys.stderr)
+            return 2
+        return gh_guard(argv[1], argv[2:])
     parser = argparse.ArgumentParser(prog="python3 -m bus.shadow")
     sub = parser.add_subparsers(dest="command", required=True)
     rep = sub.add_parser("report", help="list the would-actions since a time, with links")

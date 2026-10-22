@@ -1487,18 +1487,36 @@ operator:
   Muse, the deploy-watch revert path, the roll pin);
 - an issue close (a done or verified ticket, an epic, a rewritten source
   issue, an operator-claimed issue) and a move to `loom:shipped`;
-- a label that grants a merge (`ready-to-land`);
+- a label that grants a merge (`ready-to-land`), and any GraphQL label write
+  (it names labels by id);
+- an approving pull request review;
+- a write straight onto a branch Loom does not own (a moved ref, a file
+  committed through the contents API, a merge-queue entry, a fork sync):
+  code that lands with no pull request is a merge;
 - a branch deletion after a merge.
 
 Closing a pull request without merging it still happens (it can be reopened
-and its branch stays), and so do the closes of Loom's own signal issues (an
-invariant breach, a factory incident, a health signature) that carry no work
-label.
+and its branch stays), and so do the closes of Loom's own signal issues that
+carry no work label: an invariant breach, a factory incident, and a health
+signature the watcher filed (`loom:triage` with the watcher's marker in its
+body; `loom:triage` alone is on people's own issues too, and their close is
+held).
 
 `bus/github.py` checks every request at its one choke point and refuses a
 held one with `ShadowHeld`, whichever code sent it; `bus.brain merge`,
 `bus.brain close` and the station's closes check first, so their record names
-the risk tier and the gates that passed. Each decision is one line of an
+the risk tier and the gates that passed. Every merge or ship label in a
+request is checked, and the whole request is held if any one is new. The
+hold fails safe: a request it cannot read (a label list or body of an
+unknown shape, the item's labels unreadable, a read that failed in any way)
+is held as the worst request it could be.
+
+The brain's model rung holds a GitHub token of its own, so
+`lanes/mac/brain.sh` puts a `gh` in front of it that asks
+`python3 -m bus.shadow gh-guard` first and refuses, and records, a merge, an
+issue close, an approving review or a merge or ship label, with the same
+switch. It covers `gh` only: a rung that sends the request another way (curl)
+is held by its instructions alone (`docs/MUSE.md`, and the tick's prompt). Each decision is one line of an
 append-only JSONL ledger, `LOOM_SHADOW_LEDGER` or
 `$LOOM_HOME/state/shadow/ledger.jsonl`: time, repo, number, action, tier,
 gates passed, reason, head SHA, caller and link, written once per action and

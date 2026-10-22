@@ -717,39 +717,48 @@ class GitHub:
                 self.comment_edits = True
 
     def _hold_in_shadow(self, method: str, path: str, body: Any) -> None:
-        """Record and refuse a merge, close, ship or merge label, or branch
-        deletion in a repo in shadow mode (bus/shadow.py). Every Python write
-        to GitHub passes through here, whichever caller sent it. An exemption
-        (a signal issue's close, a label the item already has) needs the item
-        read: a read that fails holds the action."""
-        if method == "GET":
+        """Record and refuse a merge, close, ship or merge label, approving
+        review, write onto a branch Loom does not own, or branch deletion in a
+        repo in shadow mode (bus/shadow.py). Every Python write to GitHub
+        passes through here, whichever caller sent it. An exemption (a signal
+        issue's close, a label the item already has) needs the item read: a
+        read that fails in any way, or an item whose labels cannot be read,
+        holds the whole request."""
+        if str(method or "").upper() == "GET":
             return
-        found = shadow.classify(method, path, body)
+        text = str(path or "")
+        if "://" in text and text.startswith(self.api + "/"):
+            text = text[len(self.api):]   # an API under a path prefix routes the rest
+        found = shadow.classify(method, text, body)
         if found is None or not shadow.active(found.repo or None):
             return
         item: Any = None
         if found.check:
             try:
                 item = self._rest("GET", "/repos/%s/issues/%d" % (found.repo, found.number)).data
-            except GitHubError:
+            except Exception:  # noqa: BLE001 - any failed read holds the action
                 item = None
-            if found.check == "close" and shadow.close_let_through(item):
+        action = found.action
+        if found.check == "close" and shadow.close_let_through(item):
+            if not found.labels:
                 return
+            action = shadow.LABEL   # the close may go; the labels with it decide
         # Each merge or ship label the request adds that the item does not
-        # already have (all of them when the item could not be read): held if any.
-        new_labels = list(found.labels)
-        if found.check == "label" and isinstance(item, dict):
-            have = [str((x or {}).get("name") or "") for x in item.get("labels") or []
-                    if isinstance(x, dict)]
-            new_labels = [n for n in found.labels if shadow.label_is_new(n, have)]
-            if not new_labels:
-                return
-        reason = "%s %s%s" % (method, path.split("?", 1)[0],
+        # already have (every one when its labels cannot be read): held if any.
+        new_labels: List[str] = []
+        if action == shadow.LABEL:
+            new_labels = list(found.labels)
+            have = shadow.labels_of(item)
+            if found.labels and have is not None:
+                new_labels = [n for n in found.labels if shadow.label_is_new(n, have)]
+                if not new_labels:
+                    return
+        reason = "%s %s%s" % (str(method).upper(), shadow.api_path(text),
                               " (%s)" % found.detail if found.detail else "")
-        entries = [shadow.record(found.action, found.repo, found.number, found.kind,
+        entries = [shadow.record(action, found.repo, found.number, found.kind,
                                  reason=reason, label=label, source=shadow.caller())
                    for label in (new_labels or [""])]
-        what = "add %s to" % ", ".join(new_labels) if new_labels else found.action
+        what = "add %s to" % ", ".join(new_labels) if new_labels else action
         raise ShadowHeld("shadow mode: would %s %s; recorded in the shadow ledger, not sent"
                          % (what, "%s#%d" % (found.repo, found.number)
                             if found.number else (found.repo or found.detail)), entries[0])

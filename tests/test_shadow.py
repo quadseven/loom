@@ -22,7 +22,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, lock, shadow, station  # noqa: E402
+from bus import brain, lock, shadow, station, watch  # noqa: E402
 from bus.github import GitHub, GitHubError, ShadowHeld  # noqa: E402
 
 import test_bus_brain as tbb  # noqa: E402
@@ -136,6 +136,7 @@ class ChokePointTest(ShadowCase):
         ("PUT", "/repos/%s/issues/9/labels" % REPO, {"labels": ["loom:ticket", "ready-to-land"]},
          shadow.LABEL),
         ("PATCH", "/repos/%s/issues/9" % REPO, {"labels": ["loom:shipped"]}, shadow.LABEL),
+        ("POST", "/repos/%s/pulls/8/reviews" % REPO, {"event": "APPROVE"}, shadow.APPROVE),
         ("DELETE", "/repos/%s/git/refs/heads/loom/9-work" % REPO, None, shadow.DELETE_BRANCH),
         ("POST", "/graphql", {"query": "mutation { mergePullRequest(input:{pullRequestId:\"x\"})"
                                        " { clientMutationId } }"}, shadow.MERGE),
@@ -428,6 +429,254 @@ class DigestTest(ShadowCase):
         text = case.sent[0]["content"]
         self.assertIn("Shadow mode (every repo): Loom would have done 1 merge in 1 repo", text)
         self.assertIn("python3 -m bus.shadow report --since", text)
+
+
+class HoldFailsSafeTest(ShadowCase):
+    """Security review of the label hold (loom#1515): every merge or ship
+    label in a request is read, and anything the hold cannot read holds the
+    whole request."""
+
+    def test_current_labels_it_cannot_read_hold_the_write(self):
+        for labels in (5, None, "ready-to-land", {"name": "ready-to-land"}):
+            with self.subTest(labels=labels):
+                found = issue(40, ("loom:ticket",))
+                found["labels"] = labels
+                fake = Recorder({"/repos/%s/issues/40" % REPO: found})
+                with self.assertRaises(ShadowHeld):
+                    GitHub("t", transport=fake).rest(
+                        "POST", "/repos/%s/issues/40/labels" % REPO,
+                        {"labels": ["loom:merged", "ready-to-land"]})
+                self.assertEqual(fake.sent, [])
+        # An item read with no labels list at all is unreadable too.
+        found = issue(41, ("ready-to-land",))
+        del found["labels"]
+        fake = Recorder({"/repos/%s/issues/41" % REPO: found})
+        with self.assertRaises(ShadowHeld):
+            GitHub("t", transport=fake).rest("POST", "/repos/%s/issues/41/labels" % REPO,
+                                             {"labels": ["ready-to-land"]})
+        self.assertEqual(fake.sent, [])
+
+    def test_a_read_that_fails_in_any_way_holds_and_records_the_write(self):
+        class Broken(Recorder):
+            def __call__(self, method, url, headers, body):
+                if method == "GET":
+                    raise RuntimeError("the token could not be minted")
+                return super().__call__(method, url, headers, body)
+        for method, path, body in (
+                ("POST", "/repos/%s/issues/42/labels" % REPO, {"labels": ["ready-to-land"]}),
+                ("PATCH", "/repos/%s/issues/42" % REPO, {"state": "closed"})):
+            with self.subTest(body=body):
+                fake = Broken()
+                with self.assertRaises(ShadowHeld):
+                    GitHub("t", transport=fake).rest(method, path, body)
+                self.assertEqual(fake.sent, [])
+        self.assertEqual(sorted(e["action"] for e in self.entries()), ["close", "label"])
+
+    def test_a_close_that_may_go_still_holds_a_new_merge_label_in_the_same_request(self):
+        items = {"/repos/%s/issues/43" % REPO: issue(43, pr=True),
+                 "/repos/%s/issues/44" % REPO: issue(44, ("loom:invariant",))}
+        for number, label in ((43, "ready-to-land"), (44, "loom:shipped")):
+            with self.subTest(number=number):
+                fake = Recorder(items)
+                with self.assertRaisesRegex(ShadowHeld, "would add %s" % label):
+                    GitHub("t", transport=fake).rest(
+                        "PATCH", "/repos/%s/issues/%d" % (REPO, number),
+                        {"state": "closed", "labels": ["loom:triage", label]})
+                self.assertEqual(fake.sent, [])
+        # With no merge or ship label in it, the same close goes through.
+        fake = Recorder(items)
+        GitHub("t", transport=fake).rest("PATCH", "/repos/%s/issues/43" % REPO,
+                                         {"state": "closed", "labels": ["loom:closed-unmerged"]})
+        self.assertEqual(len(fake.sent), 1)
+
+    def test_a_triage_issue_closes_only_when_it_is_a_watch_signature(self):
+        # loom:triage is on every issue not yet a ticket, a person's too: it
+        # alone does not make an issue Loom's own signal issue.
+        mine = issue(45, ("loom:triage",))
+        mine["body"] = "%s\nstation: a signature" % watch.MARKER
+        items = {"/repos/%s/issues/45" % REPO: mine,
+                 "/repos/%s/issues/46" % REPO: issue(46, ("loom:triage",))}
+        fake = Recorder(items)
+        gh = GitHub("t", transport=fake)
+        gh.rest("PATCH", "/repos/%s/issues/45" % REPO, {"state": "closed"})
+        with self.assertRaises(ShadowHeld):
+            gh.rest("PATCH", "/repos/%s/issues/46" % REPO,
+                    {"state": "closed", "state_reason": "not_planned"})
+        self.assertEqual([p for _, p, _ in fake.sent], ["/repos/%s/issues/45" % REPO])
+        self.assertEqual(shadow.WATCH_MARKER, watch.MARKER)
+
+
+class OtherGrantsTest(ShadowCase):
+    """Adversarial review of the rest of the diff (loom#1515): an approving
+    review, a write straight onto a branch Loom does not own, a merge-queue
+    or label mutation, and a path spelled another way are held too."""
+
+    def held(self, method, path, body=None, gh=None):
+        fake = Recorder({"/repos/%s/issues/9" % REPO: issue(9, ("loom:ticket",))})
+        with self.assertRaises(ShadowHeld) as caught:
+            (gh or GitHub)("t", transport=fake).rest(method, path, body)
+        self.assertEqual(fake.sent, [])
+        return caught.exception.entry
+
+    def sent(self, method, path, body=None):
+        fake = Recorder()
+        GitHub("t", transport=fake).rest(method, path, body)
+        self.assertEqual(len(fake.sent), 1)
+
+    def test_an_approving_review_is_held(self):
+        for method, path, body in (
+                ("POST", "/repos/%s/pulls/9/reviews" % REPO, {"event": "APPROVE", "body": "ok"}),
+                ("POST", "/repos/%s/pulls/9/reviews" % REPO, "APPROVE"),
+                ("POST", "/repos/%s/pulls/9/reviews/7/events" % REPO, {"event": "approve"}),
+                ("POST", "/graphql", {"query": "mutation($id:ID!) { addPullRequestReview(input:"
+                                               "{pullRequestId:$id, event:APPROVE}) { clientMutationId } }"}),
+                ("POST", "/graphql", {"query": "mutation($id:ID!,$e:PullRequestReviewEvent!) {"
+                                               " submitPullRequestReview(input:{pullRequestReviewId:$id,"
+                                               " event:$e}) { clientMutationId } }",
+                                      "variables": {"e": "APPROVE"}})):
+            with self.subTest(path=path, body=body):
+                self.assertEqual(self.held(method, path, body)["action"], shadow.APPROVE)
+        self.sent("POST", "/repos/%s/pulls/9/reviews" % REPO, {"event": "COMMENT", "body": "x"})
+        self.sent("POST", "/graphql", {"query": "mutation($id:ID!,$body:String!) { "
+                                                "addPullRequestReviewThreadReply(input:{body:$body}) { "
+                                                "comment { id } } }"})
+
+    def test_a_write_onto_a_branch_loom_does_not_own_is_held(self):
+        # A ref moved or a file committed onto the default branch lands code
+        # with no pull request: a merge by another name.
+        for method, path, body in (
+                ("PATCH", "/repos/%s/git/refs/heads/main" % REPO, {"sha": "a" * 40, "force": True}),
+                ("PATCH", "/repos/%s/git/refs/heads/release%%2F1" % REPO, {"sha": "a" * 40}),
+                ("PUT", "/repos/%s/contents/README.md" % REPO, {"message": "m", "content": "eA=="}),
+                ("PUT", "/repos/%s/contents/README.md" % REPO,
+                 {"message": "m", "content": "eA==", "branch": "main"}),
+                ("DELETE", "/repos/%s/contents/README.md" % REPO, {"message": "m", "sha": "b"}),
+                ("PUT", "/repos/%s/contents/README.md" % REPO, "not an object"),
+                ("POST", "/repos/%s/merge-upstream" % REPO, {"branch": "main"})):
+            with self.subTest(method=method, path=path, body=body):
+                self.assertEqual(self.held(method, path, body)["action"], shadow.MERGE)
+        # Loom's own work branches (bus/lane.py, bus/pin.py, bus/roll_pin.py)
+        # and the brain lock are written as before.
+        self.sent("PATCH", "/repos/%s/git/refs/heads/loom%%2F12-fix-a-thing" % REPO,
+                  {"sha": "a" * 40, "force": False})
+        self.sent("PUT", "/repos/%s/contents/pins.env" % REPO,
+                  {"message": "m", "content": "eA==", "sha": "c", "branch": "loom/pin-0123456789ab"})
+        self.sent("PATCH", "/repos/%s/git/refs/heads/%s" % (REPO, lock.LOCK_BRANCH), {"sha": "a" * 40})
+
+    def test_merge_queue_label_and_ref_mutations_are_held(self):
+        for query, action in (
+                ("mutation($id:ID!) { enqueuePullRequest(input:{pullRequestId:$id}) { clientMutationId } }",
+                 shadow.MERGE),
+                ("mutation { addLabelsToLabelable(input:{labelableId:\"x\", labelIds:[\"y\"]})"
+                 " { clientMutationId } }", shadow.LABEL),
+                ("mutation { updateIssue(input:{id:\"x\", labelIds:[\"y\"]}) { issue { id } } }",
+                 shadow.LABEL),
+                ("mutation { updatePullRequest(input:{pullRequestId:\"x\", labelIds:[\"y\"]})"
+                 " { clientMutationId } }", shadow.LABEL),
+                ("mutation { updateRefs(input:{repositoryId:\"x\", refUpdates:[]}) { clientMutationId } }",
+                 shadow.MERGE),
+                ("mutation($i:CreateCommitOnBranchInput!) { createCommitOnBranch(input:$i) { commit { oid } } }",
+                 shadow.MERGE)):
+            with self.subTest(query=query):
+                self.assertEqual(self.held("POST", "/graphql", {"query": query})["action"], action)
+        self.assertEqual(self.held("POST", "/graphql", ["not", "an", "object"])["action"],
+                         shadow.MERGE)
+
+    def test_a_path_spelled_another_way_is_still_held(self):
+        for path in ("/repos/%s/pulls/8/merge#x" % REPO,
+                     "/repos/%s//pulls/8/merge" % REPO,
+                     "/repos/%s/pulls/8/%%6derge" % REPO,
+                     "https://api.github.com/repos/%s/pulls/8/merge/" % REPO):
+            with self.subTest(path=path):
+                self.assertEqual(self.held("PUT", path, {})["action"], shadow.MERGE)
+        # The method in lower case is the same request.
+        self.assertEqual(self.held("put", "/repos/%s/pulls/8/merge" % REPO, {})["action"],
+                         shadow.MERGE)
+        # An API under a path prefix (GitHub Enterprise): its absolute URLs.
+        api = "https://ghe.example.invalid/api/v3"
+        self.assertEqual(self.held("PUT", api + "/repos/%s/pulls/8/merge" % REPO, {},
+                                   gh=lambda t, transport: GitHub(t, api=api, transport=transport)
+                                   )["action"], shadow.MERGE)
+
+    def test_only_the_brain_lock_itself_may_be_deleted(self):
+        for branch in ("loom-lock/../main", "loom-lock%2F..%2Fmain", "loom-lock/a b"):
+            with self.subTest(branch=branch):
+                self.assertEqual(self.held("DELETE", "/repos/%s/git/refs/heads/%s" % (REPO, branch))
+                                 ["action"], shadow.DELETE_BRANCH)
+
+
+class GhGuardTest(ShadowCase):
+    """The brain rung's gh (lanes/mac/brain.sh): a model that holds a token
+    may run gh itself, so in shadow its gh refuses and records what the
+    choke point would hold."""
+
+    HELD = [
+        ["pr", "merge", "5", "-R", REPO, "--squash"],
+        ["pr", "merge", "--auto", "https://github.com/%s/pull/5" % REPO],
+        ["issue", "close", "5", "--repo", REPO],
+        ["pr", "review", "5", "-R", REPO, "--approve"],
+        ["pr", "review", "5", "-a", "-R", REPO],
+        ["issue", "edit", "5", "-R", REPO, "--add-label", "ready-to-land"],
+        ["pr", "edit", "5", "-R", REPO, "--add-label=loom:merged,Loom:Shipped"],
+        ["api", "-X", "PUT", "repos/%s/pulls/5/merge" % REPO],
+        ["api", "--method=PATCH", "/repos/%s/issues/5" % REPO, "-f", "state=closed"],
+        ["api", "repos/%s/issues/5/labels" % REPO, "-f", "labels[]=ready-to-land"],
+        ["api", "graphql", "-f", "query=mutation { mergePullRequest(input:{pullRequestId:\"x\"})"
+                                 " { clientMutationId } }"],
+        ["api", "-XPATCH", "repos/%s/issues/5" % REPO, "--input", "-"],
+        ["api", "-X", "PUT", "repos/{owner}/{repo}/pulls/5/merge"],
+        ["api", "-X", "PATCH", "repos/%s/git/refs/heads/main" % REPO, "-f", "sha=abc"],
+    ]
+    LET = [
+        ["pr", "view", "5", "-R", REPO, "--json", "title"],
+        ["pr", "close", "5", "-R", REPO],
+        ["issue", "comment", "5", "-R", REPO, "--body", "ready-to-land soon"],
+        ["issue", "edit", "5", "-R", REPO, "--add-label", "loom:answered"],
+        ["pr", "review", "5", "-R", REPO, "--comment", "-b", "x"],
+        ["api", "repos/%s/pulls/5/merge" % REPO],
+        ["api", "repos/%s/issues/5/comments" % REPO, "-f", "body=state=closed"],
+        ["api", "graphql", "-f", "query=query { viewer { login } }"],
+        ["--version"],
+    ]
+
+    def test_each_held_command_is_refused_and_recorded(self):
+        # Narrowed to one repo: a command whose repo gh fills in itself
+        # ({owner}/{repo}) is still held.
+        with mock.patch.dict(os.environ, {"LOOM_SHADOW_REPOS": REPO}):
+            for argv in self.HELD:
+                with self.subTest(argv=argv), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                    self.assertEqual(shadow.main(["gh-guard", os.getcwd()] + argv), 1)
+                    self.assertIn("shadow mode: would", err.getvalue())
+            for argv in self.LET:
+                with self.subTest(argv=argv):
+                    self.assertEqual(shadow.main(["gh-guard", os.getcwd()] + argv), 0)
+        self.assertEqual({e["source"] for e in self.entries()}, {"brain rung gh"})
+        # The ledger keeps one line per action, item and label.
+        self.assertEqual({e["action"] for e in self.entries()},
+                         {shadow.MERGE, shadow.CLOSE, shadow.APPROVE, shadow.LABEL})
+
+    def test_a_body_file_is_read_from_the_callers_folder(self):
+        with tempfile.TemporaryDirectory() as here:
+            with open(os.path.join(here, "close.json"), "w") as fh:
+                json.dump({"state": "closed"}, fh)
+            with open(os.path.join(here, "comment.json"), "w") as fh:
+                json.dump({"body": "hello"}, fh)
+            with mock.patch("sys.stderr", new_callable=io.StringIO):
+                self.assertEqual(shadow.main(["gh-guard", here, "api", "-X", "PATCH",
+                                              "repos/%s/issues/5" % REPO, "--input", "close.json"]), 1)
+                self.assertEqual(shadow.main(["gh-guard", here, "api", "-X", "POST",
+                                              "repos/%s/issues/5/comments" % REPO,
+                                              "--input", "comment.json"]), 0)
+                # A body it cannot read is the worst body that path takes.
+                self.assertEqual(shadow.main(["gh-guard", here, "api", "-X", "PATCH",
+                                              "repos/%s/issues/5" % REPO, "--input", "gone.json"]), 1)
+
+    def test_with_shadow_off_or_the_repo_graduated_gh_runs(self):
+        for env in ({"LOOM_SHADOW": "0"}, {"LOOM_SHADOW_REPOS": "example-owner/other"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                self.assertEqual(shadow.main(["gh-guard", os.getcwd(), "pr", "merge", "5",
+                                              "-R", REPO]), 0)
+        self.assertEqual(self.entries(), [])
 
 
 class EveryPathTest(unittest.TestCase):
