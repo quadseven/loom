@@ -326,8 +326,10 @@ this tick"; a step with no note shows nothing there.
    Spend at most a third of the tick on them; defer what is left again.
    Sensitive pull requests listed by resume are also yours to handle, even
    when another brain journaled in the last 2 hours. They are open,
-   needs-brain, older than 2 hours, green and passed the review check. Read
-   the ticket and diff, answer or resolve each review thread, then run
+   needs-brain, older than 2 hours, green and passed the review check. Resume
+   lists these oldest first, before other deferred work. Review the oldest
+   sensitive pull request before any other merge work: read the ticket and
+   diff, answer or resolve each review thread, then run
    `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N` when ready.
    Do not wait for the other brain's next tick.
    `resume` then lists up to 5 verify-due tickets (open `loom:shipped`, no

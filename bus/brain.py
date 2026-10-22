@@ -4296,7 +4296,7 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
         out += [_skip_line(repo, reason) for repo, reason in sorted(unread.items())]
     for repo, issue, found, skipped in goals:
         out += _goal_resume_lines(gh, repo, issue, found, latest, skipped, unread)
-    return "\n".join(out + _sensitive_resume_lines(gh, repos, now, env)
+    return "\n".join(_sensitive_resume_lines(gh, repos, now, env) + out
                       + _finished_epic_resume_lines(gh, [(r, i) for r, i, _, _ in goals])
                       + _verify_resume_lines(gh, repos, now)
                       + _audit_resume_lines(gh, repos, now, env))
