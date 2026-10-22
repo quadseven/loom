@@ -1716,6 +1716,19 @@ print('leak guard: clean (shape patterns only)')
         self.assertFalse(beat["available"])
         self.assertGreater(beat["retry_at"], int(time.time()))
 
+    def test_a_timeout_after_a_leaking_edit_keeps_no_branch_on_a_public_repo(self):
+        # A -timedout- branch is pushed to the public origin like a pull
+        # request, so the leak scan gates it the same way.
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.write_tool(self.bin / "codex", "#!/usr/bin/env bash\ncat > /dev/null\n"
+                        "printf 'contact %s\\n' \"$(printf 'MTAuMjMuNC41' | base64 -d)\" > fix.txt\n"
+                        "exit 124\n")
+        self.run_lane()
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-timedout-", heads)
+        self.assertIn("leak scan refused or could not check the edits", self.failure_line())
+
     def test_a_timeout_after_editing_keeps_the_edits_on_a_timedout_branch(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EDIT="1", FAKE_EXIT="124")
