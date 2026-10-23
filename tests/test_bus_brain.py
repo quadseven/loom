@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, journal, proof, text, tickets
 from bus.github import GitHub, GitHubError
+from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 # status refuses to run with no trusted login (loom#783).
 TRUSTED = {"LOOM_BRIEF_AUTHORS": "example-brain"}
@@ -67,6 +68,12 @@ class Fake:
 
     def assert_all_used(self):
         assert not self.replies, "unused replies: %s" % self.replies
+
+
+# An open invariant breach on goal #2: a goal with one is never quiet
+# (bus/quiet.py), so its report stays owed (loom#1534).
+BREACH_ON_2 = {"number": 9, "title": "Breach", "state": "open", "body": "Part of #2",
+               "labels": [{"name": "loom:invariant"}]}
 
 
 def goal():
@@ -302,6 +309,13 @@ class BrainTests(unittest.TestCase):
 
 class SensitiveResumeTests(unittest.TestCase):
     NOW = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        # These merges test the merge path's other rules, read in a fixed
+        # order; the risk tier has its own tests (test_merge_tier.py).
+        tier = unittest.mock.patch.object(brain, "_refuse_risk_tier")
+        tier.start()
+        self.addCleanup(tier.stop)
 
     def make_gh(self, entries):
         prs = []
@@ -599,7 +613,7 @@ class SensitiveResumeTests(unittest.TestCase):
         g2 = [{"body": "<!-- loom:journal v1 -->\n- Shipped: none", "createdAt": "2030-01-01T19:50:00Z", "author": bot},
               {"body": "<!-- loom:report v1 -->\nold", "createdAt": "2030-01-01T10:26:00Z", "author": bot}]
         gh = GitHub("t", transport=Fake(
-            reply(200, goals), reply(200, []),
+            reply(200, goals + [BREACH_ON_2]), reply(200, []),
             reply(200, {"data": {"repository": {"g1": {"comments": {"nodes": g1}}, "g2": {"comments": {"nodes": g2}}}}}),
             reply(200, []), reply(200, []),
             reply(200, [])))
@@ -625,7 +639,7 @@ class SensitiveResumeTests(unittest.TestCase):
               {"body": "<!-- loom:report v1 -->\nNothing moved since the last report.",
                "createdAt": "2030-01-01T19:52:00Z", "author": app}]
         gh = GitHub("t", transport=Fake(
-            reply(200, goals), reply(200, []),
+            reply(200, goals + [BREACH_ON_2]), reply(200, []),
             reply(200, {"data": {"repository": {"g2": {"comments": {"nodes": g2}}}}}),
             reply(200, []), reply(200, []), reply(200, [])))
         report = brain.status(gh, [REPO], REPO, env=TRUSTED, now=now, authors=["brain-bot"])
@@ -1257,7 +1271,7 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def _merge_replies(self, changes=None):
         pr = {"state": "open", "draft": False, "body": "Refs %s#9" % REPO, "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": REPO}}, "base": {"repo": {"full_name": REPO}}, "mergeable": True}
-        details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work", "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": []}}
+        details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work", "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": []}, "files": {"totalCount": 1, "nodes": [{"path": "bus/a.py"}]}}
         if changes:
             pr.update(changes.get("pr", {}))
             details.update(changes.get("details", {}))
@@ -1346,30 +1360,21 @@ class SensitiveResumeTests(unittest.TestCase):
                              env={"LOOM_BRIEF_AUTHORS": "alice-example"})
         self.assertTrue(result["merged"])
 
-    def test_merge_heals_ticket_stuck_in_running_when_pr_is_open(self):
-        # A ticket in loom:running with an open PR should be moved to loom:pr
-        # instead of refusing the merge. This heals the label drift when a lane
-        # opens the PR but the label update never lands.
-        pr, query = self._merge_replies()
-        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:running"},
-                                             {"name": "lane:muse"}]}
-        healed = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"},
-                                              {"name": "lane:muse"}]}
-        fake = Fake(pr, query,
-                    reply(200, issue),  # _validate_ticket_association reads ticket
-                    reply(200, healed),  # PUT labels returns healed issue
-                    # _refuse_pending_fix returns early with empty env (no authors)
-                    reply(200, {"merged": True}),
-                    reply(204),
-                    reply(200, healed), reply(200, {}))
-        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
-        self.assertTrue(result["merged"])
-        # The label update must have been sent before the merge.
-        put_calls = [c for c in fake.calls if c[0] == "PUT" and "/labels" in c[1]]
-        self.assertTrue(put_calls, "expected a label PUT to heal the ticket")
-        sent = put_calls[0][2]["labels"]
-        self.assertIn("loom:pr", sent)
-        self.assertNotIn("loom:running", sent)
+    def test_merge_refuses_a_ticket_still_running_or_briefed_without_relabeling(self):
+        # A ticket at loom:running or loom:briefed is mid fix round: the brain
+        # sent the head back and a lane is about to push, or is pushing, a new
+        # one. The merge refuses and leaves the labels alone, so the rejected
+        # head never lands and the fix round is not cancelled by a relabel.
+        for state in ("loom:running", "loom:briefed"):
+            with self.subTest(state=state):
+                pr, query = self._merge_replies()
+                issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": state}]}
+                fake = Fake(pr, query, reply(200, issue))
+                with self.assertRaisesRegex(ValueError, "ticket is not loom:pr"):
+                    brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+                writes = [c for c in fake.calls if c[0] in ("PUT", "PATCH", "POST", "DELETE")
+                          and not c[1].endswith("/graphql")]
+                self.assertEqual(writes, [])
 
     def test_merge_refuses_an_unrelated_closed_or_non_ticket_issue_before_write(self):
         cases = [
@@ -1575,6 +1580,18 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.merge(GitHub("t", transport=fake), REPO, 8,
                         adopt=True, env=self.TRUSTED)
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_adopt_refuses_a_logic_or_unlabeled_pr_with_a_neutral_review(self):
+        # Neutral is a degraded review: only docs and tests may land on it
+        # (loom#509). An unlabeled ticketless pull request is refused too.
+        runs = [{"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]
+        for labels in ([{"name": "class:logic"}], []):
+            with self.subTest(labels=labels):
+                fake = Fake(*self._adopt_replies({"pr": {"labels": labels}, "runs": runs}))
+                with self.assertRaisesRegex(ValueError, "review check has not passed"):
+                    brain.merge(GitHub("t", transport=fake), REPO, 8,
+                                adopt=True, env=self.TRUSTED)
+                self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
     def test_adopt_refuses_a_pull_request_that_already_has_a_ticket(self):
         fake = Fake(*self._adopt_replies({"pr": {"body": "Refs %s#9" % REPO}}))

@@ -35,6 +35,7 @@ from . import brain_memory
 from . import claimed
 from . import fabric
 from . import scope_fit
+from . import shadow
 from . import stale_claims
 from . import factory
 from . import friction_intake
@@ -46,7 +47,9 @@ from . import metrics
 from . import naming
 from . import notify
 from . import proof
+from . import quiet as quiet_rule
 from . import rewrite
+from . import operator_hold
 from . import ship_paths
 from . import roll_pin
 from . import revert
@@ -57,6 +60,10 @@ from . import verify_data
 from . import text as _text
 from . import tickets
 from . import transcripts
+from . import brief_check
+from . import criteria_gate
+from . import deploy_watch
+from . import scorecard
 from . import watch
 from . import labels
 from .brain import HUMAN_MARKER
@@ -169,7 +176,7 @@ FIX_CAP_TEXT = ("The fix round cap (%d) is reached, so this ticket is held for t
 REPORT_MARKER = "<!-- loom:report v1 -->"
 # The last line of a quiet standup the station edits in place, and of a
 # standup that repeats an earlier one word for word.
-QUIET_STAMP = "Still quiet as of %s; this report is edited in place until something moves."
+QUIET_STAMP = quiet_rule.HEARTBEAT_STAMP
 SAME_STAMP = "Unchanged as of %s; this report is edited in place until something changes."
 # Reports come every REPORT_EVERY (6 hours), so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
@@ -180,6 +187,12 @@ REPORT_CHECK = 300
 # grace) left every report 2.0 to 2.4 hours old before the next one, so the
 # visibility number (each goal report at most 2 hours old) could never pass.
 STANDUP_LEAD = 15 * 60
+# A goal quiet since its last report (bus/quiet.py) is owed no standup; it is
+# read again this often, so a standup still goes out soon after it moves.
+QUIET_RECHECK = 3600
+# The last line of every station standup, which is how the station finds its
+# own report to edit for a quiet goal's heartbeat.
+STANDUP_FOOTER = "Written by the station from ticket data, because no brain reported in time."
 # The operator's two reading times (2026-10-14: "Twice a day. Morning and
 # evening. 10am and 9pm"): one digest of every goal's reports each, instead of
 # each report as it is posted. LOOM_REPORT_DIGEST_TIMES="" turns it off.
@@ -228,6 +241,15 @@ SETTLE_PER_RUN = 25
 REPO_ACCESS_EVERY = 3600
 REPO_ACCESS_FILE = "repo_access.json"
 SOURCES_FILE = "sources.json"
+# The station's live checks of shipped tickets' criteria (bus/criteria_gate.py):
+# ticket -> criterion key -> {"result", "at", "seen"}. A failed or missing
+# check runs again after LIVE_CHECK_RETRY; at most LIVE_CHECKS_PER_PASS run
+# a pass.
+LIVE_CHECKS_FILE = "live-checks.json"
+LIVE_CHECK_RETRY = 6 * 3600
+LIVE_CHECKS_PER_PASS = 5
+# Asks for unverified criteria are emails: at most this many an hour.
+LIVE_ASKS_PER_HOUR = 4
 SETTLE_LANDED = ("loom:merged", "loom:shipped", "loom:verified")
 REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 CLOSE_DONE_HOLDS = ("loom:regression", "loom:urgent", RUNAWAY)
@@ -574,6 +596,14 @@ def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
         return datetime.fromtimestamp(mtime, tz=timezone.utc)
     except (FileNotFoundError, NotADirectoryError):
         return None
+
+
+def _unproven_host_checks(body: Any) -> List[str]:
+    """The ticket's unticked criteria that only a check on a live host or
+    network can meet (operator_hold.network_check): a merge proves none of
+    them. A Live line keeps its own close rule (_done_reason)."""
+    return [text for checked, text in proof.criteria(str(body or ""))
+            if not checked and operator_hold.network_check(text)]
 
 
 def _live_time_window(live: str) -> Optional[Tuple[Optional[datetime], Optional[datetime]]]:
@@ -1464,6 +1494,7 @@ class Station:
         if isinstance(writers, set):
             writers |= {a.lower() for a in settings.authors}
         self.s = settings
+        self._live_budget = LIVE_CHECKS_PER_PASS
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
         self.upload = upload or post_transcript
@@ -1929,7 +1960,7 @@ class Station:
             self._refuse(repo, issue, str(err))
             return False
         fix, fix_comment_id = fix_source if fix_source else (None, None)
-        if self._fix_blocks(repo, issue, fix):
+        if self._held_before_claim(repo, issue, fix, comments):
             return False
 
         earlier = sum(1 for c in comments
@@ -2446,6 +2477,7 @@ class Station:
         self._release_dead_lane_runaways(free)
         # A starved shipped ticket takes one free lane ahead of build work.
         free = self._reserve_verify(free)
+        free = self._not_demoted(free)
         if not free:
             self._claim_candidates([])
             self._record_slot_sample(False)
@@ -3372,6 +3404,16 @@ class Station:
         if _text.CREDENTIAL_RE.search(proof.render(record, ticked)):
             self._proof_refused(repo, number, lane, names, "Its proof holds text shaped like a credential.")
             return
+        unproven = criteria_gate.unverified(body, self._live_passed(repo, number, body))
+        if unproven:
+            # A verify lane runs with no network: its word that a live check
+            # passed, or that the operator acted, is not evidence (2026-10-22
+            # audit). The station's own check, or the operator, decides.
+            self._proof_refused(repo, number, lane, names, (
+                "Its proof was refused: a verify lane may not pass a live or operator "
+                "criterion without a passing station check: %s." % self._note_text(
+                    "; ".join(_clip(" ".join(t.split()), 120) for _, t in unproven[:3]))))
+            return
         unseen = unseen_live_evidence(record)
         if unseen:
             self._proof_refused(repo, number, lane, names, "Its proof was refused: %s." % unseen)
@@ -3552,6 +3594,57 @@ class Station:
             int(pr["number"]), pr.get("merged_at"), str(pr["merge_commit_sha"])[:12]))
         _say("%s#%d: merged pull request #%d may already do its work; verifying before any build"
              % (repo, number, int(pr["number"])))
+        return True
+
+    def _held_before_claim(self, repo: str, issue: Dict[str, Any], fix: Any,
+                           comments: List[Any]) -> bool:
+        """A fix round its pull request blocks, or a new build the brief
+        check holds (a fix round's brief is the ticket's own, so it is not
+        checked again)."""
+        return (self._fix_blocks(repo, issue, fix)
+                or (fix is None and self._brief_holds(repo, issue, comments)))
+
+    def _brief_holds(self, repo: str, issue: Dict[str, Any], comments: List[Any]) -> bool:
+        """Whether the ticket goes to no build lane (bus/brief_check.py): a
+        health ticket whose cause is missing or names only the measurement
+        goes back to the queue with needs-brain; a stale or already-shipped
+        one goes back to the queue with loom:human and one ask. A read the
+        check needs that fails holds the ticket for the next pass. A
+        regression or revert ticket is checked for its cause only: its merged
+        pull request is why it exists."""
+        number = int(issue["number"])
+        names = _label_names(issue)
+        body = str(issue.get("body") or "")
+        found = brief_check.health_verdict(body)
+        if found is None and not set(names) & {REGRESSION, factory.REVERT_LABEL}:
+            try:
+                found = brief_check.check(self.gh, repo, issue,
+                                          [c for c in comments if isinstance(c, dict)],
+                                          self.s.authors, self._default_branch(repo))
+            except brief_check.Unread as err:
+                _say("%s#%d waits: the stale-ticket check could not read (%s)"
+                     % (repo, number, err))
+                return True
+        if found is None:
+            return False
+        try:
+            brain.move(self.gh, repo, number, "queued")
+            if found.kind == brief_check.HEALTH:
+                # Added, not put: the label list read before the move is stale.
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": ["needs-brain"]})
+                self._routine(repo, number, brief_check.HEALTH_NOTE % (
+                    found.reason, "A lane gets it once its body names the cause on a "
+                    "`Cause:` line: why the affected are affected, not what the health read "
+                    "counts."))
+            else:
+                brain.human(self.gh, repo, number, brief_check.ask(found))
+        except ValueError as err:
+            _say("%s#%d gets no lane (%s), but holding it failed: %s"
+                 % (repo, number, found.reason, err))
+            return True
+        _say("%s#%d gets no lane: %s" % (repo, number, found.reason))
+        self._event("not_claiming", found.reason, "%s#%d" % (repo, number))
         return True
 
     def _model_waits(self, repo: str, issue: Dict[str, Any], lane: str,
@@ -4612,22 +4705,7 @@ class Station:
         filter missing, a pull request could look as if it touched no
         deployed path, so nothing in the repo ships this pass."""
         if repo not in self._path_filters:
-            listing = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s" % (
-                repo, ship_paths.WORKFLOWS_DIR, quote(branch, safe="")), ok=(404,)).data
-            texts: Optional[Dict[str, str]] = {} if isinstance(listing, list) else None
-            for item in listing if isinstance(listing, list) else []:
-                name = str(item.get("name") or "") if isinstance(item, dict) else ""
-                if not re.fullmatch(r"[\w.-]+\.ya?ml", name):
-                    continue
-                data = self.gh.rest("GET", "/repos/%s/contents/%s/%s?ref=%s" % (
-                    repo, ship_paths.WORKFLOWS_DIR, name, quote(branch, safe="")), ok=(404,)).data
-                try:
-                    texts[name] = base64.b64decode(data["content"]).decode("utf-8", "replace")
-                except (KeyError, TypeError, ValueError):
-                    texts = None
-                    break
-            self._path_filters[repo] = (
-                ship_paths.scoped_workflows(texts) if texts is not None else None)
+            self._path_filters[repo] = ship_paths.read_filters(self.gh, repo, branch)
         return self._path_filters[repo]
 
     def _pull_paths(self, repo: str, number: int) -> Optional[List[str]]:
@@ -5972,8 +6050,14 @@ class Station:
             + ["| %s | %s | %s |" % row for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
+            + self._scorecard_lines()
             + (["", summary.line()] if summary is not None else []))
         return body
+
+    def _scorecard_lines(self) -> List[str]:
+        """The lane scorecard's table, for the lane status comment the
+        dashboard's Lanes page reads."""
+        return scorecard.Scorecard(self.state, self.now).markdown()
 
     def _remote_claim_count(self, lane: str) -> int:
         saved = _read_json(os.path.join(self.state, "remote-status.json"), {}, strict=False)
@@ -6037,6 +6121,9 @@ class Station:
             # for the hourly republish.
             values["anthropic spend"] = "%d runs, $%.2f, budget %s" % (
                 summary.runs, summary.spent, self.s.anthropic.usd)
+        # A changed scorecard (bus/scorecard.py) republishes too.
+        values["scorecard"] = hashlib.sha256("\n".join(
+            self._scorecard_lines()).encode("utf-8")).hexdigest()[:16]
         if self._lanes_unchanged(repo, values):
             return
         number = self._lanes_issue(repo)
@@ -6606,7 +6693,10 @@ class Station:
                 continue
             sent = False
             author = str((comment.get("user") or {}).get("login") or "").lower()
-            if author in allowed:
+            if author in allowed and self._quiet_report(repo, issue, comment):
+                _say("report %s#%s not pushed: the goal was quiet since its last report"
+                     % (repo, issue.get("number")))
+            elif author in allowed:
                 if not secret_checked:
                     send = self._report_sender()
                     secret_checked = True
@@ -6627,6 +6717,28 @@ class Station:
                 # The whole file is written atomically by _write_json.
                 _write_json(path, ledger)
         return True
+
+    def _quiet_report(self, repo: str, issue: Dict[str, Any], comment: Dict[str, Any]) -> bool:
+        """Whether the goal was quiet since its report before this one
+        (bus/quiet.py): such a report is never pushed to the operator's
+        phone, as no report is owed for it (loom#1534). A read that fails
+        pushes it: a report is never lost to a failed read."""
+        number, ident = int(issue["number"]), self._report_id(comment)
+        try:
+            earlier = [c for c in self._paginate("/repos/%s/issues/%d/comments?per_page=100"
+                                                 % (repo, number))
+                       if isinstance(c, dict) and self._report_id(c) < ident]
+            children = brain.goal_children(self.gh, repo, number)
+            named = self._open_breaches(repo, number)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("report %s#%d: could not read whether the goal was quiet, so it is pushed: %s"
+                 % (repo, number, err))
+            return False
+        now = brain.datetime.fromtimestamp(self.now, brain.timezone.utc)
+        return quiet_rule.quiet(earlier, children, named, now,
+                                [a.lower() for a in self.s.authors]) is not None
 
     def _report_window(self, checked: Any) -> Optional[str]:
         """The time to read reports from, or None when the last read is too
@@ -6670,6 +6782,9 @@ class Station:
                     top = max(top, ident)
             quiet += len(issues) - len(latest)
             for issue, comment in latest.values():
+                if self._quiet_report(repo, issue, comment):
+                    quiet += 1
+                    continue
                 body = self._report_body(comment)
                 first = next((x.lstrip("#").strip() for x in body.splitlines()
                               if x.lstrip("#").strip()), "")
@@ -6696,6 +6811,16 @@ class Station:
         day = max(dated)
         passed, streak = dated[day]
         return "Factory %s: %d/9 numbers pass; streak %d of 7." % (day, passed, streak)
+
+    def _digest_shadow_lines(self, since: float) -> List[str]:
+        """What shadow mode held since the last digest (bus/shadow.py): at
+        most two lines, the counts and the command that lists each with its
+        link. An unreadable ledger says so rather than reading as empty."""
+        path = shadow.ledger_path(dict(os.environ, LOOM_HOME=self.s.home))
+        try:
+            return shadow.digest_lines(since, self.now, path)
+        except OSError as err:
+            return ["Shadow ledger %s could not be read (%s)." % (path, type(err).__name__)]
 
     def _digest_send(self, text: str) -> bool:
         """Every chunk of the digest to the channel, as the bot or through
@@ -6761,6 +6886,7 @@ class Station:
         factory_line = self._digest_factory_line()
         if factory_line:
             lines.append(factory_line)
+        lines += self._digest_shadow_lines(start)
         if not self._digest_send("\n".join(lines)):
             _say("report digest %s not sent; next pass tries again" % slot)
             return
@@ -7041,17 +7167,20 @@ class Station:
         source keeps the ticket open for a verify run, and a verified
         ticket closes through brain.close on the verify path, which checks
         its criteria. Done tickets never closed: 199 sat shipped and the
-        backlog grew all week though the work was finished."""
+        backlog grew all week though the work was finished. Since 2026-10-22
+        no done ticket closes while a live or operator criterion has no
+        evidence (_evidence_holds, bus/criteria_gate.py)."""
         if self._deferred():
             return
         left = CLOSE_DONE_PER_PASS
+        self._live_budget = LIVE_CHECKS_PER_PASS
         log_root = os.path.join(self.s.home, "logs")
         for repo in self._verify_repos():
             for issue in self._tickets_open(repo):
                 if left <= 0:
                     return
                 why = self._done_reason(issue, self._earliest_record(repo, issue, log_root))
-                if not why:
+                if not why or self._evidence_holds(repo, issue):
                     continue
                 if self._close_done_ticket(repo, issue, why):
                     left -= 1
@@ -7065,11 +7194,105 @@ class Station:
             return None
         return _earliest_evidence_record(self.s.evidence_cmds, repo, log_root)
 
+    def _live_checks(self) -> Dict[str, Any]:
+        found = _read_json(os.path.join(self.state, LIVE_CHECKS_FILE), {}, strict=False)
+        return found if isinstance(found, dict) else {}
+
+    def _live_passed(self, repo: str, number: int, body: str = "") -> List[str]:
+        """The keys of the ticket's criteria the station has evidence for:
+        its live checks that passed, and the Live line when it names log
+        strings (a verify run is dispatched only once the station's own log
+        command found them, _no_live_evidence)."""
+        mine = self._live_checks().get("%s#%d" % (repo, number))
+        keys = [k for k, v in (mine.items() if isinstance(mine, dict) else [])
+                if isinstance(v, dict) and v.get("result") == "pass"]
+        if live_needles(body):
+            keys.append(criteria_gate.key(brain.live_criterion(body, limit=None)))
+        return keys
+
+    def _run_live_checks(self, repo: str, number: int,
+                         gaps: Sequence[Tuple[str, str]]) -> Dict[str, str]:
+        """Run the runnable checks of the ticket's unverified live criteria
+        that are due, record each result in the station's state and the
+        ticket's status, and return what each failed one saw, by key."""
+        state = self._live_checks()
+        mine = state.setdefault("%s#%d" % (repo, number), {})
+        failed: Dict[str, str] = {}
+        for found, text in gaps:
+            check = criteria_gate.check_of(text) if found == criteria_gate.LIVE else None
+            k = criteria_gate.key(text)
+            last = mine.get(k) if isinstance(mine.get(k), dict) else {}
+            if check is None:
+                continue
+            due = not isinstance(last.get("at"), (int, float)) \
+                or self.now - last["at"] >= LIVE_CHECK_RETRY
+            if due and self._live_budget > 0:
+                self._live_budget -= 1
+                passed, seen = criteria_gate.run(check, self.gh)
+                last = mine[k] = {"result": "pass" if passed else "fail", "at": self.now,
+                                  "seen": seen}
+                _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
+                self._routine(repo, number, "Live check %s: `%s` (%s) for: %s" % (
+                    last["result"], check.target, seen, _clip(" ".join(text.split()), 160)))
+            if last.get("result") == "fail":
+                failed[k] = "its check failed: %s" % last.get("seen")
+        return failed
+
+    def _live_ask_room(self) -> bool:
+        """Whether another unverified-criteria ask fits this hour; takes it."""
+        state = self._live_checks()
+        asks = [t for t in state.get("_asks") or []
+                if isinstance(t, (int, float)) and 0 <= self.now - t < 3600]
+        if len(asks) >= LIVE_ASKS_PER_HOUR:
+            return False
+        state["_asks"] = asks + [self.now]
+        _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
+        return True
+
+    def _evidence_holds(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether a done ticket stays open because a live or operator
+        criterion has no evidence (bus/criteria_gate.py): a live one with a
+        check Loom can run gets the check; one with none, a failed check, or
+        an operator action sends the ticket to loom:human with one ask, once.
+        2026-10-22 audit: at least 12 tickets of the private deployment repo
+        closed shipped on green CI with live criteria never checked."""
+        number = int(issue["number"])
+        body = str(issue.get("body") or "")
+        gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
+        if not gaps:
+            return False
+        failed = self._run_live_checks(repo, number, gaps)
+        gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
+        if not gaps:
+            return False
+        waiting = [t for k, t in gaps if k == criteria_gate.LIVE
+                   and criteria_gate.check_of(t) is not None
+                   and criteria_gate.key(t) not in failed]
+        if waiting or "loom:human" in _label_names(issue) or not self._live_ask_room():
+            return True
+        try:
+            brain.human(self.gh, repo, number, criteria_gate.ask(gaps, failed))
+        except RateLimited:
+            raise
+        except (ValueError, GitHubError) as err:
+            _say("could not ask about the unverified criteria of %s#%d: %s" % (repo, number, err))
+            return True
+        _say("held done %s#%d for the operator: %d criteria have no evidence"
+             % (repo, number, len(gaps)))
+        return True
+
     def _close_done_ticket(self, repo: str, issue: Dict[str, Any],
                            reason: str) -> bool:
         """Close one done ticket with `reason`; True when the close writes
         landed, False when GitHub refused and the run moves on."""
         number = int(issue["number"])
+        if shadow.active(repo):
+            # Before the status note and the force-close label.
+            held = shadow.record_held(shadow.CLOSE, repo, number, "issue", source="station done close",
+                                 reason=reason, gates=["shipped", "every criterion has evidence"])
+            if held["new"]:
+                _say("shadow mode: would close done %s#%d (%s)" % (repo, number, reason))
+            return False
         branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
         if error:
             _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
@@ -7569,6 +7792,16 @@ class Station:
         if not act:
             _say("settle-claimed: would close %s#%d, merged as PR %s" % (repo, number, shown))
             return 1
+        if shadow.active(repo):
+            # Before the evidence comment: a held close must not say it closed.
+            held = shadow.record_held(shadow.CLOSE, repo, number, "issue",
+                                 source="station settle-claimed",
+                                 reason="claimed issue merged as PR %s" % shown,
+                                 gates=["every box proven by the merged pull requests"])
+            if held["new"]:
+                _say("settle-claimed: shadow mode, would close %s#%d, merged as PR %s"
+                     % (repo, number, shown))
+            return 1
         comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         if not any(str(c.get("body") or "").startswith(claimed.MARKER)
                    for c in comments if isinstance(c, dict)):
@@ -7616,6 +7849,11 @@ class Station:
                 if window_end is not None and earliest is not None and earliest > window_end:
                     return ("shipped, its Live window ended %s but evidence started %s" % (
                         window_end.strftime("%Y-%m-%d"), earliest.strftime("%Y-%m-%d")))
+                return ""
+            if _unproven_host_checks(issue.get("body")):
+                # 2026-10-22: a ticket whose criteria were all host checks
+                # (a version on a host, a closed port) closed as shipped on
+                # a merge that could not meet them. They wait for evidence.
                 return ""
             if not live_needles(issue.get("body")):
                 return "shipped, and its Live line names nothing a log search can find"
@@ -8487,13 +8725,17 @@ class Station:
             return
         loose, tree = brain.goal_tree(self.gh, repo, number)
         children = brain._flatten(loose, tree)
-        breaches = (self._open_breaches(repo, number)
-                    if (repo, number) == self._invariant_goal() else None)
+        named = self._open_breaches(repo, number)
+        breaches = named if (repo, number) == self._invariant_goal() else None
         hold = self._gate_hold_for(repo, number)
         body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")),
                                           breaches, gate_hold=hold,
                                           finished=brain.finished_epics(tree))
         brain._check_written_text(body)
+        if hold is None and self._quiet_standup(repo, comments, children, named, body,
+                                                authors, now):
+            state[key] = self.now - (brain.REPORT_EVERY - STANDUP_LEAD) + QUIET_RECHECK
+            return
         quiet = hold is None and body == self._overdue_standup_body(
             [], None, None if breaches is None else [])
         previous = self._last_same_report(comments, authors, body)
@@ -8507,6 +8749,33 @@ class Station:
         else:
             notify.post(self.gh, repo, number, body, notify.REPORT)
         state[key] = self.now
+
+    def _quiet_standup(self, repo: str, comments: List[Any], children: List[Any],
+                       named: List[Dict[str, Any]], body: str, authors: List[str],
+                       now: Any) -> bool:
+        """True when the goal is quiet since its last report (loom#1534): it
+        is owed no standup. Its weekly heartbeat edits the station's last
+        standup in place, which emails no one; with none to edit, nothing is
+        posted."""
+        still = quiet_rule.quiet(comments, children, named, now, authors)
+        if still is None:
+            return False
+        mine = self._last_standup(comments, authors)
+        if still.heartbeat_due(now) and mine is not None:
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, mine),
+                         {"body": quiet_rule.heartbeat(body, now)})
+        return True
+
+    @staticmethod
+    def _last_standup(comments: List[Any], authors: List[str]) -> Optional[int]:
+        """The id of the goal's newest station standup by `authors`, else None."""
+        for comment in reversed(comments):
+            text = str(comment.get("body") or "") if isinstance(comment, dict) else ""
+            if (isinstance(comment.get("id") if isinstance(comment, dict) else None, int)
+                    and tickets._login(comment.get("user")).lower() in authors
+                    and text.startswith(REPORT_MARKER) and STANDUP_FOOTER in text):
+                return comment["id"]
+        return None
 
     @staticmethod
     def _last_same_report(comments: List[Any], authors: List[str], body: str) -> Optional[int]:
@@ -8583,7 +8852,7 @@ class Station:
                 % rows(finished)] if finished else [])
             + ["",
             "### Needs you", "Open asks: %s." % rows(groups["asks"]), "",
-            "Written by the station from ticket data, because no brain reported in time."])
+            STANDUP_FOOTER])
 
     def _standup_ticket_groups(self, children: List[Any], since: Optional[float] = None
                                ) -> Dict[str, List[Dict[str, Any]]]:
@@ -9187,6 +9456,40 @@ class Station:
     def _bench_list(self) -> Any:
         return _read_json(os.path.join(self.state, "bench.json"), None, strict=False)
 
+    def score_lanes(self) -> None:
+        """Refresh the lane scorecard once an hour and demote the lanes whose
+        bad outcomes reach LOOM_LANE_DEMOTE_AT (bus/scorecard.py). Runs with
+        the factory; LOOM_FACTORY=0 turns it off."""
+        card = scorecard.Scorecard(self.state, self.now)
+        if not self.s.factory_on or not card.due():
+            return
+        repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
+        try:
+            failed = audit.held(self.gh, self._verify_repos(), self.s.authors, self.now)
+        except GitHubError as err:
+            _say("scorecard: the failed proof audits could not be read: %s" % err)
+            failed = {}
+        ledger = _read_json(os.path.join(self.state, deploy_watch.LEDGER), {}, strict=False)
+        merges = ledger.get("merges") if isinstance(ledger, dict) else None
+        card.refresh(self.gh, repos, self.s.authors, self.s.review_bot, failed,
+                     merges if isinstance(merges, dict) else {})
+        card.save()
+
+    def _not_demoted(self, free: List[str]) -> List[str]:
+        """The free lanes that may claim a build ticket: a demoted lane
+        takes none (bus/scorecard.py)."""
+        demoted = self.demoted_lanes()
+        return [lane for lane in free if lane not in demoted]
+
+    def demoted_lanes(self) -> Dict[str, str]:
+        """Each lane slot the scorecard demoted, and why. A scorecard file
+        that cannot be read demotes every lane: its demotions are unknown."""
+        card = scorecard.Scorecard(self.state, self.now)
+        if card.unreadable:
+            _say("every lane takes no build ticket: %s" % card.unreadable)
+            return {lane: card.unreadable for lane in LANES}
+        return scorecard.demoted_slots(card.demoted(), LANES)
+
     def benched_pairs(self) -> List[Tuple[str, str]]:
         """The (provider, model) pairs the bench list holds benched now."""
         return bench.benched_pairs(self._bench_list(), self.now)
@@ -9215,6 +9518,7 @@ class Station:
                                held=list(self._held_tickets()) + self._gate_held(),
                                silent=self._silent_lanes(),
                                down=self.down_lanes() + self.benched_lanes(pairs),
+                               demoted=self.demoted_lanes(),
                                benched=pairs,
                                limit_until=self.limit_until(),
                                known_waits=self._saved_waits(), **extra)
@@ -9235,6 +9539,26 @@ class Station:
         revert.Reverts(self.gh, repos, self.now, trusted=self.s.authors,
                        review_check=self.s.review_check, lanes=self._factory,
                        state_dir=self.state).run()
+
+    def watch_deploys(self) -> None:
+        """Watch the deploy of each Loom auto-merge for LOOM_POST_MERGE_WATCH
+        minutes and revert one whose deploy fails (bus/deploy_watch.py).
+        Runs with the factory; LOOM_FACTORY=0 turns it off."""
+        if not self.s.factory_on:
+            return
+        repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
+        deploy_watch.Watch(self.gh, repos, self.now, trusted=self.s.authors,
+                           state_dir=self.state, page=self._page_operator).run()
+
+    def _page_operator(self, message: str) -> Optional[bool]:
+        """Send one message to the operator, with the mention: True when it
+        went out, False to try again next pass, None with no webhook set."""
+        if not self.s.webhook_ssm:
+            return None
+        url = self._webhook()
+        if url is None:
+            return False
+        return self._send(url, message, mention=True)
 
     def _dated_metrics(self, path: str) -> Dict[str, Tuple[int, int]]:
         dated = {}
@@ -9900,7 +10224,8 @@ class Station:
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
-                     self.watch_default_branches, self.refresh_bench, self.run_factory,
+                     self.watch_default_branches, self.watch_deploys, self.score_lanes,
+                     self.refresh_bench, self.run_factory,
                      # The move first, so the invariants read a goal whose
                      # tickets sit under an epic.
                      self.move_outside_tickets, self.check_invariants,

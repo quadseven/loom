@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Sequence
 
-from . import audit, proof
+from . import audit, brain, proof, quiet
 from .github import GitHub, GitHubError, auth_from_env
 from .factory import lacks_test
 from .labels import LANES
@@ -275,6 +275,9 @@ class Totals:
     merge_times: List[float] = field(default_factory=list)
     merged_by_repo: Dict[str, int] = field(default_factory=dict)
     report_ages: Dict[str, float] = field(default_factory=dict)
+    # Goal homes quiet since their last report (bus/quiet.py): owed no report,
+    # so their last one is still current (loom#1534).
+    quiet_goals: List[str] = field(default_factory=list)
     goal_repos: set[str] = field(default_factory=set)
     # Repos with an open ticket a lane can work (WORKABLE): a goal repo with
     # none, such as a backlog goal whose every issue is done or a person's
@@ -454,12 +457,29 @@ class Collector:
         if goals:
             total.goal_repos.add(repo)
         for goal in goals:
+            key = "%s#%d" % (repo, goal["number"])
             newest = max((stamp(c.get("created_at"))
                           for c in self.issue_comments(repo, int(goal["number"]))
                           if self.trusted_comment(c)
                           and str(c.get("body") or "").startswith(REPORT)), default=0.0)
-            total.report_ages["%s#%d" % (repo, goal["number"])] = (
-                self.now - newest if newest else float("inf"))
+            # Only a report past the cadence needs the quiet read.
+            if newest and self.now - newest > brain.REPORT_EVERY \
+                    and self._quiet(repo, int(goal["number"]), issues):
+                total.quiet_goals.append(key)
+                continue
+            total.report_ages[key] = self.now - newest if newest else float("inf")
+
+    def _quiet(self, repo: str, number: int, issues: List[Dict[str, Any]]) -> bool:
+        """Whether the goal is quiet since its last report; a failed read
+        counts it as not quiet, so its report age still counts."""
+        try:
+            children = brain.goal_children(self.gh, repo, number)
+        except GitHubError:
+            return False
+        return quiet.quiet(self.issue_comments(repo, number), children,
+                           brain.goal_breaches(issues, number),
+                           datetime.fromtimestamp(self.now, timezone.utc),
+                           sorted(self.trusted)) is not None
 
     def _urgent_regression(self, repo: str, issue: Dict[str, Any], created: float) -> bool:
         notes = [(created, str(issue.get("body") or ""))]
@@ -664,11 +684,14 @@ def autonomy_number(total: Totals) -> Number:
 
 def visibility_number(total: Totals) -> Number:
     """Each goal home's newest report is no older than the report cadence
-    (brain.REPORT_EVERY: 6 hours since the operator chose it on 2026-10-18)."""
+    (brain.REPORT_EVERY: 6 hours since the operator chose it on 2026-10-18).
+    A goal quiet since its last report is owed none, so it passes (loom#1534)."""
     from .brain import REPORT_EVERY
-    max_age = max(total.report_ages.values(), default=float("inf"))
-    return Number("Visibility", "%s" % ", ".join("%s %.1fh" % (r, age / 3600)
-                                                for r, age in total.report_ages.items()),
+    max_age = max(total.report_ages.values(),
+                  default=0.0 if total.quiet_goals else float("inf"))
+    return Number("Visibility", "%s" % ", ".join(
+        ["%s %.1fh" % (r, age / 3600) for r, age in total.report_ages.items()]
+        + ["%s quiet" % r for r in total.quiet_goals]),
                   "each goal report <=%gh" % (REPORT_EVERY / 3600),
                   bool(total.goals) and max_age <= REPORT_EVERY)
 

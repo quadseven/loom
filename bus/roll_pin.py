@@ -10,7 +10,7 @@ from urllib.parse import quote
 from urllib.parse import urlsplit
 
 from . import brain, health, notify
-from .github import GitHub
+from .github import GitHub, ShadowHeld
 
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -371,6 +371,9 @@ def _poll_gate(gh: GitHub, spec: dict[str, str], deploy: str,
     env = {"LOOM_BRIEF_AUTHORS": " ".join(authors), "LOOM_REVIEW_CHECK": review_check}
     try:
         brain.merge(gh, deploy, int(pr["number"]), adopt=True, env=env)
+    except ShadowHeld:
+        # Recorded in the shadow ledger (bus/shadow.py): not a gate failure.
+        return
     except ValueError:
         _gate_alert(gh, spec["goal"], deploy, pr)
 

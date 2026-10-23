@@ -1,5 +1,6 @@
 """The factory pass (bus/factory.py) with a fake GitHub and recorded actions."""
 
+import base64
 import os
 import re
 import tempfile
@@ -7,7 +8,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-from bus import brain, factory, labels, station, status, tickets
+from bus import brain, factory, labels, merge_tier, station, status, tickets
 from bus.github import GitHubError, Response
 from bus.tickets import FIX_MARKER
 
@@ -56,6 +57,8 @@ class FakeGitHub:
         self.attempts = {}
         self.update_status = 202
         self.files = {}
+        self.patches = {}
+        self.contents = {}
         self.filed = []
         self.private = True
         self.logs = {}
@@ -136,7 +139,9 @@ class FakeGitHub:
         if m:
             page = int(m.group(2))
             names = self.files[int(m.group(1))][(page - 1) * 100:page * 100]
-            return Response(200, [{"filename": n} for n in names])
+            # A one-line change, unless the test gave the file its own patch.
+            return Response(200, [{"filename": n, "patch": self.patches.get(
+                n, "@@ -1 +1 @@\n-old\n+new")} for n in names])
         m = re.search(r"/commits/(\w+)/check-runs", path)
         if m:
             return Response(200, {"check_runs": self.runs[m.group(1)]})
@@ -145,6 +150,16 @@ class FakeGitHub:
             return Response(200, {"behind_by": self.behind.get(int(m.group(1)), 0)})
         if path == "/repos/%s" % REPO:
             return Response(200, {"private": self.private})
+        m = re.search(r"/contents/(.+?)\?ref=", path)
+        if m:
+            # A folder lists the files under it; a file comes back encoded.
+            name = m.group(1)
+            if name in self.contents:
+                return Response(200, {"content": base64.b64encode(
+                    self.contents[name].encode()).decode()})
+            listed = [{"name": k.rsplit("/", 1)[1]} for k in self.contents
+                      if k.rsplit("/", 1)[0] == name]
+            return Response(200, listed) if listed else Response(404, None)
         m = re.search(r"/actions/runs/(\d+)$", path)
         if m:
             return Response(200, {"run_attempt": self.attempts.get(m.group(1), 1)})
@@ -217,13 +232,18 @@ class FakeGitHub:
 
 class Base(unittest.TestCase):
     def setUp(self):
+        # Every risk tier may merge here: these tests are about the other
+        # merge rules; bus/merge_tier.py has its own (test_merge_tier.py).
+        tiers = mock.patch.dict(os.environ, {"LOOM_AUTO_MERGE_TIERS": ",".join(merge_tier.TIERS)})
+        tiers.start()
+        self.addCleanup(tiers.stop)
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
         self.humans = []
         self.placed = []
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
-           down=(), limit_until=None, scope=None, known_waits=None):
+           down=(), limit_until=None, scope=None, known_waits=None, demoted=None):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
@@ -255,7 +275,7 @@ class Base(unittest.TestCase):
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
                             silent=silent, down=down, limit_until=limit_until, scope=scope,
-                            known_waits=known_waits)
+                            known_waits=known_waits, demoted=demoted)
         f.run()
         return f
 
@@ -3263,7 +3283,7 @@ class Helpers(unittest.TestCase):
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
                          model_limits=None, silent=None, down=(), limit_until=None,
-                         benched=(), known_waits=None, plan_check=None):
+                         benched=(), known_waits=None, plan_check=None, demoted=None):
                 self.silent_running, self.silent, self.waits = {}, silent, {}
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))

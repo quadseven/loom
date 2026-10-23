@@ -55,7 +55,9 @@ class FakeGitHub:
             return SimpleNamespace(data={"default_branch": "main"})
         if path.startswith("/repos/%s/contents/" % TARGET):
             return self.contents(method, path, body)
-        if path.startswith("/repos/%s/git/ref/heads/" % TARGET) or path == "/repos/%s/git/refs" % TARGET:
+        if (path.startswith("/repos/%s/git/ref/heads/" % TARGET)
+                or path.startswith("/repos/%s/git/refs/heads/" % TARGET)
+                or path == "/repos/%s/git/refs" % TARGET):
             return self.refs(method, path, body)
         if "/compare/" in path:
             return SimpleNamespace(data={"commits": [{"sha": "e" * 40}], "files": self.files})
@@ -79,12 +81,19 @@ class FakeGitHub:
     def refs(self, method, path, body=None):
         if path == "/repos/%s/git/ref/heads/main" % TARGET:
             return SimpleNamespace(data={"object": {"sha": self.base_sha}})
-        if path.startswith("/repos/%s/git/ref/heads/" % TARGET):
+        if path.startswith("/repos/%s/git/refs/heads/" % TARGET) and method == "PATCH":
+            # Like GitHub: a ref is updated at git/refs/<ref>.
             if self.branch_sha is None:
                 return SimpleNamespace(status=404, data=None)
+            self.branch_sha = body.get("sha", self.branch_sha)
+            return SimpleNamespace(data={"object": {"sha": self.branch_sha}})
+        if path.startswith("/repos/%s/git/ref/heads/" % TARGET):
+            # Like GitHub: a ref is read at git/ref/<ref>, and a PATCH there
+            # answers 404 (loom#1405).
             if method == "PATCH":
-                self.branch_sha = body.get("sha", self.branch_sha)
-                return SimpleNamespace(data={"object": {"sha": self.branch_sha}})
+                raise AssertionError("PATCH to the git/ref read path answers 404: %s" % path)
+            if self.branch_sha is None:
+                return SimpleNamespace(status=404, data=None)
             return SimpleNamespace(status=200, data={"object": {"sha": self.branch_sha}})
         if path == "/repos/%s/git/refs" % TARGET and method == "POST":
             self.branch = self.base
@@ -218,7 +227,7 @@ class PinRebuildTest(unittest.TestCase):
         return 'LOOM_REVISION="%s"\nLOOM_SHA256="%s"\n' % (revision, "0" * 64)
 
     def ref_path(self):
-        return "/repos/%s/git/ref/heads/%s" % (TARGET, quote(BRANCH, safe=""))
+        return "/repos/%s/git/refs/heads/%s" % (TARGET, quote(BRANCH, safe=""))
 
     def assert_rebuilt(self, gh, revision):
         patches = [c for c in gh.calls if c[0] == "PATCH" and c[1] == self.ref_path()]
@@ -265,7 +274,7 @@ class PinRebuildTest(unittest.TestCase):
         pin.pin_one(gh, SOURCE, NEXT, SPEC, lambda: "digest", lambda _: None)
         after = len([c for c in gh.calls if c[0] in ("PUT", "PATCH", "POST")])
         self.assertEqual(after, before)
-        self.assertFalse(any(c[0] == "PATCH" and "git/ref/heads" in c[1] for c in gh.calls))
+        self.assertFalse(any(c[0] == "PATCH" and "/git/ref" in c[1] for c in gh.calls))
         self.assertFalse(any(c[0] == "PUT" and "/contents/" in c[1] for c in gh.calls))
 
 

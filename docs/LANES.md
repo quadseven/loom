@@ -199,7 +199,9 @@ failure moves the ticket to another available lane as a new attempt, at most
 `loom:queued` on its rung, never to `loom:failed` (loom#1395). A run that exits 124 after editing pushes
 its edits to a side branch `<branch>-timedout-<time>` and names it in the
 failure reason; the retry's brief tells the next attempt to start from that
-branch. A fix round that fails transiently goes
+branch. On a public repo that side branch, like a `-unvalidated-` one, is
+pushed only after the public repo leak scan passes on its edits; otherwise no
+branch is kept. A fix round that fails transiently goes
 back to `loom:pr`, and one that fails its work goes to `loom:failed`, so the
 factory climbs the ladder and sends the fix to the next rung; a lane that hit its provider limit stays unavailable until the
 provider's reset (else 60 minutes; delete its heartbeat file in
@@ -473,7 +475,9 @@ line and a link; a count of the goal homes where nothing moved; and the
 factory's daily numbers, which then no longer go out on their own. Each time
 is sent once, and a failed send is tried again on the next pass. Switching
 the digest on sends nothing until the next digest time. Setting
-`LOOM_REPORT_DIGEST_TIMES` empty forwards each report as below.
+`LOOM_REPORT_DIGEST_TIMES` empty forwards each report as below. Neither
+pushes a report whose goal was quiet since the report before it
+(docs/BRAIN.md, Quiet goals); the digest counts that goal as quiet.
 
 Each report on its own: the station also reads comments on open `loom:goal`
 issues in each `LOOM_REPOS` repo. On first run it records the newest report comment per repo
@@ -659,7 +663,10 @@ writes `verify.json`: a proof record (`bus/proof.py`),
 ahead of a build, the `unmet` answer described below. The runner copies it
 to the lane's log folder as `<brief>.verify.json`, with the run's model
 beside it in `<brief>.verify.model`. The station checks a record with
-`bus/proof.py`, ticks the criteria and moves the ticket to verified with the
+`bus/proof.py`, refuses it when it passes a live or operator criterion the
+station has no evidence for (docs/BRAIN.md, Verify before ship: a verify run
+has no network, so its word is not evidence), ticks the criteria and moves
+the ticket to verified with the
 proof, marked `"verified_by": "<lane>/<model>"` (`<lane>/unknown` when the
 run recorded no model). It refuses a record whose revision does not contain
 the merge commit of each linked pull request merged into the default branch
@@ -1479,3 +1486,14 @@ One class covers the whole pull request, highest wins:
 The pull request carries exactly one `class:<name>` label, created like
 the other labels by `bus/labels.py`. Classification never changes merge
 rules; it only tells the reader how risky the change is.
+
+## Operator steps before merge
+
+Every lane pull request body also carries an `## Operator steps before
+merge` section, after `## Out of scope`: each step a person must take
+before the change can merge and deploy (a data migration, a cutover, a VM
+or disk resize, scaling a workload down), one per line, or the single word
+`none`. The agent writes it in `.loom/summary.md`; without one the runner
+copies the ticket's section of that name, else writes `none stated`.
+A pull request that lists a step is never merged by Loom (docs/BRAIN.md,
+Operator holds).

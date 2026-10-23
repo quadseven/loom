@@ -91,10 +91,13 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
     repo, _, num = args.target.partition("#")
     with open(args.file, encoding="utf-8") as fh:
         text = fh.read()
+    authors = brain.trusted_authors()
     try:
-        journal.post(gh, repo, int(num), text, args.holder, brain.trusted_authors())
-    except journal.ReportTooSoon as held:
-        # The goal is already reported: not a failed step, so exit 0.
+        journal.post(gh, repo, int(num), text, args.holder, authors,
+                     quiet=lambda: brain.goal_quiet(gh, repo, int(num), authors))
+    except (journal.ReportTooSoon, journal.ReportQuiet) as held:
+        # The goal is already reported, or quiet since its last report
+        # (loom#1534): not a failed step, so exit 0.
         print("not posted: %s" % held)
         return 0
     print("posted to %s" % args.target)

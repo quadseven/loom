@@ -275,13 +275,16 @@ INTENT_CLASS=""
 INTENT_TEXT=""
 SENSITIVE_FILE=.loom/sensitive-paths
 SUMMARY_FILE=.loom/summary.md
+# The section a lane fills with the steps a person takes before its change
+# merges, or "none" (bus/operator_hold.py holds a pull request that lists any).
+OPERATOR_SECTION="Operator steps before merge"
 
 # What the agent is told about the Intent summary: one line per behavior
 # change in .loom/summary.md, else the runner falls back to the ticket's
 # What section, or the reason a run changed nothing (no_change_reason). The
 # file itself is never committed.
 summary_note() {
-  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion built, leave Live criteria unticked, and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE"
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion the change builds; leave every live check (a Live line, or anything seen on a running system, a host, a network or over time) and every operator action unticked, since only the station'"'"'s verifier ticks those; and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION"
 }
 
 # How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
@@ -384,7 +387,7 @@ prepare_intent() {
 }
 
 pr_body() {
-  local size issue refs="" criteria
+  local size issue refs="" criteria ops
   issue="$(field Issue "$1" || true)"
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
   # The size as the review bot's letter (Medium -> M), so its plan check
@@ -408,9 +411,16 @@ pr_body() {
   criteria="$(printf '%s\n' "$criteria" |
     PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan pad-criteria - ||
     printf '%s' "$criteria")"
-  printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
+  # The lane's own word on operator steps, else the ticket's; a body with
+  # neither says so, and the factory's keyword backstop still reads both.
+  ops="$(section "$OPERATOR_SECTION" "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
+  [ -n "$ops" ] || ops="$(section "$OPERATOR_SECTION" "$TREE/$SUMMARY_FILE" 2>/dev/null)"
+  [ -n "$ops" ] || ops="$(section "$OPERATOR_SECTION" "$1")"
+  [ -n "$ops" ] || ops="none stated"
+  printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n## %s\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
     "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$criteria" \
-    "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL" "$validated" "$refs"
+    "$size" "$(section 'Out of scope' "$1")" "$OPERATOR_SECTION" "$ops" \
+    "$2" "$LANE" "$MODEL" "$validated" "$refs"
 }
 
 # A fix brief's PR must still be open on the brief's branch. Returns 1 with
@@ -529,13 +539,33 @@ PY
 
 # The reply text reaches gh as a -f field value (a GraphQL variable), never
 # spliced into the query or a shell command line, so it cannot inject anything.
+# The agent names the thread ids, so each one is checked first: a thread on
+# any pull request but this round's own ($REPO#$FIX_PR) is skipped, and so is
+# a reply bus/text.py refuses. Resolving a thread is a merge gate input; an
+# agent must never answer or resolve one on another pull request.
 post_replies() {
-  local entry thread body resolve
+  local entry thread body resolve owner text_file
   [ -n "$REPLIES_FILE" ] && [ -f "$REPLIES_FILE" ] || return 0
   while IFS= read -r entry; do
     thread="$(jq -r '.thread' <<< "$entry")"
     body="$(jq -r '.reply' <<< "$entry")"
     resolve="$(jq -r '.resolve' <<< "$entry")"
+    owner="$(timeout "$NET_TIMEOUT" gh api graphql \
+         -f 'query=query($threadId:ID!){node(id:$threadId){... on PullRequestReviewThread{pullRequest{number repository{nameWithOwner}}}}}' \
+         -f "threadId=$thread" \
+         --jq '.data.node.pullRequest | "\(.repository.nameWithOwner)#\(.number)"' 2>> "$LOG")" || owner=""
+    if [ "$owner" != "$REPO#$FIX_PR" ]; then
+      echo "review thread $thread is not on $REPO#$FIX_PR; its reply was skipped" >> "$LOG"
+      continue
+    fi
+    text_file="$(mktemp "${TMPDIR:-/tmp}/loom-reply.XXXXXX")" || continue
+    printf '%s' "$body" > "$text_file"
+    if ! body="$(checked_text "$text_file" 2>> "$LOG")"; then
+      rm -f "$text_file"
+      echo "the reply to review thread $thread was refused; it was skipped" >> "$LOG"
+      continue
+    fi
+    rm -f "$text_file"
     if ! timeout "$NET_TIMEOUT" gh api graphql \
          -f 'query=mutation($threadId:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){comment{id}}}' \
          -f "threadId=$thread" -f "body=$body" >> "$LOG" 2>&1; then
@@ -1588,22 +1618,68 @@ resolve_factory_incidents() {
     number="$(tr -cd '0-9' < "$file")"
     if [ -n "$number" ]; then
       gh issue close --repo "$FACTORY_REPO" "$number" \
-        --comment "Cleared: the check passed on the unmodified base in $TICKET." >>"$LOG" 2>&1 || continue
+        --comment "Cleared: the check passed on the unmodified base in $(incident_ticket)." >>"$LOG" 2>&1 || continue
     fi
     rm -f "$file"
   done
 }
+# The factory repo is public, and an incident for a private repo once put
+# that repo's name, ticket and check command in it (loom#1040, loom#1273).
+# Only a repo known to be public (REPO_PRIVATE=false) is named; any other is
+# "private repo <alias>", where the alias is a random id this machine keeps
+# per repo, so its incidents still dedupe by title and close on their own.
+# Its ticket and failing line stay in the lane log and on the ticket.
+INCIDENT_WITHHELD="withheld: the lane log and the ticket have the detail"
+repo_is_public() { [ "${REPO_PRIVATE:-}" = false ]; }
+incident_ticket() {
+  if repo_is_public; then printf '%s' "$TICKET"; else printf 'a private repo ticket'; fi
+}
+incident_subject() {
+  local file alias
+  if repo_is_public; then printf '%s' "$REPO"; return 0; fi
+  file="$INCIDENT_DIR/$(printf '%s' "$REPO" | tr '/' '_').alias"
+  if [ ! -s "$file" ]; then
+    mkdir -p "$INCIDENT_DIR" && od -An -N4 -tx1 /dev/urandom | tr -cd '0-9a-f' > "$file" || return 1
+  fi
+  alias="$(tr -cd '0-9a-f' < "$file")"
+  [ "${#alias}" -eq 8 ] || return 1
+  printf 'private repo %s' "$alias"
+}
+# The public repo leak scan over a public repo's incident detail, the one
+# part of the text a check or contract supplies. A refused or unavailable
+# scan withholds it: the rest is fixed text, the repo and the ticket id.
+incident_text_clean() {  # text
+  local text_file rc=0
+  text_file="$(mktemp "${TMPDIR:-/tmp}/loom-incident.XXXXXX")" || return 1
+  printf '%s\n' "$1" > "$text_file"
+  [ -f "$LEAK_SCANNER" ] && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$text_file" \
+    --allow-repo-ref "$FACTORY_REPO" --allow-repo-ref "$REPO" >> "$LOG" 2>&1 || rc=1
+  rm -f "$text_file"
+  return "$rc"
+}
 file_factory_incident() {  # kind, detail
-  local kind="$1" detail="$2" title body number existing
-  title="Factory incident: $REPO validation $kind"
+  local kind="$1" detail="$2" title body number existing subject ticket
+  if ! subject="$(incident_subject)"; then
+    echo "could not name the incident for a private repo; nothing filed" >> "$LOG"
+    printf 'factory incident filing failed'
+    return 0
+  fi
+  ticket="$(incident_ticket)"
+  if ! repo_is_public; then
+    detail="$INCIDENT_WITHHELD"
+  elif ! incident_text_clean "$detail"; then
+    echo "the incident detail failed the public repo leak scan; it was withheld" >> "$LOG"
+    detail="$INCIDENT_WITHHELD"
+  fi
+  title="Factory incident: $subject validation $kind"
   body="$(printf '%s\n\nRepo: %s\nKind: %s\nTicket: %s\n\n%s\n' \
-    "$INCIDENT_MARKER" "$REPO" "$kind" "$TICKET" "$detail")"
+    "$INCIDENT_MARKER" "$subject" "$kind" "$ticket" "$detail")"
   existing="$(open_issue "$title")"
   if [ -n "$existing" ]; then
     number="$existing"
     # One comment on the incident with a running count, never one per run.
     printf '%s' "$detail" | upsert_sticky_comment "$FACTORY_REPO" "$number" "$INCIDENT_REPEAT_MARKER" repeat \
-      --headline "Still failing" --items-label "Tickets seen" --item "$TICKET" || true
+      --headline "Still failing" --items-label "Tickets seen" --item "$ticket" || true
   else
     number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
       --body "$body" --label loom:factory 2>>"$LOG" || \
@@ -1974,9 +2050,20 @@ check_contract_change() {
 
 # Push a commit of the lane tree to a side branch of the ticket's branch and
 # say where the edits are. Never touches the ticket's branch or an open pull
-# request.
+# request. A side branch on a public repo is as public as a pull request, so
+# the same leak scan runs first, and any repo not known to be private counts
+# as public; a refused or unavailable scan keeps no branch.
 push_side() {
-  local from="$1" side="$2"
+  local from="$1" side="$2" range
+  if [ "${REPO_PRIVATE:-}" != true ]; then
+    range="$BASE..$from"
+    [ -n "${FIX_UPSTREAM:-}" ] && range="$FIX_UPSTREAM...$from"
+    if [ ! -f "$LEAK_SCANNER" ] || ! (cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" \
+         --diff "$range" --allow-repo-ref "$REPO") >> "$LOG" 2>&1; then
+      printf 'the public repo leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree'
+      return 1
+    fi
+  fi
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        push -q origin "$from:refs/heads/$side" >> "$LOG" 2>&1; then
     printf 'the edits are on branch %s' "$side"

@@ -4,9 +4,10 @@ from __future__ import annotations
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 from . import notify as _notify
+from . import quiet as _quiet
 from . import text as _text
 from .github import GitHub
 from .handoff import (EARLIER_CLOSE, EARLIER_OPEN, JOURNAL_MARKER as _MARKER, _TICK,
@@ -27,6 +28,17 @@ REPORT_GAP = 90 * 60
 
 class ReportTooSoon(ValueError):
     """A report not posted: another went out on the goal home within REPORT_GAP."""
+
+
+class ReportQuiet(ValueError):
+    """A report not posted: the goal is quiet since its last report
+    (bus/quiet.py), and its heartbeat is not due or has no report to edit."""
+
+
+def quiet_message(still: "_quiet.Quiet") -> str:
+    return ("quiet since %s: nothing in the goal's scope moved since its last report, so "
+            "no report is owed; its heartbeat edits that report in place from %s"
+            % (_when(still.since), _when(still.next_heartbeat())))
 
 
 def _at(value: Any) -> Optional[datetime]:
@@ -248,14 +260,19 @@ def _mine_today(c: Any, me: str, day: str, holder: str) -> bool:
 
 def post(gh: GitHub, repo: str, issue_number: int, text: str,
          holder: Optional[str] = None, trusted: Sequence[str] = (),
-         now: Optional[datetime] = None):
+         now: Optional[datetime] = None,
+         quiet: Optional[Callable[[], Optional["_quiet.Quiet"]]] = None):
     """Post a journal, report or reply. A journal edits this holder's journal
     of the same UTC day in place, newest tick first, and is posted new only
     for the day's first tick: each new comment emails the operator
     (2026-10-18). Plain prose with a holder is a journal tick (as_journal).
     A report is refused with ReportTooSoon, and nothing posted, when another
     report went out on the same goal home within REPORT_GAP (report_hold
-    says whose count)."""
+    says whose count). `quiet` reads whether the goal is quiet since its last
+    report (brain.goal_quiet): a quiet goal's report is refused with
+    ReportQuiet, and once its last report is quiet.HEARTBEAT_EVERY old the
+    report is that week's heartbeat, edited into this client's newest
+    report instead of posted (loom#1534)."""
     text = as_journal(text, holder)
     if text.startswith(JOURNAL_MARKER):
         text = with_tick(text, holder)
@@ -268,5 +285,33 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
                            {"body": body})
     _text.check(text)
     if text.startswith(REPORT_MARKER):
-        _check_report_gap(gh, repo, issue_number, now or datetime.now(timezone.utc), trusted)
+        now = now or datetime.now(timezone.utc)
+        _check_report_gap(gh, repo, issue_number, now, trusted)
+        still = quiet() if quiet is not None else None
+        if still is not None:
+            if not still.heartbeat_due(now):
+                raise ReportQuiet(quiet_message(still))
+            return _heartbeat(gh, repo, issue_number, text, still, now)
     return _notify.post(gh, repo, issue_number, text, _notify.JOURNAL)
+
+
+def _heartbeat(gh: GitHub, repo: str, issue_number: int, text: str,
+               still: "_quiet.Quiet", now: datetime):
+    """A quiet goal's weekly heartbeat: `text` edited into this client's
+    newest report on the goal home, never a new comment (an edit sends no
+    email). With no report of this client's there, ReportQuiet."""
+    me = _self_login(gh).lower()
+    mine = None
+    for c in gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, int(issue_number))):
+        if (isinstance(c, dict) and c.get("id") is not None and me
+                and str((c.get("user") or {}).get("login") or "").lower() == me
+                and str(c.get("body") or "").startswith(REPORT_MARKER)
+                and (mine is None or str(c.get("created_at")) >= str(mine.get("created_at")))):
+            mine = c
+    if mine is None:
+        raise ReportQuiet("%s; %s has no report on this goal home to edit, and a heartbeat "
+                          "never posts a new one" % (quiet_message(still), me or "this client"))
+    body = _quiet.heartbeat(text, now)
+    _text.check(body)
+    return gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(mine["id"])),
+                   {"body": body})

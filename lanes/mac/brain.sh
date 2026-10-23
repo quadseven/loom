@@ -150,7 +150,24 @@ ladder_open() {
 BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_TRUSTED_BRIEFERS
   LOOM_REPO_OWNERS LOOM_HOME
   LOOM_BRAIN_SCOPE LOOM_BRAIN_HOLDER LOOM_REVIEW_CHECK LOOM_REVIEW_BOT LOOM_GOAL_CAP
-  LOOM_UNVERIFIED_LIMIT LOOM_REPAIR_EPICS LOOM_MERGE_SETTLE_SECONDS LOOM_GITHUB_LOGIN)
+  LOOM_UNVERIFIED_LIMIT LOOM_REPAIR_EPICS LOOM_MERGE_SETTLE_SECONDS LOOM_GITHUB_LOGIN
+  LOOM_SHADOW LOOM_SHADOW_REPOS LOOM_SHADOW_LEDGER)
+
+# Shadow mode (bus/shadow.py, docs/BRAIN.md Shadow mode): the rung holds a
+# GitHub token, so its gh is a guard that asks python3 -m bus.shadow gh-guard
+# first and refuses, and records, a merge, an issue close, an approving
+# review, or a merge or ship label while shadow is on. The guard reads the
+# switch itself and fails closed, so it is put in front of every rung, in $1
+# (a folder the rung can read). It covers gh only: a rung that sends the
+# request another way (curl) is held by its instructions alone (docs/MUSE.md).
+shadow_guard() {
+  local real
+  real="$(command -v gh)" || return 0
+  mkdir -p "$1" || return 1
+  printf '#!/bin/bash\n# lanes/mac/brain.sh shadow_guard: shadow mode (bus/shadow.py).\nhere="$PWD"\n(cd %q && exec python3 -B -m bus.shadow gh-guard "$here" "$@") || exit $?\nexec %q "$@"\n' \
+    "$WORK/loom" "$real" > "$1/gh" && chmod 755 "$1/gh" || return 1
+  PATH="$1:$PATH"
+}
 
 # The spark rung runs as the spark lane does: opencode inside the shared
 # sandbox, with an emptied environment and a scratch home. Its tree is the
@@ -166,6 +183,7 @@ spark_brain() {
   case "$token" in *[!A-Za-z0-9_.-]*) echo "the GitHub token has unexpected characters" >&2; return 3 ;; esac
   AGENT_HOME="$LOOM_HOME/run/brain-home"
   rm -rf "$AGENT_HOME" && mkdir -p "$AGENT_HOME" || return 3
+  shadow_guard "$AGENT_HOME/bin" || { echo "could not put the shadow gh guard in place" >&2; return 3; }
   LANE=spark SKILLS="" API_KEY="" SPARK_URL="$LOOM_SPARK_URL"
   NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
   # The sandbox denies the keychain server, which TLS verification asks for
@@ -182,7 +200,9 @@ spark_brain() {
 run_rung() {
   case "$RUNG" in
     spark) spark_brain "$1" ;;
-    *) agent_cli "$RUNG" brain "$1" ;;
+    *) shadow_guard "$LOOM_HOME/run/brain-bin" ||
+         { echo "could not put the shadow gh guard in place" >&2; return 3; }
+       agent_cli "$RUNG" brain "$1" ;;
   esac
 }
 
@@ -287,7 +307,10 @@ $HOLDER, which edits your journal of the day there instead of emailing the \
 issue's watchers with a new comment; evidence whose blocker kind has no issue \
 of exactly that kind goes to the goal home's journal, never the closest \
 issue. This replaces the 15-minute limit in MUSE.md: stop within \
-$((MINUTES - 5)) minutes; you are cut off at $MINUTES."
+$((MINUTES - 5)) minutes; you are cut off at $MINUTES. Shadow mode (MUSE.md): \
+unless LOOM_SHADOW is 0, never merge, close an issue, approve a pull request, \
+or add ready-to-land or loom:shipped by any route (gh, curl, the API); \
+bus.brain merge and bus.brain close run their gates and record what they would do."
 if [ "$SCOPE" = live ]; then
   PROMPT="$PROMPT Muse does the GitHub steps, ships and rolls, and reads \
 live data through REST APIs, but has no cluster or database access. Do what \

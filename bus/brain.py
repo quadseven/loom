@@ -14,9 +14,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from .github import GitHub, GitHubError, RateLimited, _next_link, auth_from_env, rest_login, unreadable
-from . import audit, change_class, handoff, hunt_plan, journal, lock, notify, pr_repair, proof, stale_claims, text, tickets
-from . import naming
+from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
+                     rest_login, unreadable)
+from . import audit, change_class, handoff, hunt_plan, journal, lock, notify, pr_repair, proof, quiet, stale_claims, text, tickets
+from . import merge_tier, naming, operator_hold, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -158,7 +159,8 @@ def _status_goal_fields(goal_ids: Sequence[int]) -> List[str]:
     """GraphQL aliases for the latest comments on each goal issue."""
     # __typename: GraphQL names the Loom App "<slug>" without "[bot]", and
     # only a Bot author gains the suffix that LOOM_BRIEF_AUTHORS carries.
-    return ["g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt"
+    # updatedAt: a quiet goal's heartbeat edits its last report (bus/quiet.py).
+    return ["g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt updatedAt"
             " author { __typename login } } } }" % (n, n)
             for n in goal_ids]
 
@@ -319,15 +321,58 @@ def _owed_line(issue: Dict[str, Any], led: Dict[str, Any], comments: List[Dict[s
         issue["number"], led["state"].upper(), led["due"] or "an unknown time")
 
 
+def goal_breaches(issues: Sequence[Dict[str, Any]], goal: int) -> List[Dict[str, Any]]:
+    """The open loom:invariant issues among `issues` that name the goal."""
+    return [i for i in issues if isinstance(i, dict) and "pull_request" not in i
+            and i.get("state", "open") == "open" and quiet.INVARIANT_LABEL in _labels(i)
+            and _names_goal(i.get("body"), goal)]
+
+
+def goal_quiet(gh: GitHub, repo: str, goal: int, authors: Optional[Sequence[str]] = None,
+               now: Optional[datetime] = None) -> Optional[quiet.Quiet]:
+    """Whether the goal is quiet since its last report (bus/quiet.py), read
+    the way status reads it: its comments, its tickets and the open breaches
+    that name it. `python3 -m bus journal` asks this before a report."""
+    comments = gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, goal))
+    breaches = goal_breaches(gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                         % (repo, quiet.INVARIANT_LABEL)), goal)
+    return quiet.quiet(comments, goal_children(gh, repo, goal), breaches,
+                       now or datetime.now(timezone.utc), authors)
+
+
+def _quiet_lines(still: Optional[quiet.Quiet]) -> List[str]:
+    """A quiet goal's line under it in status, else none."""
+    if still is None:
+        return []
+    return ["  - quiet since %s: no report owed; heartbeat from %s"
+            % (_iso(still.since), _iso(still.next_heartbeat()))]
+
+
+def _owed_lines(issue: Dict[str, Any], led: Dict[str, Any], comments: List[Dict[str, Any]],
+                now: datetime, authors: Optional[Sequence[str]],
+                still: Optional[quiet.Quiet]) -> List[str]:
+    """A due or overdue goal's line under "Reports owed before unlock": none
+    for a quiet goal, a HEARTBEAT line once it has been quiet a week."""
+    if still is None:
+        return [_owed_line(issue, led, comments, now, authors)]
+    if not still.heartbeat_due(now):
+        return []
+    return ["- #%s report HEARTBEAT: quiet since %s and its last report was touched %s; "
+            "`journal` edits the report in place, no new comment" % (
+                issue["number"], _iso(still.since), _iso(still.touched))]
+
+
 def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime,
                 authors: Optional[Sequence[str]] = None, gh: Optional[GitHub] = None,
-                repo: str = "") -> List[str]:
+                repo: str = "", issues: Sequence[Dict[str, Any]] = ()) -> List[str]:
     lines = ["### Goals"]
     owed = []
     limit = unverified_limit()
     for issue in goals:
         node = data["goals"].get(int(issue["number"])) or {}
         led = goal_ledger(issue, node, now, authors)
+        comments = (node.get("comments") or {}).get("nodes") or []
+        still: Optional[quiet.Quiet] = None
         lines.append("- #%s %s - latest journal %s, report %s, measure %s, action %s"
                      " - report %s (due %s)" % (
                          issue["number"], issue.get("title", ""),
@@ -351,9 +396,13 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
             if held > limit:
                 lines.append("  - OVER LIMIT: the station claims no new build ticket and the "
                              "brain files no ordinary brief for this goal until it is back under")
-        comments = (node.get("comments") or {}).get("nodes") or []
+            # loom#1534: a goal where nothing moved is owed no report; each
+            # one emailed its author "nothing moved" four times a day.
+            still = quiet.quiet(comments, _flatten(loose, tree),
+                                goal_breaches(issues, int(issue["number"])), now, authors)
+            lines += _quiet_lines(still)
         if led["state"] != "ok":
-            owed.append(_owed_line(issue, led, comments, now, authors))
+            owed += _owed_lines(issue, led, comments, now, authors, still)
         found = handoff.journals(
             [{"body": c.get("body"), "at": c.get("createdAt"),
               "login": rest_login(c.get("author"))} for c in comments], authors or ())
@@ -641,10 +690,19 @@ def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
         if ticket is not None and authors:
             comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
             if _pending_brain_fix(comments, authors):
-                line = (line.removesuffix("READY") + "blocked: pending brain fix"
-                        if line.endswith(" - READY") else line + ", pending brain fix")
+                line = _add_blocker(line, "pending brain fix")
+        if operator_hold.operator_steps(str(pr.get("body") or "")):
+            # bus.brain merge refuses it and asks the operator; status says
+            # so first, from the body it already holds (2026-10-22).
+            line = _add_blocker(line, "held for the operator: operator steps before merge")
         lines.append(line)
     return lines
+
+
+def _add_blocker(line: str, blocker: str) -> str:
+    """A merge-ready line with one more blocker."""
+    return (line.removesuffix("READY") + "blocked: " + blocker
+            if line.endswith(" - READY") else line + ", " + blocker)
 
 
 def _sensitive_pr_lines(prs: List[Dict[str, Any]]) -> List[str]:
@@ -734,7 +792,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     warn = _trunk_warning(goals, data)
     if warn:
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
-    lines += _goal_lines(goals, data, now, authors, gh, repo) + [""]
+    lines += _goal_lines(goals, data, now, authors, gh, repo, issues) + [""]
     lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
@@ -899,6 +957,17 @@ def _health_lines(env: Dict[str, str]) -> List[str]:
 def _check_model(model: Optional[str]) -> None:
     if model is not None and not MODEL_RE.fullmatch(model):
         raise ValueError("model is not a model id")
+
+
+def _check_laneable(body: str) -> None:
+    """Refuse a brief no lane can meet: every acceptance criterion is a check
+    on a live host or network (operator_hold.host_only). 2026-10-22: such a
+    ticket was laned; the lane replaced a README to have a diff, and it
+    merged."""
+    if operator_hold.host_only(body):
+        raise ValueError("every acceptance criterion is a check on a live host or network: "
+                         "no lane can meet it; file it as a needs-operator ask, or add a "
+                         "criterion a pull request can meet")
 
 
 def _check_brief_args(title: str, body: str, lane: Optional[str],
@@ -1360,6 +1429,12 @@ def close_epic(gh: GitHub, repo: str, number: int, note: str) -> None:
     if still:
         raise ValueError("epic #%d still holds open tickets: %s" % (
             number, ", ".join("#%s" % t.get("number") for t in still[:5])))
+    if shadow.active(repo):
+        entry = shadow.record_held(shadow.CLOSE, repo, number, "issue", reason="epic done: " + note,
+                              gates=["open epic", "every ticket closed"],
+                              source="bus.brain close-epic")
+        raise ShadowHeld("shadow mode: would close epic %s#%d; recorded in the shadow ledger "
+                         "and left open" % (repo, number), entry)
     notify.post(gh, repo, number, note, notify.CLOSED)
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
             {"state": "closed", "state_reason": "completed"})
@@ -2101,6 +2176,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         # A forbidden model is written as its stand-in (tickets.allowed_model).
         model = tickets.allowed_model(model)
     _check_brief_args(title, body, lane, model, base)
+    _check_laneable(body)
     if not_before is not None and not tickets.NOT_BEFORE_RE.fullmatch(not_before):
         raise ValueError("not-before is not a UTC time like 2026-10-13T17:00:00Z")
     if after is not None:
@@ -2948,6 +3024,7 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
              ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
              ' reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes {'
              ' databaseId author { __typename login } body createdAt } } } }'
+             ' files(first:100) { totalCount nodes { path deletions changeType } }'
              ' } } }') % (_gql(owner), _gql(name), number)
     data = gh.graphql(query) or {}
     return ((data.get("repository") or {}).get("pullRequest") or {})
@@ -2960,6 +3037,7 @@ def merge(gh: GitHub, repo: str, number: int,
         raise ValueError("--adopt merges a pull request that has no ticket")
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     details = _pr_graphql(gh, repo, number)
+    tier = ""
     if adopt:
         if not _ticketless(repo, pr):
             raise ValueError("pull request is linked to a ticket; merge it without --adopt")
@@ -2974,11 +3052,17 @@ def merge(gh: GitHub, repo: str, number: int,
             bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
                    or factory.DEFAULT_REVIEW_BOT)
             _validate_sensitive_merge(gh, repo, details, bot, review_check_name(env))
-        association = _validate_ticket_association(gh, repo, number, pr, ticket, "pr")
+        association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
         _refuse_pending_fix(gh, association, env)
+        _refuse_operator_hold(gh, repo, number, pr, details, association, issue)
+        tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
+    if shadow.active(repo):
+        _shadow_merge(repo, number, str(sha), association, adopt,
+                      "" if adopt else tier,
+                      change_class.class_of(pr) == "sensitive")
     result = gh.rest("PUT", "/repos/%s/pulls/%d/merge" % (repo, number),
                      {"merge_method": "squash", "sha": sha}).data or {}
     if result.get("merged") is not True:
@@ -2993,6 +3077,119 @@ def merge(gh: GitHub, repo: str, number: int,
         notify.post(gh, repo, number, ADOPT_COMMENT, notify.MERGED)
     return {"merged": True, "pull_request": (repo, number),
             "ticket": association, "head_sha": sha}
+
+
+def _shadow_merge(repo: str, number: int, sha: str, ticket: Optional[Tuple[str, int]],
+                  adopt: bool, tier: str, sensitive: bool) -> None:
+    """Record the merge every gate allowed and refuse it: `repo` is in shadow
+    mode (bus/shadow.py). The pull request stays open for the operator."""
+    if adopt:
+        gates = ["ticketless adopt checks"]
+    else:
+        gates = ["settled", "checks green and mergeable", "ticket linked and trusted",
+                 "no pending brain fix", "no operator hold"]
+        if sensitive:
+            gates.append("sensitive review")
+        gates.append("risk tier %s: review check passed, no blocking finding, under the cap"
+                     % (tier or "revert"))
+    reason = ("ticket %s#%d" % ticket) if ticket else ("adopted" if adopt else "")
+    entry = shadow.record_held(shadow.MERGE, repo, number, "pr", tier=tier, gates=gates,
+                          reason=reason, sha=sha, source="bus.brain merge")
+    raise ShadowHeld("shadow mode: would merge %s#%d at %s (tier %s); recorded in the shadow "
+                     "ledger and left open for the operator"
+                     % (repo, number, sha[:12], tier or ("adopt" if adopt else "revert")), entry)
+
+
+def _changed_files(details: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """The changed files from the merge read, as the REST files API names
+    them (filename, deletions, status), or None when it does not hold them
+    all (more than one page), so the caller reads them from REST."""
+    files = details.get("files")
+    if not isinstance(files, dict):
+        return None
+    nodes = [n for n in files.get("nodes") or [] if isinstance(n, dict)]
+    if int(files.get("totalCount") or 0) > len(nodes):
+        return None
+    if any(str(n.get("changeType") or "").upper() == "RENAMED" for n in nodes):
+        return None  # GraphQL gives no old path: REST names it (previous_filename)
+    return [{"filename": str(n.get("path") or ""), "deletions": int(n.get("deletions") or 0),
+             "status": str(n.get("changeType") or "").lower()} for n in nodes]
+
+
+def _refuse_operator_hold(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
+                          details: Dict[str, Any], ticket: Optional[Tuple[str, int]],
+                          issue: Dict[str, Any]) -> None:
+    """Refuse a lane pull request that waits for the operator
+    (bus/operator_hold.py): it declares operator steps before merge, changes
+    placement, or deletes or mostly replaces a doc its ticket does not name. Its ticket goes to loom:human with
+    one exact ask. On 2026-10-22 the brain merged one whose body left a VM
+    resize and a data migration to the operator, and the deploy took the
+    service down."""
+    why = operator_hold.reasons(gh, repo, dict(pr, number=number),
+                                str(issue.get("body") or ""), _changed_files(details))
+    if not why:
+        return
+    asked = ""
+    if ticket is not None:
+        outcome = operator_hold.hold(gh, ticket[0], ticket[1], number, why, human)
+        asked = "" if outcome in ("asked", "already") else " (%s)" % outcome
+    raise ValueError("held for the operator: %s%s" % ("; ".join(why), asked))
+
+
+def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
+                      details: Dict[str, Any], ticket: Optional[Tuple[str, int]],
+                      issue: Dict[str, Any], env: Optional[Dict[str, str]]) -> str:
+    """Refuse a lane pull request Loom may not merge on its own
+    (bus/merge_tier.py): a tier outside LOOM_AUTO_MERGE_TIERS (deploy-config,
+    security and cross-repo by default) goes to the operator with one ask on
+    its ticket; an auto tier needs the review check to have succeeded on its
+    head, no open high, critical or bad-work finding, and room under the
+    hourly caps. A revert ticket's own pull request is exempt only when
+    merge_tier.revert_refusal finds nothing: the station applied loom:revert
+    and the diff is the exact inverse of a commit the base carries. From
+    2026-10-19, 16 of 22 lane pull requests the Apps merged unattended in the
+    private deployment repo were damaging or useless, most of them deploy and
+    CI changes the change class called logic. Returns the tier ("revert" for
+    an exempt revert), which a shadow-mode record names."""
+    try:
+        entries = operator_hold.pull_files(gh, repo, number)
+    except GitHubError as err:
+        # No file list, no tier: the gate fails closed.
+        raise ValueError("held: the changed files could not be read to set the risk tier "
+                         "(%s)" % err) from err
+    if merge_tier.is_revert_ticket(pr, issue):
+        refused = merge_tier.revert_refusal(gh, repo, pr, issue, entries, env)
+        if not refused:
+            return merge_tier.REVERT
+        print("brain: %s#%d is not exempt as a revert: %s" % (repo, number, refused),
+              file=sys.stderr)
+    tier, why = merge_tier.classify(repo, entries, str(issue.get("body") or ""),
+                                    change_class.class_of(pr) == "sensitive")
+    if tier not in merge_tier.auto_tiers(env):
+        reason = merge_tier.operator_why(tier, why, env)
+        asked = ""
+        if ticket is not None:
+            outcome = operator_hold.hold(gh, ticket[0], ticket[1], number, [reason], human)
+            asked = "" if outcome in ("asked", "already") else " (%s)" % outcome
+        raise ValueError("held for the operator: %s%s" % (reason, asked))
+    sha = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
+    check = review_check_name(env)
+    if not sha or not _review_check_passed(gh, repo, sha, check):
+        raise ValueError("a %s change merges on its own only when the review check %s "
+                         "succeeded on its head commit" % (tier, check))
+    from . import factory
+    bot = (env if env is not None else os.environ).get("LOOM_REVIEW_BOT", "").strip() \
+        or factory.DEFAULT_REVIEW_BOT
+    blocking = merge_tier.blocking_findings(
+        merge_tier.review_threads(gh, repo, number),
+        str(_head_commit(details).get("committedDate") or ""),
+        lambda c: by_bot(dict(c), bot), env)
+    if blocking:
+        raise ValueError("open review findings hold the merge: %s" % ", ".join(blocking))
+    capped = merge_tier.cap_refusal(gh, repo, env)
+    if capped:
+        raise ValueError("the auto-merge cap holds the merge: %s" % capped)
+    return tier
 
 
 def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
@@ -3201,9 +3398,13 @@ def _validate_adopt_pr(gh: GitHub, repo: str, pr: Dict[str, Any],
     for ok, reason in rules:
         if not ok:
             raise ValueError(reason)
+    # A neutral review is a degraded or partial one. It passes only for the
+    # classes whose merge rule needs no more than a review pass (docs, tests;
+    # loom#509). A logic, sensitive or unlabeled pull request needs success:
+    # an operator's or brain's ticketless pull request carries no class label.
     if not sha or not _review_check_passed(
             gh, repo, sha, review_check_name(env),
-            allow_neutral=change_class.class_of(pr) != "sensitive"):
+            allow_neutral=change_class.class_of(pr) in ("docs", "tests")):
         raise ValueError("the review check has not passed on the head commit")
 
 
@@ -3332,6 +3533,15 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
     proof_url = ""
     if reason == "completed":
         proof_url = _check_proven(gh, repo, number, issue, env)
+    if shadow.active(repo):
+        # Before the note: a held close must not say it closed.
+        gates = ["open loom:ticket"] + (["loom:verified", "proof matches every criterion"]
+                                        if reason == "completed" else [])
+        entry = shadow.record_held(shadow.CLOSE, repo, number, "issue", gates=gates,
+                              reason="close as %s%s" % (reason, (": " + note) if note else ""),
+                              source="bus.brain close")
+        raise ShadowHeld("shadow mode: would close %s#%d as %s; recorded in the shadow ledger "
+                         "and left open" % (repo, number, reason), entry)
     if note is not None:
         notify.post(gh, repo, number, note, notify.CLOSED)
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
@@ -3437,6 +3647,12 @@ def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
             outcome = "closed"
             words = ("Ticket #%d, rewritten from this issue, is verified (%s), so this issue "
                      "closes as completed." % (number, _proof_words(number, proof_url)))
+        if outcome == "closed" and shadow.active(repo):
+            shadow.record_held(shadow.CLOSE, repo, source, "issue",
+                          reason="source issue of ticket #%d (%s)" % (number, outcome),
+                          gates=["ticket #%d %s" % (number, "closed" if unproven else "verified")],
+                          source="bus.brain settle_source")
+            return "shadow mode: would close source issue #%d; recorded, left open" % source
         marker = _source_marker(number, outcome)
         said = _said_for(comments, number)
         if said is None or not said.startswith(marker):
@@ -3721,28 +3937,28 @@ def _ticket_association(repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, in
 def _validate_ticket_association(gh: GitHub, repo: str, number: int,
                                  pr: Dict[str, Any], supplied: Optional[Tuple[str, int]],
                                  expected_state: str) -> Optional[Tuple[str, int]]:
+    return _validated_ticket(gh, repo, number, pr, supplied, expected_state)[0]
+
+
+def _validated_ticket(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
+                      supplied: Optional[Tuple[str, int]], expected_state: str
+                      ) -> Tuple[Optional[Tuple[str, int]], Dict[str, Any]]:
+    """The pull request's ticket and the ticket issue as read ({} when it
+    has none), after the checks _validate_ticket_association names."""
     association = _ticket_association(repo, pr)
     if supplied is not None and supplied != association:
         raise ValueError("supplied ticket does not match pull request")
     if association is None:
         if supplied is not None:
             raise ValueError("pull request is not linked to the supplied ticket")
-        return None
+        return None, {}
     issue = gh.rest("GET", "/repos/%s/issues/%d" % association).data or {}
     names = _labels(issue)
     if issue.get("state") != "open" or "loom:ticket" not in names:
         raise ValueError("ticket is not an open loom:ticket")
     if "loom:" + expected_state not in names:
-        # Self-heal: a ticket with an open PR that never left loom:running
-        # (lane crashed after opening the PR, or opened it without bus.lane pr)
-        # is moved to loom:pr instead of blocking the merge forever.
-        if expected_state == "pr" and bool({"loom:running", "loom:briefed"} & set(names)):
-            healed = [n for n in names if n not in ("loom:running", "loom:briefed", "loom:queued")]
-            healed.append("loom:pr")
-            gh.rest("PUT", "/repos/%s/issues/%d/labels" % association, {"labels": healed})
-        else:
-            raise ValueError("ticket is not loom:" + expected_state)
-    return association
+        raise ValueError("ticket is not loom:" + expected_state)
+    return association, issue
 
 
 def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
@@ -4296,7 +4512,7 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
         out += [_skip_line(repo, reason) for repo, reason in sorted(unread.items())]
     for repo, issue, found, skipped in goals:
         out += _goal_resume_lines(gh, repo, issue, found, latest, skipped, unread)
-    return "\n".join(out + _sensitive_resume_lines(gh, repos, now, env)
+    return "\n".join(_sensitive_resume_lines(gh, repos, now, env) + out
                       + _finished_epic_resume_lines(gh, [(r, i) for r, i, _, _ in goals])
                       + _verify_resume_lines(gh, repos, now)
                       + _audit_resume_lines(gh, repos, now, env))

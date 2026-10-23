@@ -315,6 +315,11 @@ done
 # LOOM_SETTLE_CLAIMED and LOOM_SETTLE_CLAIMED_MAX (settle operator-claimed
 # issues whose pull requests merged: empty or dry logs only, on writes, off
 # skips; and the most settled a run, default 10, docs/BRAIN.md), and
+# LOOM_SHADOW, LOOM_SHADOW_REPOS and LOOM_SHADOW_LEDGER (shadow mode: merges
+# and closes are recorded, not taken; on unless LOOM_SHADOW=0, and written as
+# 1 when unset; the repos still in shadow, empty for every repo; the ledger
+# path, docs/BRAIN.md Shadow mode), and LOOM_REVERT_LABELERS (the logins
+# whose loom:revert label is believed: the station App's login), and
 # LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and LOOM_GITHUB_APP_KEY_SSM
 # or LOOM_GITHUB_APP_KEY_FILE (a GitHub App installation token instead of the
 # personal one, minted from the key in that SSM parameter or that mode-600
@@ -389,6 +394,10 @@ cat > "$PLIST" <<EOF
     <key>LOOM_INVARIANT_GOAL</key><string>$(xml "${LOOM_INVARIANT_GOAL:-}")</string>
     <key>LOOM_PLAN_CHECK</key><string>$(xml "${LOOM_PLAN_CHECK:-}")</string>
     <key>LOOM_NO_TOPUP</key><string>$(xml "${LOOM_NO_TOPUP:-}")</string>
+    <key>LOOM_SHADOW</key><string>$(xml "${LOOM_SHADOW:-1}")</string>
+    <key>LOOM_SHADOW_REPOS</key><string>$(xml "${LOOM_SHADOW_REPOS:-}")</string>
+    <key>LOOM_SHADOW_LEDGER</key><string>$(xml "${LOOM_SHADOW_LEDGER:-}")</string>
+    <key>LOOM_REVERT_LABELERS</key><string>$(xml "${LOOM_REVERT_LABELERS:-}")</string>
     <key>LOOM_GITHUB_APP_ID</key><string>$(xml "${LOOM_GITHUB_APP_ID:-}")</string>
     <key>LOOM_GITHUB_APP_INSTALLATION_ID</key><string>$(xml "${LOOM_GITHUB_APP_INSTALLATION_ID:-}")</string>
     <key>LOOM_GITHUB_APP_KEY_SSM</key><string>$(xml "${LOOM_GITHUB_APP_KEY_SSM:-}")</string>

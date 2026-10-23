@@ -8,6 +8,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -52,6 +53,7 @@ exit 0
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%(name)s %%s\\n' "$*" >> "$FAKE_LOG"
 printf 'cwd %%s\\n' "$PWD" >> "$FAKE_LOG"
+printf 'gh-path-%(name)s %%s\\n' "$(command -v gh)" >> "$FAKE_LOG"
 [ -z "${FAKE_%(var)s_OUT:-}" ] || printf '%%s\\n' "$FAKE_%(var)s_OUT"
 exit "${FAKE_%(var)s_EXIT:-0}"
 """
@@ -67,6 +69,7 @@ printf 'opencode env GH_TOKEN=%s GITHUB_TOKEN=%s LOOM_REPOS=%s HOME=%s\\n' \\
   "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" "${LOOM_REPOS:-}" "$HOME" >> "$FAKE_LOG"
 printf 'opencode login %s\\n' "${LOOM_GITHUB_LOGIN:-none}" >> "$FAKE_LOG"
 printf 'opencode cwd %s\\n' "$PWD" >> "$FAKE_LOG"
+printf 'gh-path-opencode %s\\n' "$(command -v gh)" >> "$FAKE_LOG"
 env | grep -E '^(LOOM_|SSL_CERT_FILE=)' | sed 's/^/opencode setting /' >> "$FAKE_LOG"
 exit "${FAKE_OPENCODE_EXIT:-0}"
 """
@@ -522,6 +525,63 @@ class BrainTickTest(unittest.TestCase):
         self.assertFalse(any("foo-secret-value" in c or "LOOM_FOO_TOKEN" in c for c in calls))
         self.assertFalse(any("LOOM_OPENCODE_GO_KEY_SSM" in c for c in settings))
         self.assertFalse(any("LOOM_SPARK_URL" in c for c in settings))
+
+    def test_the_shadow_switch_reaches_the_sandboxed_brain(self):
+        # bus/shadow.py: the brain's own merges and closes honor the same
+        # switch and repo list as the station's.
+        _, calls = self.spark_tick(LOOM_SHADOW="1", LOOM_SHADOW_REPOS="example/project")
+        settings = [c for c in calls if c.startswith("opencode setting ")]
+        self.assertIn("opencode setting LOOM_SHADOW=1", settings)
+        self.assertIn("opencode setting LOOM_SHADOW_REPOS=example/project", settings)
+
+    def test_every_rung_runs_gh_through_the_shadow_guard(self):
+        # bus/shadow.py: the rung holds a GitHub token, so the gh it runs is
+        # the guard, and the prompt names shadow mode.
+        _, calls = self.tick()
+        guard = self.home / "run" / "brain-bin" / "gh"
+        self.assertIn("gh-path-claude %s" % guard, calls)
+        self.assertIn("python3 -B -m bus.shadow gh-guard", guard.read_text())
+        claude = self.agent_calls(calls, "claude")
+        self.assertIn("never merge, close an issue, approve a pull request", claude[0])
+        self.log.unlink()
+        _, calls = self.spark_tick()
+        self.assertIn("gh-path-opencode %s/run/brain-home/bin/gh" % self.home, calls)
+
+    def test_the_guard_refuses_a_merge_in_shadow_and_runs_gh_otherwise(self):
+        # The rung's checkout carries the real bus package, as origin does.
+        shutil.copytree(LANES.parent / "bus", self.root / "bus",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        git("add", ".", cwd=self.root)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "bus", cwd=self.root)
+        git("push", "-q", "origin", "main", cwd=self.root)
+        self.tick()
+        guard = str(self.home / "run" / "brain-bin" / "gh")
+        real = self.tmp / "real-python"
+        real.mkdir()
+        (real / "python3").symlink_to(sys.executable)
+        ledger = self.tmp / "ledger.jsonl"
+        env = {k: v for k, v in self.env.items() if not k.startswith("LOOM_SHADOW")}
+        env.update(PATH="%s:%s" % (real, self.env["PATH"]), LOOM_SHADOW_LEDGER=str(ledger))
+
+        def gh(*args, **extra):
+            run = subprocess.run([guard, *args], env={**env, **extra}, capture_output=True,
+                                 text=True, timeout=60)
+            calls = self.log.read_text().splitlines()
+            return run, calls
+
+        # No switch at all is shadow: the merge never reaches gh.
+        run, calls = gh("pr", "merge", "5", "-R", "example/project", "--squash")
+        self.assertEqual(1, run.returncode, run.stderr)
+        self.assertIn("shadow mode: would merge %s#%d" % ("example/project", 5), run.stderr)
+        self.assertNotIn("gh pr merge 5 -R example/project --squash", calls)
+        self.assertEqual("brain rung gh", json.loads(ledger.read_text())["source"])
+        run, calls = gh("pr", "view", "5", "-R", "example/project")
+        self.assertEqual(0, run.returncode, run.stderr)
+        self.assertIn("gh pr view 5 -R example/project", calls)
+        run, calls = gh("pr", "merge", "5", "-R", "example/project", LOOM_SHADOW="0")
+        self.assertEqual(0, run.returncode, run.stderr)
+        self.assertIn("gh pr merge 5 -R example/project", calls)
 
     def test_the_spark_sandbox_keeps_the_checkout_git_dir_read_only(self):
         # Found by the automated security review: with the tree at the brain

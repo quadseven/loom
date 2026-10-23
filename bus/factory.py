@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, change_class, labels, naming, notify, scope_fit, split, stale_claims, status, tickets
+from . import bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -496,6 +496,21 @@ def unticked_notes(missing: Sequence[str]) -> str:
         "- Change nothing else."])
 
 
+TICKED_HEADING = "### Live or operator criteria ticked by the lane"
+
+
+def ticked_notes(ticked: Sequence[str]) -> str:
+    """The fix note for live or operator criteria a lane ticked in its pull
+    request body (bus/criteria_gate.py): only the verifier ticks those."""
+    return "\n".join([TICKED_HEADING, ""] + ["- " + c for c in ticked] + [
+        "", "The factory sent this pull request back: these criteria are met only on a "
+        "running system or by a person, and the body ticks them.", "",
+        "- Untick each one in the pull request body's ## Acceptance criteria. The "
+        "station's verifier ticks a live criterion once its own check passes, and the "
+        "operator ticks an operator one.",
+        "- Change nothing else."])
+
+
 TEST_NOTES = NO_TEST_HEADING + """
 
 The factory sent this pull request back: it changes code and no test file.
@@ -645,12 +660,16 @@ def deferrable(threads: Sequence[Dict[str, Any]], bot: str, asked: set,
     thread is a medium or low finding the review bot opened that a fix round
     asked for, or the pull request has had DEFER_AFTER fix rounds. With
     `immediate` (a docs or tests change) any such finding defers at once,
-    with no fix round."""
+    with no fix round. A bad-work finding never defers."""
     still = [t for t in threads if not t.get("isResolved")]
 
     def minor(t: Dict[str, Any]) -> bool:
         root = _end(t, "root", 0)
-        return (brain.by_bot(root, bot) and bool(MINOR_RE.match(str(root.get("body") or "")))
+        body = str(root.get("body") or "")
+        # A bad-work finding (bus/merge_tier.py) says the change does not do
+        # what it claims: it goes back to the lane at any severity.
+        return (brain.by_bot(root, bot) and bool(MINOR_RE.match(body))
+                and not merge_tier.bad_work(body)
                 and (immediate or str(t.get("id")) in asked or rounds >= DEFER_AFTER))
     return still if still and all(minor(t) for t in still) else []
 
@@ -1113,7 +1132,9 @@ def acceptance_criteria(body: str) -> List[str]:
 
 
 def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
-    """Ticket criteria that a lane PR leaves unticked, excluding Live checks."""
+    """Ticket criteria that a lane PR leaves unticked, excluding live checks
+    and operator actions (bus/criteria_gate.py): only the station's verifier
+    or the operator can meet those, so a lane is never asked to tick them."""
     ticket = acceptance_criteria(ticket_body)
     pull = acceptance_criteria(pull_body)
     states = {}
@@ -1124,7 +1145,7 @@ def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
     missing = []
     for criterion in ticket:
         _, _, text = criterion.partition(" ")
-        if text.casefold().startswith("live:"):
+        if criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE:
             continue
         clean = NOT_BUILT_RE.sub("", text).strip().casefold()
         checked, not_built = states.get(clean, (False, False))
@@ -1334,7 +1355,8 @@ class Factory:
                  human: Callable[..., Any] = brain.human,
                  place: Callable[..., Any] = brain.place_under_epic,
                  plan_check: str = DEFAULT_PLAN_CHECK,
-                 scope: Optional[scope_fit.Ask] = None) -> None:
+                 scope: Optional[scope_fit.Ask] = None,
+                 demoted: Optional[Dict[str, str]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1356,6 +1378,10 @@ class Factory:
         # aside as from a limit. Left to the BRIEFED_STALL move, three tickets
         # waited two hours on lanes whose key had expired (2026-10-19).
         self.down = set(down)
+        # Lane slots demoted for bad work (bus/scorecard.py), and why: down
+        # for build tickets until the operator clears them.
+        self.demoted = dict(demoted or {})
+        self.down |= set(self.demoted)
         # Lane -> epoch its limit lifts, from its heartbeat (retry_at).
         self.limit_until = dict(limit_until or {})
         # Lane -> {model: epoch its limit lifts}: a lane with a model ladder
@@ -1724,7 +1750,8 @@ class Factory:
     def _send_back(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
                    comments: List[Dict[str, Any]], why: str,
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
-                   no_test: bool = False, unticked: Sequence[str] = ()) -> None:
+                   no_test: bool = False, unticked: Sequence[str] = (),
+                   ticked: Sequence[str] = ()) -> None:
         number = int(issue["number"])
         held = SEND_BACK_HOLDS & set(_labels(issue))
         if held:
@@ -1755,6 +1782,7 @@ class Factory:
                          % (repo, number, note))
                     return
                 tried, _ = self._tried(issue, comments, footer=footer)
+                self._close_past_ladder_pr(repo, pr)
                 self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
                                                  if 1 <= n <= len(CLIMB)])
                 return
@@ -1775,6 +1803,13 @@ class Factory:
                 notes = unticked_notes(unticked)
             except ValueError as err:
                 _say("%s#%d: unticked criteria not quoted in the fix note (%s)"
+                     % (repo, number, err))
+        if ticked:
+            try:
+                brain._check_written_text(ticked_notes(ticked))
+                notes = ticked_notes(ticked)
+            except ValueError as err:
+                _say("%s#%d: ticked criteria not quoted in the fix note (%s)"
                      % (repo, number, err))
         if lane is not None:
             sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane)
@@ -2194,7 +2229,15 @@ class Factory:
         """Land a clean, reviewed pull request, or send it back when it
         changes code without a test. A clean sensitive one waits for the brain."""
         missing = missing_criteria(str(issue.get("body") or ""), str(full.get("body") or ""))
-        if missing:
+        ticked = criteria_gate.lane_ticks(str(issue.get("body") or ""), str(full.get("body") or ""))
+        if ticked:
+            # Only the station's verifier or the operator ticks a live or
+            # operator criterion (bus/criteria_gate.py): a lane's tick on one
+            # read as evidence it had been checked (2026-10-22 audit).
+            self._send_back(repo, full, issue, comments,
+                            "a live or operator criterion is ticked; only the verifier "
+                            "ticks it: " + "; ".join(ticked), ticked=ticked)
+        elif missing:
             self._send_back(repo, full, issue, comments,
                             "unticked acceptance criteria; build these or mark each "
                             "not built with a reason: " + "; ".join(missing),
@@ -2202,9 +2245,64 @@ class Factory:
         elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
-        elif not sensitive:
+        elif (not sensitive and not self._operator_holds(repo, number, full, issue)
+              and not self._risk_holds(repo, number, full, issue)):
             self._file_criterion_follow_up(repo, number, issue, full)
             self._land(repo, number, full, issue, comments)
+
+    def _operator_holds(self, repo: str, number: int, full: Dict[str, Any],
+                        issue: Dict[str, Any]) -> bool:
+        """Whether the pull request waits for the operator instead of landing
+        (bus/operator_hold.py): it or its ticket declares operator steps
+        before merge, it changes placement, or it deletes or mostly replaces
+        a doc its ticket does not name. The ticket goes
+        to loom:human with one exact ask, once; the pull request never lands
+        on the factory's say-so, whatever later passes find."""
+        why = operator_hold.reasons(self.gh, repo, full, str(issue.get("body") or ""),
+                                    operator_hold.pull_files(self.gh, repo, number))
+        if not why:
+            return False
+        outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, why,
+                                     self.human)
+        if outcome == "asked":
+            self.actions += 1
+            _say("held %s#%d for the operator: %s" % (repo, number, "; ".join(why)))
+        elif outcome != "already":
+            _say("held %s#%d for the operator, but %s" % (repo, number, outcome))
+        return True
+
+    def _risk_holds(self, repo: str, number: int, full: Dict[str, Any],
+                    issue: Dict[str, Any]) -> bool:
+        """Whether the pull request's risk tier (bus/merge_tier.py) is one
+        Loom may not merge on its own: its ticket goes to loom:human with one
+        ask, once, and the operator merges it. A revert ticket's own pull
+        request never waits here when merge_tier.revert_refusal proves it. bus.brain merge refuses the same tiers, and
+        adds the review and hourly-cap rules for the tiers it may merge."""
+        try:
+            entries = operator_hold.pull_files(self.gh, repo, number)
+        except GitHubError as err:
+            # No file list, no tier: it waits for the next pass, unmerged.
+            _say("%s#%d waits: its changed files could not be read for the risk tier (%s)"
+                 % (repo, number, err))
+            return True
+        if merge_tier.is_revert_ticket(full, issue):
+            refused = merge_tier.revert_refusal(self.gh, repo, full, issue, entries)
+            if not refused:
+                return False
+            _say("%s#%d is not exempt as a revert: %s" % (repo, number, refused))
+        tier, why = merge_tier.classify(repo, entries, str(issue.get("body") or ""),
+                                        change_class.class_of(full) == "sensitive")
+        if tier in merge_tier.auto_tiers():
+            return False
+        reason = merge_tier.operator_why(tier, why)
+        outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, [reason],
+                                     self.human)
+        if outcome == "asked":
+            self.actions += 1
+            _say("held %s#%d for the operator: %s" % (repo, number, reason))
+        elif outcome != "already":
+            _say("held %s#%d for the operator, but %s" % (repo, number, outcome))
+        return True
 
     def _file_criterion_follow_up(self, repo: str, number: int,
                                   issue: Dict[str, Any], full: Dict[str, Any]) -> None:
@@ -2797,6 +2895,13 @@ class Factory:
             or self.model_limits.get(lane, {}).get(model, 0) > later
             for lane in lanes)
 
+    def _aside_why(self, lane: str) -> str:
+        """Why a ticket steps off the lane: demoted (bus/scorecard.py), down,
+        or at a limit."""
+        if lane in self.demoted:
+            return "demoted (%s; the operator clears it)" % self.demoted[lane]
+        return "down" if lane in self.down and lane not in self.limited else "at a limit"
+
     def _step_aside(self, repo: str, issue: Dict[str, Any]) -> None:
         """Move a ticket off a lane at a limit (or down) to the first free lane of its
         difficulty tier (or of a FALLBACK tier when none of its tier is up),
@@ -2808,7 +2913,7 @@ class Factory:
         if RUNAWAY in _labels(issue) or "needs-brain" in _labels(issue):
             return  # held for the brain: it moves nothing (loom#1224)
         old = _lane(issue)
-        why = "down" if old in self.down and old not in self.limited else "at a limit"
+        why = self._aside_why(old)
         rung = current_rung(issue)
         fallback = ""
         if rung:
@@ -2954,17 +3059,9 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
-        if self.now < held_until(issue):
-            return "%s is held" % ref
-        # A ticket held by After: is never briefed: the station refuses the
-        # claim each pass, and the lane it was given counts it as load and
-        # sits idle until the other ticket merges (2026-10-22).
-        waiting = self.held_by(repo, issue) if re.search(
-            r"^After:", str(issue.get("body") or ""), re.M) else []
-        if waiting:
-            reason = "waits for %s to merge (After:)" % ", ".join(a.short for a in waiting)
-            self._waiting(repo, issue["number"], reason)
-            return "%s %s" % (ref, reason)
+        held = self._queued_hold(repo, issue)
+        if held:
+            return "%s %s" % (ref, held)
         model_match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
         if model_match:
             return self._assign_queued_model(repo, issue, model_match.group(1))
@@ -2985,6 +3082,61 @@ class Factory:
             self._waiting(repo, issue["number"], "giving it a lane failed")
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
+
+    def _queued_hold(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why a queued ticket gets no lane this pass, or ""."""
+        if self.now < held_until(issue) or self._host_only(repo, issue):
+            return "is held"
+        held = self._brief_wait(repo, issue)
+        if held:
+            return "waits: " + held
+        # A ticket held by After: is never briefed: the station refuses the
+        # claim each pass, and the lane it was given counts it as load and
+        # sits idle until the other ticket merges (2026-10-22).
+        waiting = self.held_by(repo, issue) if re.search(
+            r"^After:", str(issue.get("body") or ""), re.M) else []
+        if waiting:
+            reason = "waits for %s to merge (After:)" % ", ".join(a.short for a in waiting)
+            self._waiting(repo, issue["number"], reason)
+            return reason
+        return ""
+
+    def _brief_wait(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why a queued ticket gets no lane, or "": a stale ticket waits for
+        the operator's answer (loom:human), and a health ticket for its cause
+        (bus/brief_check.py). Reads nothing."""
+        if "loom:human" in _labels(issue):
+            reason = "waits for a person (loom:human)"
+        elif brief_check.health_hold(issue):
+            reason = "health ticket names no cause"
+        else:
+            return ""
+        self._waiting(repo, issue["number"], reason)
+        return reason
+
+    def _host_only(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether every acceptance criterion of the queued ticket is a check
+        on a live host or network (operator_hold.host_only): it gets no lane
+        and goes to loom:human with one ask, once. 2026-10-22: such a ticket
+        was laned, the lane replaced a README to have a diff, and it merged."""
+        criteria = operator_hold.host_only(str(issue.get("body") or ""))
+        if not criteria:
+            return False
+        if "loom:human" in _labels(issue):
+            return True
+        try:
+            self.human(self.gh, repo, int(issue["number"]), operator_hold.host_only_ask(criteria))
+        except ValueError as err:
+            # The ask was refused (its quoted criteria, say); the ticket still
+            # gets no lane, and the log says why it waits with no ask.
+            _say("held queued %s#%s for a person, but the ask was refused: %s"
+                 % (repo, issue["number"], err))
+            return True
+        issue["labels"] = list(issue.get("labels") or []) + [{"name": "loom:human"}]
+        self.actions += 1
+        _say("held queued %s#%s for a person: every criterion is a host check"
+             % (repo, issue["number"]))
+        return True
 
     def _assign_queued_model(self, repo: str, issue: Dict[str, Any], model: str) -> str:
         """Give a queued ticket pinned to `model` a lane that takes it, or an

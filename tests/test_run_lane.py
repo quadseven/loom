@@ -96,6 +96,18 @@ if [ "$1" = api ]; then
       printf '%s %s' "${where%/issues/*}" "${where##*/}" > "$store/$id.on"
       cp "${6#body=@}" "$store/$id"; exit 0 ;;
   esac
+  # A review thread's pull request: every thread is on example/repo#7 except  # leak-guard-allow: fixture repo
+  # the ids listed in $FAKE_GH_FOREIGN_THREADS, which are on another one.
+  case "$*" in
+    "api graphql -f query=query("*"node(id:"*)
+      thread=""
+      for arg in "$@"; do case "$arg" in threadId=*) thread="${arg#threadId=}" ;; esac; done
+      case " ${FAKE_GH_FOREIGN_THREADS:-} " in
+        *" $thread "*) echo "example/other#3" ;;  # leak-guard-allow: fixture repo
+        *) echo "example/repo#7" ;;  # leak-guard-allow: fixture repo
+      esac
+      exit 0 ;;
+  esac
   [ "$*" = "api repos/example/repo --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
   exit 0
 fi
@@ -807,6 +819,26 @@ print('leak guard: clean (shape patterns only)')
         self.assertNotIn("[x]", intent)
         self.assertEqual(body.count("## Acceptance criteria"), 1)
 
+    def test_the_lanes_operator_steps_reach_the_pull_request_body(self):
+        # A lane pull request whose deploy needed a VM resize and a data
+        # migration merged on green checks (2026-10-22): the body now carries
+        # the lane's declaration, which bus/operator_hold.py holds on.
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY=self.TICKED + "\n\n## Operator steps before merge\n"
+                               "- Grow the VM disk to 40 GiB")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("\n## Operator steps before merge\n- Grow the VM disk to 40 GiB\n\n---\n",
+                      body)
+        self.assertIn("## Operator steps before merge", self.log.read_text())
+        self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_a_body_without_a_declaration_says_none_was_stated(self):
+        self.drop_brief()
+        self.run_lane()
+        self.assertIn("\n## Operator steps before merge\nnone stated\n\n---\n",
+                      self.body.read_text())
+
     def test_private_repo_does_not_run_leak_scan_and_pushes(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="private-ip", FAKE_GH_PRIVATE="true")
@@ -1382,6 +1414,27 @@ print('leak guard: clean (shape patterns only)')
                                capture_output=True, text=True, check=True).stdout.split()
         self.assertNotIn(".loom/replies.json", files)
 
+    def test_fix_runner_never_replies_to_or_resolves_a_thread_on_another_pull_request(self):
+        self.fix_brief()
+        replies = ('[{"thread":"PRRT_elsewhere","reply":"Addressed","resolve":true},'
+                   '{"thread":"PRRT_fake","reply":"Addressed","resolve":true}]')
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES=replies,
+                               FAKE_GH_FOREIGN_THREADS="PRRT_elsewhere")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertFalse(any(("addPullRequestReviewThreadReply" in c or "resolveReviewThread" in c)
+                             and "PRRT_elsewhere" in c for c in calls))
+        self.assertTrue(any("resolveReviewThread" in c and "PRRT_fake" in c for c in calls))
+
+    def test_fix_runner_skips_a_reply_the_text_check_refuses(self):
+        self.fix_brief()
+        # Not ASCII, so bus/text.py and checked_text refuse it.
+        replies = json.dumps([{"thread": "PRRT_fake", "reply": "Addressed \u2014 done", "resolve": True}])
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES=replies)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("addPullRequestReviewThreadReply" in c or "resolveReviewThread" in c
+                             for c in self.calls()))
+
     def test_fix_runner_ignores_invalid_replies_file(self):
         self.fix_brief()
         result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES='[{"thread":4}]')
@@ -1729,6 +1782,19 @@ print('leak guard: clean (shape patterns only)')
         beat = self.beat()
         self.assertFalse(beat["available"])
         self.assertGreater(beat["retry_at"], int(time.time()))
+
+    def test_a_timeout_after_a_leaking_edit_keeps_no_branch_on_a_public_repo(self):
+        # A -timedout- branch is pushed to the public origin like a pull
+        # request, so the leak scan gates it the same way.
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.write_tool(self.bin / "codex", "#!/usr/bin/env bash\ncat > /dev/null\n"
+                        "printf 'contact %s\\n' \"$(printf 'MTAuMjMuNC41' | base64 -d)\" > fix.txt\n"
+                        "exit 124\n")
+        self.run_lane()
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-timedout-", heads)
+        self.assertIn("leak scan refused or could not check the edits", self.failure_line())
 
     def test_a_timeout_after_editing_keeps_the_edits_on_a_timedout_branch(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
@@ -4933,6 +4999,52 @@ exec /usr/bin/git "$@"
         [note] = self.sticky_bodies()
         self.assertIn("Still failing: 1 times since ", note)
         self.assertIn("Tickets seen: T042-fix-the-thing", note)
+
+    def incident_titles(self):
+        return re.findall(r"--title (Factory incident: .*?) --body", self.log.read_text())
+
+    def test_a_private_repo_incident_names_no_repo_ticket_or_check(self):
+        # The factory repo is public: an incident for a private repo put its
+        # name, ticket and check in it (loom#1040, loom#1273).
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("factory incident quadseven/loom#99", self.lane_log())
+        body = Path(f"{self.body}.issue").read_text()
+        [title] = self.incident_titles()
+        self.assertRegex(title, r"^Factory incident: private repo [0-9a-f]{8} validation contract$")
+        for text in (title, body):
+            self.assertNotIn("example/repo", text)
+            self.assertNotIn("T042", text)
+            self.assertNotIn("python: 3.12", text)
+        self.assertIn("Ticket: a private repo ticket", body)
+        self.assertIn("withheld", body)
+        # The same repo files under the same title next time, so a repeat
+        # updates its open incident instead of opening another.
+        self.drop_brief()
+        self.assertEqual(self.run_contract_lane(FAKE_GH_PRIVATE="true").returncode, 0)
+        self.assertEqual(len(set(self.incident_titles())), 1)
+
+    def test_a_private_repo_incident_repeat_names_no_ticket(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_GH_PRIVATE="true", FAKE_GH_SEARCH="7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [note] = self.sticky_bodies()
+        self.assertNotIn("T042", note)
+        self.assertNotIn("python: 3.12", note)
+
+    def test_a_public_repo_incident_detail_the_leak_scan_refuses_is_withheld(self):
+        address = ".".join(["10", "23", "4", "5"])
+        self.contract_repo(contract=CONTRACT + "python: %s\n" % address)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = Path(f"{self.body}.issue").read_text()
+        self.assertNotIn(address, body)
+        self.assertIn("Repo: example/repo", body)
+        self.assertIn("withheld", body)
 
     def test_a_second_still_failing_edits_the_existing_incident_comment(self):
         self.contract_repo(contract=CONTRACT + "python: 3.12\n")

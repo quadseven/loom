@@ -91,6 +91,10 @@ Per finding, on each read:
   Why, and the Live criterion "the finding is absent from the health endpoint for 24
   hours". At most 3 new tickets a pass, and never past the goal's cap
   (`LOOM_GOAL_CAP`).
+  A health ticket gets no lane until its body names the cause on a `Cause:`
+  line: the station sends it to the brain with `needs-brain` first, and a
+  cause or a change that only moves the measurement is refused
+  (`bus/brief_check.py`, docs/BRAIN.md).
 - No open ticket carries the marker, but an open health ticket in the same
   area names the same cause: the finding joins that ticket instead of filing
   a new one. Its marker is added to the ticket's body, and the `Priority:`
