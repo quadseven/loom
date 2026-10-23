@@ -386,8 +386,9 @@ class SensitiveResumeTests(unittest.TestCase):
             self.assertIn(section, report)
         # Project repo: issues, pulls, one GraphQL request, the goal's
         # unproven-work read and epic list; lane repo: issues (no loom:lanes
-        # issue here, so no comments read). The fake has no replies left.
-        self.assertEqual(gh.requests, 6)
+        # issue here, so no comments read). Plus ticket issue fetch for goal
+        # home constraint checking. The fake has no replies left.
+        self.assertEqual(gh.requests, 7)
 
     def test_status_ranks_open_tickets_across_repos_in_work_order(self):
         def t(number, priority=None, created="2030-01-01T00:00:00Z", labels=("loom:queued",)):
@@ -442,6 +443,7 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(gh.requests, 4)
 
     def test_status_lists_a_sensitive_pull_request(self):
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}], "body": ""}
         gh = GitHub("t", transport=Fake(
             reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
                          "created_at": "2030-01-01T00:00:00Z"}]),
@@ -449,7 +451,8 @@ class SensitiveResumeTests(unittest.TestCase):
                          "labels": [{"name": "class:sensitive"}]}]),
             reply(200, {"data": {"repository": {"p4": ready_node(),
                                                 "g1": {"comments": {"nodes": []}}}}}),
-            reply(200, []), reply(200, [])))
+            reply(200, []), reply(200, []),
+            reply(200, ticket_issue)))
         lines = brain.status(gh, [REPO], REPO, env={}, authors=()).splitlines()
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
@@ -457,11 +460,13 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_status_blocks_a_sensitive_pr_with_a_neutral_review(self):
         pr = {"number": 4, "title": "Sensitive", "head": {"ref": "loom/4-work", "sha": "head1"},
               "labels": [{"name": "class:sensitive"}]}
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}], "body": ""}
         fake = Fake(reply(200, []), reply(200, [pr]),
                     reply(200, {"data": {"repository": {"p4": ready_node()}}}),
                     reply(200, {"check_runs": [
                         {"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]}),
-                    reply(200, []))
+                    reply(200, []),
+                    reply(200, ticket_issue))
         report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={}, authors=())
         self.assertIn("- #4 Sensitive - blocked: review check has not passed on the head commit",
                       report)
@@ -470,9 +475,11 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_status_lists_a_docs_pr_with_a_neutral_review_as_ready(self):
         pr = {"number": 4, "title": "Docs", "head": {"ref": "loom/4-work", "sha": "head1"},
               "labels": [{"name": "class:docs"}]}
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}], "body": ""}
         fake = Fake(reply(200, []), reply(200, [pr]),
                     reply(200, {"data": {"repository": {"p4": ready_node()}}}),
-                    reply(200, []))
+                    reply(200, []),
+                    reply(200, ticket_issue))
 
         def transport(method, url, headers, body):
             if "/check-runs?" in url:
@@ -488,15 +495,17 @@ class SensitiveResumeTests(unittest.TestCase):
         authors = ["alice-example"]
         comments_with = [{"user": {"login": "alice-example"},
                           "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}], "body": ""}
         fake_with = Fake(
             reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
                          "created_at": "2030-01-01T00:00:00Z"}]),
             reply(200, [pr]),
             reply(200, {"data": {"repository": {"p4": ready_node(),
-                                                "g1": {"comments": {"nodes": []}}}}}),
+                                                "g1": {"comments": {"nodes": []}}}}}) ,
             reply(200, []),
             reply(200, comments_with),
-            reply(200, []))
+            reply(200, []),
+            reply(200, ticket_issue))
         report_with = brain.status(GitHub("t", transport=fake_with), [REPO], REPO,
                                    env=TRUSTED, authors=authors)
         lines = report_with.splitlines()
@@ -510,10 +519,11 @@ class SensitiveResumeTests(unittest.TestCase):
                          "created_at": "2030-01-01T00:00:00Z"}]),
             reply(200, [pr]),
             reply(200, {"data": {"repository": {"p4": ready_node(),
-                                                "g1": {"comments": {"nodes": []}}}}}),
+                                                "g1": {"comments": {"nodes": []}}}}}) ,
             reply(200, []),
             reply(200, comments_without),
-            reply(200, []))
+            reply(200, []),
+            reply(200, ticket_issue))
         report_without = brain.status(GitHub("t", transport=fake_without), [REPO], REPO,
                                       env=TRUSTED, authors=authors)
         lines = report_without.splitlines()
@@ -525,26 +535,28 @@ class SensitiveResumeTests(unittest.TestCase):
         data = {"prs": {4: ready_node()}}
         bot = "grug-tribe"
         authors = ["alice-example"]
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}], "body": ""}
 
         with_fix = [{"user": {"login": "alice-example"},
                      "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
-        gh_fix = GitHub("t", transport=Fake(reply(200, with_fix)))
+        # Order: comments fetch first, then ticket issue fetch
+        gh_fix = GitHub("t", transport=Fake(reply(200, with_fix), reply(200, ticket_issue)))
         lines_with = brain._pull_request_lines(gh_fix, REPO, [pr], data, bot, authors)
         self.assertEqual(lines_with, ["### Pull requests", "- #4 PR - blocked: pending brain fix"])
 
         blocked = {"prs": {4: ready_node(checks="FAILURE")}}
-        gh_blocked = GitHub("t", transport=Fake(reply(200, with_fix)))
+        gh_blocked = GitHub("t", transport=Fake(reply(200, with_fix), reply(200, ticket_issue)))
         lines_blocked = brain._pull_request_lines(gh_blocked, REPO, [pr], blocked, bot, authors)
         self.assertEqual(lines_blocked,
                          ["### Pull requests", "- #4 PR - blocked: checks failure, pending brain fix"])
 
         without_fix = [{"user": {"login": "alice-example"},
                         "body": "%s normal fix" % tickets.FIX_MARKER}]
-        gh_without = GitHub("t", transport=Fake(reply(200, without_fix)))
+        gh_without = GitHub("t", transport=Fake(reply(200, without_fix), reply(200, ticket_issue)))
         lines_without = brain._pull_request_lines(gh_without, REPO, [pr], data, bot, authors)
         self.assertEqual(lines_without, ["### Pull requests", "- #4 PR - READY"])
 
-        no_authors = GitHub("t", transport=Fake())
+        no_authors = GitHub("t", transport=Fake(reply(200, ticket_issue)))
         lines_pure = brain._pull_request_lines(no_authors, REPO, [pr], data, bot)
         self.assertEqual(lines_pure, ["### Pull requests", "- #4 PR - READY"])
 
@@ -733,11 +745,13 @@ class SensitiveResumeTests(unittest.TestCase):
             threads=[{"isResolved": True, "root": {"nodes": [{"author": bot, "createdAt": "2030-01-01T08:06:00Z"}]}},
                      {"isResolved": True, "root": {"nodes": [{"author": operator, "createdAt": "2030-01-01T11:37:00Z"}]}}])
         pulls = [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}], "body": ""}
 
         def run():
             gh = GitHub("t", transport=Fake(reply(200, []), reply(200, pulls),
                                             reply(200, {"data": {"repository": {"p4": node}}}),
-                                            reply(200, [])))
+                                            reply(200, []),
+                                            reply(200, ticket_issue)))
             return [line for line in brain.status(gh, [REPO], REPO, env={}, authors=()).splitlines()
                     if line.startswith("- #4 ")]
 
@@ -749,8 +763,10 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(run(), ["- #4 PR - blocked: grug changes_requested"])
 
     def test_status_asks_for_every_field_merge_ready_reads(self):
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}], "body": ""}
         fake = Fake(reply(200, []), reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
-                    reply(200, {"data": {"repository": {"p4": None}}}), reply(200, []))
+                    reply(200, {"data": {"repository": {"p4": None}}}), reply(200, []),
+                    reply(200, ticket_issue))
         report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={}, authors=())
         self.assertIn("- #4 PR - blocked: checks unknown", report)
         query = fake.calls[2][2]["query"]
