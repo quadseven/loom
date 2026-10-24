@@ -1299,8 +1299,10 @@ ask_sign_in() {
   title="Lane $LANE sign-in lapsed: sign in the $LANE lane CLI again"
   how="Sign in the $LANE lane CLI again on the lane machine (an interactive login)."
   if [ "$LANE" = agy ]; then
+    # ~user, not the home path: the ask lands in a public issue.
+    local bin="${AGY_BIN/#"$AGY_HOME"/~$AGY_USER}"
     how="$(printf 'The lane runs agy as the macOS user %s, with its own sign-in; a sign-in as yourself does not reach it. On the lane machine run:\n\n    sudo -u %s -H %s update\n    sudo -u %s -H %s\n\nand finish the browser sign-in it prints, then quit agy.' \
-      "$AGY_USER" "$AGY_USER" "$AGY_BIN" "$AGY_USER" "$AGY_BIN")"
+      "$AGY_USER" "$AGY_USER" "$bin" "$AGY_USER" "$bin")"
   fi
   body="$(printf '%s\n\nLane %s waited for a sign-in nobody gave and timed out: its CLI sign-in lapsed. %s\n\nUntil then each run on the lane fails as auth.\n' \
     "$KEY_ASK_MARKER" "$SLOT" "$how")"
