@@ -1,0 +1,45 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One run per branch at a time. A newer push to main replaces main's waiting
+# run (the station deploys the newest commit whose run passed), and a newer
+# push to a pull request cancels its older run. The account runs five macOS
+# jobs at once; on 2026-10-18 eight queued main runs, one per merge, held the
+# lane pull requests and the self-deploy for over an hour.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  unittest:
+    # macOS: the API-lane tests run the agent under sandbox-exec, which only
+    # exists there, and launchd runs the lanes under /bin/bash 3.2.
+    runs-on: macos-latest
+    # Keep a hard bound in case a module hangs; the parallel runner shortens
+    # the normal path while preserving a limit for stuck tests.
+    timeout-minutes: 20
+    steps:
+      # Pinned by commit SHA: the station deploys what this job passes, so a
+      # moved tag must not change what runs here (tests/test_ci_supply_chain.py).
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: coreutils timeout
+        run: command -v timeout || brew install coreutils
+      - name: unittest (no test may skip)
+        # bash with pipefail: without it the step's status is tee's, and a
+        # failing suite passed CI (the default macOS shell is bash -e only).
+        shell: bash
+        run: |
+          set -o pipefail
+          python -B .github/unittest_parallel.py 2>&1 | tee unittest.out

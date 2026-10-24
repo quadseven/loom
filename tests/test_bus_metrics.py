@@ -1,0 +1,543 @@
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+from unittest import mock
+from datetime import datetime, timezone
+
+from bus import metrics, proof, station
+from bus.github import GitHubError, Response
+
+REPO = "example-owner/example-repo"
+NOW = datetime(2030, 1, 2, 17, tzinfo=timezone.utc).timestamp()
+
+
+def iso(at):
+    return datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def label(name):
+    return {"name": name}
+
+
+class Fake:
+    def __init__(self):
+        self.goal = {"number": 1, "labels": [label("loom:goal")]}
+        self.ticket = {"number": 2, "labels": [label(x) for x in
+                       ("loom:ticket", "loom:merged", "loom:verified")],
+                       "created_at": iso(NOW - 10000), "state": "closed"}
+        self.issues = [self.goal, self.ticket]
+        self.pr = {"number": 3, "head": {"ref": "loom/2-fix", "sha": "abc"},
+                   "state": "closed", "created_at": iso(NOW - 9000),
+                   "merged_at": iso(NOW - 1000), "body": "A feature"}
+        self.pulls = [self.pr]
+        self.comments = {1: [{"body": metrics.REPORT + "\nReport",
+                              "created_at": iso(NOW - 1000),
+                              "user": {"login": "trusted-bot"}}], 2: []}
+        self.events = {2: [{"event": "labeled", "label": label("loom:briefed"),
+                            "created_at": iso(NOW - 8000)},
+                           {"event": "labeled", "label": label("loom:merged"),
+                            "created_at": iso(NOW - 1000)}]}
+        self.checks = [{"name": "Review"}]
+        self.files = [{"filename": "tests/test_feature.py", "status": "modified"}]
+        self.posts = []
+
+    def paginate(self, path):
+        if path.endswith("/issues?state=all&per_page=100"):
+            return self.issues
+        if path.endswith("/pulls?state=all&per_page=100"):
+            return self.pulls
+        if "/issues/" in path and path.endswith("/comments"):
+            return self.comments[int(path.rsplit("/", 2)[1])]
+        if "/issues/" in path and path.endswith("/events"):
+            return self.events.get(int(path.rsplit("/", 2)[1]), [])
+        if path.endswith("/pulls/3/files"):
+            return self.files
+        raise AssertionError(path)
+
+    def rest(self, method, path, body=None):
+        if method == "GET" and "/check-runs" in path:
+            # GitHub's paging: 30 a page unless per_page says otherwise.
+            query = dict(kv.split("=") for kv in path.partition("?")[2].split("&") if "=" in kv)
+            size, page = int(query.get("per_page", 30)), int(query.get("page", 1))
+            batch = self.checks[(page - 1) * size:page * size]
+            return type("Response", (), {"data": {"check_runs": batch}})()
+        if method == "POST" and path.endswith("/issues/1/comments"):
+            self.posts.append(body["body"])
+            self.comments[1].append({"body": body["body"], "created_at": iso(NOW),
+                                     "user": {"login": "trusted-bot"}})
+            return type("Response", (), {"data": {"id": len(self.posts)}})()
+        raise AssertionError((method, path))
+
+
+class MetricsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = self.tmp.name
+        self.gh = Fake()
+        path = os.path.join(self.home, "briefs", "codex", "done")
+        os.makedirs(path)
+        run = os.path.join(path, "run.md")
+        with open(run, "w") as fh:
+            fh.write("Issue: %s#2\nModel: model-x\n" % REPO)
+        os.utime(run, (NOW - 1000, NOW - 1000))
+        path = os.path.join(self.home, "state", "station")
+        os.makedirs(path)
+        with open(os.path.join(path, "slot-samples.jsonl"), "w") as fh:
+            fh.write(json.dumps({"at": NOW - 1000, "idle": False}) + "\n")
+
+    def numbers(self):
+        return metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").collect()
+
+    def test_all_nine_pass_on_a_complete_day(self):
+        result = self.numbers()
+        self.assertEqual(len(result), 9)
+        self.assertTrue(all(n.passed for n in result), [n.line() for n in result])
+
+    def test_verify_runs_are_counted_as_their_own_kind_inside_spread(self):
+        run = os.path.join(self.home, "briefs", "codex", "done", "check.md")
+        with open(run, "w") as fh:
+            fh.write("Issue: %s#3\nDeliverable: verify\n" % REPO)
+        os.utime(run, (NOW - 1000, NOW - 1000))
+        spread = next(n for n in self.numbers() if n.name == "Spread")
+        self.assertIn("codex 2", spread.line())
+        self.assertIn("verify 1;", spread.line())
+
+    def test_throughput_splits_verified_tickets_into_lane_and_brain_proofs(self):
+        def proof_comment(by):
+            body = proof.PROOF_MARKER + "\n```json\n%s\n```" % json.dumps({"verified_by": by})
+            return {"body": body, "created_at": iso(NOW - 500), "user": {"login": "trusted-bot"}}
+        self.gh.comments[2] = [proof_comment("zen/opencode/model-free")]
+        for number, by in ((4, "brain"), (5, "codex/model-x")):
+            self.gh.issues.append(dict(self.gh.ticket, number=number))
+            self.gh.events[number] = self.gh.events[2]
+            self.gh.comments[number] = [proof_comment(by)]
+        self.gh.comments[5].append({"body": proof.PROOF_MARKER + "\n```json\n{}\n```",
+                                    "user": {"login": "someone-else"}})
+        gh = metrics.Collector(self.gh, [REPO], self.home, NOW, "Review", trusted=["trusted-bot"])
+        throughput = next(n for n in gh.collect() if n.name == "Throughput")
+        self.assertIn("verified 3/3 (lane 2, brain 1)", throughput.line())
+
+    def test_throughput_holds_only_goal_repos_with_workable_tickets_to_a_merge(self):
+        # A backlog goal whose every issue is done or a person's ask has
+        # nothing to merge; 8 of 17 goal repos read FAIL that way (2026-10-19).
+        total = metrics.Totals(goals=2, goal_repos={"o/busy", "o/idle"},
+                               workable_repos={"o/busy"},
+                               merged_by_repo={"o/busy": 1, "o/idle": 0},
+                               merged_tickets=2, verified=1)
+        number = metrics.throughput_number(total)
+        self.assertTrue(number.passed, number.line())
+        self.assertIn("o/idle 0 (no work)", number.line())
+        total.workable_repos.add("o/idle")
+        self.assertFalse(metrics.throughput_number(total).passed)
+
+    def test_an_open_queued_ticket_holds_its_goal_repo_to_a_merge(self):
+        self.gh.pr["merged_at"] = None
+        self.gh.pr["state"] = "open"
+        throughput = next(n for n in self.numbers() if n.name == "Throughput")
+        self.assertIn("%s 0 (no work)" % REPO, throughput.line())
+        self.gh.issues.append({"number": 6, "state": "open", "created_at": iso(NOW - 500),
+                               "labels": [label("loom:ticket"), label("loom:queued")]})
+        self.gh.events[6], self.gh.comments[6] = [], []
+        throughput = next(n for n in self.numbers() if n.name == "Throughput")
+        self.assertIn("%s 0;" % REPO, throughput.line())
+        self.assertFalse(throughput.passed)
+
+    def test_ticket_waits_include_reentered_state_and_current_state(self):
+        events = []
+        for kind, state, hours in (("labeled", "queued", 0), ("labeled", "briefed", 2),
+                                   ("labeled", "running", 5), ("labeled", "pr", 9),
+                                   ("labeled", "running", 10), ("labeled", "pr", 12),
+                                   ("labeled", "merged", 15)):
+            events.append({"event": kind, "label": label("loom:" + state),
+                           "created_at": iso(NOW - (15 - hours) * 3600)})
+        waits = metrics.ticket_waits(events, NOW)
+        self.assertEqual(waits, {"queued": 2, "briefed": 3, "running": 6,
+                                 "pr": 4, "merged": 0})
+
+    def test_wait_summaries_bottleneck_and_empty_states(self):
+        tickets = [("r#1", {"queued": 1, "running": 10}),
+                   ("r#2", {"queued": 2, "running": 20}),
+                   ("r#3", {"queued": 3, "running": 30}),
+                   ("r#4", {"queued": 4})]
+        rows, bottleneck = metrics.summarize_waits(tickets)
+        by_state = {row["state"]: row for row in rows}
+        self.assertEqual(by_state["queued"]["median_h"], 2.5)
+        self.assertEqual(by_state["queued"]["worst_h"], 4)
+        self.assertEqual(by_state["queued"]["worst_ticket"], "r#4")
+        self.assertEqual(by_state["queued"]["n"], 4)
+        self.assertEqual(by_state["running"]["n"], 3)
+        self.assertEqual(bottleneck, "running")
+        self.assertEqual(by_state["pr"], {"state": "pr", "median_h": None,
+                                           "worst_h": None, "worst_ticket": None, "n": 0})
+
+    def test_state_with_fewer_than_three_tickets_cannot_be_bottleneck(self):
+        rows, bottleneck = metrics.summarize_waits([
+            ("r#1", {"queued": 1, "running": 100}),
+            ("r#2", {"queued": 2, "running": 200}),
+            ("r#3", {"queued": 3}),
+        ])
+        self.assertEqual(bottleneck, "queued")
+        self.assertEqual(next(row for row in rows if row["state"] == "running")["n"], 2)
+
+    def test_a_closed_ticket_stops_its_wait_clock_at_the_close(self):
+        # A ticket verified 160h ago and closed 150h ago waited 10h in
+        # verified, not 160h: the label stays on after the close.
+        events = [{"event": "labeled", "label": label("loom:verified"), "created_at": iso(NOW - 160 * 3600)},
+                  {"event": "closed", "created_at": iso(NOW - 150 * 3600)}]
+        self.assertEqual(metrics.ticket_waits(events, NOW), {"verified": 10})
+
+    def test_a_reopen_restarts_the_clock_and_labels_added_while_closed_wait_for_it(self):
+        events = [{"event": "labeled", "label": label("loom:failed"), "created_at": iso(NOW - 20 * 3600)},
+                  {"event": "closed", "created_at": iso(NOW - 18 * 3600)},
+                  {"event": "labeled", "label": label("loom:queued"), "created_at": iso(NOW - 10 * 3600)},
+                  {"event": "reopened", "created_at": iso(NOW - 4 * 3600)}]
+        self.assertEqual(metrics.ticket_waits(events, NOW), {"failed": 2, "queued": 4})
+
+    def test_verified_is_terminal_and_never_the_bottleneck(self):
+        tickets = [("r#%d" % n, {"pr": n, "verified": 100 * n}) for n in (1, 2, 3)]
+        rows, bottleneck = metrics.summarize_waits(tickets)
+        self.assertEqual(bottleneck, "pr")
+        self.assertEqual(next(r for r in rows if r["state"] == "verified")["n"], 3)
+        self.assertIsNone(metrics.bottleneck([{"state": "verified", "median_h": 88.6, "n": 9},
+                                              {"state": "closed-unmerged", "median_h": 50, "n": 9}]))
+
+    def test_each_target_can_fail(self):
+        changes = [
+            lambda: self.gh.pr.update(state="open", created_at=iso(NOW - 30000), merged_at=None),
+            lambda: self.gh.ticket["labels"].remove(label("loom:verified")),
+            lambda: self._idle_slot(),
+            lambda: self._two_failures(),
+            lambda: self.gh.checks.clear(),
+            lambda: self.gh.issues.append({"number": 4, "labels": [label("needs-operator")],
+                                           "created_at": iso(NOW - 1000)}),
+            lambda: self.gh.comments[1].clear(),
+            lambda: self._past_rung(),
+            lambda: self._generic_file(),
+        ]
+        for index, change in enumerate(changes):
+            with self.subTest(number=index + 1):
+                self.setUp()
+                change()
+                if index == 5:
+                    self.gh.issues.append({"number": 5, "labels": [label("needs-operator")],
+                                           "created_at": iso(NOW - 1000)})
+                self.assertFalse(self.numbers()[index].passed)
+
+    def test_a_review_check_past_the_first_page_still_counts(self):
+        self.gh.checks = [{"name": "unittest (%d)" % n} for n in range(120)] + [{"name": "Review"}]
+        self.assertTrue(metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").passes(REPO, "abc"))
+        self.gh.checks = [{"name": "unittest (%d)" % n} for n in range(120)]
+        self.assertFalse(metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").passes(REPO, "abc"))
+
+    def test_check_runs_reply_without_a_body_counts_as_no_review(self):
+        self.gh.rest = lambda method, path, body=None: Response(200, None)
+        self.assertFalse(metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").passes(REPO, "abc"))
+
+    def test_a_torn_slot_sample_line_is_skipped(self):
+        path = os.path.join(self.home, "state", "station", "slot-samples.jsonl")
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"at": NOW - 1000, "idle": False}) + "\n")
+            fh.write('{"at": %d, "id' % (NOW - 500))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            samples = metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").slot_samples()
+        self.assertEqual((0, 1), samples)
+        self.assertIn("unreadable slot sample", err.getvalue())
+
+    def test_a_hung_git_ls_files_raises_os_error(self):
+        timeout = subprocess.TimeoutExpired(["git"], 60)
+        with mock.patch.object(metrics.subprocess, "run", side_effect=timeout):
+            with self.assertRaises(OSError):
+                metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").generic_files()
+
+    def _idle_slot(self):
+        path = os.path.join(self.home, "state", "station", "slot-samples.jsonl")
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"at": NOW - 1000, "idle": True}) + "\n")
+
+    def _two_failures(self):
+        folder = os.path.join(self.home, "briefs", "codex", "failed")
+        os.makedirs(folder)
+        for n in (1, 2):
+            path = os.path.join(folder, "%d.md" % n)
+            with open(path, "w") as fh:
+                fh.write("Issue: %s#2\nModel: model-x\n" % REPO)
+            os.utime(path, (NOW - 1000, NOW - 1000))
+
+    def _tag_failures(self, *kinds):
+        folder = os.path.join(self.home, "logs", "codex")
+        os.makedirs(folder, exist_ok=True)
+        for n, kind in enumerate(kinds, 1):
+            if kind:
+                with open(os.path.join(folder, "%d.log" % n), "w") as fh:
+                    fh.write("[t] %d failed: [work] first\n[t] %d failed: [%s] last\n" % (n, n, kind))
+
+    def escalation(self):
+        return next(n for n in self.numbers() if n.name == "Escalation")
+
+    def test_two_limit_failures_on_one_model_do_not_count(self):
+        self._two_failures()
+        self._tag_failures("limit", "limit")
+        number = self.escalation()
+        self.assertIn("0 tickets failed twice", number.value)
+        self.assertIn("2 failures left out", number.value)
+        self.assertTrue(number.passed)
+
+    def test_two_work_failures_on_one_model_count(self):
+        self._two_failures()
+        self._tag_failures("work", "work")
+        number = self.escalation()
+        self.assertIn("1 tickets failed twice", number.value)
+        self.assertIn("0 failures left out", number.value)
+        self.assertFalse(number.passed)
+
+    def test_a_failure_with_no_tag_line_counts_as_work(self):
+        self._two_failures()
+        self._tag_failures(None, "work")
+        self.assertIn("1 tickets failed twice", self.escalation().value)
+
+    def test_a_limit_and_a_work_failure_do_not_make_a_repeat(self):
+        self._two_failures()
+        self._tag_failures("transient", "work")
+        number = self.escalation()
+        self.assertIn("0 tickets failed twice", number.value)
+        self.assertIn("1 failures left out", number.value)
+
+    def _past_rung(self):
+        self.gh.ticket["state"] = "open"
+        self.gh.ticket["labels"].append(label("loom:failed"))
+        self.gh.comments[2].append({"body": "The factory tried every rung of the model ladder.",
+                                    "created_at": iso(NOW - 90000)})
+
+    def _generic_file(self):
+        self.gh.issues.append({"number": 8, "labels": [], "title": "unused"})
+        # The repository scan is covered separately with a patched result.
+        original = metrics.Collector.generic_files
+        metrics.Collector.generic_files = lambda collector: ["source.py"]
+        self.addCleanup(setattr, metrics.Collector, "generic_files", original)
+
+    def test_daily_comment_streak_and_discord_retry(self):
+        self.gh.comments[1].append({"body": metrics.MARKER +
+                                    "\n2030-01-01: 9/9 pass; streak 1 day(s)",
+                                    "user": {"login": "trusted-bot"}})
+        settings = station.Settings(self.home, [REPO], ["trusted-bot"], [], digest_hour=0,
+                                    metrics_goal=REPO + "#1", webhook_ssm="fake",
+                                    review_check="Review")
+        sent = []
+        st = station.Station(self.gh, settings, now=NOW,
+                             read_secret=lambda name, region: "https://example.com/webhook",
+                             post=lambda url, body: sent.append(body["content"]))
+        st.post_metrics()
+        st.post_metrics()
+        self.assertEqual(len(self.gh.posts), 1)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("9/9 pass; streak 2 day(s)", self.gh.posts[0])
+        self.assertIn("projected 7-day date 2030-01-07", self.gh.posts[0])
+        self.assertIn("9/9 pass; streak 2/7", sent[0])
+
+    def test_collection_failure_alerts_once_and_retries_daily_comment(self):
+        settings = station.Settings(self.home, [REPO], ["trusted-bot"], [], digest_hour=0,
+                                    metrics_goal=REPO + "#1", webhook_ssm="fake",
+                                    review_check="Review")
+        sent = []
+        st = station.Station(self.gh, settings, now=NOW,
+                             read_secret=lambda name, region: "https://example.com/webhook",
+                             post=lambda url, body: sent.append(body["content"]))
+        paginate = self.gh.paginate
+        failing = True
+
+        def interrupted(path):
+            if failing and path.endswith("/pulls?state=all&per_page=100"):
+                raise GitHubError("temporary API failure")
+            return paginate(path)
+
+        self.gh.paginate = interrupted
+        st.post_metrics()
+        st.post_metrics()
+        self.assertEqual(self.gh.posts, [])
+        self.assertEqual(sent, ["Loom metrics 2030-01-02: collection failed; retrying."])
+        failing = False
+        st.post_metrics()
+        self.assertEqual(len(self.gh.posts), 1)
+        self.assertEqual(len(sent), 2)
+        self.assertIn("9/9 pass", sent[1])
+
+    def test_regression_note_and_fix_without_test_fail_quality(self):
+        self.gh.pr["body"] = "Fixes a bug"
+        self.gh.files = [{"filename": "bus/brain.py", "status": "modified"}]
+        self.gh.issues.append({"number": 4, "labels": [label("loom:urgent")],
+                               "created_at": iso(NOW - 10000), "state": "open"})
+        self.gh.comments[4] = [{"body": "Regression in a shipped change",
+                                "created_at": iso(NOW - 9000)}]
+        result = self.numbers()[4]
+        self.assertFalse(result.passed)
+        self.assertIn("1 unfixed regressions", result.value)
+        self.assertIn("1 fix PRs without tests", result.value)
+
+    def test_a_config_only_fix_needs_no_test(self):
+        self.gh.pr["body"] = "Fixes the lane check"
+        self.gh.files = [{"filename": ".loom/validation.conf", "status": "modified"},
+                         {"filename": "production/kustomization.yaml", "status": "modified"}]
+        self.assertIn("0 fix PRs without tests", self.numbers()[4].value)
+
+    def test_untrusted_metrics_comment_does_not_suppress_daily_post(self):
+        self.gh.comments[1].append({"body": metrics.MARKER +
+                                    "\n2030-01-02: 9/9 pass; streak 7 day(s)",
+                                    "user": {"login": "untrusted"}})
+        settings = station.Settings(self.home, [REPO], ["trusted-bot"], [], digest_hour=0,
+                                    metrics_goal=REPO + "#1", review_check="Review")
+        station.Station(self.gh, settings, now=NOW).post_metrics()
+        self.assertEqual(len(self.gh.posts), 1)
+
+    def test_waits_for_digest_hour_and_retries_discord_without_reposting(self):
+        settings = station.Settings(self.home, [REPO], ["trusted-bot"], [], digest_hour=23,
+                                    metrics_goal=REPO + "#1", review_check="Review",
+                                    webhook_ssm="fake")
+        sent = []
+
+        def post(url, body):
+            sent.append(body["content"])
+            if len(sent) == 1:
+                raise OSError("temporary failure")
+
+        st = station.Station(self.gh, settings, now=NOW,
+                             read_secret=lambda name, region: "https://example.com/webhook",
+                             post=post)
+        st.post_metrics()
+        self.assertEqual(self.gh.posts, [])
+        st.s.digest_hour = 0
+        st.post_metrics()
+        st.post_metrics()
+        self.assertEqual(len(self.gh.posts), 1)
+        self.assertEqual(len(sent), 2)
+
+
+
+class VisibilityCadenceTest(unittest.TestCase):
+    def test_the_visibility_target_follows_the_report_cadence(self):
+        # 2026-10-18: the operator moved reports to every 6 hours; a 2-hour
+        # target would fail every goal from then on.
+        def number(hours):
+            total = metrics.Totals()
+            total.goals = 1
+            total.report_ages = {"example-owner/example-repo#1": hours * 3600}
+            return metrics.visibility_number(total)
+        self.assertTrue(number(5).passed)
+        self.assertFalse(number(7).passed)
+        self.assertIn("<=6h", number(5).target)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+class WaitsCommandTest(unittest.TestCase):
+    def test_the_waits_command_runs_as_the_module_entry_point(self):
+        # `python3 -m bus.metrics waits` once crashed with NameError: the
+        # entry point ran before the helpers it calls were defined. runpy
+        # runs the module the way -m does, top to bottom.
+        import runpy
+        import sys
+        import time
+        now = time.time()
+        updated = datetime.fromtimestamp(now - 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        seen = []
+
+        class FakeGitHub:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def paginate(self, path):
+                seen.append(path)
+                if "/events" in path:
+                    return [{"event": "labeled", "label": {"name": "loom:queued"},
+                             "created_at": updated}]
+                return [{"number": 7, "updated_at": updated}]
+
+        out = io.StringIO()
+        with mock.patch("bus.github.GitHub", FakeGitHub), \
+                mock.patch("bus.github.token_from_env", lambda: "t"), \
+                mock.patch.object(sys, "argv", ["bus.metrics", "waits", "o/r"]), \
+                mock.patch.dict(os.environ, {"LOOM_HOME": tempfile.mkdtemp()}), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as done:
+            runpy.run_module("bus.metrics", run_name="__main__", alter_sys=True)
+        self.assertEqual(done.exception.code, 0)
+        self.assertIn("queued", out.getvalue())
+        # The since= window is UTC, not local time labelled Z.
+        since = [p for p in seen if "since=" in p][0].split("since=")[1].split("&")[0]
+        want = datetime.fromtimestamp(now - 7 * 86400, timezone.utc)
+        got = datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        self.assertLess(abs((got - want).total_seconds()), 120)
+
+
+class SlowEvents:
+    """A GitHub boundary for waits_for_repos whose every request sleeps:
+    four tickets per repo (plus one too old to count and a pull request,
+    neither read further) and one queued event per ticket."""
+
+    def __init__(self, now, delay=0.03, failing=None):
+        self.now, self.delay, self.failing = now, delay, failing
+        self.lock = threading.Lock()
+        self.active = self.max_active = 0
+        self.request_time = 0.0
+        self.paths = []
+
+    def paginate(self, path):
+        started = time.monotonic()
+        with self.lock:
+            self.paths.append(path)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(self.delay)
+            if "/events" not in path:
+                return ([{"number": n, "updated_at": iso(self.now - n * 60)} for n in range(1, 5)]
+                        + [{"number": 9, "updated_at": iso(self.now - 8 * 86400)},
+                           {"number": 10, "updated_at": iso(self.now), "pull_request": {}}])
+            if self.failing and self.failing in path:
+                raise GitHubError("events read failed", 502)
+            number = int(path.split("/issues/")[1].split("/")[0])
+            return [{"event": "labeled", "label": {"name": "loom:queued"},
+                     "created_at": iso(self.now - number * 3600)}]
+        finally:
+            with self.lock:
+                self.active -= 1
+                self.request_time += time.monotonic() - started
+
+
+class WaitsReadTest(unittest.TestCase):
+    """waits_for_repos reads one event list per ticket updated in the last
+    week. Read one after another that was 699 requests and 229 s of a cold
+    dashboard's 320 s first snapshot (loom#433), so they overlap now."""
+
+    REPOS = ["example-owner/one", "example-owner/two", "example-owner/three"]
+
+    def test_event_reads_overlap_and_the_result_matches_a_serial_read(self):
+        gh = SlowEvents(NOW)
+        entered = {}
+        started = time.monotonic()
+        rows, bottleneck = metrics.waits_for_repos(gh, self.REPOS, NOW, entered)
+        elapsed = time.monotonic() - started
+        self.assertEqual(len([p for p in gh.paths if "/events" in p]), 12)
+        self.assertGreater(gh.max_active, 1)
+        self.assertLess(elapsed, gh.request_time * 0.5)
+        serial_entered = {}
+        want = metrics.waits_for_repos(SlowEvents(NOW, delay=0), self.REPOS, NOW, serial_entered,
+                                       workers=1)
+        self.assertEqual((rows, bottleneck), want)
+        self.assertEqual(list(entered.items()), list(serial_entered.items()))
+        self.assertEqual(list(entered), ["%s#%d" % (repo, n) for repo in self.REPOS for n in range(1, 5)])
+
+    def test_one_failed_event_read_fails_the_whole_read(self):
+        gh = SlowEvents(NOW, delay=0, failing="example-owner/two/issues/3/")
+        with self.assertRaises(GitHubError):
+            metrics.waits_for_repos(gh, self.REPOS, NOW, {})
