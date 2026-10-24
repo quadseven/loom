@@ -151,7 +151,6 @@ BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_TRUSTED_BRIE
   LOOM_REPO_OWNERS LOOM_HOME
   LOOM_BRAIN_SCOPE LOOM_BRAIN_HOLDER LOOM_REVIEW_CHECK LOOM_REVIEW_BOT LOOM_GOAL_CAP
   LOOM_UNVERIFIED_LIMIT LOOM_REPAIR_EPICS LOOM_MERGE_SETTLE_SECONDS LOOM_GITHUB_LOGIN
-  LOOM_FABRIC_KEY_SSM LOOM_AWS_REGION
   LOOM_SHADOW LOOM_SHADOW_REPOS LOOM_SHADOW_LEDGER)
 
 # Shadow mode (bus/shadow.py, docs/BRAIN.md Shadow mode): the rung holds a
@@ -185,6 +184,11 @@ spark_brain() {
   AGENT_HOME="$LOOM_HOME/run/brain-home"
   rm -rf "$AGENT_HOME" && mkdir -p "$AGENT_HOME" || return 3
   shadow_guard "$AGENT_HOME/bin" || { echo "could not put the shadow gh guard in place" >&2; return 3; }
+  if [ -n "${LOOM_FABRIC_KEY_SSM:-}" ]; then
+    printf '%s\n' "$LOOM_FABRIC_KEY_SSM" > "$WORK/fabric-key-ssm"
+  fi
+  printf '#!/bin/bash\nSSM_FILE=%q\n[ -r "$SSM_FILE" ] || exit 0\nexport LOOM_FABRIC_KEY_SSM="$(cat "$SSM_FILE")"\nexport LOOM_AWS_REGION="${LOOM_AWS_REGION:-us-east-1}"\nexec python3 -m bus.fabric ask "$@"\n' \
+    "$WORK/fabric-key-ssm" > "$AGENT_HOME/bin/fabric-ask" && chmod 755 "$AGENT_HOME/bin/fabric-ask" || return 3
   LANE=spark SKILLS="" API_KEY="" SPARK_URL="$LOOM_SPARK_URL"
   NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
   # The sandbox denies the keychain server, which TLS verification asks for
