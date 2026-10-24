@@ -3059,6 +3059,16 @@ class PassBudgetTest(Base):
             self.assertEqual(self.rotation(), 2)
         self.assertIn("pass budget reached", err.getvalue())
 
+    def test_the_budget_counts_from_the_step_loop_not_the_pass(self):
+        # 2026-10-24 20:20Z: the steps before the loop (reconcile, hand back,
+        # claim, assign) took about six minutes, so a budget counted from the
+        # pass's start left one loop step a pass and a full turn took hours.
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st._pass_started -= 10 * station.PASS_STEP_BUDGET
+        with mock.patch.object(station.Station, "_timed", lambda self, step: None):
+            st._run_steps()
+        self.assertEqual(self.rotation(), 0, "a long pre-loop must not cut the loop short")
+
     def test_a_pass_within_its_budget_runs_every_step_and_starts_over(self):
         self.run_pass()
         self.assertEqual(self.rotation(), 0)
