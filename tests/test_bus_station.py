@@ -3040,6 +3040,30 @@ class StepTimingTest(Base):
         self.assertNotIn(" step triage_backlogs took ", err.getvalue())
 
 
+class PassBudgetTest(Base):
+    def rotation(self):
+        path = os.path.join(self.home, "state", "station", station.STEP_ROTATION_FILE)
+        with open(path) as fh:
+            return json.load(fh)["next"]
+
+    def test_a_pass_past_its_budget_leaves_the_rest_of_its_steps_to_the_next(self):
+        # 2026-10-24: every pass ran 25 to 40 minutes, and claims, fix rounds
+        # and deploys waited for each one to end. Past the budget a pass stops
+        # its step loop; the next pass starts where it stopped, so every step
+        # still runs in turn.
+        err = io.StringIO()
+        with mock.patch.object(station, "PASS_STEP_BUDGET", 0), contextlib.redirect_stderr(err):
+            self.run_pass()
+            self.assertEqual(self.rotation(), 1)
+            self.run_pass()
+            self.assertEqual(self.rotation(), 2)
+        self.assertIn("pass budget reached", err.getvalue())
+
+    def test_a_pass_within_its_budget_runs_every_step_and_starts_over(self):
+        self.run_pass()
+        self.assertEqual(self.rotation(), 0)
+
+
 class CorruptStateTest(Base):
     def test_a_corrupt_ledger_stops_the_pass_instead_of_reporting_again(self):
         self.fake.add(12, state="running")
