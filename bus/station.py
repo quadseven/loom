@@ -5022,7 +5022,8 @@ class Station:
         repo, _, num = key.rpartition("#")
         number = int(num) if num.isdigit() else 0
         ref = info.get("incident") if isinstance(info, dict) else None
-        at = float((info or {}).get("at") or 0)
+        raw_at = (info or {}).get("at")
+        at = float(raw_at) if raw_at is not None else None
         try:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
             comments = self._paginate(
@@ -5039,13 +5040,23 @@ class Station:
             # The incident filing failed: nothing names an incident that can
             # close this hold, so release it once it has outlived
             # HELD_NO_INCIDENT_FOR instead of holding it forever.
-            if self.now - at < HELD_NO_INCIDENT_FOR:
+            green = False
+            if at is not None and self.now - at < HELD_NO_INCIDENT_FOR:
+                try:
+                    green = self._green_default_after_hold(repo, at)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("factory release: could not check default-branch CI for %s#%d: %s"
+                         % (repo, number, err))
+            if at is None or (self.now - at < HELD_NO_INCIDENT_FOR and not green):
                 return
             cleared = RUNAWAY in _label_names(issue)
+            reason = ("a newer green default-branch run passed" if green else
+                      "the hold reached %d hours" % (HELD_NO_INCIDENT_FOR // 3600))
             self._release_one(key, repo, number, issue, cleared,
                               "held: incident filing failed; no incident was "
-                              "filed, so the ticket is back on its lane after "
-                              "%d hours" % (HELD_NO_INCIDENT_FOR // 3600))
+                              "filed, so the ticket is back on its lane because " + reason)
             _say("factory release: %s#%d re-queued: incident filing failed"
                  % (repo, number))
             return
@@ -5061,6 +5072,28 @@ class Station:
                           "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
                                               if cleared else ""))
         _say("factory release: %s#%d re-queued after incident %s closed" % (repo, number, ref))
+
+    def _green_default_after_hold(self, repo: str, held_at: float) -> bool:
+        """Whether a newer commit on the default branch has all checks green."""
+        branch = self._default_branch(repo)
+        if not branch:
+            return False
+        commit = self.gh.rest("GET", "/repos/%s/commits/%s" % (repo, quote(branch, safe=""))).data
+        if not isinstance(commit, dict):
+            return False
+        sha = str(commit.get("sha") or "")
+        committed = self._epoch(str(((commit.get("commit") or {}).get("committer") or {}).get("date") or ""))
+        if not sha or committed is None or committed <= held_at:
+            return False
+        checks = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
+                              % (repo, sha)).data or {}
+        runs = checks.get("check_runs") if isinstance(checks, dict) else None
+        if not isinstance(runs, list) or not runs or any(
+                not isinstance(run, dict) or run.get("status") != "completed"
+                or run.get("conclusion") != "success" for run in runs):
+            return False
+        status_data = self.gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data or {}
+        return isinstance(status_data, dict) and status_data.get("state") == "success"
 
     def _release_one(self, key: str, repo: str, number: int, issue: Dict[str, Any],
                      cleared: bool, text: str) -> None:
@@ -5426,8 +5459,8 @@ class Station:
             self._set_wait(repo, self._issue(repo, number), "incident")
             if incident_ref is None:
                 self._routine(repo, number,
-                              "Lane %s held: %s. The ticket keeps its rung: the "
-                              "incident filing failed, so it returns to the queue "
+                              "Lane %s held: incident filing failed. %s. The ticket keeps its rung and "
+                              "returns to the queue "
                               "after %d hours." % (lane, bare,
                                                    HELD_NO_INCIDENT_FOR // 3600))
             else:

@@ -5056,6 +5056,14 @@ class FactoryIncidentTest(Base):
         self.assertIn("keeps its rung", hold[0])
         self.assertIn("factory incident %s#99" % REPO, hold[0])
 
+    def test_incident_filing_failure_is_named_in_ticket_status(self):
+        self.heartbeat("muse")
+        self.failed(reason="[factory] setup failed: incident filing failed")
+        with mock.patch.object(station.Station, "_green_default_after_hold", return_value=False):
+            self.run_pass()
+        held = [body for body in self.bodies() if "held: incident filing failed" in body]
+        self.assertTrue(held, self.bodies())
+
     def test_a_named_incident_hold_waits_while_the_incident_is_open(self):
         self.heartbeat("muse")
         self.failed()
@@ -5236,19 +5244,48 @@ class FactoryNoIncidentHoldTest(Base):
     def test_a_hold_with_no_incident_younger_than_two_hours_stays_running(self):
         now = 1700000000.0
         self.held(at=now - 600)
-        self.release(now)
+        with mock.patch.object(station.Station, "_green_default_after_hold", return_value=False):
+            self.release(now)
         self.assertIn("loom:running", self.fake.names(12))
         self.assertNotIn("loom:queued", self.fake.names(12))
         self.assertEqual(self.held_entry(), {"%s#12" % REPO: {"incident": None,
                                                               "at": now - 600}})
 
-    def test_a_hold_with_no_incident_and_no_age_is_released(self):
+    def test_a_young_hold_releases_after_a_newer_green_default_branch_run(self):
+        now = 1700000000.0
+        self.held(at=now - 600)
+        with mock.patch.object(station.Station, "_green_default_after_hold", return_value=True):
+            self.release(now)
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("%s#12" % REPO, self.held_entry() or {})
+        self.assertIn("newer green default-branch run", self.status_boxes())
+
+    def test_green_default_branch_requires_a_newer_commit_and_successful_checks(self):
+        sha = "a" * 40
+
+        def transport(method, url, headers, body):
+            path = urlsplit(url).path
+            if path == "/repos/%s" % REPO:
+                return reply(200, {"default_branch": "main"})
+            if path == "/repos/%s/commits/main" % REPO:
+                return reply(200, {"sha": sha, "commit": {"committer": {
+                    "date": "2023-11-14T22:30:00Z"}}})
+            if path == "/repos/%s/commits/%s/check-runs" % (REPO, sha):
+                return reply(200, {"check_runs": [{"status": "completed",
+                                                   "conclusion": "success"}]})
+            if path == "/repos/%s/commits/%s/status" % (REPO, sha):
+                return reply(200, {"state": "success"})
+            raise AssertionError("unexpected request %s %s" % (method, path))
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        self.assertTrue(runner._green_default_after_hold(REPO, 1700000000.0))
+
+    def test_a_hold_with_no_incident_and_no_age_stays_running(self):
         now = 1700000000.0
         self.held(at=None)
         self.release(now)
-        self.assertEqual(self.fake.names(12),
-                         ["loom:ticket", "lane:muse", "loom:queued"])
-        self.assertNotIn("%s#12" % REPO, self.held_entry() or {})
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertIn("%s#12" % REPO, self.held_entry() or {})
 
 
 class PruneTest(Base):
