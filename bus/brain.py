@@ -3255,13 +3255,37 @@ def _changed_files(details: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
              "status": str(n.get("changeType") or "").lower()} for n in nodes]
 
 
+def _constraint_check(constraint: str):
+    """The validator for one "Merge constraint:" line, or None when no check
+    for that rule exists yet. A constraint with no validator is not refused
+    for: it cannot be verified from the pull request, so it stays surfaced in
+    status and awaits a validator instead of holding a merge the brain cannot
+    judge.
+    """
+    name = str(constraint or "").lower()
+    if "c++ unit test" in name or "unit test" in name:
+        return _cpp_unit_test_required
+    return None
+
+
+def _cpp_unit_test_required(files: Sequence[Dict[str, Any]]) -> Optional[str]:
+    """A "C++ unit test required" constraint: the pull request touches a C++
+    test file under tests/. Why it is violated, or None when it is met."""
+    for entry in files:
+        path = str(entry.get("filename") or "")
+        if path.startswith("tests/") and path.lower().endswith(".cpp"):
+            return None
+    return "it changes no C++ unit test under tests/"
+
+
 def _refuse_merge_constraints(gh: GitHub, repo: str,
                              association: Optional[Tuple[str, int]],
                              ticket_issue: Dict[str, Any]) -> None:
     """Refuse a merge if the ticket's goal home has merge constraints that are
     not satisfied. Each "Merge constraint:" line in the goal home's header is
-    a rule that must be satisfied; the check is informational for now (logs the
-    constraint) but will be extended with specific validators.
+    a rule that must be satisfied; each known rule has a validator that reads
+    the pull request's changed files. A violated rule refuses the merge and
+    names the rule and the goal home.
     """
     if association is None:
         return
@@ -3275,12 +3299,18 @@ def _refuse_merge_constraints(gh: GitHub, repo: str,
     constraints = goal_merge_constraints(goal_home)
     if not constraints:
         return
-    # For now, log the constraints that apply. In the future, specific
-    # constraint validators can be added here (e.g., "C++ unit test required"
-    # would check for C++ test files in the diff).
+    number = association[1]
+    files = [entry for entry in (gh.paginate("/repos/%s/pulls/%d/files"
+                                             % (repo, number)) or [])
+             if isinstance(entry, dict)]
     for constraint in constraints:
-        print("brain: merge constraint from goal #%d: %s" % (
-            goal_home.get("number", 0), constraint), file=sys.stderr)
+        check = _constraint_check(constraint)
+        if check is None:
+            continue
+        why = check(files)
+        if why:
+            raise ValueError("merge refused: goal #%d names merge constraint %r, but %s" % (
+                goal_home.get("number", 0), constraint, why))
 
 
 def _refuse_operator_hold(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],

@@ -1355,6 +1355,44 @@ class SensitiveResumeTests(unittest.TestCase):
                                 env={"LOOM_MERGE_SETTLE_SECONDS": "0"})
                 self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
+    def test_merge_refuses_a_goal_merge_constraint_violation(self):
+        # The goal home requires a C++ unit test; the pull request changes no
+        # test, so the merge is refused and names the rule and the goal home.
+        pr, query = self._merge_replies({
+            "details": {"files": {"totalCount": 1, "nodes": [{"path": "bus/a.py"}]}}})
+        ticket = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}],
+                  "body": "Part of #1\n"}
+        goal = {"number": 1, "id": 101, "state": "open", "title": "Goal",
+                "labels": [{"name": "loom:goal"}],
+                "body": "Merge constraint: C++ unit test required\n\n## Why\nwhy\n## What\nwhat\n"
+                        "## Acceptance criteria\n- [ ] done\n## Size\nS\n## Out of scope\n- none"}
+        fake = Fake(pr, query, reply(200, ticket), reply(200, goal),
+                    reply(200, [{"filename": "bus/a.py"}]))
+        with self.assertRaisesRegex(ValueError, "goal #1 names merge constraint 'C\\+\\+ unit test required'") as caught:
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertIn("but it changes no C++ unit test under tests/", str(caught.exception))
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_merge_meets_goal_merge_constraint_still_merges(self):
+        # The goal home requires a C++ unit test and the pull request adds one,
+        # so the constraint is met and the merge lands exactly as before.
+        pr, query = self._merge_replies({
+            "details": {"files": {"totalCount": 1, "nodes": [{"path": "tests/foo.cpp"}]}}})
+        ticket = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}],
+                  "body": "Part of #1\n"}
+        goal = {"number": 1, "id": 101, "state": "open", "title": "Goal",
+                "labels": [{"name": "loom:goal"}],
+                "body": "Merge constraint: C++ unit test required\n\n## Why\nwhy\n## What\nwhat\n"
+                        "## Acceptance criteria\n- [ ] done\n## Size\nS\n## Out of scope\n- none"}
+        fake = Fake(pr, query, reply(200, ticket), reply(200, goal),
+                    reply(200, [{"filename": "tests/foo.cpp"}]),
+                    reply(200, {"merged": True}), reply(204), reply(200, []),
+                    reply(200, ticket), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertTrue(result["merged"])
+        self.assertEqual(fake.calls[5][2], {"merge_method": "squash", "sha": "checked"})
+        self.assertIn("/git/refs/heads/loom/9-work", fake.calls[6][1])
+
     def test_trusted_lane_author_can_merge_a_ticket_linked_non_loom_head(self):
         pr, query = self._merge_replies({
             "pr": {"head": {"ref": "feature/lane-work", "sha": "checked",
