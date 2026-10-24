@@ -32,8 +32,26 @@ CHAT_URL = "https://api.fabric.so/v2/chatbot"
 # A whole-library answer took 20 to 60 s in probes on 2026-10-22; a station
 # pass waits no longer than this for one.
 TIMEOUT = 90
+# The SSM parameter holding the Fabric workspace key. The spark agent's
+# environment carries no key and no SSM name (lanes/mac/brain.sh keeps both
+# out of the agent); the sandbox's AWS role reads this fixed name instead.
+FABRIC_KEY_SSM = "/loom/fabric/key"
 # A citation as the chat API writes it: [#1402 [PR] Title](fabric://<uuid>).
 _PR_CITE = re.compile(r"\[#(\d{1,7}) \[PR\] ([^\]\n]{1,300})\]\(fabric://[0-9a-f-]{36}\)")
+
+
+def _chat(question: str, key: str, region: str,
+          timeout: float = TIMEOUT) -> str:
+    """POST `question` to Fabric's chat API with `key`, or "" on failure."""
+    body = json.dumps({"scope": "user",
+                       "history": [{"role": "user", "content": question}]}).encode()
+    req = urllib.request.Request(CHAT_URL, data=body, method="POST", headers={  # noqa: S310 - fixed https URL
+        "X-Api-Key": key, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - CHAT_URL is a fixed https constant
+            return resp.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError, ValueError):
+        return ""
 
 
 def ask(question: str, key_ssm: str, region: str, timeout: float = TIMEOUT) -> str:
@@ -44,15 +62,7 @@ def ask(question: str, key_ssm: str, region: str, timeout: float = TIMEOUT) -> s
         key = read_ssm(key_ssm, region)
     except (OSError, ValueError):
         return ""
-    body = json.dumps({"scope": "user",
-                       "history": [{"role": "user", "content": question}]}).encode()
-    req = urllib.request.Request(CHAT_URL, data=body, method="POST", headers={  # noqa: S310 - fixed https URL
-        "X-Api-Key": key, "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - CHAT_URL is a fixed https constant
-            return resp.read().decode("utf-8", "replace")
-    except (urllib.error.URLError, OSError, ValueError):
-        return ""
+    return _chat(question, key, region, timeout)
 
 
 def cited_pulls(text: str) -> List[Tuple[int, str]]:
@@ -86,9 +96,13 @@ def _argument_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     """The `python3 -m bus.fabric ask` command: ask Fabric once and print the answer.
 
-    The key is read from the SSM parameter named by LOOM_FABRIC_KEY_SSM for each
+    The key is read from the SSM parameter named by FABRIC_KEY_SSM for each
     call and never printed; the command only asks, it never writes or deletes a
-    note. With no key configured it prints nothing and exits 0.
+    note. The agent's environment carries neither the key nor its SSM name
+    (lanes/mac/brain.sh keeps both out of the agent); the sandbox's AWS role
+    reads the fixed parameter name instead. With no key configured it prints a
+    one-line reason to stderr and exits 0, so the brain can tell "not asked"
+    from "no answer".
     """
     args = _argument_parser().parse_args(argv)
     if args.command != "ask":
@@ -96,9 +110,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     question = " ".join(str(args.question or "").split())
     if not question:
         return 1
-    key_ssm = os.environ.get("LOOM_FABRIC_KEY_SSM", "").strip()
     region = os.environ.get("LOOM_AWS_REGION", "").strip() or "us-east-1"
-    print(ask(question, key_ssm, region))
+    try:
+        key = read_ssm(FABRIC_KEY_SSM, region)
+    except (OSError, ValueError):
+        print("no Fabric key configured", file=sys.stderr)
+        return 0
+    print(_chat(question, key, region))
     return 0
 
 

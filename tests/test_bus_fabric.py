@@ -74,23 +74,29 @@ class AskCliTest(unittest.TestCase):
     def test_ask_sends_the_documented_request_shape(self):
         resp = mock.MagicMock()
         resp.__enter__.return_value.read.return_value = b"an answer"
-        with mock.patch.dict(os.environ, {"LOOM_FABRIC_KEY_SSM": "/p/key"}), \
+        # The brain's emptied environment carries no LOOM_FABRIC_KEY_SSM;
+        # main reads the fixed FABRIC_KEY_SSM name through the sandbox's AWS
+        # role instead, so a request is still sent.
+        with mock.patch.dict(os.environ, {}, clear=True), \
                 mock.patch("bus.fabric.read_ssm", return_value="k-123") as ssm, \
                 mock.patch("urllib.request.urlopen", return_value=resp) as op:
             self.assertEqual(fabric.main(["ask", "which?"]), 0)
-        ssm.assert_called_once_with("/p/key", "us-east-1")
+        ssm.assert_called_once_with(fabric.FABRIC_KEY_SSM, "us-east-1")
         req = op.call_args.args[0]
         self.assertEqual(req.full_url, fabric.CHAT_URL)
         self.assertEqual(req.get_header("X-api-key"), "k-123")
         self.assertEqual(json.loads(req.data), {
             "scope": "user", "history": [{"role": "user", "content": "which?"}]})
 
-    def test_ask_without_a_key_prints_nothing(self):
-        with mock.patch("bus.fabric.read_ssm") as ssm, \
-                mock.patch("urllib.request.urlopen") as op:
+    def test_ask_without_a_key_reports_to_stderr(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch("bus.fabric.read_ssm", side_effect=OSError("gone")) as ssm, \
+                mock.patch("urllib.request.urlopen") as op, \
+                mock.patch("sys.stderr") as err:
             self.assertEqual(fabric.main(["ask", "which?"]), 0)
-        ssm.assert_not_called()
+        ssm.assert_called_once_with(fabric.FABRIC_KEY_SSM, "us-east-1")
         op.assert_not_called()
+        err.write.assert_any_call("no Fabric key configured")
 
 
 class BrainEnvTest(unittest.TestCase):

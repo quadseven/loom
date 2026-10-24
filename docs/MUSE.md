@@ -406,7 +406,7 @@ this tick"; a step with no note shows nothing there.
    section in `status`: the failed tickets that ran on all three rungs, oldest
    first, each with its open pull request, its mergeable state, and each
    unresolved thread's severity, comment ID, first line and the newest lane
-   answer.    The factory resolves an answered medium or low finding itself but
+    answer. The factory resolves an answered medium or low finding itself but
    leaves a high or critical one open by design, so these wait for a ruling.
    Before ruling on a needs-brain ticket, ask Fabric's chat workspace about
    earlier decisions and fixes with `python3 -m bus.fabric ask "..."`. The
