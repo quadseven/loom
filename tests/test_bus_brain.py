@@ -746,10 +746,51 @@ class SensitiveResumeTests(unittest.TestCase):
             (ready_node(reviews=[{"author": {"__typename": "User", "login": "grug-tribe"}, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"}]),
              "READY"),
             (ready_node(checks="PENDING", threads=[{"isResolved": False}]), "blocked: checks pending, 1 unresolved threads"),
+            (dict(ready_node(), mergeable="CONFLICTING"), "blocked: conflicts with the default branch"),
         ]
         for node, want in cases:
             with self.subTest(want=want):
                 self.assertEqual(brain.merge_ready(node, "grug-tribe"), want)
+
+    def test_status_blocks_pr_when_ticket_is_at_running_not_pr(self):
+        pr = {"number": 8, "title": "Lane work", "body": "Refs %s#9" % REPO,
+              "head": {"ref": "loom/9-work"}}
+        issue = {"number": 9, "state": "open",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:running"}]}
+        data = {"prs": {8: ready_node()}}
+        lines = brain._pull_request_lines(None, REPO, [pr], data, "grug-tribe",
+                                          issues=[issue])
+        self.assertEqual(lines, ["### Pull requests",
+                                 "- #8 Lane work - blocked: ticket at loom:running, not loom:pr"])
+
+    def test_status_blocks_pr_when_mergeable_state_is_dirty(self):
+        pr = {"number": 8, "title": "Lane work", "body": "Refs %s#9" % REPO,
+              "head": {"ref": "loom/9-work"}, "mergeable_state": "dirty"}
+        line = brain._status_pr_line(None, REPO, pr, ready_node(), "grug-tribe", "Grug - Elder")
+        self.assertEqual(line, "- #8 Lane work - blocked: conflicts with the default branch")
+
+    def test_status_blocks_pr_when_risk_tier_is_held_for_operator(self):
+        pr = {"number": 8, "title": "Lane work", "body": "Refs %s#9" % REPO,
+              "head": {"ref": "loom/9-work"},
+              "files": [{"filename": "production/manifests/app/deploy.yaml"}]}
+        issue = {"number": 9, "state": "open", "body": "## What\nDeploy\n",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        data = {"prs": {8: ready_node()}}
+        lines = brain._pull_request_lines(None, REPO, [pr], data, "grug-tribe",
+                                          issues=[issue])
+        self.assertEqual(lines, ["### Pull requests",
+                                 "- #8 Lane work - blocked: held for the operator: deploy-config"])
+
+    def test_status_prints_ready_for_pull_request_merge_would_take(self):
+        pr = {"number": 8, "title": "Lane work", "body": "Refs %s#9" % REPO,
+              "head": {"ref": "loom/9-work"}, "mergeable": True, "mergeable_state": "clean",
+              "files": [{"filename": "bus/brain.py"}]}
+        issue = {"number": 9, "state": "open", "body": "## What\nWork\n",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        data = {"prs": {8: ready_node()}}
+        lines = brain._pull_request_lines(None, REPO, [pr], data, "grug-tribe",
+                                          issues=[issue])
+        self.assertEqual(lines, ["### Pull requests", "- #8 Lane work - READY"])
 
     def test_merge_ready_follows_the_newest_review_and_two_status_runs_agree(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}
@@ -784,7 +825,7 @@ class SensitiveResumeTests(unittest.TestCase):
         report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={}, authors=())
         self.assertIn("- #4 PR - blocked: checks unknown", report)
         query = fake.calls[2][2]["query"]
-        for field in ("committedDate", "statusCheckRollup", "reviews(last:100)", "submittedAt",
+        for field in ("mergeable", "committedDate", "statusCheckRollup", "reviews(last:100)", "submittedAt",
                       "reviewThreads(first:100)", "isResolved", "createdAt", "__typename"):
             self.assertIn(field, query)
 
