@@ -2153,6 +2153,36 @@ EOF
   echo "[$stamp] $TICKET: left off the kept branch: $(stray_list)"
 }
 
+# Remove the files the agent's commits added outside the brief's paths and
+# commit the removal on the lane branch. Only stray files go: the lane's real
+# work is never touched. A fix round whose commit was refused for out-of-brief
+# paths removes them here and re-commits instead of retrying the identical
+# refusal forever (loom#1476).
+# Returns 1 when a file cannot be removed or the removal cannot be committed.
+drop_stray_files() {
+  local f stamp
+  stamp="$(date -u +%FT%TZ)"
+  while IFS= read -r f; do
+    [ -z "$f" ] || {
+      if safe_git rm -q -f -- "$f"; then
+        continue
+      fi
+      # rm failed: if the file is still tracked this is a real failure;
+      # otherwise it was already removed in a previous partial attempt and
+      # there is nothing left to do for it (loom#1476).
+      if safe_git ls-files --error-unmatch -- "$f" > /dev/null 2>&1; then
+        echo "[$stamp] $TICKET: could not remove $f from the committed changes"
+        return 1
+      fi
+    }
+  done <<EOF
+$STRAY_FILES
+EOF
+  [ -n "$STRAY_FILES" ] || return 0
+  safe_git commit -qm "Drop files outside the brief's paths: $(stray_list)" || return 1
+  echo "[$stamp] $TICKET: left off the commit: $(stray_list)"
+}
+
 # What the agent is told about the contract, after its brief.
 validation_note() {
   [ -n "$HAS_CONTRACT" ] || return 0
@@ -3086,10 +3116,28 @@ for BRIEF in "$INBOX"/*.md; do
     COMMITTED=1
   fi
   # A commit that adds files outside the brief is refused before validation
-  # and push: nothing is pushed, and the reason names every stray file.
+  # and push: nothing is pushed, and the reason names every stray file. A fix
+  # round recovers instead: it removes the stray files (never the lane's real
+  # work) and commits again, so the next attempt does not retry the identical
+  # refusal (loom#1476). A fresh brief still refuses and fails, so the ticket
+  # reaches the brain or the next lane rather than looping.
   if [ "$COMMITTED" -eq 1 ]; then
     if ! check_scope "$BRIEF" 2>> "$LOG"; then
       park "$BRIEF" "could not check the committed files against the brief" transient; continue
+    fi
+    if [ -n "$STRAY_FILES" ] && [ -n "$FIX_PR" ]; then
+      # Recover the refused fix round: remove the stray files and commit the
+      # removal, then re-check so only files outside the brief's paths go.
+      if ! drop_stray_files; then
+        park "$BRIEF" "could not remove the files outside the brief's paths: $(stray_list); nothing pushed"; continue
+      fi
+      # The removal commit took the stray files off the branch. Clear the list
+      # so the refusal gate below cannot park a fix round that already removed
+      # them; the re-check above is the authority on what still strays (loom#1476).
+      STRAY_FILES=
+      if ! check_scope "$BRIEF" 2>> "$LOG"; then
+        park "$BRIEF" "commit still refused: it adds files outside the brief's paths: $(stray_list); nothing pushed"; continue
+      fi
     fi
     if [ -n "$STRAY_FILES" ]; then
       park "$BRIEF" "commit refused: it adds files outside the brief's paths: $(stray_list); nothing pushed"; continue
@@ -3232,6 +3280,7 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$COMMITTED" -eq 1 ]; then
     if ! PUSH_OUT="$(timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" 2>&1)"; then
       printf '%s\n' "$PUSH_OUT" >> "$LOG"
+      printf 'DEBUG push failed for %s: %s\n' "$BRANCH" "${PUSH_OUT:-}" >> /Users/evan/loom/worktrees/quadseven.loom-1476-r3/.loom-debug2.txt
       if [ -n "$FIX_PR" ] && printf '%s\n' "$PUSH_OUT" | grep -qE '\[rejected\].*\((fetch first|non-fast-forward)\)'; then
         NOW_HEAD="$(timeout "$NET_TIMEOUT" git -C "$TREE" ls-remote origin "refs/heads/$BRANCH" 2>> "$LOG" | cut -f1)"
         if [ -n "$NOW_HEAD" ] && [ "$NOW_HEAD" != "$BASE" ]; then
@@ -3287,6 +3336,7 @@ Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
     # edit are already on the pull request's timeline.
     if ! printf '%s' "$COMMENT" | upsert_sticky_comment "$REPO" "$FIX_PR" "$ROUND_MARKER" rounds; then
       echo "[$(date -u +%FT%TZ)] $TICKET: fixes are pushed but the comment on #$FIX_PR failed" >> "$LOG"
+      printf 'DEBUG upsert failed FIX_PR=%s COMMENT_LEN=%s\n' "$FIX_PR" "${#COMMENT}" >> /Users/evan/loom/worktrees/quadseven.loom-1476-r3/.loom-debug2.txt
     fi
     if [ "$COMMITTED" -eq 1 ]; then
       echo "[$(date -u +%FT%TZ)] $TICKET done, fixes pushed to #$FIX_PR" >> "$LOG"
