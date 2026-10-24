@@ -1303,7 +1303,7 @@ class SensitiveResumeTests(unittest.TestCase):
             "details": {"headRefName": "feature/lane-work"}})
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, {"merged": True}),
-                    reply(204), reply(200, issue), reply(200, {}))
+                    reply(204), reply(200, []), reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
                              env={"LOOM_BRIEF_AUTHORS": "example-brain"})
         self.assertTrue(result["merged"])
@@ -1331,7 +1331,7 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_good_merge_uses_checked_sha_then_deletes_and_moves_ticket(self):
         pr, query = self._merge_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
-        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204),
+        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204), reply(200, []),
                     reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertEqual(fake.calls[3][2], {"merge_method": "squash", "sha": "checked"})
@@ -1339,6 +1339,50 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(result, {"merged": True, "pull_request": (REPO, 8),
                                   "ticket": (REPO, 9), "head_sha": "checked"})
         self.assertTrue(fake.calls[-2][1].endswith("/repos/%s/issues/9" % REPO))
+
+    def _merge_with_files(self, files, labels=("loom:ticket", "loom:pr"), search_items=None):
+        pr, query = self._merge_replies()
+        issue = {"state": "open", "labels": [{"name": x} for x in labels]}
+        replies = [pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204)]
+        if "documentation" not in labels:
+            replies.append(reply(200, files))
+        if search_items is not None:
+            replies.append(reply(200, {"items": [{"path": p} for p in search_items]}))
+        replies += [reply(200, issue), reply(200, {}), reply(201, {})]
+        fake = Fake(*replies)
+        brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        puts = [c for c in fake.calls if c[0] == "PUT" and c[1].endswith("/issues/9/labels")]
+        return [x for x in puts[0][2]["labels"] if x.startswith("loom:")], fake
+
+    def test_merge_of_a_docs_only_pull_request_requeues_its_ticket(self):
+        labels, fake = self._merge_with_files([{"filename": "docs/a.md", "patch": "+x"}])
+        self.assertEqual(labels, ["loom:ticket", "loom:queued"])
+        note = [c[2]["body"] for c in fake.calls if c[1].endswith("/issues/9/comments")][0]
+        self.assertIn("only documentation", note)
+        self.assertIn("back at loom:queued", note)
+
+    def test_merge_of_a_pull_request_adding_uncalled_code_requeues_its_ticket(self):
+        patch = "+def decide(x):\n+    return x"
+        labels, fake = self._merge_with_files(
+            [{"filename": "bus/a.py", "patch": patch}], search_items=["tests/test_a.py"])
+        self.assertEqual(labels, ["loom:ticket", "loom:queued"])
+
+    def test_merge_of_a_pull_request_that_changes_behavior_marks_merged(self):
+        patch = "+def decide(x):\n+    return x\n+y = decide(1)"
+        labels, _ = self._merge_with_files([{"filename": "bus/a.py", "patch": patch}])
+        self.assertEqual(labels, ["loom:ticket", "loom:merged"])
+
+    def test_merge_of_a_pull_request_whose_function_has_a_caller_marks_merged(self):
+        patch = "+def decide(x):\n+    return x"
+        labels, _ = self._merge_with_files(
+            [{"filename": "bus/a.py", "patch": patch}], search_items=["bus/b.py"])
+        self.assertEqual(labels, ["loom:ticket", "loom:merged"])
+
+    def test_merge_of_a_docs_pull_request_for_a_docs_ticket_marks_merged(self):
+        labels, _ = self._merge_with_files(
+            [{"filename": "docs/a.md", "patch": "+x"}],
+            labels=("loom:ticket", "loom:pr", "documentation"))
+        self.assertEqual(labels[-1], "loom:merged")
 
     def test_merge_refuses_while_a_brain_fix_is_pending(self):
         pr, query = self._merge_replies()
@@ -1355,7 +1399,7 @@ class SensitiveResumeTests(unittest.TestCase):
         pr, query = self._merge_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, {"merged": True}),
-                    reply(204), reply(200, issue), reply(200, {}))
+                    reply(204), reply(200, []), reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
                              env={"LOOM_BRIEF_AUTHORS": "alice-example"})
         self.assertTrue(result["merged"])
@@ -1394,7 +1438,7 @@ class SensitiveResumeTests(unittest.TestCase):
         pr, query = self._merge_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
-                    reply(422, {"message": "Reference does not exist"}), reply(200, issue), reply(200, {}))
+                    reply(422, {"message": "Reference does not exist"}), reply(200, []), reply(200, issue), reply(200, {}))
         brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertEqual(fake.calls[-1][0], "PUT")
         # Merged is not deployed: the ticket says merged until the project's
@@ -1489,7 +1533,7 @@ class SensitiveResumeTests(unittest.TestCase):
         pr, query = self._sensitive_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, self._passing_check(), reply(200, issue),
-                    reply(200, {"merged": True}), reply(204), reply(200, issue), reply(200, {}))
+                    reply(200, {"merged": True}), reply(204), reply(200, []), reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertTrue(result["merged"])
 
@@ -1505,7 +1549,7 @@ class SensitiveResumeTests(unittest.TestCase):
             "reviewThreads": {"nodes": [high]}}})
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
-                    reply(204), reply(200, issue), reply(200, {}))
+                    reply(204), reply(200, []), reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertTrue(result["merged"])
 
