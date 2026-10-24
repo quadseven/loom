@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
+from . import bench, brain, brief_check, change_class, criteria_gate, labels, ladders, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -156,15 +156,30 @@ HOLD_STUCK = 48 * 3600
 REVIEW_GRACE = 1800
 # At most this many merges, send-backs and climbs per pass.
 MAX_ACTIONS = 12
-DEFAULT_REVIEW_CHECK = "Grug - Elder"
-# The review bot's plan check (same default as bus/invariants.py).
-DEFAULT_PLAN_CHECK = "Grug - Chief"
-# The review bot's login as GraphQL reports it (an app, without "[bot]").
-DEFAULT_REVIEW_BOT = "grug-tribe"
-BOT_FIXED_PREFIX = "Fixed in "
-# Asks the review bot to review a pull request's head again; it resolves the
-# threads it no longer raises. LOOM_REVIEW_AGAIN overrides it.
-REVIEW_AGAIN = "/grug improve"
+
+# Ladder constants and functions imported from ladders (shared with brain)
+from .ladders import (
+    ANTHROPIC, SHARED_CREDIT, LADDER, SPARKS, FREE_POOL, TIERS,
+    KINDS, LANE_KINDS, HARD_MODELS, EQUIVALENTS, FALLBACK,
+    PUBLIC_ONLY, RUNG_BUSY, ONE_LANE_MAX, RUNG_LIMIT_WAIT,
+    LIMIT_REQUEUE, SILENT_MAX, RUNG_MARKER, RUNG_RE,
+    EQUIVALENT_MARKER, EQUIVALENT_RE, CLAIM_RE, STALL_MOVE_RE,
+    NO_CHANGE_RE, FAILED_RE, RETRY_ENDED_RE, HELD_RE, STOPPED_RE,
+    CLAIMED_RE, RUN_FOOTER_RE, BRIEF_RES, RUNAWAY, NO_REASON,
+    MINOR_RE, DEFER_AFTER, DEFER_LABEL, DEFER_TITLE,
+    PARTIAL_REVIEW_TITLES, BOT_FIXED_PREFIX, REVIEW_AGAIN_MARKER,
+    REVIEW_AGAIN, DEFAULT_REVIEW_CHECK, DEFAULT_REVIEW_BOT,
+    CLIMB, STRONG, _climb_rungs, lane_kind, lane_model,
+    _mark_model, tried_rungs, known_models, footer_run, ran_models,
+    claim_models, ran_rungs, reached_rung, issue_model,
+    _attempt_rows, _ts, attempts, _is_brief, attempts_since_brief,
+    climb_rungs, next_rung,
+    DEGRADED_REVIEW_MARK,
+)
+
+
+# Factory-specific constants (not shared with brain)
+
 # The reply a lane posts on a review thread when it answered the finding
 # instead of changing the code (bus/station.py writes it). The factory reads
 # the same words to know a thread was answered and not settled.
@@ -173,20 +188,98 @@ ANSWER_RE = re.compile(r"^Lane [A-Za-z0-9_.-]+ %s" % re.escape(ANSWER_REPLY))
 # The marker on the comment that asks the review bot to judge an answer: it
 # carries the head commit, so the ask happens once per head.
 IMPROVE_MARKER = "<!-- loom:improve-head %s -->"
-# The review bot's check output title that means it did not finish every part
-# of the diff, or did not trust its own result ("WARN Elder review coverage
-# partial", "WARN Grug eyes clouded", "WARN Elder review low confidence").
-# A lane cannot finish someone else's review by editing code, so the factory
-# asks the bot to look at the head again instead of sending the pull request
-# back for a fix round it cannot close.
-PARTIAL_REVIEW_TITLES = ("WARN Elder review coverage partial",
-                         "WARN Grug eyes clouded",
-                         "WARN Elder review low confidence")
-# The review bot's own words for a result that is not a verdict ("Degraded
-# review (low_confidence_review): not a verdict. Comment /grug improve to
-# re-run once the backend recovers.").
-DEGRADED_REVIEW_MARK = "Degraded review ("
 
+# The review bot's plan check (same default as bus/invariants.py).
+DEFAULT_PLAN_CHECK = "Grug - Chief"
+
+# The no-test send-back heading
+NO_TEST_HEADING = "### Test: the change has no test"
+# A file a pull request changes is code by its extension, and a test by a
+# test or tests folder in its path or by its name.
+CODE_EXTS = (".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".cpp", ".h", ".hpp",
+             ".go", ".rs", ".sh", ".lua", ".sql")
+TEST_NAME_RE = re.compile(r"^test_|_test\.|\.test\.|\.spec\.")
+TESTS_NONE_RE = re.compile(r"^Tests: none needed \(\S[^)\n]*\)", re.M)
+ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)(?:/|$)")
+# The leak scan (infra-public's _reusable.leak-scan.yml) logs its diff and its
+# title-and-body text as two sections; each hit is "  <file>:<line>  [<rule>] ...".
+LEAK_CHECK_RE = re.compile(r"leak|private identifiers", re.I)
+LEAK_DIFF_MARK = "--- PR diff ---"
+LEAK_TEXT_MARK = "--- title and body ---"
+LEAK_HIT_RE = re.compile(r"^\s*\S+:(\d+)\s+\[([\w-]+)\]\s")
+LEAK_REF_RULE = "private-issue-ref"
+CRITERION_RE = re.compile(r"^-\s+\[([ xX])\]\s+(.+?)\s*$")
+NOT_BUILT_RE = re.compile(r"\s*;\s*not built:\s*\S.+$", re.I)
+# The scanner's cross-repo reference shape: [owner/]name#N.
+SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
+                         r"([a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9])#(\d+)\b", re.I)
+BODY_LEAK_MARKER = "<!-- loom:body-leak-repaired %s -->"
+# On the ticket: the station put it under an epic for this head commit.
+EPIC_REPAIR_MARKER = "<!-- loom:epic-repaired %s -->"
+# The plan check's summary table names this row for a ticket under no epic.
+EPIC_ROW = "which epic"
+_ORPHAN_NUMBER_RE = re.compile(r"#(\d+)")
+# On the pull request: the scope check held this head commit (bus/scope_fit.py).
+SCOPE_HOLD_MARKER = "<!-- loom:scope-hold %s -->"
+MODEL_LINE = re.compile(r"^Model:[^\n]*\n?", re.M)
+GREEN = ("success", "neutral", "skipped")
+# bus/revert.py's revert tickets, landed first and on green.
+REVERT_LABEL = "loom:revert"
+FIRST = tickets.FIRST_LABELS
+
+FIX_NOTES = """The factory sent this pull request back: it has failing checks, open \
+review threads or a conflict with the default branch, listed below.
+
+- Bring the branch up to date with the default branch first if it conflicts.
+- Fix each finding that is valid against the current code, with a test that \
+fails without the fix where the finding is about behavior.
+"""
+
+# The note for a ticket whose lane run failed with its pull request open: the
+# failed run is the finding, so it is not the stock FIX_NOTES that brain.fix
+# refuses to send alone.
+FAILED_RUN_NOTES = """The lane's last run on this ticket failed before it finished. The \
+open pull request holds the work so far.
+
+- Read the pull request's branch and finish the ticket on it.
+- Keep the whole suite green, and change nothing the ticket does not ask for."""
+
+# A green pull request that leaves ticket criteria unticked goes back with
+# each one named under this heading (2026-10-20: the generic note listed no
+# finding, so lanes had nothing to act on and one pull request came back six
+# times). stuck() climbs a ticket whose last round left a named one unticked.
+UNTICKED_HEADING = "### Acceptance criteria not ticked"
+
+# The title before the naming standard (docs/NAMING.md): an open follow-up
+# filed under it still counts, so a pull request never gets two.
+DEFER_TITLE_LEGACY = "Deferred review findings from %s#%d"
+
+TICKED_HEADING = "### Live or operator criteria ticked by the lane"
+
+TEST_NOTES = NO_TEST_HEADING + """
+
+The factory sent this pull request back: it changes code and no test file.
+
+- Add a test that fails without the change and passes with it, next to the \
+repo's other tests.
+- Change nothing else.
+- Where the change truly needs no test (no behavior changed, or the repo has \
+no test harness), the brain adds "Tests: none needed (<reason>)" to the \
+ticket body; the lane does not."""
+
+# The head of the note _give_up leaves when a ticket is past the last rung.
+GAVE_UP = "The factory tried every rung of the model ladder"
+# The class bus/station.py's CLASS_RE reads off a reported reason.
+ENDING_CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
+# An agent run cut off at the agent timeout (lanes/agent_cli.sh classes exit 124
+# [transient]). The class may be missing (an older reason) or [work] (the
+# station's own reclassing of a repeated timeout, below), never [limit].
+TIMEOUT_RE = re.compile(r"^(?:\[(?:transient|work)\] )?agent exited 124(?!\d)")
+# Two runs in a row cut off on one ticket are the ticket's doing, not a lane's.
+TIMEOUT_STRIKES = 2
+
+# lanes/run_lane.sh's reason when the agent edited a submodule (loom#1316).
+SUBMODULE_EDIT_RE = re.compile(r"the change edits files inside submodule (\S+)")
 
 def degraded_review(title: str, summary: str) -> bool:
     """True when a review check's output is a partial or degraded result, not
@@ -270,10 +363,6 @@ LANE_KINDS: Dict[str, str] = {
 }
 
 
-def lane_kind(lane: str) -> Optional[str]:
-    """LANE_KINDS for a lane or a numbered slot of one (anthropic-9 is an
-    anthropic slot, labels.base_lane); None for a lane it does not know."""
-    return LANE_KINDS.get(labels.base_lane(lane))
 # The strongest model each lane has, for a hard ticket with no Model: line
 # (bus/tickets.py render_brief writes it into the brief, so run_lane.sh runs
 # it instead of the lane default). Empty since 2026-10-21: the codex and agy
@@ -286,21 +375,6 @@ HARD_MODELS: Dict[str, str] = {}
 # entry moved claude-opus-5-5 work to agy on gemini-4-argon-high, a
 # tickets.FORBIDDEN_MODELS model, and gemini-3.8-flash is no Opus equivalent.
 EQUIVALENTS: Dict[str, Tuple[Tuple[str, ...], str, str]] = {}
-
-
-def _climb_rungs() -> Tuple[Tuple[Tuple[str, ...], str], ...]:
-    """LADDER, then one rung for each EQUIVALENTS or HARD_MODELS model the
-    ladder lacks, with the lanes that run it. The rungs a stuck ticket climbs
-    (Factory._climb, bus/brain.py escalate)."""
-    have = {model for _, model in LADDER}
-    extra: Dict[str, List[str]] = {}
-    for lanes, model, _ in EQUIVALENTS.values():
-        if model not in have:
-            extra.setdefault(model, []).extend(lanes)
-    for lane, model in HARD_MODELS.items():
-        if model not in have:
-            extra.setdefault(model, []).append(lane)
-    return LADDER + tuple((tuple(dict.fromkeys(lanes)), model) for model, lanes in extra.items())
 
 
 # The ladder's rungs, then a rung for each EQUIVALENTS or HARD_MODELS model
@@ -362,20 +436,6 @@ NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
 # Fix rounds in a row that end with no commit on one failing check before the
 # ticket goes to a person.
 NO_CHANGE_LIMIT = 2
-# bus/station.py's note on a failed run, and the runner's reason when a run
-# committed nothing and its agent wrote no reason why (lanes/run_lane.sh).
-FAILED_RE = re.compile(r"^Lane \S+ failed: ")
-# Other endings of a claim, each read as a classed reason (loom#572): since
-# status events (loom#866) these lines do not start "Lane X failed:". An
-# automatic retry carries the failed lane's classed reason after its move; a
-# factory-incident hold is a [factory] ending; and bus/station.py's limit,
-# auth and branch-moved paths record "Lane X stopped: [class] ...", worded so
-# that no reader of FAILED_RE counts it as a failure.
-RETRY_ENDED_RE = re.compile(r"^Automatic retry [0-9]+ of [0-9]+ \([a-z]+\): moved from lane "
-                            r"\S+ to lane \S+\. Lane \S+ failed: ")
-HELD_RE = re.compile(r"^Lane \S+ held: ")
-STOPPED_RE = re.compile(r"^Lane \S+ stopped: (?=\[(?:limit|auth|transient)\] )")
-CLAIMED_RE = re.compile(r"Claimed for lane ([a-z0-9-]+) \(body sha256 [0-9a-f]{12}\)")
 # The runner's footer on a lane pull request (lanes/run_lane.sh pr_body,
 # rewritten by bus/pr_repair.py on each fix round): the lane and the model the
 # newest run used.
@@ -536,14 +596,6 @@ def _default_close(gh: GitHub, repo: str, number: int, comment: str) -> None:
     body = str(pr.get("body") or "").rstrip()
     gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number),
             {"state": "closed", "body": (body + "\n\n" if body else "") + comment})
-
-
-def _ts(value: Any) -> float:
-    try:
-        return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc).timestamp()
-    except ValueError:
-        return 0.0
 
 
 def _labels(issue: Dict[str, Any]) -> List[str]:
@@ -727,148 +779,6 @@ def pick_lane(lanes: Sequence[str], load: Dict[str, int]) -> str:
     return min(lanes, key=lambda lane: (load.get(lane, 0), lanes.index(lane)))
 
 
-def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
-    """The rungs the ticket has run on since its ladder last started (the
-    newest rung 0 marker). A rung counts once a claim follows its marker: a
-    rung skipped because its lanes were busy, or one the ticket sat briefed
-    on with no lane claiming it, is not tried (on 2026-10-13 a restart wave
-    filled the claude and codex lanes, tickets spilled straight to rung 3 and
-    gave up after one more round; on 2026-10-14 a ticket that never ran
-    climbed past the last rung). An equivalent move (EQUIVALENT_MARKER)
-    leaves its rung untried: the claim after it runs the equivalent model."""
-    tried: set = set()
-    pending: set = set()
-    for c in comments:
-        body = str(c.get("body") or "")
-        if CLAIM_RE.match(body):
-            tried |= pending
-            pending = set()
-        for m in RUNG_RE.finditer(body):
-            rung = int(m.group(1))
-            if rung == 0:
-                tried, pending = set(), set()
-            else:
-                pending = pending | {rung}
-        if EQUIVALENT_RE.search(body):
-            pending = set()
-    return tried
-
-
-def _mark_model(body: str) -> Tuple[bool, Optional[str]]:
-    """Whether a comment sets the ticket's model, and the model it sets: a
-    factory rung marker gives its rung's model (rung 0 restarts the ladder
-    and sets none), an equivalent move its equivalent model, a brain
-    escalation its `Rung:` line's model."""
-    found = [int(m.group(1)) for m in RUNG_RE.finditer(body)]
-    if found:
-        rung = found[-1]
-        return True, CLIMB[rung - 1][1] if 1 <= rung <= len(CLIMB) else None
-    equivalent = EQUIVALENT_RE.search(body)
-    if equivalent:
-        return True, equivalent.group(1)
-    line = brain._RUNG_LINE.search(body) if body.startswith(brain.ESCALATE_MARKER) else None
-    return (True, line.group(2)) if line else (False, None)
-
-
-def known_models(env: Optional[Dict[str, str]] = None) -> set:
-    """The model names Loom configures: every CLIMB, HARD_MODELS and
-    EQUIVALENTS model, and each lane's LOOM_<LANE>_MODEL or LOOM_<LANE>_MODELS
-    setting (an agy setting also with its effort suffix, as run_lane.sh adds
-    it)."""
-    env = os.environ if env is None else env
-    found = {model for _, model in CLIMB} | set(HARD_MODELS.values())
-    found |= {model for _, model, _ in EQUIVALENTS.values()}
-    for key, value in env.items():
-        if re.fullmatch(r"LOOM_[A-Z0-9_]+_MODELS?", key) and key != "LOOM_BRAIN_MODEL":
-            for model in str(value).split():
-                found |= {model} | {"%s-%s" % (model, e) for e in ("low", "medium", "high")}
-    return found
-
-
-def footer_run(body: Any, env: Optional[Dict[str, str]] = None) -> Optional[Tuple[str, str]]:
-    """(lane, model) from the runner's footer on a lane pull request body,
-    the newest run on it, or None when the body has no footer or names a
-    model Loom does not configure (known_models): a footer is text in a pull
-    request body, so an unknown name never steers the ladder. Callers read it
-    only from a trusted author's pull request in the ticket's own repo."""
-    found = RUN_FOOTER_RE.findall(str(body or ""))
-    if not found or found[-1][1] not in known_models(env):
-        return None
-    return found[-1][0], found[-1][1]
-
-
-def ran_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
-               footer: Optional[Tuple[str, str]] = None) -> set:
-    """The models the ticket was claimed on since its ladder last started
-    (the newest rung 0 marker), each read from what ran (claim_models). On
-    2026-10-16 a ticket's three attempts on gpt-6-sol carried no rung marker,
-    and the factory moved it back to gpt-6-sol for a fourth."""
-    ran: set = set()
-    for comment, model in claim_models(issue, comments, footer):
-        if comment is None:
-            ran = set()  # a rung 0 marker starts the ladder again
-        else:
-            ran |= {model} - {None}
-    return ran
-
-
-def claim_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
-                 footer: Optional[Tuple[str, str]] = None) -> List[Tuple[Optional[Dict[str, Any]], Optional[str]]]:
-    """Each claim comment, oldest first, as (comment, the model it ran on or
-    None when nothing names one); a rung 0 marker appears as (None, None),
-    where the ladder starts again. A claim ran on the Model: line in force:
-    a rung marker, an equivalent move or a brain escalation sets it for the
-    claims after it, and the body's line holds before the first of those
-    when none rewrote it since (lanes/run_lane.sh runs a brief's Model: line
-    as it is). A claim with no Model: line in force ran on the model the
-    runner footer of its lane's pull request names (`footer`, (lane, model)),
-    else on its lane's configured model setting (bus/brain.py lane_model),
-    else on a model nothing names. Never a fixed lane-to-model map: on
-    2026-10-17 five runs on lane claude used claude-opus-5-5 while the ladder
-    recorded claude-sonnet-5-5 and gave up with two strong models untried.
-    The dashboard reads the newest claim's model as the model the ticket's
-    last run used."""
-    match = re.search(r"^Model:[ \t]*(\S+)", str(issue.get("body") or ""), re.M)
-    body_model = match.group(1) if match else None
-    bodies = [str(c.get("body") or "") for c in comments]
-    marks = [i for i, body in enumerate(bodies) if _mark_model(body)[0]]
-    current = body_model if not marks else None
-    out: List[Tuple[Optional[Dict[str, Any]], Optional[str]]] = []
-    for i, body in enumerate(bodies):
-        sets, model = _mark_model(body)
-        if sets:
-            if [m.group(1) for m in RUNG_RE.finditer(body)][-1:] == ["0"]:
-                out.append((None, None))
-            current = (body_model or model) if i == marks[-1] else model
-            continue
-        claim = CLAIMED_RE.fullmatch(body.strip())
-        if claim:
-            lane = claim.group(1)
-            ran = footer[1] if footer and footer[0] == lane else brain.lane_model(lane)
-            out.append((comments[i], current or ran))
-    return out
-
-
-def ran_rungs(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
-              footer: Optional[Tuple[str, str]] = None) -> set:
-    """The rungs whose model the ticket already ran on (ran_models), with or
-    without a rung marker: the ladder never gives a ticket a model that
-    already failed it (docs/MUSE.md, Repeatedly stuck work)."""
-    models = ran_models(issue, comments, footer)
-    return {n for n, (_, model) in enumerate(CLIMB, 1) if model in models}
-
-
-def reached_rung(comments: Sequence[Dict[str, Any]]) -> int:
-    """The highest rung the ticket has run on since its ladder last started, 0
-    when none."""
-    return max(tried_rungs(comments), default=0)
-
-
-def issue_model(issue: Dict[str, Any]) -> str:
-    match = re.search(r"^Model:[ \t]*(\S+)", str(issue.get("body") or ""), re.M)
-    return match.group(1) if match else "unspecified"
-
-
 def _ending(body: str) -> Optional[str]:
     """The classed reason a comment ends the attempt before it with, or None
     when it ends none: a "Lane X failed:" line or one of the other endings
@@ -879,44 +789,6 @@ def _ending(body: str) -> Optional[str]:
             return body[match.end():]
     held = HELD_RE.match(body)
     return "[factory] " + body[held.end():] if held else None
-
-
-def _attempt_rows(comments: Sequence[Any], reset_at: Any = None) -> List[List[Any]]:
-    """Each claim as [epoch, time, lane, reason it failed], oldest first, from
-    the claim comments and the endings that followed them (_ending). An
-    attempt takes the first ending after it, or "" when none was recorded.
-    With `reset_at` given, a comment it matches starts a new segment: only the
-    last segment's claims are returned."""
-    found: List[List[Any]] = []
-    for comment in comments:
-        body = str(comment.get("body") or "").strip() if isinstance(comment, dict) else ""
-        if reset_at is not None and reset_at(body):
-            found = []
-            continue
-        claim = CLAIMED_RE.fullmatch(body)
-        at = _ts(comment.get("created_at")) if claim else 0.0
-        if claim and at:
-            found.append([int(at), str(comment["created_at"]), claim.group(1), ""])
-        ending = _ending(body)
-        if ending and found and not found[-1][3]:
-            found[-1][3] = ending
-    return found
-
-
-def attempts(comments: Sequence[Any], current: str = "") -> List[Tuple[int, str, str, str]]:
-    """Each claim as (epoch, time, lane, reason it failed), oldest first, from
-    the claim comments and their endings (_attempt_rows). An attempt takes the
-    ending that followed it, or "" when none was recorded; with `current` given, the last
-    attempt is the one being reported and takes that reason."""
-    found = _attempt_rows(comments)
-    if found and current:
-        found[-1][3] = current
-    return [(a[0], a[1], a[2], a[3]) for a in found]
-
-
-def _is_brief(body: str) -> bool:
-    """Whether the comment assigns the ticket to a lane: a brief."""
-    return any(rx.search(body) for rx in BRIEF_RES)
 
 
 # The head of the note _give_up leaves when a ticket is past the last rung.
@@ -957,13 +829,6 @@ def newest_ending_class(comments: Sequence[Any]) -> str:
     rows = attempts(comments)
     match = ENDING_CLASS_RE.match(rows[-1][3]) if rows else None
     return match.group(1) if match else "work"
-
-
-def attempts_since_brief(comments: Sequence[Any]) -> List[Tuple[int, str, str, str]]:
-    """The attempts after the ticket's last brief (its last lane assignment),
-    oldest first, each with the failure that followed it. A ticket briefed
-    with no assignment comment keeps every claim."""
-    return [(a[0], a[1], a[2], a[3]) for a in _attempt_rows(comments, reset_at=_is_brief)]
 
 
 def dead_lane(comments: Sequence[Any]) -> Optional[str]:
@@ -1049,41 +914,6 @@ def current_rung(issue: Dict[str, Any]) -> int:
     model = m.group(1) if m else ""
     return next((n for n, (lanes, rung_model) in enumerate(CLIMB, 1)
                  if rung_model == model and _lane(issue) in lanes), 0)
-
-
-def climb_rungs(tried: set, reached: int = 0) -> List[int]:
-    """The rungs of CLIMB a ticket may still climb to, in order: each one not
-    in `tried` above `reached`, the highest rung the ladder itself moved it
-    to. Once it ran on the ladder's last rung or past it, every untried
-    STRONG one instead, never back to a weaker model: with Opus the only
-    strong model since 2026-10-21, a ticket Opus failed has none left."""
-    if any(n >= len(LADDER) for n in tried | {reached}):
-        return [n for n in range(1, len(CLIMB) + 1)
-                if n not in tried and CLIMB[n - 1][1] in STRONG]
-    return [n for n in range(reached + 1, len(CLIMB) + 1) if n not in tried]
-
-
-def next_rung(tried: set, load: Dict[str, int], eligible: Optional[set] = None,
-              reached: int = 0,
-              lanes: Optional[Dict[int, Tuple[str, ...]]] = None) -> int:
-    """The lowest rung of climb_rungs with a lane under RUNG_BUSY
-    (docs/MUSE.md: a higher rung rather than a wait behind a busy lane that
-    is up), else the one whose least-loaded lane holds the least, to wait
-    there. 0 when none is left. Waiting on the lowest rung instead queued 33
-    tickets on the one claude lane on 2026-10-13 while six other ladder slots
-    sat idle. `lanes`, when given, maps each rung to the lanes that may serve
-    it now (Factory._up_lanes): only those count toward its load, and a rung
-    with none is passed over. Counting every CLIMB lane made rung 3 look free
-    through the idle anthropic slots while they were out of credit."""
-    untried = [n for n in climb_rungs(tried, reached)
-               if (eligible is None or n in eligible) and (lanes is None or lanes.get(n))]
-    if not untried:
-        return 0
-    least = {n: min(load.get(lane, 0)
-                    for lane in (CLIMB[n - 1][0] if lanes is None else lanes[n]))
-             for n in untried}
-    free = [n for n in untried if least[n] < RUNG_BUSY]
-    return free[0] if free else min(untried, key=lambda n: (least[n], n))
 
 
 def pr_faults(details: Dict[str, Any], full: Dict[str, Any],

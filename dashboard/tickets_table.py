@@ -15,7 +15,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode
 
-from bus import brain, factory
+from bus import ladders
 from bus.naming import strip_kind
 from bus.metrics import stamp
 
@@ -90,7 +90,7 @@ def resolve_models(rows: Sequence[Dict[str, Any]], *, footer_runs: Dict[str, Seq
             # model its body names, else its lane's configured model, as a
             # claim does (bus/factory.py claim_models).
             when = 0.0
-            model = _model(row.get("model")) or (brain.lane_model(row["lane"]) if row.get("lane") else None)
+            model = _model(row.get("model")) or (ladders.lane_model(row["lane"]) if row.get("lane") else None)
         row["run_model"] = model
         row["model_text"] = model or (NOT_RUN if when is None else NOT_RECORDED)
         if footer and len(footer) >= 4 and footer[2] and footer[3]:

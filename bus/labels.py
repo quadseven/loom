@@ -39,7 +39,7 @@ LANES = LANES + SLOTS
 def base_lane(slot: str) -> str:
     """The lane a numbered slot belongs to (anthropic-2 -> anthropic, spark-3
     -> spark), as run_lane.sh maps it; a free provider slot such as free-kilo
-    has no number and is its own lane. bus.factory.lane_kind and the
+    has no number and is its own lane. bus.ladders.lane_kind and the
     dashboard's run outcomes (dashboard/transcripts.py) both use it."""
     return re.sub(r"-[0-9]+$", "", slot)
 

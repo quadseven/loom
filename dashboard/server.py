@@ -25,6 +25,7 @@ from bus import bench as bench_lib
 from bus import tickets as bus_tickets
 from bus import metrics as bus_metrics
 from bus import scorecard
+from bus import ladders as bus_ladders
 from bus.naming import strip_kind
 
 from .github import TicketStore
@@ -1190,7 +1191,7 @@ def _dispatch_usage(handler, state):
     now = datetime.now(timezone.utc)
     payload = state.response() if hasattr(state, "response") else {}
     lanes = {lane for row in rows for lane in (row.get("lanes") or []) if isinstance(lane, str)}
-    models = {lane: model for lane in lanes for model in [bus_brain.lane_model(lane)] if model}
+    models = {lane: model for lane in lanes for model in [bus_ladders.lane_model(lane)] if model}
     data = usage_store.build(rows, now, prs=payload.get("pull_requests") or [], models=models)
     return handler.send_page(page("Usage", "usage", usage_store.render(data),
                                   status="stale" if payload.get("stale") else "live"))
@@ -1413,7 +1414,7 @@ def _lane_card(item, tickets, newest_pr_for_lane, usage_records):
         reason = "available"
     item.update({
         "ticket": active,
-        "model": model_display or bus_brain.lane_model(lane_name),
+        "model": model_display or bus_ladders.lane_model(lane_name),
         "quota": _lane_quota(lane_name, usage_records),
         "reason": reason,
     })

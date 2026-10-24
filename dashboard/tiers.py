@@ -20,8 +20,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from bus import bench as bench_lib
-from bus import factory, labels
-from bus.brain import lane_model
+from bus import labels, ladders
 
 from . import usage
 from .tiers_sources import SourceState
@@ -42,7 +41,7 @@ UNKNOWN = {"state": "unknown", "text": "unknown", "until": None}
 # -- the tier list ----------------------------------------------------------
 
 def tier_list(env: Optional[Mapping[str, str]] = None,
-              model_of: Callable[..., Optional[str]] = lane_model) -> List[Dict[str, Any]]:
+              model_of: Callable[..., Optional[str]] = ladders.lane_model) -> List[Dict[str, Any]]:
     """Loom's tiers in order (easy, medium, hard), then the model ladder:
     [{name, title, entries: [{lane, model, kind}]}]. A hard entry runs the
     lane's HARD_MODELS model when it has one; any other runs the lane's
@@ -50,14 +49,14 @@ def tier_list(env: Optional[Mapping[str, str]] = None,
     Ladder entries carry their rung."""
     env = os.environ if env is None else env
     out = []
-    for name, lanes in factory.TIERS.items():
+    for name, lanes in ladders.TIERS.items():
         entries = []
         for lane in lanes:
-            model = factory.HARD_MODELS.get(lane) if name == "hard" else None
-            entries.append({"lane": lane, "model": model or model_of(lane, env), "kind": factory.lane_kind(lane)})
+            model = ladders.HARD_MODELS.get(lane) if name == "hard" else None
+            entries.append({"lane": lane, "model": model or model_of(lane, env), "kind": ladders.lane_kind(lane)})
         out.append({"name": name, "title": name.title(), "entries": entries})
-    ladder = [{"rung": rung, "lane": lane, "model": model, "kind": factory.lane_kind(lane)}
-              for rung, (lanes, model) in enumerate(factory.LADDER, 1) for lane in lanes]
+    ladder = [{"rung": rung, "lane": lane, "model": model, "kind": ladders.lane_kind(lane)}
+              for rung, (lanes, model) in enumerate(ladders.LADDER, 1) for lane in lanes]
     out.append({"name": "ladder", "title": "Model ladder", "entries": ladder})
     return out
 
@@ -307,8 +306,8 @@ def _usage_allowance(slots: Sequence[str], readings: SourceState, now: datetime)
 def _tier_slots() -> Dict[str, List[str]]:
     """{lane: its slots named in TIERS or LADDER}, lanes in tier order."""
     out: Dict[str, List[str]] = {}
-    named = [lane for lanes in factory.TIERS.values() for lane in lanes]
-    named += [lane for lanes, _ in factory.LADDER for lane in lanes]
+    named = [lane for lanes in ladders.TIERS.values() for lane in lanes]
+    named += [lane for lanes, _ in ladders.LADDER for lane in lanes]
     for slot in named:
         slots = out.setdefault(labels.base_lane(slot), [])
         if slot not in slots:
@@ -335,7 +334,7 @@ def loom_rows(runs: SourceState, readings: SourceState, now: datetime,
         slots = sorted(set(tier_slots.get(lane, [])) | {str(s) for groups in models.values()
                                                        for g in groups for s in (g.get("slots") or [lane])})
         allowance = _usage_allowance(slots, readings, now)
-        base = {"provider": lane, "source": "loom", "unit": "runs", "kind": factory.lane_kind(lane),
+        base = {"provider": lane, "source": "loom", "unit": "runs", "kind": ladders.lane_kind(lane),
                 "slots": slots, "allowance": allowance}
 
         def held_for(model: Optional[str], lane: str = lane, slots: List[str] = slots) -> Optional[Dict[str, Any]]:
@@ -344,7 +343,7 @@ def loom_rows(runs: SourceState, readings: SourceState, now: datetime,
 
         if not models:
             empty = _runs_cell([], "24h") if answered else None
-            configured = lane_model(lane, env)
+            configured = ladders.lane_model(lane, env)
             held = held_for(configured)
             out.append(dict(base, model="", configured_model=configured, no_runs=answered,
                             w24=empty, w7d=empty and dict(empty),

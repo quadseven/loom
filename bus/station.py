@@ -43,6 +43,7 @@ from . import evidence
 from . import handoff
 from . import health
 from . import invariants
+from . import ladders
 from . import metrics
 from . import naming
 from . import notify
@@ -112,7 +113,7 @@ GB = 1024 ** 3
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
 ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
 ANSWER_MAX = 3000
-STRONG_MODELS = frozenset(model for _, model in factory.CLIMB)
+STRONG_MODELS = frozenset(model for _, model in ladders.CLIMB)
 THREAD_QUERY = ('query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread { isResolved'
                 ' pullRequest { number repository { nameWithOwner } }'
                 ' comments(first:1) { nodes { body author { __typename login } } } } } }')
@@ -1320,13 +1321,13 @@ def brief_model(lane: str, headers: Dict[str, str]) -> str:
     if headers.get("Model"):
         return headers["Model"]
     if headers.get("Difficulty") == "hard":
-        return factory.HARD_MODELS.get(lane, "")
+        return ladders.HARD_MODELS.get(lane, "")
     return ""
 
 
 def model_lanes(model: str) -> List[str]:
     """Compatible lanes, with the model ladder's lanes first when applicable."""
-    rung = next((lanes for lanes, rung_model in factory.LADDER if rung_model == model), ())
+    rung = next((lanes for lanes, rung_model in ladders.LADDER if rung_model == model), ())
     return [lane for lane in dict.fromkeys([*rung, *LANES])
             if lane not in REMOTE_LANES and lane_takes_model(lane, model)]
 
@@ -1359,11 +1360,11 @@ def hold_expired(beat: Dict[str, Any], now: float) -> bool:
 
 def needs_public_repo(lane: str, model: str) -> bool:
     """Free lanes, and lanes whose provider trains on prompts, take public
-    repos only. A slot named in factory.PUBLIC_ONLY counts before it is mapped
+    repos only. A slot named in ladders.PUBLIC_ONLY counts before it is mapped
     to its provider: free-nvidia, free-kilo and free-groq are free provider
     slots that may train (infra#5617), while free-ollama and free-gemma may
     take private repos."""
-    if lane in factory.PUBLIC_ONLY:
+    if lane in ladders.PUBLIC_ONLY:
         return True
     lane = provider(lane)
     return (lane in FREE_LANES or lane in REMOTE_LANES or lane == "agy"
@@ -9500,7 +9501,7 @@ class Station:
         """The lanes whose configured model (LOOM_<LANE>_MODEL in this
         process) is benched on them: a ticket with no Model: line runs that
         model, so these lanes step aside like a lane that is down."""
-        return [lane for lane in LANES if bench.is_benched(pairs, lane, brain.lane_model(lane))]
+        return [lane for lane in LANES if bench.is_benched(pairs, lane, ladders.lane_model(lane))]
 
     def _factory(self) -> factory.Factory:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]

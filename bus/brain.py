@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
-from . import audit, change_class, handoff, hunt_plan, journal, lock, notify, pr_repair, proof, quiet, stale_claims, text, tickets
+from . import audit, change_class, handoff, hunt_plan, journal, lock, notify, pr_repair, proof, quiet, stale_claims, text, tickets, ladders
 from . import merge_tier, naming, operator_hold, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
@@ -623,8 +623,8 @@ def past_last_rung(tickets: List[Dict[str, Any]], histories: Dict[int, "History"
                    ) -> List[Dict[str, Any]]:
     """The loom:failed tickets that ran on every rung since their ladder last
     started, oldest first: the factory leaves them for the brain."""
-    from . import factory  # factory imports this module
-    every = set(range(1, len(factory.LADDER) + 1))
+    from . import ladders  # ladders does not import this module
+    every = set(range(1, len(ladders.LADDER) + 1))
     found = [i for i in tickets if "loom:failed" in _labels(i)
              and every <= histories.get(int(i["number"]), History(0, 0, [], [], None)).rungs]
     return sorted(found, key=lambda i: str(i.get("created_at") or ""))
@@ -885,9 +885,9 @@ def _lane_status(gh: GitHub, lanes_repo: str) -> str:
 def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
            env: Optional[Dict[str, str]] = None, now: Optional[datetime] = None,
            authors: Optional[Sequence[str]] = None) -> str:
-    from . import factory  # factory imports this module
+    from . import ladders  # ladders does not import this module
     env = os.environ if env is None else env
-    bot = env.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
+    bot = env.get("LOOM_REVIEW_BOT", "").strip() or ladders.DEFAULT_REVIEW_BOT
     now = now or datetime.now(timezone.utc)
     # Explicit `authors` are the caller's choice; read from the environment,
     # an empty list is refused, as it would trust no journal (loom#783).
@@ -2080,7 +2080,7 @@ def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional
     """A brief the station must place needs a difficulty tier. Without one the
     ticket waited for a brain to notice (2026-10-16: five factory tickets
     briefed without --difficulty sat queued up to 17 hours); the factory now
-    places it as factory.DEFAULT_DIFFICULTY, which may be the wrong tier.
+    places it as ladders.DEFAULT_DIFFICULTY, which may be the wrong tier.
     A brief with --lane is claimed by that lane, so it needs none."""
     if lane or difficulty:
         return
@@ -2648,12 +2648,12 @@ def onboard(gh: GitHub, repo: str, review_check: Optional[str] = None,
     before that label existed gets it. A new one names `operator` on an
     Operator: line (see _backlog_home). A second run changes nothing.
     Returns the lines to print."""
-    from . import factory, labels  # factory imports this module
+    from . import ladders, labels  # ladders does not import this module
     env = os.environ if env is None else env
     if operator is not None and not tickets._OPERATOR_RE.match("Operator: " + operator):
         raise ValueError("--operator %r is not a GitHub login" % operator)
     check = (review_check or env.get("LOOM_REVIEW_CHECK", "").strip()
-             or factory.DEFAULT_REVIEW_CHECK)
+             or ladders.DEFAULT_REVIEW_CHECK)
     info = gh.rest("GET", "/repos/%s" % repo).data or {}
     lines = ["%s is %s" % (repo, "private: its briefs never go to lanes that train on prompts"
                            if info.get("private") else "public")]
@@ -2814,7 +2814,7 @@ def prioritize(gh: GitHub, repo: str, number: int, priority: Optional[str],
                difficulty: Optional[str] = None) -> None:
     """Rank an open ticket, or set its Difficulty, requiring its author to be
     trusted. A queued ticket with no Difficulty line runs in the default tier
-    (factory.DEFAULT_DIFFICULTY); before this a brain could only set its tier
+    (ladders.DEFAULT_DIFFICULTY); before this a brain could only set its tier
     by hand-editing the body (2026-10-16: five factory tickets sat queued up
     to 17 hours)."""
     if priority is None and difficulty is None:
@@ -3048,9 +3048,9 @@ def merge(gh: GitHub, repo: str, number: int,
         pr, details = _await_settled(gh, repo, number, pr, details, env)
         _validate_merge_pr(repo, pr, details, env)
         if change_class.class_of(pr) == "sensitive":
-            from . import factory
+            from . import ladders
             bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
-                   or factory.DEFAULT_REVIEW_BOT)
+                   or ladders.DEFAULT_REVIEW_BOT)
             _validate_sensitive_merge(gh, repo, details, bot, review_check_name(env))
         association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
         _refuse_pending_fix(gh, association, env)
@@ -3177,9 +3177,9 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     if not sha or not _review_check_passed(gh, repo, sha, check):
         raise ValueError("a %s change merges on its own only when the review check %s "
                          "succeeded on its head commit" % (tier, check))
-    from . import factory
+    from . import ladders
     bot = (env if env is not None else os.environ).get("LOOM_REVIEW_BOT", "").strip() \
-        or factory.DEFAULT_REVIEW_BOT
+        or ladders.DEFAULT_REVIEW_BOT
     blocking = merge_tier.blocking_findings(
         merge_tier.review_threads(gh, repo, number),
         str(_head_commit(details).get("committedDate") or ""),
@@ -3325,10 +3325,10 @@ def _validate_sensitive_merge(gh: GitHub, repo: str, details: Dict[str, Any],
 
 def review_check_name(env: Optional[Dict[str, str]] = None) -> str:
     """The check run that must have run on a head before it lands: the
-    operator's named review check, `LOOM_REVIEW_CHECK` (factory default)."""
-    from . import factory  # factory imports this module
+    operator's named review check, `LOOM_REVIEW_CHECK` (ladders default)."""
+    from . import ladders  # ladders does not import this module
     raw = (os.environ if env is None else env).get("LOOM_REVIEW_CHECK", "")
-    return raw.strip() or factory.DEFAULT_REVIEW_CHECK
+    return raw.strip() or ladders.DEFAULT_REVIEW_CHECK
 
 
 def _pr_author(pr: Dict[str, Any]) -> str:
@@ -4065,8 +4065,8 @@ def _generic_fix_notes(notes: str) -> bool:
     """Are these the factory's stock notes, which say what a send-back is but
     name nothing to fix? A brain's own notes, the unticked criteria and the
     missing-test note each name their finding and are not generic."""
-    from . import factory  # factory imports this module
-    return not notes.strip() or notes.strip() == factory.FIX_NOTES.strip()
+    from . import ladders  # ladders does not import this module
+    return not notes.strip() or notes.strip() == ladders.FIX_NOTES.strip()
 
 
 def _repeats_last_fix(gh: GitHub, ticket: Tuple[str, int], issue: Dict[str, Any],
@@ -4538,13 +4538,11 @@ STUCK_STATES = ("failed", "briefed", "pr")
 UNCLAIMED_HOURS = 2
 STUCK_HOURS = 6
 # A ticket held by its After: line this long, with none of the tickets it
-# builds on merged, is stuck in the same way (bus/factory.py HOLD_STUCK
+# builds on merged, is stuck in the same way (bus/ladders.py HOLD_STUCK
 # reports it to the brain once).
 HOLD_HOURS = 48
 # Ticket histories one status call reads per repo; see _histories.
 STATUS_HISTORY_MAX = 20
-ESCALATE_MARKER = "<!-- loom:escalate v1 -->"
-_RUNG_LINE = re.compile(r"^Rung: ([0-9]+) (\S+) (\S+)[ \t]*$", re.M)
 _CLAIM = re.compile(r"Claimed for lane ([a-z0-9-]+) \(body sha256 [0-9a-f]{12}\)")
 
 
@@ -4553,20 +4551,6 @@ def _when(stamp: Any) -> Optional[datetime]:
         return datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
         return None
-
-
-def lane_model(lane: str, env: Optional[Dict[str, str]] = None) -> Optional[str]:
-    """The model a lane runs when a brief names none: its configured setting,
-    LOOM_<SLOT>_MODEL, else LOOM_<PROVIDER>_MODEL for a numbered slot
-    (lanes/run_lane.sh lane_setting); None when neither is set. Never a fixed
-    map: on 2026-10-17 lane claude ran claude-opus-5-5 (LOOM_CLAUDE_MODEL)
-    five times while the ladder recorded claude-sonnet-5-5."""
-    env = os.environ if env is None else env
-    for name in dict.fromkeys((lane, re.sub(r"-[0-9]+$", "", lane))):
-        value = str(env.get("LOOM_%s_MODEL" % name.upper().replace("-", "_")) or "").strip()
-        if value:
-            return value
-    return None
 
 
 class History:
@@ -4579,9 +4563,9 @@ class History:
         self.fixes = fixes
         self.tried = tried
         self.reasons = reasons
-        self.rung = rung  # the next rung (0-based in factory.CLIMB), or None past the ladder
+        self.rung = rung  # the next rung (0-based in ladders.CLIMB), or None past the ladder
         # The factory's rungs it ran on since its ladder last started, from
-        # trusted rung markers (bus/factory.py tried_rungs).
+        # trusted rung markers (bus/ladders.py tried_rungs).
         self.rungs = rungs or set()
         # The tickets it builds on that are not merged yet; a held ticket is
         # never late, so no rung of the ladder is the answer for it.
@@ -4596,7 +4580,7 @@ class History:
             return "waiting on %s" % ", ".join(a.short for a in self.held)
         if self.rung is None:
             return "past the ladder, needs-brain"
-        from .factory import CLIMB  # factory imports this module
+        from .ladders import CLIMB  # ladders does not import this module
         return "next rung %d %s" % (self.rung + 1, CLIMB[self.rung][1])
 
 
@@ -4622,11 +4606,11 @@ def _first_model(issue: Dict[str, Any], bodies: List[Tuple[str, Optional[datetim
 def _tried_models(current: Optional[str], bodies: List[Tuple[str, Optional[datetime]]],
                   footer: Optional[Tuple[str, str]] = None) -> List[str]:
     """The model each claim ran, in order, without repeats: the Model: line in
-    force (an escalation or an equivalent move, bus/factory.py EQUIVALENTS,
+    force (an escalation or an equivalent move, bus/ladders.py EQUIVALENTS,
     sets the one it gave), else the model the runner footer of the claim's
     lane's pull request names (`footer`, (lane, model)), else the lane's
-    configured model (lane_model), as bus/factory.py claim_models reads it."""
-    from .factory import EQUIVALENT_RE  # factory imports this module
+    configured model (lane_model), as bus/ladders.py claim_models reads it."""
+    from .ladders import EQUIVALENT_RE  # ladders does not import this module
     tried: List[str] = []
     for body, _ in bodies:
         rung = _RUNG_LINE.search(body) if body.startswith(ESCALATE_MARKER) else None
@@ -4703,9 +4687,9 @@ def _stuck_reasons(issue: Dict[str, Any], labelled: Labelled, failed: int, fixes
 def _trusted_rungs(comments: List[Any], authors: Sequence[str]) -> set:
     """The rungs a ticket ran on, from rung markers by a trusted login only,
     as in the factory: anyone can comment on a public repo."""
-    from . import factory  # factory imports this module
+    from . import ladders  # ladders does not import this module
     trusted = {a.lower() for a in authors}
-    return factory.tried_rungs([c for c in comments if isinstance(c, dict) and str(
+    return ladders.tried_rungs([c for c in comments if isinstance(c, dict) and str(
         (c.get("user") or {}).get("login") or "").lower() in trusted])
 
 
@@ -4733,16 +4717,16 @@ def _claim_times(bodies: List[Tuple[str, Any]]) -> List[Any]:
 
 
 def _done_rungs(tried: List[str], rungs: Optional[set] = None) -> set:
-    """The rungs of factory.CLIMB tried: from trusted rung markers, and each
+    """The rungs of ladders.CLIMB tried: from trusted rung markers, and each
     whose model a claim ran."""
-    from .factory import CLIMB  # factory imports this module
+    from .ladders import CLIMB  # ladders does not import this module
     return set(rungs or ()) | {n for n, (_, model) in enumerate(CLIMB, 1) if model in tried}
 
 
 def _lowest_untried(tried: List[str], rungs: Optional[set] = None) -> Optional[int]:
-    """The next rung the ticket may climb to (bus/factory.py climb_rungs),
+    """The next rung the ticket may climb to (bus/ladders.py climb_rungs),
     0-based, or None when none is left."""
-    from .factory import climb_rungs  # factory imports this module
+    from .ladders import climb_rungs  # ladders does not import this module
     left = climb_rungs(_done_rungs(tried, rungs), max(rungs or {0}))
     return left[0] - 1 if left else None
 
@@ -4857,17 +4841,17 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
         raise ValueError("ticket is held by After: %s; it is not stuck, and the "
                          "ladder is for work a lane already tried"
                          % ", ".join(a.short for a in held))
-    from . import factory  # factory imports this module
+    from . import ladders  # ladders does not import this module
     found_pr = _open_pr(gh, repo, number)
     # Its pull request's runner footer names the model its newest run used,
     # read only from a LOOM_BRIEF_AUTHORS login's pull request whose head and
     # base are in this repo (anyone can open one that matches the ticket on a
-    # public repo), and only when it names a known model (factory.footer_run).
+    # public repo), and only when it names a known model (ladders.footer_run).
     footer = None
     if found_pr is not None and _same_repo(repo, found_pr, {}) and str(
             (found_pr.get("user") or {}).get("login") or "").lower() in {
             a.lower() for a in trusted_authors()}:
-        footer = factory.footer_run(found_pr.get("body"))
+        footer = ladders.footer_run(found_pr.get("body"))
     history = _history(gh, repo, issue, datetime.now(timezone.utc), footer=footer)
     if not history.reasons:
         raise ValueError("ticket is not repeatedly stuck")
@@ -4883,16 +4867,16 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     def rung_lanes(n: int) -> Tuple[str, ...]:
         """The rung's lanes that take this repo: a public-only lane (agy)
         never takes a private repo's work. Unreadable counts as private."""
-        lanes = factory.CLIMB[n - 1][0]
-        if any(lane in factory.PUBLIC_ONLY for lane in lanes):
+        lanes = ladders.CLIMB[n - 1][0]
+        if any(lane in ladders.PUBLIC_ONLY for lane in lanes):
             if not private:
                 data = gh.rest("GET", "/repos/%s" % repo).data
                 private.append(not isinstance(data, dict) or data.get("private") is not False)
             if private[0]:
-                lanes = tuple(lane for lane in lanes if lane not in factory.PUBLIC_ONLY)
+                lanes = tuple(lane for lane in lanes if lane not in ladders.PUBLIC_ONLY)
         return lanes
 
-    left = [n for n in factory.climb_rungs(_done_rungs(history.tried, history.rungs),
+    left = [n for n in ladders.climb_rungs(_done_rungs(history.tried, history.rungs),
                                            max(history.rungs or {0})) if rung_lanes(n)]
     if not left:
         gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
@@ -4912,10 +4896,10 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     if choice is None:
         raise ValueError("no untried rung has an available lane")
     rung, lane = choice
-    model = factory.CLIMB[rung][1]
+    model = ladders.CLIMB[rung][1]
     reason = "; ".join(history.reasons)
     comment = "\n".join([ESCALATE_MARKER,
-                         "Escalated to rung %d of %d: %s on lane %s." % (rung + 1, len(factory.CLIMB), model, lane),
+                         "Escalated to rung %d of %d: %s on lane %s." % (rung + 1, len(ladders.CLIMB), model, lane),
                          "Reason: %s (attempts %d, tried %s)." % (reason, history.attempts, ", ".join(history.tried) or "none"),
                          "Rung: %d %s %s" % (rung + 1, model, lane)])
     _check_written_text(comment)
