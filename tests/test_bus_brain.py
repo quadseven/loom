@@ -712,6 +712,51 @@ class SensitiveResumeTests(unittest.TestCase):
         a_tick_earlier = station_posts - brain.timedelta(hours=1)
         self.assertEqual(brain._report_deadline(last, a_tick_earlier)[1], "due")
 
+    def test_unbuilt_criteria_block_merge_readiness_but_allow_built_and_docs(self):
+        unbuilt = ("## Acceptance criteria\n- [ ] feature works; not built: no caller\n"
+                   "- [ ] another behavior; not built: no implementation\n"
+                   "- [ ] Live: endpoint answers `ok`")
+        built = "## Acceptance criteria\n- [ ] feature works\n- [ ] other; not built: pending"
+        self.assertEqual(brain._unbuilt_criteria_reason(unbuilt),
+                         "blocked: no criterion built")
+        self.assertEqual(brain._unbuilt_criteria_reason(built), "")
+        self.assertEqual(brain._unbuilt_criteria_reason("## Acceptance criteria\n- [ ] Live: endpoint answers `ok`"), "")
+
+    def test_goal_home_cpp_constraint_requires_a_test_translation_unit(self):
+        goal = {"number": 3, "body": "Merge constraint: C++ unit test required"}
+        ticket = {"state": "open", "labels": [{"name": "loom:ticket"}]}
+        with unittest.mock.patch.object(brain, "_goal_home_for_ticket", return_value=goal):
+            with self.assertRaisesRegex(ValueError, r"goal #3 merge constraint: C\+\+ unit test required"):
+                brain._refuse_merge_constraints(
+                    Fake(), REPO, (REPO, 9), ticket, 8,
+                    {"files": {"totalCount": 1, "nodes": [
+                        {"path": "bus/change.py", "changeType": "MODIFIED"}]}})
+
+            brain._refuse_merge_constraints(
+                Fake(), REPO, (REPO, 9), ticket, 8,
+                {"files": {"totalCount": 1, "nodes": [
+                    {"path": "tests/test_change.cpp", "changeType": "ADDED"}]}})
+
+    def test_status_blocks_pr_when_all_code_criteria_are_marked_not_built(self):
+        pr = {"number": 8, "title": "Lane work", "body":
+              ("Refs %s#9\n## Acceptance criteria\n- [ ] behavior works; not built: no caller\n"
+               "- [ ] Live: endpoint answers `ok`") % REPO}
+        self.assertEqual(brain._status_pr_line(None, REPO, pr, ready_node(),
+                                               "grug-tribe", "Grug - Elder"),
+                         "- #8 Lane work - blocked: no criterion built")
+
+    def test_merge_refuses_pr_when_every_non_live_criterion_is_not_built(self):
+        body = ("Refs %s#9\n## Acceptance criteria\n"
+                "- [ ] behavior works; not built: no caller\n"
+                "- [ ] Live: endpoint answers `ok`") % REPO
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                                {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []))
+        with self.assertRaisesRegex(ValueError, "blocked: no criterion built"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
     def test_merge_ready_names_each_blocker(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}
         cases = [
@@ -910,6 +955,50 @@ class SensitiveResumeTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     brain.brief(gh, REPO, EPIC, "Ticket", text, lane)
                 self.assertFalse(any(call[0] == "POST" for call in fake.calls))
+
+    def test_brief_refuses_a_body_with_no_acceptance_checkbox(self):
+        # loom#1612: plain bullets pass the plan check but prove nothing.
+        stub = BODY.replace("- [ ] ", "- ")
+        fake = Fake()
+        with self.assertRaisesRegex(ValueError, "no acceptance criteria"):
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", stub, "codex")
+        self.assertEqual(fake.calls, [])
+
+    def test_a_rewrite_of_an_epic_or_a_map_is_not_refused_for_its_criteria(self):
+        stub = BODY.replace("- [ ] ", "- ")
+        for name in ("epic", "wayfinder:map"):
+            with self.subTest(name=name):
+                self.assertIsNone(brain.acceptance_refusal(stub, {"labels": [{"name": name}]}))
+        self.assertIsNone(brain.acceptance_refusal(stub, {"labels": [], "sub_issues_summary": {"total": 2}}))
+        self.assertIsNone(brain.acceptance_refusal(BODY))
+        self.assertIn("no acceptance criteria", brain.acceptance_refusal(stub, {"labels": []}))
+
+    def test_move_refuses_to_brief_an_issue_with_no_acceptance_checkbox(self):
+        for state in ("queued", "briefed"):
+            with self.subTest(state=state):
+                issue = {"state": "open", "body": "## Why\nwhy\n## Acceptance criteria\n- one\n",
+                         "labels": [{"name": "loom:ticket"}]}
+                fake = Fake(reply(200, issue))
+                with self.assertRaisesRegex(ValueError, "no acceptance criteria"):
+                    brain.move(GitHub("t", transport=fake), REPO, 8, state)
+                self.assertEqual([c[0] for c in fake.calls], ["GET"])
+
+    def test_move_sends_a_ticket_already_in_a_loom_state_back_without_the_criteria_check(self):
+        # A revert sends a merged ticket back to its lane, whatever its old body.
+        issue = {"state": "open", "body": "old stub", "labels": [
+            {"name": "loom:ticket"}, {"name": "loom:merged"}, {"name": "lane:codex"}]}
+        fake = Fake(reply(200, issue), reply(200, []))
+        brain.move(GitHub("t", transport=fake), REPO, 8, "briefed", "codex")
+        self.assertEqual([c[0] for c in fake.calls], ["GET", "PUT"])
+
+    def test_move_briefs_an_epic_or_a_map_with_no_acceptance_checkbox(self):
+        for name in ("epic", "wayfinder:map"):
+            with self.subTest(name=name):
+                issue = {"state": "open", "body": "Done when: done.",
+                         "labels": [{"name": "loom:ticket"}, {"name": name}]}
+                fake = Fake(reply(200, issue), reply(200, []))
+                brain.move(GitHub("t", transport=fake), REPO, 8, "queued")
+                self.assertEqual([c[0] for c in fake.calls], ["GET", "PUT"])
 
     def test_a_public_repo_brief_refuses_another_repos_issue_reference(self):
         text = BODY.replace("why", "as in other-owner/other-repo#12")
@@ -1260,7 +1349,7 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_move_remote_lane_on_public_repo_succeeds(self):
         fake = Fake(
-            reply(200, {"state": "open", "title": "My Title", "labels": [{"name": "loom:ticket"}]}),
+            reply(200, {"state": "open", "title": "My Title", "body": BODY, "labels": [{"name": "loom:ticket"}]}),
             reply(200, {"private": False}),
             reply(200, []),
             reply(200, {}),
@@ -1319,7 +1408,7 @@ class SensitiveResumeTests(unittest.TestCase):
             "details": {"headRefName": "feature/lane-work"}})
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, {"merged": True}),
-                    reply(204), reply(200, issue), reply(200, {}))
+                    reply(204), reply(200, []), reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
                              env={"LOOM_BRIEF_AUTHORS": "example-brain"})
         self.assertTrue(result["merged"])
@@ -1347,7 +1436,7 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_good_merge_uses_checked_sha_then_deletes_and_moves_ticket(self):
         pr, query = self._merge_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
-        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204),
+        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204), reply(200, []),
                     reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertEqual(fake.calls[3][2], {"merge_method": "squash", "sha": "checked"})
@@ -1355,6 +1444,50 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(result, {"merged": True, "pull_request": (REPO, 8),
                                   "ticket": (REPO, 9), "head_sha": "checked"})
         self.assertTrue(fake.calls[-2][1].endswith("/repos/%s/issues/9" % REPO))
+
+    def _merge_with_files(self, files, labels=("loom:ticket", "loom:pr"), search_items=None):
+        pr, query = self._merge_replies()
+        issue = {"state": "open", "labels": [{"name": x} for x in labels]}
+        replies = [pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204)]
+        if "documentation" not in labels:
+            replies.append(reply(200, files))
+        if search_items is not None:
+            replies.append(reply(200, {"items": [{"path": p} for p in search_items]}))
+        replies += [reply(200, issue), reply(200, {}), reply(201, {})]
+        fake = Fake(*replies)
+        brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        puts = [c for c in fake.calls if c[0] == "PUT" and c[1].endswith("/issues/9/labels")]
+        return [x for x in puts[0][2]["labels"] if x.startswith("loom:")], fake
+
+    def test_merge_of_a_docs_only_pull_request_requeues_its_ticket(self):
+        labels, fake = self._merge_with_files([{"filename": "docs/a.md", "patch": "+x"}])
+        self.assertEqual(labels, ["loom:ticket", "loom:queued"])
+        note = [c[2]["body"] for c in fake.calls if c[1].endswith("/issues/9/comments")][0]
+        self.assertIn("only documentation", note)
+        self.assertIn("back at loom:queued", note)
+
+    def test_merge_of_a_pull_request_adding_uncalled_code_requeues_its_ticket(self):
+        patch = "+def decide(x):\n+    return x"
+        labels, fake = self._merge_with_files(
+            [{"filename": "bus/a.py", "patch": patch}], search_items=["tests/test_a.py"])
+        self.assertEqual(labels, ["loom:ticket", "loom:queued"])
+
+    def test_merge_of_a_pull_request_that_changes_behavior_marks_merged(self):
+        patch = "+def decide(x):\n+    return x\n+y = decide(1)"
+        labels, _ = self._merge_with_files([{"filename": "bus/a.py", "patch": patch}])
+        self.assertEqual(labels, ["loom:ticket", "loom:merged"])
+
+    def test_merge_of_a_pull_request_whose_function_has_a_caller_marks_merged(self):
+        patch = "+def decide(x):\n+    return x"
+        labels, _ = self._merge_with_files(
+            [{"filename": "bus/a.py", "patch": patch}], search_items=["bus/b.py"])
+        self.assertEqual(labels, ["loom:ticket", "loom:merged"])
+
+    def test_merge_of_a_docs_pull_request_for_a_docs_ticket_marks_merged(self):
+        labels, _ = self._merge_with_files(
+            [{"filename": "docs/a.md", "patch": "+x"}],
+            labels=("loom:ticket", "loom:pr", "documentation"))
+        self.assertEqual(labels[-1], "loom:merged")
 
     def test_merge_refuses_while_a_brain_fix_is_pending(self):
         pr, query = self._merge_replies()
@@ -1371,7 +1504,7 @@ class SensitiveResumeTests(unittest.TestCase):
         pr, query = self._merge_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, {"merged": True}),
-                    reply(204), reply(200, issue), reply(200, {}))
+                    reply(204), reply(200, []), reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
                              env={"LOOM_BRIEF_AUTHORS": "alice-example"})
         self.assertTrue(result["merged"])
@@ -1410,7 +1543,7 @@ class SensitiveResumeTests(unittest.TestCase):
         pr, query = self._merge_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
-                    reply(422, {"message": "Reference does not exist"}), reply(200, issue), reply(200, {}))
+                    reply(422, {"message": "Reference does not exist"}), reply(200, []), reply(200, issue), reply(200, {}))
         brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertEqual(fake.calls[-1][0], "PUT")
         # Merged is not deployed: the ticket says merged until the project's
@@ -1505,7 +1638,7 @@ class SensitiveResumeTests(unittest.TestCase):
         pr, query = self._sensitive_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, self._passing_check(), reply(200, issue),
-                    reply(200, {"merged": True}), reply(204), reply(200, issue), reply(200, {}))
+                    reply(200, {"merged": True}), reply(204), reply(200, []), reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertTrue(result["merged"])
 
@@ -1521,7 +1654,7 @@ class SensitiveResumeTests(unittest.TestCase):
             "reviewThreads": {"nodes": [high]}}})
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
-                    reply(204), reply(200, issue), reply(200, {}))
+                    reply(204), reply(200, []), reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertTrue(result["merged"])
 
@@ -4368,6 +4501,21 @@ class EpicFilingTests(unittest.TestCase):
         nxt = brain.intake_epic(gh, REPO, 1)
         self.assertNotEqual(nxt, first)
         self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_TITLE)
+
+    def test_an_intake_epic_with_closed_tickets_still_has_room(self):
+        # 2026-10-24: room counted every ticket an intake epic ever held, so
+        # one with 16 closed tickets read as full and the next opened; four
+        # stood open under loom#30 and put the goal over its epic cap.
+        fake = GoalRepo()
+        gh = GitHub("t", transport=fake)
+        first = brain.intake_epic(gh, REPO, 1)
+        for n in range(70, 86):
+            fake.issues[n] = item(n, labels=["loom:ticket"], state="closed")
+            fake.subs.setdefault(first, []).append(n)
+        fresh = GitHub("t", transport=fake)
+        self.assertEqual(brain.intake_epic(fresh, REPO, 1), first)
+        url = brain.brief_intake(fresh, REPO, 1, "Ticket", BODY, "codex")
+        self.assertIn(int(url.rsplit("/", 1)[1]), fake.subs[first])
 
     def intake_epics(self, fake, held):
         """Open intake epics #60, #61, ... under goal #1, oldest first, each

@@ -730,6 +730,18 @@ transient_strike() {
 }
 transient_clear() { rm -f "$TRANSIENT_FILE"; }
 
+# A lane whose CLI sign-in lapsed rests SIGNIN_WAIT seconds, unavailable "at a
+# limit", and then tries one run again: only an interactive sign-in fixes it,
+# and the runner cannot see one happen. agy, 2026-10-24: left available, the
+# lane claimed six tickets in two hours, each waiting out the sign-in timeout.
+SIGNIN_WAIT=7200
+SIGNIN_FILE="$LOOM_HOME/state/usage/$SLOT.signin"
+signin_rest_until() {
+  local until
+  read -r until 2>/dev/null < "$SIGNIN_FILE" || return 1
+  [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] && printf '%s' "$until"
+}
+
 # Mint this run's App token into GH_TOKEN. A personal token in the
 # environment is dropped first, so a failed mint leaves gh with nothing to
 # post as. Installation tokens last an hour: a run mints again after its agent.
@@ -769,14 +781,22 @@ park() {
 # directory, and the keychain and caches agy needs; agy's settings, binaries
 # and built-in skills stay read-only, and so does everything else there (shell
 # startup files, ~/.gemini config, MCP servers). Other lanes get no rules here.
-AGY_STATE_KEEP=(settings.json bin builtin installation_id jetski_state.pbtxt updater last_check.timestamp log cli.log crashes cache)
+# antigravity-oauth-token is agy's sign-in when it cannot reach the keychain
+# (the sandbox denies /usr/bin/security): wiped, every run asked for a browser
+# login (2026-10-22 to 10-24, #1620).
+AGY_STATE_KEEP=(settings.json bin builtin installation_id jetski_state.pbtxt updater last_check.timestamp log cli.log crashes cache antigravity-oauth-token)
 AGY_CACHE_KEEP=(onboarding.json default_project_id.txt)
+# agy keeps its sign-in in its file store, Library/Application Support/
+# antigravity: inside the sandbox it cannot run /usr/bin/security to reach the
+# keychain (#1465), so it falls back there. Without a write there it could
+# neither keep nor refresh a token, and every run asked for a browser login
+# (2026-10-22 to 10-24, #1620). The Keychains folder takes no write.
 agy_write_rules() {
   [ "$LANE" = agy ] || return 0
   local h s
   h="$(cd "$AGY_HOME" && pwd -P)" || return 1
   s="$h/.gemini/antigravity-cli"
-  printf '(deny file-write* (subpath "%s"))\n(allow file-write* %s (subpath "%s") (subpath "%s/Library/Keychains") (subpath "%s/Library/Caches"))\n(deny file-write* (literal "%s/settings.json") (literal "%s/installation_id") (subpath "%s/bin") (subpath "%s/builtin"))\n' \
+  printf '(deny file-write* (subpath "%s"))\n(allow file-write* %s (subpath "%s") (subpath "%s/Library/Application Support/antigravity") (subpath "%s/Library/Caches"))\n(deny file-write* (literal "%s/settings.json") (literal "%s/installation_id") (subpath "%s/bin") (subpath "%s/builtin"))\n' \
     "$h" "$1" "$s" "$h" "$h" "$s" "$s" "$s" "$s"
 }
 
@@ -1034,7 +1054,7 @@ provider_limit_source() {
     printf '%s' "$SLOT"
     return 0
   fi
-  for slot in $(key_group); do
+  for slot in $(limit_group); do
     if [ -f "$LOOM_HOME/state/usage/$slot.provider-limit.json" ]; then
       printf '%s' "$slot"
       return 0
@@ -1071,10 +1091,13 @@ provider_limit_lifted() {
   API_KEY="$(ssm_value "$key_ssm")"
   [ -n "$API_KEY" ] || return 1
   # The model the probe found at a limit: the provider's answer is about that
-  # model, so that is the model to ask about again.
+  # model, so that is the model to ask about again, unless the slot now runs
+  # another (a limit Kimi hit says nothing of the slot's Beam Free).
   model="$(sed -nE 's/.*"model": *"([A-Za-z0-9._:/@-]+)".*/\1/p' \
     "$LOOM_HOME/state/usage/$source.provider-limit.json" 2>/dev/null | head -1)"
-  [ -n "$model" ] || model="$(lane_setting MODEL)"
+  if [ -z "$model" ] || { [ -n "$(lane_setting MODEL)" ] && [ "${model#*/}" != "$(lane_setting MODEL | sed 's#^[^/]*/##')" ]; }; then
+    model="$(lane_setting MODEL)"
+  fi
   [ -n "$model" ] || return 1
   MODEL="$model"
   if provider_at_limit; then
@@ -1091,7 +1114,7 @@ provider_limit_lifted() {
 # Usage view shows.
 lift_provider_limit() {
   local slot
-  for slot in $(key_group); do
+  for slot in $(limit_group); do
     write_beat "$slot" true ""
   done
 }
@@ -1126,6 +1149,28 @@ key_group() {
   esac
 }
 
+# The slots a usage limit holds together: the key group, less the slots on a
+# free model. OpenCode Go's free models (opencode-go/*-free) sit outside the
+# plan's allowance: on 2026-10-23 Kimi spent the monthly limit and the 429
+# held the Beam Free slots for five days while Beam Free still answered. A
+# free slot is a group of one. An expired key still holds the whole key group.
+slot_model() {
+  local s v
+  s="$(setting_var "$1" MODEL)" v="$(lane_var MODEL)"
+  printf '%s' "${!s:-${!v:-}}"
+}
+free_model() { [[ "$1" == opencode-go/*-free ]]; }
+limit_group() {
+  local slot
+  if [ "${LANE:-}" = opencode-go ] && free_model "$(slot_model "$SLOT")"; then
+    printf '%s\n' "$SLOT"
+    return 0
+  fi
+  for slot in $(key_group); do
+    free_model "$(slot_model "$slot")" || printf '%s\n' "$slot"
+  done
+}
+
 # The epoch this slot's provider limit lifts: the reset the provider gave, else
 # the next reset of the period the error names (weekly / daily), never a short
 # fixed window. Empty when there is no recorded limit to hold on.
@@ -1156,7 +1201,7 @@ hold_provider_limit() {
   LIMITED=1
   source="$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
   checked="$(date +%s)"
-  for slot in $(key_group); do
+  for slot in $(limit_group); do
     if [ "$slot" != "$SLOT" ]; then
       tmp="$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp"
       if ! cp "$source" "$tmp" \
@@ -1245,16 +1290,41 @@ key_held() {
 # output, so nothing the provider said, or a run echoed, can reach a public
 # issue.
 ask_renew_key() {
-  local reason="$1" param title body number existing
+  local reason="$1" param title body
   param="${reason#"$AUTH_WHY_PREFIX "}"
   title="Provider key expired: renew $param"
   body="$(printf '%s\n\nLane %s could not use the provider key it reads.\n\nWhat to renew: `%s`\n\nThe lane log holds what the provider said. A lane that reads that parameter is unavailable until the value there changes.\n' \
     "$KEY_ASK_MARKER" "$SLOT" "$param")"
+  file_ask "$title" "$body" "Could not use the key again"
+}
+
+# The operator's ask for a lane whose CLI sign-in lapsed: $1 is the reason.
+# Filed once per lane, like ask_renew_key, and names no agent output.
+# The agy lane signs in as its own macOS user, so the ask names that user and
+# the command: a sign-in as the operator never reaches it (2026-10-24).
+ask_sign_in() {
+  local title body how
+  title="Lane $LANE sign-in lapsed: sign in the $LANE lane CLI again"
+  how="Sign in the $LANE lane CLI again on the lane machine (an interactive login)."
+  if [ "$LANE" = agy ]; then
+    # ~user, not the home path: the ask lands in a public issue.
+    local bin="${AGY_BIN/#"$AGY_HOME"/~$AGY_USER}"
+    how="$(printf 'The lane runs agy as the macOS user %s, with its own sign-in; a sign-in as yourself does not reach it. On the lane machine run:\n\n    sudo -u %s -H %s update\n    sudo -u %s -H %s\n\nand finish the browser sign-in it prints, then quit agy.' \
+      "$AGY_USER" "$AGY_USER" "$bin" "$AGY_USER" "$bin")"
+  fi
+  body="$(printf '%s\n\nLane %s waited for a sign-in nobody gave and timed out: its CLI sign-in lapsed. %s\n\nUntil then each run on the lane fails as auth.\n' \
+    "$KEY_ASK_MARKER" "$SLOT" "$how")"
+  file_ask "$title" "$body" "Sign-in failed again"
+}
+
+# File a needs-operator ask titled $1 with body $2, or, with one already open,
+# keep one comment on it with a running count headed $3, never one per failure.
+file_ask() {
+  local title="$1" body="$2" headline="$3" number existing
   existing="$(open_issue "$title")"
   if [ -n "$existing" ]; then
-    # One comment on the ask with a running count, never one per failure.
     printf '' | upsert_sticky_comment "$FACTORY_REPO" "$existing" "$KEY_REPEAT_MARKER" repeat \
-      --headline "Could not use the key again" --items-label "Lanes seen" --item "$SLOT" ||
+      --headline "$headline" --items-label "Lanes seen" --item "$SLOT" ||
       echo "could not update the open ask $FACTORY_REPO#$existing" >> "$LOG"
     return 0
   fi
@@ -1610,6 +1680,10 @@ resolve_factory_incidents() {
     [ -f "$file" ] || continue
     number="$(tr -cd '0-9' < "$file")"
     if [ -n "$number" ]; then
+      # Shadow mode (bus/shadow.py): the guard reads the issue and lets a
+      # factory incident's close through; anything else it records and holds.
+      PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.shadow gh-guard --lane "$PWD" \
+        issue close --repo "$FACTORY_REPO" "$number" >>"$LOG" 2>&1 || continue
       gh issue close --repo "$FACTORY_REPO" "$number" \
         --comment "Cleared: the check passed on the unmodified base in $(incident_ticket)." >>"$LOG" 2>&1 || continue
     fi
@@ -1887,6 +1961,11 @@ prepare_validation() {
   if [ -n "$C_SETUP" ]; then
     contract_run "$C_SETUP"; rc=$?
     record setup "$C_SETUP" "$rc" "$BASE" "$([ "$rc" -eq 0 ] && echo true || echo false)"
+    if [ "$rc" -eq 143 ]; then
+      PARK_CLASS=transient
+      SETUP_REASON="setup interrupted by SIGTERM"
+      return 1
+    fi
     [ "$rc" -eq 0 ] || { SETUP_REASON="setup exited $rc"; return 1; }
   fi
   contract_run "$C_CHECK"; BASELINE_EXIT=$?
@@ -1894,6 +1973,11 @@ prepare_validation() {
   baseline_rev="$(safe_git rev-parse HEAD)"
   record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
     "${changed:+changed tracked files: $changed}"
+  if [ "$BASELINE_EXIT" -eq 143 ]; then
+    PARK_CLASS=transient
+    SETUP_REASON="base check interrupted by SIGTERM"
+    return 1
+  fi
   # A check that cannot run, or is already red, on the unmodified base is
   # the factory's problem, not the ticket's: file the incident and stop
   # before the agent burns a run it can never validate.
@@ -1959,6 +2043,10 @@ final_validation() {
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
     124) VALIDATION_REASON="validation failed: the check timed out after ${CHECK_TIMEOUT}s" ;;
+    143)
+      PARK_CLASS=transient
+      VALIDATION_REASON="validation interrupted by SIGTERM"
+      ;;
     125|126|127)
       # The environment broke between the baseline and the final check;
       # the agent's work is not the cause.
@@ -2122,6 +2210,29 @@ EOF
     return 1
   fi
   echo "[$stamp] $TICKET: left off the kept branch: $(stray_list)"
+}
+
+# A fix round's commit that adds files outside the brief's paths is not
+# refused: those files (STRAY_FILES, and only those, so the round's real
+# work stays) are removed in a commit on top, which keeps the push
+# fast-forward, and named in the run log. Without this the round retried the
+# identical refusal until the runaway hold caught it (loom#1476). Returns 1,
+# logged, when a file cannot be removed or the removal committed.
+drop_stray_files() {
+  local f stamp
+  stamp="$(date -u +%FT%TZ)"
+  while IFS= read -r f; do
+    [ -z "$f" ] || safe_git rm -q -f -- "$f" && continue
+    echo "[$stamp] $TICKET: could not remove $f from the fix round's commits"
+    return 1
+  done <<EOF
+$STRAY_FILES
+EOF
+  if ! safe_git commit -qm "Drop files outside the brief's paths: $(stray_list)"; then
+    echo "[$stamp] $TICKET: could not commit the removal of $(stray_list)"
+    return 1
+  fi
+  echo "[$stamp] $TICKET: left off the fix round's commits: $(stray_list)"
 }
 
 # What the agent is told about the contract, after its brief.
@@ -2540,8 +2651,29 @@ for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1" "CHECK_T
   fi
 done
 
+# An opencode-go lane runs only bus/tickets.py OPENCODE_GO_MODELS: Go's free
+# models and the paid ones allowed at least 10,000 requests per 5 hours.
+# Kimi K2.7 Code (1,350) spent the plan's allowance in hours (2026-10-23).
+# Fail closed: a lane whose model, or any model of its ladder, is off the
+# list (or the list cannot be read) does not start.
+OPENCODE_GO_ALLOWED=""
+if [ "$LANE" = opencode-go ]; then
+  OPENCODE_GO_ALLOWED=" $(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.tickets opencode-go-models 2>/dev/null | tr '\n' ' ')"
+  for candidate in $(lane_setting MODEL) $(lane_setting MODELS); do
+    if [[ "$OPENCODE_GO_ALLOWED" != *" $candidate "* ]]; then
+      echo "[$(date -u +%FT%TZ)] REFUSED: lane $SLOT model $candidate is not on the OpenCode Go allow-list (bus/tickets.py OPENCODE_GO_MODELS):${OPENCODE_GO_ALLOWED:- unreadable}" >&2
+      heartbeat false "model $candidate is not on the OpenCode Go allow-list (bus/tickets.py OPENCODE_GO_MODELS); set $(setting_var "$SLOT" MODEL) to one of:${OPENCODE_GO_ALLOWED:- (list unreadable)}"
+      exit 0
+    fi
+  done
+fi
+
 if REST_UNTIL="$(transient_rest_until)"; then
   heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
+  exit 0
+fi
+if REST_UNTIL="$(signin_rest_until)"; then
+  heartbeat false "limit: sign-in lapsed: sign in the $LANE lane CLI again; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
   exit 0
 fi
 
@@ -2549,6 +2681,16 @@ fi
 # reason that says "limit:" (which limit, until when) is kept as it was.
 LIMIT_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
 CONFIGURED_MODELS="$(lane_setting MODELS)"
+# A Go allowance hold never binds a slot on a free model (limit_group): a
+# hold written before the slot moved to one, or by an older runner, is
+# dropped. On 2026-10-23 the Beam Free slots kept a monthly hold Kimi had
+# taken, until 2026-10-28.
+if [ "$LANE" = opencode-go ] && [ -n "$LIMIT_UNTIL" ] && free_model "$(slot_model "$SLOT")" &&
+  grep -q "$GO_LIMIT_ERROR" "$BEAT" 2>/dev/null; then
+  echo "[$(date -u +%FT%TZ)] lane $SLOT runs free model $(slot_model "$SLOT"), outside the Go allowance: dropping its Go limit hold" >&2
+  rm -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
+  LIMIT_UNTIL=""
+fi
 if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
   HELD_REASON="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
   case "$HELD_REASON" in limit:*) ;; *) HELD_REASON="provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" ;; esac
@@ -2569,6 +2711,8 @@ fi
 # CLI lists the model, else it holds another LIMIT_WAIT with no ticket round.
 if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -le "$(date +%s)" ]; then
   GONE_MODEL="$(sed -nE 's/.*"reason": *"limit: model ([A-Za-z0-9._:\/@-]+) not found by the agent CLI.*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+  # A hold for a model the lane no longer runs says nothing of the one it runs.
+  [ -z "$(lane_setting MODEL)" ] || [ "$GONE_MODEL" = "$(lane_setting MODEL)" ] || GONE_MODEL=""
   if [ -n "$GONE_MODEL" ] && ! model_listed "$GONE_MODEL"; then
     GONE_UNTIL=$(( $(date +%s) + LIMIT_WAIT ))
     heartbeat false "limit: model $GONE_MODEL not found by the agent CLI; lane waits until $(utc "$GONE_UNTIL")" "$GONE_UNTIL"
@@ -2697,7 +2841,15 @@ for BRIEF in "$INBOX"/*.md; do
     claude:*|anthropic:*) park "$BRIEF" "model $MODEL is not a claude model"; continue ;;
     openrouter:openrouter/*:free) ;;
     openrouter:*) park "$BRIEF" "openrouter lane runs free models only (openrouter/...:free), not $MODEL"; continue ;;
-    opencode-go:opencode-go/*) ;;
+    opencode-go:opencode-go/*)
+      # A pin off the allow-list runs the lane's own model, which the start
+      # check above passed.
+      if [[ "$OPENCODE_GO_ALLOWED" != *" $MODEL "* ]]; then
+        echo "[$(date -u +%FT%TZ)] $TICKET REFUSED the brief's Model: $MODEL: not on the OpenCode Go allow-list; lane $SLOT runs $(lane_setting MODEL)" | tee -a "$LOG" >&2
+        MODEL="$(lane_setting MODEL)" PINNED_MODEL=""
+        [[ "$OPENCODE_GO_ALLOWED" == *" $MODEL "* ]] ||
+          { park "$BRIEF" "model $MODEL is not on the OpenCode Go allow-list" transient; continue; }
+      fi ;;
     opencode-go:*) park "$BRIEF" "model $MODEL is not an opencode-go model" transient; continue ;;
     zen:opencode/*-free) ;;
     zen:*) park "$BRIEF" "zen lane runs free models only (opencode/...-free), not $MODEL"; continue ;;
@@ -2911,6 +3063,17 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$FAIL_CLASS" = auth ]; then
     # The provider refused the key, not the lane's work, so the brief is handed
     # on rather than spent and the rest of the inbox waits for the operator.
+    if printf '%s\n' "$FAILURE_OUT" | grep -qiE "$SIGNIN_RE"; then
+      # The CLI's own sign-in lapsed: no key parameter to renew or wait on,
+      # even when the lane names one (agy names the lane user's password).
+      AUTH_WHY="sign-in lapsed: sign in the $LANE lane CLI again"
+      REST_UNTIL=$(( $(date +%s) + SIGNIN_WAIT ))
+      printf '%s\n' "$REST_UNTIL" > "$SIGNIN_FILE"
+      heartbeat false "limit: $AUTH_WHY; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
+      ask_sign_in "$AUTH_WHY"
+      park "$BRIEF" "agent exited $STATUS: $AUTH_WHY$TIMEDOUT_NOTE" auth
+      break
+    fi
     AUTH_WHY="$(key_renew_reason)"
     if key_renewable; then
       # Every slot that bills that key goes unavailable until the value at the
@@ -3020,10 +3183,20 @@ for BRIEF in "$INBOX"/*.md; do
     COMMITTED=1
   fi
   # A commit that adds files outside the brief is refused before validation
-  # and push: nothing is pushed, and the reason names every stray file.
+  # and push: nothing is pushed, and the reason names every stray file. A fix
+  # round removes them instead (drop_stray_files) and checks again, so it
+  # pushes its work rather than retrying the same refusal (loom#1476).
   if [ "$COMMITTED" -eq 1 ]; then
     if ! check_scope "$BRIEF" 2>> "$LOG"; then
       park "$BRIEF" "could not check the committed files against the brief" transient; continue
+    fi
+    if [ -n "$STRAY_FILES" ] && [ -n "$FIX_PR" ]; then
+      if ! drop_stray_files >> "$LOG" 2>&1; then
+        park "$BRIEF" "commit refused: it adds files outside the brief's paths that could not be removed: $(stray_list); nothing pushed"; continue
+      fi
+      if ! check_scope "$BRIEF" 2>> "$LOG"; then
+        park "$BRIEF" "could not check the committed files against the brief" transient; continue
+      fi
     fi
     if [ -n "$STRAY_FILES" ]; then
       park "$BRIEF" "commit refused: it adds files outside the brief's paths: $(stray_list); nothing pushed"; continue

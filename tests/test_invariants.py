@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bus import brain, invariants, metrics, station  # noqa: E402
 from bus.github import GitHubError, Response  # noqa: E402
 from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run, SilentRun, Wait  # noqa: E402
+from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401 - shadow off: these tests close
 
 REPO = "example-owner/factory"
 OTHER = "example-owner/hidden"
@@ -300,6 +301,13 @@ class AcceptanceTest(StationBase):
                            for at in range(int(T0 - 3600), int(T0) + 1, 60)
                            for kind in ("rewrite_skipped", "rewrite_failed")]
                           + [(T0 - 1800, "rewrite_succeeded", "rewrote the body")])
+        self.run_at(T0)
+        self.assertEqual(self.repeated_failure_tickets(), [])
+
+    def test_a_model_wait_success_suppresses_repeated_model_wait_failure(self):
+        self.write_events([(at, "model_wait", "no free lane takes model claude-sonnet-5-5")
+                           for at in range(int(T0 - 7200), int(T0 - 3600) + 1, 60)]
+                          + [(T0 - 1800, "model_wait_succeeded", "found free lane opencode-go-3 for model claude-sonnet-5-5")])
         self.run_at(T0)
         self.assertEqual(self.repeated_failure_tickets(), [])
 

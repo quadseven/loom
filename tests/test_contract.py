@@ -61,3 +61,20 @@ class ContractFormTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LoomOwnContractTests(unittest.TestCase):
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_loom_s_own_check_runs_the_suite_the_way_ci_does(self):
+        # 2026-10-24: the contract ran `unittest discover` serially (808 s for
+        # 3596 tests) while CI runs .github/unittest_parallel.py (about 140 s).
+        # A lane runs the check twice per ticket, so every Loom ticket spent
+        # about 27 minutes in checks before and after the agent's own work.
+        with open(os.path.join(self.ROOT, ".loom", "validation.conf"), encoding="utf-8") as fh:
+            check = next(line.split(":", 1)[1].strip() for line in fh
+                         if line.startswith("check:"))
+        with open(os.path.join(self.ROOT, ".github", "workflows", "test.yml"), encoding="utf-8") as fh:
+            workflow = fh.read()
+        self.assertIn(".github/unittest_parallel.py", workflow)
+        self.assertIn(".github/unittest_parallel.py", check)
