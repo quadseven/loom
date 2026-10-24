@@ -3220,6 +3220,25 @@ class Helpers(unittest.TestCase):
         f = factory.Factory(gh, [REPO], NOW, trusted=["alice-example"])
         self.assertEqual(f._review_state(REPO, 1, "sha", NOW), "reviewed")
 
+    def test_plan_check_failed_does_not_wait_for_review_check(self):
+        """If the plan check has failed, _review_state should not wait for
+        the review check, so the factory can send the PR back immediately."""
+        gh = FakeGitHub()
+        plan_check = factory.DEFAULT_PLAN_CHECK  # "Grug - Chief"
+        review_check = factory.DEFAULT_REVIEW_CHECK  # "Grug - Elder"
+        # Plan check failed, review check still running
+        runs = [
+            {"name": plan_check, "status": "completed", "conclusion": "failure"},
+            {"name": review_check, "status": "in_progress"},
+        ]
+
+        def rest(method, path, body=None, etag=None, ok=()):
+            return Response(200, {"check_runs": runs})
+        gh.rest = rest
+        f = factory.Factory(gh, [REPO], NOW, trusted=["alice-example"])
+        # Should return "unreviewed" (not "wait") so factory processes it
+        self.assertEqual(f._review_state(REPO, 1, "sha", NOW), "unreviewed")
+
     def test_a_check_judged_by_its_newest_run_not_a_stale_failure(self):
         gh = FakeGitHub()
         seen = []

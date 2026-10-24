@@ -1564,8 +1564,16 @@ class Factory:
 
     def _review_state(self, repo: str, number: int, sha: str, pushed_at: float) -> str:
         """"wait" while any check runs; "reviewed" once the review check has
-        run on this commit; else "unreviewed", which never merges."""
+        run on this commit; else "unreviewed", which never merges.
+        But if the plan check has failed, don't wait for the review check:
+        the factory should send the PR back immediately for "failing checks"."""
         runs = self._runs[sha] = self._check_runs(repo, sha)
+        plan_failed = any(r.get("name") == self.plan_check
+                          and r.get("status") == "completed"
+                          and r.get("conclusion") in brain.FAILED_CONCLUSIONS
+                          for r in runs)
+        if plan_failed:
+            return "unreviewed"
         if any(r.get("status") != "completed" for r in runs):
             return "wait"
         if any(r.get("name") == self.review_check for r in runs):
