@@ -634,7 +634,9 @@ backticked string from the ticket's Live criterion in
 fixed-string match (see `.env.example`). The station runs it once per string,
 with a 60-second timeout, then quotes up to 20 matching lines per string in
 the verify brief. It accepts at most five ASCII strings of at most 120
-characters.
+characters. For the live proof of a shipped ticket (bus/live_proof.py) the
+command also receives `LOOM_EVIDENCE_SINCE`, the deploy as epoch seconds, and
+only the lines stamped at or after it count.
 A Live criterion that needs its strings to be absent ("no `X` line appears",
 "never logs `X`", "`X` does not appear", every string so worded) is verified on an
 empty answer: when every command run answered and no line named any string, the

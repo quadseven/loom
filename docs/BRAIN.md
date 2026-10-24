@@ -1608,7 +1608,21 @@ or field, a kubectl verb other than get or rollout status, a ship, roll,
 restart or any other command, SQL other than one SELECT. When the close gate
 finds evidence for every criterion the close quotes it, matching log lines
 included; otherwise one status line names the missing criterion and the next
-check time. The station does not call it yet (#1608).
+check time. The station's done close runs it for each open shipped ticket
+with a live criterion that names log strings and a window ("within 24
+hours"), at most 5 a pass, with the loom:shipped label time as the deploy
+time; a Live line with log strings and no window keeps its verify run. The
+log is the repo's
+`LOOM_EVIDENCE_CMDS` command, run once per string; only lines stamped at or
+after the deploy count (a line with no time counts only when the whole log
+the command read is newer than the deploy). A proven ticket gets a station
+proof record (revision: its newest merged pull request; observed: the deploy
+to now; each criterion's evidence), moves to verified with verified_by
+`station`, and closes through `brain.close` with the evidence quoted. Any
+other gets its status line edited into the status comment and is proved
+again at the next check time, or once its criteria change when nothing Loom
+runs can change the answer. In shadow mode the close is recorded in the
+ledger (source `station live proof`) and nothing is sent (#1608).
 
 ## Post-merge watch
 
