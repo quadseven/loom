@@ -1394,6 +1394,11 @@ completed with `success`. A tick takes that line as given instead of
 re-reading the review list. `bus.brain merge` keeps its own checks.
 When a trusted brain fix is still pending on the linked ticket, status adds
 `pending brain fix` to the blockers instead of marking the pull request READY.
+For a line that would otherwise be READY, status also reads what `bus.brain
+merge` refuses on, through the same functions merge uses (loom#1643): a
+ticket not at `loom:pr` (`ticket at loom:running, not loom:pr`), a REST
+`mergeable_state` of `dirty` (`conflicts with the default branch`), and a
+risk tier outside `LOOM_AUTO_MERGE_TIERS` (`held for the operator: <tier>`).
 
 Status also prints a "Waiting on the brain" section: every open lane pull
 request whose ticket carries `needs-brain`, oldest first, with its ticket,
