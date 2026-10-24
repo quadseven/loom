@@ -69,7 +69,7 @@ from . import watch
 from . import labels
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, unreadable
+from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, rest_login, unreadable
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -1246,13 +1246,6 @@ def _write_json(path: str, data: Any) -> None:
 
 def _sha12(body: Optional[str]) -> str:
     return hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
-
-
-def _bot_name(login: str) -> str:
-    """A bot login without the "[bot]" suffix, lowercased: GraphQL and REST
-    name the same bot differently."""
-    login = login.strip().lower()
-    return login[:-len("[bot]")] if login.endswith("[bot]") else login
 
 
 def _label_names(issue: Dict[str, Any]) -> List[str]:
@@ -5158,14 +5151,17 @@ class Station:
 
     def _thread_starts_with_bot(self, thread: Dict[str, Any]) -> bool:
         """Whether the review bot opened the thread. GitHub's GraphQL API names
-        a bot without the "[bot]" suffix the REST API adds, so both forms
-        match: matching only "grug-tribe[bot]" dropped every review-bot thread
-        from fix rounds from 2026-10-13 to 2026-10-24."""
+        a bot without the "[bot]" suffix the REST API adds; matching only
+        "grug-tribe[bot]" dropped every review-bot thread from fix rounds from
+        2026-10-13 to 2026-10-24."""
         comments = (thread.get("comments") or {}).get("nodes") or []
         if not comments:
             return False
-        login = str((comments[0].get("author") or {}).get("login") or "")
-        return _bot_name(login) == _bot_name(self.s.review_bot)
+        # rest_login adds "[bot]" only for a Bot author, so a person who takes
+        # the bot's bare name as a user login is never read as the review bot.
+        login = rest_login(comments[0].get("author")).lower()
+        bot = self.s.review_bot.strip().lower()
+        return login == (bot if bot.endswith("[bot]") else bot + "[bot]")
 
     def _remove_ready_if_present(self, repo: str, number: int, names: List[str]) -> None:
         if "loom:ready" in names:

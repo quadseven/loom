@@ -3993,7 +3993,7 @@ def _open_threads(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
     owner, name = repo.split("/", 1)
     query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
              ' reviewThreads(first:100) { nodes { id isResolved path line originalLine'
-             ' comments(first:20) { nodes { databaseId body author { login } } } } }'
+             ' comments(first:20) { nodes { databaseId body author { login __typename } } } } }'
              ' } } }') % (_gql(owner), _gql(name), number)
     data = gh.graphql(query) or {}
     pr = (data.get("repository") or {}).get("pullRequest") or {}
