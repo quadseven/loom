@@ -69,7 +69,7 @@ from . import watch
 from . import labels
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, unreadable
+from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, rest_login, unreadable
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -5149,11 +5149,19 @@ class Station:
         threads = brain._open_threads(self.gh, repo, pr_number)
         return [thread for thread in threads if self._thread_starts_with_bot(thread)]
 
-    @staticmethod
-    def _thread_starts_with_bot(thread: Dict[str, Any]) -> bool:
+    def _thread_starts_with_bot(self, thread: Dict[str, Any]) -> bool:
+        """Whether the review bot opened the thread. GitHub's GraphQL API names
+        a bot without the "[bot]" suffix the REST API adds; matching only
+        "grug-tribe[bot]" dropped every review-bot thread from fix rounds from
+        2026-10-13 to 2026-10-24."""
         comments = (thread.get("comments") or {}).get("nodes") or []
-        return bool(comments and
-                    (comments[0].get("author") or {}).get("login") == "grug-tribe[bot]")
+        if not comments:
+            return False
+        # rest_login adds "[bot]" only for a Bot author, so a person who takes
+        # the bot's bare name as a user login is never read as the review bot.
+        login = rest_login(comments[0].get("author")).lower()
+        bot = self.s.review_bot.strip().lower()
+        return login == (bot if bot.endswith("[bot]") else bot + "[bot]")
 
     def _remove_ready_if_present(self, repo: str, number: int, names: List[str]) -> None:
         if "loom:ready" in names:
