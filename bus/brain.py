@@ -3583,6 +3583,17 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
     return settle_source(gh, repo, number, issue.get("body"), reason, proof_url)
 
 
+def close_pr(gh: GitHub, repo: str, number: int, reason: str) -> None:
+    """Close a pull request with a reason comment appended to its body."""
+    _check_written_text(reason)
+    pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+    if pr.get("state") != "open":
+        raise ValueError("pull request %d is not open" % number)
+    body = str(pr.get("body") or "").rstrip()
+    gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number),
+            {"state": "closed", "body": (body + "\n\n" if body else "") + reason})
+
+
 # The close-completeness guard's escape hatch (bus/github.py): a close by
 # rule, not a claim that each box was seen to hold.
 FORCE_CLOSE_LABEL = "force-close"
@@ -4964,6 +4975,7 @@ def parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
     b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--epic", type=int); b.add_argument("--goal", type=int, help=argparse.SUPPRESS); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes")
+    cp = sub.add_parser("close-pr"); cp.add_argument("pull_request"); cp.add_argument("--reason", required=True)
     ce = sub.add_parser("close-epic"); ce.add_argument("epic"); ce.add_argument("--note", required=True)
     ep = sub.add_parser("epic"); ep.add_argument("repo"); ep.add_argument("--goal", type=int, required=True); ep.add_argument("--title", required=True); ep.add_argument("--file", required=True)
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
@@ -5069,6 +5081,11 @@ def _cmd_close(gh: GitHub, args: argparse.Namespace) -> None:
         print(said)
 
 
+def _cmd_close_pr(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.pull_request, "pull request")
+    close_pr(gh, repo, number, args.reason)
+
+
 def _cmd_merge(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.pull_request, "pull request")
     ticket = _ref(args.ticket, "ticket") if args.ticket else None
@@ -5114,7 +5131,7 @@ COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate, "epic": _cmd_epic,
-            "close-epic": _cmd_close_epic}
+            "close-epic": _cmd_close_epic, "close-pr": _cmd_close_pr}
 COMMANDS["step"] = _cmd_step
 
 
