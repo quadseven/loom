@@ -25,6 +25,7 @@ from bus import bench as bench_lib
 from bus import tickets as bus_tickets
 from bus import metrics as bus_metrics
 from bus import scorecard
+from bus import ladders
 from bus.naming import strip_kind
 
 from .github import TicketStore
@@ -1256,7 +1257,7 @@ def _dispatch_brain_hot_spots(handler, state, path):
                                       payload.get("wait_rows"), waits_error)
         body, title, active = brain_view.render_brain(data), "Brain", "brain"
     else:
-        bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or hot_spots.DEFAULT_REVIEW_BOT
+        bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or ladders.DEFAULT_REVIEW_BOT
         data = hot_spots.build_hot_spots(payload, waits_error, datetime.now(timezone.utc), bot)
         body, title, active = hot_spots.render_hot_spots(data), "Hot spots", "hot-spots"
     return handler.send_page(page(title, active, body, status="stale" if payload.get("stale") else "live"))

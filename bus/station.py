@@ -39,6 +39,7 @@ from . import shadow
 from . import stale_claims
 from . import factory
 from . import friction_intake
+from . import ladders
 from . import evidence
 from . import handoff
 from . import health
@@ -1320,13 +1321,13 @@ def brief_model(lane: str, headers: Dict[str, str]) -> str:
     if headers.get("Model"):
         return headers["Model"]
     if headers.get("Difficulty") == "hard":
-        return factory.HARD_MODELS.get(lane, "")
+        return ladders.HARD_MODELS.get(lane, "")
     return ""
 
 
 def model_lanes(model: str) -> List[str]:
     """Compatible lanes, with the model ladder's lanes first when applicable."""
-    rung = next((lanes for lanes, rung_model in factory.LADDER if rung_model == model), ())
+    rung = next((lanes for lanes, rung_model in ladders.MODEL_LADDER if rung_model == model), ())
     return [lane for lane in dict.fromkeys([*rung, *LANES])
             if lane not in REMOTE_LANES and lane_takes_model(lane, model)]
 

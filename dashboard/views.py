@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import quote
 
-from bus import factory
+from bus import ladders
 from bus.friction import clean_text as _clean_text, friction_lines
 
 METRICS_MARKER = "<!-- loom:metrics v1 -->"
@@ -557,15 +557,15 @@ def _lane_chip(name, states):
 
 
 def _factory_tables(states=None):
-    """The routing tables from bus.factory, each lane marked with its state now."""
+    """The routing tables from bus.ladders, each lane marked with its state now."""
     states = states or {}
     chips = lambda lanes: '<ul class="lane-chips">%s</ul>' % "".join(_lane_chip(name, states) for name in lanes)
     tiers = ['<table class="factory-tiers"><thead><tr><th>Difficulty</th><th>Lanes, best first</th></tr></thead><tbody>']
-    for name, lanes in factory.TIERS.items():
+    for name, lanes in ladders.FACTORY_TIERS.items():
         tiers.append('<tr class="factory-tier"><th>%s</th><td>%s</td></tr>' % (html.escape(name.title()), chips(lanes)))
     tiers.append("</tbody></table>")
     ladder = ['<table class="model-ladder"><thead><tr><th>Rung</th><th>Model</th><th>Lanes</th></tr></thead><tbody>']
-    for rung, (lanes, model) in enumerate(factory.LADDER, 1):
+    for rung, (lanes, model) in enumerate(ladders.MODEL_LADDER, 1):
         ladder.append("<tr><th>%d</th><td>%s</td><td>%s</td></tr>" % (rung, html.escape(model), chips(lanes)))
     ladder.append("</tbody></table>")
     return "".join(tiers + ladder)

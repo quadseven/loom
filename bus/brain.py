@@ -626,8 +626,8 @@ def past_last_rung(tickets: List[Dict[str, Any]], histories: Dict[int, "History"
                    ) -> List[Dict[str, Any]]:
     """The loom:failed tickets that ran on every rung since their ladder last
     started, oldest first: the factory leaves them for the brain."""
-    from . import factory  # factory imports this module
-    every = set(range(1, len(factory.LADDER) + 1))
+    from . import ladders
+    every = set(range(1, len(ladders.MODEL_LADDER) + 1))
     found = [i for i in tickets if "loom:failed" in _labels(i)
              and every <= histories.get(int(i["number"]), History(0, 0, [], [], None)).rungs]
     return sorted(found, key=lambda i: str(i.get("created_at") or ""))
@@ -888,9 +888,9 @@ def _lane_status(gh: GitHub, lanes_repo: str) -> str:
 def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
            env: Optional[Dict[str, str]] = None, now: Optional[datetime] = None,
            authors: Optional[Sequence[str]] = None) -> str:
-    from . import factory  # factory imports this module
+    from . import ladders
     env = os.environ if env is None else env
-    bot = env.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
+    bot = env.get("LOOM_REVIEW_BOT", "").strip() or ladders.DEFAULT_REVIEW_BOT
     now = now or datetime.now(timezone.utc)
     # Explicit `authors` are the caller's choice; read from the environment,
     # an empty list is refused, as it would trust no journal (loom#783).

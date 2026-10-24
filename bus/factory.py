@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
+from . import bench, brief_check, brain, change_class, criteria_gate, labels, ladders, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -774,7 +774,7 @@ def _mark_model(body: str) -> Tuple[bool, Optional[str]]:
     equivalent = EQUIVALENT_RE.search(body)
     if equivalent:
         return True, equivalent.group(1)
-    line = brain._RUNG_LINE.search(body) if body.startswith(brain.ESCALATE_MARKER) else None
+    line = ladders._RUNG_LINE.search(body) if body.startswith(ladders.ESCALATE_MARKER) else None
     return (True, line.group(2)) if line else (False, None)
 
 
@@ -852,7 +852,7 @@ def claim_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
         claim = CLAIMED_RE.fullmatch(body.strip())
         if claim:
             lane = claim.group(1)
-            ran = footer[1] if footer and footer[0] == lane else brain.lane_model(lane)
+            ran = footer[1] if footer and footer[0] == lane else ladders.lane_model(lane)
             out.append((comments[i], current or ran))
     return out
 

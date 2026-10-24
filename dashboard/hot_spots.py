@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Optional
 
-from bus.factory import DEFAULT_REVIEW_BOT, RUNG_RE
+from bus import ladders
 from bus.metrics import bottleneck as name_bottleneck
 from bus.station import failure_class
 from .views import _ticket_href
@@ -114,7 +114,7 @@ def _rungs(comments):
     """{(repo, number): rung} from the newest rung marker on each ticket."""
     newest = {}
     for comment in sorted(comments or [], key=lambda c: str(c.get("created_at") or "")):
-        rung = RUNG_RE.search(str(comment.get("body") or ""))
+        rung = ladders.RUNG_RE.search(str(comment.get("body") or ""))
         number = ISSUE_URL_RE.search(str(comment.get("issue_url") or ""))
         if rung and number:
             newest[(comment.get("repo"), int(number.group(1)))] = int(rung.group(1))
@@ -133,7 +133,7 @@ def stuck_tickets(tickets, comments):
     return sorted(stuck, key=lambda row: (-row["rung"], str(row.get("repo")), row.get("number") or 0))
 
 
-def build_hot_spots(payload, waits_error, now, bot=DEFAULT_REVIEW_BOT):
+def build_hot_spots(payload, waits_error, now, bot=ladders.DEFAULT_REVIEW_BOT):
     """Everything /hot-spots shows, from the dashboard snapshot."""
     tickets = [row for rows in (payload.get("tickets") or {}).values() if rows for row in rows]
     comments = payload.get("issue_comments") or []
