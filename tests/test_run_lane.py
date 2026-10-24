@@ -4603,6 +4603,25 @@ exit %d
         self.assertFalse(self.beat()["available"])
         self.assertTrue((self.inbox / "T049-next.md").exists())
 
+    def test_the_agy_sign_in_ask_names_the_lane_user_and_the_command(self):
+        # 2026-10-24: the ask said only "sign in the agy lane CLI again"; the
+        # operator signed in as themselves, which never reaches the lane user's
+        # own sign-in, and asked what was wanted.
+        script = ('FACTORY_REPO=quadseven/loom KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"\n'
+                  'KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"\n'
+                  'LANE=agy SLOT=agy LOG=/dev/null NET_TIMEOUT=30 LOOM_ROOT="%s"\n'
+                  'AGY_USER=loom AGY_BIN=/Users/loom/.local/bin/agy\n' % RUNNER.parent.parent
+                  + self.source_functions("open_issue", "upsert_sticky_comment", "file_ask",
+                                         "ask_sign_in") +
+                  'ask_sign_in "sign-in lapsed: sign in the agy lane CLI again"\n')
+        result = subprocess.run(["bash", "-c", script, "bash"], env=self.lane_env(),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len([c for c in self.calls() if c.startswith("gh issue create")]), 1)
+        body = Path(f"{self.body}.issue").read_text()
+        self.assertIn("macOS user loom", body)
+        self.assertIn("sudo -u loom -H /Users/loom/.local/bin/agy", body)
+
     def test_a_daily_allowance_with_no_reset_time_holds_the_lane_until_midnight_utc(self):
         # Retried every hour, a spent daily allowance failed a run each time.
         self.drop_brief()

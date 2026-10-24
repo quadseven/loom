@@ -1292,11 +1292,18 @@ ask_renew_key() {
 
 # The operator's ask for a lane whose CLI sign-in lapsed: $1 is the reason.
 # Filed once per lane, like ask_renew_key, and names no agent output.
+# The agy lane signs in as its own macOS user, so the ask names that user and
+# the command: a sign-in as the operator never reaches it (2026-10-24).
 ask_sign_in() {
-  local title body
+  local title body how
   title="Lane $LANE sign-in lapsed: sign in the $LANE lane CLI again"
-  body="$(printf '%s\n\nLane %s waited for a sign-in nobody gave and timed out: its CLI sign-in lapsed. Sign in the %s lane CLI again on the lane machine (an interactive login). Until then each run on the lane fails as auth.\n' \
-    "$KEY_ASK_MARKER" "$SLOT" "$LANE")"
+  how="Sign in the $LANE lane CLI again on the lane machine (an interactive login)."
+  if [ "$LANE" = agy ]; then
+    how="$(printf 'The lane runs agy as the macOS user %s, with its own sign-in; a sign-in as yourself does not reach it. On the lane machine run:\n\n    sudo -u %s -H %s update\n    sudo -u %s -H %s\n\nand finish the browser sign-in it prints, then quit agy.' \
+      "$AGY_USER" "$AGY_USER" "$AGY_BIN" "$AGY_USER" "$AGY_BIN")"
+  fi
+  body="$(printf '%s\n\nLane %s waited for a sign-in nobody gave and timed out: its CLI sign-in lapsed. %s\n\nUntil then each run on the lane fails as auth.\n' \
+    "$KEY_ASK_MARKER" "$SLOT" "$how")"
   file_ask "$title" "$body" "Sign-in failed again"
 }
 
