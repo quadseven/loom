@@ -391,7 +391,7 @@ BRIEF_RES = (
 RUNAWAY = "loom:runaway"
 NO_REASON = "agent made no commit and wrote no reason"
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
-                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved path'
+                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved isOutdated path'
                  ' root: comments(first:1) { nodes { author { __typename login } body url } }'
                  ' comments(last:20) { nodes { author { __typename login } body } } } } } } }')
 RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
@@ -418,6 +418,14 @@ DEFER_TITLE = "Settle the review findings left from PR #%d"
 # The title before the naming standard (docs/NAMING.md): an open follow-up
 # filed under it still counts, so a pull request never gets two.
 DEFER_TITLE_LEGACY = "Deferred review findings from %s#%d"
+# The follow-up issue is filed only after its pull request merges. Deferring
+# resolves the threads and leaves this record on the ticket; the pass that
+# finds the pull request merged files the issue (settle_deferred) and leaves
+# the filed record. A pull request that closes unmerged files nothing.
+DEFERRED_MARKER = "<!-- loom:deferred pr=%d sha=%s rounds=%d ids=%s -->"
+DEFERRED_RE = re.compile(r"<!-- loom:deferred pr=(\d+) sha=(\w*) rounds=(\d+) ids=([^ ]*) -->")
+DEFERRED_FILED_MARKER = "<!-- loom:deferred-filed pr=%d -->"
+DEFER_TITLE_RE = re.compile(r"^Settle the review findings left from PR #(\d+)$")
 # A file a pull request changes is code by its extension, and a test by a
 # test or tests folder in its path or by its name.
 CODE_EXTS = (".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".cpp", ".h", ".hpp",
@@ -1633,24 +1641,79 @@ class Factory:
     def _defer_minor(self, repo: str, number: int, ticket: int, sha: str,
                      comments: Sequence[Dict[str, Any]], immediate: bool = False) -> bool:
         """Defer the open medium and low findings of a reviewed, green pull
-        request to a follow-up issue, then resolve them. True when it did.
-        With `immediate` (docs, tests, or a revert) they defer at once."""
+        request, then resolve them. True when it did. With `immediate` (docs,
+        tests, or a revert) they defer at once. The follow-up issue is not
+        filed here: the pull request has not merged, and may never
+        (settle_deferred files it once it does)."""
         threads = self._threads(repo, number)
         rounds = fixes_of(comments)
         picked = deferrable(threads, self.review_bot, asked_threads(comments), rounds, immediate)
         if not picked:
             return False
-        follow = self._follow_up(repo, number, ticket, sha, picked, rounds)
-        if not follow:
-            return False
-        reply = ("Deferred to #%d: a medium or low finding still open after %d fix "
-                 "round(s), with the review check passed on %s." % (follow, rounds, sha[:12]))
+        ids = ",".join(str(t.get("id")) for t in picked)
+        notify.post(self.gh, repo, ticket, DEFERRED_MARKER % (number, sha[:12], rounds, ids)
+                    + "\nMedium or low review findings on #%d are deferred; the follow-up "
+                    "issue is filed once it merges." % number, notify.RECORD)
+        reply = ("Deferred: a medium or low finding still open after %d fix round(s), "
+                 "with the review check passed on %s. A follow-up issue is filed once "
+                 "this pull request merges." % (rounds, sha[:12]))
         for t in picked:
             self.gh.graphql(REPLY_MUTATION, {"id": str(t.get("id")), "body": reply})
             self.gh.graphql(RESOLVE_MUTATION, {"id": str(t.get("id"))})
         self.actions += 1
-        _say("deferred %d finding(s) on %s#%d to #%d" % (len(picked), repo, number, follow))
+        _say("deferred %d finding(s) on %s#%d until it merges" % (len(picked), repo, number))
         return True
+
+    def settle_deferred(self, repo: str, issue: Dict[str, Any]) -> None:
+        """File the follow-up issue for findings deferred on a ticket's pull
+        request, once that pull request has merged and only for the findings
+        still standing on the merged head (a thread the later commits made
+        outdated is gone). Once per pull request."""
+        number = int(issue["number"])
+        comments = self._comments(repo, number)
+        text = "\n".join(str(c.get("body") or "") for c in comments)
+        for pr, sha, rounds, ids in DEFERRED_RE.findall(text):
+            pr_number = int(pr)
+            if DEFERRED_FILED_MARKER % pr_number in text:
+                continue
+            data = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data or {}
+            if not data.get("merged_at") and not data.get("merged"):
+                continue
+            wanted = set(ids.split(","))
+            standing = [t for t in self._threads(repo, pr_number)
+                        if str(t.get("id")) in wanted and not t.get("isOutdated")]
+            if standing:
+                self._follow_up(repo, pr_number, number, sha, standing, int(rounds))
+            notify.post(self.gh, repo, number, DEFERRED_FILED_MARKER % pr_number
+                        + "\nDeferred findings of #%d: %d still standing on the merged head."
+                        % (pr_number, len(standing)), notify.RECORD)
+            self.actions += 1
+            _say("settled the deferred findings of %s#%d (%d filed)"
+                 % (repo, pr_number, len(standing)))
+
+    def _close_unmerged_follow_ups(self, repo: str) -> None:
+        """Close, as not planned, each open follow-up issue of a pull request
+        that closed unmerged: its findings never landed."""
+        for found in self.gh.paginate("/repos/%s/issues?labels=%s&state=open" % (repo, DEFER_LABEL)):
+            if not isinstance(found, dict) or not self._trusted(found):
+                continue
+            title = str(found.get("title") or "")
+            match = DEFER_TITLE_RE.match(title)
+            if not match:
+                continue
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%s" % (repo, match.group(1))).data or {}
+            if pr.get("state") != "closed" or pr.get("merged_at") or pr.get("merged"):
+                continue
+            if self.actions >= MAX_ACTIONS:
+                return
+            body = str(found.get("body") or "").rstrip()
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, int(found["number"])), {
+                "state": "closed", "state_reason": "not_planned",
+                "body": body + "\n\nClosed: #%s closed without merging, so these findings "
+                "never landed." % match.group(1)})
+            self.actions += 1
+            _say("closed %s#%s: pull request #%s closed unmerged"
+                 % (repo, found["number"], match.group(1)))
 
     def _tried(self, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
                failed_here: bool = True, footer: Optional[Tuple[str, str]] = None) -> Tuple[set, int]:
@@ -3234,8 +3297,10 @@ class Factory:
             if self.actions >= MAX_ACTIONS:
                 return
             self._guarded(self.pull_request, repo, pr, tickets)
+        self._guarded(lambda r, _: self._close_unmerged_follow_ups(r), repo, {})
         steps = {"failed": lambda r, i: self.failed(r, i, linked), "briefed": self.briefed,
-                 "running": self.running}
+                 "running": self.running, "merged": self.settle_deferred,
+                 "shipped": self.settle_deferred, "verified": self.settle_deferred}
         for issue in list(tickets.values()):
             step = steps.get(_state(issue))
             if self.actions >= MAX_ACTIONS:

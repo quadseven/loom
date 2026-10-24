@@ -201,7 +201,12 @@ its edits to a side branch `<branch>-timedout-<time>` and names it in the
 failure reason; the retry's brief tells the next attempt to start from that
 branch. On a public repo that side branch, like a `-unvalidated-` one, is
 pushed only after the public repo leak scan passes on its edits; otherwise no
-branch is kept. A fix round that fails transiently goes
+branch is kept. A lane commit that adds files outside the brief's paths is
+refused and nothing is pushed, except in a fix round: there the runner removes
+exactly those files (never the round's other changes) in a commit on top,
+names them in the run log, and pushes the rest, so the round does not retry
+the same refusal; a stray file it cannot remove still refuses the commit,
+naming the file (loom#1476). A fix round that fails transiently goes
 back to `loom:pr`, and one that fails its work goes to `loom:failed`, so the
 factory climbs the ladder and sends the fix to the next rung; a lane that hit its provider limit stays unavailable until the
 provider's reset (else 60 minutes; delete its heartbeat file in

@@ -1296,11 +1296,20 @@ ask_renew_key() {
 
 # The operator's ask for a lane whose CLI sign-in lapsed: $1 is the reason.
 # Filed once per lane, like ask_renew_key, and names no agent output.
+# The agy lane signs in as its own macOS user, so the ask names that user and
+# the command: a sign-in as the operator never reaches it (2026-10-24).
 ask_sign_in() {
-  local title body
+  local title body how
   title="Lane $LANE sign-in lapsed: sign in the $LANE lane CLI again"
-  body="$(printf '%s\n\nLane %s waited for a sign-in nobody gave and timed out: its CLI sign-in lapsed. Sign in the %s lane CLI again on the lane machine (an interactive login). Until then each run on the lane fails as auth.\n' \
-    "$KEY_ASK_MARKER" "$SLOT" "$LANE")"
+  how="Sign in the $LANE lane CLI again on the lane machine (an interactive login)."
+  if [ "$LANE" = agy ]; then
+    # ~user, not the home path: the ask lands in a public issue.
+    local bin="${AGY_BIN/#"$AGY_HOME"/~$AGY_USER}"
+    how="$(printf 'The lane runs agy as the macOS user %s, with its own sign-in; a sign-in as yourself does not reach it. On the lane machine run:\n\n    sudo -u %s -H %s update\n    sudo -u %s -H %s\n\nand finish the browser sign-in it prints, then quit agy.' \
+      "$AGY_USER" "$AGY_USER" "$bin" "$AGY_USER" "$bin")"
+  fi
+  body="$(printf '%s\n\nLane %s waited for a sign-in nobody gave and timed out: its CLI sign-in lapsed. %s\n\nUntil then each run on the lane fails as auth.\n' \
+    "$KEY_ASK_MARKER" "$SLOT" "$how")"
   file_ask "$title" "$body" "Sign-in failed again"
 }
 
@@ -1948,6 +1957,11 @@ prepare_validation() {
   if [ -n "$C_SETUP" ]; then
     contract_run "$C_SETUP"; rc=$?
     record setup "$C_SETUP" "$rc" "$BASE" "$([ "$rc" -eq 0 ] && echo true || echo false)"
+    if [ "$rc" -eq 143 ]; then
+      PARK_CLASS=transient
+      SETUP_REASON="setup interrupted by SIGTERM"
+      return 1
+    fi
     [ "$rc" -eq 0 ] || { SETUP_REASON="setup exited $rc"; return 1; }
   fi
   contract_run "$C_CHECK"; BASELINE_EXIT=$?
@@ -1955,6 +1969,11 @@ prepare_validation() {
   baseline_rev="$(safe_git rev-parse HEAD)"
   record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
     "${changed:+changed tracked files: $changed}"
+  if [ "$BASELINE_EXIT" -eq 143 ]; then
+    PARK_CLASS=transient
+    SETUP_REASON="base check interrupted by SIGTERM"
+    return 1
+  fi
   # A check that cannot run, or is already red, on the unmodified base is
   # the factory's problem, not the ticket's: file the incident and stop
   # before the agent burns a run it can never validate.
@@ -2020,6 +2039,10 @@ final_validation() {
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
     124) VALIDATION_REASON="validation failed: the check timed out after ${CHECK_TIMEOUT}s" ;;
+    143)
+      PARK_CLASS=transient
+      VALIDATION_REASON="validation interrupted by SIGTERM"
+      ;;
     125|126|127)
       # The environment broke between the baseline and the final check;
       # the agent's work is not the cause.
@@ -2183,6 +2206,29 @@ EOF
     return 1
   fi
   echo "[$stamp] $TICKET: left off the kept branch: $(stray_list)"
+}
+
+# A fix round's commit that adds files outside the brief's paths is not
+# refused: those files (STRAY_FILES, and only those, so the round's real
+# work stays) are removed in a commit on top, which keeps the push
+# fast-forward, and named in the run log. Without this the round retried the
+# identical refusal until the runaway hold caught it (loom#1476). Returns 1,
+# logged, when a file cannot be removed or the removal committed.
+drop_stray_files() {
+  local f stamp
+  stamp="$(date -u +%FT%TZ)"
+  while IFS= read -r f; do
+    [ -z "$f" ] || safe_git rm -q -f -- "$f" && continue
+    echo "[$stamp] $TICKET: could not remove $f from the fix round's commits"
+    return 1
+  done <<EOF
+$STRAY_FILES
+EOF
+  if ! safe_git commit -qm "Drop files outside the brief's paths: $(stray_list)"; then
+    echo "[$stamp] $TICKET: could not commit the removal of $(stray_list)"
+    return 1
+  fi
+  echo "[$stamp] $TICKET: left off the fix round's commits: $(stray_list)"
 }
 
 # What the agent is told about the contract, after its brief.
@@ -3133,10 +3179,20 @@ for BRIEF in "$INBOX"/*.md; do
     COMMITTED=1
   fi
   # A commit that adds files outside the brief is refused before validation
-  # and push: nothing is pushed, and the reason names every stray file.
+  # and push: nothing is pushed, and the reason names every stray file. A fix
+  # round removes them instead (drop_stray_files) and checks again, so it
+  # pushes its work rather than retrying the same refusal (loom#1476).
   if [ "$COMMITTED" -eq 1 ]; then
     if ! check_scope "$BRIEF" 2>> "$LOG"; then
       park "$BRIEF" "could not check the committed files against the brief" transient; continue
+    fi
+    if [ -n "$STRAY_FILES" ] && [ -n "$FIX_PR" ]; then
+      if ! drop_stray_files >> "$LOG" 2>&1; then
+        park "$BRIEF" "commit refused: it adds files outside the brief's paths that could not be removed: $(stray_list); nothing pushed"; continue
+      fi
+      if ! check_scope "$BRIEF" 2>> "$LOG"; then
+        park "$BRIEF" "could not check the committed files against the brief" transient; continue
+      fi
     fi
     if [ -n "$STRAY_FILES" ]; then
       park "$BRIEF" "commit refused: it adds files outside the brief's paths: $(stray_list); nothing pushed"; continue
