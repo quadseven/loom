@@ -46,8 +46,10 @@ LIMIT_CODE_RE='(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
 KEY_STATE='expired|revoked|invalid|incorrect|disabled'
 # A CLI that signs in through a browser (agy) and finds its sign-in lapsed
 # waits for a login nobody gives, then says "authentication timed out" or
-# "authentication failed": that is auth, not transient (2026-10-24).
-AUTH_RE="($KEY_STATE)[ _-]*api[ _-]*key|api[ _-]*key([ _-]*(is|was|has|been|are))*[ _-]*($KEY_STATE)|(http|status|code|error)[^0-9a-z]{0,3}401([^0-9]|\$)|error:[ ]*authentication[ ]+(timed[ ]+out|failed)"
+# "authentication failed": that is auth, not transient (2026-10-24). It is the
+# lane's sign-in that lapsed, not a key, whatever key parameter the lane names.
+SIGNIN_RE="error:[ ]*authentication[ ]+(timed[ ]+out|failed)"
+AUTH_RE="($KEY_STATE)[ _-]*api[ _-]*key|api[ _-]*key([ _-]*(is|was|has|been|are))*[ _-]*($KEY_STATE)|(http|status|code|error)[^0-9a-z]{0,3}401([^0-9]|\$)|$SIGNIN_RE"
 # A quota on the whole account, not one model: every model of the lane is
 # limited until it resets (agy, 2026-10-18: "Individual quota reached ...
 # Resets in 67h", but only the model that ran was marked, so the lane stayed

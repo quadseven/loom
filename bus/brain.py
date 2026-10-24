@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
-from . import audit, change_class, handoff, hunt_plan, journal, lock, notify, pr_repair, proof, quiet, stale_claims, text, tickets
+from . import audit, change_class, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
 from . import merge_tier, naming, operator_hold, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
@@ -3072,11 +3072,41 @@ def merge(gh: GitHub, repo: str, number: int,
     gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe="/")),
             ok=(404, 422))
     if association:
-        move(gh, association[0], association[1], "merged")
+        reason = _unbuilt_reason(gh, repo, number, issue)
+        if reason:
+            move(gh, association[0], association[1], "queued",
+                 note=tickets.UNBUILT_NOTE % (number, reason))
+        else:
+            move(gh, association[0], association[1], "merged")
     if adopt:
         notify.post(gh, repo, number, ADOPT_COMMENT, notify.MERGED)
     return {"merged": True, "pull_request": (repo, number),
             "ticket": association, "head_sha": sha}
+
+
+def _unbuilt_reason(gh: GitHub, repo: str, number: int, issue: Dict[str, Any]) -> str:
+    """Why the merged pull request left its ticket unbuilt (docs only, or code
+    nothing calls), else "" (loom#1570). A documentation ticket is built by a
+    docs change, and a check that cannot read the diff never holds a merge."""
+    if {"docs", "documentation"} & {x.lower() for x in _labels(issue)}:
+        return ""
+    try:
+        files = gh.paginate("/repos/%s/pulls/%d/files" % (repo, number))
+        files = [f for f in files if isinstance(f, dict)]
+
+        def search(name: str) -> Optional[List[str]]:
+            try:
+                data = gh.rest("GET", "/search/code?q=%s+repo:%s" % (quote(name, safe=""), repo)).data
+            except Exception:
+                return None
+            items = (data or {}).get("items") if isinstance(data, dict) else None
+            if items is None:
+                return None
+            return [str(i.get("path") or "") for i in items if isinstance(i, dict)]
+
+        return merge_effect.unbuilt_reason(files, search)
+    except Exception:
+        return ""
 
 
 def _shadow_merge(repo: str, number: int, sha: str, ticket: Optional[Tuple[str, int]],
