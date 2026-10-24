@@ -51,44 +51,76 @@ def _defined(lines: Sequence[str]) -> Dict[str, str]:
     return found
 
 
+def _name(f: Mapping[str, Any]) -> str:
+    return str(f.get("filename") or "")
+
+
+def _non_doc_test_reason(files: Sequence[Mapping[str, Any]]) -> str:
+    """The docs-only / docs-and-tests-only reason, or "" when logic changed."""
+    if all(change_class.is_docs(_name(f)) for f in files):
+        return "it changed only documentation"
+    if all(change_class.is_docs(_name(f)) or change_class.is_test(_name(f)) for f in files):
+        return "it changed only documentation and tests"
+    return ""
+
+
+def _logic_code_files(files: Sequence[Mapping[str, Any]]) -> Optional[List[Mapping[str, Any]]]:
+    """The changed code files when every logic file is code with a patch and
+    nothing was removed; None when the diff cannot be judged."""
+    logic = [f for f in files
+             if not change_class.is_docs(_name(f)) and not change_class.is_test(_name(f))]
+    code = [f for f in logic if _name(f).lower().endswith(_CODE_EXTS)]
+    if len(code) != len(logic) or any(not f.get("patch") for f in code):
+        return None
+    if any(_removed(str(f["patch"])) for f in code):
+        return None
+    return code
+
+
+def _is_called(name: str, non_def: Sequence[str], code_names: Set[str],
+               search: Optional[Search]) -> bool:
+    """True when a name is, or may be, called: added elsewhere in the diff, or
+    mentioned by a non-test file outside it, or the search could not tell."""
+    word = re.compile(r"(?<![\w-])%s(?![\w-])" % re.escape(name))
+    if any(word.search(x) for x in non_def):
+        return True
+    hits = search(name) if search else None
+    if hits is None:
+        return True
+    return any(not change_class.is_test(h) and h not in code_names for h in hits)
+
+
+def _has_top_level_statement(non_def: Sequence[str], defs: Mapping[str, str]) -> bool:
+    """True when the diff adds a top-level line that is not a definition,
+    comment, decorator, import or a continuation."""
+    return any(x.strip() and not x.lstrip().startswith(("#", "//", "@", "import", "from"))
+               and not x.startswith((" ", "\t", "}", ")")) and x not in defs.values()
+               for x in non_def)
+
+
 def unbuilt_reason(files: Sequence[Mapping[str, Any]], search: Optional[Search] = None) -> str:
     """Why a merged diff left its ticket unbuilt, or "" when it did not.
     `files` are the pull request's files (filename, patch); `search(name)`
     returns the paths of repository files that mention a name, or None when it
     cannot tell."""
-    paths = [str(f.get("filename") or "") for f in files]
-    if not paths:
+    if not files:
         return ""
-    if all(change_class.is_docs(p) for p in paths):
-        return "it changed only documentation"
-    logic = [f for f in files if not change_class.is_docs(str(f.get("filename") or ""))
-             and not change_class.is_test(str(f.get("filename") or ""))]
-    if not logic:
-        return "it changed only documentation and tests"
-    code = [f for f in logic if str(f.get("filename") or "").lower().endswith(_CODE_EXTS)]
-    if len(code) != len(logic) or any(not f.get("patch") for f in code):
-        return ""
-    if any(_removed(str(f["patch"])) for f in code):
+    reason = _non_doc_test_reason(files)
+    if reason:
+        return reason
+    code = _logic_code_files(files)
+    if code is None:
         return ""
     adds = [x for f in code for x in _added(str(f["patch"]))]
     defs = _defined(adds)
     if not defs:
         return ""
     non_def = [x for x in adds if x not in defs.values()]
-    uncalled: Set[str] = set()
-    for name in sorted(defs):
-        word = re.compile(r"(?<![\w-])%s(?![\w-])" % re.escape(name))
-        if any(word.search(x) for x in non_def):
-            return ""
-        hits = search(name) if search else None
-        if hits is None or any(not change_class.is_test(h) and h not in {
-                str(f.get("filename")) for f in code} for h in hits):
-            return ""
-        uncalled.add(name)
+    code_names = {str(f.get("filename")) for f in code}
+    if any(_is_called(n, non_def, code_names, search) for n in sorted(defs)):
+        return ""
     # Every statement the diff adds outside a definition is a call only to a
     # name already checked, so a diff of other top-level lines is not judged.
-    if any(x.strip() and not x.lstrip().startswith(("#", "//", "@", "import", "from"))
-           and not x.startswith((" ", "\t", "}", ")")) and x not in defs.values()
-           for x in non_def):
+    if _has_top_level_statement(non_def, defs):
         return ""
-    return "it only added code nothing calls (%s)" % ", ".join(sorted(uncalled))
+    return "it only added code nothing calls (%s)" % ", ".join(sorted(defs))
