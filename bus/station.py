@@ -1248,6 +1248,13 @@ def _sha12(body: Optional[str]) -> str:
     return hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
 
 
+def _bot_name(login: str) -> str:
+    """A bot login without the "[bot]" suffix, lowercased: GraphQL and REST
+    name the same bot differently."""
+    login = login.strip().lower()
+    return login[:-len("[bot]")] if login.endswith("[bot]") else login
+
+
 def _label_names(issue: Dict[str, Any]) -> List[str]:
     names = []
     for lab in issue.get("labels") or []:
@@ -5149,11 +5156,16 @@ class Station:
         threads = brain._open_threads(self.gh, repo, pr_number)
         return [thread for thread in threads if self._thread_starts_with_bot(thread)]
 
-    @staticmethod
-    def _thread_starts_with_bot(thread: Dict[str, Any]) -> bool:
+    def _thread_starts_with_bot(self, thread: Dict[str, Any]) -> bool:
+        """Whether the review bot opened the thread. GitHub's GraphQL API names
+        a bot without the "[bot]" suffix the REST API adds, so both forms
+        match: matching only "grug-tribe[bot]" dropped every review-bot thread
+        from fix rounds from 2026-10-13 to 2026-10-24."""
         comments = (thread.get("comments") or {}).get("nodes") or []
-        return bool(comments and
-                    (comments[0].get("author") or {}).get("login") == "grug-tribe[bot]")
+        if not comments:
+            return False
+        login = str((comments[0].get("author") or {}).get("login") or "")
+        return _bot_name(login) == _bot_name(self.s.review_bot)
 
     def _remove_ready_if_present(self, repo: str, number: int, names: List[str]) -> None:
         if "loom:ready" in names:

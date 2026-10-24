@@ -2858,6 +2858,19 @@ class HandBackTest(unittest.TestCase):
         self.assertIn("PRRT_fake", self.gh.comments[0]["body"])
         self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
 
+    def test_a_review_bot_thread_read_through_graphql_is_sent_back(self):
+        # GitHub's GraphQL API names a bot author without the "[bot]" suffix
+        # (Bot.login "grug-tribe"); the REST API adds it. The station matched
+        # only "grug-tribe[bot]", so from 2026-10-13 every fix round left out
+        # the review bot's threads and their ids, and a lane could neither fix
+        # nor answer them (mod-overseer#1135 looped on 2026-10-24).
+        thread = {"id": "PRRT_graphql", "path": "a.py", "line": 4,
+                  "comments": {"nodes": [{"databaseId": 9, "body": "change this",
+                                             "author": {"login": "grug-tribe"}}]}}
+        self.run_hand_back(threads=[thread])
+        self.assertIn("PRRT_graphql", self.gh.comments[0]["body"])
+        self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+
     def test_unresolved_thread_not_started_by_the_review_bot_is_ignored(self):
         thread = {"id": "PRRT_user", "path": "a.py", "line": 4,
                   "comments": {"nodes": [{"databaseId": 9, "body": "ignore this",
