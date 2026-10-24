@@ -5008,12 +5008,20 @@ class ResumeCommandTests(unittest.TestCase):
                     return 403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(reset_time), "x-ratelimit-limit": "5000", "x-ratelimit-resource": "core"}, json.dumps({"message": "rate limit exceeded"}).encode()
                 return 200, {}, b"[]"
             return 200, {}, b"[]"
-        
-        code, out, err = self._run_resume(["resume", repo, "--holder", "test-holder"], rate_limit_transport)
+        waits = []
+        real_sleep = time.sleep
+        def capture_wait(seconds):
+            waits.append((seconds, sys.stderr.getvalue()))
+            real_sleep(seconds)
+        with unittest.mock.patch.object(brain.time, "sleep", capture_wait):
+            code, out, err = self._run_resume(["resume", repo, "--holder", "test-holder"], rate_limit_transport)
         self.assertEqual(code, 0)
         self.assertIn("rate limit", err.lower())
         self.assertIn("wait", err.lower())
         self.assertIn("reset", err.lower())
+        self.assertTrue(waits)
+        self.assertGreater(waits[0][0], 0)
+        self.assertIn("rate limit wait", waits[0][1])
 
     def test_resume_logs_retry_wait_to_stderr(self):
         """When a request fails and retries, resume logs the wait to stderr."""
@@ -5057,7 +5065,7 @@ class ResumeCommandTests(unittest.TestCase):
         self.assertNotIn("resume skipped " + repo1 + ": deadline", out)
 
     def test_resume_writes_each_goal_section_to_stdout_immediately(self):
-        """Each goal's section is written to stdout immediately and flushed."""
+        """The first goal is visible before resume starts reading the next repo."""
         repo1 = "owner/repo1"
         repo2 = "owner/repo2"
         fake = Fake(
@@ -5072,8 +5080,17 @@ class ResumeCommandTests(unittest.TestCase):
             reply(200, []),
             reply(200, []),
         )
-        code, out, err = self._run_resume(["resume", repo1, repo2, "--holder", "test-holder"], fake)
+        original = fake
+        observed = []
+        def slow_transport(method, url, headers, body):
+            path = url.split("api.github.com")[-1]
+            if path.startswith("/repos/%s/issues?" % repo2):
+                observed.append(sys.stdout.getvalue())
+            return original(method, url, headers, body)
+        code, out, err = self._run_resume(["resume", repo1, repo2, "--holder", "test-holder"], slow_transport)
         self.assertEqual(code, 0)
         self.assertIn("# Resume for test-holder", out)
         self.assertIn("## " + repo1, out)
         self.assertIn("## " + repo2, out)
+        self.assertTrue(observed)
+        self.assertIn("## " + repo1, observed[0])

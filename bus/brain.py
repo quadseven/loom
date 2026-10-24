@@ -4515,8 +4515,8 @@ def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
 
 
 def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
-           deadline_minutes: int = 8,
-           now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None) -> None:
+           now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None,
+           deadline_minutes: int = 8) -> None:
     """What the lock holder may finish for other brains: the live resume items
     on every goal, with each goal's stage owners, and whether broad GitHub
     work is open to it under the freshness rule (handoff.QUIET). Refuses
@@ -4539,24 +4539,28 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
 
     unread: Dict[str, str] = {}
     all_goals: List[GoalJournals] = []
+    latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark] = {}
     processed_repos = 0
 
     def _with_rate_limit_retry(func, *args, **kwargs):
         """Call func, retrying on RateLimited with logging."""
+        waited = False
         while True:
             try:
                 return func(*args, **kwargs)
             except RateLimited as err:
+                if waited:
+                    raise
                 wait = max(0, err.until - time.time())
                 reset_utc = datetime.fromtimestamp(err.until, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                print("resume: rate limit wait %.1fs (resets %s)" % (wait, reset_utc), file=sys.stderr)
+                print("resume: rate limit wait %.1fs (resets %s)" % (wait, reset_utc), file=sys.stderr, flush=True)
                 if wait > 0:
                     time.sleep(wait)
-                # Retry after waiting
+                waited = True
 
     for repo in repos:
         # Progress log to stderr
-        print("resume: reading %s (requests: %d)" % (repo, gh.requests), file=sys.stderr)
+        print("resume: reading %s (requests: %d)" % (repo, gh.requests), file=sys.stderr, flush=True)
 
         try:
             found = []
@@ -4576,11 +4580,20 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
         all_goals.extend(found)
         processed_repos += 1
 
+        for _, _, journals, _ in found:
+            for mark in handoff.marks(journals):
+                key = (mark.stage, mark.item, mark.key if mark.stage == "brief" else "")
+                if key not in latest or mark.at >= latest[key].at:
+                    latest[key] = mark
+        for goal_repo, issue, journals, skipped in found:
+            for line in _goal_resume_lines(gh, goal_repo, issue, journals, latest, skipped, unread):
+                print(line, flush=True)
+
         # Check deadline after reading repo
         if datetime.now(timezone.utc) >= deadline:
             # Print skipped for remaining repos
             for remaining_repo in repos[processed_repos:]:
-                print("resume skipped %s: deadline" % remaining_repo)
+                print("resume skipped %s: deadline" % remaining_repo, flush=True)
             break
 
     # Filter out unread repos
@@ -4591,22 +4604,9 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
         for repo, reason in sorted(unread.items()):
             print(_skip_line(repo, reason))
 
-    # Build latest markers from all goals
-    latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark] = {}
-    for _, _, found, _ in all_goals:
-        for mark in handoff.marks(found):
-            key = (mark.stage, mark.item, mark.key if mark.stage == "brief" else "")
-            if key not in latest or mark.at >= latest[key].at:
-                latest[key] = mark
-
     # Print freshness line
     print(_freshness_line(handoff.peer_journals(
         [j for _, _, found, _ in all_goals for j in found], holder, now)))
-
-    # Print each goal's resume lines
-    for repo, issue, found, skipped in all_goals:
-        for line in _goal_resume_lines(gh, repo, issue, found, latest, skipped, unread):
-            print(line)
 
     # Print remaining sections
     for line in _sensitive_resume_lines(gh, repos, now, env):
@@ -5180,7 +5180,7 @@ def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
     original_sleep = gh._sleep
     def logging_sleep(seconds: float) -> None:
         if seconds > 0:
-            print("resume: retry wait %.1fs" % seconds, file=sys.stderr)
+            print("resume: retry wait %.1fs" % seconds, file=sys.stderr, flush=True)
         original_sleep(seconds)
     gh._sleep = logging_sleep
 

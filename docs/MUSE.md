@@ -339,7 +339,7 @@ this tick"; a step with no note shows nothing there.
    followed by the answer: what was done, or the answer to the question.
    The station posts it in the channel as a reply, so it must stand on its
    own and fit in a phone message.
-   Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse`. It
+   Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse --deadline 8`. It
    refuses unless you hold the lock. Each `resume` line it prints is stage
    work another brain yielded (Handing off stage work): finish those items
    first, before measuring anything or starting new work, under the same
