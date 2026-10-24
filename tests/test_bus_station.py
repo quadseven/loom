@@ -5735,6 +5735,38 @@ class VerifyBeforeBuildTest(Base):
             later._merged_cited(REPO, self.fake.issues[12])
         self.assertEqual(ask.call_count, 1, "a changed body is asked again; the same is not")
 
+    def test_a_status_section_change_is_not_asked_again(self):
+        # 2026-10-24: the ask ledger hashed the whole body, and the station
+        # rewrites the status section on routine events, so the same ticket
+        # was asked again after every claim, hold or release. That drained the
+        # Fabric workspace's monthly AI allowance in about four days.
+        self.settings.fabric_key_ssm = "/example/fabric/key"
+        self.fake.add(12, state="briefed")
+        base = self.fake.issues[12]["body"]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch("bus.fabric.ask", return_value="") as ask:
+            st._merged_cited(REPO, self.fake.issues[12])
+        self.fake.issues[12]["body"] = base + (
+            "\n\n<!-- loom:status-body v1 begin -->\n---\n\n- 2030-01-01T00:00:00Z Claimed for lane codex\n"
+            "<!-- loom:status-body v1 end -->\n")
+        later = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch("bus.fabric.ask", return_value="") as ask:
+            later._merged_cited(REPO, self.fake.issues[12])
+        ask.assert_not_called()
+
+    def test_the_station_asks_fabric_at_most_its_daily_cap(self):
+        self.settings.fabric_key_ssm = "/example/fabric/key"
+        numbers = range(100, 100 + station.FABRIC_ASKS_PER_DAY + 5)
+        for n in numbers:
+            self.fake.add(n, state="briefed")
+        calls = 0
+        for n in numbers:
+            st = station.Station(GitHub("token", transport=self.fake), self.settings)
+            with mock.patch("bus.fabric.ask", return_value="") as ask:
+                st._merged_cited(REPO, self.fake.issues[n])
+            calls += ask.call_count
+        self.assertEqual(calls, station.FABRIC_ASKS_PER_DAY)
+
     def sent(self):
         """Ticket 12 shipped after the station sent pull request 77 to verify."""
         self.fake.private = False
