@@ -548,6 +548,36 @@ class SensitiveResumeTests(unittest.TestCase):
         lines_pure = brain._pull_request_lines(no_authors, REPO, [pr], data, bot)
         self.assertEqual(lines_pure, ["### Pull requests", "- #4 PR - READY"])
 
+    def test_pull_request_lines_blocks_merge_refusals(self):
+        def lines(ticket_state="loom:pr", mergeable_state="clean", filename="tests/test_sample.py",
+                  env=None):
+            pr = {"number": 4, "title": "PR", "body": "Refs #4",
+                  "head": {"ref": "loom/4-work", "sha": "head"},
+                  "mergeable": True, "mergeable_state": mergeable_state}
+            issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                                       {"name": ticket_state}]}
+
+            def transport(method, url, headers, body):
+                if url.endswith("/issues/4"):
+                    return reply(200, issue)
+                if "/pulls/4/files" in url:
+                    return reply(200, [{"filename": filename, "status": "modified"}])
+                return reply(200, [])
+
+            gh = GitHub("t", transport=transport)
+            with unittest.mock.patch.dict(os.environ, env or {}, clear=False):
+                result = brain._pull_request_lines(gh, REPO, [pr],
+                                                    {"prs": {4: ready_node()}}, "grug-tribe")
+            return result[1]
+
+        self.assertEqual(lines(ticket_state="loom:running"),
+                         "- #4 PR - blocked: ticket at loom:running, not loom:pr")
+        self.assertEqual(lines(mergeable_state="dirty"),
+                         "- #4 PR - blocked: conflicts with the default branch")
+        self.assertEqual(lines(filename="Dockerfile", env={"LOOM_AUTO_MERGE_TIERS": "docs-tests"}),
+                         "- #4 PR - blocked: held for the operator: deploy-config")
+        self.assertEqual(lines(), "- #4 PR - READY")
+
     def test_status_lists_a_needs_brain_lane_pr_that_is_not_sensitive(self):
         # loom#1411: a logic-class pull request whose ticket ran out of fix
         # rounds (needs-brain) with failing checks was in no status section.

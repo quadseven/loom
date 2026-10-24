@@ -693,7 +693,8 @@ def _trunk_warning(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> Optiona
 
 def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
                         data: Dict[str, Any], bot: str,
-                        authors: Sequence[str] = (), check: str = "Grug - Elder") -> List[str]:
+                        authors: Sequence[str] = (), check: str = "Grug - Elder",
+                        env: Optional[Dict[str, str]] = None) -> List[str]:
     """The pull request lines for status: heading, merge readiness for each
     loom pull request, including a pending brain fix as a blocker."""
     lines = ["### Pull requests"]
@@ -711,6 +712,20 @@ def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
             comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
             if _pending_brain_fix(comments, authors):
                 line = _add_blocker(line, "pending brain fix")
+        if ticket is not None:
+            issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+            state = _ticket_state(issue)
+            if not _ticket_at_state(issue, "pr"):
+                line = _add_blocker(line, "ticket at %s, not loom:pr" % ("loom:" + state
+                                   if state else "no loom state"))
+            mergeability = _mergeability_blocker(pr)
+            if mergeability:
+                line = _add_blocker(line, mergeability)
+            if state == "pr":
+                entries = operator_hold.pull_files(gh, repo, int(pr["number"]))
+                tier, _ = _risk_tier(gh, repo, pr, issue, entries, env)
+                if tier not in merge_tier.auto_tiers(env):
+                    line = _add_blocker(line, "held for the operator: %s" % tier)
         if operator_hold.operator_steps(str(pr.get("body") or "")):
             # bus.brain merge refuses it and asks the operator; status says
             # so first, from the body it already holds (2026-10-22).
@@ -770,12 +785,13 @@ def _skip_line(what: str, reason: str) -> str:
 def _readable_section(gh: GitHub, repo: str, now: datetime, bot: str,
                       authors: Optional[Sequence[str]] = None,
                       into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-                      check: str = "Grug - Elder") -> List[str]:
+                      check: str = "Grug - Elder",
+                      env: Optional[Dict[str, str]] = None) -> List[str]:
     """_repo_section, or one skipped line when GitHub will not show the repo
     (moved, gone or forbidden: github.unreadable), so one moved repo does
     not end the status of every other. Any other GitHubError still ends it."""
     try:
-        return _repo_section(gh, repo, now, bot, authors, into, check)
+        return _repo_section(gh, repo, now, bot, authors, into, check, env)
     except GitHubError as err:
         reason = unreadable(err)
         if reason is None:
@@ -788,7 +804,8 @@ def _readable_section(gh: GitHub, repo: str, now: datetime, bot: str,
 def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   authors: Optional[Sequence[str]] = None,
                   into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-                  check: str = "Grug - Elder") -> List[str]:
+                  check: str = "Grug - Elder",
+                  env: Optional[Dict[str, str]] = None) -> List[str]:
     """The repo's status section; with into, its open tickets are kept
     there under the repo's name for the cross-repo Priorities section."""
     issues = _issues(gh, repo)
@@ -816,7 +833,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
-    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check)
+    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check, env)
     lines += [""] + _sensitive_pr_lines(prs)
     lines += [""] + _waiting_brain_lines(tickets, pr_of, data, now, bot)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
@@ -921,7 +938,7 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
         sections = list(pool.map(
             lambda repo: _readable_section(gh, repo, now, bot, authors, found,
-                                           review_check_name(env)), repos))
+                                           review_check_name(env), env), repos))
     runaway = [(repo, issue) for repo, items in found.items() for issue in items
                if RUNAWAY in _labels(issue)
                and tickets.ticket_state(issue) not in tickets.MERGED_STATES]
@@ -3256,14 +3273,7 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
         # No file list, no tier: the gate fails closed.
         raise ValueError("held: the changed files could not be read to set the risk tier "
                          "(%s)" % err) from err
-    if merge_tier.is_revert_ticket(pr, issue):
-        refused = merge_tier.revert_refusal(gh, repo, pr, issue, entries, env)
-        if not refused:
-            return merge_tier.REVERT
-        print("brain: %s#%d is not exempt as a revert: %s" % (repo, number, refused),
-              file=sys.stderr)
-    tier, why = merge_tier.classify(repo, entries, str(issue.get("body") or ""),
-                                    change_class.class_of(pr) == "sensitive")
+    tier, why = _risk_tier(gh, repo, pr, issue, entries, env)
     if tier not in merge_tier.auto_tiers(env):
         reason = merge_tier.operator_why(tier, why, env)
         asked = ""
@@ -3289,6 +3299,19 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     if capped:
         raise ValueError("the auto-merge cap holds the merge: %s" % capped)
     return tier
+
+
+def _risk_tier(gh: GitHub, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
+               entries: List[Dict[str, Any]], env: Optional[Dict[str, str]]) -> Tuple[str, str]:
+    """The tier and reason used by both status and the merge refusal gate."""
+    if merge_tier.is_revert_ticket(pr, issue):
+        refused = merge_tier.revert_refusal(gh, repo, pr, issue, entries, env)
+        if not refused:
+            return merge_tier.REVERT, "proven revert"
+        print("brain: %s#%s is not exempt as a revert: %s" % (
+            repo, pr.get("number", "?"), refused), file=sys.stderr)
+    return merge_tier.classify(repo, entries, str(issue.get("body") or ""),
+                               change_class.class_of(pr) == "sensitive")
 
 
 def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
@@ -3373,14 +3396,27 @@ def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
         (head_ref.startswith("loom/") or trusted_lane_head,
          "pull request head is not a loom branch"),
         (_same_repo(repo, pr, details), "pull request must use the same repository"),
-        (pr.get("mergeable") is True,
+        (_mergeability_blocker(pr) is None,
          "pull request is not mergeable (GitHub may still be computing it)"),
         (_checks_green(details), "pull request checks are not successful"),
         (_threads_resolved(details), "pull request has unresolved review threads"),
     ]
     for ok, reason in rules:
         if not ok:
+            if reason == "pull request is not mergeable (GitHub may still be computing it)":
+                blocker = _mergeability_blocker(pr)
+                if blocker == "conflicts with the default branch":
+                    raise ValueError("pull request is not mergeable")
             raise ValueError(reason)
+
+
+def _mergeability_blocker(pr: Dict[str, Any]) -> Optional[str]:
+    """The mergeability refusal shared by status and merge."""
+    if pr.get("mergeable_state") == "dirty":
+        return "conflicts with the default branch"
+    if pr.get("mergeable") is True:
+        return None
+    return "pull request is not mergeable"
 
 
 # A sensitive change (bus/change_class.py) is never merged by the factory; the
@@ -4055,9 +4091,21 @@ def _validated_ticket(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     names = _labels(issue)
     if issue.get("state") != "open" or "loom:ticket" not in names:
         raise ValueError("ticket is not an open loom:ticket")
-    if "loom:" + expected_state not in names:
+    if not _ticket_at_state(issue, expected_state):
         raise ValueError("ticket is not loom:" + expected_state)
     return association, issue
+
+
+def _ticket_state(issue: Dict[str, Any]) -> str:
+    """The ticket's Loom state label for status display, if present."""
+    states = [name[5:] for name in _labels(issue)
+              if name.startswith("loom:") and name[5:] in STATES]
+    return "pr" if "pr" in states else next(iter(states), "")
+
+
+def _ticket_at_state(issue: Dict[str, Any], state: str) -> bool:
+    """Whether a ticket has the state label required by merge."""
+    return "loom:" + state in _labels(issue)
 
 
 def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],

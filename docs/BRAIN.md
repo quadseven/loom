@@ -1388,6 +1388,9 @@ A lane pull request is merge-ready if and only if all four hold:
 `blocked:` and every blocker that applies, for example `blocked: checks
 failure, grug changes_requested, 3 unresolved threads`. It is computed by
 `bus.brain.merge_ready` from the one GraphQL read status already makes.
+Status also checks the linked ticket's state, GitHub's REST mergeability
+answer, and the risk tier allowed by `LOOM_AUTO_MERGE_TIERS`; a non-`loom:pr`
+ticket, a conflicting branch, or an operator-held tier blocks READY.
 For a sensitive pull request that would otherwise be READY, status
 also checks the named review run on the head and blocks it unless that run
 completed with `success`. A tick takes that line as given instead of
