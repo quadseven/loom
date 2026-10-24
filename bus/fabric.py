@@ -29,6 +29,10 @@ from typing import List, Optional, Tuple
 from .github import read_ssm
 
 CHAT_URL = "https://api.fabric.so/v2/chatbot"
+BRAIN_QUESTION = (
+    "Summarize earlier decisions and fixes across the workspace that can help "
+    "rule on needs-brain tickets. Cite only existing issue and pull request cards."
+)
 # A whole-library answer took 20 to 60 s in probes on 2026-10-22; a station
 # pass waits no longer than this for one.
 TIMEOUT = 90
@@ -79,7 +83,6 @@ def _argument_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.fabric")
     sub = p.add_subparsers(dest="command", required=True)
     a = sub.add_parser("ask", help="ask the Fabric workspace a whole-library question")
-    a.add_argument("question", help="the question to ask Fabric")
     return p
 
 
@@ -93,12 +96,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = _argument_parser().parse_args(argv)
     if args.command != "ask":
         return 1
-    question = " ".join(str(args.question or "").split())
-    if not question:
-        return 1
     key_ssm = os.environ.get("LOOM_FABRIC_KEY_SSM", "").strip()
     region = os.environ.get("LOOM_AWS_REGION", "").strip() or "us-east-1"
-    print(ask(question, key_ssm, region))
+    print(ask(BRAIN_QUESTION, key_ssm, region))
     return 0
 
 
