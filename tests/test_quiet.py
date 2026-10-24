@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import brain, journal, metrics, quiet  # noqa: E402
+from bus import brain, handoff, journal, metrics, quiet  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
@@ -219,6 +219,22 @@ class StatusTest(unittest.TestCase):
         self.assertIn("#%d report OVERDUE since" % GOAL, owed)
         self.assertNotIn("quiet since", report)
 
+    def test_status_counts_a_report_edited_in_place_as_fresh(self):
+        # The report was created 30 hours ago and edited an hour ago; the
+        # goal moved in between, so only the edit time keeps it from owed.
+        edited = REPORT + "\n" + handoff.REPORTED_STAMP % ago(1)
+        home = GoalHome([report_comment(1, ago(30), body=edited, updated=ago(1))],
+                        [ticket(41, "loom:merged", state="closed", updated_at=ago(5))])
+        self.assertEqual(self.status(home)[1].strip(), "- none")
+
+    def test_a_forged_report_stamp_is_not_read_as_an_edit(self):
+        # The stamp is plain text: one later than the comment's last edit
+        # (or in the future) is ignored, and the report dates from creation.
+        forged = REPORT + "\n" + handoff.REPORTED_STAMP % ago(-48)
+        home = GoalHome([report_comment(1, ago(30), body=forged)],
+                        [ticket(41, "loom:merged", state="closed", updated_at=ago(5))])
+        self.assertIn("#%d report OVERDUE since" % GOAL, self.status(home)[1])
+
     def test_status_owes_a_heartbeat_a_week_after_the_last_report(self):
         home = GoalHome([report_comment(1, ago(24 * 7 + 1))])
         _, owed = self.status(home)
@@ -240,10 +256,37 @@ class JournalTest(unittest.TestCase):
         self.assertEqual((home.posts, home.edits), ([], []))
 
     def test_a_report_for_a_goal_that_moved_is_posted(self):
+        # It asks something new of the operator; one asking the same is
+        # edited in place (loom#1560).
         home = GoalHome([report_comment(1, ago(7))], [ticket(41, created_at=ago(1))])
-        self.post(home)
-        self.assertEqual(home.posts, [REPORT + "\nStill nothing."])
+        text = quiet.REPORT_MARKER + "\nTicket 41 opened. Needs you: review #41."
+        self.post(home, text)
+        self.assertEqual(home.posts, [text])
         self.assertEqual(home.edits, [])
+
+    def test_a_report_asking_nothing_new_edits_the_last_report_in_place(self):
+        # loom#1560: a goal with a stuck ticket is never quiet, and its reports
+        # repeated the same news as new comments, each an email.
+        home = GoalHome([report_comment(5, ago(7), body=REPORT + "\nOld news.")],
+                        [ticket(41, created_at=ago(1))])
+        self.post(home, REPORT + "\nNew news.")
+        self.assertEqual(home.posts, [])  # no new comment, so no email
+        self.assertEqual([ident for ident, _ in home.edits], [5])
+        self.assertEqual(home.edits[0][1], REPORT + "\nNew news.\n"
+                         + handoff.REPORTED_STAMP % "2030-01-08T12:00:00Z")
+
+    def test_a_report_with_a_new_ask_is_posted(self):
+        home = GoalHome([report_comment(5, ago(7))], [ticket(41, created_at=ago(1))])
+        text = quiet.REPORT_MARKER + "\nNew news. Needs you: decide #44."
+        self.post(home, text)
+        self.assertEqual((home.posts, home.edits), ([text], []))
+
+    def test_a_report_edited_in_place_holds_the_next_one_back(self):
+        edited = REPORT + "\n" + handoff.REPORTED_STAMP % ago(1)
+        home = GoalHome([report_comment(5, ago(30), body=edited, updated=ago(1))],
+                        [ticket(41, created_at=ago(0.5))])
+        with self.assertRaises(journal.ReportTooSoon):
+            self.post(home)
 
     def test_the_weekly_heartbeat_edits_the_last_report_in_place(self):
         home = GoalHome([report_comment(1, ago(24 * 9)),

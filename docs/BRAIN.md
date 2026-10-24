@@ -1486,7 +1486,10 @@ operator:
 - a pull request merge (the factory, `bus.brain merge` on the lane machine or
   Muse, the deploy-watch revert path, the roll pin);
 - an issue close (a done or verified ticket, an epic, a rewritten source
-  issue, an operator-claimed issue) and a move to `loom:shipped`;
+  issue, an operator-claimed issue, an invariant breach that cleared or was
+  folded into its rolling issue) and a move to `loom:shipped`;
+- an issue reopen (an invariant breach seen again, a failed audit's ticket
+  or source issue);
 - a label that grants a merge (`ready-to-land`), and any GraphQL label write
   (it names labels by id);
 - an approving pull request review;
@@ -1497,10 +1500,15 @@ operator:
 
 Closing a pull request without merging it still happens (it can be reopened
 and its branch stays), and so do the closes of Loom's own signal issues that
-carry no work label: an invariant breach, a factory incident, and a health
-signature the watcher filed (`loom:triage` with the watcher's marker in its
-body; `loom:triage` alone is on people's own issues too, and their close is
-held).
+carry no work label and no invariant label: a factory incident (an open one
+holds the tickets behind it) and a health signature the watcher filed
+(`loom:triage` with the watcher's marker in its body; `loom:triage` alone is
+on people's own issues too, and their close is held). An invariant breach's
+issue gates no ticket, so its close is recorded like any other (loom#1551):
+the invariants step asks the guard before it posts the cleared note, and
+logs `would close` once instead of `closed cleared`. run_lane.sh closes its
+factory incidents through `python3 -m bus.shadow gh-guard --lane`, which
+reads the issue first.
 
 `bus/github.py` checks every request at its one choke point and refuses a
 held one with `ShadowHeld`, whichever code sent it; `bus.brain merge`,
@@ -1590,6 +1598,31 @@ runnable check, a failed check, or an operator criterion sends the ticket to
 `loom:human` with one ask (`Kind: decision`), once, and at most 4 such asks
 an hour. A verify lane's proof that passes a live or operator criterion
 without station evidence is refused.
+
+The proof a shipped ticket names is read by `bus/live_proof.py`, read-only.
+Each live criterion names at most one step: its log strings searched from the
+deploy on, once the window it names ("within 24 hours") has passed; a check
+the gate runs; or one plain SELECT through the station's query source. A
+step that would write is refused and never run: a `gh api` call with a method
+or field, a kubectl verb other than get or rollout status, a ship, roll,
+restart or any other command, SQL other than one SELECT. When the close gate
+finds evidence for every criterion the close quotes it, matching log lines
+included; otherwise one status line names the missing criterion and the next
+check time. The station's done close runs it for each open shipped ticket
+with a live criterion that names log strings and a window ("within 24
+hours"), at most 5 a pass, with the loom:shipped label time as the deploy
+time; a Live line with log strings and no window keeps its verify run. The
+log is the repo's
+`LOOM_EVIDENCE_CMDS` command, run once per string; only lines stamped at or
+after the deploy count (a line with no time counts only when the whole log
+the command read is newer than the deploy). A proven ticket gets a station
+proof record (revision: its newest merged pull request; observed: the deploy
+to now; each criterion's evidence), moves to verified with verified_by
+`station`, and closes through `brain.close` with the evidence quoted. Any
+other gets its status line edited into the status comment and is proved
+again at the next check time, or once its criteria change when nothing Loom
+runs can change the answer. In shadow mode the close is recorded in the
+ledger (source `station live proof`) and nothing is sent (#1608).
 
 ## Post-merge watch
 

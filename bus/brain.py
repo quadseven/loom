@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
-from . import audit, change_class, handoff, hunt_plan, journal, lock, notify, pr_repair, proof, quiet, stale_claims, text, tickets
+from . import audit, change_class, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
 from . import merge_tier, naming, operator_hold, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
@@ -33,6 +33,9 @@ STATES = ("queued", "briefed", "running", "pr", "answered", "failed", "merged", 
 # Merged and shipped tickets wait on a deploy or a live check, not on a lane,
 # so they never count against a goal's cap.
 IN_FLIGHT = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:failed")
+# This is a per-goal fairness limit, not a mirror of total lane slots; larger
+# factories can raise it through LOOM_GOAL_CAP when their goals need more
+# concurrent tickets.
 DEFAULT_GOAL_CAP = 16
 # Merged and shipped tickets that still wait on a live check. A verified
 # ticket carries loom:verified instead of loom:shipped (or loom:merged for a
@@ -1433,7 +1436,12 @@ def open_epic(gh: GitHub, repo: str, epic: int
     except ValueError:
         raise ValueError("epic #%d is under #%d, which is not an open loom:goal"
                          % (epic, goal)) from None
-    held = 0 if standing_epic(issue) else len(_epic_tickets(gh, repo, epic))
+    if standing_epic(issue):
+        held = 0
+    elif str(issue.get("title") or "") == INTAKE_TITLE:
+        held = _open_count(_epic_tickets(gh, repo, epic))
+    else:
+        held = len(_epic_tickets(gh, repo, epic))
     if held >= EPIC_TICKET_CAP:
         raise ValueError("epic #%d already holds %d tickets (cap %d): file under its next epic"
                          % (epic, held, EPIC_TICKET_CAP))
@@ -1552,7 +1560,7 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1) -> int:
     roomy = [int(found["number"]) for found, held in tree
              if found.get("state", "open") == "open"
              and str(found.get("title") or "") == INTAKE_TITLE
-             and len(held) + room <= EPIC_TICKET_CAP]  # goal_tree already read its tickets
+             and _open_count(held) + room <= EPIC_TICKET_CAP]  # goal_tree already read its tickets
     if roomy:
         return max(roomy)
     made = file_epic(gh, repo, goal, INTAKE_TITLE, INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP))
@@ -1613,14 +1621,22 @@ def _outside_tickets(loose: List[Dict[str, Any]], goal: int) -> List[Dict[str, A
     return found
 
 
+def _open_count(tickets: List[Dict[str, Any]]) -> int:
+    """How many of an intake epic's tickets are still open: its room. Counting
+    closed ones too made a mostly closed intake epic read as full, so a new one
+    opened while the old one stayed open, and loom#30 went over its epic cap
+    (2026-10-24)."""
+    return sum(1 for t in tickets if t.get("state", "open") != "closed")
+
+
 def _intake_with_room(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
                       ) -> Tuple[Optional[int], int]:
     """The goal's newest open intake epic that has room, and the tickets it
     holds; (None, 0) when no intake epic has room."""
-    roomy = [(int(epic["number"]), len(held)) for epic, held in tree
+    roomy = [(int(epic["number"]), _open_count(held)) for epic, held in tree
              if epic.get("state", "open") == "open"
              and str(epic.get("title") or "") == INTAKE_TITLE
-             and len(held) < EPIC_TICKET_CAP]
+             and _open_count(held) < EPIC_TICKET_CAP]
     return max(roomy) if roomy else (None, 0)
 
 
@@ -2248,6 +2264,9 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     source, elsewhere = _rewrite_source(gh, repo, refs, env)
     if elsewhere is not None:
         body = body.rstrip("\n") + "\n\nRewritten from issue %d.\n" % refs
+    refusal = acceptance_refusal(body, source)
+    if refusal:
+        raise ValueError(refusal)
     _check_written_text(title + "\n" + body)
     _check_no_foreign_refs(gh, repo, title + "\n" + body)
     if epic is not None:
@@ -2421,6 +2440,26 @@ def missing_sections(body: Optional[str]) -> List[str]:
         missing.extend("a pull request body the review bot accepts (%s)" % found
                        for found in plan_problems(body or ""))
     return missing
+
+
+def acceptance_refusal(body: Optional[str], issue: Optional[Dict[str, Any]] = None
+                       ) -> Optional[str]:
+    """Why a body cannot be filed or briefed as a ticket for want of acceptance
+    criteria, or None. It needs an Acceptance criteria section with at least
+    one checkbox: a stub with none cost a lane a whole pass that ended in a
+    split plan, because nothing on it could be proven (loom#1612). An epic and
+    a wayfinder map plan work instead of asking for it, so the issue they are
+    (when there is one) is exempt. Whether the criteria are good is the
+    definition-of-ready check's job, not this one's."""
+    if issue is not None and (_is_epic(issue) or any(
+            name.startswith("wayfinder:") for name in _labels(issue))):
+        return None
+    if any(_CHECKBOX.match(line)
+           for line in _body_sections(body).get("acceptance criteria", [])):
+        return None
+    return ("the body has no acceptance criteria: add an ## Acceptance criteria section "
+            "with at least one - [ ] checkbox, so a lane has something to prove. The draft "
+            "is kept; nothing was filed")
 
 
 def _is_epic(issue: Dict[str, Any]) -> bool:
@@ -3054,6 +3093,15 @@ def move(gh: GitHub, repo: str, number: int, state: str,
             raise ValueError("lane %s cannot run model %s; compatible lanes: %s" %
                              (lane, effective_model,
                               ", ".join(model_lanes(effective_model)) or "none"))
+    if state in ("queued", "briefed") and not any(
+            x.startswith("loom:") and x not in ("loom:ticket", "loom:triage")
+            for x in _labels(issue)):
+        # The brief step: an issue entering the pipeline needs criteria to
+        # prove. A ticket already in a Loom state (a merged one a revert sends
+        # back, a requeue) is past it.
+        refusal = acceptance_refusal(issue.get("body"), issue)
+        if refusal:
+            raise ValueError("#%d: %s" % (number, refusal))
     kept = _moved_labels(_labels(issue), state, lane)
     proof_url = (_post_proof(gh, repo, number, issue, record, verified_by, facts)
                  if record is not None else "")
@@ -3133,11 +3181,41 @@ def merge(gh: GitHub, repo: str, number: int,
     gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe="/")),
             ok=(404, 422))
     if association:
-        move(gh, association[0], association[1], "merged")
+        reason = _unbuilt_reason(gh, repo, number, issue)
+        if reason:
+            move(gh, association[0], association[1], "queued",
+                 note=tickets.UNBUILT_NOTE % (number, reason))
+        else:
+            move(gh, association[0], association[1], "merged")
     if adopt:
         notify.post(gh, repo, number, ADOPT_COMMENT, notify.MERGED)
     return {"merged": True, "pull_request": (repo, number),
             "ticket": association, "head_sha": sha}
+
+
+def _unbuilt_reason(gh: GitHub, repo: str, number: int, issue: Dict[str, Any]) -> str:
+    """Why the merged pull request left its ticket unbuilt (docs only, or code
+    nothing calls), else "" (loom#1570). A documentation ticket is built by a
+    docs change, and a check that cannot read the diff never holds a merge."""
+    if {"docs", "documentation"} & {x.lower() for x in _labels(issue)}:
+        return ""
+    try:
+        files = gh.paginate("/repos/%s/pulls/%d/files" % (repo, number))
+        files = [f for f in files if isinstance(f, dict)]
+
+        def search(name: str) -> Optional[List[str]]:
+            try:
+                data = gh.rest("GET", "/search/code?q=%s+repo:%s" % (quote(name, safe=""), repo)).data
+            except Exception:
+                return None
+            items = (data or {}).get("items") if isinstance(data, dict) else None
+            if items is None:
+                return None
+            return [str(i.get("path") or "") for i in items if isinstance(i, dict)]
+
+        return merge_effect.unbuilt_reason(files, search)
+    except Exception:
+        return ""
 
 
 def _shadow_merge(repo: str, number: int, sha: str, ticket: Optional[Tuple[str, int]],

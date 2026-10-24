@@ -1,10 +1,12 @@
 """Read-only log evidence attached to verify briefs by the station."""
 from __future__ import annotations
 
+import calendar
 import os
 import re
 import signal
 import subprocess
+import time
 from typing import Optional, Tuple, Dict, Iterable, List
 
 from . import text
@@ -37,6 +39,10 @@ _SPAN_RE = re.compile(
     re.I)
 _SPAN_HOURS = {"h": 1, "d": 24, "w": 168}
 MAX_LINES = 20
+# The time a log line starts with, as `kubectl logs --timestamps` prints it.
+STAMP_RE = re.compile(
+    r"^\s*\[?(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:[.,]\d+)?"
+    r"(Z|[+-]\d{2}:?\d{2})?(?![\d:])")
 TIMEOUT = 60
 
 
@@ -133,16 +139,12 @@ def safe_line(line: str, known: Iterable[str] = ()) -> bool:
     return True
 
 
-def _quote(command: str, needle: str, windows: Optional[List[float]] = None
-           ) -> Tuple[str, Optional[int]]:
-    """(the quoted section lines for one needle, how many safe lines named it;
-    None when the command gave no answer or the needle is too general to run).
-    The hours of log the command says it read (WINDOW_RE) are added to windows."""
-    literal, pattern = needle_pattern(needle)
-    if not literal:
-        return ("- `%s`: too general to search (its longest fixed text is under %d "
-                "characters); no lines quoted." % (needle, MIN_LITERAL)), None
-    env = dict(os.environ, LOOM_EVIDENCE_NEEDLE=literal)
+def _run(command: str, literal: str, windows: Optional[List[float]] = None,
+         extra: Optional[Dict[str, str]] = None) -> Tuple[Optional[List[str]], str]:
+    """(the lines the command printed for `literal`, without its window line;
+    None with the reason when it gave no answer). The hours of log the command
+    says it read (WINDOW_RE) are added to windows."""
+    env = dict(os.environ, LOOM_EVIDENCE_NEEDLE=literal, **(extra or {}))
     try:
         # Station config supplies the script; ticket text enters only through env.
         process = subprocess.Popen(["/bin/sh", "-c", command], stdout=subprocess.PIPE,
@@ -155,11 +157,11 @@ def _quote(command: str, needle: str, windows: Optional[List[float]] = None
         except ProcessLookupError:
             pass
         process.communicate()
-        return "- `%s`: command timed out after %d seconds; no lines quoted." % (needle, TIMEOUT), None
+        return None, "command timed out after %d seconds" % TIMEOUT
     except OSError as err:
-        return "- `%s`: command could not start (%s); no lines quoted." % (needle, type(err).__name__), None
+        return None, "command could not start (%s)" % type(err).__name__
     if process.returncode not in (0, 1):
-        return "- `%s`: command exited %d; no lines quoted." % (needle, process.returncode), None
+        return None, "command exited %d" % process.returncode
     lines = []
     for line in stdout.splitlines():
         reported = WINDOW_RE.match(line)
@@ -168,6 +170,64 @@ def _quote(command: str, needle: str, windows: Optional[List[float]] = None
                 windows.append(float(reported.group(1)))
         else:
             lines.append(line)
+    return lines, ""
+
+
+def line_time(line: str) -> Optional[float]:
+    """The epoch time a log line starts with (`2030-01-02T03:04:05Z`, with
+    fractions, a space for the T, an offset or none, which reads as UTC, as
+    `kubectl logs --timestamps` and journald's short-iso print it); None when
+    it starts with none."""
+    found = STAMP_RE.match(line)
+    if not found:
+        return None
+    day, clock, zone = found.groups()
+    try:
+        at = calendar.timegm(time.strptime("%s %s" % (day, clock), "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return None
+    if zone and zone != "Z":
+        sign = 1 if zone[0] == "+" else -1
+        digits = zone[1:].replace(":", "")
+        at -= sign * (int(digits[:2]) * 3600 + int(digits[2:]) * 60)
+    return float(at)
+
+
+def lines_since(command: str, literal: str, since: float, now: float,
+                window_hours: float) -> Optional[List[str]]:
+    """The lines the command prints for `literal` that were written at or
+    after the epoch time `since` (a deploy); None when it gave no answer. The
+    command is handed LOOM_EVIDENCE_SINCE (epoch seconds) to narrow its own
+    search. A line that starts with a time counts by that time; one that does
+    not counts only when the whole log the command read (the hours it reports,
+    else window_hours) starts at or after `since`, so a line from before the
+    deploy is never taken as its evidence."""
+    windows: List[float] = []
+    lines, _ = _run(command, literal, windows,
+                    {"LOOM_EVIDENCE_SINCE": "%d" % int(since)})
+    if lines is None:
+        return None
+    read_from = now - (min(windows) if windows else window_hours) * 3600
+    out = []
+    for line in lines:
+        at = line_time(line)
+        if (at is not None and at >= since) or (at is None and read_from >= since):
+            out.append(line)
+    return out
+
+
+def _quote(command: str, needle: str, windows: Optional[List[float]] = None
+           ) -> Tuple[str, Optional[int]]:
+    """(the quoted section lines for one needle, how many safe lines named it;
+    None when the command gave no answer or the needle is too general to run).
+    The hours of log the command says it read (WINDOW_RE) are added to windows."""
+    literal, pattern = needle_pattern(needle)
+    if not literal:
+        return ("- `%s`: too general to search (its longest fixed text is under %d "
+                "characters); no lines quoted." % (needle, MIN_LITERAL)), None
+    lines, error = _run(command, literal, windows)
+    if lines is None:
+        return "- `%s`: %s; no lines quoted." % (needle, error), None
     matching = [line for line in lines
                 if (pattern.search(line) if pattern else needle in line)]
     safe = [line for line in matching if safe_line(line)]

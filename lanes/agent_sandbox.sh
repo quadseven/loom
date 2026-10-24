@@ -77,17 +77,20 @@ api_rules() {
 # metadata-only literals so getcwd and realpath still work without making
 # HOME listable.
 sandbox_profile() {
-  # The runner unlocks the agy lane's keychain outside the sandbox (agy_unlock),
-  # so the agent never needs it: every lane, including agy, is denied the
-  # keychain server, and so is a validation run ($3 = check), whichever lane it
-  # serves.
+  # Every lane is denied the keychain server, and so is a validation run
+  # ($3 = check), whichever lane it serves. The one exception is the agy agent
+  # run: agy reads its own stored sign-in from the lane user's keychain (the
+  # runner unlocks it outside the sandbox), so that run may reach the server
+  # and read the lane user's keychain folder; /usr/bin/security stays
+  # unrunnable. Denied, every agy run asked for a browser login and failed
+  # auth (2026-10-22 to 10-24, #1620).
   local keychain_deny='(global-name "com.apple.SecurityServer") ' agy_lane="" api_writes="" api_network=""
   case "${3:-}" in
     "" | check) ;;
     api) api_writes="$(api_rules writes)"$'\n' && api_network="$(api_rules network)"$'\n' || return 1 ;;
     *) echo "refusing sandbox: unknown mode $3" >&2; return 1 ;;
   esac
-  [ "$LANE" = agy ] && [ "${3:-}" != check ] && { api_network="$(api_rules network)" || return 1; agy_lane=1; }
+  [ "$LANE" = agy ] && [ "${3:-}" != check ] && { api_network="$(api_rules network)" || return 1; agy_lane=1; keychain_deny=""; }
   local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule="" agy_keychain_deny=""
   if [ -n "${4:-}" ]; then
     [[ "$4" =~ ^[0-9]+$ ]] && [ "$4" -ge 49152 ] && [ "$4" -le 65535 ] ||
@@ -96,7 +99,12 @@ sandbox_profile() {
   fi
   home="$(cd "$HOME" && pwd -P)"
   tree="$(cd "$1" && pwd -P)"
-  if [ "$LANE" = agy ] && [ -n "${AGY_HOME:-}" ]; then
+  # A check run on the agy lane keeps the lane user's keychain folder denied.
+  # The agy agent run does not: reading the one keychain file was not enough,
+  # since the Security framework also reads the lock and metadata files beside
+  # it, and agy still asked for a browser login (2026-10-24, #1620). That is
+  # the boundary agy ran inside before #1465; #1623 moves the credential out.
+  if [ "$LANE" = agy ] && [ -n "${AGY_HOME:-}" ] && [ -z "$agy_lane" ]; then
     agy_keychain_deny="(deny file-read* (subpath \"$(cd "$AGY_HOME" && pwd -P)/Library/Keychains\"))"
   fi
   [ -d "$SKILLS" ] && skills="$(cd "$SKILLS" && pwd -P)"
