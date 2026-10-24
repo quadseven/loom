@@ -1599,6 +1599,17 @@ runnable check, a failed check, or an operator criterion sends the ticket to
 an hour. A verify lane's proof that passes a live or operator criterion
 without station evidence is refused.
 
+The proof a shipped ticket names is read by `bus/live_proof.py`, read-only.
+Each live criterion names at most one step: its log strings searched from the
+deploy on, once the window it names ("within 24 hours") has passed; a check
+the gate runs; or one plain SELECT through the station's query source. A
+step that would write is refused and never run: a `gh api` call with a method
+or field, a kubectl verb other than get or rollout status, a ship, roll,
+restart or any other command, SQL other than one SELECT. When the close gate
+finds evidence for every criterion the close quotes it, matching log lines
+included; otherwise one status line names the missing criterion and the next
+check time. The station does not call it yet (#1608).
+
 ## Post-merge watch
 
 After a Loom auto-merge (a `loom/` lane pull request merged by a Loom App,
