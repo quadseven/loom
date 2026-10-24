@@ -518,6 +518,9 @@ class GitHub:
         # client that does not read the section must not write into it.
         self.status_in_body = False
         self._sleep = sleep
+        # Told each retry wait before it starts (seconds), so a caller can
+        # show that a slow run is waiting and not hung.
+        self.on_wait: Optional[Callable[[float], None]] = None
         self.api = api.rstrip("/")
         self.transport = transport or urllib_transport
         # Where GET answers are kept for conditional requests; None sends none.
@@ -931,13 +934,19 @@ class GitHub:
             except GitHubError as err:
                 if err.status != 0 or attempt == len(delays):
                     raise
-                self._sleep(delays[attempt])
+                self._wait(delays[attempt])
                 continue
             if status in RETRY_STATUSES and attempt < len(delays):
-                self._sleep(delays[attempt])
+                self._wait(delays[attempt])
                 continue
             return status, raw_headers, raw
         raise AssertionError("unreachable")  # pragma: no cover
+
+    def _wait(self, seconds: float) -> None:
+        """Sit out one retry delay, telling `on_wait` first."""
+        if self.on_wait is not None:
+            self.on_wait(seconds)
+        self._sleep(seconds)
 
     def _keep_answer(self, url: str, status: int, data: Any,
                      resp_headers: Dict[str, str]) -> None:

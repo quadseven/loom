@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
+import time
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -630,3 +634,132 @@ class StoredPacketTests(unittest.TestCase):
         tick = dict(self.STORED["ticks"][0], holder="@someone")
         text = self.render(dict(self.STORED, ticks=[tick]))
         self.assertNotIn("@", text)
+
+
+REPO2 = "example-owner/second-repo"
+
+
+class SlowResumeTests(unittest.TestCase):
+    """loom#1578: resume writes each goal as it is read, says when it waits on
+    GitHub, and stops at a deadline instead of running silent."""
+
+    def setUp(self):
+        self.now = [0.0]
+        self.sleeps = []
+        self.err = io.StringIO()
+        for target, value in (("_clock", lambda: self.now[0]), ("_sleep", self.sleep)):
+            patcher = unittest.mock.patch.object(brain, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = unittest.mock.patch.object(sys, "stderr", self.err)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def sleep(self, seconds):
+        self.sleeps.append((seconds, self.err.getvalue()))
+        self.now[0] += seconds
+        self.gh.limited_until = None
+
+    def routes(self):
+        routes = lock_routes()
+        for number, repo in ((1, REPO), (2, REPO2)):
+            goal = {"number": number, "title": "Goal %d" % number, "state": "open",
+                    "labels": [{"name": "loom:goal"}]}
+            routes[("GET", "/repos/%s/issues" % repo)] = (200, [goal])
+            routes[("GET", "/repos/%s/issues/%d/comments" % (repo, number))] = (200, [])
+        return routes
+
+    def stream(self, transport, emit, deadline=8):
+        self.gh = GitHub("t", transport=transport, sleep=self.sleep)
+        brain.stream_resume(self.gh, [REPO, REPO2], "lane-machine", LOCK_REPO, emit,
+                            deadline, NOW, {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
+
+    def test_the_first_goal_is_written_before_the_second_repo_is_read(self):
+        out, seen = [], []
+        routes = Routes(self.routes())
+
+        def slow(method, url, headers, body):
+            self.now[0] += 20  # every answer takes 20 seconds
+            if "/repos/%s/issues?" % REPO2 in url and not seen:
+                seen.append("\n".join(out))
+            return routes(method, url, headers, body)
+
+        self.stream(slow, out.append)
+        self.assertIn("## %s#1 Goal 1" % REPO, seen[0])
+        self.assertNotIn("Goal 2", seen[0])
+        self.assertIn("## %s#2 Goal 2" % REPO2, "\n".join(out))
+        self.assertIn("resume: reading %s (requests: " % REPO, self.err.getvalue())
+        self.assertIn("resume: reading %s (requests: " % REPO2, self.err.getvalue())
+
+    def test_a_rate_limit_wait_is_logged_with_its_length_before_it_starts(self):
+        routes, limited = Routes(self.routes()), []
+
+        def limit(method, url, headers, body):
+            if "/repos/%s/issues?" % REPO in url and not limited:
+                limited.append(1)
+                reset = str(int(time.time()) + 30)
+                return 403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": reset}, b"{}"
+            return routes(method, url, headers, body)
+
+        out = []
+        self.stream(limit, out.append)
+        self.assertEqual(1, len(self.sleeps))
+        seconds, logged = self.sleeps[0]
+        self.assertTrue(29 <= seconds <= 30)
+        self.assertRegex(logged, r"resume: waiting (29|30)s for the GitHub rate limit "
+                                 r"\(resets \d{4}-\d\d-\d\dT[\d:]+Z\)")
+        self.assertIn("## %s#1 Goal 1" % REPO, "\n".join(out))
+
+    def test_a_retry_wait_is_logged_before_it_starts(self):
+        routes, dropped = Routes(self.routes()), []
+
+        def flaky(method, url, headers, body):
+            if "/repos/%s/issues?" % REPO in url and not dropped:
+                dropped.append(1)
+                return 502, {}, b"{}"
+            return routes(method, url, headers, body)
+
+        self.stream(flaky, [].append)
+        self.assertIn("resume: waiting 2s to retry a GitHub read", self.sleeps[0][1])
+
+    def test_past_the_deadline_the_goals_not_reached_are_named(self):
+        out, routes = [], Routes(self.routes())
+
+        def emit(text):
+            out.append(text)
+            if "## %s#1" % REPO in text:
+                self.now[0] += 600  # the first goal took ten minutes
+
+        self.stream(routes, emit, deadline=5)
+        text = "\n".join(out)
+        self.assertIn("## %s#1 Goal 1" % REPO, text)
+        self.assertIn("resume skipped %s: deadline" % REPO2, text)
+        self.assertNotIn("resume skipped %s:" % REPO, text)
+        self.assertNotIn("Goal 2", text)
+        self.assertIn("resume skipped sensitive,finished-epics,verify,audit: deadline", text)
+
+    def test_a_rate_limit_wait_past_the_deadline_is_not_waited_out(self):
+        out, routes = [], Routes(self.routes())
+
+        def limit(method, url, headers, body):
+            if "/repos/%s/issues?" % REPO in url:
+                reset = str(int(time.time()) + 3600)
+                return 403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": reset}, b"{}"
+            return routes(method, url, headers, body)
+
+        self.stream(limit, out.append)
+        self.assertEqual([], self.sleeps)
+        self.assertIn("resume skipped %s: deadline" % REPO, "\n".join(out))
+
+    def test_the_command_takes_a_deadline_and_exits_zero_with_the_skipped_lines(self):
+        routes, out = Routes(self.routes()), io.StringIO()
+        env = {"LOOM_BRIEF_AUTHORS": "allowed-bot"}
+        with unittest.mock.patch.object(brain, "GitHub", lambda *a, **kw: GitHub("t", transport=routes)), \
+                unittest.mock.patch.object(brain, "auth_from_env", lambda: "t"), \
+                unittest.mock.patch.dict(os.environ, env), \
+                contextlib.redirect_stdout(out):
+            code = brain.main(["resume", REPO, REPO2, "--holder", "lane-machine",
+                               "--lock-repo", LOCK_REPO, "--deadline", "0"])
+        self.assertEqual(0, code)
+        self.assertIn("resume skipped %s: deadline\nresume skipped %s: deadline" % (REPO, REPO2),
+                      out.getvalue())

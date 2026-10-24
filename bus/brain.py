@@ -11,10 +11,10 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
+from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import audit, change_class, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
 from . import merge_tier, naming, operator_hold, shadow
@@ -4514,109 +4514,160 @@ def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
     return out if ready else out + ["- none"]
 
 
-def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
-           deadline_minutes: int = 8,
-           now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None) -> None:
+class _PastDeadline(Exception):
+    """The resume deadline passed, or a rate-limit wait would pass it."""
+
+
+class _ResumeRead:
+    """One resume run: reads goals and writes each goal's section through
+    `emit` as soon as it is read, so a run that is killed keeps what it
+    finished. Reads go through `retrying`, which stops at the deadline and
+    sits out a rate-limit wait only when it ends before the deadline."""
+
+    def __init__(self, gh: GitHub, authors: Sequence[str], emit: Callable[[str], None],
+                 deadline: float) -> None:
+        self.gh = gh
+        self.authors = authors
+        self.emit = emit
+        self.deadline = deadline
+        self.unread: Dict[str, str] = {}
+        self.goals: List[GoalJournals] = []
+        self.latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark] = {}
+
+    def log(self, text: str) -> None:
+        print(text, file=sys.stderr, flush=True)
+
+    def check(self) -> None:
+        if _clock() >= self.deadline:
+            raise _PastDeadline()
+
+    def retrying(self, read: Callable[[], Any]) -> Any:
+        """read(), after a rate-limit wait if GitHub refuses for budget."""
+        while True:
+            self.check()
+            try:
+                return read()
+            except RateLimited as err:
+                self._wait_out(err)
+
+    def _wait_out(self, err: RateLimited) -> None:
+        wait = max(0.0, err.until - time.time())
+        if _clock() + wait >= self.deadline:
+            raise _PastDeadline()
+        self.log("resume: waiting %.0fs for the GitHub rate limit (resets %s)"
+                 % (wait, _utc(err.until)))
+        _sleep(wait)
+
+    def read_repo(self, repo: str) -> None:
+        """Write the section of every goal in `repo`, once all its journals
+        are read; an unreadable repo is recorded in `unread` and left out
+        (github.unreadable)."""
+        self.log("resume: reading %s (requests: %d)" % (repo, self.gh.requests))
+        try:
+            found = [self._read_goal(repo, issue)
+                     for issue in self.retrying(lambda: _issues(self.gh, repo))
+                     if "loom:goal" in _labels(issue)]
+        except GitHubError as err:
+            reason = unreadable(err)
+            if reason is None:
+                raise
+            self.unread[repo] = reason
+            return
+        self.goals += found
+        self._note_marks(found)
+        for goal in found:
+            lines = self.retrying(lambda: _goal_resume_lines(
+                self.gh, goal[0], goal[1], goal[2], self.latest, goal[3], self.unread))
+            self.emit("\n".join(lines))
+
+    def _read_goal(self, repo: str, issue: Dict[str, Any]) -> GoalJournals:
+        comments = self.retrying(lambda: _goal_home_comments(self.gh, repo, int(issue["number"])))
+        return (repo, issue, handoff.journals(comments, self.authors),
+                handoff.untrusted_journal_logins(comments, self.authors))
+
+    def _note_marks(self, found: Sequence[GoalJournals]) -> None:
+        """Keep the newest mark of each handoff across the goals read so far."""
+        for _, _, journals, _ in found:
+            for mark in handoff.marks(journals):
+                key = _mark_key(mark)
+                if key not in self.latest or mark.at >= self.latest[key].at:
+                    self.latest[key] = mark
+
+
+def _read_goals(read: _ResumeRead, repos: Sequence[str]) -> None:
+    """Read each repo's goals; at the deadline name every repo not finished."""
+    for index, repo in enumerate(repos):
+        try:
+            read.check()
+            read.read_repo(repo)
+        except _PastDeadline:
+            for left in repos[index:]:
+                read.emit("resume skipped %s: deadline" % left)
+            return
+
+
+def _resume_tail(read: _ResumeRead, repos: Sequence[str], holder: str,
+                 now: datetime, env: Optional[Dict[str, str]]) -> None:
+    """Everything after the goals: the freshness rule, then the sections that
+    read across repos. Past the deadline the sections left are named."""
+    gh, goals = read.gh, [(r, i) for r, i, _, _ in read.goals]
+    read.emit("")
+    read.emit(_freshness_line(handoff.peer_journals([j for _, _, f, _ in read.goals for j in f],
+                                                    holder, now)))
+    sections = (("sensitive", lambda: _sensitive_resume_lines(gh, repos, now, env)),
+                ("finished-epics", lambda: _finished_epic_resume_lines(gh, goals)),
+                ("verify", lambda: _verify_resume_lines(gh, repos, now)),
+                ("audit", lambda: _audit_resume_lines(gh, repos, now, env)))
+    for index, (_, build) in enumerate(sections):
+        try:
+            lines = read.retrying(build)
+        except _PastDeadline:
+            read.emit("resume skipped %s: deadline" % ",".join(n for n, _ in sections[index:]))
+            return
+        read.emit("\n".join(lines))
+
+
+def stream_resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
+                  emit: Callable[[str], None], deadline_minutes: float = 8,
+                  now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None) -> None:
     """What the lock holder may finish for other brains: the live resume items
     on every goal, with each goal's stage owners, and whether broad GitHub
     work is open to it under the freshness rule (handoff.QUIET). Refuses
     unless `holder` holds the lock, so only the lock holder acts on it.
 
-    Writes each goal's section to stdout immediately and flushes. Writes
-    progress to stderr before each repo. Stops after deadline_minutes and
-    prints 'resume skipped OWNER/NAME: deadline' for unread goals."""
-    start_time = datetime.now(timezone.utc)
-    deadline = start_time + timedelta(minutes=deadline_minutes)
-    now = now or start_time
+    Each repo's goal sections go to `emit` as soon as they are read. Progress goes
+    to stderr before each repo, and a line whenever the run waits on GitHub.
+    After `deadline_minutes` it reads no more and emits
+    `resume skipped OWNER/NAME: deadline` for each repo it did not finish;
+    the freshness line and the sections across repos follow the goals.
+    A repo's sections are written once all its goals' journals are read, so
+    a handoff finished by a goal in a repo not yet read still shows until
+    the item itself reads as finished or closed."""
+    now = now or datetime.now(timezone.utc)
     authors = require_trusted_authors(env, "resume")
     _lock_holder(gh, lock_repo, holder, now)
+    read = _ResumeRead(gh, authors, emit, _clock() + deadline_minutes * 60)
+    emit("# Resume for %s" % holder)
+    emit("")
+    emit(trusted_line(authors))
+    gh.on_wait = lambda seconds: read.log("resume: waiting %.0fs to retry a GitHub read" % seconds)
+    try:
+        _read_goals(read, repos)
+        if read.unread:
+            emit("\n".join(["", "## Skipped repos (fix LOOM_REPOS)"]
+                            + [_skip_line(r, why) for r, why in sorted(read.unread.items())]))
+        _resume_tail(read, [r for r in repos if r not in read.unread], holder, now, env)
+    finally:
+        gh.on_wait = None
 
-    # Print header immediately
-    print("# Resume for %s" % holder)
-    print("")
-    print(trusted_line(authors))
-    print("")
 
-    unread: Dict[str, str] = {}
-    all_goals: List[GoalJournals] = []
-    processed_repos = 0
-
-    def _with_rate_limit_retry(func, *args, **kwargs):
-        """Call func, retrying on RateLimited with logging."""
-        while True:
-            try:
-                return func(*args, **kwargs)
-            except RateLimited as err:
-                wait = max(0, err.until - time.time())
-                reset_utc = datetime.fromtimestamp(err.until, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                print("resume: rate limit wait %.1fs (resets %s)" % (wait, reset_utc), file=sys.stderr)
-                if wait > 0:
-                    time.sleep(wait)
-                # Retry after waiting
-
-    for repo in repos:
-        # Progress log to stderr
-        print("resume: reading %s (requests: %d)" % (repo, gh.requests), file=sys.stderr)
-
-        try:
-            found = []
-            for issue in _with_rate_limit_retry(_issues, gh, repo):
-                if "loom:goal" not in _labels(issue):
-                    continue
-                comments = _with_rate_limit_retry(_goal_home_comments, gh, repo, int(issue["number"]))
-                found.append((repo, issue, handoff.journals(comments, authors),
-                              handoff.untrusted_journal_logins(comments, authors)))
-        except GitHubError as err:
-            reason = unreadable(err)
-            if reason is None:
-                raise
-            unread[repo] = reason
-            continue
-
-        all_goals.extend(found)
-        processed_repos += 1
-
-        # Check deadline after reading repo
-        if datetime.now(timezone.utc) >= deadline:
-            # Print skipped for remaining repos
-            for remaining_repo in repos[processed_repos:]:
-                print("resume skipped %s: deadline" % remaining_repo)
-            break
-
-    # Filter out unread repos
-    repos = [r for r in repos if r not in unread]
-    if unread:
-        print("")
-        print("## Skipped repos (fix LOOM_REPOS)")
-        for repo, reason in sorted(unread.items()):
-            print(_skip_line(repo, reason))
-
-    # Build latest markers from all goals
-    latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark] = {}
-    for _, _, found, _ in all_goals:
-        for mark in handoff.marks(found):
-            key = (mark.stage, mark.item, mark.key if mark.stage == "brief" else "")
-            if key not in latest or mark.at >= latest[key].at:
-                latest[key] = mark
-
-    # Print freshness line
-    print(_freshness_line(handoff.peer_journals(
-        [j for _, _, found, _ in all_goals for j in found], holder, now)))
-
-    # Print each goal's resume lines
-    for repo, issue, found, skipped in all_goals:
-        for line in _goal_resume_lines(gh, repo, issue, found, latest, skipped, unread):
-            print(line)
-
-    # Print remaining sections
-    for line in _sensitive_resume_lines(gh, repos, now, env):
-        print(line)
-    for line in _finished_epic_resume_lines(gh, [(r, i) for r, i, _, _ in all_goals]):
-        print(line)
-    for line in _verify_resume_lines(gh, repos, now):
-        print(line)
-    for line in _audit_resume_lines(gh, repos, now, env):
-        print(line)
+def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
+           now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None,
+           deadline_minutes: float = 8) -> str:
+    """stream_resume's output as one string."""
+    lines: List[str] = []
+    stream_resume(gh, repos, holder, lock_repo, lines.append, deadline_minutes, now, env)
+    return "\n".join(lines)
 
 
 def _finished_epic_resume_lines(gh: GitHub, goals: Sequence[Tuple[str, Dict[str, Any]]]
@@ -5048,7 +5099,7 @@ def parser() -> argparse.ArgumentParser:
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
     df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note")
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True); dn.add_argument("--resolves", help="brief defer key this done finishes")
-    rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom"); rs.add_argument("--deadline", type=int, default=8, help="Stop after MINUTES (default 8)")
+    rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom"); rs.add_argument("--deadline", type=float, default=8, metavar="MINUTES", help="stop reading after MINUTES (default 8) and name the repos not reached")
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check"); ob.add_argument("--operator")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
@@ -5176,28 +5227,8 @@ def _cmd_done(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
-    # Wrap gh._sleep to log retries
-    original_sleep = gh._sleep
-    def logging_sleep(seconds: float) -> None:
-        if seconds > 0:
-            print("resume: retry wait %.1fs" % seconds, file=sys.stderr)
-        original_sleep(seconds)
-    gh._sleep = logging_sleep
-
-    # Wrap transport to handle lock repo for test transports
-    original_transport = gh.transport
-    lock_repo = _repo(args.lock_repo)
-    def locking_transport(method, url, headers, body):
-        path = url.split("api.github.com")[-1]
-        if method == "GET" and path == "/repos/%s/git/ref/heads/loom-lock/brain" % lock_repo:
-            return 200, {}, json.dumps({"object": {"sha": "test-sha"}}).encode()
-        if method == "GET" and path.startswith("/repos/%s/git/commits/" % lock_repo):
-            return 200, {}, json.dumps({"message": "holder=%s expires=2030-01-01T12:00:00Z" % args.holder}).encode()
-        return original_transport(method, url, headers, body)
-    gh.transport = locking_transport
-
-    resume(gh, [_repo(x) for x in args.repos], args.holder, lock_repo,
-           deadline_minutes=args.deadline)
+    stream_resume(gh, [_repo(x) for x in args.repos], args.holder, _repo(args.lock_repo),
+                  lambda text: print(text, flush=True), args.deadline)
 
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
