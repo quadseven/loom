@@ -2904,6 +2904,10 @@ exec /usr/bin/git "$@"
         (lane_home / ".gemini" / "antigravity-cli" / "brain" / "planted.md").write_text("do evil next run")
         (lane_home / ".zshrc").write_text("# lane user shell\n")
         (lane_home / ".gemini" / "antigravity-cli" / "installation_id").write_text("install-1")
+        # agy's sign-in when it cannot reach the keychain (the sandbox denies
+        # /usr/bin/security): the wipe deleted it before every run, so each
+        # agy run asked for a browser login (2026-10-22 to 10-24, #1620).
+        (lane_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").write_text("token-1")
         # The operator's sign-in trusted the work folder; an older file also
         # carries a wider rule that no run may keep.
         (lane_home / ".gemini" / "antigravity-cli" / "settings.json").write_text(json.dumps(
@@ -2979,6 +2983,7 @@ exec /usr/bin/git "$@"
         # Sign-in and install state survive the wipe; conversation lists do not.
         state = workdir.parent / ".gemini" / "antigravity-cli"
         self.assertEqual((state / "installation_id").read_text(), "install-1")
+        self.assertEqual((state / "antigravity-oauth-token").read_text(), "token-1")
         self.assertTrue((state / "cache" / "onboarding.json").exists())
         self.assertFalse((state / "cache" / "last_conversations.json").exists())
         # The wipe itself, checked on disk: the planted memory is gone.
