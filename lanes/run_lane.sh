@@ -1270,16 +1270,32 @@ key_held() {
 # output, so nothing the provider said, or a run echoed, can reach a public
 # issue.
 ask_renew_key() {
-  local reason="$1" param title body number existing
+  local reason="$1" param title body
   param="${reason#"$AUTH_WHY_PREFIX "}"
   title="Provider key expired: renew $param"
   body="$(printf '%s\n\nLane %s could not use the provider key it reads.\n\nWhat to renew: `%s`\n\nThe lane log holds what the provider said. A lane that reads that parameter is unavailable until the value there changes.\n' \
     "$KEY_ASK_MARKER" "$SLOT" "$param")"
+  file_ask "$title" "$body" "Could not use the key again"
+}
+
+# The operator's ask for a lane whose CLI sign-in lapsed: $1 is the reason.
+# Filed once per lane, like ask_renew_key, and names no agent output.
+ask_sign_in() {
+  local title body
+  title="Lane $LANE sign-in lapsed: sign in the $LANE lane CLI again"
+  body="$(printf '%s\n\nLane %s waited for a sign-in nobody gave and timed out: its CLI sign-in lapsed. Sign in the %s lane CLI again on the lane machine (an interactive login). Until then each run on the lane fails as auth.\n' \
+    "$KEY_ASK_MARKER" "$SLOT" "$LANE")"
+  file_ask "$title" "$body" "Sign-in failed again"
+}
+
+# File a needs-operator ask titled $1 with body $2, or, with one already open,
+# keep one comment on it with a running count headed $3, never one per failure.
+file_ask() {
+  local title="$1" body="$2" headline="$3" number existing
   existing="$(open_issue "$title")"
   if [ -n "$existing" ]; then
-    # One comment on the ask with a running count, never one per failure.
     printf '' | upsert_sticky_comment "$FACTORY_REPO" "$existing" "$KEY_REPEAT_MARKER" repeat \
-      --headline "Could not use the key again" --items-label "Lanes seen" --item "$SLOT" ||
+      --headline "$headline" --items-label "Lanes seen" --item "$SLOT" ||
       echo "could not update the open ask $FACTORY_REPO#$existing" >> "$LOG"
     return 0
   fi
@@ -2977,6 +2993,14 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$FAIL_CLASS" = auth ]; then
     # The provider refused the key, not the lane's work, so the brief is handed
     # on rather than spent and the rest of the inbox waits for the operator.
+    if printf '%s\n' "$FAILURE_OUT" | grep -qiE "$SIGNIN_RE"; then
+      # The CLI's own sign-in lapsed: no key parameter to renew or wait on,
+      # even when the lane names one (agy names the lane user's password).
+      AUTH_WHY="sign-in lapsed: sign in the $LANE lane CLI again"
+      ask_sign_in "$AUTH_WHY"
+      park "$BRIEF" "agent exited $STATUS: $AUTH_WHY$TIMEDOUT_NOTE" auth
+      break
+    fi
     AUTH_WHY="$(key_renew_reason)"
     if key_renewable; then
       # Every slot that bills that key goes unavailable until the value at the
