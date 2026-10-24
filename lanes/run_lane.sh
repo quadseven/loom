@@ -404,6 +404,13 @@ pr_body() {
   criteria="$(section 'Acceptance criteria' "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
   [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$TREE/$SUMMARY_FILE" 2>/dev/null)"
   [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$1")"
+  # The gate wants three bullets under Acceptance criteria and a ticket may
+  # state fewer (the factory files a follow-up ticket with the one criterion
+  # a lane left not built), so the body carries the standard ones as well.
+  # A body the gate refuses holds the pull request.
+  criteria="$(printf '%s\n' "$criteria" |
+    PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan pad-criteria - ||
+    printf '%s' "$criteria")"
   # The lane's own word on operator steps, else the ticket's; a body with
   # neither says so, and the factory's keyword backstop still reads both.
   ops="$(section "$OPERATOR_SECTION" "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"

@@ -93,7 +93,10 @@ it the title is the ticket id.
 
 The runner uses the `Why`, `What`, `Acceptance criteria`, `Size`, `Out of
 scope` and `Operator steps before merge` sections when it builds the pull
-request body. Keep these headings exactly as written. A brief whose change
-needs a person first (a data migration, a cutover, a VM resize) names those
-steps in `Operator steps before merge`: the pull request is then held for
-the operator instead of merging (docs/BRAIN.md, Operator holds).
+request body. Keep these headings exactly as written. The body carries the
+standard Acceptance criteria bullets when the ticket states fewer than the
+three the review bot's plan check wants, so a ticket with one criterion still
+opens a body the check accepts. A brief whose change needs a person first (a
+data migration, a cutover, a VM resize) names those steps in `Operator steps
+before merge`: the pull request is then held for the operator instead of
+merging (docs/BRAIN.md, Operator holds).
