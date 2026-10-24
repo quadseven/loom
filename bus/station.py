@@ -482,6 +482,23 @@ VERIFY_RESERVE_FILE = "verify-reserve.json"
 # questions a pass, each up to bus/fabric.py's TIMEOUT, and the first
 # FABRIC_CITES cited pull requests checked against GitHub. FABRIC_ASKED_FILE
 # keeps the body each ticket was asked about, so a ticket is asked once.
+# A loom:ticket with no state label is queued (loom#1653), a few an hour.
+STATELESS_EVERY = 3600
+STATELESS_PER_RUN = 5
+STATELESS_FILE = "stateless.json"
+STATELESS_TEXT = ("Queued: this ticket carried no state label, so nothing would route it "
+                  "to a lane (loom#1653).")
+# Labels that mean someone or something already holds a ticket: any Loom
+# state or hold, a person's claim, an operator ask, or a wait.
+_HOLD_LABELS = {"loom:" + state for state in brain.STATES} | {
+    "loom:triage", "loom:human", "loom:held", "loom:ready", "loom:awaiting-evidence",
+    "loom:closed-unmerged", "needs-operator", "needs-brain"}
+
+
+def _holds_ticket(name: str) -> bool:
+    return name in _HOLD_LABELS or name.startswith(("claim:", "wait:"))
+
+
 FABRIC_ASKS = 2
 FABRIC_CITES = 3
 FABRIC_ASKED_FILE = "fabric-asked.json"
@@ -7670,6 +7687,47 @@ class Station:
             state["_at"] = self.now
             _write_json(path, state)
 
+    def queue_stateless_tickets(self) -> None:
+        """Queue each open loom:ticket issue that carries no state label and
+        nobody holds (loom#1653): triage reads only issues that are not tickets
+        yet and the factory routes only loom:queued ones, so a ticket filed with
+        loom:ticket alone waited forever (33 of them on 2026-10-24). A claim,
+        an operator ask, a wait, or any state or hold label leaves it alone. At
+        most STATELESS_PER_RUN a run, at most once an hour, each a routine
+        status event and no comment."""
+        path = os.path.join(self.state, STATELESS_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        last = state.get("_at")
+        if isinstance(last, (int, float)) and 0 <= self.now - last < STATELESS_EVERY:
+            return
+        left = STATELESS_PER_RUN
+        try:
+            for repo in self._verify_repos():
+                if left <= 0 or self._deferred():
+                    break
+                try:
+                    found = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open&per_page=100" % repo)
+                except GitHubError as err:
+                    _say("could not read the tickets of %s: %s" % (repo, err))
+                    continue
+                for issue in found:
+                    if left <= 0:
+                        break
+                    if not isinstance(issue, dict) or "pull_request" in issue:
+                        continue
+                    names = _label_names(issue)
+                    if any(_holds_ticket(name) for name in names):
+                        continue
+                    number = int(issue["number"])
+                    self._add_label(repo, number, "loom:queued")
+                    self._routine(repo, number, STATELESS_TEXT)
+                    _say("queued %s#%d: a ticket with no state label is never routed" % (repo, number))
+                    left -= 1
+        finally:
+            state["_at"] = self.now
+            _write_json(path, state)
+
     def release_stale_claims(self) -> None:
         """Take back another operator's claims their claimer left alone for
         claim_idle_hours (bus/stale_claims.py): remove the claim label and
@@ -10451,6 +10509,7 @@ class Station:
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.close_done_tickets, self.settle_orphan_sources,
                      self.settle_claimed_tickets, self.release_stale_claims,
+                     self.queue_stateless_tickets,
                      self.restate_shipped_live,
                      self.health_intake, self.intake_friction,
                      # The packet after the tick's row, so it renders that tick.

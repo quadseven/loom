@@ -3028,8 +3028,9 @@ class CorruptStateTest(Base):
         # open pull requests (their plan checks) still run, and so does
         # reconciliation's read of the open tickets (loom#784) and the
         # done-ticket close step's, the hourly read of rewritten sources, and
-        # the changed label-set sync.
-        self.assertEqual(self.run_pass().requests, 12)
+        # the changed label-set sync, and the hourly read of open tickets for
+        # ones with no state label (loom#1653).
+        self.assertEqual(self.run_pass().requests, 13)
 
 
 class TicketsTest(unittest.TestCase):
@@ -5687,6 +5688,25 @@ class VerifyBeforeBuildTest(Base):
         names no ticket, so no Refs line or branch links them."""
         self.fake.add(12, state="briefed")
         self.merged(body="A fix.", title=title)
+
+    def test_a_ticket_with_no_state_label_is_queued_and_claimed_ones_are_left(self):
+        # loom#1653: 33 open tickets carried loom:ticket and no state label on
+        # 2026-10-24; triage reads only issues that are not tickets yet and the
+        # factory routes only loom:queued, so they waited forever.
+        for n in (21, 22, 23, 24):
+            self.fake.add(n)
+        self.fake.issues[21]["labels"] = [{"name": "loom:ticket"}]
+        self.fake.issues[22]["labels"] = [{"name": "loom:ticket"}, {"name": "claim:ccqw"}]
+        self.fake.issues[23]["labels"] = [{"name": "loom:ticket"}, {"name": "needs-operator"}]
+        self.fake.issues[24]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:human"}]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.queue_stateless_tickets()
+        self.assertIn("loom:queued", self.fake.names(21))
+        for n in (22, 23, 24):
+            self.assertNotIn("loom:queued", self.fake.names(n), n)
+        # The only write besides the label is the routine status event.
+        self.assertTrue(all(c["body"].startswith("<!-- loom:status v1 -->")
+                            for c in self.fake.comments[21]), self.fake.comments[21])
 
     def test_a_merged_pull_request_fabric_cites_sends_the_ticket_to_verify(self):
         # loom#1437: the work merged without a link to the ticket, and a lane
