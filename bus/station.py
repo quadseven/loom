@@ -482,6 +482,10 @@ VERIFY_RESERVE_FILE = "verify-reserve.json"
 # questions a pass, each up to bus/fabric.py's TIMEOUT, and the first
 # FABRIC_CITES cited pull requests checked against GitHub. FABRIC_ASKED_FILE
 # keeps the body each ticket was asked about, so a ticket is asked once.
+# A pass step that takes this long is logged with its time and requests, so a
+# long pass names its cause: on 2026-10-24 passes ran 25 to 98 minutes and
+# 3000 to 6300 requests, and nothing said which step spent them.
+SLOW_STEP_SECONDS = 60
 # A loom:ticket with no state label is queued (loom#1653), a few an hour.
 STATELESS_EVERY = 3600
 STATELESS_PER_RUN = 5
@@ -4074,6 +4078,18 @@ class Station:
         found[number] = ticket
         _say("%s#%d: linked pull request #%d is open" % (repo, number, int(pr["number"])))
 
+    def _timed(self, step: Any) -> None:
+        """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
+        more, with the requests it made (as the step loop does)."""
+        started, asked = time.monotonic(), self.gh.requests
+        try:
+            step()
+        finally:
+            took = time.monotonic() - started
+            if took >= SLOW_STEP_SECONDS:
+                _say("step %s took %ds and %d requests"
+                     % (step.__name__, took, self.gh.requests - asked))
+
     def reconcile_pull_requests(self) -> None:
         """Repair ticket state from the PR's authoritative terminal state.
 
@@ -5202,15 +5218,14 @@ class Station:
 
     @staticmethod
     def _fix_round_count(comments: List[Any], authors: set) -> int:
-        rounds_seen = set()
-        for comment in comments:
-            if (not isinstance(comment, dict)
-                    or tickets._login(comment.get("user")) not in authors):
-                continue
-            head = Station._fix_head(str(comment.get("body") or ""))
-            if head:
-                rounds_seen.add(head)
-        return len(rounds_seen)
+        """The fix rounds sent: each trusted loom:fix comment with a head
+        marker is one round, whether or not the round moved the head. Counting
+        distinct heads let a round that failed [transient] and pushed nothing
+        repeat without end (grug#1315: 15 rounds, 9 on one head, 2026-10-24)."""
+        return sum(1 for comment in comments
+                   if isinstance(comment, dict)
+                   and tickets._login(comment.get("user")) in authors
+                   and Station._fix_head(str(comment.get("body") or "")))
 
     @staticmethod
     def _fix_head(body: str) -> Optional[str]:
@@ -10478,22 +10493,22 @@ class Station:
         self.report_outcomes()
         if not self._deferred():
             try:
-                self.reconcile_pull_requests()
+                self._timed(self.reconcile_pull_requests)
             except RateLimited:
                 raise
             except (GitHubError, OSError) as err:
                 _say("pull request reconciliation failed: %s" % err)
         if not self._deferred():
             try:
-                self.hand_back()
+                self._timed(self.hand_back)
             except RateLimited:
                 raise
             except (GitHubError, OSError) as err:
                 _say("hand_back failed: %s" % err)
-        self.claim_new()
+        self._timed(self.claim_new)
         if not self._deferred():
             try:
-                self.assign_queued()
+                self._timed(self.assign_queued)
             except RateLimited:
                 raise
             except (GitHubError, OSError) as err:
@@ -10524,7 +10539,7 @@ class Station:
             if self._deferred():
                 break
             try:
-                step()
+                self._timed(step)
             except RateLimited:
                 raise
             except (GitHubError, OSError, ValueError) as err:

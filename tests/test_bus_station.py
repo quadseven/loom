@@ -2920,6 +2920,19 @@ class HandBackTest(unittest.TestCase):
         fixes = [c for c in self.gh.comments if str(c["body"]).startswith(tickets.FIX_MARKER)]
         self.assertEqual(len(fixes), 3)
 
+    def test_fix_rounds_on_one_head_count_toward_the_cap(self):
+        # grug#1315, 2026-10-24: its fix rounds failed [transient] and pushed
+        # nothing, so the head stayed the same; the cap counted distinct heads
+        # (2) and sent 15 rounds, 9 of them for one head.
+        self.gh.comments.extend({"user": {"login": "alice-example"},
+                                 "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % ("a" * 40)}
+                                for _ in range(3))
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
+            self.run_hand_back(checks=[("lint", "failed")])
+        self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        fixes = [c for c in self.gh.comments if str(c["body"]).startswith(tickets.FIX_MARKER)]
+        self.assertEqual(len(fixes), 3)
+
     def cap_events(self):
         return [text for c in self.gh.comments if status.is_status(c["body"])
                 for _, text in status.parse(c["body"]) if text.startswith("The fix round cap")]
@@ -3007,6 +3020,24 @@ class HandBackTest(unittest.TestCase):
         self.run_hand_back()
         self.assertEqual(len(self.gh.comments), 1)
         self.assertEqual(self.ready_events(), [READY % ("b" * 40), READY % ("a" * 40)])
+
+
+class StepTimingTest(Base):
+    def test_a_slow_step_is_logged_with_its_time_and_requests(self):
+        # 2026-10-24: passes ran 25 to 98 minutes with 3000 to 6300 requests,
+        # and nothing named the step that spent them.
+        err = io.StringIO()
+        with mock.patch.object(station, "SLOW_STEP_SECONDS", 0), contextlib.redirect_stderr(err):
+            self.run_pass()
+        lines = [line for line in err.getvalue().splitlines() if " step triage_backlogs took " in line]
+        self.assertEqual(len(lines), 1, err.getvalue()[-2000:])
+        self.assertRegex(lines[0], r"step triage_backlogs took \d+s and \d+ requests")
+
+    def test_a_quick_step_is_not_logged(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_pass()
+        self.assertNotIn(" step triage_backlogs took ", err.getvalue())
 
 
 class CorruptStateTest(Base):
