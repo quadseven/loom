@@ -724,14 +724,11 @@ def lane_pr_stalled(f: Facts) -> List[Breach]:
 
 def remote_silent(f: Facts) -> List[Breach]:
     """A remote lane whose newest heartbeat is older than its beat_max. A
-    lane that never posted one is not running anywhere and is left alone, and
-    so is a retired one."""
+    lane that never posted one is not running anywhere and is left alone."""
     if f.beats is None:
         return []
     out = []
     for lane, at in sorted(f.beats.items()):
-        if REMOTE_LANES.get(lane, {}).get("retired"):
-            continue
         limit = REMOTE_LANES.get(lane, {}).get("beat_max")
         if at is None or not isinstance(limit, (int, float)) or f.now - at <= limit:
             continue

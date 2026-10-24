@@ -47,10 +47,8 @@ def base_lane(slot: str) -> str:
 # beat_max: seconds a remote worker's last heartbeat counts as up. Muse runs
 # on its own schedule (about every 30 minutes), not every minute like a
 # local runner, so its window is longer than HEARTBEAT_MAX_AGE.
-# A retired remote lane takes no work and is never reported silent: Muse was
-# retired as a Loom brain and lane on 2026-10-24 (its schedules deleted).
 REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 1,
-                         "beat_max": 2 * 3600, "retired": True}}
+                         "beat_max": 2 * 3600}}
 LANES += list(REMOTE_LANES)
 
 # The model ladder for repeatedly stuck work is bus/factory.py LADDER, and

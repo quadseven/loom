@@ -1493,9 +1493,7 @@ class Factory:
         return self._private[repo]
 
     def _up(self, lane: str) -> bool:
-        """A lane that is up and not at a limit. A retired remote lane never is."""
-        if REMOTE_LANES.get(lane, {}).get("retired"):
-            return False
+        """A lane that is up and not at a limit."""
         return lane not in self.limited and (self.available is None or lane in self.available)
 
     def _serves(self, lane: str, model: str) -> bool:
