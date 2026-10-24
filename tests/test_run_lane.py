@@ -4348,6 +4348,7 @@ exit %d
         ("AuthenticationError: HTTP 401 Unauthorized", 1, True, "auth"),
         ("panic: something broke before any edit", 1, False, "transient"),
         ("killed", 137, True, "transient"),
+        ("terminated", 143, True, "transient"),
         ('level=ERROR message=failed error="ProviderModelNotFoundError: Model not found: '
          'openrouter/vendor/gone:free. Did you mean: vendor/other:free?"\n'
          'Error: {"name": "UnknownError", "message": "Unexpected server error."}', 1, False, "limit"),
@@ -5249,6 +5250,19 @@ exec /usr/bin/git "$@"
         calls = self.log.read_text()
         self.assertIn("Repo: example/repo", calls)
         self.assertIn("exit 2", calls)
+
+    def test_a_base_check_terminated_by_sigterm_is_transient_without_an_incident(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        contract = ("interpreter: loom-test-python\n"
+                    "check: kill -TERM $$\n")
+        self.contract_repo(contract=contract)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: [transient]", self.lane_log())
+        self.assertNotIn("failed: [factory]", self.lane_log())
+        self.assertFalse(list((self.loom / "state" / "incidents").glob("*base-check")))
 
     def test_a_base_check_incident_is_recorded_then_closed_when_the_check_passes(self):
         # A stub sandbox: these tests run inside a lane's own check sandbox,
