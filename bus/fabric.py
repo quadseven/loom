@@ -17,11 +17,14 @@ each pull request card the answer cites.
 """
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import re
+import sys
 import urllib.error
 import urllib.request
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from .github import read_ssm
 
@@ -70,3 +73,34 @@ def same_title(cited: str, actual: str) -> bool:
     a = " ".join(str(cited).lower().split())
     b = " ".join(str(actual).lower().split())
     return bool(a) and bool(b) and (a == b or (len(a) >= 30 and b.startswith(a.rstrip(". "))))
+
+
+def _argument_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="python3 -m bus.fabric")
+    sub = p.add_subparsers(dest="command", required=True)
+    a = sub.add_parser("ask", help="ask the Fabric workspace a whole-library question")
+    a.add_argument("question", help="the question to ask Fabric")
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """The `python3 -m bus.fabric ask` command: ask Fabric once and print the answer.
+
+    The key is read from the SSM parameter named by LOOM_FABRIC_KEY_SSM for each
+    call and never printed; the command only asks, it never writes or deletes a
+    note. With no key configured it prints nothing and exits 0.
+    """
+    args = _argument_parser().parse_args(argv)
+    if args.command != "ask":
+        return 1
+    question = " ".join(str(args.question or "").split())
+    if not question:
+        return 1
+    key_ssm = os.environ.get("LOOM_FABRIC_KEY_SSM", "").strip()
+    region = os.environ.get("LOOM_AWS_REGION", "").strip() or "us-east-1"
+    print(ask(question, key_ssm, region))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
