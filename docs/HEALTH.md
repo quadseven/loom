@@ -127,16 +127,27 @@ Per finding, on each read:
   since <time>". That is the evidence the brain verifies against. A ticket
   that carries several findings gets it once all of them are gone. A finding
   that flaps (gone, back, gone) leaves that one note: a flip inside 24 hours of
-  the note writes nothing, a later one edits the note with a count. The
-  station never closes a ticket.
+  the note writes nothing, a later one edits the note with a count. That
+  note closes nothing.
 - The finding is gone, its ticket is `loom:shipped` and the finding has
   stayed gone 24 hours counted from the later of the absent stamp and the
   ship: one proof comment naming the absent stamp, the ship time, the last
   `checked_at` read and the goal (never the URL). A finding that went absent
   before the ship counts from the ship, and the comment says so; one that
   returns restarts the window. The next verify run takes such a ticket first
-  and quotes the comment in its brief; the station ticks no criterion, so
-  the pull request criteria are still judged by the verifier.
+  and quotes the comment in its brief; the proof comment ticks no
+  criterion; the settle step below may.
+- The finding is gone from every marker of an open ticket and has stayed gone for
+  the ticket's window (24 hours, or the "for N hours" or "for N days" its Live
+  line names; counted from the ship on a shipped ticket): the station ticks the
+  absence criterion on its own read and, when every other criterion is proven,
+  closes the ticket as completed with one comment quoting the absent stamp and
+  the last `checked_at` read. A code criterion is proven by a linked merged
+  pull request (the ticket is merged, shipped or verified) or an earlier tick; a
+  live or operator criterion, or any criterion on a ticket not yet merged, only
+  by a ticket line starting `Satisfied elsewhere:`. With anything unproven it
+  leaves one status line naming it and the ticket open. A finding that returns
+  restarts the window. Shadow mode records the close and does not send it.
 - The finding's last ticket was closed as not planned: it is not filed
   again. The station remembers a finding's ticket for 30 days after the
   ticket closed and the finding went quiet, so a finding that comes back
