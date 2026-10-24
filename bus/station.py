@@ -81,6 +81,11 @@ RUNAWAY = "loom:runaway"
 # How often the station moves the tickets that sit under a goal home and
 # under no epic into an open intake epic of that goal (decision 0003).
 OUTSIDE_EPIC_EVERY = 3600
+# How long a ticket a factory incident holds must wait before the station
+# lets one through as a probe: one hour.
+PROBE_INTERVAL = 3600
+# The state file that records when the station last probed an open incident.
+PROBE_STATE = "factory_probe.json"
 # The marker on the comment the station posts when it reviews a runaway hold
 # caused by one dead lane (loom#565): the release, or why the hold stays.
 DEAD_LANE_MARKER = "<!-- loom:runaway-dead-lane v1 lane=%s -->"
@@ -1592,6 +1597,9 @@ class Station:
         self._claimed_rereviews: Dict[str, Any] = {}
         self._claimed_writes = 0
         self._branch_cache: Dict[str, str] = {}
+        # The default branch head the station last read per repo, cached for
+        # the pass so a probe can tell whether the head moved.
+        self._head_cache: Dict[str, str] = {}
         # Per pass: each path-scoped repo's workflow filters, and its deploy runs.
         self._path_filters: Dict[str, Dict[str, List[str]]] = {}
         self._manual_listed: Dict[str, List[str]] = {}
@@ -4301,6 +4309,31 @@ class Station:
             self._branch_cache[repo] = str(data.get("default_branch") or "")
         return self._branch_cache[repo]
 
+    def _default_branch_head(self, repo: str) -> str:
+        """The SHA of the repo's default branch head, cached for the pass.
+
+        Empty when it cannot be read: a probe then falls back to the hourly
+        timer instead of a head change.
+        """
+        if repo in self._head_cache:
+            return self._head_cache[repo]
+        branch = self._default_branch(repo)
+        head = ""
+        if branch:
+            try:
+                resp = self.gh.rest("GET", "/repos/%s/commits/%s" % (repo, branch))
+            except RateLimited:
+                raise
+            except GitHubError:
+                resp = None
+            data = resp.data if resp is not None else None
+            if isinstance(data, list) and data:
+                head = str((data[0] or {}).get("sha") or "")
+            elif isinstance(data, dict):
+                head = str(data.get("sha") or "")
+        self._head_cache[repo] = head
+        return head
+
     def _hand_reverts(self, repo: str, pulls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """The hand-made revert pull requests among `pulls`, newest first."""
         branch = self._default_branch(repo)
@@ -5001,6 +5034,75 @@ class Station:
             return
         for key, info in list(held.items()):
             self._release_held(key, info, closed_incidents)
+        # Re-read: _release_held forgets the tickets of closed incidents, so
+        # only holds for still-open incidents remain. A probe may let one
+        # through for each of them.
+        held = self._held_tickets()
+        self._probe_held(held, closed_incidents)
+
+    def _probe_held(self, held: Dict[str, Any],
+                    closed_incidents: Dict[str, Any]) -> None:
+        """Let one held ticket through as a probe for each open factory
+        incident whose held tickets have all waited long enough, when the
+        default branch head moved since the incident was filed or an hour
+        passed since the last probe. A passing probe closes the incident
+        through the lane path; a failing one re-holds the ticket and waits
+        the full interval before the next probe."""
+        by_incident: Dict[str, List[Tuple[str, Any]]] = {}
+        for key, info in held.items():
+            if not isinstance(info, dict):
+                continue
+            ref = info.get("incident")
+            if ref and ref not in closed_incidents:
+                by_incident.setdefault(ref, []).append((key, info))
+        now = self.now
+        for ref, items in by_incident.items():
+            if not all(self._probe_due(info) for _, info in items):
+                continue
+            if not self._probe_eligible(ref, items, now):
+                continue
+            key, info = items[0]
+            repo, _, num = key.rpartition("#")
+            number = int(num) if num.isdigit() else 0
+            self._release_probe(repo, number)
+            self._forget_held(key)
+            self._note_probe(ref, now)
+
+    def _probe_due(self, info: Any) -> bool:
+        at = info.get("at") if isinstance(info, dict) else None
+        return isinstance(at, (int, float)) and self.now - at >= PROBE_INTERVAL
+
+    def _probe_eligible(self, ref: str, items: List[Tuple[str, Any]],
+                        now: float) -> bool:
+        repo = items[0][0].rpartition("#")[0]
+        stored_head = str(items[0][1].get("head") or "") if isinstance(items[0][1], dict) else ""
+        current_head = self._default_branch_head(repo)
+        head_changed = bool(stored_head and current_head and stored_head != current_head)
+        if head_changed:
+            return True
+        probe = _read_json(os.path.join(self.state, PROBE_STATE), {})
+        last = probe.get(ref, {}).get("at", 0) if isinstance(probe, dict) else 0
+        return isinstance(last, (int, float)) and now - last >= PROBE_INTERVAL
+
+    def _release_probe(self, repo: str, number: int) -> None:
+        """Re-queue one held ticket as a probe: a label move, no comment."""
+        try:
+            issue = self._issue(repo, number)
+        except RateLimited:
+            raise
+        except GitHubError:
+            return
+        if RUNNING not in _label_names(issue):
+            return
+        self._relabel(repo, number, "loom:queued")
+        _say("factory probe: %s#%d released to probe the incident" % (repo, number))
+
+    def _note_probe(self, ref: str, now: float) -> None:
+        probe = _read_json(os.path.join(self.state, PROBE_STATE), {})
+        if not isinstance(probe, dict):
+            probe = {}
+        probe[ref] = {"at": now}
+        _write_json(os.path.join(self.state, PROBE_STATE), probe)
 
     def _closed_incidents(self) -> Dict[str, Dict[str, Any]]:
         """Closed factory incidents the runner filed, by "owner/repo#n".
@@ -5075,7 +5177,24 @@ class Station:
 
     def _note_held(self, repo: str, number: int, incident: Optional[str]) -> None:
         held = self._held_tickets()
-        held["%s#%d" % (repo, number)] = {"incident": incident, "at": self.now}
+        key = "%s#%d" % (repo, number)
+        info = held.get(key) if isinstance(held, dict) else None
+        head = str(info.get("head") or "") if isinstance(info, dict) else ""
+        if not head:
+            # Head at incident filing: only the first hold for an incident
+            # records it, so a probe can tell whether the default branch
+            # head moved while the incident stayed open.
+            tracked = any(
+                isinstance(other, dict) and other.get("incident") == incident
+                for other in held.values())
+            if not tracked:
+                head = self._default_branch_head(repo)
+        if info is None:
+            info = {}
+        info["incident"] = incident
+        info["at"] = self.now
+        info["head"] = head
+        held[key] = info
         _write_json(os.path.join(self.state, "factory_held.json"), held)
 
     def _forget_held(self, key: str) -> None:

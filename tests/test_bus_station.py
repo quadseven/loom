@@ -58,6 +58,7 @@ class FakeGitHub:
         self.pulls = []
         self.calls = []
         self.version = 1
+        self.head_sha = "0" * 40
         self.lanes_issues = []
         self.status_comments = []
         self.created = []
@@ -199,7 +200,9 @@ class FakeGitHub:
                 return reply(200, [i for i in self.factory_incidents
                                    if any(l.get("name") == "loom:factory"
                                           for l in i.get("labels", []))])
-            return reply(200, self.factory_incidents)
+            # GitHub's state=closed only returns closed issues: an open
+            # incident must not look closed to the station.
+            return reply(200, [i for i in self.factory_incidents if i.get("state") == "closed"])
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if method == "GET" and rest == "labels":
             return reply(200, [{"name": name, "color": value["color"],
@@ -240,6 +243,9 @@ class FakeGitHub:
                 return reply(self.check_runs_status, {"message": "refused"})
             found = self.check_runs.get(runs.group(1), [])
             return reply(200, {"total_count": len(found), "check_runs": found})
+        commits = re.match(r"commits/([^/]+)$", rest)
+        if method == "GET" and commits:
+            return reply(200, [{"sha": self.head_sha}])
         files = re.match(r"pulls/(\d+)/files$", rest)
         if method == "GET" and files:
             return reply(200, self.pull_files.get(int(files.group(1)), []))
@@ -5195,6 +5201,86 @@ class FactoryIncidentTest(Base):
         with mock.patch.object(station, "FACTORY_REPO", REPO):
             self.run_pass()
         self.assertIn("loom:queued", self.fake.names(12))
+
+
+class ProbeTest(FactoryIncidentTest):
+    """A probe lets one held ticket through when an open factory incident
+    holds every ticket of a repo and none of them can run."""
+
+    def _open_incident(self):
+        labels = [{"name": "loom:factory"}]
+        self.fake.factory_incidents = [{
+            "number": 99,
+            "title": "Factory incident: %s validation base-check" % REPO,
+            "state": "open",
+            "body": ("<!-- loom:factory-incident v1 -->\n\nRepo: %s\nKind: base-check\n"
+                     "Ticket: %s#12\n\ncheck: make check (exit 1)\n" % (REPO, REPO)),
+            "labels": labels}]
+
+    def _held_file(self, held):
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(held, fh)
+
+    def test_a_probe_requeues_exactly_one_held_ticket_when_the_head_moved(self):
+        # An open base-check incident holds every ticket of the repo, all of
+        # them past the probe interval, and the default branch head moved
+        # since the incident was filed: the station passes exactly one through
+        # as a probe.
+        self.heartbeat("muse")
+        self.fake.add(12, lane="muse", body=PLAIN, state="running")
+        self.fake.add(13, lane="muse", body=PLAIN, state="running")
+        self._open_incident()
+        self.fake.head_sha = "b" * 40
+        now = time.time()
+        self._held_file({
+            "%s#12" % REPO: {"incident": "quadseven/loom#99", "at": now - 7200,
+                             "head": "a" * 40},
+            "%s#13" % REPO: {"incident": "quadseven/loom#99", "at": now - 7200,
+                             "head": "a" * 40},
+        })
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        queued = [n for n in (12, 13) if "loom:queued" in self.fake.names(n)]
+        running = [n for n in (12, 13) if "loom:running" in self.fake.names(n)]
+        self.assertEqual(len(queued), 1, self.fake.names(12) + self.fake.names(13))
+        self.assertEqual(len(running), 1)
+
+    def test_a_failed_probe_reholds_without_comment_and_waits(self):
+        # A probe that fails is re-held with a fresh wait and no new comment,
+        # so the next probe waits the full interval instead of firing again.
+        self.heartbeat("muse")
+        self.fake.add(12, lane="muse", body=PLAIN, state="running")
+        self._open_incident()
+        self.fake.head_sha = "b" * 40
+        now = time.time()
+        self._held_file({
+            "%s#12" % REPO: {"incident": "quadseven/loom#99", "at": now - 7200,
+                             "head": "a" * 40},
+        })
+        before = len(self.fake.comments[12])
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        # The probe let the ticket through: queued, no new comment.
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertEqual(len(self.fake.comments[12]), before)
+        # The probe's check fails: the lane re-holds it with a fresh wait and
+        # no comment. The ticket is back running and held.
+        self.fake.issues[12]["labels"] = [{"name": "loom:ticket"},
+                                          {"name": "lane:muse"},
+                                          {"name": "loom:running"}]
+        self._held_file({
+            "%s#12" % REPO: {"incident": "quadseven/loom#99", "at": now,
+                             "head": "a" * 40},
+        })
+        before = len(self.fake.comments[12])
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        # The re-held ticket is not re-probed: its wait is fresh, so the next
+        # probe waits the full interval, and no new comment was posted.
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertEqual(len(self.fake.comments[12]), before)
 
 
 class PruneTest(Base):
