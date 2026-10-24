@@ -8,7 +8,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import pr_repair, text  # noqa: E402
+from bus import hunt_plan, pr_repair, text  # noqa: E402
 
 
 BRIEF = """# Brief: example-owner.example-repo-42
@@ -81,6 +81,15 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("## Out of scope\n- Other things", body)
         self.assertIn("---\nLoom ticket T42, lane codex, model gpt-test.", body)
         self.assertIn("\nRefs example-owner/example-repo#42", body)
+
+    def test_rendered_body_uses_summary_when_why_is_empty_and_what_absent(self):
+        brief = BRIEF.replace("## Why\nThe thing is broken for every user.", "## Why\n")
+        brief = brief.replace("## What\nMake the thing work.",
+                              "## Summary\nMake the thing work for every user.")
+        body = pr_repair._render_generated(brief, "codex", "gpt-test", "T42")
+        self.assertIn("## Why\nMake the thing work for every user.", body)
+        self.assertIn("## Summary\nMake the thing work for every user.", body)
+        self.assertEqual(hunt_plan.problems(body), [])
 
     TICKED_BODY = RUNNER_BODY.replace("- [ ] The thing works", "- [x] The thing works").replace(
         "- [ ] Nothing else changes", "- [ ] Nothing else changes; not built: out of reach")

@@ -171,6 +171,10 @@ def _render_generated(brief: str, lane: str, model: str, ticket: str,
     _check_footer_fields(ticket, lane, model)
     why = _brief_section(brief, "Why")
     summary = _brief_section(brief, "What")
+    if not summary.strip():
+        summary = _brief_section(brief, "Summary")
+    if not why.strip():
+        why = summary
     if acceptance is None:
         acceptance = _brief_section(brief, "Acceptance criteria")
     size = _brief_size(brief)

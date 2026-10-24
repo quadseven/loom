@@ -387,7 +387,7 @@ prepare_intent() {
 }
 
 pr_body() {
-  local size issue refs="" criteria ops
+  local size issue refs="" criteria ops why summary
   issue="$(field Issue "$1" || true)"
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
   # The size as the review bot's letter (Medium -> M), so its plan check
@@ -410,8 +410,12 @@ pr_body() {
   [ -n "$ops" ] || ops="$(section "$OPERATOR_SECTION" "$TREE/$SUMMARY_FILE" 2>/dev/null)"
   [ -n "$ops" ] || ops="$(section "$OPERATOR_SECTION" "$1")"
   [ -n "$ops" ] || ops="none stated"
+  why="$(section Why "$1")"
+  summary="$(section What "$1")"
+  [ -n "$summary" ] || summary="$(section Summary "$1")"
+  [ -n "$why" ] || why="$summary"
   printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n## %s\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
-    "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$criteria" \
+    "$INTENT_TEXT" "$why" "$summary" "$criteria" \
     "$size" "$(section 'Out of scope' "$1")" "$OPERATOR_SECTION" "$ops" \
     "$2" "$LANE" "$MODEL" "$validated" "$refs"
 }

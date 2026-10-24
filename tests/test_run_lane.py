@@ -889,6 +889,18 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("## Out of scope\n- Other things", body)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def test_pr_body_uses_summary_when_why_is_empty_and_what_absent(self):
+        self.drop_brief(text=BRIEF.replace(
+            "## Why\nThe thing is broken for every user.", "## Why\n").replace(
+                "## What\nMake the thing work.",
+                "## Summary\nMake the thing work for every user."))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("## Why\nMake the thing work for every user.", body)
+        self.assertIn("## Summary\nMake the thing work for every user.", body)
+        self.assertEqual(hunt_plan.problems(body), [])
+
     def test_answer_deliverable_posts_comment_and_does_not_push_or_open_pr(self):
         self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer"))
         result = self.run_lane(FAKE_AGENT="answer-file")
