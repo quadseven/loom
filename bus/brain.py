@@ -1376,7 +1376,12 @@ def open_epic(gh: GitHub, repo: str, epic: int
     except ValueError:
         raise ValueError("epic #%d is under #%d, which is not an open loom:goal"
                          % (epic, goal)) from None
-    held = 0 if standing_epic(issue) else len(_epic_tickets(gh, repo, epic))
+    if standing_epic(issue):
+        held = 0
+    elif str(issue.get("title") or "") == INTAKE_TITLE:
+        held = _open_count(_epic_tickets(gh, repo, epic))
+    else:
+        held = len(_epic_tickets(gh, repo, epic))
     if held >= EPIC_TICKET_CAP:
         raise ValueError("epic #%d already holds %d tickets (cap %d): file under its next epic"
                          % (epic, held, EPIC_TICKET_CAP))
@@ -1495,7 +1500,7 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1) -> int:
     roomy = [int(found["number"]) for found, held in tree
              if found.get("state", "open") == "open"
              and str(found.get("title") or "") == INTAKE_TITLE
-             and len(held) + room <= EPIC_TICKET_CAP]  # goal_tree already read its tickets
+             and _open_count(held) + room <= EPIC_TICKET_CAP]  # goal_tree already read its tickets
     if roomy:
         return max(roomy)
     made = file_epic(gh, repo, goal, INTAKE_TITLE, INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP))
@@ -1556,14 +1561,22 @@ def _outside_tickets(loose: List[Dict[str, Any]], goal: int) -> List[Dict[str, A
     return found
 
 
+def _open_count(tickets: List[Dict[str, Any]]) -> int:
+    """How many of an intake epic's tickets are still open: its room. Counting
+    closed ones too made a mostly closed intake epic read as full, so a new one
+    opened while the old one stayed open, and loom#30 went over its epic cap
+    (2026-10-24)."""
+    return sum(1 for t in tickets if t.get("state", "open") != "closed")
+
+
 def _intake_with_room(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
                       ) -> Tuple[Optional[int], int]:
     """The goal's newest open intake epic that has room, and the tickets it
     holds; (None, 0) when no intake epic has room."""
-    roomy = [(int(epic["number"]), len(held)) for epic, held in tree
+    roomy = [(int(epic["number"]), _open_count(held)) for epic, held in tree
              if epic.get("state", "open") == "open"
              and str(epic.get("title") or "") == INTAKE_TITLE
-             and len(held) < EPIC_TICKET_CAP]
+             and _open_count(held) < EPIC_TICKET_CAP]
     return max(roomy) if roomy else (None, 0)
 
 
