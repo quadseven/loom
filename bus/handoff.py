@@ -15,6 +15,18 @@ from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Se
 from . import text as _text
 
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
+REPORT_MARKER = "<!-- loom:report v1 -->"
+# A goal report edited in place (bus/journal.py, loom#1560) carries the time of
+# its edit on this line: GitHub keeps the comment's first creation time, so
+# every reader that dates reports reads this stamp instead.
+REPORTED_STAMP = "<!-- loom:reported %s -->"
+_REPORTED_RE = re.compile(r"^<!-- loom:reported (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) -->[ \t]*$", re.M)
+
+
+def reported_at(body: str) -> Optional[str]:
+    """The edit time a report edited in place carries, or None."""
+    found = _REPORTED_RE.findall(str(body or ""))
+    return found[-1] if found else None
 # GitHub work any brain can do. Ships and rolls are not here: they stay with
 # whoever a goal's rules name.
 STAGES = ("review", "merge", "failed", "ask", "regression", "brief")
@@ -63,12 +75,17 @@ def expand_journals(comments: Iterable[Any], at_key: str = "at",
                     id_key: str = "id") -> List[Any]:
     """Each journal comment edited in place as one comment per tick, oldest
     first, with the tick's own time under at_key: the comment keeps the
-    createdAt of its first tick, so a tick's time is its Tick line. Every
-    other comment passes through unchanged. Ticks before the newest get
+    createdAt of its first tick, so a tick's time is its Tick line. A report
+    edited in place gets its REPORTED_STAMP time under at_key. Every other
+    comment passes through unchanged. Ticks before the newest get
     "<id>@<time>" as their id, so readers that skip a seen id keep them."""
     out: List[Any] = []
     for comment in comments:
         body = str(comment.get("body") or "").lstrip() if isinstance(comment, dict) else ""
+        if body.startswith(REPORT_MARKER) and reported_at(body):
+            # A report edited in place is dated by its edit (loom#1560).
+            out.append(dict(comment, **{at_key: reported_at(body)}))
+            continue
         if not body.startswith(JOURNAL_MARKER) or EARLIER_OPEN not in body:
             out.append(comment)
             continue
