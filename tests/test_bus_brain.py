@@ -700,6 +700,36 @@ class SensitiveResumeTests(unittest.TestCase):
         a_tick_earlier = station_posts - brain.timedelta(hours=1)
         self.assertEqual(brain._report_deadline(last, a_tick_earlier)[1], "due")
 
+    def test_unbuilt_criteria_block_merge_readiness_but_allow_built_and_docs(self):
+        unbuilt = ("## Acceptance criteria\n- [ ] feature works; not built: no caller\n"
+                   "- [ ] another behavior; not built: no implementation\n"
+                   "- [ ] Live: endpoint answers `ok`")
+        built = "## Acceptance criteria\n- [ ] feature works\n- [ ] other; not built: pending"
+        self.assertEqual(brain._unbuilt_criteria_reason(unbuilt),
+                         "blocked: no criterion built")
+        self.assertEqual(brain._unbuilt_criteria_reason(built), "")
+        self.assertEqual(brain._unbuilt_criteria_reason("## Acceptance criteria\n- [ ] Live: endpoint answers `ok`"), "")
+
+    def test_status_blocks_pr_when_all_code_criteria_are_marked_not_built(self):
+        pr = {"number": 8, "title": "Lane work", "body":
+              ("Refs %s#9\n## Acceptance criteria\n- [ ] behavior works; not built: no caller\n"
+               "- [ ] Live: endpoint answers `ok`") % REPO}
+        self.assertEqual(brain._status_pr_line(None, REPO, pr, ready_node(),
+                                               "grug-tribe", "Grug - Elder"),
+                         "- #8 Lane work - blocked: no criterion built")
+
+    def test_merge_refuses_pr_when_every_non_live_criterion_is_not_built(self):
+        body = ("Refs %s#9\n## Acceptance criteria\n"
+                "- [ ] behavior works; not built: no caller\n"
+                "- [ ] Live: endpoint answers `ok`") % REPO
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                                {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []))
+        with self.assertRaisesRegex(ValueError, "blocked: no criterion built"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
     def test_merge_ready_names_each_blocker(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}
         cases = [
@@ -894,6 +924,50 @@ class SensitiveResumeTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     brain.brief(gh, REPO, EPIC, "Ticket", text, lane)
                 self.assertFalse(any(call[0] == "POST" for call in fake.calls))
+
+    def test_brief_refuses_a_body_with_no_acceptance_checkbox(self):
+        # loom#1612: plain bullets pass the plan check but prove nothing.
+        stub = BODY.replace("- [ ] ", "- ")
+        fake = Fake()
+        with self.assertRaisesRegex(ValueError, "no acceptance criteria"):
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", stub, "codex")
+        self.assertEqual(fake.calls, [])
+
+    def test_a_rewrite_of_an_epic_or_a_map_is_not_refused_for_its_criteria(self):
+        stub = BODY.replace("- [ ] ", "- ")
+        for name in ("epic", "wayfinder:map"):
+            with self.subTest(name=name):
+                self.assertIsNone(brain.acceptance_refusal(stub, {"labels": [{"name": name}]}))
+        self.assertIsNone(brain.acceptance_refusal(stub, {"labels": [], "sub_issues_summary": {"total": 2}}))
+        self.assertIsNone(brain.acceptance_refusal(BODY))
+        self.assertIn("no acceptance criteria", brain.acceptance_refusal(stub, {"labels": []}))
+
+    def test_move_refuses_to_brief_an_issue_with_no_acceptance_checkbox(self):
+        for state in ("queued", "briefed"):
+            with self.subTest(state=state):
+                issue = {"state": "open", "body": "## Why\nwhy\n## Acceptance criteria\n- one\n",
+                         "labels": [{"name": "loom:ticket"}]}
+                fake = Fake(reply(200, issue))
+                with self.assertRaisesRegex(ValueError, "no acceptance criteria"):
+                    brain.move(GitHub("t", transport=fake), REPO, 8, state)
+                self.assertEqual([c[0] for c in fake.calls], ["GET"])
+
+    def test_move_sends_a_ticket_already_in_a_loom_state_back_without_the_criteria_check(self):
+        # A revert sends a merged ticket back to its lane, whatever its old body.
+        issue = {"state": "open", "body": "old stub", "labels": [
+            {"name": "loom:ticket"}, {"name": "loom:merged"}, {"name": "lane:codex"}]}
+        fake = Fake(reply(200, issue), reply(200, []))
+        brain.move(GitHub("t", transport=fake), REPO, 8, "briefed", "codex")
+        self.assertEqual([c[0] for c in fake.calls], ["GET", "PUT"])
+
+    def test_move_briefs_an_epic_or_a_map_with_no_acceptance_checkbox(self):
+        for name in ("epic", "wayfinder:map"):
+            with self.subTest(name=name):
+                issue = {"state": "open", "body": "Done when: done.",
+                         "labels": [{"name": "loom:ticket"}, {"name": name}]}
+                fake = Fake(reply(200, issue), reply(200, []))
+                brain.move(GitHub("t", transport=fake), REPO, 8, "queued")
+                self.assertEqual([c[0] for c in fake.calls], ["GET", "PUT"])
 
     def test_a_public_repo_brief_refuses_another_repos_issue_reference(self):
         text = BODY.replace("why", "as in other-owner/other-repo#12")
@@ -1244,7 +1318,7 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_move_remote_lane_on_public_repo_succeeds(self):
         fake = Fake(
-            reply(200, {"state": "open", "title": "My Title", "labels": [{"name": "loom:ticket"}]}),
+            reply(200, {"state": "open", "title": "My Title", "body": BODY, "labels": [{"name": "loom:ticket"}]}),
             reply(200, {"private": False}),
             reply(200, []),
             reply(200, {}),
@@ -4396,6 +4470,21 @@ class EpicFilingTests(unittest.TestCase):
         nxt = brain.intake_epic(gh, REPO, 1)
         self.assertNotEqual(nxt, first)
         self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_TITLE)
+
+    def test_an_intake_epic_with_closed_tickets_still_has_room(self):
+        # 2026-10-24: room counted every ticket an intake epic ever held, so
+        # one with 16 closed tickets read as full and the next opened; four
+        # stood open under loom#30 and put the goal over its epic cap.
+        fake = GoalRepo()
+        gh = GitHub("t", transport=fake)
+        first = brain.intake_epic(gh, REPO, 1)
+        for n in range(70, 86):
+            fake.issues[n] = item(n, labels=["loom:ticket"], state="closed")
+            fake.subs.setdefault(first, []).append(n)
+        fresh = GitHub("t", transport=fake)
+        self.assertEqual(brain.intake_epic(fresh, REPO, 1), first)
+        url = brain.brief_intake(fresh, REPO, 1, "Ticket", BODY, "codex")
+        self.assertIn(int(url.rsplit("/", 1)[1]), fake.subs[first])
 
     def intake_epics(self, fake, held):
         """Open intake epics #60, #61, ... under goal #1, oldest first, each

@@ -201,7 +201,12 @@ its edits to a side branch `<branch>-timedout-<time>` and names it in the
 failure reason; the retry's brief tells the next attempt to start from that
 branch. On a public repo that side branch, like a `-unvalidated-` one, is
 pushed only after the public repo leak scan passes on its edits; otherwise no
-branch is kept. A fix round that fails transiently goes
+branch is kept. A lane commit that adds files outside the brief's paths is
+refused and nothing is pushed, except in a fix round: there the runner removes
+exactly those files (never the round's other changes) in a commit on top,
+names them in the run log, and pushes the rest, so the round does not retry
+the same refusal; a stray file it cannot remove still refuses the commit,
+naming the file (loom#1476). A fix round that fails transiently goes
 back to `loom:pr`, and one that fails its work goes to `loom:failed`, so the
 factory climbs the ladder and sends the fix to the next rung; a lane that hit its provider limit stays unavailable until the
 provider's reset (else 60 minutes; delete its heartbeat file in
@@ -629,7 +634,9 @@ backticked string from the ticket's Live criterion in
 fixed-string match (see `.env.example`). The station runs it once per string,
 with a 60-second timeout, then quotes up to 20 matching lines per string in
 the verify brief. It accepts at most five ASCII strings of at most 120
-characters.
+characters. For the live proof of a shipped ticket (bus/live_proof.py) the
+command also receives `LOOM_EVIDENCE_SINCE`, the deploy as epoch seconds, and
+only the lines stamped at or after it count.
 A Live criterion that needs its strings to be absent ("no `X` line appears",
 "never logs `X`", "`X` does not appear", every string so worded) is verified on an
 empty answer: when every command run answered and no line named any string, the

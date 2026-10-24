@@ -4,6 +4,7 @@ import logging
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
@@ -127,6 +128,11 @@ class EvidenceEndpointTest(unittest.TestCase):
             request = Request(url, headers={"Authorization": "Bearer test-bearer"})  # noqa: S310 - URL uses this test's local server.
             with urlopen(request) as response:  # noqa: S310 - URL uses this test's local server.
                 response.read()
+            # The handler records the call after it answers, on its own
+            # thread: wait for it rather than racing it under a loaded suite.
+            deadline = time.monotonic() + 5
+            while len(calls) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
             self.assertEqual(len(calls), 2)
             self.assertEqual([call[0] for call in calls], ["unknown", "query"])
             self.assertEqual(calls[0][1], "<invalid>")
