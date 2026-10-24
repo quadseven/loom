@@ -1,4 +1,5 @@
 """Test bus.fabric: the station's one question to the Fabric workspace."""
+import io
 import json
 import os
 import unittest
@@ -71,26 +72,38 @@ class AskTest(unittest.TestCase):
 
 
 class AskCliTest(unittest.TestCase):
-    def test_ask_sends_the_documented_request_shape(self):
+    def test_ask_asks_the_helper_with_the_documented_shape(self):
         resp = mock.MagicMock()
         resp.__enter__.return_value.read.return_value = b"an answer"
-        with mock.patch.dict(os.environ, {"LOOM_FABRIC_KEY_SSM": "/p/key"}), \
-                mock.patch("bus.fabric.read_ssm", return_value="k-123") as ssm, \
+        env = {"LOOM_FABRIC_ASK": "http://127.0.0.1:7341/ask"}
+        with mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch("urllib.request.urlopen", return_value=resp) as op:
             self.assertEqual(fabric.main(["ask", "which?"]), 0)
-        ssm.assert_called_once_with("/p/key", "us-east-1")
+        self.assertNotIn("LOOM_FABRIC_KEY_SSM", os.environ)
+        self.assertNotIn("LOOM_AWS_REGION", os.environ)
         req = op.call_args.args[0]
-        self.assertEqual(req.full_url, fabric.CHAT_URL)
-        self.assertEqual(req.get_header("X-api-key"), "k-123")
+        self.assertEqual(req.full_url, "http://127.0.0.1:7341/ask")
         self.assertEqual(json.loads(req.data), {
             "scope": "user", "history": [{"role": "user", "content": "which?"}]})
 
-    def test_ask_without_a_key_prints_nothing(self):
-        with mock.patch("bus.fabric.read_ssm") as ssm, \
+    def test_ask_without_a_helper_reports_not_configured(self):
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch("sys.stderr", err), \
+                mock.patch("bus.fabric.read_ssm") as ssm, \
                 mock.patch("urllib.request.urlopen") as op:
-            self.assertEqual(fabric.main(["ask", "which?"]), 0)
+            self.assertEqual(fabric.main(["ask", "which?"]), 2)
+        self.assertEqual(err.getvalue(), "fabric: not configured\n")
         ssm.assert_not_called()
         op.assert_not_called()
+
+    def test_ask_helper_failure_reports_not_configured(self):
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"LOOM_FABRIC_ASK": "http://127.0.0.1:7341/ask"}, clear=True), \
+                mock.patch("sys.stderr", err), \
+                mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+            self.assertEqual(fabric.main(["ask", "which?"]), 2)
+        self.assertEqual(err.getvalue(), "fabric: not configured\n")
 
 
 class BrainEnvTest(unittest.TestCase):

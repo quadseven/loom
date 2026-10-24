@@ -406,13 +406,14 @@ this tick"; a step with no note shows nothing there.
    section in `status`: the failed tickets that ran on all three rungs, oldest
    first, each with its open pull request, its mergeable state, and each
    unresolved thread's severity, comment ID, first line and the newest lane
-   answer.    The factory resolves an answered medium or low finding itself but
+   answer. The factory resolves an answered medium or low finding itself but
    leaves a high or critical one open by design, so these wait for a ruling.
    Before ruling on a needs-brain ticket, ask Fabric's chat workspace about
    earlier decisions and fixes with `python3 -m bus.fabric ask "..."`. The
-   Fabric key is read from the SSM parameter named by LOOM_FABRIC_KEY_SSM for
-   each call and never printed; the agent never holds it, and the command only
-   asks, it never writes or deletes a note. Check every number Fabric cites
+   brain wrapper starts a local asking helper with the Fabric key and gives
+   the agent only its address (LOOM_FABRIC_ASK); the agent never holds the key
+   or the SSM name that names it, and the command only asks, it never writes
+   or deletes a note. Check every number Fabric cites
    against GitHub before relying on it: a cited pull request must be merged
    into this repo's default branch and carry the cited card's title, and a
    cited issue must be closed here. Take up to 3 of them per tick, oldest
