@@ -114,34 +114,25 @@ class AgentSandboxTest(unittest.TestCase):
         # The allow for 443 comes after the blanket deny.
         self.assertGreater(profile.index('(allow network-outbound (remote ip "*:443"))'),
                            profile.index(NET_DENY))
+        self.assertIn('(deny mach-lookup (global-name "com.apple.SecurityServer")', profile)
         self.assertIn('(literal "/usr/bin/security")', profile)
         self.assertIn(f'(deny file-read* (subpath "{self.scratch}/Library/Keychains"))', profile)
         # An arbitrary port on an arbitrary host is not allowed.
         self.assertNotIn('(allow network-outbound (remote ip "*:80"))', profile)
 
-    def test_the_agy_agent_run_reaches_its_own_sign_in_and_nothing_else_in_the_keychain(self):
-        # 2026-10-22 to 10-24: the keychain deny (#1465) hid agy's stored
-        # sign-in from agy itself, and every agy run asked for a browser login
-        # and failed auth (#1620). The agent run may reach the keychain server
-        # and read the lane user's one keychain file; the folder stays denied
-        # and /usr/bin/security stays unrunnable.
-        keychain = f"{self.scratch}/Library/Keychains/loom.keychain-db"
-        profile = self.profile("", lane="agy", AGY_KEYCHAIN=keychain)
-        self.assertNotIn('(global-name "com.apple.SecurityServer")', profile)
-        deny = f'(deny file-read* (subpath "{self.scratch}/Library/Keychains"))'
-        allow = f'(allow file-read* (literal "{keychain}"))'
-        self.assertIn(deny, profile)
-        self.assertIn(allow, profile)
-        self.assertGreater(profile.index(allow), profile.index(deny))
-        self.assertIn('(literal "/usr/bin/security")', profile)
-
-    def test_check_runs_and_other_lanes_keep_the_whole_keychain_deny(self):
-        keychain = f"{self.scratch}/Library/Keychains/loom.keychain-db"
-        for mode, lane in (("check", "agy"), ("", "codex"), ("api", "opencode-go")):
+    def test_every_run_keeps_the_whole_keychain_deny(self):
+        # agy reaches the keychain only through /usr/bin/security, so loosening
+        # the keychain server or files for it changed nothing (#1620, #1636):
+        # the agy agent run, an agy check run and other lanes all keep the
+        # keychain-server deny, and agy runs keep the Keychains folder deny.
+        folder = f'(deny file-read* (subpath "{self.scratch}/Library/Keychains"))'
+        for mode, lane in (("", "agy"), ("check", "agy"), ("", "codex"), ("api", "opencode-go")):
             with self.subTest(mode=mode, lane=lane):
-                profile = self.profile(mode, lane=lane, AGY_KEYCHAIN=keychain)
+                profile = self.profile(mode, lane=lane)
                 self.assertIn('(global-name "com.apple.SecurityServer")', profile)
-                self.assertNotIn(f'(allow file-read* (literal "{keychain}"))', profile)
+                self.assertIn('(literal "/usr/bin/security")', profile)
+                if lane == "agy":
+                    self.assertIn(folder, profile)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_inside_the_agy_profile_connections_and_security_stay_confined(self):

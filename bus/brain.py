@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
-from . import audit, change_class, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
+from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
 from . import merge_tier, naming, operator_hold, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
@@ -537,6 +537,18 @@ def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
     return "blocked: " + ", ".join(blockers) if blockers else "READY"
 
 
+_NOT_BUILT = re.compile(r";\s*not built:", re.I)
+
+
+def _unbuilt_criteria_reason(body: str) -> str:
+    """Block when every non-live acceptance criterion says it was not built."""
+    criteria = [text for _, text in proof.criteria(body)
+                if criteria_gate.kind(text) != criteria_gate.LIVE]
+    if criteria and all(_NOT_BUILT.search(text) for text in criteria):
+        return "blocked: no criterion built"
+    return ""
+
+
 def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> str:
     return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
 
@@ -546,13 +558,14 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     line = _pr_line(pr, node, bot)
     needs_review_check = (change_class.class_of(pr) == "sensitive"
                           or _ticketless(repo, pr))
-    if not line.endswith(" - READY") or not needs_review_check:
-        return line
-    sha = str((pr.get("head") or {}).get("sha") or "")
-    if sha and _review_check_passed(gh, repo, sha, check):
-        return line
-    return (line.removesuffix("READY")
-            + "blocked: review check has not passed on the head commit")
+    if line.endswith(" - READY") and needs_review_check:
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        if not sha or not _review_check_passed(gh, repo, sha, check):
+            return (line.removesuffix("READY")
+                    + "blocked: review check has not passed on the head commit")
+    if line.endswith(" - READY") and _unbuilt_criteria_reason(str(pr.get("body") or "")):
+        return line.removesuffix("READY") + "blocked: no criterion built"
+    return line
 
 
 def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
@@ -690,6 +703,10 @@ def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
             ticket = _ticket_association(repo, pr)
         except ValueError:
             ticket = None
+        if (ticket is not None and line.endswith("blocked: no criterion built")):
+            issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+            if {x.lower() for x in _labels(issue)} & {"docs", "documentation"}:
+                line = line.removesuffix("blocked: no criterion built") + "READY"
         if ticket is not None and authors:
             comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
             if _pending_brain_fix(comments, authors):
@@ -1376,7 +1393,12 @@ def open_epic(gh: GitHub, repo: str, epic: int
     except ValueError:
         raise ValueError("epic #%d is under #%d, which is not an open loom:goal"
                          % (epic, goal)) from None
-    held = 0 if standing_epic(issue) else len(_epic_tickets(gh, repo, epic))
+    if standing_epic(issue):
+        held = 0
+    elif str(issue.get("title") or "") == INTAKE_TITLE:
+        held = _open_count(_epic_tickets(gh, repo, epic))
+    else:
+        held = len(_epic_tickets(gh, repo, epic))
     if held >= EPIC_TICKET_CAP:
         raise ValueError("epic #%d already holds %d tickets (cap %d): file under its next epic"
                          % (epic, held, EPIC_TICKET_CAP))
@@ -1495,7 +1517,7 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1) -> int:
     roomy = [int(found["number"]) for found, held in tree
              if found.get("state", "open") == "open"
              and str(found.get("title") or "") == INTAKE_TITLE
-             and len(held) + room <= EPIC_TICKET_CAP]  # goal_tree already read its tickets
+             and _open_count(held) + room <= EPIC_TICKET_CAP]  # goal_tree already read its tickets
     if roomy:
         return max(roomy)
     made = file_epic(gh, repo, goal, INTAKE_TITLE, INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP))
@@ -1556,14 +1578,22 @@ def _outside_tickets(loose: List[Dict[str, Any]], goal: int) -> List[Dict[str, A
     return found
 
 
+def _open_count(tickets: List[Dict[str, Any]]) -> int:
+    """How many of an intake epic's tickets are still open: its room. Counting
+    closed ones too made a mostly closed intake epic read as full, so a new one
+    opened while the old one stayed open, and loom#30 went over its epic cap
+    (2026-10-24)."""
+    return sum(1 for t in tickets if t.get("state", "open") != "closed")
+
+
 def _intake_with_room(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
                       ) -> Tuple[Optional[int], int]:
     """The goal's newest open intake epic that has room, and the tickets it
     holds; (None, 0) when no intake epic has room."""
-    roomy = [(int(epic["number"]), len(held)) for epic, held in tree
+    roomy = [(int(epic["number"]), _open_count(held)) for epic, held in tree
              if epic.get("state", "open") == "open"
              and str(epic.get("title") or "") == INTAKE_TITLE
-             and len(held) < EPIC_TICKET_CAP]
+             and _open_count(held) < EPIC_TICKET_CAP]
     return max(roomy) if roomy else (None, 0)
 
 
@@ -3090,6 +3120,10 @@ def merge(gh: GitHub, repo: str, number: int,
         association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
         _refuse_pending_fix(gh, association, env)
         _refuse_operator_hold(gh, repo, number, pr, details, association, issue)
+        if not ({x.lower() for x in _labels(issue)} & {"docs", "documentation"}):
+            reason = _unbuilt_criteria_reason(str(pr.get("body") or ""))
+            if reason:
+                raise ValueError(reason)
         tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
@@ -3959,7 +3993,7 @@ def _open_threads(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
     owner, name = repo.split("/", 1)
     query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
              ' reviewThreads(first:100) { nodes { id isResolved path line originalLine'
-             ' comments(first:20) { nodes { databaseId body author { login } } } } }'
+             ' comments(first:20) { nodes { databaseId body author { login __typename } } } } }'
              ' } } }') % (_gql(owner), _gql(name), number)
     data = gh.graphql(query) or {}
     pr = (data.get("repository") or {}).get("pullRequest") or {}
