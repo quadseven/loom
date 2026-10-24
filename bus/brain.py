@@ -4576,9 +4576,11 @@ class _ResumeRead:
         self.goals += found
         self._note_marks(found)
         for goal in found:
-            lines = self.retrying(lambda: _goal_resume_lines(
-                self.gh, goal[0], goal[1], goal[2], self.latest, goal[3], self.unread))
-            self.emit("\n".join(lines))
+            self.emit("\n".join(self._goal_lines(goal)))
+
+    def _goal_lines(self, goal: GoalJournals) -> List[str]:
+        return self.retrying(lambda: _goal_resume_lines(
+            self.gh, goal[0], goal[1], goal[2], self.latest, goal[3], self.unread))
 
     def _read_goal(self, repo: str, issue: Dict[str, Any]) -> GoalJournals:
         comments = self.retrying(lambda: _goal_home_comments(self.gh, repo, int(issue["number"])))
