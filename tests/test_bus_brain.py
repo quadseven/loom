@@ -895,6 +895,50 @@ class SensitiveResumeTests(unittest.TestCase):
                     brain.brief(gh, REPO, EPIC, "Ticket", text, lane)
                 self.assertFalse(any(call[0] == "POST" for call in fake.calls))
 
+    def test_brief_refuses_a_body_with_no_acceptance_checkbox(self):
+        # loom#1612: plain bullets pass the plan check but prove nothing.
+        stub = BODY.replace("- [ ] ", "- ")
+        fake = Fake()
+        with self.assertRaisesRegex(ValueError, "no acceptance criteria"):
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", stub, "codex")
+        self.assertEqual(fake.calls, [])
+
+    def test_a_rewrite_of_an_epic_or_a_map_is_not_refused_for_its_criteria(self):
+        stub = BODY.replace("- [ ] ", "- ")
+        for name in ("epic", "wayfinder:map"):
+            with self.subTest(name=name):
+                self.assertIsNone(brain.acceptance_refusal(stub, {"labels": [{"name": name}]}))
+        self.assertIsNone(brain.acceptance_refusal(stub, {"labels": [], "sub_issues_summary": {"total": 2}}))
+        self.assertIsNone(brain.acceptance_refusal(BODY))
+        self.assertIn("no acceptance criteria", brain.acceptance_refusal(stub, {"labels": []}))
+
+    def test_move_refuses_to_brief_an_issue_with_no_acceptance_checkbox(self):
+        for state in ("queued", "briefed"):
+            with self.subTest(state=state):
+                issue = {"state": "open", "body": "## Why\nwhy\n## Acceptance criteria\n- one\n",
+                         "labels": [{"name": "loom:ticket"}]}
+                fake = Fake(reply(200, issue))
+                with self.assertRaisesRegex(ValueError, "no acceptance criteria"):
+                    brain.move(GitHub("t", transport=fake), REPO, 8, state)
+                self.assertEqual([c[0] for c in fake.calls], ["GET"])
+
+    def test_move_sends_a_ticket_already_in_a_loom_state_back_without_the_criteria_check(self):
+        # A revert sends a merged ticket back to its lane, whatever its old body.
+        issue = {"state": "open", "body": "old stub", "labels": [
+            {"name": "loom:ticket"}, {"name": "loom:merged"}, {"name": "lane:codex"}]}
+        fake = Fake(reply(200, issue), reply(200, []))
+        brain.move(GitHub("t", transport=fake), REPO, 8, "briefed", "codex")
+        self.assertEqual([c[0] for c in fake.calls], ["GET", "PUT"])
+
+    def test_move_briefs_an_epic_or_a_map_with_no_acceptance_checkbox(self):
+        for name in ("epic", "wayfinder:map"):
+            with self.subTest(name=name):
+                issue = {"state": "open", "body": "Done when: done.",
+                         "labels": [{"name": "loom:ticket"}, {"name": name}]}
+                fake = Fake(reply(200, issue), reply(200, []))
+                brain.move(GitHub("t", transport=fake), REPO, 8, "queued")
+                self.assertEqual([c[0] for c in fake.calls], ["GET", "PUT"])
+
     def test_a_public_repo_brief_refuses_another_repos_issue_reference(self):
         text = BODY.replace("why", "as in other-owner/other-repo#12")
         fake = Fake(reply(200, {"private": False}))
@@ -1244,7 +1288,7 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_move_remote_lane_on_public_repo_succeeds(self):
         fake = Fake(
-            reply(200, {"state": "open", "title": "My Title", "labels": [{"name": "loom:ticket"}]}),
+            reply(200, {"state": "open", "title": "My Title", "body": BODY, "labels": [{"name": "loom:ticket"}]}),
             reply(200, {"private": False}),
             reply(200, []),
             reply(200, {}),

@@ -30,6 +30,7 @@ from bus.github import GitHub, GitHubError, ShadowHeld  # noqa: E402
 import test_bus_brain as tbb  # noqa: E402
 import test_bus_station as tbs  # noqa: E402
 import test_merge_tier as tmt  # noqa: E402
+import test_station_live_proof as tslp  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 REPO = "example-owner/example-repo"
@@ -375,6 +376,25 @@ class CallSiteTest(ShadowCase):
         [entry] = self.entries()
         self.assertEqual((entry["action"], entry["number"], entry["source"]),
                          ("close", 5, "station done close"))
+
+    def test_the_station_live_proof_close_records_and_sends_nothing(self):
+        # loom#1608: a shipped ticket whose live proof is met is verified and
+        # closed by the station; in shadow the close is recorded before the
+        # tick, the proof comment and the verified label.
+        case = tslp.StationLiveProofTest("test_a_log_needle_closes_with_the_lines_quoted_once_its_window_has_passed")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.ship(tslp.LOG_BODY, hours_ago=30)
+        before = dict(case.fake.issues[1])
+        case.close_pass(tslp.FakeLog(["%s worker: daily status ready" % tslp.stamp(case.now - 3600)]))
+        self.assertEqual(case.fake.issues[1]["state"], "open")
+        self.assertEqual(case.fake.issues[1]["body"], before["body"])
+        self.assertNotIn("loom:verified", case.fake.names(1))
+        self.assertEqual(case.fake.comments[1], [])
+        self.assertEqual([m for m, _ in case.fake.calls if m != "GET"], [])
+        [entry] = self.entries()
+        self.assertEqual((entry["action"], entry["number"], entry["source"]),
+                         ("close", 1, "station live proof"))
 
 
 class LedgerTest(ShadowCase):
@@ -897,7 +917,9 @@ class EveryPathTest(unittest.TestCase):
         ("bus/brain.py", "reopen_source"): "",
         ("bus/brain.py", "audit_proof"): "",
         ("bus/factory.py", "_default_close"): "",   # a pull request: let through
+        ("bus/factory.py", "_close_unmerged_follow_ups"): "",
         ("bus/factory.py", "_split_pr"): "",
+        ("bus/health.py", "_close_settled"): "shadow.active(",
         ("bus/invariants.py", "_reopen"): "self._held(",
         ("bus/invariants.py", "_fold"): "self._held(",
         ("bus/invariants.py", "_close_quiet"): "self._held(",

@@ -2198,16 +2198,58 @@ cat > /dev/null
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
         self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
 
-    def test_a_fix_round_that_adds_a_stray_file_beside_a_merge_is_refused(self):
-        # main.txt came in with the merge, so only the agent's file is named.
+    def test_a_fix_round_that_adds_a_stray_file_beside_a_merge_is_removed_and_pushed(self):
+        # A fix round no longer retries the identical refusal: the file the
+        # agent added outside the brief's paths is removed and the merge is
+        # pushed (loom#1476).
         name, before = self.fix_brief()
         self.advance_main("main.txt", "main moved\n")
         self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
                         "mkdir -p .agents; echo hook > .agents/hooks.json\n")
         result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("commit refused: it adds files outside the brief's paths: "
-                      ".agents/hooks.json; nothing pushed", self.run_log(name + ".log"))
+        log = self.run_log(name + ".log")
+        self.assertNotIn("commit refused", log)
+        self.assertIn("left off the fix round's commits: .agents/hooks.json", log)
+        after = self.remote_head(self.FIX_BRANCH)
+        self.assertIn(before, subprocess.run(
+            ["git", "--git-dir", str(self.remote), "rev-list", after],
+            capture_output=True, text=True, check=True).stdout.split())
+        self.assertEqual(self.remote_file(after, "main.txt"), "main moved\n")
+        self.assertEqual(self.remote_file(after, ".agents/hooks.json"), "")
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_removes_only_the_out_of_brief_files_and_pushes_the_work(self):
+        # A session file outside the brief's paths, beside the real fix: only
+        # the stray goes, the fix is pushed (loom#1476).
+        name, before = self.fix_brief()
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
+                        "printf 'session notes\\n' > session-notes.txt\n"
+                        "printf 'fixed again\\n' > first.txt\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("left off the fix round's commits: session-notes.txt",
+                      self.run_log(name + ".log"))
+        after = self.remote_head(self.FIX_BRANCH)
+        self.assertNotEqual(after, before)
+        self.assertEqual(self.remote_file(after, "first.txt"), "fixed again\n")
+        self.assertEqual(self.remote_file(after, "session-notes.txt"), "")
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_whose_stray_file_cannot_be_removed_names_it_and_pushes_nothing(self):
+        name, before = self.fix_brief()
+        self.write_tool(self.bin / "git", """#!/usr/bin/env bash
+if [[ " $* " == *" rm -q -f -- session-notes.txt "* ]]; then echo 'refused' >&2; exit 1; fi
+exec /usr/bin/git "$@"
+""")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
+                        "printf 'session notes\\n' > session-notes.txt\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.run_log(name + ".log")
+        self.assertIn("could not remove session-notes.txt from the fix round's commits", log)
+        self.assertIn("commit refused: it adds files outside the brief's paths that could "
+                      "not be removed: session-notes.txt; nothing pushed", log)
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
         self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
 
@@ -2472,6 +2514,23 @@ cat > /dev/null
         tail = "Error: 402 Payment Required: your credit balance is too low"
         kind, retry_at, credit = self.classified(tail, tail)
         self.assertEqual((kind, credit), ("limit", "1"))
+
+    def test_a_claude_weekly_limit_is_a_provider_limit(self):
+        line = "You've hit your weekly limit \u00b7 resets 7pm (America/New_York)"
+        kind, retry_at, credit = self.classified(line, line)
+        self.assertEqual(kind, "limit")
+        self.assertGreater(retry_at, int(time.time()))
+
+    def test_a_rate_limit_filename_in_a_tool_result_is_not_a_limit(self):
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_EXIT="1", FAKE_OUT=(
+            '{"type":"step_start","part":{}}\n'
+            '{"type":"tool_use","part":{"state":{"output":"git log: add rate_limit.py"}}}\n'
+            '{"type":"text","part":{"text":"done"}}\n'
+            '{"type":"step_finish","part":{}}'))
+        log = self.run_log()
+        self.assertNotIn("[limit]", log)
+        self.assertIn("[transient]", log)
 
     def api_lane(self, lane, extra="", **env):
         if not sandbox_caps.LOCALHOST:
@@ -4331,6 +4390,7 @@ exit %d
         ("AuthenticationError: HTTP 401 Unauthorized", 1, True, "auth"),
         ("panic: something broke before any edit", 1, False, "transient"),
         ("killed", 137, True, "transient"),
+        ("terminated", 143, True, "transient"),
         ('level=ERROR message=failed error="ProviderModelNotFoundError: Model not found: '
          'openrouter/vendor/gone:free. Did you mean: vendor/other:free?"\n'
          'Error: {"name": "UnknownError", "message": "Unexpected server error."}', 1, False, "limit"),
@@ -4602,6 +4662,26 @@ exit %d
         self.assertEqual(self.calls(), [])
         self.assertFalse(self.beat()["available"])
         self.assertTrue((self.inbox / "T049-next.md").exists())
+
+    def test_the_agy_sign_in_ask_names_the_lane_user_and_the_command(self):
+        # 2026-10-24: the ask said only "sign in the agy lane CLI again"; the
+        # operator signed in as themselves, which never reaches the lane user's
+        # own sign-in, and asked what was wanted.
+        script = ('FACTORY_REPO=quadseven/loom KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"\n'
+                  'KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"\n'
+                  'LANE=agy SLOT=agy LOG=/dev/null NET_TIMEOUT=30 LOOM_ROOT="%s"\n'
+                  'AGY_USER=loom AGY_HOME=/opt/lane AGY_BIN=/opt/lane/.local/bin/agy\n' % RUNNER.parent.parent
+                  + self.source_functions("open_issue", "upsert_sticky_comment", "file_ask",
+                                         "ask_sign_in") +
+                  'ask_sign_in "sign-in lapsed: sign in the agy lane CLI again"\n')
+        result = subprocess.run(["bash", "-c", script, "bash"], env=self.lane_env(),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len([c for c in self.calls() if c.startswith("gh issue create")]), 1)
+        body = Path(f"{self.body}.issue").read_text()
+        self.assertIn("macOS user loom", body)
+        self.assertIn("sudo -u loom -H ~loom/.local/bin/agy", body)
+        self.assertNotIn("/opt/lane", body)
 
     def test_a_daily_allowance_with_no_reset_time_holds_the_lane_until_midnight_utc(self):
         # Retried every hour, a spent daily allowance failed a run each time.
@@ -5232,6 +5312,19 @@ exec /usr/bin/git "$@"
         calls = self.log.read_text()
         self.assertIn("Repo: example/repo", calls)
         self.assertIn("exit 2", calls)
+
+    def test_a_base_check_terminated_by_sigterm_is_transient_without_an_incident(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        contract = ("interpreter: loom-test-python\n"
+                    "check: kill -TERM $$\n")
+        self.contract_repo(contract=contract)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: [transient]", self.lane_log())
+        self.assertNotIn("failed: [factory]", self.lane_log())
+        self.assertFalse(list((self.loom / "state" / "incidents").glob("*base-check")))
 
     def test_a_base_check_incident_is_recorded_then_closed_when_the_check_passes(self):
         # A stub sandbox: these tests run inside a lane's own check sandbox,

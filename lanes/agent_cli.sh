@@ -38,7 +38,7 @@ agent_cli() {
 # (2026-10-20). Providers say the quota is reached, exceeded or exhausted.
 # A full shared free pool ("has no lane available; retry after 1s") is a
 # short limit, not the agent's failure (18 runs, 2026-10-21).
-LIMIT_RE='usage limit|rate[ _-]?limit|has no lane available|quota (reached|exceeded|exhausted|resets?)|exceeded (your |the )?(current )?quota|resource[ _]exhausted|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required'
+LIMIT_RE='usage limit|rate[ _-]?limit|has no lane available|quota (reached|exceeded|exhausted|resets?)|exceeded (your |the )?(current )?quota|resource[ _]exhausted|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|hit your (weekly |daily |session )?limit'
 # A bare HTTP status counts only in the short tail: a repo's own test output
 # printed "status=error detail=http 402", and a codex run that exited 0 was
 # classed out of credit and its lane parked a day (2026-10-21).
@@ -89,16 +89,17 @@ stated_reset() {
   python3 -c '
 import re, sys, time
 from datetime import datetime, timedelta
-m = re.search(r"try again at (?:([A-Za-z]{3}) ([0-9]{1,2})(?:st|nd|rd|th)?, ([0-9]{4}) )?([0-9]{1,2}):([0-9]{2}) ?([AP]M)", sys.argv[1], re.I)
+m = re.search(r"(?:try again at|resets) (?:([A-Za-z]{3}) ([0-9]{1,2})(?:st|nd|rd|th)?, ([0-9]{4}) )?([0-9]{1,2})(?::([0-9]{2}))? ?([AP]M)", sys.argv[1], re.I)
 if m:
     hour = int(m.group(4)) % 12 + (12 if m.group(6).upper() == "PM" else 0)
+    minute = int(m.group(5)) if m.group(5) else 0
     now = datetime.now()
     try:
         if m.group(1):
             at = datetime.strptime("%s %s %s" % (m.group(1).title(), m.group(2), m.group(3)), "%b %d %Y")
-            at = at.replace(hour=hour, minute=int(m.group(5)))
+            at = at.replace(hour=hour, minute=minute)
         else:
-            at = now.replace(hour=hour, minute=int(m.group(5)), second=0, microsecond=0)
+            at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if at <= now:
                 at += timedelta(days=1)
         print(int(time.mktime(at.timetuple())))
