@@ -4515,6 +4515,20 @@ exit %d
         self.assertIn("--label needs-operator", ask[0])
         self.assertIn("renew the codex lane sign-in", ask[0])
 
+    def test_a_cli_sign_in_that_timed_out_is_auth_not_transient(self):
+        # agy's sign-in lapsed: every run waited for a browser login, timed
+        # out and was classed transient, so the lane failed five runs in two
+        # hours and nobody was asked to sign it in again (2026-10-24).
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "Waiting for authentication (timeout 60s)...\n"
+            "Or, paste the authorization code here and press Enter:\n"
+            "Error: authentication timed out.\n"
+            "error: authentication failed or timed out"))
+        self.assertTrue(self.failure_line().startswith("[auth] "), self.failure_line())
+        ask = [c for c in self.calls() if c.startswith("gh issue create")]
+        self.assertEqual(len(ask), 1, self.calls())
+
     def test_a_daily_allowance_with_no_reset_time_holds_the_lane_until_midnight_utc(self):
         # Retried every hour, a spent daily allowance failed a run each time.
         self.drop_brief()
