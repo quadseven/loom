@@ -3693,6 +3693,9 @@ class Station:
         issue["labels"] = [{"name": name} for name in names]
         _say("moved %s#%d from lane %s to lane %s for model %s"
              % (repo, number, lane, target, model))
+        if already_waiting:
+            self._event("model_wait_succeeded", "found free lane %s for model %s" % (target, model),
+                        "%s#%d" % (repo, number), lane, model)
         return target
 
     # -- outcomes -------------------------------------------------------

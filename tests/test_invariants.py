@@ -303,6 +303,13 @@ class AcceptanceTest(StationBase):
         self.run_at(T0)
         self.assertEqual(self.repeated_failure_tickets(), [])
 
+    def test_a_model_wait_success_suppresses_repeated_model_wait_failure(self):
+        self.write_events([(at, "model_wait", "no free lane takes model claude-sonnet-5-5")
+                           for at in range(int(T0 - 7200), int(T0 - 3600) + 1, 60)]
+                          + [(T0 - 1800, "model_wait_succeeded", "found free lane opencode-go-3 for model claude-sonnet-5-5")])
+        self.run_at(T0)
+        self.assertEqual(self.repeated_failure_tickets(), [])
+
     def test_thirteen_metrics_lines_for_one_day_file_one_ticket_and_a_second_pass_none(self):
         for i in range(13):
             self.gh.comment(GOAL, T0 - 3600 + i * 60,
