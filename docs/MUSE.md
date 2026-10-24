@@ -557,7 +557,10 @@ this tick"; a step with no note shows nothing there.
    a failed step. It also posts no report for a goal quiet since its last
    report: it prints `not posted: quiet since <time>` and exits 0, also not
    a failed step, since every new report emails the goal's author. A
-   heartbeat (once a quiet week) is edited into the last report in place.
+   heartbeat (once a quiet week) is edited into the last report in place,
+   and so is a report whose "Needs you:" line asks the same as the last
+   report's: only a new ask posts a new comment (loom#1560). Keep the
+   "Needs you:" line exact, so an unchanged ask reads as unchanged.
 10. First run `python3 -m bus.brain step unlock --holder muse`. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
     failure as well.
 11. End the tick's chat reply in the same standup shape as the reports

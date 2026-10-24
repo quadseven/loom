@@ -2404,7 +2404,7 @@ cat > /dev/null
         (inbox / "T042-fix-the-thing.md").write_text(
             BRIEF.replace("Lane: codex", "Lane: opencode-go")
             .replace("Difficulty: medium", "Difficulty: medium\nModel: claude-sonnet-5-5"))
-        result = self.run_lane("opencode-go", LOOM_OPENCODE_GO_MODEL="opencode-go/model-free",
+        result = self.run_lane("opencode-go", LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash",
                                LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
                                FAKE_SECRET__k_oc="fake-oc-key")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2550,7 +2550,7 @@ cat > /dev/null
             "opencode-go",
             LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
             FAKE_SECRET__k_oc="fake-oc-key",
-            LOOM_OPENCODE_GO_MODEL="opencode-go/model-free",
+            LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         home = self.loom / "run" / "opencode-go-home"
@@ -3138,15 +3138,57 @@ cat > /dev/null
     def test_opencode_go_other_models_still_take_a_private_repo(self):
         inbox, result = self.api_lane(
             "opencode-go", LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
-            LOOM_OPENCODE_GO_MODEL="opencode-go/kimi-k2.7-code", FAKE_GH_PRIVATE="true")
+            LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash", FAKE_GH_PRIVATE="true")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(any(c.startswith("opencode ") for c in self.calls()), self.calls())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    # The OpenCode Go allow-list (bus/tickets.py OPENCODE_GO_MODELS): Kimi
+    # K2.7 Code, at 1,350 requests per 5 h, spent the Go plan's allowance in
+    # hours on 2026-10-23.
+    def assert_go_lane_refuses(self, **env):
+        inbox, result = self.api_lane(
+            "opencode-go", LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("REFUSED", result.stderr)
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()), self.calls())
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = self.beat("opencode-go")
+        self.assertFalse(beat["available"], beat)
+        self.assertIn("not on the OpenCode Go allow-list", beat["reason"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_an_opencode_go_lane_on_a_low_allowance_model_does_not_start(self):
+        self.assert_go_lane_refuses(LOOM_OPENCODE_GO_MODEL="opencode-go/kimi-k2.7-code")
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_an_opencode_go_lane_whose_ladder_names_a_low_allowance_model_does_not_start(self):
+        self.assert_go_lane_refuses(LOOM_OPENCODE_GO_MODEL="opencode-go/beam-free",
+                                    LOOM_OPENCODE_GO_MODELS="opencode-go/beam-free opencode-go/kimi-k3.1-pro")
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_brief_pinning_a_low_allowance_go_model_runs_the_lane_model(self):
+        inbox, result = self.api_lane(
+            "opencode-go", extra="Model: opencode-go/kimi-k2.7-code\n",
+            LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
+            LOOM_OPENCODE_GO_MODEL="opencode-go/beam-free")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = [c for c in self.calls() if c.startswith("opencode ")][-1]
+        self.assertIn("-m opencode-go/beam-free", run)
+        self.assertNotIn("-m opencode-go/kimi", run)
+        self.assertIn("REFUSED the brief's Model: opencode-go/kimi-k2.7-code", result.stderr)
+
+    def test_the_installer_defaults_every_go_slot_to_an_allowed_model(self):
+        text = (RUNNER.parent / "mac" / "install.sh").read_text()
+        defaults = re.findall(r'^LOOM_OPENCODE_GO(?:_\d)?_MODEL="\$\{[A-Z0-9_]+:-([^}]+)\}"', text, re.M)
+        self.assertEqual(len(defaults), 3, defaults)
+        for model in defaults:
+            self.assertIn(model, tickets.OPENCODE_GO_MODELS)
+
     def slot_run(self, slot, **env):
         inbox, result = self.api_lane(
             slot, LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
-            LOOM_OPENCODE_GO_MODEL="opencode-go/kimi-k2.7-code",
+            LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash",
             LOOM_OPENCODE_GO_3_MODEL="opencode-go/deepseek-v4.1-flash", **env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
@@ -3158,7 +3200,7 @@ cat > /dev/null
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_slot_without_one_runs_its_lanes_model(self):
-        self.assertIn("-m opencode-go/kimi-k2.7-code", self.slot_run("opencode-go-2"))
+        self.assertIn("-m opencode-go/mimo-v2.6-flash", self.slot_run("opencode-go-2"))
 
     def opencode_2(self):
         """A 2.0 binary outside PATH, as one slot's LOOM_<SLOT>_OPENCODE names it."""
@@ -3222,7 +3264,7 @@ cat > /dev/null
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_sibling_slot_keeps_the_default_opencode(self):
         run = self.slot_run("opencode-go-2", LOOM_OPENCODE_GO_3_OPENCODE=self.opencode_2())
-        self.assertIn("run -m opencode-go/kimi-k2.7-code", run)
+        self.assertIn("run -m opencode-go/mimo-v2.6-flash", run)
         self.assertNotIn("--standalone", run)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
@@ -3606,7 +3648,7 @@ fi
                         'exec /usr/bin/curl "$@"\n')
         return requests, {
             "LOOM_OPENCODE_GO_KEY_SSM": "/k/go", "FAKE_SECRET__k_go": "fake-go-key-s3cr3t",
-            "LOOM_OPENCODE_GO_MODEL": "opencode-go/kimi-k2.7-code",
+            "LOOM_OPENCODE_GO_MODEL": "opencode-go/mimo-v2.6-flash",
             "LOOM_OPENCODE_GO_PROBE_URL": "http://127.0.0.1:%d/zen/go/v1/chat/completions" % server.server_port,
             "LOOM_OPENCODE_GO_PROBE_HEADER": "x-opencode-session"}
 
@@ -3647,7 +3689,7 @@ fi
         # One small request for the run's model, keyed and with a session header.
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0]["path"], "/zen/go/v1/chat/completions")
-        self.assertEqual(requests[0]["body"]["model"], "kimi-k2.7-code")
+        self.assertEqual(requests[0]["body"]["model"], "mimo-v2.6-flash")
         self.assertEqual(requests[0]["body"]["max_tokens"], 1)
         self.assertEqual(requests[0]["headers"]["Authorization"], "Bearer fake-go-key-s3cr3t")
         self.assertTrue(requests[0]["headers"].get("x-opencode-session"))
@@ -3691,7 +3733,7 @@ fi
             'curl() { cat > /dev/null; printf "%s\\n" "$*" >> "$SENT"; printf "\\n200"; }\n'
             'SLOT=opencode-go API_KEY=k PROBE_TIMEOUT=1 MODEL="$1"\nprovider_at_limit; echo "rc=$?"')
         for model, reaches in (('opencode-go/kimi", "max_tokens": 99999, "x": "', False),
-                               ("opencode-go/kimi\\", False), ("opencode-go/kimi-k2.7-code", True)):
+                               ("opencode-go/kimi\\", False), ("opencode-go/mimo-v2.6-flash", True)):
             sent.unlink(missing_ok=True)
             result = subprocess.run(["bash", "-c", script, "bash", model], env={**self.lane_env(), "SENT": str(sent)},
                                     capture_output=True, text=True)
@@ -3724,7 +3766,7 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         """Run the runner's probe in a shell of its own and say what it found."""
         script = self.source_functions("provider_at_limit", "provider_checked") + (
             'lane_setting() { case "$1" in PROBE_URL) echo http://127.0.0.1:9/v1/chat ;; esac; }\n'
-            'SLOT=opencode-go API_KEY=k PROBE_TIMEOUT=1 MODEL="opencode-go/kimi-k2.7-code"\n'
+            'SLOT=opencode-go API_KEY=k PROBE_TIMEOUT=1 MODEL="opencode-go/mimo-v2.6-flash"\n'
             'provider_at_limit; echo "rc=$?"')
         return subprocess.run(["bash", "-c", script, "bash"],
                               env={**self.lane_env(), "LOOM_HOME": str(self.loom), **env},
@@ -3751,7 +3793,8 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         script = self.source_functions(
             "provider_at_limit", "provider_checked", "provider_limit_lifted",
             "provider_recheck_due", "provider_limit_source", "lift_provider_limit", "hold_provider_limit",
-            "limit_until", "key_group", "write_beat", "limited_models_json", "utc",
+            "limit_until", "key_group", "limit_group", "slot_model", "free_model",
+            "write_beat", "limited_models_json", "utc",
             "setting_var", "lane_var", "lane_setting") + (
             'ssm_value() { printf "%s" "$FAKE_KEY"; }\n'
             'LIMIT_RECHECK=300 GO_LIMIT_ERROR=GoUsageLimitError\n'
@@ -3762,7 +3805,7 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         return subprocess.run(["bash", "-c", script, "bash"],
                               env={**self.lane_env(), "LOOM_HOME": str(self.loom),
                                    "SLOT": slot, "LANE": "opencode-go",
-                                   "LOOM_OPENCODE_GO_MODEL": "opencode-go/kimi-k2.7-code",
+                                   "LOOM_OPENCODE_GO_MODEL": "opencode-go/mimo-v2.6-flash",
                                    "LOOM_OPENCODE_GO_PROBE_URL": "http://127.0.0.1:9/v1/chat",
                                    "LOOM_OPENCODE_GO_KEY_SSM": "/k/go",
                                    "FAKE_KEY": "fake-go-key", **env},
@@ -3776,7 +3819,7 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         for slot in self.GROUP:
             (usage / (slot + ".provider-limit.json")).write_text(json.dumps(
                 {"at": int(time.time()), "limit_name": "monthly",
-                 "retry_after": str(until), "model": "kimi-k2.7-code"}) + "\n")
+                 "retry_after": str(until), "model": "mimo-v2.6-flash"}) + "\n")
             (usage / (slot + ".provider-check")).write_text("%d\n" % checked_at)
             (usage / (slot + ".json")).write_text(json.dumps(
                 {"lane": slot, "at": int(time.time()), "available": False,
@@ -3858,7 +3901,7 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         # provider limit: no probe says otherwise, so it stands.
         self.hold_the_group(int(time.time()) - 1801)
         beat = json.loads((self.loom / "state/usage/opencode-go.json").read_text())
-        beat["reason"] = "limit: model opencode-go/kimi-k2.7-code not found by the agent CLI"
+        beat["reason"] = "limit: model opencode-go/mimo-v2.6-flash not found by the agent CLI"
         (self.loom / "state/usage/opencode-go.json").write_text(json.dumps(beat))
         env = self.fake_provider(status=200)
         result = self.provider_lift(**env)
@@ -3867,20 +3910,22 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         self.assertFalse(beat["available"])
         self.assertIn("not found by the agent CLI", beat["reason"])
 
-    def hold_provider_limit_for(self, slot="opencode-go-2", limit_name="weekly", retry_after=None):
+    def hold_provider_limit_for(self, slot="opencode-go-2", limit_name="weekly", retry_after=None, **extra):
         self.write_provider_limit(slot, limit_name, retry_after)
         script = self.source_functions("hold_provider_limit", "limit_until", "key_group",
-                                       "write_beat", "utc") + (
+                                       "limit_group", "slot_model", "free_model", "setting_var",
+                                       "lane_var", "write_beat", "utc") + (
             'SLOT=%s LANE=opencode-go LIMIT_WHY="the provider weekly limit (429 GoUsageLimitError)"\n'
             'hold_provider_limit\n' % slot)
-        env = {**self.lane_env(), "LOOM_HOME": str(self.loom), "SLOT": slot, "LANE": "opencode-go"}
+        env = {**self.lane_env(), "LOOM_HOME": str(self.loom), "SLOT": slot, "LANE": "opencode-go", **extra}
         return subprocess.run(["bash", "-c", script, "bash"], env=env,
                               capture_output=True, text=True)
 
     def test_a_failed_copy_into_a_group_slot_leaves_no_temp_file_behind(self):
         self.write_provider_limit("opencode-go", "weekly", None)
         script = self.source_functions("hold_provider_limit", "limit_until", "key_group",
-                                       "write_beat", "utc") + (
+                                       "limit_group", "slot_model", "free_model", "setting_var",
+                                       "lane_var", "write_beat", "utc") + (
             'mv() { case "$*" in *provider-limit.json) return 1;; esac; command mv "$@"; }\n'
             'SLOT=opencode-go LANE=opencode-go LIMIT_WHY="the provider weekly limit"\n'
             'hold_provider_limit; echo "rc=$?"\n')
@@ -3893,6 +3938,26 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         self.assertEqual(leftovers, [])
 
     GROUP = ["opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4"]
+
+    # OpenCode Go's free models sit outside the plan's allowance: on
+    # 2026-10-23 Kimi spent the monthly limit and the 429 held the Beam Free
+    # slots for five days while Beam Free still answered.
+    def test_a_go_limit_never_holds_a_slot_on_a_free_model(self):
+        result = self.hold_provider_limit_for("opencode-go", retry_after=str(int(time.time()) + 7200),
+                                              LOOM_OPENCODE_GO_2_MODEL="opencode-go/beam-free")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beats = {k: v for k, v in self.beats().items() if "." not in k}
+        self.assertEqual(sorted(beats), ["opencode-go", "opencode-go-3", "opencode-go-4"])
+        self.assertFalse((self.loom / "state/usage/opencode-go-2.provider-limit.json").exists())
+
+    def test_a_free_slot_held_for_a_paid_models_limit_lifts_alone_when_its_model_answers(self):
+        self.hold_the_group(int(time.time()) - 301)
+        result = self.provider_lift(slot="opencode-go-2", LOOM_OPENCODE_GO_2_MODEL="opencode-go/beam-free",
+                                    **self.fake_provider(status=200))
+        self.assertEqual(result.stdout.strip(), "rc=0", result.stderr)
+        self.assertTrue(self.beat("opencode-go-2")["available"])
+        for slot in ("opencode-go", "opencode-go-3", "opencode-go-4"):
+            self.assertFalse(self.beat(slot)["available"], slot)
 
     def test_a_weekly_limit_on_one_group_slot_holds_every_group_slot_until_the_stated_reset(self):
         # Acceptance: a weekly-limit failure on one lane of a group marks every
@@ -3945,7 +4010,7 @@ echo fixed > fix.txt
 
     def go_key_env(self, key="expired-key"):
         return {"LOOM_OPENCODE_GO_KEY_SSM": "/k/go", "FAKE_SECRET__k_go": key,
-                "LOOM_OPENCODE_GO_MODEL": "opencode-go/kimi-k2.7-code"}
+                "LOOM_OPENCODE_GO_MODEL": "opencode-go/mimo-v2.6-flash"}
 
     def expired_key_lane(self, key="expired-key", **env):
         """The opencode-go lane with a provider that refuses its key."""
@@ -4385,6 +4450,41 @@ exit %d
         self.assertTrue(before + 3500 <= beat["retry_at"] <= int(time.time()) + 3600, beat)
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_model_gone_hold_for_a_model_the_lane_no_longer_runs_is_dropped(self):
+        # 2026-10-23: zen moved off minimax-m3.1-flash-free, which had left the
+        # catalogue, and the hold for it would have stood an hour at a time.
+        self.hold_gone_model()
+        result = self.run_lane("zen", LOOM_ZEN_MODEL="opencode/other-free", FAKE_MODELS="opencode/other-free")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.models_calls(), [])
+        self.assertNotIn(self.GONE, self.beat("zen")["reason"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_go_limit_hold_on_a_free_slot_is_dropped(self):
+        # 2026-10-23: the Beam Free slots kept a monthly hold Kimi had taken.
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True, exist_ok=True)
+        until = int(time.time()) + 5 * 86400
+        for slot in ("opencode-go-2", "opencode-go-3"):
+            (usage / (slot + ".provider-limit.json")).write_text(json.dumps(
+                {"at": int(time.time()), "limit_name": "monthly", "retry_after": str(until)}) + "\n")
+            (usage / (slot + ".json")).write_text(json.dumps({
+                "lane": slot, "at": int(time.time()), "available": False, "retry_at": until,
+                "reason": "limit: the provider's monthly limit (429 GoUsageLimitError); unavailable until x",
+                "limited_models": {}}))
+        env = dict(LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
+                   LOOM_OPENCODE_GO_MODEL="opencode-go/beam-free",
+                   LOOM_OPENCODE_GO_3_MODEL="opencode-go/deepseek-v4.1-flash")
+        result = self.run_lane("opencode-go-2", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dropping its Go limit hold", result.stderr)
+        self.assertNotIn("GoUsageLimitError", self.beat("opencode-go-2")["reason"])
+        self.assertFalse((usage / "opencode-go-2.provider-limit.json").exists())
+        # A paid slot keeps the hold.
+        self.run_lane("opencode-go-3", **env)
+        self.assertIn("GoUsageLimitError", self.beat("opencode-go-3")["reason"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_a_lifted_model_gone_hold_clears_when_the_cli_lists_the_model(self):
         self.hold_gone_model()
         result = self.run_lane("zen", FAKE_MODELS="opencode/other-free\n%s" % self.GONE)
@@ -4449,6 +4549,20 @@ exit %d
         self.assertEqual(len(ask), 1, self.calls())
         self.assertIn("--label needs-operator", ask[0])
         self.assertIn("renew the codex lane sign-in", ask[0])
+
+    def test_a_cli_sign_in_that_timed_out_is_auth_not_transient(self):
+        # agy's sign-in lapsed: every run waited for a browser login, timed
+        # out and was classed transient, so the lane failed five runs in two
+        # hours and nobody was asked to sign it in again (2026-10-24).
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "Waiting for authentication (timeout 60s)...\n"
+            "Or, paste the authorization code here and press Enter:\n"
+            "Error: authentication timed out.\n"
+            "error: authentication failed or timed out"))
+        self.assertTrue(self.failure_line().startswith("[auth] "), self.failure_line())
+        ask = [c for c in self.calls() if c.startswith("gh issue create")]
+        self.assertEqual(len(ask), 1, self.calls())
 
     def test_a_daily_allowance_with_no_reset_time_holds_the_lane_until_midnight_utc(self):
         # Retried every hour, a spent daily allowance failed a run each time.
