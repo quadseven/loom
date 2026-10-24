@@ -4610,7 +4610,7 @@ exit %d
         script = ('FACTORY_REPO=quadseven/loom KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"\n'
                   'KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"\n'
                   'LANE=agy SLOT=agy LOG=/dev/null NET_TIMEOUT=30 LOOM_ROOT="%s"\n'
-                  'AGY_USER=loom AGY_BIN=/Users/loom/.local/bin/agy\n' % RUNNER.parent.parent
+                  'AGY_USER=loom AGY_BIN=/opt/lane/bin/agy\n' % RUNNER.parent.parent
                   + self.source_functions("open_issue", "upsert_sticky_comment", "file_ask",
                                          "ask_sign_in") +
                   'ask_sign_in "sign-in lapsed: sign in the agy lane CLI again"\n')
@@ -4620,7 +4620,7 @@ exit %d
         self.assertEqual(len([c for c in self.calls() if c.startswith("gh issue create")]), 1)
         body = Path(f"{self.body}.issue").read_text()
         self.assertIn("macOS user loom", body)
-        self.assertIn("sudo -u loom -H /Users/loom/.local/bin/agy", body)
+        self.assertIn("sudo -u loom -H /opt/lane/bin/agy", body)
 
     def test_a_daily_allowance_with_no_reset_time_holds_the_lane_until_midnight_utc(self):
         # Retried every hour, a spent daily allowance failed a run each time.
