@@ -4441,6 +4441,21 @@ class EpicFilingTests(unittest.TestCase):
         self.assertNotEqual(nxt, first)
         self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_TITLE)
 
+    def test_an_intake_epic_with_closed_tickets_still_has_room(self):
+        # 2026-10-24: room counted every ticket an intake epic ever held, so
+        # one with 16 closed tickets read as full and the next opened; four
+        # stood open under loom#30 and put the goal over its epic cap.
+        fake = GoalRepo()
+        gh = GitHub("t", transport=fake)
+        first = brain.intake_epic(gh, REPO, 1)
+        for n in range(70, 86):
+            fake.issues[n] = item(n, labels=["loom:ticket"], state="closed")
+            fake.subs.setdefault(first, []).append(n)
+        fresh = GitHub("t", transport=fake)
+        self.assertEqual(brain.intake_epic(fresh, REPO, 1), first)
+        url = brain.brief_intake(fresh, REPO, 1, "Ticket", BODY, "codex")
+        self.assertIn(int(url.rsplit("/", 1)[1]), fake.subs[first])
+
     def intake_epics(self, fake, held):
         """Open intake epics #60, #61, ... under goal #1, oldest first, each
         holding the given number of tickets."""

@@ -1599,6 +1599,31 @@ runnable check, a failed check, or an operator criterion sends the ticket to
 an hour. A verify lane's proof that passes a live or operator criterion
 without station evidence is refused.
 
+The proof a shipped ticket names is read by `bus/live_proof.py`, read-only.
+Each live criterion names at most one step: its log strings searched from the
+deploy on, once the window it names ("within 24 hours") has passed; a check
+the gate runs; or one plain SELECT through the station's query source. A
+step that would write is refused and never run: a `gh api` call with a method
+or field, a kubectl verb other than get or rollout status, a ship, roll,
+restart or any other command, SQL other than one SELECT. When the close gate
+finds evidence for every criterion the close quotes it, matching log lines
+included; otherwise one status line names the missing criterion and the next
+check time. The station's done close runs it for each open shipped ticket
+with a live criterion that names log strings and a window ("within 24
+hours"), at most 5 a pass, with the loom:shipped label time as the deploy
+time; a Live line with log strings and no window keeps its verify run. The
+log is the repo's
+`LOOM_EVIDENCE_CMDS` command, run once per string; only lines stamped at or
+after the deploy count (a line with no time counts only when the whole log
+the command read is newer than the deploy). A proven ticket gets a station
+proof record (revision: its newest merged pull request; observed: the deploy
+to now; each criterion's evidence), moves to verified with verified_by
+`station`, and closes through `brain.close` with the evidence quoted. Any
+other gets its status line edited into the status comment and is proved
+again at the next check time, or once its criteria change when nothing Loom
+runs can change the answer. In shadow mode the close is recorded in the
+ledger (source `station live proof`) and nothing is sent (#1608).
+
 ## Post-merge watch
 
 After a Loom auto-merge (a `loom/` lane pull request merged by a Loom App,
