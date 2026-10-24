@@ -4592,11 +4592,28 @@ exit %d
         self.assertTrue(line.startswith("[auth] "), line)
         self.assertIn("sign in the codex lane CLI again", line)
         self.assertNotIn("/k/lane-password", line)
-        self.assertTrue(self.beat()["available"])
         ask = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(ask), 1, self.calls())
         self.assertIn("sign in the codex lane CLI again", ask[0])
         self.assertNotIn("/k/lane-password", ask[0])
+
+    def test_a_lapsed_sign_in_rests_the_lane_instead_of_claiming_again(self):
+        # agy, 2026-10-24: after its sign-in lapsed the lane stayed available
+        # and claimed six tickets in two hours, each run waiting out the
+        # sign-in timeout and failing auth.
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="error: authentication failed or timed out")
+        beat = self.beat()
+        self.assertFalse(beat["available"])
+        self.assertTrue(beat["reason"].startswith("limit: sign-in lapsed"), beat["reason"])
+        self.assertGreater(beat["retry_at"], int(time.time()) + 3500)
+        # Resting: the next pass runs no agent and asks nothing again.
+        self.drop_brief("T049-next.md", BRIEF.replace("T042-fix-the-thing", "T049-next"))
+        self.log.write_text("")
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="ok")
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.beat()["available"])
+        self.assertTrue((self.inbox / "T049-next.md").exists())
 
     def test_a_daily_allowance_with_no_reset_time_holds_the_lane_until_midnight_utc(self):
         # Retried every hour, a spent daily allowance failed a run each time.
