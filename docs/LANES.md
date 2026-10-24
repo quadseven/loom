@@ -1111,12 +1111,26 @@ cannot query the viewer or any other local service.
   comes back as soon as it serves the lane again, because the provider's
   allowance refills while the lane sleeps (OpenCode Go refills 20% of a
   model's allowance every 5 hours). It asks about the model the probe found at
-  a limit, and only for a hold the probe itself took: a hold the agent CLI
+  a limit (or the slot's own model, when the slot now runs another), and
+  only for a hold the probe itself took: a hold the agent CLI
   recorded (a model it no longer offers, a spent allowance) stands, for no
   probe says otherwise. On 2026-10-20 the four opencode-go slots stayed held
   for days (the provider's `Retry-After` was never read, so every limit fell
   back to a week) and the lane-held invariant fired while 33 tickets of the
   tier waited.
+- The opencode-go slots run only the models on `bus/tickets.py`
+  `OPENCODE_GO_MODELS`: Go's free models and the paid ones allowed at least
+  10,000 requests per 5 hours (Beam Free; MiMo-V2.6-Flash, DeepSeek V4.1
+  Flash, Muse Spark 1.3 Contributor). A slot whose model, or any model of its
+  ladder, is off the list does not start: its heartbeat says why. A brief's
+  Model: line naming another Go model runs the slot's own model, and the
+  station never routes such a pin to these slots. On 2026-10-23 Kimi K2.7
+  Code (1,350 requests per 5 hours) spent the plan's monthly allowance in
+  hours. Defaults: `opencode-go` and `opencode-go-2` Beam Free, `opencode-go-3`
+  DeepSeek V4.1 Flash, `opencode-go-4` Muse Spark 1.3 Contributor.
+- A Go limit never holds a slot on a free model (`opencode-go/*-free`): the
+  free models sit outside the plan's allowance, so such a slot is a hold
+  group of its own. An expired key still holds all four.
 - The Usage view's meters for the free lanes (loom#812). After a ready
   heartbeat the openrouter and workersai lanes read their provider's
   read-only meter with the key they already hold, at most every five minutes,
@@ -1231,7 +1245,7 @@ lookup leaves the brief for the next pass. The rule covers:
 ## API lanes: zen, zai
 
 - `zen`: OpenCode Zen free models through opencode, `-m opencode/<id>-free`
-  (default `opencode/minimax-m3.1-flash-free`). Zen serves its free models
+  (default `opencode/deepseek-v4.1-flash-free`). Zen serves its free models
   with no stored credential, so the lane reads no key; the agent's
   environment holds no provider key at all. opencode sends Zen's
   `x-opencode-session` header itself, and Zen refuses free-tier calls from
@@ -1240,7 +1254,10 @@ lookup leaves the brief for the next pass. The rule covers:
   failed "Unexpected server error". Check `https://opencode.ai/zen/v1/models`
   for the current `-free` ids before changing the default, and try a
   candidate with `opencode run -m opencode/<id>` (that day
-  `minimax-m3.1-flash-free` answered in seconds; three others hung).
+  `minimax-m3.1-flash-free` answered in seconds; three others hung; it left
+  the catalogue on 2026-10-22. On 2026-10-23 eight free ids each fixed a
+  five-test ticket; `deepseek-v4.1-flash-free` took 22 s with 125
+  reasoning tokens).
 - `zai`: Z.ai's free Flash models through opencode's `zai` provider,
   `zai/glm-4.7-flash` (default) or `zai/glm-4.5-flash`. GLM-5.3 Flash and
   the FlashX models are paid and refused. The key comes from SSM
