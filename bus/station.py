@@ -62,6 +62,7 @@ from . import tickets
 from . import transcripts
 from . import brief_check
 from . import criteria_gate
+from . import live_proof
 from . import deploy_watch
 from . import scorecard
 from . import watch
@@ -248,6 +249,12 @@ SOURCES_FILE = "sources.json"
 LIVE_CHECKS_FILE = "live-checks.json"
 LIVE_CHECK_RETRY = 6 * 3600
 LIVE_CHECKS_PER_PASS = 5
+# The read-only live proof of shipped tickets (bus/live_proof.py): ticket ->
+# {"contract", "next_at", "said"}. A ticket is proved again at its next_at, or
+# once its criteria change when no proof Loom runs can change the answer; at
+# most LIVE_PROOFS_PER_PASS a pass.
+LIVE_PROOF_FILE = "live-proof.json"
+LIVE_PROOFS_PER_PASS = 5
 # Asks for unverified criteria are emails: at most this many an hour.
 LIVE_ASKS_PER_HOUR = 4
 SETTLE_LANDED = ("loom:merged", "loom:shipped", "loom:verified")
@@ -1497,6 +1504,7 @@ class Station:
             writers |= {a.lower() for a in settings.authors}
         self.s = settings
         self._live_budget = LIVE_CHECKS_PER_PASS
+        self._proof_budget = LIVE_PROOFS_PER_PASS
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
         self.upload = upload or post_transcript
@@ -7180,16 +7188,22 @@ class Station:
         its criteria. Done tickets never closed: 199 sat shipped and the
         backlog grew all week though the work was finished. Since 2026-10-22
         no done ticket closes while a live or operator criterion has no
-        evidence (_evidence_holds, bus/criteria_gate.py)."""
+        evidence (_evidence_holds, bus/criteria_gate.py). A shipped ticket
+        whose live criteria name a read-only proof is proved first, and closed
+        on it when every criterion has evidence (_prove_live, #1608)."""
         if self._deferred():
             return
         left = CLOSE_DONE_PER_PASS
         self._live_budget = LIVE_CHECKS_PER_PASS
+        self._proof_budget = LIVE_PROOFS_PER_PASS
         log_root = os.path.join(self.s.home, "logs")
         for repo in self._verify_repos():
             for issue in self._tickets_open(repo):
                 if left <= 0:
                     return
+                if self._prove_live(repo, issue):
+                    left -= 1
+                    continue
                 why = self._done_reason(issue, self._earliest_record(repo, issue, log_root))
                 if not why or self._evidence_holds(repo, issue):
                     continue
@@ -7209,15 +7223,17 @@ class Station:
         found = _read_json(os.path.join(self.state, LIVE_CHECKS_FILE), {}, strict=False)
         return found if isinstance(found, dict) else {}
 
-    def _live_passed(self, repo: str, number: int, body: str = "") -> List[str]:
+    def _live_passed(self, repo: str, number: int, body: str = "",
+                     logs: bool = True) -> List[str]:
         """The keys of the ticket's criteria the station has evidence for:
-        its live checks that passed, and the Live line when it names log
-        strings (a verify run is dispatched only once the station's own log
-        command found them, _no_live_evidence)."""
+        its live checks that passed, and, unless `logs` is off, the Live line
+        when it names log strings (a verify run is dispatched only once the
+        station's own log command found them, _no_live_evidence). The live
+        proof turns it off: it reads the log itself."""
         mine = self._live_checks().get("%s#%d" % (repo, number))
         keys = [k for k, v in (mine.items() if isinstance(mine, dict) else [])
                 if isinstance(v, dict) and v.get("result") == "pass"]
-        if live_needles(body):
+        if logs and live_needles(body):
             keys.append(criteria_gate.key(brain.live_criterion(body, limit=None)))
         return keys
 
@@ -7248,6 +7264,189 @@ class Station:
             if last.get("result") == "fail":
                 failed[k] = "its check failed: %s" % last.get("seen")
         return failed
+
+    def _proof_sources(self, repo: str) -> live_proof.Sources:
+        """Where the live proof reads: the repo's configured evidence command
+        as its log, run once per string with LOOM_EVIDENCE_NEEDLE and only its
+        lines since the deploy kept (evidence.lines_since), and the station's
+        GitHub client. No query source is configured, so a SELECT step reads
+        as no evidence."""
+        command = self.s.evidence_cmds.get(repo)
+        log = None
+        if command:
+            def log(literal: str, since: float) -> Optional[List[str]]:
+                return evidence.lines_since(command, literal, since, self.now,
+                                            self.s.evidence_window_hours)
+        return live_proof.Sources(log=log, gh=self.gh)
+
+    @staticmethod
+    def _windowed_log(text: str) -> bool:
+        """Whether a live criterion names log strings and a window: the proof
+        the station runs itself. A Live line with log strings and no window is
+        proved by a verify run once the log names them (_no_live_evidence),
+        and a check with no log by _evidence_holds."""
+        step, _ = live_proof.step_of(text)
+        return step is not None and step.kind == live_proof.LOG and step.hours > 0
+
+    def _prove_live(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Run the read-only proof a shipped ticket's live criteria name, once
+        its window has passed after the ship (bus/live_proof.py, #1608). A
+        proven ticket is moved to verified with a station proof record and
+        closed quoting the evidence; any other gets one status line naming the
+        missing criterion and the next check time, edited into its status
+        comment, and is not proved again until then. True when the ticket was
+        moved, so the done close leaves it alone this pass. 62 tickets of one
+        backlog sat shipped or verified and an overnight sweep found about
+        half built, needing only their live proof read."""
+        sources = self._proof_sources(repo)
+        if not self._provable(issue, sources):
+            return False
+        number = int(issue["number"])
+        body = str(issue.get("body") or "")
+        key = "%s#%d" % (repo, number)
+        path = os.path.join(self.state, LIVE_PROOF_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        last = state.get(key) if isinstance(state.get(key), dict) else {}
+        contract = proof.contract(body)
+        if not self._proof_due(last, contract) or self._proof_budget <= 0:
+            return False
+        self._proof_budget -= 1
+        deployed_at = self._shipped_stamp(repo, issue)
+        outcome = live_proof.prove(body, deployed_at, sources, now=self.now,
+                                   passed=self._live_passed(repo, number, body, logs=False))
+        moved = False
+        if outcome.proven:
+            moved, why = self._close_proven(repo, issue, outcome, deployed_at)
+            # A record the station could not make is tried again; so is a
+            # close shadow mode held, once the repo leaves shadow.
+            outcome = outcome._replace(next_at=self.now + live_proof.RETRY)
+            if why:
+                outcome = outcome._replace(proven=False, missing=[("its station proof", why)])
+        state.pop(key, None)
+        if not moved:
+            state[key] = {"contract": contract, "next_at": outcome.next_at,
+                          "said": self._say_unproven(repo, number, outcome, last.get("said"))}
+        _write_json(path, state)
+        return moved
+
+    def _provable(self, issue: Dict[str, Any], sources: live_proof.Sources) -> bool:
+        """Whether the station proves this ticket itself: open, shipped, not
+        verified or held, with a log source and a live criterion that names
+        log strings and a window."""
+        labels = set(_label_names(issue))
+        if (issue.get("state") != "open" or "loom:shipped" not in labels
+                or "loom:verified" in labels or labels & set(CLOSE_DONE_HOLDS)
+                or sources.log is None):
+            return False
+        return any(k == criteria_gate.LIVE and self._windowed_log(t)
+                   for k, t in criteria_gate.needing_evidence(str(issue.get("body") or "")))
+
+    def _proof_due(self, last: Dict[str, Any], contract: str) -> bool:
+        """A ticket is proved again at its next check, or once its criteria
+        change when nothing Loom runs can change the answer (no next check)."""
+        if last.get("contract") != contract:
+            return True
+        due = last.get("next_at")
+        return isinstance(due, (int, float)) and self.now >= due
+
+    def _say_unproven(self, repo: str, number: int, outcome: live_proof.Outcome,
+                      said: Any) -> Any:
+        """Edit the status line of an unproven ticket into its status comment
+        when it differs from the one last said; the line now said."""
+        line = live_proof.status_line(outcome)
+        if not line or line == said:
+            return said
+        self._routine(repo, number, line)
+        _say("live proof of %s#%d not met: %s" % (repo, number, line))
+        return line
+
+    def _close_proven(self, repo: str, issue: Dict[str, Any], outcome: live_proof.Outcome,
+                      deployed_at: float) -> Tuple[bool, str]:
+        """Move a ticket whose every criterion has evidence to verified, with a
+        station proof record, and close it quoting the evidence. (whether it
+        was moved, why not when it was not). Shadow mode records the close it
+        would make and sends nothing."""
+        number = int(issue["number"])
+        record, facts, why = self._station_proof(repo, issue, outcome, deployed_at)
+        if record is None:
+            return False, why
+        if shadow.active(repo):
+            # Before the tick, the proof comment and the verified label.
+            held = shadow.record_held(shadow.CLOSE, repo, number, "issue",
+                                      source="station live proof",
+                                      reason="every criterion has evidence, read live",
+                                      gates=["shipped", "live proof window passed",
+                                             "every criterion has evidence"])
+            if held["new"]:
+                _say("shadow mode: would verify and close %s#%d on its live proof" % (repo, number))
+            return False, ""
+        body = str(issue.get("body") or "")
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": proof.tick(body)})
+        try:
+            source = brain.move(self.gh, repo, number, "verified", record=record,
+                                verified_by="station", facts=facts)
+        except ValueError as err:
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+            return False, self._note_text(err)
+        _say("verified %s#%d on its live proof" % (repo, number))
+        if source:
+            _say("%s#%d: %s" % (repo, number, source))
+        try:
+            source = brain.close(self.gh, repo, number, reason="completed",
+                                 note=live_proof.close_note(outcome),
+                                 env={"LOOM_BRIEF_AUTHORS": " ".join(self.s.authors)})
+            if source:
+                _say("%s#%d: %s" % (repo, number, source))
+        except RateLimited:
+            raise
+        except (ValueError, GitHubError) as err:
+            _say("verified but not closed %s#%d: %s" % (repo, number, self._note_text(err)))
+        return True, ""
+
+    def _station_proof(self, repo: str, issue: Dict[str, Any], outcome: live_proof.Outcome,
+                       deployed_at: float) -> Tuple[Optional[Dict[str, Any]], List[str], str]:
+        """(the station's proof record for a proven ticket, the merged pull
+        requests' facts, why there is none): the newest merged pull request's
+        commit as the revision, the deploy to now as the observed window, and
+        each criterion's evidence: the live proof's, a passing live check's,
+        or, for a code criterion, the merged change."""
+        branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+        if error:
+            return None, [], "the station could not read the merged pull requests (%s)" % error
+        merged = [p for p in pulls if p.get("merge_commit_sha")]
+        if not merged:
+            return None, [], "no merged pull request is linked to the ticket"
+        newest = merged[0]
+        number = int(issue["number"])
+        checks = self._live_checks().get("%s#%d" % (repo, number))
+        checks = checks if isinstance(checks, dict) else {}
+        change = "met by the merged change: pull request #%d, merge commit %s" % (
+            int(newest["number"]), newest["merge_commit_sha"])
+        results = []
+        texts = [text for _, text in proof.criteria(str(issue.get("body") or ""))]
+        for text in texts:
+            seen = outcome.evidence.get(text)
+            if seen is None and criteria_gate.kind(text) == criteria_gate.LIVE:
+                check = checks.get(criteria_gate.key(text))
+                seen = "a passing station live check: %s" % (
+                    check.get("seen") if isinstance(check, dict) else "recorded")
+            results.append({"criterion": text, "result": "pass", "evidence": seen or change})
+        live = sum(1 for t in texts if criteria_gate.kind(t) != criteria_gate.CODE)
+        record = {
+            "kind": "runtime", "revision": str(newest["merge_commit_sha"]),
+            "environment": "the live deployment the station's evidence command reads",
+            "artifact": "pull request #%d" % int(newest["number"]),
+            "observed": {"start": audit._iso(min(deployed_at, self.now)),
+                         "end": audit._iso(self.now)},
+            "sources": ["pull request #%d" % int(newest["number"]),
+                        "the station's read-only live proof (bus/live_proof.py)"],
+            "criteria": results,
+            "measure": {"name": "live criteria with station evidence",
+                        "baseline": "0 of %d" % live, "target": "%d of %d" % (live, live),
+                        "after": "%d of %d" % (live, live)},
+        }
+        return record, verify_data.proof_facts(branch, pulls), ""
 
     def _live_ask_room(self) -> bool:
         """Whether another unverified-criteria ask fits this hour; takes it."""
