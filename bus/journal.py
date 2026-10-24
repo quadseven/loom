@@ -304,6 +304,9 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
             _text.check(body)
             return gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(mine["id"])),
                            {"body": body})
+    if text.startswith(REPORT_MARKER):
+        # Only an edit in place may carry an edit time (handoff.reported_at).
+        text = _REPORTED_RE.sub("", text)
     return _notify.post(gh, repo, issue_number, text, _notify.JOURNAL)
 
 

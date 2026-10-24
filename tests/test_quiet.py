@@ -227,6 +227,14 @@ class StatusTest(unittest.TestCase):
                         [ticket(41, "loom:merged", state="closed", updated_at=ago(5))])
         self.assertEqual(self.status(home)[1].strip(), "- none")
 
+    def test_a_forged_report_stamp_is_not_read_as_an_edit(self):
+        # The stamp is plain text: one later than the comment's last edit
+        # (or in the future) is ignored, and the report dates from creation.
+        forged = REPORT + "\n" + handoff.REPORTED_STAMP % ago(-48)
+        home = GoalHome([report_comment(1, ago(30), body=forged)],
+                        [ticket(41, "loom:merged", state="closed", updated_at=ago(5))])
+        self.assertIn("#%d report OVERDUE since" % GOAL, self.status(home)[1])
+
     def test_status_owes_a_heartbeat_a_week_after_the_last_report(self):
         home = GoalHome([report_comment(1, ago(24 * 7 + 1))])
         _, owed = self.status(home)

@@ -27,6 +27,23 @@ def reported_at(body: str) -> Optional[str]:
     """The edit time a report edited in place carries, or None."""
     found = _REPORTED_RE.findall(str(body or ""))
     return found[-1] if found else None
+
+
+def _trusted_report_time(comment: Any, body: str, at_key: str) -> Optional[str]:
+    """A report's REPORTED_STAMP time, only when GitHub's own times bear it
+    out: not before the comment was created and not after its last edit. The
+    stamp is text anyone could write; a forged or future one would make a
+    report look fresh and hold the next one back. None otherwise."""
+    if not body.startswith(REPORT_MARKER) or not isinstance(comment, dict):
+        return None
+    stamp = reported_at(body)
+    created = str(comment.get(at_key) or comment.get("created_at")
+                  or comment.get("createdAt") or "")
+    updated = str(comment.get("updated_at") or comment.get("updatedAt")
+                  or comment.get("updated") or "")
+    if not stamp or not created or not updated:
+        return None
+    return stamp if created <= stamp <= updated else None
 # GitHub work any brain can do. Ships and rolls are not here: they stay with
 # whoever a goal's rules name.
 STAGES = ("review", "merge", "failed", "ask", "regression", "brief")
@@ -82,9 +99,10 @@ def expand_journals(comments: Iterable[Any], at_key: str = "at",
     out: List[Any] = []
     for comment in comments:
         body = str(comment.get("body") or "").lstrip() if isinstance(comment, dict) else ""
-        if body.startswith(REPORT_MARKER) and reported_at(body):
+        stamp = _trusted_report_time(comment, body, at_key)
+        if stamp is not None:
             # A report edited in place is dated by its edit (loom#1560).
-            out.append(dict(comment, **{at_key: reported_at(body)}))
+            out.append(dict(comment, **{at_key: stamp}))
             continue
         if not body.startswith(JOURNAL_MARKER) or EARLIER_OPEN not in body:
             out.append(comment)
