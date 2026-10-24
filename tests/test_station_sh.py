@@ -105,6 +105,31 @@ class StationScriptTest(unittest.TestCase):
         self.assertEqual(record["revision"], target)
         self.assertLessEqual(abs(record["at"] - time.time()), 60)
 
+    def test_infra_checkout_is_cloned_and_refreshed_at_most_hourly(self):
+        infra_seed = self.tmp / "infra-seed"
+        infra_remote = self.tmp / "infra.git"
+        infra_checkout = self.tmp / "home" / "infra-public"
+        git("init", "-q", "--bare", "-b", "main", str(infra_remote))
+        git("clone", "-q", str(infra_remote), str(infra_seed))
+        (infra_seed / "scanner").write_text("one\n")
+        git("add", "scanner", cwd=infra_seed)
+        git("commit", "-qm", "one", cwd=infra_seed)
+        git("push", "-q", "origin", "HEAD:main", cwd=infra_seed)
+        result = self.run_script(LOOM_INFRA_PUBLIC_URL=str(infra_remote))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((infra_checkout / "scanner").read_text(), "one\n")
+        (infra_seed / "scanner").write_text("two\n")
+        git("commit", "-qam", "two", cwd=infra_seed)
+        git("push", "-q", "origin", "HEAD:main", cwd=infra_seed)
+        result = self.run_script(LOOM_INFRA_PUBLIC_URL=str(infra_remote))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((infra_checkout / "scanner").read_text(), "one\n")
+        (self.tmp / "home" / "state" / "station" / "infra-public.updated").write_text(
+            str(int(time.time()) - 3601) + "\n")
+        result = self.run_script(LOOM_INFRA_PUBLIC_URL=str(infra_remote))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((infra_checkout / "scanner").read_text(), "two\n")
+
     def test_configured_pin_pass_runs_after_deploy_and_retries_next_pass(self):
         self.push_change()
         settings = {"LOOM_PIN_TARGETS": '[{"repo":"example-owner/deploy","path":"pin.env",'

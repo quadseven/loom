@@ -71,7 +71,7 @@ LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_ROOT/../infra-public/.github/scripts/check_private_leaks.py}"
+LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_HOME/infra-public/.github/scripts/check_private_leaks.py}"
 INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
 
@@ -3052,7 +3052,9 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   if [ "$REPO_PRIVATE" = false ]; then
     if [ ! -f "$LEAK_SCANNER" ]; then
-      park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed" transient
+      REASON="public repo leak scanner is missing; nothing pushed"
+      note_factory_incident leak-scanner "$REASON" REASON
+      park "$BRIEF" "$REASON" hold
       continue
     fi
     # A fix round that merged the default branch scans what the pull request

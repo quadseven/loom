@@ -4977,6 +4977,16 @@ exec /usr/bin/git "$@"
         self.assertIn("Repo: example/repo", body)
         self.assertIn("python: 3.12", body)
 
+    def test_missing_public_leak_scanner_files_factory_incident(self):
+        self.drop_brief()
+        result = self.run_lane(LOOM_LEAK_SCANNER=str(Path(self._tmp.name) / "missing-scanner"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("failed: [hold]", self.lane_log())
+        self.assertIn("[hold] public repo leak scanner is missing", self.lane_log())
+        self.assertIn("factory incident quadseven/loom#99", self.lane_log())
+        self.assertIn("public repo leak scanner is missing", self.log.read_text())
+        self.assertEqual(self.remote_heads().count("refs/heads/loom/"), 0)
+
     def test_a_repeated_factory_incident_updates_the_open_issue(self):
         self.contract_repo(contract=CONTRACT + "python: 3.12\n")
         self.drop_brief()

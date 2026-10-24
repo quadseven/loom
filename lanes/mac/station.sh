@@ -23,6 +23,9 @@ BRANCH="${LOOM_DEPLOY_BRANCH:-main}"
 CHECK="${LOOM_DEPLOY_CHECK:-unittest}"
 DEPLOY_LOOKBACK=8
 STATE_DIR="${LOOM_HOME:-$HOME/loom}/state/station"
+INFRA_HOME="${LOOM_HOME:-$HOME/loom}/infra-public"
+INFRA_UPDATED="$STATE_DIR/infra-public.updated"
+INFRA_URL="${LOOM_INFRA_PUBLIC_URL:-https://github.com/quadseven/infra-public.git}"
 say() { printf 'station: %s\n' "$*"; }
 g() { git -C "$REPO_ROOT" -c core.hooksPath=/dev/null "$@"; }
 
@@ -113,6 +116,25 @@ deploy() {
 }
 
 deploy
+mkdir -p "$STATE_DIR"
+now="$(date +%s)"
+last="$(cat "$INFRA_UPDATED" 2>/dev/null || printf '0')"
+if [ ! -d "$INFRA_HOME/.git" ]; then
+  if timeout 120 git clone -q --branch main "$INFRA_URL" "$INFRA_HOME"; then
+    printf '%s\n' "$now" > "$INFRA_UPDATED.tmp" && mv -f "$INFRA_UPDATED.tmp" "$INFRA_UPDATED"
+    say "cloned infra-public"
+  else
+    say "could not clone infra-public; lane leak scans will file factory incidents"
+  fi
+elif ! [[ "$last" =~ ^[0-9]+$ ]] || [ "$((now - last))" -ge 3600 ]; then
+  if timeout 120 git -C "$INFRA_HOME" fetch -q origin main &&
+     git -C "$INFRA_HOME" merge --ff-only -q FETCH_HEAD; then
+    printf '%s\n' "$now" > "$INFRA_UPDATED.tmp" && mv -f "$INFRA_UPDATED.tmp" "$INFRA_UPDATED"
+    say "updated infra-public"
+  else
+    say "could not fast-forward infra-public; lane leak scans will file factory incidents"
+  fi
+fi
 if [ -n "${LOOM_PIN_TARGETS:-}" ] && [ "${LOOM_DEPLOY:-1}" != 0 ] &&
    [ "$(g symbolic-ref --short -q HEAD)" = "$BRANCH" ]; then
   LOOM_SELF_REPO="${LOOM_SELF_REPO:-$(g remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')}" \
