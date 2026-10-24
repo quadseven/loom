@@ -526,6 +526,15 @@ class BrainTickTest(unittest.TestCase):
         self.assertFalse(any("LOOM_OPENCODE_GO_KEY_SSM" in c for c in settings))
         self.assertFalse(any("LOOM_SPARK_URL" in c for c in settings))
 
+    def test_the_fabric_key_and_its_ssm_name_never_reach_the_agent(self):
+        # The Fabric key and its SSM name stay out of the agent's environment:
+        # brain.sh reads the key itself and asks Fabric outside the sandbox.
+        _, calls = self.spark_tick(LOOM_FABRIC_KEY_SSM="/example/fabric/key")
+        self.assertFalse(any("LOOM_FABRIC_KEY_SSM" in c for c in calls))
+        settings = [c for c in calls if c.startswith("opencode setting ")]
+        self.assertFalse(any("LOOM_FABRIC_KEY_SSM" in c for c in settings))
+        self.assertFalse(any("/example/fabric/key" in c for c in settings))
+
     def test_the_shadow_switch_reaches_the_sandboxed_brain(self):
         # bus/shadow.py: the brain's own merges and closes honor the same
         # switch and repo list as the station's.
