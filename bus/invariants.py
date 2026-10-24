@@ -39,6 +39,7 @@ from . import brain
 from . import journal
 from . import naming
 from . import notify
+from . import shadow
 from . import text as _text
 from . import watch
 from .github import GitHubError
@@ -1122,10 +1123,28 @@ class Filer:
                                if CLEARED_TEXT in str(c.get("body", ""))) if t is not None]
         return not cleared or max(noted) >= max(cleared)
 
-    def _reopen(self, b: Breach, number: int, comments: List[Dict[str, Any]]) -> None:
+    def _held(self, number: int, body: Dict[str, Any], issue: Any, why: str) -> bool:
+        """True, after recording it, when shadow mode holds this close or
+        reopen (bus/shadow.py guard, loom#1551): the caller then posts no note
+        and sends no PATCH. Asked before the note, so a held close never says
+        it closed. The ledger keeps one entry, so the log says it once."""
+        entry = shadow.guard("PATCH", "/repos/%s/issues/%d" % (self.repo, number), body, issue,
+                             source="station invariants", reason=why)
+        if entry is None:
+            return False
+        if entry.get("new", True):
+            self.say("invariants: shadow mode: would %s %s#%d (%s); recorded in the shadow "
+                     "ledger, left as it is" % (entry.get("action") or "close", self.repo,
+                                                number, why))
+        return True
+
+    def _reopen(self, b: Breach, number: int, comments: List[Dict[str, Any]],
+                issue: Any = None) -> bool:
         """Reopen the issue and say so in its one broken-again note: a count
         and the last time, edited in place (a new comment each time mailed
-        everyone watching, loom#1223)."""
+        everyone watching, loom#1223). False when shadow mode holds it."""
+        if self._held(number, {"state": "open"}, issue, "breach again: " + b.title):
+            return False
         mine = [c for c in comments if BROKEN_MARKER in str(c.get("body", ""))]
         note = mine[-1] if mine else None
         times = (self._broken_times(comments) + [self.now])[-BROKEN_TIMES_MAX:]
@@ -1148,6 +1167,7 @@ class Filer:
             notify.post(self.gh, self.repo, number, body, notify.REOPENED)
         self.writes += 1
         self.say("invariants: reopened %s#%d: %s" % (self.repo, number, b.title))
+        return True
 
     def _comments(self, number: int) -> List[Dict[str, Any]]:
         return [c for c in self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100"
@@ -1164,9 +1184,13 @@ class Filer:
                 return number
         return None
 
-    def _fold(self, number: int, into: int, comments: List[Dict[str, Any]]) -> None:
+    def _fold(self, number: int, into: int, comments: List[Dict[str, Any]],
+              issue: Any = None) -> None:
         """Close an issue whose breach is now one line of rolling issue
         #into: not cleared, only listed there."""
+        if self._held(number, {"state": "closed", "state_reason": "not_planned"}, issue,
+                      "folded into #%d" % into):
+            return
         body = ("Folded into #%d, the one rolling issue for this invariant: it lists "
                 "this subject with the others and is updated in place." % into)
         if not any(("Folded into #%d" % into) in str(c.get("body", "")) for c in comments):
@@ -1201,7 +1225,7 @@ class Filer:
                 # Still broken, so no clear wait: its subject is a line of #into.
                 if self.writes + 2 > WRITES_MAX:
                     return
-                self._fold(number, into, comments)
+                self._fold(number, into, comments, issue)
             elif key in _standing_keys():
                 if self.writes >= WRITES_MAX:
                     return
@@ -1250,6 +1274,9 @@ class Filer:
             return True
         if self.writes + 2 > WRITES_MAX:
             return False
+        if self._held(number, {"state": "closed", "state_reason": "not_planned"}, issue,
+                      "cleared: last breach %s" % utc(max(times))):
+            return True
         body = ("The invariant cleared by %s; its last breach was observed at %s, "
                 "more than 6 hours earlier." % (utc(self.now), utc(max(times))))
         # A note from an earlier close does not explain this one (loom#651).
@@ -1314,7 +1341,8 @@ class Filer:
                 self.say("invariants: %s#%d was closed again while its breach stands; not "
                          "reopened: %s" % (self.repo, number, b.title))
                 return
-            self._reopen(b, number, comments)
+            if not self._reopen(b, number, comments, issue):
+                return
             if b.rolling:
                 self._rolling_open[b.key] = number
                 if self.writes < WRITES_MAX:
