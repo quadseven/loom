@@ -1167,7 +1167,7 @@ def _dispatch_basic(handler, state, path):
         return _handle_brain(handler, state)
     if path == "/api/usage":
         return _handle_usage_get(handler, state)
-    if path == "/api/bench" or path == "/api/bench/":
+    if path == "/api/bench":
         return _handle_bench_get(handler, state)
     return handler.send_text(404, "not found")
 
