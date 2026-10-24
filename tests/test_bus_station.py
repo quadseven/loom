@@ -2920,6 +2920,19 @@ class HandBackTest(unittest.TestCase):
         fixes = [c for c in self.gh.comments if str(c["body"]).startswith(tickets.FIX_MARKER)]
         self.assertEqual(len(fixes), 3)
 
+    def test_fix_rounds_on_one_head_count_toward_the_cap(self):
+        # grug#1315, 2026-10-24: its fix rounds failed [transient] and pushed
+        # nothing, so the head stayed the same; the cap counted distinct heads
+        # (2) and sent 15 rounds, 9 of them for one head.
+        self.gh.comments.extend({"user": {"login": "alice-example"},
+                                 "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % ("a" * 40)}
+                                for _ in range(3))
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
+            self.run_hand_back(checks=[("lint", "failed")])
+        self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        fixes = [c for c in self.gh.comments if str(c["body"]).startswith(tickets.FIX_MARKER)]
+        self.assertEqual(len(fixes), 3)
+
     def cap_events(self):
         return [text for c in self.gh.comments if status.is_status(c["body"])
                 for _, text in status.parse(c["body"]) if text.startswith("The fix round cap")]
