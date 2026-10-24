@@ -4542,12 +4542,14 @@ def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
 
 
 def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
-                            env: Optional[Dict[str, str]]) -> List[str]:
-    """Ready sensitive PRs needing brain attention, oldest first."""
+                            env: Optional[Dict[str, str]],
+                            pulls: Optional[Callable[[str], List[Any]]] = None) -> List[str]:
+    """Ready sensitive PRs needing brain attention, oldest first. `pulls`
+    reads a repo's open pull requests (default: straight from GitHub)."""
     check = review_check_name(env)
+    pulls = pulls or (lambda repo: gh.paginate("/repos/%s/pulls?state=open" % repo))
     ready = [item for repo in repos
-             for item in (_ready_sensitive(gh, repo, pr, now, check)
-                          for pr in gh.paginate("/repos/%s/pulls?state=open" % repo))
+             for item in (_ready_sensitive(gh, repo, pr, now, check) for pr in pulls(repo))
              if item is not None]
     ready.sort(key=lambda item: (item["created"], item["repo"], int(item["pr"]["number"])))
     out = ["", "## Sensitive pull requests (up to %d, oldest first)" % SENSITIVE_RESUME_MAX]
@@ -4609,7 +4611,9 @@ class _ResumeRead:
     def read_repo(self, repo: str) -> None:
         """Write the section of every goal in `repo`, once all its journals
         are read; an unreadable repo is recorded in `unread` and left out
-        (github.unreadable)."""
+        (github.unreadable). A repo already found unreadable is not read again."""
+        if repo in self.unread:
+            return
         self.log("resume: reading %s (requests: %d)" % (repo, self.gh.requests))
         try:
             found = [self._read_goal(repo, issue)
@@ -4625,6 +4629,18 @@ class _ResumeRead:
         self._note_marks(found)
         for goal in found:
             self.emit("\n".join(self._goal_lines(goal)))
+
+    def open_pulls(self, repo: str) -> List[Any]:
+        """The repo's open pull requests; a repo GitHub will not show
+        (github.unreadable) is recorded in `unread` and reads as none."""
+        try:
+            return self.retrying(lambda: self.gh.paginate("/repos/%s/pulls?state=open" % repo))
+        except GitHubError as err:
+            reason = unreadable(err)
+            if reason is None:
+                raise
+            self.unread[repo] = reason
+            return []
 
     def _goal_lines(self, goal: GoalJournals) -> List[str]:
         return self.retrying(lambda: _goal_resume_lines(
@@ -4656,6 +4672,20 @@ def _read_goals(read: _ResumeRead, repos: Sequence[str]) -> None:
             return
 
 
+def _resume_sensitive(read: _ResumeRead, repos: Sequence[str], now: datetime,
+                      env: Optional[Dict[str, str]]) -> None:
+    """The sensitive pull requests, written before the goals as resume always
+    listed them. The deadline is checked before each repo's pull requests are
+    read; past it the section is named and the goals that follow are too."""
+    try:
+        lines = read.retrying(lambda: _sensitive_resume_lines(read.gh, repos, now, env,
+                                                              read.open_pulls))
+    except _PastDeadline:
+        read.emit("resume skipped sensitive: deadline")
+        return
+    read.emit("\n".join(lines))
+
+
 def _resume_tail(read: _ResumeRead, repos: Sequence[str], holder: str,
                  now: datetime, env: Optional[Dict[str, str]]) -> None:
     """Everything after the goals: the freshness rule, then the sections that
@@ -4664,8 +4694,7 @@ def _resume_tail(read: _ResumeRead, repos: Sequence[str], holder: str,
     read.emit("")
     read.emit(_freshness_line(handoff.peer_journals([j for _, _, f, _ in read.goals for j in f],
                                                     holder, now)))
-    sections = (("sensitive", lambda: _sensitive_resume_lines(gh, repos, now, env)),
-                ("finished-epics", lambda: _finished_epic_resume_lines(gh, goals)),
+    sections = (("finished-epics", lambda: _finished_epic_resume_lines(gh, goals)),
                 ("verify", lambda: _verify_resume_lines(gh, repos, now)),
                 ("audit", lambda: _audit_resume_lines(gh, repos, now, env)))
     for index, (_, build) in enumerate(sections):
@@ -4685,7 +4714,8 @@ def stream_resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     work is open to it under the freshness rule (handoff.QUIET). Refuses
     unless `holder` holds the lock, so only the lock holder acts on it.
 
-    Each repo's goal sections go to `emit` as soon as they are read. Progress goes
+    The sensitive pull requests come first, then each repo's goal sections go
+    to `emit` as soon as they are read. Progress goes
     to stderr before each repo, and a line whenever the run waits on GitHub.
     After `deadline_minutes` it reads no more and emits
     `resume skipped OWNER/NAME: deadline` for each repo it did not finish;
@@ -4697,11 +4727,12 @@ def stream_resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     authors = require_trusted_authors(env, "resume")
     _lock_holder(gh, lock_repo, holder, now)
     read = _ResumeRead(gh, authors, emit, _clock() + deadline_minutes * 60)
-    emit("# Resume for %s" % holder)
-    emit("")
-    emit(trusted_line(authors))
     gh.on_wait = lambda seconds: read.log("resume: waiting %.0fs to retry a GitHub read" % seconds)
     try:
+        _resume_sensitive(read, repos, now, env)
+        emit("# Resume for %s" % holder)
+        emit("")
+        emit(trusted_line(authors))
         _read_goals(read, repos)
         if read.unread:
             emit("\n".join(["", "## Skipped repos (fix LOOM_REPOS)"]

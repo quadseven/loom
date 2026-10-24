@@ -691,6 +691,29 @@ class SlowResumeTests(unittest.TestCase):
         self.assertIn("resume: reading %s (requests: " % REPO, self.err.getvalue())
         self.assertIn("resume: reading %s (requests: " % REPO2, self.err.getvalue())
 
+    def test_the_sensitive_section_comes_before_the_first_goal(self):
+        out = []
+        self.stream(Routes(self.routes()), out.append)
+        text = "\n".join(out)
+        self.assertLess(text.index("## Sensitive pull requests"),
+                        text.index("## %s#1 Goal 1" % REPO))
+
+    def test_a_deadline_in_the_sensitive_section_names_it_and_the_goals(self):
+        routes = Routes(self.routes())
+
+        def slow(method, url, headers, body):
+            if "/pulls" in url:
+                self.now[0] += 600  # the pull request list took ten minutes
+            return routes(method, url, headers, body)
+
+        out = []
+        self.stream(slow, out.append, deadline=5)
+        text = "\n".join(out)
+        self.assertIn("resume skipped sensitive: deadline", text)
+        self.assertNotIn("## Sensitive pull requests", text)
+        self.assertIn("resume skipped %s: deadline\nresume skipped %s: deadline" % (REPO, REPO2),
+                      text)
+
     def test_a_rate_limit_wait_is_logged_with_its_length_before_it_starts(self):
         routes, limited = Routes(self.routes()), []
 
@@ -736,7 +759,7 @@ class SlowResumeTests(unittest.TestCase):
         self.assertIn("resume skipped %s: deadline" % REPO2, text)
         self.assertNotIn("resume skipped %s:" % REPO, text)
         self.assertNotIn("Goal 2", text)
-        self.assertIn("resume skipped sensitive,finished-epics,verify,audit: deadline", text)
+        self.assertIn("resume skipped finished-epics,verify,audit: deadline", text)
 
     def test_a_rate_limit_wait_past_the_deadline_is_not_waited_out(self):
         out, routes = [], Routes(self.routes())

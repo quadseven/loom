@@ -88,6 +88,22 @@ class ResumeSkipTests(unittest.TestCase):
         self.assertNotIn("resume merge %s#3" % MOVED, out)
         self.assertIn("## Verify due", out)
 
+    def test_a_repo_whose_pull_requests_answer_moved_is_named_once(self):
+        routes = Routes(self.routes())
+
+        def moved_pulls(method, url, headers, body):
+            if "/repos/%s/pulls" % MOVED in url:
+                return 301, {}, json.dumps(MOVED_BODY).encode()
+            return routes(method, url, headers, body)
+
+        out, _ = quiet(brain.resume, GitHub("t", transport=moved_pulls), [MOVED, REPO],
+                       "lane-machine", LOCK_REPO, NOW, ENV)
+        line = "- skipped %s: HTTP 301 Moved Permanently: renamed or transferred" % MOVED
+        self.assertEqual(1, out.count(line))
+        self.assertIn("## Sensitive pull requests", out)
+        self.assertIn("- resume merge %s#7 (deferred by muse at %s)" % (REPO, at(5)), out)
+        self.assertNotIn(("GET", "/repos/%s/issues" % MOVED), routes.calls)
+
     def test_a_handoff_item_that_answers_forbidden_is_named(self):
         routes = self.routes()
         routes[("GET", "/repos/%s/issues/7" % REPO)] = (403, {"message": "Must have admin rights"})
