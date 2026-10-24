@@ -1672,6 +1672,23 @@ print('leak guard: clean (shape patterns only)')
         self.assertFalse(missing, "function not found in runner: %s" % ", ".join(missing))
         return "".join(found[n].group(0) for n in names)
 
+    def test_the_agy_run_may_write_its_file_secret_store_and_not_the_keychains(self):
+        # 2026-10-24: agy reads its keychain sign-in by running
+        # /usr/bin/security, which the lane sandbox denies (#1465), and falls
+        # back to its file store under Library/Application Support/antigravity.
+        # The lane user's home allowed no write there, so agy could neither
+        # keep nor refresh a token, and every run asked for a browser login
+        # (#1620). The Keychains folder needs no write any more.
+        home = self.home / "agy-home"
+        home.mkdir()
+        script = ('LANE=agy AGY_HOME="%s"\n' % home
+                  + self.source_functions("agy_write_rules") + 'agy_write_rules "(subpath \\"/t\\")"\n')
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        h = str(home.resolve())
+        self.assertIn('(subpath "%s/Library/Application Support/antigravity")' % h, result.stdout)
+        self.assertNotIn("Library/Keychains", result.stdout)
+
     def test_free_slots_use_distinct_pinned_gateway_routes(self):
         script = self.source_functions("setting_var", "lane_var", "lane_setting") + 'lane_setting URL'
         routes = {
