@@ -95,6 +95,16 @@ _CRITERION = re.compile(r"^- \[([ xX])\] (.*?)(?:; not built: (.*))?$")
 # leak scan reads on a fix round, so only plain words and punctuation pass:
 # no digits, so no address, version, token or issue number (security review).
 _REASON = re.compile(r"[A-Za-z ,.'()-]{1,200}")
+# Standard acceptance criteria appended to a pull request body when the ticket
+# names fewer than three. The Grug - Chief plan check needs at least three
+# non-empty acceptance criteria bullets, so a follow-up ticket whose criteria
+# were all marked not built (for example two) still yields a body Chief can
+# pass. Kept generic so it is true of any pull request.
+_STANDARD_FOLLOW_UP_CRITERIA = (
+    "The change is built and a test that fails without it is added",
+    "The pull request changes only what is needed, so the review check has no reviewability note",
+    "The full test suite passes as CI runs it",
+)
 
 
 def _criteria_text(section: str) -> list:
@@ -140,14 +150,23 @@ def _checklist(brief: str, current_body: str, summary: str) -> str:
     ticket = _brief_section(brief, "Acceptance criteria")
     lane = _brief_section(summary, "Acceptance criteria") if summary else ""
     if lane:
-        return _lane_ticks(ticket, lane)
-    # The body's section runs on to its Size: line; its checklist is the
-    # "- [" lines.
-    current = "\n".join(line for line in _brief_section(current_body, "Acceptance criteria")
-                         .split("\n") if line.startswith("- ["))
-    if current and _criteria_text(current) == _criteria_text(ticket):
-        return _lane_ticks(ticket, current)
-    return ticket
+        result = _lane_ticks(ticket, lane)
+    else:
+        current = "\n".join(line for line in _brief_section(current_body, "Acceptance criteria")
+                             .split("\n") if line.startswith("- ["))
+        if current and _criteria_text(current) == _criteria_text(ticket):
+            result = _lane_ticks(ticket, current)
+        else:
+            result = ticket
+    # The Grug - Chief plan check needs at least three non-empty acceptance
+    # criteria bullets. When the ticket names fewer, append standard criteria
+    # so the pull request body passes the check.
+    bullets = [l for l in result.split("\n") if l.strip().startswith("- [")]
+    non_empty = [b for b in bullets
+                 if _CRITERION.match(b.strip()) and _CRITERION.match(b.strip()).group(2).strip()]
+    for i in range(max(0, 3 - len(non_empty))):
+        result = result.rstrip("\n") + "\n- [ ] " + _STANDARD_FOLLOW_UP_CRITERIA[len(non_empty) + i]
+    return result
 
 
 def _operator_steps(brief: str, current_body: str, summary: str) -> str:

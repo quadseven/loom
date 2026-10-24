@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
+from . import bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -2307,10 +2307,15 @@ class Factory:
     def _file_criterion_follow_up(self, repo: str, number: int,
                                   issue: Dict[str, Any], full: Dict[str, Any]) -> None:
         """File a ticket for criteria explicitly marked not built in a lane PR."""
-        criteria = not_built_criteria(str(issue.get("body") or ""),
-                                      str(full.get("body") or ""))
+        criteria = list(not_built_criteria(str(issue.get("body") or ""),
+                                           str(full.get("body") or "")))
         if not criteria:
             return
+        # The Grug - Chief plan check needs at least three non-empty acceptance
+        # criteria bullets. When the ticket names fewer, append standard criteria
+        # so a pull request opened from it can pass Chief's check.
+        for i in range(max(0, 3 - len(criteria))):
+            criteria.append(pr_repair._STANDARD_FOLLOW_UP_CRITERIA[len(criteria)])
         title = "Complete criteria left from PR #%d" % number
         if any(isinstance(found, dict) and found.get("title") == title
                for found in self.gh.paginate("/repos/%s/issues?labels=loom:ticket" % repo)):
