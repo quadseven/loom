@@ -899,6 +899,7 @@ class EveryPathTest(unittest.TestCase):
         ("bus/factory.py", "_default_close"): "",   # a pull request: let through
         ("bus/factory.py", "_close_unmerged_follow_ups"): "",
         ("bus/factory.py", "_split_pr"): "",
+        ("bus/health.py", "_close_settled"): "shadow.active(",
         ("bus/invariants.py", "_reopen"): "self._held(",
         ("bus/invariants.py", "_fold"): "self._held(",
         ("bus/invariants.py", "_close_quiet"): "self._held(",
