@@ -8,7 +8,6 @@ import sys
 import tempfile
 import time
 import unittest
-import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1145,19 +1144,10 @@ class InvariantTest(unittest.TestCase):
         self.assertEqual(invariants.plan_check_failed(Facts(T0, checks=checks)), [])
 
     def test_a_remote_lane_past_its_beat_max(self):
-        limit = 2 * 3600
-        lanes = {"remote-x": {"tiers": ("easy",), "scope": "public", "slots": 1, "beat_max": limit}}
-        with unittest.mock.patch.dict(invariants.REMOTE_LANES, lanes):
-            self.assertEqual(invariants.remote_silent(Facts(T0, beats={"remote-x": None})), [])
-            self.assertEqual(invariants.remote_silent(Facts(T0, beats={"remote-x": T0 - limit + 60})), [])
-            self.assertEqual(len(invariants.remote_silent(Facts(T0, beats={"remote-x": T0 - limit - 60}))), 1)
-
-    def test_a_retired_remote_lane_is_never_silent(self):
-        # Muse was retired as a Loom brain and lane on 2026-10-24; its last
-        # heartbeat stays on the status issue, and every pass filed the breach
-        # again ("Remote lane muse has not posted a heartbeat for 45 hours").
-        self.assertTrue(invariants.REMOTE_LANES["muse"].get("retired"))
-        self.assertEqual(invariants.remote_silent(Facts(T0, beats={"muse": T0 - 30 * 86400})), [])
+        limit = invariants.REMOTE_LANES["muse"]["beat_max"]
+        self.assertEqual(invariants.remote_silent(Facts(T0, beats={"muse": None})), [])
+        self.assertEqual(invariants.remote_silent(Facts(T0, beats={"muse": T0 - limit + 60})), [])
+        self.assertEqual(len(invariants.remote_silent(Facts(T0, beats={"muse": T0 - limit - 60}))), 1)
 
     def test_a_lane_that_held_a_running_ticket_while_silent_is_named(self):
         run = SilentRun("codex", 31 * 60, (Ref("%s#1" % REPO, "#1"),), T0 - 60)
