@@ -5724,16 +5724,19 @@ class VerifyBeforeBuildTest(Base):
         # loom#1653: 33 open tickets carried loom:ticket and no state label on
         # 2026-10-24; triage reads only issues that are not tickets yet and the
         # factory routes only loom:queued, so they waited forever.
-        for n in (21, 22, 23, 24):
+        for n in (21, 22, 23, 24, 25):
             self.fake.add(n)
         self.fake.issues[21]["labels"] = [{"name": "loom:ticket"}]
         self.fake.issues[22]["labels"] = [{"name": "loom:ticket"}, {"name": "claim:ccqw"}]
         self.fake.issues[23]["labels"] = [{"name": "loom:ticket"}, {"name": "needs-operator"}]
         self.fake.issues[24]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:human"}]
+        # loom#964: built work waiting only on its live check is not new build
+        # work; queueing it again handed it to a build lane as if unbuilt.
+        self.fake.issues[25]["labels"] = [{"name": "loom:ticket"}, {"name": "awaiting-live-check"}]
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         st.queue_stateless_tickets()
         self.assertIn("loom:queued", self.fake.names(21))
-        for n in (22, 23, 24):
+        for n in (22, 23, 24, 25):
             self.assertNotIn("loom:queued", self.fake.names(n), n)
         # The only write besides the label is the routine status event.
         self.assertTrue(all(c["body"].startswith("<!-- loom:status v1 -->")

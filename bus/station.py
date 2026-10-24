@@ -496,7 +496,7 @@ STATELESS_TEXT = ("Queued: this ticket carried no state label, so nothing would 
 # state or hold, a person's claim, an operator ask, or a wait.
 _HOLD_LABELS = {"loom:" + state for state in brain.STATES} | {
     "loom:triage", "loom:human", "loom:held", "loom:ready", "loom:awaiting-evidence",
-    "loom:closed-unmerged", "needs-operator", "needs-brain"}
+    "loom:closed-unmerged", "needs-operator", "needs-brain", brain.LIVE_CHECK_LABEL}
 
 
 def _holds_ticket(name: str) -> bool:
