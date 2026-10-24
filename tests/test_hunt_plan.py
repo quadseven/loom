@@ -61,6 +61,10 @@ class ProblemsTest(unittest.TestCase):
     def test_a_good_body_passes(self):
         self.assertEqual(hunt_plan.problems(GOOD), [])
 
+    def test_what_good_look_like_is_an_acceptance_criteria_heading(self):
+        body = GOOD.replace("## Acceptance criteria", "## What good look like")
+        self.assertEqual(hunt_plan.problems(body), [])
+
     def test_each_blocking_check_is_named(self):
         cases = {
             "## Why has 2 words": GOOD.replace("The page query is slow for every visitor.", "Too slow."),
