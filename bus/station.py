@@ -69,7 +69,7 @@ from . import watch
 from . import labels
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, unreadable
+from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, rest_login, unreadable
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -482,9 +482,42 @@ VERIFY_RESERVE_FILE = "verify-reserve.json"
 # questions a pass, each up to bus/fabric.py's TIMEOUT, and the first
 # FABRIC_CITES cited pull requests checked against GitHub. FABRIC_ASKED_FILE
 # keeps the body each ticket was asked about, so a ticket is asked once.
+# The step loop's share of a pass: past this many seconds from the pass's
+# start, the remaining steps wait for the next pass (STEP_ROTATION_FILE keeps
+# where it stopped). On 2026-10-24 every pass ran 25 to 40 minutes.
+PASS_STEP_BUDGET = 300
+STEP_ROTATION_FILE = "step-rotation.json"
+# A pass step that takes this long is logged with its time and requests, so a
+# long pass names its cause: on 2026-10-24 passes ran 25 to 98 minutes and
+# 3000 to 6300 requests, and nothing said which step spent them.
+SLOW_STEP_SECONDS = 60
+# A loom:ticket with no state label is queued (loom#1653), a few an hour.
+STATELESS_EVERY = 3600
+STATELESS_PER_RUN = 5
+STATELESS_FILE = "stateless.json"
+STATELESS_TEXT = ("Queued: this ticket carried no state label, so nothing would route it "
+                  "to a lane (loom#1653).")
+# Labels that mean someone or something already holds a ticket: any Loom
+# state or hold, a person's claim, an operator ask, or a wait.
+_HOLD_LABELS = {"loom:" + state for state in brain.STATES} | {
+    "loom:triage", "loom:human", "loom:held", "loom:ready", "loom:awaiting-evidence",
+    "loom:closed-unmerged", "needs-operator", "needs-brain"}
+
+
+def _holds_ticket(name: str) -> bool:
+    return name in _HOLD_LABELS or name.startswith(("claim:", "wait:"))
+
+
 FABRIC_ASKS = 2
 FABRIC_CITES = 3
 FABRIC_ASKED_FILE = "fabric-asked.json"
+# Each question is a whole-library Fabric chat, the costliest call there is.
+# The ledger keys a ticket on its body without the status section: hashing the
+# whole body re-asked a ticket after every status event and drained the
+# workspace's monthly AI allowance in about four days (2026-10-24). A day's
+# asks stop at FABRIC_ASKS_PER_DAY whatever the ledger says, leaving most
+# of the allowance to the scheduled review jobs.
+FABRIC_ASKS_PER_DAY = 10
 FABRIC_QUESTION = (
     "A ticket in the GitHub repo %s is about to be built.\n\nTitle: %s\n\n"
     "Acceptance criteria:\n%s\n\n"
@@ -1518,6 +1551,7 @@ class Station:
         self.discord = discord or discord_call
         self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         self.now = time.time() if now is None else now
+        self._pass_started = time.monotonic()
         self.state = os.path.join(settings.home, "state", "station")
         self._fabric_asks = 0  # Fabric questions this pass (FABRIC_ASKS)
         self.event_log = os.path.join(settings.home, "logs", "events.jsonl")
@@ -4050,6 +4084,73 @@ class Station:
         found[number] = ticket
         _say("%s#%d: linked pull request #%d is open" % (repo, number, int(pr["number"])))
 
+    def _run_steps(self) -> None:
+        """The pass's main step loop, given PASS_STEP_BUDGET seconds of its
+        own: counted from the pass's start, the steps before it (reconcile,
+        hand back, claim, assign, about six minutes on 2026-10-24) left one
+        loop step a pass and a full turn of the loop took hours."""
+        loop_started = time.monotonic()
+        # Below the budget floor these wait for the reset; trees are local.
+        steps = (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_merged,
+                     self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
+                     self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
+                     self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
+                     self.close_done_tickets, self.settle_orphan_sources,
+                     self.settle_claimed_tickets, self.release_stale_claims,
+                     self.queue_stateless_tickets,
+                     self.restate_shipped_live,
+                     self.health_intake, self.intake_friction,
+                     # The packet after the tick's row, so it renders that tick.
+                     self.watch_brain, self.upload_transcripts, self.post_brain_memory,
+                     self.publish_handoff, self.relay_operator,
+                     self.watch_default_branches, self.watch_deploys, self.score_lanes,
+                     self.refresh_bench, self.run_factory,
+                     # The move first, so the invariants read a goal whose
+                     # tickets sit under an epic.
+                     self.move_outside_tickets, self.check_invariants,
+                     self.release_factory_held)
+        rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
+        rotation = _read_json(rotation_path, {}, strict=False)
+        start = rotation.get("next") if isinstance(rotation, dict) else 0
+        start = start if isinstance(start, int) and 0 <= start < len(steps) else 0
+        stopped_at = None
+        for offset in range(len(steps)):
+            if self._deferred():
+                break
+            # Past the budget the rest of the loop waits for the next pass,
+            # which starts here: claims, fix rounds and deploys come round
+            # every few minutes instead of after a 40-minute pass, and every
+            # step still runs in turn, in the same order.
+            if offset and time.monotonic() - loop_started >= PASS_STEP_BUDGET:
+                stopped_at = (start + offset) % len(steps)
+                _say("pass budget reached after %ds of steps: %d step(s) wait for the next pass, from %s"
+                     % (time.monotonic() - loop_started, len(steps) - offset,
+                        steps[stopped_at].__name__))
+                break
+            step = steps[(start + offset) % len(steps)]
+            try:
+                self._timed(step)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("%s failed: %s" % (step.__name__, err))
+        try:
+            _write_json(rotation_path, {"next": stopped_at if stopped_at is not None else 0})
+        except OSError as err:
+            _say("could not record the step rotation: %s" % err)
+
+    def _timed(self, step: Any) -> None:
+        """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
+        more, with the requests it made (as the step loop does)."""
+        started, asked = time.monotonic(), self.gh.requests
+        try:
+            step()
+        finally:
+            took = time.monotonic() - started
+            if took >= SLOW_STEP_SECONDS:
+                _say("step %s took %ds and %d requests"
+                     % (step.__name__, took, self.gh.requests - asked))
+
     def reconcile_pull_requests(self) -> None:
         """Repair ticket state from the PR's authoritative terminal state.
 
@@ -5149,11 +5250,19 @@ class Station:
         threads = brain._open_threads(self.gh, repo, pr_number)
         return [thread for thread in threads if self._thread_starts_with_bot(thread)]
 
-    @staticmethod
-    def _thread_starts_with_bot(thread: Dict[str, Any]) -> bool:
+    def _thread_starts_with_bot(self, thread: Dict[str, Any]) -> bool:
+        """Whether the review bot opened the thread. GitHub's GraphQL API names
+        a bot without the "[bot]" suffix the REST API adds; matching only
+        "grug-tribe[bot]" dropped every review-bot thread from fix rounds from
+        2026-10-13 to 2026-10-24."""
         comments = (thread.get("comments") or {}).get("nodes") or []
-        return bool(comments and
-                    (comments[0].get("author") or {}).get("login") == "grug-tribe[bot]")
+        if not comments:
+            return False
+        # rest_login adds "[bot]" only for a Bot author, so a person who takes
+        # the bot's bare name as a user login is never read as the review bot.
+        login = rest_login(comments[0].get("author")).lower()
+        bot = self.s.review_bot.strip().lower()
+        return login == (bot if bot.endswith("[bot]") else bot + "[bot]")
 
     def _remove_ready_if_present(self, repo: str, number: int, names: List[str]) -> None:
         if "loom:ready" in names:
@@ -5170,15 +5279,14 @@ class Station:
 
     @staticmethod
     def _fix_round_count(comments: List[Any], authors: set) -> int:
-        rounds_seen = set()
-        for comment in comments:
-            if (not isinstance(comment, dict)
-                    or tickets._login(comment.get("user")) not in authors):
-                continue
-            head = Station._fix_head(str(comment.get("body") or ""))
-            if head:
-                rounds_seen.add(head)
-        return len(rounds_seen)
+        """The fix rounds sent: each trusted loom:fix comment with a head
+        marker is one round, whether or not the round moved the head. Counting
+        distinct heads let a round that failed [transient] and pushed nothing
+        repeat without end (grug#1315: 15 rounds, 9 on one head, 2026-10-24)."""
+        return sum(1 for comment in comments
+                   if isinstance(comment, dict)
+                   and tickets._login(comment.get("user")) in authors
+                   and Station._fix_head(str(comment.get("body") or "")))
 
     @staticmethod
     def _fix_head(body: str) -> Optional[str]:
@@ -5826,11 +5934,18 @@ class Station:
         if not isinstance(asked, dict):
             asked = {}
         key = "%s#%d" % (repo, int(issue["number"]))
-        stamp = hashlib.sha256(str(issue.get("body") or "").encode("utf-8")).hexdigest()[:16]
+        body = status._SECTION_RE.sub("", str(issue.get("body") or ""))
+        stamp = hashlib.sha256(body.strip().encode("utf-8")).hexdigest()[:16]
         if asked.get(key) == stamp:
+            return False
+        today = datetime.fromtimestamp(self.now, timezone.utc).strftime("%Y-%m-%d")
+        day = asked.get("_day") if isinstance(asked.get("_day"), dict) else {}
+        count = int(day.get("count") or 0) if day.get("date") == today else 0
+        if count >= FABRIC_ASKS_PER_DAY:
             return False
         self._fabric_asks += 1
         asked[key] = stamp
+        asked["_day"] = {"date": today, "count": count + 1}
         _write_json(path, asked)
         return True
 
@@ -7644,6 +7759,47 @@ class Station:
                     raise
                 except GitHubError as err:
                     _say("could not settle the claimed issues of %s: %s" % (repo, err))
+        finally:
+            state["_at"] = self.now
+            _write_json(path, state)
+
+    def queue_stateless_tickets(self) -> None:
+        """Queue each open loom:ticket issue that carries no state label and
+        nobody holds (loom#1653): triage reads only issues that are not tickets
+        yet and the factory routes only loom:queued ones, so a ticket filed with
+        loom:ticket alone waited forever (33 of them on 2026-10-24). A claim,
+        an operator ask, a wait, or any state or hold label leaves it alone. At
+        most STATELESS_PER_RUN a run, at most once an hour, each a routine
+        status event and no comment."""
+        path = os.path.join(self.state, STATELESS_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        last = state.get("_at")
+        if isinstance(last, (int, float)) and 0 <= self.now - last < STATELESS_EVERY:
+            return
+        left = STATELESS_PER_RUN
+        try:
+            for repo in self._verify_repos():
+                if left <= 0 or self._deferred():
+                    break
+                try:
+                    found = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open&per_page=100" % repo)
+                except GitHubError as err:
+                    _say("could not read the tickets of %s: %s" % (repo, err))
+                    continue
+                for issue in found:
+                    if left <= 0:
+                        break
+                    if not isinstance(issue, dict) or "pull_request" in issue:
+                        continue
+                    names = _label_names(issue)
+                    if any(_holds_ticket(name) for name in names):
+                        continue
+                    number = int(issue["number"])
+                    self._add_label(repo, number, "loom:queued")
+                    self._routine(repo, number, STATELESS_TEXT)
+                    _say("queued %s#%d: a ticket with no state label is never routed" % (repo, number))
+                    left -= 1
         finally:
             state["_at"] = self.now
             _write_json(path, state)
@@ -10398,22 +10554,22 @@ class Station:
         self.report_outcomes()
         if not self._deferred():
             try:
-                self.reconcile_pull_requests()
+                self._timed(self.reconcile_pull_requests)
             except RateLimited:
                 raise
             except (GitHubError, OSError) as err:
                 _say("pull request reconciliation failed: %s" % err)
         if not self._deferred():
             try:
-                self.hand_back()
+                self._timed(self.hand_back)
             except RateLimited:
                 raise
             except (GitHubError, OSError) as err:
                 _say("hand_back failed: %s" % err)
-        self.claim_new()
+        self._timed(self.claim_new)
         if not self._deferred():
             try:
-                self.assign_queued()
+                self._timed(self.assign_queued)
             except RateLimited:
                 raise
             except (GitHubError, OSError) as err:
@@ -10422,32 +10578,7 @@ class Station:
             self.record_scans()
         except OSError as err:
             _say("could not record the repo scans: %s" % err)
-        # Below the budget floor these wait for the reset; trees are local.
-        for step in (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_merged,
-                     self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
-                     self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
-                     self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
-                     self.close_done_tickets, self.settle_orphan_sources,
-                     self.settle_claimed_tickets, self.release_stale_claims,
-                     self.restate_shipped_live,
-                     self.health_intake, self.intake_friction,
-                     # The packet after the tick's row, so it renders that tick.
-                     self.watch_brain, self.upload_transcripts, self.post_brain_memory,
-                     self.publish_handoff, self.relay_operator,
-                     self.watch_default_branches, self.watch_deploys, self.score_lanes,
-                     self.refresh_bench, self.run_factory,
-                     # The move first, so the invariants read a goal whose
-                     # tickets sit under an epic.
-                     self.move_outside_tickets, self.check_invariants,
-                     self.release_factory_held):
-            if self._deferred():
-                break
-            try:
-                step()
-            except RateLimited:
-                raise
-            except (GitHubError, OSError, ValueError) as err:
-                _say("%s failed: %s" % (step.__name__, err))
+        self._run_steps()
         # The day's metrics line goes out even below the budget floor: one post
         # a day, and on 2026-10-18 the floor deferred it every pass, so the
         # operator got no numbers for the day. Only a spent budget stops it.
