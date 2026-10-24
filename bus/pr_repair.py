@@ -63,6 +63,8 @@ def _brief_section(brief: str, name: str) -> str:
     Blank lines are dropped (the runner's sed does this), and leading/trailing
     blank lines are stripped.
     """
+    import re
+    heading_re = re.compile(r"^#+ ")
     lines = brief.split("\n")
     out: list[str] = []
     on = False
@@ -71,7 +73,7 @@ def _brief_section(brief: str, name: str) -> str:
             on = True
             continue
         if on:
-            if line.startswith("#"):
+            if heading_re.match(line):
                 break
             if line.strip():
                 out.append(line)
