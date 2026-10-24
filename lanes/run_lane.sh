@@ -1916,6 +1916,11 @@ prepare_validation() {
   if [ -n "$C_SETUP" ]; then
     contract_run "$C_SETUP"; rc=$?
     record setup "$C_SETUP" "$rc" "$BASE" "$([ "$rc" -eq 0 ] && echo true || echo false)"
+    if [ "$rc" -eq 143 ]; then
+      PARK_CLASS=transient
+      SETUP_REASON="setup interrupted by SIGTERM"
+      return 1
+    fi
     [ "$rc" -eq 0 ] || { SETUP_REASON="setup exited $rc"; return 1; }
   fi
   contract_run "$C_CHECK"; BASELINE_EXIT=$?
@@ -1923,6 +1928,11 @@ prepare_validation() {
   baseline_rev="$(safe_git rev-parse HEAD)"
   record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
     "${changed:+changed tracked files: $changed}"
+  if [ "$BASELINE_EXIT" -eq 143 ]; then
+    PARK_CLASS=transient
+    SETUP_REASON="base check interrupted by SIGTERM"
+    return 1
+  fi
   # A check that cannot run, or is already red, on the unmodified base is
   # the factory's problem, not the ticket's: file the incident and stop
   # before the agent burns a run it can never validate.
@@ -1988,6 +1998,10 @@ final_validation() {
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
     124) VALIDATION_REASON="validation failed: the check timed out after ${CHECK_TIMEOUT}s" ;;
+    143)
+      PARK_CLASS=transient
+      VALIDATION_REASON="validation interrupted by SIGTERM"
+      ;;
     125|126|127)
       # The environment broke between the baseline and the final check;
       # the agent's work is not the cause.
