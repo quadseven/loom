@@ -2199,8 +2199,8 @@ cat > /dev/null
         self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
 
     def test_a_fix_round_that_adds_a_stray_file_beside_a_merge_is_removed_and_pushed(self):
-        # A fix round no longer retries the identical refusal: the stray file
-        # the agent added outside the brief's paths is removed and the work is
+        # A fix round no longer retries the identical refusal: the file the
+        # agent added outside the brief's paths is removed and the merge is
         # pushed (loom#1476).
         name, before = self.fix_brief()
         self.advance_main("main.txt", "main moved\n")
@@ -2208,28 +2208,50 @@ cat > /dev/null
                         "mkdir -p .agents; echo hook > .agents/hooks.json\n")
         result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("commit refused", self.run_log(name + ".log"))
+        log = self.run_log(name + ".log")
+        self.assertNotIn("commit refused", log)
+        self.assertIn("left off the fix round's commits: .agents/hooks.json", log)
         after = self.remote_head(self.FIX_BRANCH)
-        self.assertNotEqual(after, before)
+        self.assertIn(before, subprocess.run(
+            ["git", "--git-dir", str(self.remote), "rev-list", after],
+            capture_output=True, text=True, check=True).stdout.split())
         self.assertEqual(self.remote_file(after, "main.txt"), "main moved\n")
         self.assertEqual(self.remote_file(after, ".agents/hooks.json"), "")
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
-    def test_a_fix_round_removes_out_of_brief_files_and_pushes_the_work(self):
-        # A lane's session scratch file (sh-thd-*) sits outside the brief's
-        # paths beside its real fix: the round removes the stray and pushes.
+    def test_a_fix_round_removes_only_the_out_of_brief_files_and_pushes_the_work(self):
+        # A session file outside the brief's paths, beside the real fix: only
+        # the stray goes, the fix is pushed (loom#1476).
         name, before = self.fix_brief()
         self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
-                        "printf 'session scratch\\n' > sh-thd-3211296841\n"
-                        "printf 'fixed\\n' > fix.txt\n")
+                        "printf 'session notes\\n' > session-notes.txt\n"
+                        "printf 'fixed again\\n' > first.txt\n")
         result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("commit refused", self.run_log(name + ".log"))
+        self.assertIn("left off the fix round's commits: session-notes.txt",
+                      self.run_log(name + ".log"))
         after = self.remote_head(self.FIX_BRANCH)
         self.assertNotEqual(after, before)
-        self.assertEqual(self.remote_file(after, "fix.txt"), "fixed\n")
-        self.assertEqual(self.remote_file(after, "sh-thd-3211296841"), "")
+        self.assertEqual(self.remote_file(after, "first.txt"), "fixed again\n")
+        self.assertEqual(self.remote_file(after, "session-notes.txt"), "")
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_whose_stray_file_cannot_be_removed_names_it_and_pushes_nothing(self):
+        name, before = self.fix_brief()
+        self.write_tool(self.bin / "git", """#!/usr/bin/env bash
+if [[ " $* " == *" rm -q -f -- session-notes.txt "* ]]; then echo 'refused' >&2; exit 1; fi
+exec /usr/bin/git "$@"
+""")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
+                        "printf 'session notes\\n' > session-notes.txt\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.run_log(name + ".log")
+        self.assertIn("could not remove session-notes.txt from the fix round's commits", log)
+        self.assertIn("commit refused: it adds files outside the brief's paths that could "
+                      "not be removed: session-notes.txt; nothing pushed", log)
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
 
     def test_a_fix_round_names_dropped_scratch_in_its_pr_comment(self):
         name, _ = self.fix_brief()
