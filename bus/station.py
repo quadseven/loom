@@ -5091,6 +5091,10 @@ class Station:
         committed = self._epoch(str(((commit.get("commit") or {}).get("committer") or {}).get("date") or ""))
         if not sha or committed is None or committed <= held_at:
             return False
+        return self._default_commit_checks_green(repo, sha)
+
+    def _default_commit_checks_green(self, repo: str, sha: str) -> bool:
+        """Whether all check runs and the combined status for a commit passed."""
         checks = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
                               % (repo, sha)).data or {}
         runs = checks.get("check_runs") if isinstance(checks, dict) else None
