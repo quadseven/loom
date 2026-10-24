@@ -1805,7 +1805,12 @@ class Station:
                                         or not re.fullmatch(r"[0-9a-f]{64}", reason)):
                                     continue
                                 if self.now - invariants.EVENT_WINDOW <= at <= self.now:
-                                    rows.append(invariants.Event(at, kind, reason))
+                                    rows.append(invariants.Event(
+                                        at, kind, reason,
+                                        item=row.get("item", ""),
+                                        lane=row.get("lane", ""),
+                                        model=row.get("model", ""),
+                                    ))
                             except (ValueError, TypeError):
                                 continue
                 except FileNotFoundError:
@@ -3671,6 +3676,7 @@ class Station:
                        and (not needs_public_repo(candidate, model) or self._public(repo))), None)
         number = int(issue["number"])
         names = [name for name in _label_names(issue) if not name.startswith("lane:")]
+        already_waiting = WAIT + "lane" in names
         if target is None:
             names = [name for name in names if name != BRIEFED and not name.startswith(WAIT)] \
                 + ["loom:queued", WAIT + "lane"]
@@ -3688,6 +3694,9 @@ class Station:
         issue["labels"] = [{"name": name} for name in names]
         _say("moved %s#%d from lane %s to lane %s for model %s"
              % (repo, number, lane, target, model))
+        if already_waiting:
+            self._event("model_wait_succeeded", "found free lane %s for model %s" % (target, model),
+                        "%s#%d" % (repo, number), lane, model)
         return target
 
     # -- outcomes -------------------------------------------------------
