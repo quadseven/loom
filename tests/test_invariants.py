@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bus import brain, invariants, metrics, station  # noqa: E402
 from bus.github import GitHubError, Response  # noqa: E402
 from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run, SilentRun, Wait  # noqa: E402
+from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401 - shadow off: these tests close
 
 REPO = "example-owner/factory"
 OTHER = "example-owner/hidden"

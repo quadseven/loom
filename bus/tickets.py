@@ -32,14 +32,35 @@ FORBIDDEN_MODELS: Tuple[Tuple[str, str], ...] = (
     ("gpt-6-sol", "gpt-6-luna"),
     ("gemini-4-argon", "gemini-3.8-flash-high"),
 )
+# The only models an opencode-go lane may run: OpenCode Go's free models and
+# the paid ones with an allowance of at least 10,000 requests per 5 hours.
+# Kimi K2.7 Code (1,350 per 5 h) spent the Go plan's allowance in hours on
+# 2026-10-23 (operator: "why the hell are we using the most expensive
+# models... STOP THAT"). An allow-list, not a deny-list, so a model Go adds
+# later is refused until someone checks its allowance. lanes/run_lane.sh
+# reads it (`python3 -m bus.tickets opencode-go-models`) and refuses to start
+# a lane whose model is not on it; the station routes only these models to
+# the opencode-go lanes. Allowances per 5 h from
+# https://opencode.ai/v2/docs/console/go/#usage-limits on 2026-10-23.
+OPENCODE_GO_MODELS: Tuple[str, ...] = (
+    "opencode-go/beam-free",                    # free, unlimited
+    "opencode-go/mimo-v2.6-flash",              # 30,100
+    "opencode-go/deepseek-v4.1-flash",          # 34,670
+    "opencode-go/muse-spark-1.3-contributor",   # 45,300; trains on prompts
+)
+# What a ticket's Model: line naming another opencode-go model runs instead.
+OPENCODE_GO_STAND_IN = "opencode-go/mimo-v2.6-flash"
 
 
 def allowed_model(model: str) -> str:
     """The model a lane may run for `model`: the stand-in of a
-    FORBIDDEN_MODELS model, else `model` itself."""
+    FORBIDDEN_MODELS model or of an opencode-go model off OPENCODE_GO_MODELS,
+    else `model` itself."""
     for prefix, stand_in in FORBIDDEN_MODELS:
         if model.startswith(prefix):
             return stand_in
+    if model.startswith("opencode-go/") and model not in OPENCODE_GO_MODELS:
+        return OPENCODE_GO_STAND_IN
     return model
 
 
@@ -1051,3 +1072,11 @@ def after_holds(repo: str, headers: Dict[str, str],
         entry = After(where, number, short, state)
         (released if state == "not-planned" else holds).append(entry)
     return holds, released
+
+
+if __name__ == "__main__":
+    import sys
+    if sys.argv[1:] == ["opencode-go-models"]:
+        print("\n".join(OPENCODE_GO_MODELS))
+    else:
+        sys.exit("usage: python3 -m bus.tickets opencode-go-models")

@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
+from . import handoff
 from . import notify as _notify
 from . import quiet as _quiet
 from . import text as _text
@@ -188,8 +189,10 @@ def _check_report_gap(gh: GitHub, repo: str, issue_number: int, now: datetime,
     since = _when(now - timedelta(seconds=REPORT_GAP))
     found = gh.paginate("/repos/%s/issues/%d/comments?since=%s"
                         % (repo, int(issue_number), since))
+    # A report edited in place counts from its edit (loom#1560).
+    found = handoff.expand_journals([c for c in found if isinstance(c, dict)], at_key="created_at")
     held = report_hold(((str((c.get("user") or {}).get("login") or ""), c.get("created_at"),
-                         c.get("body")) for c in found if isinstance(c, dict)), now, trusted)
+                         c.get("body")) for c in found), now, trusted)
     if held is not None:
         raise ReportTooSoon(hold_message(held, now))
 
@@ -292,14 +295,41 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
             if not still.heartbeat_due(now):
                 raise ReportQuiet(quiet_message(still))
             return _heartbeat(gh, repo, issue_number, text, still, now)
+        mine = _newest_report(gh, repo, issue_number) if _ask(text) is not None else None
+        if mine is not None and _same_ask(text, str(mine.get("body") or "")):
+            # Nothing new is asked of the operator: the report is edited into
+            # the last one, as an edit sends no email (loom#1560).
+            body = "%s\n%s" % (_REPORTED_RE.sub("", text).rstrip("\n"),
+                                handoff.REPORTED_STAMP % _when(now))
+            _text.check(body)
+            return gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(mine["id"])),
+                           {"body": body})
+    if text.startswith(REPORT_MARKER):
+        # Only an edit in place may carry an edit time (handoff.reported_at).
+        text = _REPORTED_RE.sub("", text)
     return _notify.post(gh, repo, issue_number, text, _notify.JOURNAL)
 
 
-def _heartbeat(gh: GitHub, repo: str, issue_number: int, text: str,
-               still: "_quiet.Quiet", now: datetime):
-    """A quiet goal's weekly heartbeat: `text` edited into this client's
-    newest report on the goal home, never a new comment (an edit sends no
-    email). With no report of this client's there, ReportQuiet."""
+_NEEDS_YOU = re.compile(r"needs you:\s*(.*)$", re.I | re.M)
+_REPORTED_RE = re.compile(r"^<!-- loom:reported [^>]*-->[ \t]*\n?", re.M)
+
+
+def _ask(body: str) -> Optional[str]:
+    """What a report asks of the operator: its "Needs you:" text, compared
+    without case, spacing or a closing period; None when it has none."""
+    found = _NEEDS_YOU.findall(_REPORTED_RE.sub("", body))
+    if not found:
+        return None
+    return " ".join(found[-1].lower().split()).rstrip(". ")
+
+
+def _same_ask(new: str, old: str) -> bool:
+    asked = _ask(new)
+    return asked is not None and asked == _ask(old)
+
+
+def _newest_report(gh: GitHub, repo: str, issue_number: int) -> Optional[Dict[str, Any]]:
+    """This client's newest report comment on the goal home, or None."""
     me = _self_login(gh).lower()
     mine = None
     for c in gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, int(issue_number))):
@@ -308,6 +338,16 @@ def _heartbeat(gh: GitHub, repo: str, issue_number: int, text: str,
                 and str(c.get("body") or "").startswith(REPORT_MARKER)
                 and (mine is None or str(c.get("created_at")) >= str(mine.get("created_at")))):
             mine = c
+    return mine
+
+
+def _heartbeat(gh: GitHub, repo: str, issue_number: int, text: str,
+               still: "_quiet.Quiet", now: datetime):
+    """A quiet goal's weekly heartbeat: `text` edited into this client's
+    newest report on the goal home, never a new comment (an edit sends no
+    email). With no report of this client's there, ReportQuiet."""
+    me = _self_login(gh).lower()
+    mine = _newest_report(gh, repo, issue_number)
     if mine is None:
         raise ReportQuiet("%s; %s has no report on this goal home to edit, and a heartbeat "
                           "never posts a new one" % (quiet_message(still), me or "this client"))

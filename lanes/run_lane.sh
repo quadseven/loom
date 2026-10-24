@@ -1034,7 +1034,7 @@ provider_limit_source() {
     printf '%s' "$SLOT"
     return 0
   fi
-  for slot in $(key_group); do
+  for slot in $(limit_group); do
     if [ -f "$LOOM_HOME/state/usage/$slot.provider-limit.json" ]; then
       printf '%s' "$slot"
       return 0
@@ -1071,10 +1071,13 @@ provider_limit_lifted() {
   API_KEY="$(ssm_value "$key_ssm")"
   [ -n "$API_KEY" ] || return 1
   # The model the probe found at a limit: the provider's answer is about that
-  # model, so that is the model to ask about again.
+  # model, so that is the model to ask about again, unless the slot now runs
+  # another (a limit Kimi hit says nothing of the slot's Beam Free).
   model="$(sed -nE 's/.*"model": *"([A-Za-z0-9._:/@-]+)".*/\1/p' \
     "$LOOM_HOME/state/usage/$source.provider-limit.json" 2>/dev/null | head -1)"
-  [ -n "$model" ] || model="$(lane_setting MODEL)"
+  if [ -z "$model" ] || { [ -n "$(lane_setting MODEL)" ] && [ "${model#*/}" != "$(lane_setting MODEL | sed 's#^[^/]*/##')" ]; }; then
+    model="$(lane_setting MODEL)"
+  fi
   [ -n "$model" ] || return 1
   MODEL="$model"
   if provider_at_limit; then
@@ -1091,7 +1094,7 @@ provider_limit_lifted() {
 # Usage view shows.
 lift_provider_limit() {
   local slot
-  for slot in $(key_group); do
+  for slot in $(limit_group); do
     write_beat "$slot" true ""
   done
 }
@@ -1126,6 +1129,28 @@ key_group() {
   esac
 }
 
+# The slots a usage limit holds together: the key group, less the slots on a
+# free model. OpenCode Go's free models (opencode-go/*-free) sit outside the
+# plan's allowance: on 2026-10-23 Kimi spent the monthly limit and the 429
+# held the Beam Free slots for five days while Beam Free still answered. A
+# free slot is a group of one. An expired key still holds the whole key group.
+slot_model() {
+  local s v
+  s="$(setting_var "$1" MODEL)" v="$(lane_var MODEL)"
+  printf '%s' "${!s:-${!v:-}}"
+}
+free_model() { [[ "$1" == opencode-go/*-free ]]; }
+limit_group() {
+  local slot
+  if [ "${LANE:-}" = opencode-go ] && free_model "$(slot_model "$SLOT")"; then
+    printf '%s\n' "$SLOT"
+    return 0
+  fi
+  for slot in $(key_group); do
+    free_model "$(slot_model "$slot")" || printf '%s\n' "$slot"
+  done
+}
+
 # The epoch this slot's provider limit lifts: the reset the provider gave, else
 # the next reset of the period the error names (weekly / daily), never a short
 # fixed window. Empty when there is no recorded limit to hold on.
@@ -1156,7 +1181,7 @@ hold_provider_limit() {
   LIMITED=1
   source="$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
   checked="$(date +%s)"
-  for slot in $(key_group); do
+  for slot in $(limit_group); do
     if [ "$slot" != "$SLOT" ]; then
       tmp="$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp"
       if ! cp "$source" "$tmp" \
@@ -1610,6 +1635,10 @@ resolve_factory_incidents() {
     [ -f "$file" ] || continue
     number="$(tr -cd '0-9' < "$file")"
     if [ -n "$number" ]; then
+      # Shadow mode (bus/shadow.py): the guard reads the issue and lets a
+      # factory incident's close through; anything else it records and holds.
+      PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.shadow gh-guard --lane "$PWD" \
+        issue close --repo "$FACTORY_REPO" "$number" >>"$LOG" 2>&1 || continue
       gh issue close --repo "$FACTORY_REPO" "$number" \
         --comment "Cleared: the check passed on the unmodified base in $(incident_ticket)." >>"$LOG" 2>&1 || continue
     fi
@@ -2540,6 +2569,23 @@ for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1" "CHECK_T
   fi
 done
 
+# An opencode-go lane runs only bus/tickets.py OPENCODE_GO_MODELS: Go's free
+# models and the paid ones allowed at least 10,000 requests per 5 hours.
+# Kimi K2.7 Code (1,350) spent the plan's allowance in hours (2026-10-23).
+# Fail closed: a lane whose model, or any model of its ladder, is off the
+# list (or the list cannot be read) does not start.
+OPENCODE_GO_ALLOWED=""
+if [ "$LANE" = opencode-go ]; then
+  OPENCODE_GO_ALLOWED=" $(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.tickets opencode-go-models 2>/dev/null | tr '\n' ' ')"
+  for candidate in $(lane_setting MODEL) $(lane_setting MODELS); do
+    if [[ "$OPENCODE_GO_ALLOWED" != *" $candidate "* ]]; then
+      echo "[$(date -u +%FT%TZ)] REFUSED: lane $SLOT model $candidate is not on the OpenCode Go allow-list (bus/tickets.py OPENCODE_GO_MODELS):${OPENCODE_GO_ALLOWED:- unreadable}" >&2
+      heartbeat false "model $candidate is not on the OpenCode Go allow-list (bus/tickets.py OPENCODE_GO_MODELS); set $(setting_var "$SLOT" MODEL) to one of:${OPENCODE_GO_ALLOWED:- (list unreadable)}"
+      exit 0
+    fi
+  done
+fi
+
 if REST_UNTIL="$(transient_rest_until)"; then
   heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
   exit 0
@@ -2549,6 +2595,16 @@ fi
 # reason that says "limit:" (which limit, until when) is kept as it was.
 LIMIT_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
 CONFIGURED_MODELS="$(lane_setting MODELS)"
+# A Go allowance hold never binds a slot on a free model (limit_group): a
+# hold written before the slot moved to one, or by an older runner, is
+# dropped. On 2026-10-23 the Beam Free slots kept a monthly hold Kimi had
+# taken, until 2026-10-28.
+if [ "$LANE" = opencode-go ] && [ -n "$LIMIT_UNTIL" ] && free_model "$(slot_model "$SLOT")" &&
+  grep -q "$GO_LIMIT_ERROR" "$BEAT" 2>/dev/null; then
+  echo "[$(date -u +%FT%TZ)] lane $SLOT runs free model $(slot_model "$SLOT"), outside the Go allowance: dropping its Go limit hold" >&2
+  rm -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
+  LIMIT_UNTIL=""
+fi
 if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
   HELD_REASON="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
   case "$HELD_REASON" in limit:*) ;; *) HELD_REASON="provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" ;; esac
@@ -2569,6 +2625,8 @@ fi
 # CLI lists the model, else it holds another LIMIT_WAIT with no ticket round.
 if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -le "$(date +%s)" ]; then
   GONE_MODEL="$(sed -nE 's/.*"reason": *"limit: model ([A-Za-z0-9._:\/@-]+) not found by the agent CLI.*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+  # A hold for a model the lane no longer runs says nothing of the one it runs.
+  [ -z "$(lane_setting MODEL)" ] || [ "$GONE_MODEL" = "$(lane_setting MODEL)" ] || GONE_MODEL=""
   if [ -n "$GONE_MODEL" ] && ! model_listed "$GONE_MODEL"; then
     GONE_UNTIL=$(( $(date +%s) + LIMIT_WAIT ))
     heartbeat false "limit: model $GONE_MODEL not found by the agent CLI; lane waits until $(utc "$GONE_UNTIL")" "$GONE_UNTIL"
@@ -2697,7 +2755,15 @@ for BRIEF in "$INBOX"/*.md; do
     claude:*|anthropic:*) park "$BRIEF" "model $MODEL is not a claude model"; continue ;;
     openrouter:openrouter/*:free) ;;
     openrouter:*) park "$BRIEF" "openrouter lane runs free models only (openrouter/...:free), not $MODEL"; continue ;;
-    opencode-go:opencode-go/*) ;;
+    opencode-go:opencode-go/*)
+      # A pin off the allow-list runs the lane's own model, which the start
+      # check above passed.
+      if [[ "$OPENCODE_GO_ALLOWED" != *" $MODEL "* ]]; then
+        echo "[$(date -u +%FT%TZ)] $TICKET REFUSED the brief's Model: $MODEL: not on the OpenCode Go allow-list; lane $SLOT runs $(lane_setting MODEL)" | tee -a "$LOG" >&2
+        MODEL="$(lane_setting MODEL)" PINNED_MODEL=""
+        [[ "$OPENCODE_GO_ALLOWED" == *" $MODEL "* ]] ||
+          { park "$BRIEF" "model $MODEL is not on the OpenCode Go allow-list" transient; continue; }
+      fi ;;
     opencode-go:*) park "$BRIEF" "model $MODEL is not an opencode-go model" transient; continue ;;
     zen:opencode/*-free) ;;
     zen:*) park "$BRIEF" "zen lane runs free models only (opencode/...-free), not $MODEL"; continue ;;
