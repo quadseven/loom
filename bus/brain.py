@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
-from . import audit, change_class, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
+from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
 from . import merge_tier, naming, operator_hold, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
@@ -537,6 +537,18 @@ def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
     return "blocked: " + ", ".join(blockers) if blockers else "READY"
 
 
+_NOT_BUILT = re.compile(r";\s*not built:", re.I)
+
+
+def _unbuilt_criteria_reason(body: str) -> str:
+    """Block when every non-live acceptance criterion says it was not built."""
+    criteria = [text for _, text in proof.criteria(body)
+                if criteria_gate.kind(text) != criteria_gate.LIVE]
+    if criteria and all(_NOT_BUILT.search(text) for text in criteria):
+        return "blocked: no criterion built"
+    return ""
+
+
 def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> str:
     return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
 
@@ -546,13 +558,14 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     line = _pr_line(pr, node, bot)
     needs_review_check = (change_class.class_of(pr) == "sensitive"
                           or _ticketless(repo, pr))
-    if not line.endswith(" - READY") or not needs_review_check:
-        return line
-    sha = str((pr.get("head") or {}).get("sha") or "")
-    if sha and _review_check_passed(gh, repo, sha, check):
-        return line
-    return (line.removesuffix("READY")
-            + "blocked: review check has not passed on the head commit")
+    if line.endswith(" - READY") and needs_review_check:
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        if not sha or not _review_check_passed(gh, repo, sha, check):
+            return (line.removesuffix("READY")
+                    + "blocked: review check has not passed on the head commit")
+    if line.endswith(" - READY") and _unbuilt_criteria_reason(str(pr.get("body") or "")):
+        return line.removesuffix("READY") + "blocked: no criterion built"
+    return line
 
 
 def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
@@ -690,6 +703,10 @@ def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
             ticket = _ticket_association(repo, pr)
         except ValueError:
             ticket = None
+        if (ticket is not None and line.endswith("blocked: no criterion built")):
+            issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+            if {x.lower() for x in _labels(issue)} & {"docs", "documentation"}:
+                line = line.removesuffix("blocked: no criterion built") + "READY"
         if ticket is not None and authors:
             comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
             if _pending_brain_fix(comments, authors):
@@ -3103,6 +3120,10 @@ def merge(gh: GitHub, repo: str, number: int,
         association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
         _refuse_pending_fix(gh, association, env)
         _refuse_operator_hold(gh, repo, number, pr, details, association, issue)
+        if not ({x.lower() for x in _labels(issue)} & {"docs", "documentation"}):
+            reason = _unbuilt_criteria_reason(str(pr.get("body") or ""))
+            if reason:
+                raise ValueError(reason)
         tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
