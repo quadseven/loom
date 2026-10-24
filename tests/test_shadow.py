@@ -719,6 +719,61 @@ class GhGuardTest(ShadowCase):
         self.assertEqual({(e["action"], e["source"]) for e in self.entries()},
                          {(shadow.CLOSE, "run_lane.sh gh"), (shadow.REOPEN, "brain rung gh")})
 
+    def test_the_brain_rungs_issue_close_is_held_unread_even_for_an_incident(self):
+        # The rung's model picks its own arguments: only run_lane.sh's own
+        # closes (--lane) read the issue and may let one go.
+        done = mock.Mock(returncode=0, stdout=json.dumps(issue(5, ("loom:factory",))))
+        with mock.patch.object(shadow.subprocess, "run", return_value=done) as run, \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            for argv in (["issue", "close", "5", "-R", REPO], ["issue", "reopen", "5", "-R", REPO],
+                         ["api", "-X", "PATCH", "repos/%s/issues/5" % REPO, "-f", "state=closed"]):
+                with self.subTest(argv=argv):
+                    self.assertEqual(shadow.main(["gh-guard", os.getcwd()] + argv), 1)
+        run.assert_not_called()
+
+    def test_a_lane_close_that_names_its_issue_ambiguously_is_held_unread(self):
+        # A value, a second number or a second URL must not let the read of
+        # one issue close another (security review of loom#1551).
+        other = "https://github.com/example-owner/other/issues/5"
+        mine = "https://github.com/%s/issues/5" % REPO
+        shapes = [
+            ["5", "1542", "-R", REPO],            # two numbers
+            [mine, "1542"],                       # a URL and a number
+            [mine, mine],                         # two URLs
+            [other, "-R", REPO],                  # a URL repo that is not -R
+            ["5"],                                # no repo
+            ["5", "-R", REPO, "--unknown", "x"],  # a flag gh may read a value for
+            ["5", "-R"],                          # a flag with no value
+            ["https://github.com/%s/pull/5" % REPO, "-R", REPO],
+        ]
+        done = mock.Mock(returncode=0, stdout=json.dumps(issue(5, ("loom:factory",))))
+        with mock.patch.object(shadow.subprocess, "run", return_value=done) as run, \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            for rest in shapes:
+                with self.subTest(argv=rest):
+                    self.assertEqual(shadow.main(["gh-guard", "--lane", os.getcwd(), "issue",
+                                                  "close"] + rest), 1)
+            run.assert_not_called()
+            # The shapes gh reads as one issue are read and let go.
+            for rest in (["5", "-R", REPO, "-c", "Cleared: see 1542"], ["--repo=%s" % REPO, "5"],
+                         [mine, "--comment", "1542"], ["-R%s" % REPO, "-r", "completed", "5"],
+                         ["-R", REPO, "--", "5"]):
+                with self.subTest(argv=rest):
+                    self.assertEqual(shadow.main(["gh-guard", "--lane", os.getcwd(), "issue",
+                                                  "close"] + rest), 0)
+        self.assertTrue(all(c.args[0] == ["gh", "api", "repos/%s/issues/5" % REPO]
+                            for c in run.call_args_list))
+        # A comment's value is never the selector: the issue read is the one
+        # gh closes.
+        for rest, number in ((["5", "-R", REPO, "-c", "1542"], 5),
+                             (["-c", "5", "-R", REPO, "1542"], 1542)):
+            with self.subTest(argv=rest), mock.patch.object(
+                    shadow.subprocess, "run", return_value=done) as run, \
+                    mock.patch("sys.stderr", new_callable=io.StringIO):
+                shadow.main(["gh-guard", "--lane", os.getcwd(), "issue", "close"] + rest)
+                self.assertEqual(run.call_args.args[0],
+                                 ["gh", "api", "repos/%s/issues/%d" % (REPO, number)])
+
     def test_a_body_file_is_read_from_the_callers_folder(self):
         with tempfile.TemporaryDirectory() as here:
             with open(os.path.join(here, "close.json"), "w") as fh:

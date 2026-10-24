@@ -755,13 +755,81 @@ def gh_request(argv: Sequence[str], cwd: str = ".") -> Optional[Request]:
     repo, number = _gh_target(rest)
     if (group, sub) in _GH_COMMANDS:
         action, kind, check = _GH_COMMANDS[(group, sub)]
-        return Request(action, repo, number, kind, "gh %s %s" % (group, sub),
-                       check if repo and number else "")
+        if check:
+            # The item read lets a close go only when the command names one
+            # issue beyond doubt: else it is held unread, as it was.
+            selector = _gh_issue_selector(rest)
+            if selector is None:
+                return Request(action, repo, number, kind, "gh %s %s" % (group, sub), "")
+            repo, number = selector
+        return Request(action, repo, number, kind, "gh %s %s" % (group, sub), check)
     if (group, sub) == ("pr", "review") and ("-a" in rest or "--approve" in rest):
         return Request(APPROVE, repo, number, "pr", "gh pr review --approve", "")
     if group in ("pr", "issue") and sub == "edit":
         return _gh_added_labels(repo, number, rest)
     return None
+
+
+# The flags gh issue close and reopen take a value with (the rest are switches).
+_GH_ISSUE_VALUE_FLAGS = ("-c", "--comment", "-r", "--reason", "-R", "--repo", "-b", "--body",
+                         "--duplicate-of")
+_GH_ISSUE_SWITCHES = ("-h", "--help")
+_ISSUE_URL = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/([0-9]+)/?")
+
+
+def _gh_issue_selector(args: Sequence[str]) -> Optional[Tuple[str, int]]:
+    """(repo, number) of the one issue a gh issue close or reopen names,
+    read the way gh reads its arguments; None when there is any doubt: a
+    flag it does not know, no positional or more than one, a selector that
+    is neither a number nor an issue URL, no repo, or a URL whose repo is
+    not the -R one."""
+    repo, positionals, i = "", [], 0
+    while i < len(args):
+        arg = args[i]
+        name = arg.split("=", 1)[0]
+        if arg == "--":
+            positionals += args[i + 1:]
+            break
+        if arg.startswith("--"):
+            if name not in _GH_ISSUE_VALUE_FLAGS + _GH_ISSUE_SWITCHES:
+                return None
+            if name in _GH_ISSUE_VALUE_FLAGS and "=" not in arg:
+                i += 1
+                if i >= len(args):
+                    return None
+                value = args[i]
+            else:
+                value = arg.partition("=")[2]
+            if name == "--repo":
+                repo = value
+        elif arg.startswith("-") and len(arg) > 1:
+            flag = arg[:2]
+            if flag not in _GH_ISSUE_VALUE_FLAGS + _GH_ISSUE_SWITCHES:
+                return None
+            value = arg[2:]
+            if flag in _GH_ISSUE_VALUE_FLAGS and not value:
+                i += 1
+                if i >= len(args):
+                    return None
+                value = args[i]
+            if flag == "-R":
+                repo = value
+        else:
+            positionals.append(arg)
+        i += 1
+    if len(positionals) != 1:
+        return None
+    target = positionals[0]
+    if target.isdigit():
+        number = int(target)
+    else:
+        url = _ISSUE_URL.fullmatch(target)
+        if not url or (repo and repo.lower() != url.group(1).lower()):
+            return None
+        repo, number = url.group(1), int(url.group(2))
+    if not REPO_RE.fullmatch(repo or "") or number <= 0:
+        return None
+    return repo, number
 
 
 def _gh_added_labels(repo: str, number: int, args: Sequence[str]) -> Optional[Request]:
@@ -783,16 +851,19 @@ def _gh_item(found: Request) -> Any:
         return None
 
 
-def gh_guard(cwd: str, argv: Sequence[str], source: str = "brain rung gh") -> int:
+def gh_guard(cwd: str, argv: Sequence[str], source: str = "brain rung gh",
+             read_item: bool = False) -> int:
     """0 when the gh command may run; 1, after recording it, when shadow mode
-    holds it. Any doubt holds it."""
+    holds it. Any doubt holds it. Only run_lane.sh's own closes (read_item,
+    --lane) read the issue and let a factory incident go: the brain rung's
+    model chooses its own arguments, so its closes and reopens are held."""
     try:
         found = gh_request(argv, cwd)
     except Exception as err:  # noqa: BLE001 - a command it cannot read is held
         found = Request(MERGE, "", 0, "pr", "unreadable gh command (%s)" % type(err).__name__, "")
     if found is None or not active(found.repo or None):
         return 0
-    if (found.check == "close" and found.repo and found.number
+    if (read_item and found.check == "close" and found.repo and found.number
             and held_after_read(found, _gh_item(found)) is None):
         return 0
     reason = "gh %s" % " ".join(argv)[:300]
@@ -816,7 +887,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 2
         if argv[1:2] == ["--lane"] and len(argv) >= 3:
             # run_lane.sh's own gh writes (its factory incident closes).
-            return gh_guard(argv[2], argv[3:], source="run_lane.sh gh")
+            return gh_guard(argv[2], argv[3:], source="run_lane.sh gh", read_item=True)
         return gh_guard(argv[1], argv[2:])
     parser = argparse.ArgumentParser(prog="python3 -m bus.shadow")
     sub = parser.add_subparsers(dest="command", required=True)
