@@ -730,6 +730,18 @@ transient_strike() {
 }
 transient_clear() { rm -f "$TRANSIENT_FILE"; }
 
+# A lane whose CLI sign-in lapsed rests SIGNIN_WAIT seconds, unavailable "at a
+# limit", and then tries one run again: only an interactive sign-in fixes it,
+# and the runner cannot see one happen. agy, 2026-10-24: left available, the
+# lane claimed six tickets in two hours, each waiting out the sign-in timeout.
+SIGNIN_WAIT=7200
+SIGNIN_FILE="$LOOM_HOME/state/usage/$SLOT.signin"
+signin_rest_until() {
+  local until
+  read -r until 2>/dev/null < "$SIGNIN_FILE" || return 1
+  [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] && printf '%s' "$until"
+}
+
 # Mint this run's App token into GH_TOKEN. A personal token in the
 # environment is dropped first, so a failed mint leaves gh with nothing to
 # post as. Installation tokens last an hour: a run mints again after its agent.
@@ -2629,6 +2641,10 @@ if REST_UNTIL="$(transient_rest_until)"; then
   heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
   exit 0
 fi
+if REST_UNTIL="$(signin_rest_until)"; then
+  heartbeat false "limit: sign-in lapsed: sign in the $LANE lane CLI again; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
+  exit 0
+fi
 
 # A provider limit hit by an earlier pass holds until its retry time. A
 # reason that says "limit:" (which limit, until when) is kept as it was.
@@ -3020,6 +3036,9 @@ for BRIEF in "$INBOX"/*.md; do
       # The CLI's own sign-in lapsed: no key parameter to renew or wait on,
       # even when the lane names one (agy names the lane user's password).
       AUTH_WHY="sign-in lapsed: sign in the $LANE lane CLI again"
+      REST_UNTIL=$(( $(date +%s) + SIGNIN_WAIT ))
+      printf '%s\n' "$REST_UNTIL" > "$SIGNIN_FILE"
+      heartbeat false "limit: $AUTH_WHY; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
       ask_sign_in "$AUTH_WHY"
       park "$BRIEF" "agent exited $STATUS: $AUTH_WHY$TIMEDOUT_NOTE" auth
       break
