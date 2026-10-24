@@ -2181,6 +2181,29 @@ EOF
   echo "[$stamp] $TICKET: left off the kept branch: $(stray_list)"
 }
 
+# A fix round's commit that adds files outside the brief's paths is not
+# refused: those files (STRAY_FILES, and only those, so the round's real
+# work stays) are removed in a commit on top, which keeps the push
+# fast-forward, and named in the run log. Without this the round retried the
+# identical refusal until the runaway hold caught it (loom#1476). Returns 1,
+# logged, when a file cannot be removed or the removal committed.
+drop_stray_files() {
+  local f stamp
+  stamp="$(date -u +%FT%TZ)"
+  while IFS= read -r f; do
+    [ -z "$f" ] || safe_git rm -q -f -- "$f" && continue
+    echo "[$stamp] $TICKET: could not remove $f from the fix round's commits"
+    return 1
+  done <<EOF
+$STRAY_FILES
+EOF
+  if ! safe_git commit -qm "Drop files outside the brief's paths: $(stray_list)"; then
+    echo "[$stamp] $TICKET: could not commit the removal of $(stray_list)"
+    return 1
+  fi
+  echo "[$stamp] $TICKET: left off the fix round's commits: $(stray_list)"
+}
+
 # What the agent is told about the contract, after its brief.
 validation_note() {
   [ -n "$HAS_CONTRACT" ] || return 0
@@ -3129,10 +3152,20 @@ for BRIEF in "$INBOX"/*.md; do
     COMMITTED=1
   fi
   # A commit that adds files outside the brief is refused before validation
-  # and push: nothing is pushed, and the reason names every stray file.
+  # and push: nothing is pushed, and the reason names every stray file. A fix
+  # round removes them instead (drop_stray_files) and checks again, so it
+  # pushes its work rather than retrying the same refusal (loom#1476).
   if [ "$COMMITTED" -eq 1 ]; then
     if ! check_scope "$BRIEF" 2>> "$LOG"; then
       park "$BRIEF" "could not check the committed files against the brief" transient; continue
+    fi
+    if [ -n "$STRAY_FILES" ] && [ -n "$FIX_PR" ]; then
+      if ! drop_stray_files >> "$LOG" 2>&1; then
+        park "$BRIEF" "commit refused: it adds files outside the brief's paths that could not be removed: $(stray_list); nothing pushed"; continue
+      fi
+      if ! check_scope "$BRIEF" 2>> "$LOG"; then
+        park "$BRIEF" "could not check the committed files against the brief" transient; continue
+      fi
     fi
     if [ -n "$STRAY_FILES" ]; then
       park "$BRIEF" "commit refused: it adds files outside the brief's paths: $(stray_list); nothing pushed"; continue
