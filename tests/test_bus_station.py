@@ -3009,6 +3009,24 @@ class HandBackTest(unittest.TestCase):
         self.assertEqual(self.ready_events(), [READY % ("b" * 40), READY % ("a" * 40)])
 
 
+class StepTimingTest(Base):
+    def test_a_slow_step_is_logged_with_its_time_and_requests(self):
+        # 2026-10-24: passes ran 25 to 98 minutes with 3000 to 6300 requests,
+        # and nothing named the step that spent them.
+        err = io.StringIO()
+        with mock.patch.object(station, "SLOW_STEP_SECONDS", 0), contextlib.redirect_stderr(err):
+            self.run_pass()
+        lines = [line for line in err.getvalue().splitlines() if " step triage_backlogs took " in line]
+        self.assertEqual(len(lines), 1, err.getvalue()[-2000:])
+        self.assertRegex(lines[0], r"step triage_backlogs took \d+s and \d+ requests")
+
+    def test_a_quick_step_is_not_logged(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_pass()
+        self.assertNotIn(" step triage_backlogs took ", err.getvalue())
+
+
 class CorruptStateTest(Base):
     def test_a_corrupt_ledger_stops_the_pass_instead_of_reporting_again(self):
         self.fake.add(12, state="running")
