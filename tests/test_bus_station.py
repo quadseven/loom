@@ -3228,9 +3228,9 @@ class ClaimTest(Base):
         self.assertFalse(any("waits for a free compatible lane" in c["body"]
                              for c in self.fake.comments[12]))
 
-    def test_model_wait_event_logged_once_per_ticket(self):
-        # The model_wait event should only be logged when the wait condition
-        # is first detected, not on every station pass (loom#1471).
+    def test_model_wait_event_logged_on_each_waiting_pass(self):
+        # A sustained model wait must remain visible to repeated-failure
+        # detection (loom#1471).
         self.heartbeat("opencode-go-3")
         body = BODY.replace("Model: model-x", "Model: claude-sonnet-5-5")
         self.fake.add(12, lane="opencode-go-3", body=body)
@@ -3248,16 +3248,14 @@ class ClaimTest(Base):
         model_wait_events = [e for e in events if e.kind == "model_wait"
                              and e.item == hashlib.sha256(("%s#12" % REPO).encode()).hexdigest()]
         self.assertEqual(len(model_wait_events), 1)
-        # Run a second pass with the same now time - the event should not be logged again
-        with contextlib.redirect_stderr(err):
-            self.assertEqual(station.run(
-                self.settings, GitHub("token", transport=self.fake),
-                now=self.start), 0)
-        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.start)
+        # A subsequent pass reaching the same wait decision records another
+        # event, even while the wait label is already present.
+        issue = self.fake.issues[12]
+        st._route_model_claim(REPO, issue, "opencode-go-3", "claude-sonnet-5-5", [])
         events = st._read_events()
         model_wait_events = [e for e in events if e.kind == "model_wait"
                              and e.item == hashlib.sha256(("%s#12" % REPO).encode()).hexdigest()]
-        self.assertEqual(len(model_wait_events), 1)
+        self.assertEqual(len(model_wait_events), 2)
 
     def test_the_brief_carries_the_operators_notes_and_pull_requests_in_other_repos(self):
         # 2026-10-22: the operator's comment and two merges in
