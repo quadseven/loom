@@ -115,24 +115,18 @@ class AgentSandboxTest(unittest.TestCase):
         self.assertGreater(profile.index('(allow network-outbound (remote ip "*:443"))'),
                            profile.index(NET_DENY))
         self.assertIn('(literal "/usr/bin/security")', profile)
-        self.assertIn(f'(deny file-read* (subpath "{self.scratch}/Library/Keychains"))', profile)
         # An arbitrary port on an arbitrary host is not allowed.
         self.assertNotIn('(allow network-outbound (remote ip "*:80"))', profile)
 
-    def test_the_agy_agent_run_reaches_its_own_sign_in_and_nothing_else_in_the_keychain(self):
+    def test_the_agy_agent_run_reaches_its_own_sign_in(self):
         # 2026-10-22 to 10-24: the keychain deny (#1465) hid agy's stored
         # sign-in from agy itself, and every agy run asked for a browser login
-        # and failed auth (#1620). The agent run may reach the keychain server
-        # and read the lane user's one keychain file; the folder stays denied
-        # and /usr/bin/security stays unrunnable.
-        keychain = f"{self.scratch}/Library/Keychains/loom.keychain-db"
-        profile = self.profile("", lane="agy", AGY_KEYCHAIN=keychain)
+        # and failed auth (#1620). Allowing the one keychain file was not
+        # enough: the agent run may reach the keychain server and read the lane
+        # user's keychain folder; /usr/bin/security stays unrunnable.
+        profile = self.profile("", lane="agy")
         self.assertNotIn('(global-name "com.apple.SecurityServer")', profile)
-        deny = f'(deny file-read* (subpath "{self.scratch}/Library/Keychains"))'
-        allow = f'(allow file-read* (literal "{keychain}"))'
-        self.assertIn(deny, profile)
-        self.assertIn(allow, profile)
-        self.assertGreater(profile.index(allow), profile.index(deny))
+        self.assertNotIn("/Library/Keychains", profile)
         self.assertIn('(literal "/usr/bin/security")', profile)
 
     def test_check_runs_and_other_lanes_keep_the_whole_keychain_deny(self):
@@ -142,6 +136,8 @@ class AgentSandboxTest(unittest.TestCase):
                 profile = self.profile(mode, lane=lane, AGY_KEYCHAIN=keychain)
                 self.assertIn('(global-name "com.apple.SecurityServer")', profile)
                 self.assertNotIn(f'(allow file-read* (literal "{keychain}"))', profile)
+        self.assertIn(f'(deny file-read* (subpath "{self.scratch}/Library/Keychains"))',
+                      self.profile("check", lane="agy"))
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_inside_the_agy_profile_connections_and_security_stay_confined(self):
