@@ -340,7 +340,12 @@ this tick"; a step with no note shows nothing there.
    The station posts it in the channel as a reply, so it must stand on its
    own and fit in a phone message.
    Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse`. It
-   refuses unless you hold the lock. Each `resume` line it prints is stage
+   refuses unless you hold the lock. It writes each repo's goal sections as
+   it reads them and logs progress to stderr (the repo, the requests so far,
+   and every rate-limit or retry wait); a killed run keeps what it wrote.
+   With `--deadline MINUTES` (default 8) it stops reading at that point,
+   prints `resume skipped OWNER/NAME: deadline` for each repo it did not
+   finish and exits 0: work those repos next tick. Each `resume` line it prints is stage
    work another brain yielded (Handing off stage work): finish those items
    first, before measuring anything or starting new work, under the same
    rules as the steps below (a merge still needs a ready pull request).
@@ -348,7 +353,7 @@ this tick"; a step with no note shows nothing there.
    Sensitive pull requests listed by resume are also yours to handle, even
    when another brain journaled in the last 2 hours. They are open,
    needs-brain, older than 2 hours, green and passed the review check. Resume
-   lists these oldest first, before other deferred work. Review the oldest
+   lists these oldest first, after the goal sections. Review the oldest
    sensitive pull request before any other merge work: read the ticket and
    diff, answer or resolve each review thread, then run
    `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N` when ready.
