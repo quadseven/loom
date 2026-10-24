@@ -108,6 +108,25 @@ def goal_trunk(issue: Dict[str, Any]) -> Optional[str]:
     return match.group(1) if match else None
 
 
+# A goal home may name merge constraints in its body's header area (before the
+# first heading). Each constraint is a "Merge constraint:" line that names a
+# rule that must be satisfied for any pull request whose ticket belongs to this
+# goal. Multiple constraints are allowed, one per line.
+_MERGE_CONSTRAINT_RE = re.compile(r"^Merge constraint:[ \t]*(.+)[ \t]*$", re.M)
+
+
+def goal_merge_constraints(issue: Dict[str, Any]) -> List[str]:
+    """The merge constraints named in a goal home's body header, in order."""
+    body = str(issue.get("body") or "")
+    header = body.split("\n", 1)[0] if "\n" in body else body
+    for line in header.splitlines():
+        if line.startswith("#"):
+            break
+    else:
+        header = body
+    return [m.group(1).strip() for m in _MERGE_CONSTRAINT_RE.finditer(header)]
+
+
 def _repo(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
         raise ValueError("repo must be OWNER/NAME")
@@ -695,6 +714,22 @@ def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
             # bus.brain merge refuses it and asks the operator; status says
             # so first, from the body it already holds (2026-10-22).
             line = _add_blocker(line, "held for the operator: operator steps before merge")
+        # Surface goal home merge constraints
+        if ticket is not None:
+            try:
+                ticket_issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+            except GitHubError:
+                ticket_issue = {}
+            if ticket_issue.get("state") == "open" and "loom:ticket" in _labels(ticket_issue):
+                try:
+                    goal_home = _goal_home_for_ticket(gh, repo, ticket_issue)
+                except GitHubError:
+                    goal_home = None
+                if goal_home is not None:
+                    constraints = goal_merge_constraints(goal_home)
+                    if constraints:
+                        for c in constraints:
+                            line = _add_blocker(line, "goal constraint: %s" % c)
         lines.append(line)
     return lines
 
@@ -1063,6 +1098,31 @@ def _parent_number(issue: Dict[str, Any]) -> Optional[int]:
         return int(match.group(1))
     match = re.search(r"/issues/(\d+)(?:[/?#]|$)", str(issue.get("parent_issue_url") or ""))
     return int(match.group(1)) if match else None
+
+
+def _goal_home_for_ticket(gh: GitHub, repo: str, ticket: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The goal home issue for a ticket, or None if it cannot be resolved.
+
+    A ticket's "Part of #N" line names either a goal home or an epic.
+    If it names an epic, the epic's own "Part of #N" names the goal home.
+    """
+    parent = _parent_number(ticket)
+    if parent is None:
+        return None
+    parent_issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, parent)).data or {}
+    if parent_issue.get("state") != "open":
+        return None
+    parent_labels = _labels(parent_issue)
+    if "loom:goal" in parent_labels:
+        return parent_issue
+    if "epic" in parent_labels:
+        # Epic: its Part of names the goal home
+        epic_parent = _parent_number(parent_issue)
+        if epic_parent is not None:
+            goal_issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, epic_parent)).data or {}
+            if goal_issue.get("state") == "open" and "loom:goal" in _labels(goal_issue):
+                return goal_issue
+    return None
 
 
 def is_repair(repo: str, issue: Dict[str, Any], env: Optional[Dict[str, str]] = None) -> bool:
@@ -3055,6 +3115,7 @@ def merge(gh: GitHub, repo: str, number: int,
         association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
         _refuse_pending_fix(gh, association, env)
         _refuse_operator_hold(gh, repo, number, pr, details, association, issue)
+        _refuse_merge_constraints(gh, repo, association, issue)
         tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
@@ -3144,6 +3205,34 @@ def _changed_files(details: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         return None  # GraphQL gives no old path: REST names it (previous_filename)
     return [{"filename": str(n.get("path") or ""), "deletions": int(n.get("deletions") or 0),
              "status": str(n.get("changeType") or "").lower()} for n in nodes]
+
+
+def _refuse_merge_constraints(gh: GitHub, repo: str,
+                             association: Optional[Tuple[str, int]],
+                             ticket_issue: Dict[str, Any]) -> None:
+    """Refuse a merge if the ticket's goal home has merge constraints that are
+    not satisfied. Each "Merge constraint:" line in the goal home's header is
+    a rule that must be satisfied; the check is informational for now (logs the
+    constraint) but will be extended with specific validators.
+    """
+    if association is None:
+        return
+    try:
+        goal_home = _goal_home_for_ticket(gh, repo, ticket_issue)
+    except GitHubError:
+        # If we can't read the goal home, skip constraint checking
+        return
+    if goal_home is None:
+        return
+    constraints = goal_merge_constraints(goal_home)
+    if not constraints:
+        return
+    # For now, log the constraints that apply. In the future, specific
+    # constraint validators can be added here (e.g., "C++ unit test required"
+    # would check for C++ test files in the diff).
+    for constraint in constraints:
+        print("brain: merge constraint from goal #%d: %s" % (
+            goal_home.get("number", 0), constraint), file=sys.stderr)
 
 
 def _refuse_operator_hold(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
