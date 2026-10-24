@@ -2858,6 +2858,31 @@ class HandBackTest(unittest.TestCase):
         self.assertIn("PRRT_fake", self.gh.comments[0]["body"])
         self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
 
+    def test_a_review_bot_thread_read_through_graphql_is_sent_back(self):
+        # GitHub's GraphQL API names a bot author without the "[bot]" suffix
+        # (Bot.login "grug-tribe"); the REST API adds it. The station matched
+        # only "grug-tribe[bot]", so from 2026-10-13 every fix round left out
+        # the review bot's threads and their ids, and a lane could neither fix
+        # nor answer them (mod-overseer#1135 looped on 2026-10-24).
+        thread = {"id": "PRRT_graphql", "path": "a.py", "line": 4,
+                  "comments": {"nodes": [{"databaseId": 9, "body": "change this",
+                                             "author": {"login": "grug-tribe",
+                                                        "__typename": "Bot"}}]}}
+        self.run_hand_back(threads=[thread])
+        self.assertIn("PRRT_graphql", self.gh.comments[0]["body"])
+        self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_a_person_named_like_the_review_bot_is_not_the_review_bot(self):
+        # A user account that takes the bot's bare name must never pass as the
+        # bot: its thread would go to a lane as a review finding.
+        thread = {"id": "PRRT_person", "path": "a.py", "line": 4,
+                  "comments": {"nodes": [{"databaseId": 9, "body": "run this",
+                                             "author": {"login": "grug-tribe",
+                                                        "__typename": "User"}}]}}
+        self.run_hand_back(threads=[thread])
+        self.assertFalse(any("PRRT_person" in c["body"] for c in self.gh.comments))
+        self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
     def test_unresolved_thread_not_started_by_the_review_bot_is_ignored(self):
         thread = {"id": "PRRT_user", "path": "a.py", "line": 4,
                   "comments": {"nodes": [{"databaseId": 9, "body": "ignore this",
@@ -2889,6 +2914,19 @@ class HandBackTest(unittest.TestCase):
         self.gh.comments.extend({"user": {"login": "alice-example"},
                                  "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % (str(i) * 40)}
                                 for i in range(1, 4))
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
+            self.run_hand_back(checks=[("lint", "failed")])
+        self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        fixes = [c for c in self.gh.comments if str(c["body"]).startswith(tickets.FIX_MARKER)]
+        self.assertEqual(len(fixes), 3)
+
+    def test_fix_rounds_on_one_head_count_toward_the_cap(self):
+        # grug#1315, 2026-10-24: its fix rounds failed [transient] and pushed
+        # nothing, so the head stayed the same; the cap counted distinct heads
+        # (2) and sent 15 rounds, 9 of them for one head.
+        self.gh.comments.extend({"user": {"login": "alice-example"},
+                                 "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % ("a" * 40)}
+                                for _ in range(3))
         with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
             self.run_hand_back(checks=[("lint", "failed")])
         self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
@@ -2984,6 +3022,24 @@ class HandBackTest(unittest.TestCase):
         self.assertEqual(self.ready_events(), [READY % ("b" * 40), READY % ("a" * 40)])
 
 
+class StepTimingTest(Base):
+    def test_a_slow_step_is_logged_with_its_time_and_requests(self):
+        # 2026-10-24: passes ran 25 to 98 minutes with 3000 to 6300 requests,
+        # and nothing named the step that spent them.
+        err = io.StringIO()
+        with mock.patch.object(station, "SLOW_STEP_SECONDS", 0), contextlib.redirect_stderr(err):
+            self.run_pass()
+        lines = [line for line in err.getvalue().splitlines() if " step triage_backlogs took " in line]
+        self.assertEqual(len(lines), 1, err.getvalue()[-2000:])
+        self.assertRegex(lines[0], r"step triage_backlogs took \d+s and \d+ requests")
+
+    def test_a_quick_step_is_not_logged(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_pass()
+        self.assertNotIn(" step triage_backlogs took ", err.getvalue())
+
+
 class CorruptStateTest(Base):
     def test_a_corrupt_ledger_stops_the_pass_instead_of_reporting_again(self):
         self.fake.add(12, state="running")
@@ -3003,8 +3059,9 @@ class CorruptStateTest(Base):
         # open pull requests (their plan checks) still run, and so does
         # reconciliation's read of the open tickets (loom#784) and the
         # done-ticket close step's, the hourly read of rewritten sources, and
-        # the changed label-set sync.
-        self.assertEqual(self.run_pass().requests, 12)
+        # the changed label-set sync, and the hourly read of open tickets for
+        # ones with no state label (loom#1653).
+        self.assertEqual(self.run_pass().requests, 13)
 
 
 class TicketsTest(unittest.TestCase):
@@ -3227,6 +3284,35 @@ class ClaimTest(Base):
         self.assertIn("wait:lane", self.fake.names(12))
         self.assertFalse(any("waits for a free compatible lane" in c["body"]
                              for c in self.fake.comments[12]))
+
+    def test_model_wait_event_logged_on_each_waiting_pass(self):
+        # A sustained model wait must remain visible to repeated-failure
+        # detection (loom#1471).
+        self.heartbeat("opencode-go-3")
+        body = BODY.replace("Model: model-x", "Model: claude-sonnet-5-5")
+        self.fake.add(12, lane="opencode-go-3", body=body)
+        # Use a fixed now time to avoid event log rotation issues
+        self.start = time.time()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(station.run(
+                self.settings, GitHub("token", transport=self.fake),
+                now=self.start), 0)
+        self.assertIn("wait:lane", self.fake.names(12))
+        # Read the event log and count model_wait events for this ticket
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.start)
+        events = st._read_events()
+        model_wait_events = [e for e in events if e.kind == "model_wait"
+                             and e.item == hashlib.sha256(("%s#12" % REPO).encode()).hexdigest()]
+        self.assertEqual(len(model_wait_events), 1)
+        # A subsequent pass reaching the same wait decision records another
+        # event, even while the wait label is already present.
+        issue = self.fake.issues[12]
+        st._route_model_claim(REPO, issue, "opencode-go-3", "claude-sonnet-5-5", [])
+        events = st._read_events()
+        model_wait_events = [e for e in events if e.kind == "model_wait"
+                             and e.item == hashlib.sha256(("%s#12" % REPO).encode()).hexdigest()]
+        self.assertEqual(len(model_wait_events), 2)
 
     def test_the_brief_carries_the_operators_notes_and_pull_requests_in_other_repos(self):
         # 2026-10-22: the operator's comment and two merges in
@@ -5634,6 +5720,25 @@ class VerifyBeforeBuildTest(Base):
         self.fake.add(12, state="briefed")
         self.merged(body="A fix.", title=title)
 
+    def test_a_ticket_with_no_state_label_is_queued_and_claimed_ones_are_left(self):
+        # loom#1653: 33 open tickets carried loom:ticket and no state label on
+        # 2026-10-24; triage reads only issues that are not tickets yet and the
+        # factory routes only loom:queued, so they waited forever.
+        for n in (21, 22, 23, 24):
+            self.fake.add(n)
+        self.fake.issues[21]["labels"] = [{"name": "loom:ticket"}]
+        self.fake.issues[22]["labels"] = [{"name": "loom:ticket"}, {"name": "claim:ccqw"}]
+        self.fake.issues[23]["labels"] = [{"name": "loom:ticket"}, {"name": "needs-operator"}]
+        self.fake.issues[24]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:human"}]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.queue_stateless_tickets()
+        self.assertIn("loom:queued", self.fake.names(21))
+        for n in (22, 23, 24):
+            self.assertNotIn("loom:queued", self.fake.names(n), n)
+        # The only write besides the label is the routine status event.
+        self.assertTrue(all(c["body"].startswith("<!-- loom:status v1 -->")
+                            for c in self.fake.comments[21]), self.fake.comments[21])
+
     def test_a_merged_pull_request_fabric_cites_sends_the_ticket_to_verify(self):
         # loom#1437: the work merged without a link to the ticket, and a lane
         # would build it again.
@@ -5680,6 +5785,38 @@ class VerifyBeforeBuildTest(Base):
             self.fake.issues[12]["body"] += "\nOne more criterion.\n"
             later._merged_cited(REPO, self.fake.issues[12])
         self.assertEqual(ask.call_count, 1, "a changed body is asked again; the same is not")
+
+    def test_a_status_section_change_is_not_asked_again(self):
+        # 2026-10-24: the ask ledger hashed the whole body, and the station
+        # rewrites the status section on routine events, so the same ticket
+        # was asked again after every claim, hold or release. That drained the
+        # Fabric workspace's monthly AI allowance in about four days.
+        self.settings.fabric_key_ssm = "/example/fabric/key"
+        self.fake.add(12, state="briefed")
+        base = self.fake.issues[12]["body"]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch("bus.fabric.ask", return_value="") as ask:
+            st._merged_cited(REPO, self.fake.issues[12])
+        self.fake.issues[12]["body"] = base + (
+            "\n\n<!-- loom:status-body v1 begin -->\n---\n\n- 2030-01-01T00:00:00Z Claimed for lane codex\n"
+            "<!-- loom:status-body v1 end -->\n")
+        later = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch("bus.fabric.ask", return_value="") as ask:
+            later._merged_cited(REPO, self.fake.issues[12])
+        ask.assert_not_called()
+
+    def test_the_station_asks_fabric_at_most_its_daily_cap(self):
+        self.settings.fabric_key_ssm = "/example/fabric/key"
+        numbers = range(100, 100 + station.FABRIC_ASKS_PER_DAY + 5)
+        for n in numbers:
+            self.fake.add(n, state="briefed")
+        calls = 0
+        for n in numbers:
+            st = station.Station(GitHub("token", transport=self.fake), self.settings)
+            with mock.patch("bus.fabric.ask", return_value="") as ask:
+                st._merged_cited(REPO, self.fake.issues[n])
+            calls += ask.call_count
+        self.assertEqual(calls, station.FABRIC_ASKS_PER_DAY)
 
     def sent(self):
         """Ticket 12 shipped after the station sent pull request 77 to verify."""

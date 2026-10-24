@@ -120,6 +120,20 @@ class AgentSandboxTest(unittest.TestCase):
         # An arbitrary port on an arbitrary host is not allowed.
         self.assertNotIn('(allow network-outbound (remote ip "*:80"))', profile)
 
+    def test_every_run_keeps_the_whole_keychain_deny(self):
+        # agy reaches the keychain only through /usr/bin/security, so loosening
+        # the keychain server or files for it changed nothing (#1620, #1636):
+        # the agy agent run, an agy check run and other lanes all keep the
+        # keychain-server deny, and agy runs keep the Keychains folder deny.
+        folder = f'(deny file-read* (subpath "{self.scratch}/Library/Keychains"))'
+        for mode, lane in (("", "agy"), ("check", "agy"), ("", "codex"), ("api", "opencode-go")):
+            with self.subTest(mode=mode, lane=lane):
+                profile = self.profile(mode, lane=lane)
+                self.assertIn('(global-name "com.apple.SecurityServer")', profile)
+                self.assertIn('(literal "/usr/bin/security")', profile)
+                if lane == "agy":
+                    self.assertIn(folder, profile)
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_inside_the_agy_profile_connections_and_security_stay_confined(self):
         result = self.bash(

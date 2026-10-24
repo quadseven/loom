@@ -15,6 +15,35 @@ from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Se
 from . import text as _text
 
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
+REPORT_MARKER = "<!-- loom:report v1 -->"
+# A goal report edited in place (bus/journal.py, loom#1560) carries the time of
+# its edit on this line: GitHub keeps the comment's first creation time, so
+# every reader that dates reports reads this stamp instead.
+REPORTED_STAMP = "<!-- loom:reported %s -->"
+_REPORTED_RE = re.compile(r"^<!-- loom:reported (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) -->[ \t]*$", re.M)
+
+
+def reported_at(body: str) -> Optional[str]:
+    """The edit time a report edited in place carries, or None."""
+    found = _REPORTED_RE.findall(str(body or ""))
+    return found[-1] if found else None
+
+
+def _trusted_report_time(comment: Any, body: str, at_key: str) -> Optional[str]:
+    """A report's REPORTED_STAMP time, only when GitHub's own times bear it
+    out: not before the comment was created and not after its last edit. The
+    stamp is text anyone could write; a forged or future one would make a
+    report look fresh and hold the next one back. None otherwise."""
+    if not body.startswith(REPORT_MARKER) or not isinstance(comment, dict):
+        return None
+    stamp = reported_at(body)
+    created = str(comment.get(at_key) or comment.get("created_at")
+                  or comment.get("createdAt") or "")
+    updated = str(comment.get("updated_at") or comment.get("updatedAt")
+                  or comment.get("updated") or "")
+    if not stamp or not created or not updated:
+        return None
+    return stamp if created <= stamp <= updated else None
 # GitHub work any brain can do. Ships and rolls are not here: they stay with
 # whoever a goal's rules name.
 STAGES = ("review", "merge", "failed", "ask", "regression", "brief")
@@ -63,12 +92,18 @@ def expand_journals(comments: Iterable[Any], at_key: str = "at",
                     id_key: str = "id") -> List[Any]:
     """Each journal comment edited in place as one comment per tick, oldest
     first, with the tick's own time under at_key: the comment keeps the
-    createdAt of its first tick, so a tick's time is its Tick line. Every
-    other comment passes through unchanged. Ticks before the newest get
+    createdAt of its first tick, so a tick's time is its Tick line. A report
+    edited in place gets its REPORTED_STAMP time under at_key. Every other
+    comment passes through unchanged. Ticks before the newest get
     "<id>@<time>" as their id, so readers that skip a seen id keep them."""
     out: List[Any] = []
     for comment in comments:
         body = str(comment.get("body") or "").lstrip() if isinstance(comment, dict) else ""
+        stamp = _trusted_report_time(comment, body, at_key)
+        if stamp is not None:
+            # A report edited in place is dated by its edit (loom#1560).
+            out.append(dict(comment, **{at_key: stamp}))
+            continue
         if not body.startswith(JOURNAL_MARKER) or EARLIER_OPEN not in body:
             out.append(comment)
             continue

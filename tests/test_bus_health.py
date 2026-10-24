@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
 import unittest.mock
 
-from bus import brain, health, station, tickets
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from bus import brain, health, station, tickets  # noqa: E402
+from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 REPO = "example-owner/example-repo"
 URL = "https://health.example.test/api/health"
@@ -870,3 +874,93 @@ class Proof(Base):
                                 ["station"])
         self.assertEqual(found, "real")
         self.assertEqual(health.proof_of([comment("stranger", "forged")], ["station"]), "")
+
+
+class Settle(Base):
+    """A health ticket whose finding stays absent past its window closes with
+    the evidence quoted, when nothing else on it is unproven (loom#1611)."""
+
+    DAY = health.PROVE_AFTER
+
+    def ticket(self, label="loom:shipped", number=100, extra=""):
+        body = health.ticket_body(health._finding(finding())[0]) + extra
+        issue = {"number": number, "body": body,
+                 "labels": [{"name": "loom:ticket"}, {"name": label}]}
+        self.gh.open.append(issue)
+        self.gh.events[number] = [labelled(label, NOW - 3600)]
+        return issue
+
+    def pass_at(self, when, present=False):
+        self.doc = {"checked_at": stamp(when), "findings": [finding()] if present else []}
+        self.run_once(when)
+
+    def closes(self):
+        return [w for w in self.gh.writes if w[0] == "PATCH"
+                and (w[2] or {}).get("state") == "closed"]
+
+    def comments(self, needle):
+        return [w for w in self.gh.writes if w[0] == "POST" and needle in w[2]["body"]]
+
+    def test_absent_past_the_window_with_the_other_criteria_proven_closes(self):
+        self.ticket()
+        self.pass_at(NOW)
+        self.pass_at(NOW + self.DAY - 60)
+        self.assertEqual(self.closes(), [])
+        self.pass_at(NOW + self.DAY)
+        self.assertEqual(len(self.closes()), 1)
+        self.assertEqual(self.closes()[0][2]["state_reason"], "completed")
+        ticked = [w for w in self.gh.writes if w[0] == "PATCH" and "body" in (w[2] or {})]
+        self.assertNotIn("[ ]", ticked[-1][2]["body"])
+        note = self.comments("Closed: the health finding stayed absent")
+        self.assertEqual(len(note), 1)
+        for part in ("finding absent since " + stamp(NOW), "last checked_at read in the window "
+                     + stamp(NOW + self.DAY), "proven by the merged pull request"):
+            self.assertIn(part, note[0][2]["body"])
+        self.assertNotIn("health.example.test", note[0][2]["body"])
+
+    def test_a_finding_that_returns_inside_the_window_resets_it(self):
+        self.ticket()
+        self.pass_at(NOW)
+        self.pass_at(NOW + self.DAY - 3600, present=True)
+        self.pass_at(NOW + self.DAY - 1800)
+        self.pass_at(NOW + self.DAY + 900)
+        self.assertEqual(self.closes(), [])
+        self.pass_at(NOW + 2 * self.DAY - 1800)
+        self.assertEqual(len(self.closes()), 1)
+
+    def test_an_unproven_criterion_leaves_one_status_line_and_the_ticket_open(self):
+        issue = self.ticket(label="loom:queued")
+        self.pass_at(NOW)
+        self.pass_at(NOW + self.DAY)
+        self.pass_at(NOW + self.DAY + 900)
+        self.assertEqual(self.closes(), [])
+        status = self.comments("stays open: not proven yet")
+        self.assertEqual(len(status), 1)
+        self.assertIn("A test fails without the fix", status[0][2]["body"])
+        # The ticket marking the rest as met elsewhere lets it close.
+        issue["body"] += "\nSatisfied elsewhere: the fix landed under another ticket.\n"
+        self.pass_at(NOW + self.DAY + 1800)
+        self.assertEqual(len(self.closes()), 1)
+        self.assertEqual(len(self.comments("stays open: not proven yet")), 1)
+
+    def test_shadow_mode_holds_the_close(self):
+        self.ticket()
+        self.pass_at(NOW)
+        with unittest.mock.patch.dict(os.environ, {"LOOM_SHADOW": "1"}):
+            self.pass_at(NOW + self.DAY)
+        self.assertEqual(self.closes(), [])
+        self.assertEqual([w for w in self.gh.writes if w[0] == "PATCH"], [])
+
+    def test_the_window_is_the_one_the_live_line_names(self):
+        extra = ""
+        body = health.ticket_body(health._finding(finding())[0])
+        self.assertEqual(health.window_of(body), health.PROVE_AFTER)
+        longer = body.replace("for 24 hours", "for 3 days")
+        self.assertEqual(health.window_of(longer), 3 * 86400)
+        issue = self.ticket(extra=extra)
+        issue["body"] = longer
+        self.pass_at(NOW)
+        self.pass_at(NOW + 2 * self.DAY)
+        self.assertEqual(self.closes(), [])
+        self.pass_at(NOW + 3 * self.DAY)
+        self.assertEqual(len(self.closes()), 1)
