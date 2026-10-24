@@ -2191,6 +2191,9 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     source, elsewhere = _rewrite_source(gh, repo, refs, env)
     if elsewhere is not None:
         body = body.rstrip("\n") + "\n\nRewritten from issue %d.\n" % refs
+    refusal = acceptance_refusal(body, source)
+    if refusal:
+        raise ValueError(refusal)
     _check_written_text(title + "\n" + body)
     _check_no_foreign_refs(gh, repo, title + "\n" + body)
     if epic is not None:
@@ -2364,6 +2367,26 @@ def missing_sections(body: Optional[str]) -> List[str]:
         missing.extend("a pull request body the review bot accepts (%s)" % found
                        for found in plan_problems(body or ""))
     return missing
+
+
+def acceptance_refusal(body: Optional[str], issue: Optional[Dict[str, Any]] = None
+                       ) -> Optional[str]:
+    """Why a body cannot be filed or briefed as a ticket for want of acceptance
+    criteria, or None. It needs an Acceptance criteria section with at least
+    one checkbox: a stub with none cost a lane a whole pass that ended in a
+    split plan, because nothing on it could be proven (loom#1612). An epic and
+    a wayfinder map plan work instead of asking for it, so the issue they are
+    (when there is one) is exempt. Whether the criteria are good is the
+    definition-of-ready check's job, not this one's."""
+    if issue is not None and (_is_epic(issue) or any(
+            name.startswith("wayfinder:") for name in _labels(issue))):
+        return None
+    if any(_CHECKBOX.match(line)
+           for line in _body_sections(body).get("acceptance criteria", [])):
+        return None
+    return ("the body has no acceptance criteria: add an ## Acceptance criteria section "
+            "with at least one - [ ] checkbox, so a lane has something to prove. The draft "
+            "is kept; nothing was filed")
 
 
 def _is_epic(issue: Dict[str, Any]) -> bool:
@@ -2997,6 +3020,15 @@ def move(gh: GitHub, repo: str, number: int, state: str,
             raise ValueError("lane %s cannot run model %s; compatible lanes: %s" %
                              (lane, effective_model,
                               ", ".join(model_lanes(effective_model)) or "none"))
+    if state in ("queued", "briefed") and not any(
+            x.startswith("loom:") and x not in ("loom:ticket", "loom:triage")
+            for x in _labels(issue)):
+        # The brief step: an issue entering the pipeline needs criteria to
+        # prove. A ticket already in a Loom state (a merged one a revert sends
+        # back, a requeue) is past it.
+        refusal = acceptance_refusal(issue.get("body"), issue)
+        if refusal:
+            raise ValueError("#%d: %s" % (number, refusal))
     kept = _moved_labels(_labels(issue), state, lane)
     proof_url = (_post_proof(gh, repo, number, issue, record, verified_by, facts)
                  if record is not None else "")
