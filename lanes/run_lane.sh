@@ -783,12 +783,17 @@ park() {
 # startup files, ~/.gemini config, MCP servers). Other lanes get no rules here.
 AGY_STATE_KEEP=(settings.json bin builtin installation_id jetski_state.pbtxt updater last_check.timestamp log cli.log crashes cache)
 AGY_CACHE_KEEP=(onboarding.json default_project_id.txt)
+# agy keeps its sign-in in its file store, Library/Application Support/
+# antigravity: inside the sandbox it cannot run /usr/bin/security to reach the
+# keychain (#1465), so it falls back there. Without a write there it could
+# neither keep nor refresh a token, and every run asked for a browser login
+# (2026-10-22 to 10-24, #1620). The Keychains folder takes no write.
 agy_write_rules() {
   [ "$LANE" = agy ] || return 0
   local h s
   h="$(cd "$AGY_HOME" && pwd -P)" || return 1
   s="$h/.gemini/antigravity-cli"
-  printf '(deny file-write* (subpath "%s"))\n(allow file-write* %s (subpath "%s") (subpath "%s/Library/Keychains") (subpath "%s/Library/Caches"))\n(deny file-write* (literal "%s/settings.json") (literal "%s/installation_id") (subpath "%s/bin") (subpath "%s/builtin"))\n' \
+  printf '(deny file-write* (subpath "%s"))\n(allow file-write* %s (subpath "%s") (subpath "%s/Library/Application Support/antigravity") (subpath "%s/Library/Caches"))\n(deny file-write* (literal "%s/settings.json") (literal "%s/installation_id") (subpath "%s/bin") (subpath "%s/builtin"))\n' \
     "$h" "$1" "$s" "$h" "$h" "$s" "$s" "$s" "$s"
 }
 
