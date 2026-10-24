@@ -33,6 +33,9 @@ STATES = ("queued", "briefed", "running", "pr", "answered", "failed", "merged", 
 # Merged and shipped tickets wait on a deploy or a live check, not on a lane,
 # so they never count against a goal's cap.
 IN_FLIGHT = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:failed")
+# This is a per-goal fairness limit, not a mirror of total lane slots; larger
+# factories can raise it through LOOM_GOAL_CAP when their goals need more
+# concurrent tickets.
 DEFAULT_GOAL_CAP = 16
 # Merged and shipped tickets that still wait on a live check. A verified
 # ticket carries loom:verified instead of loom:shipped (or loom:merged for a
