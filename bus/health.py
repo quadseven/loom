@@ -698,26 +698,34 @@ class Intake:
         if not tickets.LIVE_CRITERION_RE.match(brain.live_criterion(body, limit=None)):
             return
         absent = max(_epoch(r["absent"]) or 0.0 for r in recs)
-        since = absent
-        if tickets.ticket_state(issue) == "shipped":
-            shipped = self._ship_time(source, number, recs)
-            if shipped is None:
-                return
-            since = max(absent, shipped)
+        shipped = self._ship_time(source, number, recs) \
+            if tickets.ticket_state(issue) == "shipped" else absent
         window = window_of(body)
-        if absent == 0.0 or self.now - since < window:
+        if not absent or shipped is None or self.now - max(absent, shipped) < window:
             return
         missing = unproven(issue)
-        hours = window // 3600
         if missing:
-            said = ",".join(missing)
-            if recs[0].get("held") != said:
-                self._comment(source.repo, issue, status_comment(_stamp(absent), hours, missing),
-                              notify.STATUS)
-                recs[0]["held"] = said
-                self.say("health %s#%d: finding absent %d hours; open, %d criteria unproven"
-                         % (source.repo, number, hours, len(missing)))
+            self._hold_settle(source, number, issue, recs, _stamp(absent), window // 3600, missing)
             return
+        self._close_settled(source, number, issue, recs, _stamp(absent), checked, window // 3600)
+
+    def _hold_settle(self, source: Source, number: int, issue: Dict[str, Any],
+                     recs: List[Dict[str, Any]], absent: str, hours: int,
+                     missing: List[str]) -> None:
+        """One status line per distinct set of unproven criteria."""
+        said = ",".join(missing)
+        if recs[0].get("held") == said:
+            return
+        self._comment(source.repo, issue, status_comment(absent, hours, missing), notify.STATUS)
+        recs[0]["held"] = said
+        self.say("health %s#%d: finding absent %d hours; open, %d criteria unproven"
+                 % (source.repo, number, hours, len(missing)))
+
+    def _close_settled(self, source: Source, number: int, issue: Dict[str, Any],
+                       recs: List[Dict[str, Any]], absent: str, checked: str,
+                       hours: int) -> None:
+        """Tick the ticket's boxes and close it as completed, with the
+        evidence comment first. Shadow mode records the close and sends none."""
         if shadow.active(source.repo):
             held = shadow.record_held(shadow.CLOSE, source.repo, number, "issue",
                                       source="health intake", gates=["absent past its window",
@@ -726,15 +734,14 @@ class Intake:
             if held["new"]:
                 self.say("shadow mode: would close health %s#%d" % (source.repo, number))
             return
-        how = "proven by the merged pull request" \
-            if tickets.ticket_state(issue) in tickets.MERGED_STATES \
+        body = str(issue.get("body") or "")
+        landed = tickets.ticket_state(issue) in tickets.MERGED_STATES
+        how = "proven by the merged pull request" if landed and not SATISFIED_RE.search(body) \
             else "marked as satisfied elsewhere on the ticket"
-        if SATISFIED_RE.search(body):
-            how = "marked as satisfied elsewhere on the ticket"
         names = [str(x.get("name") or "") for x in issue.get("labels") or [] if isinstance(x, dict)]
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (source.repo, number),
                      {"body": proof.tick(body)})
-        self._comment(source.repo, issue, settle_comment(_stamp(absent), checked, hours, how),
+        self._comment(source.repo, issue, settle_comment(absent, checked, hours, how),
                       notify.CLOSED)
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (source.repo, number),
                      {"state": "closed", "state_reason": "completed"})
