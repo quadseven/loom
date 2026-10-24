@@ -7298,28 +7298,18 @@ class Station:
         moved, so the done close leaves it alone this pass. 62 tickets of one
         backlog sat shipped or verified and an overnight sweep found about
         half built, needing only their live proof read."""
-        labels = set(_label_names(issue))
-        if (issue.get("state") != "open" or "loom:shipped" not in labels
-                or "loom:verified" in labels or labels & set(CLOSE_DONE_HOLDS)):
-            return False
-        body = str(issue.get("body") or "")
         sources = self._proof_sources(repo)
-        if sources.log is None or not any(
-                k == criteria_gate.LIVE and self._windowed_log(t)
-                for k, t in criteria_gate.needing_evidence(body)):
+        if not self._provable(issue, sources):
             return False
         number = int(issue["number"])
+        body = str(issue.get("body") or "")
         key = "%s#%d" % (repo, number)
         path = os.path.join(self.state, LIVE_PROOF_FILE)
         state = _read_json(path, {}, strict=False)
         state = state if isinstance(state, dict) else {}
         last = state.get(key) if isinstance(state.get(key), dict) else {}
         contract = proof.contract(body)
-        if last.get("contract") == contract:
-            due = last.get("next_at")
-            if not isinstance(due, (int, float)) or self.now < due:
-                return False
-        if self._proof_budget <= 0:
+        if not self._proof_due(last, contract) or self._proof_budget <= 0:
             return False
         self._proof_budget -= 1
         deployed_at = self._shipped_stamp(repo, issue)
@@ -7333,18 +7323,43 @@ class Station:
             outcome = outcome._replace(next_at=self.now + live_proof.RETRY)
             if why:
                 outcome = outcome._replace(proven=False, missing=[("its station proof", why)])
-        if moved:
-            state.pop(key, None)
-        else:
+        state.pop(key, None)
+        if not moved:
             state[key] = {"contract": contract, "next_at": outcome.next_at,
-                          "said": last.get("said")}
-        line = live_proof.status_line(outcome)
-        if line and line != last.get("said"):
-            self._routine(repo, number, line)
-            state[key]["said"] = line
-            _say("live proof of %s#%d not met: %s" % (repo, number, line))
+                          "said": self._say_unproven(repo, number, outcome, last.get("said"))}
         _write_json(path, state)
         return moved
+
+    def _provable(self, issue: Dict[str, Any], sources: live_proof.Sources) -> bool:
+        """Whether the station proves this ticket itself: open, shipped, not
+        verified or held, with a log source and a live criterion that names
+        log strings and a window."""
+        labels = set(_label_names(issue))
+        if (issue.get("state") != "open" or "loom:shipped" not in labels
+                or "loom:verified" in labels or labels & set(CLOSE_DONE_HOLDS)
+                or sources.log is None):
+            return False
+        return any(k == criteria_gate.LIVE and self._windowed_log(t)
+                   for k, t in criteria_gate.needing_evidence(str(issue.get("body") or "")))
+
+    def _proof_due(self, last: Dict[str, Any], contract: str) -> bool:
+        """A ticket is proved again at its next check, or once its criteria
+        change when nothing Loom runs can change the answer (no next check)."""
+        if last.get("contract") != contract:
+            return True
+        due = last.get("next_at")
+        return isinstance(due, (int, float)) and self.now >= due
+
+    def _say_unproven(self, repo: str, number: int, outcome: live_proof.Outcome,
+                      said: Any) -> Any:
+        """Edit the status line of an unproven ticket into its status comment
+        when it differs from the one last said; the line now said."""
+        line = live_proof.status_line(outcome)
+        if not line or line == said:
+            return said
+        self._routine(repo, number, line)
+        _say("live proof of %s#%d not met: %s" % (repo, number, line))
+        return line
 
     def _close_proven(self, repo: str, issue: Dict[str, Any], outcome: live_proof.Outcome,
                       deployed_at: float) -> Tuple[bool, str]:
