@@ -3,6 +3,7 @@ import json
 import os
 import unittest
 import urllib.error
+from pathlib import Path
 from unittest import mock
 
 from bus import fabric
@@ -90,6 +91,22 @@ class AskCliTest(unittest.TestCase):
             self.assertEqual(fabric.main(["ask", "which?"]), 0)
         ssm.assert_not_called()
         op.assert_not_called()
+
+
+class BrainEnvTest(unittest.TestCase):
+    """The brain agent must never receive the Fabric key or the SSM name that
+    names it (lanes/mac/brain.sh keeps keys and SSM names out of the agent's
+    environment, so a prompt injected through an issue cannot reach the key)."""
+
+    BRAIN_SH = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "brain.sh"
+
+    def test_brain_sh_keeps_fabric_key_ssm_out_of_agent_env(self):
+        text = self.BRAIN_SH.read_text()
+        settings = [line for line in text.splitlines()
+                    if line.strip().startswith("BRAIN_SETTINGS=")]
+        self.assertEqual(len(settings), 1)
+        self.assertNotIn("LOOM_FABRIC_KEY_SSM", settings[0])
+        self.assertNotIn("LOOM_AWS_REGION", settings[0])
 
 
 if __name__ == "__main__":
