@@ -2595,6 +2595,16 @@ fi
 # reason that says "limit:" (which limit, until when) is kept as it was.
 LIMIT_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
 CONFIGURED_MODELS="$(lane_setting MODELS)"
+# A Go allowance hold never binds a slot on a free model (limit_group): a
+# hold written before the slot moved to one, or by an older runner, is
+# dropped. On 2026-10-23 the Beam Free slots kept a monthly hold Kimi had
+# taken, until 2026-10-28.
+if [ "$LANE" = opencode-go ] && [ -n "$LIMIT_UNTIL" ] && free_model "$(slot_model "$SLOT")" &&
+  grep -q "$GO_LIMIT_ERROR" "$BEAT" 2>/dev/null; then
+  echo "[$(date -u +%FT%TZ)] lane $SLOT runs free model $(slot_model "$SLOT"), outside the Go allowance: dropping its Go limit hold" >&2
+  rm -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
+  LIMIT_UNTIL=""
+fi
 if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
   HELD_REASON="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
   case "$HELD_REASON" in limit:*) ;; *) HELD_REASON="provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" ;; esac
@@ -2615,6 +2625,8 @@ fi
 # CLI lists the model, else it holds another LIMIT_WAIT with no ticket round.
 if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -le "$(date +%s)" ]; then
   GONE_MODEL="$(sed -nE 's/.*"reason": *"limit: model ([A-Za-z0-9._:\/@-]+) not found by the agent CLI.*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+  # A hold for a model the lane no longer runs says nothing of the one it runs.
+  [ -z "$(lane_setting MODEL)" ] || [ "$GONE_MODEL" = "$(lane_setting MODEL)" ] || GONE_MODEL=""
   if [ -n "$GONE_MODEL" ] && ! model_listed "$GONE_MODEL"; then
     GONE_UNTIL=$(( $(date +%s) + LIMIT_WAIT ))
     heartbeat false "limit: model $GONE_MODEL not found by the agent CLI; lane waits until $(utc "$GONE_UNTIL")" "$GONE_UNTIL"
