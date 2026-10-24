@@ -700,6 +700,36 @@ class SensitiveResumeTests(unittest.TestCase):
         a_tick_earlier = station_posts - brain.timedelta(hours=1)
         self.assertEqual(brain._report_deadline(last, a_tick_earlier)[1], "due")
 
+    def test_unbuilt_criteria_block_merge_readiness_but_allow_built_and_docs(self):
+        unbuilt = ("## Acceptance criteria\n- [ ] feature works; not built: no caller\n"
+                   "- [ ] another behavior; not built: no implementation\n"
+                   "- [ ] Live: endpoint answers `ok`")
+        built = "## Acceptance criteria\n- [ ] feature works\n- [ ] other; not built: pending"
+        self.assertEqual(brain._unbuilt_criteria_reason(unbuilt),
+                         "blocked: no criterion built")
+        self.assertEqual(brain._unbuilt_criteria_reason(built), "")
+        self.assertEqual(brain._unbuilt_criteria_reason("## Acceptance criteria\n- [ ] Live: endpoint answers `ok`"), "")
+
+    def test_status_blocks_pr_when_all_code_criteria_are_marked_not_built(self):
+        pr = {"number": 8, "title": "Lane work", "body":
+              ("Refs %s#9\n## Acceptance criteria\n- [ ] behavior works; not built: no caller\n"
+               "- [ ] Live: endpoint answers `ok`") % REPO}
+        self.assertEqual(brain._status_pr_line(None, REPO, pr, ready_node(),
+                                               "grug-tribe", "Grug - Elder"),
+                         "- #8 Lane work - blocked: no criterion built")
+
+    def test_merge_refuses_pr_when_every_non_live_criterion_is_not_built(self):
+        body = ("Refs %s#9\n## Acceptance criteria\n"
+                "- [ ] behavior works; not built: no caller\n"
+                "- [ ] Live: endpoint answers `ok`") % REPO
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                                {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []))
+        with self.assertRaisesRegex(ValueError, "blocked: no criterion built"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
     def test_merge_ready_names_each_blocker(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}
         cases = [
