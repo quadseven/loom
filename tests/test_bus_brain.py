@@ -922,6 +922,14 @@ class SensitiveResumeTests(unittest.TestCase):
                     brain.move(GitHub("t", transport=fake), REPO, 8, state)
                 self.assertEqual([c[0] for c in fake.calls], ["GET"])
 
+    def test_move_sends_a_ticket_already_in_a_loom_state_back_without_the_criteria_check(self):
+        # A revert sends a merged ticket back to its lane, whatever its old body.
+        issue = {"state": "open", "body": "old stub", "labels": [
+            {"name": "loom:ticket"}, {"name": "loom:merged"}, {"name": "lane:codex"}]}
+        fake = Fake(reply(200, issue), reply(200, []))
+        brain.move(GitHub("t", transport=fake), REPO, 8, "briefed", "codex")
+        self.assertEqual([c[0] for c in fake.calls], ["GET", "PUT"])
+
     def test_move_briefs_an_epic_or_a_map_with_no_acceptance_checkbox(self):
         for name in ("epic", "wayfinder:map"):
             with self.subTest(name=name):

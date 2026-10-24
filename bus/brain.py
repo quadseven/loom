@@ -3020,8 +3020,12 @@ def move(gh: GitHub, repo: str, number: int, state: str,
             raise ValueError("lane %s cannot run model %s; compatible lanes: %s" %
                              (lane, effective_model,
                               ", ".join(model_lanes(effective_model)) or "none"))
-    if state in ("queued", "briefed") and not any(x in _labels(issue) for x in IN_FLIGHT):
-        # The brief step: an issue entering the pipeline needs criteria to prove.
+    if state in ("queued", "briefed") and not any(
+            x.startswith("loom:") and x not in ("loom:ticket", "loom:triage")
+            for x in _labels(issue)):
+        # The brief step: an issue entering the pipeline needs criteria to
+        # prove. A ticket already in a Loom state (a merged one a revert sends
+        # back, a requeue) is past it.
         refusal = acceptance_refusal(issue.get("body"), issue)
         if refusal:
             raise ValueError("#%d: %s" % (number, refusal))
