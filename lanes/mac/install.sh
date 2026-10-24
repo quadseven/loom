@@ -39,7 +39,13 @@ LOOM_AGY_ONLY_MODEL="${LOOM_AGY_ONLY_MODEL-gemini-3.8-flash}"
 LOOM_CLAUDE_MODEL="${LOOM_CLAUDE_MODEL:-claude-opus-5-5}"
 LOOM_MUSE_MODEL="${LOOM_MUSE_MODEL:-muse-spark-1.3}"
 LOOM_OPENROUTER_MODEL="${LOOM_OPENROUTER_MODEL:-openrouter/cohere/north-mini-code:free}"
-LOOM_OPENCODE_GO_MODEL="${LOOM_OPENCODE_GO_MODEL:-opencode-go/kimi-k2.7-code}"
+# The opencode-go slots run only bus/tickets.py OPENCODE_GO_MODELS (free, or
+# at least 10,000 requests per 5 h); a lane on any other model refuses to
+# start. Kimi K2.7 Code (1,350 per 5 h) spent the Go allowance in hours on
+# 2026-10-23. opencode-go and opencode-go-2 run Beam Free (free, unlimited,
+# not trained on); opencode-go-3 DeepSeek V4.1 Flash (34,670 per 5 h) and
+# opencode-go-4 Muse Spark 1.3 Contributor (45,300, trains: public only).
+LOOM_OPENCODE_GO_MODEL="${LOOM_OPENCODE_GO_MODEL:-opencode-go/beam-free}"
 LOOM_OPENCODE_GO_3_MODEL="${LOOM_OPENCODE_GO_3_MODEL:-opencode-go/deepseek-v4.1-flash}"
 LOOM_OPENCODE_GO_4_MODEL="${LOOM_OPENCODE_GO_4_MODEL:-opencode-go/muse-spark-1.3-contributor}"
 # OpenCode Go's chat endpoint, asked for its usage limit before each run
@@ -47,7 +53,7 @@ LOOM_OPENCODE_GO_4_MODEL="${LOOM_OPENCODE_GO_4_MODEL:-opencode-go/muse-spark-1.3
 LOOM_OPENCODE_GO_PROBE_URL="${LOOM_OPENCODE_GO_PROBE_URL:-https://opencode.ai/zen/go/v1/chat/completions}"
 LOOM_OPENCODE_GO_PROBE_HEADER="${LOOM_OPENCODE_GO_PROBE_HEADER:-x-opencode-session}"
 LOOM_ANTHROPIC_MODEL="${LOOM_ANTHROPIC_MODEL:-claude-sonnet-5-5}"
-LOOM_ZEN_MODEL="${LOOM_ZEN_MODEL:-opencode/minimax-m3.1-flash-free}"
+LOOM_ZEN_MODEL="${LOOM_ZEN_MODEL:-opencode/deepseek-v4.1-flash-free}"
 LOOM_ZAI_MODEL="${LOOM_ZAI_MODEL:-zai/glm-4.7-flash}"
 LOOM_WORKERSAI_MODEL="${LOOM_WORKERSAI_MODEL:-cloudflare-workers-ai/@cf/qwen/qwen3.8-27b}"
 LOOM_AGY_MODEL="${LOOM_AGY_MODEL:-gemini-3.8-flash-high}"
