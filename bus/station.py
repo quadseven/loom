@@ -383,7 +383,9 @@ LANE_MODELS = {
     "claude": CLAUDE_MODELS,
     "anthropic": ["claude*"],
     "openrouter": ["openrouter/*:free"],
-    "opencode-go": ["opencode-go/*"],
+    # Only the allow-listed models (tickets.OPENCODE_GO_MODELS), so a pin to
+    # a low-allowance Go model is never routed to an opencode-go lane.
+    "opencode-go": list(tickets.OPENCODE_GO_MODELS),
     "zen": ["opencode/*-free"],
     "zai": ["zai/glm-4.7-flash", "zai/glm-4.5-flash"],
     "workersai": ["cloudflare-workers-ai/@cf/*"],

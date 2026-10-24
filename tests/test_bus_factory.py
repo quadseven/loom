@@ -3448,6 +3448,21 @@ class ForbiddenModels(unittest.TestCase):
             self.assert_allowed(model, "the strong models")
         self.assertEqual(dict(factory.LADDER[1:2]), {("codex", "codex-2"): "gpt-6-luna"})
 
+    def test_a_go_model_off_the_allow_list_reads_as_the_stand_in(self):
+        # Kimi K2.7 Code (1,350 requests per 5 h) spent the Go allowance in
+        # hours on 2026-10-23; the allow-list is free or 10,000+ models only.
+        self.assertIn(tickets.OPENCODE_GO_STAND_IN, tickets.OPENCODE_GO_MODELS)
+        for named in ("opencode-go/kimi-k2.7-code", "opencode-go/kimi-k3.1-pro",
+                      "opencode-go/gemini-4-argon-contributor", "opencode-go/some-new-model"):
+            headers, _ = tickets.parse("Model: %s\nDifficulty: easy\n\n## Why\nx\n" % named)
+            self.assertEqual(headers["Model"], tickets.OPENCODE_GO_STAND_IN, named)
+            self.assertFalse(station.lane_takes_model("opencode-go-2", named), named)
+        for model in tickets.OPENCODE_GO_MODELS:
+            self.assertEqual(tickets.allowed_model(model), model)
+            self.assertTrue(station.lane_takes_model("opencode-go", model), model)
+        for _, model in factory.CLIMB:
+            self.assertFalse(model.startswith("opencode-go/") and model not in tickets.OPENCODE_GO_MODELS)
+
     def test_the_forbidden_list_covers_both_families(self):
         self.assertEqual(tuple(p for p, _ in tickets.FORBIDDEN_MODELS), self.FORBIDDEN)
 
