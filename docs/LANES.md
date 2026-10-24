@@ -45,6 +45,11 @@ use the documentation ranges `192.0.2.0/24`, `198.51.100.0/24`, or
 `203.0.113.0/24`; add `leak-guard-allow` on a line only when a deliberate
 range bound must appear.
 
+Before opening a pull request, the runner checks its generated body against
+the review bot's Hunt Plan. If a brief is stale or edited and the body fails,
+the runner parks the brief as a work failure and does not open the pull
+request; the pushed branch remains available for the brain to repair.
+
 ## Validation contract
 
 A repo opts in with `.loom/validation.conf`, the same steps its CI runs:

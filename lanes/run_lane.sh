@@ -3353,11 +3353,11 @@ Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
   [ -n "${PR_BODY:-}" ] || PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
-  # Briefs are checked when filed, so this only fires on a brief filed
-  # before that check or edited by hand: the PR still opens (the work is
-  # done), and the log names what the review bot will hold it for.
+  # A brief may predate filing checks or have been edited by hand. Do not
+  # open a pull request whose body the review bot will hold.
   if ! PLAN_PROBLEMS="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)"; then
-    echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$PLAN_PROBLEMS" | tr '\n' ';')" >> "$LOG"
+    park "$BRIEF" "pull request body fails the plan checks: $(printf '%s' "$PLAN_PROBLEMS" | tr '\n' ';')"
+    continue
   fi
   if ! PR_URL="$(timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
        --body "$PR_BODY" 2>> "$LOG")"; then

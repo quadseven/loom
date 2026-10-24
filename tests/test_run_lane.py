@@ -1177,6 +1177,17 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("failed: [transient] pr create failed",
                       (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text())
 
+    def test_a_body_failing_the_hunt_plan_is_parked_without_opening_a_pr(self):
+        brief = BRIEF.replace("- [ ] A test covers the thing\n- [ ] Nothing else changes\n", "")
+        self.drop_brief(text=brief)
+
+        result = self.run_lane()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("non-empty bullets; need >=3", self.run_log())
+        self.assertFalse(any(call.startswith("gh pr create") for call in self.calls()))
+
     def test_brief_base_branch_is_cloned_and_targeted_by_the_pr(self):
         # The remote's default branch is not where work lands: seed one with
         # a different tree and name the real base in the brief.
