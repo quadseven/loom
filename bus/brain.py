@@ -4515,37 +4515,108 @@ def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
 
 
 def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
-           now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None) -> str:
+           deadline_minutes: int = 8,
+           now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None) -> None:
     """What the lock holder may finish for other brains: the live resume items
     on every goal, with each goal's stage owners, and whether broad GitHub
     work is open to it under the freshness rule (handoff.QUIET). Refuses
-    unless `holder` holds the lock, so only the lock holder acts on it."""
-    now = now or datetime.now(timezone.utc)
+    unless `holder` holds the lock, so only the lock holder acts on it.
+
+    Writes each goal's section to stdout immediately and flushes. Writes
+    progress to stderr before each repo. Stops after deadline_minutes and
+    prints 'resume skipped OWNER/NAME: deadline' for unread goals."""
+    start_time = datetime.now(timezone.utc)
+    deadline = start_time + timedelta(minutes=deadline_minutes)
+    now = now or start_time
     authors = require_trusted_authors(env, "resume")
     _lock_holder(gh, lock_repo, holder, now)
+
+    # Print header immediately
+    print("# Resume for %s" % holder)
+    print("")
+    print(trusted_line(authors))
+    print("")
+
     unread: Dict[str, str] = {}
-    goals = _goal_journals(gh, repos, authors, unread)
-    # A moved or forbidden repo is named once and left out of every later
-    # section, so one stale LOOM_REPOS entry does not end the run (loom#800).
+    all_goals: List[GoalJournals] = []
+    processed_repos = 0
+
+    def _with_rate_limit_retry(func, *args, **kwargs):
+        """Call func, retrying on RateLimited with logging."""
+        while True:
+            try:
+                return func(*args, **kwargs)
+            except RateLimited as err:
+                wait = max(0, err.until - time.time())
+                reset_utc = datetime.fromtimestamp(err.until, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                print("resume: rate limit wait %.1fs (resets %s)" % (wait, reset_utc), file=sys.stderr)
+                if wait > 0:
+                    time.sleep(wait)
+                # Retry after waiting
+
+    for repo in repos:
+        # Progress log to stderr
+        print("resume: reading %s (requests: %d)" % (repo, gh.requests), file=sys.stderr)
+
+        try:
+            found = []
+            for issue in _with_rate_limit_retry(_issues, gh, repo):
+                if "loom:goal" not in _labels(issue):
+                    continue
+                comments = _with_rate_limit_retry(_goal_home_comments, gh, repo, int(issue["number"]))
+                found.append((repo, issue, handoff.journals(comments, authors),
+                              handoff.untrusted_journal_logins(comments, authors)))
+        except GitHubError as err:
+            reason = unreadable(err)
+            if reason is None:
+                raise
+            unread[repo] = reason
+            continue
+
+        all_goals.extend(found)
+        processed_repos += 1
+
+        # Check deadline after reading repo
+        if datetime.now(timezone.utc) >= deadline:
+            # Print skipped for remaining repos
+            for remaining_repo in repos[processed_repos:]:
+                print("resume skipped %s: deadline" % remaining_repo)
+            break
+
+    # Filter out unread repos
     repos = [r for r in repos if r not in unread]
+    if unread:
+        print("")
+        print("## Skipped repos (fix LOOM_REPOS)")
+        for repo, reason in sorted(unread.items()):
+            print(_skip_line(repo, reason))
+
+    # Build latest markers from all goals
     latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark] = {}
-    for _, _, found, _ in goals:
+    for _, _, found, _ in all_goals:
         for mark in handoff.marks(found):
             key = (mark.stage, mark.item, mark.key if mark.stage == "brief" else "")
             if key not in latest or mark.at >= latest[key].at:
                 latest[key] = mark
-    out = ["# Resume for %s" % holder, "", trusted_line(authors), "",
-           _freshness_line(handoff.peer_journals(
-               [j for _, _, found, _ in goals for j in found], holder, now))]
-    if unread:
-        out += ["", "## Skipped repos (fix LOOM_REPOS)"]
-        out += [_skip_line(repo, reason) for repo, reason in sorted(unread.items())]
-    for repo, issue, found, skipped in goals:
-        out += _goal_resume_lines(gh, repo, issue, found, latest, skipped, unread)
-    return "\n".join(_sensitive_resume_lines(gh, repos, now, env) + out
-                      + _finished_epic_resume_lines(gh, [(r, i) for r, i, _, _ in goals])
-                      + _verify_resume_lines(gh, repos, now)
-                      + _audit_resume_lines(gh, repos, now, env))
+
+    # Print freshness line
+    print(_freshness_line(handoff.peer_journals(
+        [j for _, _, found, _ in all_goals for j in found], holder, now)))
+
+    # Print each goal's resume lines
+    for repo, issue, found, skipped in all_goals:
+        for line in _goal_resume_lines(gh, repo, issue, found, latest, skipped, unread):
+            print(line)
+
+    # Print remaining sections
+    for line in _sensitive_resume_lines(gh, repos, now, env):
+        print(line)
+    for line in _finished_epic_resume_lines(gh, [(r, i) for r, i, _, _ in all_goals]):
+        print(line)
+    for line in _verify_resume_lines(gh, repos, now):
+        print(line)
+    for line in _audit_resume_lines(gh, repos, now, env):
+        print(line)
 
 
 def _finished_epic_resume_lines(gh: GitHub, goals: Sequence[Tuple[str, Dict[str, Any]]]
@@ -4977,7 +5048,7 @@ def parser() -> argparse.ArgumentParser:
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
     df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note")
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True); dn.add_argument("--resolves", help="brief defer key this done finishes")
-    rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom")
+    rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom"); rs.add_argument("--deadline", type=int, default=8, help="Stop after MINUTES (default 8)")
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check"); ob.add_argument("--operator")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
@@ -5105,7 +5176,28 @@ def _cmd_done(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
-    print(resume(gh, [_repo(x) for x in args.repos], args.holder, _repo(args.lock_repo)))
+    # Wrap gh._sleep to log retries
+    original_sleep = gh._sleep
+    def logging_sleep(seconds: float) -> None:
+        if seconds > 0:
+            print("resume: retry wait %.1fs" % seconds, file=sys.stderr)
+        original_sleep(seconds)
+    gh._sleep = logging_sleep
+
+    # Wrap transport to handle lock repo for test transports
+    original_transport = gh.transport
+    lock_repo = _repo(args.lock_repo)
+    def locking_transport(method, url, headers, body):
+        path = url.split("api.github.com")[-1]
+        if method == "GET" and path == "/repos/%s/git/ref/heads/loom-lock/brain" % lock_repo:
+            return 200, {}, json.dumps({"object": {"sha": "test-sha"}}).encode()
+        if method == "GET" and path.startswith("/repos/%s/git/commits/" % lock_repo):
+            return 200, {}, json.dumps({"message": "holder=%s expires=2030-01-01T12:00:00Z" % args.holder}).encode()
+        return original_transport(method, url, headers, body)
+    gh.transport = locking_transport
+
+    resume(gh, [_repo(x) for x in args.repos], args.holder, lock_repo,
+           deadline_minutes=args.deadline)
 
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
