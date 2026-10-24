@@ -1486,7 +1486,10 @@ operator:
 - a pull request merge (the factory, `bus.brain merge` on the lane machine or
   Muse, the deploy-watch revert path, the roll pin);
 - an issue close (a done or verified ticket, an epic, a rewritten source
-  issue, an operator-claimed issue) and a move to `loom:shipped`;
+  issue, an operator-claimed issue, an invariant breach that cleared or was
+  folded into its rolling issue) and a move to `loom:shipped`;
+- an issue reopen (an invariant breach seen again, a failed audit's ticket
+  or source issue);
 - a label that grants a merge (`ready-to-land`), and any GraphQL label write
   (it names labels by id);
 - an approving pull request review;
@@ -1497,10 +1500,15 @@ operator:
 
 Closing a pull request without merging it still happens (it can be reopened
 and its branch stays), and so do the closes of Loom's own signal issues that
-carry no work label: an invariant breach, a factory incident, and a health
-signature the watcher filed (`loom:triage` with the watcher's marker in its
-body; `loom:triage` alone is on people's own issues too, and their close is
-held).
+carry no work label and no invariant label: a factory incident (an open one
+holds the tickets behind it) and a health signature the watcher filed
+(`loom:triage` with the watcher's marker in its body; `loom:triage` alone is
+on people's own issues too, and their close is held). An invariant breach's
+issue gates no ticket, so its close is recorded like any other (loom#1551):
+the invariants step asks the guard before it posts the cleared note, and
+logs `would close` once instead of `closed cleared`. run_lane.sh closes its
+factory incidents through `python3 -m bus.shadow gh-guard --lane`, which
+reads the issue first.
 
 `bus/github.py` checks every request at its one choke point and refuses a
 held one with `ShadowHeld`, whichever code sent it; `bus.brain merge`,

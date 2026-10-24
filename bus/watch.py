@@ -54,6 +54,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import handoff
 from . import notify
+from . import shadow
 from . import text as _text
 from . import transcripts
 from .github import GitHubError
@@ -1057,7 +1058,14 @@ class Watcher:
             if not self.write or self.writes + 2 > WRITES_MAX:
                 continue
             try:
-                if self._is_open(int(number)):
+                issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (self.repo, int(number))).data
+                if isinstance(issue, dict) and issue.get("state") == "open":
+                    # Before the note, so a close shadow mode holds (the
+                    # signature became a ticket) says nothing (loom#1551).
+                    if shadow.guard("PATCH", "/repos/%s/issues/%d" % (self.repo, int(number)),
+                                    {"state": "closed", "state_reason": "not_planned"}, issue,
+                                    source="watch quiet close") is not None:
+                        continue
                     body = self._quiet_body(rec)
                     _text.check(body)
                     notify.post(self.gh, self.repo, number, body, notify.CLOSED)

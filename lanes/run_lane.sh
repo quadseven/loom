@@ -1610,6 +1610,10 @@ resolve_factory_incidents() {
     [ -f "$file" ] || continue
     number="$(tr -cd '0-9' < "$file")"
     if [ -n "$number" ]; then
+      # Shadow mode (bus/shadow.py): the guard reads the issue and lets a
+      # factory incident's close through; anything else it records and holds.
+      PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.shadow gh-guard --lane "$PWD" \
+        issue close --repo "$FACTORY_REPO" "$number" >>"$LOG" 2>&1 || continue
       gh issue close --repo "$FACTORY_REPO" "$number" \
         --comment "Cleared: the check passed on the unmodified base in $(incident_ticket)." >>"$LOG" 2>&1 || continue
     fi

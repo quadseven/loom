@@ -108,6 +108,13 @@ if [ "$1" = api ]; then
       esac
       exit 0 ;;
   esac
+  # The shadow guard reads an issue before it lets a close go: the issue
+  # carries the one label $FAKE_GH_ISSUE_LABEL (a factory incident's default).
+  case "$#:$2" in
+    "2:repos/"*"/issues/"[0-9]*)
+      printf '{"number":%s,"labels":[{"name":"%s"}]}\\n' "${2##*/}" "${FAKE_GH_ISSUE_LABEL:-loom:factory}"
+      exit 0 ;;
+  esac
   [ "$*" = "api repos/example/repo --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
   exit 0
 fi
@@ -5105,6 +5112,21 @@ exec /usr/bin/git "$@"
         self.assertEqual(len(closes), 1, self.calls())
         self.assertIn("--repo quadseven/loom 41", closes[0])
         self.assertFalse(marker.exists())
+
+    def test_an_incident_close_shadow_mode_holds_is_not_sent_and_kept(self):
+        # Shadow mode (bus/shadow.py): the close asks the gh guard first, which
+        # reads the issue; one that is not a factory incident stays open.
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        marker = self.loom / "state" / "incidents" / "example_repo-base-check"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("41\n")
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_GH_ISSUE_LABEL="loom:invariant")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("gh api repos/quadseven/loom/issues/41", self.calls())
+        self.assertFalse(any(c.startswith("gh issue close") for c in self.calls()))
+        self.assertTrue(marker.exists())
 
     def test_a_green_fix_branch_does_not_close_an_incident(self):
         # A fix round's tree holds the agent's unmerged edits: only the trusted
