@@ -61,7 +61,7 @@ class ProblemsTest(unittest.TestCase):
     def test_a_good_body_passes(self):
         self.assertEqual(hunt_plan.problems(GOOD), [])
 
-    def test_what_good_look_like_is_an_acceptance_criteria_heading(self):
+    def test_chief_acceptance_criteria_check_accepts_what_good_look_like(self):
         body = GOOD.replace("## Acceptance criteria", "## What good look like")
         self.assertEqual(hunt_plan.problems(body), [])
 
