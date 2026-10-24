@@ -1803,7 +1803,12 @@ class Station:
                                         or not re.fullmatch(r"[0-9a-f]{64}", reason)):
                                     continue
                                 if self.now - invariants.EVENT_WINDOW <= at <= self.now:
-                                    rows.append(invariants.Event(at, kind, reason))
+                                    rows.append(invariants.Event(
+                                        at, kind, reason,
+                                        item=row.get("item", ""),
+                                        lane=row.get("lane", ""),
+                                        model=row.get("model", ""),
+                                    ))
                             except (ValueError, TypeError):
                                 continue
                 except FileNotFoundError:
@@ -3669,6 +3674,7 @@ class Station:
                        and (not needs_public_repo(candidate, model) or self._public(repo))), None)
         number = int(issue["number"])
         names = [name for name in _label_names(issue) if not name.startswith("lane:")]
+        already_waiting = WAIT + "lane" in names
         if target is None:
             names = [name for name in names if name != BRIEFED and not name.startswith(WAIT)] \
                 + ["loom:queued", WAIT + "lane"]
@@ -3677,8 +3683,9 @@ class Station:
             # A log line, not a comment: each comment emails the operator
             # (2026-10-18), and the ticket's labels already say it waits.
             _say("%s#%d waits: no free lane takes model %s" % (repo, number, model))
-            self._event("model_wait", "no free lane takes model %s" % model,
-                        "%s#%d" % (repo, number), lane, model)
+            if not already_waiting:
+                self._event("model_wait", "no free lane takes model %s" % model,
+                            "%s#%d" % (repo, number), lane, model)
             return None
         names.append("lane:" + target)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),

@@ -3228,6 +3228,37 @@ class ClaimTest(Base):
         self.assertFalse(any("waits for a free compatible lane" in c["body"]
                              for c in self.fake.comments[12]))
 
+    def test_model_wait_event_logged_once_per_ticket(self):
+        # The model_wait event should only be logged when the wait condition
+        # is first detected, not on every station pass (loom#1471).
+        self.heartbeat("opencode-go-3")
+        body = BODY.replace("Model: model-x", "Model: claude-sonnet-5-5")
+        self.fake.add(12, lane="opencode-go-3", body=body)
+        # Use a fixed now time to avoid event log rotation issues
+        self.start = time.time()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(station.run(
+                self.settings, GitHub("token", transport=self.fake),
+                now=self.start), 0)
+        self.assertIn("wait:lane", self.fake.names(12))
+        # Read the event log and count model_wait events for this ticket
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.start)
+        events = st._read_events()
+        model_wait_events = [e for e in events if e.kind == "model_wait"
+                             and e.item == hashlib.sha256(("%s#12" % REPO).encode()).hexdigest()]
+        self.assertEqual(len(model_wait_events), 1)
+        # Run a second pass with the same now time - the event should not be logged again
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(station.run(
+                self.settings, GitHub("token", transport=self.fake),
+                now=self.start), 0)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.start)
+        events = st._read_events()
+        model_wait_events = [e for e in events if e.kind == "model_wait"
+                             and e.item == hashlib.sha256(("%s#12" % REPO).encode()).hexdigest()]
+        self.assertEqual(len(model_wait_events), 1)
+
     def test_the_brief_carries_the_operators_notes_and_pull_requests_in_other_repos(self):
         # 2026-10-22: the operator's comment and two merges in
         # other repos never reached the brief, and a lane redid shipped work.
