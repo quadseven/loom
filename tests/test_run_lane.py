@@ -2473,6 +2473,23 @@ cat > /dev/null
         kind, retry_at, credit = self.classified(tail, tail)
         self.assertEqual((kind, credit), ("limit", "1"))
 
+    def test_a_claude_weekly_limit_is_a_provider_limit(self):
+        line = "You've hit your weekly limit \u00b7 resets 7pm (America/New_York)"
+        kind, retry_at, credit = self.classified(line, line)
+        self.assertEqual(kind, "limit")
+        self.assertGreater(retry_at, int(time.time()))
+
+    def test_a_rate_limit_filename_in_a_tool_result_is_not_a_limit(self):
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_EXIT="1", FAKE_OUT=(
+            '{"type":"step_start","part":{}}\n'
+            '{"type":"tool_use","part":{"state":{"output":"git log: add rate_limit.py"}}}\n'
+            '{"type":"text","part":{"text":"done"}}\n'
+            '{"type":"step_finish","part":{}}'))
+        log = self.run_log()
+        self.assertNotIn("[limit]", log)
+        self.assertIn("[transient]", log)
+
     def api_lane(self, lane, extra="", **env):
         if not sandbox_caps.LOCALHOST:
             self.skipTest(sandbox_caps.NO_LOCALHOST)
