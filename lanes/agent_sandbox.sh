@@ -77,17 +77,20 @@ api_rules() {
 # metadata-only literals so getcwd and realpath still work without making
 # HOME listable.
 sandbox_profile() {
-  # The runner unlocks the agy lane's keychain outside the sandbox (agy_unlock),
-  # so the agent never needs it: every lane, including agy, is denied the
-  # keychain server, and so is a validation run ($3 = check), whichever lane it
-  # serves.
+  # Every lane is denied the keychain server, and so is a validation run
+  # ($3 = check), whichever lane it serves. The one exception is the agy agent
+  # run: agy reads its own stored sign-in from the lane user's keychain (the
+  # runner unlocks it outside the sandbox), so that run may reach the server
+  # and read that one keychain file, and nothing else under Library/Keychains;
+  # /usr/bin/security stays unrunnable. Denied, every agy run asked for a
+  # browser login and failed auth (2026-10-22 to 10-24, #1620).
   local keychain_deny='(global-name "com.apple.SecurityServer") ' agy_lane="" api_writes="" api_network=""
   case "${3:-}" in
     "" | check) ;;
     api) api_writes="$(api_rules writes)"$'\n' && api_network="$(api_rules network)"$'\n' || return 1 ;;
     *) echo "refusing sandbox: unknown mode $3" >&2; return 1 ;;
   esac
-  [ "$LANE" = agy ] && [ "${3:-}" != check ] && { api_network="$(api_rules network)" || return 1; agy_lane=1; }
+  [ "$LANE" = agy ] && [ "${3:-}" != check ] && { api_network="$(api_rules network)" || return 1; agy_lane=1; keychain_deny=""; }
   local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule="" agy_keychain_deny=""
   if [ -n "${4:-}" ]; then
     [[ "$4" =~ ^[0-9]+$ ]] && [ "$4" -ge 49152 ] && [ "$4" -le 65535 ] ||
@@ -98,6 +101,11 @@ sandbox_profile() {
   tree="$(cd "$1" && pwd -P)"
   if [ "$LANE" = agy ] && [ -n "${AGY_HOME:-}" ]; then
     agy_keychain_deny="(deny file-read* (subpath \"$(cd "$AGY_HOME" && pwd -P)/Library/Keychains\"))"
+    if [ -n "$agy_lane" ] && [ -n "${AGY_KEYCHAIN:-}" ]; then
+      # shellcheck disable=SC1003 # matching a literal backslash
+      case "$AGY_KEYCHAIN" in *'"'*|*'\'*) echo "refusing sandbox: unsafe path $AGY_KEYCHAIN" >&2; return 1 ;; esac
+      agy_keychain_deny="$agy_keychain_deny"$'\n'"(allow file-read* (literal \"$AGY_KEYCHAIN\"))"
+    fi
   fi
   [ -d "$SKILLS" ] && skills="$(cd "$SKILLS" && pwd -P)"
   cli_link="$(command -v "$2")" && [ -n "$cli_link" ] || { echo "refusing sandbox: $2 not on PATH" >&2; return 1; }
