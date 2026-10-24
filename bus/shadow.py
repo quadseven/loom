@@ -8,13 +8,14 @@ Held while a repo is in shadow:
   merge` (the station's and Muse's), the deploy-watch revert path and the
   roll pin;
 - an issue close (PATCH state=closed, GraphQL closeIssue or an update to
-  CLOSED), except Loom's own signal issues (an invariant breach, a factory
-  incident, a health signature) that carry no work label. Closing a pull
-  request without merging it is let through: it can be reopened, its branch
-  stays, and the factory closes superseded lane pull requests so lanes do
-  not work twice;
-- a label that grants a merge or marks a ticket shipped (MERGE_LABELS), and
-  a GraphQL label write, whose label ids it cannot read;
+  CLOSED) and an issue reopen (PATCH state=open, GraphQL reopenIssue), an
+  invariant breach's own issue included (loom#1551), except Loom's own
+  factory incidents and health signatures that carry no work label: an open
+  incident holds the tickets behind it. Closing or reopening a pull request
+  is let through: it can be undone, its branch stays, and the factory closes
+  superseded lane pull requests so lanes do not work twice;
+- a label that grants a merge or marks a ticket shipped
+  (MERGE_LABELS), and a GraphQL label write, whose label ids it cannot read;
 - an approving pull request review (REST or GraphQL);
 - a write straight onto a branch Loom does not own (a ref moved, a file
   committed or deleted through the contents API, a merge-queue entry, a fork
@@ -28,7 +29,9 @@ worst request it could be.
 bus/github.py checks every request against classify() at its one choke point
 (GitHub._rest) and raises ShadowHeld instead of sending a held one; `bus.brain
 merge`, `bus.brain close` and the station's closes check active() first, so
-their record carries the risk tier and the gates that passed. The brain's
+their record carries the risk tier and the gates that passed; the invariants
+step asks guard() before its closes and reopens, so a held one posts no
+note either. The brain's
 model rung holds a GitHub token of its own: lanes/mac/brain.sh puts a gh in
 front of it that asks gh_guard() first (`python3 -m bus.shadow gh-guard`).
 
@@ -48,7 +51,7 @@ through: the hold does not depend on the record.
     python3 -m bus.shadow report [--since 24h|7d|2026-10-22[T10:00:00Z]]
                                  [--repo OWNER/NAME] [--json]
     python3 -m bus.shadow status
-    python3 -m bus.shadow gh-guard CWD GH-ARGS...   # exit 1: held
+    python3 -m bus.shadow gh-guard [--lane] CWD GH-ARGS...   # exit 1: held
 """
 from __future__ import annotations
 
@@ -57,6 +60,7 @@ import calendar
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import traceback
@@ -70,9 +74,9 @@ LEDGER = "LOOM_SHADOW_LEDGER"
 OFF = ("0", "false", "off", "no")
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
-MERGE, CLOSE, LABEL, DELETE_BRANCH, APPROVE = (
-    "merge", "close", "label", "delete-branch", "approve")
-ACTIONS = (MERGE, CLOSE, LABEL, DELETE_BRANCH, APPROVE)
+MERGE, CLOSE, REOPEN, LABEL, DELETE_BRANCH, APPROVE = (
+    "merge", "close", "reopen", "label", "delete-branch", "approve")
+ACTIONS = (MERGE, CLOSE, REOPEN, LABEL, DELETE_BRANCH, APPROVE)
 
 # Labels whose addition grants a merge or ships a ticket, each with the labels
 # that mean the ticket is already past it (a verified ticket moved back to
@@ -83,11 +87,14 @@ MERGE_LABELS: Dict[str, Tuple[str, ...]] = {
 }
 # A close of an issue with one of these is a decision about work: held.
 WORK_LABELS = ("loom:ticket", "loom:goal", "loom:backlog", "loom:rewritten")
-# An issue Loom files about itself closes on its own rule, in shadow too: an
-# invariant that healed, a factory incident whose check passed again, a health
-# signature not seen for a day. Holding those would hold the tickets they
-# block. Only an issue with one of these and no work label is let through.
-SIGNAL_LABELS = ("loom:invariant", "loom:factory", "loom:recurring")
+# An invariant breach's issue gates no ticket (only reports read it), so its
+# close on the invariants step's own rule is a decision shadow mode records
+# like any other (loom#1551): held, whatever other label it carries.
+HELD_SIGNAL_LABELS = ("loom:invariant", "loom:recurring")
+# A factory incident whose check passed again closes in shadow too: holding
+# it would hold every ticket it blocks (wait:incident). Only an issue with one
+# of these, no work label and no held signal label is let through.
+SIGNAL_LABELS = ("loom:factory",)
 # loom:triage is on every open issue that is not yet a ticket, a person's
 # too, so it marks a signal issue only on a health signature the watcher
 # filed: its body carries the watcher's marker (bus/watch.py MARKER).
@@ -107,6 +114,7 @@ _GRAPHQL_ACTIONS = {
     "mergePullRequest": MERGE, "enablePullRequestAutoMerge": MERGE,
     "enqueuePullRequest": MERGE, "mergeBranch": MERGE, "updateRef": MERGE,
     "updateRefs": MERGE, "createCommitOnBranch": MERGE, "closeIssue": CLOSE,
+    "reopenIssue": REOPEN,
     "deleteRef": DELETE_BRANCH, "addLabelsToLabelable": LABEL,
 }
 _GRAPHQL_HELD = re.compile(r"\b(%s)\b" % "|".join(_GRAPHQL_ACTIONS))
@@ -231,9 +239,13 @@ def _issue_edit(path: str, body: Any) -> Optional[Request]:
     labels = _label_request(repo, number, body["labels"]) if "labels" in body else None
     if labels is not None and not labels.check:
         return labels   # a label list it cannot read
-    if str(body.get("state") or "").strip().lower() == "closed":
+    state = str(body.get("state") or "").strip().lower()
+    if state == "closed":
         return Request(CLOSE, repo, number, "issue",
                        str(body.get("state_reason") or "completed"), "close",
+                       labels.labels if labels else ())
+    if state == "open":
+        return Request(REOPEN, repo, number, "issue", "reopen", "close",
                        labels.labels if labels else ())
     return labels
 
@@ -303,7 +315,7 @@ def _graphql_request(body: Any) -> Optional[Request]:
     if held:
         name = held.group(1)
         action = _GRAPHQL_ACTIONS[name]
-        kind = {MERGE: "pr", LABEL: "issue", CLOSE: "issue"}.get(action, "branch")
+        kind = {MERGE: "pr", LABEL: "issue", CLOSE: "issue", REOPEN: "issue"}.get(action, "branch")
         return Request(action, "", 0, kind, name, "")
     if _GRAPHQL_LABEL_IDS.search(text):
         return Request(LABEL, "", 0, "issue", "label ids in a GraphQL update", "")
@@ -350,17 +362,18 @@ def label_is_new(label: str, have: Sequence[str]) -> bool:
 
 
 def close_let_through(issue: Any) -> bool:
-    """Whether a close of `issue` (as read just now; None when the read
-    failed) goes through in shadow: a pull request (closed unmerged, it can
-    be reopened), or Loom's own signal issue closing on its rule (a signal
-    label, or a watcher's health signature, and no work label). An issue
-    whose labels cannot be read is held."""
+    """Whether a close or reopen of `issue` (as read just now; None when the
+    read failed) goes through in shadow: a pull request (closed unmerged, it
+    can be reopened), or a factory incident or a watcher's health signature
+    closing on its rule (no work label, no invariant label). An invariant
+    breach's issue is held (loom#1551), and so is an issue whose labels
+    cannot be read."""
     if not isinstance(issue, dict):
         return False
     if "pull_request" in issue:
         return True
     names = labels_of(issue)
-    if names is None or set(names) & set(WORK_LABELS):
+    if names is None or set(names) & set(WORK_LABELS + HELD_SIGNAL_LABELS):
         return False
     if set(names) & set(SIGNAL_LABELS):
         return True
@@ -471,6 +484,28 @@ def record_held(action: str, repo: str, number: int, kind: str, **fields: Any) -
                 "label": str(fields.get("label") or ""), "new": True}
 
 
+def guard(method: str, path: str, body: Any, item: Any, source: str = "",
+          reason: str = "") -> Optional[Dict[str, Any]]:
+    """The choke point's decision, asked before a write by a caller that
+    already holds the item it names (`item`, as read; None when unread):
+    None when the request may be sent, else the ledger entry it was recorded
+    as. A caller asks first so a held close posts no note saying it closed;
+    GitHub._rest still holds the request if it is sent anyway."""
+    found = classify(method, path, body)
+    if found is None or not active(found.repo or None):
+        return None
+    held = held_after_read(found, item if found.check else None)
+    if held is None:
+        return None
+    action, new_labels = held
+    why = reason or "%s %s%s" % (str(method).upper(), api_path(path),
+                                 " (%s)" % found.detail if found.detail else "")
+    entries = [record_held(action, found.repo, found.number, found.kind, reason=why,
+                           label=label, source=source or caller())
+               for label in (new_labels or [""])]
+    return entries[0]
+
+
 def read(path: str, since: float = 0.0, repo: str = "") -> List[Dict[str, Any]]:
     """The ledger's entries at or after `since` (epoch seconds), for `repo`
     when given. A missing ledger is empty; an unreadable line is skipped
@@ -520,7 +555,7 @@ def parse_since(text: str, now: float) -> float:
 
 
 def _counts(entries: Sequence[Mapping[str, Any]]) -> str:
-    words = {MERGE: "merge", CLOSE: "close", LABEL: "ship or merge label",
+    words = {MERGE: "merge", CLOSE: "close", REOPEN: "reopen", LABEL: "ship or merge label",
              DELETE_BRANCH: "branch deletion", APPROVE: "approving review"}
     parts = []
     for action in ACTIONS:
@@ -701,14 +736,17 @@ def _gh_api_request(args: Sequence[str], cwd: str) -> Optional[Request]:
     return found
 
 
-# gh commands held whatever their flags say: (group, command) -> (action, kind).
-_GH_COMMANDS = {("pr", "merge"): (MERGE, "pr"), ("issue", "close"): (CLOSE, "issue")}
+# gh commands held whatever their flags say: (group, command) -> (action,
+# kind, check). An issue close or reopen reads the issue first (gh_guard), as
+# the choke point does, so a factory incident closes in shadow too.
+_GH_COMMANDS = {("pr", "merge"): (MERGE, "pr", ""), ("issue", "close"): (CLOSE, "issue", "close"),
+                ("issue", "reopen"): (REOPEN, "issue", "close")}
 
 
 def gh_request(argv: Sequence[str], cwd: str = ".") -> Optional[Request]:
     """The held action a gh command line (its arguments after `gh`) is, or
-    None. It reads no item, so it holds what the choke point would hold
-    before its exemptions: the brain merges and closes through bus.brain."""
+    None. It reads no item: gh_guard reads the issue an issue close or
+    reopen names (Request.check), as the choke point does."""
     args = [str(a) for a in argv]
     group, sub = (args + ["", ""])[:2]
     if group == "api":
@@ -716,8 +754,9 @@ def gh_request(argv: Sequence[str], cwd: str = ".") -> Optional[Request]:
     rest = args[2:]
     repo, number = _gh_target(rest)
     if (group, sub) in _GH_COMMANDS:
-        action, kind = _GH_COMMANDS[(group, sub)]
-        return Request(action, repo, number, kind, "gh %s %s" % (group, sub), "")
+        action, kind, check = _GH_COMMANDS[(group, sub)]
+        return Request(action, repo, number, kind, "gh %s %s" % (group, sub),
+                       check if repo and number else "")
     if (group, sub) == ("pr", "review") and ("-a" in rest or "--approve" in rest):
         return Request(APPROVE, repo, number, "pr", "gh pr review --approve", "")
     if group in ("pr", "issue") and sub == "edit":
@@ -733,7 +772,18 @@ def _gh_added_labels(repo: str, number: int, args: Sequence[str]) -> Optional[Re
     return Request(LABEL, repo, number, "issue", ", ".join(found), "label", found)
 
 
-def gh_guard(cwd: str, argv: Sequence[str]) -> int:
+def _gh_item(found: Request) -> Any:
+    """The issue a gh close or reopen names, read with gh api; None when the
+    read fails in any way (held)."""
+    try:
+        out = subprocess.run(["gh", "api", "repos/%s/issues/%d" % (found.repo, found.number)],
+                             capture_output=True, text=True, timeout=60, check=False)
+        return json.loads(out.stdout) if out.returncode == 0 else None
+    except Exception:  # noqa: BLE001 - any failed read holds the action
+        return None
+
+
+def gh_guard(cwd: str, argv: Sequence[str], source: str = "brain rung gh") -> int:
     """0 when the gh command may run; 1, after recording it, when shadow mode
     holds it. Any doubt holds it."""
     try:
@@ -742,10 +792,13 @@ def gh_guard(cwd: str, argv: Sequence[str]) -> int:
         found = Request(MERGE, "", 0, "pr", "unreadable gh command (%s)" % type(err).__name__, "")
     if found is None or not active(found.repo or None):
         return 0
+    if (found.check == "close" and found.repo and found.number
+            and held_after_read(found, _gh_item(found)) is None):
+        return 0
     reason = "gh %s" % " ".join(argv)[:300]
     for label in found.labels or ("",):
         record_held(found.action, found.repo, found.number, found.kind, reason=reason,
-                    label=label, source="brain rung gh")
+                    label=label, source=source)
     print("shadow mode: would %s %s; recorded in the shadow ledger, not sent. Merge and "
           "close only through python3 -m bus.brain merge and close, which record them "
           "(docs/MUSE.md)." % (found.action, "%s#%d" % (found.repo, found.number)
@@ -761,6 +814,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if len(argv) < 2:
             print("usage: python3 -m bus.shadow gh-guard CWD GH-ARGS...", file=sys.stderr)
             return 2
+        if argv[1:2] == ["--lane"] and len(argv) >= 3:
+            # run_lane.sh's own gh writes (its factory incident closes).
+            return gh_guard(argv[2], argv[3:], source="run_lane.sh gh")
         return gh_guard(argv[1], argv[2:])
     parser = argparse.ArgumentParser(prog="python3 -m bus.shadow")
     sub = parser.add_subparsers(dest="command", required=True)
