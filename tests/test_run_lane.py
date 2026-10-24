@@ -4450,6 +4450,41 @@ exit %d
         self.assertTrue(before + 3500 <= beat["retry_at"] <= int(time.time()) + 3600, beat)
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_model_gone_hold_for_a_model_the_lane_no_longer_runs_is_dropped(self):
+        # 2026-10-23: zen moved off minimax-m3.1-flash-free, which had left the
+        # catalogue, and the hold for it would have stood an hour at a time.
+        self.hold_gone_model()
+        result = self.run_lane("zen", LOOM_ZEN_MODEL="opencode/other-free", FAKE_MODELS="opencode/other-free")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.models_calls(), [])
+        self.assertNotIn(self.GONE, self.beat("zen")["reason"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_go_limit_hold_on_a_free_slot_is_dropped(self):
+        # 2026-10-23: the Beam Free slots kept a monthly hold Kimi had taken.
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True, exist_ok=True)
+        until = int(time.time()) + 5 * 86400
+        for slot in ("opencode-go-2", "opencode-go-3"):
+            (usage / (slot + ".provider-limit.json")).write_text(json.dumps(
+                {"at": int(time.time()), "limit_name": "monthly", "retry_after": str(until)}) + "\n")
+            (usage / (slot + ".json")).write_text(json.dumps({
+                "lane": slot, "at": int(time.time()), "available": False, "retry_at": until,
+                "reason": "limit: the provider's monthly limit (429 GoUsageLimitError); unavailable until x",
+                "limited_models": {}}))
+        env = dict(LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
+                   LOOM_OPENCODE_GO_MODEL="opencode-go/beam-free",
+                   LOOM_OPENCODE_GO_3_MODEL="opencode-go/deepseek-v4.1-flash")
+        result = self.run_lane("opencode-go-2", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dropping its Go limit hold", result.stderr)
+        self.assertNotIn("GoUsageLimitError", self.beat("opencode-go-2")["reason"])
+        self.assertFalse((usage / "opencode-go-2.provider-limit.json").exists())
+        # A paid slot keeps the hold.
+        self.run_lane("opencode-go-3", **env)
+        self.assertIn("GoUsageLimitError", self.beat("opencode-go-3")["reason"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_a_lifted_model_gone_hold_clears_when_the_cli_lists_the_model(self):
         self.hold_gone_model()
         result = self.run_lane("zen", FAKE_MODELS="opencode/other-free\n%s" % self.GONE)
