@@ -4120,7 +4120,8 @@ echo fixed > fix.txt
         script = ('FACTORY_REPO=quadseven/loom KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"\n'
                   'KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"\n'
                   'SLOT=opencode-go-2 LOG=/dev/null NET_TIMEOUT=30 LOOM_ROOT="%s"\n' % RUNNER.parent.parent
-                  + self.source_functions("open_issue", "upsert_sticky_comment", "ask_renew_key") +
+                  + self.source_functions("open_issue", "upsert_sticky_comment", "file_ask",
+                                         "ask_renew_key") +
                   'ask_renew_key "API key expired: renew /k/go"\n'
                   'SLOT=opencode-go-3\n'
                   'ask_renew_key "API key expired: renew /k/go"\n'
@@ -4605,6 +4606,27 @@ exit %d
         self.assertTrue(self.failure_line().startswith("[auth] "), self.failure_line())
         ask = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(ask), 1, self.calls())
+
+    def test_a_lapsed_sign_in_asks_for_the_sign_in_and_never_holds_on_the_key(self):
+        # agy names an SSM parameter (the lane user's password), so its lapsed
+        # CLI sign-in was read as an expired key: the ask said to renew that
+        # parameter, and the lane was held until a value that has nothing to
+        # do with the sign-in changed (2026-10-24).
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "Waiting for authentication (timeout 60s)...\n"
+            "Error: authentication timed out.\n"
+            "error: authentication failed or timed out"),
+            LOOM_CODEX_KEY_SSM="/k/lane-password", FAKE_SECRET__k_lane_password="pw")
+        line = self.failure_line()
+        self.assertTrue(line.startswith("[auth] "), line)
+        self.assertIn("sign in the codex lane CLI again", line)
+        self.assertNotIn("/k/lane-password", line)
+        self.assertTrue(self.beat()["available"])
+        ask = [c for c in self.calls() if c.startswith("gh issue create")]
+        self.assertEqual(len(ask), 1, self.calls())
+        self.assertIn("sign in the codex lane CLI again", ask[0])
+        self.assertNotIn("/k/lane-password", ask[0])
 
     def test_a_daily_allowance_with_no_reset_time_holds_the_lane_until_midnight_utc(self):
         # Retried every hour, a spent daily allowance failed a run each time.
