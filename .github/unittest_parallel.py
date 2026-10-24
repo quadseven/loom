@@ -97,6 +97,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tests-dir", type=Path, default=Path("tests"))
     parser.add_argument("--shard-size", type=int, default=60)
+    # The lane check (.loom/validation.conf) runs inside a sandbox where the
+    # tests needing sandbox-exec, ps or a localhost port skip by design; CI
+    # leaves this off and refuses every skip.
+    parser.add_argument("--allow-skips", action="store_true")
     args = parser.parse_args()
     test_dir = args.tests_dir.resolve()
     modules = discovered_modules(test_dir)
@@ -125,7 +129,8 @@ def main() -> int:
         if result.returncode:
             failed = True
         for line in output.splitlines():
-            if "... skipped " in line and "LOOM_TEST_OPENCODE2" not in line:
+            if ("... skipped " in line and "LOOM_TEST_OPENCODE2" not in line
+                    and not args.allow_skips):
                 print("::error::a test skipped; the sandbox tests must run in CI")
                 failed = True
     print("Parallel unittest total: Ran %d tests across %d modules in %d processes"
