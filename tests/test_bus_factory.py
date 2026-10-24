@@ -1921,6 +1921,14 @@ class Queued(Base):
         worker.assign_queued()
         return worker
 
+    def test_a_retired_remote_lane_is_never_up(self):
+        # Muse was retired on 2026-10-24: even a stale heartbeat file that says
+        # available must not put work on it.
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["muse", "codex"])
+        self.assertFalse(worker._up("muse"))
+        self.assertTrue(worker._up("codex"))
+
     def test_a_queued_ticket_that_waits_says_why_in_waits(self):
         # The factory's reason for leaving a ticket where it is reached only
         # the log; nothing saw the same reason repeat for hours (2026-10-21).
