@@ -777,49 +777,51 @@ _GH_ISSUE_SWITCHES = ("-h", "--help")
 _ISSUE_URL = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/([0-9]+)/?")
 
 
-def _gh_issue_selector(args: Sequence[str]) -> Optional[Tuple[str, int]]:
-    """(repo, number) of the one issue a gh issue close or reopen names,
-    read the way gh reads its arguments; None when there is any doubt: a
-    flag it does not know, no positional or more than one, a selector that
-    is neither a number nor an issue URL, no repo, or a URL whose repo is
-    not the -R one."""
+def _gh_issue_flag(args: Sequence[str], i: int) -> Optional[Tuple[str, str, int]]:
+    """(flag, value, next index) of the gh issue close or reopen flag at
+    args[i] (--x v, --x=v, -x v, -xv); None for a flag it does not know or
+    one whose value is missing."""
+    arg = args[i]
+    if arg.startswith("--"):
+        flag, eq, value = arg.partition("=")
+    else:
+        flag, value = arg[:2], arg[2:]
+        eq = "=" if value else ""
+    if flag in _GH_ISSUE_SWITCHES:
+        return flag, "", i + 1
+    if flag not in _GH_ISSUE_VALUE_FLAGS:
+        return None
+    if eq:
+        return flag, value, i + 1
+    if i + 1 >= len(args):
+        return None
+    return flag, args[i + 1], i + 2
+
+
+def _gh_issue_args(args: Sequence[str]) -> Optional[Tuple[str, List[str]]]:
+    """(the -R repo, the positionals) of a gh issue close or reopen, read
+    the way gh reads them; None when a flag cannot be read."""
     repo, positionals, i = "", [], 0
     while i < len(args):
         arg = args[i]
-        name = arg.split("=", 1)[0]
         if arg == "--":
-            positionals += args[i + 1:]
-            break
-        if arg.startswith("--"):
-            if name not in _GH_ISSUE_VALUE_FLAGS + _GH_ISSUE_SWITCHES:
-                return None
-            if name in _GH_ISSUE_VALUE_FLAGS and "=" not in arg:
-                i += 1
-                if i >= len(args):
-                    return None
-                value = args[i]
-            else:
-                value = arg.partition("=")[2]
-            if name == "--repo":
-                repo = value
-        elif arg.startswith("-") and len(arg) > 1:
-            flag = arg[:2]
-            if flag not in _GH_ISSUE_VALUE_FLAGS + _GH_ISSUE_SWITCHES:
-                return None
-            value = arg[2:]
-            if flag in _GH_ISSUE_VALUE_FLAGS and not value:
-                i += 1
-                if i >= len(args):
-                    return None
-                value = args[i]
-            if flag == "-R":
-                repo = value
-        else:
+            return repo, positionals + list(args[i + 1:])
+        if not arg.startswith("-") or arg == "-":
             positionals.append(arg)
-        i += 1
-    if len(positionals) != 1:
-        return None
-    target = positionals[0]
+            i += 1
+            continue
+        read = _gh_issue_flag(args, i)
+        if read is None:
+            return None
+        flag, value, i = read
+        if flag in ("-R", "--repo"):
+            repo = value
+    return repo, positionals
+
+
+def _gh_issue_target(repo: str, target: str) -> Optional[Tuple[str, int]]:
+    """(repo, number) of one selector, a number or an issue URL whose repo
+    is the -R one when both name it; None otherwise."""
     if target.isdigit():
         number = int(target)
     else:
@@ -830,6 +832,17 @@ def _gh_issue_selector(args: Sequence[str]) -> Optional[Tuple[str, int]]:
     if not REPO_RE.fullmatch(repo or "") or number <= 0:
         return None
     return repo, number
+
+
+def _gh_issue_selector(args: Sequence[str]) -> Optional[Tuple[str, int]]:
+    """(repo, number) of the one issue a gh issue close or reopen names;
+    None when there is any doubt: a flag it does not know, no positional or
+    more than one, a selector that is neither a number nor an issue URL, no
+    repo, or a URL whose repo is not the -R one."""
+    read = _gh_issue_args(args)
+    if read is None or len(read[1]) != 1:
+        return None
+    return _gh_issue_target(read[0], read[1][0])
 
 
 def _gh_added_labels(repo: str, number: int, args: Sequence[str]) -> Optional[Request]:
