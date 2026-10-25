@@ -367,7 +367,8 @@ def _owed_lines(issue: Dict[str, Any], led: Dict[str, Any], comments: List[Dict[
 
 def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime,
                 authors: Optional[Sequence[str]] = None, gh: Optional[GitHub] = None,
-                repo: str = "", issues: Sequence[Dict[str, Any]] = ()) -> List[str]:
+                repo: str = "", issues: Sequence[Dict[str, Any]] = (),
+                shares: Optional[Dict[int, int]] = None) -> List[str]:
     lines = ["### Goals"]
     owed = []
     limit = unverified_limit()
@@ -386,6 +387,8 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
             # loom#483: each goal's unproven count against the limit, beside
             # the brain's own ledger, so the operator sees why new work waits.
             loose, tree = goal_tree(gh, repo, int(issue["number"]))
+            if shares is not None:
+                shares[int(issue["number"])] = goal_human_share(_flatten(loose, tree), issues)
             held, waiting = _count_unproven(_flatten(loose, tree))
             lines.append("  - unproven work %d/%d (shipped with no standing proof; "
                          "%d more await live evidence and do not count)"
@@ -707,6 +710,9 @@ def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
             issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
             if {x.lower() for x in _labels(issue)} & {"docs", "documentation"}:
                 line = line.removesuffix("blocked: no criterion built") + "READY"
+        if line.endswith(" - READY"):
+            for blocker in _merge_refusals(gh, repo, pr, ticket):
+                line = _add_blocker(line, blocker)
         if ticket is not None and authors:
             comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
             if _pending_brain_fix(comments, authors):
@@ -717,6 +723,37 @@ def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
             line = _add_blocker(line, "held for the operator: operator steps before merge")
         lines.append(line)
     return lines
+
+
+def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
+                    ticket: Optional[Tuple[str, int]]) -> List[str]:
+    """What bus.brain merge would refuse a READY pull request for, read with
+    the functions merge uses (loom#1643): its ticket's state, a conflict,
+    and a risk tier held for the operator."""
+    number = int(pr["number"])
+    issue: Dict[str, Any] = {}
+    found = []
+    if ticket is not None:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+        reason = _ticket_refusal(issue, "pr")
+        if reason == "ticket is not loom:pr":
+            at = [x for x in _labels(issue) if x.startswith("loom:") and x[5:] in STATES]
+            reason = "ticket at %s, not loom:pr" % (", ".join(at) or "no state")
+        if reason:
+            found.append(reason)
+    rest = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+    # A null mergeable is GitHub still computing it, which merge waits out.
+    if rest.get("mergeable") is not None and not _mergeable(rest):
+        found.append("conflicts with the default branch"
+                     if rest.get("mergeable_state") == "dirty" else
+                     "not mergeable (%s)" % (rest.get("mergeable_state") or "unknown"))
+    try:
+        tier, _ = _risk_tier(gh, repo, number, pr, issue, None)
+    except ValueError as err:
+        return found + [str(err)]
+    if tier != merge_tier.REVERT and tier not in merge_tier.auto_tiers(None):
+        found.append("held for the operator: %s" % tier)
+    return found
 
 
 def _add_blocker(line: str, blocker: str) -> str:
@@ -770,28 +807,37 @@ def _skip_line(what: str, reason: str) -> str:
 def _readable_section(gh: GitHub, repo: str, now: datetime, bot: str,
                       authors: Optional[Sequence[str]] = None,
                       into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-                      check: str = "Grug - Elder") -> List[str]:
+                      check: str = "Grug - Elder",
+                      waiting: Optional[Dict[str, Dict[str, Any]]] = None) -> List[str]:
     """_repo_section, or one skipped line when GitHub will not show the repo
     (moved, gone or forbidden: github.unreadable), so one moved repo does
     not end the status of every other. Any other GitHubError still ends it."""
     try:
-        return _repo_section(gh, repo, now, bot, authors, into, check)
+        return _repo_section(gh, repo, now, bot, authors, into, check, waiting)
     except GitHubError as err:
         reason = unreadable(err)
         if reason is None:
             raise
         if into is not None:
             into.pop(repo, None)
+        if waiting is not None:
+            waiting.pop(repo, None)
         return ["", "## %s" % repo, "", _skip_line(repo, reason)]
 
 
 def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   authors: Optional[Sequence[str]] = None,
                   into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-                  check: str = "Grug - Elder") -> List[str]:
+                  check: str = "Grug - Elder",
+                  waiting: Optional[Dict[str, Dict[str, Any]]] = None) -> List[str]:
     """The repo's status section; with into, its open tickets are kept
-    there under the repo's name for the cross-repo Priorities section."""
+    there under the repo's name for the cross-repo Priorities section. With
+    waiting, so are the repo's open loom:human count and, per goal, the share
+    under that goal (waiting_lines)."""
     issues = _issues(gh, repo)
+    shares: Dict[int, int] = {}
+    if waiting is not None:
+        waiting[repo] = {"count": len(open_human(issues)), "goals": shares}
     goals = [i for i in issues if "loom:goal" in _labels(i)]
     tickets = [i for i in issues if "loom:ticket" in _labels(i)]
     if into is not None:
@@ -812,7 +858,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     warn = _trunk_warning(goals, data)
     if warn:
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
-    lines += _goal_lines(goals, data, now, authors, gh, repo, issues) + [""]
+    lines += _goal_lines(goals, data, now, authors, gh, repo, issues, shares) + [""]
     lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
@@ -918,16 +964,18 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     # sections keep the order of `repos`. A status took 68 s here and 152 s
     # from a remote brain, over a 15-minute tick (2026-10-15).
     found: Dict[str, List[Dict[str, Any]]] = {}
+    waiting: Dict[str, Dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
         sections = list(pool.map(
             lambda repo: _readable_section(gh, repo, now, bot, authors, found,
-                                           review_check_name(env)), repos))
+                                           review_check_name(env), waiting), repos))
     runaway = [(repo, issue) for repo, items in found.items() for issue in items
                if RUNAWAY in _labels(issue)
                and tickets.ticket_state(issue) not in tickets.MERGED_STATES]
     out += [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
         repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
     out += [""] + priority_lines(found, now)
+    out += [""] + waiting_lines(waiting, repos)
     out += [""] + _health_lines(env)
     for section in sections:
         out += section
@@ -936,6 +984,35 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
 
 
 PRIORITIES_SHOWN = 10
+
+
+def open_human(issues: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The open loom:human issues among `issues` (pull requests left out)."""
+    return [i for i in issues if isinstance(i, dict) and "pull_request" not in i
+            and i.get("state", "open") == "open" and "loom:human" in _labels(i)]
+
+
+def goal_human_share(children: Sequence[Dict[str, Any]], issues: Sequence[Dict[str, Any]]) -> int:
+    """How many of the repo's open loom:human `issues` are among the goal's
+    `children` (the goal_tree walk, as every other goal count): the goal's
+    own share of what waits on the operator (loom#1775)."""
+    waiting = {int(i.get("number") or 0) for i in open_human(issues)}
+    return len({int(c.get("number") or 0) for c in children if isinstance(c, dict)} & waiting)
+
+
+def waiting_lines(waiting: Dict[str, Dict[str, Any]], repos: Sequence[str]) -> List[str]:
+    """The "## Waiting on you" section: for each goal, the exact line that goes
+    right under "Needs you:" in its report (journal.waiting_line), so the
+    report's count comes from data. The repo counts span every repo status
+    read; the share is the goal's own."""
+    by_repo = {repo: int(waiting[repo]["count"]) for repo in repos if repo in waiting}
+    lines = ["## Waiting on you (paste the line under \"Needs you:\" in each goal's report; "
+             "\"Needs you:\" never carries a count)"]
+    goals = [(repo, number, share) for repo in repos if repo in waiting
+             for number, share in sorted(waiting[repo]["goals"].items())]
+    for repo, number, share in goals:
+        lines.append("- %s#%d: %s" % (repo, number, journal.waiting_line(by_repo, share)))
+    return lines if goals else lines + ["- no goals"]
 
 
 def priority_lines(found: Dict[str, List[Dict[str, Any]]], now: datetime,
@@ -3235,6 +3312,27 @@ def _refuse_operator_hold(gh: GitHub, repo: str, number: int, pr: Dict[str, Any]
     raise ValueError("held for the operator: %s%s" % ("; ".join(why), asked))
 
 
+def _risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
+               issue: Dict[str, Any], env: Optional[Dict[str, str]]) -> Tuple[str, str]:
+    """(tier, why) for a lane pull request (bus/merge_tier.py), or
+    merge_tier.REVERT for a revert merge_tier.revert_refusal exempts.
+    Raises ValueError when its changed files cannot be read."""
+    try:
+        entries = operator_hold.pull_files(gh, repo, number)
+    except GitHubError as err:
+        # No file list, no tier: the gate fails closed.
+        raise ValueError("held: the changed files could not be read to set the risk tier "
+                         "(%s)" % err) from err
+    if merge_tier.is_revert_ticket(pr, issue):
+        refused = merge_tier.revert_refusal(gh, repo, pr, issue, entries, env)
+        if not refused:
+            return merge_tier.REVERT, ""
+        print("brain: %s#%d is not exempt as a revert: %s" % (repo, number, refused),
+              file=sys.stderr)
+    return merge_tier.classify(repo, entries, str(issue.get("body") or ""),
+                               change_class.class_of(pr) == "sensitive")
+
+
 def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
                       details: Dict[str, Any], ticket: Optional[Tuple[str, int]],
                       issue: Dict[str, Any], env: Optional[Dict[str, str]]) -> str:
@@ -3250,20 +3348,9 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     private deployment repo were damaging or useless, most of them deploy and
     CI changes the change class called logic. Returns the tier ("revert" for
     an exempt revert), which a shadow-mode record names."""
-    try:
-        entries = operator_hold.pull_files(gh, repo, number)
-    except GitHubError as err:
-        # No file list, no tier: the gate fails closed.
-        raise ValueError("held: the changed files could not be read to set the risk tier "
-                         "(%s)" % err) from err
-    if merge_tier.is_revert_ticket(pr, issue):
-        refused = merge_tier.revert_refusal(gh, repo, pr, issue, entries, env)
-        if not refused:
-            return merge_tier.REVERT
-        print("brain: %s#%d is not exempt as a revert: %s" % (repo, number, refused),
-              file=sys.stderr)
-    tier, why = merge_tier.classify(repo, entries, str(issue.get("body") or ""),
-                                    change_class.class_of(pr) == "sensitive")
+    tier, why = _risk_tier(gh, repo, number, pr, issue, env)
+    if tier == merge_tier.REVERT:
+        return tier
     if tier not in merge_tier.auto_tiers(env):
         reason = merge_tier.operator_why(tier, why, env)
         asked = ""
@@ -3310,6 +3397,11 @@ def _same_repo(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -> bool:
     rest_base = ((pr.get("base") or {}).get("repo") or {}).get("full_name")
     graph_head = (details.get("headRepository") or {}).get("nameWithOwner")
     return rest_head == repo and rest_base == repo and graph_head in (None, repo)
+
+
+def _mergeable(pr: Dict[str, Any]) -> bool:
+    """GitHub's REST answer says the pull request merges cleanly."""
+    return pr.get("mergeable") is True
 
 
 def _checks_green(details: Dict[str, Any]) -> bool:
@@ -3373,7 +3465,7 @@ def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
         (head_ref.startswith("loom/") or trusted_lane_head,
          "pull request head is not a loom branch"),
         (_same_repo(repo, pr, details), "pull request must use the same repository"),
-        (pr.get("mergeable") is True,
+        (_mergeable(pr),
          "pull request is not mergeable (GitHub may still be computing it)"),
         (_checks_green(details), "pull request checks are not successful"),
         (_threads_resolved(details), "pull request has unresolved review threads"),
@@ -4052,12 +4144,20 @@ def _validated_ticket(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
             raise ValueError("pull request is not linked to the supplied ticket")
         return None, {}
     issue = gh.rest("GET", "/repos/%s/issues/%d" % association).data or {}
+    reason = _ticket_refusal(issue, expected_state)
+    if reason:
+        raise ValueError(reason)
+    return association, issue
+
+
+def _ticket_refusal(issue: Dict[str, Any], expected_state: str) -> str:
+    """Why merge refuses a pull request for its ticket's state, else ""."""
     names = _labels(issue)
     if issue.get("state") != "open" or "loom:ticket" not in names:
-        raise ValueError("ticket is not an open loom:ticket")
+        return "ticket is not an open loom:ticket"
     if "loom:" + expected_state not in names:
-        raise ValueError("ticket is not loom:" + expected_state)
-    return association, issue
+        return "ticket is not loom:" + expected_state
+    return ""
 
 
 def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],

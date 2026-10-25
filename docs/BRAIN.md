@@ -534,6 +534,11 @@ prompts; with the private command empty the repo is skipped. The station runs
 at most 5 rewrites per backlog goal home per hour (and 5 per pass), oldest
 first, under the budget floor rule. `state/station/rewrite.json` records each
 attempt; an issue that did not become a ticket is not tried again for a day.
+The agent command runs as a background job (`state/station/rewrite-jobs/`),
+so a model never holds the station pass (loom#1663): the pass that starts a
+job waits at most 10 seconds for it, and a later pass writes the answer of
+any job that ended since. A job with no result 5 minutes past its 10-minute
+timeout is logged as a rewrite that wrote nothing.
 
 ## Proof
 
@@ -1394,6 +1399,11 @@ completed with `success`. A tick takes that line as given instead of
 re-reading the review list. `bus.brain merge` keeps its own checks.
 When a trusted brain fix is still pending on the linked ticket, status adds
 `pending brain fix` to the blockers instead of marking the pull request READY.
+For a line that would otherwise be READY, status also reads what `bus.brain
+merge` refuses on, through the same functions merge uses (loom#1643): a
+ticket not at `loom:pr` (`ticket at loom:running, not loom:pr`), a REST
+`mergeable_state` of `dirty` (`conflicts with the default branch`), and a
+risk tier outside `LOOM_AUTO_MERGE_TIERS` (`held for the operator: <tier>`).
 
 Status also prints a "Waiting on the brain" section: every open lane pull
 request whose ticket carries `needs-brain`, oldest first, with its ticket,
@@ -1624,6 +1634,32 @@ again at the next check time, or once its criteria change when nothing Loom
 runs can change the answer. In shadow mode the close is recorded in the
 ledger (source `station live proof`) and nothing is sent (#1608).
 
+A repo whose live data sits behind its own read-only routes (a log archive
+with per-workload reports, a read-only database user) declares a live-evidence
+adapter in `.loom/live-evidence.json` on its default branch
+(`bus/live_adapter.py`, #1770). It names a `log` command with the log
+`sources` it serves and a `sql` command, each an argv run without a shell:
+its first item a bare command on the station's PATH (never a shell or an
+interpreter, and its verb a fixed literal) or an executable `.loom/` script
+read from the default branch and run from a private temporary copy; every
+other item a literal or one whole placeholder (`{source}`, `{since}`,
+`{since_epoch}`, `{needle}`; `{sql}`). The command prints matching lines or
+rows, and may print `loom-evidence-window-hours: N` (log read in full) and
+`loom-evidence-count: N` (matches counted); it exits 0, or 1 for no match.
+A Live line names a step in a templated form: `log:<source>` with the strings
+that must appear in that log since the ship (or, worded as absent, must not
+appear over the window named, which the adapter must say it read), or
+`sql:<SELECT ...>` (one SELECT or SHOW) with the strings its answer must
+contain. The station runs an adapter only for repos in
+`LOOM_LIVE_EVIDENCE_REPOS`; the child gets PATH, HOME, LANG, TMPDIR and only
+the variables named in `LOOM_LIVE_EVIDENCE_PASS_ENV`, a timeout of at most
+300 seconds that kills its process group, and at most 64 KiB and 200 lines
+of output. A SQL statement is checked when the step is read and again just
+before it runs. Loom bounds what it asks and keeps; the routes behind the
+adapter keep themselves read-only (a SELECT-only user, a reader that cannot
+exec). An adapter error, a timeout or too much output is no evidence, and the
+status line names it.
+
 ## Post-merge watch
 
 After a Loom auto-merge (a `loom/` lane pull request merged by a Loom App,
@@ -1844,7 +1880,13 @@ ticket naming what evidence is missing.
 Every 6 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
 flight, blocked, next. A goal quiet since its last report gets none (Quiet
-goals, below).
+goals, below). The report ends with two lines: "Needs you:" (only what only
+the operator can do for this goal, or "nothing new for this goal"; it alone
+decides new comment or edit in place) and "Waiting on you:" (the count of
+open `loom:human` issues by repo and this goal's share, or "nothing"). `status`
+prints each goal's "Waiting on you:" line under "## Waiting on you"; `journal`
+refuses a report that puts the count on the "Needs you:" line or says
+"nothing" beside a count (loom#1775).
 
 ### Handoff packet
 

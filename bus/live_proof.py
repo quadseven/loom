@@ -17,6 +17,12 @@ Each live criterion of the ticket names at most one proof step (`step_of`):
 - url, gh or kubectl: the read-only checks bus/criteria_gate.py runs.
 - query: one SELECT the criterion gives, read through the station's query
   source.
+- an adapter step, the templated form a repo's live-evidence adapter
+  answers (bus/live_adapter.py, loom#1770): a `log:<source>` span with the
+  strings that must appear in that log since the deploy (or must not, over
+  the window named), or a `sql:<SELECT ...>` span with the strings its
+  answer must contain. The target repo declares how each is read; Loom
+  knows only the form.
 
 A step that would write is refused, not run (`refusal`): a `gh api` call
 with a method or a field, a kubectl verb other than get or rollout status, a
@@ -67,23 +73,45 @@ class Step(NamedTuple):
     """One read-only proof step: its kind (log, query, url, gh or kubectl),
     the target (a log string, a SELECT, a URL, an API path or an argv
     string), the strings the answer must contain, and the hours after the
-    deploy it waits before it runs."""
+    deploy it waits before it runs. A log step read through a repo's
+    adapter names its `source` (the log the adapter serves) and may name
+    `absent` strings that must not appear; its target is "" when it names
+    only absent ones."""
     kind: str
     target: str
     expects: Tuple[str, ...]
     hours: float
+    source: str = ""
+    absent: Tuple[str, ...] = ()
+
+
+class Answer(NamedTuple):
+    """What a repo's live-evidence adapter answered (bus/live_adapter.py):
+    the lines it printed (None when it gave no answer, with `error` saying
+    why), the hours of log it says it read (`loom-evidence-window-hours:`),
+    and the matches it says it counted (`loom-evidence-count:`), each None
+    when it said nothing."""
+    lines: Optional[List[str]]
+    hours: Optional[float] = None
+    count: Optional[int] = None
+    error: str = ""
 
 
 class Sources(NamedTuple):
     """Where the steps read from. `log(literal, since)` returns the log
     lines since the epoch time `since` that contain `literal`, or None when
     the source gave no answer; `query(sql)` returns the rows as text lines,
-    or None. Either may be None when the station has no such source."""
+    or None. Either may be None when the station has no such source.
+    `source_log(source, literal, since)` and `sql(statement)` read through
+    the repo's live-evidence adapter and return an Answer; None when the
+    repo declares no adapter for them."""
     log: Optional[Callable[[str, float], Optional[List[str]]]] = None
     query: Optional[Callable[[str], Optional[List[str]]]] = None
     gh: Any = None
     fetch: Optional[Callable[[str, int], Tuple[int, str, str]]] = None
     runner: Optional[Callable[..., Any]] = None
+    source_log: Optional[Callable[[str, str, float], Answer]] = None
+    sql: Optional[Callable[[str], Answer]] = None
 
 
 class Outcome(NamedTuple):
@@ -119,6 +147,56 @@ def _select(span: str) -> bool:
             and ";" not in body and not _SQL_WRITE_RE.search(body))
 
 
+# The SHOW forms a read-only SQL step may use; nothing after them can write.
+_SHOW_RE = re.compile(
+    r"^show\s+(?:full\s+)?(?:databases|schemas|tables|columns|fields|index|indexes|keys"
+    r"|create\s+table|table\s+status|grants|variables|status|processlist)\b[^;]*$", re.I)
+# A source name a `log:` span may give.
+SOURCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+MAX_SQL = 1000
+_LOG_PREFIX = "log:"
+_SQL_PREFIX = "sql:"
+
+
+def sql_refusal(statement: str) -> str:
+    """Why a statement may not run as a proof, or "" when it is one plain
+    SELECT (or WITH ... SELECT) or one SHOW: no second statement, nothing
+    that writes. The adapter runner asks again just before it runs."""
+    body = statement.strip().rstrip(";").strip()
+    if not body.isascii() or len(body) > MAX_SQL or any(
+            ord(char) < 32 and char not in "\t\n" for char in body):
+        return "the statement is not plain ASCII of at most %d characters" % MAX_SQL
+    if _select(body) or (_SHOW_RE.match(body) and ";" not in body):
+        return ""
+    return "`%s` is not one read-only SELECT or SHOW" % " ".join(body.split())[:STATUS_WIDTH]
+
+
+def _adapter_step(text: str, spans: List[str], hours: float) -> Tuple[Optional[Step], str]:
+    """(the adapter step a criterion names in the templated form, or None;
+    why it has none). ("", "") when it uses no template."""
+    for span in spans:
+        if span.lower().startswith(_SQL_PREFIX):
+            statement = span[len(_SQL_PREFIX):].strip()
+            why = sql_refusal(statement)
+            if why:
+                return None, why
+            rest = tuple(s for s in spans if s != span)
+            return Step(QUERY, statement, rest, hours, source="adapter"), ""
+    for span in spans:
+        if span.lower().startswith(_LOG_PREFIX):
+            source = span[len(_LOG_PREFIX):].strip()
+            if not SOURCE_RE.match(source):
+                return None, "`%s` names no log source a repo adapter can serve" % span
+            absent = tuple(n for n in evidence.absent_needles(text) if n != span)
+            present = [n for n in evidence.needles(text) if n != span and n not in absent]
+            if not present and not absent:
+                return None, "`%s` names no string to find in that log" % span
+            target = present[0] if present else ""
+            return Step(LOG, target, tuple(present[1:]), hours, source=source,
+                        absent=absent), ""
+    return None, ""
+
+
 def refusal(span: str) -> str:
     """Why a span names a proof step that is not read-only, or "" when it is
     read-only or names no command at all (a plain log string)."""
@@ -142,6 +220,9 @@ def step_of(text: str) -> Tuple[Optional[Step], str]:
         if why:
             return None, why
     hours = evidence.required_span(text) or 0.0
+    step, why = _adapter_step(text, spans, hours)
+    if step is not None or why:
+        return step, why
     for span in spans:
         if _select(span):
             return Step(QUERY, span.strip(), tuple(s for s in spans if s != span), hours), ""
@@ -159,8 +240,13 @@ def step_of(text: str) -> Tuple[Optional[Step], str]:
 
 
 def _step_refusal(step: Step) -> str:
+    if step.kind == LOG and step.source and not SOURCE_RE.match(step.source):
+        return "`%s` is not a log source name" % step.source
     if step.kind == LOG:
-        return refusal(step.target)
+        return refusal(step.target) or next(
+            (refusal(n) for n in step.expects + step.absent if refusal(n)), "")
+    if step.kind == QUERY and step.source:
+        return sql_refusal(step.target)
     if step.kind == QUERY:
         return "" if _select(step.target) else "`%s` is not one read-only SELECT" % step.target
     if step.kind == "url":
@@ -177,6 +263,69 @@ def _step_refusal(step: Step) -> str:
 def _matching(lines: Sequence[str], needle: str) -> List[str]:
     _, pattern = evidence.needle_pattern(needle)
     return [line for line in lines if (pattern.search(line) if pattern else needle in line)]
+
+
+def _absence(step: Step, needle: str, answer: Answer, lines: List[str],
+             safe: List[str], count: int, since: float, now: float) -> Tuple[bool, str]:
+    """(whether an absent string is shown absent, what was seen): no match
+    over a window the adapter says it read in full, at least the hours the
+    criterion names, else all of the time since the deploy."""
+    needed = step.hours if step.hours > 0 else max(0.0, (now - since) / 3600)
+    if answer.hours is None:
+        return False, ("the `%s` log adapter did not say how much log it read, so "
+                       "`%s` cannot be shown absent" % (step.source, needle))
+    if answer.hours + 1e-6 < needed:
+        return False, ("the `%s` log adapter read %.1f hours, short of the %.1f "
+                       "needed to show `%s` absent" % (step.source, answer.hours, needed, needle))
+    if count or lines:
+        return False, "the `%s` log names `%s` %d times since the deploy%s" % (
+            step.source, needle, max(count, len(lines)), _quoted(safe))
+    return True, "`%s` absent from the `%s` log over the %.1f hours read" % (
+        needle, step.source, answer.hours)
+
+
+def _quoted(safe: List[str]) -> str:
+    return "".join("\n    > " + line for line in safe[:evidence.MAX_LINES])
+
+
+def _source_needle(step: Step, needle: str, since: float, now: float,
+                   sources: Sources) -> Tuple[bool, str]:
+    """(passed, what was seen) for one string of an adapter log step."""
+    literal, _ = evidence.needle_pattern(needle)
+    if not literal:
+        return False, "`%s` is too general to search" % needle
+    answer = sources.source_log(step.source, literal, since)
+    if answer.lines is None:
+        return False, "the `%s` log adapter gave no answer for `%s` (%s)" % (
+            step.source, needle, answer.error or "no reason given")
+    # A line stamped before the deploy is never its evidence.
+    lines = [line for line in _matching(answer.lines, needle)
+             if (evidence.line_time(line) or since) >= since]
+    safe = [line for line in lines if evidence.safe_line(line)]
+    count = answer.count if answer.count is not None else len(lines)
+    if needle in step.absent:
+        return _absence(step, needle, answer, lines, safe, count, since, now)
+    if not count and not safe:
+        return False, "no `%s` log line since the deploy names `%s`" % (step.source, needle)
+    return True, "`%s` named %d times in the `%s` log since the deploy%s" % (
+        needle, count, step.source, _quoted(safe))
+
+
+def _source_log_step(step: Step, since: float, now: float,
+                     sources: Sources) -> Tuple[bool, str]:
+    """A log step read through the repo's adapter: each wanted string must
+    have a match since the deploy (a quoted safe line or a count the adapter
+    gives), and each absent one none (_absence)."""
+    if sources.source_log is None:
+        return False, "the repo declares no live-evidence log adapter"
+    wanted = ((step.target,) if step.target else ()) + step.expects
+    seen: List[str] = []
+    for needle in wanted + step.absent:
+        ok, what = _source_needle(step, needle, since, now, sources)
+        if not ok:
+            return False, what
+        seen.append(what)
+    return True, "read through the repo's live-evidence adapter: " + "; ".join(seen)
 
 
 def _log_step(step: Step, since: float, sources: Sources) -> Tuple[bool, str]:
@@ -200,11 +349,21 @@ def _log_step(step: Step, since: float, sources: Sources) -> Tuple[bool, str]:
 
 
 def _query_step(step: Step, sources: Sources) -> Tuple[bool, str]:
-    if sources.query is None:
+    if sources.sql is not None:
+        answer = sources.sql(step.target)
+        if answer.lines is None:
+            return False, "the repo's SQL adapter gave no answer (%s)" % (
+                answer.error or "no reason given")
+        rows = [row for row in answer.lines if evidence.safe_line(row)]
+    elif step.source:
+        return False, "the repo declares no live-evidence SQL adapter"
+    elif sources.query is None:
         return False, "the station has no query source"
-    rows = sources.query(step.target)
-    if rows is None:
-        return False, "the query source gave no answer"
+    else:
+        found = sources.query(step.target)
+        if found is None:
+            return False, "the query source gave no answer"
+        rows = found
     text = "\n".join(rows)
     missing = [e for e in step.expects if e not in text]
     if missing or not rows:
@@ -214,13 +373,16 @@ def _query_step(step: Step, sources: Sources) -> Tuple[bool, str]:
         ", found `%s`" % e for e in step.expects))
 
 
-def run(step: Step, since: float, sources: Sources) -> Tuple[bool, str]:
+def run(step: Step, since: float, sources: Sources,
+        now: Optional[float] = None) -> Tuple[bool, str]:
     """(passed, what was seen) for one step, refused without running when it
     is not read-only. What was seen quotes safe log lines and otherwise names
     only the status and the strings found or missing."""
     why = _step_refusal(step)
     if why:
         return False, "refused: %s" % why
+    if step.kind == LOG and step.source:
+        return _source_log_step(step, since, time.time() if now is None else now, sources)
     if step.kind == LOG:
         return _log_step(step, since, sources)
     if step.kind == QUERY:
@@ -253,7 +415,7 @@ def prove(body: str, deployed_at: float, sources: Sources, now: Optional[float] 
             why_not[text] = "its window has not passed"
             later.append(due)
             continue
-        ok, what = run(step, deployed_at, sources)
+        ok, what = run(step, deployed_at, sources, now=now)
         if ok:
             seen[text] = what
         else:
