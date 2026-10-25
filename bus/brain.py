@@ -11,13 +11,13 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
-from . import ci_facts, ci_gap, merge_tier, naming, operator_hold, shadow
+from . import answer, ci_facts, ci_gap, merge_tier, naming, operator_hold, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -3207,12 +3207,13 @@ def merge(gh: GitHub, repo: str, number: int,
             _validate_sensitive_merge(gh, repo, details, bot, review_check_name(env))
         association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
         _refuse_pending_fix(gh, association, env)
-        _refuse_operator_hold(gh, repo, number, pr, details, association, issue)
+        verdict = _verdict_reader(gh, repo, number, details, association, env)
+        _refuse_operator_hold(gh, repo, number, pr, details, association, issue, verdict)
         if not ({x.lower() for x in _labels(issue)} & {"docs", "documentation"}):
             reason = _unbuilt_criteria_reason(str(pr.get("body") or ""))
             if reason:
                 raise ValueError(reason)
-        tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env)
+        tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env, verdict)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
@@ -3303,9 +3304,47 @@ def _changed_files(details: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
              "status": str(n.get("changeType") or "").lower()} for n in nodes]
 
 
+def _verdict_reader(gh: GitHub, repo: str, number: int, details: Dict[str, Any],
+                    ticket: Optional[Tuple[str, int]],
+                    env: Optional[Dict[str, str]]) -> Callable[[], Optional[answer.Answer]]:
+    """The operator's Merge or Hold on this pull request's hold ask
+    (answer.pr_verdict), read from its ticket's comments at most once, and
+    only when a hold asks for it. An answer given before the head commit it
+    would merge does not count: the operator saw an older change."""
+    found: List[Optional[answer.Answer]] = []
+
+    def read() -> Optional[answer.Answer]:
+        if not found:
+            verdict = None
+            if ticket is not None:
+                comments = [c for c in gh.paginate("/repos/%s/issues/%d/comments" % ticket)
+                            if isinstance(c, dict)]
+                trusted = trusted_authors(env)
+                since = str(_head_commit(details).get("committedDate") or "")
+                verdict = answer.pr_verdict(comments, number, trusted,
+                                            answer.operators(env, trusted), since)
+            if verdict is not None:
+                sha = str(details.get("headRefOid") or "")
+                # The ledger is the process's own, as _shadow_merge writes it.
+                answer.record_verdict(repo, number, verdict, sha, ticket, "bus.brain merge")
+            found.append(verdict)
+        return found[0]
+    return read
+
+
+def _lifted(verdict: Optional[Callable[[], Optional[answer.Answer]]], number: int) -> bool:
+    """Whether the operator's answer lifts this pull request's hold: True on
+    Merge; ValueError on Hold; False with no answer (the hold asks)."""
+    found = verdict() if verdict is not None else None
+    if answer.is_hold(found):
+        raise ValueError("held for the operator: %s answered hold on #%d" % (found.login, number))
+    return answer.is_merge(found)
+
+
 def _refuse_operator_hold(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
                           details: Dict[str, Any], ticket: Optional[Tuple[str, int]],
-                          issue: Dict[str, Any]) -> None:
+                          issue: Dict[str, Any],
+                          verdict: Optional[Callable[[], Optional[answer.Answer]]] = None) -> None:
     """Refuse a lane pull request that waits for the operator
     (bus/operator_hold.py): it declares operator steps before merge, changes
     placement, or deletes or mostly replaces a doc its ticket does not name. Its ticket goes to loom:human with
@@ -3314,7 +3353,7 @@ def _refuse_operator_hold(gh: GitHub, repo: str, number: int, pr: Dict[str, Any]
     service down."""
     why = operator_hold.reasons(gh, repo, dict(pr, number=number),
                                 str(issue.get("body") or ""), _changed_files(details))
-    if not why:
+    if not why or _lifted(verdict, number):
         return
     asked = ""
     if ticket is not None:
@@ -3346,7 +3385,8 @@ def _risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
 
 def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
                       details: Dict[str, Any], ticket: Optional[Tuple[str, int]],
-                      issue: Dict[str, Any], env: Optional[Dict[str, str]]) -> str:
+                      issue: Dict[str, Any], env: Optional[Dict[str, str]],
+                      verdict: Optional[Callable[[], Optional[answer.Answer]]] = None) -> str:
     """Refuse a lane pull request Loom may not merge on its own
     (bus/merge_tier.py): a tier outside LOOM_AUTO_MERGE_TIERS (deploy-config,
     security and cross-repo by default) goes to the operator with one ask on
@@ -3362,7 +3402,7 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     tier, why = _risk_tier(gh, repo, number, pr, issue, env)
     if tier == merge_tier.REVERT:
         return tier
-    if tier not in merge_tier.auto_tiers(env):
+    if tier not in merge_tier.auto_tiers(env) and not _lifted(verdict, number):
         reason = merge_tier.operator_why(tier, why, env)
         asked = ""
         if ticket is not None:
