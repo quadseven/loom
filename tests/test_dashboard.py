@@ -557,7 +557,7 @@ class BacklogHelperTest(unittest.TestCase):
                                       {"repo": "example-owner/sample", "number": 4, "title": "next", "waiting_since": "2026-02", "unblocks": 7}],
                    "ready_for_human": [{"repo": "example-owner/sample", "number": 4, "title": "duplicate"}]}
         body = _needs_you(payload, State())
-        self.assertEqual(body.count("example-owner/sample#3 - "), 1)
+        self.assertEqual(body.count("example-owner/sample" + "#3 - "), 1)
         self.assertLess(body.index("#3"), body.index("#4"))
         self.assertIn("idle", body)
         self.assertIn("Exact ask", body)
