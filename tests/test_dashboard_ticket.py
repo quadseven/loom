@@ -301,6 +301,17 @@ class TicketPageTests(unittest.TestCase):
         self.assertIn('data-running="true"', body)
         self.assertNotIn("Waiting:", body)
 
+    def test_a_claimed_unfinished_run_names_lane_model_claim_time_and_step(self):
+        record = dict(RECORD, state="running", lane="agy", model="gemini-4-argon-high")
+        detail = {"comments": [{"body": "Claimed for lane agy (body sha256 a1fc29bcee5e)",
+                                "created_at": "2026-10-24T17:21:00Z"}],
+                  "events": [], "errors": {}, "step": "agent"}
+        body = render(record, [], None, [], detail=detail)
+        self.assertNotIn("No run yet", body)
+        self.assertIn("lane agy / gemini-4-argon-high / claimed 17:21 UTC / agent", body)
+        self.assertIn('data-running="true"', body)
+        self.assertNotIn("No transcript yet", body)
+
     def test_repeated_claims_handed_back_at_a_limit_are_one_path_row(self):
         from dashboard.ticket import path_steps
         steps = path_steps(dict(RECORD, state="running"), self.LIMIT_LOOP, [])
