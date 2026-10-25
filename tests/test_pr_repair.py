@@ -192,6 +192,56 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("## Operator steps before merge\n- Grow the VM disk first\n\n---",
                       result["body"])
 
+    OPEN_7 = staticmethod(lambda repo, number: (
+        {"number": 7, "state": "open", "created_at": "2026-09-01T00:00:00Z"}
+        if (repo, number) == ("example-owner/example-repo", 7) else {}))
+
+    def bugs_summary(self, lines):
+        summary = os.path.join(self._tmp.name, "summary.md")
+        with open(summary, "w", encoding="utf-8") as fh:
+            fh.write("Fix it\n\n## Bugs discovered\n" + lines + "\n")
+        return summary
+
+    def test_a_bug_citing_an_open_issue_reaches_the_body(self):
+        # loom#1779: a bug line is kept only when its issue checks out.
+        self.write_brief(BRIEF)
+        result = pr_repair.reconcile(
+            self.brief, "Fix the thing", RUNNER_BODY, "codex", "gpt-test", "T42",
+            summary_path=self.bugs_summary("- The parser drops a tab, #7"),
+            repo="example-owner/example-repo", lookup=self.OPEN_7)
+        self.assertEqual(result["reason"], "")
+        self.assertIn("## Operator steps before merge\nnone stated\n\n"
+                      "## Bugs discovered\n- The parser drops a tab, #7\n\n---\n", result["body"])
+
+    def test_a_bug_line_that_does_not_check_out_refuses_the_repair(self):
+        self.write_brief(BRIEF)
+        for line, why in (("- The cache never expires", "cites no issue"),
+                          ("- Missing, #8", "does not exist")):
+            result = pr_repair.reconcile(
+                self.brief, "Fix the thing", RUNNER_BODY, "codex", "gpt-test", "T42",
+                summary_path=self.bugs_summary(line),
+                repo="example-owner/example-repo", lookup=self.OPEN_7)
+            self.assertFalse(result["changed"], line)
+            self.assertIn(why, result["reason"])
+            self.assertIn("file the issue and cite it as #N, or drop the line", result["reason"])
+
+    def test_a_bug_line_is_refused_without_a_repo_to_check_it_in(self):
+        self.write_brief(BRIEF)
+        result = pr_repair.reconcile(
+            self.brief, "Fix the thing", RUNNER_BODY, "codex", "gpt-test", "T42",
+            summary_path=self.bugs_summary("- The parser drops a tab, #7"), lookup=self.OPEN_7)
+        self.assertFalse(result["changed"])
+        self.assertIn("no repo", result["reason"])
+
+    def test_a_verified_bugs_section_survives_a_round_without_one(self):
+        body = RUNNER_BODY.replace("none stated\n\n---",
+                                   "none stated\n\n## Bugs discovered\n- Tab bug, #7\n\n---")
+        self.write_brief(BRIEF)
+        result = pr_repair.reconcile(self.brief, "Fix the thing", body, "codex", "gpt-test", "T42",
+                                     lookup=self.OPEN_7)
+        self.assertEqual(result["reason"], "")
+        self.assertFalse(result["changed"], result)
+
     def test_a_body_from_before_the_operator_section_is_repaired_to_carry_it(self):
         old = RUNNER_BODY.replace("## Operator steps before merge\nnone stated\n\n", "")
         self.write_brief(BRIEF)

@@ -1574,3 +1574,19 @@ or disk resize, scaling a workload down), one per line, or the single word
 copies the ticket's section of that name, else writes `none stated`.
 A pull request that lists a step is never merged by Loom (docs/BRAIN.md,
 Operator holds).
+
+## Bugs discovered
+
+A lane that finds a bug outside its ticket writes a `## Bugs discovered`
+section in `.loom/summary.md` (also read as "Bugs found", "Found bugs" or
+"Discovered bugs"), one bug per line. Each line must cite an issue: `#N`
+in the pull request's own repo, or OWNER/NAME#N. `bus/bug_refs.py` looks
+each cited issue up and keeps the line only when the issue exists, is an
+issue rather than a pull request, and is open or was filed in the last two
+days; a failed lookup rejects the line. A new pull request body carries the
+kept lines under `## Bugs discovered`, after the operator steps, and the
+lane log names each line left out. On a fix round the PR text repair
+refuses while any line is rejected, with a reason asking the lane to file
+the issue and cite it, or drop the line; a round whose summary has no such
+section keeps the body's earlier one. In a public repo another repo's
+citation is written as "issue N of another repo".

@@ -15,7 +15,7 @@ import sys
 import tempfile
 from typing import Dict, Optional, Tuple
 
-from . import hunt_plan, text
+from . import bug_refs, hunt_plan, text
 
 # Headings the runner injects into the PR body, in order.
 GENERATED_HEADINGS = ("## Why", "## Summary", "## Acceptance criteria",
@@ -166,9 +166,33 @@ def _operator_steps(brief: str, current_body: str, summary: str) -> str:
     return OPERATOR_NONE
 
 
+def _body_bugs(current_body: str) -> str:
+    """The current body's bugs section, as an earlier round verified it."""
+    found = _brief_section(current_body, bug_refs.HEADING) if current_body else ""
+    found = found.split("\n" + FOOTER_RULE + "\n", 1)[0]
+    return "" if found == FOOTER_RULE else found.removesuffix("\n" + FOOTER_RULE)
+
+
+def _bugs(current_body: str, summary: str, repo: Optional[str], public: bool,
+          lookup: bug_refs.Lookup) -> Tuple[str, str]:
+    """(bugs section, refusal reason): the summary's lines when every one
+    cites a real issue, else a reason; the body's own section when the
+    summary has none (so a round keeps what an earlier one verified)."""
+    lines = bug_refs.section(summary) if summary else []
+    if not lines:
+        return _body_bugs(current_body), ""
+    if not repo:
+        return "", bug_refs.refusal([bug_refs.Rejected(
+            i, "no repo to look the cited issue up in") for i in range(1, len(lines) + 1)])
+    kept, rejected = bug_refs.check(lines, repo, lookup)
+    if rejected:
+        return "", bug_refs.refusal(rejected)
+    return bug_refs.render(kept, repo, public), ""
+
+
 def _render_generated(brief: str, lane: str, model: str, ticket: str,
                       acceptance: Optional[str] = None,
-                      operator_steps: str = OPERATOR_NONE) -> str:
+                      operator_steps: str = OPERATOR_NONE, bugs: str = "") -> str:
     """Render the generated sections the way lanes/run_lane.sh::pr_body does."""
     _check_footer_fields(ticket, lane, model)
     why = _brief_section(brief, "Why")
@@ -181,12 +205,15 @@ def _render_generated(brief: str, lane: str, model: str, ticket: str,
     refs = ""
     if _ISSUE_RE.fullmatch(issue):
         refs = "\nRefs %s" % issue
+    # The verified bugs section, only when a lane reported one
+    # (lanes/run_lane.sh::pr_body writes it in the same place).
+    bugs_part = "## %s\n%s\n\n" % (bug_refs.HEADING, bugs) if bugs else ""
     return (
         "## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\n"
-        "Size: %s\n\n## Out of scope\n%s\n\n## %s\n%s\n\n%s\n%s ticket %s, lane %s, "
+        "Size: %s\n\n## Out of scope\n%s\n\n## %s\n%s\n\n%s%s\n%s ticket %s, lane %s, "
         "model %s.%s" % (
             why, summary, acceptance, size, out_of_scope, OPERATOR_SECTION, operator_steps,
-            FOOTER_RULE, FOOTER_PREFIX, ticket, lane, model, refs))
+            bugs_part, FOOTER_RULE, FOOTER_PREFIX, ticket, lane, model, refs))
 
 
 def _find_heading(body: str, heading: str) -> int:
@@ -249,9 +276,25 @@ def _split_current(body: str) -> Tuple[str, str, str]:
     return prefix, generated, suffix
 
 
+def _read_summary(summary_path: Optional[str]) -> str:
+    """The lane's Intent summary, "" when there is none or it is unreadable,
+    with local paths as <path>: a model that writes its tool's file path into
+    it (infra-5956-r3, 2026-10-25) must not stop every repair."""
+    if not summary_path:
+        return ""
+    try:
+        with open(summary_path, encoding="utf-8") as fh:
+            summary = _normalise(fh.read())
+    except OSError:
+        return ""
+    return text.LOCAL_PATH_RE.sub("<path>", summary)
+
+
 def reconcile(brief_path: str, current_title: str, current_body: str,
               lane: str, model: str, ticket: str,
-              summary_path: Optional[str] = None) -> Dict[str, object]:
+              summary_path: Optional[str] = None, repo: Optional[str] = None,
+              public: bool = True,
+              lookup: bug_refs.Lookup = bug_refs.gh_lookup) -> Dict[str, object]:
     """Return new title/body and hashes, or a reason why it cannot be done.
 
     The returned dict has keys:
@@ -278,22 +321,20 @@ def reconcile(brief_path: str, current_title: str, current_body: str,
         result["reason"] = "cannot read brief: %s" % err
         return result
 
-    summary = ""
-    if summary_path:
-        try:
-            with open(summary_path, encoding="utf-8") as fh:
-                summary = _normalise(fh.read())
-        except OSError:
-            summary = ""
-    # The summary is the lane's own text: a model that writes its tool's file
-    # path into it (infra-5956-r3, 2026-10-25) must not stop every repair.
-    summary = text.LOCAL_PATH_RE.sub("<path>", summary)
+    summary = _read_summary(summary_path)
+
+    # Every bug the lane reports must cite a real issue (loom#1779): a
+    # rejected line refuses the repair, and the lane files it or drops it.
+    bugs, refused = _bugs(_normalise(current_body), summary, repo, public, lookup)
+    if refused:
+        result["reason"] = refused
+        return result
 
     try:
         desired_generated = _render_generated(
             brief, lane, model, ticket,
             _checklist(brief, _normalise(current_body), summary),
-            _operator_steps(brief, _normalise(current_body), summary))
+            _operator_steps(brief, _normalise(current_body), summary), bugs)
         new_hash = _sha12(_normalise(desired_generated))
         result["new_hash"] = new_hash
         old_hash = _hash_generated(current_body)
@@ -383,7 +424,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--apply", type=int, metavar="PR",
                         help="apply the repair to this PR number via gh")
     parser.add_argument("--repo",
-                        help="owner/name repository for --apply")
+                        help="owner/name repository for --apply, and where a "
+                             "bug line's #N is looked up")
+    parser.add_argument("--private", action="store_true",
+                        help="the repo is private: another repo's issue refs in "
+                             "the bugs section stay as written")
     parser.add_argument("lane", help="lane name")
     parser.add_argument("model", help="model id")
     parser.add_argument("ticket", help="ticket id used in the PR footer")
@@ -415,7 +460,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     current_body = str(pr.get("body") or "")
 
     result = reconcile(args.brief, current_title, current_body,
-                       args.lane, args.model, args.ticket, args.summary)
+                       args.lane, args.model, args.ticket, args.summary,
+                       repo=args.repo, public=not args.private)
 
     if not args.apply:
         print(json.dumps(result))

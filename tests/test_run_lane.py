@@ -109,10 +109,12 @@ if [ "$1" = api ]; then
       exit 0 ;;
   esac
   # The shadow guard reads an issue before it lets a close go: the issue
-  # carries the one label $FAKE_GH_ISSUE_LABEL (a factory incident's default).
+  # carries the one label $FAKE_GH_ISSUE_LABEL (a factory incident's default)
+  # and is in state $FAKE_GH_ISSUE_STATE (default open); issue 404 is missing.
   case "$#:$2" in
+    "2:repos/"*"/issues/404") echo "HTTP 404: Not Found" >&2; exit 1 ;;
     "2:repos/"*"/issues/"[0-9]*)
-      printf '{"number":%s,"labels":[{"name":"%s"}]}\\n' "${2##*/}" "${FAKE_GH_ISSUE_LABEL:-loom:factory}"
+      printf '{"number":%s,"state":"%s","labels":[{"name":"%s"}]}\\n' "${2##*/}" "${FAKE_GH_ISSUE_STATE:-open}" "${FAKE_GH_ISSUE_LABEL:-loom:factory}"
       exit 0 ;;
   esac
   [ "$*" = "api repos/example/repo --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
@@ -846,6 +848,29 @@ print('leak guard: clean (shape patterns only)')
                       body)
         self.assertIn("## Operator steps before merge", self.log.read_text())
         self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_only_bugs_that_cite_a_real_issue_reach_the_pull_request_body(self):
+        # A lane's "Bugs discovered" line that cites no issue, or one that
+        # does not exist, is a dead end nobody triages (loom#1779).
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY=self.TICKED + "\n\n## Bugs discovered\n"
+                               "- The parser drops a trailing tab, #7\n"
+                               "- The cache never expires\n"
+                               "- The retry loop spins, #404")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("\n## Bugs discovered\n- The parser drops a trailing tab, #7\n\n---\n", body)
+        self.assertNotIn("cache never expires", body)
+        self.assertNotIn("#404", body)
+        log = self.run_log()
+        self.assertIn("Bugs discovered line 2 left out: the line cites no issue", log)
+        self.assertIn("Bugs discovered line 3 left out: the cited issue could not be looked up", log)
+        self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_a_body_without_bugs_has_no_bugs_section(self):
+        self.drop_brief()
+        self.run_lane(FAKE_SUMMARY=self.TICKED)
+        self.assertNotIn("Bugs discovered", self.body.read_text())
 
     def test_a_body_without_a_declaration_says_none_was_stated(self):
         self.drop_brief()
