@@ -3017,7 +3017,7 @@ for BRIEF in "$INBOX"/*.md; do
   LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
   ( set -m
     (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
-      [ -z "${LANE_GH_CONFIG_DIR:-}" ] || export GH_CONFIG_DIR="$LANE_GH_CONFIG_DIR"
+      { [ -z "${LANE_GH_CONFIG_DIR:-}" ] || export GH_CONFIG_DIR="$LANE_GH_CONFIG_DIR"; } &&
       run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
     wait $! ) &

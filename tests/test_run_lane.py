@@ -4546,6 +4546,30 @@ exit %d
         self.assertIn("Do not poll pull request checks or reviews", self.log.read_text())
         self.assertIn("agent gh calls:", log)
 
+    def test_agent_launch_chain_stops_when_the_tree_cannot_be_entered(self):
+        source = RUNNER.read_text()
+        self.assertRegex(
+            source,
+            r'cd "\$TREE" && unset GH_TOKEN GITHUB_TOKEN "\$\{!LOOM_GITHUB_APP_@\}" '
+            r'"\$\{!GIT_CONFIG_@\}" &&\s*\{\s*\[ -z "\$\{LANE_GH_CONFIG_DIR:-\}" \] '
+            r'\|\| export GH_CONFIG_DIR="\$LANE_GH_CONFIG_DIR";\s*\} &&\s*'
+            r'run_agent "\$RUN_BRIEF"',
+        )
+        agent_called = Path(self._tmp.name) / "agent-called"
+        result = subprocess.run(
+            ["bash", "-c",
+             '(cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" '
+             '"${!GIT_CONFIG_@}" && { [ -z "${LANE_GH_CONFIG_DIR:-}" ] '
+             '|| export GH_CONFIG_DIR="$LANE_GH_CONFIG_DIR"; } && '
+             'touch "$AGENT_CALLED")'],
+            env={**os.environ, "TREE": str(Path(self._tmp.name) / "missing-tree"),
+                 "GH_TOKEN": "ghs_test_token", "AGENT_CALLED": str(agent_called)},
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(agent_called.exists())
+
     def test_a_lane_whose_app_token_cannot_be_minted_posts_nothing_as_anyone(self):
         self.drop_brief()
         self.run_lane(LOOM_GITHUB_APP_ID="124",
