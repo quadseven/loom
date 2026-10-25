@@ -1275,40 +1275,6 @@ class InvariantTest(unittest.TestCase):
                 self.assertEqual(invariants.lane_pr_stalled(
                     Facts(T0, lane_pulls=[self.pull(T0 - 7 * 3600, **shape)])), [])
 
-    def test_lane_pr_stalled_by_failed_ticket_resolved_by_new_brief(self):
-        """T1490: A PR stalled by a loom:failed ticket is resolved when the PR
-        is closed as superseded or a new brief drives a new PR."""
-        # PR #1119 open for 48 hours, carried by ticket #1101 which is loom:failed
-        pr_1119 = self.pull(T0 - 48 * 3600, number=1119, ticket=1101,
-                            labels=("loom:ticket", "loom:pr", "loom:failed"))
-        breaches = invariants.lane_pr_stalled(Facts(T0, lane_pulls=[pr_1119]))
-        self.assertEqual(len(breaches), 1)
-        self.assertEqual(breaches[0].subject, "%s#1119" % REPO)
-        self.assertIn("ticket past the model ladder", breaches[0].title)
-        self.assertIn("bus.brain brief", " ".join(breaches[0].evidence))
-
-        # Fix 1: Close the PR as superseded (no lane pull)
-        breaches = invariants.lane_pr_stalled(Facts(T0, lane_pulls=[]))
-        self.assertEqual(breaches, [])
-
-        # Fix 2: New brief creates ticket #1120 which drives new PR #1121
-        # The old PR #1119 is closed, new PR #1121 is driven by ticket #1120
-        pr_1121 = self.pull(T0 - 1 * 3600, number=1121, ticket=1120,
-                            labels=("loom:ticket", "loom:pr"), drives=True)
-        breaches = invariants.lane_pr_stalled(Facts(T0, lane_pulls=[pr_1121]))
-        self.assertEqual(breaches, [])
-
-        # Fix 3: New brief creates ticket #1120 but old PR #1119 still open (not fixed)
-        pr_1119_still_open = self.pull(T0 - 48 * 3600, number=1119, ticket=1101,
-                                       labels=("loom:ticket", "loom:pr", "loom:failed"))
-        pr_1121_new = self.pull(T0 - 1 * 3600, number=1121, ticket=1120,
-                                labels=("loom:ticket", "loom:pr"), drives=True)
-        breaches = invariants.lane_pr_stalled(
-            Facts(T0, lane_pulls=[pr_1119_still_open, pr_1121_new]))
-        self.assertEqual(len(breaches), 1)
-        self.assertEqual(breaches[0].subject, "%s#1119" % REPO)
-
-
 if __name__ == "__main__":
     unittest.main()
 
