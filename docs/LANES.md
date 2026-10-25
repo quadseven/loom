@@ -1501,6 +1501,44 @@ unchanged for a run that did not end on a described step.
   a kept entry is removed, never followed, so deletion cannot reach into
   the keychain folder or another ticket's tree.
 
+## Lane pods: an API lane on a Linux cluster
+
+An API lane can run in a container on a Kubernetes cluster instead of on
+the station Mac, so each run's checkout and agent state live on the
+cluster's disk, not the Mac's (quadseven/loom#1824). The pod runs the same
+`lanes/run_lane.sh`; `lanes/k8s/pod.sh` starts it for each slot in
+`LOOM_POD_SLOTS` every `LOOM_POD_INTERVAL` seconds (default 60), as launchd
+does on the Mac.
+
+What changes in a pod:
+
+- `LOOM_SANDBOX=bwrap`: the agent and the validation run are confined by
+  bubblewrap instead of `sandbox-exec`. HOME is replaced by an empty tmpfs
+  with only the run's tree, its scratch home, the skill snapshot and the
+  CLI's folder bound back; `.git` stays read-only; in api mode the rest of
+  the filesystem is read-only; a fresh `/proc` in a new PID namespace hides
+  the runner's processes. bwrap does not narrow the network: the pod's
+  egress does. bwrap needs user namespaces inside the container; a lane
+  whose bwrap cannot start reports itself unavailable (`sandbox_ready`).
+  The agy lane and the codex and claude lanes stay on the Mac.
+- `LOOM_DROP_TREES=1`: each run's tree, the runner's files beside it and the
+  scratch homes are removed when the run ends, whatever its outcome
+  (`drop_run_scratch`). Logs and the brief stay under `LOOM_HOME`.
+- `LOOM_SSM_DIR`: a folder under HOME holding a copy of each SSM parameter
+  the pod reads, at the parameter's name (`/a/b` is `$LOOM_SSM_DIR/a/b`),
+  kept in step with SSM by the cluster. `ssm_value` reads the file and makes
+  no AWS call, so the pod holds no AWS key. The GitHub App key comes from
+  `LOOM_GITHUB_APP_KEY_FILE`, also under HOME.
+
+Everything the agent must not read (the copied parameters, the App key,
+`LOOM_HOME`) sits under HOME; bwrap shows the agent nothing there but its
+own tree and scratch home. The image carries bash, coreutils, git, gh,
+python3, uv, rsync, openssl, netcat, procps, bubblewrap and the opencode
+CLI, plus this repo and the leak scanner at a pinned commit.
+
+How the station hands a pod lane its briefs and reads its reports is the
+second slice of quadseven/loom#1824; until then a pod lane takes no work.
+
 ## Adding a lane
 
 A lane is a name in `lanes/run_lane.sh`, not a directory of its own: that one
@@ -1508,8 +1546,8 @@ runner polls, heartbeats, commits, pushes and opens the PR for every lane.
 Adding one takes:
 
 - In `lanes/run_lane.sh`, a CLI in `lane_ready`, and the name in the header
-  comment's lane list. An API lane also joins the case that wants
-  `sandbox-exec` and a key read from `LOOM_<LANE>_KEY_SSM`; a lane whose CLI
+  comment's lane list. An API lane also joins the case that wants a
+  sandbox (`sandbox_ready`) and a key read from `LOOM_<LANE>_KEY_SSM`; a lane whose CLI
   or key is missing reports itself unavailable and takes no work.
 - A branch in `run_agent` that runs the lane's CLI with the brief and the
   model. An API lane calls `api_agent <key var or -> <CLI...>`

@@ -168,5 +168,167 @@ class AgentSandboxTest(unittest.TestCase):
         self.assertFalse(outside.exists())
 
 
+class BwrapSandboxTest(unittest.TestCase):
+    """LOOM_SANDBOX=bwrap, the lane pod's sandbox (docs/LANES.md, "Lane pods"):
+    the profile is bubblewrap's arguments, one a line. The tree and scratch
+    home sit under HOME, as in a pod."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name).resolve()
+        self.home = self.root / "home"
+        self.tree = self.home / "loom" / "worktrees" / "T1"
+        self.scratch = self.home / "loom" / "run" / "opencode-go-home"
+        self.bin = self.root / "bin"
+        for d in (self.tree / ".git", self.scratch / "tmp", self.bin):
+            d.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def bash(self, script, *args, lane="opencode-go", **env):
+        full = dict(os.environ, HOME=str(self.home), AGENT_HOME=str(self.scratch), LANE=lane,
+                    SKILLS=str(self.root / "no-skills"), LOOM_SANDBOX="bwrap", NET_TIMEOUT="10")
+        full.update(env)
+        return subprocess.run(["bash", "-c", '. "$1"; shift; ' + script, "bash", str(SANDBOX),
+                               str(self.tree), *args],
+                              capture_output=True, text=True, env=full, timeout=60)
+
+    def profile(self, mode, cli="bash", **env):
+        result = self.bash('sandbox_profile "$1" "$2" "$3"', cli, mode, **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.splitlines()
+
+    @staticmethod
+    def pairs(lines, flag):
+        """The operands that follow each occurrence of flag (two for a bind)."""
+        out = []
+        for i, line in enumerate(lines):
+            if line == flag:
+                out.append(tuple(lines[i + 1:i + 3]) if "bind" in flag else lines[i + 1])
+        return out
+
+    def test_an_api_run_sees_only_its_tree_and_scratch_home_under_home(self):
+        lines = self.profile("api")
+        self.assertEqual(self.pairs(lines, "--ro-bind")[0], ("/", "/"))
+        self.assertNotIn(("/", "/"), self.pairs(lines, "--bind"))
+        self.assertEqual(self.pairs(lines, "--tmpfs"), [str(self.home)])
+        binds = self.pairs(lines, "--bind")
+        self.assertEqual(binds, [(str(self.tree), str(self.tree)), (str(self.scratch), str(self.scratch))])
+        git = str(self.tree / ".git")
+        self.assertIn((git, git), self.pairs(lines, "--ro-bind"))
+        # HOME is emptied before anything is bound back over it, and .git is
+        # made read-only after the tree is bound.
+        self.assertLess(lines.index("--tmpfs"), lines.index(str(self.tree)))
+        self.assertLess(lines.index(str(self.tree)), lines.index(git))
+        for flag in ("--unshare-pid", "--die-with-parent", "--new-session"):
+            self.assertIn(flag, lines)
+        self.assertEqual(self.pairs(lines, "--proc"), ["/proc"])
+        self.assertEqual(self.pairs(lines, "--chdir"), [str(self.tree)])
+
+    def test_a_validation_run_keeps_writes_outside_home(self):
+        uv = self.home / ".local" / "bin" / "uv"
+        uv.parent.mkdir(parents=True)
+        uv.write_text("#!/bin/sh\n")
+        uv.chmod(0o755)
+        lines = self.profile("check", CHECK_UV_BINS=str(uv))
+        self.assertIn(("/", "/"), self.pairs(lines, "--bind"))
+        self.assertNotIn(("/", "/"), self.pairs(lines, "--ro-bind"))
+        self.assertEqual(self.pairs(lines, "--tmpfs"), [str(self.home)])
+        self.assertIn((str(uv), str(uv)), self.pairs(lines, "--ro-bind"))
+
+    def test_a_cli_under_home_is_bound_back_read_only(self):
+        cli = self.home / ".opencode" / "bin" / "opencode"
+        cli.parent.mkdir(parents=True)
+        cli.write_text("#!/bin/sh\n")
+        cli.chmod(0o755)
+        lines = self.profile("api", cli="opencode", PATH=f"{cli.parent}:{os.environ['PATH']}")
+        self.assertIn((str(cli.parent), str(cli.parent)), self.pairs(lines, "--ro-bind"))
+        self.assertNotIn((str(cli.parent), str(cli.parent)), self.pairs(lines, "--bind"))
+
+    def test_bwrap_refuses_the_agy_lanes_profile(self):
+        result = self.bash('sandbox_profile "$1" bash ""', lane="agy", AGY_HOME=str(self.scratch))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("bwrap serves api and check runs only", result.stderr)
+
+    def test_an_unknown_sandbox_is_refused(self):
+        result = self.bash('sandbox_profile "$1" bash api', LOOM_SANDBOX="jail")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unknown LOOM_SANDBOX 'jail'", result.stderr)
+        result = self.bash('sandbox_ready || { echo "$SANDBOX_WHY"; exit 1; }', LOOM_SANDBOX="jail")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unknown LOOM_SANDBOX 'jail'", result.stdout)
+
+    def test_the_sandbox_command_is_bwrap_with_the_profile_lines_then_a_separator(self):
+        result = self.bash('p="$(sandbox_profile "$1" bash api)" || exit 9\n'
+                           'sandbox_command "$p" || exit 8\nprintf "%s\\n" "${SANDBOX_CMD[@]}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        words = result.stdout.splitlines()
+        self.assertEqual(words[0], "bwrap")
+        self.assertEqual(words[-1], "--")
+        self.assertEqual(words[1:-1], self.profile("api"))
+        seatbelt = self.bash('sandbox_command "(version 1)" && printf "%s|" "${SANDBOX_CMD[@]}"',
+                             LOOM_SANDBOX="seatbelt")
+        self.assertEqual(seatbelt.stdout, "sandbox-exec|-p|(version 1)|")
+
+    def test_sandbox_ready_says_why_bwrap_cannot_run(self):
+        path = f"{self.bin}:/usr/bin:/bin"
+        ready = 'sandbox_ready && echo ready || echo "$SANDBOX_WHY"'
+        self.assertEqual(self.bash(ready, PATH=path).stdout.strip(), "bwrap not available")
+        bwrap = self.bin / "bwrap"
+        bwrap.write_text("#!/bin/sh\nexit 1\n")
+        bwrap.chmod(0o755)
+        self.assertIn("bwrap cannot start a sandbox here", self.bash(ready, PATH=path).stdout)
+        bwrap.write_text("#!/bin/sh\nexit 0\n")
+        self.assertEqual(self.bash(ready, PATH=path).stdout.strip(), "ready")
+
+
+class SsmDirTest(unittest.TestCase):
+    """LOOM_SSM_DIR: a lane pod reads copied SSM values from files and holds
+    no AWS key."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name).resolve()
+        self.dir = self.root / "home" / ".ssm"
+        (self.dir / "k").mkdir(parents=True)
+        (self.dir / "k" / "oc").write_text("fake-oc-key")
+        (self.root / "outside").write_text("not a parameter")
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.log = self.root / "aws.log"
+        aws = self.bin / "aws"
+        aws.write_text(f"#!/bin/sh\necho called >> {self.log}\necho from-aws\n")
+        aws.chmod(0o755)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def value(self, name, **env):
+        full = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", NET_TIMEOUT="10", **env)
+        return subprocess.run(["bash", "-c", '. "$1"; ssm_value "$2"', "bash", str(SANDBOX), name],
+                              capture_output=True, text=True, env=full, timeout=30)
+
+    def test_the_value_is_the_file_at_the_parameters_name(self):
+        result = self.value("/k/oc", LOOM_SSM_DIR=str(self.dir))
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "fake-oc-key")
+        self.assertFalse(self.log.exists())
+
+    def test_a_name_that_leaves_the_folder_or_is_missing_reads_nothing(self):
+        for name in ("/../../outside", "k/oc", "/k/./oc", "/k/missing"):
+            with self.subTest(name=name):
+                result = self.value(name, LOOM_SSM_DIR=str(self.dir))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+        self.assertFalse(self.log.exists())
+
+    def test_without_the_folder_ssm_is_asked(self):
+        result = self.value("/k/oc")
+        self.assertEqual(result.stdout.strip(), "from-aws")
+        self.assertTrue(self.log.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
