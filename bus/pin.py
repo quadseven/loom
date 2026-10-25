@@ -244,7 +244,9 @@ def main() -> int:
     try:
         specs = targets(os.environ["LOOM_PIN_TARGETS"])
         source = os.environ["LOOM_SELF_REPO"]
-        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, cwd=repo_root).strip()
         state = os.path.join(os.environ.get("LOOM_HOME", os.path.expanduser("~/loom")),
                              "state", "station", "deployed.json")
         with open(state, encoding="utf-8") as stream:
@@ -252,7 +254,8 @@ def main() -> int:
                 raise ValueError("checkout is not the recorded deployment")
         run(_pin_client(), source, revision,
             os.environ.get("LOOM_DEPLOY_CHECK", "unittest"), specs)
-    except (GitHubError, KeyError, OSError, ValueError) as exc:
+    except (GitHubError, KeyError, OSError, ValueError,
+            subprocess.CalledProcessError) as exc:
         print("pin: %s" % exc, file=sys.stderr)
         return 1
     return 0

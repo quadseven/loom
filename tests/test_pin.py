@@ -3,8 +3,13 @@ import base64
 import hashlib
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.parse import quote
 
 from bus import hunt_plan, pin
@@ -304,6 +309,51 @@ class PinAuthTest(unittest.TestCase):
                     os.environ.pop(name, None)
                 else:
                     os.environ[name] = saved[name]
+
+
+class PinMainTest(unittest.TestCase):
+    """The pin pass entry point: main() must fail cleanly, never crash."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.state_dir = self.tmp / "state" / "station"
+        self.state_dir.mkdir(parents=True)
+        self.deployed = self.state_dir / "deployed.json"
+        self._saved = {}
+        for name in ("LOOM_PIN_TARGETS", "LOOM_SELF_REPO", "LOOM_HOME"):
+            self._saved[name] = os.environ.get(name)
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def _env(self, revision="a" * 40):
+        os.environ["LOOM_PIN_TARGETS"] = json.dumps([SPEC])
+        os.environ["LOOM_SELF_REPO"] = SOURCE
+        os.environ["LOOM_HOME"] = str(self.tmp)
+        self.deployed.write_text(json.dumps({"revision": revision}))
+
+    def test_main_returns_one_when_git_rev_parse_fails(self):
+        """git rev-parse HEAD failing returns 1, never an uncaught traceback."""
+        self._env()
+        with patch("bus.pin.subprocess.check_output",
+                   side_effect=subprocess.CalledProcessError(1, ["git", "rev-parse", "HEAD"])):
+            result = pin.main()
+        self.assertEqual(result, 1)
+
+    def test_main_runs_git_from_repo_root(self):
+        """git rev-parse HEAD runs from the repo root, not the caller's cwd."""
+        self._env()
+        expected_cwd = os.path.dirname(os.path.dirname(os.path.abspath(pin.__file__)))
+        with patch("bus.pin.subprocess.check_output", return_value="a" * 40) as mock:
+            with patch("bus.pin._pin_client"):
+                with patch("bus.pin.run"):
+                    pin.main()
+        self.assertEqual(mock.call_args.kwargs.get("cwd"), expected_cwd)
 
 
 if __name__ == "__main__":
