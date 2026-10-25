@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from . import proof, status
+from . import answer, proof, status
 
 # The runner's own patterns (lanes/run_lane.sh).
 MODEL_RE = re.compile(r"[A-Za-z0-9._:][A-Za-z0-9._:/@-]*")
@@ -32,14 +32,35 @@ FORBIDDEN_MODELS: Tuple[Tuple[str, str], ...] = (
     ("gpt-6-sol", "gpt-6-luna"),
     ("gemini-4-argon", "gemini-3.8-flash-high"),
 )
+# The only models an opencode-go lane may run: OpenCode Go's free models and
+# the paid ones with an allowance of at least 10,000 requests per 5 hours.
+# Kimi K2.7 Code (1,350 per 5 h) spent the Go plan's allowance in hours on
+# 2026-10-23 (operator: "why the hell are we using the most expensive
+# models... STOP THAT"). An allow-list, not a deny-list, so a model Go adds
+# later is refused until someone checks its allowance. lanes/run_lane.sh
+# reads it (`python3 -m bus.tickets opencode-go-models`) and refuses to start
+# a lane whose model is not on it; the station routes only these models to
+# the opencode-go lanes. Allowances per 5 h from
+# https://opencode.ai/v2/docs/console/go/#usage-limits on 2026-10-23.
+OPENCODE_GO_MODELS: Tuple[str, ...] = (
+    "opencode-go/beam-free",                    # free, unlimited
+    "opencode-go/mimo-v2.6-flash",              # 30,100
+    "opencode-go/deepseek-v4.1-flash",          # 34,670
+    "opencode-go/muse-spark-1.3-contributor",   # 45,300; trains on prompts
+)
+# What a ticket's Model: line naming another opencode-go model runs instead.
+OPENCODE_GO_STAND_IN = "opencode-go/mimo-v2.6-flash"
 
 
 def allowed_model(model: str) -> str:
     """The model a lane may run for `model`: the stand-in of a
-    FORBIDDEN_MODELS model, else `model` itself."""
+    FORBIDDEN_MODELS model or of an opencode-go model off OPENCODE_GO_MODELS,
+    else `model` itself."""
     for prefix, stand_in in FORBIDDEN_MODELS:
         if model.startswith(prefix):
             return stand_in
+    if model.startswith("opencode-go/") and model not in OPENCODE_GO_MODELS:
+        return OPENCODE_GO_STAND_IN
     return model
 
 
@@ -546,15 +567,24 @@ LINKED_MAX = 10
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
-def operator_notes(comments: Iterable[Any], logins: Iterable[str]) -> List[Tuple[str, str, str]]:
+def operator_notes(comments: Iterable[Any], logins: Iterable[str],
+                   operators: Optional[Iterable[str]] = None) -> List[Tuple[str, str, str]]:
     """(login, created_at, body) of the newest NOTES_MAX comments a person
     wrote under one of `logins` (the operator's logins and trusted briefers),
     oldest first. A [bot] login, a factory marker comment and a claim line
-    are the factory's own, not notes."""
+    are the factory's own, not notes. An answer an operator gave on the
+    dashboard (bus/answer.py; `operators`, else LOOM_OPERATORS or the person
+    logins of LOOM_BRIEF_AUTHORS) is that operator's note."""
+    logins = list(logins)
     allowed = {login.lower() for login in logins}
+    ops = list(operators) if operators is not None else answer.operators()
     found = []
     for c in comments:
         if not isinstance(c, dict):
+            continue
+        given = answer.trusted_answer(c, logins, ops)
+        if given is not None:
+            found.append((given.login, given.created_at, "Answer: " + given.text()))
             continue
         login, body = _login(c.get("user")), str(c.get("body") or "").strip()
         if (login in allowed and not login.endswith("[bot]") and body
@@ -1051,3 +1081,11 @@ def after_holds(repo: str, headers: Dict[str, str],
         entry = After(where, number, short, state)
         (released if state == "not-planned" else holds).append(entry)
     return holds, released
+
+
+if __name__ == "__main__":
+    import sys
+    if sys.argv[1:] == ["opencode-go-models"]:
+        print("\n".join(OPENCODE_GO_MODELS))
+    else:
+        sys.exit("usage: python3 -m bus.tickets opencode-go-models")

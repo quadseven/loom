@@ -285,12 +285,42 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 }
 .share-track, .quota { position: relative; height: 8px; border-radius: 6px; background: var(--raised); overflow: visible; }
 .ask-card { display: grid; gap: 10px; max-width: 760px; margin-bottom: 12px; padding: 16px; border-color: color-mix(in srgb, var(--accent) 38%, transparent); border-radius: 14px; background: var(--surface); }
-.ask-card h2 { margin: 0; font-size: 17px; line-height: 1.35; }
+.ask-card h3 { margin: 0; font-size: 17px; line-height: 1.35; }
 .ask-card blockquote { margin: 0; color: var(--body); font-size: 14px; line-height: 1.5; }
 .ask-head { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font: 11.5px var(--font-mono); }
 .backlog-asks { max-width: 760px; margin: 18px 0; }
 .backlog-asks summary { min-height: 44px; display: flex; align-items: center; color: var(--muted); font: 12px var(--font-mono); cursor: pointer; }
 .ask-missing { margin: 0; color: var(--muted); font-size: 13px; }
+.answer-form { display: grid; gap: 8px; }
+.answer-choices { display: flex; flex-wrap: wrap; gap: 8px; }
+.answer-choices button, .answer-auth button { min-height: 44px; min-width: 72px; padding: 0 16px; border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent); border-radius: 10px; background: var(--raised); cursor: pointer; }
+.answer-choices button:disabled { opacity: .55; cursor: progress; }
+.answer-choices input, .answer-note, .answer-auth input, .answer-auth select { min-height: 44px; min-width: 0; flex: 1 1 160px; padding: 0 10px; border: 1px solid color-mix(in srgb, var(--muted) 40%, transparent); border-radius: 10px; background: var(--surface); color: inherit; font: inherit; }
+.answer-status { margin: 0; min-height: 1em; color: var(--muted); font-size: 13px; }
+.answer-state { margin: 0; font-size: 13px; line-height: 1.45; }
+.answer-state[data-state="pending"] { color: var(--accent); }
+.answer-off { margin: 0; }
+.answer-bar { max-width: 760px; margin: 0 0 16px; padding: 12px 16px; border-radius: 14px; }
+.answer-bar summary { min-height: 32px; cursor: pointer; color: var(--muted); font: 12px var(--font-mono); }
+.answer-auth { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; margin-top: 8px; }
+.answer-auth label { display: grid; gap: 4px; flex: 1 1 200px; color: var(--muted); font-size: 12px; }
+.needs-summary { display: grid; gap: 8px; max-width: 920px; margin-bottom: 20px; padding: 16px; border-radius: 14px; }
+.needs-headline { margin: 0; font-size: 17px; line-height: 1.4; }
+.needs-start-head { margin: 6px 0 0; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.needs-start { margin: 0; padding-left: 20px; display: grid; gap: 4px; font-size: 14px; line-height: 1.45; }
+.needs-group { max-width: 920px; margin: 22px 0 8px; }
+.needs-group > h2 { margin: 0 0 2px; font-size: 15px; }
+.needs-group > .muted { margin: 0 0 10px; font-size: 13px; }
+.needs-group .ask-card { margin-bottom: 6px; padding: 0; border-radius: 10px; }
+.ask-row > summary { display: grid; grid-template-columns: 104px 1fr; gap: 2px 12px; padding: 10px 14px; cursor: pointer; list-style: none; }
+.ask-row > summary::-webkit-details-marker { display: none; }
+.ask-row .ask-age { grid-row: span 3; color: var(--muted); font: 12px var(--font-mono); }
+.ask-row .ask-ref { color: var(--muted); font: 11.5px var(--font-mono); }
+.ask-row .ask-title { font-weight: 600; font-size: 14.5px; line-height: 1.35; }
+.ask-row .ask-lead { color: var(--body); font-size: 13.5px; line-height: 1.45; }
+.ask-row[open] > summary { border-bottom: 1px solid var(--border, transparent); }
+.ask-body { display: grid; gap: 8px; padding: 12px 14px 14px; }
+@media (max-width: 640px) { .ask-row > summary { grid-template-columns: 1fr; } .ask-row .ask-age { grid-row: auto; } }
 .ask-head .ask-human { margin-left: auto; padding: 0 8px; border: 1px solid var(--info); border-radius: 999px; color: var(--info-on-bg); white-space: nowrap; }
 .ask-source { margin: 0; color: var(--muted); font-size: 12px; }
 .needs-filter .chip[aria-current="true"] { border-color: var(--accent); color: var(--accent-on-bg); }

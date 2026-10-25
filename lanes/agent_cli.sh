@@ -12,12 +12,25 @@
 # answer in print mode. A brain tick reads and writes GitHub and works from
 # its own checkout, so its agent gets the network and skips every prompt.
 # Neither reads the keychain: both CLIs keep their sign-in in a file.
+# A codex lane run has no network, so uv could not fetch the packages a test
+# needs and the run failed on a DNS error (loom#1665). When the runner left
+# the agent a copy of the base check's uv cache (AGENT_UV_DIR, with the
+# check's Pythons in AGENT_UV_PYTHON), uv runs offline from it: the copy is
+# the one extra directory codex may write (uv locks its cache), and the
+# network stays closed.
 agent_cli() {
+  local uv_env=() uv_dir=()
+  if [ "$1:$2" = codex:lane ] && [ -n "${AGENT_UV_DIR:-}" ]; then
+    uv_env=("UV_CACHE_DIR=$AGENT_UV_DIR/cache" "UV_PYTHON_INSTALL_DIR=$AGENT_UV_PYTHON"
+            UV_OFFLINE=1 UV_MANAGED_PYTHON=1 PIP_NO_INDEX=1)
+    uv_dir=(--add-dir "$AGENT_UV_DIR")
+  fi
   case "$1:$2" in
     claude:lane) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$3" < /dev/null ;;
     claude:brain) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" \
       --permission-mode bypassPermissions "$3" < /dev/null ;;
-    codex:lane) timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write --model "$MODEL" "$3" < /dev/null ;;
+    codex:lane) timeout "$AGENT_TIMEOUT" env ${uv_env[@]+"${uv_env[@]}"} codex exec --sandbox workspace-write \
+      ${uv_dir[@]+"${uv_dir[@]}"} --model "$MODEL" "$3" < /dev/null ;;
     codex:brain) timeout "$AGENT_TIMEOUT" codex exec --sandbox danger-full-access \
       --skip-git-repo-check --model "$MODEL" "$3" < /dev/null ;;
     *) echo "no agent CLI for lane $1 ($2)" >&2; return 2 ;;
@@ -38,13 +51,18 @@ agent_cli() {
 # (2026-10-20). Providers say the quota is reached, exceeded or exhausted.
 # A full shared free pool ("has no lane available; retry after 1s") is a
 # short limit, not the agent's failure (18 runs, 2026-10-21).
-LIMIT_RE='usage limit|rate[ _-]?limit|has no lane available|quota (reached|exceeded|exhausted|resets?)|exceeded (your |the )?(current )?quota|resource[ _]exhausted|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required'
+LIMIT_RE='usage limit|rate[ _-]?limit|has no lane available|quota (reached|exceeded|exhausted|resets?)|exceeded (your |the )?(current )?quota|resource[ _]exhausted|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|hit your (weekly |daily |session )?limit'
 # A bare HTTP status counts only in the short tail: a repo's own test output
 # printed "status=error detail=http 402", and a codex run that exited 0 was
 # classed out of credit and its lane parked a day (2026-10-21).
 LIMIT_CODE_RE='(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
 KEY_STATE='expired|revoked|invalid|incorrect|disabled'
-AUTH_RE="($KEY_STATE)[ _-]*api[ _-]*key|api[ _-]*key([ _-]*(is|was|has|been|are))*[ _-]*($KEY_STATE)|(http|status|code|error)[^0-9a-z]{0,3}401([^0-9]|\$)"
+# A CLI that signs in through a browser (agy) and finds its sign-in lapsed
+# waits for a login nobody gives, then says "authentication timed out" or
+# "authentication failed": that is auth, not transient (2026-10-24). It is the
+# lane's sign-in that lapsed, not a key, whatever key parameter the lane names.
+SIGNIN_RE="error:[ ]*authentication[ ]+(timed[ ]+out|failed)"
+AUTH_RE="($KEY_STATE)[ _-]*api[ _-]*key|api[ _-]*key([ _-]*(is|was|has|been|are))*[ _-]*($KEY_STATE)|(http|status|code|error)[^0-9a-z]{0,3}401([^0-9]|\$)|$SIGNIN_RE"
 # A quota on the whole account, not one model: every model of the lane is
 # limited until it resets (agy, 2026-10-18: "Individual quota reached ...
 # Resets in 67h", but only the model that ran was marked, so the lane stayed
@@ -77,28 +95,46 @@ LIMIT_WAIT_MAX=86400
 # round each time (2026-10-21).
 RESET_WAIT_MAX=$((7 * 86400))
 
-# The epoch of the reset time stated in $1 ("try again at ..."), read as the
-# machine's local time, the time of day alone meaning its next occurrence;
-# prints nothing when $1 states none.
+# The epoch of the reset time or duration stated in $1 ("try again at ...",
+# "resets in ..."), read as the machine's local time or now plus the duration,
+# the time of day alone meaning its next occurrence; prints nothing when $1
+# states none.
 stated_reset() {
   python3 -c '
 import re, sys, time
 from datetime import datetime, timedelta
-m = re.search(r"try again at (?:([A-Za-z]{3}) ([0-9]{1,2})(?:st|nd|rd|th)?, ([0-9]{4}) )?([0-9]{1,2}):([0-9]{2}) ?([AP]M)", sys.argv[1], re.I)
+m = re.search(r"(?:try again at|resets) (?:([A-Za-z]{3}) ([0-9]{1,2})(?:st|nd|rd|th)?, ([0-9]{4}) )?([0-9]{1,2})(?::([0-9]{2}))? ?([AP]M)", sys.argv[1], re.I)
+done = False
 if m:
     hour = int(m.group(4)) % 12 + (12 if m.group(6).upper() == "PM" else 0)
+    minute = int(m.group(5)) if m.group(5) else 0
     now = datetime.now()
     try:
         if m.group(1):
             at = datetime.strptime("%s %s %s" % (m.group(1).title(), m.group(2), m.group(3)), "%b %d %Y")
-            at = at.replace(hour=hour, minute=int(m.group(5)))
+            at = at.replace(hour=hour, minute=minute)
         else:
-            at = now.replace(hour=hour, minute=int(m.group(5)), second=0, microsecond=0)
+            at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if at <= now:
                 at += timedelta(days=1)
         print(int(time.mktime(at.timetuple())))
+        done = True
     except ValueError:
         pass
+if not done:
+    m = re.search(r"(?:try again in|resets? in)[:\s]\s*((?:[0-9]+\s*[a-z]+[.,\s]*(?:and\s+)?)+)", sys.argv[1], re.I)
+    if m:
+        units = {
+            "d": 86400, "day": 86400, "days": 86400,
+            "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+            "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+            "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+        }
+        parts = re.findall(r"([0-9]+)\s*([a-z]+)", m.group(1), re.I)
+        if parts and all(u.lower() in units for _, u in parts):
+            seconds = sum(int(v) * units[u.lower()] for v, u in parts)
+            if seconds > 0:
+                print(int(time.time() + seconds))
 ' "$1" 2>/dev/null
 }
 
@@ -124,8 +160,14 @@ provider_text() {
 }
 
 classify_failure() {
-  local status="$1" whole="$2" edited="$3" now n tail cap stated monthly=0
+  local status="$1" whole="$2" edited="$3" now n tail cap stated monthly=0 seen
   tail="${4:-$whole}"
+  # A run that exited 0 wrote its answer: a limit phrase earlier in its
+  # output came from a file or test it read (a Makefile echoing "Rate-limiting
+  # wrapper deployed", a test named test_..._rate_limited parked two codex
+  # lanes until midnight, 2026-10-25), so only what its CLI said last counts.
+  seen="$whole"
+  [ "$status" -eq 0 ] && seen="$tail"
   FAIL_CLASS=work RETRY_AT="" OUT_OF_CREDIT=""
   now="$(date +%s)"
   shopt -s nocasematch
@@ -133,10 +175,11 @@ classify_failure() {
     FAIL_CLASS=auth
   elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
-  elif [[ "$whole" =~ $LIMIT_RE ]] || [[ "$tail" =~ $LIMIT_CODE_RE ]]; then
+  elif [[ "$seen" =~ $LIMIT_RE ]] || [[ "$tail" =~ $LIMIT_CODE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT)) cap=$LIMIT_WAIT_MAX
-    # A reset time the provider states wins: codex's five-hour limit says
-    # "purchase more credits or try again at 10:28 AM" (2026-10-21).
+    # A reset time or duration the provider states wins: codex's five-hour
+    # limit says "purchase more credits or try again at 10:28 AM", agy's
+    # "Resets in 87h14m1s" (2026-10-21).
     if stated="$(stated_reset "$whole")" && [ -n "$stated" ]; then
       RETRY_AT="$stated" cap=$RESET_WAIT_MAX
     elif [[ "$whole" =~ $OUT_OF_CREDIT_RE ]] || [[ "$tail" =~ $CREDIT_CODE_RE ]]; then

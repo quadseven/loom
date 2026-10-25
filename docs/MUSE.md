@@ -532,10 +532,16 @@ this tick"; a step with no note shows nothing there.
      named as stuck or blocked and still is, with how long; say "nothing"
      when the list is empty. Read the previous report to fill this in.
    - Next: what the brain will do before the next report.
-   - Needs you: only what only the operator can do, or "nothing", then the
-     count of open `loom:human` issues by repo (for example "loom:human: 12
-     in OWNER/NAME, 3 in OWNER/OTHER"); the daily digest lists them, so do
-     not list them here.
+   - Needs you: only what only the operator can do for THIS goal, or
+     "nothing new for this goal". Never a count: this line is what `journal`
+     compares to tell a new ask from an unchanged one.
+   - Waiting on you: the next line, always. Copy it from the "## Waiting on
+     you" section of `status`, which fills it from data: "Waiting on you: 28
+     open loom:human (25 in OWNER/NAME, 3 in OWNER/OTHER; 4 of them under
+     this goal), listed in the daily digest", or "Waiting on you: nothing"
+     when none is open. The daily digest lists them, so do not list them here.
+     "nothing" never sits beside a count on one line (the operator read
+     "Needs you: nothing. loom:human: 28 in OWNER/NAME." as both, 2026-10-25).
    Write sentences, not ticket lists: name a ticket only where the operator
    may want to open it, and never more than one or two per line. Numbers
    over adjectives. A goal home may ask for extra lines; add them after
@@ -549,7 +555,15 @@ this tick"; a step with no note shows nothing there.
    a failed step. It also posts no report for a goal quiet since its last
    report: it prints `not posted: quiet since <time>` and exits 0, also not
    a failed step, since every new report emails the goal's author. A
-   heartbeat (once a quiet week) is edited into the last report in place.
+   heartbeat (once a quiet week) is edited into the last report in place,
+   and so is a report whose "Needs you:" line asks the same as the last
+   report's: only a new ask posts a new comment (loom#1560). Keep the
+   "Needs you:" line exact, so an unchanged ask reads as unchanged. Only
+   that line is compared: a "Waiting on you:" count that moved alone edits
+   the last report in place (loom#1775). A report whose "Needs you:" line
+   carries a `loom:human` count, or whose "Waiting on you:" line says
+   "nothing" beside a number, is refused: `journal` posts nothing, prints
+   `not posted:` and the reason, and exits 2, a failed step to rewrite.
 10. First run `python3 -m bus.brain step unlock --holder muse`. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
     failure as well.
 11. End the tick's chat reply in the same standup shape as the reports

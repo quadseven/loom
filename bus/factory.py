@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -156,6 +156,9 @@ HOLD_STUCK = 48 * 3600
 REVIEW_GRACE = 1800
 # At most this many merges, send-backs and climbs per pass.
 MAX_ACTIONS = 12
+# At most this many dashboard answers (loom:answer-pending issues) are read in
+# one repo a pass; the rest wait for the next.
+ANSWERS_PER_PASS = 10
 DEFAULT_REVIEW_CHECK = "Grug - Elder"
 # The review bot's plan check (same default as bus/invariants.py).
 DEFAULT_PLAN_CHECK = "Grug - Chief"
@@ -391,7 +394,7 @@ BRIEF_RES = (
 RUNAWAY = "loom:runaway"
 NO_REASON = "agent made no commit and wrote no reason"
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
-                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved path'
+                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved isOutdated path'
                  ' root: comments(first:1) { nodes { author { __typename login } body url } }'
                  ' comments(last:20) { nodes { author { __typename login } body } } } } } } }')
 RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
@@ -418,6 +421,14 @@ DEFER_TITLE = "Settle the review findings left from PR #%d"
 # The title before the naming standard (docs/NAMING.md): an open follow-up
 # filed under it still counts, so a pull request never gets two.
 DEFER_TITLE_LEGACY = "Deferred review findings from %s#%d"
+# The follow-up issue is filed only after its pull request merges. Deferring
+# resolves the threads and leaves this record on the ticket; the pass that
+# finds the pull request merged files the issue (settle_deferred) and leaves
+# the filed record. A pull request that closes unmerged files nothing.
+DEFERRED_MARKER = "<!-- loom:deferred pr=%d sha=%s rounds=%d ids=%s -->"
+DEFERRED_RE = re.compile(r"<!-- loom:deferred pr=(\d+) sha=(\w*) rounds=(\d+) ids=([^ ]*) -->")
+DEFERRED_FILED_MARKER = "<!-- loom:deferred-filed pr=%d -->"
+DEFER_TITLE_RE = re.compile(r"^Settle the review findings left from PR #(\d+)$")
 # A file a pull request changes is code by its extension, and a test by a
 # test or tests folder in its path or by its name.
 CODE_EXTS = (".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".cpp", ".h", ".hpp",
@@ -497,6 +508,13 @@ def unticked_notes(missing: Sequence[str]) -> str:
 
 
 TICKED_HEADING = "### Live or operator criteria ticked by the lane"
+
+
+def _last_ask(comments: Sequence[Dict[str, Any]]) -> str:
+    """The newest loom:human ask among the comments, or ""."""
+    asks = [str(c.get("body") or "") for c in comments
+            if str(c.get("body") or "").startswith(answer.HUMAN_MARKER)]
+    return asks[-1] if asks else ""
 
 
 def ticked_notes(ticked: Sequence[str]) -> str:
@@ -1356,7 +1374,8 @@ class Factory:
                  place: Callable[..., Any] = brain.place_under_epic,
                  plan_check: str = DEFAULT_PLAN_CHECK,
                  scope: Optional[scope_fit.Ask] = None,
-                 demoted: Optional[Dict[str, str]] = None) -> None:
+                 demoted: Optional[Dict[str, str]] = None,
+                 operators: Optional[Sequence[str]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1410,6 +1429,10 @@ class Factory:
         # The same map as the last pass left it (the station's saved waits): a
         # ticket whose reason is unchanged is not announced again.
         self.known_waits = dict(known_waits or {})
+        # The operators whose answers on the dashboard (bus/answer.py) count:
+        # LOOM_OPERATORS, else the person logins among the trusted ones.
+        self.operators = [o.lower() for o in (operators if operators is not None
+                                              else answer.operators(trusted=trusted))]
         self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
         # Sends the scope check's prompt to a cheap model (bus/scope_fit.py);
@@ -1633,24 +1656,79 @@ class Factory:
     def _defer_minor(self, repo: str, number: int, ticket: int, sha: str,
                      comments: Sequence[Dict[str, Any]], immediate: bool = False) -> bool:
         """Defer the open medium and low findings of a reviewed, green pull
-        request to a follow-up issue, then resolve them. True when it did.
-        With `immediate` (docs, tests, or a revert) they defer at once."""
+        request, then resolve them. True when it did. With `immediate` (docs,
+        tests, or a revert) they defer at once. The follow-up issue is not
+        filed here: the pull request has not merged, and may never
+        (settle_deferred files it once it does)."""
         threads = self._threads(repo, number)
         rounds = fixes_of(comments)
         picked = deferrable(threads, self.review_bot, asked_threads(comments), rounds, immediate)
         if not picked:
             return False
-        follow = self._follow_up(repo, number, ticket, sha, picked, rounds)
-        if not follow:
-            return False
-        reply = ("Deferred to #%d: a medium or low finding still open after %d fix "
-                 "round(s), with the review check passed on %s." % (follow, rounds, sha[:12]))
+        ids = ",".join(str(t.get("id")) for t in picked)
+        notify.post(self.gh, repo, ticket, DEFERRED_MARKER % (number, sha[:12], rounds, ids)
+                    + "\nMedium or low review findings on #%d are deferred; the follow-up "
+                    "issue is filed once it merges." % number, notify.RECORD)
+        reply = ("Deferred: a medium or low finding still open after %d fix round(s), "
+                 "with the review check passed on %s. A follow-up issue is filed once "
+                 "this pull request merges." % (rounds, sha[:12]))
         for t in picked:
             self.gh.graphql(REPLY_MUTATION, {"id": str(t.get("id")), "body": reply})
             self.gh.graphql(RESOLVE_MUTATION, {"id": str(t.get("id"))})
         self.actions += 1
-        _say("deferred %d finding(s) on %s#%d to #%d" % (len(picked), repo, number, follow))
+        _say("deferred %d finding(s) on %s#%d until it merges" % (len(picked), repo, number))
         return True
+
+    def settle_deferred(self, repo: str, issue: Dict[str, Any]) -> None:
+        """File the follow-up issue for findings deferred on a ticket's pull
+        request, once that pull request has merged and only for the findings
+        still standing on the merged head (a thread the later commits made
+        outdated is gone). Once per pull request."""
+        number = int(issue["number"])
+        comments = self._comments(repo, number)
+        text = "\n".join(str(c.get("body") or "") for c in comments)
+        for pr, sha, rounds, ids in DEFERRED_RE.findall(text):
+            pr_number = int(pr)
+            if DEFERRED_FILED_MARKER % pr_number in text:
+                continue
+            data = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data or {}
+            if not data.get("merged_at") and not data.get("merged"):
+                continue
+            wanted = set(ids.split(","))
+            standing = [t for t in self._threads(repo, pr_number)
+                        if str(t.get("id")) in wanted and not t.get("isOutdated")]
+            if standing:
+                self._follow_up(repo, pr_number, number, sha, standing, int(rounds))
+            notify.post(self.gh, repo, number, DEFERRED_FILED_MARKER % pr_number
+                        + "\nDeferred findings of #%d: %d still standing on the merged head."
+                        % (pr_number, len(standing)), notify.RECORD)
+            self.actions += 1
+            _say("settled the deferred findings of %s#%d (%d filed)"
+                 % (repo, pr_number, len(standing)))
+
+    def _close_unmerged_follow_ups(self, repo: str) -> None:
+        """Close, as not planned, each open follow-up issue of a pull request
+        that closed unmerged: its findings never landed."""
+        for found in self.gh.paginate("/repos/%s/issues?labels=%s&state=open" % (repo, DEFER_LABEL)):
+            if not isinstance(found, dict) or not self._trusted(found):
+                continue
+            title = str(found.get("title") or "")
+            match = DEFER_TITLE_RE.match(title)
+            if not match:
+                continue
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%s" % (repo, match.group(1))).data or {}
+            if pr.get("state") != "closed" or pr.get("merged_at") or pr.get("merged"):
+                continue
+            if self.actions >= MAX_ACTIONS:
+                return
+            body = str(found.get("body") or "").rstrip()
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, int(found["number"])), {
+                "state": "closed", "state_reason": "not_planned",
+                "body": body + "\n\nClosed: #%s closed without merging, so these findings "
+                "never landed." % match.group(1)})
+            self.actions += 1
+            _say("closed %s#%s: pull request #%s closed unmerged"
+                 % (repo, found["number"], match.group(1)))
 
     def _tried(self, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
                failed_here: bool = True, footer: Optional[Tuple[str, str]] = None) -> Tuple[set, int]:
@@ -2245,23 +2323,29 @@ class Factory:
         elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
-        elif (not sensitive and not self._operator_holds(repo, number, full, issue)
-              and not self._risk_holds(repo, number, full, issue)):
+        elif (not sensitive and not self._operator_holds(repo, number, full, issue, comments)
+              and not self._risk_holds(repo, number, full, issue, comments)):
             self._file_criterion_follow_up(repo, number, issue, full)
             self._land(repo, number, full, issue, comments)
 
     def _operator_holds(self, repo: str, number: int, full: Dict[str, Any],
-                        issue: Dict[str, Any]) -> bool:
+                        issue: Dict[str, Any], comments: Sequence[Dict[str, Any]] = ()) -> bool:
         """Whether the pull request waits for the operator instead of landing
         (bus/operator_hold.py): it or its ticket declares operator steps
         before merge, it changes placement, or it deletes or mostly replaces
         a doc its ticket does not name. The ticket goes
         to loom:human with one exact ask, once; the pull request never lands
-        on the factory's say-so, whatever later passes find."""
+        on the factory's say-so, whatever later passes find. The operator's
+        own answer to that ask (bus/answer.py) decides instead: Merge lifts
+        this hold only, so every other gate still runs; Hold keeps it held
+        and asks nothing more."""
         why = operator_hold.reasons(self.gh, repo, full, str(issue.get("body") or ""),
                                     operator_hold.pull_files(self.gh, repo, number))
         if not why:
             return False
+        settled = self._operator_verdict(repo, number, full, issue, comments)
+        if settled is not None:
+            return settled
         outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, why,
                                      self.human)
         if outcome == "asked":
@@ -2272,7 +2356,7 @@ class Factory:
         return True
 
     def _risk_holds(self, repo: str, number: int, full: Dict[str, Any],
-                    issue: Dict[str, Any]) -> bool:
+                    issue: Dict[str, Any], comments: Sequence[Dict[str, Any]] = ()) -> bool:
         """Whether the pull request's risk tier (bus/merge_tier.py) is one
         Loom may not merge on its own: its ticket goes to loom:human with one
         ask, once, and the operator merges it. A revert ticket's own pull
@@ -2294,6 +2378,9 @@ class Factory:
                                         change_class.class_of(full) == "sensitive")
         if tier in merge_tier.auto_tiers():
             return False
+        settled = self._operator_verdict(repo, number, full, issue, comments)
+        if settled is not None:
+            return settled
         reason = merge_tier.operator_why(tier, why)
         outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, [reason],
                                      self.human)
@@ -2303,6 +2390,59 @@ class Factory:
         elif outcome != "already":
             _say("held %s#%d for the operator, but %s" % (repo, number, outcome))
         return True
+
+    def _operator_verdict(self, repo: str, number: int, full: Dict[str, Any],
+                          issue: Dict[str, Any],
+                          comments: Sequence[Dict[str, Any]]) -> Optional[bool]:
+        """The operator's answer to the hold ask on this pull request
+        (answer.pr_verdict), as the hold's outcome: False (Merge: the hold is
+        lifted and the other gates decide), True (Hold: held, no new ask), or
+        None (no answer: the hold asks as before). Each verdict is written to
+        the shadow ledger as the operator's."""
+        verdict = answer.pr_verdict(list(comments), number, self.trusted, self.operators)
+        if verdict is None:
+            return None
+        sha = str((full.get("head") or {}).get("sha") or "")
+        answer.record_verdict(repo, number, verdict, sha, (repo, int(issue["number"])),
+                              source="bus.factory")
+        if answer.is_merge(verdict):
+            _say("%s#%d: the operator %s answered merge; its operator hold is lifted and its "
+                 "other gates decide" % (repo, number, verdict.login))
+            return False
+        _say("%s#%d stays held: the operator %s answered hold" % (repo, number, verdict.login))
+        return True
+
+    def _settle_answers(self, repo: str) -> None:
+        """Read each answer the dashboard posted (an open issue labelled
+        loom:answer-pending, bus/answer.py) and take the label off: the
+        answer is now the operator's newest comment, which the brief, the
+        stale-brief check and the merge gates read. A Hold on a lane pull
+        request held for the operator puts loom:human back, so it keeps
+        waiting on a person. An issue whose label no operator answer backs
+        loses the label too."""
+        items = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                 % (repo, quote(answer.ANSWERED_LABEL, safe="")))
+        for issue in [i for i in items if isinstance(i, dict)][:ANSWERS_PER_PASS]:
+            if self.actions >= MAX_ACTIONS:
+                return
+            number = int(issue.get("number") or 0)
+            comments = self._comments(repo, number)
+            found = answer.newest(comments, self.trusted, self.operators)
+            if found is None:
+                _say("%s#%d is labelled %s, but no operator answer backs it; label removed"
+                     % (repo, number, answer.ANSWERED_LABEL))
+            elif answer.is_hold(found) and answer.held_pr(_last_ask(comments)) is not None:
+                if "loom:human" not in _labels(issue):
+                    self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                                 {"labels": ["loom:human"]})
+                _say("%s#%d: the operator %s answered hold; it keeps waiting on a person"
+                     % (repo, number, found.login))
+            else:
+                _say("%s#%d: read the operator %s's answer (%s)"
+                     % (repo, number, found.login, found.choice))
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                         % (repo, number, quote(answer.ANSWERED_LABEL, safe="")), ok=(404,))
+            self.actions += 1
 
     def _file_criterion_follow_up(self, repo: str, number: int,
                                   issue: Dict[str, Any], full: Dict[str, Any]) -> None:
@@ -3227,6 +3367,7 @@ class Factory:
         # GitHub.paginate asks for 100 a page and follows every page.
         all_prs = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
                    if isinstance(p, dict)]
+        self._guarded(lambda r, _: self._settle_answers(r), repo, {})
         closed_numbers = self._close_superseded_prs(repo, all_prs, tickets)
         prs = [p for p in all_prs if self._trusted(p) and int(p.get("number") or 0) not in closed_numbers]
         linked = {a[1]: pr for pr in prs for a in [self._association(repo, pr)] if a}
@@ -3234,8 +3375,10 @@ class Factory:
             if self.actions >= MAX_ACTIONS:
                 return
             self._guarded(self.pull_request, repo, pr, tickets)
+        self._guarded(lambda r, _: self._close_unmerged_follow_ups(r), repo, {})
         steps = {"failed": lambda r, i: self.failed(r, i, linked), "briefed": self.briefed,
-                 "running": self.running}
+                 "running": self.running, "merged": self.settle_deferred,
+                 "shipped": self.settle_deferred, "verified": self.settle_deferred}
         for issue in list(tickets.values()):
             step = steps.get(_state(issue))
             if self.actions >= MAX_ACTIONS:

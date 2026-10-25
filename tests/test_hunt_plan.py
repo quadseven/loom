@@ -94,6 +94,33 @@ class BriefToPullRequestTest(unittest.TestCase):
         self.assertTrue(brain.plan_problems(BRIEF % "XL"))
         self.assertEqual(brain.plan_problems(BRIEF % "Medium"), [])
 
+    def test_why_opening_with_issue_reference_is_read_as_text(self):
+        # A brief whose Why section opens with an issue reference like
+        # "#214 (Routes 2-4) ..." should be read as body text, not as a heading.
+        # The plan check must find the words in the Why section.
+        brief = """## Why
+#214 (Routes 2-4) The page query is slow for every visitor.
+
+## What
+Cache the query.
+
+## Acceptance criteria
+- [ ] The page loads in under a second.
+- [ ] A test fails without the cache.
+- [ ] The query runs once a minute.
+
+## Size
+Medium
+
+## Out of scope
+- Other pages.
+"""
+        body = pr_repair._render_generated(brief, "lane", "model", "T1")
+        self.assertEqual(hunt_plan.problems(body), [])
+        why = hunt_plan._section_text(body, "Why", "Summary")
+        self.assertIsNotNone(why)
+        self.assertGreaterEqual(len(why.split()), 5)
+
 
 class OneSizeParserTest(unittest.TestCase):
     """#668: triage, the Hunt Plan gate and PR repair read the size through

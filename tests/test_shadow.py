@@ -9,12 +9,14 @@ leaves shadow without the operator removing it.
 """
 from __future__ import annotations
 
+import ast
 import io
 import json
 import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -22,12 +24,13 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, lock, shadow, station, watch  # noqa: E402
+from bus import brain, invariants, lock, shadow, station, watch  # noqa: E402
 from bus.github import GitHub, GitHubError, ShadowHeld  # noqa: E402
 
 import test_bus_brain as tbb  # noqa: E402
 import test_bus_station as tbs  # noqa: E402
 import test_merge_tier as tmt  # noqa: E402
+import test_station_live_proof as tslp  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 REPO = "example-owner/example-repo"
@@ -136,6 +139,9 @@ class ChokePointTest(ShadowCase):
         ("PUT", "/repos/%s/issues/9/labels" % REPO, {"labels": ["loom:ticket", "ready-to-land"]},
          shadow.LABEL),
         ("PATCH", "/repos/%s/issues/9" % REPO, {"labels": ["loom:shipped"]}, shadow.LABEL),
+        ("PATCH", "/repos/%s/issues/9" % REPO, {"state": "open"}, shadow.REOPEN),
+        ("POST", "/graphql", {"query": "mutation { reopenIssue(input:{issueId:\"x\"}) { issue { id } } }"},
+         shadow.REOPEN),
         ("POST", "/repos/%s/pulls/8/reviews" % REPO, {"event": "APPROVE"}, shadow.APPROVE),
         ("DELETE", "/repos/%s/git/refs/heads/loom/9-work" % REPO, None, shadow.DELETE_BRANCH),
         ("POST", "/graphql", {"query": "mutation { mergePullRequest(input:{pullRequestId:\"x\"})"
@@ -183,25 +189,29 @@ class ChokePointTest(ShadowCase):
                     gh.rest("PATCH" if "state" in body else "POST", path, body)
         self.assertEqual(fake.sent, [])
 
-    def test_closing_a_pull_request_unmerged_and_loom_signal_issues_goes_through(self):
+    def test_closing_a_pull_request_unmerged_and_a_factory_incident_goes_through(self):
         items = {"/repos/%s/issues/20" % REPO: issue(20, pr=True),
                  "/repos/%s/issues/21" % REPO: issue(21, ("loom:triage", "loom:invariant")),
                  "/repos/%s/issues/22" % REPO: issue(22, ("loom:factory",)),
                  "/repos/%s/issues/23" % REPO: issue(23, ("loom:triage", "loom:ticket")),
-                 "/repos/%s/issues/24" % REPO: issue(24, ())}
+                 "/repos/%s/issues/24" % REPO: issue(24, ()),
+                 "/repos/%s/issues/25" % REPO: issue(25, ("loom:factory", "loom:invariant"))}
         fake = Recorder(items)
         gh = GitHub("t", transport=fake)
         gh.rest("PATCH", "/repos/%s/pulls/19" % REPO, {"state": "closed"})
-        for number in (20, 21, 22):
+        for number in (20, 22):
             gh.rest("PATCH", "/repos/%s/issues/%d" % (REPO, number),
                     {"state": "closed", "state_reason": "not_planned"})
-        for number in (23, 24):   # a ticket, and an issue Loom cannot tell is its own
+        # An invariant breach's issue (loom#1551), a ticket, and an issue
+        # Loom cannot tell is its own.
+        for number in (21, 23, 24, 25):
             with self.assertRaises(ShadowHeld):
                 gh.rest("PATCH", "/repos/%s/issues/%d" % (REPO, number),
                         {"state": "closed", "state_reason": "not_planned"})
         self.assertEqual([p for _, p, _ in fake.sent],
                          ["/repos/%s/pulls/19" % REPO] +
-                         ["/repos/%s/issues/%d" % (REPO, n) for n in (20, 21, 22)])
+                         ["/repos/%s/issues/%d" % (REPO, n) for n in (20, 22)])
+        self.assertEqual(sorted(e["number"] for e in self.entries()), [21, 23, 24, 25])
 
     def test_a_label_already_on_or_already_past_is_no_new_grant(self):
         items = {"/repos/%s/issues/30" % REPO: issue(30, ("loom:ticket", "loom:shipped")),
@@ -367,6 +377,25 @@ class CallSiteTest(ShadowCase):
         self.assertEqual((entry["action"], entry["number"], entry["source"]),
                          ("close", 5, "station done close"))
 
+    def test_the_station_live_proof_close_records_and_sends_nothing(self):
+        # loom#1608: a shipped ticket whose live proof is met is verified and
+        # closed by the station; in shadow the close is recorded before the
+        # tick, the proof comment and the verified label.
+        case = tslp.StationLiveProofTest("test_a_log_needle_closes_with_the_lines_quoted_once_its_window_has_passed")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.ship(tslp.LOG_BODY, hours_ago=30)
+        before = dict(case.fake.issues[1])
+        case.close_pass(tslp.FakeLog(["%s worker: daily status ready" % tslp.stamp(case.now - 3600)]))
+        self.assertEqual(case.fake.issues[1]["state"], "open")
+        self.assertEqual(case.fake.issues[1]["body"], before["body"])
+        self.assertNotIn("loom:verified", case.fake.names(1))
+        self.assertEqual(case.fake.comments[1], [])
+        self.assertEqual([m for m, _ in case.fake.calls if m != "GET"], [])
+        [entry] = self.entries()
+        self.assertEqual((entry["action"], entry["number"], entry["source"]),
+                         ("close", 1, "station live proof"))
+
 
 class LedgerTest(ShadowCase):
     def test_the_same_action_is_written_once_and_a_new_head_again(self):
@@ -505,7 +534,7 @@ class HoldFailsSafeTest(ShadowCase):
 
     def test_a_close_that_may_go_still_holds_a_new_merge_label_in_the_same_request(self):
         items = {"/repos/%s/issues/43" % REPO: issue(43, pr=True),
-                 "/repos/%s/issues/44" % REPO: issue(44, ("loom:invariant",))}
+                 "/repos/%s/issues/44" % REPO: issue(44, ("loom:factory",))}
         for number, label in ((43, "ready-to-land"), (44, "loom:shipped")):
             with self.subTest(number=number):
                 fake = Recorder(items)
@@ -672,8 +701,9 @@ class GhGuardTest(ShadowCase):
 
     def test_each_held_command_is_refused_and_recorded(self):
         # Narrowed to one repo: a command whose repo gh fills in itself
-        # ({owner}/{repo}) is still held.
-        with mock.patch.dict(os.environ, {"LOOM_SHADOW_REPOS": REPO}):
+        # ({owner}/{repo}) is still held. An issue it cannot read is held.
+        with mock.patch.dict(os.environ, {"LOOM_SHADOW_REPOS": REPO}), \
+                mock.patch.object(shadow, "_gh_item", return_value=None):
             for argv in self.HELD:
                 with self.subTest(argv=argv), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
                     self.assertEqual(shadow.main(["gh-guard", os.getcwd()] + argv), 1)
@@ -686,13 +716,92 @@ class GhGuardTest(ShadowCase):
         self.assertEqual({e["action"] for e in self.entries()},
                          {shadow.MERGE, shadow.CLOSE, shadow.APPROVE, shadow.LABEL})
 
+    def test_an_issue_close_reads_the_issue_and_lets_a_factory_incident_go(self):
+        # run_lane.sh closes the factory incidents it filed through this
+        # guard (--lane): holding one would hold every ticket behind it.
+        def answer(labels):
+            done = mock.Mock(returncode=0, stdout=json.dumps(issue(5, labels)))
+            return mock.patch.object(shadow.subprocess, "run", return_value=done)
+        close = ["issue", "close", "--repo", REPO, "5"]
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with answer(("loom:factory",)) as run:
+                self.assertEqual(shadow.main(["gh-guard", "--lane", os.getcwd()] + close), 0)
+            self.assertEqual(run.call_args[0][0], ["gh", "api", "repos/%s/issues/5" % REPO])
+            for labels in (("loom:triage", "loom:invariant"), ("loom:factory", "loom:ticket")):
+                with self.subTest(labels=labels), answer(labels):
+                    self.assertEqual(shadow.main(["gh-guard", "--lane", os.getcwd()] + close), 1)
+            failed = mock.Mock(returncode=1, stdout="")
+            with mock.patch.object(shadow.subprocess, "run", return_value=failed):
+                self.assertEqual(shadow.main(["gh-guard", "--lane", os.getcwd()] + close), 1)
+            with answer(("loom:triage", "loom:invariant")):
+                self.assertEqual(shadow.main(["gh-guard", os.getcwd(), "issue", "reopen", "5",
+                                              "-R", REPO]), 1)
+        self.assertEqual({(e["action"], e["source"]) for e in self.entries()},
+                         {(shadow.CLOSE, "run_lane.sh gh"), (shadow.REOPEN, "brain rung gh")})
+
+    def test_the_brain_rungs_issue_close_is_held_unread_even_for_an_incident(self):
+        # The rung's model picks its own arguments: only run_lane.sh's own
+        # closes (--lane) read the issue and may let one go.
+        done = mock.Mock(returncode=0, stdout=json.dumps(issue(5, ("loom:factory",))))
+        with mock.patch.object(shadow.subprocess, "run", return_value=done) as run, \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            for argv in (["issue", "close", "5", "-R", REPO], ["issue", "reopen", "5", "-R", REPO],
+                         ["api", "-X", "PATCH", "repos/%s/issues/5" % REPO, "-f", "state=closed"]):
+                with self.subTest(argv=argv):
+                    self.assertEqual(shadow.main(["gh-guard", os.getcwd()] + argv), 1)
+        run.assert_not_called()
+
+    def test_a_lane_close_that_names_its_issue_ambiguously_is_held_unread(self):
+        # A value, a second number or a second URL must not let the read of
+        # one issue close another (security review of loom#1551).
+        other = "https://github.com/example-owner/other/issues/5"
+        mine = "https://github.com/%s/issues/5" % REPO
+        shapes = [
+            ["5", "1542", "-R", REPO],            # two numbers
+            [mine, "1542"],                       # a URL and a number
+            [mine, mine],                         # two URLs
+            [other, "-R", REPO],                  # a URL repo that is not -R
+            ["5"],                                # no repo
+            ["5", "-R", REPO, "--unknown", "x"],  # a flag gh may read a value for
+            ["5", "-R"],                          # a flag with no value
+            ["https://github.com/%s/pull/5" % REPO, "-R", REPO],
+        ]
+        done = mock.Mock(returncode=0, stdout=json.dumps(issue(5, ("loom:factory",))))
+        with mock.patch.object(shadow.subprocess, "run", return_value=done) as run, \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            for rest in shapes:
+                with self.subTest(argv=rest):
+                    self.assertEqual(shadow.main(["gh-guard", "--lane", os.getcwd(), "issue",
+                                                  "close"] + rest), 1)
+            run.assert_not_called()
+            # The shapes gh reads as one issue are read and let go.
+            for rest in (["5", "-R", REPO, "-c", "Cleared: see 1542"], ["--repo=%s" % REPO, "5"],
+                         [mine, "--comment", "1542"], ["-R%s" % REPO, "-r", "completed", "5"],
+                         ["-R", REPO, "--", "5"]):
+                with self.subTest(argv=rest):
+                    self.assertEqual(shadow.main(["gh-guard", "--lane", os.getcwd(), "issue",
+                                                  "close"] + rest), 0)
+        self.assertTrue(all(c.args[0] == ["gh", "api", "repos/%s/issues/5" % REPO]
+                            for c in run.call_args_list))
+        # A comment's value is never the selector: the issue read is the one
+        # gh closes.
+        for rest, number in ((["5", "-R", REPO, "-c", "1542"], 5),
+                             (["-c", "5", "-R", REPO, "1542"], 1542)):
+            with self.subTest(argv=rest), mock.patch.object(
+                    shadow.subprocess, "run", return_value=done) as run, \
+                    mock.patch("sys.stderr", new_callable=io.StringIO):
+                shadow.main(["gh-guard", "--lane", os.getcwd(), "issue", "close"] + rest)
+                self.assertEqual(run.call_args.args[0],
+                                 ["gh", "api", "repos/%s/issues/%d" % (REPO, number)])
+
     def test_a_body_file_is_read_from_the_callers_folder(self):
         with tempfile.TemporaryDirectory() as here:
             with open(os.path.join(here, "close.json"), "w") as fh:
                 json.dump({"state": "closed"}, fh)
             with open(os.path.join(here, "comment.json"), "w") as fh:
                 json.dump({"body": "hello"}, fh)
-            with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with mock.patch("sys.stderr", new_callable=io.StringIO), \
+                    mock.patch.object(shadow, "_gh_item", return_value=issue(5, ("loom:ticket",))):
                 self.assertEqual(shadow.main(["gh-guard", here, "api", "-X", "PATCH",
                                               "repos/%s/issues/5" % REPO, "--input", "close.json"]), 1)
                 self.assertEqual(shadow.main(["gh-guard", here, "api", "-X", "POST",
@@ -710,6 +819,72 @@ class GhGuardTest(ShadowCase):
         self.assertEqual(self.entries(), [])
 
 
+class InvariantsCloseTest(ShadowCase):
+    """loom#1551: the invariants step closed two cleared breach issues for
+    real at 00:42Z on the first shadow night ("closed cleared"). Run on the
+    real GitHub client with only its HTTP layer replaced, the step's clear
+    path records the close and sends no close and no note."""
+
+    NOW = 1_800_000_000.0
+    NUMBER = 77
+
+    def wire(self, state="open"):
+        breach = {"number": self.NUMBER, "state": state, "title": "Lane pull request #5 open",
+                  "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW - 86400)),
+                  "closed_at": None if state == "open" else time.strftime(
+                      "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW - 3600)),
+                  "body": invariants.MARKER % "lane-pr-stalled/ad09a1c365b8" + "\nA breach.",
+                  "labels": [{"name": "loom:triage"}, {"name": "loom:invariant"}]}
+        sent = []
+
+        def transport(method, url, headers, body):
+            path = url.split("api.github.com", 1)[-1]
+            bare = path.split("?", 1)[0]
+            if method != "GET":
+                sent.append((method, bare, json.loads(body) if body else None))
+                return 200, {}, b"{}"
+            if bare == "/repos/%s/issues" % REPO:
+                return 200, {}, json.dumps([breach]).encode()
+            if bare == "/repos/%s/issues/%d" % (REPO, self.NUMBER):
+                return 200, {}, json.dumps(breach).encode()
+            if bare == "/repos/%s/issues/%d/comments" % (REPO, self.NUMBER):
+                return 200, {}, b"[]"
+            return 404, {}, b"{}"
+        return transport, sent
+
+    def run_filer(self, transport, breaches=()):
+        said = []
+        with mock.patch("bus.github.urllib_transport", transport):
+            gh = GitHub("t")
+            invariants.Filer(gh, REPO, 30, {}, self.NOW, said.append).run(list(breaches))
+        return said
+
+    def test_the_cleared_close_is_recorded_and_no_close_is_sent(self):
+        transport, sent = self.wire()
+        said = self.run_filer(transport)
+        closes = [r for r in sent if isinstance(r[2], dict) and r[2].get("state") == "closed"]
+        self.assertEqual(closes, [], "shadow mode sent a close: %s" % closes)
+        self.assertEqual(sent, [], "a held close posts no note either")
+        [entry] = self.entries()
+        self.assertEqual((entry["action"], entry["number"], entry["source"]),
+                         (shadow.CLOSE, self.NUMBER, "station invariants"))
+        self.assertTrue(any("would close" in line for line in said), said)
+        self.assertFalse(any("closed cleared" in line for line in said), said)
+        # The next pass tries again and adds nothing to the ledger or the log.
+        said = self.run_filer(transport)
+        self.assertEqual((sent, len(self.entries())), ([], 1))
+        self.assertFalse(any("would close" in line for line in said), said)
+
+    def test_with_shadow_off_the_cleared_issue_closes(self):
+        transport, sent = self.wire()
+        with mock.patch.dict(os.environ, {"LOOM_SHADOW": "0"}):
+            said = self.run_filer(transport)
+        self.assertIn(("PATCH", "/repos/%s/issues/%d" % (REPO, self.NUMBER),
+                       {"state": "closed", "state_reason": "not_planned"}), sent)
+        self.assertTrue(any("closed cleared" in line for line in said), said)
+        self.assertEqual(self.entries(), [])
+
+
 class EveryPathTest(unittest.TestCase):
     """By symbol, across the whole tree: every merge, close or branch delete
     is a GitHub.rest call (held at the choke point) or a listed exception."""
@@ -721,9 +896,41 @@ class EveryPathTest(unittest.TestCase):
     # A gh CLI call from Python: its first two words.
     GH_ARGV = re.compile(r"\[\s*[\"']gh[\"']\s*,\s*[\"'](\w+)[\"']\s*,\s*[\"'](\w+)[\"']")
     # The one write outside Python: run_lane.sh closes the factory incident
-    # issues it filed itself (loom:factory, a signal issue) once the check
-    # passes again; holding it would hold every ticket the incident blocks.
+    # issues it filed itself once the check passes again. It asks the gh
+    # guard first (test_every_shell_close_asks_the_gh_guard_first), which
+    # lets a factory incident go: holding it would hold every ticket behind it.
     SHELL_ALLOWED = {("lanes/run_lane.sh", "gh issue close --repo \"$FACTORY_REPO\"")}
+    # An issue close or reopen, as Python writes it or as gh does.
+    CLOSE_SHAPE = re.compile(r"""[\"']state[\"']\s*:\s*[\"'](closed|open)[\"']|"""
+                             r"\b(closeIssue|reopenIssue)\b")
+    SHELL_CLOSE = re.compile(r"\bgh\s+issue\s+(close|reopen)\b|"
+                             r"\bgh\s+api\b.*\bstate=(closed|open)\b")
+    # Every Python function that closes or reopens an issue (loom#1551): each
+    # sends it with GitHub.rest, where _hold_in_shadow holds it, and the ones
+    # that post a note first ask the guard before the note, so a held close
+    # never says it closed. The value is what it asks ("" when the request
+    # is sent before any note, so the choke point alone holds it).
+    CLOSE_SITES = {
+        ("bus/brain.py", "close_epic"): "shadow.active(",
+        ("bus/brain.py", "close"): "shadow.active(",
+        ("bus/brain.py", "settle_source"): "shadow.active(",
+        ("bus/brain.py", "reopen_source"): "",
+        ("bus/brain.py", "audit_proof"): "",
+        ("bus/factory.py", "_default_close"): "",   # a pull request: let through
+        ("bus/factory.py", "_close_unmerged_follow_ups"): "",
+        ("bus/factory.py", "_split_pr"): "",
+        ("bus/health.py", "_close_settled"): "shadow.active(",
+        ("bus/invariants.py", "_reopen"): "self._held(",
+        ("bus/invariants.py", "_fold"): "self._held(",
+        ("bus/invariants.py", "_close_quiet"): "self._held(",
+        ("bus/station.py", "_close_done_ticket"): "shadow.active(",
+        ("bus/station.py", "_settle_claimed"): "shadow.active(",
+        ("bus/watch.py", "_close_quiet"): "shadow.guard(",
+    }
+    # A state of "closed" or "open" that is no write: the guard's own tables
+    # and a dashboard row.
+    NOT_WRITES = {("bus/shadow.py", "<module>"), ("dashboard/free_view.py", "_ticket_shape")}
+    GUARDS = ("_held", "guard")
 
     def files(self):
         for top in ("bus", "dispatch", "lanes", "dashboard"):
@@ -745,6 +952,68 @@ class EveryPathTest(unittest.TestCase):
                 if not any(rel == f and s in code for f, s in self.SHELL_ALLOWED):
                     found.append("%s: %s" % (rel, code.strip()))
         self.assertEqual(found, [])
+
+    @staticmethod
+    def _call_name(node):
+        func = node.func
+        return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+
+    def close_sites(self):
+        """(file, function) -> the first line of each issue close or reopen
+        found by grep, with the function's source; guard calls left out."""
+        found = {}
+        for path in self.files():
+            if path.suffix != ".py":
+                continue
+            text = path.read_text(encoding="utf-8")
+            lines = text.splitlines()
+            hits = [i + 1 for i, line in enumerate(lines)
+                    if self.CLOSE_SHAPE.search(line.split("#", 1)[0])]
+            if not hits:
+                continue
+            tree = ast.parse(text)
+            defs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+            for line in hits:
+                around = [c for c in calls if c.lineno <= line <= c.end_lineno]
+                inner = min(around, key=lambda c: c.end_lineno - c.lineno) if around else None
+                if inner is not None and self._call_name(inner) in self.GUARDS:
+                    continue
+                owner = [d for d in defs if d.lineno <= line <= d.end_lineno]
+                fn = min(owner, key=lambda d: d.end_lineno - d.lineno) if owner else None
+                key = (str(path.relative_to(ROOT)), fn.name if fn else "<module>")
+                if key not in found:
+                    src = "\n".join(lines[fn.lineno - 1:line]) if fn else ""
+                    found[key] = (line, src, inner is not None and self._call_name(inner) == "rest")
+        return found
+
+    def test_every_issue_close_and_reopen_goes_through_the_shadow_guard(self):
+        found = self.close_sites()
+        self.assertEqual(sorted(set(found) - self.NOT_WRITES), sorted(self.CLOSE_SITES),
+                         "a new issue close or reopen: route it through the shadow guard, "
+                         "then list it in CLOSE_SITES")
+        for key, asks in sorted(self.CLOSE_SITES.items()):
+            line, before, _ = found[key]
+            with self.subTest(site=key, line=line):
+                if asks:
+                    self.assertIn(asks, before, "%s:%d closes before it asks the guard" % (key[0], line))
+        # The choke point every one of them sends through.
+        rest = (ROOT / "bus" / "github.py").read_text(encoding="utf-8")
+        self.assertRegex(rest, r"def _rest\(self[^)]*\)[^:]*:\n(?:.*\n){0,4}\s+self\._hold_in_shadow\(")
+
+    def test_every_shell_close_asks_the_gh_guard_first(self):
+        unguarded = []
+        for path in self.files():
+            if path.suffix != ".sh":
+                continue
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            for i, line in enumerate(lines):
+                code = line.split("#", 1)[0]
+                if not self.SHELL_CLOSE.search(code):
+                    continue
+                if not any("bus.shadow gh-guard" in prior for prior in lines[max(0, i - 4):i]):
+                    unguarded.append("%s:%d: %s" % (path.relative_to(ROOT), i + 1, code.strip()))
+        self.assertEqual(unguarded, [])
 
     def test_python_reaches_github_only_through_bus_github(self):
         senders = []
