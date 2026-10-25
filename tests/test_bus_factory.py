@@ -1517,6 +1517,34 @@ class ReviewBotThreads(Base):
         self.assertEqual(self.merged, [(50, (REPO, 5))])
         self.assertEqual((self.fixed, factory.rung_of(self.gh.comments[5])), ([], 0))
 
+    def test_a_thread_whose_bot_root_comment_starts_with_fixed_in_and_has_no_later_comment_is_resolved(self):
+        self.gh.ticket(5, "pr", lane="codex")
+        self.gh.comments[5].append({"body": FIX_ASKED.replace("### Check: lint\n\n    E1\n\n", ""),
+                                    "user": ME})
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((BOT, "Fixed in abc1234: the flagged code changed and this review clears it."))
+        self.go()
+        self.assertIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertEqual((self.fixed, factory.rung_of(self.gh.comments[5])), ([], 0))
+
+    def test_an_edited_bot_root_comment_with_a_later_person_comment_stays_open(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((BOT, "Fixed in abc1234: finding"), (ME, "this still breaks when x is empty"))
+        self.go()
+        self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [])
+
+    def test_an_edited_bot_root_comment_with_a_later_lane_comment_stays_open(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((BOT, "Fixed in abc1234: finding"),
+                    (ME, "Lane codex %s already guarded" % factory.ANSWER_REPLY))
+        self.go()
+        self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [])
+
     def test_a_person_with_the_bot_login_does_not_resolve_a_thread(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, resolved=False)

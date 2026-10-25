@@ -69,8 +69,9 @@ Neither needs a model:
   the body reruns the scan. Once per head commit, with a comment on the
   ticket saying which lines changed.
 - The review bot replies "Fixed in <sha>" on a thread whose flagged code
-  changed, but GitHub does not let its app resolve threads, so the thread
-  stays open. Such a thread, with nobody writing after the bot's reply, is
+  changed (or edits its root comment to start with "Fixed in <sha>" when it
+  collapses it), but GitHub does not let its app resolve threads, so the
+  thread stays open. Such a thread, with nobody writing after the bot, is
   resolved here before the pull request is judged; otherwise it would count
   as a finding that survived the round (77 of 218 open threads on
   2026-10-13 were the bot's own "Fixed in" threads).
@@ -628,12 +629,21 @@ def _end(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
 
 def bot_marked_fixed(thread: Dict[str, Any], bot: str) -> bool:
     """An open thread the review bot opened whose newest comment is its own
-    "Fixed in" reply. A thread a person opened, or any reply after the
-    bot's, stays open for a person or the brain."""
-    last = _end(thread, "comments", -1)
-    return (not thread.get("isResolved") and brain.by_bot(_end(thread, "root", 0), bot)
-            and brain.by_bot(last, bot)
-            and str(last.get("body") or "").startswith(BOT_FIXED_PREFIX))
+    "Fixed in" reply, or whose root comment starts with "Fixed in <sha>"
+    when no one wrote after it. A thread a person opened, or any reply
+    after the bot's, stays open for a person or the brain."""
+    if thread.get("isResolved"):
+        return False
+    comments = (thread.get("comments") or {}).get("nodes") or []
+    root = _end(thread, "root", 0)
+    if not root and comments:
+        root = comments[0] or {}
+    if not brain.by_bot(root, bot):
+        return False
+    if len(comments) <= 1:
+        return str(root.get("body") or "").startswith(BOT_FIXED_PREFIX)
+    last = comments[-1] or {}
+    return brain.by_bot(last, bot) and str(last.get("body") or "").startswith(BOT_FIXED_PREFIX)
 
 
 def bot_fixed(threads: Sequence[Dict[str, Any]], bot: str) -> List[str]:
