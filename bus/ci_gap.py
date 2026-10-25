@@ -209,7 +209,8 @@ def find_job(jobs: Sequence[Job], run_name: str) -> Optional[Job]:
 
 def failing_steps(job: Job, api_steps: Sequence[Any]) -> List[Step]:
     """The job's run steps the Actions job API reports as failed; every run
-    step when none can be told apart. An unnamed run step is reported as
+    step when a step failed but none can be matched, and none when the API
+    reports no failed step. An unnamed run step is reported as
     "Run <first line of its command>"."""
     failed = [str(s.get("name") or "") for s in api_steps
               if isinstance(s, dict) and s.get("conclusion") == "failure"]
@@ -220,7 +221,10 @@ def failing_steps(job: Job, api_steps: Sequence[Any]) -> List[Step]:
             if (step.name and name == step.name) or (
                     not step.name and name.startswith("Run ") and first.startswith(name[4:].strip())):
                 found.append(step)
-    return found or list(job.steps)
+    # A failed step this reader cannot match (a renamed or composite step)
+    # still names the job's commands; a job with no failed step at all (it
+    # was cancelled or timed out) names none, so nothing it runs is a gap.
+    return found or (list(job.steps) if failed else [])
 
 
 # ---- coverage -------------------------------------------------------------

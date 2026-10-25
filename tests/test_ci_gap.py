@@ -61,8 +61,13 @@ class WorkflowReaderTest(unittest.TestCase):
         self.assertEqual([s.name for s in steps], ["Unit"])
         lint = ci_gap.failing_steps(jobs[1], [{"name": "Run ruff check .", "conclusion": "failure"}])
         self.assertEqual([s.command for s in lint], ["ruff check ."])
-        # Nothing to tell apart: every run step of the job.
-        self.assertEqual(len(ci_gap.failing_steps(jobs[0], [])), 2)
+        # A failed step it cannot match: every run step of the job.
+        self.assertEqual(len(ci_gap.failing_steps(
+            jobs[0], [{"name": "Composite", "conclusion": "failure"}])), 2)
+        # No failed step (a cancelled or timed-out job): no command is a gap.
+        self.assertEqual(ci_gap.failing_steps(jobs[0], []), [])
+        self.assertEqual(ci_gap.failing_steps(
+            jobs[0], [{"name": "Unit", "conclusion": "success"}]), [])
 
 
 class CoverageTest(unittest.TestCase):
