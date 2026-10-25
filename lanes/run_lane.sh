@@ -1210,10 +1210,25 @@ limit_until() {
 # Hold every slot in this slot's group until the provider's reset, and
 # hand on every brief still in the inbox this pass.
 hold_provider_limit() {
-  local until slot source checked tmp
+  local until slot source checked tmp limit_name
   until="$(limit_until)" || return 0
   LIMITED=1
   source="$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
+  limit_name="$(sed -nE 's/.*"limit_name": *"([^"]*)".*/\1/p' "$source" 2>/dev/null | head -1)"
+  if [ "${LANE:-}" = opencode-go ] && [ "$limit_name" = "5-hour" ]; then
+    record_model_limit "$MODEL" "$until" "$LIMIT_WHY"
+    PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.catalogue record-limit "$MODEL" "$limit_name" "$until" 2>/dev/null || true
+    if [ -n "$CONFIGURED_MODELS" ]; then
+      local candidate avail=""
+      for candidate in $CONFIGURED_MODELS; do
+        if ! model_limit_until "$candidate" >/dev/null; then avail="$candidate"; break; fi
+      done
+      if [ -n "$avail" ]; then
+        heartbeat true "model $avail available; limited: $(ladder_reason "$CONFIGURED_MODELS")"
+        return 0
+      fi
+    fi
+  fi
   checked="$(date +%s)"
   for slot in $(limit_group); do
     if [ "$slot" != "$SLOT" ]; then
@@ -2695,7 +2710,7 @@ OPENCODE_GO_ALLOWED=""
 if [ "$LANE" = opencode-go ]; then
   OPENCODE_GO_ALLOWED=" $(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.tickets opencode-go-models 2>/dev/null | tr '\n' ' ')"
   for candidate in $(lane_setting MODEL) $(lane_setting MODELS); do
-    if [[ "$OPENCODE_GO_ALLOWED" != *" $candidate "* ]]; then
+    if ! free_model "$candidate" && [[ "$OPENCODE_GO_ALLOWED" != *" $candidate "* ]]; then
       echo "[$(date -u +%FT%TZ)] REFUSED: lane $SLOT model $candidate is not on the OpenCode Go allow-list (bus/tickets.py OPENCODE_GO_MODELS):${OPENCODE_GO_ALLOWED:- unreadable}" >&2
       heartbeat false "model $candidate is not on the OpenCode Go allow-list (bus/tickets.py OPENCODE_GO_MODELS); set $(setting_var "$SLOT" MODEL) to one of:${OPENCODE_GO_ALLOWED:- (list unreadable)}"
       exit 0
@@ -2844,6 +2859,10 @@ for BRIEF in "$INBOX"/*.md; do
   if [ -z "$MODEL" ]; then
     MODEL="$(lane_setting MODEL)"
     [ -n "$MODEL" ] || { [ "$LANE" = copilot ] && MODEL="copilot-free"; }
+    if [ "$LANE" = opencode-go ] && [ -z "$CONFIGURED_MODELS" ]; then
+      DIFFICULTY="$(field Difficulty "$BRIEF" || echo "medium")"
+      CONFIGURED_MODELS="$(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.catalogue models-for-tier "$DIFFICULTY" 2>/dev/null)"
+    fi
     if [ -n "$CONFIGURED_MODELS" ]; then
       MODEL=""
       for candidate in $CONFIGURED_MODELS; do
@@ -2879,7 +2898,7 @@ for BRIEF in "$INBOX"/*.md; do
     opencode-go:opencode-go/*)
       # A pin off the allow-list runs the lane's own model, which the start
       # check above passed.
-      if [[ "$OPENCODE_GO_ALLOWED" != *" $MODEL "* ]]; then
+      if ! free_model "$MODEL" && [[ "$OPENCODE_GO_ALLOWED" != *" $MODEL "* ]]; then
         echo "[$(date -u +%FT%TZ)] $TICKET REFUSED the brief's Model: $MODEL: not on the OpenCode Go allow-list; lane $SLOT runs $(lane_setting MODEL)" | tee -a "$LOG" >&2
         MODEL="$(lane_setting MODEL)" PINNED_MODEL=""
         [[ "$OPENCODE_GO_ALLOWED" == *" $MODEL "* ]] ||
@@ -3000,6 +3019,7 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
   fi
   resume_earlier_attempt
+  [ "$LANE" = opencode-go ] && PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.catalogue record-call "$MODEL" 2>/dev/null || true
   LOG_START="$(wc -c < "$LOG" | tr -d ' ')"
 
   # The agent runs as a background job of a job-control subshell, which puts
@@ -3078,6 +3098,7 @@ for BRIEF in "$INBOX"/*.md; do
       heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     elif [ -n "$CONFIGURED_MODELS" ]; then
       record_model_limit "$MODEL" "$RETRY_AT" "$LIMIT_REASON"
+      [ "$LANE" = opencode-go ] && PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.catalogue record-limit "$MODEL" "5-hour" "$RETRY_AT" 2>/dev/null || true
       WHY="$(ladder_reason "$CONFIGURED_MODELS")"
       MAX_UNTIL="$(awk 'BEGIN{m=0} {if ($2>m)m=$2} END{print m}' "$MODEL_LIMIT_FILE")"
       AVAILABLE_MODEL=""

@@ -3875,6 +3875,28 @@ fi
         for slot, beat in beats.items():
             self.assertEqual(beat["retry_at"], until, slot)
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_go_5_hour_limit_selects_alternative_model_on_next_run(self):
+        # When a model reaches its 5-hour limit, the lane automatically selects
+        # an alternative model with available allowance.
+        limit_answer = (429, '{"type": "GoUsageLimitError", "limitName": "5-hour"}')
+        ok_answer = (200, '{"id": "chat-ok", "choices": [{"message": {"role": "assistant", "content": "pong"}}]}')
+        requests, env = self.provider(limit_answer, ok_answer, retry_after=1800)
+        env["LOOM_OPENCODE_GO_MODELS"] = "opencode-go/mimo-v2.6-flash opencode-go/deepseek-v4.1-flash"
+        inbox, result = self.api_lane("opencode-go", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        beat = self.beat("opencode-go")
+        self.assertTrue(beat["available"])
+        self.assertIn("opencode-go/deepseek-v4.1-flash available", beat["reason"])
+
+        (inbox / "T043-next.md").write_text(BRIEF.replace("T042", "T043").replace("Lane: codex", "Lane: opencode-go"))
+        result2 = self.run_lane("opencode-go", **env)
+        self.assertEqual(result2.returncode, 0, result2.stderr)
+
+        self.assertGreaterEqual(len(requests), 2)
+        self.assertEqual(requests[1]["body"]["model"], "deepseek-v4.1-flash")
+
     def test_a_model_with_a_quote_never_reaches_the_probe_body(self):
         # The probe checks the model itself, not only through the brief loop's allowlist.
         sent = Path(self._tmp.name) / "probe-sent"
@@ -4136,6 +4158,54 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
             self.assertIn("weekly", beat["reason"])
             self.assertTrue(before + 7 * 86400 <= beat["retry_at"] <= now + 7 * 86400, slot)
             self.assertGreater(beat["retry_at"], before + 43200, slot)
+
+    def test_a_5_hour_limit_with_alternative_model_leaves_lane_available(self):
+        # A 5-hour limit on one model leaves the lane available when an alternative
+        # model in CONFIGURED_MODELS has allowance.
+        reset = int(time.time()) + 18000
+        self.write_provider_limit("opencode-go-2", limit_name="5-hour", retry_after=str(reset))
+        script = self.source_functions("hold_provider_limit", "limit_until", "key_group",
+                                       "limit_group", "slot_model", "free_model", "setting_var",
+                                       "lane_var", "write_beat", "utc", "record_model_limit",
+                                       "model_limit_until", "ladder_reason", "heartbeat") + (
+            'SLOT=opencode-go-2 LANE=opencode-go MODEL=opencode-go/mimo-v2.6-flash\n'
+            'MODEL_LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.models"\n'
+            'CONFIGURED_MODELS="opencode-go/mimo-v2.6-flash opencode-go/deepseek-v4.1-flash"\n'
+            'LIMIT_WHY="the provider 5-hour limit (429 GoUsageLimitError)"\n'
+            'hold_provider_limit\n')
+        env = {**self.lane_env(), "LOOM_HOME": str(self.loom), "SLOT": "opencode-go-2",
+               "LANE": "opencode-go"}
+        result = subprocess.run(["bash", "-c", script, "bash"], env=env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat("opencode-go-2")
+        self.assertTrue(beat["available"])
+        self.assertIn("opencode-go/deepseek-v4.1-flash available", beat["reason"])
+
+    def test_a_5_hour_limit_when_all_models_limited_holds_lane(self):
+        # A 5-hour limit when all models are limited holds the lane.
+        reset = int(time.time()) + 18000
+        self.write_provider_limit("opencode-go-2", limit_name="5-hour", retry_after=str(reset))
+        (self.loom / "state" / "usage").mkdir(parents=True, exist_ok=True)
+        (self.loom / "state" / "usage" / "opencode-go-2.models").write_text(
+            "opencode-go/deepseek-v4.1-flash %d limited\n" % reset)
+        script = self.source_functions("hold_provider_limit", "limit_until", "key_group",
+                                       "limit_group", "slot_model", "free_model", "setting_var",
+                                       "lane_var", "write_beat", "utc", "record_model_limit",
+                                       "model_limit_until", "ladder_reason", "heartbeat") + (
+            'SLOT=opencode-go-2 LANE=opencode-go MODEL=opencode-go/mimo-v2.6-flash\n'
+            'MODEL_LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.models"\n'
+            'CONFIGURED_MODELS="opencode-go/mimo-v2.6-flash opencode-go/deepseek-v4.1-flash"\n'
+            'LIMIT_WHY="the provider 5-hour limit (429 GoUsageLimitError)"\n'
+            'hold_provider_limit\n')
+        env = {**self.lane_env(), "LOOM_HOME": str(self.loom), "SLOT": "opencode-go-2",
+               "LANE": "opencode-go"}
+        result = subprocess.run(["bash", "-c", script, "bash"], env=env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat("opencode-go-2")
+        self.assertFalse(beat["available"])
+        self.assertIn("unavailable until", beat["reason"])
 
     # A sandbox that runs what it is given: the seatbelt itself is another
     # lane's subject (tests above), and this run is about the class an expired

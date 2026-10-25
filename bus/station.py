@@ -394,9 +394,9 @@ LANE_MODELS = {
     "claude": CLAUDE_MODELS,
     "anthropic": ["claude*"],
     "openrouter": ["openrouter/*:free"],
-    # Only the allow-listed models (tickets.OPENCODE_GO_MODELS), so a pin to
-    # a low-allowance Go model is never routed to an opencode-go lane.
-    "opencode-go": list(tickets.OPENCODE_GO_MODELS),
+    # Only the allow-listed models (tickets.OPENCODE_GO_MODELS) and free models,
+    # so a pin to a low-allowance Go model is never routed to an opencode-go lane.
+    "opencode-go": list(tickets.OPENCODE_GO_MODELS) + ["opencode-go/*-free"],
     "zen": ["opencode/*-free"],
     "zai": ["zai/glm-4.7-flash", "zai/glm-4.5-flash"],
     "workersai": ["cloudflare-workers-ai/@cf/*"],
@@ -10677,6 +10677,25 @@ class Station:
             self.upload_usage_limits(records)
         except OSError as err:
             _say("could not write usage limits: %s" % err)
+        try:
+            self._refresh_model_catalogue()
+        except Exception as err:
+            _say("model catalogue refresh failed: %s" % err)
+
+    def _refresh_model_catalogue(self) -> None:
+        from . import catalogue
+        cat_file = catalogue.catalogue_file(self.s.home)
+        now = self.now
+        try:
+            mtime = cat_file.stat().st_mtime
+            if now - mtime < catalogue.DISCOVERY_INTERVAL:
+                return
+        except OSError:
+            pass
+        url = os.environ.get("LOOM_OPENCODE_GO_MODELS_URL", catalogue.OPENCODE_GO_MODELS_URL)
+        discovered = catalogue.discover_models(url=url)
+        if discovered:
+            catalogue.save_catalogue(discovered, cat_file)
 
     def upload_usage_limits(self, records: List[Dict[str, Any]]) -> None:
         """Send the current limits snapshot using the transcript upload token."""

@@ -59,7 +59,9 @@ def allowed_model(model: str) -> str:
     for prefix, stand_in in FORBIDDEN_MODELS:
         if model.startswith(prefix):
             return stand_in
-    if model.startswith("opencode-go/") and model not in OPENCODE_GO_MODELS:
+    if model.startswith("opencode-go/"):
+        if model in OPENCODE_GO_MODELS or model.endswith("-free"):
+            return model
         return OPENCODE_GO_STAND_IN
     return model
 
@@ -1077,6 +1079,9 @@ def after_holds(repo: str, headers: Dict[str, str],
 if __name__ == "__main__":
     import sys
     if sys.argv[1:] == ["opencode-go-models"]:
-        print("\n".join(OPENCODE_GO_MODELS))
+        from . import catalogue
+        models = set(OPENCODE_GO_MODELS)
+        models.update(m.id for m in catalogue.load_catalogue().values())
+        print("\n".join(sorted(models)))
     else:
         sys.exit("usage: python3 -m bus.tickets opencode-go-models")
