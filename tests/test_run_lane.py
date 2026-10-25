@@ -5128,6 +5128,53 @@ exit %d
         self.assertFalse((self.loom / "run" / "codex-check").exists())
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_codex_agent_runs_uv_offline_from_a_copy_of_the_base_checks_cache(self):
+        # loom#1665: a codex agent has no network, so uv could not fetch the
+        # packages its tests need ("dns error" from the package index) while
+        # the base check, outside the agent's sandbox, had downloaded them.
+        # The base check here leaves a uv cache entry; the agent must get a
+        # writable copy of it, uv's offline settings and that one extra
+        # writable directory, and its writes must not reach the check's cache.
+        # The check fails when it finds the agent's write in its own cache.
+        self.contract_repo(CONTRACT.replace("check: ", (
+            "check: loom-test-python -c 'import os; d = os.path.expanduser(\"~/.cache/uv\"); "
+            "os.makedirs(d, exist_ok=True); p = d + \"/pkg\"; "
+            "assert not os.path.exists(p) or open(p).read() == \"cached\"; "
+            "open(p, \"w\").write(\"cached\")' && ")))
+        self.drop_brief()
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace("cat > /dev/null\n", (
+            "cat > /dev/null\n"
+            'printf "uv-env cache=%s python=%s offline=%s managed=%s pip=%s\\n" '
+            '"${UV_CACHE_DIR:-unset}" "${UV_PYTHON_INSTALL_DIR:-unset}" "${UV_OFFLINE:-unset}" '
+            '"${UV_MANAGED_PYTHON:-unset}" "${PIP_NO_INDEX:-unset}" >> "$FAKE_LOG"\n'
+            'printf "uv-pkg %s\\n" "$(cat "$UV_CACHE_DIR/pkg" 2>&1)" >> "$FAKE_LOG"\n'
+            'echo agent > "$UV_CACHE_DIR/pkg"\n'), 1))
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        check_home = self.loom / "run" / "codex-check"
+        calls = self.calls()
+        agent = [c for c in calls if c.startswith("codex exec")]
+        self.assertEqual(len(agent), 1, calls)
+        self.assertIn("--sandbox workspace-write --add-dir %s/agent-uv --model" % check_home, agent[0])
+        self.assertIn("uv-env cache=%s/agent-uv/cache python=%s/.local/share/uv/python "
+                      "offline=1 managed=1 pip=1" % (check_home, check_home), calls)
+        self.assertIn("uv-pkg cached", calls)
+        # The final check read its own cache, not the agent's copy.
+        self.assertEqual([(r["phase"], r["ok"]) for r in self.records()][-1], ("final", True))
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_codex_agent_without_a_uv_cache_runs_as_before(self):
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agent = [c for c in self.calls() if c.startswith("codex exec")]
+        self.assertEqual(len(agent), 1, self.calls())
+        self.assertIn("--sandbox workspace-write --model", agent[0])
+        self.assertNotIn("--add-dir", agent[0])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_an_edit_inside_a_submodule_is_refused_before_the_check(self):
         # The push carries only the submodule's pinned commit, so a check that
         # passed on the agent's edits inside it passed on code CI never sees:
