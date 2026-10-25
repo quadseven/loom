@@ -2736,8 +2736,13 @@ exec /usr/bin/git "$@"
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             closed = "127.0.0.1:%d" % probe.getsockname()[1]
+        reachable = socket.socket()
+        reachable.bind(("127.0.0.1", 0))
+        reachable.listen(8)
+        self.addCleanup(reachable.close)
         result = self.run_lane("opencode-go", LOOM_SANDBOX="bwrap", LOOM_DROP_TREES="1",
                                LOOM_EGRESS_DENY_PROBES=closed,
+                               LOOM_EGRESS_ALLOW_PROBE="127.0.0.1:%d" % reachable.getsockname()[1],
                                LOOM_SSM_DIR=str(self.home / ".ssm"),
                                LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
                                LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash")

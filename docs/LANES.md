@@ -1527,12 +1527,16 @@ What changes in a pod:
   claude lanes stay on the Mac.
 - Egress, fail closed: bwrap narrows no network, so the pod's network
   policy must (no cloud metadata address, no API server, no cluster-internal
-  ranges; DNS and 443 to the internet only). `LOOM_EGRESS_DENY_PROBES` names,
-  as `host:port`, destinations that policy blocks, and `sandbox_ready` tries
-  each before every pass: an empty list, a malformed entry or a destination
-  that accepts a connection holds the lane unavailable, with the reason in
-  its heartbeat. A policy that the cluster network does not enforce
-  therefore holds the lane too.
+  ranges; DNS and 443 to the internet only). `sandbox_ready` proves it
+  before every pass. `LOOM_EGRESS_DENY_PROBES` names blocked destinations as
+  literal `IPv4:port` (a name is refused: one that does not resolve would
+  fail to connect and pass as blocked); the API server at
+  `KUBERNETES_SERVICE_HOST` is added to them when the pod has it; each must
+  fail to connect. `LOOM_EGRESS_ALLOW_PROBE` (`host:port`, the provider's
+  HTTPS endpoint) must connect, so a pod with no network or no DNS does not
+  pass because everything fails. Anything else holds the lane unavailable,
+  with the reason in its heartbeat, so a policy the cluster network does not
+  enforce holds the lane too.
 - `LOOM_DROP_TREES=1`: each run's tree, the runner's files beside it and the
   scratch homes are removed when the run ends, whatever its outcome
   (`drop_run_scratch`). Logs and the brief stay under `LOOM_HOME`.

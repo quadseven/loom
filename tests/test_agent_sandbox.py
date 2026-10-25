@@ -293,19 +293,13 @@ class BwrapSandboxTest(unittest.TestCase):
                              LOOM_SANDBOX="seatbelt")
         self.assertEqual(seatbelt.stdout, "sandbox-exec|-p|(version 1)|")
 
-    def test_sandbox_ready_says_why_bwrap_cannot_run(self):
-        path = f"{self.bin}:/usr/bin:/bin"
-        ready = 'sandbox_ready && echo ready || echo "$SANDBOX_WHY"'
-        closed = "127.0.0.1:%d" % self.closed_port()
-        self.assertEqual(self.bash(ready, PATH=path, LOOM_EGRESS_DENY_PROBES=closed).stdout.strip(),
-                         "bwrap not available")
-        bwrap = self.bin / "bwrap"
-        bwrap.write_text("#!/bin/sh\nexit 1\n")
-        bwrap.chmod(0o755)
-        self.assertIn("bwrap cannot start a sandbox here",
-                      self.bash(ready, PATH=path, LOOM_EGRESS_DENY_PROBES=closed).stdout)
-        bwrap.write_text("#!/bin/sh\nexit 0\n")
-        self.assertEqual(self.bash(ready, PATH=path, LOOM_EGRESS_DENY_PROBES=closed).stdout.strip(), "ready")
+    def setUpListener(self):
+        """A local port that accepts connections: the positive control."""
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        self.addCleanup(listener.close)
+        return "127.0.0.1:%d" % listener.getsockname()[1]
 
     @staticmethod
     def closed_port():
@@ -313,28 +307,64 @@ class BwrapSandboxTest(unittest.TestCase):
             s.bind(("127.0.0.1", 0))
             return s.getsockname()[1]
 
-    def ready(self, **env):
+    def ready(self, bwrap_exit=0, path=None, **env):
         bwrap = self.bin / "bwrap"
-        bwrap.write_text("#!/bin/sh\nexit 0\n")
+        bwrap.write_text("#!/bin/sh\nexit %d\n" % bwrap_exit)
         bwrap.chmod(0o755)
+        env.setdefault("KUBERNETES_SERVICE_HOST", "")
         return self.bash('sandbox_ready && echo ready || echo "$SANDBOX_WHY"',
-                         PATH=f"{self.bin}:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin", **env).stdout.strip()
+                         PATH=path or f"{self.bin}:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
+                         **env).stdout.strip()
+
+    @unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
+    def test_sandbox_ready_says_why_bwrap_cannot_run(self):
+        good = {"LOOM_EGRESS_DENY_PROBES": "127.0.0.1:%d" % self.closed_port(),
+                "LOOM_EGRESS_ALLOW_PROBE": self.setUpListener()}
+        result = self.bash('sandbox_ready && echo ready || echo "$SANDBOX_WHY"',
+                           PATH=f"{self.bin}:/usr/bin:/bin", **good)
+        self.assertEqual(result.stdout.strip(), "bwrap not available")
+        self.assertIn("bwrap cannot start a sandbox here", self.ready(bwrap_exit=1, **good))
+        self.assertEqual(self.ready(**good), "ready")
 
     def test_bwrap_fails_closed_without_a_declared_egress_policy(self):
-        self.assertIn("bwrap narrows no network", self.ready())
-        self.assertIn("bwrap narrows no network", self.ready(LOOM_EGRESS_DENY_PROBES=""))
-        self.assertIn("is not host:port", self.ready(LOOM_EGRESS_DENY_PROBES="metadata"))
+        self.assertIn("set LOOM_EGRESS_DENY_PROBES", self.ready())
+        self.assertIn("set LOOM_EGRESS_DENY_PROBES", self.ready(LOOM_EGRESS_DENY_PROBES=""))
+        self.assertIn("set LOOM_EGRESS_ALLOW_PROBE", self.ready(LOOM_EGRESS_DENY_PROBES="192.0.2.1:80"))
+
+    def test_a_blocked_probe_must_be_a_literal_address(self):
+        # A name that does not resolve fails to connect too, and would pass
+        # as blocked on a pod with broken DNS.
+        for target in ("metadata.invalid:80", "metadata", "192.0.2.1", "192.0.2.1:http"):
+            with self.subTest(target=target):
+                why = self.ready(LOOM_EGRESS_DENY_PROBES=target, LOOM_EGRESS_ALLOW_PROBE="127.0.0.1:1")
+                self.assertIn("is not IPv4:port", why)
 
     @unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
     def test_bwrap_fails_closed_when_a_blocked_destination_answers(self):
         closed = "127.0.0.1:%d" % self.closed_port()
-        with socket.socket() as service:
-            service.bind(("127.0.0.1", 0))
-            service.listen(1)
-            open_ = "127.0.0.1:%d" % service.getsockname()[1]
-            why = self.ready(LOOM_EGRESS_DENY_PROBES=f"{closed} {open_}")
+        allow = self.setUpListener()
+        open_ = self.setUpListener()
+        why = self.ready(LOOM_EGRESS_DENY_PROBES=f"{closed} {open_}", LOOM_EGRESS_ALLOW_PROBE=allow)
         self.assertEqual(why, f"egress not narrowed: {open_} accepts connections, so no agent runs here")
-        self.assertEqual(self.ready(LOOM_EGRESS_DENY_PROBES=closed), "ready")
+        self.assertEqual(self.ready(LOOM_EGRESS_DENY_PROBES=closed, LOOM_EGRESS_ALLOW_PROBE=allow), "ready")
+
+    @unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
+    def test_the_api_server_the_pod_is_given_is_always_probed(self):
+        closed = "127.0.0.1:%d" % self.closed_port()
+        allow = self.setUpListener()
+        api = self.setUpListener()
+        host, port = api.split(":")
+        why = self.ready(LOOM_EGRESS_DENY_PROBES=closed, LOOM_EGRESS_ALLOW_PROBE=allow,
+                         KUBERNETES_SERVICE_HOST=host, KUBERNETES_SERVICE_PORT=port)
+        self.assertEqual(why, f"egress not narrowed: {api} accepts connections, so no agent runs here")
+
+    @unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
+    def test_a_pod_with_no_network_does_not_pass_because_everything_fails(self):
+        closed = "127.0.0.1:%d" % self.closed_port()
+        why = self.ready(LOOM_EGRESS_DENY_PROBES=closed, LOOM_EGRESS_ALLOW_PROBE=closed)
+        self.assertEqual(why, f"egress unproven: {closed} did not connect, so the blocked probes prove nothing")
+        why = self.ready(LOOM_EGRESS_DENY_PROBES=closed, LOOM_EGRESS_ALLOW_PROBE="name.invalid:443")
+        self.assertIn("egress unproven: name.invalid:443 did not connect", why)
 
 
 class SsmDirTest(unittest.TestCase):

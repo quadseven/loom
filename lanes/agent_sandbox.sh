@@ -40,10 +40,7 @@ sandbox_kind() {
 # namespaces, or with a masked /proc) is found before any run, so the lane
 # says it is unavailable instead of failing every brief.
 # bwrap narrows no network, so it also fails closed unless the pod's own
-# egress is narrowed: LOOM_EGRESS_DENY_PROBES must name, as host:port, the
-# destinations the pod's network policy blocks (the cloud metadata address,
-# the API server, a cluster-internal service), and every one must refuse a
-# connection now. An empty list, or one that connects, holds the lane.
+# egress is narrowed, proved before every pass by egress_denied.
 # shellcheck disable=SC2034 # SANDBOX_WHY is read by the callers
 sandbox_ready() {
   local kind
@@ -59,26 +56,48 @@ sandbox_ready() {
   esac
 }
 
-# Whether every LOOM_EGRESS_DENY_PROBES destination refuses a connection
-# (each tried for at most LOOM_EGRESS_PROBE_SECONDS, default 3). Sets
-# SANDBOX_WHY when one connects, the list is empty, or an entry is not
-# host:port.
+# Whether the pod's egress is narrowed, proved, not assumed. Every
+# must-be-blocked destination must fail to connect: those in
+# LOOM_EGRESS_DENY_PROBES (IPv4:port, literal addresses only, so a name that
+# does not resolve can never pass as blocked), plus the API server at
+# KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT when the pod has them. And
+# the positive control LOOM_EGRESS_ALLOW_PROBE (host:port, the provider's or
+# gateway's HTTPS endpoint) must connect, so a pod with no network or no DNS
+# does not pass because every connection fails. Each try takes at most
+# LOOM_EGRESS_PROBE_SECONDS (default 3). Sets SANDBOX_WHY when it fails.
 # shellcheck disable=SC2034 # SANDBOX_WHY is read by sandbox_ready's callers
 egress_denied() {
-  local target host port wait="${LOOM_EGRESS_PROBE_SECONDS:-3}"
+  local target host port wait="${LOOM_EGRESS_PROBE_SECONDS:-3}" denied allow="${LOOM_EGRESS_ALLOW_PROBE:-}"
+  local ipv4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
   [[ "$wait" =~ ^[1-9][0-9]?$ ]] || wait=3
-  [ -n "${LOOM_EGRESS_DENY_PROBES:-}" ] ||
-    { SANDBOX_WHY="bwrap narrows no network: set LOOM_EGRESS_DENY_PROBES to the destinations the pod's egress policy blocks"; return 1; }
-  for target in $LOOM_EGRESS_DENY_PROBES; do
+  denied="${LOOM_EGRESS_DENY_PROBES:-}"
+  [ -n "$denied" ] ||
+    { SANDBOX_WHY="bwrap narrows no network: set LOOM_EGRESS_DENY_PROBES to the addresses the pod's egress policy blocks"; return 1; }
+  [ -n "$allow" ] ||
+    { SANDBOX_WHY="bwrap narrows no network: set LOOM_EGRESS_ALLOW_PROBE to an HTTPS endpoint the lane must reach"; return 1; }
+  if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+    denied="$denied $KUBERNETES_SERVICE_HOST:${KUBERNETES_SERVICE_PORT:-443}"
+  fi
+  for target in $denied; do
     host="${target%:*}" port="${target##*:}"
-    [[ "$host" =~ ^[A-Za-z0-9.-]+$ && "$port" =~ ^[1-9][0-9]{0,4}$ ]] ||
-      { SANDBOX_WHY="LOOM_EGRESS_DENY_PROBES entry '$target' is not host:port"; return 1; }
-    # shellcheck disable=SC2016 # $1 and $2 expand in the child shell
-    if timeout "$wait" bash -c 'exec 3<> "/dev/tcp/$1/$2"' _ "$host" "$port" > /dev/null 2>&1; then
+    [[ "$host" =~ $ipv4 && "$port" =~ ^[1-9][0-9]{0,4}$ ]] ||
+      { SANDBOX_WHY="egress probe '$target' is not IPv4:port (a name could fail to resolve and pass as blocked)"; return 1; }
+    if probe_connects "$host" "$port" "$wait"; then
       SANDBOX_WHY="egress not narrowed: $target accepts connections, so no agent runs here"
       return 1
     fi
   done
+  host="${allow%:*}" port="${allow##*:}"
+  [[ "$host" =~ ^[A-Za-z0-9.-]+$ && "$port" =~ ^[1-9][0-9]{0,4}$ ]] ||
+    { SANDBOX_WHY="LOOM_EGRESS_ALLOW_PROBE '$allow' is not host:port"; return 1; }
+  probe_connects "$host" "$port" "$wait" ||
+    { SANDBOX_WHY="egress unproven: $allow did not connect, so the blocked probes prove nothing"; return 1; }
+}
+
+# Whether a TCP connection to $1:$2 opens within $3 seconds.
+probe_connects() {
+  # shellcheck disable=SC2016 # $1 and $2 expand in the child shell
+  timeout "$3" bash -c 'exec 3<> "/dev/tcp/$1/$2"' _ "$1" "$2" > /dev/null 2>&1
 }
 
 # SANDBOX_CMD: the command words that run a command inside the profile $1

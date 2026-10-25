@@ -52,8 +52,9 @@
 # endpoint, asked for a usage limit before each run and after a timeout; see
 # provider_at_limit),
 # LOOM_SANDBOX (seatbelt, the default, or bwrap in a lane pod, which also
-# needs LOOM_EGRESS_DENY_PROBES: host:port destinations the pod's egress
-# policy blocks, each tried before a pass),
+# needs LOOM_EGRESS_DENY_PROBES, IPv4:port addresses the pod's egress policy
+# blocks, and LOOM_EGRESS_ALLOW_PROBE, a host:port it must reach; see
+# egress_denied),
 # LOOM_DROP_TREES (1: each run's scratch goes when it ends), LOOM_SSM_DIR (a
 # folder of copied SSM values read in place of SSM; docs/LANES.md, "Lane
 # pods"), LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
