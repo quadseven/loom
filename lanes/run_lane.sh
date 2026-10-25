@@ -278,13 +278,16 @@ SUMMARY_FILE=.loom/summary.md
 # The section a lane fills with the steps a person takes before its change
 # merges, or "none" (bus/operator_hold.py holds a pull request that lists any).
 OPERATOR_SECTION="Operator steps before merge"
+# The section a lane fills with bugs it found outside its ticket, each
+# citing a real issue (bus/bug_refs.py checks every one).
+BUGS_SECTION="Bugs discovered"
 
 # What the agent is told about the Intent summary: one line per behavior
 # change in .loom/summary.md, else the runner falls back to the ticket's
 # What section, or the reason a run changed nothing (no_change_reason). The
 # file itself is never committed.
 summary_note() {
-  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion the change builds; leave every live check (a Live line, or anything seen on a running system, a host, a network or over time) and every operator action unticked, since only the station'"'"'s verifier ticks those; and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION"
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion the change builds; leave every live check (a Live line, or anything seen on a running system, a host, a network or over time) and every operator action unticked, since only the station'"'"'s verifier ticks those; and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If you found a bug outside this ticket, add a ## %s section, one bug per line, each citing its issue as #N (this repo) or OWNER/NAME#N; file the issue first if none exists. The station looks each issue up and leaves out any line whose issue does not exist, is a pull request, or is closed and was not filed in the last two days. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION" "$BUGS_SECTION"
 }
 
 # How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
@@ -386,8 +389,22 @@ prepare_intent() {
   INTENT_TEXT="$(printf '%s' "$out" | sed '$d')"
 }
 
+# The verified bugs section of the lane's summary, as "## Bugs discovered"
+# and its lines, or nothing: a line whose cited issue does not check out is
+# left out, and bus/bug_refs.py says which on stderr (the lane log).
+bugs_part() {
+  local file="$WORKDIR/$TICKET.summary.md" private=() lines
+  [ -f "$file" ] || file="$TREE/$SUMMARY_FILE"
+  [ -f "$file" ] || return 0
+  repo_is_public || private=(--private)
+  lines="$(NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" timeout "$NET_TIMEOUT" \
+    python3 -B -m bus.bug_refs "$file" --repo "$REPO" ${private[@]+"${private[@]}"} 2>> "$LOG")" ||
+    { echo "bugs section check failed; the section is left out" >> "$LOG"; return 0; }
+  [ -z "$lines" ] || printf '## %s\n%s' "$BUGS_SECTION" "$lines"
+}
+
 pr_body() {
-  local size issue refs="" criteria ops
+  local size issue refs="" criteria ops bugs
   issue="$(field Issue "$1" || true)"
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
   # The size as the review bot's letter (Medium -> M), so its plan check
@@ -410,9 +427,12 @@ pr_body() {
   [ -n "$ops" ] || ops="$(section "$OPERATOR_SECTION" "$TREE/$SUMMARY_FILE" 2>/dev/null)"
   [ -n "$ops" ] || ops="$(section "$OPERATOR_SECTION" "$1")"
   [ -n "$ops" ] || ops="none stated"
-  printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n## %s\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
+  # Command substitution drops the trailing blank line the format needs.
+  bugs="$(bugs_part)"
+  [ -z "$bugs" ] || bugs="$bugs"$'\n\n'
+  printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n## %s\n%s\n\n%s---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
     "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$criteria" \
-    "$size" "$(section 'Out of scope' "$1")" "$OPERATOR_SECTION" "$ops" \
+    "$size" "$(section 'Out of scope' "$1")" "$OPERATOR_SECTION" "$ops" "$bugs" \
     "$2" "$LANE" "$MODEL" "$validated" "$refs"
 }
 
@@ -579,10 +599,12 @@ post_replies() {
 # outside those sections. Scope changes are logged with old/new body hashes.
 # Exit: 0 = updated, 1 = no change needed, 2 = refused, 3 = gh/helper error.
 repair_pr_text() {
-  local summary=()
+  local summary=() private=()
   [ -f "$WORKDIR/$TICKET.summary.md" ] && summary=(--summary "$WORKDIR/$TICKET.summary.md")
+  repo_is_public || private=(--private)
   NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -m bus.pr_repair \
-    --apply "$FIX_PR" --repo "$REPO" ${summary[@]+"${summary[@]}"} "$BRIEF" "$LANE" "$MODEL" "$TICKET"
+    --apply "$FIX_PR" --repo "$REPO" ${summary[@]+"${summary[@]}"} ${private[@]+"${private[@]}"} \
+    "$BRIEF" "$LANE" "$MODEL" "$TICKET"
 }
 
 # Prints the text of file $1 when it is fit for a ticket comment: at most
