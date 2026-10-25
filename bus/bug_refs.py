@@ -36,6 +36,9 @@ _OWN_REF = re.compile(r"(?<![\w/#-])#([0-9]+)\b")
 # How old a closed issue may be and still count as the lane's own report.
 RECENT = dt.timedelta(days=2)
 MAX_LINE = 300
+# Lines past this many are rejected unchecked: each lookup has its own
+# timeout, so this bounds how long a section can take.
+MAX_LINES = 20
 _NONE = {"none", "none.", "no bugs", "none found", "n/a"}
 _BULLET = re.compile(r"^(?:[-*+][ \t]+|[0-9]+[.)][ \t]+)")
 
@@ -104,6 +107,8 @@ def issue_problem(issue: Dict[str, object], now: dt.datetime) -> str:
 
 
 def _line_problem(line: str, repo: str, lookup: Lookup, now: dt.datetime) -> str:
+    if not isinstance(line, str):
+        return "the line is missing"
     if not line.isascii() or len(line) > MAX_LINE or any(ord(c) < 32 for c in line):
         return "the line is not plain ASCII text of at most %d characters" % MAX_LINE
     refs = citations(line, repo)
@@ -126,7 +131,8 @@ def check(lines: List[str], repo: str, lookup: Lookup,
     kept: List[str] = []
     rejected: List[Rejected] = []
     for position, line in enumerate(lines, 1):
-        problem = _line_problem(line, repo, lookup, now)
+        problem = (_line_problem(line, repo, lookup, now) if position <= MAX_LINES
+                   else "more than %d lines" % MAX_LINES)
         if problem:
             rejected.append(Rejected(position, problem))
         else:

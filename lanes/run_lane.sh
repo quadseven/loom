@@ -391,13 +391,15 @@ prepare_intent() {
 
 # The verified bugs section of the lane's summary, as "## Bugs discovered"
 # and its lines, or nothing: a line whose cited issue does not check out is
-# left out, and bus/bug_refs.py says which on stderr (the lane log).
+# left out, and bus/bug_refs.py says which on stderr (the lane log). No
+# outer timeout: each gh lookup runs under its own NET_TIMEOUT, which kills
+# that gh call, and the section is capped at bug_refs.MAX_LINES lookups.
 bugs_part() {
   local file="$WORKDIR/$TICKET.summary.md" private=() lines
   [ -f "$file" ] || file="$TREE/$SUMMARY_FILE"
   [ -f "$file" ] || return 0
   repo_is_public || private=(--private)
-  lines="$(NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" timeout "$NET_TIMEOUT" \
+  lines="$(NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" \
     python3 -B -m bus.bug_refs "$file" --repo "$REPO" ${private[@]+"${private[@]}"} 2>> "$LOG")" ||
     { echo "bugs section check failed; the section is left out" >> "$LOG"; return 0; }
   [ -z "$lines" ] || printf '## %s\n%s' "$BUGS_SECTION" "$lines"

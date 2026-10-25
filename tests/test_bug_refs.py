@@ -91,6 +91,23 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(kept, [])
         self.assertEqual(rejected[0].position, 1)
 
+    def test_a_missing_line_is_rejected_not_raised(self):
+        kept, rejected = bug_refs.check([None], REPO, fake_lookup(ISSUES), NOW)
+        self.assertEqual((kept, rejected[0].why), ([], "the line is missing"))
+
+    def test_lines_past_the_cap_are_rejected_unchecked(self):
+        calls = []
+
+        def lookup(repo, number):
+            calls.append(number)
+            return ISSUES[(REPO, 7)]
+        lines = ["Bug, #7"] * (bug_refs.MAX_LINES + 2)
+        kept, rejected = bug_refs.check(lines, REPO, lookup, NOW)
+        self.assertEqual(len(kept), bug_refs.MAX_LINES)
+        self.assertEqual([r.position for r in rejected],
+                         [bug_refs.MAX_LINES + 1, bug_refs.MAX_LINES + 2])
+        self.assertEqual(len(calls), bug_refs.MAX_LINES)
+
     def test_an_issue_with_no_number_does_not_exist(self):
         kept, rejected = bug_refs.check(["Bug, #7"], REPO, lambda r, n: {}, NOW)
         self.assertEqual(kept, [])
