@@ -1987,6 +1987,27 @@ prepare_validation() {
       note_factory_incident environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
       return 1 ;;
   esac
+  # One red run does not make the base red: Loom's own check timed out
+  # under a busy station's load and passed on the next ticket's run, and
+  # each such flake held its ticket behind a factory incident (56 by
+  # 2026-10-25). A red base check runs once more; only a second red files.
+  if [ "$BASELINE_EXIT" -ne 0 ]; then
+    if [ -n "$changed" ] && ! safe_git reset --hard HEAD >> "$LOG" 2>&1; then
+      SETUP_REASON="could not restore tracked files changed by the baseline check"
+      return 1
+    fi
+    local first_exit="$BASELINE_EXIT"
+    contract_run "$C_CHECK"; BASELINE_EXIT=$?
+    changed="$(tracked_changes)"
+    record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
+      "second run after exit $first_exit${changed:+; changed tracked files: $changed}"
+    if [ "$BASELINE_EXIT" -eq 143 ]; then
+      PARK_CLASS=transient
+      SETUP_REASON="base check interrupted by SIGTERM"
+      return 1
+    fi
+    [ "$BASELINE_EXIT" -ne 0 ] || echo "base check exited $first_exit, then passed on a second run" >> "$LOG"
+  fi
   # Only a pass on the trusted base clears an incident: a fix round's tree
   # holds the agent's unmerged edits, so it counts only once the default
   # branch itself passes (below).

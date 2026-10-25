@@ -5368,6 +5368,23 @@ exec /usr/bin/git "$@"
         self.assertIn("Repo: example/repo", calls)
         self.assertIn("exit 2", calls)
 
+    def test_a_base_check_red_once_and_green_on_a_second_run_files_no_incident(self):
+        # Loom's own base check timed out once under a busy station's load,
+        # held its ticket and filed a factory incident that the next ticket's
+        # pass cleared: 56 such holds by 2026-10-25 (#1716, #1737).
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        flaky = ("interpreter: loom-test-python\n"
+                 "check: test -f .ran-once || { touch .ran-once; exit 1; }\n")
+        self.contract_repo(contract=flaky)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.lane_log()
+        self.assertNotIn("failed: [factory]", log)
+        self.assertIn("base check exited 1, then passed on a second run", log)
+        self.assertTrue(any(c.startswith("codex") for c in self.calls()))
+        self.assertFalse(list((self.loom / "state" / "incidents").glob("*base-check")))
+
     def test_a_base_check_terminated_by_sigterm_is_transient_without_an_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         contract = ("interpreter: loom-test-python\n"
