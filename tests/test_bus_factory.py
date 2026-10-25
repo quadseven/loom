@@ -2022,6 +2022,65 @@ class Queued(Base):
             self.assertEqual(worker.waits["%s#7" % REPO], "no free lane takes model gpt-6-luna")
             self.assertEqual(factory._state(self.gh.issues[7]), "queued")
 
+    def overdue(self, number, reason, hours):
+        """A worker that knows ticket `number` has waited `hours` for `reason`."""
+        key = "%s#%d" % (REPO, number)
+        return factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                               available=["codex", "codex-2"],
+                               known_waits={key: reason},
+                               wait_since={key: NOW - hours * 3600})
+
+    def test_a_tier_ticket_overdue_for_a_lane_is_briefed_on_the_least_loaded_busy_lane(self):
+        # loom#1312, 2026-10-21: 25 medium tickets waited up to 18 hours for a
+        # lane whose load reached zero while fix rounds and climbs kept every
+        # lane of the tier busy.
+        self.queued(7)
+        self.busy(8, "codex")
+        self.busy(9, "codex")
+        self.busy(10, "codex-2")
+        worker = self.overdue(7, "no free lane in tier medium", 3)
+        worker.assign_queued()
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "codex-2"))
+        self.assertNotIn("%s#7" % REPO, worker.waits)
+
+    def test_a_tier_ticket_not_yet_overdue_waits_for_a_free_lane(self):
+        self.queued(7)
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        worker = self.overdue(7, "no free lane in tier medium", 1)
+        worker.assign_queued()
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertEqual(worker.waits["%s#7" % REPO], "no free lane in tier medium")
+
+    def test_a_ticket_overdue_for_another_reason_still_waits_for_a_free_lane(self):
+        self.queued(7)
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        worker = self.overdue(7, "waits for #5 to merge (After:)", 9)
+        worker.assign_queued()
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+
+    def test_an_overdue_tier_ticket_skips_a_down_lane(self):
+        self.queued(7)
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        self.busy(10, "codex-2")
+        key = "%s#7" % REPO
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["codex", "codex-2"], down=["codex"],
+                                 known_waits={key: "no free lane in tier medium"},
+                                 wait_since={key: NOW - 3 * 3600})
+        worker.assign_queued()
+        self.assertEqual(self.lane(7), "codex-2")
+
+    def test_a_model_ticket_overdue_for_a_lane_is_briefed_on_a_busy_up_lane(self):
+        self.queued(7, body="Model: gpt-6-luna\nDifficulty: medium\n\n## Why\nx\n")
+        self.busy(8, "codex")
+        self.busy(9, "codex-2")
+        worker = self.overdue(7, "no free lane takes model gpt-6-luna", 3)
+        worker.assign_queued()
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "codex"))
+
     def test_a_model_ticket_without_a_first_label_waits_for_a_free_lane(self):
         self.queued(7, body="Model: gpt-6-luna\nDifficulty: medium\n\n## Why\nx\n")
         self.busy(8, "codex")
@@ -3359,7 +3418,8 @@ class Helpers(unittest.TestCase):
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
                          model_limits=None, silent=None, down=(), limit_until=None,
-                         benched=(), known_waits=None, plan_check=None, demoted=None):
+                         benched=(), known_waits=None, wait_since=None, plan_check=None,
+                         demoted=None):
                 self.silent_running, self.silent, self.waits = {}, silent, {}
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))

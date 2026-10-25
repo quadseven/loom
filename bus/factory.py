@@ -347,6 +347,14 @@ ONE_LANE_MAX = 4
 # rung's one lane for a day while two fix rounds and their open pull requests
 # waited on it (2026-10-19).
 RUNG_LIMIT_WAIT = 2 * 3600
+# A queued ticket that has waited this long for a free lane (a CAPACITY_WAIT
+# reason) is briefed on the least-loaded lane that is up, busy or not, and
+# the lane claims it in work order. Climbs and fix rounds land on busy lanes,
+# so a lane of a full tier never reached zero load: 25 medium tickets waited
+# up to 18 hours for one (loom#1312, 2026-10-21). Well under the six hours
+# invariants.WAIT_LIMIT raises.
+QUEUE_OVERDUE = 2 * 3600
+CAPACITY_WAIT = "no free lane "
 # A tier ticket briefed to a lane that is down, or at a limit lifting further
 # off than this, goes back to the queue when no lane of its tier is free.
 LIMIT_REQUEUE = 2 * 3600
@@ -1370,6 +1378,7 @@ class Factory:
                  limit_until: Optional[Dict[str, float]] = None,
                  benched: Sequence[Tuple[str, str]] = (),
                  known_waits: Optional[Dict[str, str]] = None,
+                 wait_since: Optional[Dict[str, float]] = None,
                  human: Callable[..., Any] = brain.human,
                  place: Callable[..., Any] = brain.place_under_epic,
                  plan_check: str = DEFAULT_PLAN_CHECK,
@@ -1429,6 +1438,9 @@ class Factory:
         # The same map as the last pass left it (the station's saved waits): a
         # ticket whose reason is unchanged is not announced again.
         self.known_waits = dict(known_waits or {})
+        # When each of those reasons began (the station's saved since): a
+        # ticket waiting for a free lane past QUEUE_OVERDUE takes a busy one.
+        self.wait_since = dict(wait_since or {})
         # The operators whose answers on the dashboard (bus/answer.py) count:
         # LOOM_OPERATORS, else the person logins among the trusted ones.
         self.operators = [o.lower() for o in (operators if operators is not None
@@ -3214,6 +3226,8 @@ class Factory:
             lane, fallback = self._tier_move(repo, issue, old=assigned)
         else:
             lane, fallback = self._tier_move(repo, issue)
+        if lane is None and self._overdue(repo, issue):
+            lane, fallback = self._busy_tier_lane(repo, issue), "overdue for a free lane"
         if lane is None:
             self._waiting(repo, issue["number"], "no free lane in tier %s" % difficulty_of(issue))
             return "%s waits: no free lane in tier %s" % (ref, difficulty_of(issue))
@@ -3222,6 +3236,23 @@ class Factory:
             self._waiting(repo, issue["number"], "giving it a lane failed")
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
+
+    def _overdue(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether the queued ticket has waited for a free lane (a
+        CAPACITY_WAIT reason, unchanged since) for over QUEUE_OVERDUE."""
+        key = "%s#%s" % (repo, issue["number"])
+        since = self.wait_since.get(key)
+        return (self.known_waits.get(key, "").startswith(CAPACITY_WAIT)
+                and since is not None and self.now - since > QUEUE_OVERDUE)
+
+    def _busy_tier_lane(self, repo: str, issue: Dict[str, Any]) -> Optional[str]:
+        """The least-loaded lane of the ticket's tier that is up and not down,
+        busy or not; never a remote lane, which pulls only what it takes."""
+        agy_ok = agy_takes_header(issue, rung_only=True)
+        up = [x for x in lanes_of(difficulty_of(issue), self._is_private(repo))
+              if x not in REMOTE_LANES and x not in self.down
+              and (x != "agy" or agy_ok) and self._up(x)]
+        return pick_lane(up, self.load) if up else None
 
     def _queued_hold(self, repo: str, issue: Dict[str, Any]) -> str:
         """Why a queued ticket gets no lane this pass, or ""."""
@@ -3288,11 +3319,12 @@ class Factory:
                 return "%s: giving it lane %s failed" % (ref, equivalent[0])
             return ""
         lane = self._queued_model_lane(repo, model)
-        if lane is None and set(FIRST) & set(_labels(issue)):
+        if lane is None and (set(FIRST) & set(_labels(issue)) or self._overdue(repo, issue)):
             # A lane that always has another fix round waiting is never free,
             # so a pinned regression ticket sat queued for days (loom#1300,
             # 2026-10-21). Brief it on an up lane; the station claims FIRST
-            # tickets before the lane's other work.
+            # tickets before the lane's other work, and an overdue one in its
+            # work order.
             lane = self._queued_model_lane(repo, model, busy_ok=True)
         if lane is None:
             why = "%s waits: no free lane takes model %s" % (ref, model)

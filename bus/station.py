@@ -10159,7 +10159,8 @@ class Station:
                                demoted=self.demoted_lanes(),
                                benched=pairs,
                                limit_until=self.limit_until(),
-                               known_waits=self._saved_waits(), **extra)
+                               known_waits=self._saved_waits(),
+                               wait_since=self._saved_wait_since(), **extra)
 
     def _saved_waits(self) -> Dict[str, str]:
         """Each ticket's wait reason as the last pass recorded it (_record_waits)."""
@@ -10167,6 +10168,13 @@ class Station:
         return {str(key): info["reason"] for key, info in
                 (saved.items() if isinstance(saved, dict) else [])
                 if isinstance(info, dict) and isinstance(info.get("reason"), str)}
+
+    def _saved_wait_since(self) -> Dict[str, float]:
+        """When each ticket's saved wait reason began (_record_waits)."""
+        saved = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
+        return {str(key): float(info["since"]) for key, info in
+                (saved.items() if isinstance(saved, dict) else [])
+                if isinstance(info, dict) and self._num(info.get("since"))}
 
     def watch_default_branches(self) -> None:
         """Fix forward after a red lane merge, then revert if it stays red.

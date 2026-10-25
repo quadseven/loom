@@ -348,6 +348,9 @@ A new App is easiest made from
 
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
+A ticket that has waited over two hours for a free lane
+(`factory.QUEUE_OVERDUE`) takes the least-loaded lane of its tier, or that
+takes its model, that is up though busy; the lane claims it in work order.
 It skips future `Not before:` times and tickets without a readable Difficulty.
 The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason

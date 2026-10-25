@@ -4985,6 +4985,17 @@ class SilentLaneTest(Base):
         self.assertEqual(st._factory().known_waits,
                          {key: "stalled on lane claude: no other lane of its rung is available"})
 
+    def test_the_factory_is_given_when_each_saved_wait_began(self):
+        # A ticket waiting for a free lane past factory.QUEUE_OVERDUE takes a
+        # busy one (loom#1312), so the factory must know each wait's start.
+        st = self.station()
+        key = "%s#12" % REPO
+        start = st.now
+        st._record_waits({key: "no free lane in tier medium"})
+        st.now = start + 3600
+        st._record_waits({key: "no free lane in tier medium"})
+        self.assertEqual(st._factory().wait_since, {key: start})
+
     def test_a_wait_reason_that_could_carry_ticket_text_never_reaches_the_invariant(self):
         st = self.station()
         st._record_waits({"%s#12" % REPO: "no free lane takes model `x` <img src=y>",
