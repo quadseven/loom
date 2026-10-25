@@ -277,6 +277,13 @@ sandbox_profile() {
   if [ "$kind" = bwrap ]; then
     local agent_home
     agent_home="$(cd "$AGENT_HOME" && pwd -P)" || return 1
+    # A bind at or above HOME would hand the agent all of HOME (the loom
+    # home, the copied SSM values): writable for the tree or scratch home,
+    # readable for the rest. Every bind must sit below HOME or beside it.
+    for p in "$tree" "$agent_home" "$cli_root" ${skills:+"$skills"} $uv_files; do
+      case "$p" in /) echo "refusing sandbox: $p is the root" >&2; return 1 ;; esac
+      case "$home/" in "$p"/*) echo "refusing sandbox: $p sits at or above HOME" >&2; return 1 ;; esac
+    done
     bwrap_profile
     return 0
   fi

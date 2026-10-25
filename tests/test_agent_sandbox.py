@@ -221,7 +221,8 @@ class BwrapSandboxTest(unittest.TestCase):
         for hidden in ("/home", "/var", "/run", "/src", str(self.home)):
             self.assertNotIn((hidden, hidden), system)
         tmpfs = self.pairs(lines, "--tmpfs")
-        for masked in ("/tmp", "/run/secrets", "/var/run/secrets"):
+        # The sandbox's own mount points, not files this test creates.
+        for masked in ("/tmp", "/run/secrets", "/var/run/secrets"):  # noqa: S108
             self.assertIn(masked, tmpfs)
         # Writable: the tree and the scratch home only.
         self.assertEqual(self.pairs(lines, "--bind"),
@@ -266,6 +267,23 @@ class BwrapSandboxTest(unittest.TestCase):
         result = self.bash('sandbox_ready && echo ready || echo "$SANDBOX_WHY"',
                            PATH=f"{self.bin}:/usr/bin:/bin", LOOM_SANDBOX="seatbelt")
         self.assertEqual(result.stdout.strip(), "ready")
+
+    def test_a_bind_at_or_above_home_is_refused(self):
+        # The tree or scratch home at HOME, or above it, would expose all of
+        # HOME (the loom home, the copied SSM values) to the agent.
+        for name, env, tree in (("tree is HOME", {}, self.home),
+                                ("tree above HOME", {}, self.root),
+                                ("scratch is HOME", {"AGENT_HOME": str(self.home)}, self.tree)):
+            with self.subTest(name):
+                full = dict(os.environ, HOME=str(self.home), AGENT_HOME=str(self.scratch), LANE="opencode-go",
+                            SKILLS=str(self.root / "no-skills"), LOOM_SANDBOX="bwrap")
+                full.update(env)
+                result = subprocess.run(["bash", "-c", '. "$1"; sandbox_profile "$2" bash api', "bash",
+                                         str(SANDBOX), str(tree)],
+                                        capture_output=True, text=True, env=full, timeout=30)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("sits at or above HOME", result.stderr)
 
     def test_bwrap_refuses_the_agy_lanes_profile(self):
         result = self.bash('sandbox_profile "$1" bash ""', lane="agy", AGY_HOME=str(self.scratch))
