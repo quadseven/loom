@@ -203,6 +203,11 @@ REPORT_OVERLAP = 3600
 REPORT_FIRST_LOOKBACK = 24 * 3600
 # A backlog goal home is triaged at most this often.
 TRIAGE_INTERVAL = 3600
+# A loom:triage issue waiting on the brain (needs-brain) that has had no ruling
+# for this many hours is released: one operator ask, then loom:human.
+TRIAGE_WAIT_HOURS = 24
+# A triage item older than this many days is aged on the standup and named.
+TRIAGE_OLD_DAYS = 7
 # Agent rewrites of loom:triage issues: per backlog goal home per hour, per
 # pass (each one waits on an agent command), and how long before an issue
 # whose rewrite did not produce a ticket is tried again.
@@ -4101,7 +4106,8 @@ class Station:
         steps = (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_merged,
                      self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
-                     self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
+                     self.forward_reports, self.triage_backlogs, self.release_triage_waiting,
+                     self.rewrite_triaged,
                      self.close_done_tickets, self.settle_orphan_sources,
                      self.settle_claimed_tickets, self.release_stale_claims,
                      self.queue_stateless_tickets,
@@ -7239,6 +7245,41 @@ class Station:
         _write_json(path, state)
         self.file_validation_contracts()
 
+    def release_triage_waiting(self) -> None:
+        """Release loom:triage issues waiting on the brain (needs-brain) that
+        have had no ruling for TRIAGE_WAIT_HOURS: post one exact operator ask
+        and move each to loom:human, once. The loom:human label keeps an issue
+        from being moved again, so a pass never asks twice for the same one."""
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                issues = self._paginate(
+                    "/repos/%s/issues?labels=loom%%3Atriage&state=open&per_page=100" % repo)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("triage release: skipped %s: %s" % (repo, err))
+                continue
+            for issue in (issues if isinstance(issues, list) else []):
+                if not isinstance(issue, dict) or "pull_request" in issue:
+                    continue
+                names = [str(x.get("name", "")) for x in issue.get("labels", [])]
+                if "loom:triage" not in names or "needs-brain" not in names:
+                    continue
+                created = self._epoch(str(issue.get("created_at") or ""))
+                if created is None or self.now - created <= TRIAGE_WAIT_HOURS * 3600:
+                    continue
+                number = int(issue["number"])
+                title = " ".join(str(issue.get("title") or "").split())
+                try:
+                    brain.human(self.gh, repo, number, "Kind: decision\n%s" % title)
+                except ValueError as err:
+                    _say("triage release: %s#%d not moved: %s" % (repo, number, err))
+                    continue
+                _say("triage release: %s#%d moved to loom:human, waiting on the brain"
+                     % (repo, number))
+
     # -- agent rewrites of loom:triage issues ----------------------------
     def _rewrite_goals(self) -> List[Tuple[str, str, int]]:
         """(ledger key, repo, goal) for the backlog goal homes triage knows."""
@@ -9165,9 +9206,19 @@ class Station:
         named = self._open_breaches(repo, number)
         breaches = named if (repo, number) == self._invariant_goal() else None
         hold = self._gate_hold_for(repo, number)
+        try:
+            triage = self._paginate(
+                "/repos/%s/issues?labels=loom%%3Atriage&state=open&per_page=100" % repo)
+            triage = triage if isinstance(triage, list) else []
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("standup: triage read skipped %s: %s" % (repo, err))
+            triage = []
         body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")),
                                           breaches, gate_hold=hold,
-                                          finished=brain.finished_epics(tree))
+                                          finished=brain.finished_epics(tree),
+                                          triage=triage)
         brain._check_written_text(body)
         if hold is None and self._quiet_standup(repo, comments, children, named, body,
                                                 authors, now):
@@ -9254,18 +9305,61 @@ class Station:
             return None
         return info
 
+    def triage_partition(self, issues: List[Any]) -> Tuple[int, int, int, Optional[Dict[str, Any]]]:
+        """(untriaged, waiting, aged, oldest) for the loom:triage issues.
+
+        untriaged: triage issues with no needs:<login> (not waiting on a
+        person). waiting: triage issues carrying needs:<login> (waiting on
+        that person). aged: triage items older than TRIAGE_OLD_DAYS. oldest:
+        the oldest aged triage item, else None."""
+        untriaged = 0
+        waiting = 0
+        aged = 0
+        oldest = None
+        oldest_at = None
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            names = [str(x.get("name", "")) for x in issue.get("labels", [])]
+            if "loom:triage" not in names:
+                continue
+            if brain.needs_login_names(names):
+                waiting += 1
+            else:
+                untriaged += 1
+            created = self._epoch(str(issue.get("created_at") or ""))
+            if created is None:
+                continue
+            if self.now - created > TRIAGE_OLD_DAYS * 86400:
+                aged += 1
+                if oldest_at is None or created < oldest_at:
+                    oldest_at = created
+                    oldest = issue
+        return untriaged, waiting, aged, oldest
+
     def _overdue_standup_body(self, children: List[Any], since: Optional[float] = None,
                               breaches: Optional[List[Dict[str, Any]]] = None,
                               gate_hold: Optional[Dict[str, Any]] = None,
-                              finished: Optional[List[Dict[str, Any]]] = None) -> str:
+                              finished: Optional[List[Dict[str, Any]]] = None,
+                              triage: Sequence[Any] = ()) -> str:
         groups = self._standup_ticket_groups(children, since)
         rows = self._standup_rows
+        untriaged, waiting, aged, oldest = self.triage_partition(list(triage))
         counts = [(len(groups[k]), word) for k, word in (
             ("merged", "merged"), ("verified", "verified"), ("sent_back", "shipped"),
             ("failed", "failed"), ("regressed", "regressed"), ("aged_pr", "stuck"),
-            ("in_flight", "in flight"), ("queued", "queued"), ("asks", "waiting on you"))]
+            ("in_flight", "in flight"), ("queued", "queued"))]
+        asks = len(groups["asks"]) + waiting
+        if asks:
+            counts.append((asks, "waiting on you"))
+        if untriaged:
+            counts.append((untriaged, "triage"))
         summary = ", ".join("%d %s" % (n, word) for n, word in counts if n)
         first = ("%s since the last report." % summary) if summary else "Nothing moved since the last report."
+        if aged:
+            oldest_title = " ".join(str(oldest.get("title") or "").split()) if oldest else ""
+            first = "%s %d triage older than %dd; oldest: #%d %s." % (
+                first, aged, TRIAGE_OLD_DAYS, int(oldest["number"]) if oldest else 0, oldest_title)
         stuck = "Past the stuck age in PR: %s." % rows(groups["aged_pr"])
         if gate_hold is not None:
             stuck += (" Held by the unproven-work gate: goal #%d -- %d tickets shipped "
