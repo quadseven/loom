@@ -208,33 +208,46 @@ class BwrapSandboxTest(unittest.TestCase):
                 out.append(tuple(lines[i + 1:i + 3]) if "bind" in flag else lines[i + 1])
         return out
 
-    def test_an_api_run_sees_only_its_tree_and_scratch_home_under_home(self):
-        lines = self.profile("api")
-        self.assertEqual(self.pairs(lines, "--ro-bind")[0], ("/", "/"))
+    def assert_confined_root(self, lines):
+        """The root is an empty tmpfs: no bind of / at all, only the system
+        folders read-only, a private /tmp, and the secret folders masked."""
         self.assertNotIn(("/", "/"), self.pairs(lines, "--bind"))
-        self.assertEqual(self.pairs(lines, "--tmpfs"), [str(self.home)])
-        binds = self.pairs(lines, "--bind")
-        self.assertEqual(binds, [(str(self.tree), str(self.tree)), (str(self.scratch), str(self.scratch))])
+        self.assertNotIn(("/", "/"), self.pairs(lines, "--ro-bind"))
+        self.assertEqual(self.pairs(lines, "--bind-try"), [])
+        system = self.pairs(lines, "--ro-bind-try")
+        self.assertIn(("/usr", "/usr"), system)
+        self.assertIn(("/etc", "/etc"), system)
+        self.assertTrue(all(src == dst and src.count("/") == 1 for src, dst in system), system)
+        for hidden in ("/home", "/var", "/run", "/src", str(self.home)):
+            self.assertNotIn((hidden, hidden), system)
+        tmpfs = self.pairs(lines, "--tmpfs")
+        for masked in ("/tmp", "/run/secrets", "/var/run/secrets"):
+            self.assertIn(masked, tmpfs)
+        # Writable: the tree and the scratch home only.
+        self.assertEqual(self.pairs(lines, "--bind"),
+                         [(str(self.tree), str(self.tree)), (str(self.scratch), str(self.scratch))])
         git = str(self.tree / ".git")
         self.assertIn((git, git), self.pairs(lines, "--ro-bind"))
-        # HOME is emptied before anything is bound back over it, and .git is
-        # made read-only after the tree is bound.
-        self.assertLess(lines.index("--tmpfs"), lines.index(str(self.tree)))
         self.assertLess(lines.index(str(self.tree)), lines.index(git))
+
+    def test_an_api_run_sees_only_its_tree_and_scratch_home_and_the_system_folders(self):
+        lines = self.profile("api")
+        self.assert_confined_root(lines)
         for flag in ("--unshare-pid", "--die-with-parent", "--new-session"):
             self.assertIn(flag, lines)
         self.assertEqual(self.pairs(lines, "--proc"), ["/proc"])
         self.assertEqual(self.pairs(lines, "--chdir"), [str(self.tree)])
+        # The root tmpfs takes no writes, after everything is bound in.
+        self.assertEqual(self.pairs(lines, "--remount-ro"), ["/"])
+        self.assertGreater(lines.index("--remount-ro"), max(i for i, w in enumerate(lines) if w == "--bind"))
 
-    def test_a_validation_run_keeps_writes_outside_home(self):
+    def test_a_validation_run_writes_only_its_tree_check_home_and_tmp(self):
         uv = self.home / ".local" / "bin" / "uv"
         uv.parent.mkdir(parents=True)
         uv.write_text("#!/bin/sh\n")
         uv.chmod(0o755)
         lines = self.profile("check", CHECK_UV_BINS=str(uv))
-        self.assertIn(("/", "/"), self.pairs(lines, "--bind"))
-        self.assertNotIn(("/", "/"), self.pairs(lines, "--ro-bind"))
-        self.assertEqual(self.pairs(lines, "--tmpfs"), [str(self.home)])
+        self.assert_confined_root(lines)
         self.assertIn((str(uv), str(uv)), self.pairs(lines, "--ro-bind"))
 
     def test_a_cli_under_home_is_bound_back_read_only(self):
@@ -245,6 +258,14 @@ class BwrapSandboxTest(unittest.TestCase):
         lines = self.profile("api", cli="opencode", PATH=f"{cli.parent}:{os.environ['PATH']}")
         self.assertIn((str(cli.parent), str(cli.parent)), self.pairs(lines, "--ro-bind"))
         self.assertNotIn((str(cli.parent), str(cli.parent)), self.pairs(lines, "--bind"))
+
+    def test_the_seatbelt_sandbox_needs_no_egress_probes(self):
+        sandbox_exec = self.bin / "sandbox-exec"
+        sandbox_exec.write_text("#!/bin/sh\nexit 0\n")
+        sandbox_exec.chmod(0o755)
+        result = self.bash('sandbox_ready && echo ready || echo "$SANDBOX_WHY"',
+                           PATH=f"{self.bin}:/usr/bin:/bin", LOOM_SANDBOX="seatbelt")
+        self.assertEqual(result.stdout.strip(), "ready")
 
     def test_bwrap_refuses_the_agy_lanes_profile(self):
         result = self.bash('sandbox_profile "$1" bash ""', lane="agy", AGY_HOME=str(self.scratch))
@@ -275,13 +296,45 @@ class BwrapSandboxTest(unittest.TestCase):
     def test_sandbox_ready_says_why_bwrap_cannot_run(self):
         path = f"{self.bin}:/usr/bin:/bin"
         ready = 'sandbox_ready && echo ready || echo "$SANDBOX_WHY"'
-        self.assertEqual(self.bash(ready, PATH=path).stdout.strip(), "bwrap not available")
+        closed = "127.0.0.1:%d" % self.closed_port()
+        self.assertEqual(self.bash(ready, PATH=path, LOOM_EGRESS_DENY_PROBES=closed).stdout.strip(),
+                         "bwrap not available")
         bwrap = self.bin / "bwrap"
         bwrap.write_text("#!/bin/sh\nexit 1\n")
         bwrap.chmod(0o755)
-        self.assertIn("bwrap cannot start a sandbox here", self.bash(ready, PATH=path).stdout)
+        self.assertIn("bwrap cannot start a sandbox here",
+                      self.bash(ready, PATH=path, LOOM_EGRESS_DENY_PROBES=closed).stdout)
         bwrap.write_text("#!/bin/sh\nexit 0\n")
-        self.assertEqual(self.bash(ready, PATH=path).stdout.strip(), "ready")
+        self.assertEqual(self.bash(ready, PATH=path, LOOM_EGRESS_DENY_PROBES=closed).stdout.strip(), "ready")
+
+    @staticmethod
+    def closed_port():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def ready(self, **env):
+        bwrap = self.bin / "bwrap"
+        bwrap.write_text("#!/bin/sh\nexit 0\n")
+        bwrap.chmod(0o755)
+        return self.bash('sandbox_ready && echo ready || echo "$SANDBOX_WHY"',
+                         PATH=f"{self.bin}:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin", **env).stdout.strip()
+
+    def test_bwrap_fails_closed_without_a_declared_egress_policy(self):
+        self.assertIn("bwrap narrows no network", self.ready())
+        self.assertIn("bwrap narrows no network", self.ready(LOOM_EGRESS_DENY_PROBES=""))
+        self.assertIn("is not host:port", self.ready(LOOM_EGRESS_DENY_PROBES="metadata"))
+
+    @unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
+    def test_bwrap_fails_closed_when_a_blocked_destination_answers(self):
+        closed = "127.0.0.1:%d" % self.closed_port()
+        with socket.socket() as service:
+            service.bind(("127.0.0.1", 0))
+            service.listen(1)
+            open_ = "127.0.0.1:%d" % service.getsockname()[1]
+            why = self.ready(LOOM_EGRESS_DENY_PROBES=f"{closed} {open_}")
+        self.assertEqual(why, f"egress not narrowed: {open_} accepts connections, so no agent runs here")
+        self.assertEqual(self.ready(LOOM_EGRESS_DENY_PROBES=closed), "ready")
 
 
 class SsmDirTest(unittest.TestCase):

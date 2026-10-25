@@ -39,6 +39,11 @@ sandbox_kind() {
 # bwrap that cannot make its namespaces here (a container without user
 # namespaces, or with a masked /proc) is found before any run, so the lane
 # says it is unavailable instead of failing every brief.
+# bwrap narrows no network, so it also fails closed unless the pod's own
+# egress is narrowed: LOOM_EGRESS_DENY_PROBES must name, as host:port, the
+# destinations the pod's network policy blocks (the cloud metadata address,
+# the API server, a cluster-internal service), and every one must refuse a
+# connection now. An empty list, or one that connects, holds the lane.
 # shellcheck disable=SC2034 # SANDBOX_WHY is read by the callers
 sandbox_ready() {
   local kind
@@ -49,8 +54,31 @@ sandbox_ready() {
     bwrap)
       command -v bwrap > /dev/null || { SANDBOX_WHY="bwrap not available"; return 1; }
       bwrap --die-with-parent --unshare-pid --ro-bind / / --dev /dev --proc /proc true > /dev/null 2>&1 ||
-        { SANDBOX_WHY="bwrap cannot start a sandbox here (user namespaces or /proc denied)"; return 1; } ;;
+        { SANDBOX_WHY="bwrap cannot start a sandbox here (user namespaces or /proc denied)"; return 1; }
+      egress_denied || return 1 ;;
   esac
+}
+
+# Whether every LOOM_EGRESS_DENY_PROBES destination refuses a connection
+# (each tried for at most LOOM_EGRESS_PROBE_SECONDS, default 3). Sets
+# SANDBOX_WHY when one connects, the list is empty, or an entry is not
+# host:port.
+# shellcheck disable=SC2034 # SANDBOX_WHY is read by sandbox_ready's callers
+egress_denied() {
+  local target host port wait="${LOOM_EGRESS_PROBE_SECONDS:-3}"
+  [[ "$wait" =~ ^[1-9][0-9]?$ ]] || wait=3
+  [ -n "${LOOM_EGRESS_DENY_PROBES:-}" ] ||
+    { SANDBOX_WHY="bwrap narrows no network: set LOOM_EGRESS_DENY_PROBES to the destinations the pod's egress policy blocks"; return 1; }
+  for target in $LOOM_EGRESS_DENY_PROBES; do
+    host="${target%:*}" port="${target##*:}"
+    [[ "$host" =~ ^[A-Za-z0-9.-]+$ && "$port" =~ ^[1-9][0-9]{0,4}$ ]] ||
+      { SANDBOX_WHY="LOOM_EGRESS_DENY_PROBES entry '$target' is not host:port"; return 1; }
+    # shellcheck disable=SC2016 # $1 and $2 expand in the child shell
+    if timeout "$wait" bash -c 'exec 3<> "/dev/tcp/$1/$2"' _ "$host" "$port" > /dev/null 2>&1; then
+      SANDBOX_WHY="egress not narrowed: $target accepts connections, so no agent runs here"
+      return 1
+    fi
+  done
 }
 
 # SANDBOX_CMD: the command words that run a command inside the profile $1
@@ -73,26 +101,33 @@ sandbox_command() {
 }
 
 # The bubblewrap form of sandbox_profile, one argument per line. The variables
-# are sandbox_profile's, already canonical and checked. HOME is replaced by an
-# empty tmpfs, so nothing under it (the loom home, the copied SSM values, the
-# runner's own files) is visible, and the tree, the scratch home, the CLI's
-# folder, the skill snapshot and the check's uv files are bound back over it;
-# .git stays read-only. In api mode the rest of the filesystem is read-only
-# too; a validation run keeps writes outside HOME. A fresh /proc in a new PID
-# namespace hides the runner's processes and their environments. The network
-# is not narrowed here: in a pod that is the pod's own egress.
+# are sandbox_profile's, already canonical and checked. The root is an empty
+# tmpfs: only the system folders (BWRAP_SYSTEM_DIRS) are bound in, read-only,
+# so nothing else on the machine is there at all (HOME with the loom home and
+# the copied SSM values, /run/secrets, /var/run/secrets, the loom checkout).
+# Then the tree and the scratch home are bound writable, .git read-only, and
+# the CLI's folder, the skill snapshot and the check's uv files read-only.
+# /tmp is a private tmpfs; the root itself is read-only. Check runs get the same root as agent runs: their
+# writes go to the tree, the check home and /tmp only. A fresh /proc in a new
+# PID namespace hides the runner's processes and their environments.
+# /run/secrets and /var/run/secrets are masked again with empty tmpfs in case
+# a system folder ever reaches them. The network is the pod's (sandbox_ready
+# requires its egress narrowed).
+BWRAP_SYSTEM_DIRS="/usr /bin /sbin /lib /lib32 /lib64 /libx32 /etc /opt"
 bwrap_profile() {
-  local mode="$1" p
+  local p
   printf '%s\n' --die-with-parent --new-session --unshare-pid --unshare-ipc --unshare-uts
-  if [ "$mode" = check ]; then printf '%s\n' --bind / /; else printf '%s\n' --ro-bind / /; fi
-  printf '%s\n' --dev /dev --proc /proc --tmpfs "$home"
+  for p in $BWRAP_SYSTEM_DIRS; do printf '%s\n' --ro-bind-try "$p" "$p"; done
+  printf '%s\n' --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run/secrets --tmpfs /var/run/secrets
   printf '%s\n' --bind "$tree" "$tree"
   [ -e "$tree/.git" ] && printf '%s\n' --ro-bind "$tree/.git" "$tree/.git"
   printf '%s\n' --bind "$agent_home" "$agent_home"
   for p in "$cli_root" "$cli_link" ${skills:+"$skills"} $uv_files; do
-    case "$p/" in "$home"/*) printf '%s\n' --ro-bind "$p" "$p" ;; esac
+    printf '%s\n' --ro-bind "$p" "$p"
   done
-  printf '%s\n' --chdir "$tree"
+  # The root tmpfs itself takes no writes (remount-ro does not reach the
+  # binds and /tmp, which are mounts of their own).
+  printf '%s\n' --remount-ro / --chdir "$tree"
 }
 
 # The ports an API-lane agent may connect to, space-separated: 443, its
@@ -223,7 +258,7 @@ sandbox_profile() {
   if [ "$kind" = bwrap ]; then
     local agent_home
     agent_home="$(cd "$AGENT_HOME" && pwd -P)" || return 1
-    bwrap_profile "${3:-}"
+    bwrap_profile
     return 0
   fi
   for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"} $uv_files; do

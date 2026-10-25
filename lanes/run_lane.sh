@@ -51,7 +51,9 @@
 # LOOM_<SLOT>_PROBE_URL and _PROBE_HEADER (API lanes: the provider's chat
 # endpoint, asked for a usage limit before each run and after a timeout; see
 # provider_at_limit),
-# LOOM_SANDBOX (seatbelt, the default, or bwrap in a lane pod),
+# LOOM_SANDBOX (seatbelt, the default, or bwrap in a lane pod, which also
+# needs LOOM_EGRESS_DENY_PROBES: host:port destinations the pod's egress
+# policy blocks, each tried before a pass),
 # LOOM_DROP_TREES (1: each run's scratch goes when it ends), LOOM_SSM_DIR (a
 # folder of copied SSM values read in place of SSM; docs/LANES.md, "Lane
 # pods"), LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
@@ -134,10 +136,11 @@ drop_check_home() { [ -z "${CHECK_HOME:-}" ] || rm -rf "$CHECK_HOME"; }
 drop_run_scratch() {
   [ "${LOOM_DROP_TREES:-}" = 1 ] && [ "$LANE" != agy ] || return 0
   drop_check_home
+  [ -z "${CHECK_HOME:-}" ] || rm -rf "$CHECK_HOME-default"
   [ -z "${AGENT_HOME:-}" ] || rm -rf "$AGENT_HOME"
   [[ "${TICKET:-}" =~ ^[A-Za-z0-9._-]+$ ]] && [ -n "${WORKDIR:-}" ] || return 0
   local f
-  for f in "" .answers .described-step .final-message .no-change.md .opencode-events .run.md .summary.md; do
+  for f in "" -default-check .answers .described-step .final-message .no-change.md .opencode-events .run.md .summary.md; do
     rm -rf "${WORKDIR:?}/$TICKET$f"
   done
 }

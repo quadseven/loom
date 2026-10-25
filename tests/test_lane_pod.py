@@ -47,6 +47,19 @@ class LanePodTest(unittest.TestCase):
         self.assertIn("runner output for zen",
                       (self.home / "logs" / "zen-service.log").read_text())
 
+    def test_a_lock_left_by_an_earlier_container_is_cleared(self):
+        # A restarted container reuses pids from 1: an old lock could name a
+        # live, unrelated process and hold the slot for good.
+        stale = self.home / "run" / "zen.lock"
+        stale.mkdir(parents=True)
+        (stale / "pid").write_text("1\n")
+        other = self.home / "run" / "codex.lock"
+        other.mkdir()
+        result = self.pod(LOOM_POD_SLOTS="zen")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(stale.exists())
+        self.assertTrue(other.exists())
+
     def test_settings_in_the_environment_win_over_the_defaults(self):
         result = self.pod(LOOM_POD_SLOTS="zen", LOOM_SANDBOX="seatbelt", LOOM_DROP_TREES="0")
         self.assertEqual(result.returncode, 0, result.stderr)

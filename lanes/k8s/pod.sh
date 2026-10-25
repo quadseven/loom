@@ -22,10 +22,15 @@ done
 : "${LOOM_HOME:?set LOOM_HOME}"
 export LOOM_SANDBOX="${LOOM_SANDBOX:-bwrap}" LOOM_DROP_TREES="${LOOM_DROP_TREES:-1}"
 RUNNER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/run_lane.sh"
-mkdir -p "$LOOM_HOME/logs"
+mkdir -p "$LOOM_HOME/logs" || { echo "cannot write $LOOM_HOME" >&2; exit 2; }
+# This pod is the only runner set for its slots, and a restarted container
+# starts its process ids again from 1: a lock left by the last container
+# could name a live, unrelated pid and hold its slot for good.
+for slot in $SLOTS; do rm -rf "$LOOM_HOME/run/$slot.lock"; done
 
-# A stopping pod stops its runners: each run's EXIT trap drops its scratch
-# and lock before the container goes.
+# A stopping pod stops its runners; each runner's EXIT trap drops its lock
+# and scratch. An agent in its own process group may outlive its runner by
+# moments; the container's exit ends it.
 trap 'trap - TERM INT; kill -TERM $(jobs -p) 2> /dev/null; wait; exit 143' TERM INT
 
 while :; do

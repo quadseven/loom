@@ -1513,14 +1513,26 @@ does on the Mac.
 What changes in a pod:
 
 - `LOOM_SANDBOX=bwrap`: the agent and the validation run are confined by
-  bubblewrap instead of `sandbox-exec`. HOME is replaced by an empty tmpfs
-  with only the run's tree, its scratch home, the skill snapshot and the
-  CLI's folder bound back; `.git` stays read-only; in api mode the rest of
-  the filesystem is read-only; a fresh `/proc` in a new PID namespace hides
-  the runner's processes. bwrap does not narrow the network: the pod's
-  egress does. bwrap needs user namespaces inside the container; a lane
-  whose bwrap cannot start reports itself unavailable (`sandbox_ready`).
-  The agy lane and the codex and claude lanes stay on the Mac.
+  bubblewrap instead of `sandbox-exec`. The sandbox root is an empty tmpfs
+  with only the system folders (`/usr`, `/bin`, `/lib*`, `/etc`, `/opt`)
+  bound in read-only, so HOME, `/run/secrets`, `/var/run/secrets` and the
+  loom checkout are not there at all (the two secret folders are also masked
+  with empty tmpfs). The run's tree and scratch home are the only writable
+  binds, `.git` stays read-only, the CLI's folder and the skill snapshot are
+  read-only, and `/tmp` is private. A validation run gets the same root:
+  its writes go to the tree, its check home and `/tmp`. A fresh `/proc` in a
+  new PID namespace hides the runner's processes. bwrap needs user
+  namespaces inside the container; a lane whose bwrap cannot start reports
+  itself unavailable (`sandbox_ready`). The agy lane and the codex and
+  claude lanes stay on the Mac.
+- Egress, fail closed: bwrap narrows no network, so the pod's network
+  policy must (no cloud metadata address, no API server, no cluster-internal
+  ranges; DNS and 443 to the internet only). `LOOM_EGRESS_DENY_PROBES` names,
+  as `host:port`, destinations that policy blocks, and `sandbox_ready` tries
+  each before every pass: an empty list, a malformed entry or a destination
+  that accepts a connection holds the lane unavailable, with the reason in
+  its heartbeat. A policy that the cluster network does not enforce
+  therefore holds the lane too.
 - `LOOM_DROP_TREES=1`: each run's tree, the runner's files beside it and the
   scratch homes are removed when the run ends, whatever its outcome
   (`drop_run_scratch`). Logs and the brief stay under `LOOM_HOME`.
@@ -1531,8 +1543,9 @@ What changes in a pod:
   `LOOM_GITHUB_APP_KEY_FILE`, also under HOME.
 
 Everything the agent must not read (the copied parameters, the App key,
-`LOOM_HOME`) sits under HOME; bwrap shows the agent nothing there but its
-own tree and scratch home. The image carries bash, coreutils, git, gh,
+`LOOM_HOME`) sits under HOME, outside the system folders bwrap binds; the
+agent sees nothing there but its own tree and scratch home. The pod mounts
+no service account token, and its code is read-only and owned by root. The image carries bash, coreutils, git, gh,
 python3, uv, rsync, openssl, netcat, procps, bubblewrap and the opencode
 CLI, plus this repo and the leak scanner at a pinned commit.
 

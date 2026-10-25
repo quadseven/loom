@@ -2730,7 +2730,14 @@ exec /usr/bin/git "$@"
         inbox = self.loom / "briefs" / "opencode-go"
         inbox.mkdir(parents=True)
         (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: opencode-go"))
+        # Leftovers of a check a killed runner never finished.
+        (self.loom / "worktrees" / "T042-fix-the-thing-default-check").mkdir(parents=True)
+        (self.loom / "run" / "opencode-go-check-default").mkdir(parents=True)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = "127.0.0.1:%d" % probe.getsockname()[1]
         result = self.run_lane("opencode-go", LOOM_SANDBOX="bwrap", LOOM_DROP_TREES="1",
+                               LOOM_EGRESS_DENY_PROBES=closed,
                                LOOM_SSM_DIR=str(self.home / ".ssm"),
                                LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
                                LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash")
@@ -2748,14 +2755,36 @@ exec /usr/bin/git "$@"
         home = str(self.home.resolve())
         tree = str((self.loom / "worktrees" / "T042-fix-the-thing").resolve())
         self.assertEqual(words[-1], "key=fake-oc-key")
-        self.assertEqual(words[words.index("--tmpfs") + 1], home)
+        triples = [words[i:i + 3] for i in range(len(words))]
+        # No bind of / and nothing of HOME but the tree and scratch home.
+        self.assertFalse([t for t in triples if t[0] in ("--bind", "--ro-bind", "--ro-bind-try") and t[1] in ("/", home)])
+        self.assertIn("/var/run/secrets", [words[i + 1] for i, w in enumerate(words) if w == "--tmpfs"])
         self.assertIn(["--bind", tree, tree], [words[i:i + 3] for i in range(len(words))])
         self.assertIn(["--ro-bind", tree + "/.git", tree + "/.git"], [words[i:i + 3] for i in range(len(words))])
         # The run's scratch is gone; its log and the brief stay.
         self.assertEqual(sorted(p.name for p in (self.loom / "worktrees").iterdir()), [])
         self.assertFalse((self.loom / "run" / "opencode-go-home").exists())
         self.assertFalse((self.loom / "run" / "opencode-go-check").exists())
+        self.assertFalse((self.loom / "run" / "opencode-go-check-default").exists())
         self.assertIn("T042-fix-the-thing done", (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text())
+
+    def test_a_pod_lane_without_narrowed_egress_runs_no_agent(self):
+        self.write_tool(self.bin / "bwrap", "#!/bin/sh\necho bwrap >> \"$FAKE_LOG\"\nexit 0\n")
+        ssm = self.home / ".ssm" / "k"
+        ssm.mkdir(parents=True)
+        (ssm / "oc").write_text("fake-oc-key")
+        inbox = self.loom / "briefs" / "opencode-go"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: opencode-go"))
+        result = self.run_lane("opencode-go", LOOM_SANDBOX="bwrap", LOOM_SSM_DIR=str(self.home / ".ssm"),
+                               LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
+                               LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        self.assertFalse([c for c in self.calls() if c.startswith("opencode run")])
+        beat = json.loads((self.loom / "state" / "usage" / "opencode-go.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("bwrap narrows no network", beat["reason"])
 
     def test_without_drop_trees_a_lane_keeps_its_tree_for_the_station_to_prune(self):
         self.drop_brief()
