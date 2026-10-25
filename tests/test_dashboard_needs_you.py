@@ -7,7 +7,7 @@ import os
 import unittest
 from unittest import mock
 
-from dashboard import server
+from dashboard import needs_you, server
 from dashboard.github import OPERATOR_CLAIMS_SECONDS, TicketStore
 from tests.test_dashboard_operators_page import ENV, FakeGitHub, _issue
 
@@ -141,7 +141,7 @@ class NeedsYouPageTest(unittest.TestCase):
         code, filtered = handler.result
         self.assertEqual(code, 200)
         self.assertEqual(sorted(card.split(" -")[0].rsplit("#", 1)[-1] for card in
-                                (c.split("<span>", 1)[1] for c in self.cards(filtered))), ["40", "43"])
+                                (c.split("<span class=\"ask-ref\">", 1)[1] for c in self.cards(filtered))), ["40", "43"])
         self.assertIn('href="/needs-you?who=%s" aria-current="true"' % OWNER, filtered)
         operator = self.page(who=needs_you.who_param("operator"))
         self.assertEqual(len(self.cards(operator)), 2)
@@ -181,3 +181,63 @@ class RefKeyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecutiveSummaryTest(NeedsYouPageTest):
+    """loom#810 follow-up: the page reads as an executive summary. A headline
+    says how much waits and on whom, a short list says where to start, and
+    the items are grouped by the kind of action they need, oldest first."""
+
+    def test_the_page_opens_with_a_headline_naming_the_counts_and_the_oldest_item(self):
+        body = self.page()
+        summary = body.split('<section class="needs-summary', 1)[1].split("</section>", 1)[0]
+        self.assertIn("4 items wait on people", summary)
+        self.assertIn("2 on %s" % OWNER, summary)
+        self.assertIn("Oldest: %s#40" % REPO, summary)
+        self.assertLess(body.index("needs-summary"), body.index('class="card ask-card"'))
+
+    def test_start_here_lists_at_most_three_items(self):
+        body = self.page()
+        start = body.split('<ol class="needs-start">', 1)[1].split("</ol>", 1)[0]
+        self.assertEqual(start.count("<li>"), 3)
+        self.assertIn("%s#40" % REPO, start)
+
+    def test_items_are_grouped_by_the_action_they_need_oldest_first(self):
+        body = self.page()
+        self.assertIn("Access and credentials (3)", body)
+        self.assertIn("Decisions (1)", body)
+        access = body.split("Access and credentials (3)", 1)[1].split("</section>", 1)[0]
+        order = [access.index("%s#%d -" % (REPO, n)) for n in (40, 41, 43)]
+        self.assertEqual(order, sorted(order))
+        self.assertNotIn("%s#42 -" % REPO, access)
+
+    def test_each_item_is_one_line_that_opens_to_the_whole_ask(self):
+        card = needs_you.card({"repo": REPO, "number": 7, "title": "Long ask", "who": [OWNER],
+                               "unblocks": 0, "body_ask": "Rotate the key. Then paste its id here.",
+                               "comment_ask": None, "comment_url": ""})
+        line, rest = card.split("</summary>", 1)
+        self.assertIn("Long ask", line)
+        self.assertIn("Rotate the key.", line)
+        self.assertNotIn("paste its id", line)
+        self.assertIn("<blockquote>Rotate the key. Then paste its id here.</blockquote>", rest)
+
+    def test_start_here_names_the_longest_waiting_items(self):
+        start = self.page().split('<ol class="needs-start">', 1)[1].split("</ol>", 1)[0]
+        self.assertLess(start.index("%s#40" % REPO), start.index("%s#41" % REPO))
+
+    def test_the_action_kind_comes_from_the_ask(self):
+        kind = needs_you.action_kind
+        self.assertEqual(kind({"body_ask": "Plug a monitor into the box and power it on."}), "device")
+        self.assertEqual(kind({"body_ask": "Create an OAuth client and paste its id."}), "access")
+        self.assertEqual(kind({"body_ask": "Reply yes or no."}), "decide")
+        self.assertEqual(kind({"body_ask": "Merge PR 12 as is, or reply hold."}), "decide")
+        self.assertEqual(kind({"body_ask": "", "comment_ask": ""}), "missing")
+        self.assertEqual(kind({"body_ask": "Look at the log."}), "other")
+
+    def test_the_lead_skips_the_lead_in_that_only_says_who_it_waits_on(self):
+        lead = needs_you.first_sentence
+        self.assertEqual(lead("**Needs the operator (one ask).** Merge PR 12 as is, or reply hold. More."),
+                         "Merge PR 12 as is, or reply hold.")
+        self.assertEqual(lead("Exact ask (owner): open Accounts and reconnect it. Then sync."),
+                         "open Accounts and reconnect it.")
+        self.assertEqual(lead("Ask (needs:ccqw): one open box is left."), "one open box is left.")

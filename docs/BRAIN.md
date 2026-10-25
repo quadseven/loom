@@ -57,6 +57,7 @@ that talks to GitHub about tickets.
 | `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
 | `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
 | `loom:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
+| `loom:answer-pending` | An operator answered the item's ask on the dashboard's Needs you page (`<!-- loom:answer v1 -->` comment, `bus/answer.py`); the station has not read it yet. The factory reads it on its next pass and takes the label off (see Operator answers). |
 | `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:window`, `wait:live-event` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, a deploy or roll window, or (`wait:live-event`, on a shipped ticket) its Live box needs a rare event the log has not shown in 7 days since it shipped. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
@@ -534,6 +535,11 @@ prompts; with the private command empty the repo is skipped. The station runs
 at most 5 rewrites per backlog goal home per hour (and 5 per pass), oldest
 first, under the budget floor rule. `state/station/rewrite.json` records each
 attempt; an issue that did not become a ticket is not tried again for a day.
+The agent command runs as a background job (`state/station/rewrite-jobs/`),
+so a model never holds the station pass (loom#1663): the pass that starts a
+job waits at most 10 seconds for it, and a later pass writes the answer of
+any job that ended since. A job with no result 5 minutes past its 10-minute
+timeout is logged as a rewrite that wrote nothing.
 
 ## Proof
 
@@ -1150,6 +1156,7 @@ pull request's review thread is not a new issue comment and is not scanned.
 | --- | --- |
 | `failure` | A red merge, a revert, or a lane's hand-back that a person may need to read. |
 | `ask` | The exact thing only a person can do (`loom:human`). |
+| `answer` | An operator's answer to an ask, posted from the dashboard's Needs you page (`bus/answer.py`, see Operator answers). |
 | `runaway` | A hold or release of a ticket that ran past its attempts. |
 | `proof-refused` | The station stops handing a ticket out to verify after refused proofs. |
 | `fix-brief` | A `loom:fix` brief that sends findings back to a lane (loom#866 and loom#821 own moving it). |
@@ -1394,6 +1401,11 @@ completed with `success`. A tick takes that line as given instead of
 re-reading the review list. `bus.brain merge` keeps its own checks.
 When a trusted brain fix is still pending on the linked ticket, status adds
 `pending brain fix` to the blockers instead of marking the pull request READY.
+For a line that would otherwise be READY, status also reads what `bus.brain
+merge` refuses on, through the same functions merge uses (loom#1643): a
+ticket not at `loom:pr` (`ticket at loom:running, not loom:pr`), a REST
+`mergeable_state` of `dirty` (`conflicts with the default branch`), and a
+risk tier outside `LOOM_AUTO_MERGE_TIERS` (`held for the operator: <tier>`).
 
 Status also prints a "Waiting on the brain" section: every open lane pull
 request whose ticket carries `needs-brain`, oldest first, with its ticket,
@@ -1457,6 +1469,33 @@ steps, or check that the placement is safe for the data and the nodes it
 lands on, then merge the pull request by hand. Loom never merges it, and the
 ask is posted once. `bus.brain status` marks a pull request whose body
 declares steps `blocked: held for the operator`.
+
+### Operator answers
+
+The dashboard's Needs you page takes an answer to each ask in one tap
+(loom#1777, docs/DASHBOARD.md). It posts one comment as the Loom App,
+`<!-- loom:answer v1 --> Answer from <login> (via the dashboard): <choice>.
+<note>`, takes off `loom:human`, `needs:<login>` and `needs-operator`, and
+adds `loom:answer-pending`. An answer counts only when its author is trusted
+(`LOOM_BRIEF_AUTHORS`, where the App's bot login is) or is the operator it
+names, and the login it names is an operator (`LOOM_OPERATORS`, else the
+person logins of `LOOM_BRIEF_AUTHORS`). The station reads it as that
+operator's newest comment: the stale-brief check (`bus/brief_check.py`)
+reads it as the operator's own words, and the brief's Operator notes carry
+it ("Answer: ..."). Each factory pass reads the open `loom:answer-pending`
+issues of a repo (at most 10) and takes the label off.
+
+On a lane pull request held for the operator, the hold ask offers Merge or
+Hold. Merge lifts that hold only, in the factory and in `bus.brain merge`:
+the risk tier's review check, open findings and hourly cap, the checks, the
+criteria and shadow mode still decide, so in shadow mode the merge is still
+only recorded. Hold keeps the pull request held with no new ask, and the
+factory puts `loom:human` back so it keeps waiting on a person. An answer
+counts only for the pull request the newest hold ask names, given after that
+ask and not before the head commit it would merge; a newer ask, or a newer
+head, asks again. Each Merge or Hold is written once to the shadow ledger as
+an `operator-verdict` entry (its label the verdict), beside the would-merge
+it pairs with; the ledger's counts and digest leave verdicts out.
 
 A ticket whose every acceptance criterion is a check on a live host or
 network (a command run on a host, a reach test from a network, a port, a
@@ -1624,6 +1663,32 @@ again at the next check time, or once its criteria change when nothing Loom
 runs can change the answer. In shadow mode the close is recorded in the
 ledger (source `station live proof`) and nothing is sent (#1608).
 
+A repo whose live data sits behind its own read-only routes (a log archive
+with per-workload reports, a read-only database user) declares a live-evidence
+adapter in `.loom/live-evidence.json` on its default branch
+(`bus/live_adapter.py`, #1770). It names a `log` command with the log
+`sources` it serves and a `sql` command, each an argv run without a shell:
+its first item a bare command on the station's PATH (never a shell or an
+interpreter, and its verb a fixed literal) or an executable `.loom/` script
+read from the default branch and run from a private temporary copy; every
+other item a literal or one whole placeholder (`{source}`, `{since}`,
+`{since_epoch}`, `{needle}`; `{sql}`). The command prints matching lines or
+rows, and may print `loom-evidence-window-hours: N` (log read in full) and
+`loom-evidence-count: N` (matches counted); it exits 0, or 1 for no match.
+A Live line names a step in a templated form: `log:<source>` with the strings
+that must appear in that log since the ship (or, worded as absent, must not
+appear over the window named, which the adapter must say it read), or
+`sql:<SELECT ...>` (one SELECT or SHOW) with the strings its answer must
+contain. The station runs an adapter only for repos in
+`LOOM_LIVE_EVIDENCE_REPOS`; the child gets PATH, HOME, LANG, TMPDIR and only
+the variables named in `LOOM_LIVE_EVIDENCE_PASS_ENV`, a timeout of at most
+300 seconds that kills its process group, and at most 64 KiB and 200 lines
+of output. A SQL statement is checked when the step is read and again just
+before it runs. Loom bounds what it asks and keeps; the routes behind the
+adapter keep themselves read-only (a SELECT-only user, a reader that cannot
+exec). An adapter error, a timeout or too much output is no evidence, and the
+status line names it.
+
 ## Post-merge watch
 
 After a Loom auto-merge (a `loom/` lane pull request merged by a Loom App,
@@ -1694,6 +1759,15 @@ forgets the outcomes before it. A demoted lane still takes verify runs. A
 repo that cannot be read keeps its records, and nothing is cleared by an
 error. The table goes on the lane status comment, and the dashboard's Lanes
 page shows it as Scorecard.
+
+Each merged record also gets a settled difficulty (`bus/difficulty.py`),
+scored blind from the merged work alone: the diff's changed lines and files,
+the fix rounds sent back and the review findings, never the ticket's
+`Difficulty:` line. The perceived difficulty on that line is kept beside it
+and never changed. The lane status comment compares the two per lane, model
+and kind (the change class) over the last 14 days: how many agree, how many
+were harder or easier, and the bias in tiers (positive: harder than the
+brief said), so routing can see where its guess is off.
 
 ## Pull requests without a ticket
 
@@ -1844,7 +1918,13 @@ ticket naming what evidence is missing.
 Every 6 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
 flight, blocked, next. A goal quiet since its last report gets none (Quiet
-goals, below).
+goals, below). The report ends with two lines: "Needs you:" (only what only
+the operator can do for this goal, or "nothing new for this goal"; it alone
+decides new comment or edit in place) and "Waiting on you:" (the count of
+open `loom:human` issues by repo and this goal's share, or "nothing"). `status`
+prints each goal's "Waiting on you:" line under "## Waiting on you"; `journal`
+refuses a report that puts the count on the "Needs you:" line or says
+"nothing" beside a count (loom#1775).
 
 ### Handoff packet
 

@@ -50,6 +50,14 @@ print(json.dumps(found))
 """
 
 
+MAX_WORKERS = 4
+
+
+def worker_count(item_count: int, cpu_count: int | None) -> int:
+    """Bound concurrent test processes to keep validation resource use steady."""
+    return min(item_count, cpu_count or 1, MAX_WORKERS)
+
+
 def child_env(test_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
     python_path = str(test_dir)
@@ -111,7 +119,7 @@ def main() -> int:
     items = work_items(modules, test_dir, max(1, args.shard_size))
     failed = False
     total = 0
-    max_workers = min(len(items), os.cpu_count() or 1)
+    max_workers = worker_count(len(items), os.cpu_count())
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         # Discovery order, not most-tests first: test count does not predict
         # time. Most-tests first queued test_dashboard (43 tests, 610s on the

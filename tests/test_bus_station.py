@@ -3030,6 +3030,166 @@ class HandBackTest(unittest.TestCase):
         self.assertEqual(self.ready_events(), [READY % ("b" * 40), READY % ("a" * 40)])
 
 
+RBAC_WORKFLOW = """name: rbac
+on:
+  pull_request:
+    paths:
+      - "deploy/rbac/**"
+jobs:
+  unit:
+    name: rbac unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/rbac
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: |
+          python -m unittest discover -s tests
+"""
+RBAC_LOG = ("FAIL: test_rbac_matches_source (tests.test_render.RenderTest.test_rbac_matches_source)\n"
+            "AssertionError: rbac.yaml is stale: regenerate it with "
+            "`python3 render.py --render-rbac > rbac.yaml`\n"
+            "##[error]Process completed with exit code 1.")
+
+
+class GapFake(ReviewFake):
+    """ReviewFake with what the validation-gap reader asks of GitHub: the
+    contract on the base branch, the head's check runs, the Actions job and
+    run, the workflow file, the pull request's files and the repo's gap
+    issues (loom#1773)."""
+
+    def __init__(self, contract="check: python3 -m unittest discover -s tests\n"):
+        super().__init__()
+        self.pr["base"] = {"ref": "main"}
+        self.contract = contract
+        self.failing = [{"id": 501, "name": "rbac unit tests", "status": "completed",
+                         "conclusion": "failure", "started_at": "2026-10-25T00:00:00Z",
+                         "app": {"slug": "github-actions"}, "check_suite": {"id": 9}}]
+        self.created = []
+        self.gap_issues = []
+
+    def rest(self, method, path, data=None, ok=()):
+        if method == "POST" and path == "/repos/%s/issues" % REPO:
+            number = 900 + len(self.created)
+            issue = dict(data, number=number)
+            self.created.append(issue)
+            self.gap_issues.append(issue)
+            return mock.Mock(data={"number": number})
+        return super().rest(method, path, data)
+
+    def _contents(self, text):
+        if text is None:
+            return mock.Mock(data=None, status=404)
+        return mock.Mock(data={"content": base64.b64encode(text.encode()).decode()}, status=200)
+
+    def _get(self, path):
+        if path == "/repos/%s/contents/.loom/validation.conf?ref=main" % REPO:
+            return self._contents(self.contract)
+        if path == "/repos/%s/contents/.github/workflows/test.rbac.yml?ref=%s" % (REPO, "a" * 40):
+            return self._contents(RBAC_WORKFLOW)
+        if path.endswith("/check-runs?filter=all&per_page=100"):
+            return mock.Mock(data={"check_runs": self.failing})
+        if path == "/repos/%s/actions/jobs/501" % REPO:
+            return mock.Mock(data={"run_id": 77, "name": "rbac unit tests", "steps": [
+                {"name": "Set up job", "conclusion": "success"},
+                {"name": "Test", "conclusion": "failure"}]})
+        if path == "/repos/%s/actions/runs/77" % REPO:
+            return mock.Mock(data={"path": ".github/workflows/test.rbac.yml"})
+        if path.startswith("/repos/%s/issues?labels=loom%%3Avalidation-gap&state=all" % REPO):
+            return mock.Mock(data=list(self.gap_issues))
+        return super()._get(path)
+
+    def paginate(self, path):
+        if path == "/repos/%s/pulls/7/files" % REPO:
+            return [{"filename": "deploy/rbac/source.yaml"}]
+        return super().paginate(path)
+
+
+class ValidationGapTest(unittest.TestCase):
+    """loom#1773: a lane pull request went red in CI on a per-directory suite
+    its repo's contract never ran, and only fix rounds followed."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.gh = GapFake()
+        self.station = station.Station(self.gh, station.Settings(self.temp.name, [REPO], AUTHORS, OWNERS))
+
+    def hand_back(self, sha="a" * 40):
+        self.gh.pr["head"]["sha"] = sha
+        self.gh.issue["labels"] = [{"name": n} for n in ("loom:ticket", "loom:pr", "lane:codex")]
+        with mock.patch("bus.brain._failing_checks", return_value=[("rbac unit tests", RBAC_LOG)]), \
+             mock.patch("bus.brain._open_threads", return_value=[]):
+            self.station.hand_back()
+        return [c["body"] for c in self.gh.comments if c["body"].startswith(tickets.FIX_MARKER)]
+
+    def state(self):
+        with open(os.path.join(self.temp.name, "state", "station", "validation_gaps.json")) as fh:
+            return json.load(fh)
+
+    def test_a_ci_job_the_contract_does_not_run_files_one_gap_and_tells_the_fix_round(self):
+        fixes = self.hand_back()
+        self.assertEqual(len(self.gh.created), 1)
+        issue = self.gh.created[0]
+        self.assertEqual(issue["title"],
+                         "Validation gap: CI job rbac unit tests is not in .loom/validation.conf")
+        self.assertEqual(issue["labels"], ["loom:validation-gap"])
+        self.assertIn("    affected: cd deploy/rbac && python -m unittest discover -s tests",
+                      issue["body"])
+        self.assertIn("`deploy/rbac/**`", issue["body"])
+        self.assertIn("`deploy/rbac/source.yaml`", issue["body"])
+        self.assertIn("## Acceptance criteria", issue["body"])
+        self.assertEqual(len(fixes), 1)
+        self.assertIn("does not run, so the lane's own validation never ran it (validation gap "
+                      "#900). Run it in the tree before you push.", fixes[0])
+        # The fix round's next red head names the same gap: nothing new is filed.
+        self.hand_back("b" * 40)
+        self.assertEqual(len(self.gh.created), 1)
+        self.assertEqual(list(self.state()["gaps"][REPO].values())[0]["issue"], 900)
+
+    def test_a_gap_already_on_an_issue_is_not_filed_again_when_the_state_is_lost(self):
+        self.hand_back()
+        os.remove(os.path.join(self.temp.name, "state", "station", "validation_gaps.json"))
+        self.hand_back("b" * 40)
+        self.assertEqual(len(self.gh.created), 1)
+
+    def test_a_ci_job_the_contract_runs_files_no_gap(self):
+        self.gh.contract = ("check: python3 -m unittest\n"
+                            "affected: cd deploy/rbac && python -m unittest discover -s tests\n")
+        fixes = self.hand_back()
+        self.assertEqual(self.gh.created, [])
+        self.assertNotIn("validation gap", fixes[0])
+
+    def test_a_repo_without_a_contract_files_no_gap(self):
+        self.gh.contract = None
+        self.hand_back()
+        self.assertEqual(self.gh.created, [])
+
+    def test_the_first_push_red_rate_is_recorded_once_and_shown_in_status(self):
+        self.hand_back()
+        self.hand_back("b" * 40)  # a fix round's head is not a first push
+        pushes = self.state()["first_push"][REPO]
+        self.assertEqual(list(pushes), ["7"])
+        self.assertTrue(pushes["7"]["red"])
+        lines = brain.validation_gap_lines({"LOOM_HOME": self.temp.name})
+        self.assertIn("- %s: 1 of 1 lane pull requests red on first push (100%%); 1 gap filed" % REPO,
+                      lines)
+        self.assertTrue(any(line.startswith("  - #900 job rbac unit tests: add `affected: cd "
+                                            "deploy/rbac") for line in lines), lines)
+
+    def test_the_fix_comment_names_the_failing_test_and_the_regenerate_command_first(self):
+        body = self.hand_back()[0]
+        lines = body.splitlines()
+        first = next(i for i, l in enumerate(lines) if l.startswith("First step:"))
+        self.assertLess(first, next(i for i, l in enumerate(lines) if l.startswith("- Check ")))
+        self.assertIn("First step: run `python3 render.py --render-rbac > rbac.yaml` and commit "
+                      "what it writes", body)
+        self.assertIn("Failing tests:\n- `tests.test_render.RenderTest.test_rbac_matches_source`", body)
+        self.assertIn("Assertion lines:\n\n    AssertionError: rbac.yaml is stale", body)
+
+
 class StepTimingTest(Base):
     def test_a_slow_step_is_logged_with_its_time_and_requests(self):
         # 2026-10-24: passes ran 25 to 98 minutes with 3000 to 6300 requests,

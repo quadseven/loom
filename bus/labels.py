@@ -17,7 +17,11 @@ LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
 # Contributor (LOOM_OPENCODE_GO_4_MODEL), which trains on prompts, so it
 # takes public repos only.
 SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-6",
-         "anthropic-7", "anthropic-8", "codex-2", "opencode-go-2", "opencode-go-3",
+         "anthropic-7", "anthropic-8", "codex-2",
+         # Six more codex slots, all on gpt-6-luna, so the Codex allowance is
+         # used rather than left to reset (operator, 2026-10-25).
+         "codex-3", "codex-4", "codex-5", "codex-6", "codex-7", "codex-8",
+         "opencode-go-2", "opencode-go-3",
          "opencode-go-4",
          # A second local coder: the other Spark box, at LOOM_SPARK_2_URL.
          "spark-2",
@@ -63,6 +67,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:running": {"color": "fbca04", "description": "Handed to the lane's runner"},
     "loom:pr": {"color": "0075ca", "description": "The runner opened a pull request"},
     "loom:answered": {"color": "5319e7", "description": "The runner posted an answer for brain review"},
+    "loom:answer-pending": {"color": "c5def5", "description": "An operator answered on the dashboard; the station has not read it yet"},
     "loom:ready": {"color": "0e8a16", "description": "Checks passed and review-bot threads are resolved"},
     "loom:failed": {"color": "d93f0b", "description": "The runner gave up; see the ticket"},
     "loom:merged": {"color": "8fd19e", "description": "Merged, not deployed yet"},
@@ -80,6 +85,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:runaway": {"color": "b60205", "description": "Held for brain review after repeated or regressive attempts"},
     "loom:recurring": {"color": "fbca04", "description": "Invariant breached repeatedly; keep open for a fix"},
     "loom:factory": {"color": "b60205", "description": "A factory validation incident"},
+    "loom:validation-gap": {"color": "fbca04", "description": "A CI job the repo's .loom/validation.conf does not run"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
