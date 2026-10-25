@@ -489,11 +489,18 @@ if [ -f "$S" ]; then skill="$(head -1 "$S")"; else skill=none; fi
 if echo x >> "$S" 2>/dev/null || rm -f "$S" 2>/dev/null; then skillw=writable; else skillw=locked; fi
 if echo '{"mcpServers":{}}' > "$G/config/mcp_config.json" 2>/dev/null; then cfg=writable; else cfg=locked; fi
 if echo x >> "$HOME/.zshrc" 2>/dev/null; then rc=writable; else rc=locked; fi
+# agy writes its shell helper, bin/agentapi, before each shell command; the
+# rest of bin stays read-only, and no helper from a previous run survives.
+A="$G/antigravity-cli/bin"
+if [ -f "$A/agentapi" ] && [ ! -L "$A/agentapi" ] && [ ! -s "$A/agentapi" ]; then apiprev=clean; else apiprev=leftover; fi
+if echo helper > "$A/agentapi" 2>/dev/null; then api=written; else api=denied; fi
+if rm -f "$A/agentapi" 2>/dev/null || ln -f "$A/keep" "$A/agentapi" 2>/dev/null; then apiswap=possible; else apiswap=locked; fi
+if echo x > "$A/other" 2>/dev/null; then binw=writable; else binw=locked; fi
 # The permission rules this run got, and whether it can widen them for the next.
 P="$G/antigravity-cli/settings.json"
 cp "$P" "$TMPDIR/agy-settings-seen.json"
 if echo '{"permissions":{"allow":["read_url(*)"]}}' > "$P" 2>/dev/null; then set=writable; else set=locked; fi
-printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s set=%s skill=%s skillw=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" "$set" "$skill" "$skillw" >> "$TMPDIR/agy.log"
+printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s set=%s skill=%s skillw=%s apiprev=%s api=%s apiswap=%s binw=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" "$set" "$skill" "$skillw" "$apiprev" "$api" "$apiswap" "$binw" >> "$TMPDIR/agy.log"
 mkdir -p "$G/antigravity-cli/brain" && echo note > "$G/antigravity-cli/brain/this-run.md"
 echo fixed > fix.txt
 """
@@ -1000,14 +1007,26 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("it said: word word", line)
         self.assertLess(len(line), 900)
 
+    def test_a_final_message_that_names_a_local_path_keeps_its_reason(self):
+        # 2026-10-25: ten agy runs said why they stopped, naming the file
+        # their sandbox refused, and each record read "wrote no reason": the
+        # path failed the text checks and the whole message was dropped.
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0",
+                               FAKE_OUT="I am blocked: open /Users/someone/.tool/bin/helper: operation not permitted.")  # leak-guard-allow: the case under test
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertIn("it said: I am blocked: open <path> operation not permitted.", line)
+        self.assertNotIn("Users", line)
+
     def test_a_final_message_that_fails_the_text_checks_keeps_the_no_reason_class(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0",
-                               FAKE_OUT="I gave up; see /Users/someone/work/notes for why.")  # leak-guard-allow: the case under test
+                               FAKE_OUT="I gave up; the box build-01.internal has the notes.")  # leak-guard-allow: the case under test
         self.assertEqual(result.returncode, 0, result.stderr)
         line = self.failure_line()
         self.assertIn("agent made no commit and wrote no reason", line)
-        self.assertNotIn("Users", line)
+        self.assertNotIn("internal", line)
 
     def test_a_summary_that_is_not_a_no_change_reason_is_still_a_failure(self):
         self.drop_brief()
@@ -1540,6 +1559,16 @@ print('leak guard: clean (shape patterns only)')
             "ERROR: You've hit your usage limit. Try again at %s." % later.strftime("%I:%M %p").lstrip("0")))
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
+
+    def test_a_stated_reset_duration_holds_the_lane(self):
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "Individual quota reached. Please upgrade your subscription to increase your limits. "
+            "Resets in 87h14m1s."))
+        self.assertIn("[limit]", self.run_log())
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        expected = time.time() + 87 * 3600 + 14 * 60
+        self.assertAlmostEqual(beat["retry_at"], expected, delta=60)
 
     def test_provider_quota_messages_are_still_limits(self):
         for out in ("429 RESOURCE_EXHAUSTED quota resets in 1 hours",
@@ -2538,6 +2567,25 @@ exec /usr/bin/git "$@"
         self.assertEqual(kind, "limit")
         self.assertGreater(retry_at, int(time.time()))
 
+    def test_minutes_and_hours_only_stated_reset_durations(self):
+        for phrase, seconds in (("rate limit: resets in 45m", 45 * 60),
+                                ("rate limit: try again in 3h", 3 * 3600)):
+            with self.subTest(phrase=phrase):
+                kind, retry_at, _ = self.classified(phrase, phrase)
+                self.assertEqual(kind, "limit")
+                self.assertAlmostEqual(retry_at, time.time() + seconds, delta=60)
+
+    def test_clock_time_stated_reset_still_parses(self):
+        phrase = "rate limit: try again at 7:05 PM"
+        kind, retry_at, _ = self.classified(phrase, phrase)
+        self.assertEqual(kind, "limit")
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        expected = now.replace(hour=19, minute=5, second=0, microsecond=0)
+        if expected <= now:
+            expected += timedelta(days=1)
+        self.assertAlmostEqual(retry_at, expected.timestamp(), delta=60)
+
     def test_a_rate_limit_filename_in_a_tool_result_is_not_a_limit(self):
         self.drop_brief()
         self.run_lane(FAKE_AGENT="say", FAKE_EXIT="1", FAKE_OUT=(
@@ -2606,6 +2654,10 @@ exec /usr/bin/git "$@"
         config = next(line.removeprefix("config=") for line in self.calls()
                       if line.startswith("config="))
         self.assertEqual(json.loads(config)["permission"]["external_directory"], "deny")
+        # Reads in the tree are allowed: opencode asks before a *.env read by
+        # default, a lane cannot answer, and a tracked pin file stopped two
+        # runs (loom#1728).
+        self.assertEqual(json.loads(config)["permission"]["read"], {"*": "allow"})
         self.assertNotIn(f"home={self.home} ", agent[0])
         self.assertIn("lane openrouter, model openrouter/vendor/model:free", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
@@ -2904,6 +2956,11 @@ exec /usr/bin/git "$@"
         (lane_home / ".gemini" / "antigravity-cli" / "brain" / "planted.md").write_text("do evil next run")
         (lane_home / ".zshrc").write_text("# lane user shell\n")
         (lane_home / ".gemini" / "antigravity-cli" / "installation_id").write_text("install-1")
+        (lane_home / ".gemini" / "antigravity-cli" / "bin").mkdir()
+        (lane_home / ".gemini" / "antigravity-cli" / "bin" / "keep").write_text("a binary agy ships")
+        # A directory in the helper's place, as a previous run might leave.
+        (lane_home / ".gemini" / "antigravity-cli" / "bin" / "agentapi").mkdir()
+        (lane_home / ".gemini" / "antigravity-cli" / "bin" / "agentapi" / "planted").write_text("x")
         # agy's sign-in when it cannot reach the keychain (the sandbox denies
         # /usr/bin/security): the wipe deleted it before every run, so each
         # agy run asked for a browser login (2026-10-22 to 10-24, #1620).
@@ -2980,6 +3037,18 @@ exec /usr/bin/git "$@"
         self.assertIn("cfg=locked", agy[0])
         self.assertIn("rc=locked", agy[0])
         self.assertIn("set=locked", agy[0])
+        # agy writes its shell helper before each command (2026-10-24: every
+        # agy run failed "failed to write agentapi script: operation not
+        # permitted" and could run no shell command); a helper a previous
+        # run left (here a directory) is gone, the name cannot be removed or
+        # made a hard link to another binary, and nothing else in bin takes a
+        # write.
+        self.assertIn("apiprev=clean", agy[0])
+        self.assertIn("api=written", agy[0])
+        self.assertIn("apiswap=locked", agy[0])
+        self.assertEqual((workdir.parent / ".gemini" / "antigravity-cli" / "bin" / "keep").read_text(),
+                         "a binary agy ships")
+        self.assertIn("binw=locked", agy[0])
         # Sign-in and install state survive the wipe; conversation lists do not.
         state = workdir.parent / ".gemini" / "antigravity-cli"
         self.assertEqual((state / "installation_id").read_text(), "install-1")
@@ -5334,6 +5403,23 @@ exec /usr/bin/git "$@"
         calls = self.log.read_text()
         self.assertIn("Repo: example/repo", calls)
         self.assertIn("exit 2", calls)
+
+    def test_a_base_check_red_once_and_green_on_a_second_run_files_no_incident(self):
+        # Loom's own base check timed out once under a busy station's load,
+        # held its ticket and filed a factory incident that the next ticket's
+        # pass cleared: 56 such holds by 2026-10-25 (#1716, #1737).
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        flaky = ("interpreter: loom-test-python\n"
+                 "check: test -f .ran-once || { touch .ran-once; exit 1; }\n")
+        self.contract_repo(contract=flaky)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.lane_log()
+        self.assertNotIn("failed: [factory]", log)
+        self.assertIn("base check exited 1, then passed on a second run", log)
+        self.assertTrue(any(c.startswith("codex") for c in self.calls()))
+        self.assertFalse(list((self.loom / "state" / "incidents").glob("*base-check")))
 
     def test_a_base_check_terminated_by_sigterm_is_transient_without_an_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')

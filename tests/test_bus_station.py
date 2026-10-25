@@ -1004,7 +1004,9 @@ class ReconcilePullRequestTest(Base):
 
     def test_an_adoption_ticket_moves_to_merged_when_its_target_merges(self):
         sha = "%040x" % 77
-        for index, state in enumerate(("queued", "briefed", "running", "answered")):
+        # A failed lane run leaves the ticket loom:failed; its target can
+        # still merge, and the factory must not re-brief landed work (loom#1717).
+        for index, state in enumerate(("queued", "briefed", "running", "answered", "failed")):
             with self.subTest(state=state):
                 number = 12 + index
                 self.adoption(number, 77, state=state, lane="spark-2")
@@ -5096,6 +5098,30 @@ class FactoryIncidentTest(Base):
         self.assertIn("keeps its rung", hold[0])
         self.assertIn("factory incident %s#99" % REPO, hold[0])
 
+    def test_incident_filing_failure_is_named_in_ticket_status(self):
+        self.heartbeat("muse")
+        self.failed(reason="[factory] setup failed: incident filing failed")
+        with mock.patch.object(station.Station, "_green_default_after_hold", return_value=False):
+            self.run_pass()
+        held = [body for body in self.bodies() if "held: incident filing failed" in body]
+        self.assertTrue(held, self.bodies())
+
+    def test_a_named_incident_hold_waits_while_the_incident_is_open(self):
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        # No incident is closed: the hold keeps the ticket running until it
+        # closes, the same as before.
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertEqual(set(self.fake.names(12)),
+                         {"loom:ticket", "lane:muse", "loom:running", "wait:incident"})
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        with open(path, encoding="utf-8") as fh:
+            held = json.load(fh)
+        self.assertEqual(held, {"%s#12" % REPO: {"incident": "%s#99" % REPO,
+                                                 "at": held["%s#12" % REPO]["at"]}})
+
     def test_factory_failures_never_flag_runaway(self):
         self.heartbeat("muse")
         at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
@@ -5232,6 +5258,14 @@ class ProbeTest(FactoryIncidentTest):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as fh:
             json.dump(held, fh)
+        return path
+
+    def _probe_file(self, probe):
+        path = os.path.join(self.home, "state", "station", "factory_probe.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(probe, fh)
+        return path
 
     def test_a_probe_requeues_exactly_one_held_ticket_when_the_head_moved(self):
         # An open base-check incident holds every ticket of the repo, all of
@@ -5244,11 +5278,11 @@ class ProbeTest(FactoryIncidentTest):
         self._open_incident()
         self.fake.head_sha = "b" * 40
         now = time.time()
+        self._probe_file({
+            "quadseven/loom#99": {"head": "a" * 40, "at": now - 7200}})
         self._held_file({
-            "%s#12" % REPO: {"incident": "quadseven/loom#99", "at": now - 7200,
-                             "head": "a" * 40},
-            "%s#13" % REPO: {"incident": "quadseven/loom#99", "at": now - 7200,
-                             "head": "a" * 40},
+            "%s#12" % REPO: {"incident": "quadseven/loom#99", "at": now - 7200},
+            "%s#13" % REPO: {"incident": "quadseven/loom#99", "at": now - 7200},
         })
         with mock.patch.object(station, "FACTORY_REPO", REPO):
             self.run_pass()
@@ -5265,9 +5299,10 @@ class ProbeTest(FactoryIncidentTest):
         self._open_incident()
         self.fake.head_sha = "b" * 40
         now = time.time()
+        self._probe_file({
+            "quadseven/loom#99": {"head": "a" * 40, "at": now - 7200}})
         self._held_file({
-            "%s#12" % REPO: {"incident": "quadseven/loom#99", "at": now - 7200,
-                             "head": "a" * 40},
+            "%s#12" % REPO: {"incident": "quadseven/loom#99", "at": now - 7200},
         })
         before = len(self.fake.comments[12])
         with mock.patch.object(station, "FACTORY_REPO", REPO):
@@ -5281,8 +5316,7 @@ class ProbeTest(FactoryIncidentTest):
                                           {"name": "lane:muse"},
                                           {"name": "loom:running"}]
         self._held_file({
-            "%s#12" % REPO: {"incident": "quadseven/loom#99", "at": now,
-                             "head": "a" * 40},
+            "%s#12" % REPO: {"incident": "quadseven/loom#99", "at": now},
         })
         before = len(self.fake.comments[12])
         with mock.patch.object(station, "FACTORY_REPO", REPO):
@@ -5291,6 +5325,97 @@ class ProbeTest(FactoryIncidentTest):
         # probe waits the full interval, and no new comment was posted.
         self.assertIn("loom:running", self.fake.names(12))
         self.assertEqual(len(self.fake.comments[12]), before)
+
+
+class FactoryNoIncidentHoldTest(Base):
+    """A [factory] hold whose reason names no incident (the incident filing
+    failed) is released after HELD_NO_INCIDENT_FOR instead of being held
+    forever."""
+
+    def held(self, number=12, at=None, lane="muse", incident=None):
+        self.fake.add(number, lane=lane, body=PLAIN, state="running")
+        held = {"%s#%d" % (REPO, number): {"incident": incident, "at": at}}
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(held, fh)
+        return path
+
+    def held_file(self):
+        return os.path.join(self.home, "state", "station", "factory_held.json")
+
+    def held_entry(self):
+        try:
+            with open(self.held_file(), encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    def release(self, now):
+        gh = GitHub("token", transport=self.fake)
+        runner = station.Station(gh, self.settings, now=now)
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            runner.release_factory_held()
+        return gh
+
+    def status_boxes(self, number=12):
+        return "\n".join(c["body"] for c in self.fake.comments[number]
+                         if status.is_status(c.get("body")))
+
+    def test_a_hold_with_no_incident_older_than_two_hours_is_released(self):
+        now = 1700000000.0
+        self.held(at=now - 3 * 3600)
+        self.release(now)
+        self.assertEqual(self.fake.names(12),
+                         ["loom:ticket", "lane:muse", "loom:queued"])
+        self.assertNotIn("%s#12" % REPO, self.held_entry() or {})
+        self.assertIn("incident filing failed", self.status_boxes())
+
+    def test_a_hold_with_no_incident_younger_than_two_hours_stays_running(self):
+        now = 1700000000.0
+        self.held(at=now - 600)
+        with mock.patch.object(station.Station, "_green_default_after_hold", return_value=False):
+            self.release(now)
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertNotIn("loom:queued", self.fake.names(12))
+        self.assertEqual(self.held_entry(), {"%s#12" % REPO: {"incident": None,
+                                                              "at": now - 600}})
+
+    def test_a_young_hold_releases_after_a_newer_green_default_branch_run(self):
+        now = 1700000000.0
+        self.held(at=now - 600)
+        with mock.patch.object(station.Station, "_green_default_after_hold", return_value=True):
+            self.release(now)
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("%s#12" % REPO, self.held_entry() or {})
+        self.assertIn("newer green default-branch run", self.status_boxes())
+
+    def test_green_default_branch_requires_a_newer_commit_and_successful_checks(self):
+        sha = "a" * 40
+
+        def transport(method, url, headers, body):
+            path = urlsplit(url).path
+            if path == "/repos/%s" % REPO:
+                return reply(200, {"default_branch": "main"})
+            if path == "/repos/%s/commits/main" % REPO:
+                return reply(200, {"sha": sha, "commit": {"committer": {
+                    "date": "2023-11-14T22:30:00Z"}}})
+            if path == "/repos/%s/commits/%s/check-runs" % (REPO, sha):
+                return reply(200, {"check_runs": [{"status": "completed",
+                                                   "conclusion": "success"}]})
+            if path == "/repos/%s/commits/%s/status" % (REPO, sha):
+                return reply(200, {"state": "success"})
+            raise AssertionError("unexpected request %s %s" % (method, path))
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        self.assertTrue(runner._green_default_after_hold(REPO, 1700000000.0))
+
+    def test_a_hold_with_no_incident_and_no_age_stays_running(self):
+        now = 1700000000.0
+        self.held(at=None)
+        self.release(now)
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertIn("%s#12" % REPO, self.held_entry() or {})
 
 
 class PruneTest(Base):
