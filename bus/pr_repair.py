@@ -174,7 +174,7 @@ def _render_generated(brief: str, lane: str, model: str, ticket: str,
     if not summary.strip():
         summary = _brief_section(brief, "Summary")
     if not why.strip():
-        why = summary
+        why = summary if summary.strip() else (_brief_title(brief) or "")
     if acceptance is None:
         acceptance = _brief_section(brief, "Acceptance criteria")
     size = _brief_size(brief)
