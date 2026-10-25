@@ -142,6 +142,26 @@ def _steps(lines: List[str], start: int, end: int, job_workdir: str) -> List[Ste
     return found
 
 
+def _job(lines: List[str], index: int, indent: int, ident: str) -> Job:
+    """One job: its name, its run steps and the working-directory its
+    defaults name before the steps."""
+    job_end = _block_end(lines, index + 1, indent)
+    name, workdir, steps_at, child = ident, "", None, None
+    for c_index, c_indent, c_line in _content(lines, index + 1, job_end):
+        child = c_indent if child is None else child
+        key, rest = ship_paths._name(c_line)
+        if c_indent == child and key == "name":
+            name = ship_paths._strip(rest) or ident
+        elif c_indent == child and key == "steps":
+            steps_at = (c_index, c_indent)
+        elif key == "working-directory" and c_indent > child and steps_at is None:
+            workdir = ship_paths._strip(rest)
+    if steps_at is None:
+        return Job(ident, name, [])
+    start = steps_at[0] + 1
+    return Job(ident, name, _steps(lines, start, _block_end(lines, start, steps_at[1]), workdir))
+
+
 def workflow_jobs(text: str) -> List[Job]:
     """Each job under the workflow's top-level `jobs:`: its id, its name (the
     id when it has none) and its run steps."""
@@ -150,35 +170,13 @@ def workflow_jobs(text: str) -> List[Job]:
                     if not indent and ship_paths._name(line)[0] == "jobs"), None)
     if jobs_at is None:
         return []
-    end = _block_end(lines, jobs_at + 1, 0)
+    entries = list(_content(lines, jobs_at + 1, _block_end(lines, jobs_at + 1, 0)))
+    job_indent = entries[0][1] if entries else 0
     found: List[Job] = []
-    job_indent = None
-    for index, indent, line in _content(lines, jobs_at + 1, end):
-        if job_indent is None:
-            job_indent = indent
-        if indent != job_indent:
-            continue
-        ident = ship_paths._name(line)[0]
-        if not ident:
-            continue
-        job_end = _block_end(lines, index + 1, indent)
-        name, workdir, steps_at = ident, "", None
-        child = None
-        for c_index, c_indent, c_line in _content(lines, index + 1, job_end):
-            if child is None:
-                child = c_indent
-            key, rest = ship_paths._name(c_line)
-            if c_indent == child and key == "name":
-                name = ship_paths._strip(rest) or ident
-            elif c_indent == child and key == "steps":
-                steps_at = (c_index, c_indent)
-            elif key == "working-directory" and c_indent > child and steps_at is None:
-                workdir = ship_paths._strip(rest)
-        steps = []
-        if steps_at is not None:
-            steps = _steps(lines, steps_at[0] + 1, _block_end(lines, steps_at[0] + 1, steps_at[1]),
-                           workdir)
-        found.append(Job(ident, name, steps))
+    for index, indent, line in entries:
+        ident = ship_paths._name(line)[0] if indent == job_indent else None
+        if ident:
+            found.append(_job(lines, index, indent, ident))
     return found
 
 
@@ -305,6 +303,46 @@ def contract_fields(gh: Any, repo: str, ref: str) -> Optional[Dict[str, str]]:
         return None
 
 
+def _run_workflow(gh: Any, repo: str, run: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """(workflow path, Actions job) of a GitHub Actions check run; ("", {})
+    when it is not one or either read fails."""
+    if (run.get("app") or {}).get("slug") != "github-actions":
+        return "", {}
+    job_data = gh.rest("GET", "/repos/%s/actions/jobs/%d" % (repo, int(run["id"])),
+                       ok=(404,)).data
+    if not isinstance(job_data, dict) or not job_data.get("run_id"):
+        return "", {}
+    run_data = gh.rest("GET", "/repos/%s/actions/runs/%d" % (repo, int(job_data["run_id"])),
+                       ok=(404,)).data
+    path = str(run_data.get("path") or "") if isinstance(run_data, dict) else ""
+    path = path.split("@", 1)[0]
+    if not re.fullmatch(r"\.github/workflows/[\w.-]+\.ya?ml", path):
+        return "", {}
+    return path, job_data
+
+
+class _Reads:
+    """What find_gaps reads once per call: workflow texts by path and the
+    pull request's files (only when a gap's workflow has a paths filter)."""
+
+    def __init__(self, gh: Any, repo: str, sha: str, changed: Callable[[], List[str]]):
+        self.gh, self.repo, self.sha, self.changed = gh, repo, sha, changed
+        self.texts: Dict[str, Optional[str]] = {}
+        self.files: Optional[List[str]] = None
+
+    def text(self, path: str) -> Optional[str]:
+        if path not in self.texts:
+            self.texts[path] = _text(self.gh, self.repo, path, self.sha)
+        return self.texts[path]
+
+    def matched(self, paths: List[str]) -> List[str]:
+        if not paths:
+            return []
+        if self.files is None:
+            self.files = self.changed()
+        return [f for f in self.files if ship_paths.matches(paths, f)][:5]
+
+
 def find_gaps(gh: Any, repo: str, pr: int, sha: str, fields: Dict[str, str],
               failing: Sequence[Dict[str, Any]], changed: Callable[[], List[str]]) -> List[Gap]:
     """The gaps in the failing GitHub Actions check runs of a lane pull
@@ -313,28 +351,13 @@ def find_gaps(gh: Any, repo: str, pr: int, sha: str, fields: Dict[str, str],
     run. `changed` lists the pull request's files, read only when a gap's
     workflow has a paths filter."""
     have = "\n".join(fields.get(k, "") for k in ("setup", "check", "affected"))
+    reads = _Reads(gh, repo, sha, changed)
     gaps: List[Gap] = []
-    texts: Dict[str, Optional[str]] = {}
-    files: Optional[List[str]] = None
     for run in failing:
-        if (run.get("app") or {}).get("slug") != "github-actions":
-            continue
-        job_data = gh.rest("GET", "/repos/%s/actions/jobs/%d" % (repo, int(run["id"])),
-                           ok=(404,)).data
-        if not isinstance(job_data, dict) or not job_data.get("run_id"):
-            continue
-        run_data = gh.rest("GET", "/repos/%s/actions/runs/%d" % (repo, int(job_data["run_id"])),
-                           ok=(404,)).data
-        path = str((run_data or {}).get("path") or "") if isinstance(run_data, dict) else ""
-        path = path.split("@", 1)[0]
-        if not re.fullmatch(r"\.github/workflows/[\w.-]+\.ya?ml", path):
-            continue
-        if path not in texts:
-            texts[path] = _text(gh, repo, path, sha)
-        text = texts[path]
-        if text is None:
-            continue
-        job = find_job(workflow_jobs(text), str(run.get("name") or job_data.get("name") or ""))
+        path, job_data = _run_workflow(gh, repo, run)
+        text = reads.text(path) if path else None
+        job = find_job(workflow_jobs(text), str(run.get("name") or job_data.get("name") or "")) \
+            if text is not None else None
         if job is None:
             continue
         paths = pull_request_paths(text)
@@ -342,13 +365,8 @@ def find_gaps(gh: Any, repo: str, pr: int, sha: str, fields: Dict[str, str],
             if covered(step.command, have, step.workdir):
                 continue
             command = _with_workdir(step)
-            matched: List[str] = []
-            if paths:
-                if files is None:
-                    files = changed()
-                matched = [f for f in files if ship_paths.matches(paths, f)][:5]
             gaps.append(Gap(repo, pr, path, job.name, step.name or "run step", command,
-                            list(paths), matched, suggestion(command, paths, fields),
+                            list(paths), reads.matched(paths), suggestion(command, paths, fields),
                             gap_key(repo, path, job.name, command)))
     return gaps
 
