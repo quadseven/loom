@@ -30,7 +30,7 @@ LOOKUP_METHODS = ("__getitem__", "__contains__", "__missing__", "get")
 
 _CLASS_RE = re.compile(r"^\s*class\s+([A-Za-z_]\w*)\s*\(\s*([A-Za-z_]\w*)\s*\)")
 _DEF_RE = re.compile(r"^\s*def\s+(__getitem__|__contains__|__missing__|get)\b")
-_TEST_RE = re.compile(r"^\s*def\s+(test_\w+)\b")
+_TEST_RE = re.compile(r"^\s*def\s+(test_\w+)\b", re.M)
 _FIXTURE_RE = re.compile(r"^\s*([A-Z][A-Z0-9_]*)\s*=\s*[\[{]", re.M)
 _CODE_EXTS = (".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".cpp", ".h",
               ".hpp", ".go", ".rs", ".sh", ".lua", ".sql")
@@ -98,9 +98,10 @@ def findings(changed: Dict[str, str], ticket_body: str = "", pr_body: str = "",
     against the base commit's code (so the fix never made it fail).
     """
     out: List[str] = []
-    code_files = [path for path in changed if _is_code(path)]
     test_files = [path for path in changed if _is_test(path)]
-    ticket_asks = bool(re.search(r"\bfixture|expected|table\b", ticket_body or "", re.I))
+    code_files = [path for path in changed if _is_code(path) and not _is_test(path)]
+    ticket_asks = bool(re.search(r"\b(fixture|expected|table)\b", ticket_body or "", re.I))
+    pr_asks = bool(re.search(r"\b(fixture|expected|table)\b", pr_body or "", re.I))
     # 1. A subclass of a builtin container that overrides lookup/membership.
     for path in code_files:
         for cls_name, container, method in _container_overrides(changed[path]):
@@ -108,8 +109,8 @@ def findings(changed: Dict[str, str], ticket_body: str = "", pr_body: str = "",
                        "does not raise (class %s in %s)"
                        % (container, method, cls_name, path))
     # 2. A test's expected table or fixture edited alongside the code under
-    #    test, unless the ticket asks for it.
-    if code_files and test_files and not ticket_asks:
+    #    test, unless the ticket or PR asks for it.
+    if code_files and test_files and not ticket_asks and not pr_asks:
         for path in test_files:
             for name in _fixture_tests(changed[path]):
                 out.append("edits the expected table or fixture of test %s in "

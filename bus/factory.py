@@ -132,6 +132,7 @@ turned into a trusted brief by the factory editing it.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -140,7 +141,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -1576,6 +1577,36 @@ class Factory:
                 break
         return paths
 
+    def _file_contents(self, repo: str, number: int, sha: str) -> Dict[str, str]:
+        """The new source text of each file the pull request changes, from the
+        head commit `sha`. Returns a mapping of path -> content for files that
+        exist and are readable at the head."""
+        files: Dict[str, str] = {}
+        for page in range(1, 31):
+            data = self.gh.rest("GET", "/repos/%s/pulls/%d/files?per_page=100&page=%d"
+                                % (repo, number, page)).data or []
+            batch = [f for f in data if isinstance(f, dict)]
+            if not batch:
+                break
+            for entry in batch:
+                path = str(entry.get("filename") or "")
+                if not path:
+                    continue
+                # Fetch the file content from the head commit
+                content_data = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s"
+                                            % (repo, quote(path, safe=""), sha), ok=(404,))
+                if content_data.status == 404:
+                    continue
+                content = content_data.data or {}
+                if content.get("encoding") == "base64" and content.get("content"):
+                    try:
+                        files[path] = base64.b64decode(content["content"]).decode("utf-8", "replace")
+                    except (ValueError, TypeError):
+                        pass
+            if len(batch) < 100:
+                break
+        return files
+
     def _needs_test(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
         """Does this pull request change code and no test, in a repo and on a
         ticket that ask for tests?"""
@@ -2323,10 +2354,24 @@ class Factory:
         elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
-        elif (not sensitive and not self._operator_holds(repo, number, full, issue, comments)
-              and not self._risk_holds(repo, number, full, issue, comments)):
-            self._file_criterion_follow_up(repo, number, issue, full)
-            self._land(repo, number, full, issue, comments)
+        else:
+            # Vacuous-test gate: a lane PR whose code bends a lookup so its
+            # own test cannot fail is not ready (loom#1681).
+            sha = str((full.get("head") or {}).get("sha") or "")
+            if sha:
+                changed = self._file_contents(repo, number, sha)
+                if changed:
+                    ticket_body = str(issue.get("body") or "")
+                    pr_body = str(full.get("body") or "")
+                    findings = vacuous.findings(changed, ticket_body, pr_body)
+                    if findings:
+                        self._send_back(repo, full, issue, comments,
+                                        "vacuous test: " + "; ".join(findings))
+                        return
+            if (not sensitive and not self._operator_holds(repo, number, full, issue, comments)
+                  and not self._risk_holds(repo, number, full, issue, comments)):
+                self._file_criterion_follow_up(repo, number, issue, full)
+                self._land(repo, number, full, issue, comments)
 
     def _operator_holds(self, repo: str, number: int, full: Dict[str, Any],
                         issue: Dict[str, Any], comments: Sequence[Dict[str, Any]] = ()) -> bool:
