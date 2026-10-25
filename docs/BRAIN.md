@@ -1634,6 +1634,32 @@ again at the next check time, or once its criteria change when nothing Loom
 runs can change the answer. In shadow mode the close is recorded in the
 ledger (source `station live proof`) and nothing is sent (#1608).
 
+A repo whose live data sits behind its own read-only routes (a log archive
+with per-workload reports, a read-only database user) declares a live-evidence
+adapter in `.loom/live-evidence.json` on its default branch
+(`bus/live_adapter.py`, #1770). It names a `log` command with the log
+`sources` it serves and a `sql` command, each an argv run without a shell:
+its first item a bare command on the station's PATH (never a shell or an
+interpreter, and its verb a fixed literal) or an executable `.loom/` script
+read from the default branch and run from a private temporary copy; every
+other item a literal or one whole placeholder (`{source}`, `{since}`,
+`{since_epoch}`, `{needle}`; `{sql}`). The command prints matching lines or
+rows, and may print `loom-evidence-window-hours: N` (log read in full) and
+`loom-evidence-count: N` (matches counted); it exits 0, or 1 for no match.
+A Live line names a step in a templated form: `log:<source>` with the strings
+that must appear in that log since the ship (or, worded as absent, must not
+appear over the window named, which the adapter must say it read), or
+`sql:<SELECT ...>` (one SELECT or SHOW) with the strings its answer must
+contain. The station runs an adapter only for repos in
+`LOOM_LIVE_EVIDENCE_REPOS`; the child gets PATH, HOME, LANG, TMPDIR and only
+the variables named in `LOOM_LIVE_EVIDENCE_PASS_ENV`, a timeout of at most
+300 seconds that kills its process group, and at most 64 KiB and 200 lines
+of output. A SQL statement is checked when the step is read and again just
+before it runs. Loom bounds what it asks and keeps; the routes behind the
+adapter keep themselves read-only (a SELECT-only user, a reader that cannot
+exec). An adapter error, a timeout or too much output is no evidence, and the
+status line names it.
+
 ## Post-merge watch
 
 After a Loom auto-merge (a `loom/` lane pull request merged by a Loom App,
