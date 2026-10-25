@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from . import proof, status
+from . import answer, proof, status
 
 # The runner's own patterns (lanes/run_lane.sh).
 MODEL_RE = re.compile(r"[A-Za-z0-9._:][A-Za-z0-9._:/@-]*")
@@ -567,15 +567,24 @@ LINKED_MAX = 10
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
-def operator_notes(comments: Iterable[Any], logins: Iterable[str]) -> List[Tuple[str, str, str]]:
+def operator_notes(comments: Iterable[Any], logins: Iterable[str],
+                   operators: Optional[Iterable[str]] = None) -> List[Tuple[str, str, str]]:
     """(login, created_at, body) of the newest NOTES_MAX comments a person
     wrote under one of `logins` (the operator's logins and trusted briefers),
     oldest first. A [bot] login, a factory marker comment and a claim line
-    are the factory's own, not notes."""
+    are the factory's own, not notes. An answer an operator gave on the
+    dashboard (bus/answer.py; `operators`, else LOOM_OPERATORS or the person
+    logins of LOOM_BRIEF_AUTHORS) is that operator's note."""
+    logins = list(logins)
     allowed = {login.lower() for login in logins}
+    ops = list(operators) if operators is not None else answer.operators()
     found = []
     for c in comments:
         if not isinstance(c, dict):
+            continue
+        given = answer.trusted_answer(c, logins, ops)
+        if given is not None:
+            found.append((given.login, given.created_at, "Answer: " + given.text()))
             continue
         login, body = _login(c.get("user")), str(c.get("body") or "").strip()
         if (login in allowed and not login.endswith("[bot]") and body

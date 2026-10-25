@@ -57,6 +57,7 @@ that talks to GitHub about tickets.
 | `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
 | `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
 | `loom:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
+| `loom:answer-pending` | An operator answered the item's ask on the dashboard's Needs you page (`<!-- loom:answer v1 -->` comment, `bus/answer.py`); the station has not read it yet. The factory reads it on its next pass and takes the label off (see Operator answers). |
 | `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:window`, `wait:live-event` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, a deploy or roll window, or (`wait:live-event`, on a shipped ticket) its Live box needs a rare event the log has not shown in 7 days since it shipped. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
@@ -1155,6 +1156,7 @@ pull request's review thread is not a new issue comment and is not scanned.
 | --- | --- |
 | `failure` | A red merge, a revert, or a lane's hand-back that a person may need to read. |
 | `ask` | The exact thing only a person can do (`loom:human`). |
+| `answer` | An operator's answer to an ask, posted from the dashboard's Needs you page (`bus/answer.py`, see Operator answers). |
 | `runaway` | A hold or release of a ticket that ran past its attempts. |
 | `proof-refused` | The station stops handing a ticket out to verify after refused proofs. |
 | `fix-brief` | A `loom:fix` brief that sends findings back to a lane (loom#866 and loom#821 own moving it). |
@@ -1467,6 +1469,33 @@ steps, or check that the placement is safe for the data and the nodes it
 lands on, then merge the pull request by hand. Loom never merges it, and the
 ask is posted once. `bus.brain status` marks a pull request whose body
 declares steps `blocked: held for the operator`.
+
+### Operator answers
+
+The dashboard's Needs you page takes an answer to each ask in one tap
+(loom#1777, docs/DASHBOARD.md). It posts one comment as the Loom App,
+`<!-- loom:answer v1 --> Answer from <login> (via the dashboard): <choice>.
+<note>`, takes off `loom:human`, `needs:<login>` and `needs-operator`, and
+adds `loom:answer-pending`. An answer counts only when its author is trusted
+(`LOOM_BRIEF_AUTHORS`, where the App's bot login is) or is the operator it
+names, and the login it names is an operator (`LOOM_OPERATORS`, else the
+person logins of `LOOM_BRIEF_AUTHORS`). The station reads it as that
+operator's newest comment: the stale-brief check (`bus/brief_check.py`)
+reads it as the operator's own words, and the brief's Operator notes carry
+it ("Answer: ..."). Each factory pass reads the open `loom:answer-pending`
+issues of a repo (at most 10) and takes the label off.
+
+On a lane pull request held for the operator, the hold ask offers Merge or
+Hold. Merge lifts that hold only, in the factory and in `bus.brain merge`:
+the risk tier's review check, open findings and hourly cap, the checks, the
+criteria and shadow mode still decide, so in shadow mode the merge is still
+only recorded. Hold keeps the pull request held with no new ask, and the
+factory puts `loom:human` back so it keeps waiting on a person. An answer
+counts only for the pull request the newest hold ask names, given after that
+ask and not before the head commit it would merge; a newer ask, or a newer
+head, asks again. Each Merge or Hold is written once to the shadow ledger as
+an `operator-verdict` entry (its label the verdict), beside the would-merge
+it pairs with; the ledger's counts and digest leave verdicts out.
 
 A ticket whose every acceptance criterion is a check on a live host or
 network (a command run on a host, a reach test from a network, a port, a
