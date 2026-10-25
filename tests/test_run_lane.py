@@ -5445,10 +5445,12 @@ exec /usr/bin/git "$@"
         self.drop_brief()
         result = self.run_lane(LOOM_LEAK_SCANNER=str(Path(self._tmp.name) / "missing-scanner"))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("failed: [hold]", self.lane_log())
-        self.assertIn("[hold] public repo leak scanner is missing", self.lane_log())
+        self.assertIn("failed: [factory] public repo leak scanner is missing", self.lane_log())
         self.assertIn("factory incident quadseven/loom#99", self.lane_log())
-        self.assertIn("public repo leak scanner is missing", self.log.read_text())
+        # With no scanner the incident detail cannot be scanned, so it is
+        # withheld; the title still names the kind.
+        self.assertIn("validation leak-scanner", self.log.read_text())
+        self.assertIn("withheld: the lane log", self.log.read_text())
         self.assertEqual(self.remote_heads().count("refs/heads/loom/"), 0)
 
     def test_a_repeated_factory_incident_updates_the_open_issue(self):

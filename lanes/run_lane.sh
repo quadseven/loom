@@ -3383,8 +3383,10 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$REPO_PRIVATE" = false ]; then
     if [ ! -f "$LEAK_SCANNER" ]; then
       REASON="public repo leak scanner is missing; nothing pushed"
+      # [factory] is the class the station holds a ticket on (bus/station.py
+      # CLASS_RE): no rung spent, re-queued when the incident closes.
       note_factory_incident leak-scanner "$REASON" REASON
-      park "$BRIEF" "$REASON" hold
+      park "$BRIEF" "$REASON" factory
       continue
     fi
     # A fix round that merged the default branch scans what the pull request
