@@ -34,7 +34,7 @@ from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from . import proof, status, text as _text
+from . import proof, shadow, status, text as _text
 
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
@@ -74,6 +74,17 @@ class GitHubError(Exception):
         super().__init__(message)
         self.status = status
         self.body = body
+
+
+class ShadowHeld(GitHubError, ValueError):
+    """A merge, close, ship label or branch deletion shadow mode recorded
+    instead of sending (bus/shadow.py). Both a GitHubError and a ValueError,
+    so every caller that handles a refused write or a refused gate handles it
+    the same way: logged, and tried again (and recorded once) next pass."""
+
+    def __init__(self, message: str, entry: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message, 0, "")
+        self.entry = entry or {}
 
 
 class RateLimited(GitHubError):
@@ -636,6 +647,7 @@ class GitHub:
 
     def _rest(self, method: str, path: str, body: Any = None,
               etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
+        self._hold_in_shadow(method, path, body)
         self._refuse_incomplete_close(method, path, body)
         url = self._url(path)
         # A caller's own ETag means the caller keeps the answer; otherwise
@@ -703,6 +715,43 @@ class GitHub:
                 self.issue_writes.add((owner.group(1), int(owner.group(2))))
             else:
                 self.comment_edits = True
+
+    def _hold_in_shadow(self, method: str, path: str, body: Any) -> None:
+        """Record and refuse a merge, close, ship or merge label, approving
+        review, write onto a branch Loom does not own, or branch deletion in a
+        repo in shadow mode (bus/shadow.py). Every Python write to GitHub
+        passes through here, whichever caller sent it. An exemption (a signal
+        issue's close, a label the item already has) needs the item read: a
+        read that fails in any way, or an item whose labels cannot be read,
+        holds the whole request."""
+        if str(method or "").upper() == "GET":
+            return
+        text = str(path or "")
+        if "://" in text and text.startswith(self.api + "/"):
+            text = text[len(self.api):]   # an API under a path prefix routes the rest
+        found = shadow.classify(method, text, body)
+        if found is None or not shadow.active(found.repo or None):
+            return
+        held = shadow.held_after_read(found, self._shadow_item(found))
+        if held is None:
+            return
+        action, new_labels = held
+        reason = "%s %s%s" % (str(method).upper(), shadow.api_path(text),
+                              " (%s)" % found.detail if found.detail else "")
+        entries = [shadow.record_held(action, found.repo, found.number, found.kind,
+                                      reason=reason, label=label, source=shadow.caller())
+                   for label in (new_labels or [""])]
+        raise ShadowHeld(shadow.held_error_text(action, new_labels, found), entries[0])
+
+    def _shadow_item(self, found: "shadow.Request") -> Any:
+        """The issue or pull request a held request's exemption reads; None
+        when it needs none or the read failed in any way (held)."""
+        if not found.check:
+            return None
+        try:
+            return self._rest("GET", "/repos/%s/issues/%d" % (found.repo, found.number)).data
+        except Exception:  # noqa: BLE001 - any failed read holds the action
+            return None
 
     def _refuse_incomplete_close(self, method: str, path: str, body: Any) -> None:
         """Refuse a PATCH that would close an issue as completed while its

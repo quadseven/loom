@@ -14,6 +14,12 @@ the diff adds is in scope when either holds:
   RUNNABLE_DIRS. A pull request runs its own workflow files, so a new
   workflow or action must be named in the brief.
 
+- it sits at the top level beside tracked top-level files of its
+  extension (Python only), and a line the diff adds to a tracked file
+  imports it: ``import <stem>`` or ``from <stem> import``. A repo
+  that keeps its modules at the top level had every new module refused,
+  since no brief can name a file the agent has not chosen yet (loom#1705).
+
 Everything else is stray: a new file at the top level, under a new
 top-level directory, or under a hidden one, that the brief never names.
 Only added files count; an edit to a tracked file is never stray. A file
@@ -26,8 +32,10 @@ paths. As a script it prints one stray path per line, made printable::
     python3 -m bus.scope_check <tree> <base> <head> <brief> [<rev>...]
 
 With ``--scratch``, it prints only stray files safe to drop: unreferenced
-top-level test/debug files, object/build_test outputs, and .loom metadata
-other than the validation contract. New .github files are never dropped.
+top-level test/debug files, object files and build output (BUILD_OUTPUT_DIRS),
+top-level shell here-document temp files (``sh-thd-*``) and ``*.patch`` files,
+and .loom metadata other than the validation contract. New .github files are
+never dropped.
 
 It exits 2 on a usage error or when git cannot read a revision, so the
 runner never mistakes a failed check for a clean one.
@@ -39,11 +47,17 @@ import os
 import re
 import subprocess
 import sys
-from typing import Iterable, List, Sequence, Set
+from typing import Iterable, List, Optional, Sequence, Set
 
 # Characters that may sit inside a path token in the brief's prose.
 _PATH_CHAR = r"[\w./-]"
 
+
+# Build and tool output an agent's own commands leave in the tree: a stray file
+# under one of these is dropped, never refused (ten refusals on 2026-10-21/22
+# were a Gradle daemon cache, a build/ output and the like). A folder the base
+# tracks is in scope, so it is never stray and never dropped.
+BUILD_OUTPUT_DIRS = ("build_test/", "build/", ".gradle/")
 
 # Hidden directories whose new files GitHub runs: never in scope unnamed.
 RUNNABLE_DIRS = (".github/workflows/", ".github/actions/")
@@ -115,6 +129,57 @@ def in_known_hidden_subdir(path: str, tracked: Set[str]) -> bool:
     return any(name.startswith(parent) for name in tracked)
 
 
+def edited_files(tree: str, base: str, head: str) -> List[str]:
+    """Tracked paths the diff edits between base and head."""
+    return _names(_git(tree, "diff", "-z", "--no-renames", "--diff-filter=M",
+                       "--name-only", base, head))
+
+
+# Extensions a new top-level file may be wired in with. Python only: its
+# import line is the proof, while other toolchains load files by naming
+# convention alone (build.rs, *_test.go, *.config.js), so those files and all
+# config or tool-entry files must be named in the brief.
+WIRED_EXTENSIONS = frozenset(("py",))
+
+# Source files that tools load or run on their own: never in scope unnamed.
+AUTO_RUN_NAMES = frozenset(("conftest.py", "setup.py", "sitecustomize.py",
+                            "usercustomize.py", "noxfile.py", "__init__.py",
+                            "__main__.py", "tasks.py", "fabfile.py", "dodo.py",
+                            "manage.py"))
+
+
+def added_lines(tree: str, base: str, head: str, paths: Sequence[str]) -> List[str]:
+    """The lines the diff adds to these paths."""
+    # No external diff driver or textconv: the agent's tree must not choose
+    # a program for this check to run or a filter that rewrites its lines.
+    out = _git(tree, "diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff",
+               "--no-textconv", base, head, "--",
+               *(":(literal)" + p for p in paths))
+    return [line[1:] for line in out.splitlines()
+            if line.startswith("+") and not line.startswith("+++")]
+
+
+def wired_top_level(path: str, tracked: Set[str], lines: Sequence[str]) -> bool:
+    """True when a new top-level Python file sits beside tracked top-level
+    Python files and a line the diff adds to an edited tracked file
+    imports it. Only those lines count, so two new files
+    cannot vouch for each other and an old mention vouches for nothing;
+    hidden, auto-run and standard-library names never qualify."""
+    name, dot, suffix = path.rpartition(".")
+    if ("/" in path or not dot or not name or path.startswith(".")
+            or not path.isprintable() or suffix not in WIRED_EXTENSIONS
+            or path.casefold() in AUTO_RUN_NAMES):
+        return False
+    if name.casefold() in getattr(sys, "stdlib_module_names", ()):
+        return False
+    if not any("/" not in t and t.endswith(dot + suffix) for t in tracked):
+        return False
+    if not name.isidentifier():
+        return False
+    imported = re.compile(r"^\s*(from|import)\s+%s(\s|\.|,|$)" % re.escape(name))
+    return any(imported.match(line) for line in lines)
+
+
 def stray_files(tree: str, base: str, head: str, brief_text: str,
                 also: Sequence[str] = ()) -> List[str]:
     """Paths the agent's commits added that the brief does not allow."""
@@ -125,10 +190,17 @@ def stray_files(tree: str, base: str, head: str, brief_text: str,
         dirs |= top_dirs(tree, rev)
         elsewhere |= tracked_files(tree, rev)
     stray = []
+    lines: Optional[List[str]] = None
     for path in added_files(tree, base, head):
         if (path in elsewhere or named(brief_text, path) or in_known_dir(path, dirs)
                 or in_known_hidden_subdir(path, tracked)):
             continue
+        if "/" not in path:
+            if lines is None:
+                edited = edited_files(tree, base, head)
+                lines = added_lines(tree, base, head, edited) if edited else []
+            if wired_top_level(path, tracked, lines):
+                continue
         stray.append(path)
     return stray
 
@@ -156,7 +228,9 @@ def scratch_files(tree: str, base: str, head: str, brief_text: str,
             continue
         if path.startswith(".loom/") and path != ".loom/validation.conf":
             scratch.append(path)
-        elif path.startswith("build_test/") or path.endswith(".o"):
+        elif path.startswith(BUILD_OUTPUT_DIRS) or path.endswith(".o"):
+            scratch.append(path)
+        elif "/" not in path and (path.startswith("sh-thd-") or path.endswith(".patch")):
             scratch.append(path)
         elif "/" not in path and (fnmatch.fnmatchcase(path, "test_*") or
                                   fnmatch.fnmatchcase(path, "*_debug*")):

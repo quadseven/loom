@@ -57,6 +57,7 @@ interpreter: python3.12
 submodules: yes
 setup: scripts/setup.sh
 check: scripts/check.sh
+affected: scripts/affected.sh
 ```
 
 `interpreter` is a command that must be on the lane machine's PATH,
@@ -65,11 +66,25 @@ prepares the tree (a venv, locked dependencies, a pinned linter) and `check`
 is the required check. Point the repo's CI at the same two scripts so the
 lane and CI cannot drift apart. Unknown lines are refused.
 
+`affected` is optional: a command for the suites the repo's CI runs only for
+some paths (a per-directory unit suite, a generated file compared with its
+source), which a repo-wide `check` leaves out. The runner runs it after
+`check` passes on the committed tree, with the pull request's changed files,
+one path per line, on stdin and in `LOOM_CHANGED_FILES` (the lane's commits
+on a new run; what the pull request adds to the default branch on a fix
+round). It passes like `check` (exit 0, no tracked file changed), a failure
+parks the brief as `validation failed: the affected check exited N` and
+pushes nothing, and its record is the `affected` phase. A lane pull request
+in the deploy repo passed its check and went red in CI on two such suites
+(loom#1773).
+
 The runner's reader (`bus/contract.py`) also accepts a list of
 `<kind> | <command>` lines, or `[kind]`, `[kind.name]` and `[[kind]]` tables
 with a `command = "..."` key, for the kinds lint, format, type and test. It
-joins the commands, in that order, into one `check`. List only commands that
-run on a lane machine with no secrets, simulators or unset variables.
+joins the commands, in that order, into one `check`. The kind `affected`
+(`affected | <command>`, `[affected]`) becomes the `affected` command instead.
+List only commands that run on a lane machine with no secrets, simulators or
+unset variables.
 
 - The runner reads the file from the base revision before the agent starts
   (on a fix run, from the base branch, not the pull request's branch);
@@ -106,10 +121,49 @@ run on a lane machine with no secrets, simulators or unset variables.
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
 - `logs/<lane>/<ticket>.validation.jsonl` holds one line per step: phase
-  (`prepare`, `setup`, `baseline`, `contract-setup`, `contract-check`, `final`), command, exit code, tree
+  (`prepare`, `setup`, `baseline`, `contract-setup`, `contract-check`, `final`, `affected`), command, exit code, tree
   revision, `ok` and detail (the interpreter's version, the submodule
   revisions).
 - A repo without the file is not validated by the runner; CI still is.
+
+### Validation gaps
+
+When a lane pull request goes back for a fix round on a red CI job, the
+station checks whether the contract runs that job's command
+(`bus/ci_gap.py`). It maps each failing GitHub Actions check run to its
+workflow file, job and failing step (the Actions job API), reads the step's
+`run:` command and working directory from the workflow at the pull request's
+head, and looks for it in the contract's `setup`, `check` and `affected` text
+on the base branch. A command the contract does not run is a validation gap:
+
+- The station files one issue per repo per gap in that repo, labelled
+  `loom:validation-gap`, with a `<!-- loom:validation-gap v1 key=... -->`
+  marker. It names the job, the workflow and step, the command CI runs, the
+  workflow's `on.pull_request` paths filter and the changed files it matched,
+  and the line to add: `affected: <command>` for a path-scoped job, else
+  `check: <check> && <command>`. A gap already in
+  `state/station/validation_gaps.json`, or on an issue with its marker (open
+  or closed), is not filed again.
+- The fix round's comment tells the lane to run the command in the tree
+  before it pushes, naming the gap issue.
+- The station records once per lane pull request whether CI was red on its
+  first push (its checks finished before any fix round; the review bot's
+  check is not counted). `bus.brain status` shows, per repo, the first-push
+  CI red rate and the gaps filed, under "Validation gaps".
+
+A gap is judged only for a repo with a contract; a repo without one gets the
+"Add the repository validation contract" ticket instead.
+
+### What a fix round is told about a red job
+
+The loom:fix comment quotes each failing check's log excerpt and, above it,
+the failing test names (pytest, unittest, go test and TAP forms) and up to
+eight assertion lines from the excerpt. When the failure text names a command
+that regenerates a file (a quoted command on a line that says a file is stale
+or must be regenerated, or a command that renders into a file with a
+redirect, such as `tool --render-rbac > rbac.yaml`), the comment's first line
+after its header says to run that command and commit what it writes
+(`bus/ci_facts.py`).
 
 ## The brain tick
 
@@ -201,7 +255,14 @@ failure moves the ticket to another available lane as a new attempt, at most
 `loom:queued` on its rung, never to `loom:failed` (loom#1395). A run that exits 124 after editing pushes
 its edits to a side branch `<branch>-timedout-<time>` and names it in the
 failure reason; the retry's brief tells the next attempt to start from that
-branch. A fix round that fails transiently goes
+branch. On a public repo that side branch, like a `-unvalidated-` one, is
+pushed only after the public repo leak scan passes on its edits; otherwise no
+branch is kept. A lane commit that adds files outside the brief's paths is
+refused and nothing is pushed, except in a fix round: there the runner removes
+exactly those files (never the round's other changes) in a commit on top,
+names them in the run log, and pushes the rest, so the round does not retry
+the same refusal; a stray file it cannot remove still refuses the commit,
+naming the file (loom#1476). A fix round that fails transiently goes
 back to `loom:pr`, and one that fails its work goes to `loom:failed`, so the
 factory climbs the ladder and sends the fix to the next rung; a lane that hit its provider limit stays unavailable until the
 provider's reset (else 60 minutes; delete its heartbeat file in
@@ -475,7 +536,9 @@ line and a link; a count of the goal homes where nothing moved; and the
 factory's daily numbers, which then no longer go out on their own. Each time
 is sent once, and a failed send is tried again on the next pass. Switching
 the digest on sends nothing until the next digest time. Setting
-`LOOM_REPORT_DIGEST_TIMES` empty forwards each report as below.
+`LOOM_REPORT_DIGEST_TIMES` empty forwards each report as below. Neither
+pushes a report whose goal was quiet since the report before it
+(docs/BRAIN.md, Quiet goals); the digest counts that goal as quiet.
 
 Each report on its own: the station also reads comments on open `loom:goal`
 issues in each `LOOM_REPOS` repo. On first run it records the newest report comment per repo
@@ -627,7 +690,9 @@ backticked string from the ticket's Live criterion in
 fixed-string match (see `.env.example`). The station runs it once per string,
 with a 60-second timeout, then quotes up to 20 matching lines per string in
 the verify brief. It accepts at most five ASCII strings of at most 120
-characters.
+characters. For the live proof of a shipped ticket (bus/live_proof.py) the
+command also receives `LOOM_EVIDENCE_SINCE`, the deploy as epoch seconds, and
+only the lines stamped at or after it count.
 A Live criterion that needs its strings to be absent ("no `X` line appears",
 "never logs `X`", "`X` does not appear", every string so worded) is verified on an
 empty answer: when every command run answered and no line named any string, the
@@ -661,7 +726,10 @@ writes `verify.json`: a proof record (`bus/proof.py`),
 ahead of a build, the `unmet` answer described below. The runner copies it
 to the lane's log folder as `<brief>.verify.json`, with the run's model
 beside it in `<brief>.verify.model`. The station checks a record with
-`bus/proof.py`, ticks the criteria and moves the ticket to verified with the
+`bus/proof.py`, refuses it when it passes a live or operator criterion the
+station has no evidence for (docs/BRAIN.md, Verify before ship: a verify run
+has no network, so its word is not evidence), ticks the criteria and moves
+the ticket to verified with the
 proof, marked `"verified_by": "<lane>/<model>"` (`<lane>/unknown` when the
 run recorded no model). It refuses a record whose revision does not contain
 the merge commit of each linked pull request merged into the default branch
@@ -1106,12 +1174,26 @@ cannot query the viewer or any other local service.
   comes back as soon as it serves the lane again, because the provider's
   allowance refills while the lane sleeps (OpenCode Go refills 20% of a
   model's allowance every 5 hours). It asks about the model the probe found at
-  a limit, and only for a hold the probe itself took: a hold the agent CLI
+  a limit (or the slot's own model, when the slot now runs another), and
+  only for a hold the probe itself took: a hold the agent CLI
   recorded (a model it no longer offers, a spent allowance) stands, for no
   probe says otherwise. On 2026-10-20 the four opencode-go slots stayed held
   for days (the provider's `Retry-After` was never read, so every limit fell
   back to a week) and the lane-held invariant fired while 33 tickets of the
   tier waited.
+- The opencode-go slots run only the models on `bus/tickets.py`
+  `OPENCODE_GO_MODELS`: Go's free models and the paid ones allowed at least
+  10,000 requests per 5 hours (Beam Free; MiMo-V2.6-Flash, DeepSeek V4.1
+  Flash, Muse Spark 1.3 Contributor). A slot whose model, or any model of its
+  ladder, is off the list does not start: its heartbeat says why. A brief's
+  Model: line naming another Go model runs the slot's own model, and the
+  station never routes such a pin to these slots. On 2026-10-23 Kimi K2.7
+  Code (1,350 requests per 5 hours) spent the plan's monthly allowance in
+  hours. Defaults: `opencode-go` and `opencode-go-2` Beam Free, `opencode-go-3`
+  DeepSeek V4.1 Flash, `opencode-go-4` Muse Spark 1.3 Contributor.
+- A Go limit never holds a slot on a free model (`opencode-go/*-free`): the
+  free models sit outside the plan's allowance, so such a slot is a hold
+  group of its own. An expired key still holds all four.
 - The Usage view's meters for the free lanes (loom#812). After a ready
   heartbeat the openrouter and workersai lanes read their provider's
   read-only meter with the key they already hold, at most every five minutes,
@@ -1226,7 +1308,7 @@ lookup leaves the brief for the next pass. The rule covers:
 ## API lanes: zen, zai
 
 - `zen`: OpenCode Zen free models through opencode, `-m opencode/<id>-free`
-  (default `opencode/minimax-m3.1-flash-free`). Zen serves its free models
+  (default `opencode/deepseek-v4.1-flash-free`). Zen serves its free models
   with no stored credential, so the lane reads no key; the agent's
   environment holds no provider key at all. opencode sends Zen's
   `x-opencode-session` header itself, and Zen refuses free-tier calls from
@@ -1235,7 +1317,10 @@ lookup leaves the brief for the next pass. The rule covers:
   failed "Unexpected server error". Check `https://opencode.ai/zen/v1/models`
   for the current `-free` ids before changing the default, and try a
   candidate with `opencode run -m opencode/<id>` (that day
-  `minimax-m3.1-flash-free` answered in seconds; three others hung).
+  `minimax-m3.1-flash-free` answered in seconds; three others hung; it left
+  the catalogue on 2026-10-22. On 2026-10-23 eight free ids each fixed a
+  five-test ticket; `deepseek-v4.1-flash-free` took 22 s with 125
+  reasoning tokens).
 - `zai`: Z.ai's free Flash models through opencode's `zai` provider,
   `zai/glm-4.7-flash` (default) or `zai/glm-4.5-flash`. GLM-5.3 Flash and
   the FlashX models are paid and refused. The key comes from SSM
@@ -1257,6 +1342,9 @@ lookup leaves the brief for the next pass. The rule covers:
 
 - Tool: `codex exec --sandbox workspace-write` on a logged-in box: no network and
  no .git writes, so the agent edits and the runner commits and pushes.
+ When the base check left a uv cache, the agent gets a copy of it and runs uv
+ offline (`UV_OFFLINE`, `PIP_NO_INDEX`), so tests that need packages run
+ without network (loom#1665).
 - Best for: scoped implementation, CI failure repair, `codex review` passes.
 - Models per ticket: Astra (hardest), Sol (default building), Luna (volume).
 
@@ -1477,3 +1565,30 @@ One class covers the whole pull request, highest wins:
 The pull request carries exactly one `class:<name>` label, created like
 the other labels by `bus/labels.py`. Classification never changes merge
 rules; it only tells the reader how risky the change is.
+
+## Operator steps before merge
+
+Every lane pull request body also carries an `## Operator steps before
+merge` section, after `## Out of scope`: each step a person must take
+before the change can merge and deploy (a data migration, a cutover, a VM
+or disk resize, scaling a workload down), one per line, or the single word
+`none`. The agent writes it in `.loom/summary.md`; without one the runner
+copies the ticket's section of that name, else writes `none stated`.
+A pull request that lists a step is never merged by Loom (docs/BRAIN.md,
+Operator holds).
+
+## Bugs discovered
+
+A lane that finds a bug outside its ticket writes a `## Bugs discovered`
+section in `.loom/summary.md` (also read as "Bugs found", "Found bugs" or
+"Discovered bugs"), one bug per line. Each line must cite an issue: `#N`
+in the pull request's own repo, or OWNER/NAME#N. `bus/bug_refs.py` looks
+each cited issue up and keeps the line only when the issue exists, is an
+issue rather than a pull request, and is open or was filed in the last two
+days; a failed lookup rejects the line. A new pull request body carries the
+kept lines under `## Bugs discovered`, after the operator steps, and the
+lane log names each line left out. On a fix round the PR text repair
+refuses while any line is rejected, with a reason asking the lane to file
+the issue and cite it, or drop the line; a round whose summary has no such
+section keeps the body's earlier one. In a public repo another repo's
+citation is written as "issue N of another repo".

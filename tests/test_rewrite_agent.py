@@ -274,7 +274,11 @@ class RewriteAgentTest(unittest.TestCase):
         # every rewrite in a burst then spent its 90 seconds on Gemma before the
         # next model answered (2026-10-21). The first failure starts a
         # cooldown; the rewrites after it skip the free entry at once.
-        env = {"LOOM_REWRITE_FREE_URL": "https://gateway.invalid/v1", "LOOM_REWRITE_FREE_TIMEOUT": "3"}
+        # The free timeout is set well above the bound below, so a skip and a
+        # wait stay apart even on a loaded machine: with a 3 s timeout and a
+        # 2.5 s bound, a lane's parallel base check took 4.7 s and the factory
+        # held every Loom ticket as "base check exited 1" (2026-10-24).
+        env = {"LOOM_REWRITE_FREE_URL": "https://gateway.invalid/v1", "LOOM_REWRITE_FREE_TIMEOUT": "20"}
         first = self.run_wrapper("MODE=hang", args=("-", "free/gemma-4-31b-it,codex/test-model"),
                                  env_overrides=env)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -282,7 +286,7 @@ class RewriteAgentTest(unittest.TestCase):
         second = self.run_wrapper("MODE=hang", args=("-", "free/gemma-4-31b-it,codex/test-model"),
                                   env_overrides=env)
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertLess(time.time() - started, 2.5)
+        self.assertLess(time.time() - started, 15)
         self.assertIn("cooling down", second.stderr)
 
     def test_a_free_model_with_no_route_set_falls_through_to_the_next(self):

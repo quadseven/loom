@@ -57,6 +57,7 @@ that talks to GitHub about tickets.
 | `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
 | `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
 | `loom:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
+| `loom:answer-pending` | An operator answered the item's ask on the dashboard's Needs you page (`<!-- loom:answer v1 -->` comment, `bus/answer.py`); the station has not read it yet. The factory reads it on its next pass and takes the label off (see Operator answers). |
 | `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:window`, `wait:live-event` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, a deploy or roll window, or (`wait:live-event`, on a shipped ticket) its Live box needs a rare event the log has not shown in 7 days since it shipped. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
@@ -534,6 +535,11 @@ prompts; with the private command empty the repo is skipped. The station runs
 at most 5 rewrites per backlog goal home per hour (and 5 per pass), oldest
 first, under the budget floor rule. `state/station/rewrite.json` records each
 attempt; an issue that did not become a ticket is not tried again for a day.
+The agent command runs as a background job (`state/station/rewrite-jobs/`),
+so a model never holds the station pass (loom#1663): the pass that starts a
+job waits at most 10 seconds for it, and a later pass writes the answer of
+any job that ended since. A job with no result 5 minutes past its 10-minute
+timeout is logged as a rewrite that wrote nothing.
 
 ## Proof
 
@@ -805,6 +811,35 @@ station already judged for the ticket (one it sent back for unbuilt criteria
 after that merge, or one a verify run found wanting). The status events are
 the record; the station keeps no other state for it.
 
+Then the station checks the brief itself (`bus/brief_check.py`). A ticket
+is stale when the operator's newest comment says its work is done or
+superseded, when the issue it was rewritten from is already closed as
+completed, when a pull request in another repo of the owner that names it in
+full has merged, when a pull request a person linked in it or its comments
+merged after it was filed, or when every file its criteria ask to add already
+exists on the default branch. A stale ticket goes back to `loom:queued` with
+`loom:human` and one ask (`Kind: decision`) naming the evidence; the factory
+gives a queued `loom:human` ticket no lane. Each piece of evidence holds it
+once: once the operator removes `loom:human`, the same evidence does not hold
+it again. The audit of 2026-10-22 found a rewrite of an issue whose leak-scan
+caller and deny-list layer had shipped weeks before; the lane read "out of
+scope" as "must be absent" and deleted the working deny-list layer, in two
+repos.
+
+A health ticket (one health intake filed, or one whose Why names a health
+finding) gets no lane until its body names the cause, on a `Cause:` line or
+under `## Cause`. A cause whose subject is the measurement (the health read,
+a threshold or floor, a miscount) is refused, and so is a What whose every
+step changes the measurement. Naming a cause is diagnosis: the ticket goes
+back to `loom:queued` with `needs-brain` and a status event, and the factory
+gives it no lane until the cause is named. At merge, a lane change on a
+health ticket that edits the health read itself or a bound (a threshold,
+floor, ceiling or cutoff) waits for the operator (`bus/operator_hold.py`). The
+audit's health ticket was met by a health read that began counting money the
+fund's holder carried, so the finding vanished while every affected member
+stayed affected, and by a sibling that held refunds back to stay above the
+floor. A read the check needs that fails holds the ticket for the next pass.
+
 A ticket briefed again after `loom:failed` gets a fresh branch:
 `loom/<number>-<slug>-r<attempt>`, where the attempt is one more than the
 station's earlier claim comments on it.
@@ -876,7 +911,9 @@ pushes the agent's work onto it (fast-forward only, never forced) and
 comments on the pull request; it never opens a second one. The sandboxed agent
 can write `.loom/replies.json` with thread ids, reply text and a resolve
 boolean. The runner posts valid entries after a successful push and resolves
-those marked true; missing or invalid files produce no replies. A fix brief
+those marked true; missing or invalid files produce no replies. An entry
+whose thread is not on the round's own pull request, or whose text
+`bus/text.py` refuses, is skipped and logged. A fix brief
 whose pull request is no longer open is parked as failed (a merged one is
 reported as no failure, below).
 
@@ -1088,6 +1125,11 @@ that fails posts nothing, so a bad API answer cannot start a second comment.
   expired, edit one `<!-- loom:incident-repeat v1 -->` or
   `<!-- loom:key-repeat v1 -->` comment on the open issue: a running count, the
   first and last time, the tickets (or lanes) seen, and the latest detail.
+- A factory incident is filed on the public factory repo, so it names only a
+  repo known to be public. Any other repo is `private repo <alias>` (a random
+  id the lane machine keeps per repo), and its ticket and failing line are
+  withheld; they stay in the lane log and on the ticket. A public repo's
+  detail that fails the public repo leak scan is withheld the same way.
 
 ## Where a new comment is posted
 
@@ -1114,6 +1156,7 @@ pull request's review thread is not a new issue comment and is not scanned.
 | --- | --- |
 | `failure` | A red merge, a revert, or a lane's hand-back that a person may need to read. |
 | `ask` | The exact thing only a person can do (`loom:human`). |
+| `answer` | An operator's answer to an ask, posted from the dashboard's Needs you page (`bus/answer.py`, see Operator answers). |
 | `runaway` | A hold or release of a ticket that ran past its attempts. |
 | `proof-refused` | The station stops handing a ticket out to verify after refused proofs. |
 | `fix-brief` | A `loom:fix` brief that sends findings back to a lane (loom#866 and loom#821 own moving it). |
@@ -1193,6 +1236,11 @@ digest carries only titles and links. When the digest does not fit in one
 message, its full list, grouped by goal, is a comment on the `loom:digest`
 issue in each ask's own repo, and the message links to it. To file an ask
 under its goal, name the goal home in its body (`Part of #N`).
+
+An ask about an outage dates it by its window, never by one time: the last
+good observation and the first failing one ("last good read 04:28Z, first
+failing read 09:02Z"). The last good read is not the start. Every text a
+`bus` command posts is checked for this (`bus/text.py`).
 
 Open `loom:human` issues are not asks: the station never posts one on its
 own. They are listed once a day under "Waiting on you" at the end of the
@@ -1353,6 +1401,11 @@ completed with `success`. A tick takes that line as given instead of
 re-reading the review list. `bus.brain merge` keeps its own checks.
 When a trusted brain fix is still pending on the linked ticket, status adds
 `pending brain fix` to the blockers instead of marking the pull request READY.
+For a line that would otherwise be READY, status also reads what `bus.brain
+merge` refuses on, through the same functions merge uses (loom#1643): a
+ticket not at `loom:pr` (`ticket at loom:running, not loom:pr`), a REST
+`mergeable_state` of `dirty` (`conflicts with the default branch`), and a
+risk tier outside `LOOM_AUTO_MERGE_TIERS` (`held for the operator: <tier>`).
 
 Status also prints a "Waiting on the brain" section: every open lane pull
 request whose ticket carries `needs-brain`, oldest first, with its ticket,
@@ -1379,6 +1432,343 @@ decides merge-ready, so consequence decides the rule:
   critical finding is open on the head commit.
 - A pull request with no class label keeps the `logic` rule.
 
+## Operator holds
+
+A lane pull request waits for the operator, whatever its class, checks and
+review, when either holds (`bus/operator_hold.py`):
+
+- **Operator steps.** Its `## Operator steps before merge` section lists a
+  step (anything but `none`), or, as a backstop, its body or its ticket's
+  body names one in words: "leave X to the operator", an operator task, step
+  or prerequisite, a data migration, a live cutover, a VM or disk resize, or
+  a sentence that opens with a merge hold ("Do not merge until ...", "Merge
+  only after ...").
+- **Placement.** A manifest (`.yaml`, `.yml`, `.json`) changes where a
+  workload runs or what it mounts: `nodeSelector`, a
+  `kubernetes.io/hostname` pin, affinity, tolerations, `hostIP`, volumes and
+  their claims, `hostPath`, a storage class. The hold fails closed: only a
+  listing in the base branch's `.loom/manual-paths` (the file
+  `LOOM_SHIP_PATH_WORKFLOWS` ships by) exempts a manifest, a manifest no
+  deploy workflow covers is still held, a manifest GitHub sends no patch for
+  counts as a placement change, and a pull request that also changes
+  `.github/workflows/` or `.loom/manual-paths` exempts nothing. The ask names
+  the push workflows on the base branch that cover the files (a push
+  workflow with no paths filter covers every path).
+
+- **Rewrite.** It deletes, renames away, or replaces at least half of, a
+  doc its ticket does not name: a top-level file whose name starts with
+  `README`, `AGENTS.md` or `CLAUDE.md` at any size, any other `.md` file from
+  10 lines. A doc whose base cannot be read counts as replaced, and a doc
+  renamed away counts as removed (`bus.brain merge` reads the REST file list
+  for the old path whenever GraphQL reports a rename).
+
+The factory checks before it lands a pull request, and `bus.brain merge`
+checks before it merges one, so whichever reaches it first holds it. The
+ticket goes to `loom:human` with one exact ask (`Kind: decision`): do the
+steps, or check that the placement is safe for the data and the nodes it
+lands on, then merge the pull request by hand. Loom never merges it, and the
+ask is posted once. `bus.brain status` marks a pull request whose body
+declares steps `blocked: held for the operator`.
+
+### Operator answers
+
+The dashboard's Needs you page takes an answer to each ask in one tap
+(loom#1777, docs/DASHBOARD.md). It posts one comment as the Loom App,
+`<!-- loom:answer v1 --> Answer from <login> (via the dashboard): <choice>.
+<note>`, takes off `loom:human`, `needs:<login>` and `needs-operator`, and
+adds `loom:answer-pending`. An answer counts only when its author is trusted
+(`LOOM_BRIEF_AUTHORS`, where the App's bot login is) or is the operator it
+names, and the login it names is an operator (`LOOM_OPERATORS`, else the
+person logins of `LOOM_BRIEF_AUTHORS`). The station reads it as that
+operator's newest comment: the stale-brief check (`bus/brief_check.py`)
+reads it as the operator's own words, and the brief's Operator notes carry
+it ("Answer: ..."). Each factory pass reads the open `loom:answer-pending`
+issues of a repo (at most 10) and takes the label off.
+
+On a lane pull request held for the operator, the hold ask offers Merge or
+Hold. Merge lifts that hold only, in the factory and in `bus.brain merge`:
+the risk tier's review check, open findings and hourly cap, the checks, the
+criteria and shadow mode still decide, so in shadow mode the merge is still
+only recorded. Hold keeps the pull request held with no new ask, and the
+factory puts `loom:human` back so it keeps waiting on a person. An answer
+counts only for the pull request the newest hold ask names, given after that
+ask and not before the head commit it would merge; a newer ask, or a newer
+head, asks again. Each Merge or Hold is written once to the shadow ledger as
+an `operator-verdict` entry (its label the verdict), beside the would-merge
+it pairs with; the ledger's counts and digest leave verdicts out.
+
+A ticket whose every acceptance criterion is a check on a live host or
+network (a command run on a host, a reach test from a network, a port, a
+firewall or ACL rule, a check across the hosts, or a Live line, and none
+naming a test) gets no lane: the factory puts it to `loom:human` with one
+ask instead of giving it one, and `bus.brain brief` refuses it. The
+station's close of a shipped ticket whose Live line names nothing to search
+leaves it open while an unticked criterion is such a host or network check:
+a merge proves none of them.
+
+On 2026-10-22 the brain merged a lane pull request whose body said "Leave VM
+resizing and the live data migration to the operator", on green checks and a
+passing review; its deploy moved every workload of a service off the node
+that held its local volumes, and the service was down for about four hours.
+The same day it merged a lane pull request for a ticket of host checks
+only, which replaced the deployment repo's root README with a write-up of
+the ticket; the station then closed that ticket as shipped.
+
+## Shadow mode
+
+Loom resumes in shadow mode (`bus/shadow.py`, loom#1515). The station, the
+brain and the lanes run as usual: tickets are claimed, pull requests opened,
+fix rounds run, and every merge gate is checked as above. At the point Loom
+would act, it records the decision instead and leaves the item for the
+operator:
+
+- a pull request merge (the factory, `bus.brain merge` on the lane machine or
+  Muse, the deploy-watch revert path, the roll pin);
+- an issue close (a done or verified ticket, an epic, a rewritten source
+  issue, an operator-claimed issue, an invariant breach that cleared or was
+  folded into its rolling issue) and a move to `loom:shipped`;
+- an issue reopen (an invariant breach seen again, a failed audit's ticket
+  or source issue);
+- a label that grants a merge (`ready-to-land`), and any GraphQL label write
+  (it names labels by id);
+- an approving pull request review;
+- a write straight onto a branch Loom does not own (a moved ref, a file
+  committed through the contents API, a merge-queue entry, a fork sync):
+  code that lands with no pull request is a merge;
+- a branch deletion after a merge.
+
+Closing a pull request without merging it still happens (it can be reopened
+and its branch stays), and so do the closes of Loom's own signal issues that
+carry no work label and no invariant label: a factory incident (an open one
+holds the tickets behind it) and a health signature the watcher filed
+(`loom:triage` with the watcher's marker in its body; `loom:triage` alone is
+on people's own issues too, and their close is held). An invariant breach's
+issue gates no ticket, so its close is recorded like any other (loom#1551):
+the invariants step asks the guard before it posts the cleared note, and
+logs `would close` once instead of `closed cleared`. run_lane.sh closes its
+factory incidents through `python3 -m bus.shadow gh-guard --lane`, which
+reads the issue first.
+
+`bus/github.py` checks every request at its one choke point and refuses a
+held one with `ShadowHeld`, whichever code sent it; `bus.brain merge`,
+`bus.brain close` and the station's closes check first, so their record names
+the risk tier and the gates that passed. Every merge or ship label in a
+request is checked, and the whole request is held if any one is new. The
+hold fails safe: a request it cannot read (a label list or body of an
+unknown shape, the item's labels unreadable, a read that failed in any way)
+is held as the worst request it could be.
+
+The brain's model rung holds a GitHub token of its own, so
+`lanes/mac/brain.sh` puts a `gh` in front of it that asks
+`python3 -m bus.shadow gh-guard` first and refuses, and records, a merge, an
+issue close, an approving review or a merge or ship label, with the same
+switch. It covers `gh` only: a rung that sends the request another way (curl)
+is held by its instructions alone (`docs/MUSE.md`, and the tick's prompt). Each decision is one line of an
+append-only JSONL ledger, `LOOM_SHADOW_LEDGER` or
+`$LOOM_HOME/state/shadow/ledger.jsonl`: time, repo, number, action, tier,
+gates passed, reason, head SHA, caller and link, written once per action and
+head. Each report digest adds what was held since the last one, and
+
+    python3 -m bus.shadow report --since 24h      # or 7d, or an ISO date or UTC time
+    python3 -m bus.shadow status                  # which repos are in shadow
+
+lists each would-action with its link, for the operator's review.
+
+The switch fails closed. `LOOM_SHADOW` turns shadow off only when it reads
+`0` (or `false`, `off`, `no`); unset, empty, any other value, or a value that
+cannot be read is shadow. A Muse whose environment never names the switch is
+in shadow. `LOOM_SHADOW_REPOS` lists the repos still in shadow (`OWNER/NAME`,
+space or comma separated); empty, `*`, or an entry that is not `OWNER/NAME`
+means every repo. A repo not listed has graduated. The station plist is
+written with `LOOM_SHADOW=1` unless the installer is told otherwise. A repo
+added to `LOOM_REPOS` after the list was narrowed is not in it: add it to
+`LOOM_SHADOW_REPOS` first.
+
+Graduation is the operator's act, never Loom's. A repo leaves shadow only
+when the operator removes it from `LOOM_SHADOW_REPOS` (on the station and on
+Muse alike), and only after the operator's own review of the same pull
+requests and tickets finds:
+
+- at least N would-merges in the repo (20 for `docs-tests` and `app-code` by
+  default), with zero damaging ones: a would-merge the operator did not merge
+  as it was, or merged and later reverted;
+- zero would-closes of a ticket with an unmet criterion.
+
+Lowest risk tier first: `docs-tests`, then `app-code`; `deploy-config`,
+`security` and `cross-repo` stay with the operator (`LOOM_AUTO_MERGE_TIERS`).
+A damaging would-merge resets the repo's count. `LOOM_SHADOW=0` ends shadow
+for every repo at once.
+
+## Verify before ship
+
+A ticket closes only when every acceptance criterion has evidence
+(`bus/criteria_gate.py`). An audit of 2026-10-22 found at least 12 tickets of
+the private deployment repo closed as completed on green CI with their live
+criteria never checked (a roller "enabled" while paused, a run-rate
+"recorded" by a runbook that says the run never happened, a verdict from a
+simulated run), and lanes ticking live boxes with nothing running. Each
+criterion is one of three kinds:
+
+- code: met by the merged change (a test, a file, a behavior in the code);
+  the shipped merge is its evidence.
+- live: met only on a running system: a `Live:` line, a host or network
+  check, a box that names live, deployed or production behavior, a time
+  window or an observed event, an imperative verify or measure, a result
+  recorded on the ticket, a round trip, a reboot. Its evidence is a passing
+  station check, or, for a `Live:` line with log strings, the station's own
+  log search that dispatched the verify run.
+- operator: something only a person does (signs off, approves, acts by
+  hand, checks a handset). Loom never closes it.
+
+A tick is nobody's evidence: not the ticket's, not the lane's pull request
+body's. The station's done close leaves a shipped ticket open while a live
+or operator criterion has no evidence. A live criterion that names a check
+Loom can run gets one, at most 5 a pass, again after 6 hours when it fails:
+an `https://` URL fetched with GET, a `gh api <path>` read through the
+station's GitHub client, or a read-only `kubectl get` / `kubectl rollout
+status` (never a secret, `exec` or another cluster's credentials). The
+criterion's other backticked or double-quoted strings must be in the answer.
+Only a 2xx passes a URL check: a redirect is not followed, so a 3xx (a login
+or error page behind it) fails as "redirect not followed", unless every
+expected string names that exact status or Location.
+Each result is kept in the station's `live-checks.json` and written to the
+ticket's status; the answer itself is never written. A criterion with no
+runnable check, a failed check, or an operator criterion sends the ticket to
+`loom:human` with one ask (`Kind: decision`), once, and at most 4 such asks
+an hour. A verify lane's proof that passes a live or operator criterion
+without station evidence is refused.
+
+The proof a shipped ticket names is read by `bus/live_proof.py`, read-only.
+Each live criterion names at most one step: its log strings searched from the
+deploy on, once the window it names ("within 24 hours") has passed; a check
+the gate runs; or one plain SELECT through the station's query source. A
+step that would write is refused and never run: a `gh api` call with a method
+or field, a kubectl verb other than get or rollout status, a ship, roll,
+restart or any other command, SQL other than one SELECT. When the close gate
+finds evidence for every criterion the close quotes it, matching log lines
+included; otherwise one status line names the missing criterion and the next
+check time. The station's done close runs it for each open shipped ticket
+with a live criterion that names log strings and a window ("within 24
+hours"), at most 5 a pass, with the loom:shipped label time as the deploy
+time; a Live line with log strings and no window keeps its verify run. The
+log is the repo's
+`LOOM_EVIDENCE_CMDS` command, run once per string; only lines stamped at or
+after the deploy count (a line with no time counts only when the whole log
+the command read is newer than the deploy). A proven ticket gets a station
+proof record (revision: its newest merged pull request; observed: the deploy
+to now; each criterion's evidence), moves to verified with verified_by
+`station`, and closes through `brain.close` with the evidence quoted. Any
+other gets its status line edited into the status comment and is proved
+again at the next check time, or once its criteria change when nothing Loom
+runs can change the answer. In shadow mode the close is recorded in the
+ledger (source `station live proof`) and nothing is sent (#1608).
+
+A repo whose live data sits behind its own read-only routes (a log archive
+with per-workload reports, a read-only database user) declares a live-evidence
+adapter in `.loom/live-evidence.json` on its default branch
+(`bus/live_adapter.py`, #1770). It names a `log` command with the log
+`sources` it serves and a `sql` command, each an argv run without a shell:
+its first item a bare command on the station's PATH (never a shell or an
+interpreter, and its verb a fixed literal) or an executable `.loom/` script
+read from the default branch and run from a private temporary copy; every
+other item a literal or one whole placeholder (`{source}`, `{since}`,
+`{since_epoch}`, `{needle}`; `{sql}`). The command prints matching lines or
+rows, and may print `loom-evidence-window-hours: N` (log read in full) and
+`loom-evidence-count: N` (matches counted); it exits 0, or 1 for no match.
+A Live line names a step in a templated form: `log:<source>` with the strings
+that must appear in that log since the ship (or, worded as absent, must not
+appear over the window named, which the adapter must say it read), or
+`sql:<SELECT ...>` (one SELECT or SHOW) with the strings its answer must
+contain. The station runs an adapter only for repos in
+`LOOM_LIVE_EVIDENCE_REPOS`; the child gets PATH, HOME, LANG, TMPDIR and only
+the variables named in `LOOM_LIVE_EVIDENCE_PASS_ENV`, a timeout of at most
+300 seconds that kills its process group, and at most 64 KiB and 200 lines
+of output. A SQL statement is checked when the step is read and again just
+before it runs. Loom bounds what it asks and keeps; the routes behind the
+adapter keep themselves read-only (a SELECT-only user, a reader that cannot
+exec). An adapter error, a timeout or too much output is no evidence, and the
+status line names it.
+
+## Post-merge watch
+
+After a Loom auto-merge (a `loom/` lane pull request merged by a Loom App,
+not by a person), the station watches its deploy for `LOOM_POST_MERGE_WATCH`
+minutes (default 60) and reverts it when the deploy fails
+(`bus/deploy_watch.py`). `bus/revert.py` reverts only a red default branch,
+and most damage an audit of 2026-10-22 found never turned CI red: a build
+workflow that failed on the other build nodes, a config roll that
+crash-looped a StatefulSet, a backup hub left unpinned.
+
+Every signal answers healthy, failed or pending, with a reason; the merge is
+failed when any signal failed and healthy when all are. A repo names its
+deploy workflow in `.loom/deploy-signal` on its default branch, one signal a
+line:
+
+```
+# .loom/deploy-signal
+workflow sync.manifests.yml production/manifests/**
+```
+
+The workflow's run for the merge commit is read. A Rollout reports one
+annotation with a fixed title: `rollout-healthy` is healthy, and
+`rollout-aborted`, `rollout-degraded`, `rollout-paused`, `rollout-timeout`
+and `rollout-unreadable` are failed. A workload that is not a Rollout is
+judged by the run, which fails when its rollout or readiness wait fails. A
+merge that changes nothing under the globs is healthy. The ticket's live
+check (`bus/criteria_gate.py`), when it has one, is a signal too: healthy
+once it passes, failed if it still fails when the window ends. Another kind
+of signal is a new entry in `SIGNAL_KINDS`.
+
+Every read fails closed: an unreadable file, run or annotation list, a
+cancelled run, or an unknown signal kind is pending, never healthy. A merge
+still pending when the window ends is not reverted; the operator is paged
+that Loom could not tell.
+
+A failed merge gets a `loom:revert` ticket and GitHub's own revert pull
+request of it. That revert is the only change the watch merges, and only
+when `merge_tier.revert_refusal` finds nothing (the station applied the
+label, the body names the one reverted commit, which the base carries, and
+the diff is its exact inverse) and `bus.brain merge` passes it. A revert
+whose checks fail, that is refused, or that has not merged in 60 minutes is
+left for the operator. Either way the operator gets one page naming the
+failed signal and both pull requests; with no webhook set up, the message
+goes on the merged ticket. A revert is never watched, so Loom never reverts
+a revert. Each merge's watch is kept in the station's `deploy-watch.json`.
+
+## Lane scorecard
+
+Each lane and model keeps a scorecard (`bus/scorecard.py`), and a lane that
+ships bad work is demoted. Once an hour the station reads each repo's newest
+closed lane pull requests (a `loom/` branch, a trusted author, and the
+runner's footer naming the lane and model) and records per pull request its
+review outcome (clean, findings, or bad-work: a finding from
+`bus/merge_tier.py`'s bad-work rules), its send-backs (the fix briefs on its
+ticket), whether it merged, whether a merged revert undid it, and whether the
+post-merge watch found its deploy failed. Failed proof audits count against
+the lane that made the proof. The 2026-10-22 audit's verdicts seed the
+scorecard, aggregated per lane and model.
+
+A bad outcome is a bad-work finding, a revert, a failed deploy, a failed
+proof audit or a damaging audit verdict. A lane (all its slots) whose bad
+outcomes over the last `LOOM_LANE_DEMOTE_DAYS` days (default 7) reach
+`LOOM_LANE_DEMOTE_AT` (default 3) is demoted: it claims no build ticket, its
+briefed tickets step aside to other lanes with a status event naming the
+demotion and its counts, and it stays demoted until the operator runs
+`python3 -m bus.scorecard clear <lane>` (`show` prints the table). Clearing
+forgets the outcomes before it. A demoted lane still takes verify runs. A
+repo that cannot be read keeps its records, and nothing is cleared by an
+error. The table goes on the lane status comment, and the dashboard's Lanes
+page shows it as Scorecard.
+
+Each merged record also gets a settled difficulty (`bus/difficulty.py`),
+scored blind from the merged work alone: the diff's changed lines and files,
+the fix rounds sent back and the review findings, never the ticket's
+`Difficulty:` line. The perceived difficulty on that line is kept beside it
+and never changed. The lane status comment compares the two per lane, model
+and kind (the change class) over the last 14 days: how many agree, how many
+were harder or easier, and the bias in tiers (positive: harder than the
+brief said), so routing can see where its guess is off.
+
 ## Pull requests without a ticket
 
 A pull request with no ticket (no `Refs` line and no `loom/` branch) that a
@@ -1396,8 +1786,9 @@ ticketless pull request when all of these hold:
   merge that without `--adopt`);
 - its head commit's check rollup is `SUCCESS`;
 - the review check (`LOOM_REVIEW_CHECK`, else `Grug - Elder`) completed
-  with `success` or `neutral` on the head commit. A sensitive-class pull
-  request still requires `success`;
+  with `success` on the head commit, or `neutral` for a `class:docs` or
+  `class:tests` pull request only. A logic, sensitive or unlabeled pull
+  request requires `success`;
 - every review thread is resolved.
 
 It pins the head SHA in the squash merge, deletes the branch only after
@@ -1526,7 +1917,14 @@ ticket naming what evidence is missing.
 
 Every 6 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
-flight, blocked, next.
+flight, blocked, next. A goal quiet since its last report gets none (Quiet
+goals, below). The report ends with two lines: "Needs you:" (only what only
+the operator can do for this goal, or "nothing new for this goal"; it alone
+decides new comment or edit in place) and "Waiting on you:" (the count of
+open `loom:human` issues by repo and this goal's share, or "nothing"). `status`
+prints each goal's "Waiting on you:" line under "## Waiting on you"; `journal`
+refuses a report that puts the count on the "Needs you:" line or says
+"nothing" beside a count (loom#1775).
 
 ### Handoff packet
 
@@ -1573,7 +1971,8 @@ valid report, a measurement (a journal or report with a `Measure:` line that
 is not none) and a completed action (a `Shipped:` line that is not none),
 and its report state: ok, due (2 hours past), or overdue (one more tick,
 30 minutes, past that). Due and overdue goals are listed under "Reports
-owed before unlock"; the tick posts those reports before it unlocks.
+owed before unlock"; the tick posts those reports before it unlocks. A due
+or overdue goal that is quiet (below) is not listed there.
 
 Two reports on one goal home stay at least 90 minutes apart (the
 `report-cadence` invariant). A due or overdue goal with a report under 90
@@ -1587,3 +1986,48 @@ otherwise a person outside the list cannot hold a goal's reports back. An
 overdue report is a missed deadline only: it is separate from a report the
 station could not forward and from a brain that stopped ticking, which the
 station reports on its own.
+
+### Quiet goals
+
+Every new comment on a goal home emails the goal's author, so a goal where
+nothing happened is owed no report (loom#1534: a goal home got "nothing
+moved, nothing needs you" by email every few hours). `bus/quiet.py` holds the
+rule, and it reads only data `status` already has, never a report's prose.
+A goal is quiet since its newest valid report when all of these hold:
+
+- no ticket in its scope (the tickets `goal_tree` walks) was opened or
+  closed after that report, and none carrying `loom:merged`, `loom:shipped`,
+  `loom:verified` or `loom:failed` was updated after it;
+- no open `loom:invariant` issue names the goal (`Part of #N`) or sits in
+  its scope;
+- no open ticket in its scope asks the operator (`loom:human`,
+  `needs-operator`);
+- nothing in its scope is stuck: no open ticket carries `loom:failed`,
+  `loom:runaway`, `loom:regression` or `needs-brain`, and none has sat in
+  `loom:pr` past the stuck age (6 hours);
+- the numbers on its newest `Measure:` line (journal ticks and reports, with
+  dates and clock times left out) are the numbers it had when that report
+  went out.
+
+A goal with no report yet is never quiet. `status` prints a quiet goal's
+`quiet since <time>` line under it and leaves it out of "Reports owed before
+unlock". Once its last report was touched (posted or edited) 7 days ago, it
+is listed there as `report HEARTBEAT`: the next report is that week's
+heartbeat, and `python3 -m bus journal` edits it into this login's newest
+report on the goal home, with a `Still quiet as of <time>` line, instead of
+posting a new comment (an edit sends no email). Any other report for a quiet
+goal is refused like one inside 90 minutes: `journal` posts nothing, prints
+`not posted: quiet since <time>` and exits 0. Refusing, rather than editing
+the last report each time, keeps the last report saying what it said when it
+went out, and needs no write at all; a brain cannot edit another login's
+report anyway.
+
+The station follows the same rule. It posts no standup for a quiet goal and
+reads it again an hour later (`QUIET_RECHECK`); its weekly heartbeat edits
+its own last standup in place and, with none on the goal home, posts
+nothing. Its push of reports to the operator's phone, each report on its own
+or in the digest, skips a report whose goal was quiet since the report
+before it (counted quiet in the digest); a heartbeat is an edit, never a new
+comment, so it is never pushed. A read that fails pushes the report. The
+daily Visibility number counts a quiet goal as current: its last report is
+owed no successor.

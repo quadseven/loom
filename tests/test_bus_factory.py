@@ -1,13 +1,15 @@
 """The factory pass (bus/factory.py) with a fake GitHub and recorded actions."""
 
+import base64
 import os
 import re
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from urllib.parse import unquote
 from unittest import mock
 
-from bus import brain, factory, labels, station, status, tickets
+from bus import brain, factory, labels, merge_tier, station, status, tickets
 from bus.github import GitHubError, Response
 from bus.tickets import FIX_MARKER
 
@@ -56,6 +58,8 @@ class FakeGitHub:
         self.attempts = {}
         self.update_status = 202
         self.files = {}
+        self.patches = {}
+        self.contents = {}
         self.filed = []
         self.private = True
         self.logs = {}
@@ -105,6 +109,9 @@ class FakeGitHub:
             return list(self.pulls.values())
         if path.endswith("/issues?labels=loom:triage&state=open"):
             return list(self.filed)
+        if "/issues?labels=loom%3Aanswer-pending&state=open" in path:
+            return [i for i in self.issues.values() if i.get("state") == "open"
+                    and "loom:answer-pending" in [x["name"] for x in i.get("labels") or []]]
         m = re.search(r"/issues/(\d+)/comments$", path)
         if m:
             # As the GitHub client does: a status comment reads as its events.
@@ -136,7 +143,9 @@ class FakeGitHub:
         if m:
             page = int(m.group(2))
             names = self.files[int(m.group(1))][(page - 1) * 100:page * 100]
-            return Response(200, [{"filename": n} for n in names])
+            # A one-line change, unless the test gave the file its own patch.
+            return Response(200, [{"filename": n, "patch": self.patches.get(
+                n, "@@ -1 +1 @@\n-old\n+new")} for n in names])
         m = re.search(r"/commits/(\w+)/check-runs", path)
         if m:
             return Response(200, {"check_runs": self.runs[m.group(1)]})
@@ -145,6 +154,16 @@ class FakeGitHub:
             return Response(200, {"behind_by": self.behind.get(int(m.group(1)), 0)})
         if path == "/repos/%s" % REPO:
             return Response(200, {"private": self.private})
+        m = re.search(r"/contents/(.+?)\?ref=", path)
+        if m:
+            # A folder lists the files under it; a file comes back encoded.
+            name = m.group(1)
+            if name in self.contents:
+                return Response(200, {"content": base64.b64encode(
+                    self.contents[name].encode()).decode()})
+            listed = [{"name": k.rsplit("/", 1)[1]} for k in self.contents
+                      if k.rsplit("/", 1)[0] == name]
+            return Response(200, listed) if listed else Response(404, None)
         m = re.search(r"/actions/runs/(\d+)$", path)
         if m:
             return Response(200, {"run_attempt": self.attempts.get(m.group(1), 1)})
@@ -170,11 +189,22 @@ class FakeGitHub:
             made = dict(body, number=900 + len(self.filed), id=5000 + len(self.filed), user=ME)
             self.filed.append(made)
             return Response(201, made)
+        m = re.search(r"/issues/(\d+)/labels/([^/]+)$", path)
+        if m and method == "DELETE":
+            # As GitHub does: one label off, a missing one is a 404 the caller allows.
+            item = self.issues.get(int(m.group(1))) or self.pulls.get(int(m.group(1))) or {}
+            gone = unquote(m.group(2))
+            item["labels"] = [x for x in item.get("labels") or [] if x["name"] != gone]
+            return Response(200, {})
         m = re.search(r"/issues/(\d+)(/labels|/comments)?$", path)
         if m:
             number = int(m.group(1))
             if m.group(2) == "/labels":
-                if number in self.issues:
+                if number in self.issues and method == "POST":
+                    # Added, as GitHub's POST adds; a PUT replaces them all.
+                    have = [x["name"] for x in self.issues[number]["labels"]]
+                    self.issues[number]["labels"] = [{"name": x} for x in dict.fromkeys(have + body["labels"])]
+                elif number in self.issues:
                     self.issues[number]["labels"] = [{"name": x} for x in body["labels"]]
                 else:
                     have = [x["name"] for x in self.pulls[number].get("labels", [])]
@@ -185,7 +215,9 @@ class FakeGitHub:
                 self.comments.setdefault(number, []).append(
                     {"id": self.next_comment, "body": body["body"], "created_at": iso(0), "user": ME})
             elif method == "PATCH":
-                self.issues[number].update(body)
+                target = self.issues.get(number) or next(
+                    (f for f in self.filed if f["number"] == number), None)
+                target.update(body)
         m = re.search(r"/issues/comments/(\d+)$", path)
         if m and method == "PATCH":
             for found in self.comments.values():
@@ -217,13 +249,18 @@ class FakeGitHub:
 
 class Base(unittest.TestCase):
     def setUp(self):
+        # Every risk tier may merge here: these tests are about the other
+        # merge rules; bus/merge_tier.py has its own (test_merge_tier.py).
+        tiers = mock.patch.dict(os.environ, {"LOOM_AUTO_MERGE_TIERS": ",".join(merge_tier.TIERS)})
+        tiers.start()
+        self.addCleanup(tiers.stop)
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
         self.humans = []
         self.placed = []
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
-           down=(), limit_until=None, scope=None, known_waits=None):
+           down=(), limit_until=None, scope=None, known_waits=None, demoted=None):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
@@ -255,7 +292,7 @@ class Base(unittest.TestCase):
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
                             silent=silent, down=down, limit_until=limit_until, scope=scope,
-                            known_waits=known_waits)
+                            known_waits=known_waits, demoted=demoted)
         f.run()
         return f
 
@@ -1592,6 +1629,13 @@ class DeferredFindings(Base):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, resolved=False)
 
+    def settle(self, merged=True, outdated=False):
+        """The pass after the pull request closed: the ticket is merged now."""
+        self.gh.pulls[50].update(state="closed", merged=merged, merged_at=iso(0) if merged else None)
+        self.gh.details[50]["reviewThreads"]["nodes"][0]["isOutdated"] = outdated
+        self.gh.issues[5]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:merged"}]
+        self.go()
+
     def finding(self, body, author=BOT, asked=(ASKED_ONCE,)):
         root = {"author": author, "body": body, "url": "https://example.invalid/pr/50#r1"}
         self.gh.details[50]["reviewThreads"]["nodes"][0].update(
@@ -1601,6 +1645,9 @@ class DeferredFindings(Base):
     def test_a_medium_finding_a_round_asked_for_goes_to_a_follow_up_and_the_pull_request_lands(self):
         self.finding(MEDIUM)
         self.go()
+        # The pull request has not merged yet: nothing is filed until it does.
+        self.assertEqual(self.gh.filed, [])
+        self.settle()
         self.assertEqual(len(self.gh.filed), 1)
         filed = self.gh.filed[0]
         self.assertEqual((filed["title"], filed["labels"]),
@@ -1610,15 +1657,16 @@ class DeferredFindings(Base):
         self.assertTrue(all(ord(ch) < 128 for ch in filed["body"]))
         replies = [w for w in self.gh.writes if w[0] == "REPLY"]
         self.assertEqual(len(replies), 1)
-        self.assertTrue(replies[0][2].startswith("Deferred to #900: "))
+        self.assertTrue(replies[0][2].startswith("Deferred: "))
         self.assertIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
         self.assertEqual((self.merged, self.fixed), ([(50, (REPO, 5))], []))
 
     def test_a_new_medium_finding_on_the_first_round_is_deferred_not_sent_back(self):
         self.finding(MEDIUM, asked=(ASKED_OTHER,))
         self.go()
-        self.assertEqual((len(self.gh.filed), self.merged, self.fixed),
-                         (1, [(50, (REPO, 5))], []))
+        self.assertEqual((self.gh.filed, self.merged, self.fixed), ([], [(50, (REPO, 5))], []))
+        self.settle()
+        self.assertEqual(len(self.gh.filed), 1)
 
     def test_a_high_finding_on_a_logic_pull_request_still_goes_back(self):
         self.gh.pulls[50]["labels"] = [{"name": "class:logic"}]
@@ -1630,8 +1678,9 @@ class DeferredFindings(Base):
         self.gh.issues[5]["labels"].append({"name": "loom:revert"})
         self.finding(MEDIUM, asked=())
         self.go()
-        self.assertEqual((len(self.gh.filed), self.merged, self.fixed),
-                         (1, [(50, (REPO, 5))], []))
+        self.assertEqual((self.gh.filed, self.merged, self.fixed), ([], [(50, (REPO, 5))], []))
+        self.settle()
+        self.assertEqual(len(self.gh.filed), 1)
 
     def test_a_revert_still_goes_back_for_a_high_finding(self):
         self.gh.issues[5]["labels"].append({"name": "loom:revert"})
@@ -1642,7 +1691,9 @@ class DeferredFindings(Base):
     def test_after_two_fix_rounds_a_new_medium_finding_is_deferred(self):
         self.finding(MEDIUM, asked=(ASKED_OTHER, ASKED_OTHER))
         self.go()
-        self.assertEqual((len(self.gh.filed), self.merged), (1, [(50, (REPO, 5))]))
+        self.assertEqual((self.gh.filed, self.merged), ([], [(50, (REPO, 5))]))
+        self.settle()
+        self.assertEqual(len(self.gh.filed), 1)
 
     def test_prose_that_starts_with_low_is_not_a_low_finding(self):
         self.finding("Low risk, but this list can be empty.", asked=(ASKED_ONCE, ASKED_ONCE))
@@ -1679,38 +1730,83 @@ class DeferredFindings(Base):
                               "user": ME})
         self.finding(MEDIUM)
         self.go()
+        self.settle()
         self.assertEqual(len(self.gh.filed), 1)
-        self.assertTrue([w for w in self.gh.writes if w[0] == "REPLY"][0][2].startswith("Deferred to #778: "))
 
     def test_an_open_follow_up_from_an_earlier_pass_is_reused(self):
         self.gh.filed.append({"number": 777, "title": "Deferred review findings from %s#50" % REPO,
                               "user": ME})
         self.finding(MEDIUM)
         self.go()
+        self.settle()
         self.assertEqual(len(self.gh.filed), 1)
-        self.assertTrue([w for w in self.gh.writes if w[0] == "REPLY"][0][2].startswith("Deferred to #777: "))
         self.assertEqual(self.merged, [(50, (REPO, 5))])
 
     def test_a_docs_pull_request_defers_a_medium_finding_at_once(self):
         self.gh.pulls[50]["labels"] = [{"name": "class:docs"}]
         self.finding(MEDIUM, asked=())
         self.go()
-        self.assertEqual((len(self.gh.filed), self.merged), (1, [(50, (REPO, 5))]))
+        self.assertEqual((self.gh.filed, self.merged), ([], [(50, (REPO, 5))]))
+        self.settle()
+        self.assertEqual(len(self.gh.filed), 1)
         self.assertEqual(self.fixed, [])
 
     def test_a_tests_pull_request_defers_a_low_finding_at_once(self):
         self.gh.pulls[50]["labels"] = [{"name": "class:tests"}]
         self.finding("low | _style_ | `nit`", asked=())
         self.go()
-        self.assertEqual((len(self.gh.filed), self.merged), (1, [(50, (REPO, 5))]))
+        self.assertEqual((self.gh.filed, self.merged), ([], [(50, (REPO, 5))]))
+        self.settle()
+        self.assertEqual(len(self.gh.filed), 1)
 
     def test_a_logic_pull_request_defers_a_minor_finding_without_a_fix_round(self):
         # 2026-10-14: medium findings no longer cost a fix round on any class.
         self.gh.pulls[50]["labels"] = [{"name": "class:logic"}]
         self.finding(MEDIUM, asked=())
         self.go()
-        self.assertEqual((len(self.gh.filed), self.merged, self.fixed),
-                         (1, [(50, (REPO, 5))], []))
+        self.assertEqual((self.gh.filed, self.merged, self.fixed), ([], [(50, (REPO, 5))], []))
+        self.settle()
+        self.assertEqual(len(self.gh.filed), 1)
+
+    def test_nothing_is_filed_while_the_pull_request_is_open(self):
+        self.finding(MEDIUM)
+        self.go()
+        self.go()
+        self.assertEqual((self.gh.filed, len(self.merged)), ([], 2))
+
+    def test_nothing_is_filed_when_the_pull_request_closed_unmerged(self):
+        self.finding(MEDIUM)
+        self.go()
+        self.settle(merged=False)
+        self.assertEqual(self.gh.filed, [])
+
+    def test_a_finding_the_merged_head_outdated_is_not_filed(self):
+        self.finding(MEDIUM)
+        self.go()
+        self.settle(outdated=True)
+        self.assertEqual(self.gh.filed, [])
+        self.assertTrue(any(factory.DEFERRED_FILED_MARKER % 50 in c["body"]
+                            for c in self.gh.comments[5]))
+
+    def test_the_follow_up_is_filed_once(self):
+        self.finding(MEDIUM)
+        self.go()
+        self.settle()
+        self.go()
+        self.assertEqual(len(self.gh.filed), 1)
+
+    def test_closing_a_pull_request_unmerged_closes_its_open_follow_up(self):
+        self.gh.pull(60, 5, state="closed")
+        self.gh.pull(61, 5, state="closed", merged_at=iso(0))
+        self.gh.pull(62, 5)
+        for n in (60, 61, 62):
+            self.gh.filed.append({"number": 700 + n, "state": "open", "user": ME, "body": "x",
+                                  "title": "Settle the review findings left from PR #%d" % n})
+        self.go()
+        by = {f["number"]: f.get("state") for f in self.gh.filed}
+        self.assertEqual(by, {760: "closed", 761: "open", 762: "open"})
+        self.assertEqual(self.gh.filed[0]["state_reason"], "not_planned")
+        self.assertIn("closed without merging", self.gh.filed[0]["body"])
 
 
 class ChangeClasses(Base):
@@ -3263,7 +3359,7 @@ class Helpers(unittest.TestCase):
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
                          model_limits=None, silent=None, down=(), limit_until=None,
-                         benched=(), known_waits=None, plan_check=None):
+                         benched=(), known_waits=None, plan_check=None, demoted=None):
                 self.silent_running, self.silent, self.waits = {}, silent, {}
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))
@@ -3427,6 +3523,21 @@ class ForbiddenModels(unittest.TestCase):
         for model in factory.STRONG | station.STRONG_MODELS:
             self.assert_allowed(model, "the strong models")
         self.assertEqual(dict(factory.LADDER[1:2]), {("codex", "codex-2"): "gpt-6-luna"})
+
+    def test_a_go_model_off_the_allow_list_reads_as_the_stand_in(self):
+        # Kimi K2.7 Code (1,350 requests per 5 h) spent the Go allowance in
+        # hours on 2026-10-23; the allow-list is free or 10,000+ models only.
+        self.assertIn(tickets.OPENCODE_GO_STAND_IN, tickets.OPENCODE_GO_MODELS)
+        for named in ("opencode-go/kimi-k2.7-code", "opencode-go/kimi-k3.1-pro",
+                      "opencode-go/gemini-4-argon-contributor", "opencode-go/some-new-model"):
+            headers, _ = tickets.parse("Model: %s\nDifficulty: easy\n\n## Why\nx\n" % named)
+            self.assertEqual(headers["Model"], tickets.OPENCODE_GO_STAND_IN, named)
+            self.assertFalse(station.lane_takes_model("opencode-go-2", named), named)
+        for model in tickets.OPENCODE_GO_MODELS:
+            self.assertEqual(tickets.allowed_model(model), model)
+            self.assertTrue(station.lane_takes_model("opencode-go", model), model)
+        for _, model in factory.CLIMB:
+            self.assertFalse(model.startswith("opencode-go/") and model not in tickets.OPENCODE_GO_MODELS)
 
     def test_the_forbidden_list_covers_both_families(self):
         self.assertEqual(tuple(p for p, _ in tickets.FORBIDDEN_MODELS), self.FORBIDDEN)

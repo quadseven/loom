@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import claimed, station  # noqa: E402
 from bus.github import GitHub  # noqa: E402
+from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 REPO = "example-owner/example-repo"
 MERGE_SHA = "a1" * 20

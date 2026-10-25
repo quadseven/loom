@@ -16,6 +16,18 @@ comments there send them no email; an @mention still does. Use `muse` as your lo
 holder (the lane machine's tick uses its own name and takes the lock for
 you). The lock lives in `quadseven/loom`.
 
+Shadow mode (docs/BRAIN.md, Shadow mode): set `LOOM_SHADOW=1` and
+`LOOM_SHADOW_REPOS` to the same values as the station. Unset, the brain is in
+shadow for every repo. In shadow, `bus.brain merge` and `bus.brain close` run
+every gate and then stop with "shadow mode: would ..."; that is the expected
+result, not a failure to retry or work around. Name each such pull request or
+ticket in the journal as "would merge" or "would close". Never merge or close
+a pull request or issue any other way (curl, `gh pr merge`, `gh issue close`,
+the web), in shadow or out of it. In shadow, also never approve a pull
+request, add `ready-to-land` or `loom:shipped` by hand, or write onto a branch
+Loom does not own, by any route: `bus.brain move` records a ship instead of
+taking it, and the tick's `gh` refuses the rest and records them.
+
 ## What Muse does and leaves
 
 Muse reads live data through REST APIs on the tailnet, through its proxy,
@@ -82,7 +94,9 @@ not looked hard enough yet. Each tick the brain:
   ticket it with the evidence.
 - Finishes before it starts: each tick merges every lane pull request that
   `bus.brain status` marks `READY` (the merge-ready signal in
-  docs/BRAIN.md) before it briefs anything new.
+  docs/BRAIN.md) before it briefs anything new. A pull request held for
+  the operator (docs/BRAIN.md, Operator holds) is not merged: `bus.brain
+  merge` refuses it and asks the operator on its ticket.
 - In the brief step, rank up to 5 open tickets that have no `Priority:` line
   with `python3 -m bus.brain prioritize OWNER/NAME#N --priority P0|P1|P2|P3
   --note "REASON"`. Choose highest goal cost first, and make each note one
@@ -298,7 +312,14 @@ this tick"; a step with no note shows nothing there.
    report once the last report is 5 hours 45 minutes old, so no goal's
    report passes 6 hours; never hand an owed report to another brain.
    A goal listed as `report HELD` already has a report under 90 minutes old
-   (the station's included): skip it this tick. Each lane
+   (the station's included): skip it this tick. A goal whose line says
+   `quiet since <time>` is quiet since its last report (no ticket opened,
+   merged, shipped, verified, failed or closed, no breach, no ask, nothing
+   stuck, the same metric numbers; docs/BRAIN.md, Quiet goals): it is owed
+   no report and is not listed, so write none for it. A goal listed as
+   `report HEARTBEAT` has been quiet for a week: write its report as usual,
+   and `journal` edits it into your last report there instead of posting a
+   new one. Each lane
    pull request's line ends in `READY`
    or `blocked:` and its blockers; take that verdict as given rather than
    re-deriving it from the review list.
@@ -326,8 +347,10 @@ this tick"; a step with no note shows nothing there.
    Spend at most a third of the tick on them; defer what is left again.
    Sensitive pull requests listed by resume are also yours to handle, even
    when another brain journaled in the last 2 hours. They are open,
-   needs-brain, older than 2 hours, green and passed the review check. Read
-   the ticket and diff, answer or resolve each review thread, then run
+   needs-brain, older than 2 hours, green and passed the review check. Resume
+   lists these oldest first, before other deferred work. Review the oldest
+   sensitive pull request before any other merge work: read the ticket and
+   diff, answer or resolve each review thread, then run
    `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N` when ready.
    Do not wait for the other brain's next tick.
    `resume` then lists up to 5 verify-due tickets (open `loom:shipped`, no
@@ -493,8 +516,9 @@ this tick"; a step with no note shows nothing there.
    the step's name from the list above (lock, status, merge, verify, failed,
    asks, brief, triage, journal, unlock): the station files a ticket when one
    brain's two ticks in a row carry such a line (docs/LANES.md, Invariants).
-   Every 6 hours per goal (when status lists the goal as due or overdue),
-   also post the report: a separate comment on the goal
+   Every 6 hours per goal (when status lists the goal under "Reports owed
+   before unlock" as due, overdue or heartbeat; a quiet goal is not
+   listed and gets no report), also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line
    `<!-- loom:report v1 -->` followed by the report itself, written as a
    standup the operator can read in thirty seconds on a phone:
@@ -508,10 +532,16 @@ this tick"; a step with no note shows nothing there.
      named as stuck or blocked and still is, with how long; say "nothing"
      when the list is empty. Read the previous report to fill this in.
    - Next: what the brain will do before the next report.
-   - Needs you: only what only the operator can do, or "nothing", then the
-     count of open `loom:human` issues by repo (for example "loom:human: 12
-     in OWNER/NAME, 3 in OWNER/OTHER"); the daily digest lists them, so do
-     not list them here.
+   - Needs you: only what only the operator can do for THIS goal, or
+     "nothing new for this goal". Never a count: this line is what `journal`
+     compares to tell a new ask from an unchanged one.
+   - Waiting on you: the next line, always. Copy it from the "## Waiting on
+     you" section of `status`, which fills it from data: "Waiting on you: 28
+     open loom:human (25 in OWNER/NAME, 3 in OWNER/OTHER; 4 of them under
+     this goal), listed in the daily digest", or "Waiting on you: nothing"
+     when none is open. The daily digest lists them, so do not list them here.
+     "nothing" never sits beside a count on one line (the operator read
+     "Needs you: nothing. loom:human: 28 in OWNER/NAME." as both, 2026-10-25).
    Write sentences, not ticket lists: name a ticket only where the operator
    may want to open it, and never more than one or two per line. Numbers
    over adjectives. A goal home may ask for extra lines; add them after
@@ -522,7 +552,18 @@ this tick"; a step with no note shows nothing there.
    posts no report within 90 minutes of another report on the same goal
    home, the Loom App's included: it prints `not posted:` with that
    report's author and time and exits 0. The goal is reported; that is not
-   a failed step.
+   a failed step. It also posts no report for a goal quiet since its last
+   report: it prints `not posted: quiet since <time>` and exits 0, also not
+   a failed step, since every new report emails the goal's author. A
+   heartbeat (once a quiet week) is edited into the last report in place,
+   and so is a report whose "Needs you:" line asks the same as the last
+   report's: only a new ask posts a new comment (loom#1560). Keep the
+   "Needs you:" line exact, so an unchanged ask reads as unchanged. Only
+   that line is compared: a "Waiting on you:" count that moved alone edits
+   the last report in place (loom#1775). A report whose "Needs you:" line
+   carries a `loom:human` count, or whose "Waiting on you:" line says
+   "nothing" beside a number, is refused: `journal` posts nothing, prints
+   `not posted:` and the reason, and exits 2, a failed step to rewrite.
 10. First run `python3 -m bus.brain step unlock --holder muse`. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
     failure as well.
 11. End the tick's chat reply in the same standup shape as the reports
@@ -703,6 +744,65 @@ say-so alone:
   review check passed and no high or critical finding is open on the head
   commit.
 - A pull request with no class label keeps the `logic` rule.
+- A medium or low finding from a bad-work rule is never deferred (below).
+
+## Merge by risk tier
+
+The change class says how a change is reviewed; the risk tier says who may
+merge it (`bus/merge_tier.py`). From 2026-10-19, when the station and brain
+Apps merged unattended, 16 of 22 lane pull requests in the private deployment
+repo were damaging or useless, most of them CI and deploy changes the class
+called `logic`; the lane pull requests the operator merged by hand the week
+before were all good. Each lane pull request gets the highest tier of its files
+and its ticket:
+
+- `docs-tests`: documentation and tests only.
+- `app-code`: application code and anything not named below.
+- `deploy-config`: manifests, Helm values, Dockerfiles, IaC (Pulumi,
+  Terraform, Ansible), systemd units, runtime config files, dependency
+  manifests, and anything under a deploy, production, infra or similar
+  directory.
+- `security`: CI workflows and actions, CODEOWNERS, `.loom/`, a
+  `class:sensitive` pull request, and paths that name auth, secrets, tokens,
+  credentials, permissions, policy, sandboxing, TLS or the leak scan.
+- `cross-repo`: a submodule gitlink, `.gitmodules`, a `pin.env` or `*PINS*`
+  file, or a ticket whose own words name another repo of the owner.
+
+Loom merges on its own only the tiers in `LOOM_AUTO_MERGE_TIERS` (default
+`docs-tests,app-code`). Any other tier is held for the operator: the factory
+puts its ticket to `loom:human` with one ask (`Kind: decision`, posted once),
+and `bus.brain merge` refuses it with "held for the operator". The operator
+merges it by hand.
+
+An auto tier still merges only when it is clean:
+
+- the review check (`LOOM_REVIEW_CHECK`) concluded success on the head
+  commit; neutral is not enough;
+- no high or critical review-bot finding, and no finding from a bad-work rule
+  at any severity, is open, or was resolved with no commit after it. The
+  bad-work rules are the review bot's `intent-mismatch`, `unmet-criterion`,
+  `dead-code` and the rules named in `merge_tier.BAD_WORK_RULES`, any rule in
+  `LOOM_ELDER_BLOCKING_RULES`, and any finding whose category is `bad-work`.
+  The factory never defers such a finding as minor: it goes back to the lane;
+- fewer than `LOOM_AUTO_MERGE_PER_REPO_HOUR` (default 2) `loom/` pull requests
+  merged in the repo in the last hour, and fewer than `LOOM_AUTO_MERGE_PER_HOUR`
+  (default 4) across the owner. GitHub's search gives the counts, so every
+  brain and station sees the same numbers; a `loom/` branch the operator
+  merged by hand counts too, and a count GitHub will not give refuses the
+  merge.
+
+A revert ticket's own pull request is exempt from the tier, the review rule
+and the caps only when it is proven: its ticket carries `loom:revert` applied
+by a revert labeler (`LOOM_REVERT_LABELERS`, else the `LOOM_BRIEF_AUTHORS`
+logins that are not a lane's), its body names one commit (`git revert <sha>`)
+its base branch carries, and its diff is that commit's exact inverse. A
+revert that fails any of these takes the normal gates.
+
+Higher tiers are read first, so a test-named manifest, IaC under `tests/`
+or a Dockerfile under `docs/` is never `docs-tests`, and a rename takes the
+higher tier of its old and new paths. Every review thread is read, all
+pages, and a list that cannot be read in full refuses the merge. The adopt path
+(`--adopt`, a ticketless pull request a trusted login opened) is not tiered.
 
 ## Rules
 
@@ -716,6 +816,10 @@ say-so alone:
   private repo names.
 - Put asks in a `needs-operator` issue with one exact ask. Use `loom:urgent`
   only for something breaking now.
+- Date an outage by its window: the last good observation and the first
+  failing one ("last good read 04:28Z, first failing read 09:02Z"). Never
+  write the last good read as the start ("down since 04:28Z"): `bus`
+  commands refuse that text.
 - Never retry a failed step in the same tick. Stop at 25 minutes.
 - Every note or piece of evidence a tick leaves on an issue, outside the
   comments a `bus` or `bus.brain` command writes itself, goes through

@@ -183,4 +183,84 @@
       });
     });
   }
+
+  // Needs you (loom#1777): one-tap answers. The answer token and the
+  // operator it answers as are kept in this browser only.
+  const store = {
+    get(name) { try { return localStorage.getItem(`loom-answer-${name}`) || ''; } catch (error) { return ''; } },
+    set(name, value) { try { localStorage.setItem(`loom-answer-${name}`, value); } catch (error) { /* private mode */ } },
+  };
+  const bar = document.querySelector('[data-answer-mode]');
+  const authForm = document.querySelector('[data-answer-auth]');
+  if (authForm) {
+    const who = authForm.querySelector('select[name="as"]');
+    if (who && store.get('as')) who.value = store.get('as');
+    authForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const token = authForm.querySelector('input[name="token"]').value.trim();
+      if (token) store.set('token', token);
+      if (who) store.set('as', who.value);
+      authForm.querySelector('input[name="token"]').value = '';
+      authForm.querySelector('.answer-status').textContent = store.get('token')
+        ? `Kept in this browser; answers post as ${store.get('as') || 'the operator'}.` : 'Enter the answer token.';
+    });
+  }
+
+  function replaceCard(article, html) {
+    if (!article || !html) return;
+    const holder = document.createElement('div');
+    // The card is the dashboard's own server-rendered HTML, every value in it
+    // escaped (dashboard/needs_you.py card), never text a person typed here.
+    holder.innerHTML = html; // nosemgrep: elder-js-unescaped-html-sink
+    const fresh = holder.firstElementChild;
+    if (fresh) article.replaceWith(fresh);
+  }
+
+  document.addEventListener('submit', async (event) => {
+    const form = event.target.closest('[data-answer]');
+    if (!form) return;
+    event.preventDefault();
+    const status = form.querySelector('.answer-status');
+    const button = event.submitter;
+    const field = form.querySelector('input[name="choice"]');
+    const choice = button && button.name === 'choice' ? button.value : (field ? field.value : '');
+    const mode = bar ? bar.dataset.answerMode : 'token';
+    const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
+    if (mode === 'token') {
+      if (!store.get('token')) {
+        status.textContent = 'Enter the answer token under "Answering from this browser" first.';
+        if (bar) { bar.open = true; bar.scrollIntoView({ block: 'center' }); }
+        return;
+      }
+      headers.Authorization = `Bearer ${store.get('token')}`;
+    }
+    form.querySelectorAll('button').forEach((item) => { item.disabled = true; });
+    status.textContent = 'Posting...';
+    try {
+      const response = await fetch('/api/needs-you/answer', {
+        method: 'POST', headers,
+        body: JSON.stringify({ repo: form.dataset.repo, number: Number(form.dataset.number), choice,
+          note: form.querySelector('input[name="note"]').value, as: store.get('as') }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || `the answer failed (${response.status})`);
+      if (payload.label_error) status.textContent = payload.label_error;
+      replaceCard(form.closest('article'), payload.card);
+    } catch (error) {
+      status.textContent = error.message;
+      form.querySelectorAll('button').forEach((item) => { item.disabled = false; });
+    }
+  });
+
+  // A card whose ask is in a comment the refresh has not read is read now.
+  document.querySelectorAll('[data-ask-read]').forEach(async (slot) => {
+    try {
+      const response = await fetch(slot.dataset.askRead, { headers: { Accept: 'application/json' } });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || `the read failed (${response.status})`);
+      replaceCard(slot.closest('article'), payload.card);
+    } catch (error) {
+      slot.textContent = `The ask is in a comment not read yet: ${error.message}`;
+    }
+  });
 })();

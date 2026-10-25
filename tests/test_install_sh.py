@@ -160,6 +160,24 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_PIN_SHIP_REPOS</key><string>example-owner/deploy</string>", plist)
 
+    def test_the_station_plist_installs_in_shadow_mode_unless_told_otherwise(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LOOM_SHADOW")}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_SHADOW</key><string>1</string>", plist)
+        self.assertIn("<key>LOOM_SHADOW_REPOS</key><string></string>", plist)
+
+    def test_shadow_repos_and_revert_labelers_are_written_to_station_plist(self):
+        result = self.run_install(LOOM_SHADOW="1", LOOM_SHADOW_REPOS="example-owner/a example-owner/b",
+                                  LOOM_REVERT_LABELERS="example-station[bot]")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_SHADOW_REPOS</key><string>example-owner/a example-owner/b</string>",
+                      plist)
+        self.assertIn("<key>LOOM_REVERT_LABELERS</key><string>example-station[bot]</string>", plist)
+
     def test_ship_rules_are_written_to_station_plist(self):
         result = self.run_install(LOOM_SHIP_ON_MERGE="example-owner/lib",
                                   LOOM_SHIP_WORKFLOWS="example-owner/svc=deploy.yml",
@@ -192,6 +210,15 @@ class InstallScriptTest(unittest.TestCase):
         entry = "<key>LOOM_TRUSTED_BRIEFERS</key><string>dana-example</string>"
         self.assertIn(entry, (agents / "com.loom.station.plist").read_text())
         self.assertIn(entry, (agents / "com.loom.brain.plist").read_text())
+
+    def test_goal_limits_are_written_to_station_and_brain_plists(self):
+        result = self.run_install(LOOM_GOAL_CAP="28", LOOM_UNVERIFIED_LIMIT="60")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        for label in ("com.loom.station", "com.loom.brain"):
+            plist = (agents / (label + ".plist")).read_text()
+            self.assertIn("<key>LOOM_GOAL_CAP</key><string>28</string>", plist)
+            self.assertIn("<key>LOOM_UNVERIFIED_LIMIT</key><string>60</string>", plist)
 
     def test_lane_model_settings_are_written_to_station_plist(self):
         # The factory reads what a lane ran from its setting (bus/brain.py

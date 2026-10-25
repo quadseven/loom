@@ -50,6 +50,14 @@ print(json.dumps(found))
 """
 
 
+MAX_WORKERS = 4
+
+
+def worker_count(item_count: int, cpu_count: int | None) -> int:
+    """Bound concurrent test processes to keep validation resource use steady."""
+    return min(item_count, cpu_count or 1, MAX_WORKERS)
+
+
 def child_env(test_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
     python_path = str(test_dir)
@@ -97,6 +105,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tests-dir", type=Path, default=Path("tests"))
     parser.add_argument("--shard-size", type=int, default=60)
+    # The lane check (.loom/validation.conf) runs inside a sandbox where the
+    # tests needing sandbox-exec, ps or a localhost port skip by design; CI
+    # leaves this off and refuses every skip.
+    parser.add_argument("--allow-skips", action="store_true")
     args = parser.parse_args()
     test_dir = args.tests_dir.resolve()
     modules = discovered_modules(test_dir)
@@ -107,7 +119,7 @@ def main() -> int:
     items = work_items(modules, test_dir, max(1, args.shard_size))
     failed = False
     total = 0
-    max_workers = min(len(items), os.cpu_count() or 1)
+    max_workers = worker_count(len(items), os.cpu_count())
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         # Discovery order, not most-tests first: test count does not predict
         # time. Most-tests first queued test_dashboard (43 tests, 610s on the
@@ -125,7 +137,8 @@ def main() -> int:
         if result.returncode:
             failed = True
         for line in output.splitlines():
-            if "... skipped " in line and "LOOM_TEST_OPENCODE2" not in line:
+            if ("... skipped " in line and "LOOM_TEST_OPENCODE2" not in line
+                    and not args.allow_skips):
                 print("::error::a test skipped; the sandbox tests must run in CI")
                 failed = True
     print("Parallel unittest total: Ran %d tests across %d modules in %d processes"

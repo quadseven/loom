@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, change_class, labels, naming, notify, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -156,6 +156,9 @@ HOLD_STUCK = 48 * 3600
 REVIEW_GRACE = 1800
 # At most this many merges, send-backs and climbs per pass.
 MAX_ACTIONS = 12
+# At most this many dashboard answers (loom:answer-pending issues) are read in
+# one repo a pass; the rest wait for the next.
+ANSWERS_PER_PASS = 10
 DEFAULT_REVIEW_CHECK = "Grug - Elder"
 # The review bot's plan check (same default as bus/invariants.py).
 DEFAULT_PLAN_CHECK = "Grug - Chief"
@@ -391,7 +394,7 @@ BRIEF_RES = (
 RUNAWAY = "loom:runaway"
 NO_REASON = "agent made no commit and wrote no reason"
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
-                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved path'
+                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved isOutdated path'
                  ' root: comments(first:1) { nodes { author { __typename login } body url } }'
                  ' comments(last:20) { nodes { author { __typename login } body } } } } } } }')
 RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
@@ -418,6 +421,14 @@ DEFER_TITLE = "Settle the review findings left from PR #%d"
 # The title before the naming standard (docs/NAMING.md): an open follow-up
 # filed under it still counts, so a pull request never gets two.
 DEFER_TITLE_LEGACY = "Deferred review findings from %s#%d"
+# The follow-up issue is filed only after its pull request merges. Deferring
+# resolves the threads and leaves this record on the ticket; the pass that
+# finds the pull request merged files the issue (settle_deferred) and leaves
+# the filed record. A pull request that closes unmerged files nothing.
+DEFERRED_MARKER = "<!-- loom:deferred pr=%d sha=%s rounds=%d ids=%s -->"
+DEFERRED_RE = re.compile(r"<!-- loom:deferred pr=(\d+) sha=(\w*) rounds=(\d+) ids=([^ ]*) -->")
+DEFERRED_FILED_MARKER = "<!-- loom:deferred-filed pr=%d -->"
+DEFER_TITLE_RE = re.compile(r"^Settle the review findings left from PR #(\d+)$")
 # A file a pull request changes is code by its extension, and a test by a
 # test or tests folder in its path or by its name.
 CODE_EXTS = (".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".cpp", ".h", ".hpp",
@@ -493,6 +504,28 @@ def unticked_notes(missing: Sequence[str]) -> str:
         "without it.",
         "- Then tick each built criterion in the pull request body's ## Acceptance "
         "criteria, or leave it unticked and end its line with \"; not built: <reason>\".",
+        "- Change nothing else."])
+
+
+TICKED_HEADING = "### Live or operator criteria ticked by the lane"
+
+
+def _last_ask(comments: Sequence[Dict[str, Any]]) -> str:
+    """The newest loom:human ask among the comments, or ""."""
+    asks = [str(c.get("body") or "") for c in comments
+            if str(c.get("body") or "").startswith(answer.HUMAN_MARKER)]
+    return asks[-1] if asks else ""
+
+
+def ticked_notes(ticked: Sequence[str]) -> str:
+    """The fix note for live or operator criteria a lane ticked in its pull
+    request body (bus/criteria_gate.py): only the verifier ticks those."""
+    return "\n".join([TICKED_HEADING, ""] + ["- " + c for c in ticked] + [
+        "", "The factory sent this pull request back: these criteria are met only on a "
+        "running system or by a person, and the body ticks them.", "",
+        "- Untick each one in the pull request body's ## Acceptance criteria. The "
+        "station's verifier ticks a live criterion once its own check passes, and the "
+        "operator ticks an operator one.",
         "- Change nothing else."])
 
 
@@ -645,12 +678,16 @@ def deferrable(threads: Sequence[Dict[str, Any]], bot: str, asked: set,
     thread is a medium or low finding the review bot opened that a fix round
     asked for, or the pull request has had DEFER_AFTER fix rounds. With
     `immediate` (a docs or tests change) any such finding defers at once,
-    with no fix round."""
+    with no fix round. A bad-work finding never defers."""
     still = [t for t in threads if not t.get("isResolved")]
 
     def minor(t: Dict[str, Any]) -> bool:
         root = _end(t, "root", 0)
-        return (brain.by_bot(root, bot) and bool(MINOR_RE.match(str(root.get("body") or "")))
+        body = str(root.get("body") or "")
+        # A bad-work finding (bus/merge_tier.py) says the change does not do
+        # what it claims: it goes back to the lane at any severity.
+        return (brain.by_bot(root, bot) and bool(MINOR_RE.match(body))
+                and not merge_tier.bad_work(body)
                 and (immediate or str(t.get("id")) in asked or rounds >= DEFER_AFTER))
     return still if still and all(minor(t) for t in still) else []
 
@@ -1113,7 +1150,9 @@ def acceptance_criteria(body: str) -> List[str]:
 
 
 def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
-    """Ticket criteria that a lane PR leaves unticked, excluding Live checks."""
+    """Ticket criteria that a lane PR leaves unticked, excluding live checks
+    and operator actions (bus/criteria_gate.py): only the station's verifier
+    or the operator can meet those, so a lane is never asked to tick them."""
     ticket = acceptance_criteria(ticket_body)
     pull = acceptance_criteria(pull_body)
     states = {}
@@ -1124,7 +1163,7 @@ def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
     missing = []
     for criterion in ticket:
         _, _, text = criterion.partition(" ")
-        if text.casefold().startswith("live:"):
+        if criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE:
             continue
         clean = NOT_BUILT_RE.sub("", text).strip().casefold()
         checked, not_built = states.get(clean, (False, False))
@@ -1334,7 +1373,9 @@ class Factory:
                  human: Callable[..., Any] = brain.human,
                  place: Callable[..., Any] = brain.place_under_epic,
                  plan_check: str = DEFAULT_PLAN_CHECK,
-                 scope: Optional[scope_fit.Ask] = None) -> None:
+                 scope: Optional[scope_fit.Ask] = None,
+                 demoted: Optional[Dict[str, str]] = None,
+                 operators: Optional[Sequence[str]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1356,6 +1397,10 @@ class Factory:
         # aside as from a limit. Left to the BRIEFED_STALL move, three tickets
         # waited two hours on lanes whose key had expired (2026-10-19).
         self.down = set(down)
+        # Lane slots demoted for bad work (bus/scorecard.py), and why: down
+        # for build tickets until the operator clears them.
+        self.demoted = dict(demoted or {})
+        self.down |= set(self.demoted)
         # Lane -> epoch its limit lifts, from its heartbeat (retry_at).
         self.limit_until = dict(limit_until or {})
         # Lane -> {model: epoch its limit lifts}: a lane with a model ladder
@@ -1384,6 +1429,10 @@ class Factory:
         # The same map as the last pass left it (the station's saved waits): a
         # ticket whose reason is unchanged is not announced again.
         self.known_waits = dict(known_waits or {})
+        # The operators whose answers on the dashboard (bus/answer.py) count:
+        # LOOM_OPERATORS, else the person logins among the trusted ones.
+        self.operators = [o.lower() for o in (operators if operators is not None
+                                              else answer.operators(trusted=trusted))]
         self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
         # Sends the scope check's prompt to a cheap model (bus/scope_fit.py);
@@ -1607,24 +1656,79 @@ class Factory:
     def _defer_minor(self, repo: str, number: int, ticket: int, sha: str,
                      comments: Sequence[Dict[str, Any]], immediate: bool = False) -> bool:
         """Defer the open medium and low findings of a reviewed, green pull
-        request to a follow-up issue, then resolve them. True when it did.
-        With `immediate` (docs, tests, or a revert) they defer at once."""
+        request, then resolve them. True when it did. With `immediate` (docs,
+        tests, or a revert) they defer at once. The follow-up issue is not
+        filed here: the pull request has not merged, and may never
+        (settle_deferred files it once it does)."""
         threads = self._threads(repo, number)
         rounds = fixes_of(comments)
         picked = deferrable(threads, self.review_bot, asked_threads(comments), rounds, immediate)
         if not picked:
             return False
-        follow = self._follow_up(repo, number, ticket, sha, picked, rounds)
-        if not follow:
-            return False
-        reply = ("Deferred to #%d: a medium or low finding still open after %d fix "
-                 "round(s), with the review check passed on %s." % (follow, rounds, sha[:12]))
+        ids = ",".join(str(t.get("id")) for t in picked)
+        notify.post(self.gh, repo, ticket, DEFERRED_MARKER % (number, sha[:12], rounds, ids)
+                    + "\nMedium or low review findings on #%d are deferred; the follow-up "
+                    "issue is filed once it merges." % number, notify.RECORD)
+        reply = ("Deferred: a medium or low finding still open after %d fix round(s), "
+                 "with the review check passed on %s. A follow-up issue is filed once "
+                 "this pull request merges." % (rounds, sha[:12]))
         for t in picked:
             self.gh.graphql(REPLY_MUTATION, {"id": str(t.get("id")), "body": reply})
             self.gh.graphql(RESOLVE_MUTATION, {"id": str(t.get("id"))})
         self.actions += 1
-        _say("deferred %d finding(s) on %s#%d to #%d" % (len(picked), repo, number, follow))
+        _say("deferred %d finding(s) on %s#%d until it merges" % (len(picked), repo, number))
         return True
+
+    def settle_deferred(self, repo: str, issue: Dict[str, Any]) -> None:
+        """File the follow-up issue for findings deferred on a ticket's pull
+        request, once that pull request has merged and only for the findings
+        still standing on the merged head (a thread the later commits made
+        outdated is gone). Once per pull request."""
+        number = int(issue["number"])
+        comments = self._comments(repo, number)
+        text = "\n".join(str(c.get("body") or "") for c in comments)
+        for pr, sha, rounds, ids in DEFERRED_RE.findall(text):
+            pr_number = int(pr)
+            if DEFERRED_FILED_MARKER % pr_number in text:
+                continue
+            data = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data or {}
+            if not data.get("merged_at") and not data.get("merged"):
+                continue
+            wanted = set(ids.split(","))
+            standing = [t for t in self._threads(repo, pr_number)
+                        if str(t.get("id")) in wanted and not t.get("isOutdated")]
+            if standing:
+                self._follow_up(repo, pr_number, number, sha, standing, int(rounds))
+            notify.post(self.gh, repo, number, DEFERRED_FILED_MARKER % pr_number
+                        + "\nDeferred findings of #%d: %d still standing on the merged head."
+                        % (pr_number, len(standing)), notify.RECORD)
+            self.actions += 1
+            _say("settled the deferred findings of %s#%d (%d filed)"
+                 % (repo, pr_number, len(standing)))
+
+    def _close_unmerged_follow_ups(self, repo: str) -> None:
+        """Close, as not planned, each open follow-up issue of a pull request
+        that closed unmerged: its findings never landed."""
+        for found in self.gh.paginate("/repos/%s/issues?labels=%s&state=open" % (repo, DEFER_LABEL)):
+            if not isinstance(found, dict) or not self._trusted(found):
+                continue
+            title = str(found.get("title") or "")
+            match = DEFER_TITLE_RE.match(title)
+            if not match:
+                continue
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%s" % (repo, match.group(1))).data or {}
+            if pr.get("state") != "closed" or pr.get("merged_at") or pr.get("merged"):
+                continue
+            if self.actions >= MAX_ACTIONS:
+                return
+            body = str(found.get("body") or "").rstrip()
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, int(found["number"])), {
+                "state": "closed", "state_reason": "not_planned",
+                "body": body + "\n\nClosed: #%s closed without merging, so these findings "
+                "never landed." % match.group(1)})
+            self.actions += 1
+            _say("closed %s#%s: pull request #%s closed unmerged"
+                 % (repo, found["number"], match.group(1)))
 
     def _tried(self, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
                failed_here: bool = True, footer: Optional[Tuple[str, str]] = None) -> Tuple[set, int]:
@@ -1724,7 +1828,8 @@ class Factory:
     def _send_back(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
                    comments: List[Dict[str, Any]], why: str,
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
-                   no_test: bool = False, unticked: Sequence[str] = ()) -> None:
+                   no_test: bool = False, unticked: Sequence[str] = (),
+                   ticked: Sequence[str] = ()) -> None:
         number = int(issue["number"])
         held = SEND_BACK_HOLDS & set(_labels(issue))
         if held:
@@ -1755,6 +1860,7 @@ class Factory:
                          % (repo, number, note))
                     return
                 tried, _ = self._tried(issue, comments, footer=footer)
+                self._close_past_ladder_pr(repo, pr)
                 self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
                                                  if 1 <= n <= len(CLIMB)])
                 return
@@ -1775,6 +1881,13 @@ class Factory:
                 notes = unticked_notes(unticked)
             except ValueError as err:
                 _say("%s#%d: unticked criteria not quoted in the fix note (%s)"
+                     % (repo, number, err))
+        if ticked:
+            try:
+                brain._check_written_text(ticked_notes(ticked))
+                notes = ticked_notes(ticked)
+            except ValueError as err:
+                _say("%s#%d: ticked criteria not quoted in the fix note (%s)"
                      % (repo, number, err))
         if lane is not None:
             sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane)
@@ -2194,7 +2307,15 @@ class Factory:
         """Land a clean, reviewed pull request, or send it back when it
         changes code without a test. A clean sensitive one waits for the brain."""
         missing = missing_criteria(str(issue.get("body") or ""), str(full.get("body") or ""))
-        if missing:
+        ticked = criteria_gate.lane_ticks(str(issue.get("body") or ""), str(full.get("body") or ""))
+        if ticked:
+            # Only the station's verifier or the operator ticks a live or
+            # operator criterion (bus/criteria_gate.py): a lane's tick on one
+            # read as evidence it had been checked (2026-10-22 audit).
+            self._send_back(repo, full, issue, comments,
+                            "a live or operator criterion is ticked; only the verifier "
+                            "ticks it: " + "; ".join(ticked), ticked=ticked)
+        elif missing:
             self._send_back(repo, full, issue, comments,
                             "unticked acceptance criteria; build these or mark each "
                             "not built with a reason: " + "; ".join(missing),
@@ -2202,9 +2323,126 @@ class Factory:
         elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
-        elif not sensitive:
+        elif (not sensitive and not self._operator_holds(repo, number, full, issue, comments)
+              and not self._risk_holds(repo, number, full, issue, comments)):
             self._file_criterion_follow_up(repo, number, issue, full)
             self._land(repo, number, full, issue, comments)
+
+    def _operator_holds(self, repo: str, number: int, full: Dict[str, Any],
+                        issue: Dict[str, Any], comments: Sequence[Dict[str, Any]] = ()) -> bool:
+        """Whether the pull request waits for the operator instead of landing
+        (bus/operator_hold.py): it or its ticket declares operator steps
+        before merge, it changes placement, or it deletes or mostly replaces
+        a doc its ticket does not name. The ticket goes
+        to loom:human with one exact ask, once; the pull request never lands
+        on the factory's say-so, whatever later passes find. The operator's
+        own answer to that ask (bus/answer.py) decides instead: Merge lifts
+        this hold only, so every other gate still runs; Hold keeps it held
+        and asks nothing more."""
+        why = operator_hold.reasons(self.gh, repo, full, str(issue.get("body") or ""),
+                                    operator_hold.pull_files(self.gh, repo, number))
+        if not why:
+            return False
+        settled = self._operator_verdict(repo, number, full, issue, comments)
+        if settled is not None:
+            return settled
+        outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, why,
+                                     self.human)
+        if outcome == "asked":
+            self.actions += 1
+            _say("held %s#%d for the operator: %s" % (repo, number, "; ".join(why)))
+        elif outcome != "already":
+            _say("held %s#%d for the operator, but %s" % (repo, number, outcome))
+        return True
+
+    def _risk_holds(self, repo: str, number: int, full: Dict[str, Any],
+                    issue: Dict[str, Any], comments: Sequence[Dict[str, Any]] = ()) -> bool:
+        """Whether the pull request's risk tier (bus/merge_tier.py) is one
+        Loom may not merge on its own: its ticket goes to loom:human with one
+        ask, once, and the operator merges it. A revert ticket's own pull
+        request never waits here when merge_tier.revert_refusal proves it. bus.brain merge refuses the same tiers, and
+        adds the review and hourly-cap rules for the tiers it may merge."""
+        try:
+            entries = operator_hold.pull_files(self.gh, repo, number)
+        except GitHubError as err:
+            # No file list, no tier: it waits for the next pass, unmerged.
+            _say("%s#%d waits: its changed files could not be read for the risk tier (%s)"
+                 % (repo, number, err))
+            return True
+        if merge_tier.is_revert_ticket(full, issue):
+            refused = merge_tier.revert_refusal(self.gh, repo, full, issue, entries)
+            if not refused:
+                return False
+            _say("%s#%d is not exempt as a revert: %s" % (repo, number, refused))
+        tier, why = merge_tier.classify(repo, entries, str(issue.get("body") or ""),
+                                        change_class.class_of(full) == "sensitive")
+        if tier in merge_tier.auto_tiers():
+            return False
+        settled = self._operator_verdict(repo, number, full, issue, comments)
+        if settled is not None:
+            return settled
+        reason = merge_tier.operator_why(tier, why)
+        outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, [reason],
+                                     self.human)
+        if outcome == "asked":
+            self.actions += 1
+            _say("held %s#%d for the operator: %s" % (repo, number, reason))
+        elif outcome != "already":
+            _say("held %s#%d for the operator, but %s" % (repo, number, outcome))
+        return True
+
+    def _operator_verdict(self, repo: str, number: int, full: Dict[str, Any],
+                          issue: Dict[str, Any],
+                          comments: Sequence[Dict[str, Any]]) -> Optional[bool]:
+        """The operator's answer to the hold ask on this pull request
+        (answer.pr_verdict), as the hold's outcome: False (Merge: the hold is
+        lifted and the other gates decide), True (Hold: held, no new ask), or
+        None (no answer: the hold asks as before). Each verdict is written to
+        the shadow ledger as the operator's."""
+        verdict = answer.pr_verdict(list(comments), number, self.trusted, self.operators)
+        if verdict is None:
+            return None
+        sha = str((full.get("head") or {}).get("sha") or "")
+        answer.record_verdict(repo, number, verdict, sha, (repo, int(issue["number"])),
+                              source="bus.factory")
+        if answer.is_merge(verdict):
+            _say("%s#%d: the operator %s answered merge; its operator hold is lifted and its "
+                 "other gates decide" % (repo, number, verdict.login))
+            return False
+        _say("%s#%d stays held: the operator %s answered hold" % (repo, number, verdict.login))
+        return True
+
+    def _settle_answers(self, repo: str) -> None:
+        """Read each answer the dashboard posted (an open issue labelled
+        loom:answer-pending, bus/answer.py) and take the label off: the
+        answer is now the operator's newest comment, which the brief, the
+        stale-brief check and the merge gates read. A Hold on a lane pull
+        request held for the operator puts loom:human back, so it keeps
+        waiting on a person. An issue whose label no operator answer backs
+        loses the label too."""
+        items = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                 % (repo, quote(answer.ANSWERED_LABEL, safe="")))
+        for issue in [i for i in items if isinstance(i, dict)][:ANSWERS_PER_PASS]:
+            if self.actions >= MAX_ACTIONS:
+                return
+            number = int(issue.get("number") or 0)
+            comments = self._comments(repo, number)
+            found = answer.newest(comments, self.trusted, self.operators)
+            if found is None:
+                _say("%s#%d is labelled %s, but no operator answer backs it; label removed"
+                     % (repo, number, answer.ANSWERED_LABEL))
+            elif answer.is_hold(found) and answer.held_pr(_last_ask(comments)) is not None:
+                if "loom:human" not in _labels(issue):
+                    self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                                 {"labels": ["loom:human"]})
+                _say("%s#%d: the operator %s answered hold; it keeps waiting on a person"
+                     % (repo, number, found.login))
+            else:
+                _say("%s#%d: read the operator %s's answer (%s)"
+                     % (repo, number, found.login, found.choice))
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                         % (repo, number, quote(answer.ANSWERED_LABEL, safe="")), ok=(404,))
+            self.actions += 1
 
     def _file_criterion_follow_up(self, repo: str, number: int,
                                   issue: Dict[str, Any], full: Dict[str, Any]) -> None:
@@ -2797,6 +3035,13 @@ class Factory:
             or self.model_limits.get(lane, {}).get(model, 0) > later
             for lane in lanes)
 
+    def _aside_why(self, lane: str) -> str:
+        """Why a ticket steps off the lane: demoted (bus/scorecard.py), down,
+        or at a limit."""
+        if lane in self.demoted:
+            return "demoted (%s; the operator clears it)" % self.demoted[lane]
+        return "down" if lane in self.down and lane not in self.limited else "at a limit"
+
     def _step_aside(self, repo: str, issue: Dict[str, Any]) -> None:
         """Move a ticket off a lane at a limit (or down) to the first free lane of its
         difficulty tier (or of a FALLBACK tier when none of its tier is up),
@@ -2808,7 +3053,7 @@ class Factory:
         if RUNAWAY in _labels(issue) or "needs-brain" in _labels(issue):
             return  # held for the brain: it moves nothing (loom#1224)
         old = _lane(issue)
-        why = "down" if old in self.down and old not in self.limited else "at a limit"
+        why = self._aside_why(old)
         rung = current_rung(issue)
         fallback = ""
         if rung:
@@ -2954,17 +3199,9 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
-        if self.now < held_until(issue):
-            return "%s is held" % ref
-        # A ticket held by After: is never briefed: the station refuses the
-        # claim each pass, and the lane it was given counts it as load and
-        # sits idle until the other ticket merges (2026-10-22).
-        waiting = self.held_by(repo, issue) if re.search(
-            r"^After:", str(issue.get("body") or ""), re.M) else []
-        if waiting:
-            reason = "waits for %s to merge (After:)" % ", ".join(a.short for a in waiting)
-            self._waiting(repo, issue["number"], reason)
-            return "%s %s" % (ref, reason)
+        held = self._queued_hold(repo, issue)
+        if held:
+            return "%s %s" % (ref, held)
         model_match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
         if model_match:
             return self._assign_queued_model(repo, issue, model_match.group(1))
@@ -2985,6 +3222,61 @@ class Factory:
             self._waiting(repo, issue["number"], "giving it a lane failed")
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
+
+    def _queued_hold(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why a queued ticket gets no lane this pass, or ""."""
+        if self.now < held_until(issue) or self._host_only(repo, issue):
+            return "is held"
+        held = self._brief_wait(repo, issue)
+        if held:
+            return "waits: " + held
+        # A ticket held by After: is never briefed: the station refuses the
+        # claim each pass, and the lane it was given counts it as load and
+        # sits idle until the other ticket merges (2026-10-22).
+        waiting = self.held_by(repo, issue) if re.search(
+            r"^After:", str(issue.get("body") or ""), re.M) else []
+        if waiting:
+            reason = "waits for %s to merge (After:)" % ", ".join(a.short for a in waiting)
+            self._waiting(repo, issue["number"], reason)
+            return reason
+        return ""
+
+    def _brief_wait(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why a queued ticket gets no lane, or "": a stale ticket waits for
+        the operator's answer (loom:human), and a health ticket for its cause
+        (bus/brief_check.py). Reads nothing."""
+        if "loom:human" in _labels(issue):
+            reason = "waits for a person (loom:human)"
+        elif brief_check.health_hold(issue):
+            reason = "health ticket names no cause"
+        else:
+            return ""
+        self._waiting(repo, issue["number"], reason)
+        return reason
+
+    def _host_only(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether every acceptance criterion of the queued ticket is a check
+        on a live host or network (operator_hold.host_only): it gets no lane
+        and goes to loom:human with one ask, once. 2026-10-22: such a ticket
+        was laned, the lane replaced a README to have a diff, and it merged."""
+        criteria = operator_hold.host_only(str(issue.get("body") or ""))
+        if not criteria:
+            return False
+        if "loom:human" in _labels(issue):
+            return True
+        try:
+            self.human(self.gh, repo, int(issue["number"]), operator_hold.host_only_ask(criteria))
+        except ValueError as err:
+            # The ask was refused (its quoted criteria, say); the ticket still
+            # gets no lane, and the log says why it waits with no ask.
+            _say("held queued %s#%s for a person, but the ask was refused: %s"
+                 % (repo, issue["number"], err))
+            return True
+        issue["labels"] = list(issue.get("labels") or []) + [{"name": "loom:human"}]
+        self.actions += 1
+        _say("held queued %s#%s for a person: every criterion is a host check"
+             % (repo, issue["number"]))
+        return True
 
     def _assign_queued_model(self, repo: str, issue: Dict[str, Any], model: str) -> str:
         """Give a queued ticket pinned to `model` a lane that takes it, or an
@@ -3075,6 +3367,7 @@ class Factory:
         # GitHub.paginate asks for 100 a page and follows every page.
         all_prs = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
                    if isinstance(p, dict)]
+        self._guarded(lambda r, _: self._settle_answers(r), repo, {})
         closed_numbers = self._close_superseded_prs(repo, all_prs, tickets)
         prs = [p for p in all_prs if self._trusted(p) and int(p.get("number") or 0) not in closed_numbers]
         linked = {a[1]: pr for pr in prs for a in [self._association(repo, pr)] if a}
@@ -3082,8 +3375,10 @@ class Factory:
             if self.actions >= MAX_ACTIONS:
                 return
             self._guarded(self.pull_request, repo, pr, tickets)
+        self._guarded(lambda r, _: self._close_unmerged_follow_ups(r), repo, {})
         steps = {"failed": lambda r, i: self.failed(r, i, linked), "briefed": self.briefed,
-                 "running": self.running}
+                 "running": self.running, "merged": self.settle_deferred,
+                 "shipped": self.settle_deferred, "verified": self.settle_deferred}
         for issue in list(tickets.values()):
             step = steps.get(_state(issue))
             if self.actions >= MAX_ACTIONS:

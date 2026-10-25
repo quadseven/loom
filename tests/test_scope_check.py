@@ -62,6 +62,60 @@ class ScopeCheckTest(unittest.TestCase):
         self.assertEqual(sorted(self.stray()), [".agents/hooks.json", ".github/workflows/extra.yml",
                                                 "bin/test.txt", "test_hook.sh"])
 
+    def test_a_new_top_level_module_the_change_imports_is_in_scope(self):
+        # A repo that keeps its modules at the top level: a lane's new module
+        # was refused in 5 runs on 2026-10-24 because no brief can name it
+        # ahead of the agent (loom#1705).
+        self.write("app.py", "import os\n")
+        self.write("notes.txt", "x\n")
+        self.base = self.commit("flat")
+        self.write("app.py", "import os\nfrom helper_server import serve\n")
+        self.write("helper_server.py", "def serve():\n    pass\n")
+        self.write("other_feed.py", "z = 1\n")
+        self.write("README.md", "readme\nSee other_feed.py.\n")
+        self.commit("work")
+        # A bare mention is not an import: only the imported module is in scope.
+        self.assertEqual(self.stray(), ["other_feed.py"])
+
+    def test_only_an_edited_tracked_file_vouches_for_a_new_top_level_file(self):
+        self.write("app.py", "import os\nimport old_name\n")
+        self.base = self.commit("flat")
+        # New files naming each other, a mention the base already held, a
+        # standard-library name, auto-run names in any case, a hidden name,
+        # a config file and a name inside a longer one all stay stray.
+        self.write("first_new.py", "import second_new\n")
+        self.write("second_new.py", "import first_new\n")
+        self.write("old_name.py", "x = 1\n")
+        self.write("json.py", "x = 1\n")
+        self.write("conftest.py", "x = 1\n")
+        self.write(".hidden.py", "x = 1\n")
+        self.write("pyproject.toml", "x = 1\n")
+        self.write("a.py", "x = 1\n")
+        self.write("app.py", "import os\nimport old_name\nimport json\nimport conftest\n"
+                             "# .hidden.py data.py pyproject.toml\n")
+        self.commit("work")
+        self.assertEqual(sorted(self.stray()), [".hidden.py", "a.py",
+                                                "conftest.py", "first_new.py", "json.py",
+                                                "old_name.py", "pyproject.toml",
+                                                "second_new.py"])
+        self.assertFalse(scope_check.wired_top_level(
+            "Conftest.py", {"app.py"}, ["import Conftest"]))
+        self.assertTrue(scope_check.wired_top_level(
+            "helper.py", {"app.py"}, ["from helper import x"]))
+        self.assertFalse(scope_check.wired_top_level(
+            "helper.js", {"app.js"}, ["import helper from './helper.js'"]))
+
+    def test_a_new_top_level_file_nothing_changed_wires_in_stays_stray(self):
+        self.write("app.py", "import os\n")
+        self.base = self.commit("flat")
+        self.write("scratch_server.py", "x = 1\n")
+        self.write("app.py", "import os\n# scratch_server is not imported\n")
+        self.write("unused.txt", "x\n")
+        self.write("tool.sh", "echo\n")
+        self.write("bus/station.py", "x = 1\n# see tool.sh\n")
+        self.commit("work")
+        self.assertEqual(sorted(self.stray()), ["scratch_server.py", "tool.sh", "unused.txt"])
+
     def test_scratch_rules_only_select_new_unnamed_files(self):
         self.write("test_debug.py", "print('scratch')\n")
         self.write("module_debug.txt", "scratch\n")
@@ -76,6 +130,28 @@ class ScopeCheckTest(unittest.TestCase):
         self.assertEqual(sorted(found), [".loom/test.txt", "artifact.o",
                                          "build_test/result.o", "module_debug.txt",
                                          "nested/result.o", "test_debug.py"])
+
+    def test_build_output_tool_temp_files_and_patches_are_scratch(self):
+        # Ten lane commits on 2026-10-21/22 were refused for a Gradle daemon
+        # cache, a build/ output, a shell's here-document temp file or a patch
+        # file the agent left behind; each cost the run.
+        self.write(".gradle/daemon/8.13/daemon-1.out.log", "log\n")
+        self.write("build/WindowContaminationTest", "out\n")
+        self.write("sh-thd-3211296841", "tmp\n")
+        self.write("T762.patch", "--- a\n+++ b\n")
+        self.write("IMPLEMENTATION_SUMMARY.md", "notes\n")
+        self.write("redistribute_epics.py", "pass\n")
+        self.commit("work")
+        found = scope_check.scratch_files(str(self.tree), self.base, "HEAD", "")
+        self.assertEqual(sorted(found), [".gradle/daemon/8.13/daemon-1.out.log", "T762.patch",
+                                         "build/WindowContaminationTest", "sh-thd-3211296841"])
+
+    def test_a_build_folder_the_base_tracks_is_not_scratch(self):
+        self.write("build/keep.txt", "tracked\n")
+        self.base = self.commit("base with build")
+        self.write("build/new.txt", "new\n")
+        self.commit("work")
+        self.assertEqual(scope_check.scratch_files(str(self.tree), self.base, "HEAD", ""), [])
 
     def test_referenced_top_level_test_file_is_kept(self):
         self.write("test_probe.py", "print('probe')\n")

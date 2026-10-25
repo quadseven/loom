@@ -150,7 +150,7 @@ def pin_one(gh: GitHub, source: str, revision: str, spec: dict[str, str],
     base = gh.rest("GET", "/repos/%s" % repo).data["default_branch"]
     old_text, _ = content(gh, repo, path)
     old = value(old_text, spec["revision_var"])
-    pulls = gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % repo).data or []
+    pulls = gh.paginate("/repos/%s/pulls?state=open&per_page=100" % repo)
     active = next((pr for pr in pulls if pr.get("head", {}).get("ref") == branch), None)
     ref = gh.rest("GET", "/repos/%s/git/ref/heads/%s" % (repo, quote(branch, safe="")),
                   ok=(404,))
@@ -172,7 +172,9 @@ def pin_one(gh: GitHub, source: str, revision: str, spec: dict[str, str],
     # file is computed from the default branch's text, not the branch's.
     head = gh.rest("GET", "/repos/%s/git/ref/heads/%s" % (repo, quote(base, safe=""))).data
     if exists:
-        gh.rest("PATCH", "/repos/%s/git/ref/heads/%s" % (repo, quote(branch, safe="")),
+        # GitHub reads a ref at git/ref/<ref> but updates it at git/refs/<ref>;
+        # a PATCH to the read path answers 404 (loom#1405).
+        gh.rest("PATCH", "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe="")),
                 {"sha": head["object"]["sha"], "force": True})
     else:
         gh.rest("POST", "/repos/%s/git/refs" % repo,

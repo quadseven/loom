@@ -39,7 +39,13 @@ LOOM_AGY_ONLY_MODEL="${LOOM_AGY_ONLY_MODEL-gemini-3.8-flash}"
 LOOM_CLAUDE_MODEL="${LOOM_CLAUDE_MODEL:-claude-opus-5-5}"
 LOOM_MUSE_MODEL="${LOOM_MUSE_MODEL:-muse-spark-1.3}"
 LOOM_OPENROUTER_MODEL="${LOOM_OPENROUTER_MODEL:-openrouter/cohere/north-mini-code:free}"
-LOOM_OPENCODE_GO_MODEL="${LOOM_OPENCODE_GO_MODEL:-opencode-go/kimi-k2.7-code}"
+# The opencode-go slots run only bus/tickets.py OPENCODE_GO_MODELS (free, or
+# at least 10,000 requests per 5 h); a lane on any other model refuses to
+# start. Kimi K2.7 Code (1,350 per 5 h) spent the Go allowance in hours on
+# 2026-10-23. opencode-go and opencode-go-2 run Beam Free (free, unlimited,
+# not trained on); opencode-go-3 DeepSeek V4.1 Flash (34,670 per 5 h) and
+# opencode-go-4 Muse Spark 1.3 Contributor (45,300, trains: public only).
+LOOM_OPENCODE_GO_MODEL="${LOOM_OPENCODE_GO_MODEL:-opencode-go/beam-free}"
 LOOM_OPENCODE_GO_3_MODEL="${LOOM_OPENCODE_GO_3_MODEL:-opencode-go/deepseek-v4.1-flash}"
 LOOM_OPENCODE_GO_4_MODEL="${LOOM_OPENCODE_GO_4_MODEL:-opencode-go/muse-spark-1.3-contributor}"
 # OpenCode Go's chat endpoint, asked for its usage limit before each run
@@ -47,7 +53,7 @@ LOOM_OPENCODE_GO_4_MODEL="${LOOM_OPENCODE_GO_4_MODEL:-opencode-go/muse-spark-1.3
 LOOM_OPENCODE_GO_PROBE_URL="${LOOM_OPENCODE_GO_PROBE_URL:-https://opencode.ai/zen/go/v1/chat/completions}"
 LOOM_OPENCODE_GO_PROBE_HEADER="${LOOM_OPENCODE_GO_PROBE_HEADER:-x-opencode-session}"
 LOOM_ANTHROPIC_MODEL="${LOOM_ANTHROPIC_MODEL:-claude-sonnet-5-5}"
-LOOM_ZEN_MODEL="${LOOM_ZEN_MODEL:-opencode/minimax-m3.1-flash-free}"
+LOOM_ZEN_MODEL="${LOOM_ZEN_MODEL:-opencode/deepseek-v4.1-flash-free}"
 LOOM_ZAI_MODEL="${LOOM_ZAI_MODEL:-zai/glm-4.7-flash}"
 LOOM_WORKERSAI_MODEL="${LOOM_WORKERSAI_MODEL:-cloudflare-workers-ai/@cf/qwen/qwen3.8-27b}"
 LOOM_AGY_MODEL="${LOOM_AGY_MODEL:-gemini-3.8-flash-high}"
@@ -315,6 +321,11 @@ done
 # LOOM_SETTLE_CLAIMED and LOOM_SETTLE_CLAIMED_MAX (settle operator-claimed
 # issues whose pull requests merged: empty or dry logs only, on writes, off
 # skips; and the most settled a run, default 10, docs/BRAIN.md), and
+# LOOM_SHADOW, LOOM_SHADOW_REPOS and LOOM_SHADOW_LEDGER (shadow mode: merges
+# and closes are recorded, not taken; on unless LOOM_SHADOW=0, and written as
+# 1 when unset; the repos still in shadow, empty for every repo; the ledger
+# path, docs/BRAIN.md Shadow mode), and LOOM_REVERT_LABELERS (the logins
+# whose loom:revert label is believed: the station App's login), and
 # LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and LOOM_GITHUB_APP_KEY_SSM
 # or LOOM_GITHUB_APP_KEY_FILE (a GitHub App installation token instead of the
 # personal one, minted from the key in that SSM parameter or that mode-600
@@ -350,6 +361,8 @@ cat > "$PLIST" <<EOF
     <key>LOOM_DEPLOY</key><string>$(xml "${LOOM_DEPLOY:-1}")</string>
     <key>LOOM_BRIEF_AUTHORS</key><string>$(xml "${LOOM_BRIEF_AUTHORS:-}")</string>
     <key>LOOM_TRUSTED_BRIEFERS</key><string>$(xml "${LOOM_TRUSTED_BRIEFERS:-}")</string>
+    <key>LOOM_GOAL_CAP</key><string>$(xml "${LOOM_GOAL_CAP:-}")</string>
+    <key>LOOM_UNVERIFIED_LIMIT</key><string>$(xml "${LOOM_UNVERIFIED_LIMIT:-}")</string>
     <key>LOOM_REPO_OWNERS</key><string>$(xml "$LOOM_REPO_OWNERS")</string>
     <key>LOOM_STATUS_REPO</key><string>$(xml "${LOOM_STATUS_REPO:-}")</string>
     <key>LOOM_SELF_REPO</key><string>$(xml "${LOOM_SELF_REPO:-}")</string>
@@ -389,6 +402,10 @@ cat > "$PLIST" <<EOF
     <key>LOOM_INVARIANT_GOAL</key><string>$(xml "${LOOM_INVARIANT_GOAL:-}")</string>
     <key>LOOM_PLAN_CHECK</key><string>$(xml "${LOOM_PLAN_CHECK:-}")</string>
     <key>LOOM_NO_TOPUP</key><string>$(xml "${LOOM_NO_TOPUP:-}")</string>
+    <key>LOOM_SHADOW</key><string>$(xml "${LOOM_SHADOW:-1}")</string>
+    <key>LOOM_SHADOW_REPOS</key><string>$(xml "${LOOM_SHADOW_REPOS:-}")</string>
+    <key>LOOM_SHADOW_LEDGER</key><string>$(xml "${LOOM_SHADOW_LEDGER:-}")</string>
+    <key>LOOM_REVERT_LABELERS</key><string>$(xml "${LOOM_REVERT_LABELERS:-}")</string>
     <key>LOOM_GITHUB_APP_ID</key><string>$(xml "${LOOM_GITHUB_APP_ID:-}")</string>
     <key>LOOM_GITHUB_APP_INSTALLATION_ID</key><string>$(xml "${LOOM_GITHUB_APP_INSTALLATION_ID:-}")</string>
     <key>LOOM_GITHUB_APP_KEY_SSM</key><string>$(xml "${LOOM_GITHUB_APP_KEY_SSM:-}")</string>
