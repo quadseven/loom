@@ -264,6 +264,16 @@ CLOSE_DONE_LABEL = "force-close"
 RESTATE_KEY = "_live_station"
 REWRITE_RETRY = 24 * 3600
 REWRITE_TIMEOUT = 600
+# Rewrite agent jobs (rewrite.start_job): the pass that starts them waits at
+# most REWRITE_WAIT seconds, polling every REWRITE_POLL, and leaves the rest
+# to a later pass; a job with no result REWRITE_JOB_GRACE past its timeout is
+# dropped as failed. Inline, five model runs held one pass for minutes
+# (loom#1663).
+REWRITE_WAIT = 10
+REWRITE_POLL = 0.2
+REWRITE_JOB_GRACE = 300
+REWRITE_JOBS_KEY = "_jobs"
+REWRITE_JOBS_DIR = "rewrite-jobs"
 # Through the bot, a report is one short line (the goal's short name and the
 # report's first line) with a thread on it holding the full report.
 SHORT_NAME_RE = re.compile(r"^[ \t]*Short name:[ \t]*(\S.*?)[ \t]*$", re.M | re.I)
@@ -1542,6 +1552,8 @@ class Station:
         self.s = settings
         self._live_budget = LIVE_CHECKS_PER_PASS
         self._proof_budget = LIVE_PROOFS_PER_PASS
+        # Rewrite agent jobs this pass started, by issue (_start_rewrite).
+        self._rewrite_procs: Dict[str, Any] = {}
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
         self.upload = upload or post_transcript
@@ -7266,9 +7278,12 @@ class Station:
         return cache[repo]
 
     def _rewrite_goal(self, key: str, repo: str, goal: int, rec: Dict[str, Any],
-                      budget: int, cmds: Dict[str, str]) -> int:
-        """Rewrite oldest-first what the goal's hourly allowance and the
-        pass allow; returns how many rewrites ran."""
+                      budget: int, cmds: Dict[str, str],
+                      jobs: Optional[Dict[str, Any]] = None) -> int:
+        """Start oldest-first the rewrites the goal's hourly allowance and the
+        pass allow, each as a background agent job kept in `jobs`
+        (_start_rewrite); returns how many started."""
+        jobs = {} if jobs is None else jobs
         runs = [t for t in rec.get("runs", []) if isinstance(t, (int, float))
                 and 0 <= self.now - t < 3600]
         rec["runs"] = runs
@@ -7305,22 +7320,101 @@ class Station:
             tried[str(number)] = self.now
             done += 1
             try:
-                action = rewrite.rewrite_issue(self.gh, repo, goal, issue, cmd,
-                                               REWRITE_TIMEOUT)
+                self._start_rewrite(key, repo, goal, issue, cmd, jobs)
             except rewrite.CommandFailure as err:
                 tried.pop(str(number), None)
-                _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
-                self._event("rewrite_failed", str(err), "%s#%d" % (repo, number))
-                continue
+                self._rewrite_failed(repo, number, err)
             except RateLimited:
                 raise
             except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
-                _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
-                self._event("rewrite_failed", str(err), "%s#%d" % (repo, number))
-                continue
-            _say("rewrite %s#%d: %s" % (repo, number, action))
-            self._event("rewrite_succeeded", action, "%s#%d" % (repo, number))
+                self._rewrite_failed(repo, number, err)
         return done
+
+    def _rewrite_failed(self, repo: str, number: int, err: Exception) -> None:
+        _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
+        self._event("rewrite_failed", str(err), "%s#%d" % (repo, number))
+
+    def _rewrite_folder(self, repo: str, number: int) -> str:
+        return os.path.join(self.state, REWRITE_JOBS_DIR,
+                            "%s-%d" % (repo.replace("/", "-"), number))
+
+    def _start_rewrite(self, key: str, repo: str, goal: int, issue: Dict[str, Any],
+                       cmd: str, jobs: Dict[str, Any]) -> None:
+        """Start the agent command for one issue in the background and record
+        the job; a later collect writes its answer (_collect_rewrites). The
+        model never holds the pass: five rewrites of up to REWRITE_TIMEOUT
+        each ran inline, and the step took 305 s of one pass (loom#1663)."""
+        number = int(issue["number"])
+        folder = self._rewrite_folder(repo, number)
+        prompt = rewrite.prompt_for(self.gh, repo, issue)
+        proc = rewrite.start_job(cmd, prompt, REWRITE_TIMEOUT, folder)
+        self._rewrite_procs["%s#%d" % (repo, number)] = proc
+        jobs["%s#%d" % (repo, number)] = {"goal_key": key, "repo": repo, "goal": goal,
+                                          "number": number, "started": self.now}
+
+    def _collect_rewrites(self, state: Dict[str, Any], wait: float = 0) -> None:
+        """Write the answer of every rewrite job that has ended, waiting up
+        to `wait` seconds for the ones this pass started. A job with no
+        result past REWRITE_TIMEOUT and a grace is dropped as failed."""
+        jobs = state.get(REWRITE_JOBS_KEY)
+        if not isinstance(jobs, dict):
+            jobs = state[REWRITE_JOBS_KEY] = {}
+        deadline = time.monotonic() + wait
+        while True:
+            for job_key in list(jobs):
+                self._collect_rewrite(state, jobs, job_key)
+            running = [k for k in jobs if k in self._rewrite_procs]
+            if not running or time.monotonic() >= deadline:
+                break
+            time.sleep(REWRITE_POLL)
+        for job_key in running if wait else []:
+            if job_key in jobs:
+                _say("rewrite %s: the agent still runs; a later pass writes its answer"
+                     % job_key)
+
+    def _collect_rewrite(self, state: Dict[str, Any], jobs: Dict[str, Any],
+                         job_key: str) -> None:
+        job = jobs[job_key]
+        if not isinstance(job, dict) or not isinstance(job.get("number"), int):
+            del jobs[job_key]
+            return
+        repo, number = str(job.get("repo")), job["number"]
+        proc = self._rewrite_procs.get(job_key)
+        if proc is not None and proc.poll() is not None:
+            del self._rewrite_procs[job_key]
+        folder = self._rewrite_folder(repo, number)
+        result = rewrite.job_result(folder)
+        started = job.get("started")
+        if result is None:
+            if (job_key in self._rewrite_procs or not isinstance(started, (int, float))
+                    or self.now - started < REWRITE_TIMEOUT + REWRITE_JOB_GRACE):
+                return
+            result = {"error": "no result after %ds" % (self.now - started)}
+        try:
+            output = rewrite.answer_of(result, REWRITE_TIMEOUT)
+            issue = self._issue(repo, number)
+            if issue.get("state") != "open" or "loom:triage" not in _label_names(issue):
+                raise rewrite.Invalid("the issue is no longer open in loom:triage")
+            action = rewrite.apply_answer(self.gh, repo, int(job.get("goal") or 0), number,
+                                          output)
+        except RateLimited:
+            raise  # the job and its answer wait for the next pass
+        except rewrite.CommandFailure as err:
+            rec = state.get(str(job.get("goal_key")))
+            if isinstance(rec, dict) and isinstance(rec.get("tried"), dict):
+                rec["tried"].pop(str(number), None)
+            self._rewrite_failed(repo, number, err)
+            action = ""
+        except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
+            self._rewrite_failed(repo, number, err)
+            action = ""
+        del jobs[job_key]
+        self._rewrite_procs.pop(job_key, None)
+        shutil.rmtree(folder, ignore_errors=True)
+        if not action:
+            return
+        _say("rewrite %s#%d: %s" % (repo, number, action))
+        self._event("rewrite_succeeded", action, "%s#%d" % (repo, number))
 
     def rewrite_triaged(self) -> None:
         """Rewrite loom:triage issues in backlog goal homes with the agent
@@ -7335,25 +7429,31 @@ class Station:
         state = _read_json(path, {}, strict=False)
         if not isinstance(state, dict):
             state = {}
+        # The agent runs as a background job: the answers of the jobs that
+        # ended since the last pass are written first, and this pass's jobs
+        # get REWRITE_WAIT seconds before they are left to a later pass.
+        try:
+            self._collect_rewrites(state)
+        finally:
+            _write_json(path, state)
+        jobs = state[REWRITE_JOBS_KEY]
         goals = self._rewrite_goals()
         recent = [t for t in state.get(REWRITE_STATION_KEY) or []
                   if isinstance(t, (int, float)) and 0 <= self.now - t < 3600]
         for stale in [k for k in state
-                      if k not in (REWRITE_STATION_KEY, "_live_tried")
+                      if k not in (REWRITE_STATION_KEY, "_live_tried", REWRITE_JOBS_KEY)
                       and k not in {g[0] for g in goals}]:
             del state[stale]
         state[REWRITE_STATION_KEY] = recent
         budget = min(REWRITE_PER_PASS, REWRITE_STATION_PER_HOUR - len(recent))
-        if budget <= 0:
-            return
         cmds: Dict[str, str] = {}
-        for key, repo, goal in goals:
+        for key, repo, goal in goals if budget > 0 else []:
             rec = state.get(key)
             if not isinstance(rec, dict):
                 rec = state[key] = {}
             used = 0
             try:
-                used = self._rewrite_goal(key, repo, goal, rec, budget, cmds)
+                used = self._rewrite_goal(key, repo, goal, rec, budget, cmds, jobs)
             except RateLimited:
                 raise
             except (GitHubError, OSError) as err:
@@ -7363,6 +7463,11 @@ class Station:
             _write_json(path, state)
             if budget <= 0 or self._deferred():
                 break
+        if self._rewrite_procs:
+            try:
+                self._collect_rewrites(state, REWRITE_WAIT)
+            finally:
+                _write_json(path, state)
 
     def close_done_tickets(self) -> None:
         """Close each done ticket, by the operator's rule (2026-10-19): a
