@@ -202,9 +202,15 @@ class FakeGitHub:
             return reply(200, self.factory_incidents)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if method == "GET" and rest == "labels":
-            return reply(200, [{"name": name, "color": value["color"],
-                                "description": value["description"]}
-                               for name, value in labels_module.LABELS.items()])
+            repo_labels = {name: {"name": name, "color": value["color"],
+                                  "description": value["description"]}
+                           for name, value in labels_module.LABELS.items()}
+            for issue in self.issues.values():
+                for lab in issue.get("labels", []):
+                    name = lab.get("name")
+                    if name and name not in repo_labels:
+                        repo_labels[name] = {"name": name, "color": "ededed", "description": ""}
+            return reply(200, list(repo_labels.values()))
         if rest == "issues/900/comments" and method == "POST":
             return self._post_page(data)
         if rest == "issues" or re.match(r"issues/comments/\d+$", rest) \
@@ -317,6 +323,12 @@ class FakeGitHub:
         if "labels=loom%3Aticket" in query or "labels=loom:ticket&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:ticket" in self.names(i["number"])])
+        if "needs:" in query or "needs%3A" in query:
+            m = re.search(r"labels=(?:[^&]*)(needs(?::|%3A)[^&]+)", query)
+            target_label = unquote(m.group(1)) if m else None
+            return reply(200, [i for i in self.issues.values() if i.get("state") == "open"
+                               and (target_label in self.names(i["number"]) if target_label
+                                    else any(l.startswith("needs:") for l in self.names(i["number"])))])
         if "needs-operator" in query:
             return self._list_asks(headers)
         if "loom:human" in query:
@@ -10782,3 +10794,109 @@ class RemoteClaimCountTest(unittest.TestCase):
             runner = self.runner()
             body = runner._lanes_body(runner._lane_rows())
         self.assertIn("Remote claims: muse 1/1", body)
+
+
+class StaleAsksTest(Base):
+    """T1668: A needs:<login> ask that a deploy made stale goes back to work on its own."""
+
+    def test_issue_whose_ask_names_live_commit_moved_off_needs_login_with_one_note_and_not_moved_twice(self):
+        self.fake.add(5, title="Fix the widget", lane="codex")
+        self.fake.issues[5]["labels"] = [{"name": "loom:ticket"}, {"name": "needs:quadseven"}]
+        self.fake.comments[5] = [{"body": "Please review this.\nstale-when: commit 7d7a163 live\n",
+                                  "user": {"login": "quadseven"}}]
+        self.fake.carried = {"7d7a163"}
+
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=100000)
+        moved = st.check_stale_asks()
+
+        self.assertEqual(moved, [(REPO, 5)])
+        self.assertNotIn("needs:quadseven", self.fake.names(5))
+        self.assertIn("loom:queued", self.fake.names(5))
+
+        comments = [c for c in self.fake.comments[5] if c.get("user", {}).get("login") == self.fake.bot]
+        self.assertEqual(len(comments), 1)
+        self.assertIn("Withdrew stale needs ask", comments[0]["body"])
+        self.assertIn("commit 7d7a163 is live", comments[0]["body"])
+        self.assertIn("moved back to the ticket queue", comments[0]["body"])
+
+        moved_second = st.check_stale_asks()
+        self.assertEqual(moved_second, [])
+        comments_second = [c for c in self.fake.comments[5] if c.get("user", {}).get("login") == self.fake.bot]
+        self.assertEqual(len(comments_second), 1)
+
+    def test_issue_labelled_needs_login_with_no_ask_comment_reported_in_standup_and_not_counted_as_waiting(self):
+        ticket = {
+            "number": 31,
+            "title": "Stale ticket with no ask",
+            "state": "open",
+            "created_at": "2030-01-01T00:00:00Z",
+            "labels": [{"name": "loom:ticket"}, {"name": "needs:quadseven"}],
+            "comments": 0,
+        }
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=100000)
+        body = st._overdue_standup_body([ticket])
+
+        first_line = body.splitlines()[1]
+        self.assertNotIn("waiting on you", first_line)
+
+        needs_you = body.split("### Needs you")[1].split("Written by the station")[0]
+        self.assertIn("Asks with no comment: #31 Stale ticket with no ask.", needs_you)
+        self.assertIn("Open asks: none.", needs_you)
+
+    def test_standup_line_includes_count_of_asks_withdrawn_as_stale(self):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=100000)
+        st._record_stale_ask_withdrawn(REPO, 42, "commit aaaaaaa is live")
+
+        body = st._overdue_standup_body([])
+        first_line = body.splitlines()[1]
+        self.assertIn("1 asks withdrawn as stale since the last report.", first_line)
+
+    def test_stale_when_roll_live_withdraws_ask(self):
+        self.fake.add(6, title="Roll fix ask", lane="codex")
+        self.fake.issues[6]["labels"] = [{"name": "loom:ticket"}, {"name": "needs:quadseven"}]
+        self.fake.comments[6] = [{"body": "stale-when: roll 62 live\n",
+                                  "user": {"login": "quadseven"}}]
+        self.fake.pulls.append({
+            "number": 99, "state": "closed", "title": "roll 72: deploy update",
+            "merged_at": "2030-01-02T00:00:00Z", "merge_commit_sha": "f" * 40,
+        })
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=100000)
+        moved = st.check_stale_asks()
+        self.assertEqual(moved, [(REPO, 6)])
+        self.assertNotIn("needs:quadseven", self.fake.names(6))
+        comments = [c for c in self.fake.comments[6] if c.get("user", {}).get("login") == self.fake.bot]
+        self.assertEqual(len(comments), 1)
+        self.assertIn("roll 62 is live", comments[0]["body"])
+
+    def test_stale_when_issue_exists_withdraws_ask(self):
+        self.fake.add(7, title="Needs bump ticket", lane="codex")
+        self.fake.issues[7]["labels"] = [{"name": "loom:ticket"}, {"name": "needs:quadseven"}]
+        self.fake.comments[7] = [{"body": "Bump ticket #1173\nstale-when: issue exists\n",  # leak-guard-allow
+                                  "user": {"login": "quadseven"}}]
+        self.fake.add(1173, title="Bump dependency", state="open")
+
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=100000)
+        moved = st.check_stale_asks()
+        self.assertEqual(moved, [(REPO, 7)])
+        self.assertNotIn("needs:quadseven", self.fake.names(7))
+        comments = [c for c in self.fake.comments[7] if c.get("user", {}).get("login") == self.fake.bot]
+        self.assertEqual(len(comments), 1)
+        self.assertIn("issue %s#1173 exists" % REPO, comments[0]["body"])  # leak-guard-allow
+
+    def test_issue_with_awaiting_live_check_moves_back_to_awaiting_live_check(self):
+        self.fake.add(8, title="Live verification needed", lane="codex")
+        self.fake.issues[8]["labels"] = [{"name": "awaiting-live-check"}, {"name": "needs:quadseven"}]
+        self.fake.comments[8] = [{"body": "stale-when: commit 7d7a163 live\n",
+                                  "user": {"login": "quadseven"}}]
+        self.fake.carried = {"7d7a163"}
+
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=100000)
+        moved = st.check_stale_asks()
+        self.assertEqual(moved, [(REPO, 8)])
+        self.assertNotIn("needs:quadseven", self.fake.names(8))
+        self.assertIn("awaiting-live-check", self.fake.names(8))
+        self.assertNotIn("loom:queued", self.fake.names(8))
+        comments = [c for c in self.fake.comments[8] if c.get("user", {}).get("login") == self.fake.bot]
+        self.assertEqual(len(comments), 1)
+        self.assertIn("moved back to awaiting-live-check", comments[0]["body"])
+

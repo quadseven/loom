@@ -144,6 +144,9 @@ LANES_LABEL = "loom:lanes"
 LANES_TITLE = "Loom lane status"
 LANES_REPUBLISH = 3600
 NEEDS_OPERATOR = "needs-operator"
+NEEDS_LOGIN_RE = re.compile(r"^needs:([A-Za-z0-9_.-]+)$")
+STALE_WHEN_RE = re.compile(r"^\s*stale-when:\s*(.*?)\s*$", re.I | re.M)
+STALE_ASKS_FILE = "stale_asks.json"
 URGENT = "loom:urgent"
 REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
@@ -4096,7 +4099,8 @@ class Station:
         loop_started = time.monotonic()
         # Below the budget floor these wait for the reset; trees are local.
         steps = (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_merged,
-                     self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
+                 self.ship_workflows, self.ship_path_workflows, self.check_stale_asks,
+                 self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.close_done_tickets, self.settle_orphan_sources,
@@ -4556,6 +4560,8 @@ class Station:
                            "the station deployed revision %s at %s" % (
                                revision[:12], self._utc(at)),
                            "deployed %s" % revision[:12])
+        if carried:
+            self.check_stale_asks(deploy_event=True)
 
     def _ticket_pull_beyond_window(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
         """The merged pull request of a merged ticket that _merged_pulls did
@@ -4727,6 +4733,8 @@ class Station:
                         workflow, repo, str(run["head_sha"])[:12], run.get("id")),
                     "workflow %s" % workflow):
                 shipped += 1
+        if shipped:
+            self.check_stale_asks(deploy_event=True)
 
     def ship_path_workflows(self) -> None:
         """Move the open merged tickets of each LOOM_SHIP_PATH_WORKFLOWS repo
@@ -4784,6 +4792,8 @@ class Station:
                     continue
                 if self._ship_one(repo, number, pr, how, "deploy paths"):
                     shipped += 1
+            if shipped:
+                self.check_stale_asks(deploy_event=True)
         finally:
             _write_json(cache_path, {**{k: v for k, v in known.items() if k.split("#")[0] != repo}, **kept})
             _write_json(manual_path, told)
@@ -4932,6 +4942,8 @@ class Station:
                     settled = self.now - (self._epoch(str(pin["merged_at"])) or self.now)
                     if finished and settled >= PIN_SHIP_SETTLE:
                         done[key] = str(pin["merged_at"])
+            if done != saved:
+                self.check_stale_asks(deploy_event=True)
         finally:
             _write_json(path, done)
 
@@ -6730,6 +6742,254 @@ class Station:
             self._send_urgent(url, todo, ledger)
         if digest_due:
             self._send_digest(url, keyed, ledger, today)
+
+    # -- stale operator asks ----------------------------------------------
+    def _daily_stale_asks_withdrawn(self) -> int:
+        """How many needs:<login> asks were withdrawn as stale today."""
+        path = os.path.join(self.state, STALE_ASKS_FILE)
+        data = _read_json(path, {}, strict=False)
+        if not isinstance(data, dict):
+            return 0
+        today = datetime.fromtimestamp(self.now, timezone.utc).strftime("%Y-%m-%d")
+        daily = data.get("withdrawn", {}).get(today, [])
+        return len(daily) if isinstance(daily, list) else 0
+
+    def _record_stale_ask_withdrawn(self, repo: str, number: int, reason: str) -> None:
+        path = os.path.join(self.state, STALE_ASKS_FILE)
+        data = _read_json(path, {}, strict=False)
+        if not isinstance(data, dict):
+            data = {}
+        today = datetime.fromtimestamp(self.now, timezone.utc).strftime("%Y-%m-%d")
+        withdrawn = data.setdefault("withdrawn", {})
+        if not isinstance(withdrawn, dict):
+            withdrawn = data["withdrawn"] = {}
+        daily = withdrawn.setdefault(today, [])
+        if not isinstance(daily, list):
+            daily = withdrawn[today] = []
+        key = "%s#%d" % (repo, number)
+        if key not in daily:
+            daily.append(key)
+        history = data.setdefault("history", {})
+        if not isinstance(history, dict):
+            history = data["history"] = {}
+        history[key] = {"at": self.now, "reason": reason}
+        _write_json(path, data)
+
+    def _was_stale_ask_withdrawn(self, repo: str, number: int) -> bool:
+        path = os.path.join(self.state, STALE_ASKS_FILE)
+        data = _read_json(path, {}, strict=False)
+        if not isinstance(data, dict):
+            return False
+        history = data.get("history", {})
+        return isinstance(history, dict) and ("%s#%d" % (repo, number)) in history
+
+    def _needs_login_labels(self, repo: str) -> List[str]:
+        """All needs:<login> labels in the repository."""
+        found = set()
+        try:
+            for item in self.gh.paginate("/repos/%s/labels" % repo):
+                if isinstance(item, dict):
+                    name = str(item.get("name") or "")
+                    if NEEDS_LOGIN_RE.match(name):
+                        found.add(name)
+        except (GitHubError, OSError):
+            pass
+        if not found:
+            owner = repo.split("/")[0] if "/" in repo else ""
+            candidates = [owner] + list(self.s.authors)
+            for c in candidates:
+                if c:
+                    found.add("needs:%s" % c)
+        return sorted(found)
+
+    def _is_commit_live(self, repo: str, commit: str) -> bool:
+        """True when the commit is in the live deployment or default branch."""
+        if not commit or not re.match(r"^[0-9a-f]{7,40}$", commit):
+            return False
+        try:
+            branch = self._default_branch(repo)
+            if self._carries(repo, commit, branch):
+                return True
+        except (GitHubError, OSError):
+            pass
+        if repo == self.s.self_repo:
+            deployed = self._deployed()
+            if deployed:
+                revision, _ = deployed
+                if revision.startswith(commit) or self.ancestor(commit, revision):
+                    return True
+                try:
+                    if self._carries(repo, commit, revision):
+                        return True
+                except (GitHubError, OSError):
+                    pass
+        return False
+
+    def _is_roll_live(self, repo: str, roll_num: int) -> bool:
+        """True when roll roll_num or higher is live in merged PRs or tags."""
+        try:
+            for pr in self._closed_pulls(repo):
+                if pr.get("merged_at"):
+                    title = str(pr.get("title") or "")
+                    m = re.search(r"\broll[ -]?([0-9]+)\b", title, re.I)
+                    if m and int(m.group(1)) >= roll_num:
+                        return True
+        except (GitHubError, OSError):
+            pass
+        try:
+            for tag in self.gh.paginate("/repos/%s/tags" % repo):
+                if isinstance(tag, dict):
+                    name = str(tag.get("name") or "")
+                    m = re.search(r"\broll[ -]?([0-9]+)\b", name, re.I)
+                    if m and int(m.group(1)) >= roll_num:
+                        return True
+        except (GitHubError, OSError):
+            pass
+        return False
+
+    def _issue_exists(self, repo: str, number: int) -> bool:
+        try:
+            resp = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number), ok=(404,))
+            return resp.status == 200 and isinstance(resp.data, dict)
+        except (GitHubError, OSError):
+            return False
+
+    def _find_target_issue(self, repo: str, directive: str,
+                           comment_body: str) -> Optional[Tuple[str, int]]:
+        m = re.search(r"\bissue\s+([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)\b", directive, re.I)
+        if m:
+            return m.group(1), int(m.group(2))
+        m = re.search(r"\bissue\s+#?([0-9]+)\b", directive, re.I)
+        if m:
+            return repo, int(m.group(1))
+        m = re.search(r"\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)\b", comment_body)
+        if m:
+            return m.group(1), int(m.group(2))
+        m = re.search(r"#([0-9]+)\b", comment_body)
+        if m:
+            return repo, int(m.group(1))
+        return None
+
+    def _evaluate_stale_directive(self, repo: str, directive: str,
+                                  comment_body: str) -> Tuple[bool, str]:
+        commit_m = re.search(r"\bcommit\s+([0-9a-f]{7,40})\b", directive, re.I)
+        if not commit_m:
+            commit_m = re.search(r"\b([0-9a-f]{7,40})\s+live\b", directive, re.I)
+        if commit_m:
+            sha = commit_m.group(1)
+            if self._is_commit_live(repo, sha):
+                return True, "commit %s is live" % sha[:12]
+            return False, ""
+
+        roll_m = re.search(r"\broll\s+([0-9]+)\b", directive, re.I)
+        if roll_m:
+            num = int(roll_m.group(1))
+            if self._is_roll_live(repo, num):
+                return True, "roll %d is live" % num
+            return False, ""
+
+        if re.search(r"\bissue\b.*\bexists\b", directive, re.I):
+            target = self._find_target_issue(repo, directive, comment_body)
+            if target:
+                t_repo, t_num = target
+                if self._issue_exists(t_repo, t_num):
+                    return True, "issue %s#%d exists" % (t_repo, t_num)
+            return False, ""
+
+        return False, ""
+
+    @staticmethod
+    def _looks_like_ask_comment(body: str) -> bool:
+        return bool(body.startswith(HUMAN_MARKER) or STALE_WHEN_RE.search(body)
+                    or re.search(r"(?i)\b(?:ask|decision|waiting on|please)\b", body))
+
+    def _is_ask_stale(self, repo: str, issue: Dict[str, Any],
+                      comments: List[Dict[str, Any]]) -> Tuple[bool, str]:
+        if not comments:
+            return True, "issue carries no ask comment"
+        has_stale_directive = False
+        has_ask_content = False
+        for c in comments:
+            body = str(c.get("body") or "")
+            m = STALE_WHEN_RE.search(body)
+            if m:
+                has_stale_directive = True
+                directive = m.group(1).strip()
+                stale, reason = self._evaluate_stale_directive(repo, directive, body)
+                if stale:
+                    return True, reason
+            if self._looks_like_ask_comment(body):
+                has_ask_content = True
+        if has_stale_directive:
+            return False, ""
+        if not has_ask_content:
+            return True, "issue carries no ask comment"
+        return False, ""
+
+    def _check_one_stale_ask(self, repo: str, issue: Dict[str, Any]) -> bool:
+        number = int(issue["number"])
+        current_labels = _label_names(issue)
+        needs_labels = [l for l in current_labels if NEEDS_LOGIN_RE.match(l)]
+        if not needs_labels or self._was_stale_ask_withdrawn(repo, number):
+            return False
+        comments = []
+        try:
+            for c in self._paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number)):
+                if isinstance(c, dict) and not status.is_status(str(c.get("body") or "")):
+                    comments.append(c)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError) as err:
+            _say("could not read comments on %s#%d: %s" % (repo, number, err))
+            return False
+
+        is_stale, reason = self._is_ask_stale(repo, issue, comments)
+        if not is_stale:
+            return False
+
+        if "awaiting-live-check" in current_labels or "loom:awaiting-evidence" in current_labels:
+            target_label = "awaiting-live-check"
+            target_desc = "awaiting-live-check"
+        else:
+            target_label = "loom:queued"
+            target_desc = "the ticket queue"
+
+        new_labels = [l for l in current_labels if not NEEDS_LOGIN_RE.match(l)]
+        if target_label not in new_labels:
+            new_labels.append(target_label)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": new_labels})
+        note = "Withdrew stale needs ask (%s): moved back to %s." % (reason, target_desc)
+        notify.post(self.gh, repo, number, note, notify.NOTE)
+        self._record_stale_ask_withdrawn(repo, number, reason)
+        _say("withdrew stale ask on %s#%d (%s): moved to %s" % (repo, number, reason, target_desc))
+        return True
+
+    def check_stale_asks(self, deploy_event: bool = False) -> List[Tuple[str, int]]:
+        """Re-check open needs:<login> issues and move stale ones back to work."""
+        withdrawn_now: List[Tuple[str, int]] = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            labels = self._needs_login_labels(repo)
+            if not labels:
+                continue
+            for label in labels:
+                try:
+                    query = "/repos/%s/issues?labels=%s&state=open" % (repo, quote(label, safe=""))
+                    for issue in self._paginate(query):
+                        if not isinstance(issue, dict) or "number" not in issue:
+                            continue
+                        number = int(issue["number"])
+                        if (repo, number) in withdrawn_now:
+                            continue
+                        moved = self._check_one_stale_ask(repo, issue)
+                        if moved:
+                            withdrawn_now.append((repo, number))
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError) as err:
+                    _say("check_stale_asks failed for %s (%s): %s" % (repo, label, err))
+        return withdrawn_now
 
     # -- goal reports -----------------------------------------------------
     def _goal_issues(self, repo: str) -> List[Dict[str, Any]]:
@@ -9261,6 +9521,9 @@ class Station:
             ("merged", "merged"), ("verified", "verified"), ("sent_back", "shipped"),
             ("failed", "failed"), ("regressed", "regressed"), ("aged_pr", "stuck"),
             ("in_flight", "in flight"), ("queued", "queued"), ("asks", "waiting on you"))]
+        stale_withdrawn = self._daily_stale_asks_withdrawn()
+        if stale_withdrawn:
+            counts.append((stale_withdrawn, "asks withdrawn as stale"))
         summary = ", ".join("%d %s" % (n, word) for n, word in counts if n)
         first = ("%s since the last report." % summary) if summary else "Nothing moved since the last report."
         stuck = "Past the stuck age in PR: %s." % rows(groups["aged_pr"])
@@ -9270,6 +9533,9 @@ class Station:
                       "%d lanes idle." % (gate_hold["goal"], gate_hold["count"],
                                           gate_hold["limit"], len(gate_hold["tickets"]),
                                           gate_hold["idle"]))
+        needs_you = ["### Needs you", "Open asks: %s." % rows(groups["asks"])]
+        if groups.get("uncommented_asks"):
+            needs_you.append("Asks with no comment: %s." % rows(groups["uncommented_asks"]))
         return "\n".join([REPORT_MARKER, first,
             "", "### Going well", "Merged: %s. Verified: %s. Shipped: %s." %
             (rows(groups["merged"]), rows(groups["verified"]),
@@ -9284,8 +9550,7 @@ class Station:
             "Needs difficulty: %s." % rows(groups["needs_difficulty"])]
             + (["Epics with every ticket closed (check the done-when, then close): %s."
                 % rows(finished)] if finished else [])
-            + ["",
-            "### Needs you", "Open asks: %s." % rows(groups["asks"]), "",
+            + [""] + needs_you + ["",
             STANDUP_FOOTER])
 
     def _standup_ticket_groups(self, children: List[Any], since: Optional[float] = None
@@ -9294,12 +9559,26 @@ class Station:
         tickets updated since the last report, so a standup says what changed."""
         groups: Dict[str, List[Dict[str, Any]]] = {key: [] for key in (
             "merged", "verified", "sent_back", "failed", "regressed", "aged_pr",
-            "in_flight", "queued", "needs_difficulty", "asks")}
+            "in_flight", "queued", "needs_difficulty", "asks", "uncommented_asks")}
         for issue in children:
             if isinstance(issue, dict):
                 for group in self._standup_groups_of(issue, since):
                     groups[group].append(issue)
         return groups
+
+    @staticmethod
+    def _issue_has_ask_comment(issue: Dict[str, Any]) -> bool:
+        if "has_ask" in issue:
+            return bool(issue["has_ask"])
+        if "ask_comment" in issue:
+            return bool(issue["ask_comment"])
+        comments = issue.get("comments")
+        if isinstance(comments, int):
+            return comments > 0
+        if isinstance(comments, list):
+            return any(not status.is_status(str(c.get("body") or ""))
+                       for c in comments if isinstance(c, dict))
+        return False
 
     def _standup_groups_of(self, issue: Dict[str, Any], since: Optional[float]) -> List[str]:
         """The standup headings one ticket belongs under."""
@@ -9310,7 +9589,10 @@ class Station:
                                             ("loom:verified", "verified"),
                                             ("loom:shipped", "sent_back"))
                  if label in labels and recent]
-        if issue.get("state") != "open" or "loom:ticket" not in labels:
+        has_needs_login = any(NEEDS_LOGIN_RE.match(l) for l in labels)
+        if issue.get("state") != "open":
+            return found
+        if "loom:ticket" not in labels and not has_needs_login and not (labels & {NEEDS_OPERATOR, HUMAN}):
             return found
         created = self._epoch(str(issue.get("created_at") or ""))
         aged = created is not None and self.now - created > factory.STUCK_AGE
@@ -9323,10 +9605,13 @@ class Station:
                                                         "loom:pr"})),
                            ("queued", "loom:queued" in labels),
                            ("needs_difficulty", "loom:queued" in labels and
-                            not factory.has_difficulty(issue)),
-                           ("asks", bool(labels & {NEEDS_OPERATOR, HUMAN}))):
+                            not factory.has_difficulty(issue))):
             if hit:
                 found.append(group)
+        if has_needs_login and not self._issue_has_ask_comment(issue):
+            found.append("uncommented_asks")
+        elif bool(labels & {NEEDS_OPERATOR, HUMAN}) or has_needs_login:
+            found.append("asks")
         return found
 
     @staticmethod
@@ -10589,6 +10874,7 @@ class Station:
             try:
                 roll_pin.run(self.gh, self.s.roll_ship_docs, self.s.authors,
                              self.s.review_check)
+                self.check_stale_asks(deploy_event=True)
             except ValueError as err:
                 raise GitHubError("invalid roll ship document or pin: %s" % err) from err
             except health.NotLooked as err:
