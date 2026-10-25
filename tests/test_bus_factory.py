@@ -6,6 +6,7 @@ import re
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from urllib.parse import unquote
 from unittest import mock
 
 from bus import brain, factory, labels, merge_tier, station, status, tickets
@@ -108,6 +109,9 @@ class FakeGitHub:
             return list(self.pulls.values())
         if path.endswith("/issues?labels=loom:triage&state=open"):
             return list(self.filed)
+        if "/issues?labels=loom%3Aanswer-pending&state=open" in path:
+            return [i for i in self.issues.values() if i.get("state") == "open"
+                    and "loom:answer-pending" in [x["name"] for x in i.get("labels") or []]]
         m = re.search(r"/issues/(\d+)/comments$", path)
         if m:
             # As the GitHub client does: a status comment reads as its events.
@@ -185,11 +189,22 @@ class FakeGitHub:
             made = dict(body, number=900 + len(self.filed), id=5000 + len(self.filed), user=ME)
             self.filed.append(made)
             return Response(201, made)
+        m = re.search(r"/issues/(\d+)/labels/([^/]+)$", path)
+        if m and method == "DELETE":
+            # As GitHub does: one label off, a missing one is a 404 the caller allows.
+            item = self.issues.get(int(m.group(1))) or self.pulls.get(int(m.group(1))) or {}
+            gone = unquote(m.group(2))
+            item["labels"] = [x for x in item.get("labels") or [] if x["name"] != gone]
+            return Response(200, {})
         m = re.search(r"/issues/(\d+)(/labels|/comments)?$", path)
         if m:
             number = int(m.group(1))
             if m.group(2) == "/labels":
-                if number in self.issues:
+                if number in self.issues and method == "POST":
+                    # Added, as GitHub's POST adds; a PUT replaces them all.
+                    have = [x["name"] for x in self.issues[number]["labels"]]
+                    self.issues[number]["labels"] = [{"name": x} for x in dict.fromkeys(have + body["labels"])]
+                elif number in self.issues:
                     self.issues[number]["labels"] = [{"name": x} for x in body["labels"]]
                 else:
                     have = [x["name"] for x in self.pulls[number].get("labels", [])]
