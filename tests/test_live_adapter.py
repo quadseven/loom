@@ -226,7 +226,7 @@ class ManifestTest(unittest.TestCase):
             "interpreter": ["python3", "x", "{source}", "{needle}"],
             "placeholder in a literal": [".loom/live-evidence/log", "--match={needle}",
                                          "{source}"],
-            "ticket picks the verb": ["realm-logs", "{needle}", "{source}"],
+            "ticket picks the verb": ["archive-logs", "{needle}", "{source}"],
             "kubectl write": ["kubectl", "delete", "{source}", "{needle}"],
             "exec": ["kubectl", "get", "exec", "{source}", "{needle}"],
             "escape .loom": [".loom/../bin/sh", "{source}", "{needle}"],
@@ -248,7 +248,7 @@ class ManifestTest(unittest.TestCase):
         self.assertIn("not on the default branch", why)
 
     def test_a_bare_read_command_parses(self):
-        adapter, why = self.parse(self.with_log(["realm-logs", "report", "{source}", "{since}",
+        adapter, why = self.parse(self.with_log(["archive-logs", "report", "{source}", "{since}",
                                                  "{needle}"]))
         self.assertEqual(why, "")
         self.assertEqual(adapter.scripts, {})
