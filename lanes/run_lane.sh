@@ -1218,6 +1218,9 @@ hold_provider_limit() {
   if [ "${LANE:-}" = opencode-go ] && [ "$limit_name" = "5-hour" ]; then
     record_model_limit "$MODEL" "$until" "$LIMIT_WHY"
     PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.catalogue record-limit "$MODEL" "$limit_name" "$until" 2>/dev/null || true
+    if [ -z "$CONFIGURED_MODELS" ]; then
+      CONFIGURED_MODELS="$(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.catalogue models-for-tier "medium" 2>/dev/null)"
+    fi
     if [ -n "$CONFIGURED_MODELS" ]; then
       local candidate avail=""
       for candidate in $CONFIGURED_MODELS; do
@@ -2860,8 +2863,10 @@ for BRIEF in "$INBOX"/*.md; do
     MODEL="$(lane_setting MODEL)"
     [ -n "$MODEL" ] || { [ "$LANE" = copilot ] && MODEL="copilot-free"; }
     if [ "$LANE" = opencode-go ] && [ -z "$CONFIGURED_MODELS" ]; then
-      DIFFICULTY="$(field Difficulty "$BRIEF" || echo "medium")"
-      CONFIGURED_MODELS="$(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.catalogue models-for-tier "$DIFFICULTY" 2>/dev/null)"
+      if [ -z "$MODEL" ] || model_limit_until "$MODEL" >/dev/null; then
+        DIFFICULTY="$(field Difficulty "$BRIEF" || echo "medium")"
+        CONFIGURED_MODELS="$(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.catalogue models-for-tier "$DIFFICULTY" 2>/dev/null)"
+      fi
     fi
     if [ -n "$CONFIGURED_MODELS" ]; then
       MODEL=""
@@ -3096,9 +3101,10 @@ for BRIEF in "$INBOX"/*.md; do
         record_model_limit "$candidate" "$RETRY_AT" "$LIMIT_REASON"
       done
       heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
-    elif [ -n "$CONFIGURED_MODELS" ]; then
+    elif [ -n "$CONFIGURED_MODELS" ] || [ "$LANE" = opencode-go ]; then
       record_model_limit "$MODEL" "$RETRY_AT" "$LIMIT_REASON"
       [ "$LANE" = opencode-go ] && PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.catalogue record-limit "$MODEL" "5-hour" "$RETRY_AT" 2>/dev/null || true
+      [ -z "$CONFIGURED_MODELS" ] && CONFIGURED_MODELS="$(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.catalogue models-for-tier "medium" 2>/dev/null)"
       WHY="$(ladder_reason "$CONFIGURED_MODELS")"
       MAX_UNTIL="$(awk 'BEGIN{m=0} {if ($2>m)m=$2} END{print m}' "$MODEL_LIMIT_FILE")"
       AVAILABLE_MODEL=""

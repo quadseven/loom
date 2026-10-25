@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
-import time
 import unittest
+from unittest import mock
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, List
 
 from bus import catalogue
 
@@ -306,6 +307,68 @@ class ModelCatalogueTests(unittest.TestCase):
             "opencode-go/deepseek-v4.1-flash",
             "opencode-go/beam-free",
         ])
+
+    def test_fetch_rejects_unpermitted_scheme(self):
+        models = catalogue.fetch_remote_models("file:///etc/passwd")
+        self.assertEqual(models, [])
+
+    def test_preferred_model_selected_until_limited(self):
+        cat = {
+            "opencode-go/mimo-v2.6-flash": catalogue.ModelEntry(
+                id="opencode-go/mimo-v2.6-flash",
+                provider="opencode-go",
+                raw_id="mimo-v2.6-flash",
+                api_shape="openai-compatible",
+                is_free=False,
+                tier="flash",
+            ),
+            "opencode-go/deepseek-v4.1-flash": catalogue.ModelEntry(
+                id="opencode-go/deepseek-v4.1-flash",
+                provider="opencode-go",
+                raw_id="deepseek-v4.1-flash",
+                api_shape="openai-compatible",
+                is_free=False,
+                tier="flash",
+            ),
+        }
+        tracker = catalogue.AllowanceTracker()
+        choice = catalogue.select_model("medium", cat, tracker, now=NOW,
+                                        preferred_model="opencode-go/mimo-v2.6-flash")
+        self.assertIsNotNone(choice)
+        self.assertEqual(choice.id, "opencode-go/mimo-v2.6-flash")
+
+        # When preferred model is limited, fallback to next tier candidate
+        tracker.record_limit("opencode-go", "opencode-go/mimo-v2.6-flash", "5-hour", 18000, now=NOW)
+        choice2 = catalogue.select_model("medium", cat, tracker, now=NOW,
+                                         preferred_model="opencode-go/mimo-v2.6-flash")
+        self.assertIsNotNone(choice2)
+        self.assertEqual(choice2.id, "opencode-go/deepseek-v4.1-flash")
+
+    def test_cli_select_model_command(self):
+        cat = {
+            "opencode-go/mimo-v2.6-flash": catalogue.ModelEntry(
+                id="opencode-go/mimo-v2.6-flash",
+                provider="opencode-go",
+                raw_id="mimo-v2.6-flash",
+                api_shape="openai-compatible",
+                is_free=False,
+                tier="flash",
+            ),
+        }
+        catalogue.save_catalogue(cat, catalogue.catalogue_file(self.home))
+        env_backup = os.environ.get("LOOM_HOME")
+        try:
+            os.environ["LOOM_HOME"] = str(self.home)
+            stdout = io.StringIO()
+            with mock.patch("sys.stdout", stdout):
+                code = catalogue.main(["select-model", "medium"])
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue().strip(), "opencode-go/mimo-v2.6-flash")
+        finally:
+            if env_backup is not None:
+                os.environ["LOOM_HOME"] = env_backup
+            else:
+                os.environ.pop("LOOM_HOME", None)
 
 
 if __name__ == "__main__":

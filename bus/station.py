@@ -10671,6 +10671,9 @@ class Station:
                 local()
             except OSError as err:
                 _say("%s failed: %s" % (local.__name__, err))
+        self._tend_usage()
+
+    def _tend_usage(self) -> None:
         try:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)

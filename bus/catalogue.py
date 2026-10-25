@@ -14,7 +14,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 OPENCODE_GO_MODELS_URL = "https://opencode.ai/inference/go/v1/models"
 DISCOVERY_INTERVAL = 3600
@@ -25,13 +25,6 @@ DEFAULT_ALLOWLIST: Set[str] = {
     "mimo-v2.6-flash",
     "deepseek-v4.1-flash",
     "muse-spark-1.3-contributor",
-    "kimi-k3",
-    "kimi-k3.1-pro",
-    "kimi-k2.7-code",
-    "glm-5.3",
-    "qwen-2.5-72b",
-    "minimax-m3.1-flash-free",
-    "longcat-2.5-preview-free",
 }
 
 STRONG_PREFERENCE = [
@@ -118,10 +111,13 @@ def parse_model_ids(payload: Any) -> List[str]:
 def fetch_remote_models(url: str, timeout: int = PROBE_TIMEOUT,
                         fetch: Optional[Callable[[Any], Any]] = None) -> List[str]:
     """Fetch model IDs from remote endpoint."""
-    fetcher = fetch or urllib.request.urlopen
-    req = urllib.request.Request(url, headers={"User-Agent": "loom-model-discovery"})
+    if not (url.startswith("http://") or url.startswith("https://")):
+        sys.stderr.write("model discovery failed from %s: scheme must be http or https\n" % url)
+        return []
+    req = urllib.request.Request(url, headers={"User-Agent": "loom-model-discovery"})  # noqa: S310 - scheme checked above
     try:
-        with fetcher(req) as resp:
+        resp = fetch(req) if fetch is not None else urllib.request.urlopen(req, timeout=timeout)  # noqa: S310
+        with resp:
             raw = resp.read()
             data = json.loads(raw.decode("utf-8"))
             return parse_model_ids(data)
@@ -261,7 +257,8 @@ def _model_sort_key(entry: ModelEntry) -> int:
 def select_model(tier: str, catalogue: Dict[str, ModelEntry],
                  tracker: AllowanceTracker, now: Optional[float] = None,
                  pinned_model: Optional[str] = None,
-                 public_only: bool = False) -> Optional[ModelEntry]:
+                 public_only: bool = False,
+                 preferred_model: Optional[str] = None) -> Optional[ModelEntry]:
     """Select model for ticket tier with available allowance. Brief Model: line wins."""
     current_time = time.time() if now is None else now
 
@@ -278,6 +275,14 @@ def select_model(tier: str, catalogue: Dict[str, ModelEntry],
             is_free=raw.endswith("-free"),
             tier=classify_tier(raw),
         )
+
+    if preferred_model:
+        clean_pref = preferred_model.strip()
+        pref_entry = catalogue.get(clean_pref)
+        if pref_entry is not None:
+            if (public_only or "contributor" not in pref_entry.raw_id) and \
+                    not tracker.is_limited(pref_entry.provider, pref_entry.id, now=current_time):
+                return pref_entry
 
     tier_order = _tier_stages(tier)
     for stage in tier_order:
@@ -301,10 +306,18 @@ def _tier_stages(tier: str) -> List[str]:
 
 
 def tier_candidates(tier: str, catalogue: Dict[str, ModelEntry],
-                    public_only: bool = False) -> List[str]:
+                    public_only: bool = False,
+                    preferred_model: Optional[str] = None) -> List[str]:
     """Get ordered list of candidate model IDs for a tier."""
     stages = _tier_stages(tier)
     result = []
+    if preferred_model:
+        clean_pref = preferred_model.strip()
+        if clean_pref in catalogue:
+            pref_entry = catalogue[clean_pref]
+            if public_only or "contributor" not in pref_entry.raw_id:
+                result.append(clean_pref)
+
     for stage in stages:
         entries = [m for m in catalogue.values() if m.tier == stage]
         entries.sort(key=_model_sort_key)
@@ -383,10 +396,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("discovered %d models" % len(discovered))
         return 0
 
+    if cmd == "select-model":
+        tier = args[1] if len(args) > 1 else "medium"
+        pinned = args[2] if len(args) > 2 and args[2] else None
+        preferred = args[3] if len(args) > 3 and args[3] else None
+        cat = load_catalogue(home)
+        tracker = AllowanceTracker.load(allowance_file(home))
+        entry = select_model(tier, cat, tracker, pinned_model=pinned, preferred_model=preferred)
+        if entry:
+            print(entry.id)
+            return 0
+        return 1
+
     if cmd == "models-for-tier":
         tier = args[1] if len(args) > 1 else "medium"
+        preferred = args[2] if len(args) > 2 and args[2] else None
         cat = load_catalogue(home)
-        candidates = tier_candidates(tier, cat)
+        candidates = tier_candidates(tier, cat, preferred_model=preferred)
         print(" ".join(candidates))
         return 0
 
