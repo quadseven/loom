@@ -1286,6 +1286,9 @@ lookup leaves the brief for the next pass. The rule covers:
 
 - Tool: `codex exec --sandbox workspace-write` on a logged-in box: no network and
  no .git writes, so the agent edits and the runner commits and pushes.
+ When the base check left a uv cache, the agent gets a copy of it and runs uv
+ offline (`UV_OFFLINE`, `PIP_NO_INDEX`), so tests that need packages run
+ without network (loom#1665).
 - Best for: scoped implementation, CI failure repair, `codex review` passes.
 - Models per ticket: Astra (hardest), Sol (default building), Luna (volume).
 

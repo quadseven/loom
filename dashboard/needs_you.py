@@ -154,22 +154,86 @@ def _ask_html(entry: Dict[str, Any]) -> str:
             'comment names it.</p>')
 
 
+# The kind of action an ask needs, read from its words, in the order the page
+# shows them: a decision is settled by a reply, so it comes first. Patterns are
+# tried access, device, decide, so an ask to buy a phone service reads as access.
+KINDS = (
+    ("decide", "Decisions", "a reply settles each one"),
+    ("access", "Access and credentials", "a sign-in, a key, a grant or a purchase"),
+    ("device", "On a device or in person", "hands on a machine, a phone or a cable"),
+    ("other", "Other asks", ""),
+    ("missing", "No exact ask written", "an agent should write one; nothing here says what to do"),
+)
+_ACCESS_RE = re.compile(r"\b(sign in|log in|oauth|api key|token|credentials?|password|secret|rotate|"
+                        r"grant|access|role|mint|reconnect|buy|buying|purchase|usd)\b", re.I)
+_DEVICE_RE = re.compile(r"\b(handsets?|phones?|router|monitor|power(ed)?[ -](it )?(on|off|cycle)|plug|"
+                        r"cable|cold boot|on the next trip|a real drive|physical|console|keyboard|"
+                        r"bring the [\w -]{1,40} up)\b", re.I)
+_DECIDE_RE = re.compile(r"\b(yes or no|reply|choose|pick|decide|decision|approve|merge|hold|keep|close|"
+                        r"option|recommend(ed)?)\b", re.I)
+_SENTENCE_RE = re.compile(r"^(.+?[.!?])(\s|$)", re.S)
+# The lead-ins asks open with ("Needs the operator (one ask).", "Exact ask
+# (owner):", "Ask (needs:login):", "Waiting on the repo owner (needs:login)."),
+# which say who it waits on, never what to do.
+_PREAMBLE_RE = re.compile(r"^(?:(?:needs the operator \(one ask\)\.|exact ask[^:]{0,60}:|ask(?: for [^:]{1,40})?"
+                          r"(?: \([^)]{1,40}\))?:|waiting on the repo owner \([^)]{1,40}\)\.)\s*)+", re.I)
+
+
+def ask_text(entry: Dict[str, Any]) -> str:
+    """The ask as written: the body section, else the comment that names it."""
+    return str(entry.get("body_ask") or entry.get("comment_ask") or "").strip()
+
+
+def action_kind(entry: Dict[str, Any]) -> str:
+    """decide, access, device, other, or missing (no ask written)."""
+    text = ask_text(entry)
+    if not text:
+        return "missing"
+    for kind, pattern in (("access", _ACCESS_RE), ("device", _DEVICE_RE), ("decide", _DECIDE_RE)):
+        if pattern.search(text):
+            return kind
+    return "other"
+
+
+def first_sentence(text: str, limit: int = 180) -> str:
+    """The ask's first sentence, cut at a word boundary past the limit."""
+    text = _PREAMBLE_RE.sub("", " ".join(text.replace("**", "").split()))
+    found = _SENTENCE_RE.match(text)
+    lead = found.group(1) if found else text
+    return lead if len(lead) <= limit else lead[:limit].rsplit(" ", 1)[0] + "..."
+
+
+def _since(entry: Dict[str, Any]) -> str:
+    since = entry.get("created_at") or entry.get("waiting_since")
+    return str(since) if since and since != "9999" else ""
+
+
+def _oldest_first(found: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(found, key=lambda entry: _since(entry) or "9999")
+
+
 def ref(entry: Dict[str, Any]) -> str:
     return "%s#%s" % (entry.get("repo"), entry.get("number"))
 
 
 def card(entry: Dict[str, Any]) -> str:
+    """One item as one line - age, who it waits on, title and the ask's first
+    sentence - that opens to the whole ask and its facts."""
     esc = html.escape
     url = str(entry.get("html_url") or entry.get("url") or "/tickets")
     waiting = "idle" if entry.get("waiting_since_source") == "updated" else "waiting"
-    since = entry.get("created_at") or entry.get("waiting_since")
-    age = views.format_age(since) if since and since != "9999" else None
+    age = views.format_age(_since(entry)) if _since(entry) else None
     kind = "pull request" if entry.get("pull_request") else "issue"
-    return ('<article class="card ask-card" data-who="%s"><div class="ask-head"><span>%s - %s</span>'
-            '<span class="ask-human">needs a human</span><span>%s</span></div><h2><a href="%s">%s</a></h2>%s'
-            '<p class="machine-fact">%s | unblocks %s | <a href="%s">open the %s</a></p></article>') % (
+    lead = first_sentence(ask_text(entry)) or "No exact ask written."
+    return ('<article class="card ask-card" data-who="%s"><details class="ask-row"><summary>'
+            '<span class="ask-age">%s</span><span class="ask-ref">%s - %s</span>'
+            '<span class="ask-title">%s</span><span class="ask-lead">%s</span></summary>'
+            '<div class="ask-body"><div class="ask-head"><span class="ask-human">needs a human</span></div>'
+            '<h3><a href="%s">%s</a></h3>%s<p class="machine-fact">%s | unblocks %s | <a href="%s">open the %s</a>'
+            '</p></div></details></article>') % (
         esc(" ".join(OPERATOR_PARAM if login == OPERATOR else login for login in entry["who"]), quote=True),
-        esc(ref(entry)), esc(_who_text(entry["who"])), esc(age or "age unknown"), esc(url, quote=True),
+        esc(age or "age unknown"), esc(ref(entry)), esc(_who_text(entry["who"])),
+        esc(str(entry.get("title") or ref(entry))), esc(lead), esc(url, quote=True),
         esc(str(entry.get("title") or ref(entry))), _ask_html(entry), waiting, esc(str(entry["unblocks"])),
         esc(url, quote=True), kind)
 
@@ -201,6 +265,57 @@ def chips(found: List[Dict[str, Any]], who: str) -> str:
         for key, label, count in rows)
 
 
+def _who_name(login: str) -> str:
+    return "the operator" if login == OPERATOR else login
+
+
+def summary(shown: List[Dict[str, Any]]) -> str:
+    """One headline: how many items wait, on whom, how many a reply settles,
+    and the oldest."""
+    esc = html.escape
+    tally = counts(shown)
+    whom = ", ".join("%d on %s" % (count, _who_name(login)) for login, count in
+                     sorted(tally.items(), key=lambda pair: (-pair[1], pair[0])))
+    decide = sum(1 for entry in shown if action_kind(entry) == "decide")
+    oldest = next(iter(_oldest_first(shown)), None)
+    parts = ['<p class="needs-headline"><strong>%d item%s wait on people</strong>: %s.</p>' % (
+        len(shown), "" if len(shown) == 1 else "s", esc(whom))]
+    facts = ["%d settled by a reply" % decide]
+    if oldest is not None and _since(oldest):
+        facts.append("Oldest: %s, %s" % (ref(oldest), views.format_age(_since(oldest)) or "age unknown"))
+    parts.append('<p class="machine-fact">%s.</p>' % esc("; ".join(facts)))
+    return '<section class="needs-summary card">%s%s</section>' % ("".join(parts), _start(shown))
+
+
+def _start(shown: List[Dict[str, Any]]) -> str:
+    """Up to three items to do first: the most unblocking, then the longest
+    waiting."""
+    first = sorted(_oldest_first(shown), key=lambda entry: -entry["unblocks"])[:3]
+    if not first:
+        return ""
+    esc = html.escape
+    rows = []
+    for entry in first:
+        url = str(entry.get("html_url") or entry.get("url") or "/tickets")
+        lead = first_sentence(ask_text(entry)) or "no exact ask written"
+        rows.append('<li><a href="%s">%s</a> - %s</li>' % (esc(url, quote=True), esc(ref(entry)), esc(lead)))
+    return '<h2 class="needs-start-head">Start here</h2><ol class="needs-start">%s</ol>' % "".join(rows)
+
+
+def groups(shown: List[Dict[str, Any]]) -> str:
+    """The items grouped by the kind of action they need, oldest first."""
+    esc = html.escape
+    out = []
+    for kind, label, hint in KINDS:
+        members = [entry for entry in _oldest_first(shown) if action_kind(entry) == kind]
+        if not members:
+            continue
+        out.append('<section class="needs-group" data-kind="%s"><h2>%s (%d)</h2>%s%s</section>' % (
+            kind, esc(label), len(members), '<p class="muted">%s</p>' % esc(hint) if hint else "",
+            "".join(card(entry) for entry in members)))
+    return "".join(out)
+
+
 def _read_note(claims: Dict[str, Any]) -> str:
     read_at = _number(claims.get("read_at"))
     if not read_at:
@@ -226,6 +341,8 @@ def render(operator_asks: Iterable[Any], claims: Optional[Dict[str, Any]], who: 
         else:
             out.append('<p class="empty-state">Nothing needs you right now: no open needs-operator or '
                        'needs:&lt;login&gt; issue.</p>')
-    out.extend(card(entry) for entry in shown)
+    if shown:
+        out.append(summary(shown))
+        out.append(groups(shown))
     out.append('<p class="machine-fact needs-read">%s</p>' % _read_note(claims))
     return found, "".join(out)
