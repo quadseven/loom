@@ -131,50 +131,73 @@ def _script_path(path: str) -> bool:
             and len(parts) >= 2)
 
 
-def _command(kind: str, raw: object) -> Tuple[Optional[Command], str]:
-    if not isinstance(raw, dict):
-        return None, "`%s` is not an object" % kind
-    argv = raw.get("argv")
+def _argv_shape(kind: str, argv: object) -> str:
+    """Why an argv is not a short list of short ASCII strings, or ""."""
     if not (isinstance(argv, list) and argv and len(argv) <= 32
             and all(isinstance(a, str) and a.isascii() and 0 < len(a) <= 200 for a in argv)):
-        return None, "`%s.argv` is not a list of short ASCII strings" % kind
+        return "`%s.argv` is not a list of short ASCII strings" % kind
+    return ""
+
+
+def _program_refusal(kind: str, argv: List[str]) -> str:
+    """Why argv[0] (and, for a bare command, its verb) may not run, or ""."""
     first = argv[0]
     if not (_NAME_RE.match(first) or _script_path(first)):
-        return None, ("`%s.argv[0]` must be a bare command name or a path under .loom/, "
-                      "not `%s`" % (kind, first))
-    if not first.startswith(".loom/"):
-        if first in _RUNS_CODE or re.match(r"^python[0-9.]*$", first):
-            return None, ("`%s` runs other code; ship the adapter as a .loom/ script "
-                          "instead" % first)
-        # The verb is the manifest's, never a ticket's.
-        if len(argv) < 2 or _PLACEHOLDER_RE.match(argv[1]):
-            return None, "`%s.argv[1]` must be a literal, so a ticket never picks the verb" % kind
-        if first == "kubectl" and argv[1] not in _KUBECTL_READS:
-            return None, "`kubectl %s` is not a read; only %s run" % (
-                argv[1], ", ".join(sorted(_KUBECTL_READS)))
-    if "exec" in argv[1:]:
-        return None, "`%s.argv` names exec; an adapter only reads" % kind
-    for item in argv[1:]:
-        if _PLACEHOLDER_RE.match(item):
-            if item not in PLACEHOLDERS[kind]:
-                return None, "`%s` is not a %s placeholder" % (item, kind)
-        elif "{" in item or "}" in item:
-            return None, ("`%s` puts a placeholder inside a literal; a placeholder must be "
-                          "a whole argument" % item)
-    missing = [p for p in REQUIRED[kind] if p not in argv[1:]]
-    if missing:
-        return None, "`%s.argv` must name %s" % (kind, ", ".join(missing))
+        return ("`%s.argv[0]` must be a bare command name or a path under .loom/, "
+                "not `%s`" % (kind, first))
+    if first.startswith(".loom/"):
+        return ""
+    if first in _RUNS_CODE or re.match(r"^python[0-9.]*$", first):
+        return "`%s` runs other code; ship the adapter as a .loom/ script instead" % first
+    # The verb is the manifest's, never a ticket's.
+    if len(argv) < 2 or _PLACEHOLDER_RE.match(argv[1]):
+        return "`%s.argv[1]` must be a literal, so a ticket never picks the verb" % kind
+    if first == "kubectl" and argv[1] not in _KUBECTL_READS:
+        return "`kubectl %s` is not a read; only %s run" % (
+            argv[1], ", ".join(sorted(_KUBECTL_READS)))
+    return ""
+
+
+def _item_refusal(kind: str, item: str) -> str:
+    """Why one argv item after the first may not be used, or ""."""
+    if item == "exec":
+        return "`%s.argv` names exec; an adapter only reads" % kind
+    if _PLACEHOLDER_RE.match(item):
+        return "" if item in PLACEHOLDERS[kind] else "`%s` is not a %s placeholder" % (item, kind)
+    if "{" in item or "}" in item:
+        return ("`%s` puts a placeholder inside a literal; a placeholder must be "
+                "a whole argument" % item)
+    return ""
+
+
+def _timeout(kind: str, raw: Dict[str, object]) -> Tuple[Optional[int], str]:
     timeout = raw.get("timeout", DEFAULT_TIMEOUT)
     if not (isinstance(timeout, int) and not isinstance(timeout, bool)
             and 0 < timeout <= MAX_TIMEOUT):
         return None, "`%s.timeout` must be whole seconds from 1 to %d" % (kind, MAX_TIMEOUT)
+    return timeout, ""
+
+
+def _command(kind: str, raw: object) -> Tuple[Optional[Command], str]:
+    """(one declared command, or None; why it may not run)."""
+    if not isinstance(raw, dict):
+        return None, "`%s` is not an object" % kind
+    argv = raw.get("argv")
+    why = _argv_shape(kind, argv) or _program_refusal(kind, argv) or next(
+        (w for w in (_item_refusal(kind, item) for item in argv[1:]) if w), "")
+    if why:
+        return None, why
+    missing = [p for p in REQUIRED[kind] if p not in argv[1:]]
+    if missing:
+        return None, "`%s.argv` must name %s" % (kind, ", ".join(missing))
+    timeout, why = _timeout(kind, raw)
+    if timeout is None:
+        return None, why
     return Command(tuple(argv), timeout), ""
 
 
-def parse(text: Optional[str],
-          read: Callable[[str], Optional[str]]) -> Tuple[Optional[Adapter], str]:
-    """(the adapter a manifest declares, or None; why there is none). `read`
-    returns a repo file's text from the default branch, None when absent."""
+def _manifest(text: Optional[str]) -> Tuple[Optional[Dict[str, object]], str]:
+    """(the manifest's JSON object, or None; why it is not a version 1 one)."""
     if text is None:
         return None, "the repo has no %s" % MANIFEST
     try:
@@ -183,30 +206,52 @@ def parse(text: Optional[str],
         return None, "%s is not JSON (%s)" % (MANIFEST, err)
     if not isinstance(data, dict) or data.get("version") != 1:
         return None, "%s is not a version 1 object" % MANIFEST
+    return data, ""
+
+
+def _sources(raw: object) -> Tuple[Optional[Tuple[str, ...]], str]:
+    if not (isinstance(raw, list) and raw and all(
+            isinstance(s, str) and live_proof.SOURCE_RE.match(s) for s in raw)):
+        return None, "`log.sources` must list the log source names it serves"
+    return tuple(raw), ""
+
+
+def _scripts(commands: Sequence[Optional[Command]],
+             read: Callable[[str], Optional[str]]) -> Tuple[Optional[Dict[str, str]], str]:
+    """(the text of each `.loom/` script the commands run, or None; why)."""
+    scripts: Dict[str, str] = {}
+    for path in {c.argv[0] for c in commands if c is not None and c.argv[0].startswith(".loom/")}:
+        body = read(path)
+        if body is None:
+            return None, "`%s` is not on the default branch" % path
+        if len(body.encode("utf-8")) > MAX_SCRIPT_BYTES:
+            return None, "`%s` is larger than %d bytes" % (path, MAX_SCRIPT_BYTES)
+        scripts[path] = body
+    return scripts, ""
+
+
+def parse(text: Optional[str],
+          read: Callable[[str], Optional[str]]) -> Tuple[Optional[Adapter], str]:
+    """(the adapter a manifest declares, or None; why there is none). `read`
+    returns a repo file's text from the default branch, None when absent."""
+    data, why = _manifest(text)
+    if data is None:
+        return None, why
     commands: Dict[str, Optional[Command]] = {"log": None, "sql": None}
-    for kind in commands:
-        if kind in data:
-            commands[kind], why = _command(kind, data[kind])
-            if why:
-                return None, why
+    for kind in [k for k in commands if k in data]:
+        commands[kind], why = _command(kind, data[kind])
+        if why:
+            return None, why
     if commands["log"] is None and commands["sql"] is None:
         return None, "%s declares neither `log` nor `sql`" % MANIFEST
-    sources: Tuple[str, ...] = ()
+    sources: Optional[Tuple[str, ...]] = ()
     if commands["log"] is not None:
-        raw = data["log"].get("sources")
-        if not (isinstance(raw, list) and raw and all(
-                isinstance(s, str) and live_proof.SOURCE_RE.match(s) for s in raw)):
-            return None, "`log.sources` must list the log source names it serves"
-        sources = tuple(raw)
-    scripts: Dict[str, str] = {}
-    for command in commands.values():
-        if command is not None and command.argv[0].startswith(".loom/"):
-            body = read(command.argv[0])
-            if body is None:
-                return None, "`%s` is not on the default branch" % command.argv[0]
-            if len(body.encode("utf-8")) > MAX_SCRIPT_BYTES:
-                return None, "`%s` is larger than %d bytes" % (command.argv[0], MAX_SCRIPT_BYTES)
-            scripts[command.argv[0]] = body
+        sources, why = _sources(data["log"].get("sources"))
+        if sources is None:
+            return None, why
+    scripts, why = _scripts(list(commands.values()), read)
+    if scripts is None:
+        return None, why
     return Adapter(commands["log"], sources, commands["sql"], scripts), ""
 
 

@@ -265,51 +265,66 @@ def _matching(lines: Sequence[str], needle: str) -> List[str]:
     return [line for line in lines if (pattern.search(line) if pattern else needle in line)]
 
 
+def _absence(step: Step, needle: str, answer: Answer, lines: List[str],
+             safe: List[str], count: int, since: float, now: float) -> Tuple[bool, str]:
+    """(whether an absent string is shown absent, what was seen): no match
+    over a window the adapter says it read in full, at least the hours the
+    criterion names, else all of the time since the deploy."""
+    needed = step.hours if step.hours > 0 else max(0.0, (now - since) / 3600)
+    if answer.hours is None:
+        return False, ("the `%s` log adapter did not say how much log it read, so "
+                       "`%s` cannot be shown absent" % (step.source, needle))
+    if answer.hours + 1e-6 < needed:
+        return False, ("the `%s` log adapter read %.1f hours, short of the %.1f "
+                       "needed to show `%s` absent" % (step.source, answer.hours, needed, needle))
+    if count or lines:
+        return False, "the `%s` log names `%s` %d times since the deploy%s" % (
+            step.source, needle, max(count, len(lines)), _quoted(safe))
+    return True, "`%s` absent from the `%s` log over the %.1f hours read" % (
+        needle, step.source, answer.hours)
+
+
+def _quoted(safe: List[str]) -> str:
+    return "".join("\n    > " + line for line in safe[:evidence.MAX_LINES])
+
+
+def _source_needle(step: Step, needle: str, since: float, now: float,
+                   sources: Sources) -> Tuple[bool, str]:
+    """(passed, what was seen) for one string of an adapter log step."""
+    literal, _ = evidence.needle_pattern(needle)
+    if not literal:
+        return False, "`%s` is too general to search" % needle
+    answer = sources.source_log(step.source, literal, since)
+    if answer.lines is None:
+        return False, "the `%s` log adapter gave no answer for `%s` (%s)" % (
+            step.source, needle, answer.error or "no reason given")
+    # A line stamped before the deploy is never its evidence.
+    lines = [line for line in _matching(answer.lines, needle)
+             if (evidence.line_time(line) or since) >= since]
+    safe = [line for line in lines if evidence.safe_line(line)]
+    count = answer.count if answer.count is not None else len(lines)
+    if needle in step.absent:
+        return _absence(step, needle, answer, lines, safe, count, since, now)
+    if not count and not safe:
+        return False, "no `%s` log line since the deploy names `%s`" % (step.source, needle)
+    return True, "`%s` named %d times in the `%s` log since the deploy%s" % (
+        needle, count, step.source, _quoted(safe))
+
+
 def _source_log_step(step: Step, since: float, now: float,
                      sources: Sources) -> Tuple[bool, str]:
     """A log step read through the repo's adapter: each wanted string must
     have a match since the deploy (a quoted safe line or a count the adapter
-    gives), and each absent one none over a window the adapter says it read
-    in full: at least the hours the criterion names, else all of the time
-    since the deploy."""
+    gives), and each absent one none (_absence)."""
     if sources.source_log is None:
         return False, "the repo declares no live-evidence log adapter"
     wanted = ((step.target,) if step.target else ()) + step.expects
     seen: List[str] = []
     for needle in wanted + step.absent:
-        literal, _ = evidence.needle_pattern(needle)
-        if not literal:
-            return False, "`%s` is too general to search" % needle
-        answer = sources.source_log(step.source, literal, since)
-        if answer.lines is None:
-            return False, "the `%s` log adapter gave no answer for `%s` (%s)" % (
-                step.source, needle, answer.error or "no reason given")
-        # A line stamped before the deploy is never its evidence.
-        lines = [line for line in _matching(answer.lines, needle)
-                 if (evidence.line_time(line) or since) >= since]
-        safe = [line for line in lines if evidence.safe_line(line)]
-        count = answer.count if answer.count is not None else len(lines)
-        if needle in step.absent:
-            needed = step.hours if step.hours > 0 else max(0.0, (now - since) / 3600)
-            if answer.hours is None:
-                return False, ("the `%s` log adapter did not say how much log it read, so "
-                               "`%s` cannot be shown absent" % (step.source, needle))
-            if answer.hours + 1e-6 < needed:
-                return False, ("the `%s` log adapter read %.1f hours, short of the %.1f "
-                               "needed to show `%s` absent" % (
-                                   step.source, answer.hours, needed, needle))
-            if count or lines:
-                return False, "the `%s` log names `%s` %d times since the deploy%s" % (
-                    step.source, needle, max(count, len(lines)), "".join(
-                        "\n    > " + line for line in safe[:evidence.MAX_LINES]))
-            seen.append("`%s` absent from the `%s` log over the %.1f hours read" % (
-                needle, step.source, answer.hours))
-            continue
-        if not count and not safe:
-            return False, "no `%s` log line since the deploy names `%s`" % (step.source, needle)
-        seen.append("`%s` named %d times in the `%s` log since the deploy%s" % (
-            needle, count, step.source,
-            "".join("\n    > " + line for line in safe[:evidence.MAX_LINES])))
+        ok, what = _source_needle(step, needle, since, now, sources)
+        if not ok:
+            return False, what
+        seen.append(what)
     return True, "read through the repo's live-evidence adapter: " + "; ".join(seen)
 
 

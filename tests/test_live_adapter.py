@@ -33,9 +33,10 @@ stamp = tslp.stamp
 HEAD = ("Difficulty: easy\n\n## Why\nBecause.\n\n## Acceptance criteria\n"
         "- [ ] A test passes\n")
 LOG_BODY = HEAD + "- [ ] Live: after the ship, `log:worker` names `boat leg taken`\n"
-SQL_BODY = HEAD + ("- [ ] Live: `sql:SELECT COUNT(*) AS stuck FROM queue WHERE state = 'held'` "
+# Ticket text under test, never run as SQL: the refusal is what is tested.
+SQL_BODY = HEAD + ("- [ ] Live: `sql:SELECT COUNT(*) AS stuck FROM queue WHERE state = 'held'` "  # noqa: S608
                    "answers `stuck=0`\n")
-WRITE_SQL_BODY = HEAD + "- [ ] Live: `sql:UPDATE queue SET state = 'done'` answers `ok`\n"
+WRITE_SQL_BODY = HEAD + "- [ ] Live: `sql:UPDATE queue SET state = 'done'` answers `ok`\n"  # noqa: S608
 ABSENT_BODY = HEAD + ("- [ ] Live: over 24 hours after the ship, `log:worker` never names "
                       "`drowned below the pier`\n")
 SCRIPT = """#!/bin/sh
