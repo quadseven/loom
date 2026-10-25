@@ -8270,6 +8270,7 @@ class TranscriptUploadTest(Base):
             raise OSError("connect to %s with %s failed" % (url, token))
         if isinstance(body, list):  # a usage snapshot, not a transcript
             self.usage_sent = getattr(self, "usage_sent", []) + [body]
+            self.usage_urls = getattr(self, "usage_urls", []) + [url]
             return
         self.sent.append((url, token, body))
 
@@ -8286,6 +8287,8 @@ class TranscriptUploadTest(Base):
         self.fail = 1
         out, pause = self.usage()
         self.assertEqual(self.usage_sent, [[{"lane": "codex"}]])
+        self.assertEqual(self.usage_urls, [
+            "https://dashboard.example.com/api/usage?key=QUERY-SECRET"])
         self.assertNotIn("usage snapshot upload failed", out)
         pause.assert_called_once_with(station.USAGE_RETRY_PAUSE)
 
