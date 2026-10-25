@@ -46,6 +46,8 @@ JOURNAL = "journal"
 EVIDENCE = "evidence"
 STATUS = "status"
 RECORD = "record"
+# An operator's answer to an ask, posted from the dashboard (bus/answer.py).
+ANSWER = "answer"
 
 KINDS = {
     FAILURE: "a red merge, a revert, or a lane's hand-back that a person may need to read",
@@ -71,6 +73,7 @@ KINDS = {
     EVIDENCE: "evidence a scan adds to the issue it files",
     STATUS: "the first status comment of a ticket (later events edit it)",
     RECORD: "a marker comment Loom reads back (a claim, a heartbeat, a handoff packet)",
+    ANSWER: "an operator's answer to an ask, posted from the dashboard's Needs you page",
 }
 
 

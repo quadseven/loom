@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -156,6 +156,9 @@ HOLD_STUCK = 48 * 3600
 REVIEW_GRACE = 1800
 # At most this many merges, send-backs and climbs per pass.
 MAX_ACTIONS = 12
+# At most this many dashboard answers (loom:answer-pending issues) are read in
+# one repo a pass; the rest wait for the next.
+ANSWERS_PER_PASS = 10
 DEFAULT_REVIEW_CHECK = "Grug - Elder"
 # The review bot's plan check (same default as bus/invariants.py).
 DEFAULT_PLAN_CHECK = "Grug - Chief"
@@ -505,6 +508,13 @@ def unticked_notes(missing: Sequence[str]) -> str:
 
 
 TICKED_HEADING = "### Live or operator criteria ticked by the lane"
+
+
+def _last_ask(comments: Sequence[Dict[str, Any]]) -> str:
+    """The newest loom:human ask among the comments, or ""."""
+    asks = [str(c.get("body") or "") for c in comments
+            if str(c.get("body") or "").startswith(answer.HUMAN_MARKER)]
+    return asks[-1] if asks else ""
 
 
 def ticked_notes(ticked: Sequence[str]) -> str:
@@ -1364,7 +1374,8 @@ class Factory:
                  place: Callable[..., Any] = brain.place_under_epic,
                  plan_check: str = DEFAULT_PLAN_CHECK,
                  scope: Optional[scope_fit.Ask] = None,
-                 demoted: Optional[Dict[str, str]] = None) -> None:
+                 demoted: Optional[Dict[str, str]] = None,
+                 operators: Optional[Sequence[str]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1418,6 +1429,10 @@ class Factory:
         # The same map as the last pass left it (the station's saved waits): a
         # ticket whose reason is unchanged is not announced again.
         self.known_waits = dict(known_waits or {})
+        # The operators whose answers on the dashboard (bus/answer.py) count:
+        # LOOM_OPERATORS, else the person logins among the trusted ones.
+        self.operators = [o.lower() for o in (operators if operators is not None
+                                              else answer.operators(trusted=trusted))]
         self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
         # Sends the scope check's prompt to a cheap model (bus/scope_fit.py);
@@ -2308,23 +2323,29 @@ class Factory:
         elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
-        elif (not sensitive and not self._operator_holds(repo, number, full, issue)
-              and not self._risk_holds(repo, number, full, issue)):
+        elif (not sensitive and not self._operator_holds(repo, number, full, issue, comments)
+              and not self._risk_holds(repo, number, full, issue, comments)):
             self._file_criterion_follow_up(repo, number, issue, full)
             self._land(repo, number, full, issue, comments)
 
     def _operator_holds(self, repo: str, number: int, full: Dict[str, Any],
-                        issue: Dict[str, Any]) -> bool:
+                        issue: Dict[str, Any], comments: Sequence[Dict[str, Any]] = ()) -> bool:
         """Whether the pull request waits for the operator instead of landing
         (bus/operator_hold.py): it or its ticket declares operator steps
         before merge, it changes placement, or it deletes or mostly replaces
         a doc its ticket does not name. The ticket goes
         to loom:human with one exact ask, once; the pull request never lands
-        on the factory's say-so, whatever later passes find."""
+        on the factory's say-so, whatever later passes find. The operator's
+        own answer to that ask (bus/answer.py) decides instead: Merge lifts
+        this hold only, so every other gate still runs; Hold keeps it held
+        and asks nothing more."""
         why = operator_hold.reasons(self.gh, repo, full, str(issue.get("body") or ""),
                                     operator_hold.pull_files(self.gh, repo, number))
         if not why:
             return False
+        settled = self._operator_verdict(repo, number, full, issue, comments)
+        if settled is not None:
+            return settled
         outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, why,
                                      self.human)
         if outcome == "asked":
@@ -2335,7 +2356,7 @@ class Factory:
         return True
 
     def _risk_holds(self, repo: str, number: int, full: Dict[str, Any],
-                    issue: Dict[str, Any]) -> bool:
+                    issue: Dict[str, Any], comments: Sequence[Dict[str, Any]] = ()) -> bool:
         """Whether the pull request's risk tier (bus/merge_tier.py) is one
         Loom may not merge on its own: its ticket goes to loom:human with one
         ask, once, and the operator merges it. A revert ticket's own pull
@@ -2357,6 +2378,9 @@ class Factory:
                                         change_class.class_of(full) == "sensitive")
         if tier in merge_tier.auto_tiers():
             return False
+        settled = self._operator_verdict(repo, number, full, issue, comments)
+        if settled is not None:
+            return settled
         reason = merge_tier.operator_why(tier, why)
         outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, [reason],
                                      self.human)
@@ -2366,6 +2390,59 @@ class Factory:
         elif outcome != "already":
             _say("held %s#%d for the operator, but %s" % (repo, number, outcome))
         return True
+
+    def _operator_verdict(self, repo: str, number: int, full: Dict[str, Any],
+                          issue: Dict[str, Any],
+                          comments: Sequence[Dict[str, Any]]) -> Optional[bool]:
+        """The operator's answer to the hold ask on this pull request
+        (answer.pr_verdict), as the hold's outcome: False (Merge: the hold is
+        lifted and the other gates decide), True (Hold: held, no new ask), or
+        None (no answer: the hold asks as before). Each verdict is written to
+        the shadow ledger as the operator's."""
+        verdict = answer.pr_verdict(list(comments), number, self.trusted, self.operators)
+        if verdict is None:
+            return None
+        sha = str((full.get("head") or {}).get("sha") or "")
+        answer.record_verdict(repo, number, verdict, sha, (repo, int(issue["number"])),
+                              source="bus.factory")
+        if answer.is_merge(verdict):
+            _say("%s#%d: the operator %s answered merge; its operator hold is lifted and its "
+                 "other gates decide" % (repo, number, verdict.login))
+            return False
+        _say("%s#%d stays held: the operator %s answered hold" % (repo, number, verdict.login))
+        return True
+
+    def _settle_answers(self, repo: str) -> None:
+        """Read each answer the dashboard posted (an open issue labelled
+        loom:answer-pending, bus/answer.py) and take the label off: the
+        answer is now the operator's newest comment, which the brief, the
+        stale-brief check and the merge gates read. A Hold on a lane pull
+        request held for the operator puts loom:human back, so it keeps
+        waiting on a person. An issue whose label no operator answer backs
+        loses the label too."""
+        items = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                 % (repo, quote(answer.ANSWERED_LABEL, safe="")))
+        for issue in [i for i in items if isinstance(i, dict)][:ANSWERS_PER_PASS]:
+            if self.actions >= MAX_ACTIONS:
+                return
+            number = int(issue.get("number") or 0)
+            comments = self._comments(repo, number)
+            found = answer.newest(comments, self.trusted, self.operators)
+            if found is None:
+                _say("%s#%d is labelled %s, but no operator answer backs it; label removed"
+                     % (repo, number, answer.ANSWERED_LABEL))
+            elif answer.is_hold(found) and answer.held_pr(_last_ask(comments)) is not None:
+                if "loom:human" not in _labels(issue):
+                    self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                                 {"labels": ["loom:human"]})
+                _say("%s#%d: the operator %s answered hold; it keeps waiting on a person"
+                     % (repo, number, found.login))
+            else:
+                _say("%s#%d: read the operator %s's answer (%s)"
+                     % (repo, number, found.login, found.choice))
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                         % (repo, number, quote(answer.ANSWERED_LABEL, safe="")), ok=(404,))
+            self.actions += 1
 
     def _file_criterion_follow_up(self, repo: str, number: int,
                                   issue: Dict[str, Any], full: Dict[str, Any]) -> None:
@@ -3290,6 +3367,7 @@ class Factory:
         # GitHub.paginate asks for 100 a page and follows every page.
         all_prs = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
                    if isinstance(p, dict)]
+        self._guarded(lambda r, _: self._settle_answers(r), repo, {})
         closed_numbers = self._close_superseded_prs(repo, all_prs, tickets)
         prs = [p for p in all_prs if self._trusted(p) and int(p.get("number") or 0) not in closed_numbers]
         linked = {a[1]: pr for pr in prs for a in [self._association(repo, pr)] if a}

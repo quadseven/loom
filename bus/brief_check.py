@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import proof, tickets
+from . import answer, proof, tickets
 from .github import GitHubError
 
 STALE = "stale"
@@ -389,7 +389,10 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
         return health
     done = asked(comments, trusted)
     operator = tickets.operator_login(trusted) or ""
-    reads = (lambda: operator_done(comments, operator),
+    # An answer an operator gave on the dashboard (bus/answer.py) reads as
+    # the operator's own comment.
+    spoken = answer.as_operator_comments(comments, trusted, answer.operators(trusted=trusted), operator)
+    reads = (lambda: operator_done(spoken, operator),
              lambda: source_shipped(gh, repo, body),
              lambda: merged_elsewhere(gh, repo, int(issue["number"])),
              lambda: merged_linked(gh, repo, issue, comments, trusted),
