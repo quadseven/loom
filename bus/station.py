@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 
 from . import audit
 from . import bench
+from . import ci_gap
 from . import brain_memory
 from . import claimed
 from . import fabric
@@ -5281,6 +5282,7 @@ class Station:
                 if not (name == self.s.review_check and factory.degraded_review(tail, tail))]
         degraded = len(kept) != len(failed)
         failed = kept
+        self._note_first_push(repo, pr_number, comments, failed)
         threads = self._bot_threads(repo, pr_number)
         if not failed and not threads and not degraded:
             self._mark_ready(repo, number, sha, names, ready)
@@ -5290,6 +5292,53 @@ class Station:
             return
         self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
                                    comments, names, failed, threads, rounds)
+
+    def _note_first_push(self, repo: str, pr_number: int, comments: List[Any],
+                         failed: List[Tuple[str, str]]) -> None:
+        """Record once whether a lane pull request was red in CI on its first
+        push: its checks finished and no fix round was sent yet. The review
+        bot's check is not CI. bus.brain status shows the rate per repo
+        (bus/ci_gap.py)."""
+        authors = {author.lower() for author in self.s.authors}
+        if self._fix_round_count(comments, authors):
+            return
+        red = any(name != self.s.review_check for name, _ in failed)
+        try:
+            ci_gap.note_first_push(self.state, repo, pr_number, red, self.now)
+        except OSError as err:
+            _say("could not record the first push of %s#%d: %s" % (repo, pr_number, err))
+
+    def _validation_gaps(self, repo: str, pr_number: int, detail: Dict[str, Any], sha: str,
+                         failed: List[Tuple[str, str]]) -> str:
+        """File a validation gap for each failing CI job whose command the
+        repo's contract does not run (bus/ci_gap.py), and return the fix
+        round's notes: run those commands before pushing. "" when there is
+        no contract, no gap, or the reads fail (the fix round goes as before)."""
+        names = {name for name, _ in failed if name != self.s.review_check}
+        if not names:
+            return ""
+        base = str((detail.get("base") or {}).get("ref") or "")
+        if not base:
+            return ""
+        try:
+            fields = ci_gap.contract_fields(self.gh, repo, base)
+            if fields is None:
+                return ""
+            runs = brain.newest_check_runs((self.gh.rest(
+                "GET", "/repos/%s/commits/%s/check-runs?filter=all&per_page=100" % (repo, sha)).data
+                or {}).get("check_runs") or [])
+            failing = [run for run in runs if isinstance(run, dict)
+                       and run.get("conclusion") in brain.FAILED_CONCLUSIONS
+                       and str(run.get("name") or "") in names]
+            gaps = ci_gap.find_gaps(self.gh, repo, pr_number, sha, fields, failing,
+                                    lambda: self._pull_paths(repo, pr_number) or [])
+            filed = ci_gap.file_gaps(self.gh, self.state, gaps, self.now, _say)
+        except RateLimited:
+            raise
+        except (GitHubError, ValueError, OSError, KeyError) as err:
+            _say("validation gap: could not judge %s#%d: %s" % (repo, pr_number, err))
+            return ""
+        return ci_gap.fix_notes(filed)
 
     def _ready_head(self, comments: List[Any]) -> Optional[str]:
         """The head the newest ready mark of ours names. A mark is an event in
@@ -5408,7 +5457,8 @@ class Station:
                           detail: Dict[str, Any], sha: str, failed: List[Any],
                           threads: List[Any]) -> None:
         branch = str((detail.get("head") or {}).get("ref") or "")
-        body = brain._fix_body(repo, pr_number, branch, "", failed, threads)
+        notes = self._validation_gaps(repo, pr_number, detail, sha, failed)
+        body = brain._fix_body(repo, pr_number, branch, notes, failed, threads)
         marker = "\n\n<!-- loom:fix-head %s -->\n" % sha
         if len(body) > MAX_FIX_BODY:  # the API rejects comments over 65536 characters
             body = body[:MAX_FIX_BODY].rstrip() + "\n\n(findings truncated)"

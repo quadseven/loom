@@ -12,6 +12,15 @@ WORKFLOW = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "t
 
 
 class UnittestStep(unittest.TestCase):
+    def test_parallel_runner_caps_workers_to_avoid_oversubscribing_lane_checks(self):
+        runner = WORKFLOW.parents[1] / "unittest_parallel.py"
+        spec = __import__("importlib.util").util.spec_from_file_location("unittest_parallel", runner)
+        module = __import__("importlib.util").util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.worker_count(145, 12), 4)
+        self.assertEqual(module.worker_count(2, 12), 2)
+        self.assertEqual(module.worker_count(145, 2), 2)
+
     def test_the_piped_unittest_step_runs_with_pipefail(self):
         text = WORKFLOW.read_text()
         step = text[text.index("- name: unittest"):]

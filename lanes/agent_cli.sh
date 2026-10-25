@@ -160,8 +160,14 @@ provider_text() {
 }
 
 classify_failure() {
-  local status="$1" whole="$2" edited="$3" now n tail cap stated monthly=0
+  local status="$1" whole="$2" edited="$3" now n tail cap stated monthly=0 seen
   tail="${4:-$whole}"
+  # A run that exited 0 wrote its answer: a limit phrase earlier in its
+  # output came from a file or test it read (a Makefile echoing "Rate-limiting
+  # wrapper deployed", a test named test_..._rate_limited parked two codex
+  # lanes until midnight, 2026-10-25), so only what its CLI said last counts.
+  seen="$whole"
+  [ "$status" -eq 0 ] && seen="$tail"
   FAIL_CLASS=work RETRY_AT="" OUT_OF_CREDIT=""
   now="$(date +%s)"
   shopt -s nocasematch
@@ -169,7 +175,7 @@ classify_failure() {
     FAIL_CLASS=auth
   elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
-  elif [[ "$whole" =~ $LIMIT_RE ]] || [[ "$tail" =~ $LIMIT_CODE_RE ]]; then
+  elif [[ "$seen" =~ $LIMIT_RE ]] || [[ "$tail" =~ $LIMIT_CODE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT)) cap=$LIMIT_WAIT_MAX
     # A reset time or duration the provider states wins: codex's five-hour
     # limit says "purchase more credits or try again at 10:28 AM", agy's

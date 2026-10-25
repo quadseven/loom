@@ -100,6 +100,11 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
         # (loom#1534): not a failed step, so exit 0.
         print("not posted: %s" % held)
         return 0
+    except journal.ReportInvalid as bad:
+        # A report that contradicts itself is the brain's to rewrite, so this
+        # is a failed step: nothing is posted and the exit is non-zero.
+        print("not posted: %s" % bad)
+        return 2
     print("posted to %s" % args.target)
     return 0
 

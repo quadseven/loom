@@ -31,6 +31,11 @@ class ReportTooSoon(ValueError):
     """A report not posted: another went out on the goal home within REPORT_GAP."""
 
 
+class ReportInvalid(ValueError):
+    """A report not posted: its Needs you / Waiting on you lines contradict
+    each other (loom#1775)."""
+
+
 class ReportQuiet(ValueError):
     """A report not posted: the goal is quiet since its last report
     (bus/quiet.py), and its heartbeat is not due or has no report to edit."""
@@ -288,6 +293,7 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
                            {"body": body})
     _text.check(text)
     if text.startswith(REPORT_MARKER):
+        check_report(text)
         now = now or datetime.now(timezone.utc)
         _check_report_gap(gh, repo, issue_number, now, trusted)
         still = quiet() if quiet is not None else None
@@ -310,13 +316,60 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
     return _notify.post(gh, repo, issue_number, text, _notify.JOURNAL)
 
 
-_NEEDS_YOU = re.compile(r"needs you:\s*(.*)$", re.I | re.M)
+# [ \t] and not \s: a "Needs you:" with nothing after it must not read the
+# next line (the "Waiting on you:" line) as its ask.
+_NEEDS_YOU = re.compile(r"needs you:[ \t]*(.*)$", re.I | re.M)
+_WAITING = re.compile(r"^[ \t]*(?:[-*][ \t]+)?waiting on you:[ \t]*(.*)$", re.I | re.M)
 _REPORTED_RE = re.compile(r"^<!-- loom:reported [^>]*-->[ \t]*\n?", re.M)
+# A count of open loom:human issues: the label and a number on one line.
+_HUMAN_COUNT = re.compile(r"loom:human", re.I)
+_NOTHING = re.compile(r"(?:nothing|none|no one|n/a)\b", re.I)
+
+
+def waiting_line(by_repo: Dict[str, int], share: int = 0) -> str:
+    """The report's "Waiting on you:" line: the open loom:human issues by
+    repo, how many of them sit under this goal, and where they are listed
+    (the daily digest). "Waiting on you: nothing" when there are none. It is
+    its own line, apart from "Needs you:", so that "nothing" never sits next
+    to a non-zero count and a moving count never reads as a new ask (loom#1775)."""
+    counts = [(repo, int(n)) for repo, n in by_repo.items() if int(n) > 0]
+    total = sum(n for _, n in counts)
+    if total == 0:
+        return "Waiting on you: nothing"
+    counts.sort(key=lambda item: (-item[1], item[0]))
+    return ("Waiting on you: %d open loom:human (%s; %d of them under this goal), listed in "
+            "the daily digest" % (total, ", ".join("%d in %s" % (n, repo) for repo, n in counts),
+                                  int(share)))
+
+
+def check_report(text: str) -> None:
+    """Raise ReportInvalid when a report's "Needs you:" line carries a count of
+    loom:human issues, or its "Waiting on you:" line says nothing beside a
+    number. On 2026-10-25 a report ended "Needs you: nothing. loom:human: 28 in
+    <repo>.", and the operator could not tell whether anything was needed. The
+    count belongs on the "Waiting on you:" line (waiting_line), and "Needs you:"
+    names only what only the operator can do for this goal."""
+    body = _REPORTED_RE.sub("", text)
+    needs = _NEEDS_YOU.findall(body)
+    if needs and _HUMAN_COUNT.search(needs[-1]) and re.search(r"\d", needs[-1]):
+        says = " says nothing is needed and" if _NOTHING.match(needs[-1].strip()) else ""
+        raise ReportInvalid(
+            "the \"Needs you:\" line%s carries a loom:human count. \"Needs you:\" names only "
+            "what only the operator can do for this goal, or \"nothing new for this goal\"; "
+            "put the count on its own line after it, \"Waiting on you: N open loom:human (...)\" "
+            "or \"Waiting on you: nothing\" (docs/MUSE.md)" % says)
+    waiting = _WAITING.findall(body)
+    if waiting and _NOTHING.match(waiting[-1].strip()) and re.search(r"\d", waiting[-1]):
+        raise ReportInvalid(
+            "the \"Waiting on you:\" line says nothing next to a count; write "
+            "\"Waiting on you: nothing\" only when no loom:human issue is open")
 
 
 def _ask(body: str) -> Optional[str]:
     """What a report asks of the operator: its "Needs you:" text, compared
-    without case, spacing or a closing period; None when it has none."""
+    without case, spacing or a closing period; None when it has none. Only
+    that line: the "Waiting on you:" line below it moves with the count of
+    open loom:human issues and is not an ask (loom#1775)."""
     found = _NEEDS_YOU.findall(_REPORTED_RE.sub("", body))
     if not found:
         return None
