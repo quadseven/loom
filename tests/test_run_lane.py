@@ -1541,6 +1541,16 @@ print('leak guard: clean (shape patterns only)')
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
 
+    def test_a_stated_reset_duration_holds_the_lane(self):
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "Individual quota reached. Please upgrade your subscription to increase your limits. "
+            "Resets in 87h14m1s."))
+        self.assertIn("[limit]", self.run_log())
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        expected = time.time() + 87 * 3600 + 14 * 60
+        self.assertAlmostEqual(beat["retry_at"], expected, delta=60)
+
     def test_provider_quota_messages_are_still_limits(self):
         for out in ("429 RESOURCE_EXHAUSTED quota resets in 1 hours",
                     "Error: You exceeded your current quota, please check your plan",
@@ -2537,6 +2547,25 @@ exec /usr/bin/git "$@"
         kind, retry_at, credit = self.classified(line, line)
         self.assertEqual(kind, "limit")
         self.assertGreater(retry_at, int(time.time()))
+
+    def test_minutes_and_hours_only_stated_reset_durations(self):
+        for phrase, seconds in (("rate limit: resets in 45m", 45 * 60),
+                                ("rate limit: try again in 3h", 3 * 3600)):
+            with self.subTest(phrase=phrase):
+                kind, retry_at, _ = self.classified(phrase, phrase)
+                self.assertEqual(kind, "limit")
+                self.assertAlmostEqual(retry_at, time.time() + seconds, delta=60)
+
+    def test_clock_time_stated_reset_still_parses(self):
+        phrase = "rate limit: try again at 7:05 PM"
+        kind, retry_at, _ = self.classified(phrase, phrase)
+        self.assertEqual(kind, "limit")
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        expected = now.replace(hour=19, minute=5, second=0, microsecond=0)
+        if expected <= now:
+            expected += timedelta(days=1)
+        self.assertAlmostEqual(retry_at, expected.timestamp(), delta=60)
 
     def test_a_rate_limit_filename_in_a_tool_result_is_not_a_limit(self):
         self.drop_brief()

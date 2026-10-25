@@ -372,6 +372,10 @@ RETRY_MAX = 2
 FACTORY_REPO = "quadseven/loom"
 INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
 HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)")
+# A [factory] hold whose reason names no incident (the incident filing failed)
+# has nothing that can close it, so the station releases it after this long:
+# the ticket is not held forever.
+HELD_NO_INCIDENT_FOR = 2 * 3600
 RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
                       r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
 # The brain's lane order for a retry, after the failed lane's own provider.
@@ -482,6 +486,11 @@ VERIFY_RESERVE_FILE = "verify-reserve.json"
 # questions a pass, each up to bus/fabric.py's TIMEOUT, and the first
 # FABRIC_CITES cited pull requests checked against GitHub. FABRIC_ASKED_FILE
 # keeps the body each ticket was asked about, so a ticket is asked once.
+# The step loop's share of a pass: past this many seconds from the pass's
+# start, the remaining steps wait for the next pass (STEP_ROTATION_FILE keeps
+# where it stopped). On 2026-10-24 every pass ran 25 to 40 minutes.
+PASS_STEP_BUDGET = 300
+STEP_ROTATION_FILE = "step-rotation.json"
 # A pass step that takes this long is logged with its time and requests, so a
 # long pass names its cause: on 2026-10-24 passes ran 25 to 98 minutes and
 # 3000 to 6300 requests, and nothing said which step spent them.
@@ -1546,6 +1555,7 @@ class Station:
         self.discord = discord or discord_call
         self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         self.now = time.time() if now is None else now
+        self._pass_started = time.monotonic()
         self.state = os.path.join(settings.home, "state", "station")
         self._fabric_asks = 0  # Fabric questions this pass (FABRIC_ASKS)
         self.event_log = os.path.join(settings.home, "logs", "events.jsonl")
@@ -4078,6 +4088,61 @@ class Station:
         found[number] = ticket
         _say("%s#%d: linked pull request #%d is open" % (repo, number, int(pr["number"])))
 
+    def _run_steps(self) -> None:
+        """The pass's main step loop, given PASS_STEP_BUDGET seconds of its
+        own: counted from the pass's start, the steps before it (reconcile,
+        hand back, claim, assign, about six minutes on 2026-10-24) left one
+        loop step a pass and a full turn of the loop took hours."""
+        loop_started = time.monotonic()
+        # Below the budget floor these wait for the reset; trees are local.
+        steps = (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_merged,
+                     self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
+                     self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
+                     self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
+                     self.close_done_tickets, self.settle_orphan_sources,
+                     self.settle_claimed_tickets, self.release_stale_claims,
+                     self.queue_stateless_tickets,
+                     self.restate_shipped_live,
+                     self.health_intake, self.intake_friction,
+                     # The packet after the tick's row, so it renders that tick.
+                     self.watch_brain, self.upload_transcripts, self.post_brain_memory,
+                     self.publish_handoff, self.relay_operator,
+                     self.watch_default_branches, self.watch_deploys, self.score_lanes,
+                     self.refresh_bench, self.run_factory,
+                     # The move first, so the invariants read a goal whose
+                     # tickets sit under an epic.
+                     self.move_outside_tickets, self.check_invariants,
+                     self.release_factory_held)
+        rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
+        rotation = _read_json(rotation_path, {}, strict=False)
+        start = rotation.get("next") if isinstance(rotation, dict) else 0
+        start = start if isinstance(start, int) and 0 <= start < len(steps) else 0
+        stopped_at = None
+        for offset in range(len(steps)):
+            if self._deferred():
+                break
+            # Past the budget the rest of the loop waits for the next pass,
+            # which starts here: claims, fix rounds and deploys come round
+            # every few minutes instead of after a 40-minute pass, and every
+            # step still runs in turn, in the same order.
+            if offset and time.monotonic() - loop_started >= PASS_STEP_BUDGET:
+                stopped_at = (start + offset) % len(steps)
+                _say("pass budget reached after %ds of steps: %d step(s) wait for the next pass, from %s"
+                     % (time.monotonic() - loop_started, len(steps) - offset,
+                        steps[stopped_at].__name__))
+                break
+            step = steps[(start + offset) % len(steps)]
+            try:
+                self._timed(step)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("%s failed: %s" % (step.__name__, err))
+        try:
+            _write_json(rotation_path, {"next": stopped_at if stopped_at is not None else 0})
+        except OSError as err:
+            _say("could not record the step rotation: %s" % err)
+
     def _timed(self, step: Any) -> None:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
         more, with the requests it made (as the step loop does)."""
@@ -5012,12 +5077,14 @@ class Station:
 
     def _release_held(self, key: str, info: Any,
                       closed_incidents: Dict[str, Dict[str, Any]]) -> None:
-        """Re-queue one held ticket if its incident is closed and named on
-        it; forget it once it is no longer running."""
+        """Re-queue one held ticket: a closed and named incident, or a hold
+        with no incident (the filing failed) that has outlived
+        HELD_NO_INCIDENT_FOR. Forget it once it is no longer running."""
         repo, _, num = key.rpartition("#")
         number = int(num) if num.isdigit() else 0
         ref = info.get("incident") if isinstance(info, dict) else None
-        incident = closed_incidents.get(ref) if ref else None
+        raw_at = (info or {}).get("at")
+        at = float(raw_at) if raw_at is not None else None
         try:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
             comments = self._paginate(
@@ -5030,26 +5097,80 @@ class Station:
         if not isinstance(issue, dict) or RUNNING not in _label_names(issue):
             self._forget_held(key)
             return
+        if ref is None:
+            # The incident filing failed: nothing names an incident that can
+            # close this hold, so release it once it has outlived
+            # HELD_NO_INCIDENT_FOR instead of holding it forever.
+            green = False
+            if at is not None and self.now - at < HELD_NO_INCIDENT_FOR:
+                try:
+                    green = self._green_default_after_hold(repo, at)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("factory release: could not check default-branch CI for %s#%d: %s"
+                         % (repo, number, err))
+            if at is None or (self.now - at < HELD_NO_INCIDENT_FOR and not green):
+                return
+            cleared = RUNAWAY in _label_names(issue)
+            reason = ("a newer green default-branch run passed" if green else
+                      "the hold reached %d hours" % (HELD_NO_INCIDENT_FOR // 3600))
+            self._release_one(key, repo, number, issue, cleared,
+                              "held: incident filing failed; no incident was "
+                              "filed, so the ticket is back on its lane because " + reason)
+            _say("factory release: %s#%d re-queued: incident filing failed"
+                 % (repo, number))
+            return
+        incident = closed_incidents.get(ref) if ref else None
         if incident is None or not any(isinstance(c, dict) and ref in str(c.get("body") or "")
                                        for c in comments):
             return
         if self._claimed_since(comments, incident):
             return
-        self._relabel(repo, number, "loom:queued")
         cleared = RUNAWAY in _label_names(issue)
-        if cleared:
-            # The hold came from the factory's own failure, which is now fixed
-            # (loom#572); a runaway label kept here held tickets for hours.
-            kept = [n for n in _label_names(self._issue(repo, number)) if n != RUNAWAY]
-            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
-        # A status event, not a comment: closing five incidents released 16
-        # tickets and sent 16 emails at once (2026-10-19).
-        self._routine(repo, number,
-                      "Factory incident %s is closed: the ticket is back in the queue "
-                      "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
-                                          if cleared else ""))
-        self._forget_held(key)
+        self._release_one(key, repo, number, issue, cleared,
+                          "Factory incident %s is closed: the ticket is back in the queue "
+                          "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
+                                              if cleared else ""))
         _say("factory release: %s#%d re-queued after incident %s closed" % (repo, number, ref))
+
+    def _green_default_after_hold(self, repo: str, held_at: float) -> bool:
+        """Whether a newer commit on the default branch has all checks green."""
+        branch = self._default_branch(repo)
+        if not branch:
+            return False
+        commit = self.gh.rest("GET", "/repos/%s/commits/%s" % (repo, quote(branch, safe=""))).data
+        if not isinstance(commit, dict):
+            return False
+        sha = str(commit.get("sha") or "")
+        committed = self._epoch(str(((commit.get("commit") or {}).get("committer") or {}).get("date") or ""))
+        if not sha or committed is None or committed <= held_at:
+            return False
+        return self._default_commit_checks_green(repo, sha)
+
+    def _default_commit_checks_green(self, repo: str, sha: str) -> bool:
+        """Whether all check runs and the combined status for a commit passed."""
+        checks = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
+                              % (repo, sha)).data or {}
+        runs = checks.get("check_runs") if isinstance(checks, dict) else None
+        if not isinstance(runs, list) or not runs or any(
+                not isinstance(run, dict) or run.get("status") != "completed"
+                or run.get("conclusion") != "success" for run in runs):
+            return False
+        status_data = self.gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data or {}
+        return isinstance(status_data, dict) and status_data.get("state") == "success"
+
+    def _release_one(self, key: str, repo: str, number: int, issue: Dict[str, Any],
+                     cleared: bool, text: str) -> None:
+        """Move a held running ticket to loom:queued, clear its runaway hold
+        when the release cleared one, post the status event, and forget it."""
+        self._relabel(repo, number, "loom:queued")
+        if cleared:
+            kept = [n for n in _label_names(self._issue(repo, number)) if n != RUNAWAY]
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": kept})
+        self._routine(repo, number, text)
+        self._forget_held(key)
 
     def _claimed_since(self, comments: List[Any], incident: Dict[str, Any]) -> bool:
         """A lane claim comment is newer than the incident's close."""
@@ -5395,14 +5516,22 @@ class Station:
         if klass == "factory":
             # The validation environment the factory broke, not the ticket's
             # work: the ticket stays running on its lane and keeps its rung.
-            # release_factory_held re-queues it when the incident closes.
+            # release_factory_held re-queues it when the incident closes, and
+            # releases a hold with no incident after HELD_NO_INCIDENT_FOR.
             match = HELD_FOR_RE.search(bare)
-            self._note_held(repo, number,
-                            "%s#%s" % (match.group(1), match.group(2)) if match else None)
+            incident_ref = "%s#%s" % (match.group(1), match.group(2)) if match else None
+            self._note_held(repo, number, incident_ref)
             self._set_wait(repo, self._issue(repo, number), "incident")
-            self._routine(repo, number,
-                          "Lane %s held: %s. The ticket keeps its rung and returns to the "
-                          "queue when the factory incident closes." % (lane, bare))
+            if incident_ref is None:
+                self._routine(repo, number,
+                              "Lane %s held: incident filing failed. %s. The ticket keeps its rung and "
+                              "returns to the queue "
+                              "after %d hours." % (lane, bare,
+                                                   HELD_NO_INCIDENT_FOR // 3600))
+            else:
+                self._routine(repo, number,
+                              "Lane %s held: %s. The ticket keeps its rung and returns to the "
+                              "queue when the factory incident closes." % (lane, bare))
             _say("held %s#%d for the factory: %s" % (repo, number, reason))
             return True
         if klass == "auth":
@@ -10517,33 +10646,7 @@ class Station:
             self.record_scans()
         except OSError as err:
             _say("could not record the repo scans: %s" % err)
-        # Below the budget floor these wait for the reset; trees are local.
-        for step in (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_merged,
-                     self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
-                     self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
-                     self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
-                     self.close_done_tickets, self.settle_orphan_sources,
-                     self.settle_claimed_tickets, self.release_stale_claims,
-                     self.queue_stateless_tickets,
-                     self.restate_shipped_live,
-                     self.health_intake, self.intake_friction,
-                     # The packet after the tick's row, so it renders that tick.
-                     self.watch_brain, self.upload_transcripts, self.post_brain_memory,
-                     self.publish_handoff, self.relay_operator,
-                     self.watch_default_branches, self.watch_deploys, self.score_lanes,
-                     self.refresh_bench, self.run_factory,
-                     # The move first, so the invariants read a goal whose
-                     # tickets sit under an epic.
-                     self.move_outside_tickets, self.check_invariants,
-                     self.release_factory_held):
-            if self._deferred():
-                break
-            try:
-                self._timed(step)
-            except RateLimited:
-                raise
-            except (GitHubError, OSError, ValueError) as err:
-                _say("%s failed: %s" % (step.__name__, err))
+        self._run_steps()
         # The day's metrics line goes out even below the budget floor: one post
         # a day, and on 2026-10-18 the floor deferred it every pass, so the
         # operator got no numbers for the day. Only a spent budget stops it.
