@@ -1539,7 +1539,14 @@ safe_git() {
 #   setup: <shell command>      prepares the tree (a venv, locked deps, lint)
 #   check: <shell command>      the required check; exit 0 and no tracked
 #                               file changed means it passed
-# setup and check run as shell commands, like the run: steps of a CI
+#   affected: <shell command>   optional; runs after check passes on the
+#                               committed tree, with the pull request's changed
+#                               files (one path per line) on stdin and in
+#                               LOOM_CHANGED_FILES; the same pass rule as
+#                               check, and a failure blocks the push the same
+#                               way. It runs the per-directory suites a repo's
+#                               path-scoped CI jobs run (loom#1773).
+# setup, check and affected run as shell commands, like the run: steps of a CI
 # workflow, so they are only ever read from the branch the pull request
 # merges into: the base revision of a new run, and the base branch (fetched
 # for it) of a fix run, whose own branch holds unmerged agent edits. Nothing
@@ -1547,11 +1554,11 @@ safe_git() {
 # validated by the runner (its CI still is).
 CONTRACT_FILE=.loom/validation.conf
 # Read the key: value lines bus.contract printed into C_INTERP, C_SUBMODULES,
-# C_SETUP and C_CHECK. Returns 1 with SETUP_REASON when a line, the check,
+# C_SETUP, C_CHECK and C_AFFECTED. Returns 1 with SETUP_REASON when a line, the check,
 # submodules, the interpreter or a command is unusable.
 parse_contract() {
   local canon="$1" line key val
-  C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK=""
+  C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED=""
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     key="${line%%:*}" val="${line#*:}"
@@ -1561,6 +1568,7 @@ parse_contract() {
       submodules) C_SUBMODULES="$val" ;;
       setup) C_SETUP="$val" ;;
       check) C_CHECK="$val" ;;
+      affected) C_AFFECTED="$val" ;;
       *) SETUP_REASON="$CONTRACT_FILE has an unknown line '${line:0:40}'"; return 1 ;;
     esac
   done <<< "$canon"
@@ -1572,6 +1580,8 @@ parse_contract() {
     contract_command_ok "$val" ||
       { SETUP_REASON="$CONTRACT_FILE setup: and check: must be printable ASCII, at most 1000 characters"; return 1; }
   done
+  contract_command_ok "$C_AFFECTED" ||
+    { SETUP_REASON="$CONTRACT_FILE affected: must be printable ASCII, at most 1000 characters"; return 1; }
 }
 
 # A fix round's base branch, fetched into the shallow tree for its contract.
@@ -1590,7 +1600,7 @@ fetch_base_for_contract() {
 
 load_contract() {
   local rev="$BASE" mode canon
-  HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK=""
+  HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED=""
   if [ -n "$FIX_PR" ] && ! { fetch_base_for_contract &&
        rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
     HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
@@ -1796,9 +1806,12 @@ note_factory_incident() {  # kind, detail, reason_var_name
 # The command passed to bash -c is deliberately shell syntax: load_contract
 # reads it from the base branch's trusted CI contract, never the agent's
 # branch, and contract_command_ok refuses (exit 125, nothing run) any string
-# that is not one bounded line of printable ASCII.
+# that is not one bounded line of printable ASCII. An optional second
+# argument names a file of changed paths (the affected step): it is the
+# command's stdin and its text is LOOM_CHANGED_FILES; otherwise stdin is
+# /dev/null. The runner opens the file, so the sandbox never reads it.
 contract_run() {
-  local profile tool uv_bin uv_dir uv_path_dirs="" uv_bins=""
+  local profile tool uv_bin uv_dir uv_path_dirs="" uv_bins="" changed_list="${2:-}"
   contract_command_ok "$1" || { echo "contract_run: refusing a command that is not printable ASCII" >> "$LOG"; return 125; }
   # A contract that runs `uvx` failed every check with 127 on the unmodified
   # base: the lane machine keeps uv and uvx in the runner's .local/bin,
@@ -1831,7 +1844,13 @@ contract_run() {
     # the scratch home, where agent_uv_cache copies them for a codex agent.
     export PATH="${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
     export UV_CACHE_DIR="$home/.cache/uv" UV_PYTHON_INSTALL_DIR="$home/.local/share/uv/python"
-    exec timeout "$CHECK_TIMEOUT" sandbox-exec -p "$profile" /bin/bash -c "$1" < /dev/null
+    input=/dev/null
+    if [ -n "${changed_list:-}" ]; then
+      input="$changed_list"
+      LOOM_CHANGED_FILES="$(cat "$input")" || exit 125
+      export LOOM_CHANGED_FILES
+    fi
+    exec timeout "$CHECK_TIMEOUT" sandbox-exec -p "$profile" /bin/bash -c "$1" < "$input"
   ) 2>&1 | timeout "$((CHECK_TIMEOUT + 60))" cat >> "$LOG"
 }
 
@@ -2094,10 +2113,67 @@ final_validation() {
     *) VALIDATION_REASON="validation failed: the check exited $rc" ;;
   esac
   record final "$C_CHECK" "$rc" "$rev" "$ok" "${changed:+changed tracked files: $changed}"
+  [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || final_affected "$rev" || ok=false
   # The last check of this brief has run; the next one starts a fresh home.
   drop_check_home
   [ "$ok" = true ] || { VALIDATION_REASON="$VALIDATION_REASON at ${rev:0:12} (base check exited $BASELINE_EXIT)"; return 1; }
   VALIDATED="check exited 0 at ${rev:0:12}"
+  [ -z "${C_AFFECTED:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
+}
+
+# The paths the pull request changes, one per line: the lane's commits on a
+# new run; on a fix round, everything the pull request adds to the default
+# branch (the round's commits and the earlier ones), as CI sees it. A round
+# whose branch already held the default branch sets no FIX_UPSTREAM, so the
+# fetched default branch is the other end.
+lane_changed_files() {
+  local range="$BASE..HEAD" upstream="${FIX_UPSTREAM:-}"
+  if [ -z "$upstream" ] && [ -n "${FIX_PR:-}" ] && [ -n "${FIX_DEFAULT:-}" ]; then
+    upstream="$(safe_git rev-parse --verify -q "origin/$FIX_DEFAULT^{commit}")" || upstream=""
+  fi
+  [ -z "$upstream" ] || range="$upstream...HEAD"
+  safe_git diff --name-only "$range"
+}
+
+# The contract's affected command after the check passed (loom#1773): the
+# per-directory suites path-scoped CI jobs run, which a repo-wide check
+# leaves out. A lane pull request in the deploy repo passed its check and
+# failed two such suites in CI (a generated file not regenerated, a pinned
+# test in another directory). It gets the changed files on stdin and in
+# LOOM_CHANGED_FILES, and passes as check does: exit 0, no tracked file
+# changed. Sets VALIDATION_REASON and returns 1 when it does not pass.
+final_affected() {
+  local rev="$1" rc changed list ok=false
+  list="$(mktemp "$LOOM_HOME/run/$SLOT-changed.XXXXXX")" || {
+    VALIDATION_REASON="validation environment unavailable: could not write the changed file list"
+    record affected "$C_AFFECTED" 125 "$rev" false "$VALIDATION_REASON"
+    return 1
+  }
+  if ! lane_changed_files > "$list" 2>> "$LOG"; then
+    rm -f "$list"
+    VALIDATION_REASON="validation environment unavailable: could not list the changed files"
+    record affected "$C_AFFECTED" 125 "$rev" false "$VALIDATION_REASON"
+    return 1
+  fi
+  contract_run "$C_AFFECTED" "$list"; rc=$?
+  rm -f "$list"
+  changed="$(tracked_changes)"
+  case "$rc" in
+    0) [ -z "$changed" ] && ok=true ||
+         VALIDATION_REASON="validation failed: the affected check changed tracked files ($changed)" ;;
+    124) VALIDATION_REASON="validation failed: the affected check timed out after ${CHECK_TIMEOUT}s" ;;
+    143)
+      PARK_CLASS=transient
+      VALIDATION_REASON="validation interrupted by SIGTERM"
+      ;;
+    125|126|127)
+      VALIDATION_REASON="validation environment unavailable: the affected check exited $rc"
+      note_factory_incident environment "affected: $C_AFFECTED (exit $rc)" VALIDATION_REASON
+      ;;
+    *) VALIDATION_REASON="validation failed: the affected check exited $rc" ;;
+  esac
+  record affected "$C_AFFECTED" "$rc" "$rev" "$ok" "${changed:+changed tracked files: $changed}"
+  [ "$ok" = true ]
 }
 
 # Run the check of the contract the lane commits (C_* hold it) on the lane's
@@ -2144,6 +2220,7 @@ run_committed_contract() {
 check_contract_change() {
   local range="$BASE..HEAD" touched mode canon rc=0
   local b_interp="$C_INTERP" b_subs="$C_SUBMODULES" b_setup="$C_SETUP" b_check="$C_CHECK" b_cli="${CHECK_CLI:-}"
+  local b_affected="${C_AFFECTED:-}"
   CONTRACT_REFUSAL=""
   [ -z "$FIX_UPSTREAM" ] || range="$FIX_UPSTREAM...HEAD"
   touched="$(safe_git diff --name-only "$range" -- "$CONTRACT_FILE" 2>> "$LOG")" ||
@@ -2163,6 +2240,7 @@ check_contract_change() {
     run_committed_contract "$b_setup" || rc=$?
   fi
   C_INTERP="$b_interp" C_SUBMODULES="$b_subs" C_SETUP="$b_setup" C_CHECK="$b_check" CHECK_CLI="$b_cli"
+  C_AFFECTED="$b_affected"
   [ -n "$HAS_CONTRACT" ] || drop_check_home
   return "$rc"
 }
@@ -2278,6 +2356,7 @@ validation_note() {
   [ -n "$HAS_CONTRACT" ] || return 0
   printf '\n\n## Validation environment\nThe runner prepared this tree from %s (interpreter: %s, submodules: %s, setup: %s). After you finish it runs the check below on your committed tree; the pull request opens only if it exits 0 and changes no tracked file. On the base it exited %s.\n\n    %s\n' \
     "$CONTRACT_FILE" "${C_INTERP:-any}" "$C_SUBMODULES" "${C_SETUP:-none}" "$BASELINE_EXIT" "$C_CHECK"
+  [ -z "${C_AFFECTED:-}" ] || printf '\nAfter the check passes it runs this affected command with your changed files on stdin (and in LOOM_CHANGED_FILES); it must pass the same way:\n\n    %s\n' "$C_AFFECTED"
   [ "$C_SUBMODULES" != yes ] || printf '\nNever edit files inside a submodule: the push carries only its pinned commit, so the runner refuses a run that does and pushes nothing.\n'
 }
 
