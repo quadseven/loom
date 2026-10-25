@@ -317,6 +317,9 @@ class FakeGitHub:
         if "labels=loom%3Aticket" in query or "labels=loom:ticket&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:ticket" in self.names(i["number"])])
+        if "labels=loom%3Atriage" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:triage" in self.names(i["number"])])
         if "needs-operator" in query:
             return self._list_asks(headers)
         if "loom:human" in query:
@@ -2441,6 +2444,69 @@ class TriageTest(Base):
         self.run_at()
         self.assertEqual(len(self.triage_reads()), 0)
 
+    def test_a_triage_issue_waiting_on_the_brain_is_released_once(self):
+        # AC1: a loom:triage issue waiting on the brain (needs-brain) with no
+        # ruling for 24h gets exactly one operator ask and moves to loom:human,
+        # and a second pass never asks again.
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            self.start - 25 * 3600))
+        self.fake.add_open_issue(100, title="Slow page", created=old)
+        self.fake.issues[100]["labels"] = [{"name": "loom:triage"},
+                                           {"name": "needs-brain"}]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=self.start)
+        st.release_triage_waiting()
+        self.assertIn("loom:human", self.fake.names(100))
+        self.assertNotIn("loom:triage", self.fake.names(100))
+        asks = [c for c in self.fake.comments[100]
+                if str(c.get("body", "")).startswith("<!-- loom:human v1 -->")]
+        self.assertEqual(len(asks), 1)
+        self.assertIn("Slow page\nKind: decision", asks[0]["body"])
+        # A second pass does not ask again (already loom:human).
+        st.release_triage_waiting()
+        self.assertEqual(len([c for c in self.fake.comments[100]
+                              if str(c.get("body", "")).startswith(
+                                  "<!-- loom:human v1 -->")]), 1)
+
+    def test_a_triage_issue_waiting_on_a_person_is_not_released(self):
+        # needs:<login> is waiting on a person, not the brain: no release.
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            self.start - 25 * 3600))
+        self.fake.add_open_issue(101, title="Needs review", created=old)
+        self.fake.issues[101]["labels"] = [{"name": "loom:triage"},
+                                           {"name": "needs:alice-example"}]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=self.start)
+        st.release_triage_waiting()
+        self.assertNotIn("loom:human", self.fake.names(101))
+        self.assertEqual([c for c in self.fake.comments[101]], [])
+
+    def test_triage_partition_excludes_person_wait_from_triage_count(self):
+        # AC2: triage count excludes needs:<login> issues; waiting-on-person
+        # count includes them. aged counts items older than 7 days and names
+        # the oldest.
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.start))
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            self.start - 10 * 86400))
+        issues = [
+            {"number": 1, "title": "Plain", "state": "open", "created_at": recent,
+             "labels": [{"name": "loom:triage"}]},
+            {"number": 2, "title": "Person wait", "state": "open", "created_at": recent,
+             "labels": [{"name": "loom:triage"}, {"name": "needs:bob-example"}]},
+            {"number": 3, "title": "Aged", "state": "open", "created_at": old,
+             "labels": [{"name": "loom:triage"}]},
+            {"number": 4, "title": "Not triage", "state": "open", "created_at": recent,
+             "labels": [{"name": "loom:briefed"}]},
+        ]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=self.start)
+        untriaged, waiting, aged, oldest = st.triage_partition(issues)
+        self.assertEqual(untriaged, 2)
+        self.assertEqual(waiting, 1)
+        self.assertEqual(aged, 1)
+        self.assertIsNotNone(oldest)
+        self.assertEqual(int(oldest["number"]), 3)
+
 
 class HandoffFake:
     """The reads one handoff packet pass makes, and the comment writes."""
@@ -3096,8 +3162,9 @@ class CorruptStateTest(Base):
         # reconciliation's read of the open tickets (loom#784) and the
         # done-ticket close step's, the hourly read of rewritten sources, and
         # the changed label-set sync, and the hourly read of open tickets for
-        # ones with no state label (loom#1653).
-        self.assertEqual(self.run_pass().requests, 13)
+        # ones with no state label (loom#1653), and the triage release's read
+        # of open triage issues waiting on the brain.
+        self.assertEqual(self.run_pass().requests, 14)
 
 
 class TicketsTest(unittest.TestCase):
@@ -3636,9 +3703,10 @@ class ClaimTest(Base):
         # scans add their usual reads. It also reads the open tickets, to
         # find a queued or briefed one a merged pull request delivers
         # (loom#784; a conditional read the verify runs share, which the
-        # done-ticket close step reuses: one more request, no more calls).
-        self.assertEqual(len(self.fake.calls), first + 6)
-        self.assertEqual(gh.requests, 9)
+        # done-ticket close step reuses: one more request, no more calls),
+        # plus the triage release's read of open triage issues.
+        self.assertEqual(len(self.fake.calls), first + 7)
+        self.assertEqual(gh.requests, 10)
         self.assertEqual(gh.not_modified, 1)
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
@@ -7206,6 +7274,48 @@ class ReportsTest(Base):
             self.assertIn("#%d %s" % (number, title), body)
         self.assertEqual(body.splitlines()[1], "1 merged, 1 verified, 1 shipped, 1 failed, "
                          "1 stuck, 2 in flight, 1 waiting on you since the last report.")
+        brain._check_written_text(body)
+
+    def test_standup_counts_triage_and_names_the_oldest_aged_item(self):
+        # AC2 + AC3: the standup counts triage items (excluding needs:<login>
+        # person-wait, which joins "waiting on you") and, when any triage item
+        # is older than 7 days, names the oldest. A ticket opened since the
+        # last report keeps the goal from being quiet so the standup posts.
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
+        self.fake.comments[40][0]["created_at"] = old
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
+        aged = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - 10 * 86400))
+        self.fake.sub_issues[40] = [
+            {"number": 42, "title": "Open task", "state": "open",
+             "created_at": recent, "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}]
+        self.fake.issues[100] = {"number": 100, "title": "Plain triage",
+                                 "state": "open", "created_at": recent,
+                                 "labels": [{"name": "loom:triage"}]}
+        self.fake.issues[101] = {"number": 101, "title": "Person wait",
+                                 "state": "open", "created_at": recent,
+                                 "labels": [{"name": "loom:triage"},
+                                            {"name": "needs:bob-example"}]}
+        self.fake.issues[102] = {"number": 102, "title": "Aged triage",
+                                 "state": "open", "created_at": aged,
+                                 "labels": [{"name": "loom:triage"}]}
+        self.clock = time.time()
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=self.clock)
+        st.post_overdue_standups()
+        made = [c for c in self.fake.comments[40] if str(c.get("body", "")).startswith(
+            station.REPORT_MARKER)]
+        self.assertEqual(len(made), 2)  # old report + new standup
+        body = made[-1]["body"]
+        # person-wait (needs:bob) is not a triage count; it joins asks.
+        self.assertIn("1 waiting on you", body)
+        # two plain triage items (100, 102); 101 is person-wait.
+        self.assertIn("2 triage", body)
+        # 102 is the only item older than 7 days: it is the oldest, named.
+        self.assertIn("1 triage older than 7d; oldest: #102 Aged triage.", body)
         brain._check_written_text(body)
 
     def test_station_standup_lists_the_tickets_of_the_goals_epics(self):

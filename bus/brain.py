@@ -2462,7 +2462,17 @@ def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
     names = _labels(issue)
     if any(name.startswith("loom:") for name in names) or "needs-operator" in names:
         return "already labelled"
+    if any(name.startswith("needs:") for name in names):
+        # needs:<login>: waiting on a person, not triage's to take
+        return "waiting on a person"
     return not_work_reason(issue)
+
+
+def needs_login_names(names: Sequence[str]) -> List[str]:
+    """The needs:<login> person-wait labels in `names` (needs-brain uses a
+    hyphen, so it is not one of these)."""
+    return [name for name in names
+            if isinstance(name, str) and name.startswith("needs:") and name[len("needs:"):]]
 
 
 def _oldest_open_issues(gh: GitHub, repo: str):
