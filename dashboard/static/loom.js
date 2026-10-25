@@ -209,7 +209,9 @@
   function replaceCard(article, html) {
     if (!article || !html) return;
     const holder = document.createElement('div');
-    holder.innerHTML = html;
+    // The card is the dashboard's own server-rendered HTML, every value in it
+    // escaped (dashboard/needs_you.py card), never text a person typed here.
+    holder.innerHTML = html; // nosemgrep: elder-js-unescaped-html-sink
     const fresh = holder.firstElementChild;
     if (fresh) article.replaceWith(fresh);
   }

@@ -606,11 +606,7 @@ def _entry_lines(e: Mapping[str, Any]) -> List[str]:
     """One would-action (or operator verdict): its line, then its gates,
     reason and caller."""
     if e.get("action") == VERDICT:
-        lines = ["%s  operator verdict %-8s %-28s %s  %s" % (
-            e.get("time"), str(e.get("label") or ""), "%s#%s" % (e.get("repo") or "?", e.get("number") or "?"),
-            ("sha=%s" % str(e["sha"])[:12]) if e.get("sha") else "", e.get("url") or "")]
-        return lines + ["    %s: %s" % (name, e[key]) for key, name in (("reason", "reason"), ("source", "from"))
-                        if e.get(key)]
+        return _verdict_lines(e)
     what = str(e.get("action") or "")
     if e.get("label"):
         what += " " + str(e["label"])
@@ -625,6 +621,15 @@ def _entry_lines(e: Mapping[str, Any]) -> List[str]:
         if e.get(key):
             lines.append("    %s: %s" % (name, e[key]))
     return lines
+
+
+def _verdict_lines(e: Mapping[str, Any]) -> List[str]:
+    """One operator verdict: its line, then its reason and source."""
+    lines = ["%s  operator verdict %-8s %-28s %s  %s" % (
+        e.get("time"), str(e.get("label") or ""), "%s#%s" % (e.get("repo") or "?", e.get("number") or "?"),
+        ("sha=%s" % str(e["sha"])[:12]) if e.get("sha") else "", e.get("url") or "")]
+    return lines + ["    %s: %s" % (name, e[key]) for key, name in (("reason", "reason"), ("source", "from"))
+                    if e.get(key)]
 
 
 def _tally_lines(entries: Sequence[Mapping[str, Any]]) -> List[str]:

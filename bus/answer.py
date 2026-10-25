@@ -307,22 +307,22 @@ def pr_verdict(comments: Sequence[Any], number: int, trusted: Iterable[str], ops
         return None
     asked = asks[-1][1]
     asked_at = str(asked.get("created_at") or "")
-    after = False
-    verdict = None
-    for comment in comments:
-        if comment is asked:
-            after = True
-            continue
-        if not after:
-            continue
-        found = trusted_answer(comment, trusted, ops)
-        if found is not None and found.choice.lower() in (MERGE.lower(), HOLD.lower()):
-            verdict = found
+    verdict = _last_merge_or_hold(comments, asked, trusted, ops)
     if verdict is None or (asked_at and verdict.created_at and verdict.created_at < asked_at):
         return None
     if since and verdict.created_at and verdict.created_at < since:
         return None
     return verdict
+
+
+def _last_merge_or_hold(comments: Sequence[Any], asked: Any, trusted: List[str],
+                       ops: List[str]) -> Optional[Answer]:
+    """The newest operator Merge or Hold after the comment `asked`."""
+    later = list(comments)
+    later = later[next(i for i, c in enumerate(later) if c is asked) + 1:]
+    found = [a for a in (trusted_answer(c, trusted, ops) for c in later)
+             if a is not None and a.choice.lower() in (MERGE.lower(), HOLD.lower())]
+    return found[-1] if found else None
 
 
 def is_merge(verdict: Optional[Answer]) -> bool:

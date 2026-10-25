@@ -65,21 +65,36 @@ def identify(headers: Mapping[str, str], body: Mapping[str, Any],
     otherwise."""
     values = os.environ if env is None else env
     known = answer.operator_map(values)
-    ops = list(dict.fromkeys(known.values()))
-    if not ops:
+    if not known:
         raise Refused(403, "no operator is configured (LOOM_OPERATORS or LOOM_BRIEF_AUTHORS)")
     header = str(values.get(IDENTITY_HEADER) or "").strip()
     if header:
-        ident = str(headers.get(header) or "").strip().lower()
-        login = known.get(ident) or known.get(ident.split("@", 1)[0] if ident.endswith("@github") else "")
-        if not ident or not login:
-            raise Refused(403, "this identity is not an operator")
-        return login
-    supplied = str(headers.get("Authorization") or "")
+        return _header_login(str(headers.get(header) or ""), known)
+    _check_token(str(headers.get("Authorization") or ""), values)
+    return _named_login(body, list(dict.fromkeys(known.values())))
+
+
+def _header_login(value: str, known: Mapping[str, str]) -> str:
+    """The operator a proxy identity names; Refused (403) for anyone else."""
+    ident = value.strip().lower()
+    bare = ident.split("@", 1)[0] if ident.endswith("@github") else ""
+    login = known.get(ident) or known.get(bare)
+    if not ident or not login:
+        raise Refused(403, "this identity is not an operator")
+    return login
+
+
+def _check_token(supplied: str, values: Mapping[str, str]) -> None:
+    """Refused (401) unless the bearer token is one of TOKENS' values."""
     tokens = [str(values.get(name) or "") for name in TOKENS]
     if not supplied.startswith("Bearer ") or not any(
             token and hmac.compare_digest(supplied[7:], token) for token in tokens):
         raise Refused(401, "the answer token is missing or wrong")
+
+
+def _named_login(body: Mapping[str, Any], ops: List[str]) -> str:
+    """The operator the request answers as ("as", the one operator when only
+    one is listed); Refused (403) for a login outside the list."""
     named = str(body.get("as") or "").strip().lower()
     if not named and len(ops) == 1:
         named = ops[0]
