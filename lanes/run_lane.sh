@@ -628,6 +628,9 @@ FINAL_SAID_MAX=600
 # checked_text. Sets FINAL_SAID, empty when the agent said nothing or its words
 # were refused. The agent CLI's own log lines and the runner's timestamped
 # lines are left out: retried stream errors once filled the whole quote.
+# Local paths read <path>: an agent naming the file its sandbox refused
+# failed the text checks, and ten agy runs on 2026-10-24 read "wrote no
+# reason" (loom#1736).
 FINAL_SAID_SKIP_RE='^timestamp=[^ ]+ level=[A-Z]+ |^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z\] '
 final_said() {
   local file="$WORKDIR/$TICKET.final-message" line
@@ -635,6 +638,8 @@ final_said() {
   line="$(printf '%s\n' "$RUN_OUTPUT" | { grep -vE "$FINAL_SAID_SKIP_RE" || true; } | tail -n 20 | LC_ALL=C tr -cd '\11\12\40-\176' |
           tr -s ' \t\n' ' ' | sed 's/^ //; s/ $//')"
   [ -n "$line" ] || return 0
+  line="$(printf '%s' "$line" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
+    'import sys; from bus.text import LOCAL_PATH_RE; sys.stdout.write(LOCAL_PATH_RE.sub("<path>", sys.stdin.read()))')" || return 0
   [ "${#line}" -le "$FINAL_SAID_MAX" ] || line="${line:0:FINAL_SAID_MAX}..."
   printf '%s\n' "$line" > "$file"
   FINAL_SAID="$(checked_text "$file" 2>> "$LOG")" || FINAL_SAID=""
@@ -795,13 +800,19 @@ AGY_CACHE_KEEP=(onboarding.json default_project_id.txt)
 # keychain (#1465), so it falls back there. Without a write there it could
 # neither keep nor refresh a token, and every run asked for a browser login
 # (2026-10-22 to 10-24, #1620). The Keychains folder takes no write.
+# agy writes its shell helper, bin/agentapi, before each shell command:
+# denied with the rest of bin, every agy run from 2026-10-24 could run no
+# command and commit nothing. agy_forget makes that file new and empty before
+# each run, and the run may rewrite its contents and mode but not create,
+# remove or link it: a run free to create the name could make it a hard link
+# to another binary in bin, or a directory that stops every later run.
 agy_write_rules() {
   [ "$LANE" = agy ] || return 0
   local h s
   h="$(cd "$AGY_HOME" && pwd -P)" || return 1
   s="$h/.gemini/antigravity-cli"
-  printf '(deny file-write* (subpath "%s"))\n(allow file-write* %s (subpath "%s") (subpath "%s/Library/Application Support/antigravity") (subpath "%s/Library/Caches"))\n(deny file-write* (literal "%s/settings.json") (literal "%s/installation_id") (subpath "%s/bin") (subpath "%s/builtin"))\n' \
-    "$h" "$1" "$s" "$h" "$h" "$s" "$s" "$s" "$s"
+  printf '(deny file-write* (subpath "%s"))\n(allow file-write* %s (subpath "%s") (subpath "%s/Library/Application Support/antigravity") (subpath "%s/Library/Caches"))\n(deny file-write* (literal "%s/settings.json") (literal "%s/installation_id") (subpath "%s/bin") (subpath "%s/builtin"))\n(allow file-write-data file-write-mode (literal "%s/bin/agentapi"))\n' \
+    "$h" "$1" "$s" "$h" "$h" "$s" "$s" "$s" "$s" "$s"
 }
 
 # agy remembers past conversations (brain, summaries, annotations) and reads
@@ -816,6 +827,9 @@ agy_forget() {
     while [ "$1" != -- ]; do keep="$keep$1 "; shift; done; shift
     for k in "$@"; do cache_keep="$cache_keep$k "; done
     [ -d "$s" ] || exit 0
+    if [ -d "$s/bin" ] && [ ! -L "$s/bin" ]; then
+      rm -rf "$s/bin/agentapi" && (umask 022; : > "$s/bin/agentapi") && chmod 755 "$s/bin/agentapi" || exit 1
+    fi
     # Kept entries are real files and directories. A link an agent left in
     # their place is removed, never followed: the forget would otherwise
     # delete through it, into the keychain folder or another ticket'"'"'s tree.
@@ -1991,6 +2005,27 @@ prepare_validation() {
       note_factory_incident environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
       return 1 ;;
   esac
+  # One red run does not make the base red: Loom's own check timed out
+  # under a busy station's load and passed on the next ticket's run, and
+  # each such flake held its ticket behind a factory incident (56 by
+  # 2026-10-25). A red base check runs once more; only a second red files.
+  if [ "$BASELINE_EXIT" -ne 0 ]; then
+    if [ -n "$changed" ] && ! safe_git reset --hard HEAD >> "$LOG" 2>&1; then
+      SETUP_REASON="could not restore tracked files changed by the baseline check"
+      return 1
+    fi
+    local first_exit="$BASELINE_EXIT"
+    contract_run "$C_CHECK"; BASELINE_EXIT=$?
+    changed="$(tracked_changes)"
+    record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
+      "second run after exit $first_exit${changed:+; changed tracked files: $changed}"
+    if [ "$BASELINE_EXIT" -eq 143 ]; then
+      PARK_CLASS=transient
+      SETUP_REASON="base check interrupted by SIGTERM"
+      return 1
+    fi
+    [ "$BASELINE_EXIT" -ne 0 ] || echo "base check exited $first_exit, then passed on a second run" >> "$LOG"
+  fi
   # Only a pass on the trusted base clears an incident: a fix round's tree
   # holds the agent's unmerged edits, so it counts only once the default
   # branch itself passes (below).
