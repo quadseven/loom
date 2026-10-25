@@ -367,7 +367,8 @@ def _owed_lines(issue: Dict[str, Any], led: Dict[str, Any], comments: List[Dict[
 
 def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime,
                 authors: Optional[Sequence[str]] = None, gh: Optional[GitHub] = None,
-                repo: str = "", issues: Sequence[Dict[str, Any]] = ()) -> List[str]:
+                repo: str = "", issues: Sequence[Dict[str, Any]] = (),
+                shares: Optional[Dict[int, int]] = None) -> List[str]:
     lines = ["### Goals"]
     owed = []
     limit = unverified_limit()
@@ -386,6 +387,8 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
             # loom#483: each goal's unproven count against the limit, beside
             # the brain's own ledger, so the operator sees why new work waits.
             loose, tree = goal_tree(gh, repo, int(issue["number"]))
+            if shares is not None:
+                shares[int(issue["number"])] = goal_human_share(_flatten(loose, tree), issues)
             held, waiting = _count_unproven(_flatten(loose, tree))
             lines.append("  - unproven work %d/%d (shipped with no standing proof; "
                          "%d more await live evidence and do not count)"
@@ -804,28 +807,37 @@ def _skip_line(what: str, reason: str) -> str:
 def _readable_section(gh: GitHub, repo: str, now: datetime, bot: str,
                       authors: Optional[Sequence[str]] = None,
                       into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-                      check: str = "Grug - Elder") -> List[str]:
+                      check: str = "Grug - Elder",
+                      waiting: Optional[Dict[str, Dict[str, Any]]] = None) -> List[str]:
     """_repo_section, or one skipped line when GitHub will not show the repo
     (moved, gone or forbidden: github.unreadable), so one moved repo does
     not end the status of every other. Any other GitHubError still ends it."""
     try:
-        return _repo_section(gh, repo, now, bot, authors, into, check)
+        return _repo_section(gh, repo, now, bot, authors, into, check, waiting)
     except GitHubError as err:
         reason = unreadable(err)
         if reason is None:
             raise
         if into is not None:
             into.pop(repo, None)
+        if waiting is not None:
+            waiting.pop(repo, None)
         return ["", "## %s" % repo, "", _skip_line(repo, reason)]
 
 
 def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   authors: Optional[Sequence[str]] = None,
                   into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-                  check: str = "Grug - Elder") -> List[str]:
+                  check: str = "Grug - Elder",
+                  waiting: Optional[Dict[str, Dict[str, Any]]] = None) -> List[str]:
     """The repo's status section; with into, its open tickets are kept
-    there under the repo's name for the cross-repo Priorities section."""
+    there under the repo's name for the cross-repo Priorities section. With
+    waiting, so are the repo's open loom:human count and, per goal, the share
+    under that goal (waiting_lines)."""
     issues = _issues(gh, repo)
+    shares: Dict[int, int] = {}
+    if waiting is not None:
+        waiting[repo] = {"count": len(open_human(issues)), "goals": shares}
     goals = [i for i in issues if "loom:goal" in _labels(i)]
     tickets = [i for i in issues if "loom:ticket" in _labels(i)]
     if into is not None:
@@ -846,7 +858,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     warn = _trunk_warning(goals, data)
     if warn:
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
-    lines += _goal_lines(goals, data, now, authors, gh, repo, issues) + [""]
+    lines += _goal_lines(goals, data, now, authors, gh, repo, issues, shares) + [""]
     lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
@@ -952,16 +964,18 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     # sections keep the order of `repos`. A status took 68 s here and 152 s
     # from a remote brain, over a 15-minute tick (2026-10-15).
     found: Dict[str, List[Dict[str, Any]]] = {}
+    waiting: Dict[str, Dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
         sections = list(pool.map(
             lambda repo: _readable_section(gh, repo, now, bot, authors, found,
-                                           review_check_name(env)), repos))
+                                           review_check_name(env), waiting), repos))
     runaway = [(repo, issue) for repo, items in found.items() for issue in items
                if RUNAWAY in _labels(issue)
                and tickets.ticket_state(issue) not in tickets.MERGED_STATES]
     out += [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
         repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
     out += [""] + priority_lines(found, now)
+    out += [""] + waiting_lines(waiting, repos)
     out += [""] + _health_lines(env)
     for section in sections:
         out += section
@@ -970,6 +984,35 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
 
 
 PRIORITIES_SHOWN = 10
+
+
+def open_human(issues: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The open loom:human issues among `issues` (pull requests left out)."""
+    return [i for i in issues if isinstance(i, dict) and "pull_request" not in i
+            and i.get("state", "open") == "open" and "loom:human" in _labels(i)]
+
+
+def goal_human_share(children: Sequence[Dict[str, Any]], issues: Sequence[Dict[str, Any]]) -> int:
+    """How many of the repo's open loom:human `issues` are among the goal's
+    `children` (the goal_tree walk, as every other goal count): the goal's
+    own share of what waits on the operator (loom#1775)."""
+    waiting = {int(i.get("number") or 0) for i in open_human(issues)}
+    return len({int(c.get("number") or 0) for c in children if isinstance(c, dict)} & waiting)
+
+
+def waiting_lines(waiting: Dict[str, Dict[str, Any]], repos: Sequence[str]) -> List[str]:
+    """The "## Waiting on you" section: for each goal, the exact line that goes
+    right under "Needs you:" in its report (journal.waiting_line), so the
+    report's count comes from data. The repo counts span every repo status
+    read; the share is the goal's own."""
+    by_repo = {repo: int(waiting[repo]["count"]) for repo in repos if repo in waiting}
+    lines = ["## Waiting on you (paste the line under \"Needs you:\" in each goal's report; "
+             "\"Needs you:\" never carries a count)"]
+    goals = [(repo, number, share) for repo in repos if repo in waiting
+             for number, share in sorted(waiting[repo]["goals"].items())]
+    for repo, number, share in goals:
+        lines.append("- %s#%d: %s" % (repo, number, journal.waiting_line(by_repo, share)))
+    return lines if goals else lines + ["- no goals"]
 
 
 def priority_lines(found: Dict[str, List[Dict[str, Any]]], now: datetime,
