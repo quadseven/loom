@@ -534,6 +534,11 @@ prompts; with the private command empty the repo is skipped. The station runs
 at most 5 rewrites per backlog goal home per hour (and 5 per pass), oldest
 first, under the budget floor rule. `state/station/rewrite.json` records each
 attempt; an issue that did not become a ticket is not tried again for a day.
+The agent command runs as a background job (`state/station/rewrite-jobs/`),
+so a model never holds the station pass (loom#1663): the pass that starts a
+job waits at most 10 seconds for it, and a later pass writes the answer of
+any job that ended since. A job with no result 5 minutes past its 10-minute
+timeout is logged as a rewrite that wrote nothing.
 
 ## Proof
 
