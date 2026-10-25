@@ -78,6 +78,29 @@ export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_ROOT/../infra-public/.github/scripts/check_private_leaks.py}"
+# The SSM parameter of the shared deny-list: names and products with no
+# generic shape, which only this list catches. Every scan passes it.
+LEAK_DENY_SSM="${LOOM_LEAK_DENY_SSM:-/infra/leak-scan/deny-list}"
+
+# The public repo leak scan, the one way the runner calls the scanner, so no
+# scan runs without the deny-list. Arguments are the scanner's (--diff RANGE
+# or --text-file FILE, --allow-repo-ref ...). Exit 0 clean, 1 a hit, 2 no
+# scan: the scanner is missing, the deny-list cannot be read (the scanner
+# exits 2), or this is a lane pod. A pod (LOOM_SSM_DIR) holds no AWS key and
+# the scanner reads the deny-list only from SSM, so a pod scans nothing and
+# pushes nothing to a public repo rather than scan without the list.
+leak_scan() {
+  if [ ! -f "$LEAK_SCANNER" ]; then
+    echo "leak scanner not found: $LEAK_SCANNER" >&2
+    return 2
+  fi
+  if [ -n "${LOOM_SSM_DIR:-}" ]; then
+    echo "a lane pod cannot read the leak scan deny-list $LEAK_DENY_SSM (the scanner reads it only from SSM); nothing scanned" >&2
+    return 2
+  fi
+  env ${LOOM_AWS_REGION:+AWS_REGION="$LOOM_AWS_REGION"} timeout "$NET_TIMEOUT" \
+    python3 -B "$LEAK_SCANNER" "$@" --deny-list-ssm "$LEAK_DENY_SSM"
+}
 INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
 
@@ -1791,7 +1814,7 @@ incident_text_clean() {  # text
   local text_file rc=0
   text_file="$(mktemp "${TMPDIR:-/tmp}/loom-incident.XXXXXX")" || return 1
   printf '%s\n' "$1" > "$text_file"
-  [ -f "$LEAK_SCANNER" ] && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$text_file" \
+  leak_scan --text-file "$text_file" \
     --allow-repo-ref "$FACTORY_REPO" --allow-repo-ref "$REPO" >> "$LOG" 2>&1 || rc=1
   rm -f "$text_file"
   return "$rc"
@@ -2304,8 +2327,7 @@ push_side() {
   if [ "${REPO_PRIVATE:-}" != true ]; then
     range="$BASE..$from"
     [ -n "${FIX_UPSTREAM:-}" ] && range="$FIX_UPSTREAM...$from"
-    if [ ! -f "$LEAK_SCANNER" ] || ! (cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" \
-         --diff "$range" --allow-repo-ref "$REPO") >> "$LOG" 2>&1; then
+    if ! (cd "$TREE" && leak_scan --diff "$range" --allow-repo-ref "$REPO") >> "$LOG" 2>&1; then
       printf 'the public repo leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree'
       return 1
     fi
@@ -3418,7 +3440,14 @@ for BRIEF in "$INBOX"/*.md; do
     [ -n "$FIX_UPSTREAM" ] && SCAN_RANGE="$FIX_UPSTREAM...HEAD"
     # The repo's own issue refs (OWNER/NAME#N and NAME#N in code or tests)
     # name nothing private; the scanner exempts exactly this repo for them.
-    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$SCAN_RANGE" --allow-repo-ref "$REPO" 2>&1)"; then
+    # Exit 2 is no scan (the deny-list could not be read), not a hit in the
+    # lane's work: transient, so another lane may take the ticket.
+    LEAK_RC=0
+    LEAK_OUT="$(cd "$TREE" && leak_scan --diff "$SCAN_RANGE" --allow-repo-ref "$REPO" 2>&1)" || LEAK_RC=$?
+    if [ "$LEAK_RC" -eq 2 ]; then
+      park "$BRIEF" "public repo leak scan could not run; nothing pushed: $LEAK_OUT" transient
+      continue
+    elif [ "$LEAK_RC" -ne 0 ]; then
       park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
       continue
     fi
@@ -3446,7 +3475,7 @@ for BRIEF in "$INBOX"/*.md; do
       # --allow-repo-ref exempts exactly those two forms, as for the diff:
       # rewriting only OWNER/NAME#N to #N left NAME#N flagged (2026-10-21).
       printf '%s\n' "$PR_BODY" > "$BODY_FILE"
-      if ! LEAK_OUT="$(timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$BODY_FILE" --allow-repo-ref "$REPO" 2>&1)"; then
+      if ! LEAK_OUT="$(leak_scan --text-file "$BODY_FILE" --allow-repo-ref "$REPO" 2>&1)"; then
         rm -f "$BODY_FILE"
         park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $LEAK_OUT"
         continue

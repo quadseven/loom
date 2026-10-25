@@ -593,9 +593,16 @@ class LaneRunnerTest(unittest.TestCase):
         self.write_tool(self.bin / "curl", FAKE_CURL)
         self.scanner = root / "check_private_leaks.py"
         self.scanner.write_text("""#!/usr/bin/env python3
-import re, subprocess, sys
+import os, re, subprocess, sys
 args = sys.argv[1:]
 mode, value = args[0], args[1]
+# Each call's arguments, one a line, for the tests that check what it was asked.
+with open(os.environ['FAKE_LOG'] + '.scanner', 'a', encoding='utf-8') as calls:
+    calls.write(' '.join(args) + '\\n')
+# The real scanner exits 2 when it cannot read the deny-list it was asked for.
+if '--deny-list-ssm' in args and os.environ.get('FAKE_DENY_UNREADABLE'):
+    print('FATAL: could not read deny-list from SSM', file=sys.stderr)
+    sys.exit(2)
 # The real scanner's private-issue-ref rule: an issue reference to any repo
 # but the ones named with --allow-repo-ref may name a private repo.
 allowed = [args[i + 1] for i, a in enumerate(args) if a == '--allow-repo-ref']
@@ -707,6 +714,46 @@ print('leak guard: clean (shape patterns only)')
 
     def run_log(self, name="T042-fix-the-thing.log"):
         return (self.loom / "logs" / "codex" / name).read_text()
+
+    def scanner_calls(self):
+        """The fake leak scanner's calls, each its argument string."""
+        calls = Path(str(self.log) + ".scanner")
+        return calls.read_text().splitlines() if calls.exists() else []
+
+    DENY = " --deny-list-ssm /infra/leak-scan/deny-list"
+
+    def test_every_leak_scan_before_a_push_checks_the_deny_list(self):
+        # Every scan ran in shape-only mode, so names and products reached
+        # public branches unchecked (quadseven/loom#1826).
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.scanner_calls()
+        self.assertEqual([c.split()[0] for c in calls], ["--diff", "--text-file"], calls)
+        for call in calls:
+            self.assertTrue(call.endswith(self.DENY), call)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_the_deny_list_parameter_is_a_setting(self):
+        self.drop_brief()
+        self.run_lane(LOOM_LEAK_DENY_SSM="/other/deny-list")
+        calls = self.scanner_calls()
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertTrue(call.endswith(" --deny-list-ssm /other/deny-list"), call)
+
+    def test_an_unreadable_deny_list_pushes_nothing(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_DENY_UNREADABLE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        line = self.failure_line()
+        self.assertTrue(line.startswith("[transient] public repo leak scan could not run"), line)
+        self.assertIn("could not read deny-list", line)
 
     def test_probe_files_are_dropped_before_the_pr_opens(self):
         self.drop_brief()
@@ -1865,6 +1912,17 @@ print('leak guard: clean (shape patterns only)')
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("-timedout-", heads)
         self.assertIn("leak scan refused or could not check the edits", self.failure_line())
+        self.assertEqual(len(self.scanner_calls()), 1, self.scanner_calls())
+        self.assertTrue(self.scanner_calls()[0].endswith(self.DENY), self.scanner_calls())
+
+    def test_a_timeout_keeps_no_branch_on_a_public_repo_when_the_deny_list_is_unreadable(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EDIT="1", FAKE_EXIT="124",
+                      FAKE_DENY_UNREADABLE="1")
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-timedout-", heads)
+        self.assertIn("leak scan refused or could not check the edits", self.failure_line())
 
     def test_a_timeout_after_editing_keeps_the_edits_on_a_timedout_branch(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
@@ -2712,9 +2770,56 @@ exec /usr/bin/git "$@"
         self.assertIn("lane openrouter, model openrouter/vendor/model:free", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def pod_lane(self, **env):
+        """A lane pod pass (bwrap, copied SSM values, egress proved) on
+        opencode-go. Returns the inbox and the result."""
+        self.write_tool(self.bin / "bwrap", "#!/usr/bin/env bash\n"
+                        "while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n"
+                        "[ $# -gt 0 ] || exit 0\nshift\nexec \"$@\"\n")
+        ssm = self.home / ".ssm" / "k"
+        ssm.mkdir(parents=True)
+        (ssm / "oc").write_text("fake-oc-key")
+        inbox = self.loom / "briefs" / "opencode-go"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: opencode-go"))
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = "127.0.0.1:%d" % probe.getsockname()[1]
+        reachable = socket.socket()
+        reachable.bind(("127.0.0.1", 0))
+        reachable.listen(8)
+        self.addCleanup(reachable.close)
+        result = self.run_lane("opencode-go", LOOM_SANDBOX="bwrap", LOOM_EGRESS_DENY_PROBES=closed,
+                               LOOM_EGRESS_ALLOW_PROBE="127.0.0.1:%d" % reachable.getsockname()[1],
+                               LOOM_SSM_DIR=str(self.home / ".ssm"), LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
+                               LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash", **env)
+        return inbox, result
+
+    def test_a_pod_lane_pushes_nothing_to_a_public_repo_without_the_deny_list(self):
+        # A pod holds no AWS key and the scanner reads the deny-list only
+        # from SSM, so a pod scan would run without it (quadseven/loom#1826).
+        inbox, result = self.pod_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertEqual(self.scanner_calls(), [])
+        line = self.failure_line(lane="opencode-go")
+        self.assertTrue(line.startswith("[transient] public repo leak scan could not run"), line)
+        self.assertIn("cannot read the leak scan deny-list", line)
+
+    def test_a_pod_lane_pushes_to_a_private_repo(self):
+        inbox, result = self.pod_lane(FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), self.calls())
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+
     def test_a_pod_lane_runs_under_bwrap_reads_its_key_from_files_and_drops_its_scratch(self):
         # A lane pod (docs/LANES.md, "Lane pods"): no sandbox-exec, no AWS
-        # key, and a scratch volume that holds no finished run.
+        # key, and a scratch volume that holds no finished run. A private
+        # repo: a pod pushes nothing public (see the test above).
         record = Path(self._tmp.name) / "bwrap.calls"
         # Each call: its options up to --, the command and its first argument,
         # and the key it was handed, one a line, then a blank line.
@@ -2745,7 +2850,8 @@ exec /usr/bin/git "$@"
                                LOOM_EGRESS_ALLOW_PROBE="127.0.0.1:%d" % reachable.getsockname()[1],
                                LOOM_SSM_DIR=str(self.home / ".ssm"),
                                LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
-                               LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash")
+                               LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash",
+                               FAKE_GH_PRIVATE="true")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), self.calls())
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
@@ -5592,6 +5698,18 @@ exec /usr/bin/git "$@"
         body = Path(f"{self.body}.issue").read_text()
         self.assertNotIn(address, body)
         self.assertIn("Repo: example/repo", body)
+        self.assertIn("withheld", body)
+        self.assertTrue(self.scanner_calls())
+        for call in self.scanner_calls():
+            self.assertTrue(call.endswith(self.DENY), call)
+
+    def test_a_public_repo_incident_detail_is_withheld_when_the_deny_list_is_unreadable(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_DENY_UNREADABLE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = Path(f"{self.body}.issue").read_text()
+        self.assertNotIn("python: 3.12", body)
         self.assertIn("withheld", body)
 
     def test_a_second_still_failing_edits_the_existing_incident_comment(self):
