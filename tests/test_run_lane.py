@@ -27,6 +27,12 @@ from tests.local_http import LocalHTTPServer  # noqa: E402
 ROUND_MARKER = "<!-- loom:lane-round v1 -->"
 RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
 INSTALL_LOCK = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "lock.sh"
+# The sandbox helpers contract_run and sandbox_profile call, for the tests
+# that run those functions alone (the default seatbelt sandbox).
+SANDBOX_HELPERS = "".join(
+    re.search(r"^%s\(\) \{\n.*?^\}\n" % name,
+              (RUNNER.parent / "agent_sandbox.sh").read_text(), re.S | re.M).group(0)
+    for name in ("sandbox_kind", "sandbox_command"))
 
 BRIEF = """# Brief: T042-fix-the-thing
 
@@ -2705,6 +2711,91 @@ exec /usr/bin/git "$@"
         self.assertNotIn(f"home={self.home} ", agent[0])
         self.assertIn("lane openrouter, model openrouter/vendor/model:free", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_pod_lane_runs_under_bwrap_reads_its_key_from_files_and_drops_its_scratch(self):
+        # A lane pod (docs/LANES.md, "Lane pods"): no sandbox-exec, no AWS
+        # key, and a scratch volume that holds no finished run.
+        record = Path(self._tmp.name) / "bwrap.calls"
+        # Each call: its options up to --, the command and its first argument,
+        # and the key it was handed, one a line, then a blank line.
+        self.write_tool(self.bin / "bwrap", "#!/usr/bin/env bash\n"
+                        "out=" + shlex.quote(str(record)) + "\n"
+                        "while [ $# -gt 0 ] && [ \"$1\" != -- ]; do printf '%s\\n' \"$1\" >> \"$out\"; shift; done\n"
+                        "printf '%s\\n' \"${1:-}\" \"${2:-}\" \"${3:-}\" \"key=${OPENCODE_API_KEY:-none}\" '' >> \"$out\"\n"
+                        "[ $# -gt 0 ] || exit 0\nshift\nexec \"$@\"\n")
+        self.write_tool(self.bin / "sandbox-exec", "#!/bin/sh\necho sandbox-exec >> \"$FAKE_LOG\"\nexit 97\n")
+        ssm = self.home / ".ssm" / "k"
+        ssm.mkdir(parents=True)
+        (ssm / "oc").write_text("fake-oc-key")
+        inbox = self.loom / "briefs" / "opencode-go"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: opencode-go"))
+        # Leftovers of a check a killed runner never finished.
+        (self.loom / "worktrees" / "T042-fix-the-thing-default-check").mkdir(parents=True)
+        (self.loom / "run" / "opencode-go-check-default").mkdir(parents=True)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = "127.0.0.1:%d" % probe.getsockname()[1]
+        reachable = socket.socket()
+        reachable.bind(("127.0.0.1", 0))
+        reachable.listen(8)
+        self.addCleanup(reachable.close)
+        result = self.run_lane("opencode-go", LOOM_SANDBOX="bwrap", LOOM_DROP_TREES="1",
+                               LOOM_EGRESS_DENY_PROBES=closed,
+                               LOOM_EGRESS_ALLOW_PROBE="127.0.0.1:%d" % reachable.getsockname()[1],
+                               LOOM_SSM_DIR=str(self.home / ".ssm"),
+                               LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
+                               LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), self.calls())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+        calls = self.calls()
+        self.assertNotIn("sandbox-exec", calls)
+        self.assertFalse([c for c in calls if c.startswith("aws ")], calls)
+        runs = [call.splitlines() for call in record.read_text().split("\n\n")
+                if "\n--\nopencode\nrun\n" in call]
+        self.assertEqual(len(runs), 1, record.read_text())
+        words = runs[0]
+        home = str(self.home.resolve())
+        tree = str((self.loom / "worktrees" / "T042-fix-the-thing").resolve())
+        self.assertEqual(words[-1], "key=fake-oc-key")
+        triples = [words[i:i + 3] for i in range(len(words))]
+        # No bind of / and nothing of HOME but the tree and scratch home.
+        self.assertFalse([t for t in triples if t[0] in ("--bind", "--ro-bind", "--ro-bind-try") and t[1] in ("/", home)])
+        self.assertIn("/var/run/secrets", [words[i + 1] for i, w in enumerate(words) if w == "--tmpfs"])
+        self.assertIn(["--bind", tree, tree], [words[i:i + 3] for i in range(len(words))])
+        self.assertIn(["--ro-bind", tree + "/.git", tree + "/.git"], [words[i:i + 3] for i in range(len(words))])
+        # The run's scratch is gone; its log and the brief stay.
+        self.assertEqual(sorted(p.name for p in (self.loom / "worktrees").iterdir()), [])
+        self.assertFalse((self.loom / "run" / "opencode-go-home").exists())
+        self.assertFalse((self.loom / "run" / "opencode-go-check").exists())
+        self.assertFalse((self.loom / "run" / "opencode-go-check-default").exists())
+        self.assertIn("T042-fix-the-thing done", (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text())
+
+    def test_a_pod_lane_without_narrowed_egress_runs_no_agent(self):
+        self.write_tool(self.bin / "bwrap", "#!/bin/sh\necho bwrap >> \"$FAKE_LOG\"\nexit 0\n")
+        ssm = self.home / ".ssm" / "k"
+        ssm.mkdir(parents=True)
+        (ssm / "oc").write_text("fake-oc-key")
+        inbox = self.loom / "briefs" / "opencode-go"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: opencode-go"))
+        result = self.run_lane("opencode-go", LOOM_SANDBOX="bwrap", LOOM_SSM_DIR=str(self.home / ".ssm"),
+                               LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
+                               LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        self.assertFalse([c for c in self.calls() if c.startswith("opencode run")])
+        beat = json.loads((self.loom / "state" / "usage" / "opencode-go.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("bwrap narrows no network", beat["reason"])
+
+    def test_without_drop_trees_a_lane_keeps_its_tree_for_the_station_to_prune(self):
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.loom / "worktrees" / "T042-fix-the-thing").is_dir())
 
     def test_opencode_temp_paths_and_external_directory_denial_keep_the_sandbox_boundary(self):
         profile_file = str(Path(self._tmp.name) / "sandbox.profile")
@@ -5793,7 +5884,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(tmp / "log"), "TREE": str(tmp),
                "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30"}
         result = subprocess.run(["bash", "-c", script, "test", f"true\x1b[2K; touch {marker}"],
@@ -5823,7 +5914,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
         log = tmp / "log"
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log), "TREE": str(tmp),
                "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30",
@@ -5856,7 +5947,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
         log = tmp / "log"
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(tmp / "home"), "LOG": str(log),
                "TREE": str(tmp), "CHECK_HOME": str(tmp), "CHECK_CLI": "bash",
@@ -5942,7 +6033,7 @@ exec /usr/bin/git "$@"
         # runner's home: the two binaries get file literals, their directory
         # gets no subpath rule.
         text = (Path(__file__).resolve().parent.parent / "lanes" / "agent_sandbox.sh").read_text()
-        funcs = re.search(r"^sandbox_profile\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        funcs = SANDBOX_HELPERS + re.search(r"^sandbox_profile\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
         tmp = Path(self._tmp.name)
         home = tmp / "home"
         tree = tmp / "tree"

@@ -51,7 +51,13 @@
 # LOOM_<SLOT>_PROBE_URL and _PROBE_HEADER (API lanes: the provider's chat
 # endpoint, asked for a usage limit before each run and after a timeout; see
 # provider_at_limit),
-# LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
+# LOOM_SANDBOX (seatbelt, the default, or bwrap in a lane pod, which also
+# needs LOOM_EGRESS_DENY_PROBES, IPv4:port addresses the pod's egress policy
+# blocks, and LOOM_EGRESS_ALLOW_PROBE, a host:port it must reach; see
+# egress_denied),
+# LOOM_DROP_TREES (1: each run's scratch goes when it ends), LOOM_SSM_DIR (a
+# folder of copied SSM values read in place of SSM; docs/LANES.md, "Lane
+# pods"), LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
 # LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
 # (docs/LANES.md, "Anthropic spend"), and for the spark lane LOOM_SPARK_URL
 # (the OpenAI-compatible base URL of the local vLLM coder, e.g.
@@ -121,6 +127,24 @@ echo $$ > "$LOCK/pid"
 # built its caches) goes with the runner, before the lock is let go, so run/
 # holds one only while its lane is running (loom#643).
 drop_check_home() { [ -z "${CHECK_HOME:-}" ] || rm -rf "$CHECK_HOME"; }
+# LOOM_DROP_TREES=1 (a lane pod; docs/LANES.md, "Lane pods"): a run's scratch
+# goes when the run ends, whatever its outcome: its tree, the runner's files
+# beside it, the agent's scratch home and the check's. The station prunes
+# trees on the Mac (prune_trees) but cannot see a pod's disk, and a pod's
+# scratch volume is sized for the runs in flight, not for kept trees. Logs and
+# the brief stay where the station reads them. Called before each brief and
+# when the runner exits.
+drop_run_scratch() {
+  [ "${LOOM_DROP_TREES:-}" = 1 ] && [ "$LANE" != agy ] || return 0
+  drop_check_home
+  [ -z "${CHECK_HOME:-}" ] || rm -rf "$CHECK_HOME-default"
+  [ -z "${AGENT_HOME:-}" ] || rm -rf "$AGENT_HOME"
+  [[ "${TICKET:-}" =~ ^[A-Za-z0-9._-]+$ ]] && [ -n "${WORKDIR:-}" ] || return 0
+  local f
+  for f in "" -default-check .answers .described-step .final-message .no-change.md .opencode-events .run.md .summary.md; do
+    rm -rf "${WORKDIR:?}/$TICKET$f"
+  done
+}
 # The runner writes its usage heartbeat between runs, not during one, and a
 # run can take over an hour (loom#1281). While this runner lives, a background
 # loop stamps state/usage/<slot>.alive with the time every
@@ -148,7 +172,7 @@ stop_keepalive() {
 mkdir -p "$LOOM_HOME/state/usage"
 keepalive_loop $$ > /dev/null 2>&1 &
 KEEPALIVE_PID=$!
-trap 'drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
+trap 'drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
@@ -1854,6 +1878,7 @@ contract_run() {
     uv_bins="${uv_bins:+$uv_bins }$uv_bin"
   done
   profile="$(AGENT_HOME="$CHECK_HOME" CHECK_UV_BINS="$uv_bins" sandbox_profile "$TREE" "$CHECK_CLI" check)" || return 125
+  sandbox_command "$profile" || return 125
   # shellcheck disable=SC2030,SC2031 # deliberately local to the check's subshell
   (
     cd "$TREE" || exit 125
@@ -1874,7 +1899,7 @@ contract_run() {
       LOOM_CHANGED_FILES="$(cat "$input")" || exit 125
       export LOOM_CHANGED_FILES
     fi
-    exec timeout "$CHECK_TIMEOUT" sandbox-exec -p "$profile" /bin/bash -c "$1" < "$input"
+    exec timeout "$CHECK_TIMEOUT" "${SANDBOX_CMD[@]}" /bin/bash -c "$1" < "$input"
   ) 2>&1 | timeout "$((CHECK_TIMEOUT + 60))" cat >> "$LOG"
 }
 
@@ -1982,9 +2007,9 @@ prepare_validation() {
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
   what="interpreter ${C_INTERP:-none}; submodules $C_SUBMODULES"
-  if ! command -v sandbox-exec > /dev/null; then
-    SETUP_REASON="sandbox-exec not available"
-    note_factory_incident environment "sandbox-exec not available" SETUP_REASON
+  if ! sandbox_ready; then
+    SETUP_REASON="$SANDBOX_WHY"
+    note_factory_incident environment "$SANDBOX_WHY" SETUP_REASON
   elif [ -n "$C_INTERP" ] && ! interp="$(command -v "$C_INTERP")"; then
     SETUP_REASON="interpreter $C_INTERP is not on PATH"
     note_factory_incident environment "interpreter: $C_INTERP" SETUP_REASON
@@ -2207,7 +2232,7 @@ final_affected() {
 # changes tracked files; 2 when the runner cannot run a check at all.
 run_committed_contract() {
   local base_setup="$1" rc changed rev
-  command -v sandbox-exec > /dev/null || { CONTRACT_REFUSAL="sandbox-exec not available"; return 2; }
+  sandbox_ready || { CONTRACT_REFUSAL="$SANDBOX_WHY"; return 2; }
   if [ -n "$C_INTERP" ] && ! command -v "$C_INTERP" > /dev/null; then
     CONTRACT_REFUSAL="the contract names interpreter $C_INTERP, which is not on the lane machine's PATH"
     return 1
@@ -2757,7 +2782,7 @@ lane_ready() {
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
   [ "$LANE" = anthropic ] && ! anthropic_credit_ok && return 1
   case "$LANE" in codex|claude) return 0 ;; esac
-  command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
+  sandbox_ready || { READY_REASON="$SANDBOX_WHY"; return 1; }
   case "$LANE" in zen) return 0 ;; spark|free) spark_ready; return ;; esac
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
@@ -2910,6 +2935,7 @@ fi
 
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
+  drop_run_scratch
   PR_BODY=""
   DROPPED_SCRATCH_FILES=""
   TICKET="$(basename "$BRIEF" .md)"
