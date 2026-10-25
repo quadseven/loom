@@ -276,6 +276,20 @@ def _split_current(body: str) -> Tuple[str, str, str]:
     return prefix, generated, suffix
 
 
+def _read_summary(summary_path: Optional[str]) -> str:
+    """The lane's Intent summary, "" when there is none or it is unreadable,
+    with local paths as <path>: a model that writes its tool's file path into
+    it (infra-5956-r3, 2026-10-25) must not stop every repair."""
+    if not summary_path:
+        return ""
+    try:
+        with open(summary_path, encoding="utf-8") as fh:
+            summary = _normalise(fh.read())
+    except OSError:
+        return ""
+    return text.LOCAL_PATH_RE.sub("<path>", summary)
+
+
 def reconcile(brief_path: str, current_title: str, current_body: str,
               lane: str, model: str, ticket: str,
               summary_path: Optional[str] = None, repo: Optional[str] = None,
@@ -307,16 +321,7 @@ def reconcile(brief_path: str, current_title: str, current_body: str,
         result["reason"] = "cannot read brief: %s" % err
         return result
 
-    summary = ""
-    if summary_path:
-        try:
-            with open(summary_path, encoding="utf-8") as fh:
-                summary = _normalise(fh.read())
-        except OSError:
-            summary = ""
-    # The summary is the lane's own text: a model that writes its tool's file
-    # path into it (infra-5956-r3, 2026-10-25) must not stop every repair.
-    summary = text.LOCAL_PATH_RE.sub("<path>", summary)
+    summary = _read_summary(summary_path)
 
     # Every bug the lane reports must cite a real issue (loom#1779): a
     # rejected line refuses the repair, and the lane files it or drops it.
