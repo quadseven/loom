@@ -34,9 +34,10 @@ HEAD = ("Difficulty: easy\n\n## Why\nBecause.\n\n## Acceptance criteria\n"
         "- [ ] A test passes\n")
 LOG_BODY = HEAD + "- [ ] Live: after the ship, `log:worker` names `boat leg taken`\n"
 # Ticket text under test, never run as SQL: the refusal is what is tested.
-SQL_BODY = HEAD + ("- [ ] Live: `sql:SELECT COUNT(*) AS stuck FROM queue WHERE state = 'held'` "  # noqa: S608
-                   "answers `stuck=0`\n")
-WRITE_SQL_BODY = HEAD + "- [ ] Live: `sql:UPDATE queue SET state = 'done'` answers `ok`\n"  # noqa: S608
+STUCK = "SELECT COUNT(*) AS stuck FROM queue WHERE state = 'held'"  # noqa: S608
+SQL_BODY = HEAD + "- [ ] Live: `sql:%s` answers `stuck=0`\n" % STUCK
+WRITE = "UPDATE queue SET state = 'done'"  # noqa: S608
+WRITE_SQL_BODY = HEAD + "- [ ] Live: `sql:%s` answers `ok`\n" % WRITE
 ABSENT_BODY = HEAD + ("- [ ] Live: over 24 hours after the ship, `log:worker` never names "
                       "`drowned below the pier`\n")
 SCRIPT = """#!/bin/sh
@@ -93,8 +94,10 @@ class StationAdapterProofTest(tbs.Base):
         return st
 
     def note(self):
-        [note] = [c for c in self.plain_comments() if "Every acceptance criterion has evidence" in c]
-        return note
+        found = [c for c in self.plain_comments()
+                 if "Every acceptance criterion has evidence" in c]
+        self.assertEqual(len(found), 1)
+        return found[0]
 
     def test_a_log_source_box_closes_quoting_the_adapter_lines(self):
         self.ship(LOG_BODY, hours_ago=2)
@@ -124,8 +127,7 @@ class StationAdapterProofTest(tbs.Base):
         fake = FakeAdapter(rows=["stuck=0"])
         self.adapter_pass(fake)
         self.assertEqual(self.fake.issues[self.NUMBER]["state"], "closed")
-        self.assertEqual(fake.calls, [
-            ("sql", "SELECT COUNT(*) AS stuck FROM queue WHERE state = 'held'")])
+        self.assertEqual(fake.calls, [("sql", STUCK)])
         self.assertIn("the query answered 1 rows, found `stuck=0`", self.note())
 
     def test_a_failing_read_stays_open_with_the_reason(self):
@@ -160,8 +162,8 @@ class StationAdapterProofTest(tbs.Base):
 
     def test_a_present_absent_string_keeps_the_ticket_open(self):
         self.ship(ABSENT_BODY, hours_ago=30)
-        self.adapter_pass(FakeAdapter(["%s worker: drowned below the pier" % stamp(self.now - HOUR)],
-                                      hours=30))
+        line = "%s worker: drowned below the pier" % stamp(self.now - HOUR)
+        self.adapter_pass(FakeAdapter([line], hours=30))
         self.assertEqual(self.fake.issues[self.NUMBER]["state"], "open")
         self.assertIn("names `drowned below the pier` 1 times", self.status_text())
 
@@ -218,7 +220,8 @@ class ManifestTest(unittest.TestCase):
         adapter, why = self.parse(MANIFEST)
         self.assertEqual(why, "")
         self.assertEqual(adapter.sources, ("worker",))
-        self.assertEqual(set(adapter.scripts), {".loom/live-evidence/log", ".loom/live-evidence/sql"})
+        self.assertEqual(set(adapter.scripts),
+                         {".loom/live-evidence/log", ".loom/live-evidence/sql"})
 
     def test_shell_shaped_and_write_shaped_argv_are_refused(self):
         refused = {
