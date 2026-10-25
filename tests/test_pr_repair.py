@@ -232,6 +232,42 @@ class ReconcileTest(unittest.TestCase):
         self.assertFalse(result["changed"])
         self.assertIn("review bot", result["reason"])
 
+    def test_a_local_path_in_the_lanes_summary_reads_path(self):
+        # A model wrote its write tool's file path into the summary's
+        # operator steps, and every repair of the pull request was refused
+        # (infra-5956-r3, 2026-10-25).
+        self.write_brief(BRIEF_CORRECTED)
+        summary = os.path.join(self._tmp.name, "summary.md")
+        with open(summary, "w", encoding="utf-8") as fh:
+            fh.write("## Operator steps before merge\nnone\nfilePath\">\n"
+                     "/private/var/loom/worktrees/T42/.loom/summary.md\n")
+        result = pr_repair.reconcile(self.brief, "Fix the thing", RUNNER_BODY,
+                                     "codex", "gpt-test", "T42", summary_path=summary)
+        self.assertEqual(result["reason"], "")
+        self.assertTrue(result["changed"])
+        self.assertIn("## Operator steps before merge\nnone\nfilePath\">\n<path>\n", result["body"])
+        self.assertNotIn("/private/", result["body"])
+
+    def test_a_path_the_ticket_names_is_kept(self):
+        # The ticket named a server path, the first pull request body carried
+        # it, and the repair refused that same text (infra-5819-r3).
+        named = BRIEF.replace("Make the thing work.", "Keep the data under `/opt/apps/*`.")
+        self.write_brief(named.replace(
+            "- [ ] A test covers the thing",
+            "- [ ] A test covers the thing\n- [ ] The edge case is handled"))
+        body = RUNNER_BODY.replace("Make the thing work.", "Keep the data under `/opt/apps/*`.")
+        result = pr_repair.reconcile(self.brief, "Fix the thing", body, "codex", "gpt-test", "T42")
+        self.assertEqual(result["reason"], "")
+        self.assertTrue(result["changed"])
+        self.assertIn("Keep the data under `/opt/apps/*`.", result["body"])
+
+    def test_refuses_a_path_neither_the_ticket_nor_the_lane_wrote(self):
+        self.write_brief(BRIEF_CORRECTED)
+        body = RUNNER_BODY.replace("---\n", "Reviewer note: see /var/run/notes\n\n---\n")
+        result = pr_repair.reconcile(self.brief, "Fix the thing", body, "codex", "gpt-test", "T42")
+        self.assertFalse(result["changed"])
+        self.assertIn("absolute path", result["reason"])
+
     def test_refuses_proposed_text_with_closing_keyword(self):
         body = RUNNER_BODY
         bad = BRIEF.replace("Make the thing work.", "Fixes #42.")
