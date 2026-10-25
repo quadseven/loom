@@ -15,7 +15,7 @@ the diff adds is in scope when either holds:
   workflow or action must be named in the brief.
 
 - it sits at the top level beside tracked top-level files of its
-  extension, and a tracked file the diff edits wires it in: a Python
+  extension, and a line the diff adds to a tracked file wires it in: a Python
   ``import <stem>`` / ``from <stem> import``, or its full name. A repo
   that keeps its modules at the top level had every new module refused,
   since no brief can name a file the agent has not chosen yet (loom#1705).
@@ -47,7 +47,7 @@ import os
 import re
 import subprocess
 import sys
-from typing import Iterable, List, Sequence, Set
+from typing import Iterable, List, Optional, Sequence, Set
 
 # Characters that may sit inside a path token in the brief's prose.
 _PATH_CHAR = r"[\w./-]"
@@ -135,39 +135,45 @@ def edited_files(tree: str, base: str, head: str) -> List[str]:
                        "--name-only", base, head))
 
 
-# Top-level names that tools load or run on their own: never in scope unnamed.
+# Source extensions a new top-level file may wire in by import or name.
+# Config and tool-entry files (pyproject.toml, tox.ini, a Makefile) are not
+# here, so the brief must name them.
+WIRED_EXTENSIONS = frozenset(("py", "js", "mjs", "ts", "go", "rb", "lua", "rs"))
+
+# Source files that tools load or run on their own: never in scope unnamed.
 AUTO_RUN_NAMES = frozenset(("conftest.py", "setup.py", "sitecustomize.py",
-                            "usercustomize.py", "noxfile.py", "Makefile"))
+                            "usercustomize.py", "noxfile.py", "__init__.py",
+                            "__main__.py", "tasks.py", "fabfile.py", "dodo.py",
+                            "manage.py"))
 
 
-def _grep(tree: str, head: str, args: Sequence[str], paths: Sequence[str]) -> bool:
-    proc = subprocess.run(["git", "-C", tree, "grep", "-I", "-q", *args, head, "--",
-                           *(":(literal)" + p for p in paths)],
-                          capture_output=True, check=False)
-    if proc.returncode not in (0, 1):
-        raise GitError("git grep failed: %s" % proc.stderr.decode(errors="replace").strip())
-    return proc.returncode == 0
+def added_lines(tree: str, base: str, head: str, paths: Sequence[str]) -> List[str]:
+    """The lines the diff adds to these paths."""
+    out = _git(tree, "diff", "-U0", "--no-renames", "--no-color", base, head, "--",
+               *(":(literal)" + p for p in paths))
+    return [line[1:] for line in out.splitlines()
+            if line.startswith("+") and not line.startswith("+++")]
 
 
-def wired_top_level(tree: str, head: str, path: str, tracked: Set[str],
-                    edited: Sequence[str]) -> bool:
-    """True when a new top-level file sits beside tracked top-level files of
-    its extension and a tracked file the diff edits imports it or names it.
-    Only edited tracked files count, so two new files cannot vouch for each
-    other; hidden, auto-run and standard-library names never qualify."""
+def wired_top_level(path: str, tracked: Set[str], lines: Sequence[str]) -> bool:
+    """True when a new top-level source file sits beside tracked top-level
+    files of its extension and a line the diff adds to an edited tracked
+    file imports it or names it. Only those lines count, so two new files
+    cannot vouch for each other and an old mention vouches for nothing;
+    hidden, auto-run and standard-library names never qualify."""
     name, dot, suffix = path.rpartition(".")
     if ("/" in path or not dot or not name or path.startswith(".")
-            or not path.isprintable() or path in AUTO_RUN_NAMES):
+            or not path.isprintable() or suffix not in WIRED_EXTENSIONS
+            or path.casefold() in AUTO_RUN_NAMES):
         return False
-    if suffix == "py" and name in getattr(sys, "stdlib_module_names", ()):
+    if suffix == "py" and name.casefold() in getattr(sys, "stdlib_module_names", ()):
         return False
-    if not edited or not any("/" not in t and t.endswith(dot + suffix) for t in tracked):
+    if not any("/" not in t and t.endswith(dot + suffix) for t in tracked):
         return False
-    if _grep(tree, head, ["-w", "-F", "-e", path], edited):
-        return True
-    return (suffix == "py" and name.isidentifier() and _grep(
-        tree, head, ["-E", "-e", r"^[[:space:]]*(from|import)[[:space:]]+%s([[:space:].,]|$)" % name],
-        edited))
+    whole = re.compile(r"(?<![\w./-])%s(?![\w/-]|\.\w)" % re.escape(path))
+    imported = (re.compile(r"^\s*(from|import)\s+%s(\s|\.|,|$)" % re.escape(name))
+                if suffix == "py" and name.isidentifier() else None)
+    return any(whole.search(line) or (imported and imported.match(line)) for line in lines)
 
 
 def stray_files(tree: str, base: str, head: str, brief_text: str,
@@ -180,14 +186,16 @@ def stray_files(tree: str, base: str, head: str, brief_text: str,
         dirs |= top_dirs(tree, rev)
         elsewhere |= tracked_files(tree, rev)
     stray = []
-    edited: List[str] = []
+    lines: Optional[List[str]] = None
     for path in added_files(tree, base, head):
         if (path in elsewhere or named(brief_text, path) or in_known_dir(path, dirs)
                 or in_known_hidden_subdir(path, tracked)):
             continue
         if "/" not in path:
-            edited = edited or edited_files(tree, base, head)
-            if wired_top_level(tree, head, path, tracked, edited):
+            if lines is None:
+                edited = edited_files(tree, base, head)
+                lines = added_lines(tree, base, head, edited) if edited else []
+            if wired_top_level(path, tracked, lines):
                 continue
         stray.append(path)
     return stray
