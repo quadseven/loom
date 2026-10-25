@@ -2647,6 +2647,10 @@ exec /usr/bin/git "$@"
         config = next(line.removeprefix("config=") for line in self.calls()
                       if line.startswith("config="))
         self.assertEqual(json.loads(config)["permission"]["external_directory"], "deny")
+        # Reads in the tree are allowed: opencode asks before a *.env read by
+        # default, a lane cannot answer, and a tracked pin file stopped two
+        # runs (loom#1728).
+        self.assertEqual(json.loads(config)["permission"]["read"], {"*": "allow"})
         self.assertNotIn(f"home={self.home} ", agent[0])
         self.assertIn("lane openrouter, model openrouter/vendor/model:free", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
