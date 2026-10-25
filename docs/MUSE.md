@@ -615,18 +615,18 @@ Anthropic lane and never goes to agy. A `Model:` line naming gpt-6-sol or a
 gemini-4-argon model reads as gpt-6-luna or gemini-3.8-flash-high, and the
 brain writes the same stand-in (`FORBIDDEN_MODELS` in bus/tickets.py).
 
-When no lane of a ticket's tier is up (every one at a limit or down), the
-factory's tier moves (a ticket off a lane at a limit, a queued ticket getting
-its lane) fall back to the next harder tier's free lanes, then the easier
+When no lane of a ticket's tier is up for hours (every one at a limit or
+down), the factory's tier moves (a ticket off a lane at a limit, a queued
+ticket getting its lane) fall back to the next harder tier's free lanes, then the easier
 tier's (the table `FALLBACK` next to `TIERS` in bus/factory.py), keeping
 private repos off the public-only lanes. Medium falls back to hard, then
 easy: claude when it is free, else spark or a free lane. Easy and hard have
 no fallback, for the rules above. A fallback move says so in its note
 ("fallback: no medium lane is up"); the ticket keeps its `Difficulty:` line,
-so its next move takes its own tier again once a lane of it is up. A tier
-with a lane up but busy is waited for, not fallen back from, and so is a
-tier whose lanes are down or at a limit but one of them lifts within two
-hours (`LIMIT_REQUEUE`); a lane at a limit with no known end counts as out
+so its next move takes its own tier again once a lane of it is up. Queued
+tickets also use a fallback lane when every available lane in their tier is
+occupied. A tier whose lanes are down or at a limit but one lifts within two
+hours (`LIMIT_REQUEUE`) still waits; a lane at a limit with no known end counts as out
 for hours. A move off a lane at a limit names when it lifts in its note. A
 ticket marked `needs-brain` or `loom:runaway` is held for the brain, and no
 such move touches it.

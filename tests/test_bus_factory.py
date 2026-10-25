@@ -2144,6 +2144,18 @@ class Queued(Base):
         say.assert_called_once_with("assigned 0 of 1 queued: %s#7 waits: no free lane "
                                     "in tier medium" % REPO)
 
+    def test_a_queued_medium_ticket_uses_free_fallback_when_its_tier_is_busy(self):
+        self.gh.ticket(6, "running", lane="codex")
+        self.queued(7)
+        self.assign(available=["codex", "claude"])
+        self.assertEqual(self.lane(7), "claude")
+
+    def test_a_queued_ticket_with_a_retired_model_uses_its_supported_stand_in(self):
+        self.queued(7, body="Model: gpt-6-sol\nDifficulty: medium\n\n## Why\nx\n")
+        self.assign(available=["codex"])
+        self.assertEqual(self.lane(7), "codex")
+        self.assertIn("Model: gpt-6-luna", self.gh.issues[7]["body"])
+
     def test_a_queued_ticket_with_no_difficulty_takes_a_medium_lane(self):
         # A queued ticket whose body had no Difficulty line was in no tier, so
         # no lane could ever take it; one waited a day (2026-10-21).

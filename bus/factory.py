@@ -313,10 +313,10 @@ STRONG = frozenset({LADDER[-1][1]} | set(HARD_MODELS.values())
                    | {model for _, model, _ in EQUIVALENTS.values()})
 EQUIVALENT_MARKER = "<!-- loom:equivalent %s -->"
 EQUIVALENT_RE = re.compile(r"<!-- loom:equivalent (\S+) -->")
-# When no lane of a ticket's tier is up (each at a limit or down), a tier move
-# takes a free lane of these tiers instead, in order: the next harder tier,
-# then the easier one (docs/MUSE.md, Lane choice). On 2026-10-14 every medium
-# lane was at a limit for hours while claude and the free lanes sat idle.
+# When no lane of a ticket's tier is up for hours, a tier move takes a free
+# lane of these tiers instead, in order: the next harder tier, then the easier
+# one (docs/MUSE.md, Lane choice). Queued tickets also use an idle fallback
+# when their own tier is up but fully occupied.
 # Easy has none (never anthropic or claude) and hard has none (never a free
 # lane or spark).
 FALLBACK: Dict[str, Tuple[str, ...]] = {"medium": ("hard", "easy")}
@@ -1508,11 +1508,11 @@ class Factory:
         return self._up(lane) and self.load.get(lane, 0) == 0
 
     def _tier_move(self, repo: str, issue: Dict[str, Any],
-                   old: str = "", allow_remote: bool = True) -> Tuple[Optional[str], str]:
-        """(lane, fallback) for a tier move off lane `old`: the first free lane
-        of the ticket's tier, with fallback ""; else, when no lane of its tier
-        is up, the first free lane of its FALLBACK tiers in order, with
-        fallback saying so. (None, "") when it should wait."""
+                   old: str = "", allow_remote: bool = True,
+                   busy_fallback: bool = False) -> Tuple[Optional[str], str]:
+        """(lane, fallback) for a tier move off lane `old`: prefer its own
+        tier, then use a FALLBACK tier when the own tier is out for hours or
+        queued work has no free lane because its tier is occupied."""
         private = self._is_private(repo)
         difficulty = difficulty_of(issue)
         agy_ok = agy_takes_header(issue, rung_only=True)
@@ -1520,20 +1520,26 @@ class Factory:
                if x != old and (allow_remote or x not in REMOTE_LANES)
                and (x != "agy" or agy_ok)]
         lane = next((x for x in own if self._free(x)), None)
-        if lane is not None or any(self._up(x) for x in own):
+        if lane is not None:
             return lane, ""
+        own_up = any(self._up(x) for x in own)
         whole = own + ([old] if old in lanes_of(difficulty, private) and old not in own else [])
-        if not all(self._out_hours(x) for x in whole):
-            # A lane of the tier lifts within LIMIT_REQUEUE: wait for it
-            # rather than leave the tier (loom#1224).
+        out_for_hours = all(self._out_hours(x) for x in whole)
+        busy = any(self._up(x) and self.load.get(x, 0) > 0 for x in own)
+        if not out_for_hours and not (busy_fallback and own_up and busy):
             return None, ""
+        # Keep the tier preference, but let queued work use idle fallback
+        # capacity when every available lane in its tier is already occupied.
         for tier in FALLBACK.get(difficulty, ()):
             fallback_lanes = [x for x in lanes_of(tier, private)
                               if x != old and (allow_remote or x not in REMOTE_LANES)
                               and (x != "agy" or agy_ok)]
             lane = next((x for x in fallback_lanes if self._free(x)), None)
             if lane is not None:
-                return lane, "fallback: no %s lane is up" % difficulty
+                reason = "no %s lane is free" % difficulty if own_up else "no %s lane is up" % difficulty
+                return lane, "fallback: " + reason
+        if own_up:
+            return None, ""
         return None, ""
 
     def _check_runs(self, repo: str, sha: str) -> List[Dict[str, Any]]:
@@ -3107,7 +3113,7 @@ class Factory:
 
     def assign_queued(self) -> None:
         """Give queued tickets free tier lanes (or FALLBACK lanes when none of
-        the tier is up) across repos in tickets.work_order: FIRST labels,
+        the tier is free) across repos in tickets.work_order: FIRST labels,
         then priority, then the oldest. A pass that gives none a lane says
         how many wait and why the first does."""
         found_by_repo = {repo: self._tickets(repo) for repo in self.repos}
@@ -3127,16 +3133,16 @@ class Factory:
             return "%s %s" % (ref, held)
         model_match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
         if model_match:
-            return self._assign_queued_model(repo, issue, model_match.group(1))
+            return self._assign_queued_model(repo, issue, tickets.allowed_model(model_match.group(1)))
         assigned = _lane(issue)
         if assigned in REMOTE_LANES and not self._is_private(repo) and self._up(assigned):
             # A live remote assignment stays queued for its pull worker.
             self._waiting(repo, issue["number"], "remote lane %s has not pulled it" % assigned)
             return "%s waits for remote lane %s to pull it" % (ref, assigned)
         if assigned in REMOTE_LANES:
-            lane, fallback = self._tier_move(repo, issue, old=assigned)
+            lane, fallback = self._tier_move(repo, issue, old=assigned, busy_fallback=True)
         else:
-            lane, fallback = self._tier_move(repo, issue)
+            lane, fallback = self._tier_move(repo, issue, busy_fallback=True)
         if lane is None:
             self._waiting(repo, issue["number"], "no free lane in tier %s" % difficulty_of(issue))
             return "%s waits: no free lane in tier %s" % (ref, difficulty_of(issue))
@@ -3224,7 +3230,8 @@ class Factory:
                 else "(its Model: line names no model id)"))
             _say(why)
             return why
-        if not self._guarded(self._assign_queued_one, repo, issue, lane, "model %s" % model):
+        if not self._guarded(self._assign_queued_one, repo, issue, lane,
+                             "model %s" % model, model):
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
 
@@ -3247,7 +3254,7 @@ class Factory:
              % (repo, number, lane, model, pinned))
 
     def _assign_queued_one(self, repo: str, issue: Dict[str, Any], lane: str,
-                           tier: str) -> None:
+                           tier: str, model: Optional[str] = None) -> None:
         number = int(issue["number"])
         if lane in REMOTE_LANES:
             self.move(self.gh, repo, number, "queued", lane=lane)
@@ -3260,7 +3267,7 @@ class Factory:
             _say("reserved queued %s#%d for remote lane %s (tier %s)"
                  % (repo, number, lane, tier))
             return
-        self.move(self.gh, repo, number, "briefed", lane=lane)
+        self.move(self.gh, repo, number, "briefed", lane=lane, model=model)
         self._status_note(repo, number,
                           "The station gave this queued ticket lane %s (tier %s)." % (lane, tier))
         issue["labels"] = [{"name": x} for x in brain._moved_labels(
