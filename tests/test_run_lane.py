@@ -5274,6 +5274,55 @@ exec /usr/bin/git "$@"
         records = [json.loads(line) for line in path.read_text().splitlines()]
         self.assertEqual(records[-1]["command"], "test -f .prepared && loom-test-python check.py")
 
+    # loom#1773: a lane pull request passed its check and failed two
+    # per-directory suites in CI that the contract never ran. An affected:
+    # command runs after the check with the changed files.
+    AFFECTED_SEES_FIX = ("affected: grep -qx fix.txt && "
+                         "printf '%s\\n' \"$LOOM_CHANGED_FILES\" | grep -qx fix.txt\n")
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_an_affected_command_gets_the_changed_files_and_runs_after_the_check(self):
+        self.contract_repo(CONTRACT + self.AFFECTED_SEES_FIX)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        records = self.records()
+        self.assertEqual([(r["phase"], r["exit"], r["ok"]) for r in records][-2:],
+                         [("final", 0, True), ("affected", 0, True)])
+        self.assertTrue(records[-1]["command"].startswith("grep -qx fix.txt"))
+        self.assertIn("affected check exited 0", self.body.read_text())
+        self.assertIn("After the check passes it runs this affected command", self.log.read_text())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_failing_affected_command_blocks_the_push_like_the_check(self):
+        self.contract_repo(CONTRACT + "affected: ! grep -qx fix.txt\n")
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        self.assertIn("validation failed: the affected check exited 1", self.lane_log())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", self.remote_heads())
+        self.assertEqual([(r["phase"], r["ok"]) for r in self.records()][-2:],
+                         [("final", True), ("affected", False)])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_fix_rounds_affected_command_gets_what_the_pull_request_changes(self):
+        # The round's own commit and the pull request's earlier one, never a
+        # file the branch shares with the default branch.
+        listed = "printf '%s\\n' \"$LOOM_CHANGED_FILES\""
+        self.contract_repo(CONTRACT + "affected: %s | grep -qx first.txt && %s | grep -qx fix.txt"
+                           " && ! %s | grep -qx check.py\n" % (listed, listed, listed))
+        name, before = self.fix_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = self.loom / "logs" / "codex" / (name + ".validation.jsonl")
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual([(r["phase"], r["ok"]) for r in records][-2:],
+                         [("final", True), ("affected", True)])
+        self.assertNotEqual(self.remote_head(self.FIX_BRANCH), before)
+
     def contract_edit_lane(self, text):
         self.contract_repo()
         self.drop_brief()
