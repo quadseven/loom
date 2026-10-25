@@ -624,6 +624,9 @@ FINAL_SAID_MAX=600
 # checked_text. Sets FINAL_SAID, empty when the agent said nothing or its words
 # were refused. The agent CLI's own log lines and the runner's timestamped
 # lines are left out: retried stream errors once filled the whole quote.
+# Local paths read <path>: an agent naming the file its sandbox refused
+# failed the text checks, and ten agy runs on 2026-10-24 read "wrote no
+# reason" (loom#1736).
 FINAL_SAID_SKIP_RE='^timestamp=[^ ]+ level=[A-Z]+ |^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z\] '
 final_said() {
   local file="$WORKDIR/$TICKET.final-message" line
@@ -631,6 +634,8 @@ final_said() {
   line="$(printf '%s\n' "$RUN_OUTPUT" | { grep -vE "$FINAL_SAID_SKIP_RE" || true; } | tail -n 20 | LC_ALL=C tr -cd '\11\12\40-\176' |
           tr -s ' \t\n' ' ' | sed 's/^ //; s/ $//')"
   [ -n "$line" ] || return 0
+  line="$(printf '%s' "$line" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
+    'import sys; from bus.text import LOCAL_PATH_RE; sys.stdout.write(LOCAL_PATH_RE.sub("<path>", sys.stdin.read()))')" || return 0
   [ "${#line}" -le "$FINAL_SAID_MAX" ] || line="${line:0:FINAL_SAID_MAX}..."
   printf '%s\n' "$line" > "$file"
   FINAL_SAID="$(checked_text "$file" 2>> "$LOG")" || FINAL_SAID=""

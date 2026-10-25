@@ -1000,14 +1000,26 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("it said: word word", line)
         self.assertLess(len(line), 900)
 
+    def test_a_final_message_that_names_a_local_path_keeps_its_reason(self):
+        # 2026-10-25: ten agy runs said why they stopped, naming the file
+        # their sandbox refused, and each record read "wrote no reason": the
+        # path failed the text checks and the whole message was dropped.
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0",
+                               FAKE_OUT="I am blocked: open /Users/someone/.tool/bin/helper: operation not permitted.")  # leak-guard-allow: the case under test
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertIn("it said: I am blocked: open <path> operation not permitted.", line)
+        self.assertNotIn("Users", line)
+
     def test_a_final_message_that_fails_the_text_checks_keeps_the_no_reason_class(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0",
-                               FAKE_OUT="I gave up; see /Users/someone/work/notes for why.")  # leak-guard-allow: the case under test
+                               FAKE_OUT="I gave up; the box build-01.internal has the notes.")  # leak-guard-allow: the case under test
         self.assertEqual(result.returncode, 0, result.stderr)
         line = self.failure_line()
         self.assertIn("agent made no commit and wrote no reason", line)
-        self.assertNotIn("Users", line)
+        self.assertNotIn("internal", line)
 
     def test_a_summary_that_is_not_a_no_change_reason_is_still_a_failure(self):
         self.drop_brief()
