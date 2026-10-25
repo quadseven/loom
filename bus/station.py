@@ -372,6 +372,10 @@ RETRY_MAX = 2
 FACTORY_REPO = "quadseven/loom"
 INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
 HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)")
+# A [factory] hold whose reason names no incident (the incident filing failed)
+# has nothing that can close it, so the station releases it after this long:
+# the ticket is not held forever.
+HELD_NO_INCIDENT_FOR = 2 * 3600
 RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
                       r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
 # The brain's lane order for a retry, after the failed lane's own provider.
@@ -5073,12 +5077,14 @@ class Station:
 
     def _release_held(self, key: str, info: Any,
                       closed_incidents: Dict[str, Dict[str, Any]]) -> None:
-        """Re-queue one held ticket if its incident is closed and named on
-        it; forget it once it is no longer running."""
+        """Re-queue one held ticket: a closed and named incident, or a hold
+        with no incident (the filing failed) that has outlived
+        HELD_NO_INCIDENT_FOR. Forget it once it is no longer running."""
         repo, _, num = key.rpartition("#")
         number = int(num) if num.isdigit() else 0
         ref = info.get("incident") if isinstance(info, dict) else None
-        incident = closed_incidents.get(ref) if ref else None
+        raw_at = (info or {}).get("at")
+        at = float(raw_at) if raw_at is not None else None
         try:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
             comments = self._paginate(
@@ -5091,26 +5097,80 @@ class Station:
         if not isinstance(issue, dict) or RUNNING not in _label_names(issue):
             self._forget_held(key)
             return
+        if ref is None:
+            # The incident filing failed: nothing names an incident that can
+            # close this hold, so release it once it has outlived
+            # HELD_NO_INCIDENT_FOR instead of holding it forever.
+            green = False
+            if at is not None and self.now - at < HELD_NO_INCIDENT_FOR:
+                try:
+                    green = self._green_default_after_hold(repo, at)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("factory release: could not check default-branch CI for %s#%d: %s"
+                         % (repo, number, err))
+            if at is None or (self.now - at < HELD_NO_INCIDENT_FOR and not green):
+                return
+            cleared = RUNAWAY in _label_names(issue)
+            reason = ("a newer green default-branch run passed" if green else
+                      "the hold reached %d hours" % (HELD_NO_INCIDENT_FOR // 3600))
+            self._release_one(key, repo, number, issue, cleared,
+                              "held: incident filing failed; no incident was "
+                              "filed, so the ticket is back on its lane because " + reason)
+            _say("factory release: %s#%d re-queued: incident filing failed"
+                 % (repo, number))
+            return
+        incident = closed_incidents.get(ref) if ref else None
         if incident is None or not any(isinstance(c, dict) and ref in str(c.get("body") or "")
                                        for c in comments):
             return
         if self._claimed_since(comments, incident):
             return
-        self._relabel(repo, number, "loom:queued")
         cleared = RUNAWAY in _label_names(issue)
-        if cleared:
-            # The hold came from the factory's own failure, which is now fixed
-            # (loom#572); a runaway label kept here held tickets for hours.
-            kept = [n for n in _label_names(self._issue(repo, number)) if n != RUNAWAY]
-            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
-        # A status event, not a comment: closing five incidents released 16
-        # tickets and sent 16 emails at once (2026-10-19).
-        self._routine(repo, number,
-                      "Factory incident %s is closed: the ticket is back in the queue "
-                      "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
-                                          if cleared else ""))
-        self._forget_held(key)
+        self._release_one(key, repo, number, issue, cleared,
+                          "Factory incident %s is closed: the ticket is back in the queue "
+                          "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
+                                              if cleared else ""))
         _say("factory release: %s#%d re-queued after incident %s closed" % (repo, number, ref))
+
+    def _green_default_after_hold(self, repo: str, held_at: float) -> bool:
+        """Whether a newer commit on the default branch has all checks green."""
+        branch = self._default_branch(repo)
+        if not branch:
+            return False
+        commit = self.gh.rest("GET", "/repos/%s/commits/%s" % (repo, quote(branch, safe=""))).data
+        if not isinstance(commit, dict):
+            return False
+        sha = str(commit.get("sha") or "")
+        committed = self._epoch(str(((commit.get("commit") or {}).get("committer") or {}).get("date") or ""))
+        if not sha or committed is None or committed <= held_at:
+            return False
+        return self._default_commit_checks_green(repo, sha)
+
+    def _default_commit_checks_green(self, repo: str, sha: str) -> bool:
+        """Whether all check runs and the combined status for a commit passed."""
+        checks = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
+                              % (repo, sha)).data or {}
+        runs = checks.get("check_runs") if isinstance(checks, dict) else None
+        if not isinstance(runs, list) or not runs or any(
+                not isinstance(run, dict) or run.get("status") != "completed"
+                or run.get("conclusion") != "success" for run in runs):
+            return False
+        status_data = self.gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data or {}
+        return isinstance(status_data, dict) and status_data.get("state") == "success"
+
+    def _release_one(self, key: str, repo: str, number: int, issue: Dict[str, Any],
+                     cleared: bool, text: str) -> None:
+        """Move a held running ticket to loom:queued, clear its runaway hold
+        when the release cleared one, post the status event, and forget it."""
+        self._relabel(repo, number, "loom:queued")
+        if cleared:
+            kept = [n for n in _label_names(self._issue(repo, number)) if n != RUNAWAY]
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": kept})
+        self._routine(repo, number, text)
+        self._forget_held(key)
 
     def _claimed_since(self, comments: List[Any], incident: Dict[str, Any]) -> bool:
         """A lane claim comment is newer than the incident's close."""
@@ -5456,14 +5516,22 @@ class Station:
         if klass == "factory":
             # The validation environment the factory broke, not the ticket's
             # work: the ticket stays running on its lane and keeps its rung.
-            # release_factory_held re-queues it when the incident closes.
+            # release_factory_held re-queues it when the incident closes, and
+            # releases a hold with no incident after HELD_NO_INCIDENT_FOR.
             match = HELD_FOR_RE.search(bare)
-            self._note_held(repo, number,
-                            "%s#%s" % (match.group(1), match.group(2)) if match else None)
+            incident_ref = "%s#%s" % (match.group(1), match.group(2)) if match else None
+            self._note_held(repo, number, incident_ref)
             self._set_wait(repo, self._issue(repo, number), "incident")
-            self._routine(repo, number,
-                          "Lane %s held: %s. The ticket keeps its rung and returns to the "
-                          "queue when the factory incident closes." % (lane, bare))
+            if incident_ref is None:
+                self._routine(repo, number,
+                              "Lane %s held: incident filing failed. %s. The ticket keeps its rung and "
+                              "returns to the queue "
+                              "after %d hours." % (lane, bare,
+                                                   HELD_NO_INCIDENT_FOR // 3600))
+            else:
+                self._routine(repo, number,
+                              "Lane %s held: %s. The ticket keeps its rung and returns to the "
+                              "queue when the factory incident closes." % (lane, bare))
             _say("held %s#%d for the factory: %s" % (repo, number, reason))
             return True
         if klass == "auth":
