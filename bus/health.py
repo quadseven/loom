@@ -17,12 +17,18 @@ station reads each endpoint and, per finding:
   posts the new numbers at most every EVIDENCE_EVERY;
 - once the finding is gone, posts one "finding absent since" comment, the
   evidence the brain verifies against. A finding that flaps edits that one
-  note (at most once every RESEEN_EVERY) and posts no second one. It never
-  closes a ticket;
+  note (at most once every RESEEN_EVERY) and posts no second one. The note
+  itself closes nothing;
 - once a shipped ticket's finding has stayed absent PROVE_AFTER, counted from
   the later of the absent stamp and the ship, posts one proof comment naming
   both times: the station's evidence for the Live criterion, which a verify
-  run quotes (loom#585). It ticks nothing;
+  run quotes (loom#585);
+- once any open ticket's findings have stayed absent for its verify window
+  (24 hours unless its Live line names another), settles it: the absence
+  criterion is ticked on the station's own read and, when the ticket's other
+  criteria are proven (a linked merged pull request, or a "Satisfied
+  elsewhere:" line on the ticket), the ticket is closed as completed with the
+  evidence quoted. Otherwise one status line says what is missing;
 - when the finding is still reported REGRESS_AFTER after its open ticket
   shipped, the fix did not work: the ticket is re-briefed as a regression
   through brain brief --regresses, at most once per ticket per
@@ -56,7 +62,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import urlsplit
 
-from . import brain, naming, notify, text, tickets
+from . import brain, criteria_gate, naming, notify, proof, shadow, text, tickets
 from .github import GitHub, GitHubError, _OPENER
 
 EVERY = 900
@@ -88,6 +94,13 @@ PROOF_MARKER = "<!-- loom:health-proof -->"
 # ticket's ship has met the ticket's Live criterion (loom#585).
 PROVE_AFTER = 24 * 3600
 RESEEN_MARKER = "<!-- loom:health-reseen -->"
+SETTLE_MARKER = "<!-- loom:health-settle -->"
+STATUS_MARKER = "<!-- loom:health-status -->"
+# A ticket that names the proof of its other criteria itself ("Satisfied
+# elsewhere: <where>") may close on the absence alone.
+SATISFIED_RE = re.compile(r"^[ \t]*Satisfied elsewhere:[ \t]*\S", re.I | re.M)
+_WINDOW_RE = re.compile(r"\bfor (\d{1,3}) (hour|day)s?\b", re.I)
+WINDOW_MAX = 30 * 24 * 3600
 # "<who> is <state>: <what>" and "<n> members are <state>: <what>" name one
 # cause, "<state>: <what>", whoever it hits.
 _CAUSE_RE = re.compile(r".+? (?:is|are) ([a-z]+): (.+)")
@@ -423,6 +436,55 @@ def proof_of(comments: Any, authors: List[str]) -> str:
     return found
 
 
+def window_of(body: Any) -> int:
+    """Seconds the ticket's finding must stay absent: the "for N hours" or
+    "for N days" its Live line names, else PROVE_AFTER."""
+    found = _WINDOW_RE.search(brain.live_criterion(body, limit=None))
+    if not found:
+        return PROVE_AFTER
+    seconds = int(found.group(1)) * (3600 if found.group(2).lower() == "hour" else 86400)
+    return seconds if 0 < seconds <= WINDOW_MAX else PROVE_AFTER
+
+
+def unproven(issue: Dict[str, Any]) -> List[str]:
+    """The criteria of a ticket, other than its absence line, that nothing
+    proves yet. A code criterion is proven by a linked merged pull request (the
+    ticket is merged, shipped or verified) or an earlier tick; a live or
+    operator criterion by neither (a tick is nobody's evidence). The ticket's
+    "Satisfied elsewhere:" line proves all of them."""
+    body = str(issue.get("body") or "")
+    if SATISFIED_RE.search(body):
+        return []
+    landed = tickets.ticket_state(issue) in tickets.MERGED_STATES
+    absence = " ".join(brain.live_criterion(body, limit=None).split())
+    out = []
+    for checked, line in proof.criteria(body):
+        line = " ".join(line.split())
+        if line == absence:
+            continue
+        if criteria_gate.kind(line) == criteria_gate.CODE and (checked or landed):
+            continue
+        out.append(line)
+    return out
+
+
+def settle_comment(absent: str, checked: str, hours: int, how: str) -> str:
+    """The closing note: the station's own reads, never the endpoint URL."""
+    return ("%s\nClosed: the health finding stayed absent for %d hours: finding absent since "
+            "%s; last checked_at read in the window %s. The absence criterion is ticked on "
+            "that read. The other criteria: %s."
+            % (SETTLE_MARKER, hours, absent, checked, how))
+
+
+def status_comment(absent: str, hours: int, missing: List[str]) -> str:
+    listed = "; ".join(_PLAIN_OUT.sub("", x)[:100] for x in missing[:3])
+    return ("%s\nThe health finding has stayed absent for %d hours (since %s), but the ticket "
+            "stays open: not proven yet: %s%s. A linked merged pull request proves a code "
+            "criterion; a ticket line starting \"Satisfied elsewhere:\" says the rest is met."
+            % (STATUS_MARKER, hours, absent, listed,
+               " (and %d more)" % (len(missing) - 3) if len(missing) > 3 else ""))
+
+
 def _stamp(epoch: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
@@ -584,31 +646,38 @@ class Intake:
                       open_by_digest: Dict[str, Dict[str, Any]], checked: str) -> None:
         """Post the proof comment on each shipped ticket whose findings are
         all gone and have stayed gone PROVE_AFTER since the later of their
-        absent stamp and the ship. A finding that came back lost its stamp,
-        so its ticket waits for a fresh window."""
+        absent stamp and the ship, then settle each open ticket whose
+        findings stayed gone for its own window. A finding that came back
+        lost its stamp, so its ticket waits for a fresh window."""
         by_ticket: Dict[int, Tuple[Dict[str, Any], List[Dict[str, Any]]]] = {}
         for digest, issue in open_by_digest.items():
             by_ticket.setdefault(int(issue["number"]), (issue, []))[1].append(
                 ledger.setdefault(digest, {}))
         for number, (issue, recs) in sorted(by_ticket.items()):
-            if tickets.ticket_state(issue) != "shipped":
+            if not all(r.get("absent") for r in recs):
                 continue
-            if all(r.get("absent") for r in recs) and not any(r.get("proved") for r in recs):
+            if tickets.ticket_state(issue) == "shipped" and not any(r.get("proved") for r in recs):
                 self._prove(source, number, issue, recs, checked)
+            self._settle(source, number, issue, recs, checked)
+
+    def _ship_time(self, source: Source, number: int, recs: List[Dict[str, Any]]) -> Optional[float]:
+        cached = recs[0].get("shipped")
+        if isinstance(cached, list) and len(cached) == 2 and cached[0] == number:
+            return float(cached[1])
+        shipped = self._shipped_at(source.repo, number)
+        if shipped is None:
+            self.say("health %s#%d: no loom:shipped label event, so its ship time is "
+                     "unknown; no proof posted" % (source.repo, number))
+            return None
+        recs[0]["shipped"] = [number, shipped]
+        return shipped
 
     def _prove(self, source: Source, number: int, issue: Dict[str, Any],
                recs: List[Dict[str, Any]], checked: str) -> None:
         absent = max(_epoch(r["absent"]) or 0.0 for r in recs)
-        cached = recs[0].get("shipped")
-        if isinstance(cached, list) and len(cached) == 2 and cached[0] == number:
-            shipped: Optional[float] = float(cached[1])
-        else:
-            shipped = self._shipped_at(source.repo, number)
-            if shipped is None:
-                self.say("health %s#%d: no loom:shipped label event, so its ship time is "
-                         "unknown; no proof posted" % (source.repo, number))
-                return
-            recs[0]["shipped"] = [number, shipped]
+        shipped = self._ship_time(source, number, recs)
+        if shipped is None:
+            return
         if absent == 0.0 or self.now - max(absent, shipped) < PROVE_AFTER:
             return
         self._comment(source.repo, issue, proof_comment(
@@ -617,6 +686,73 @@ class Intake:
             rec["proved"] = self.now
         self.say("health %s#%d: finding absent %d hours since the later of absence and ship; "
                  "proof posted" % (source.repo, number, PROVE_AFTER // 3600))
+
+    def _settle(self, source: Source, number: int, issue: Dict[str, Any],
+                recs: List[Dict[str, Any]], checked: str) -> None:
+        """The ticket's finding has been gone; once that has lasted its window
+        (counted from the ship of a shipped ticket), tick the absence
+        criterion on the station's read and close the ticket when nothing else
+        is unproven, else say once what is missing. A finding that returns
+        clears the stamp, so the window and the status line start over."""
+        body = str(issue.get("body") or "")
+        if not tickets.LIVE_CRITERION_RE.match(brain.live_criterion(body, limit=None)):
+            return
+        absent = max(_epoch(r["absent"]) or 0.0 for r in recs)
+        shipped = self._ship_time(source, number, recs) \
+            if tickets.ticket_state(issue) == "shipped" else absent
+        window = window_of(body)
+        if not absent or shipped is None or self.now - max(absent, shipped) < window:
+            return
+        missing = unproven(issue)
+        if missing:
+            self._hold_settle(source, number, issue, recs, _stamp(absent), window // 3600, missing)
+            return
+        self._close_settled(source, number, issue, recs, _stamp(absent), checked, window // 3600)
+
+    def _hold_settle(self, source: Source, number: int, issue: Dict[str, Any],
+                     recs: List[Dict[str, Any]], absent: str, hours: int,
+                     missing: List[str]) -> None:
+        """One status line per distinct set of unproven criteria."""
+        said = ",".join(missing)
+        if recs[0].get("held") == said:
+            return
+        self._comment(source.repo, issue, status_comment(absent, hours, missing), notify.STATUS)
+        recs[0]["held"] = said
+        self.say("health %s#%d: finding absent %d hours; open, %d criteria unproven"
+                 % (source.repo, number, hours, len(missing)))
+
+    def _close_settled(self, source: Source, number: int, issue: Dict[str, Any],
+                       recs: List[Dict[str, Any]], absent: str, checked: str,
+                       hours: int) -> None:
+        """Tick the ticket's boxes and close it as completed, with the
+        evidence comment first. Shadow mode records the close and sends none."""
+        if shadow.active(source.repo):
+            held = shadow.record_held(shadow.CLOSE, source.repo, number, "issue",
+                                      source="health intake", gates=["absent past its window",
+                                                                      "every criterion proven"],
+                                      reason="finding absent %d hours" % hours)
+            if held["new"]:
+                self.say("shadow mode: would close health %s#%d" % (source.repo, number))
+            return
+        body = str(issue.get("body") or "")
+        landed = tickets.ticket_state(issue) in tickets.MERGED_STATES
+        how = "proven by the merged pull request" if landed and not SATISFIED_RE.search(body) \
+            else "marked as satisfied elsewhere on the ticket"
+        names = [str(x.get("name") or "") for x in issue.get("labels") or [] if isinstance(x, dict)]
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (source.repo, number),
+                     {"body": proof.tick(body)})
+        self._comment(source.repo, issue, settle_comment(absent, checked, hours, how),
+                      notify.CLOSED)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (source.repo, number),
+                     {"state": "closed", "state_reason": "completed"})
+        kept = brain.closing_labels(names, brain.trusted_authors())
+        if kept != names:
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (source.repo, number),
+                         {"labels": kept})
+        for rec in recs:
+            rec["settled"] = self.now
+        self.say("health %s#%d: finding absent %d hours; criteria proven, closed"
+                 % (source.repo, number, hours))
 
     def _refused(self, source: Source, refused: Dict[str, str],
                  ledger: Dict[str, Any]) -> None:
@@ -705,6 +841,7 @@ class Intake:
         was briefed."""
         back = rec.pop("absent", None)
         rec.pop("proved", None)
+        rec.pop("held", None)
         rec.pop("refused", None)
         rec.pop("gone", None)
         if issue is None:

@@ -49,6 +49,27 @@ class UnittestStep(unittest.TestCase):
                                      text=True, capture_output=True)
             self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
 
+    def test_allow_skips_lets_a_lane_sandbox_skip_but_still_fails_a_failure(self):
+        # The lane check runs this runner inside a sandbox where tests that need
+        # sandbox-exec, ps or a localhost port skip by design (about 118 of
+        # them); CI still refuses every skip.
+        runner = WORKFLOW.parents[1] / "unittest_parallel.py"
+        with tempfile.TemporaryDirectory() as temp:
+            tests = Path(temp, "tests")
+            tests.mkdir()
+            Path(tests, "test_skip.py").write_text(
+                "import unittest\nclass Skip(unittest.TestCase):\n"
+                " @unittest.skip('needs sandbox-exec')\n def test_skips(self): pass\n")
+            allowed = subprocess.run([sys.executable, str(runner), "--tests-dir", str(tests),
+                                      "--allow-skips"], text=True, capture_output=True)
+            self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
+            Path(tests, "test_failure.py").write_text(
+                "import unittest\nclass Failure(unittest.TestCase):\n"
+                " def test_fails(self): self.fail('expected failure')\n")
+            failed = subprocess.run([sys.executable, str(runner), "--tests-dir", str(tests),
+                                     "--allow-skips"], text=True, capture_output=True)
+            self.assertNotEqual(failed.returncode, 0)
+
     def test_parallel_runner_reports_the_discovered_test_total(self):
         runner = WORKFLOW.parents[1] / "unittest_parallel.py"
         with tempfile.TemporaryDirectory() as temp:

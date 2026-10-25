@@ -624,6 +624,9 @@ FINAL_SAID_MAX=600
 # checked_text. Sets FINAL_SAID, empty when the agent said nothing or its words
 # were refused. The agent CLI's own log lines and the runner's timestamped
 # lines are left out: retried stream errors once filled the whole quote.
+# Local paths read <path>: an agent naming the file its sandbox refused
+# failed the text checks, and ten agy runs on 2026-10-24 read "wrote no
+# reason" (loom#1736).
 FINAL_SAID_SKIP_RE='^timestamp=[^ ]+ level=[A-Z]+ |^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z\] '
 final_said() {
   local file="$WORKDIR/$TICKET.final-message" line
@@ -631,6 +634,8 @@ final_said() {
   line="$(printf '%s\n' "$RUN_OUTPUT" | { grep -vE "$FINAL_SAID_SKIP_RE" || true; } | tail -n 20 | LC_ALL=C tr -cd '\11\12\40-\176' |
           tr -s ' \t\n' ' ' | sed 's/^ //; s/ $//')"
   [ -n "$line" ] || return 0
+  line="$(printf '%s' "$line" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
+    'import sys; from bus.text import LOCAL_PATH_RE; sys.stdout.write(LOCAL_PATH_RE.sub("<path>", sys.stdin.read()))')" || return 0
   [ "${#line}" -le "$FINAL_SAID_MAX" ] || line="${line:0:FINAL_SAID_MAX}..."
   printf '%s\n' "$line" > "$file"
   FINAL_SAID="$(checked_text "$file" 2>> "$LOG")" || FINAL_SAID=""
@@ -730,6 +735,18 @@ transient_strike() {
 }
 transient_clear() { rm -f "$TRANSIENT_FILE"; }
 
+# A lane whose CLI sign-in lapsed rests SIGNIN_WAIT seconds, unavailable "at a
+# limit", and then tries one run again: only an interactive sign-in fixes it,
+# and the runner cannot see one happen. agy, 2026-10-24: left available, the
+# lane claimed six tickets in two hours, each waiting out the sign-in timeout.
+SIGNIN_WAIT=7200
+SIGNIN_FILE="$LOOM_HOME/state/usage/$SLOT.signin"
+signin_rest_until() {
+  local until
+  read -r until 2>/dev/null < "$SIGNIN_FILE" || return 1
+  [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] && printf '%s' "$until"
+}
+
 # Mint this run's App token into GH_TOKEN. A personal token in the
 # environment is dropped first, so a failed mint leaves gh with nothing to
 # post as. Installation tokens last an hour: a run mints again after its agent.
@@ -769,15 +786,29 @@ park() {
 # directory, and the keychain and caches agy needs; agy's settings, binaries
 # and built-in skills stay read-only, and so does everything else there (shell
 # startup files, ~/.gemini config, MCP servers). Other lanes get no rules here.
-AGY_STATE_KEEP=(settings.json bin builtin installation_id jetski_state.pbtxt updater last_check.timestamp log cli.log crashes cache)
+# antigravity-oauth-token is agy's sign-in when it cannot reach the keychain
+# (the sandbox denies /usr/bin/security): wiped, every run asked for a browser
+# login (2026-10-22 to 10-24, #1620).
+AGY_STATE_KEEP=(settings.json bin builtin installation_id jetski_state.pbtxt updater last_check.timestamp log cli.log crashes cache antigravity-oauth-token)
 AGY_CACHE_KEEP=(onboarding.json default_project_id.txt)
+# agy keeps its sign-in in its file store, Library/Application Support/
+# antigravity: inside the sandbox it cannot run /usr/bin/security to reach the
+# keychain (#1465), so it falls back there. Without a write there it could
+# neither keep nor refresh a token, and every run asked for a browser login
+# (2026-10-22 to 10-24, #1620). The Keychains folder takes no write.
+# agy writes its shell helper, bin/agentapi, before each shell command:
+# denied with the rest of bin, every agy run from 2026-10-24 could run no
+# command and commit nothing. agy_forget makes that file new and empty before
+# each run, and the run may rewrite its contents and mode but not create,
+# remove or link it: a run free to create the name could make it a hard link
+# to another binary in bin, or a directory that stops every later run.
 agy_write_rules() {
   [ "$LANE" = agy ] || return 0
   local h s
   h="$(cd "$AGY_HOME" && pwd -P)" || return 1
   s="$h/.gemini/antigravity-cli"
-  printf '(deny file-write* (subpath "%s"))\n(allow file-write* %s (subpath "%s") (subpath "%s/Library/Keychains") (subpath "%s/Library/Caches"))\n(deny file-write* (literal "%s/settings.json") (literal "%s/installation_id") (subpath "%s/bin") (subpath "%s/builtin"))\n' \
-    "$h" "$1" "$s" "$h" "$h" "$s" "$s" "$s" "$s"
+  printf '(deny file-write* (subpath "%s"))\n(allow file-write* %s (subpath "%s") (subpath "%s/Library/Application Support/antigravity") (subpath "%s/Library/Caches"))\n(deny file-write* (literal "%s/settings.json") (literal "%s/installation_id") (subpath "%s/bin") (subpath "%s/builtin"))\n(allow file-write-data file-write-mode (literal "%s/bin/agentapi"))\n' \
+    "$h" "$1" "$s" "$h" "$h" "$s" "$s" "$s" "$s" "$s"
 }
 
 # agy remembers past conversations (brain, summaries, annotations) and reads
@@ -792,6 +823,9 @@ agy_forget() {
     while [ "$1" != -- ]; do keep="$keep$1 "; shift; done; shift
     for k in "$@"; do cache_keep="$cache_keep$k "; done
     [ -d "$s" ] || exit 0
+    if [ -d "$s/bin" ] && [ ! -L "$s/bin" ]; then
+      rm -rf "$s/bin/agentapi" && (umask 022; : > "$s/bin/agentapi") && chmod 755 "$s/bin/agentapi" || exit 1
+    fi
     # Kept entries are real files and directories. A link an agent left in
     # their place is removed, never followed: the forget would otherwise
     # delete through it, into the keychain folder or another ticket'"'"'s tree.
@@ -1280,11 +1314,20 @@ ask_renew_key() {
 
 # The operator's ask for a lane whose CLI sign-in lapsed: $1 is the reason.
 # Filed once per lane, like ask_renew_key, and names no agent output.
+# The agy lane signs in as its own macOS user, so the ask names that user and
+# the command: a sign-in as the operator never reaches it (2026-10-24).
 ask_sign_in() {
-  local title body
+  local title body how
   title="Lane $LANE sign-in lapsed: sign in the $LANE lane CLI again"
-  body="$(printf '%s\n\nLane %s waited for a sign-in nobody gave and timed out: its CLI sign-in lapsed. Sign in the %s lane CLI again on the lane machine (an interactive login). Until then each run on the lane fails as auth.\n' \
-    "$KEY_ASK_MARKER" "$SLOT" "$LANE")"
+  how="Sign in the $LANE lane CLI again on the lane machine (an interactive login)."
+  if [ "$LANE" = agy ]; then
+    # ~user, not the home path: the ask lands in a public issue.
+    local bin="${AGY_BIN/#"$AGY_HOME"/~$AGY_USER}"
+    how="$(printf 'The lane runs agy as the macOS user %s, with its own sign-in; a sign-in as yourself does not reach it. On the lane machine run:\n\n    sudo -u %s -H %s update\n    sudo -u %s -H %s\n\nand finish the browser sign-in it prints, then quit agy.' \
+      "$AGY_USER" "$AGY_USER" "$bin" "$AGY_USER" "$bin")"
+  fi
+  body="$(printf '%s\n\nLane %s waited for a sign-in nobody gave and timed out: its CLI sign-in lapsed. %s\n\nUntil then each run on the lane fails as auth.\n' \
+    "$KEY_ASK_MARKER" "$SLOT" "$how")"
   file_ask "$title" "$body" "Sign-in failed again"
 }
 
@@ -1932,6 +1975,11 @@ prepare_validation() {
   if [ -n "$C_SETUP" ]; then
     contract_run "$C_SETUP"; rc=$?
     record setup "$C_SETUP" "$rc" "$BASE" "$([ "$rc" -eq 0 ] && echo true || echo false)"
+    if [ "$rc" -eq 143 ]; then
+      PARK_CLASS=transient
+      SETUP_REASON="setup interrupted by SIGTERM"
+      return 1
+    fi
     [ "$rc" -eq 0 ] || { SETUP_REASON="setup exited $rc"; return 1; }
   fi
   contract_run "$C_CHECK"; BASELINE_EXIT=$?
@@ -1939,6 +1987,11 @@ prepare_validation() {
   baseline_rev="$(safe_git rev-parse HEAD)"
   record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
     "${changed:+changed tracked files: $changed}"
+  if [ "$BASELINE_EXIT" -eq 143 ]; then
+    PARK_CLASS=transient
+    SETUP_REASON="base check interrupted by SIGTERM"
+    return 1
+  fi
   # A check that cannot run, or is already red, on the unmodified base is
   # the factory's problem, not the ticket's: file the incident and stop
   # before the agent burns a run it can never validate.
@@ -1948,6 +2001,27 @@ prepare_validation() {
       note_factory_incident environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
       return 1 ;;
   esac
+  # One red run does not make the base red: Loom's own check timed out
+  # under a busy station's load and passed on the next ticket's run, and
+  # each such flake held its ticket behind a factory incident (56 by
+  # 2026-10-25). A red base check runs once more; only a second red files.
+  if [ "$BASELINE_EXIT" -ne 0 ]; then
+    if [ -n "$changed" ] && ! safe_git reset --hard HEAD >> "$LOG" 2>&1; then
+      SETUP_REASON="could not restore tracked files changed by the baseline check"
+      return 1
+    fi
+    local first_exit="$BASELINE_EXIT"
+    contract_run "$C_CHECK"; BASELINE_EXIT=$?
+    changed="$(tracked_changes)"
+    record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
+      "second run after exit $first_exit${changed:+; changed tracked files: $changed}"
+    if [ "$BASELINE_EXIT" -eq 143 ]; then
+      PARK_CLASS=transient
+      SETUP_REASON="base check interrupted by SIGTERM"
+      return 1
+    fi
+    [ "$BASELINE_EXIT" -ne 0 ] || echo "base check exited $first_exit, then passed on a second run" >> "$LOG"
+  fi
   # Only a pass on the trusted base clears an incident: a fix round's tree
   # holds the agent's unmerged edits, so it counts only once the default
   # branch itself passes (below).
@@ -2004,6 +2078,10 @@ final_validation() {
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
     124) VALIDATION_REASON="validation failed: the check timed out after ${CHECK_TIMEOUT}s" ;;
+    143)
+      PARK_CLASS=transient
+      VALIDATION_REASON="validation interrupted by SIGTERM"
+      ;;
     125|126|127)
       # The environment broke between the baseline and the final check;
       # the agent's work is not the cause.
@@ -2167,6 +2245,29 @@ EOF
     return 1
   fi
   echo "[$stamp] $TICKET: left off the kept branch: $(stray_list)"
+}
+
+# A fix round's commit that adds files outside the brief's paths is not
+# refused: those files (STRAY_FILES, and only those, so the round's real
+# work stays) are removed in a commit on top, which keeps the push
+# fast-forward, and named in the run log. Without this the round retried the
+# identical refusal until the runaway hold caught it (loom#1476). Returns 1,
+# logged, when a file cannot be removed or the removal committed.
+drop_stray_files() {
+  local f stamp
+  stamp="$(date -u +%FT%TZ)"
+  while IFS= read -r f; do
+    [ -z "$f" ] || safe_git rm -q -f -- "$f" && continue
+    echo "[$stamp] $TICKET: could not remove $f from the fix round's commits"
+    return 1
+  done <<EOF
+$STRAY_FILES
+EOF
+  if ! safe_git commit -qm "Drop files outside the brief's paths: $(stray_list)"; then
+    echo "[$stamp] $TICKET: could not commit the removal of $(stray_list)"
+    return 1
+  fi
+  echo "[$stamp] $TICKET: left off the fix round's commits: $(stray_list)"
 }
 
 # What the agent is told about the contract, after its brief.
@@ -2606,6 +2707,10 @@ if REST_UNTIL="$(transient_rest_until)"; then
   heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
   exit 0
 fi
+if REST_UNTIL="$(signin_rest_until)"; then
+  heartbeat false "limit: sign-in lapsed: sign in the $LANE lane CLI again; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
+  exit 0
+fi
 
 # A provider limit hit by an earlier pass holds until its retry time. A
 # reason that says "limit:" (which limit, until when) is kept as it was.
@@ -2997,6 +3102,9 @@ for BRIEF in "$INBOX"/*.md; do
       # The CLI's own sign-in lapsed: no key parameter to renew or wait on,
       # even when the lane names one (agy names the lane user's password).
       AUTH_WHY="sign-in lapsed: sign in the $LANE lane CLI again"
+      REST_UNTIL=$(( $(date +%s) + SIGNIN_WAIT ))
+      printf '%s\n' "$REST_UNTIL" > "$SIGNIN_FILE"
+      heartbeat false "limit: $AUTH_WHY; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
       ask_sign_in "$AUTH_WHY"
       park "$BRIEF" "agent exited $STATUS: $AUTH_WHY$TIMEDOUT_NOTE" auth
       break
@@ -3110,10 +3218,20 @@ for BRIEF in "$INBOX"/*.md; do
     COMMITTED=1
   fi
   # A commit that adds files outside the brief is refused before validation
-  # and push: nothing is pushed, and the reason names every stray file.
+  # and push: nothing is pushed, and the reason names every stray file. A fix
+  # round removes them instead (drop_stray_files) and checks again, so it
+  # pushes its work rather than retrying the same refusal (loom#1476).
   if [ "$COMMITTED" -eq 1 ]; then
     if ! check_scope "$BRIEF" 2>> "$LOG"; then
       park "$BRIEF" "could not check the committed files against the brief" transient; continue
+    fi
+    if [ -n "$STRAY_FILES" ] && [ -n "$FIX_PR" ]; then
+      if ! drop_stray_files >> "$LOG" 2>&1; then
+        park "$BRIEF" "commit refused: it adds files outside the brief's paths that could not be removed: $(stray_list); nothing pushed"; continue
+      fi
+      if ! check_scope "$BRIEF" 2>> "$LOG"; then
+        park "$BRIEF" "could not check the committed files against the brief" transient; continue
+      fi
     fi
     if [ -n "$STRAY_FILES" ]; then
       park "$BRIEF" "commit refused: it adds files outside the brief's paths: $(stray_list); nothing pushed"; continue
