@@ -77,6 +77,11 @@ REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 MERGE, CLOSE, REOPEN, LABEL, DELETE_BRANCH, APPROVE = (
     "merge", "close", "reopen", "label", "delete-branch", "approve")
 ACTIONS = (MERGE, CLOSE, REOPEN, LABEL, DELETE_BRANCH, APPROVE)
+# Not a would-action: the operator's own Merge or Hold on a lane pull request
+# held for them, answered on the dashboard (bus/answer.py, loom#1777), so the
+# ledger pairs what Loom would have done with the operator's verdict. Its
+# label is the verdict ("merge" or "hold"); it is never counted as an action.
+VERDICT = "operator-verdict"
 
 # Labels whose addition grants a merge or ships a ticket, each with the labels
 # that mean the ticket is already past it (a verified ticket moved back to
@@ -570,7 +575,7 @@ def digest_lines(since: float, now: float, path: Optional[str] = None,
     """At most two lines for the report digest: what Loom would have done
     since the last digest and the command that lists it; nothing when shadow
     is off and nothing was recorded."""
-    entries = read(path or ledger_path(env), since)
+    entries = [e for e in read(path or ledger_path(env), since) if e.get("action") != VERDICT]
     on, repos = scope(env)
     if not on and not entries:
         return []
@@ -587,15 +592,25 @@ def digest_lines(since: float, now: float, path: Optional[str] = None,
 
 def report_lines(entries: Sequence[Mapping[str, Any]], since: float, path: str) -> List[str]:
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
-    lines = ["%d would-action%s since %s (%s)"
-             % (len(entries), "" if len(entries) == 1 else "s", stamp, path)]
+    actions = [e for e in entries if e.get("action") != VERDICT]
+    verdicts = len(entries) - len(actions)
+    lines = ["%d would-action%s since %s (%s)%s"
+             % (len(actions), "" if len(actions) == 1 else "s", stamp, path,
+                ", and %d operator verdict%s" % (verdicts, "" if verdicts == 1 else "s") if verdicts else "")]
     for e in entries:
         lines += _entry_lines(e)
     return lines + _tally_lines(entries)
 
 
 def _entry_lines(e: Mapping[str, Any]) -> List[str]:
-    """One would-action: its line, then its gates, reason and caller."""
+    """One would-action (or operator verdict): its line, then its gates,
+    reason and caller."""
+    if e.get("action") == VERDICT:
+        lines = ["%s  operator verdict %-8s %-28s %s  %s" % (
+            e.get("time"), str(e.get("label") or ""), "%s#%s" % (e.get("repo") or "?", e.get("number") or "?"),
+            ("sha=%s" % str(e["sha"])[:12]) if e.get("sha") else "", e.get("url") or "")]
+        return lines + ["    %s: %s" % (name, e[key]) for key, name in (("reason", "reason"), ("source", "from"))
+                        if e.get(key)]
     what = str(e.get("action") or "")
     if e.get("label"):
         what += " " + str(e["label"])
@@ -615,6 +630,8 @@ def _entry_lines(e: Mapping[str, Any]) -> List[str]:
 def _tally_lines(entries: Sequence[Mapping[str, Any]]) -> List[str]:
     tally: Dict[Tuple[str, str, str], int] = {}
     for e in entries:
+        if e.get("action") == VERDICT:
+            continue
         k = (str(e.get("repo") or "?"), str(e.get("tier") or "-"), str(e.get("action") or ""))
         tally[k] = tally.get(k, 0) + 1
     if not tally:

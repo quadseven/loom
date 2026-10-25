@@ -67,6 +67,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:running": {"color": "fbca04", "description": "Handed to the lane's runner"},
     "loom:pr": {"color": "0075ca", "description": "The runner opened a pull request"},
     "loom:answered": {"color": "5319e7", "description": "The runner posted an answer for brain review"},
+    "loom:answer-pending": {"color": "c5def5", "description": "An operator answered on the dashboard; the station has not read it yet"},
     "loom:ready": {"color": "0e8a16", "description": "Checks passed and review-bot threads are resolved"},
     "loom:failed": {"color": "d93f0b", "description": "The runner gave up; see the ticket"},
     "loom:merged": {"color": "8fd19e", "description": "Merged, not deployed yet"},
