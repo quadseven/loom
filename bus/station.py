@@ -10883,7 +10883,7 @@ class Station:
         """Send the current limits snapshot using the transcript upload token."""
         if not (self.s.transcript_url and self.s.transcript_token_ssm):
             return
-        url = self.s.transcript_url.removesuffix("/api/transcripts") + "/api/usage"
+        url = brain_memory.dashboard_url(self.s.transcript_url, "/api/usage")
         token = self._transcript_token()
         if token is None:
             return
