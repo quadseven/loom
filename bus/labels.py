@@ -17,7 +17,11 @@ LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
 # Contributor (LOOM_OPENCODE_GO_4_MODEL), which trains on prompts, so it
 # takes public repos only.
 SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-6",
-         "anthropic-7", "anthropic-8", "codex-2", "opencode-go-2", "opencode-go-3",
+         "anthropic-7", "anthropic-8", "codex-2",
+         # Six more codex slots, all on gpt-6-luna, so the Codex allowance is
+         # used rather than left to reset (operator, 2026-10-25).
+         "codex-3", "codex-4", "codex-5", "codex-6", "codex-7", "codex-8",
+         "opencode-go-2", "opencode-go-3",
          "opencode-go-4",
          # A second local coder: the other Spark box, at LOOM_SPARK_2_URL.
          "spark-2",
