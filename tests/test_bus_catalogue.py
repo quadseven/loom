@@ -344,6 +344,40 @@ class ModelCatalogueTests(unittest.TestCase):
         self.assertIsNotNone(choice2)
         self.assertEqual(choice2.id, "opencode-go/deepseek-v4.1-flash")
 
+    def test_preferred_contributor_model_excluded_when_public_only(self):
+        cat = {
+            "opencode-go/muse-spark-1.3-contributor": catalogue.ModelEntry(
+                id="opencode-go/muse-spark-1.3-contributor",
+                provider="opencode-go",
+                raw_id="muse-spark-1.3-contributor",
+                api_shape="openai-compatible",
+                is_free=False,
+                tier="flash",
+            ),
+            "opencode-go/deepseek-v4.1-flash": catalogue.ModelEntry(
+                id="opencode-go/deepseek-v4.1-flash",
+                provider="opencode-go",
+                raw_id="deepseek-v4.1-flash",
+                api_shape="openai-compatible",
+                is_free=False,
+                tier="flash",
+            ),
+        }
+        tracker = catalogue.AllowanceTracker()
+        # When public_only=True, preferred contributor model is excluded
+        choice = catalogue.select_model("medium", cat, tracker, now=NOW,
+                                        public_only=True,
+                                        preferred_model="opencode-go/muse-spark-1.3-contributor")
+        self.assertIsNotNone(choice)
+        self.assertEqual(choice.id, "opencode-go/deepseek-v4.1-flash")
+
+        # When public_only=False, preferred contributor model is allowed
+        choice2 = catalogue.select_model("medium", cat, tracker, now=NOW,
+                                         public_only=False,
+                                         preferred_model="opencode-go/muse-spark-1.3-contributor")
+        self.assertIsNotNone(choice2)
+        self.assertEqual(choice2.id, "opencode-go/muse-spark-1.3-contributor")
+
     def test_cli_select_model_command(self):
         cat = {
             "opencode-go/mimo-v2.6-flash": catalogue.ModelEntry(

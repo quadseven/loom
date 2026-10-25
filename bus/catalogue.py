@@ -280,7 +280,7 @@ def select_model(tier: str, catalogue: Dict[str, ModelEntry],
         clean_pref = preferred_model.strip()
         pref_entry = catalogue.get(clean_pref)
         if pref_entry is not None:
-            if (public_only or "contributor" not in pref_entry.raw_id) and \
+            if (not public_only or "contributor" not in pref_entry.raw_id) and \
                     not tracker.is_limited(pref_entry.provider, pref_entry.id, now=current_time):
                 return pref_entry
 
@@ -315,7 +315,7 @@ def tier_candidates(tier: str, catalogue: Dict[str, ModelEntry],
         clean_pref = preferred_model.strip()
         if clean_pref in catalogue:
             pref_entry = catalogue[clean_pref]
-            if public_only or "contributor" not in pref_entry.raw_id:
+            if not public_only or "contributor" not in pref_entry.raw_id:
                 result.append(clean_pref)
 
     for stage in stages:
@@ -379,6 +379,57 @@ def load_catalogue(home: Optional[Union[str, Path]] = None) -> Dict[str, ModelEn
         return default_catalogue()
 
 
+def _cmd_discover(home: Union[str, Path]) -> int:
+    url = os.environ.get("LOOM_OPENCODE_GO_MODELS_URL", OPENCODE_GO_MODELS_URL)
+    discovered = discover_models(url=url)
+    if discovered:
+        save_catalogue(discovered, catalogue_file(home))
+        print("discovered %d models" % len(discovered))
+    return 0
+
+
+def _cmd_select_model(args: List[str], home: Union[str, Path]) -> int:
+    tier = args[1] if len(args) > 1 else "medium"
+    pinned = args[2] if len(args) > 2 and args[2] else None
+    preferred = args[3] if len(args) > 3 and args[3] else None
+    cat = load_catalogue(home)
+    tracker = AllowanceTracker.load(allowance_file(home))
+    entry = select_model(tier, cat, tracker, pinned_model=pinned, preferred_model=preferred)
+    if entry:
+        print(entry.id)
+        return 0
+    return 1
+
+
+def _cmd_models_for_tier(args: List[str], home: Union[str, Path]) -> int:
+    tier = args[1] if len(args) > 1 else "medium"
+    preferred = args[2] if len(args) > 2 and args[2] else None
+    cat = load_catalogue(home)
+    candidates = tier_candidates(tier, cat, preferred_model=preferred)
+    print(" ".join(candidates))
+    return 0
+
+
+def _cmd_record_limit(args: List[str], home: Union[str, Path]) -> int:
+    if len(args) < 4:
+        sys.exit("usage: python3 -m bus.catalogue record-limit <model> <window> <retry_after>")
+    model, window, retry_after = args[1], args[2], args[3]
+    tracker = AllowanceTracker.load(allowance_file(home))
+    tracker.record_limit("opencode-go", model, window, retry_after)
+    tracker.save(allowance_file(home))
+    return 0
+
+
+def _cmd_record_call(args: List[str], home: Union[str, Path]) -> int:
+    if len(args) < 2:
+        sys.exit("usage: python3 -m bus.catalogue record-call <model>")
+    model = args[1]
+    tracker = AllowanceTracker.load(allowance_file(home))
+    tracker.record_call("opencode-go", model)
+    tracker.save(allowance_file(home))
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = argv if argv is not None else sys.argv[1:]
     if not args:
@@ -389,51 +440,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     home = os.environ.get("LOOM_HOME", ".")
 
     if cmd == "discover":
-        url = os.environ.get("LOOM_OPENCODE_GO_MODELS_URL", OPENCODE_GO_MODELS_URL)
-        discovered = discover_models(url=url)
-        if discovered:
-            save_catalogue(discovered, catalogue_file(home))
-            print("discovered %d models" % len(discovered))
-        return 0
-
+        return _cmd_discover(home)
     if cmd == "select-model":
-        tier = args[1] if len(args) > 1 else "medium"
-        pinned = args[2] if len(args) > 2 and args[2] else None
-        preferred = args[3] if len(args) > 3 and args[3] else None
-        cat = load_catalogue(home)
-        tracker = AllowanceTracker.load(allowance_file(home))
-        entry = select_model(tier, cat, tracker, pinned_model=pinned, preferred_model=preferred)
-        if entry:
-            print(entry.id)
-            return 0
-        return 1
-
+        return _cmd_select_model(args, home)
     if cmd == "models-for-tier":
-        tier = args[1] if len(args) > 1 else "medium"
-        preferred = args[2] if len(args) > 2 and args[2] else None
-        cat = load_catalogue(home)
-        candidates = tier_candidates(tier, cat, preferred_model=preferred)
-        print(" ".join(candidates))
-        return 0
-
+        return _cmd_models_for_tier(args, home)
     if cmd == "record-limit":
-        if len(args) < 4:
-            sys.exit("usage: python3 -m bus.catalogue record-limit <model> <window> <retry_after>")
-        model, window, retry_after = args[1], args[2], args[3]
-        tracker = AllowanceTracker.load(allowance_file(home))
-        tracker.record_limit("opencode-go", model, window, retry_after)
-        tracker.save(allowance_file(home))
-        return 0
-
+        return _cmd_record_limit(args, home)
     if cmd == "record-call":
-        if len(args) < 2:
-            sys.exit("usage: python3 -m bus.catalogue record-call <model>")
-        model = args[1]
-        tracker = AllowanceTracker.load(allowance_file(home))
-        tracker.record_call("opencode-go", model)
-        tracker.save(allowance_file(home))
-        return 0
-
+        return _cmd_record_call(args, home)
     return 1
 
 
