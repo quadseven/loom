@@ -1845,7 +1845,10 @@ contract_run() {
     # python3 on an arm64 host without Rosetta) made uv exit 2 before any
     # test, so every muster lane run failed on the unmodified base
     # (2026-10-16).
+    # UV_CACHE_DIR and UV_PYTHON_INSTALL_DIR name uv's own defaults under
+    # the scratch home, where agent_uv_cache copies them for a codex agent.
     export PATH="${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
+    export UV_CACHE_DIR="$home/.cache/uv" UV_PYTHON_INSTALL_DIR="$home/.local/share/uv/python"
     exec timeout "$CHECK_TIMEOUT" sandbox-exec -p "$profile" /bin/bash -c "$1" < /dev/null
   ) 2>&1 | timeout "$((CHECK_TIMEOUT + 60))" cat >> "$LOG"
 }
@@ -2568,6 +2571,25 @@ markers_left() {
   return 0
 }
 
+# A codex agent has no network, so its tests could not fetch the packages
+# the base check had already downloaded (loom#1665). Give it a copy of the
+# check's uv cache (a clone on APFS, so it costs no space): uv must write
+# the cache it reads, and a copy keeps the agent from changing the cache the
+# final check reads. Sets AGENT_UV_DIR and AGENT_UV_PYTHON for agent_cli, or
+# leaves them empty when this ticket's base check left no uv cache.
+agent_uv_cache() {
+  local src="$CHECK_HOME/.cache/uv" dir="$CHECK_HOME/agent-uv"
+  AGENT_UV_DIR="" AGENT_UV_PYTHON=""
+  [ "$LANE" = codex ] && [ -n "$HAS_CONTRACT" ] && [ -d "$src" ] || return 0
+  rm -rf "$dir"
+  if mkdir -p "$dir" && { cp -Rc "$src" "$dir/cache" 2> /dev/null ||
+       { rm -rf "$dir/cache"; cp -R "$src" "$dir/cache"; }; }; then
+    AGENT_UV_DIR="$dir" AGENT_UV_PYTHON="$CHECK_HOME/.local/share/uv/python"
+  else
+    echo "could not copy the base check's uv cache for the agent; its uv runs without one"
+  fi
+}
+
 run_agent() {
   local brief_text
   brief_text="$(cat "$1")$(work_note)$(validation_note)$(summary_note)"
@@ -2578,6 +2600,7 @@ run_agent() {
 Do not search the whole filesystem (for example, find /). Search within the checkout and read the repository's build files to learn how it builds and tests."
   fi
   AGENT_EXTRA_ENV=""
+  agent_uv_cache
   is_api_lane && fresh_agent_home
   case "$LANE" in
     codex|claude) agent_cli "$LANE" lane "$brief_text" ;;

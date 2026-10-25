@@ -445,6 +445,53 @@ class StationRewriteTest(Base):
         key = "%s#%d" % (REPO, GOAL)
         self.assertNotIn("7", ledger[key]["tried"])
 
+    def test_a_slow_agent_does_not_hold_the_pass(self):
+        # loom#1663: five inline rewrites of up to ten minutes each held the
+        # pass (305 s of one), and with it claims, fix rounds and deploys.
+        self.fake.add_triage(7)
+        gate = os.path.join(self._tmp.name, "gate")
+        script = os.path.join(self._tmp.name, "slow.py")
+        with open(script, "w") as fh:
+            fh.write("import os, sys, time\nsys.stdin.read()\nend = time.time() + 8\n"
+                     "while not os.path.exists(%r) and time.time() < end:\n"
+                     "    time.sleep(0.05)\nprint(%r)\n" % (gate, json.dumps(BRIEF)))
+        cmd = "%s %s" % (shlex.quote(sys.executable), shlex.quote(script))
+        st = self.station(cmd=cmd)
+        began = time.monotonic()
+        with mock.patch.object(station, "REWRITE_WAIT", 0.3, create=True):
+            err = self.run_station(st)
+        self.assertLess(time.monotonic() - began, 5)
+        self.assertEqual(self.fake.created, [])
+        self.assertIn("rewrite %s#7: the agent still runs" % REPO, err)
+        open(gate, "w").close()
+        folder = st._rewrite_folder(REPO, 7)
+        for proc in st._rewrite_procs.values():
+            proc.wait(timeout=20)
+        self.assertIsNotNone(rewrite.job_result(folder))
+        err = self.run_station(self.station(cmd=cmd, now=60))
+        self.assertEqual(len(self.fake.created), 1)
+        self.assertIn("rewrite %s#7: brief" % REPO, err)
+        self.assertFalse(os.path.exists(folder))
+        with open(os.path.join(st.state, "rewrite.json")) as fh:
+            self.assertEqual(json.load(fh)["_jobs"], {})
+
+    def test_a_job_that_left_no_result_is_dropped_after_its_timeout(self):
+        self.fake.add_triage(7)
+        st = self.station(cmd=self.agent(BRIEF))
+        os.makedirs(st.state, exist_ok=True)
+        key = "%s#%d" % (REPO, GOAL)
+        job = {"goal_key": key, "repo": REPO, "goal": GOAL, "number": 7, "started": self.start}
+        with open(os.path.join(st.state, "rewrite.json"), "w") as fh:
+            json.dump({"_jobs": {"%s#7" % REPO: job}, key: {"tried": {"7": self.start}}}, fh)
+        err = self.run_station(self.station(cmd=self.agent(BRIEF), now=60))
+        self.assertNotIn("wrote nothing", err)
+        self.assertEqual(self.fake.created, [])
+        err = self.run_station(self.station(
+            cmd=self.agent(BRIEF), now=station.REWRITE_TIMEOUT + station.REWRITE_JOB_GRACE + 1))
+        self.assertIn("rewrite %s#7 wrote nothing: the agent command could not run: no result"
+                      % REPO, err)
+        self.assertEqual(self.fake.created, [])
+
     def test_a_backlog_nobody_triaged_is_left_alone(self):
         self.fake.add_triage(7)
         st = self.station(cmd=self.agent(BRIEF))

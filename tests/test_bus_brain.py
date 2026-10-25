@@ -87,6 +87,15 @@ def ready_node(checks="SUCCESS", reviews=(), threads=()):
             "reviews": {"nodes": list(reviews)}, "reviewThreads": {"nodes": list(threads)}}
 
 
+def merge_takes(ticket=4):
+    """The reads status makes for a READY lane pull request (loom#1643): its
+    ticket at loom:pr, a mergeable REST answer and an app-code file."""
+    return (reply(200, {"number": ticket, "state": "open",
+                        "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}),
+            reply(200, {"mergeable": True, "mergeable_state": "clean"}),
+            reply(200, [{"filename": "bus/a.py", "patch": "+x"}]))
+
+
 class BrainTests(unittest.TestCase):
     def test_prioritize_sets_and_replaces_priority_without_changing_body_content(self):
         original = "Difficulty: medium\n\n## Why\nExact text.  \n\n## What\nKeep this.\n"
@@ -472,7 +481,7 @@ class SensitiveResumeTests(unittest.TestCase):
               "labels": [{"name": "class:docs"}]}
         fake = Fake(reply(200, []), reply(200, [pr]),
                     reply(200, {"data": {"repository": {"p4": ready_node()}}}),
-                    reply(200, []))
+                    *merge_takes(), reply(200, []))
 
         def transport(method, url, headers, body):
             if "/check-runs?" in url:
@@ -495,6 +504,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, {"data": {"repository": {"p4": ready_node(),
                                                 "g1": {"comments": {"nodes": []}}}}}),
             reply(200, []),
+            *merge_takes(),
             reply(200, comments_with),
             reply(200, []))
         report_with = brain.status(GitHub("t", transport=fake_with), [REPO], REPO,
@@ -512,6 +522,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, {"data": {"repository": {"p4": ready_node(),
                                                 "g1": {"comments": {"nodes": []}}}}}),
             reply(200, []),
+            *merge_takes(),
             reply(200, comments_without),
             reply(200, []))
         report_without = brain.status(GitHub("t", transport=fake_without), [REPO], REPO,
@@ -528,7 +539,7 @@ class SensitiveResumeTests(unittest.TestCase):
 
         with_fix = [{"user": {"login": "alice-example"},
                      "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
-        gh_fix = GitHub("t", transport=Fake(reply(200, with_fix)))
+        gh_fix = GitHub("t", transport=Fake(*merge_takes(), reply(200, with_fix)))
         lines_with = brain._pull_request_lines(gh_fix, REPO, [pr], data, bot, authors)
         self.assertEqual(lines_with, ["### Pull requests", "- #4 PR - blocked: pending brain fix"])
 
@@ -540,11 +551,11 @@ class SensitiveResumeTests(unittest.TestCase):
 
         without_fix = [{"user": {"login": "alice-example"},
                         "body": "%s normal fix" % tickets.FIX_MARKER}]
-        gh_without = GitHub("t", transport=Fake(reply(200, without_fix)))
+        gh_without = GitHub("t", transport=Fake(*merge_takes(), reply(200, without_fix)))
         lines_without = brain._pull_request_lines(gh_without, REPO, [pr], data, bot, authors)
         self.assertEqual(lines_without, ["### Pull requests", "- #4 PR - READY"])
 
-        no_authors = GitHub("t", transport=Fake())
+        no_authors = GitHub("t", transport=Fake(*merge_takes()))
         lines_pure = brain._pull_request_lines(no_authors, REPO, [pr], data, bot)
         self.assertEqual(lines_pure, ["### Pull requests", "- #4 PR - READY"])
 
@@ -767,7 +778,7 @@ class SensitiveResumeTests(unittest.TestCase):
         def run():
             gh = GitHub("t", transport=Fake(reply(200, []), reply(200, pulls),
                                             reply(200, {"data": {"repository": {"p4": node}}}),
-                                            reply(200, [])))
+                                            *merge_takes(), reply(200, [])))
             return [line for line in brain.status(gh, [REPO], REPO, env={}, authors=()).splitlines()
                     if line.startswith("- #4 ")]
 
@@ -2253,6 +2264,44 @@ class Routed:
 
     def sent(self, method, suffix):
         return [c[2] for c in self.calls if c[0] == method and c[1].split("?")[0].endswith(suffix)]
+
+
+class StatusMergeRefusalTests(unittest.TestCase):
+    """loom#1643: status prints READY only for a pull request merge would
+    take; each refusal merge makes before it merges is a blocker."""
+
+    PR = {"number": 9, "title": "Work", "head": {"ref": "loom/7-work", "sha": "h"},
+          "labels": [{"name": "class:logic"}]}
+
+    def lines(self, state="pr", mergeable=True, mergeable_state="clean",
+              files=("bus/a.py", "tests/test_a.py"), env=None):
+        issue = {"number": 7, "state": "open", "body": "",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]}
+        routes = {
+            ("GET", "/issues/7"): reply(200, issue),
+            ("GET", "/pulls/9"): reply(200, {"number": 9, "mergeable": mergeable,
+                                             "mergeable_state": mergeable_state}),
+            ("GET", "/pulls/9/files"): reply(200, [{"filename": f, "patch": "+x"} for f in files]),
+        }
+        gh = GitHub("t", transport=Routed(routes))
+        with unittest.mock.patch.dict(os.environ, env or {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}):
+            return brain._pull_request_lines(gh, REPO, [self.PR], {"prs": {9: ready_node()}},
+                                             "grug-tribe")
+
+    def test_a_ticket_not_at_pr_blocks(self):
+        self.assertEqual(self.lines(state="running")[1],
+                         "- #9 Work - blocked: ticket at loom:running, not loom:pr")
+
+    def test_a_dirty_pull_request_blocks_as_a_conflict(self):
+        self.assertEqual(self.lines(mergeable=False, mergeable_state="dirty")[1],
+                         "- #9 Work - blocked: conflicts with the default branch")
+
+    def test_a_tier_outside_the_auto_tiers_is_held_for_the_operator(self):
+        line = self.lines(files=("deploy/app.yaml",))[1]
+        self.assertEqual(line, "- #9 Work - blocked: held for the operator: deploy-config")
+
+    def test_a_pull_request_merge_would_take_is_ready(self):
+        self.assertEqual(self.lines()[1], "- #9 Work - READY")
 
 
 class ModelFlagTests(unittest.TestCase):
