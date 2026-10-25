@@ -719,43 +719,77 @@ def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
     loom pull request, including a pending brain fix as a blocker."""
     lines = ["### Pull requests"]
     for pr in prs:
-        line = _status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check)
-        try:
-            ticket = _ticket_association(repo, pr)
-        except ValueError:
-            ticket = None
-        if (ticket is not None and line.endswith("blocked: no criterion built")):
-            issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
-            if {x.lower() for x in _labels(issue)} & {"docs", "documentation"}:
-                line = line.removesuffix("blocked: no criterion built") + "READY"
-        if line.endswith(" - READY"):
-            for blocker in _merge_refusals(gh, repo, pr, ticket):
-                line = _add_blocker(line, blocker)
-        if ticket is not None and authors:
-            comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
-            if _pending_brain_fix(comments, authors):
-                line = _add_blocker(line, "pending brain fix")
-        if operator_hold.operator_steps(str(pr.get("body") or "")):
-            # bus.brain merge refuses it and asks the operator; status says
-            # so first, from the body it already holds (2026-10-22).
-            line = _add_blocker(line, "held for the operator: operator steps before merge")
-        # Surface goal home merge constraints
-        if ticket is not None:
-            try:
-                ticket_issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
-            except GitHubError:
-                ticket_issue = {}
-            if ticket_issue.get("state") == "open" and "loom:ticket" in _labels(ticket_issue):
-                try:
-                    goal_home = _goal_home_for_ticket(gh, repo, ticket_issue)
-                except GitHubError:
-                    goal_home = None
-                if goal_home is not None:
-                    constraints = goal_merge_constraints(goal_home)
-                    if constraints:
-                        line += " - " + "; ".join("rule: %s" % c for c in constraints)
-        lines.append(line)
+        lines.append(_pull_request_line(gh, repo, pr, data, bot, authors, check))
     return lines
+
+
+def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
+                       data: Dict[str, Any], bot: str, authors: Sequence[str],
+                       check: str) -> str:
+    """Build one status line, including brain and goal-home blockers."""
+    node = data["prs"].get(int(pr["number"]))
+    line = _status_pr_line(gh, repo, pr, node, bot, check)
+    ticket = _safe_ticket_association(repo, pr)
+    line = _docs_criterion_override(gh, repo, ticket, line)
+    if line.endswith(" - READY"):
+        for blocker in _merge_refusals(gh, repo, pr, ticket):
+            line = _add_blocker(line, blocker)
+    line = _pending_fix_blocker(gh, ticket, authors, line)
+    if operator_hold.operator_steps(str(pr.get("body") or "")):
+        line = _add_blocker(line, "held for the operator: operator steps before merge")
+    return line + _goal_constraint_suffix(gh, repo, ticket)
+
+
+def _safe_ticket_association(repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+    """Return the associated ticket, ignoring an invalid association."""
+    try:
+        return _ticket_association(repo, pr)
+    except ValueError:
+        return None
+
+
+def _docs_criterion_override(gh: GitHub, repo: str,
+                             ticket: Optional[Tuple[str, int]], line: str) -> str:
+    """Docs tickets do not require a built acceptance criterion."""
+    if ticket is None or not line.endswith("blocked: no criterion built"):
+        return line
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+    if {x.lower() for x in _labels(issue)} & {"docs", "documentation"}:
+        return line.removesuffix("blocked: no criterion built") + "READY"
+    return line
+
+
+def _pending_fix_blocker(gh: GitHub, ticket: Optional[Tuple[str, int]],
+                         authors: Sequence[str], line: str) -> str:
+    """Add a blocker while a brain fix still awaits its author."""
+    if ticket is not None and authors:
+        comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
+        if _pending_brain_fix(comments, authors):
+            return _add_blocker(line, "pending brain fix")
+    return line
+
+
+def _goal_constraint_suffix(gh: GitHub, repo: str,
+                            ticket: Optional[Tuple[str, int]]) -> str:
+    """Format the applicable goal-home rules for a status line."""
+    if ticket is None:
+        return ""
+    try:
+        ticket_issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+    except GitHubError:
+        return ""
+    if ticket_issue.get("state") != "open" or "loom:ticket" not in _labels(ticket_issue):
+        return ""
+    try:
+        goal_home = _goal_home_for_ticket(gh, repo, ticket_issue)
+    except GitHubError:
+        return ""
+    if goal_home is None:
+        return ""
+    constraints = goal_merge_constraints(goal_home)
+    if not constraints:
+        return ""
+    return " - " + "; ".join("rule: %s" % constraint for constraint in constraints)
 
 
 def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
