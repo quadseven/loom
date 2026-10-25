@@ -998,7 +998,9 @@ class ReconcilePullRequestTest(Base):
 
     def test_an_adoption_ticket_moves_to_merged_when_its_target_merges(self):
         sha = "%040x" % 77
-        for index, state in enumerate(("queued", "briefed", "running", "answered")):
+        # A failed lane run leaves the ticket loom:failed; its target can
+        # still merge, and the factory must not re-brief landed work (loom#1717).
+        for index, state in enumerate(("queued", "briefed", "running", "answered", "failed")):
             with self.subTest(state=state):
                 number = 12 + index
                 self.adoption(number, 77, state=state, lane="spark-2")

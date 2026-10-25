@@ -3864,7 +3864,10 @@ class Station:
         request its title and body name has merged, freeing its lane. A
         target still open, or closed unmerged, leaves the ticket: its job is
         then to supersede that pull request (loom#1020)."""
-        waiting = ("loom:queued", "loom:briefed", "loom:running", "loom:answered")
+        # loom:failed too: a lane run on the ticket can fail while its target
+        # merges, and the factory then re-briefed landed work (loom#1717).
+        waiting = ("loom:queued", "loom:briefed", "loom:running", "loom:answered",
+                   "loom:failed")
         for issue in open_tickets:
             if (not isinstance(issue, dict) or "pull_request" in issue
                     or not set(_label_names(issue)).intersection(waiting)):
