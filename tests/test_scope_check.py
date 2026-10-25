@@ -76,6 +76,23 @@ class ScopeCheckTest(unittest.TestCase):
         self.commit("work")
         self.assertEqual(self.stray(), [])
 
+    def test_only_an_edited_tracked_file_vouches_for_a_new_top_level_file(self):
+        self.write("app.py", "import os\n")
+        self.base = self.commit("flat")
+        # New files naming each other, a standard-library name, an auto-run
+        # name, a hidden name and a name inside a longer one all stay stray.
+        self.write("first_new.py", "import second_new\n")
+        self.write("second_new.py", "import first_new\n")
+        self.write("json.py", "x = 1\n")
+        self.write("conftest.py", "x = 1\n")
+        self.write(".hidden.py", "x = 1\n")
+        self.write("a.py", "x = 1\n")
+        self.write("app.py", "import os\nimport json\nimport conftest\n"
+                             "# .hidden.py data.py\n")
+        self.commit("work")
+        self.assertEqual(sorted(self.stray()), [".hidden.py", "a.py", "conftest.py",
+                                                "first_new.py", "json.py", "second_new.py"])
+
     def test_a_new_top_level_file_nothing_changed_wires_in_stays_stray(self):
         self.write("app.py", "import os\n")
         self.base = self.commit("flat")

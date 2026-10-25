@@ -15,7 +15,7 @@ the diff adds is in scope when either holds:
   workflow or action must be named in the brief.
 
 - it sits at the top level beside tracked top-level files of its
-  extension, and a file the diff adds or edits wires it in: a Python
+  extension, and a tracked file the diff edits wires it in: a Python
   ``import <stem>`` / ``from <stem> import``, or its full name. A repo
   that keeps its modules at the top level had every new module refused,
   since no brief can name a file the agent has not chosen yet (loom#1705).
@@ -129,33 +129,45 @@ def in_known_hidden_subdir(path: str, tracked: Set[str]) -> bool:
     return any(name.startswith(parent) for name in tracked)
 
 
-def changed_files(tree: str, base: str, head: str) -> List[str]:
-    """Paths the diff adds or edits between base and head."""
-    return _names(_git(tree, "diff", "-z", "--no-renames", "--diff-filter=AM",
+def edited_files(tree: str, base: str, head: str) -> List[str]:
+    """Tracked paths the diff edits between base and head."""
+    return _names(_git(tree, "diff", "-z", "--no-renames", "--diff-filter=M",
                        "--name-only", base, head))
 
 
-def wired_top_level(tree: str, head: str, path: str, tracked: Set[str],
-                    changed: Sequence[str]) -> bool:
-    """True when a new top-level file sits beside tracked top-level files of
-    its extension and another changed file imports it or names it."""
-    name, dot, suffix = path.rpartition(".")
-    if "/" in path or not dot or not name:
-        return False
-    if not any("/" not in t and t.endswith(dot + suffix) for t in tracked):
-        return False
-    others = [p for p in changed if p != path]
-    if not others:
-        return False
-    patterns = ["-e", re.sub(r"([.\[\]()*+?{}|^$\\])", r"\\\1", path)]
-    if suffix == "py" and name.isidentifier():
-        patterns += ["-e", r"^[[:space:]]*(from|import)[[:space:]]+%s([[:space:].,]|$)" % name]
-    proc = subprocess.run(["git", "-C", tree, "grep", "-I", "-q", "-E", *patterns,
-                           head, "--", *(":(literal)" + p for p in others)],
+# Top-level names that tools load or run on their own: never in scope unnamed.
+AUTO_RUN_NAMES = frozenset(("conftest.py", "setup.py", "sitecustomize.py",
+                            "usercustomize.py", "noxfile.py", "Makefile"))
+
+
+def _grep(tree: str, head: str, args: Sequence[str], paths: Sequence[str]) -> bool:
+    proc = subprocess.run(["git", "-C", tree, "grep", "-I", "-q", *args, head, "--",
+                           *(":(literal)" + p for p in paths)],
                           capture_output=True, check=False)
     if proc.returncode not in (0, 1):
         raise GitError("git grep failed: %s" % proc.stderr.decode(errors="replace").strip())
     return proc.returncode == 0
+
+
+def wired_top_level(tree: str, head: str, path: str, tracked: Set[str],
+                    edited: Sequence[str]) -> bool:
+    """True when a new top-level file sits beside tracked top-level files of
+    its extension and a tracked file the diff edits imports it or names it.
+    Only edited tracked files count, so two new files cannot vouch for each
+    other; hidden, auto-run and standard-library names never qualify."""
+    name, dot, suffix = path.rpartition(".")
+    if ("/" in path or not dot or not name or path.startswith(".")
+            or not path.isprintable() or path in AUTO_RUN_NAMES):
+        return False
+    if suffix == "py" and name in getattr(sys, "stdlib_module_names", ()):
+        return False
+    if not edited or not any("/" not in t and t.endswith(dot + suffix) for t in tracked):
+        return False
+    if _grep(tree, head, ["-w", "-F", "-e", path], edited):
+        return True
+    return (suffix == "py" and name.isidentifier() and _grep(
+        tree, head, ["-E", "-e", r"^[[:space:]]*(from|import)[[:space:]]+%s([[:space:].,]|$)" % name],
+        edited))
 
 
 def stray_files(tree: str, base: str, head: str, brief_text: str,
@@ -168,14 +180,14 @@ def stray_files(tree: str, base: str, head: str, brief_text: str,
         dirs |= top_dirs(tree, rev)
         elsewhere |= tracked_files(tree, rev)
     stray = []
-    changed: List[str] = []
+    edited: List[str] = []
     for path in added_files(tree, base, head):
         if (path in elsewhere or named(brief_text, path) or in_known_dir(path, dirs)
                 or in_known_hidden_subdir(path, tracked)):
             continue
         if "/" not in path:
-            changed = changed or changed_files(tree, base, head)
-            if wired_top_level(tree, head, path, tracked, changed):
+            edited = edited or edited_files(tree, base, head)
+            if wired_top_level(tree, head, path, tracked, edited):
                 continue
         stray.append(path)
     return stray
