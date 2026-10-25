@@ -1586,6 +1586,10 @@ class Factory:
         """The new source text of each file the pull request changes, from the
         head commit `sha`. Returns a mapping of path -> content for files that
         exist and are readable at the head."""
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+            return {}
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return {}
         files: Dict[str, str] = {}
         for page in range(1, 31):
             data = self.gh.rest("GET", "/repos/%s/pulls/%d/files?per_page=100&page=%d"
@@ -1707,8 +1711,7 @@ class Factory:
         finally:
             # Clean up the temporary directory
             try:
-                if os.path.exists(base_dir):
-                    shutil.rmtree(base_dir)
+                shutil.rmtree(base_dir, ignore_errors=True)
             except OSError:
                 pass
 

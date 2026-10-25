@@ -118,14 +118,15 @@ def _base_pass_findings(changed: Dict[str, str], test_files: List[str],
     out: List[str] = []
     if run_on_base is not None and test_files:
         for path in test_files:
-            for name in _test_names(changed[path]):
-                try:
-                    if run_on_base(path):
+            try:
+                if run_on_base(path):
+                    for name in _test_names(changed[path]):
                         out.append("test %s passes against the base commit's "
                                    "code, so the fix never made it fail (%s)"
                                    % (name, path))
-                except OSError:
-                    continue
+            except OSError as e:
+                print("vacuous: base test run failed for %s: %s" % (path, e), flush=True)
+                continue
     return out
 
 
