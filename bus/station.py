@@ -5181,7 +5181,7 @@ class Station:
         except RateLimited:
             raise
         except GitHubError:
-            return
+            raise
         if RUNNING not in _label_names(issue):
             return
         self._relabel(repo, number, "loom:queued")

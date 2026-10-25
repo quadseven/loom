@@ -5451,6 +5451,31 @@ class ProbeTest(FactoryIncidentTest):
         self.assertEqual(len(queued), 1, self.fake.names(12) + self.fake.names(13))
         self.assertEqual(len(running), 1)
 
+    def test_a_failed_probe_read_keeps_the_hold_and_does_not_record_a_probe(self):
+        self.heartbeat("muse")
+        self.fake.add(12, lane="muse", body=PLAIN, state="running")
+        self._open_incident()
+        self.fake.head_sha = "b" * 40
+        now = time.time()
+        incident_ref = "quadseven/loom#99"
+        self._probe_file({incident_ref: {"head": "a" * 40, "at": now - 7200}})
+        held_path = self._held_file({
+            "%s#12" % REPO: {"incident": incident_ref, "at": now - 7200}})
+        def transport(method, url, headers, body):
+            if method == "GET" and urlsplit(url).path == "/repos/%s/issues/12" % REPO:
+                raise station.GitHubError("temporary failure", 502)
+            return self.fake(method, url, headers, body)
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            with mock.patch.object(runner, "_probe_eligible", return_value=True):
+                with self.assertRaises(station.GitHubError):
+                    runner._probe_held(runner._held_tickets(), {})
+        with open(held_path, encoding="utf-8") as fh:
+            self.assertIn("%s#12" % REPO, json.load(fh))
+        with open(os.path.join(self.home, "state", "station", "factory_probe.json"),
+                  encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)[incident_ref]["at"], now - 7200)
+
     def test_a_failed_probe_reholds_without_comment_and_waits(self):
         # A probe that fails is re-held with a fresh wait and no new comment,
         # so the next probe waits the full interval instead of firing again.
