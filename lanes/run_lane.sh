@@ -157,9 +157,10 @@ REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
 # A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
 # writes as that App, never as the operator (loom#1142): lanes opened 58 pull
 # requests as the operator in a day. It clones over https, and each run mints
-# an installation token for gh and git (lane_app_token); the agent never gets
-# it, its settings or git's helper. LOOM_APP_TOKEN_CMD, when set, is the command
-# that prints the token in place of `python3 -m bus app token`.
+# an installation token for gh and git (lane_app_token); the agent gets gh
+# access through an isolated gh config directory, not token environment
+# variables or App settings. LOOM_APP_TOKEN_CMD, when set, prints the token in
+# place of `python3 -m bus app token`.
 if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
   CLONE_BASE="${LOOM_CLONE_BASE:-https://github.com/}"
   # git asks gh for github.com credentials, and gh answers with GH_TOKEN.
@@ -294,7 +295,7 @@ summary_note() {
 # (its AGENTS.md rules), and another redid work its operator notes said had
 # shipped in other repos.
 work_note() {
-  printf '\n\n## How to work\n- Before you change anything, read the repo'"'"'s AGENTS.md and CLAUDE.md and the docs they point to: they state rules its CI enforces, such as which packages a test may import.\n- When the Operator notes or a merged pull request under Linked pull requests show the work is already done or belongs elsewhere, change nothing and say why in the Intent summary.\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line. In a public repo, never write a reference to another repo'"'"'s issue in the OWNER/NAME#<number> or NAME#<number> shape, not even a made-up one in a test fixture: write NAME#N, or add leak-guard-allow to that line when the shape is what the test is about.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
+  printf '\n\n## How to work\n- Before you change anything, read the repo'"'"'s AGENTS.md and CLAUDE.md and the docs they point to: they state rules its CI enforces, such as which packages a test may import.\n- When the Operator notes or a merged pull request under Linked pull requests show the work is already done or belongs elsewhere, change nothing and say why in the Intent summary.\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Do not poll pull request checks or reviews. Open or update the pull request, then stop; the station reads checks and hands work back.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line. In a public repo, never write a reference to another repo'"'"'s issue in the OWNER/NAME#<number> or NAME#<number> shape, not even a made-up one in a test fixture: write NAME#N, or add leak-guard-allow to that line when the shape is what the test is about.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
 # Lists the sandbox probes and out-of-path scratch files the agent added
@@ -742,12 +743,12 @@ signin_rest_until() {
   [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] && printf '%s' "$until"
 }
 
-# Mint this run's App token into GH_TOKEN. A personal token in the
-# environment is dropped first, so a failed mint leaves gh with nothing to
-# post as. Installation tokens last an hour: a run mints again after its agent.
+# Mint this run's App token into the runner's GH_TOKEN. The agent gets its own
+# gh config directory through gh's stdin interface, never a token in its
+# environment. Installation tokens last an hour: mint again after work.
 lane_app_token() {
   [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
-  local token
+  local token configure_agent="${1:-agent}"
   unset GH_TOKEN GITHUB_TOKEN
   if [ -n "${LOOM_APP_TOKEN_CMD:-}" ]; then
     token="$("$LOOM_APP_TOKEN_CMD" 2>> "$LOG")" || return 1
@@ -757,6 +758,12 @@ lane_app_token() {
   # Installation tokens are ghs_ and a JWT-like body: letters, digits, _ . -
   [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
   export GH_TOKEN="$token"
+  [ "$configure_agent" = agent ] || return 0
+  local auth_dir="$LOOM_HOME/run/gh-auth-$SLOT"
+  mkdir -p "$auth_dir" || return 1
+  chmod 700 "$auth_dir" || return 1
+  printf '%s' "$token" | GH_CONFIG_DIR="$auth_dir" gh auth login --with-token >/dev/null 2>> "$LOG" || return 1
+  export LANE_GH_CONFIG_DIR="$auth_dir"
 }
 APP_TOKEN_WHY="could not mint the lane's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
 
@@ -767,6 +774,7 @@ park() {
     reason="$reason; dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
   fi
   echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $reason" | tee -a "$LOG" >&2
+  [ -z "${AGENT_GH_CALLS:-}" ] || printf '[%s] %s agent gh calls: %s\n' "$(date -u +%FT%TZ)" "$TICKET" "$AGENT_GH_CALLS" >> "$LOG"
   mv "$1" "$INBOX/failed/"
 }
 
@@ -2974,13 +2982,21 @@ for BRIEF in "$INBOX"/*.md; do
   LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
   ( set -m
     (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
+      [ -z "${LANE_GH_CONFIG_DIR:-}" ] || export GH_CONFIG_DIR="$LANE_GH_CONFIG_DIR"
       run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
     wait $! ) &
   wait $!
   STATUS=$?
+  AGENT_GH_CALLS="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -cE '(^|[[:space:]])gh [^[:space:]]+' || true)"
+  if [ -n "${LANE_GH_CONFIG_DIR:-}" ] && ! rm -rf "$LANE_GH_CONFIG_DIR"; then
+    park "$BRIEF" "could not remove the lane's temporary GitHub credential store" transient
+    unset LANE_GH_CONFIG_DIR
+    continue
+  fi
+  unset LANE_GH_CONFIG_DIR
   is_api_lane && archive_transcripts
-  if ! lane_app_token; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
+  if ! lane_app_token runner; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
@@ -3329,6 +3345,7 @@ for BRIEF in "$INBOX"/*.md; do
     # The station reads this marker, not the log, which carries agent output.
     mv "$LOGDIR/$TICKET.answered.tmp" "$LOGDIR/$TICKET.answered"
     echo "[$(date -u +%FT%TZ)] $TICKET done, answered: nothing to change" >> "$LOG"
+    printf '[%s] %s agent gh calls: %s\n' "$(date -u +%FT%TZ)" "$TICKET" "$AGENT_GH_CALLS" >> "$LOG"
     mv "$BRIEF" "$INBOX/done/"
     continue
   fi
@@ -3432,5 +3449,6 @@ Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
     echo "[$(date -u +%FT%TZ)] could not add label class:$INTENT_CLASS to $PR_URL; the PR stands" >> "$LOG"
   fi
   echo "[$(date -u +%FT%TZ)] $TICKET done" >> "$LOG"
+  printf '[%s] %s agent gh calls: %s\n' "$(date -u +%FT%TZ)" "$TICKET" "$AGENT_GH_CALLS" >> "$LOG"
   mv "$BRIEF" "$INBOX/done/"
 done

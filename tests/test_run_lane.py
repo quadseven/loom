@@ -155,6 +155,10 @@ if [ "$1 $2" = "pr create" ]; then
   while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_BODY"; shift; done
   echo "https://github.com/example/repo/pull/7"
 fi
+if [ "$1 $2" = "auth login" ]; then
+  [ -z "${FAKE_GH_AUTH_TOKEN:-}" ] || cat > "$FAKE_GH_AUTH_TOKEN"
+  exit 0
+fi
 # Fake factory incidents: `search issues` prints $FAKE_GH_SEARCH (default
 # empty: no open incident), `issue create` writes its --body to
 # $FAKE_BODY.issue and prints the new issue's URL, `issue comment`
@@ -188,7 +192,7 @@ fi
 # rewrites the validation contract.
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
-[ -z "${FAKE_AGENT_ENV:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" "${LOOM_GITHUB_APP_ID:-none}" "${GIT_CONFIG_COUNT:-none}" >> "$FAKE_AGENT_ENV"
+[ -z "${FAKE_AGENT_ENV:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" "${LOOM_GITHUB_APP_ID:-none}" "${GIT_CONFIG_COUNT:-none}" "${GH_CONFIG_DIR:-none}" >> "$FAKE_AGENT_ENV"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = say ]; then
@@ -4482,16 +4486,29 @@ exit %d
         seen_gh = Path(self._tmp.name) / "gh-tokens"
         seen_agent = Path(self._tmp.name) / "agent-tokens"
         self.drop_brief()
+        auth_token = Path(self._tmp.name) / "gh-auth-token"
         self.run_lane(LOOM_GITHUB_APP_ID="124",
                       # Installation tokens carry dots and dashes (2026-10-20: 383
                       # characters, ghs_ then a JWT-like body).
                       LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo ghs_lanes.tok-en"),
                       GH_TOKEN="ghp_personal", FAKE_GH_TOKENS=str(seen_gh),
+                      FAKE_GH_AUTH_TOKEN=str(auth_token),
                       FAKE_AGENT_ENV=str(seen_agent))
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.calls())
         self.assertEqual(set(seen_gh.read_text().split()), {"ghs_lanes.tok-en"})
         # Nor the App's settings to mint one, nor git's helper to borrow one.
-        self.assertEqual(seen_agent.read_text().split(), ["none", "none", "none"])
+        agent_env = seen_agent.read_text().splitlines()
+        self.assertEqual(agent_env[:3], ["none", "none", "none"])
+        self.assertTrue(agent_env[3].endswith("gh-auth-codex"))
+        self.assertEqual(auth_token.read_text(), "ghs_lanes.tok-en")
+        self.assertFalse((self.loom / "run" / "gh-auth-codex").exists())
+
+    def test_agent_brief_says_stop_after_opening_pr_and_summary_reports_gh_calls(self):
+        self.drop_brief()
+        self.run_lane()
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("Do not poll pull request checks or reviews", self.log.read_text())
+        self.assertIn("agent gh calls:", log)
 
     def test_a_lane_whose_app_token_cannot_be_minted_posts_nothing_as_anyone(self):
         self.drop_brief()
