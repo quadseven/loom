@@ -74,7 +74,8 @@ class ScopeCheckTest(unittest.TestCase):
         self.write("other_feed.py", "z = 1\n")
         self.write("README.md", "readme\nSee other_feed.py.\n")
         self.commit("work")
-        self.assertEqual(self.stray(), [])
+        # A bare mention is not an import: only the imported module is in scope.
+        self.assertEqual(self.stray(), ["other_feed.py"])
 
     def test_only_an_edited_tracked_file_vouches_for_a_new_top_level_file(self):
         self.write("app.py", "import os\nimport old_name\n")
@@ -101,6 +102,8 @@ class ScopeCheckTest(unittest.TestCase):
             "Conftest.py", {"app.py"}, ["import Conftest"]))
         self.assertTrue(scope_check.wired_top_level(
             "helper.py", {"app.py"}, ["from helper import x"]))
+        self.assertFalse(scope_check.wired_top_level(
+            "helper.js", {"app.js"}, ["import helper from './helper.js'"]))
 
     def test_a_new_top_level_file_nothing_changed_wires_in_stays_stray(self):
         self.write("app.py", "import os\n")
