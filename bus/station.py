@@ -62,7 +62,7 @@ from . import tickets
 from . import transcripts
 from . import brief_check
 from . import criteria_gate
-from . import live_proof
+from . import live_adapter, live_proof
 from . import deploy_watch
 from . import scorecard
 from . import watch
@@ -728,6 +728,8 @@ class Settings:
                  friction_mode: str = "",
                  evidence_cmds: Optional[Dict[str, str]] = None,
                  evidence_window_hours: float = EVIDENCE_WINDOW_HOURS,
+                 live_evidence_repos: Sequence[str] = (),
+                 live_evidence_env: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
                  pin_ship_repos: Sequence[str] = (),
                  briefers: Sequence[str] = (),
@@ -783,6 +785,12 @@ class Settings:
         # searches, which bounds the absence a verify can prove (a command that
         # prints loom-evidence-window-hours: N overrides it per run).
         self.evidence_window_hours = evidence_window_hours
+        # LOOM_LIVE_EVIDENCE_REPOS: repos whose .loom/live-evidence.json
+        # adapter the live proof may run (bus/live_adapter.py, loom#1770);
+        # LOOM_LIVE_EVIDENCE_PASS_ENV names the station variables (a
+        # read-only kubeconfig) an adapter is handed. Empty is off.
+        self.live_evidence_repos = list(live_evidence_repos)
+        self.live_evidence_env = dict(live_evidence_env or {})
         self.roll_ship_docs = roll_ship_docs or []
         # Local times (hour, minute) to send one digest of every goal's
         # reports; empty forwards each report as it is posted.
@@ -898,6 +906,10 @@ class Settings:
                    evidence_cmds=_evidence_commands(env),
                    evidence_window_hours=_hours(env.get("LOOM_EVIDENCE_WINDOW_HOURS", ""),
                                                 EVIDENCE_WINDOW_HOURS),
+                   live_evidence_repos=live_adapter.opted_in(
+                       env.get("LOOM_LIVE_EVIDENCE_REPOS", "")),
+                   live_evidence_env=live_adapter.passed_env(
+                       env.get("LOOM_LIVE_EVIDENCE_PASS_ENV", ""), env),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
                    friction_mode=friction_intake.mode(env.get("LOOM_FRICTION_INTAKE", "")),
@@ -7560,7 +7572,9 @@ class Station:
         """Where the live proof reads: the repo's configured evidence command
         as its log, run once per string with LOOM_EVIDENCE_NEEDLE and only its
         lines since the deploy kept (evidence.lines_since), and the station's
-        GitHub client. No query source is configured, so a SELECT step reads
+        GitHub client, and, for a repo the operator opted in, the repo's
+        live-evidence adapter for `log:<source>` and SQL steps
+        (bus/live_adapter.py, loom#1770). With no adapter a SELECT step reads
         as no evidence."""
         command = self.s.evidence_cmds.get(repo)
         log = None
@@ -7568,16 +7582,49 @@ class Station:
             def log(literal: str, since: float) -> Optional[List[str]]:
                 return evidence.lines_since(command, literal, since, self.now,
                                             self.s.evidence_window_hours)
-        return live_proof.Sources(log=log, gh=self.gh)
+        runner = self._live_adapter(repo)
+        if runner is None:
+            return live_proof.Sources(log=log, gh=self.gh)
+        return live_proof.Sources(
+            log=log, gh=self.gh,
+            source_log=runner.log if runner.adapter.log is not None else None,
+            sql=runner.query if runner.adapter.sql is not None else None)
+
+    def _live_adapter(self, repo: str) -> Optional[live_adapter.Runner]:
+        """The repo's live-evidence adapter, read once a pass from its default
+        branch, for a repo in LOOM_LIVE_EVIDENCE_REPOS; None otherwise or when
+        its manifest does not parse (said once a pass)."""
+        if repo not in self.s.live_evidence_repos:
+            return None
+        cache = self.__dict__.setdefault("_live_adapters", {})
+        if repo not in cache:
+            def read(path: str) -> Optional[str]:
+                return self._contents_text(repo, path)
+            adapter, why = live_adapter.parse(read(live_adapter.MANIFEST), read)
+            if adapter is None:
+                _say("no live-evidence adapter for %s: %s" % (repo, why))
+            cache[repo] = None if adapter is None else live_adapter.Runner(
+                adapter, extra=self.s.live_evidence_env)
+        return cache[repo]
 
     @staticmethod
-    def _windowed_log(text: str) -> bool:
-        """Whether a live criterion names log strings and a window: the proof
-        the station runs itself. A Live line with log strings and no window is
-        proved by a verify run once the log names them (_no_live_evidence),
-        and a check with no log by _evidence_holds."""
+    def _station_step(text: str, sources: live_proof.Sources) -> bool:
+        """Whether a live criterion names a proof the station runs itself with
+        these sources: log strings and a window read by the station's log
+        command, or a step the repo's live-evidence adapter answers (a
+        `log:<source>` or SQL step). A Live line with log strings and no
+        window is proved by a verify run once the log names them
+        (_no_live_evidence), and a check with no log by _evidence_holds."""
         step, _ = live_proof.step_of(text)
-        return step is not None and step.kind == live_proof.LOG and step.hours > 0
+        if step is None:
+            return False
+        if step.kind == live_proof.LOG and step.source:
+            return sources.source_log is not None
+        if step.kind == live_proof.LOG:
+            return sources.log is not None and step.hours > 0
+        if step.kind == live_proof.QUERY:
+            return sources.sql is not None
+        return False
 
     def _prove_live(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Run the read-only proof a shipped ticket's live criteria name, once
@@ -7623,14 +7670,13 @@ class Station:
 
     def _provable(self, issue: Dict[str, Any], sources: live_proof.Sources) -> bool:
         """Whether the station proves this ticket itself: open, shipped, not
-        verified or held, with a log source and a live criterion that names
-        log strings and a window."""
+        verified or held, with a live criterion that names a proof its
+        sources can read (_station_step)."""
         labels = set(_label_names(issue))
         if (issue.get("state") != "open" or "loom:shipped" not in labels
-                or "loom:verified" in labels or labels & set(CLOSE_DONE_HOLDS)
-                or sources.log is None):
+                or "loom:verified" in labels or labels & set(CLOSE_DONE_HOLDS)):
             return False
-        return any(k == criteria_gate.LIVE and self._windowed_log(t)
+        return any(k == criteria_gate.LIVE and self._station_step(t, sources)
                    for k, t in criteria_gate.needing_evidence(str(issue.get("body") or "")))
 
     def _proof_due(self, last: Dict[str, Any], contract: str) -> bool:
