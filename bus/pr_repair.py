@@ -285,6 +285,9 @@ def reconcile(brief_path: str, current_title: str, current_body: str,
                 summary = _normalise(fh.read())
         except OSError:
             summary = ""
+    # The summary is the lane's own text: a model that writes its tool's file
+    # path into it (infra-5956-r3, 2026-10-25) must not stop every repair.
+    summary = text.LOCAL_PATH_RE.sub("<path>", summary)
 
     try:
         desired_generated = _render_generated(
@@ -317,8 +320,13 @@ def reconcile(brief_path: str, current_title: str, current_body: str,
     if suffix:
         new_body = new_body + "\n" + suffix
 
+    # A path the ticket itself names (a server path in a private repo's
+    # ticket) reached the first pull request body with it; refusing it here
+    # stopped every repair of that pull request (infra-5819-r3).
+    named = set(m.group(0) for m in text.LOCAL_PATH_RE.finditer(brief))
     try:
-        text.check(new_body)
+        text.check(text.LOCAL_PATH_RE.sub(
+            lambda m: "<path>" if m.group(0) in named else m.group(0), new_body))
         if desired_title:
             text.check(desired_title)
     except ValueError as err:
