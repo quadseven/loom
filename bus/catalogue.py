@@ -123,7 +123,7 @@ def fetch_remote_models(url: str, timeout: int = PROBE_TIMEOUT,
             return parse_model_ids(data)
     except Exception as err:
         sys.stderr.write("model discovery failed from %s: %s\n" % (url, err))
-        return []
+        raise
 
 
 def discover_models(url: str = OPENCODE_GO_MODELS_URL,
@@ -254,6 +254,13 @@ def _model_sort_key(entry: ModelEntry) -> int:
     return 100
 
 
+def _is_eligible_candidate(entry: ModelEntry, tracker: AllowanceTracker,
+                           now: float, public_only: bool) -> bool:
+    if public_only and "contributor" in entry.raw_id:
+        return False
+    return not tracker.is_limited(entry.provider, entry.id, now=now)
+
+
 def select_model(tier: str, catalogue: Dict[str, ModelEntry],
                  tracker: AllowanceTracker, now: Optional[float] = None,
                  pinned_model: Optional[str] = None,
@@ -264,34 +271,23 @@ def select_model(tier: str, catalogue: Dict[str, ModelEntry],
 
     if pinned_model:
         clean_pinned = pinned_model.strip()
-        if clean_pinned in catalogue:
-            return catalogue[clean_pinned]
-        raw = clean_pinned.split("/", 1)[-1]
-        return ModelEntry(
-            id=clean_pinned,
-            provider="opencode-go",
-            raw_id=raw,
-            api_shape="openai-compatible",
-            is_free=raw.endswith("-free"),
-            tier=classify_tier(raw),
-        )
+        entry = catalogue.get(clean_pinned)
+        if entry is not None and _is_eligible_candidate(entry, tracker, current_time, public_only):
+            return entry
+        return None
 
     if preferred_model:
         clean_pref = preferred_model.strip()
         pref_entry = catalogue.get(clean_pref)
-        if pref_entry is not None:
-            if (not public_only or "contributor" not in pref_entry.raw_id) and \
-                    not tracker.is_limited(pref_entry.provider, pref_entry.id, now=current_time):
-                return pref_entry
+        if pref_entry is not None and _is_eligible_candidate(pref_entry, tracker, current_time, public_only):
+            return pref_entry
 
     tier_order = _tier_stages(tier)
     for stage in tier_order:
         candidates = [m for m in catalogue.values() if m.tier == stage]
         candidates.sort(key=_model_sort_key)
         for cand in candidates:
-            if not public_only and "contributor" in cand.raw_id:
-                continue
-            if not tracker.is_limited(cand.provider, cand.id, now=current_time):
+            if _is_eligible_candidate(cand, tracker, current_time, public_only):
                 return cand
     return None
 
@@ -315,14 +311,14 @@ def tier_candidates(tier: str, catalogue: Dict[str, ModelEntry],
         clean_pref = preferred_model.strip()
         if clean_pref in catalogue:
             pref_entry = catalogue[clean_pref]
-            if not public_only or "contributor" not in pref_entry.raw_id:
+            if not (public_only and "contributor" in pref_entry.raw_id):
                 result.append(clean_pref)
 
     for stage in stages:
         entries = [m for m in catalogue.values() if m.tier == stage]
         entries.sort(key=_model_sort_key)
         for e in entries:
-            if not public_only and "contributor" in e.raw_id:
+            if public_only and "contributor" in e.raw_id:
                 continue
             if e.id not in result:
                 result.append(e.id)
@@ -389,7 +385,9 @@ def _cmd_discover(home: Union[str, Path]) -> int:
 
 
 def _cmd_select_model(args: List[str], home: Union[str, Path]) -> int:
-    tier = args[1] if len(args) > 1 else "medium"
+    if len(args) < 2:
+        sys.exit("usage: python3 -m bus.catalogue select-model <tier> [pinned] [preferred]")
+    tier = args[1]
     pinned = args[2] if len(args) > 2 and args[2] else None
     preferred = args[3] if len(args) > 3 and args[3] else None
     cat = load_catalogue(home)

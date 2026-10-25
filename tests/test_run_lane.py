@@ -3879,7 +3879,8 @@ fi
     def test_a_go_5_hour_limit_selects_alternative_model_on_next_run(self):
         # When a model reaches its 5-hour limit, the lane automatically selects
         # an alternative model with available allowance.
-        limit_answer = (429, '{"type": "GoUsageLimitError", "limitName": "5-hour"}')
+        limit_answer = (429, '{"type": "GoUsageLimitError", "limitName": "5-hour", '
+                             '"message": "5-hour usage limit reached"}')
         ok_answer = (200, '{"id": "chat-ok", "choices": [{"message": {"role": "assistant", "content": "pong"}}]}')
         requests, env = self.provider(limit_answer, ok_answer, retry_after=1800)
         env["LOOM_OPENCODE_GO_MODELS"] = "opencode-go/mimo-v2.6-flash opencode-go/deepseek-v4.1-flash"

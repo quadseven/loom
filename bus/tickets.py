@@ -54,14 +54,21 @@ OPENCODE_GO_STAND_IN = "opencode-go/mimo-v2.6-flash"
 
 def allowed_model(model: str) -> str:
     """The model a lane may run for `model`: the stand-in of a
-    FORBIDDEN_MODELS model or of an opencode-go model off OPENCODE_GO_MODELS,
-    else `model` itself."""
+    FORBIDDEN_MODELS model or of an opencode-go model off OPENCODE_GO_MODELS
+    or the discovered catalogue, else `model` itself."""
     for prefix, stand_in in FORBIDDEN_MODELS:
         if model.startswith(prefix):
             return stand_in
     if model.startswith("opencode-go/"):
-        if model in OPENCODE_GO_MODELS or model.endswith("-free"):
+        if model in OPENCODE_GO_MODELS:
             return model
+        try:
+            from . import catalogue
+            cat = catalogue.load_catalogue()
+            if model in cat:
+                return model
+        except Exception:
+            pass
         return OPENCODE_GO_STAND_IN
     return model
 

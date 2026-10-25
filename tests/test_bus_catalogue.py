@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from unittest import mock
+import urllib.error
 from pathlib import Path
 from typing import Any, List
 
@@ -398,6 +399,119 @@ class ModelCatalogueTests(unittest.TestCase):
                 code = catalogue.main(["select-model", "medium"])
             self.assertEqual(code, 0)
             self.assertEqual(stdout.getvalue().strip(), "opencode-go/mimo-v2.6-flash")
+        finally:
+            if env_backup is not None:
+                os.environ["LOOM_HOME"] = env_backup
+            else:
+                os.environ.pop("LOOM_HOME", None)
+
+    def test_fetch_remote_models_raises_on_failure(self):
+        fetch = FakeFetch(urllib.error.URLError("connection refused"))
+        with self.assertRaises(urllib.error.URLError):
+            catalogue.fetch_remote_models("http://192.0.2.1/models", fetch=fetch)
+
+    def test_pinned_model_limited_or_absent_returns_none(self):
+        cat = {
+            "opencode-go/mimo-v2.6-flash": catalogue.ModelEntry(
+                id="opencode-go/mimo-v2.6-flash",
+                provider="opencode-go",
+                raw_id="mimo-v2.6-flash",
+                api_shape="openai-compatible",
+                is_free=False,
+                tier="flash",
+            ),
+        }
+        tracker = catalogue.AllowanceTracker()
+        # Model not in catalogue returns None
+        self.assertIsNone(catalogue.select_model("medium", cat, tracker, now=NOW,
+                                                pinned_model="opencode-go/non-existent"))
+
+        # Pinned model that is limited returns None
+        tracker.record_limit("opencode-go", "opencode-go/mimo-v2.6-flash", "5-hour", 18000, now=NOW)
+        self.assertIsNone(catalogue.select_model("medium", cat, tracker, now=NOW,
+                                                pinned_model="opencode-go/mimo-v2.6-flash"))
+
+    def test_pinned_model_contributor_excluded_when_public_only(self):
+        cat = {
+            "opencode-go/muse-spark-1.3-contributor": catalogue.ModelEntry(
+                id="opencode-go/muse-spark-1.3-contributor",
+                provider="opencode-go",
+                raw_id="muse-spark-1.3-contributor",
+                api_shape="openai-compatible",
+                is_free=False,
+                tier="flash",
+            ),
+        }
+        tracker = catalogue.AllowanceTracker()
+        self.assertIsNone(catalogue.select_model("medium", cat, tracker, now=NOW,
+                                                pinned_model="opencode-go/muse-spark-1.3-contributor",
+                                                public_only=True))
+        self.assertIsNotNone(catalogue.select_model("medium", cat, tracker, now=NOW,
+                                                   pinned_model="opencode-go/muse-spark-1.3-contributor",
+                                                   public_only=False))
+
+    def test_tier_candidates_and_select_contributor_filtering(self):
+        cat = {
+            "opencode-go/muse-spark-1.3-contributor": catalogue.ModelEntry(
+                id="opencode-go/muse-spark-1.3-contributor",
+                provider="opencode-go",
+                raw_id="muse-spark-1.3-contributor",
+                api_shape="openai-compatible",
+                is_free=False,
+                tier="flash",
+            ),
+            "opencode-go/deepseek-v4.1-flash": catalogue.ModelEntry(
+                id="opencode-go/deepseek-v4.1-flash",
+                provider="opencode-go",
+                raw_id="deepseek-v4.1-flash",
+                api_shape="openai-compatible",
+                is_free=False,
+                tier="flash",
+            ),
+        }
+        tracker = catalogue.AllowanceTracker()
+        # tier_candidates excludes contributor when public_only=True
+        candidates_public = catalogue.tier_candidates("flash", cat, public_only=True)
+        self.assertNotIn("opencode-go/muse-spark-1.3-contributor", candidates_public)
+        self.assertIn("opencode-go/deepseek-v4.1-flash", candidates_public)
+
+        # tier_candidates includes contributor when public_only=False
+        candidates_all = catalogue.tier_candidates("flash", cat, public_only=False)
+        self.assertIn("opencode-go/muse-spark-1.3-contributor", candidates_all)
+
+        # select_model in tier loop skips contributor when public_only=True
+        choice = catalogue.select_model("flash", cat, tracker, now=NOW, public_only=True)
+        self.assertEqual(choice.id, "opencode-go/deepseek-v4.1-flash")
+
+    def test_cli_select_model_missing_tier_exits(self):
+        with self.assertRaises(SystemExit) as ctx:
+            catalogue.main(["select-model"])
+        self.assertIn("usage:", str(ctx.exception))
+
+    def test_allowed_model_with_discovered_and_unapproved_models(self):
+        from bus import tickets
+        cat = {
+            "opencode-go/new-novel-model-free": catalogue.ModelEntry(
+                id="opencode-go/new-novel-model-free",
+                provider="opencode-go",
+                raw_id="new-novel-model-free",
+                api_shape="openai-compatible",
+                is_free=True,
+                tier="free",
+            ),
+        }
+        catalogue.save_catalogue(cat, catalogue.catalogue_file(self.home))
+        env_backup = os.environ.get("LOOM_HOME")
+        try:
+            os.environ["LOOM_HOME"] = str(self.home)
+            # Known allowlisted model allowed
+            self.assertEqual(tickets.allowed_model("opencode-go/beam-free"), "opencode-go/beam-free")
+            # Newly discovered free model in catalogue allowed
+            self.assertEqual(tickets.allowed_model("opencode-go/new-novel-model-free"),
+                             "opencode-go/new-novel-model-free")
+            # Unapproved model not in catalogue replaced by stand-in, even with -free
+            self.assertEqual(tickets.allowed_model("opencode-go/fake-not-in-catalogue-free"),
+                             tickets.OPENCODE_GO_STAND_IN)
         finally:
             if env_backup is not None:
                 os.environ["LOOM_HOME"] = env_backup
