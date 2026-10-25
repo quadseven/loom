@@ -62,6 +62,31 @@ class ScopeCheckTest(unittest.TestCase):
         self.assertEqual(sorted(self.stray()), [".agents/hooks.json", ".github/workflows/extra.yml",
                                                 "bin/test.txt", "test_hook.sh"])
 
+    def test_a_new_top_level_module_the_change_imports_is_in_scope(self):
+        # A repo that keeps its modules at the top level: a lane's new module
+        # was refused in 5 runs on 2026-10-24 because no brief can name it
+        # ahead of the agent (loom#1705).
+        self.write("app.py", "import os\n")
+        self.write("notes.txt", "x\n")
+        self.base = self.commit("flat")
+        self.write("app.py", "import os\nfrom helper_server import serve\n")
+        self.write("helper_server.py", "def serve():\n    pass\n")
+        self.write("other_feed.py", "z = 1\n")
+        self.write("README.md", "readme\nSee other_feed.py.\n")
+        self.commit("work")
+        self.assertEqual(self.stray(), [])
+
+    def test_a_new_top_level_file_nothing_changed_wires_in_stays_stray(self):
+        self.write("app.py", "import os\n")
+        self.base = self.commit("flat")
+        self.write("scratch_server.py", "x = 1\n")
+        self.write("app.py", "import os\n# scratch_server is not imported\n")
+        self.write("unused.txt", "x\n")
+        self.write("tool.sh", "echo\n")
+        self.write("bus/station.py", "x = 1\n# see tool.sh\n")
+        self.commit("work")
+        self.assertEqual(sorted(self.stray()), ["scratch_server.py", "tool.sh", "unused.txt"])
+
     def test_scratch_rules_only_select_new_unnamed_files(self):
         self.write("test_debug.py", "print('scratch')\n")
         self.write("module_debug.txt", "scratch\n")

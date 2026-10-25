@@ -14,6 +14,12 @@ the diff adds is in scope when either holds:
   RUNNABLE_DIRS. A pull request runs its own workflow files, so a new
   workflow or action must be named in the brief.
 
+- it sits at the top level beside tracked top-level files of its
+  extension, and a file the diff adds or edits wires it in: a Python
+  ``import <stem>`` / ``from <stem> import``, or its full name. A repo
+  that keeps its modules at the top level had every new module refused,
+  since no brief can name a file the agent has not chosen yet (loom#1705).
+
 Everything else is stray: a new file at the top level, under a new
 top-level directory, or under a hidden one, that the brief never names.
 Only added files count; an edit to a tracked file is never stray. A file
@@ -123,6 +129,35 @@ def in_known_hidden_subdir(path: str, tracked: Set[str]) -> bool:
     return any(name.startswith(parent) for name in tracked)
 
 
+def changed_files(tree: str, base: str, head: str) -> List[str]:
+    """Paths the diff adds or edits between base and head."""
+    return _names(_git(tree, "diff", "-z", "--no-renames", "--diff-filter=AM",
+                       "--name-only", base, head))
+
+
+def wired_top_level(tree: str, head: str, path: str, tracked: Set[str],
+                    changed: Sequence[str]) -> bool:
+    """True when a new top-level file sits beside tracked top-level files of
+    its extension and another changed file imports it or names it."""
+    name, dot, suffix = path.rpartition(".")
+    if "/" in path or not dot or not name:
+        return False
+    if not any("/" not in t and t.endswith(dot + suffix) for t in tracked):
+        return False
+    others = [p for p in changed if p != path]
+    if not others:
+        return False
+    patterns = ["-e", re.sub(r"([.\[\]()*+?{}|^$\\])", r"\\\1", path)]
+    if suffix == "py" and name.isidentifier():
+        patterns += ["-e", r"^[[:space:]]*(from|import)[[:space:]]+%s([[:space:].,]|$)" % name]
+    proc = subprocess.run(["git", "-C", tree, "grep", "-I", "-q", "-E", *patterns,
+                           head, "--", *(":(literal)" + p for p in others)],
+                          capture_output=True, check=False)
+    if proc.returncode not in (0, 1):
+        raise GitError("git grep failed: %s" % proc.stderr.decode(errors="replace").strip())
+    return proc.returncode == 0
+
+
 def stray_files(tree: str, base: str, head: str, brief_text: str,
                 also: Sequence[str] = ()) -> List[str]:
     """Paths the agent's commits added that the brief does not allow."""
@@ -133,10 +168,15 @@ def stray_files(tree: str, base: str, head: str, brief_text: str,
         dirs |= top_dirs(tree, rev)
         elsewhere |= tracked_files(tree, rev)
     stray = []
+    changed: List[str] = []
     for path in added_files(tree, base, head):
         if (path in elsewhere or named(brief_text, path) or in_known_dir(path, dirs)
                 or in_known_hidden_subdir(path, tracked)):
             continue
+        if "/" not in path:
+            changed = changed or changed_files(tree, base, head)
+            if wired_top_level(tree, head, path, tracked, changed):
+                continue
         stray.append(path)
     return stray
 
