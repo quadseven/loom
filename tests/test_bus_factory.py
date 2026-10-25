@@ -627,6 +627,15 @@ class PullRequests(Base):
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
         self.assertEqual(self.lane(5), "spark")
 
+    def test_a_fix_round_for_a_ticket_with_multiple_lane_labels_replaces_them(self):
+        self.gh.ticket(5, "pr", lane="codex")
+        self.gh.issues[5]["labels"].append({"name": "lane:claude"})
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(sum(x["name"].startswith("lane:") for x in self.fixed[0][2]), 1)
+        self.assertEqual(self.lane(5), "spark")
+
     def test_a_thread_that_survives_a_fix_round_climbs_to_the_first_rung(self):
         self.gh.ticket(5, "pr", lane="opencode-go")
         self.gh.comments[5].append({"body": FIX_ASKED, "user": ME})

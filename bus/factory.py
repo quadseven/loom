@@ -1851,9 +1851,10 @@ class Factory:
                 return
         lane = None
         # A ticket with no lane label (a silent-lane requeue drops it, and the
-        # run's pull request opens after; loom#1095, 2026-10-21) failed every
-        # fix brief on "exactly one lane label": it moves like a remote one.
-        if not _lane(issue) or _lane(issue) in REMOTE_LANES:
+        # run's pull request opens after) or multiple lane labels cannot be
+        # sent back without replacing them with one local lane.
+        lane_labels = [name for name in _labels(issue) if name.startswith("lane:")]
+        if len(lane_labels) != 1 or _lane(issue) in REMOTE_LANES:
             lane, _ = self._tier_move(repo, issue, allow_remote=False)
             if lane is None:
                 lane = LADDER[0][0][0]
