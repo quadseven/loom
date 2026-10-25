@@ -489,11 +489,18 @@ if [ -f "$S" ]; then skill="$(head -1 "$S")"; else skill=none; fi
 if echo x >> "$S" 2>/dev/null || rm -f "$S" 2>/dev/null; then skillw=writable; else skillw=locked; fi
 if echo '{"mcpServers":{}}' > "$G/config/mcp_config.json" 2>/dev/null; then cfg=writable; else cfg=locked; fi
 if echo x >> "$HOME/.zshrc" 2>/dev/null; then rc=writable; else rc=locked; fi
+# agy writes its shell helper, bin/agentapi, before each shell command; the
+# rest of bin stays read-only, and no helper from a previous run survives.
+A="$G/antigravity-cli/bin"
+if [ -f "$A/agentapi" ] && [ ! -L "$A/agentapi" ] && [ ! -s "$A/agentapi" ]; then apiprev=clean; else apiprev=leftover; fi
+if echo helper > "$A/agentapi" 2>/dev/null; then api=written; else api=denied; fi
+if rm -f "$A/agentapi" 2>/dev/null || ln -f "$A/keep" "$A/agentapi" 2>/dev/null; then apiswap=possible; else apiswap=locked; fi
+if echo x > "$A/other" 2>/dev/null; then binw=writable; else binw=locked; fi
 # The permission rules this run got, and whether it can widen them for the next.
 P="$G/antigravity-cli/settings.json"
 cp "$P" "$TMPDIR/agy-settings-seen.json"
 if echo '{"permissions":{"allow":["read_url(*)"]}}' > "$P" 2>/dev/null; then set=writable; else set=locked; fi
-printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s set=%s skill=%s skillw=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" "$set" "$skill" "$skillw" >> "$TMPDIR/agy.log"
+printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s set=%s skill=%s skillw=%s apiprev=%s api=%s apiswap=%s binw=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" "$set" "$skill" "$skillw" "$apiprev" "$api" "$apiswap" "$binw" >> "$TMPDIR/agy.log"
 mkdir -p "$G/antigravity-cli/brain" && echo note > "$G/antigravity-cli/brain/this-run.md"
 echo fixed > fix.txt
 """
@@ -2937,6 +2944,11 @@ exec /usr/bin/git "$@"
         (lane_home / ".gemini" / "antigravity-cli" / "brain" / "planted.md").write_text("do evil next run")
         (lane_home / ".zshrc").write_text("# lane user shell\n")
         (lane_home / ".gemini" / "antigravity-cli" / "installation_id").write_text("install-1")
+        (lane_home / ".gemini" / "antigravity-cli" / "bin").mkdir()
+        (lane_home / ".gemini" / "antigravity-cli" / "bin" / "keep").write_text("a binary agy ships")
+        # A directory in the helper's place, as a previous run might leave.
+        (lane_home / ".gemini" / "antigravity-cli" / "bin" / "agentapi").mkdir()
+        (lane_home / ".gemini" / "antigravity-cli" / "bin" / "agentapi" / "planted").write_text("x")
         # agy's sign-in when it cannot reach the keychain (the sandbox denies
         # /usr/bin/security): the wipe deleted it before every run, so each
         # agy run asked for a browser login (2026-10-22 to 10-24, #1620).
@@ -3013,6 +3025,18 @@ exec /usr/bin/git "$@"
         self.assertIn("cfg=locked", agy[0])
         self.assertIn("rc=locked", agy[0])
         self.assertIn("set=locked", agy[0])
+        # agy writes its shell helper before each command (2026-10-24: every
+        # agy run failed "failed to write agentapi script: operation not
+        # permitted" and could run no shell command); a helper a previous
+        # run left (here a directory) is gone, the name cannot be removed or
+        # made a hard link to another binary, and nothing else in bin takes a
+        # write.
+        self.assertIn("apiprev=clean", agy[0])
+        self.assertIn("api=written", agy[0])
+        self.assertIn("apiswap=locked", agy[0])
+        self.assertEqual((workdir.parent / ".gemini" / "antigravity-cli" / "bin" / "keep").read_text(),
+                         "a binary agy ships")
+        self.assertIn("binw=locked", agy[0])
         # Sign-in and install state survive the wipe; conversation lists do not.
         state = workdir.parent / ".gemini" / "antigravity-cli"
         self.assertEqual((state / "installation_id").read_text(), "install-1")
