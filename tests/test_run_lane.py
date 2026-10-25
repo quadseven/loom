@@ -2574,6 +2574,25 @@ exec /usr/bin/git "$@"
         kind, _, credit = self.classified(whole, "FAILED (failures=2)\nagent: tests still fail")
         self.assertEqual((kind, credit), ("work", "none"))
 
+    # A codex run that exited 0 with a written answer read a Makefile that
+    # echoes "Rate-limiting wrapper deployed", another a test named
+    # test_the_pass_is_rate_limited, and both lanes were parked until midnight
+    # (2026-10-25). A run that exits 0 is limited only by what its CLI said last.
+    def test_a_limit_phrase_in_a_clean_runs_output_is_not_a_limit(self):
+        answer = "No files changed and no commit created: the work lives in another repo."
+        for read in ('\t@echo "Rate-limiting wrapper deployed. Calls queue instead of failing."',
+                     "    def test_the_pass_is_rate_limited(self):"):
+            with self.subTest(read=read):
+                whole = "\n".join(["reading Makefile", read, "tokens used", answer])
+                kind, _, credit = self.classified(whole, answer, status=0)
+                self.assertEqual((kind, credit), ("work", "none"))
+
+    def test_a_clean_run_whose_cli_ends_on_a_limit_is_still_a_limit(self):
+        limit = ("ERROR: You've hit your usage limit. Upgrade to Pro, visit the usage page to "
+                 "purchase more credits or try again at 10:28 AM.")
+        kind, _, _ = self.classified("\n".join(["working", limit]), limit, status=0)
+        self.assertEqual(kind, "limit")
+
     def test_a_stated_reset_time_wins_over_a_credit_pattern(self):
         limit = ("ERROR: You've hit your usage limit. Upgrade to Pro, visit the usage page to "
                  "purchase more credits or try again at 10:28 AM.")
