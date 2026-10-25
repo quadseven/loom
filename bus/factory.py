@@ -136,12 +136,15 @@ import base64
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets, vacuous
+from . import answer, bench, brain, brief_check, change_class, contract, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -1376,7 +1379,8 @@ class Factory:
                  plan_check: str = DEFAULT_PLAN_CHECK,
                  scope: Optional[scope_fit.Ask] = None,
                  demoted: Optional[Dict[str, str]] = None,
-                 operators: Optional[Sequence[str]] = None) -> None:
+                 operators: Optional[Sequence[str]] = None,
+                 workspace: str = "") -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1436,6 +1440,7 @@ class Factory:
                                               else answer.operators(trusted=trusted))]
         self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
+        self.workspace = workspace
         # Sends the scope check's prompt to a cheap model (bus/scope_fit.py);
         # None skips the check.
         self.scope = scope
@@ -1606,6 +1611,106 @@ class Factory:
             if len(batch) < 100:
                 break
         return files
+
+    def _validation_contract(self, repo: str, ref: str) -> Optional[Dict[str, str]]:
+        """Read the validation contract from the repo at the given ref."""
+        try:
+            content_data = self.gh.rest("GET", "/repos/%s/contents/.loom/validation.conf?ref=%s"
+                                        % (repo, quote(ref, safe="")), ok=(404,))
+            if content_data.status == 404:
+                return None
+            content = content_data.data or {}
+            if content.get("encoding") == "base64" and content.get("content"):
+                text = base64.b64decode(content["content"]).decode("utf-8", "replace")
+                return contract.fields(text)
+        except (ValueError, TypeError, KeyError):
+            pass
+        return None
+
+    def _run_test_on_base(self, repo: str, base_sha: str, test_path: str) -> bool:
+        """Run a specific test file against the base commit's code.
+
+        Clones the repo at the base commit, reads the validation contract,
+        and runs the check command filtered to the test file.
+        Returns True if the test passes, False otherwise.
+        """
+        if not self.workspace:
+            return False
+
+        # Get the validation contract from the base commit
+        contract_data = self._validation_contract(repo, base_sha)
+        if not contract_data:
+            return False
+
+        check_cmd = contract_data.get("check")
+        interpreter = contract_data.get("interpreter", "python3")
+        if not check_cmd:
+            return False
+
+        # Create a temporary directory for the base commit checkout
+        repo_name = repo.replace("/", "_")
+        base_dir = os.path.join(self.workspace, f"base_{repo_name}_{base_sha[:12]}")
+
+        try:
+            # Clean up any existing directory
+            if os.path.exists(base_dir):
+                shutil.rmtree(base_dir)
+
+            # Shallow clone the repo at the base commit
+            clone_url = f"https://github.com/{repo}.git"
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", "--branch", base_sha, clone_url, base_dir],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode != 0:
+                # Try fetching the specific commit if branch clone fails
+                os.makedirs(base_dir, exist_ok=True)
+                result = subprocess.run(
+                    ["git", "init"], cwd=base_dir, capture_output=True, text=True, timeout=30
+                )
+                result = subprocess.run(
+                    ["git", "remote", "add", "origin", clone_url],
+                    cwd=base_dir, capture_output=True, text=True, timeout=30
+                )
+                result = subprocess.run(
+                    ["git", "fetch", "--depth", "1", "origin", base_sha],
+                    cwd=base_dir, capture_output=True, text=True, timeout=120
+                )
+                result = subprocess.run(
+                    ["git", "checkout", "FETCH_HEAD"],
+                    cwd=base_dir, capture_output=True, text=True, timeout=30
+                )
+                if result.returncode != 0:
+                    return False
+
+            # Determine how to run the specific test
+            # The check command runs the full suite; we need to run just the test file
+            # Convert test_path to a module name for unittest
+            test_module = test_path.replace("/", ".").replace(".py", "")
+            if test_module.startswith("tests."):
+                test_module = test_module[6:]  # Remove "tests." prefix
+
+            # Run the test using the interpreter and unittest
+            # Use the same approach as unittest_parallel.py but for a single module
+            env = os.environ.copy()
+            env["PYTHONPATH"] = base_dir
+
+            result = subprocess.run(
+                [interpreter, "-B", "-m", "unittest", test_module, "-v"],
+                cwd=base_dir, env=env, capture_output=True, text=True, timeout=60
+            )
+
+            return result.returncode == 0
+
+        except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+            return False
+        finally:
+            # Clean up the temporary directory
+            try:
+                if os.path.exists(base_dir):
+                    shutil.rmtree(base_dir)
+            except OSError:
+                pass
 
     def _needs_test(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
         """Does this pull request change code and no test, in a repo and on a
@@ -2358,12 +2463,18 @@ class Factory:
             # Vacuous-test gate: a lane PR whose code bends a lookup so its
             # own test cannot fail is not ready (loom#1681).
             sha = str((full.get("head") or {}).get("sha") or "")
+            base_sha = str((full.get("base") or {}).get("sha") or "")
             if sha:
                 changed = self._file_contents(repo, number, sha)
                 if changed:
                     ticket_body = str(issue.get("body") or "")
                     pr_body = str(full.get("body") or "")
-                    findings = vacuous.findings(changed, ticket_body, pr_body)
+                    # Create run_on_base callable for finding 3: test passes on base commit
+                    run_on_base = None
+                    if base_sha:
+                        def run_on_base(test_path: str, repo=repo, base_sha=base_sha) -> bool:
+                            return self._run_test_on_base(repo, base_sha, test_path)
+                    findings = vacuous.findings(changed, ticket_body, pr_body, run_on_base=run_on_base)
                     if findings:
                         self._send_back(repo, full, issue, comments,
                                         "vacuous test: " + "; ".join(findings))
