@@ -1731,6 +1731,15 @@ repo that cannot be read keeps its records, and nothing is cleared by an
 error. The table goes on the lane status comment, and the dashboard's Lanes
 page shows it as Scorecard.
 
+Each merged record also gets a settled difficulty (`bus/difficulty.py`),
+scored blind from the merged work alone: the diff's changed lines and files,
+the fix rounds sent back and the review findings, never the ticket's
+`Difficulty:` line. The perceived difficulty on that line is kept beside it
+and never changed. The lane status comment compares the two per lane, model
+and kind (the change class) over the last 14 days: how many agree, how many
+were harder or easier, and the bias in tiers (positive: harder than the
+brief said), so routing can see where its guess is off.
+
 ## Pull requests without a ticket
 
 A pull request with no ticket (no `Refs` line and no `loom/` branch) that a

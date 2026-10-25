@@ -109,10 +109,12 @@ if [ "$1" = api ]; then
       exit 0 ;;
   esac
   # The shadow guard reads an issue before it lets a close go: the issue
-  # carries the one label $FAKE_GH_ISSUE_LABEL (a factory incident's default).
+  # carries the one label $FAKE_GH_ISSUE_LABEL (a factory incident's default)
+  # and is in state $FAKE_GH_ISSUE_STATE (default open); issue 404 is missing.
   case "$#:$2" in
+    "2:repos/"*"/issues/404") echo "HTTP 404: Not Found" >&2; exit 1 ;;
     "2:repos/"*"/issues/"[0-9]*)
-      printf '{"number":%s,"labels":[{"name":"%s"}]}\\n' "${2##*/}" "${FAKE_GH_ISSUE_LABEL:-loom:factory}"
+      printf '{"number":%s,"state":"%s","labels":[{"name":"%s"}]}\\n' "${2##*/}" "${FAKE_GH_ISSUE_STATE:-open}" "${FAKE_GH_ISSUE_LABEL:-loom:factory}"
       exit 0 ;;
   esac
   [ "$*" = "api repos/example/repo --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
@@ -850,6 +852,29 @@ print('leak guard: clean (shape patterns only)')
                       body)
         self.assertIn("## Operator steps before merge", self.log.read_text())
         self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_only_bugs_that_cite_a_real_issue_reach_the_pull_request_body(self):
+        # A lane's "Bugs discovered" line that cites no issue, or one that
+        # does not exist, is a dead end nobody triages (loom#1779).
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY=self.TICKED + "\n\n## Bugs discovered\n"
+                               "- The parser drops a trailing tab, #7\n"
+                               "- The cache never expires\n"
+                               "- The retry loop spins, #404")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("\n## Bugs discovered\n- The parser drops a trailing tab, #7\n\n---\n", body)
+        self.assertNotIn("cache never expires", body)
+        self.assertNotIn("#404", body)
+        log = self.run_log()
+        self.assertIn("Bugs discovered line 2 left out: the line cites no issue", log)
+        self.assertIn("Bugs discovered line 3 left out: the cited issue could not be looked up", log)
+        self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_a_body_without_bugs_has_no_bugs_section(self):
+        self.drop_brief()
+        self.run_lane(FAKE_SUMMARY=self.TICKED)
+        self.assertNotIn("Bugs discovered", self.body.read_text())
 
     def test_a_body_without_a_declaration_says_none_was_stated(self):
         self.drop_brief()
@@ -5314,6 +5339,55 @@ exec /usr/bin/git "$@"
         path = self.loom / "logs" / "codex" / (name + ".validation.jsonl")
         records = [json.loads(line) for line in path.read_text().splitlines()]
         self.assertEqual(records[-1]["command"], "test -f .prepared && loom-test-python check.py")
+
+    # loom#1773: a lane pull request passed its check and failed two
+    # per-directory suites in CI that the contract never ran. An affected:
+    # command runs after the check with the changed files.
+    AFFECTED_SEES_FIX = ("affected: grep -qx fix.txt && "
+                         "printf '%s\\n' \"$LOOM_CHANGED_FILES\" | grep -qx fix.txt\n")
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_an_affected_command_gets_the_changed_files_and_runs_after_the_check(self):
+        self.contract_repo(CONTRACT + self.AFFECTED_SEES_FIX)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        records = self.records()
+        self.assertEqual([(r["phase"], r["exit"], r["ok"]) for r in records][-2:],
+                         [("final", 0, True), ("affected", 0, True)])
+        self.assertTrue(records[-1]["command"].startswith("grep -qx fix.txt"))
+        self.assertIn("affected check exited 0", self.body.read_text())
+        self.assertIn("After the check passes it runs this affected command", self.log.read_text())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_failing_affected_command_blocks_the_push_like_the_check(self):
+        self.contract_repo(CONTRACT + "affected: ! grep -qx fix.txt\n")
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        self.assertIn("validation failed: the affected check exited 1", self.lane_log())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", self.remote_heads())
+        self.assertEqual([(r["phase"], r["ok"]) for r in self.records()][-2:],
+                         [("final", True), ("affected", False)])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_fix_rounds_affected_command_gets_what_the_pull_request_changes(self):
+        # The round's own commit and the pull request's earlier one, never a
+        # file the branch shares with the default branch.
+        listed = "printf '%s\\n' \"$LOOM_CHANGED_FILES\""
+        self.contract_repo(CONTRACT + "affected: %s | grep -qx first.txt && %s | grep -qx fix.txt"
+                           " && ! %s | grep -qx check.py\n" % (listed, listed, listed))
+        name, before = self.fix_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = self.loom / "logs" / "codex" / (name + ".validation.jsonl")
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual([(r["phase"], r["ok"]) for r in records][-2:],
+                         [("final", True), ("affected", True)])
+        self.assertNotEqual(self.remote_head(self.FIX_BRANCH), before)
 
     def contract_edit_lane(self, text):
         self.contract_repo()
