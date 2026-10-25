@@ -791,13 +791,19 @@ AGY_CACHE_KEEP=(onboarding.json default_project_id.txt)
 # keychain (#1465), so it falls back there. Without a write there it could
 # neither keep nor refresh a token, and every run asked for a browser login
 # (2026-10-22 to 10-24, #1620). The Keychains folder takes no write.
+# agy writes its shell helper, bin/agentapi, before each shell command:
+# denied with the rest of bin, every agy run from 2026-10-24 could run no
+# command and commit nothing. agy_forget makes that file new and empty before
+# each run, and the run may rewrite its contents and mode but not create,
+# remove or link it: a run free to create the name could make it a hard link
+# to another binary in bin, or a directory that stops every later run.
 agy_write_rules() {
   [ "$LANE" = agy ] || return 0
   local h s
   h="$(cd "$AGY_HOME" && pwd -P)" || return 1
   s="$h/.gemini/antigravity-cli"
-  printf '(deny file-write* (subpath "%s"))\n(allow file-write* %s (subpath "%s") (subpath "%s/Library/Application Support/antigravity") (subpath "%s/Library/Caches"))\n(deny file-write* (literal "%s/settings.json") (literal "%s/installation_id") (subpath "%s/bin") (subpath "%s/builtin"))\n' \
-    "$h" "$1" "$s" "$h" "$h" "$s" "$s" "$s" "$s"
+  printf '(deny file-write* (subpath "%s"))\n(allow file-write* %s (subpath "%s") (subpath "%s/Library/Application Support/antigravity") (subpath "%s/Library/Caches"))\n(deny file-write* (literal "%s/settings.json") (literal "%s/installation_id") (subpath "%s/bin") (subpath "%s/builtin"))\n(allow file-write-data file-write-mode (literal "%s/bin/agentapi"))\n' \
+    "$h" "$1" "$s" "$h" "$h" "$s" "$s" "$s" "$s" "$s"
 }
 
 # agy remembers past conversations (brain, summaries, annotations) and reads
@@ -812,6 +818,9 @@ agy_forget() {
     while [ "$1" != -- ]; do keep="$keep$1 "; shift; done; shift
     for k in "$@"; do cache_keep="$cache_keep$k "; done
     [ -d "$s" ] || exit 0
+    if [ -d "$s/bin" ] && [ ! -L "$s/bin" ]; then
+      rm -rf "$s/bin/agentapi" && (umask 022; : > "$s/bin/agentapi") && chmod 755 "$s/bin/agentapi" || exit 1
+    fi
     # Kept entries are real files and directories. A link an agent left in
     # their place is removed, never followed: the forget would otherwise
     # delete through it, into the keychain folder or another ticket'"'"'s tree.
