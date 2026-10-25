@@ -730,6 +730,92 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
+    def test_merge_refuses_pr_when_ticked_criterion_names_another_repo(self):
+        repo_b = "repo-b"
+        criterion = "`%s` converts two 5-man parties into a single 10-man raid group" % repo_b
+        body = ("Refs %s#9\n## Acceptance criteria\n"
+                "- [x] %s\n"
+                "- [x] local feature works\n") % (REPO, criterion)
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                              {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []))
+        env = {"LOOM_REPOS": "%s example-owner/%s" % (REPO, repo_b)}
+        with self.assertRaises(ValueError) as ctx:
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env=env)
+        msg = str(ctx.exception)
+        self.assertIn("blocked: criterion", msg)
+        self.assertIn(criterion, msg)
+        self.assertIn("belongs in %s; not built: belongs in %s" % (repo_b, repo_b), msg)
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_merge_allows_foreign_criterion_ending_not_built_belongs_in_other_repo(self):
+        repo_b = "repo-b"
+        criterion = "`%s` converts two 5-man parties into a single 10-man raid group; not built: belongs in %s" % (repo_b, repo_b)
+        body = ("Refs %s#9\n## Acceptance criteria\n"
+                "- [x] %s\n"
+                "- [x] local feature works\n") % (REPO, criterion)
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                              {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, {"merged": True}),
+                    reply(204), reply(200, []), reply(200, issue), reply(200, {}))
+        env = {"LOOM_REPOS": "%s example-owner/%s" % (REPO, repo_b),
+               "LOOM_BRIEF_AUTHORS": "example-brain"}
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env=env)
+        self.assertTrue(result["merged"])
+
+    def test_merge_allows_ticked_criterion_naming_own_repo(self):
+        own_name = REPO.split("/")[-1]
+        criterion = "`%s` local feature processes the party" % own_name
+        body = ("Refs %s#9\n## Acceptance criteria\n"
+                "- [x] %s\n") % (REPO, criterion)
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                              {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, {"merged": True}),
+                    reply(204), reply(200, []), reply(200, issue), reply(200, {}))
+        env = {"LOOM_REPOS": REPO, "LOOM_BRIEF_AUTHORS": "example-brain"}
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env=env)
+        self.assertTrue(result["merged"])
+
+    def test_status_blocks_pr_when_ticked_criterion_names_another_repo(self):
+        repo_b = "repo-b"
+        criterion = "`%s` converts two 5-man parties into a single 10-man raid group" % repo_b
+        body = ("Refs %s#9\n## Acceptance criteria\n"
+                "- [x] %s\n"
+                "- [x] local feature works\n") % (REPO, criterion)
+        pr = {"number": 8, "title": "Lane work", "body": body}
+        env = {"LOOM_REPOS": "%s example-owner/%s" % (REPO, repo_b)}
+        line = brain._status_pr_line(None, REPO, pr, ready_node(),
+                                     "grug-tribe", "Grug - Elder", env=env)
+        want_blocker = "blocked: criterion %r belongs in %s; not built: belongs in %s" % (
+            criterion, repo_b, repo_b)
+        self.assertEqual(line, "- #8 Lane work - " + want_blocker)
+
+    def test_foreign_repo_criteria_blocker_helper(self):
+        env = {"LOOM_REPOS": "example-owner/example-repo example-owner/repo-b",
+               "LOOM_REPO_OWNERS": "example-owner"}
+        body1 = "## Acceptance criteria\n- [x] `repo-b` does something\n"
+        self.assertIn("criterion '`repo-b` does something' belongs in repo-b; not built: belongs in repo-b",
+                      brain._foreign_repo_criteria_blocker(body1, REPO, env))
+
+        body2 = "## Acceptance criteria\n- [x] example-owner/repo-b does something\n"
+        self.assertIn("criterion 'example-owner/repo-b does something' belongs in repo-b; not built: belongs in repo-b",
+                      brain._foreign_repo_criteria_blocker(body2, REPO, env))
+
+        body3 = "## Acceptance criteria\n- [x] `repo-b` does something; not built: belongs in repo-b\n"
+        self.assertEqual(brain._foreign_repo_criteria_blocker(body3, REPO, env), "")
+
+        body4 = "## Acceptance criteria\n- [x] `example-repo` does something\n"
+        self.assertEqual(brain._foreign_repo_criteria_blocker(body4, REPO, env), "")
+
+        body5 = "## Acceptance criteria\n- [x] `bridge.py` does something\n"
+        self.assertEqual(brain._foreign_repo_criteria_blocker(body5, REPO, env), "")
+
+        body6 = "## Acceptance criteria\n- [ ] `repo-b` does something\n"
+        self.assertEqual(brain._foreign_repo_criteria_blocker(body6, REPO, env), "")
+
     def test_merge_ready_names_each_blocker(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}
         cases = [

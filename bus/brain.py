@@ -11,7 +11,7 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
@@ -538,6 +538,102 @@ def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
 
 
 _NOT_BUILT = re.compile(r";\s*not built:", re.I)
+_NON_REPO_EXTS = (
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".cpp", ".h", ".hpp",
+    ".go", ".rs", ".sh", ".lua", ".sql", ".md", ".json", ".yaml", ".yml",
+    ".txt", ".toml", ".conf", ".ini", ".cfg", ".lock"
+)
+
+
+def _owner_repos(repo: str, env: Optional[Dict[str, str]] = None) -> Set[str]:
+    repos_str = env.get("LOOM_REPOS") if env is not None else None
+    if repos_str is None:
+        repos_str = os.environ.get("LOOM_REPOS", "")
+    names = set()
+    owner = repo.split("/", 1)[0] if "/" in repo else ""
+    for item in repos_str.replace(",", " ").split():
+        if not item:
+            continue
+        names.add(item)
+        if "/" in item:
+            r_owner, r_name = item.split("/", 1)
+            if not owner or r_owner == owner:
+                names.add(r_name)
+        else:
+            names.add(item)
+    return names
+
+
+def _cand_foreign_repo(cand: str, owner_lower: str, repo_name_lower: str,
+                       owner_repos_lower: Set[str], owner_names_lower: Set[str]) -> Optional[str]:
+    cand = cand.strip().rstrip(".,;:")
+    if not cand or cand.lower().endswith(_NON_REPO_EXTS):
+        return None
+    if "/" in cand:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", cand):
+            return None
+        c_owner, c_name = cand.split("/", 1)
+        c_name = c_name.rstrip(".,;:")
+        if (c_owner.lower() in owner_names_lower or (owner_lower and c_owner.lower() == owner_lower)) and c_name.lower() != repo_name_lower:
+            return c_name
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", cand):
+        return None
+    cand_lower = cand.lower()
+    if cand_lower != repo_name_lower and (
+            cand_lower in owner_repos_lower
+            or (owner_lower and ("%s/%s" % (owner_lower, cand_lower)) in owner_repos_lower)):
+        return cand
+    return None
+
+
+def _target_foreign_repo(text: str, owner: str, repo_name: str,
+                         owner_repos: Set[str], owner_names: Set[str]) -> Optional[str]:
+    """The foreign owner repo named in `text`, or None."""
+    owner_lower = owner.lower()
+    repo_name_lower = repo_name.lower()
+    owner_names_lower = {o.lower() for o in owner_names}
+    owner_repos_lower = {r.lower() for r in owner_repos}
+
+    for match in re.finditer(r"`([^`\n]+)`", text):
+        found = _cand_foreign_repo(match.group(1), owner_lower, repo_name_lower,
+                                   owner_repos_lower, owner_names_lower)
+        if found:
+            return found
+
+    for match in re.finditer(r"(?<![\w/-])([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?![\w/-])", text):
+        found = _cand_foreign_repo(match.group(0), owner_lower, repo_name_lower,
+                                   owner_repos_lower, owner_names_lower)
+        if found:
+            return found
+
+    return None
+
+
+def _foreign_repo_criteria_blocker(body: str, repo: str,
+                                   env: Optional[Dict[str, str]] = None) -> str:
+    """A blocker when any ticked criterion names another repo of the owner."""
+    owner = repo.split("/", 1)[0] if "/" in repo else ""
+    repo_name = repo.split("/")[-1]
+    owner_repos = _owner_repos(repo, env)
+    owner_names = {owner} if owner else set()
+    raw_owners = env.get("LOOM_REPO_OWNERS") if env is not None else None
+    if raw_owners is None:
+        raw_owners = os.environ.get("LOOM_REPO_OWNERS", "")
+    for o in raw_owners.replace(",", " ").split():
+        if o:
+            owner_names.add(o)
+
+    for checked, text in proof.criteria(body):
+        if not checked:
+            continue
+        if re.search(r";\s*not built:\s*belongs in\b", text, re.I):
+            continue
+        target_repo = _target_foreign_repo(text, owner, repo_name, owner_repos, owner_names)
+        if target_repo:
+            return ("criterion %r belongs in %s; not built: belongs in %s"
+                    % (text.strip(), target_repo, target_repo))
+    return ""
 
 
 def _unbuilt_criteria_reason(body: str) -> str:
@@ -554,7 +650,8 @@ def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> st
 
 
 def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
-                    node: Optional[Dict[str, Any]], bot: str, check: str) -> str:
+                    node: Optional[Dict[str, Any]], bot: str, check: str,
+                    env: Optional[Dict[str, str]] = None) -> str:
     line = _pr_line(pr, node, bot)
     needs_review_check = (change_class.class_of(pr) == "sensitive"
                           or _ticketless(repo, pr))
@@ -563,6 +660,9 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
         if not sha or not _review_check_passed(gh, repo, sha, check):
             return (line.removesuffix("READY")
                     + "blocked: review check has not passed on the head commit")
+    foreign = _foreign_repo_criteria_blocker(str(pr.get("body") or ""), repo, env)
+    if line.endswith(" - READY") and foreign:
+        return line.removesuffix("READY") + "blocked: " + foreign
     if line.endswith(" - READY") and _unbuilt_criteria_reason(str(pr.get("body") or "")):
         return line.removesuffix("READY") + "blocked: no criterion built"
     return line
@@ -693,12 +793,13 @@ def _trunk_warning(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> Optiona
 
 def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
                         data: Dict[str, Any], bot: str,
-                        authors: Sequence[str] = (), check: str = "Grug - Elder") -> List[str]:
+                        authors: Sequence[str] = (), check: str = "Grug - Elder",
+                        env: Optional[Dict[str, str]] = None) -> List[str]:
     """The pull request lines for status: heading, merge readiness for each
     loom pull request, including a pending brain fix as a blocker."""
     lines = ["### Pull requests"]
     for pr in prs:
-        line = _status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check)
+        line = _status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check, env)
         try:
             ticket = _ticket_association(repo, pr)
         except ValueError:
@@ -770,12 +871,13 @@ def _skip_line(what: str, reason: str) -> str:
 def _readable_section(gh: GitHub, repo: str, now: datetime, bot: str,
                       authors: Optional[Sequence[str]] = None,
                       into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-                      check: str = "Grug - Elder") -> List[str]:
+                      check: str = "Grug - Elder",
+                      env: Optional[Dict[str, str]] = None) -> List[str]:
     """_repo_section, or one skipped line when GitHub will not show the repo
     (moved, gone or forbidden: github.unreadable), so one moved repo does
     not end the status of every other. Any other GitHubError still ends it."""
     try:
-        return _repo_section(gh, repo, now, bot, authors, into, check)
+        return _repo_section(gh, repo, now, bot, authors, into, check, env)
     except GitHubError as err:
         reason = unreadable(err)
         if reason is None:
@@ -788,7 +890,8 @@ def _readable_section(gh: GitHub, repo: str, now: datetime, bot: str,
 def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   authors: Optional[Sequence[str]] = None,
                   into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-                  check: str = "Grug - Elder") -> List[str]:
+                  check: str = "Grug - Elder",
+                  env: Optional[Dict[str, str]] = None) -> List[str]:
     """The repo's status section; with into, its open tickets are kept
     there under the repo's name for the cross-repo Priorities section."""
     issues = _issues(gh, repo)
@@ -816,12 +919,12 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
-    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check)
+    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check, env)
     lines += [""] + _sensitive_pr_lines(prs)
     lines += [""] + _waiting_brain_lines(tickets, pr_of, data, now, bot)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
     lines += ["", ADOPT_HEADING]
-    lines += [_status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check)
+    lines += [_status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check, env)
               for pr in adoptable]
     lines += [""] + _verify_due_lines(verify_due(gh, repo, tickets, now), now)
     lines += ["", INVARIANTS_HEADING]
@@ -906,7 +1009,9 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
            env: Optional[Dict[str, str]] = None, now: Optional[datetime] = None,
            authors: Optional[Sequence[str]] = None) -> str:
     from . import factory  # factory imports this module
-    env = os.environ if env is None else env
+    env = dict(os.environ if env is None else env)
+    if "LOOM_REPOS" not in env or not env["LOOM_REPOS"].strip():
+        env["LOOM_REPOS"] = " ".join(repos)
     bot = env.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     now = now or datetime.now(timezone.utc)
     # Explicit `authors` are the caller's choice; read from the environment,
@@ -921,7 +1026,7 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
         sections = list(pool.map(
             lambda repo: _readable_section(gh, repo, now, bot, authors, found,
-                                           review_check_name(env)), repos))
+                                           review_check_name(env), env), repos))
     runaway = [(repo, issue) for repo, items in found.items() for issue in items
                if RUNAWAY in _labels(issue)
                and tickets.ticket_state(issue) not in tickets.MERGED_STATES]
@@ -3120,6 +3225,9 @@ def merge(gh: GitHub, repo: str, number: int,
         association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
         _refuse_pending_fix(gh, association, env)
         _refuse_operator_hold(gh, repo, number, pr, details, association, issue)
+        foreign = _foreign_repo_criteria_blocker(str(pr.get("body") or ""), repo, env)
+        if foreign:
+            raise ValueError("blocked: " + foreign)
         if not ({x.lower() for x in _labels(issue)} & {"docs", "documentation"}):
             reason = _unbuilt_criteria_reason(str(pr.get("body") or ""))
             if reason:
