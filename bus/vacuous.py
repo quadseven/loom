@@ -87,6 +87,48 @@ def _is_test(path: str) -> bool:
             or bool(_TEST_NAME_RE.search(name)))
 
 
+def _container_findings(changed: Dict[str, str], code_files: List[str]) -> List[str]:
+    """Finding 1: subclasses of builtin containers that override lookup/membership."""
+    out: List[str] = []
+    for path in code_files:
+        for cls_name, container, method in _container_overrides(changed[path]):
+            out.append("subclasses builtin %s and overrides %s so a missing key "
+                       "does not raise (class %s in %s)"
+                       % (container, method, cls_name, path))
+    return out
+
+
+def _fixture_findings(changed: Dict[str, str], code_files: List[str],
+                      test_files: List[str], ticket_body: str) -> List[str]:
+    """Finding 2: test fixture/table edited alongside code, unless ticket asks."""
+    out: List[str] = []
+    ticket_asks = bool(re.search(r"\b(fixture|expected|table)\b", ticket_body or "", re.I))
+    if code_files and test_files and not ticket_asks:
+        for path in test_files:
+            for name in _fixture_tests(changed[path]):
+                out.append("edits the expected table or fixture of test %s in "
+                           "the same pull request that changes the code under "
+                           "test (%s)" % (name, path))
+    return out
+
+
+def _base_pass_findings(changed: Dict[str, str], test_files: List[str],
+                        run_on_base: Optional[Callable[[str], bool]]) -> List[str]:
+    """Finding 3: changed test that passes against base commit code."""
+    out: List[str] = []
+    if run_on_base is not None and test_files:
+        for path in test_files:
+            for name in _test_names(changed[path]):
+                try:
+                    if run_on_base(path):
+                        out.append("test %s passes against the base commit's "
+                                   "code, so the fix never made it fail (%s)"
+                                   % (name, path))
+                except OSError:
+                    continue
+    return out
+
+
 def findings(changed: Dict[str, str], ticket_body: str = "", pr_body: str = "",
              run_on_base: Optional[Callable[[str], bool]] = None) -> List[str]:
     """Findings for one pull request's changed files.
@@ -97,35 +139,11 @@ def findings(changed: Dict[str, str], ticket_body: str = "", pr_body: str = "",
     with each changed test file path and must return True when the test passes
     against the base commit's code (so the fix never made it fail).
     """
-    out: List[str] = []
     test_files = [path for path in changed if _is_test(path)]
     code_files = [path for path in changed if _is_code(path) and not _is_test(path)]
-    ticket_asks = bool(re.search(r"\b(fixture|expected|table)\b", ticket_body or "", re.I))
-    pr_asks = bool(re.search(r"\b(fixture|expected|table)\b", pr_body or "", re.I))
-    # 1. A subclass of a builtin container that overrides lookup/membership.
-    for path in code_files:
-        for cls_name, container, method in _container_overrides(changed[path]):
-            out.append("subclasses builtin %s and overrides %s so a missing key "
-                       "does not raise (class %s in %s)"
-                       % (container, method, cls_name, path))
-    # 2. A test's expected table or fixture edited alongside the code under
-    #    test, unless the ticket or PR asks for it.
-    if code_files and test_files and not ticket_asks and not pr_asks:
-        for path in test_files:
-            for name in _fixture_tests(changed[path]):
-                out.append("edits the expected table or fixture of test %s in "
-                           "the same pull request that changes the code under "
-                           "test (%s)" % (name, path))
-    # 3. A changed test that passes against the base commit's code.
-    if run_on_base is not None and test_files:
-        for path in test_files:
-            for name in _test_names(changed[path]):
-                try:
-                    if run_on_base(path):
-                        out.append("test %s passes against the base commit's "
-                                   "code, so the fix never made it fail (%s)"
-                                   % (name, path))
-                except OSError:
-                    # A test that cannot run against base is not flagged here.
-                    continue
+
+    out: List[str] = []
+    out.extend(_container_findings(changed, code_files))
+    out.extend(_fixture_findings(changed, code_files, test_files, ticket_body))
+    out.extend(_base_pass_findings(changed, test_files, run_on_base))
     return out

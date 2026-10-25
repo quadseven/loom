@@ -93,7 +93,9 @@ def test_add():
 """
         }
         findings = vacuous.findings(changed, "", "This PR updates the expected fixture table")
-        self.assertEqual(findings, [])
+        self.assertEqual(len(findings), 1)
+        self.assertIn("edits the expected table or fixture", findings[0])
+        self.assertIn("test_add", findings[0])
 
     def test_only_fixture_no_code_change(self):
         changed = {
