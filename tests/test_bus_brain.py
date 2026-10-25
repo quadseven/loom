@@ -1375,6 +1375,10 @@ class SensitiveResumeTests(unittest.TestCase):
             details.update(changes.get("details", {}))
         return reply(200, pr), reply(200, {"data": {"repository": {"pullRequest": details}}})
 
+    def test_goal_constraints_scan_until_first_heading(self):
+        issue = {"body": "Goal overview\nMerge constraint: C++ unit test required\n\n# Details\nMerge constraint: ignored"}
+        self.assertEqual(["C++ unit test required"], brain.goal_merge_constraints(issue))
+
     def test_goal_home_cpp_unit_test_constraint_blocks_without_test_file(self):
         goal = {"number": 1, "state": "open", "labels": [{"name": "loom:goal"}],
                 "body": "Merge constraint: C++ unit test required\n# Goal"}

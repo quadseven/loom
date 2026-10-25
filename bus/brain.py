@@ -120,13 +120,12 @@ _MERGE_CONSTRAINT_RE = re.compile(r"^Merge constraint:[ \t]*(.+)[ \t]*$", re.M)
 
 def goal_merge_constraints(issue: Dict[str, Any]) -> List[str]:
     """The merge constraints named in a goal home's body header, in order."""
-    body = str(issue.get("body") or "")
-    header = body.split("\n", 1)[0] if "\n" in body else body
-    for line in header.splitlines():
+    lines = []
+    for line in str(issue.get("body") or "").splitlines():
         if line.startswith("#"):
             break
-    else:
-        header = body
+        lines.append(line)
+    header = "\n".join(lines)
     return [m.group(1).strip() for m in _MERGE_CONSTRAINT_RE.finditer(header)]
 
 
