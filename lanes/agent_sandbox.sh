@@ -228,7 +228,10 @@ opencode_config() {
   # The free lane (a free provider's route on the spark-gateway) is declared the
   # same way, as provider free serving the model after "free/".
   local provider="" id="${MODEL#*/}" permission="${OPENCODE_PERMISSION:-}"
-  [ -n "$permission" ] || permission='{"external_directory": "deny"}'
+  # Reads in the tree are allowed: opencode asks before a *.env read by
+  # default, a run cannot answer, and a tracked pin file stopped two runs
+  # (loom#1728). The tree is a fresh clone, and reads outside it stay denied.
+  [ -n "$permission" ] || permission='{"external_directory": "deny", "read": {"*": "allow"}}'
   # The window the endpoint serves (LOOM_SPARK_CONTEXT, LOOM_SPARK_OUTPUT;
   # whole numbers, else the vLLM defaults below). A window smaller than the
   # server's makes the agent compact and lose its place on a large repo: the
