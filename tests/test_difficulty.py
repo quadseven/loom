@@ -120,6 +120,24 @@ class AfterMerge(unittest.TestCase):
         later = self.refresh(card(now=NOW + scorecard.REFRESH, state=state))
         self.assertEqual(later.data["records"]["%s#1" % REPO]["settled"], "hard")
 
+    def test_a_ticket_with_no_body_settles_with_no_guess(self):
+        self.fake.routes["/repos/%s/issues/101" % REPO] = {"number": 101, "body": None}
+        one = self.refresh(card()).data["records"]["%s#1" % REPO]
+        self.assertEqual((one["perceived"], one["settled"]), ("", "hard"))
+
+    def test_a_ticket_that_cannot_be_read_is_settled_on_a_later_refresh(self):
+        # Not settled with an empty guess: a failed read is retried, so a
+        # passing outage never records the ticket as having no Difficulty line.
+        self.fake.fail.add("/repos/%s/issues/101" % REPO)
+        state = card().path.rsplit("/", 1)[0]
+        first = self.refresh(card(state=state))
+        self.assertNotIn("settled", first.data["records"]["%s#1" % REPO])
+        self.assertEqual(first.data["records"]["%s#2" % REPO]["settled"], "hard")
+        first.save()
+        self.fake.fail.clear()
+        later = self.refresh(card(now=NOW + scorecard.REFRESH, state=state))
+        self.assertEqual(later.data["records"]["%s#1" % REPO]["perceived"], "easy")
+
     def test_the_status_shows_agreement_and_bias(self):
         got = self.refresh(card())
         lines = got.markdown()
