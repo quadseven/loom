@@ -3555,15 +3555,19 @@ class Factory:
             if self.actions >= MAX_ACTIONS:
                 return
             moved: List[bool] = []
-            if not self._guarded(lambda r, i: moved.append(self._reroute(r, i, reason, age)),
-                                 repo, issue):
+            if not self._guarded(self._reroute_into, repo, issue, reason, age, moved):
                 continue
             if not (moved and moved[0]):
                 if age < NO_LANE_HANDOFF or not self._guarded(
-                        lambda r, i: self._hand_off(r, i, reason, age), repo, issue):
+                        self._hand_off, repo, issue, reason, age):
                     continue
             self.waits.pop(key, None)
             self.settled.add(key)
+
+    def _reroute_into(self, repo: str, issue: Dict[str, Any], reason: str, age: float,
+                      moved: List[bool]) -> None:
+        """_reroute for _guarded, which keeps no return value: appends it."""
+        moved.append(self._reroute(repo, issue, reason, age))
 
     def _reroute(self, repo: str, issue: Dict[str, Any], reason: str, age: float) -> bool:
         """Move a queued or briefed ticket pinned to a model no lane takes to
