@@ -19,7 +19,7 @@ from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, a
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
 from . import answer, ci_facts, ci_gap, fixrounds, merge_tier, naming, operator_hold, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
-from .labels import LANES, REMOTE_LANES
+from .labels import HANDOFF, LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
@@ -1922,15 +1922,28 @@ def _link_to_goal(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any],
 
 
 def _in_flight(issue: Dict[str, Any]) -> bool:
+    """An open ticket in an IN_FLIGHT state. A ticket in the hand-off pool
+    (labels.HANDOFF) is not, unless it is at loom:pr: no lane of this Loom
+    takes it, so it must not hold the goal's cap (loom#1831). A pr-state
+    ticket counts as it always has."""
     names = _labels(issue)
+    if HANDOFF in names and "loom:pr" not in names:
+        return False
     return (issue.get("state") == "open" and "loom:ticket" in names
             and any(state in names for state in IN_FLIGHT))
+
+
+def goal_flying(gh: GitHub, repo: str, goal: int,
+                issue: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """The tickets in flight under an open loom:goal issue; ValueError for
+    anything else."""
+    return [i for i in _goal_children(gh, repo, goal, issue) if _in_flight(i)]
 
 
 def _goal_in_flight(gh: GitHub, repo: str, goal: int,
                     issue: Optional[Dict[str, Any]] = None) -> int:
     """Tickets in flight under an open loom:goal issue; ValueError for anything else."""
-    return sum(1 for i in _goal_children(gh, repo, goal, issue) if _in_flight(i))
+    return len(goal_flying(gh, repo, goal, issue))
 
 
 def _check_goal_capacity(children: List[Dict[str, Any]], goal: int) -> None:

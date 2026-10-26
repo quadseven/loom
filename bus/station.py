@@ -220,6 +220,14 @@ DEAD_BRIEF_AGE = 3600
 # running, whatever its heartbeat's age. Several missed stamps still count.
 ALIVE_MAX_AGE = 300
 REWRITE_PER_PASS = 5
+# A goal at its in-flight cap this long is stuck: the rewrite skip line and
+# the dashboard's Needs-you page say so, with how many of its in-flight
+# tickets wait with no lane (loom#1831). A record the rewrite step has not
+# refreshed in GOAL_CAP_SEEN is not sent.
+GOAL_CAP_STUCK = 6 * 3600
+GOAL_CAP_SEEN = 2 * 3600
+GOAL_CAPS_PATH = "/api/goal-caps"
+GOAL_CAPS_EVERY = 600
 # A recorded ticket wait the factory has not repeated for this long is gone:
 # the ticket moved, or left the factory (invariants.ticket_waiting).
 WAIT_UNSEEN = 3600
@@ -7397,13 +7405,13 @@ class Station:
         # Intake refuses a brief at the goal's in-flight cap, so a model run
         # then writes nothing (17 of 72 rewrites on 2026-10-21).
         try:
-            in_flight = brain._goal_in_flight(self.gh, repo, goal)
+            flying = brain.goal_flying(self.gh, repo, goal)
         except ValueError:
-            in_flight = 0  # not an open goal: intake says why per issue
-        if in_flight >= brain.goal_cap():
-            _say("rewrite %s: goal has %d tickets in flight (cap %d); skipped"
-                 % (key, in_flight, brain.goal_cap()))
+            flying = []  # not an open goal: intake says why per issue
+        if len(flying) >= brain.goal_cap():
+            _say(self._at_cap(key, repo, rec, flying, brain.goal_cap()))
             return 0
+        rec.pop("cap", None)
         done = 0
         for issue in rewrite.candidates(self.gh, repo):
             if done >= room or self._deferred():
@@ -7511,6 +7519,64 @@ class Station:
         _say("rewrite %s#%d: %s" % (repo, number, action))
         self._event("rewrite_succeeded", action, "%s#%d" % (repo, number))
 
+    def _at_cap(self, key: str, repo: str, rec: Dict[str, Any],
+                flying: List[Dict[str, Any]], cap: int) -> str:
+        """Keep in the goal's rewrite record since when it has been at its
+        in-flight cap and how many of its in-flight tickets wait with no lane
+        that takes them (ticket-waits.json no_lane_since), and return the skip
+        line: past GOAL_CAP_STUCK it says the goal is stuck (loom#1831)."""
+        waiting = self._no_lane_since()
+        blocked = sum(1 for issue in flying if "%s#%s" % (repo, issue.get("number")) in waiting)
+        old = rec.get("cap") if isinstance(rec.get("cap"), dict) else {}
+        since = old["since"] if self._num(old.get("since")) else self.now
+        rec["cap"] = {"since": since, "seen": self.now, "in_flight": len(flying), "cap": cap,
+                      "no_lane": blocked}
+        counts = "%d tickets in flight (cap %d), %d blocked on no lane" % (len(flying), cap, blocked)
+        if self.now - since > GOAL_CAP_STUCK:
+            return "rewrite %s: goal stuck at its cap for %.0f hours: %s; skipped" % (
+                key, (self.now - since) / 3600, counts)
+        return "rewrite %s: goal has %s; skipped" % (key, counts)
+
+    def _stuck_goals(self, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The goals the rewrite step found at their cap for over
+        GOAL_CAP_STUCK and saw so within GOAL_CAP_SEEN, from rewrite.json."""
+        out = []
+        for key, rec in sorted(state.items()):
+            cap = rec.get("cap") if isinstance(rec, dict) else None
+            if not (isinstance(cap, dict) and self._num(cap.get("since"))
+                    and self._num(cap.get("seen")) and self.now - cap["seen"] <= GOAL_CAP_SEEN
+                    and self.now - cap["since"] > GOAL_CAP_STUCK):
+                continue
+            out.append({"goal": key, "since": cap["since"],
+                        **{field: int(cap.get(field) or 0) for field in ("in_flight", "cap", "no_lane")}})
+        return out
+
+    def post_stuck_goals(self, state: Dict[str, Any]) -> None:
+        """Send the dashboard (POST GOAL_CAPS_PATH) the goals stuck at their
+        cap, for its Needs-you page: when the list changes, else at most every
+        GOAL_CAPS_EVERY seconds. A failed send is tried again next pass."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return
+        goals = self._stuck_goals(state)
+        path = os.path.join(self.state, "goal-caps.json")
+        posted = _read_json(path, {}, strict=False)
+        posted = posted if isinstance(posted, dict) else {}
+        shown = sorted(g["goal"] for g in goals)
+        if (posted.get("goals") == shown and self._num(posted.get("at"))
+                and 0 <= self.now - posted["at"] < GOAL_CAPS_EVERY):
+            return
+        token = self._transcript_token()
+        if token is None:
+            return
+        try:
+            self.upload(brain_memory.dashboard_url(self.s.transcript_url, GOAL_CAPS_PATH), token,
+                        {"goals": goals, "at": self.now})
+        # Deliberately broad, as in upload_usage_limits: only the type is logged.
+        except Exception as err:  # noqa: BLE001
+            _say("could not send the goals stuck at their cap (%s); next pass" % type(err).__name__)
+            return
+        _write_json(path, {"goals": shown, "at": self.now})
+
     def rewrite_triaged(self) -> None:
         """Rewrite loom:triage issues in backlog goal homes with the agent
         command from LOOM_REWRITE_CMD (public repos) or
@@ -7563,6 +7629,7 @@ class Station:
                 self._collect_rewrites(state, REWRITE_WAIT)
             finally:
                 _write_json(path, state)
+        self.post_stuck_goals(state)
 
     def close_done_tickets(self) -> None:
         """Close each done ticket, by the operator's rule (2026-10-19): a
@@ -9990,7 +10057,7 @@ class Station:
             return
         runner = self._factory()
         runner.run()
-        self._record_waits(runner.waits)
+        self._record_waits(runner.waits, runner.settled)
         self._record_silent(runner.silent_running, runner.silent)
         self._return_silent_briefs(runner.silent_running)
 
@@ -10088,24 +10155,34 @@ class Station:
         if self.s.factory_on:
             runner = self._factory()
             runner.assign_queued()
-            self._record_waits(runner.waits)
+            self._record_waits(runner.waits, runner.settled)
 
-    def _record_waits(self, found: Dict[str, str]) -> None:
+    def _record_waits(self, found: Dict[str, str], settled: Iterable[str] = ()) -> None:
         """Time each ticket the factory left where it is: a reason it repeats
         keeps its start, a new reason starts again, and a ticket it has not
-        named for WAIT_UNSEEN is dropped (invariants.ticket_waiting)."""
+        named for WAIT_UNSEEN is dropped (invariants.ticket_waiting). A ticket
+        waiting with no lane that takes it (factory.no_lane) also keeps
+        no_lane_since, the first time it so waited, across its no-lane
+        reasons; a ticket whose wait the factory settled (a lane took it, a
+        reroute, the hand-off pool) is dropped (loom#1831)."""
         path = os.path.join(self.state, "ticket-waits.json")
         saved = _read_json(path, {}, strict=False)
         saved = saved if isinstance(saved, dict) else {}
+        dropped = [key for key in settled if saved.pop(key, None) is not None]
         for key, reason in found.items():
             old = saved.get(key)
             if isinstance(old, dict) and old.get("reason") == reason and self._num(old.get("since")):
                 old["seen"] = self.now
             else:
                 saved[key] = {"reason": reason, "since": self.now, "seen": self.now}
+            entry, kept_since = saved[key], old.get("no_lane_since") if isinstance(old, dict) else None
+            if factory.no_lane(reason):
+                entry["no_lane_since"] = kept_since if self._num(kept_since) else self.now
+            else:
+                entry.pop("no_lane_since", None)
         kept = {key: info for key, info in saved.items() if isinstance(info, dict)
                 and self._num(info.get("seen")) and self.now - info["seen"] <= WAIT_UNSEEN}
-        if kept or saved:
+        if kept or saved or dropped:
             _write_json(path, kept)
 
     def _invariant_waits(self) -> List[invariants.Wait]:
@@ -10221,7 +10298,15 @@ class Station:
                                demoted=self.demoted_lanes(),
                                benched=pairs,
                                limit_until=self.limit_until(),
-                               known_waits=self._saved_waits(), **extra)
+                               known_waits=self._saved_waits(),
+                               no_lane_since=self._no_lane_since(), **extra)
+
+    def _no_lane_since(self) -> Dict[str, float]:
+        """Each ticket's first no-lane wait as _record_waits kept it."""
+        saved = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
+        return {str(key): float(info["no_lane_since"]) for key, info in
+                (saved.items() if isinstance(saved, dict) else [])
+                if isinstance(info, dict) and self._num(info.get("no_lane_since"))}
 
     def _saved_waits(self) -> Dict[str, str]:
         """Each ticket's wait reason as the last pass recorded it (_record_waits)."""

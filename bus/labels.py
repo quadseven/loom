@@ -7,6 +7,11 @@ from urllib.parse import quote
 
 from .github import GitHub
 
+# The hand-off pool: a ticket no lane of this Loom takes (bus/factory.py
+# NO_LANE_HANDOFF) carries it, leaves its goal's in-flight count, and waits
+# for the second operator's session to claim it (docs/BRAIN.md).
+HANDOFF = "handoff:claude"
+
 LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
          "zai", "workersai", "agy", "spark"]
 # Extra slots: parallel copies of a lane on the same provider (run_lane.sh
@@ -104,6 +109,9 @@ LABELS: Dict[str, Dict[str, str]] = {
     "wait:after": {"color": "fef2c0", "description": "Waiting: another ticket must merge first (After:)"},
     "wait:window": {"color": "fef2c0", "description": "Waiting: a deploy or roll window"},
     "wait:live-event": {"color": "fef2c0", "description": "Waiting: its Live box needs a rare event the log has not shown; held apart from open work"},
+    # The hand-off pool (docs/BRAIN.md): tickets this Loom's lanes do not
+    # take, for the second operator's session to claim.
+    HANDOFF: {"color": "d876e3", "description": "In the hand-off pool for the second operator's session; out of the goal's in-flight count"},
 }
 for _lane in LANES:
     LABELS["lane:" + _lane] = {"color": "bfdadc",

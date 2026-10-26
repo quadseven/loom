@@ -512,3 +512,54 @@ def find(operator_asks: Iterable[Any], claims: Optional[Dict[str, Any]], repo: s
     names = full_names(list(repos or []) + [entry.get("repo") for entry in every + pending])
     key = ref_key(repo, number, names)
     return next((entry for entry in every + pending if entry["key"] == key), None)
+
+
+# The station's goals stuck at their in-flight cap (bus/station.py
+# post_stuck_goals, loom#1831): kept while the station refreshes them, and
+# dropped once a report is this old (the station sends every ten minutes).
+GOAL_CAPS_MAX_AGE = 3600
+GOAL_CAPS_MAX = 200
+_GOAL_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+")
+
+
+def goal_caps(body: Any, now: float) -> Dict[str, Any]:
+    """The stored form of a POST /api/goal-caps body: each goal as
+    OWNER/NAME#N with its whole-number counts and since time, and when it was
+    received; ValueError for a body that is not that shape."""
+    goals = body.get("goals") if isinstance(body, dict) else None
+    if not isinstance(goals, list) or len(goals) > GOAL_CAPS_MAX:
+        raise ValueError("goals must be a list of at most %d entries" % GOAL_CAPS_MAX)
+    kept = []
+    for goal in goals:
+        if not (isinstance(goal, dict) and _GOAL_RE.fullmatch(str(goal.get("goal") or ""))):
+            raise ValueError("each goal needs goal as OWNER/NAME#N")
+        counts = {field: goal.get(field) for field in ("in_flight", "cap", "no_lane", "since")}
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v < 1e12
+                   for v in counts.values()):
+            raise ValueError("in_flight, cap, no_lane and since must be numbers")
+        kept.append({"goal": goal["goal"], "since": float(counts["since"]),
+                     **{field: int(counts[field]) for field in ("in_flight", "cap", "no_lane")}})
+    return {"goals": kept, "received_at": now}
+
+
+def goal_caps_section(stored: Any, now: float) -> str:
+    """A Needs-you section for each goal stuck at its in-flight cap: how
+    long, its count against the cap, and how many of its in-flight tickets
+    wait with no lane that takes them. Nothing when none is, or the report is
+    older than GOAL_CAPS_MAX_AGE."""
+    if not isinstance(stored, dict) or not isinstance(stored.get("received_at"), (int, float)):
+        return ""
+    if now - stored["received_at"] > GOAL_CAPS_MAX_AGE or not stored.get("goals"):
+        return ""
+    esc = html.escape
+    rows = "".join(
+        '<li class="card"><strong>%s</strong> stuck at its cap for %.0f hours: %d of %d in flight, '
+        '%d blocked on no lane.</li>' % (
+            esc(goal["goal"]), max(0.0, now - goal["since"]) / 3600, goal["in_flight"], goal["cap"],
+            goal["no_lane"])
+        for goal in stored["goals"])
+    return ('<section class="needs-group needs-goal-caps" data-kind="goal-caps"><h2>Goals stuck at '
+            'their cap (%d)</h2><p class="muted">the station skips their triage rewrites; tickets no '
+            'lane takes are rerouted after hours and go to the hand-off pool within a day</p>'
+            '<ul>%s</ul></section>') % (len(stored["goals"]), rows)
+

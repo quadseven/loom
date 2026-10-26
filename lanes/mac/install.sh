@@ -362,6 +362,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_BRIEF_AUTHORS</key><string>$(xml "${LOOM_BRIEF_AUTHORS:-}")</string>
     <key>LOOM_TRUSTED_BRIEFERS</key><string>$(xml "${LOOM_TRUSTED_BRIEFERS:-}")</string>
     <key>LOOM_GOAL_CAP</key><string>$(xml "${LOOM_GOAL_CAP:-}")</string>
+    <key>LOOM_NO_LANE_REROUTE</key><string>$(xml "${LOOM_NO_LANE_REROUTE:-}")</string>
     <key>LOOM_UNVERIFIED_LIMIT</key><string>$(xml "${LOOM_UNVERIFIED_LIMIT:-}")</string>
     <key>LOOM_REPO_OWNERS</key><string>$(xml "$LOOM_REPO_OWNERS")</string>
     <key>LOOM_STATUS_REPO</key><string>$(xml "${LOOM_STATUS_REPO:-}")</string>

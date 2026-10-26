@@ -341,11 +341,74 @@ class StationRewriteTest(Base):
         # 17 of 72 rewrites ran the model only for intake to refuse the brief
         # at the goal's in-flight cap (2026-10-21).
         self.fake.add_triage(7)
-        with mock.patch.object(brain, "_goal_in_flight", return_value=brain.goal_cap()):
+        with mock.patch.object(brain, "goal_flying",
+                               return_value=[{"number": n} for n in range(brain.goal_cap())]):
             err = self.run_station(self.station(cmd=self.agent(BRIEF)))
         self.assertFalse(os.path.exists(self.prompt_file))
         self.assertEqual(self.fake.created, [])
         self.assertIn("tickets in flight", err)
+
+    def at_cap(self, st, blocked=()):
+        """Run the rewrite step with the goal at its cap and tickets 1.. in
+        flight, of which `blocked` wait with no lane (ticket-waits.json)."""
+        os.makedirs(st.state, exist_ok=True)
+        with open(os.path.join(st.state, "ticket-waits.json"), "w") as fh:
+            json.dump({"%s#%d" % (REPO, n): {"reason": "no free lane takes model claude-sonnet-5-5",
+                                             "since": st.now, "seen": st.now,
+                                             "no_lane_since": st.now} for n in blocked}, fh)
+        flying = [{"number": n} for n in range(1, brain.goal_cap() + 1)]
+        with mock.patch.object(brain, "goal_flying", return_value=flying):
+            return self.run_station(st)
+
+    def test_the_cap_skip_names_the_tickets_blocked_on_no_lane_and_a_stuck_goal(self):
+        # loom#1831: a goal sat at 32 of 28 all day, most of it tickets no
+        # lane takes, and the skip line said only the count.
+        self.fake.add_triage(7)
+        st = self.station(cmd=self.agent(BRIEF))
+        err = self.at_cap(st, blocked=(1, 2, 3))
+        self.assertIn("goal has %d tickets in flight (cap %d), 3 blocked on no lane; skipped"
+                      % (brain.goal_cap(), brain.goal_cap()), err)
+        self.assertNotIn("stuck", err)
+        st.now += station.GOAL_CAP_STUCK + 3600
+        err = self.at_cap(st, blocked=(1, 2))
+        self.assertIn("goal stuck at its cap for 7 hours: %d tickets in flight (cap %d), "
+                      "2 blocked on no lane; skipped" % (brain.goal_cap(), brain.goal_cap()), err)
+        state = json.load(open(os.path.join(st.state, "rewrite.json")))
+        (stuck,) = st._stuck_goals(state)
+        self.assertEqual((stuck["goal"], stuck["no_lane"], stuck["cap"]),
+                         ("%s#%d" % (REPO, GOAL), 2, brain.goal_cap()))
+
+    def test_a_goal_back_under_its_cap_starts_its_clock_again(self):
+        self.fake.add_triage(7)
+        st = self.station(cmd=self.agent(BRIEF))
+        self.at_cap(st)
+        st.now += station.GOAL_CAP_STUCK + 3600
+        with mock.patch.object(brain, "goal_flying", return_value=[]):
+            self.run_station(st)
+        state = json.load(open(os.path.join(st.state, "rewrite.json")))
+        self.assertEqual(st._stuck_goals(state), [])
+        self.assertNotIn("cap", state["%s#%d" % (REPO, GOAL)])
+
+    def test_the_stuck_goals_go_to_the_dashboard(self):
+        self.fake.add_triage(7)
+        st = self.station(cmd=self.agent(BRIEF))
+        st.s.transcript_url, st.s.transcript_token_ssm = "https://dash.example.com/api/transcripts", "/x"
+        sent = []
+        st._transcript_token = lambda: "token"
+        st.upload = lambda url, token, body: sent.append((url, body))
+        self.at_cap(st, blocked=(1,))
+        self.assertEqual(sent[-1][1]["goals"], [])
+        st.now += station.GOAL_CAP_STUCK + 3600
+        self.at_cap(st, blocked=(1,))
+        url, body = sent[-1]
+        self.assertTrue(url.endswith(station.GOAL_CAPS_PATH), url)
+        self.assertEqual([(g["goal"], g["no_lane"]) for g in body["goals"]],
+                         [("%s#%d" % (REPO, GOAL), 1)])
+        # The same list is not sent again within GOAL_CAPS_EVERY.
+        count = len(sent)
+        st.now += 60
+        self.at_cap(st, blocked=(1,))
+        self.assertEqual(len(sent), count)
 
     def test_a_private_repo_with_an_empty_private_command_is_skipped(self):
         self.fake.private = True
