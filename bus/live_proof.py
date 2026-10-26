@@ -267,9 +267,13 @@ def adapter_step(text: str) -> Tuple[Optional[Step], str]:
     count, so the lane's answer never names a URL, a command or a bare log
     string for the station to run."""
     step, why = step_of(text)
-    if step is not None and step.source and step.kind in (LOG, QUERY):
-        return step, ""
-    return None, why or "it is not a `log:<source>` or `sql:<SELECT ...>` step"
+    if step is None or not step.source or step.kind not in (LOG, QUERY):
+        return None, why or "it is not a `log:<source>` or `sql:<SELECT ...>` step"
+    # The lane picks the step, so it must name something to find: a bare
+    # SELECT or an absence alone would pass on almost any answer.
+    if not (step.expects if step.kind == QUERY else step.target):
+        return None, "it names no string for the read to find"
+    return step, ""
 
 
 def _step_refusal(step: Step) -> str:

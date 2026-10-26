@@ -159,6 +159,16 @@ class ProseLiveTest(tbs.Base):
         [ask] = self.asks()
         self.assertIn("`sql:DELETE FROM t`", ask)
 
+    def test_a_select_that_names_no_string_to_find_is_refused(self):
+        runner = adapter_runner(live_proof.Answer([], hours=24, count=0))
+        st = self.station(runner)
+        self.answer({"step": "`sql:SELECT 1 FROM t`"})
+        self.report(st)
+        st.close_done_tickets()
+        runner.query.assert_not_called()
+        [ask] = self.asks()
+        self.assertIn("names no string for the read to find", ask)
+
     def test_a_repo_without_an_adapter_gets_todays_ask_and_no_verify_run(self):
         st = self.station(None)
         st.close_done_tickets()
