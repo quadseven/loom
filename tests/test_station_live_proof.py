@@ -158,6 +158,22 @@ class StationLiveProofTest(tbs.Base):
         self.assertNotIn("Live proof missing:", self.status_text())
         self.assertIn("loom:human", self.fake.names(self.NUMBER))
 
+    def test_prose_live_criterion_in_adapter_repo_is_queued_for_verify(self):
+        body = LOG_BODY.replace("prints `daily status ready`", "shows the daily measurements remain stable")
+        self.ship(body, hours_ago=30)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
+        st.s.live_evidence_repos = [REPO]
+        st._live_adapters = {REPO: mock.Mock(adapter=mock.Mock(
+            sources=("archive",), sql=object()))}
+        self.assertFalse(st._evidence_holds(REPO, self.fake.issues[self.NUMBER]))
+        self.assertNotIn("loom:human", self.fake.names(self.NUMBER))
+
+    def test_prose_live_criterion_without_adapter_still_asks(self):
+        body = LOG_BODY.replace("prints `daily status ready`", "shows the daily measurements remain stable")
+        self.ship(body, hours_ago=30)
+        self.close_pass(FakeLog([]))
+        self.assertIn("loom:human", self.fake.names(self.NUMBER))
+
 
 class EvidenceLinesSinceTest(unittest.TestCase):
     """The log source built on the configured evidence command keeps only the
