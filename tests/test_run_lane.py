@@ -5044,6 +5044,14 @@ exit %d
         self.assertEqual(auth_token.read_text(), "ghs_lanes.tok-en")
         self.assertFalse((self.loom / "run" / "gh-auth-codex").exists())
 
+    def test_agent_gh_call_count_is_unknown_when_the_log_is_missing_or_empty(self):
+        source = RUNNER.read_text()
+        self.assertRegex(
+            source,
+            r'if \[ -r "\$LOG" \] && \[ -s "\$LOG" \]; then\s+'
+            r'AGENT_GH_CALLS=.*?\s+else\s+AGENT_GH_CALLS=unknown\s+fi',
+        )
+
     def test_agent_brief_says_stop_after_opening_pr_and_summary_reports_gh_calls(self):
         self.drop_brief()
         self.run_lane()

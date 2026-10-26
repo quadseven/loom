@@ -3378,7 +3378,11 @@ for BRIEF in "$INBOX"/*.md; do
     wait $! ) &
   wait $!
   STATUS=$?
-  AGENT_GH_CALLS="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -cE '(^|[[:space:]])gh [^[:space:]]+' || true)"
+  if [ -r "$LOG" ] && [ -s "$LOG" ]; then
+    AGENT_GH_CALLS="$(tail -c +$((LOG_START + 1)) "$LOG" 2>/dev/null | grep -cE '(^|[[:space:]])gh [^[:space:]]+' || true)"
+  else
+    AGENT_GH_CALLS=unknown
+  fi
   if [ -n "${LANE_GH_CONFIG_DIR:-}" ] && ! rm -rf "$LANE_GH_CONFIG_DIR"; then
     park "$BRIEF" "could not remove the lane's temporary GitHub credential store" transient
     unset LANE_GH_CONFIG_DIR
