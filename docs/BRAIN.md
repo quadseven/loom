@@ -1716,7 +1716,7 @@ appear over the window named, which the adapter must say it read), or
 `sql:<SELECT ...>` (one SELECT or SHOW) with the strings its answer must
 contain. The station runs an adapter only for repos in
 `LOOM_LIVE_EVIDENCE_REPOS`; the child gets PATH, HOME, LANG, TMPDIR and only
-the variables named in `LOOM_LIVE_EVIDENCE_PASS_ENV`, a timeout of at most
+the variables the operator names in `LOOM_LIVE_EVIDENCE_PASS_ENV`, a timeout of at most
 300 seconds that kills its process group, and at most 64 KiB and 200 lines
 of output. A SQL statement is checked when the step is read and again just
 before it runs. Loom bounds what it asks and keeps; the routes behind the

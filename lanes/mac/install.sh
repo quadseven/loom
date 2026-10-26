@@ -193,18 +193,42 @@ X_REPO="$(xml "$REPO_ROOT")" X_LOOM="$(xml "$LOOM_HOME")" X_HOME="$(xml "$HOME")
 
 # Every LOOM_* setting in the environment, as plist entries, less the names
 # given as arguments (the ones a plist writes itself: a key twice is ambiguous).
+# Every LOOM_* setting in the environment, as plist entries, less the names
+# given as arguments (the ones a plist writes itself: a key twice is ambiguous).
 loom_env() {
   local skip=" $* "
+  # Parse LOOM_STATION_PASS_ENV like live_adapter.py does
+  local pass_env="${LOOM_STATION_PASS_ENV:-}"
+  local pass_names=()
+  if [ -n "$pass_env" ]; then
+    pass_names=($(echo "$pass_env" | tr ',' '\n' | tr '[:space:]' '\n' | grep -E "^[A-Z_][A-Z0-9_]*$" | tr '\n' ' '))
+  fi
   env | LC_ALL=C sort | while IFS='=' read -r k v; do
-    case "$k" in
-      LOOM_HOME|LOOM_REPO_OWNERS|LOOM_EVIDENCE_CMDS) continue ;;
-      # Each job gets its own writer's App from app_env, never another's.
-      LOOM_GITHUB_APP_*|LOOM_LANES_GITHUB_APP_*|LOOM_BRAIN_GITHUB_APP_*) continue ;;
-      LOOM_*) ;; *) continue ;;
-    esac
+    # Skip if it's in the skip list
     case "$skip" in *" $k "*) continue ;; esac
-    v="$(xml "$v")"
-    printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
+    
+    # Skip LOOM_* variables unless they're in the allowed list
+    if [[ "$k" == LOOM_* ]]; then
+      # Skip LOOM_HOME, LOOM_REPO_OWNERS, LOOM_EVIDENCE_CMDS
+      if [[ "$k" == LOOM_HOME || "$k" == LOOM_REPO_OWNERS || "$k" == LOOM_EVIDENCE_CMDS ]]; then
+        continue
+      fi
+      # Skip LOOM_GITHUB_APP_*, LOOM_LANES_GITHUB_APP_*, LOOM_BRAIN_GITHUB_APP_*
+      if [[ "$k" =~ ^LOOM_(GITHUB_APP|LANES_GITHUB_APP|BRAIN_GITHUB_APP)_ ]]; then
+        continue
+      fi
+      # Always include LOOM_* variables, or those in pass_names
+      if [ ${#pass_names[@]} -eq 0 ] || [[ " ${pass_names[*]} " == *"$k "* ]]; then
+        v="$(xml "$v")"
+        printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
+      fi
+    else
+      # Skip non-LOOM variables unless they're in pass_names
+      if [ ${#pass_names[@]} -gt 0 ] && [[ " ${pass_names[*]} " == *"$k "* ]]; then
+        v="$(xml "$v")"
+        printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
+      fi
+    fi
   done
 }
 
@@ -410,7 +434,8 @@ cat > "$PLIST" <<EOF
     <key>LOOM_GITHUB_APP_INSTALLATION_ID</key><string>$(xml "${LOOM_GITHUB_APP_INSTALLATION_ID:-}")</string>
     <key>LOOM_GITHUB_APP_KEY_SSM</key><string>$(xml "${LOOM_GITHUB_APP_KEY_SSM:-}")</string>
     <key>LOOM_GITHUB_APP_KEY_FILE</key><string>$(xml "${LOOM_GITHUB_APP_KEY_FILE:-}")</string>
-$(model_env)
+    $(loom_env)
+    $(model_env)
   </dict>
 </dict>
 </plist>

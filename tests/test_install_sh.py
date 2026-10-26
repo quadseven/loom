@@ -59,11 +59,17 @@ class InstallScriptTest(unittest.TestCase):
                     LOOM_HOME=str(self.loom),
                     LOOM_REPO_OWNERS="example-owner",
                     LOOM_CODEX_MODEL="codex-test",
-                    FAKE_LOG=str(self.log))
+                    FAKE_LOG=str(self.log),
+                    AGENT="1",
+                    SLEEP_LOG="sleep.log",
+                    LANG="en_US.UTF-8",
+                    LOGNAME="root")
         full.update(env)
         return subprocess.run(
             ["bash", str(self.checkout / "lanes" / "mac" / "install.sh"), "codex"],
             env=full, capture_output=True, text=True, timeout=60)
+
+
 
     def test_a_held_lock_is_waited_for_then_the_station_installs(self):
         # A live pid (this test process) holds the lock; a helper frees it
@@ -502,6 +508,51 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("LOOM_DASHBOARD_PORT", result.stderr)
         self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def test_station_keeps_configured_pass_env(self):
+        result = self.run_install(LOOM_STATION_PASS_ENV="KUBECONFIG", KUBECONFIG="/path/to/kubeconfig")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>KUBECONFIG</key><string>/path/to/kubeconfig</string>", plist)
+
+    def test_station_keeps_multiple_pass_env_variables(self):
+        result = self.run_install(LOOM_STATION_PASS_ENV="KUBECONFIG,KUBECONFIG_CA_DATA,OTHER_VAR",
+                                  KUBECONFIG="/path/to/kubeconfig",
+                                  KUBECONFIG_CA_DATA="data",
+                                  OTHER_VAR="value",
+                                  UNRELATED_VAR="should_not_appear")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>KUBECONFIG</key><string>/path/to/kubeconfig</string>", plist)
+        self.assertIn("<key>KUBECONFIG_CA_DATA</key><string>data</string>", plist)
+        self.assertIn("<key>OTHER_VAR</key><string>value</string>", plist)
+        self.assertNotIn("<key>UNRELATED_VAR</key>", plist)
+
+    def test_station_keeps_pass_env_without_matching_env(self):
+        result = self.run_install(LOOM_STATION_PASS_ENV="KUBECONFIG,MISSING_VAR")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertNotIn("<key>KUBECONFIG</key>", plist)
+
+    def test_station_keeps_existing_loom_vars_even_without_pass_env(self):
+        result = self.run_install(LOOM_CLAUDE_MODEL="test-model")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_CLAUDE_MODEL</key><string>test-model</string>", plist)
+
+    def test_station_keeps_pass_env_variables_and_loom_vars_together(self):
+        result = self.run_install(LOOM_STATION_PASS_ENV="KUBECONFIG", KUBECONFIG="/path/to/kubeconfig", LOOM_CLAUDE_MODEL="test-model")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>KUBECONFIG</key><string>/path/to/kubeconfig</string>", plist)
+        self.assertIn("<key>LOOM_CLAUDE_MODEL</key><string>test-model</string>", plist)
+
+    def test_station_keeps_pass_env_variables_without_passing_test_env_vars(self):
+        result = self.run_install(LOOM_STATION_PASS_ENV="KUBECONFIG", KUBECONFIG="/path/to/kubeconfig")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertNotIn("<key>FAKE_LOG</key>", plist)
+
 
 
 if __name__ == "__main__":
