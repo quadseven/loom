@@ -893,7 +893,9 @@ new), is a stuck round. A stuck round climbs the model ladder at once
 new finding is progress and stays on its lane. `LOOM_FIX_ROUNDS` caps the
 rounds per rung (default 3). With no rung left above a stuck round, or the cap
 reached, the rounds stop: the ticket moves to `loom:failed` with one note
-naming what still fails and gets `handoff:claude`. A clean
+naming what still fails and gets `handoff:claude`. A failure of the plan check alone gets no round: the factory
+rebuilds the body from the ticket (loom#1837), and the plan check never counts
+toward a stuck round. A clean
 PR receives `loom:ready`; a later push removes that label until the new head
 has finished checks and review again. A degraded or partial result of the
 review check (its summary says `Degraded review (...): not a verdict`, or its

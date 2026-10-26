@@ -3119,6 +3119,22 @@ class StuckFixRoundTest(unittest.TestCase):
         self.assertNotIn("lane:claude", self.names())
         self.assertIn("loom:briefed", self.names())
 
+    def test_a_plan_check_only_failure_is_left_for_the_factorys_body_repair(self):
+        # The factory rebuilds the body for a plan-check-only failure
+        # (loom#1837); the hand-back sends no round and judges nothing stuck.
+        self.last_round("### Check: %s\n\n    0 non-empty bullets" % factory.DEFAULT_PLAN_CHECK)
+        self.run_hand_back(checks=[(factory.DEFAULT_PLAN_CHECK, "0 non-empty bullets")])
+        self.assertEqual(self.names(), ["loom:ticket", "loom:pr", "lane:spark"])
+        self.assertEqual(len(self.rounds()), 1)
+
+    def test_a_plan_check_failing_again_beside_a_new_failure_is_not_stuck(self):
+        self.last_round("### Check: %s\n\n    0 non-empty bullets" % factory.DEFAULT_PLAN_CHECK)
+        self.run_hand_back(checks=[(factory.DEFAULT_PLAN_CHECK, "0 non-empty bullets"),
+                                   ("lint", "new failure")])
+        self.assertIn("lane:spark", self.names())
+        self.assertIn("loom:briefed", self.names())
+        self.assertEqual(len(self.rounds()), 2)
+
     def test_a_stuck_round_with_no_rung_left_stops_and_hands_the_ticket_off(self):
         self.gh.issue["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
                                    {"name": "lane:claude"}]

@@ -5389,6 +5389,11 @@ class Station:
         self._remove_ready_if_present(repo, number, names)
         if not failed and not threads:
             return
+        if not threads and all(name == self.s.plan_check for name, _ in failed):
+            # A plan check failure alone is the pull request's body, which the
+            # factory rebuilds from the ticket (factory._judge, loom#1837): a
+            # lane round cannot change it, and it is no round to judge stuck.
+            return
         self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
                                    comments, names, failed, threads, rounds)
 
@@ -5550,7 +5555,7 @@ class Station:
         failing = [name for name, _ in failed]
         persisted = converge.persistent(
             converge.last_fix_body(comments, authors, (repo, pr_number)),
-            failing, threads, ignore=(self.s.review_check,))
+            failing, threads, ignore=(self.s.review_check, self.s.plan_check))
         if persisted:
             lane = self._climb_stuck(repo, number, pr_number, detail, comments, persisted)
             if lane is None:
@@ -5559,7 +5564,8 @@ class Station:
         elif self._rung_round_count(comments, authors) >= rounds:
             self._stop_fix_rounds(repo, number, pr_number,
                                   "the fix round cap (%d) is reached on its rung" % rounds,
-                                  converge.describe(failing, threads, (self.s.review_check,)))
+                                  converge.describe(failing, threads, (self.s.review_check,
+                                                                       self.s.plan_check)))
             return
         self._post_fix_comment(repo, number, pr_number, detail, sha, failed, threads, comments)
         self._move_fix_to_lane(repo, number, lane, names)
