@@ -536,7 +536,9 @@ Reports: by default the station sends a digest, not each report:
 `LOOM_REPORT_DIGEST_TIMES` (default `10:00,21:00`, local time) names when.
 At each time it sends one message: every goal home whose latest report since
 the last digest says something moved, as its short name, the report's first
-line and a link; a count of the goal homes where nothing moved; and the
+line and a link; a count of the goal homes where nothing moved; one line
+per backlog goal home (labelled `loom:backlog`), counted from its tickets,
+since a backlog goal posts no report on GitHub; and the
 factory's daily numbers, which then no longer go out on their own. Each time
 is sent once, and a failed send is tried again on the next pass. Switching
 the digest on sends nothing until the next digest time. Setting
