@@ -10720,14 +10720,7 @@ class Station:
         run = os.path.join(self.s.home, "run")
         removed = caches = 0
         for slot in LANES:
-            if self._lane_locked(run, slot):
-                continue
-            try:
-                if any(e.endswith(".md") for e in os.listdir(self.inbox(slot))):
-                    continue
-            except FileNotFoundError:
-                pass
-            except OSError:
+            if not self._lane_idle(run, slot):
                 continue
             last = self._last_finished(slot)
             finished = last is not None and self._tree_done(last, busy)
@@ -10742,26 +10735,40 @@ class Station:
                 if finished:
                     _remove(path)
                     removed += 1
-                    continue
-                if suffix != "-home" or not stat.S_ISDIR(st.st_mode):
-                    continue
-                for name in RUN_HOME_CACHES:
-                    cache = os.path.join(path, name)
-                    try:
-                        os.lstat(cache)
-                    except OSError:
-                        continue
-                    if self._lane_locked(run, slot):
-                        break
-                    _remove(cache)
-                    caches += 1
-                    # The home's time stays its run's, so the settle check
-                    # still reads it as idle on the next pass.
-                    os.utime(path, (st.st_atime, st.st_mtime), follow_symlinks=False)
+                elif suffix == "-home" and stat.S_ISDIR(st.st_mode):
+                    caches += self._drop_home_caches(run, slot, path, st)
         if removed:
             _say("removed %d idle lane run folder(s) of tickets done" % removed)
         if caches:
             _say("removed %d cache folder(s) from idle lane homes" % caches)
+
+    def _lane_idle(self, run: str, slot: str) -> bool:
+        """No runner holds the slot and no brief waits in its inbox."""
+        if self._lane_locked(run, slot):
+            return False
+        try:
+            return not any(e.endswith(".md") for e in os.listdir(self.inbox(slot)))
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    def _drop_home_caches(self, run: str, slot: str, home: str, st: os.stat_result) -> int:
+        """Remove RUN_HOME_CACHES from an idle lane's home, checking the lock
+        again before each; the home keeps its time, so the settle check still
+        reads it as idle on the next pass. The number removed."""
+        dropped = 0
+        for name in RUN_HOME_CACHES:
+            cache = os.path.join(home, name)
+            if not os.path.lexists(cache):
+                continue
+            if self._lane_locked(run, slot):
+                break
+            _remove(cache)
+            dropped += 1
+        if dropped:
+            os.utime(home, (st.st_atime, st.st_mtime), follow_symlinks=False)
+        return dropped
 
     @staticmethod
     def _lane_locked(run: str, slot: str) -> bool:

@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -203,7 +204,10 @@ def opencode_gz_events(packed: Path) -> list[dict]:
         with os.fdopen(fd, "wb") as out, gzip.open(packed, "rb") as src:
             shutil.copyfileobj(src, out, 1 << 20)
         return opencode_events(Path(tmp))
-    except (OSError, EOFError, gzip.BadGzipFile):
+    except (OSError, EOFError) as err:
+        # A store that cannot be unpacked reads as none, as an unreadable
+        # SQLite store does in opencode_events, and the reason is said.
+        print(f"cannot unpack session store {packed}: {err}", file=sys.stderr)
         return []
     finally:
         try:

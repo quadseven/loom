@@ -6042,6 +6042,22 @@ class LogRetentionTest(Base):
         self.assertIn("100.0 GB free on its disk", line[0])
         self.assertFalse(any(s.startswith("loom home holds ") for s in self.tend()))
 
+    def test_low_free_disk_is_said_by_the_claim_guard_not_every_pass(self):
+        # loom#1808 replaced the warning that repeated every pass: the claim
+        # guard (DiskGuardTest) says a low disk once per change instead.
+        said = self.tend(free=3 * 1024 ** 3)
+        self.assertFalse(any(s.startswith("warning:") for s in said), said)
+        self.assertTrue(any(s.startswith("loom home holds ") and "3.0 GB free" in s
+                            for s in said), said)
+
+    def test_a_store_that_cannot_be_unpacked_is_said_and_reads_as_none(self):
+        from bus import sessions
+        packed = Path(self._tmp.name) / "opencode.db.gz"
+        packed.write_bytes(b"not gzip")
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(sessions.opencode_gz_events(packed), [])
+        self.assertIn("cannot unpack session store", err.getvalue())
+
     def session_run(self, slot, name, days=3, text=b"SQLite format 3\x00" + b"x" * 5000):
         run = os.path.join(self.home, "logs", slot, name)
         folder = os.path.join(run, ".local", "share", "opencode")

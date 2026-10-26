@@ -182,6 +182,8 @@ drop_build_output() {
   for tree in "$WORKDIR/$TICKET" "$WORKDIR/$TICKET-default-check"; do
     [ -d "$tree" ] && [ ! -L "$tree" ] && [ -e "$tree/.git" ] || continue
     while IFS= read -r -d '' path; do
+      # find names every path ./..., so none reads as an option.
+      [[ "$path" == ./* ]] || continue
       git -C "$tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
         check-ignore -q -- "$path" 2> /dev/null || continue
       tracked="$(git -C "$tree" -c core.fsmonitor=false ls-files -- "$path" 2> /dev/null)" || continue
