@@ -48,7 +48,7 @@ that talks to GitHub about tickets.
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
 | `loom:answered` | The runner posted a diagnosis answer, or a run found its work already done or no longer applying and no merged pull request carries it (see Claim and outcome); the brain reviews it, then closes/verifies the ticket or briefs it again. |
 | `loom:ready` | Checks passed and review-bot threads are resolved for the current PR head. |
-| `needs-brain` | The automatic fix round limit was reached, or a ticket failed a second time with no commit and no reason; review this ticket in full. |
+| `needs-brain` | A ticket failed a second time with no commit and no reason, or went past the model ladder; review this ticket in full. |
 | `loom:failed` | The runner gave up and the station did not retry it; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:closed-unmerged` | The linked pull request closed without merging. |
@@ -59,7 +59,7 @@ that talks to GitHub about tickets.
 | `loom:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
 | `loom:answer-pending` | An operator answered the item's ask on the dashboard's Needs you page (`<!-- loom:answer v1 -->` comment, `bus/answer.py`); the station has not read it yet. The factory reads it on its next pass and takes the label off (see Operator answers). |
 | `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:window`, `wait:live-event` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, a deploy or roll window, or (`wait:live-event`, on a shipped ticket) its Live box needs a rare event the log has not shown in 7 days since it shipped. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
-| `handoff:claude` | The hand-off pool, machine-readable: a ticket no lane of this Loom took for a day, with no other lane or model rung its tier allows free (see Tickets no lane takes). It is `loom:queued` with no lane, holds no slot of its goal's in-flight cap (one at `loom:pr` still counts), and the factory moves it no more. The second operator's session works this pool (its goal issue, #1036) and may claim such a ticket at any state; taking the label off returns the ticket to this Loom's queue. |
+| `handoff:claude` | The hand-off pool, machine-readable. Two routes lead into it: a ticket no lane of this Loom took for a day, with no other lane or model rung its tier allows free (see Tickets no lane takes), which is `loom:queued` with no lane and holds no slot of its goal's in-flight cap (one at `loom:pr` still counts); and a ticket whose fix rounds stopped on the same failures, with no rung of the model ladder left or the round cap reached on its rung (see the station's hand-back below), which is `loom:failed` with one note naming what still fails. The factory moves neither any more. The second operator's session works this pool (its goal issue, #1036) and may claim such a ticket at any state; taking the label off returns the ticket to this Loom. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs-operator` | An ask for the operator (see Asks). |
@@ -883,9 +883,18 @@ The station polls lane PRs once per pass. Once checks finish, failed checks
 and unresolved threads started by `grug-tribe[bot]` are sent back to the same
 lane as a `loom:fix` comment, using the same findings format as
 `python3 -m bus.brain fix`. The ticket returns to `loom:briefed`; the runner
-pushes fixes to the existing branch. `LOOM_FIX_ROUNDS` caps automatic rounds
-per ticket (default 3), after which the station adds `needs-brain` and records
-one status event saying the cap was reached. A clean
+pushes fixes to the existing branch. Before each round after the first, the
+station asks whether the last one moved anything (`bus/converge.py`): the same
+check names still failing, or a review-bot finding at the same path within 10
+lines under the same rule (a new thread id or check run id does not make it
+new), is a stuck round. A stuck round climbs the model ladder at once
+(`factory.Factory._climb`, which keeps the model and private-repo rules); a
+new finding is progress and stays on its lane. `LOOM_FIX_ROUNDS` caps the
+rounds per rung (default 3). With no rung left above a stuck round, or the cap
+reached, the rounds stop: the ticket moves to `loom:failed` with one note
+naming what still fails and gets `handoff:claude`. A failure of the plan check alone gets no round: the factory
+rebuilds the body from the ticket (loom#1837), and the plan check never counts
+toward a stuck round. A clean
 PR receives `loom:ready`; a later push removes that label until the new head
 has finished checks and review again. A degraded or partial result of the
 review check (its summary says `Degraded review (...): not a verdict`, or its

@@ -85,18 +85,24 @@ LEAK_DENY_SSM="${LOOM_LEAK_DENY_SSM:-/infra/leak-scan/deny-list}"
 # The public repo leak scan, the one way the runner calls the scanner, so no
 # scan runs without the deny-list. Arguments are the scanner's (--diff RANGE
 # or --text-file FILE, --allow-repo-ref ...). Exit 0 clean, 1 a hit, 2 no
-# scan: the scanner is missing, the deny-list cannot be read (the scanner
-# exits 2), or this is a lane pod. A pod (LOOM_SSM_DIR) holds no AWS key and
-# the scanner reads the deny-list only from SSM, so a pod scans nothing and
-# pushes nothing to a public repo rather than scan without the list.
+# scan: the scanner is missing, or the deny-list cannot be read (the scanner
+# exits 2). A lane pod or cluster runner (LOOM_SSM_DIR) holds no AWS key: the
+# scanner reads the deny-list's copy under LOOM_SSM_DIR through the stand-in
+# lanes/k8s/ssm-dir-bin/aws, first on its PATH. With no copy there it scans
+# nothing and pushes nothing to a public repo rather than scan without the list.
 leak_scan() {
   if [ ! -f "$LEAK_SCANNER" ]; then
     echo "leak scanner not found: $LEAK_SCANNER" >&2
     return 2
   fi
   if [ -n "${LOOM_SSM_DIR:-}" ]; then
-    echo "a lane pod cannot read the leak scan deny-list $LEAK_DENY_SSM (the scanner reads it only from SSM); nothing scanned" >&2
-    return 2
+    if [ ! -s "$LOOM_SSM_DIR$LEAK_DENY_SSM" ]; then
+      echo "no copy of the leak scan deny-list $LEAK_DENY_SSM under LOOM_SSM_DIR; nothing scanned" >&2
+      return 2
+    fi
+    PATH="$LOOM_ROOT/lanes/k8s/ssm-dir-bin:$PATH" timeout "$NET_TIMEOUT" \
+      python3 -B "$LEAK_SCANNER" "$@" --deny-list-ssm "$LEAK_DENY_SSM"
+    return
   fi
   env ${LOOM_AWS_REGION:+AWS_REGION="$LOOM_AWS_REGION"} timeout "$NET_TIMEOUT" \
     python3 -B "$LEAK_SCANNER" "$@" --deny-list-ssm "$LEAK_DENY_SSM"
@@ -625,6 +631,49 @@ fix_items() {
         on && n && /^Does not apply/ {out = out " [does not apply]"}
         on && n && /^Fixed$/ {out = out " [fixed]"}
         END {print out}' "$1" | cut -c1-500
+}
+
+# The checks a fix brief asks a round to fix: the "### Check:" headings of its
+# ## Fix section, "; " between them.
+fix_checks() {
+  awk '$0 == "## Fix" {on=1; next} on && /^## / {on=0}
+        on && /^### Check: / {sub(/^### Check: /, ""); gsub(/[[:cntrl:]]/, ""); out = out (n++ ? "; " : "") $0}
+        END {print out}' "$1" | cut -c1-500
+}
+
+# The fix brief's checks a commit must fix: fix_checks without the review
+# bot's own checks (LOOM_REVIEW_CHECK and LOOM_PLAN_CHECK, as bus/factory.py
+# names them), which a round may settle with no commit, by answering a
+# finding or repairing the PR text.
+fix_code_checks() {
+  awk -v review="${LOOM_REVIEW_CHECK:-Grug - Elder}" -v plan="${LOOM_PLAN_CHECK:-Grug - Chief}" \
+    '$0 == "## Fix" {on=1; next} on && /^## / {on=0}
+     on && /^### Check: / {sub(/^### Check: /, ""); gsub(/[[:cntrl:]]/, "")
+       if ($0 != review && $0 != plan) out = out (n++ ? "; " : "") $0}
+     END {print out}' "$1" | cut -c1-500
+}
+
+# The head commit the fix brief's checks failed on (its loom:fix-head marker),
+# or nothing.
+fix_head() {
+  sed -n 's/^<!-- loom:fix-head \([0-9a-f]\{40\}\) -->$/\1/p' "$1" | tail -1
+}
+
+# One line for the round's log: whether the repo's validation contract runs a
+# check for the failing CI jobs the brief names. The contract's check runs on
+# the round's head before any push (final_validation), so a failure there is a
+# failed round; a job it does not run is first checked by CI after the push.
+fix_contract_line() {
+  local checks
+  checks="$(fix_checks "$1")"
+  [ -n "$checks" ] || return 0
+  if [ -z "$HAS_CONTRACT" ]; then
+    printf 'no validation contract check maps to the failing checks (%s): the repo has no %s, so CI is the first to run them on the new head' "$checks" "$CONTRACT_FILE"
+  elif grep -q "so the lane's own validation never ran it" "$1"; then
+    printf 'no validation contract check maps to some failing checks (%s): the brief names CI jobs %s does not run; the contract check %s' "$checks" "$CONTRACT_FILE" "${VALIDATED:-did not pass}"
+  else
+    printf 'the contract check for the failing checks (%s) ran before push: %s' "$checks" "${VALIDATED:-did not pass}"
+  fi
 }
 
 # A fix round's commits for its PR comment: at most ten, each hash and
@@ -3627,6 +3676,19 @@ for BRIEF in "$INBOX"/*.md; do
   # bring its deleted branch back.
   if [ -n "$FIX_PR" ] && ! fix_pr_open; then
     park "$BRIEF" "${FIX_REASON:-could not check pull request #$FIX_PR before pushing}"; continue
+  fi
+  # A fix round that commits nothing leaves the checks it was asked to fix
+  # failing on the very head CI failed them on: it is a failed round, not
+  # "done", however it answered the threads or repaired the text. On
+  # 2026-10-26 four such rounds of one ticket each reported done in 10 to 27
+  # minutes with both checks still red (bus/converge.py).
+  if [ -n "$FIX_PR" ]; then
+    FIX_CHECKS="$(fix_code_checks "$BRIEF")"
+    if [ "$COMMITTED" -eq 0 ] && [ -n "$FIX_CHECKS" ] && [ "$(fix_head "$BRIEF")" = "$BASE" ]; then
+      park "$BRIEF" "fix round made no commit, so the checks it was asked to fix still fail on ${BASE:0:12}, the head CI failed them on: $FIX_CHECKS; nothing pushed"
+      continue
+    fi
+    [ -z "$(fix_checks "$BRIEF")" ] || echo "[$(date -u +%FT%TZ)] $TICKET: $(fix_contract_line "$BRIEF")" >> "$LOG"
   fi
   # For fix-mode briefs, reconcile generated PR sections with the approved
   # ticket revision. A metadata-only repair is a valid outcome.

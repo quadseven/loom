@@ -2812,6 +2812,24 @@ class ReviewFake:
         raise AssertionError(path)
 
 
+class LadderReviewFake(ReviewFake):
+    """ReviewFake that also answers the reads and writes of a climb: the
+    repo's visibility and the ticket body's Model: line."""
+
+    def __init__(self, private=False):
+        super().__init__()
+        self.private = private
+
+    def rest(self, method, path, data=None):
+        if method == "GET" and path == "/repos/%s" % REPO:
+            return mock.Mock(data={"private": self.private})
+        if method == "PATCH" and path == "/repos/%s/issues/12" % REPO:
+            self.issue["body"] = data["body"]
+            self.writes.append(("PATCH", path, data))
+            return mock.Mock(data=self.issue)
+        return super().rest(method, path, data)
+
+
 READY = station.READY_TEXT
 
 
@@ -2935,13 +2953,16 @@ class HandBackTest(unittest.TestCase):
         self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
         self.assertNotIn("loom:pr", [x["name"] for x in self.gh.issue["labels"]])
 
-    def test_fix_round_cap_adds_needs_brain(self):
+    def test_fix_round_cap_stops_the_rounds_and_hands_the_ticket_off(self):
         self.gh.comments.extend({"user": {"login": "alice-example"},
                                  "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % (str(i) * 40)}
                                 for i in range(1, 4))
         with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
             self.run_hand_back(checks=[("lint", "failed")])
-        self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        names = [x["name"] for x in self.gh.issue["labels"]]
+        self.assertIn("loom:failed", names)
+        self.assertIn(factory.HANDOFF_LABEL, names)
+        self.assertNotIn("loom:briefed", names)
         fixes = [c for c in self.gh.comments if str(c["body"]).startswith(tickets.FIX_MARKER)]
         self.assertEqual(len(fixes), 3)
 
@@ -2954,24 +2975,64 @@ class HandBackTest(unittest.TestCase):
                                 for _ in range(3))
         with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
             self.run_hand_back(checks=[("lint", "failed")])
-        self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertIn("loom:failed", [x["name"] for x in self.gh.issue["labels"]])
         fixes = [c for c in self.gh.comments if str(c["body"]).startswith(tickets.FIX_MARKER)]
         self.assertEqual(len(fixes), 3)
 
-    def cap_events(self):
-        return [text for c in self.gh.comments if status.is_status(c["body"])
-                for _, text in status.parse(c["body"]) if text.startswith("The fix round cap")]
+    def stop_notes(self):
+        return [c["body"] for c in self.gh.comments
+                if str(c["body"]).startswith("The station stopped the fix rounds")]
 
-    def test_fix_round_cap_says_so_once_in_the_status_comment(self):
+    def test_fix_round_cap_writes_one_note_naming_what_still_fails(self):
         self.gh.comments.extend({"user": {"login": "alice-example"},
                                  "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % (str(i) * 40)}
                                 for i in range(1, 4))
         with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
             self.run_hand_back(checks=[("lint", "failed")])
-            self.assertEqual(self.cap_events(), [station.FIX_CAP_TEXT % 3])
-            # The ticket is held now; the next pass writes no second event.
+        [note] = self.stop_notes()
+        self.assertIn("pull request #7", note)
+        self.assertIn("check lint", note)
+        self.assertIn(factory.HANDOFF_LABEL, note)
+
+    def test_fix_round_cap_says_so_once_in_the_status_comment(self):
+        # Replaces the needs-brain hold: at the cap the ticket leaves loom:pr
+        # for loom:failed, so the next pass lists it no more and writes no
+        # second note (GitHub lists loom:pr tickets by label).
+        listed = self.gh._get
+
+        def by_label(path):
+            if (path.startswith("/repos/%s/issues?labels=loom:pr" % REPO)
+                    and "loom:pr" not in [x["name"] for x in self.gh.issue["labels"]]):
+                return mock.Mock(data=[])
+            return listed(path)
+        self.gh._get = by_label
+        self.gh.comments.extend({"user": {"login": "alice-example"},
+                                 "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % (str(i) * 40)}
+                                for i in range(1, 4))
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
             self.run_hand_back(checks=[("lint", "failed")])
-        self.assertEqual(len(self.cap_events()), 1)
+            self.run_hand_back(checks=[("lint", "failed")])
+        self.assertEqual(len(self.stop_notes()), 1)
+        self.assertNotIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertIn(factory.HANDOFF_LABEL, [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_a_refused_failure_summary_keeps_the_stop_and_logs_why(self):
+        real = station.brain._check_written_text
+
+        def check(text):
+            if "check lint" in text:
+                raise ValueError("example refusal")
+            return real(text)
+        self.gh.comments.extend({"user": {"login": "alice-example"},
+                                 "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % (str(i) * 40)}
+                                for i in range(1, 4))
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}), \
+                mock.patch.object(station.brain, "_check_written_text", side_effect=check), \
+                mock.patch.object(station, "_say") as say:
+            self.run_hand_back(checks=[("lint", "failed")])
+        [note] = self.stop_notes()
+        self.assertIn("the failures the last fix round names", note)
+        self.assertTrue(any("refused (example refusal)" in str(c.args[0]) for c in say.call_args_list))
 
     def test_markerless_fix_comments_do_not_consume_rounds(self):
         self.gh.comments.extend({"user": {"login": "alice-example"}, "body": tickets.FIX_MARKER}
@@ -3045,6 +3106,108 @@ class HandBackTest(unittest.TestCase):
         self.run_hand_back()
         self.assertEqual(len(self.gh.comments), 1)
         self.assertEqual(self.ready_events(), [READY % ("b" * 40), READY % ("a" * 40)])
+
+
+
+class StuckFixRoundTest(unittest.TestCase):
+    """A fix round that leaves the same failures is stuck: the next round
+    climbs the model ladder, or the rounds stop with no rung left
+    (2026-10-26: four rounds of one ticket on a local model, each "done",
+    each leaving the same two checks failing and the same finding open)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.gh = LadderReviewFake()
+        self.gh.issue["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                                   {"name": "lane:spark"}]
+        self.station = station.Station(self.gh, station.Settings(self.temp.name, [REPO],
+                                                                 AUTHORS, OWNERS))
+        made = mock.patch.object(station.Station, "_factory", lambda st: factory.Factory(
+            st.gh, [REPO], st.now, trusted=AUTHORS, available=None))
+        made.start()
+        self.addCleanup(made.stop)
+
+    def last_round(self, findings):
+        self.gh.comments.append({
+            "id": 900, "user": {"login": "alice-example"}, "created_at": "2030-01-01T00:00:00Z",
+            "body": "%s\nPull request: %s#7, branch loom/12-fix\n\n%s\n\n<!-- loom:fix-head %s -->\n"
+                    % (tickets.FIX_MARKER, REPO, findings, "a" * 40)})
+
+    def run_hand_back(self, checks=None, threads=None):
+        with mock.patch("bus.brain._failing_checks", return_value=checks or []), \
+             mock.patch("bus.brain._open_threads", return_value=threads or []):
+            self.station.hand_back()
+
+    def names(self):
+        return [x["name"] for x in self.gh.issue["labels"]]
+
+    def rounds(self):
+        return [c for c in self.gh.comments if str(c["body"]).startswith(tickets.FIX_MARKER)]
+
+    @staticmethod
+    def thread(ident, line, rule):
+        return {"id": ident, "path": "web/staged.js", "line": line,
+                "comments": {"nodes": [{"databaseId": 9, "author": {"login": "grug-tribe",
+                                                                    "__typename": "Bot"},
+                                        "body": "high | _security_ | `%s` | quick win\n\nDetail."
+                                                % rule}]}}
+
+    def test_a_round_that_leaves_the_same_check_failing_climbs_the_ladder(self):
+        self.last_round("### Check: pytest\n\n    1 failed")
+        self.run_hand_back(checks=[("pytest", "1 failed, on a new run id")])
+        self.assertIn("lane:claude", self.names())
+        self.assertNotIn("lane:spark", self.names())
+        self.assertIn("loom:briefed", self.names())
+        self.assertIn("Model: claude-sonnet-5-5", self.gh.issue["body"])
+        self.assertEqual(len(self.rounds()), 2)
+
+    def test_a_finding_reposted_as_a_new_thread_a_few_lines_lower_is_the_same_finding(self):
+        self.last_round("### Thread PRRT_old (comment 5) at web/staged.js:54\n\n"
+                        "    grug-tribe: high | _security_ | `unvalidated-external-input` | quick win")
+        self.run_hand_back(threads=[self.thread("PRRT_new", 59, "unvalidated-external-input")])
+        self.assertIn("lane:claude", self.names())
+        self.assertNotIn("lane:spark", self.names())
+
+    def test_a_new_finding_is_progress_and_stays_on_its_lane(self):
+        self.last_round("### Thread PRRT_old (comment 5) at web/staged.js:54\n\n"
+                        "    grug-tribe: high | _security_ | `unvalidated-external-input` | quick win")
+        self.run_hand_back(threads=[self.thread("PRRT_new", 59, "resource-leak"),
+                                    self.thread("PRRT_far", 90, "unvalidated-external-input")])
+        self.assertIn("lane:spark", self.names())
+        self.assertNotIn("lane:claude", self.names())
+        self.assertIn("loom:briefed", self.names())
+
+    def test_a_plan_check_only_failure_is_left_for_the_factorys_body_repair(self):
+        # The factory rebuilds the body for a plan-check-only failure
+        # (loom#1837); the hand-back sends no round and judges nothing stuck.
+        self.last_round("### Check: %s\n\n    0 non-empty bullets" % factory.DEFAULT_PLAN_CHECK)
+        self.run_hand_back(checks=[(factory.DEFAULT_PLAN_CHECK, "0 non-empty bullets")])
+        self.assertEqual(self.names(), ["loom:ticket", "loom:pr", "lane:spark"])
+        self.assertEqual(len(self.rounds()), 1)
+
+    def test_a_plan_check_failing_again_beside_a_new_failure_is_not_stuck(self):
+        self.last_round("### Check: %s\n\n    0 non-empty bullets" % factory.DEFAULT_PLAN_CHECK)
+        self.run_hand_back(checks=[(factory.DEFAULT_PLAN_CHECK, "0 non-empty bullets"),
+                                   ("lint", "new failure")])
+        self.assertIn("lane:spark", self.names())
+        self.assertIn("loom:briefed", self.names())
+        self.assertEqual(len(self.rounds()), 2)
+
+    def test_a_stuck_round_with_no_rung_left_stops_and_hands_the_ticket_off(self):
+        self.gh.issue["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                                   {"name": "lane:claude"}]
+        self.gh.issue["body"] = "Model: claude-opus-5-5\n\n" + self.gh.issue["body"]
+        self.last_round("### Check: pytest\n\n    1 failed")
+        self.run_hand_back(checks=[("pytest", "1 failed")])
+        self.assertIn("loom:failed", self.names())
+        self.assertIn(factory.HANDOFF_LABEL, self.names())
+        self.assertNotIn("loom:briefed", self.names())
+        self.assertEqual(len(self.rounds()), 1)
+        [note] = [c["body"] for c in self.gh.comments
+                  if str(c["body"]).startswith("The station stopped the fix rounds")]
+        self.assertIn("check pytest", note)
+        self.assertIn("no rung of the model ladder is left", note)
 
 
 class StampedReviewFake(ReviewFake):
@@ -3153,7 +3316,7 @@ class FixRoundsInPlaceTest(unittest.TestCase):
         self.assertEqual(ident, self.fixes()[0]["id"])
         # The cap counts them too: a fourth round with a cap of 3 holds instead.
         self.round(4, rounds="3")
-        self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertIn(factory.HANDOFF_LABEL, [x["name"] for x in self.gh.issue["labels"]])
         self.assertEqual(station.Station._fix_round_count(
             self.gh.paginate("/repos/%s/issues/12/comments" % REPO), self.authors), 3)
 
@@ -3170,7 +3333,7 @@ class FixRoundsInPlaceTest(unittest.TestCase):
         comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
         self.assertEqual(station.Station._fix_round_count(comments, self.authors), 4)
         self.round(5, rounds="4")
-        self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertIn(factory.HANDOFF_LABEL, [x["name"] for x in self.gh.issue["labels"]])
 
     def test_a_simulated_day_of_passes_with_fix_rounds_posts_at_most_one_comment(self):
         start = time.time()
@@ -3180,8 +3343,11 @@ class FixRoundsInPlaceTest(unittest.TestCase):
             day = station.Station(self.gh, station.Settings(self.temp.name, [REPO], AUTHORS, OWNERS),
                                   now=start + hour * 3600)
             with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "100"}), \
-                 mock.patch("bus.brain._failing_checks", return_value=[("lint", "log %d" % hour)]), \
+                 mock.patch("bus.brain._failing_checks",
+                            return_value=[("lint-%d" % hour, "log %d" % hour)]), \
                  mock.patch("bus.brain._open_threads", return_value=[]):
+                # A new failure each hour: every round is progress, so none
+                # climbs the ladder (StuckFixRoundTest covers a stuck one).
                 day.hand_back()
         comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
         self.assertEqual(station.Station._fix_round_count(comments, self.authors), 24)

@@ -231,10 +231,30 @@ model_env() {
   done
 }
 
+# A slot in LOOM_RUNNER_SLOTS runs on cluster runners: the station
+# dispatches its briefs (bus/runners.py), so it gets no runner here, and one
+# installed before is removed (docs/LANES.md, "Lanes on cluster runners").
+RUNNER_SLOTS=" $(printf '%s' "${LOOM_RUNNER_SLOTS:-}" | tr ',\t\n' '   ') "
+# The station's settings for its runner slots, as plist entries.
+runner_env() {
+  local k v
+  [ -n "${LOOM_RUNNER_SLOTS:-}" ] || return 0
+  PYTHONPATH="$REPO_ROOT" python3 -B -m bus.runners station-env | while IFS='=' read -r k v; do
+    printf '    <key>%s</key><string>%s</string>\n' "$k" "$(xml "$v")"
+  done
+}
+
 for L in "${LANES[@]}"; do
   LABEL="com.loom.$L"
   if runner_busy "$LOOM_HOME/run/$L.lock"; then
     echo "skipped $LABEL: runner busy, re-run the installer later"
+    continue
+  fi
+  if [[ "$RUNNER_SLOTS" == *" $L "* ]]; then
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    wait_job_gone "gui/$(id -u)/$LABEL"
+    rm -f "$AGENTS/$LABEL.plist"
+    echo "no $LABEL: $L runs on cluster runners (LOOM_RUNNER_SLOTS)"
     continue
   fi
   PLIST="$AGENTS/$LABEL.plist"
@@ -413,6 +433,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_GITHUB_APP_KEY_SSM</key><string>$(xml "${LOOM_GITHUB_APP_KEY_SSM:-}")</string>
     <key>LOOM_GITHUB_APP_KEY_FILE</key><string>$(xml "${LOOM_GITHUB_APP_KEY_FILE:-}")</string>
 $(model_env)
+$(runner_env)
   </dict>
 </dict>
 </plist>

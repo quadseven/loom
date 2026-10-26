@@ -325,6 +325,21 @@ class MuseSlotsTests(unittest.TestCase):
                              for c in gh.comments[4]), 1)
 
 
+class DefaultDifficultyTests(unittest.TestCase):
+    def test_a_ticket_with_no_difficulty_line_is_claimed_at_the_factorys_default_tier(self):
+        # The factory reserves a ticket with no Difficulty: line for Muse at its
+        # default tier (medium); the claim must read it the same way, or Muse is
+        # handed tickets it never takes (2026-10-26).
+        gh = FakeGitHub(body=BODY.replace("Difficulty: medium\n\n", "Priority: P2\n\n"))
+        got = lane.claim(gh, ["example/project"], now=1000)
+        self.assertIsNotNone(got)
+        self.assertEqual(got["number"], 4)
+
+    def test_a_hard_ticket_is_still_not_a_muse_ticket(self):
+        gh = FakeGitHub(body=BODY.replace("Difficulty: medium", "Difficulty: hard"))
+        self.assertIsNone(lane.claim(gh, ["example/project"], now=1000))
+
+
 class TakesTest(unittest.TestCase):
     def test_a_queued_ticket_with_no_or_empty_body_is_skipped_not_a_crash(self):
         # tickets.parse returns (headers, rest) for any body, so [0] is a
