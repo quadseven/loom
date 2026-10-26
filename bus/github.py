@@ -191,6 +191,9 @@ def request_kind(method: str, url: str) -> str:
     return "other"
 
 
+DEFERRABLE_KINDS = {"events", "comments", "other"}
+
+
 def _int(value: Any) -> Optional[int]:
     try:
         return int(str(value).strip())
@@ -495,7 +498,8 @@ class GitHub:
                  transport: Optional[Transport] = None,
                  cache_dir: Optional[str] = None,
                  sleep: Callable[[float], None] = time.sleep,
-                 unsubscribe: bool = False) -> None:
+                 unsubscribe: bool = False,
+                 target: Optional[int] = None) -> None:
         # A personal token string, or an AppToken minted on first use.
         self._token = token
         # With a personal token, leave each issue this client opens or
@@ -531,6 +535,10 @@ class GitHub:
         self.not_modified = 0
         # Requests by request_kind, 304s left out: what the budget counted.
         self.kinds: Dict[str, int] = {}
+        # Counted request ceiling per pass; None leaves it unconstrained.
+        self.target = target
+        # Deferrable reads carried over when counted reached the target.
+        self.carried_over: Dict[str, int] = {}
         self.issue_writes: set[Tuple[str, int]] = set()
         self.comment_edits = False
         # resource (core, graphql, ...) -> (remaining, limit, reset epoch),
@@ -539,6 +547,10 @@ class GitHub:
         # Set by a budget refusal: until then every call fails at once with
         # RateLimited and spends nothing (loom#666).
         self.limited_until: Optional[int] = None
+
+    @property
+    def counted(self) -> int:
+        return self.requests - self.not_modified
 
     def _url(self, path: str) -> str:
         # Absolute URLs (pagination's next links) must stay on the API host:
@@ -1051,12 +1063,18 @@ class GitHub:
     def paginate(self, path: str) -> List[Any]:
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"
+        kind = request_kind("GET", path)
+        if self.target is not None and self.counted >= self.target and kind in DEFERRABLE_KINDS:
+            with self._count_lock:
+                self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
+            return []
         return self._paginate_from(path, self.rest("GET", path))
 
     def _paginate_from(self, path: str, first: Response) -> List[Any]:
         items: List[Any] = []
         url: Optional[str] = path
         resp = first
+        kind = request_kind("GET", path)
         while url:
             page = resp.data if isinstance(resp.data, list) else []
             items.extend(page)
@@ -1070,6 +1088,10 @@ class GitHub:
                 nxt = _with_page(url, _page_of(url) + 1)
             url = nxt
             if url:
+                if self.target is not None and self.counted >= self.target and kind in DEFERRABLE_KINDS:
+                    with self._count_lock:
+                        self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
+                    break
                 resp = self.rest("GET", url)
         return status.resort(items)
 

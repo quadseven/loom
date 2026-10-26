@@ -225,7 +225,7 @@ class FakeGitHub:
             return reply(200, getattr(self, "timelines", {}).get(int(tl.group(1)), []))
         m = re.match(r"issues/(\d+)(?:/(\w+))?$", rest)
         if m:
-            return self._issue_call(method, int(m.group(1)), m.group(2), data)
+            return self._issue_call(method, int(m.group(1)), m.group(2), data, parts.query)
         if method == "POST" and rest == "labels":
             self.made_labels = getattr(self, "made_labels", []) + [data["name"]]
             return reply(201, data)
@@ -392,14 +392,31 @@ class FakeGitHub:
         self.version += 1
         return reply(201 if method == "POST" else 200, [])
 
-    def _get_issue(self, n, sub):
+    def _get_issue(self, n, sub, query=""):
         if sub == "sub_issues":
             return reply(200, self.sub_issues.get(n, []))
         found = {None: self.issues, "events": self.events, "comments": self.comments}
         if sub in found:
             if sub is None and n not in found[sub]:
                 return reply(404, {"message": "Not Found"})
-            return reply(200, found[sub][n])
+            items = found[sub].get(n, [])
+            if sub in ("events", "comments") and isinstance(items, list):
+                page_match = re.search(r"(?:^|&)page=(\d+)", query)
+                page = int(page_match.group(1)) if page_match else 1
+                per_page_match = re.search(r"(?:^|&)per_page=(\d+)", query)
+                per_page = int(per_page_match.group(1)) if per_page_match else 100
+                if len(items) > per_page:
+                    start = (page - 1) * per_page
+                    end = start + per_page
+                    page_items = items[start:end]
+                    headers = {}
+                    if end < len(items):
+                        clean_query = re.sub(r"(?:^|&)page=\d+", "", query).strip("&")
+                        nxt_query = clean_query + ("&" if clean_query else "") + ("page=%d" % (page + 1))
+                        headers["Link"] = "<https://api.github.com/repos/%s/issues/%d/%s?%s>; rel=\"next\"" % (
+                            REPO, n, sub, nxt_query)
+                    return reply(200, page_items, headers)
+            return reply(200, items)
         return None
 
     def _patch_issue(self, n, data):
@@ -408,9 +425,9 @@ class FakeGitHub:
                 self.issues[n][key] = data[key]
         return reply(200, {})
 
-    def _issue_call(self, method, n, sub, data):
+    def _issue_call(self, method, n, sub, data, query=""):
         if method == "GET":
-            result = self._get_issue(n, sub)
+            result = self._get_issue(n, sub, query)
             if result is not None:
                 return result
         if method == "POST" and sub == "comments":
@@ -2291,6 +2308,53 @@ class BudgetTest(Base):
             self.passes(now=start + 60 * n)
         self.assertEqual(len(self.gets("loom:briefed")), 3)
         self.assertEqual(len(self.gets("loom:pr")), 6)
+
+    def test_a_station_pass_stops_deferrable_reads_at_target_and_next_pass_reads_the_rest(self):
+        self.heartbeat("claude")
+        self.fake.add(12, lane="codex", state="briefed")
+        self.fake.events[12] = [
+            labeled("lane:codex", "bob-example"), labeled("loom:briefed", "alice-example")
+        ] + [labeled("lane:codex", "bob-example") for _ in range(30000)]
+        self.fake.comments[12] = [
+            {"id": i, "body": "comment %d" % i, "user": {"login": "alice-example"}}
+            for i in range(30000)
+        ]
+        self.fake.add(13, lane="claude", state="briefed")
+        self.fake.events[13] = [
+            labeled("lane:claude", "bob-example"), labeled("loom:briefed", "alice-example")
+        ] + [labeled("lane:claude", "bob-example") for _ in range(5000)]
+        self.fake.comments[13] = [
+            {"id": i, "body": "comment %d" % i, "user": {"login": "alice-example"}}
+            for i in range(5000)
+        ]
+        gh1, err1 = self.passes()
+        writes1 = gh1.kinds.get("writes", 0)
+        self.assertLessEqual(gh1.counted, station.PASS_REQUEST_TARGET + writes1)
+        self.assertIn("carried over", err1)
+        self.assertRegex(err1, r"carried over.*comments")
+        self.assertRegex(err1, r"carried over.*events")
+        ticket_reads_path = os.path.join(self.home, "state", "station", "ticket_reads.json")
+        st_reads1 = station._read_json(ticket_reads_path, {}, strict=False)
+        self.assertNotIn("%s#12/comments" % REPO, st_reads1)
+        self.assertNotIn("%s#13/events" % REPO, st_reads1)
+        gh2 = GitHub("token", transport=self.fake, target=100000)
+        gh2, err2 = self.passes(gh=gh2)
+        self.assertNotIn("carried over", err2)
+        self.assertGreater(gh2.kinds.get("comments", 0), 100)
+        self.assertGreater(gh2.kinds.get("events", 0), 50)
+
+    def test_a_pass_log_line_names_the_reads_carried_over_when_target_reached(self):
+        self.fake.add(12, state="briefed")
+        self.fake.events[12] = [labeled("l%d" % i, "alice-example") for i in range(1500)]
+        self.fake.comments[12] = [
+            {"id": i, "body": "c%d" % i, "user": {"login": "alice-example"}}
+            for i in range(1500)
+        ]
+        gh = GitHub("token", transport=self.fake, target=10)
+        gh, err = self.passes(gh=gh)
+        self.assertIn("target 10 counted", err)
+        self.assertIn("carried over", err)
+        self.assertRegex(err, r"carried over.*(comments|events)")
 
 
 READY_BODY = ("## Why\nThe page query is slow for every visitor.\n## What\nwhat\n"
