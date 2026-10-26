@@ -3836,12 +3836,7 @@ class Factory:
         repaired_at = max((_ts(c.get("created_at")) for c in comments
                            if marker in str(c.get("body") or "")), default=0.0)
         if repaired_at:
-            if not failing:
-                self._status_note(repo, ticket, note)
-                return True
-            if failing == [self.plan_check] and self.now - repaired_at <= REVIEW_GRACE:
-                return None
-            return False
+            return self._repaired_before(repo, ticket, failing, repaired_at, note)
         if failing != [self.plan_check]:
             return False
         found = self._plan_found(repo, number, full, issue)
@@ -3850,6 +3845,18 @@ class Factory:
         self._apply_plan_body(repo, number, issue, found, marker, also=note)
         self._lift_plan_hold(repo, number, issue, comments)
         return True
+
+    def _repaired_before(self, repo: str, ticket: int, failing: Sequence[str],
+                         repaired_at: float, note: str) -> Optional[bool]:
+        """_hold_repair for a body already rebuilt on this head: True (with
+        the note) once every check passes, None while the plan check may not
+        have read it yet (REVIEW_GRACE), else False."""
+        if not failing:
+            self._status_note(repo, ticket, note)
+            return True
+        if list(failing) == [self.plan_check] and self.now - repaired_at <= REVIEW_GRACE:
+            return None
+        return False
 
     def _hold_hand_off(self, repo: str, issue: Dict[str, Any], note: str) -> None:
         """Put a held ticket in the hand-off pool (HANDOFF_LABEL) without

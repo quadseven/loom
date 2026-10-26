@@ -110,6 +110,24 @@ class BrainHoldsTest(unittest.TestCase):
         self.assertIn(labels.HANDOFF, names)
         self.assertFalse(brain._in_flight(self.gh.issues[5]))
 
+    def test_a_body_rebuilt_on_this_head_that_now_passes_lifts_the_hold(self):
+        self.plan_held()
+        self.gh.runs["sha50"][0]["conclusion"] = "success"
+        self.gh.comments[5].append({"id": 71, "user": ME, "created_at": iso(3 * 3600),
+                                    "body": factory.PLAN_REPAIR_MARKER % "sha50" + "\nRebuilt."})
+        self.run_holds()
+        self.assertNotIn(brain_hold.LABEL, self.names(5))
+        self.assertNotIn(labels.HANDOFF, self.names(5))
+        self.assertEqual(self.gh.pulls[50]["body"], PLAN_BODY)
+
+    def test_a_rebuilt_body_the_plan_check_still_fails_past_the_grace_is_handed_off(self):
+        self.plan_held()
+        self.gh.comments[5].append({"id": 71, "user": ME, "created_at": iso(3 * 3600),
+                                    "body": factory.PLAN_REPAIR_MARKER % "sha50" + "\nRebuilt."})
+        self.run_holds()
+        self.assertIn(labels.HANDOFF, self.names(5))
+        self.assertNotIn(brain_hold.LABEL, self.names(5))
+
     def test_a_held_pull_request_whose_checks_run_waits(self):
         self.plan_held(extra_runs=[{"name": "unittest", "status": "in_progress"}])
         report = self.run_holds()
