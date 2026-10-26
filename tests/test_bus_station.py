@@ -2975,6 +2975,28 @@ class HandBackTest(unittest.TestCase):
         self.assertIn("check lint", note)
         self.assertIn(factory.HANDOFF_LABEL, note)
 
+    def test_fix_round_cap_says_so_once_and_never_adds_needs_brain(self):
+        # Replaces the needs-brain hold: at the cap the ticket leaves loom:pr
+        # for loom:failed, so the next pass lists it no more and writes no
+        # second note (GitHub lists loom:pr tickets by label).
+        listed = self.gh._get
+
+        def by_label(path):
+            if (path.startswith("/repos/%s/issues?labels=loom:pr" % REPO)
+                    and "loom:pr" not in [x["name"] for x in self.gh.issue["labels"]]):
+                return mock.Mock(data=[])
+            return listed(path)
+        self.gh._get = by_label
+        self.gh.comments.extend({"user": {"login": "alice-example"},
+                                 "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % (str(i) * 40)}
+                                for i in range(1, 4))
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
+            self.run_hand_back(checks=[("lint", "failed")])
+            self.run_hand_back(checks=[("lint", "failed")])
+        self.assertEqual(len(self.stop_notes()), 1)
+        self.assertNotIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertIn(factory.HANDOFF_LABEL, [x["name"] for x in self.gh.issue["labels"]])
+
     def test_markerless_fix_comments_do_not_consume_rounds(self):
         self.gh.comments.extend({"user": {"login": "alice-example"}, "body": tickets.FIX_MARKER}
                                 for _ in range(3))
