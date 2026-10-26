@@ -35,6 +35,7 @@ from . import ci_gap
 from . import brain_memory
 from . import claimed
 from . import fabric
+from . import fixrounds
 from . import scope_fit
 from . import shadow
 from . import stale_claims
@@ -1996,7 +1997,9 @@ class Station:
         later non-fix comments. Raises ValueError for an unusable fix."""
         allowed = {a.lower() for a in self.s.authors}
         last_claim, newest_fix = -1, None
-        for i, c in enumerate(comments):
+        # A fix-rounds comment is one fix per round, its newest the newest
+        # (loom#1640); the client expands it already, and this reads a raw list.
+        for i, c in enumerate(fixrounds.expand(comments, allowed)):
             if not isinstance(c, dict):
                 continue
             body = str(c.get("body") or "")
@@ -2019,11 +2022,13 @@ class Station:
         fix in the same pass, after self.now, and a claim sorted before its
         fix left the fix unclaimed, so the next pass sent the same round
         again (39 duplicate fix rounds, 2026-10-21)."""
-        for c in comments if fix_comment_id is not None else ():
-            if isinstance(c, dict) and c.get("id") == fix_comment_id:
-                posted = self._epoch(str(c.get("created_at") or ""))
-                if posted is not None and posted >= self.now:
-                    return posted + 1
+        # The rounds of one fix-rounds comment share its id: the newest counts.
+        times = [self._epoch(str(c.get("created_at") or ""))
+                 for c in (comments if fix_comment_id is not None else ())
+                 if isinstance(c, dict) and c.get("id") == fix_comment_id]
+        posted = max((t for t in times if t is not None), default=None)
+        if posted is not None and posted >= self.now:
+            return posted + 1
         return self.now
 
     def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
@@ -5371,7 +5376,8 @@ class Station:
         return any(isinstance(comment, dict)
                    and tickets._login(comment.get("user")) in authors
                    and str(comment.get("body") or "").startswith(tickets.FIX_MARKER)
-                   and marker in str(comment.get("body") or "") for comment in comments)
+                   and marker in str(comment.get("body") or "")
+                   for comment in fixrounds.expand(comments, authors))
 
     def _clear_stale_ready(self, repo: str, number: int, names: List[str],
                            ready: Optional[str], sha: str) -> None:
@@ -5422,7 +5428,8 @@ class Station:
         marker is one round, whether or not the round moved the head. Counting
         distinct heads let a round that failed [transient] and pushed nothing
         repeat without end (grug#1315: 15 rounds, 9 on one head, 2026-10-24)."""
-        return sum(1 for comment in comments
+        # Each round of a fix-rounds comment is one round (loom#1640).
+        return sum(1 for comment in fixrounds.expand(comments, authors)
                    if isinstance(comment, dict)
                    and tickets._login(comment.get("user")) in authors
                    and Station._fix_head(str(comment.get("body") or "")))
@@ -5442,7 +5449,7 @@ class Station:
         if self._fix_round_count(comments, authors) >= rounds:
             self._escalate_fix(repo, number, names)
             return
-        self._post_fix_comment(repo, number, pr_number, detail, sha, failed, threads)
+        self._post_fix_comment(repo, number, pr_number, detail, sha, failed, threads, comments)
         self._move_fix_to_lane(repo, number, lane, names)
 
     def _escalate_fix(self, repo: str, number: int, names: List[str]) -> None:
@@ -5453,7 +5460,7 @@ class Station:
 
     def _post_fix_comment(self, repo: str, number: int, pr_number: int,
                           detail: Dict[str, Any], sha: str, failed: List[Any],
-                          threads: List[Any]) -> None:
+                          threads: List[Any], comments: Optional[List[Any]] = None) -> None:
         branch = str((detail.get("head") or {}).get("ref") or "")
         notes = self._validation_gaps(repo, pr_number, detail, sha, failed)
         body = brain._fix_body(repo, pr_number, branch, notes, failed, threads)
@@ -5461,7 +5468,9 @@ class Station:
         if len(body) > MAX_FIX_BODY:  # the API rejects comments over 65536 characters
             body = body[:MAX_FIX_BODY].rstrip() + "\n\n(findings truncated)"
         body = body.rstrip() + marker
-        notify.post(self.gh, repo, number, body, notify.FIX_BRIEF)
+        # A later round on the same pull request edits that one comment, so it
+        # sends no email (loom#1640).
+        fixrounds.post_round(self.gh, repo, number, body, self.s.authors, comments)
 
     def _move_fix_to_lane(self, repo: str, number: int, lane: str,
                           names: List[str]) -> None:

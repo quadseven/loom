@@ -34,7 +34,7 @@ from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from . import proof, shadow, status, text as _text
+from . import fixrounds, proof, shadow, status, text as _text
 
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
@@ -559,8 +559,13 @@ class GitHub:
         if method == "GET" and status.COMMENTS_RE.search(path):
             # A ticket's status comment reads as one comment per event, so
             # every reader of those events sees them as before (loom#866).
-            expanded = status.expand(resp.data, self._status_logins())
+            writers = self._status_logins()
+            expanded = status.expand(resp.data, writers)
             expanded = self._with_body_events(path, expanded)
+            # A pull request's one fix comment reads as one comment per
+            # round, so round counting and the lane's brief see every round
+            # (loom#1640).
+            expanded = fixrounds.expand(expanded, writers)
             if expanded is not resp.data:
                 resp = Response(resp.status, expanded, resp.etag, resp.headers)
         return resp
