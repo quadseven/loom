@@ -347,6 +347,7 @@ class BwrapSandboxTest(unittest.TestCase):
     def test_bwrap_fails_closed_without_a_declared_egress_policy(self):
         self.assertIn("set LOOM_EGRESS_DENY_PROBES", self.ready())
         self.assertIn("set LOOM_EGRESS_DENY_PROBES", self.ready(LOOM_EGRESS_DENY_PROBES=""))
+        self.assertIn("set LOOM_EGRESS_DENY_PROBES", self.ready(LOOM_EGRESS_DENY_PROBES=" , ,"))
         self.assertIn("set LOOM_EGRESS_ALLOW_PROBE", self.ready(LOOM_EGRESS_DENY_PROBES="192.0.2.1:80"))
 
     def test_a_blocked_probe_must_be_a_literal_address(self):
@@ -356,6 +357,21 @@ class BwrapSandboxTest(unittest.TestCase):
             with self.subTest(target=target):
                 why = self.ready(LOOM_EGRESS_DENY_PROBES=target, LOOM_EGRESS_ALLOW_PROBE="127.0.0.1:1")
                 self.assertIn("is not IPv4:port", why)
+
+    def test_blocked_probes_may_be_comma_separated(self):
+        # The cluster's secret holds them comma-separated; on 2026-10-26 the
+        # first runner lanes refused the whole list as one bad address.
+        why = self.ready(LOOM_EGRESS_DENY_PROBES="metadata:80,192.0.2.1:80",
+                         LOOM_EGRESS_ALLOW_PROBE="127.0.0.1:1")
+        self.assertIn("egress probe 'metadata:80' is not IPv4:port", why)
+
+    @unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
+    def test_every_comma_separated_probe_is_tried(self):
+        closed = "127.0.0.1:%d" % self.closed_port()
+        allow = self.setUpListener()
+        open_ = self.setUpListener()
+        why = self.ready(LOOM_EGRESS_DENY_PROBES=f"{closed},{open_}", LOOM_EGRESS_ALLOW_PROBE=allow)
+        self.assertEqual(why, f"egress not narrowed: {open_} accepts connections, so no agent runs here")
 
     @unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
     def test_bwrap_fails_closed_when_a_blocked_destination_answers(self):
