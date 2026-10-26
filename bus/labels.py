@@ -92,6 +92,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:runaway": {"color": "b60205", "description": "Held for brain review after repeated or regressive attempts"},
     "loom:recurring": {"color": "fbca04", "description": "Invariant breached repeatedly; keep open for a fix"},
     "loom:factory": {"color": "b60205", "description": "A factory validation incident"},
+    "grug:idle": {"color": "ededed", "description": "PR marked idle by grug bot for hourly station review"},
     "loom:validation-gap": {"color": "fbca04", "description": "A CI job the repo's .loom/validation.conf does not run"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder; the brain must review or ask"},

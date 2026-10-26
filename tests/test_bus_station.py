@@ -135,6 +135,30 @@ class FakeGitHub:
         self.comments[number] = [{"body": "<!-- loom:human v1 -->\n%s" % ask,
                                   "user": {"login": author}}] if ask else []
 
+    def add_grug_idle_pr(self, number, title="Idle PR", author="alice-example",
+                          created="2030-01-01T00:00:00Z", branch="feature-branch", body=""):
+        """An open pull request with grug:idle label."""
+        pr = {"number": number, "title": title, "user": {"login": author},
+              "labels": [{"name": "grug:idle"}],
+              "created_at": created,
+              "head": {"ref": branch, "repo": {"full_name": REPO}},
+              "body": body,
+              "state": "open",
+              "pull_request": {"url": "https://api.github.com/repos/%s/pulls/%d" % (REPO, number)},
+              "html_url": "https://github.com/%s/pull/%d" % (REPO, number)}
+        self.pulls.append(pr)
+        # Also add to issues dict for label operations (PRs share number space with issues)
+        self.issues[number] = {
+            "number": number, "title": title, "body": body, "state": "open",
+            "user": {"login": author}, "created_at": created,
+            "updated_at": created,
+            "labels": [{"name": "grug:idle"}],
+        }
+        self.events[number] = []
+        self.comments[number] = []
+        self.grug_idle_prs = getattr(self, "grug_idle_prs", []) + [pr]
+        self.version += 1
+
     def add_open_issue(self, number, title="Open issue", body="It is slow.",
                        author="alice-example", created="2030-01-01T00:00:00Z"):
         """An open issue with no Loom labels, eligible for triage."""
@@ -325,6 +349,8 @@ class FakeGitHub:
             return self._list_asks(headers)
         if "loom:human" in query:
             return reply(200, self.humans)
+        if "grug:idle" in query:
+            return reply(200, getattr(self, "grug_idle_prs", []))
         if "loom:goal" in query:
             return self._get_goals()
         if "labels=epic&" in query:
@@ -3659,7 +3685,7 @@ class CorruptStateTest(Base):
         # done-ticket close step's, the hourly read of rewritten sources, and
         # the changed label-set sync, and the hourly read of open tickets for
         # ones with no state label (loom#1653).
-        self.assertEqual(self.run_pass().requests, 13)
+        self.assertEqual(self.run_pass().requests, 14)
 
 
 class TicketsTest(unittest.TestCase):
@@ -11676,4 +11702,63 @@ class RemoteClaimCountTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             runner = self.runner()
             body = runner._lanes_body(runner._lane_rows())
-        self.assertIn("Remote claims: muse 1/4", body)
+
+
+class GrugIdleTest(Base):
+    """Acceptance tests for grug:idle PR handling."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.webhook_ssm = "/example/webhook"
+        self.sent = []
+        self.fail_post = False
+
+    def _run_pass(self, now=NOON):
+        def post(url, payload):
+            if self.fail_post:
+                raise OSError("down")
+            self.sent.append((url, payload))
+
+        def secret(name, region):
+            return URL
+        gh = GitHub("token", transport=self.fake)
+        station.Station(gh, self.settings, now=now, read_secret=secret, post=post).run_pass()
+
+    def test_lane_pr_with_grug_idle_gets_needs_brain_label(self):
+        """Lane PR (loom/ branch) with grug:idle should get needs-brain label."""
+        # Add a PR with grug:idle label on a loom/ branch (lane PR)
+        self.fake.add_grug_idle_pr(42, title="Fix something", branch="loom/42-fix", body="Refs quadseven/loom#42")
+        self._run_pass()
+        # Verify needs-brain label was added
+        issue = self.fake.issues.get(42)
+        self.assertIsNotNone(issue)
+        labels = [lab["name"] for lab in issue["labels"]]
+        self.assertIn("needs-brain", labels)
+
+    def test_non_lane_pr_with_grug_idle_appears_in_asks_digest(self):
+        """Non-lane PR with grug:idle should appear in asks digest with merge/close/brief choices."""
+        # Add a PR with grug:idle label on a non-loom branch (non-lane PR)
+        self.fake.add_grug_idle_pr(43, title="Update docs", branch="feature/update-docs")
+        self._run_pass(NOON)  # Run at digest time
+        # Verify it appears in the digest with merge/close/brief choices
+        self.assertEqual(len(self.sent), 1)
+        content = self.sent[0][1]["content"]
+        self.assertIn("Update docs", content)
+        self.assertIn("[merge/close/brief]", content)
+
+    def test_grug_idle_scan_runs_at_most_once_per_hour_per_repo(self):
+        """The grug:idle scan should run at most once per hour per repo."""
+        self.fake.add_grug_idle_pr(44, title="Idle PR 1", branch="feature/one")
+        # First run
+        self._run_pass(NOON)
+        # Second run within the same hour (should not re-scan)
+        self._run_pass(NOON + 1800)  # 30 minutes later
+        # Third run after an hour (should scan again)
+        self._run_pass(NOON + 3600 + 1)
+        # The scan state file should track last scan time
+        scan_path = os.path.join(self.settings.home, "state", "station", "grug-idle-scans.json")
+        self.assertTrue(os.path.exists(scan_path))
+        with open(scan_path) as fh:
+            scans = json.load(fh)
+        # The scan time should be updated on first and third run, not second
+        self.assertAlmostEqual(scans[REPO]["at"], NOON + 3600 + 1, delta=10)

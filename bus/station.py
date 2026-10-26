@@ -508,6 +508,8 @@ BUDGET_FLOOR = 0.15
 PASS_REQUEST_TARGET = 500
 # A repo with no briefed, running or pr ticket is scanned this often at most.
 IDLE_SCAN = 600
+# A repo is scanned for grug:idle PRs at most this often (1 hour).
+GRUG_IDLE_SCAN = 3600
 # Conditional-request answers unused this long are removed.
 CACHE_KEEP = 24 * 3600
 VERIFY_INTERVAL = 6 * 3600
@@ -1836,6 +1838,17 @@ class Station:
         self._observe(repo, "briefed", bool(out))
         return out
 
+    def _poll_grug_idle(self, repo: str) -> List[Dict[str, Any]]:
+        """Search for open pull requests with the grug:idle label.
+        Returns a list of PR dicts (not issues)."""
+        # Search for PRs with grug:idle label
+        resp = self.gh.rest(
+            "GET", "/repos/%s/issues?labels=grug:idle&state=open&per_page=100" % repo)
+        items = resp.data if isinstance(resp.data, list) else []
+        # Filter to only pull requests
+        prs = [i for i in items if isinstance(i, dict) and "pull_request" in i]
+        return prs
+
     # -- which repos a pass scans -----------------------------------------
     def _inbox_repos(self) -> set:
         """Repos named by a brief waiting or running in a lane inbox."""
@@ -1909,6 +1922,71 @@ class Station:
             busy = repo in self._busy or repo in local or (unread and was_busy)
             record[repo] = {"at": self.now, "busy": busy}
         _write_json(os.path.join(self.state, "scans.json"), record)
+
+    def _scan_grug_idle(self) -> None:
+        """Scan repos for grug:idle pull requests at most once per hour per repo.
+        Lane PRs (loom/ branch or Refs to Loom ticket) get needs-brain label.
+        Non-lane PRs are added to the asks digest with merge/close/brief choices."""
+        # Load last scan times
+        grug_scan_path = os.path.join(self.state, "grug-idle-scans.json")
+        saved = _read_json(grug_scan_path, {}, strict=False)
+        scans = saved if isinstance(saved, dict) else {}
+
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            rec = scans.get(repo)
+            last_scan = rec.get("at") if isinstance(rec, dict) else None
+            if isinstance(last_scan, (int, float)) and 0 <= self.now - last_scan < GRUG_IDLE_SCAN:
+                continue  # Not yet time to scan this repo
+
+            try:
+                prs = self._poll_grug_idle(repo)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not list grug:idle PRs in %s: %s" % (repo, err))
+                continue
+
+            for pr in prs:
+                pr_number = int(pr.get("number", 0))
+                if not pr_number:
+                    continue
+
+                # Check if this is a lane PR: branch starts with loom/ or body has Refs to Loom ticket
+                ticket_number = self._pr_ticket_number(repo, pr)
+                if ticket_number is not None:
+                    # Lane PR: add needs-brain label to route to stuck path
+                    try:
+                        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, pr_number),
+                                     {"labels": ["needs-brain"]})
+                        _say("%s#%d: lane PR marked grug:idle, added needs-brain" % (repo, pr_number))
+                    except GitHubError as err:
+                        _say("could not add needs-brain to %s#%d: %s" % (repo, pr_number, err))
+                else:
+                    # Non-lane PR: add to asks digest list
+                    self._add_grug_idle_to_asks(repo, pr)
+
+            # Update last scan time
+            scans[repo] = {"at": self.now}
+
+        _write_json(grug_scan_path, scans)
+
+    def _add_grug_idle_to_asks(self, repo: str, pr: Dict[str, Any]) -> None:
+        """Add a non-lane grug:idle PR to the asks digest list."""
+        # Store in a file for the digest to pick up
+        asks_path = os.path.join(self.state, "grug-idle-asks.json")
+        saved = _read_json(asks_path, [], strict=False)
+        asks = saved if isinstance(saved, list) else []
+        pr_number = int(pr.get("number", 0))
+        asks.append({
+            "repo": repo,
+            "number": pr_number,
+            "title": str(pr.get("title") or ""),
+            "html_url": pr.get("html_url", ""),
+            "at": self.now,
+        })
+        _write_json(asks_path, asks)
 
     # -- once-only memory ----------------------------------------------
     def _skip_known(self, repo: str, issue: Dict[str, Any]) -> bool:
@@ -6631,7 +6709,11 @@ class Station:
 
     @staticmethod
     def _line(issue: Dict[str, Any]) -> str:
-        return "- %s %s" % (" ".join(str(issue.get("title") or "").split()), issue["html_url"])
+        title = " ".join(str(issue.get("title") or "").split())
+        url = issue["html_url"]
+        if issue.get("grug_idle"):
+            return "- %s %s [merge/close/brief]" % (title, url)
+        return "- %s %s" % (title, url)
 
     def _send(self, url: str, content: str, mention: bool = True) -> bool:
         allowed: Dict[str, Any] = {"parse": []}
@@ -6714,6 +6796,17 @@ class Station:
                     lines.append("  %s" % ask)
         return "\n".join(lines)
 
+    def _gather_grug_idle_asks(self) -> List[Dict[str, Any]]:
+        """Read stored grug:idle PRs for the asks digest."""
+        asks_path = os.path.join(self.state, "grug-idle-asks.json")
+        saved = _read_json(asks_path, [], strict=False)
+        asks = saved if isinstance(saved, list) else []
+        # Filter out old entries (older than 7 days)
+        cutoff = self.now - 7 * 24 * 3600
+        asks = [a for a in asks if isinstance(a, dict) and a.get("at", 0) > cutoff]
+        _write_json(asks_path, asks)
+        return asks
+
     def _gather_asks(self) -> Optional[List[Tuple[str, str, Dict[str, Any]]]]:
         """(key, repo, issue) for every open ask, oldest first; None when any
         repo could not be read (a partial list must not become a digest)."""
@@ -6731,7 +6824,23 @@ class Station:
         # A loom:human issue waits in the digest's own list, never alone.
         asks = [a for a in asks if HUMAN not in _label_names(a[1])]
         asks.sort(key=lambda a: (str(a[1].get("created_at") or ""), a[0], int(a[1]["number"])))
-        return [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
+        keyed = [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
+
+        # Add grug:idle PRs (non-lane) to the asks list
+        grug_asks = self._gather_grug_idle_asks()
+        for grug in grug_asks:
+            repo = grug.get("repo", "")
+            number = grug.get("number", 0)
+            if not repo or not number:
+                continue
+            keyed.append(("%s#%d" % (repo, number), repo, {
+                "number": number,
+                "title": grug.get("title", ""),
+                "html_url": grug.get("html_url", ""),
+                "grug_idle": True,
+            }))
+
+        return keyed
 
     def _check_asks(self, keyed: List[Tuple[str, str, Dict[str, Any]]],
                     wanted: set) -> Optional[Dict[str, bool]]:
@@ -6939,10 +7048,15 @@ class Station:
     def _new_digest_plan(self, keyed: List[Tuple[str, str, Dict[str, Any]]],
                          covered: Any, today: str) -> Optional[Dict[str, Any]]:
         """Build the day's fixed plan after every ask and human item can be read."""
-        trust = self._check_asks(keyed, {k for k, _, _ in keyed})
+        # Filter out grug:idle PRs from trust check (they are informational only)
+        non_grug = [a for a in keyed if not a[2].get("grug_idle")]
+        grug_asks = [a for a in keyed if a[2].get("grug_idle")]
+        trust = self._check_asks(non_grug, {k for k, _, _ in non_grug})
         if trust is None:
             return None
-        asks = [a for a in keyed if trust.get(a[0])]
+        asks = [a for a in non_grug if trust.get(a[0])]
+        # Add grug:idle PRs back (they don't need trust check)
+        asks.extend(grug_asks)
         found = self._gather_human()
         if found is None:
             return None
@@ -11451,6 +11565,12 @@ class Station:
             self.record_scans()
         except OSError as err:
             _say("could not record the repo scans: %s" % err)
+        try:
+            self._scan_grug_idle()
+        except RateLimited:
+            raise
+        except (GitHubError, OSError) as err:
+            _say("grug:idle scan failed: %s" % err)
         self._run_steps()
         # The day's metrics line goes out even below the budget floor: one post
         # a day, and on 2026-10-18 the floor deferred it every pass, so the
