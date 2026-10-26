@@ -1737,6 +1737,8 @@ class Station:
         self._issue_stamps: Dict[Tuple[str, int], str] = {}
         saved_reads = _read_json(os.path.join(self.state, "ticket_reads.json"), {}, strict=False)
         self._ticket_reads: Dict[str, Any] = saved_reads if isinstance(saved_reads, dict) else {}
+        if getattr(self.gh, "target", None) is None:
+            self.gh.target = PASS_REQUEST_TARGET
 
     # -- paths ---------------------------------------------------------
     def inbox(self, lane: str) -> str:
@@ -1778,8 +1780,11 @@ class Station:
         if isinstance(kept, dict) and kept.get("stamp") == stamp and isinstance(kept.get("data"), list):
             kept["seen"] = self.now
             return kept["data"]
+        carried_before = dict(getattr(self.gh, "carried_over", {}))
         items = self.gh.paginate(path)
-        self._ticket_reads[key] = {"stamp": stamp, "data": items, "seen": self.now}
+        carried_after = getattr(self.gh, "carried_over", {})
+        if carried_before == carried_after:
+            self._ticket_reads[key] = {"stamp": stamp, "data": items, "seen": self.now}
         return items
 
     def _issue(self, repo: str, number: int) -> Dict[str, Any]:
@@ -1815,6 +1820,8 @@ class Station:
     def _check_trust(self, repo: str, issue: Dict[str, Any]) -> Tuple[bool, str]:
         number = int(issue["number"])
         events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
+        if self._target_reached():
+            return False, "target reached"
         editor = self._editor(repo, number)
         return tickets.trusted(issue, events, editor, self.s.authors, self.s.owners,
                                self.s.briefers)
@@ -2141,6 +2148,8 @@ class Station:
         if self._verify_before_build(repo, issue):
             return False
         comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        if self._target_reached():
+            return False
         try:
             fix_source = self._fix_for(repo, comments)
         except ValueError as err:
@@ -3694,6 +3703,8 @@ class Station:
             _say("%s#%s is held until %s" % (repo, issue["number"], headers["Not before"]))
             return False
         ok, reason = self._check_trust(repo, issue)
+        if self._target_reached():
+            return False
         if not ok:
             self._refuse(repo, issue, reason)
             return False
@@ -4262,6 +4273,7 @@ class Station:
         stopped_at = None
         for offset in range(len(steps)):
             if self._deferred():
+                stopped_at = (start + offset) % len(steps)
                 break
             # Past the budget the rest of the loop waits for the next pass,
             # which starts here: claims, fix rounds and deploys come round
@@ -11256,9 +11268,16 @@ class Station:
                if v[0] < BUDGET_FLOOR * v[1]]
         return min(low)[1:] if low else None
 
+    def _target_reached(self) -> bool:
+        target = getattr(self.gh, "target", None)
+        counted = getattr(self.gh, "counted", self.gh.requests - self.gh.not_modified)
+        return target is not None and counted >= target
+
     def _deferred(self) -> bool:
-        """True when the budget is low: the step waits for the reset. Said
-        once per rate limit window."""
+        """True when the budget is low or the pass request target has been
+        reached: deferrable steps wait for the reset or next pass."""
+        if self._target_reached():
+            return True
         low = self.budget_low()
         if low is None:
             return False
@@ -11293,8 +11312,14 @@ class Station:
         line = "requests: %d, %d counted (%s), %d answered 304 (not counted)" % (
             gh.requests, gh.requests - gh.not_modified, kinds or "none", gh.not_modified)
         counted = gh.requests - gh.not_modified
+        target = getattr(gh, "target", None) or PASS_REQUEST_TARGET
         line += "; target %d counted (%s)" % (
-            PASS_REQUEST_TARGET, "over" if counted > PASS_REQUEST_TARGET else "met")
+            target, "over" if counted > target else "met")
+        carried = ", ".join("%s %d" % (k, n) for k, n in
+                            sorted(getattr(gh, "carried_over", {}).items(),
+                                   key=lambda kv: (-kv[1], kv[0])))
+        if carried:
+            line += "; carried over %s" % carried
         rates = self._rates()
         if "core" in rates:
             remaining, limit, reset = rates["core"]
