@@ -17,7 +17,7 @@ from urllib.parse import quote
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
-from . import answer, ci_facts, ci_gap, merge_tier, naming, operator_hold, shadow
+from . import answer, ci_facts, ci_gap, fixrounds, merge_tier, naming, operator_hold, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -5390,6 +5390,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gh.status_in_body = True  # read the events in the issue body (loom#1341)
         # Status comments by the trusted writers read as events (bus/status.py).
         gh.status_authors |= {a.lower() for a in os.environ.get("LOOM_BRIEF_AUTHORS", "").split()}
+        # The station's fix-rounds comments read as their rounds (loom#1640).
+        gh.fix_ledger = fixrounds.ledger_from_env()
         COMMANDS[args.command](gh, args)
         return 0
     except (ValueError, OSError, GitHubError) as exc:
