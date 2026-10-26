@@ -2176,6 +2176,26 @@ class BudgetTest(Base):
         with self.assertRaises(TargetReached):
             gh.paginate("/repos/%s/issues/12/events" % REPO)
 
+    def test_the_target_check_reads_the_count_under_the_count_lock(self):
+        # brain.status reads on several threads: the check and the
+        # carry-over count must see one snapshot of requests and 304s.
+        seen = []
+
+        class Watched(GitHub):
+            @property
+            def counted(self):
+                seen.append(self._count_lock.locked())
+                return GitHub.counted.fget(self)
+
+        self.fake.events[12] = [{"id": i} for i in range(250)]
+        gh = Watched("token", transport=self.fake, target=1)
+
+        with self.assertRaises(TargetReached):
+            gh.paginate("/repos/%s/issues/12/events" % REPO)
+        self.assertTrue(seen)
+        self.assertTrue(all(seen), seen)
+        self.assertEqual(gh.carried_over, {"events": 1})
+
     def test_a_repeated_list_read_sends_the_etag_and_a_304_is_unchanged(self):
         self.fake.add(12, state="pr")
         sent = []

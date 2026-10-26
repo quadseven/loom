@@ -1067,13 +1067,24 @@ class GitHub:
     def paginate(self, path: str) -> List[Any]:
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"
-        kind = request_kind("GET", path)
-        if (isinstance(self.target, int) and not isinstance(self.target, bool)
-                and self.counted >= self.target and kind in DEFERRABLE_KINDS):
-            with self._count_lock:
-                self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
-            raise TargetReached("%s read carried over at request target" % kind)
+        self._stop_at_target(request_kind("GET", path))
         return self._paginate_from(path, self.rest("GET", path))
+
+    def _has_target(self) -> bool:
+        return isinstance(self.target, int) and not isinstance(self.target, bool)
+
+    def _stop_at_target(self, kind: str) -> None:
+        """Raise TargetReached, counting the read as carried over, when a
+        deferrable read would go past the pass target. The check and the
+        count share one hold of the lock so threads read one snapshot."""
+        with self._count_lock:
+            target = self.target
+            over = (isinstance(target, int) and not isinstance(target, bool)
+                    and kind in DEFERRABLE_KINDS and self.counted >= target)
+            if over:
+                self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
+        if over:
+            raise TargetReached("%s read carried over at request target" % kind)
 
     def _paginate_from(self, path: str, first: Response) -> List[Any]:
         items: List[Any] = []
@@ -1093,11 +1104,7 @@ class GitHub:
                 nxt = _with_page(url, _page_of(url) + 1)
             url = nxt
             if url:
-                if (isinstance(self.target, int) and not isinstance(self.target, bool)
-                        and self.counted >= self.target and kind in DEFERRABLE_KINDS):
-                    with self._count_lock:
-                        self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
-                    raise TargetReached("%s read carried over at request target" % kind)
+                self._stop_at_target(kind)
                 resp = self.rest("GET", url)
         return status.resort(items)
 
@@ -1105,8 +1112,7 @@ class GitHub:
         """Read known pages concurrently, preserving their page order."""
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"
-        if (isinstance(self.target, int) and not isinstance(self.target, bool)
-                and request_kind("GET", path) in DEFERRABLE_KINDS):
+        if self._has_target() and request_kind("GET", path) in DEFERRABLE_KINDS:
             return self.paginate(path)
         first = self.rest("GET", path)
         last = _last_link(first.headers.get("link", ""))
