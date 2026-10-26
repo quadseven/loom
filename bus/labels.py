@@ -94,7 +94,6 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:factory": {"color": "b60205", "description": "A factory validation incident"},
     "loom:validation-gap": {"color": "fbca04", "description": "A CI job the repo's .loom/validation.conf does not run"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
-    "handoff:claude": {"color": "d876e3", "description": "Fix rounds stopped on the same failures; for the second operator's session"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
     "loom:regression": {"color": "b60205", "description": "Fixes a measured regression of a shipped ticket"},

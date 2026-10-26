@@ -447,11 +447,6 @@ BRIEF_RES = (
     re.compile(r"the factory moved this ticket up the model ladder to rung \d+, \S+ on lane ([a-z0-9-]+)\."),
 )
 RUNAWAY = "loom:runaway"
-# The hand-off pool: tickets whose fix rounds stopped with the same failures
-# (no rung left, or the round cap reached on its rung), left loom:failed for
-# the second operator's session (its goal issue, loom#1036, works them). The
-# factory never re-briefs one; that session claims it before working it.
-HANDOFF_LABEL = "handoff:claude"
 NO_REASON = "agent made no commit and wrote no reason"
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
                  ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved isOutdated path line originalLine'
@@ -1937,9 +1932,10 @@ class Factory:
         return trusted_threads(self._threads(repo, int(pr["number"])), self.review_bot,
                                self.trusted)
 
-    def _hand_off(self, repo: str, issue: Dict[str, Any]) -> None:
-        """Put a ticket whose fix rounds stopped in the hand-off pool
-        (HANDOFF_LABEL)."""
+    def _hand_off_failed(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Put a ticket whose fix rounds stopped past the ladder in the
+        hand-off pool (HANDOFF_LABEL), left loom:failed; _hand_off is the
+        no-lane route, which leaves it queued."""
         names = _labels(issue)
         if HANDOFF_LABEL in names:
             return
@@ -2000,7 +1996,7 @@ class Factory:
                 self._close_past_ladder_pr(repo, pr)
                 self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
                                                  if 1 <= n <= len(CLIMB)])
-                self._hand_off(repo, issue)
+                self._hand_off_failed(repo, issue)
                 return
         lane = None
         # A ticket with no lane label (a silent-lane requeue drops it, and the
@@ -2896,8 +2892,6 @@ class Factory:
 
     def failed(self, repo: str, issue: Dict[str, Any],
                prs: Dict[int, Dict[str, Any]]) -> None:
-        if HANDOFF_LABEL in _labels(issue):
-            return  # in the hand-off pool: the second operator's session has it
         number = int(issue["number"])
         comments = self._comments(repo, number)
         if repeated_no_reason(comments):

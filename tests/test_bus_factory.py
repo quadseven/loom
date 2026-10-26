@@ -1703,10 +1703,12 @@ class ReviewBotThreads(Base):
         self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
         self.assertEqual(self.merged, [])
 
-    def stuck_case(self, author):
+    def stuck_case(self, author, lane="codex", model=None):
         """Ticket 5's last round asked about a finding at a.py:3; the open
         thread, under a new id, holds the same rule at a.py:5."""
-        self.gh.ticket(5, "pr", lane="codex")
+        self.gh.ticket(5, "pr", lane=lane)
+        if model:
+            self.gh.issues[5]["body"] = "Model: %s\n" % model + self.gh.issues[5]["body"]
         self.gh.comments[5].append({"body": FIX_MARKER + "\nPull request: x#50\n\n"
                                     "### Thread PRRT_old (comment 1) at a.py:3\n\n"
                                     "    grug-tribe: high | `rule-x` | quick win", "user": ME})
@@ -1718,6 +1720,12 @@ class ReviewBotThreads(Base):
     def test_the_review_bots_finding_posted_again_climbs_the_ladder(self):
         self.stuck_case(BOT)
         self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+
+    def test_a_stuck_send_back_past_the_last_rung_goes_to_the_hand_off_pool(self):
+        self.stuck_case(BOT, lane="claude", model="claude-opus-5-5")
+        self.assertIn((5, "failed", None), self.moved)
+        self.assertIn(factory.HANDOFF_LABEL, [x["name"] for x in self.gh.issues[5]["labels"]])
+        self.assertEqual(self.fixed, [])
 
     def test_a_strangers_thread_at_the_same_place_never_counts_toward_stuck(self):
         # On a public repo anyone can open a thread: one copying a finding's

@@ -196,7 +196,7 @@ ASK_GOAL_REF_RE = re.compile(r"(?<![\w/])#([0-9]+)\b")
 FIX_ROUNDS_DEFAULT = 3
 # A ticket whose fix rounds stop (bus/converge.py: no rung left above a stuck
 # round, or the round cap reached on its rung) is left loom:failed with this
-# note and factory.HANDOFF_LABEL, the pool the second operator's session works.
+# note and labels.HANDOFF, the pool the second operator's session works.
 FIX_STOP_TEXT = ("The station stopped the fix rounds on pull request #%d: %s. Still failing: %s. "
                  "The ticket is left loom:failed with the %s label for the second operator's "
                  "session, which claims it before working it.")
@@ -5613,16 +5613,16 @@ class Station:
                          failures: List[str]) -> None:
         """No more fix rounds: the ticket goes to loom:failed with one note
         naming what still fails, and into the hand-off pool
-        (factory.HANDOFF_LABEL). Another round would repeat the last one."""
+        (labels.HANDOFF). Another round would repeat the last one."""
         note = FIX_STOP_TEXT % (pr_number, why, converge.summary(failures) or "see the last "
-                                "fix round", factory.HANDOFF_LABEL)
+                                "fix round", labels.HANDOFF)
         try:
             brain._check_written_text(note)
         except ValueError:
             note = FIX_STOP_TEXT % (pr_number, why, "the failures the last fix round names",
-                                    factory.HANDOFF_LABEL)
+                                    labels.HANDOFF)
         brain.move(self.gh, repo, number, "failed", note=note)
-        self._add_label(repo, number, factory.HANDOFF_LABEL)
+        self._add_label(repo, number, labels.HANDOFF)
         _say("%s#%d: fix rounds stopped (%s); left failed for the hand-off pool"
              % (repo, number, why))
 
