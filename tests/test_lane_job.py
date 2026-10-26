@@ -220,6 +220,7 @@ class LaneJobTest(unittest.TestCase):
             self.assertNotIn(name, env)
         self.assertEqual(env["LOOM_SANDBOX"], "bwrap")
         self.assertEqual(env["LOOM_DROP_TREES"], "1")
+        self.assertEqual(env["TMPDIR"], str(self.job / "tmp"))
         self.assertEqual(env["LOOM_SSM_DIR"], str(self.job / "ssm"))
         self.assertEqual(env["LOOM_GITHUB_APP_KEY_FILE"], str(self.job / "app-key.pem"))
         self.assertEqual(env["LOOM_EGRESS_DENY_PROBES"], "192.0.2.1:443")

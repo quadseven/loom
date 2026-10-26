@@ -1694,8 +1694,10 @@ What the cluster side must provide:
   scaled to zero when idle. Its image carries bash, coreutils, git, gh,
   python3, uv, rsync, openssl, procps, bubblewrap with user namespaces and
   the opencode CLI; nothing is installed at run time, and no AWS CLI is
-  needed (the job signs its SSM reads itself). HOME holds the job's files,
-  so nothing under it is shown to an agent.
+  needed (the job signs its SSM reads itself). The job keeps its files,
+  trees and scratch under the workspace (`LOOM_JOB_DIR`), which sits under
+  HOME, so no agent sees it, and on the runner's large work volume, not its
+  small `/tmp`.
 - A network policy for the runner pods that the cluster enforces: DNS, the
   providers and GitHub on 443, the package indexes, AWS STS and SSM, and
   the gateway's in-cluster service; no cloud metadata address, API server or

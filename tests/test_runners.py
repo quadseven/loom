@@ -371,6 +371,30 @@ class RunnersTest(unittest.TestCase):
         self.assertFalse((self.inbox / "done" / (TICKET + ".md")).exists())
         self.assertIn("the report's MAC does not match", self.failure_line())
 
+    def test_a_malformed_mac_is_refused_without_an_exception(self):
+        run, run_id = self.dispatched()
+        artifact = self.seal(run_id, {"briefs/opencode-go-2/done/%s.md" % TICKET: BRIEF})
+        r = self.runner(now=self.now + 600)
+        for mac, why in (("\u00e9".encode("utf-8") * 32, "is not 64 hex digits"),
+                         (b"ab" * 31, "is not 64 hex digits"),
+                         (b"AB" * 32, "is not 64 hex digits")):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(io.BytesIO(artifact)) as src, zipfile.ZipFile(buf, "w") as dst:
+                for name in ("key.enc", "report.enc"):
+                    dst.writestr(name, src.read(name))
+                dst.writestr("report.mac", mac)
+            with self.assertRaises(runners.ReportError) as caught:
+                r.open_report(buf.getvalue(), run_id, self.mac_key)
+            self.assertIn(why, str(caught.exception))
+
+    def test_anything_a_malformed_report_raises_parks_the_brief(self):
+        run, run_id = self.dispatched()
+        self.finish(run, run_id, b"not a zip")
+        with mock.patch.object(runners.Runners, "_open_report", side_effect=TypeError("odd")):
+            self.runner(now=self.now + 600).tend()
+        self.assertIn("could not read the runner's report: the report could not be opened (TypeError)",
+                      self.failure_line())
+
     def test_a_report_that_unpacks_past_the_bound_is_refused(self):
         run, run_id = self.dispatched()
         artifact = self.seal(run_id, {"briefs/opencode-go-2/done/%s.md" % TICKET: BRIEF,

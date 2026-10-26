@@ -210,7 +210,7 @@ def _fetch(name: str, region: str) -> str:
     headers = sigv4_headers(body, region, key_id, secret, os.environ.get("AWS_SESSION_TOKEN", ""),
                             time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
     url = "https://%s/" % headers["host"]
-    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)  # noqa: S310 - fixed https AWS endpoint
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 - fixed AWS endpoint
             data = json.loads(resp.read().decode("utf-8"))
@@ -267,7 +267,10 @@ def lane_env() -> Dict[str, str]:
         "LOOM_SSM_DIR": os.path.join(d, "ssm"),
         "LOOM_SANDBOX": "bwrap",
         "LOOM_DROP_TREES": "1",
+        # Scratch on the job's volume, not the runner's small /tmp.
+        "TMPDIR": os.path.join(d, "tmp"),
     })
+    os.makedirs(env["TMPDIR"], mode=0o700, exist_ok=True)
     for name in ("LOOM_EGRESS_DENY_PROBES", "LOOM_EGRESS_ALLOW_PROBE", "LOOM_EGRESS_PROBE_SECONDS",
                  "LOOM_LEAK_SCANNER", "KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT"):
         if os.environ.get(name):

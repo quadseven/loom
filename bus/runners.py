@@ -214,7 +214,7 @@ def _https_fetch(url: str) -> bytes:
     URL carries its own signature), at most ARTIFACT_MAX bytes."""
     if not url.startswith("https://"):
         raise ReportError("refusing a non-https artifact URL")
-    req = urllib.request.Request(url, headers={"User-Agent": "loom-bus"})
+    req = urllib.request.Request(url, headers={"User-Agent": "loom-bus"})  # noqa: S310 - https checked above
     try:
         with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:  # noqa: S310 - https only
             data = resp.read(ARTIFACT_MAX + 1)
@@ -450,40 +450,52 @@ class Runners:
         entry["conclusion"] = str(run.get("conclusion") or "")
         self._collect(ledger, entry)
 
-    def _collect(self, ledger: Dict[str, Any], entry: Dict[str, Any]) -> None:
-        slot, ticket = entry["slot"], entry["ticket"]
-        conclusion = entry.get("conclusion") or "unknown"
+    def _report_artifact(self, entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The run's unexpired report artifact, or None."""
         data = self.gh.rest("GET", "/repos/%s/actions/runs/%d/artifacts"
                             % (self.repo, entry["run"])).data
         artifacts = data.get("artifacts") if isinstance(data, dict) else None
         name = "lane-report-%s" % entry["run_id"]
-        found = next((a for a in artifacts or [] if isinstance(a, dict)
-                      and a.get("name") == name and not a.get("expired")), None)
-        if found is None:
-            self._park(slot, ticket, "the runner run ended %s with no report" % conclusion,
-                       "transient")
+        return next((a for a in artifacts or [] if isinstance(a, dict)
+                     and a.get("name") == name and not a.get("expired")), None)
+
+    def _read_report(self, entry: Dict[str, Any], artifact: Dict[str, Any]) -> Dict[str, bytes]:
+        resp = self.gh.rest("GET", "/repos/%s/actions/artifacts/%d/zip"
+                            % (self.repo, int(artifact["id"])), ok=(302,))
+        location = str((resp.headers or {}).get("location") or "")
+        return self.open_report(self.fetch(location), entry["run_id"], entry["mac"])
+
+    def _take_beat(self, ledger: Dict[str, Any], slot: str, beat: Optional[Dict[str, Any]]) -> None:
+        """Hold the slot as the run's heartbeat says: until its reset, else
+        HOLD_SECONDS when it was unavailable; keep its model limits."""
+        if beat is None:
             return
-        try:
-            resp = self.gh.rest("GET", "/repos/%s/actions/artifacts/%d/zip"
-                                % (self.repo, int(found["id"])), ok=(302,))
-            location = str((resp.headers or {}).get("location") or "")
-            files = self.open_report(self.fetch(location), entry["run_id"], entry["mac"])
-            beat = self.apply(slot, ticket, files)
-        except ReportError as err:
-            self._park(slot, ticket, "could not read the runner's report: %s" % err, "transient")
-            return
-        if beat is not None and beat.get("available") is not True:
+        models = beat.get("limited_models")
+        if beat.get("available") is not True:
             until = beat.get("retry_at")
             if isinstance(until, bool) or not isinstance(until, (int, float)) or until <= self.now:
                 until = self.now + HOLD_SECONDS
             self._hold(ledger, slot, float(until), str(beat.get("reason") or "unavailable on the runner"),
-                       beat.get("limited_models"))
-        elif beat is not None:
-            ledger["holds"].pop(slot, None)
-            models = beat.get("limited_models")
-            if isinstance(models, dict) and models:
-                ledger["holds"][slot] = {"until": 0, "reason": "",
-                                         "limited_models": models}
+                       models)
+            return
+        ledger["holds"].pop(slot, None)
+        if isinstance(models, dict) and models:
+            self._hold(ledger, slot, 0, "", models)
+
+    def _collect(self, ledger: Dict[str, Any], entry: Dict[str, Any]) -> None:
+        slot, ticket = entry["slot"], entry["ticket"]
+        conclusion = entry.get("conclusion") or "unknown"
+        artifact = self._report_artifact(entry)
+        if artifact is None:
+            self._park(slot, ticket, "the runner run ended %s with no report" % conclusion,
+                       "transient")
+            return
+        try:
+            beat = self.apply(slot, ticket, self._read_report(entry, artifact))
+        except ReportError as err:
+            self._park(slot, ticket, "could not read the runner's report: %s" % err, "transient")
+            return
+        self._take_beat(ledger, slot, beat)
         if os.path.exists(os.path.join(self.inbox(slot), ticket + ".md")):
             why = str((beat or {}).get("reason") or "") or (
                 "the runner run ended %s without finishing the brief" % conclusion)
@@ -552,6 +564,16 @@ class Runners:
         return hmac.new(mac_key.encode("ascii"), text, hashlib.sha256).hexdigest()
 
     def open_report(self, archive: bytes, run_id: str, mac_key: str) -> Dict[str, bytes]:
+        """_open_report, with any failure a ReportError: whatever a malformed
+        artifact raises, the brief parks and nothing in it is trusted."""
+        try:
+            return self._open_report(archive, run_id, mac_key)
+        except ReportError:
+            raise
+        except Exception as err:  # noqa: BLE001 - an untrusted archive may raise anything
+            raise ReportError("the report could not be opened (%s)" % type(err).__name__) from None
+
+    def _open_report(self, archive: bytes, run_id: str, mac_key: str) -> Dict[str, bytes]:
         """The files of a report artifact, as relative path -> bytes. The zip
         holds key.enc (the run's random key, RSA-OAEP to this station's
         key), report.enc (a tar.gz, AES-256-CBC with that key through PBKDF2)
@@ -570,15 +592,18 @@ class Runners:
                     self._zip_member(zf, "report.mac", MAC_MAX, mac_buf)
                     with open(sealed_path, "wb") as fh:
                         self._zip_member(zf, "report.enc", ARTIFACT_MAX, fh)
-            except (zipfile.BadZipFile, KeyError, OSError, RuntimeError) as err:
+            except (zipfile.BadZipFile, zipfile.LargeZipFile, KeyError, OSError, RuntimeError,
+                    EOFError, zlib.error, NotImplementedError, ValueError) as err:
                 raise ReportError("not a lane report artifact (%s)" % type(err).__name__) from None
             digest = hashlib.sha256()
             with open(sealed_path, "rb") as fh:
                 for chunk in iter(lambda: fh.read(CHUNK), b""):
                     digest.update(chunk)
             want = self.report_mac(mac_key, run_id, key_buf.getvalue(), digest.hexdigest())
-            got = mac_buf.getvalue().decode("ascii", "replace").strip()
-            if not hmac.compare_digest(want, got):
+            got = mac_buf.getvalue().strip()
+            if not re.fullmatch(rb"[0-9a-f]{64}", got):
+                raise ReportError("the report's MAC is not 64 hex digits")
+            if not hmac.compare_digest(want.encode("ascii"), got):
                 raise ReportError("the report's MAC does not match this run's key")
             secret = self._openssl(["pkeyutl", "-decrypt", "-inkey", self.key_path(),
                                     "-pkeyopt", "rsa_padding_mode:oaep"], key_buf.getvalue())
@@ -611,30 +636,39 @@ class Runners:
                         total += self._bounded(fh, UNPACKED_MAX - total, buf)
                     name = member.name[2:] if member.name.startswith("./") else member.name
                     files[name] = buf.getvalue()
-        except (tarfile.TarError, OSError, EOFError, zlib.error) as err:
+        except (tarfile.TarError, OSError, EOFError, zlib.error, NotImplementedError,
+                ValueError) as err:
             raise ReportError("the report is not a readable archive (%s)" % type(err).__name__) from None
         return files
+
+    @staticmethod
+    def _brief_path(slot: str, ticket: str, rest: List[str]) -> bool:
+        if len(rest) == 2 and rest[0] in ("done", "failed"):
+            return rest[1] == ticket + ".md"
+        return len(rest) >= 3 and rest[:2] == ["answers", ticket]
+
+    @staticmethod
+    def _log_path(ticket: str, rest: List[str]) -> bool:
+        if not rest:
+            return False
+        leaf = rest[0]
+        if len(rest) > 1:
+            return leaf == ticket
+        return leaf == ticket or (leaf.startswith(ticket + ".") and not leaf.endswith(".md"))
 
     def allowed_path(self, slot: str, ticket: str, rel: str) -> bool:
         """Whether a report file may be written at `rel` under the loom home:
         only this run's brief, logs, answers and the slot's heartbeat files."""
         parts = rel.split("/")
-        if not rel or rel.startswith("/") or any(p in ("", ".", "..") for p in parts):
-            return False
-        if not all(re.fullmatch(r"[A-Za-z0-9._@+-]+", p) for p in parts):
+        if rel.startswith("/") or not all(re.fullmatch(r"[A-Za-z0-9._@+-]+", p)
+                                          and p not in (".", "..") for p in parts):
             return False
         if parts[:2] == ["briefs", slot]:
-            rest = parts[2:]
-            if len(rest) == 2 and rest[0] in ("done", "failed") and rest[1] == ticket + ".md":
-                return True
-            return len(rest) >= 3 and rest[:2] == ["answers", ticket]
-        if parts[:2] == ["logs", slot] and len(parts) >= 3:
-            leaf = parts[2]
-            if len(parts) == 3:
-                return leaf == ticket or (leaf.startswith(ticket + ".") and not leaf.endswith(".md"))
-            return leaf == ticket
+            return self._brief_path(slot, ticket, parts[2:])
+        if parts[:2] == ["logs", slot]:
+            return self._log_path(ticket, parts[2:])
         if parts[:2] == ["state", "usage"] and len(parts) == 3:
-            return any(parts[2] == slot + s for s in USAGE_SUFFIXES)
+            return parts[2] in [slot + suffix for suffix in USAGE_SUFFIXES]
         return False
 
     def apply(self, slot: str, ticket: str, files: Dict[str, bytes]) -> Optional[Dict[str, Any]]:

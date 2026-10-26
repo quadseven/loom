@@ -74,6 +74,10 @@ jobs:
     # The agent's own bound (LOOM_AGENT_TIMEOUT, an hour), the checks
     # (LOOM_CHECK_TIMEOUT) and the push, with room to seal the report.
     timeout-minutes: 150
+    env:
+      # The job's files: under HOME, which no agent sandbox shows, and on
+      # the runner's work volume rather than its small /tmp.
+      LOOM_JOB_DIR: ${{ github.workspace }}/loom-job
     permissions:
       contents: read   # check out this repo
       id-token: write  # the OIDC token the AWS role is assumed with
@@ -157,6 +161,6 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lane-report-${{ inputs.run_id }}
-          path: ~/loom-job/report/
+          path: ${{ github.workspace }}/loom-job/report/
           retention-days: 3
           if-no-files-found: ignore
