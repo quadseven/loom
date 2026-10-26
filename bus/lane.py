@@ -225,7 +225,10 @@ def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
                 continue
             recent = [at for _, at, _ in _claims(_comments(gh, repo, int(issue["number"])), lane)
                       if now - at < CLAIM_AGE]
-            if len(recent) >= REMOTE_LANES[lane]["slots"]:
+            # One claim per ticket, whatever the lane's slot count: with
+            # several slots, a ticket a hand-back left queued while its claim
+            # is fresh would otherwise be claimed again by another run.
+            if recent:
                 skipped.append("#%s skipped: claim active" % issue["number"])
                 continue
             claimed_result = _take(gh, repo, issue, lane, now)

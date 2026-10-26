@@ -51,7 +51,9 @@ def base_lane(slot: str) -> str:
 # beat_max: seconds a remote worker's last heartbeat counts as up. Muse runs
 # on its own schedule (about every 30 minutes), not every minute like a
 # local runner, so its window is longer than HEARTBEAT_MAX_AGE.
-REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 1,
+# slots: tickets the lane may hold at once; Muse runs four scheduled lane
+# tasks (operator, 2026-10-25).
+REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 4,
                          "beat_max": 2 * 3600}}
 LANES += list(REMOTE_LANES)
 
