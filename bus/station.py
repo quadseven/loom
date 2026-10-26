@@ -75,7 +75,8 @@ from . import watch
 from . import labels
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, rest_login, unreadable
+from .github import (GitHub, GitHubError, RateLimited, TargetReached, _OPENER,
+                     _next_link, read_ssm, rest_login, unreadable)
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -1786,6 +1787,8 @@ class Station:
         self._issue_stamps: Dict[Tuple[str, int], str] = {}
         saved_reads = _read_json(os.path.join(self.state, "ticket_reads.json"), {}, strict=False)
         self._ticket_reads: Dict[str, Any] = saved_reads if isinstance(saved_reads, dict) else {}
+        if hasattr(self.gh, "target") and self.gh.target is None:
+            self.gh.target = PASS_REQUEST_TARGET
 
     # -- paths ---------------------------------------------------------
     def inbox(self, lane: str) -> str:
@@ -1827,8 +1830,11 @@ class Station:
         if isinstance(kept, dict) and kept.get("stamp") == stamp and isinstance(kept.get("data"), list):
             kept["seen"] = self.now
             return kept["data"]
+        carried_before = dict(getattr(self.gh, "carried_over", {}))
         items = self.gh.paginate(path)
-        self._ticket_reads[key] = {"stamp": stamp, "data": items, "seen": self.now}
+        carried_after = getattr(self.gh, "carried_over", {})
+        if carried_before == carried_after:
+            self._ticket_reads[key] = {"stamp": stamp, "data": items, "seen": self.now}
         return items
 
     def _issue(self, repo: str, number: int) -> Dict[str, Any]:
@@ -1864,6 +1870,8 @@ class Station:
     def _check_trust(self, repo: str, issue: Dict[str, Any]) -> Tuple[bool, str]:
         number = int(issue["number"])
         events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
+        if self._target_reached():
+            return False, "target reached"
         editor = self._editor(repo, number)
         return tickets.trusted(issue, events, editor, self.s.authors, self.s.owners,
                                self.s.briefers)
@@ -2187,9 +2195,9 @@ class Station:
         or when its newest claim's brief is still waiting or running in a
         lane inbox (left for the next pass)."""
         number = int(issue["number"])
-        if self._verify_before_build(repo, issue):
+        comments = self._claim_comments(repo, issue, number)
+        if comments is None:
             return False
-        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         try:
             fix_source = self._fix_for(repo, comments)
         except ValueError as err:
@@ -2234,6 +2242,14 @@ class Station:
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
+
+    def _claim_comments(self, repo: str, issue: Dict[str, Any],
+                        number: int) -> Optional[List[Any]]:
+        """Read claim comments after verification, stopping at the pass target."""
+        if self._verify_before_build(repo, issue):
+            return None
+        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        return None if self._target_reached() else comments
 
     def _linked_pulls(self, repo: str, number: int) -> List[str]:
         """The pull requests in any repo that reference the ticket, from the
@@ -2990,6 +3006,10 @@ class Station:
                     return
             except RateLimited:
                 raise
+            except TargetReached as err:
+                # Claims made earlier this pass stay made; the rest wait.
+                _say("%s#%s waits for the next pass: %s" % (repo, issue["number"], err))
+                return
             except (GitHubError, OSError) as err:
                 _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
 
@@ -3030,6 +3050,8 @@ class Station:
             self._try_ticket(repo, lane, issue, free)
         except RateLimited:
             raise
+        except TargetReached as err:
+            _say("%s#%s waits for the next pass: %s" % (repo, issue["number"], err))
         except (GitHubError, OSError) as err:
             _say("could not queue %s#%s: %s" % (repo, issue["number"], err))
 
@@ -3743,6 +3765,8 @@ class Station:
             _say("%s#%s is held until %s" % (repo, issue["number"], headers["Not before"]))
             return False
         ok, reason = self._check_trust(repo, issue)
+        if self._target_reached():
+            return False
         if not ok:
             self._refuse(repo, issue, reason)
             return False
@@ -4311,6 +4335,7 @@ class Station:
         stopped_at = None
         for offset in range(len(steps)):
             if self._deferred():
+                stopped_at = (start + offset) % len(steps)
                 break
             # Past the budget the rest of the loop waits for the next pass,
             # which starts here: claims, fix rounds and deploys come round
@@ -4324,7 +4349,10 @@ class Station:
                 break
             step = steps[(start + offset) % len(steps)]
             try:
-                self._timed(step)
+                if not self._timed(step):
+                    # The carried-over step starts the next pass's loop.
+                    stopped_at = (start + offset) % len(steps)
+                    break
             except RateLimited:
                 raise
             except (GitHubError, OSError, ValueError) as err:
@@ -4334,17 +4362,23 @@ class Station:
         except OSError as err:
             _say("could not record the step rotation: %s" % err)
 
-    def _timed(self, step: Any) -> None:
+    def _timed(self, step: Any) -> bool:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
-        more, with the requests it made (as the step loop does)."""
+        more, with the requests it made (as the step loop does). False when
+        a read the step needed was carried over at the pass request target:
+        the line names the step, and the rest of it waits for the next pass."""
         started, asked = time.monotonic(), self.gh.requests
         try:
             step()
+        except TargetReached as err:
+            _say("step %s carried over to the next pass: %s" % (step.__name__, err))
+            return False
         finally:
             took = time.monotonic() - started
             if took >= SLOW_STEP_SECONDS:
                 _say("step %s took %ds and %d requests"
                      % (step.__name__, took, self.gh.requests - asked))
+        return True
 
     def reconcile_pull_requests(self) -> None:
         """Repair ticket state from the PR's authoritative terminal state.
@@ -11349,9 +11383,20 @@ class Station:
                if v[0] < BUDGET_FLOOR * v[1]]
         return min(low)[1:] if low else None
 
+    def _target_reached(self) -> bool:
+        target = getattr(self.gh, "target", None)
+        if not isinstance(target, int) or isinstance(target, bool):
+            return False
+        counted = getattr(self.gh, "counted", None)
+        if counted is None:
+            counted = getattr(self.gh, "requests", 0) - getattr(self.gh, "not_modified", 0)
+        return counted >= target
+
     def _deferred(self) -> bool:
-        """True when the budget is low: the step waits for the reset. Said
-        once per rate limit window."""
+        """True when the budget is low or the pass request target has been
+        reached: deferrable steps wait for the reset or next pass."""
+        if self._target_reached():
+            return True
         low = self.budget_low()
         if low is None:
             return False
@@ -11386,8 +11431,14 @@ class Station:
         line = "requests: %d, %d counted (%s), %d answered 304 (not counted)" % (
             gh.requests, gh.requests - gh.not_modified, kinds or "none", gh.not_modified)
         counted = gh.requests - gh.not_modified
+        target = getattr(gh, "target", None) or PASS_REQUEST_TARGET
         line += "; target %d counted (%s)" % (
-            PASS_REQUEST_TARGET, "over" if counted > PASS_REQUEST_TARGET else "met")
+            target, "over" if counted > target else "met")
+        carried = ", ".join("%s %d" % (k, n) for k, n in
+                            sorted(getattr(gh, "carried_over", {}).items(),
+                                   key=lambda kv: (-kv[1], kv[0])))
+        if carried:
+            line += "; carried over %s" % carried
         rates = self._rates()
         if "core" in rates:
             remaining, limit, reset = rates["core"]
@@ -11671,7 +11722,7 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         st = Station(gh, settings, **hooks)
         try:
             st.run_pass()
-        except RateLimited as err:
+        except (RateLimited, TargetReached) as err:
             _say("%s; the pass stopped there" % err)
         except StateError as err:
             _say("stopping: %s" % err)
