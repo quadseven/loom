@@ -908,6 +908,41 @@ print('leak guard: clean (shape patterns only)')
                                  "- [ ] A test covers the thing\n- [ ] Nothing else changes")
                 self.assertEqual(hunt_plan.problems(self.body.read_text()), [])
 
+    def test_a_body_failing_the_plan_checks_is_rebuilt_from_the_brief_before_it_opens(self):
+        # A lane checklist that drops a criterion left two bullets in the
+        # body, which the plan check fails; the runner logged it and opened
+        # the pull request anyway, and every fix round edited code
+        # (loom#1837). The brief's checklist, with the lane's ticks, fills it.
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY="Fix the thing so it works\n\n## Acceptance criteria\n"
+                                            "- [x] The thing works\n- [x] A test covers the thing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertEqual(hunt_plan.problems(body), [])
+        self.assertEqual(self.body_criteria(), "- [x] The thing works\n"
+                         "- [x] A test covers the thing\n- [ ] Nothing else changes")
+        self.assertNotIn(pr_repair.PLAN_HOLD_MARKER, body)
+        self.assertIn("pull request body rebuilt from the brief", self.run_log())
+        self.assertEqual(self.sticky_bodies(), [])
+
+    def test_a_brief_that_cannot_fill_the_body_opens_a_marked_pull_request_and_notes_the_ticket(self):
+        brief = BRIEF.replace("S: one function.", "big")
+        self.drop_brief(text=brief)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        body = self.body.read_text()
+        self.assertTrue(body.rstrip().endswith(pr_repair.PLAN_HOLD_MARKER))
+        self.assertIn("no Size", " ".join(hunt_plan.problems(body)))
+        notes = self.sticky_bodies()
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0].startswith(pr_repair.PLAN_NOTE_MARKER))
+        self.assertIn("- ## Size (XS, S, M or L)", notes[0])
+        self.assertIn("Pull requests: #7", notes[0])
+        # Found by its marker first, so a later pull request edits this note.
+        self.assertTrue(any(c.startswith("gh api --paginate repos/example/repo/issues/42/comments")
+                            for c in self.calls()))
+
     def test_a_lane_checklist_under_an_acceptance_heading_reaches_the_body(self):
         self.drop_brief()
         result = self.run_lane(FAKE_SUMMARY=self.TICKED.replace(

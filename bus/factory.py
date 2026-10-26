@@ -68,6 +68,13 @@ Neither needs a model:
   "issue N of another repo" in words, or dropped when it cannot be; editing
   the body reruns the scan. Once per head commit, with a comment on the
   ticket saying which lines changed.
+- A pull request whose only failing check is the plan check, failing on its
+  body (bus/hunt_plan.py), has the failing parts rebuilt from its ticket
+  (bus/pr_repair.py plan_repair) instead of a lane round whose agent edits
+  code (loom#1837): the body edit makes the review bot read it again. Once
+  per head commit, on the ticket's status comment. A ticket that lacks the
+  parts is held for the brain with one note naming them, edited in place;
+  the hold lifts when the ticket gains them.
 - The review bot replies "Fixed in <sha>" on a thread whose flagged code
   changed, but GitHub does not let its app resolve threads, so the thread
   stays open. Such a thread, with nobody writing after the bot's reply, is
@@ -140,7 +147,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brief_check, change_class, criteria_gate, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -454,6 +461,9 @@ SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
 BODY_LEAK_MARKER = "<!-- loom:body-leak-repaired %s -->"
 # On the ticket: the station put it under an epic for this head commit.
 EPIC_REPAIR_MARKER = "<!-- loom:epic-repaired %s -->"
+# On the ticket's status comment: the factory rebuilt the pull request body
+# from the ticket for this head commit after a body-only plan check failure.
+PLAN_REPAIR_MARKER = "<!-- loom:plan-repaired %s -->"
 # The plan check's summary table names this row for a ticket under no epic.
 EPIC_ROW = "which epic"
 _ORPHAN_NUMBER_RE = re.compile(r"#(\d+)")
@@ -2109,6 +2119,7 @@ class Factory:
                 self._split_pr(repo, number, full, issue, comments, sha)
                 or self._repair_body_leak(repo, number, full, issue, comments, sha)
                 or self._repair_ticket_epic(repo, number, issue, comments, sha)
+                or self._repair_plan_body(repo, number, full, issue, comments, sha)
                 or self._run_again(repo, number, sha)
                 or self._review_again(repo, number, full, sha)):
             return
@@ -2300,6 +2311,110 @@ class Factory:
         self.actions += 1
         _say("put %s#%d under epic #%d after %s held #%d" % (repo, ticket, epic, self.plan_check, number))
         return True
+
+    def _repair_plan_body(self, repo: str, number: int, full: Dict[str, Any],
+                          issue: Dict[str, Any], comments: List[Dict[str, Any]],
+                          sha: str) -> bool:
+        """When the plan check is the only failing check and the body fails
+        it (bus/hunt_plan.problems), rebuild the failing parts from the
+        ticket with bus/pr_repair.py and edit the body, which makes the review
+        bot read it again, instead of a fix round that runs an agent on code
+        that cannot change the body (loom#1837). Once per head commit, kept
+        on the ticket's status comment, which sends no email. When the ticket
+        itself lacks the parts, the ticket is held for the brain with one
+        note, edited in place, naming them; no lane round is sent. False
+        leaves the pull request to the usual paths: another failing check, a
+        body that passes (the check failed on something else), a body with no
+        runner footer to rebuild from, or a repair the text checks refuse."""
+        failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
+        if len(failed) != 1 or failed[0].get("name") != self.plan_check:
+            return False
+        body = str(full.get("body") or "")
+        ticket = int(issue["number"])
+        marker = PLAN_REPAIR_MARKER % sha
+        repaired_at = max((_ts(c.get("created_at")) for c in comments
+                           if marker in str(c.get("body") or "")), default=0.0)
+        if repaired_at:
+            if (_ts(failed[0].get("completed_at")) < repaired_at
+                    and self.now - repaired_at <= REVIEW_GRACE):
+                _say("%s#%d waits: its body was rebuilt from ticket #%d and %s has not read "
+                     "it again" % (repo, number, ticket, self.plan_check))
+                return True
+            return False  # read again and still failing: the usual paths
+        if not hunt_plan.problems(body):
+            return False
+        fields = pr_repair.footer_fields(body)
+        if fields is None:
+            return False
+        name, lane, model = fields
+        found = pr_repair.plan_repair(tickets.render_brief(repo, issue, lane),
+                                      str(full.get("title") or ""), body, lane, model, name,
+                                      repo=repo, public=not self._is_private(repo))
+        if found["reason"]:
+            _say("%s#%d: plan body repair refused (%s)" % (repo, number, found["reason"]))
+            return False
+        if found["changed"]:
+            self.gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number), {"body": found["body"]})
+            self._status_note(repo, ticket, "%s\n%s failed on pull request #%d only on its "
+                              "body (%s), which the runner writes from this ticket, so the "
+                              "factory rebuilt it from the ticket instead of sending a lane "
+                              "round." % (marker, self.plan_check, number,
+                                          "; ".join(found["before"])))  # type: ignore[arg-type]
+            self._lift_plan_hold(repo, number, issue, comments)
+            self.actions += 1
+            _say("rebuilt %s#%d's body from ticket #%d after a body-only %s failure"
+                 % (repo, number, ticket, self.plan_check))
+            return True
+        self._hold_plan(repo, number, issue, comments,
+                        pr_repair.ticket_gaps(list(found["after"])))  # type: ignore[arg-type]
+        return True
+
+    @staticmethod
+    def _plan_note(comments: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """The ticket's plan-hold note (bus/pr_repair.PLAN_NOTE_MARKER), a
+        real comment the runner or the factory wrote, or None."""
+        return next((c for c in comments if c.get("id") and not c.get(status.EXPANDED)
+                     and str(c.get("body") or "").startswith(pr_repair.PLAN_NOTE_MARKER)), None)
+
+    def _hold_plan(self, repo: str, number: int, issue: Dict[str, Any],
+                   comments: Sequence[Dict[str, Any]], gaps: List[str]) -> None:
+        """Hold the ticket for the brain: needs-brain, and the one note naming
+        what the ticket lacks, posted once and edited only when it changes."""
+        ticket = int(issue["number"])
+        text = pr_repair.hold_note(number, self.plan_check, gaps)
+        wrote = False
+        if "needs-brain" not in _labels(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, ticket),
+                         {"labels": ["needs-brain"]})
+            issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
+            wrote = True
+        note = self._plan_note(comments)
+        if note is None:
+            notify.post(self.gh, repo, ticket, text, notify.HELD)
+            wrote = True
+        elif str(note.get("body") or "").strip() != text.strip():
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(note["id"])),
+                         {"body": text})
+            wrote = True
+        if wrote:
+            self.actions += 1
+            _say("held %s#%d for the brain: its body fails %s and ticket #%d lacks %s"
+                 % (repo, number, self.plan_check, ticket, "; ".join(gaps)))
+
+    def _lift_plan_hold(self, repo: str, number: int, issue: Dict[str, Any],
+                        comments: Sequence[Dict[str, Any]]) -> None:
+        """After a repair: lift a plan hold this factory or the runner put on
+        the ticket (its note says so), and say so in the same note."""
+        note = self._plan_note(comments)
+        if note is None or str(note.get("body") or "").strip() == pr_repair.lifted_note(number):
+            return
+        if "needs-brain" in _labels(issue):
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/needs-brain" % (repo, int(issue["number"])),
+                         ok=(404,))
+            issue["labels"] = [x for x in issue.get("labels") or []
+                               if (x.get("name") if isinstance(x, dict) else x) != "needs-brain"]
+        self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(note["id"])),
+                     {"body": pr_repair.lifted_note(number)})
 
     def _land_or_ask_test(self, repo: str, number: int, full: Dict[str, Any],
                           issue: Dict[str, Any], comments: List[Dict[str, Any]],

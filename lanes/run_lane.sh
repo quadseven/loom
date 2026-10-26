@@ -497,6 +497,60 @@ pr_body() {
     "$2" "$LANE" "$MODEL" "$validated" "$refs"
 }
 
+# The markers bus/pr_repair.py names PLAN_HOLD_MARKER (in a pull request
+# body) and PLAN_NOTE_MARKER (the ticket's one plan-hold note).
+PLAN_HOLD_MARKER="<!-- loom:plan-hold v1 -->"
+PLAN_NOTE_MARKER="<!-- loom:plan-hold-note v1 -->"
+
+# The body of a new pull request, in PR_BODY. A body that fails the review
+# bot's plan checks (bus/hunt_plan.py) has the failing parts rebuilt from the
+# brief by bus/pr_repair.py, the code the factory and fix rounds use. What the
+# brief still lacks goes in PLAN_GAPS, one per line: the pull request opens
+# anyway (the work is done), marked so the factory sends it no lane round,
+# whose agent edits code and never the body (loom#1837).
+compose_pr_body() {
+  local problems body_file out_file summary=() private=()
+  PLAN_GAPS=""
+  PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+  problems="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)" && return 0
+  echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$problems" | tr '\n' ';')" >> "$LOG"
+  if ! body_file="$(mktemp)" || ! out_file="$(mktemp)"; then
+    PLAN_GAPS="$problems"; return 0
+  fi
+  printf '%s\n' "$PR_BODY" > "$body_file"
+  if [ -f "$WORKDIR/$TICKET.summary.md" ]; then
+    summary=(--summary "$WORKDIR/$TICKET.summary.md")
+  elif [ -f "$TREE/$SUMMARY_FILE" ]; then
+    summary=(--summary "$TREE/$SUMMARY_FILE")
+  fi
+  repo_is_public || private=(--private)
+  if PLAN_GAPS="$(NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -B -m bus.pr_repair plan \
+       "$BRIEF" "$body_file" "$LANE" "$MODEL" "$TICKET" --out "$out_file" --repo "$REPO" \
+       ${summary[@]+"${summary[@]}"} ${private[@]+"${private[@]}"} 2>> "$LOG")"; then
+    PR_BODY="$(cat "$out_file")"
+    PLAN_GAPS=""
+    echo "[$(date -u +%FT%TZ)] $TICKET pull request body rebuilt from the brief; it passes the plan checks" >> "$LOG"
+  else
+    [ -n "$PLAN_GAPS" ] || PLAN_GAPS="$problems"
+    echo "[$(date -u +%FT%TZ)] $TICKET the brief lacks for the plan checks: $(printf '%s' "$PLAN_GAPS" | tr '\n' ';')" >> "$LOG"
+  fi
+  rm -f "$body_file" "$out_file"
+}
+
+# The ticket's one plan-hold note, edited in place on every later pull
+# request of the ticket: the factory holds the ticket for the brain and keeps
+# the same comment. Argument: the new pull request's URL.
+note_plan_hold() {
+  local number="${1##*/}"
+  [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || return 0
+  printf 'The ticket lacks what the runner writes these parts of the body from:\n%s\n\nA lane cannot edit the ticket, so the factory sends no fix round for it. Add the missing parts to this ticket; the factory then rebuilds the pull request body from it.\n' \
+    "$(printf '%s\n' "$PLAN_GAPS" | sed 's/^/- /')" |
+    upsert_sticky_comment "$REPO" "$ISSUE_NUMBER" "$PLAN_NOTE_MARKER" repeat \
+      --headline "Held for the brain: a pull request body fails the review bot's plan check" \
+      --items-label "Pull requests" --item "#$number" ||
+    echo "[$(date -u +%FT%TZ)] $TICKET: the plan-hold note on the ticket failed" >> "$LOG"
+}
+
 # A fix brief's PR must still be open on the brief's branch. Returns 1 with
 # FIX_REASON set when it is not, and with FIX_REASON empty when gh could not
 # say (the brief then waits for the next pass).
@@ -2971,6 +3025,7 @@ for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
   drop_run_scratch
   PR_BODY=""
+  PLAN_GAPS=""
   DROPPED_SCRATCH_FILES=""
   TICKET="$(basename "$BRIEF" .md)"
   REPO="$(field Repo "$BRIEF")"
@@ -3487,7 +3542,7 @@ for BRIEF in "$INBOX"/*.md; do
         INTENT_TEXT="${INTENT_TEXT}
 - Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
       fi
-      PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+      compose_pr_body
       PR_BODY="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
         'import sys; from bus.factory import SCAN_REF_RE; owner, name = sys.argv[1].lower().split("/", 1); f = lambda m: m.group(0) if m.group(2).lower() == name and (m.group(1) or owner).lower() == owner else "issue %s of another repo" % m.group(3); print("\n".join(SCAN_REF_RE.sub(f, x) for x in sys.stdin.read().splitlines()))' "$REPO")" || {
         park "$BRIEF" "could not prepare public repo PR text; nothing pushed" transient; continue
@@ -3655,18 +3710,18 @@ Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
   fi
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
-  [ -n "${PR_BODY:-}" ] || PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
-  # Briefs are checked when filed, so this only fires on a brief filed
-  # before that check or edited by hand: the PR still opens (the work is
-  # done), and the log names what the review bot will hold it for.
-  if ! PLAN_PROBLEMS="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)"; then
-    echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$PLAN_PROBLEMS" | tr '\n' ';')" >> "$LOG"
-  fi
+  # Briefs are checked when filed, so a failing body comes from a brief filed
+  # before that check, edited by hand, or read differently by the shell and
+  # Python readers: compose_pr_body rebuilds it, and marks the pull request
+  # when the brief cannot fill it.
+  [ -n "${PR_BODY:-}" ] || compose_pr_body
+  [ -z "$PLAN_GAPS" ] || PR_BODY="$PR_BODY"$'\n\n'"$PLAN_HOLD_MARKER"
   if ! PR_URL="$(timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
        --body "$PR_BODY" 2>> "$LOG")"; then
     park "$BRIEF" "pr create failed; branch $BRANCH is pushed" transient; continue
   fi
   echo "$PR_URL" >> "$LOG"
+  [ -z "$PLAN_GAPS" ] || note_plan_hold "$PR_URL"
   if [ -n "$INTENT_CLASS" ] && ! timeout "$NET_TIMEOUT" gh pr edit "$PR_URL" -R "$REPO" --add-label "class:$INTENT_CLASS" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] could not add label class:$INTENT_CLASS to $PR_URL; the PR stands" >> "$LOG"
   fi
