@@ -406,6 +406,30 @@ check_scope() {
   STRAY_FILES="$(timeout "$NET_TIMEOUT" env PYTHONPATH="$REPO_ROOT" python3 -B -m bus.scope_check "$TREE" "$BASE" HEAD "$1" ${FIX_UPSTREAM:+"$FIX_UPSTREAM"})"
 }
 
+# Checks the commits' Kubernetes manifest changes against the live cluster,
+# SSM and DNS (bus/live_cluster.py), over the range the leak scan reads. A
+# miss parks the brief as work and returns 1, so nothing is pushed. A check
+# that cannot run at all, or a part of it, sets LIVE_NOTES, which the log and
+# the pull request body or round comment carry.
+LIVE_NOTES=""
+live_cluster_check() {
+  local range="$BASE..HEAD" out rc=0
+  LIVE_NOTES=""
+  [ -n "$FIX_UPSTREAM" ] && range="$FIX_UPSTREAM...HEAD"
+  out="$(timeout "$NET_TIMEOUT" env PYTHONPATH="$REPO_ROOT" ${LOOM_AWS_REGION:+AWS_REGION="$LOOM_AWS_REGION"} \
+    python3 -B -m bus.live_cluster "$TREE" "$range" 2>> "$LOG")" || rc=$?
+  if [ "$rc" -eq 1 ]; then
+    park "$BRIEF" "$out; nothing pushed"
+    return 1
+  fi
+  [ -z "$out" ] || printf '%s\n' "$out" >> "$LOG"
+  if [ "$rc" -ne 0 ]; then
+    out="live-cluster check could not run: the check exited $rc"
+    printf '%s\n' "$out" >> "$LOG"
+  fi
+  LIVE_NOTES="$(printf '%s\n' "$out" | grep '^live-cluster check could not run: ' || true)"
+}
+
 # STRAY_FILES as one comma-separated line, at most ten names.
 stray_list() {
   local n
@@ -3506,6 +3530,11 @@ for BRIEF in "$INBOX"/*.md; do
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
   fi
+  # Node labels, SSM parameters and hosts a manifest change names must exist
+  # live before anything is pushed (bus/live_cluster.py, loom#1832). A miss
+  # is the lane's work to fix; a check that cannot run is a note, not a stop.
+  LIVE_NOTES=""
+  if [ "$COMMITTED" -eq 1 ]; then live_cluster_check || continue; fi
   if [ "$REPO_PRIVATE" = false ]; then
     if [ ! -f "$LEAK_SCANNER" ]; then
       park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed" transient
@@ -3679,6 +3708,11 @@ $CHECKED"
     else
       COMMENT="Lane $SLOT repaired the PR text for: ${ITEMS:-the findings on the ticket}"
     fi
+    if [ -n "$LIVE_NOTES" ]; then
+      COMMENT="$COMMENT
+
+$LIVE_NOTES"
+    fi
     if [ -n "$DROPPED_SCRATCH_FILES" ]; then
       COMMENT="$COMMENT
 
@@ -3715,6 +3749,7 @@ Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
   # Python readers: compose_pr_body rebuilds it, and marks the pull request
   # when the brief cannot fill it.
   [ -n "${PR_BODY:-}" ] || compose_pr_body
+  [ -z "$LIVE_NOTES" ] || PR_BODY="$PR_BODY"$'\n\n'"$LIVE_NOTES"
   [ -z "$PLAN_GAPS" ] || PR_BODY="$PR_BODY"$'\n\n'"$PLAN_HOLD_MARKER"
   if ! PR_URL="$(timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
        --body "$PR_BODY" 2>> "$LOG")"; then
