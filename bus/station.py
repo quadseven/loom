@@ -768,6 +768,7 @@ class Settings:
                  report_digest: Sequence[Tuple[int, int]] = (),
                  health_urls: str = "",
                  health_every: int = health.EVERY,
+                 health_diagnose: Optional[Dict[str, str]] = None,
                  friction_mode: str = "",
                  evidence_cmds: Optional[Dict[str, str]] = None,
                  evidence_window_hours: float = EVIDENCE_WINDOW_HOURS,
@@ -819,6 +820,9 @@ class Settings:
         # endpoint (bus/health.py, docs/HEALTH.md), read every health_every s.
         self.health_urls = health_urls
         self.health_every = health_every
+        # "owner/name#goal" -> the goal home's read-only diagnosis command,
+        # whose output every health brief quotes (docs/HEALTH.md, loom#1243).
+        self.health_diagnose = health_diagnose or {}
         # LOOM_FRICTION_INTAKE: "on" files a ticket for a slowdown the tick
         # journals keep naming, "dry" logs what it would file, "" is off
         # (bus/friction_intake.py).
@@ -955,6 +959,7 @@ class Settings:
                        env.get("LOOM_LIVE_EVIDENCE_PASS_ENV", ""), env),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
+                   health_diagnose=_health_diagnose(env),
                    friction_mode=friction_intake.mode(env.get("LOOM_FRICTION_INTAKE", "")),
                    roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")),
                    pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"),
@@ -1140,6 +1145,13 @@ def _workflow_run_steps(path: str, workflow: str) -> List[Tuple[str, str]]:
         if command:
             found.append(("%s, step %s" % (path, step_name or str(run_number)), command))
     return found
+
+
+def _health_diagnose(env: Dict[str, str]) -> Dict[str, str]:
+    commands, problem = health.diagnose_commands(env.get("LOOM_HEALTH_DIAGNOSE_CMDS", ""))
+    if problem:
+        _say("ignoring LOOM_HEALTH_DIAGNOSE_CMDS: %s" % problem)
+    return commands
 
 
 def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
@@ -8871,7 +8883,7 @@ class Station:
         last = state.get("last")
         if isinstance(last, (int, float)) and 0 <= self.now - last < self.s.health_every:
             return
-        sources, problems = health.parse_sources(self.s.health_urls)
+        sources, problems = health.parse_sources(self.s.health_urls, self.s.health_diagnose)
         for problem in problems:
             _say("ignoring a LOOM_HEALTH_URLS entry: %s" % problem)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now))
