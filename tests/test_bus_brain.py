@@ -632,9 +632,9 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertIn("#1 Fresh - latest journal 2030-01-01T19:45:00Z, report 2030-01-01T19:00:00Z, "
                       "measure 2030-01-01T19:45:00Z, action 2030-01-01T19:45:00Z - report ok", report)
         self.assertIn("#2 Stale - latest journal 2030-01-01T19:50:00Z, report 2030-01-01T10:26:00Z, "
-                      "measure none, action none - report overdue (due 2030-01-01T16:26:00Z)", report)
+                      "measure none, action none - report overdue (due 2030-01-01T15:00:00Z)", report)
         owed = report.split("### Reports owed before unlock")[1].split("###")[0]
-        self.assertIn("#2 report OVERDUE since 2030-01-01T16:26:00Z", owed)
+        self.assertIn("#2 report OVERDUE since 2030-01-01T15:00:00Z", owed)
         self.assertNotIn("#1", owed)
 
     def test_a_goal_the_app_reported_minutes_ago_is_held_not_owed(self):
@@ -663,7 +663,8 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_only_a_marked_report_on_the_goal_advances_its_deadline(self):
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
-        issue = {"number": 3, "created_at": "2030-01-01T13:00:00Z"}
+        # Opened at 05:00 New York, so its first report is due at 10:00 there.
+        issue = {"number": 3, "created_at": "2030-01-01T10:00:00Z"}
         bot = {"login": "brain-bot"}
         ignored = [
             {"body": "<!-- loom:journal v1 -->\nquoting <!-- loom:report v1 -->", "createdAt": "2030-01-01T19:55:00Z", "author": bot},
@@ -672,13 +673,13 @@ class SensitiveResumeTests(unittest.TestCase):
         ]
         led = brain.goal_ledger(issue, {"comments": {"nodes": ignored}}, now, ["brain-bot"])
         self.assertNotIn("report", led)
-        self.assertEqual((led["state"], led["due"]), ("overdue", "2030-01-01T19:00:00Z"))
-        earlier = brain.datetime(2030, 1, 1, 19, 15, tzinfo=brain.timezone.utc)
+        self.assertEqual((led["state"], led["due"]), ("overdue", "2030-01-01T15:00:00Z"))
+        earlier = brain.datetime(2030, 1, 1, 15, 15, tzinfo=brain.timezone.utc)
         self.assertEqual(brain.goal_ledger(issue, {"comments": {"nodes": ignored}}, earlier, ["brain-bot"])["state"], "due")
         marked = ignored + [{"body": "<!-- loom:report v1 -->\n- Measure: 1", "createdAt": "2030-01-01T19:58:00Z", "author": bot}]
         led = brain.goal_ledger(issue, {"comments": {"nodes": marked}}, now, ["brain-bot"])
         self.assertEqual((led["report"], led["state"], led["due"]),
-                         ("2030-01-01T19:58:00Z", "ok", "2030-01-02T01:58:00Z"))
+                         ("2030-01-01T19:58:00Z", "ok", "2030-01-02T02:00:00Z"))
 
     def test_goal_without_any_stamp_is_unknown_not_young(self):
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
@@ -687,7 +688,8 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_report_deadline_changes_state_at_due_and_grace(self):
         last = brain.datetime(2030, 1, 1, 17, 0, tzinfo=brain.timezone.utc)
-        due = last + brain.timedelta(seconds=brain.REPORT_EVERY)
+        due = brain.next_report_due(last)
+        self.assertEqual(due, brain.datetime(2030, 1, 2, 2, 0, tzinfo=brain.timezone.utc))
         grace = brain.timedelta(seconds=brain.REPORT_GRACE)
         owed = due - brain.timedelta(seconds=brain.REPORT_OWED_EARLY)
         for now, state in ((owed - brain.timedelta(seconds=1), "ok"),
@@ -706,7 +708,7 @@ class SensitiveResumeTests(unittest.TestCase):
         # with time to write it first.
         from bus import station
         last = brain.datetime(2030, 1, 1, 17, 0, tzinfo=brain.timezone.utc)
-        station_posts = (last + brain.timedelta(seconds=brain.REPORT_EVERY)
+        station_posts = (brain.next_report_due(last)
                          - brain.timedelta(seconds=station.STANDUP_LEAD))
         a_tick_earlier = station_posts - brain.timedelta(hours=1)
         self.assertEqual(brain._report_deadline(last, a_tick_earlier)[1], "due")
@@ -4133,10 +4135,27 @@ class LogExcerptTests(unittest.TestCase):
 
 
 class ReportCadenceTest(unittest.TestCase):
-    def test_a_goal_report_is_due_every_six_hours(self):
+    def test_a_goal_report_is_due_at_the_two_reading_times(self):
         # 2026-10-18: 2-hourly reports on 13 goals sent the operator about 13
-        # emails an hour; the operator chose every 6 hours.
-        self.assertEqual(brain.REPORT_EVERY, 6 * 3600)
+        # emails an hour; 6-hourly ones on 26 goals sent up to a hundred a
+        # day. 2026-10-25: twice a day, 10:00 and 21:00 New York, the digest's
+        # times.
+        from bus import station
+        self.assertEqual(brain.REPORT_TIMES, ((10, 0), (21, 0)))
+        self.assertEqual(station.DIGEST_TIMES, "10:00,21:00")
+        utc = brain.timezone.utc
+        for last, due in (
+                # Winter (UTC-5): 10:00 is 15:00Z, 21:00 is 02:00Z next day.
+                ((2030, 1, 1, 2, 0), (2030, 1, 1, 15, 0)),
+                ((2030, 1, 1, 12, 44), (2030, 1, 1, 15, 0)),
+                # Written in the 2h15m before 10:00, it counts for 10:00.
+                ((2030, 1, 1, 12, 45), (2030, 1, 2, 2, 0)),
+                ((2030, 1, 1, 23, 50), (2030, 1, 2, 15, 0)),
+                # Summer (UTC-4): 10:00 is 14:00Z.
+                ((2030, 7, 1, 3, 0), (2030, 7, 1, 14, 0))):
+            with self.subTest(last=last):
+                self.assertEqual(brain.next_report_due(brain.datetime(*last, tzinfo=utc)),
+                                 brain.datetime(*due, tzinfo=utc))
 
 class LiveCriterionTest(unittest.TestCase):
     """2026-10-18: 3 of 72 merged tickets verified; most verify runs found no

@@ -80,6 +80,32 @@ def _brief_section(brief: str, name: str) -> str:
     return "\n".join(out)
 
 
+# The headings a ticket writes its criteria under, lower-cased; mirrors
+# lanes/run_lane.sh::criteria_section.
+_CRITERIA_HEADINGS = ("## acceptance criteria", "## acceptance")
+
+
+def _brief_criteria(brief: str) -> str:
+    """The acceptance criteria of a brief or summary, as
+    lanes/run_lane.sh::criteria_section reads them: its "## Acceptance
+    criteria" section in any case, or its "## Acceptance" section, blank
+    lines dropped. Read as exactly "## Acceptance criteria", a ticket with
+    "## Acceptance" rendered an empty section every fix round (2026-10-25)."""
+    heading_re = re.compile(r"^#+ ")
+    out: list[str] = []
+    on = False
+    for line in brief.split("\n"):
+        if line.rstrip().lower() in _CRITERIA_HEADINGS:
+            on = True
+            continue
+        if on:
+            if heading_re.match(line):
+                break
+            if line.strip():
+                out.append(line)
+    return "\n".join(out)
+
+
 def _brief_size(brief: str) -> str:
     """The brief's size as the review bot's letter (Medium -> M), read the
     way the runner reads it (hunt_plan.brief_size: a ## Size section or an
@@ -139,8 +165,8 @@ def _checklist(brief: str, current_body: str, summary: str) -> str:
     from its summary when it wrote any, else the pull request's own when it
     names the ticket's criteria (so a round keeps earlier ticks). Rendering
     the ticket's every round dropped every tick a lane made (2026-10-20)."""
-    ticket = _brief_section(brief, "Acceptance criteria")
-    lane = _brief_section(summary, "Acceptance criteria") if summary else ""
+    ticket = _brief_criteria(brief)
+    lane = _brief_criteria(summary) if summary else ""
     if lane:
         return _lane_ticks(ticket, lane)
     # The body's section runs on to its Size: line; its checklist is the
@@ -198,7 +224,7 @@ def _render_generated(brief: str, lane: str, model: str, ticket: str,
     why = _brief_section(brief, "Why")
     summary = _brief_section(brief, "What")
     if acceptance is None:
-        acceptance = _brief_section(brief, "Acceptance criteria")
+        acceptance = _brief_criteria(brief)
     size = _brief_size(brief)
     out_of_scope = _brief_section(brief, "Out of scope")
     issue = _field(brief, "Issue")

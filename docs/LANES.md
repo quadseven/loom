@@ -36,10 +36,16 @@ only), and commit. On 2026-10-14, 27 of 95 tickets took six or more
 rounds, and no lane ran a test before opening its pull request.
 
 Before pushing a branch or opening a pull request on a public repository, the
-lane runner uses infra-public's `check_private_leaks.py` in shape-only mode on
-the diff and generated pull request body. Set `LOOM_LEAK_SCANNER` to that
-script's path when it is not at `../infra-public/.github/scripts/check_private_leaks.py`
-relative to the Loom checkout. A missing scanner or a hit blocks the push.
+lane runner uses infra-public's `check_private_leaks.py` on the diff and
+generated pull request body, with the shared deny-list of names and products
+(`--deny-list-ssm`, the SSM parameter `LOOM_LEAK_DENY_SSM`, default
+`/infra/leak-scan/deny-list`). Every scan goes through `leak_scan`. Set
+`LOOM_LEAK_SCANNER` to that script's path when it is not at
+`../infra-public/.github/scripts/check_private_leaks.py` relative to the Loom
+checkout. A missing scanner, a deny-list the scanner cannot read (it exits 2)
+or a hit blocks the push; a scan that could not run parks the brief
+`[transient]`. A lane pod (`LOOM_SSM_DIR`) holds no AWS key and the scanner
+reads the deny-list only from SSM, so a pod pushes nothing to a public repo.
 Private repositories skip this scan. Test IP addresses in public changes must
 use the documentation ranges `192.0.2.0/24`, `198.51.100.0/24`, or
 `203.0.113.0/24`; add `leak-guard-allow` on a line only when a deliberate
@@ -533,7 +539,9 @@ Reports: by default the station sends a digest, not each report:
 `LOOM_REPORT_DIGEST_TIMES` (default `10:00,21:00`, local time) names when.
 At each time it sends one message: every goal home whose latest report since
 the last digest says something moved, as its short name, the report's first
-line and a link; a count of the goal homes where nothing moved; and the
+line and a link; a count of the goal homes where nothing moved; one line
+per backlog goal home (labelled `loom:backlog`), counted from its tickets,
+since a backlog goal posts no report on GitHub; and the
 factory's daily numbers, which then no longer go out on their own. Each time
 is sent once, and a failed send is tried again on the next pass. Switching
 the digest on sends nothing until the next digest time. Setting
@@ -1504,6 +1512,61 @@ unchanged for a run that did not end on a described step.
   a kept entry is removed, never followed, so deletion cannot reach into
   the keychain folder or another ticket's tree.
 
+## Lane pods: an API lane on a Linux cluster
+
+An API lane can run in a container on a Kubernetes cluster instead of on
+the station Mac, so each run's checkout and agent state live on the
+cluster's disk, not the Mac's (quadseven/loom#1824). The pod runs the same
+`lanes/run_lane.sh`; `lanes/k8s/pod.sh` starts it for each slot in
+`LOOM_POD_SLOTS` every `LOOM_POD_INTERVAL` seconds (default 60), as launchd
+does on the Mac.
+
+What changes in a pod:
+
+- `LOOM_SANDBOX=bwrap`: the agent and the validation run are confined by
+  bubblewrap instead of `sandbox-exec`. The sandbox root is an empty tmpfs
+  with only the system folders (`/usr`, `/bin`, `/lib*`, `/etc`, `/opt`)
+  bound in read-only, so HOME, `/run/secrets`, `/var/run/secrets` and the
+  loom checkout are not there at all (the two secret folders are also masked
+  with empty tmpfs). The run's tree and scratch home are the only writable
+  binds, `.git` stays read-only, the CLI's folder and the skill snapshot are
+  read-only, and `/tmp` is private. A validation run gets the same root:
+  its writes go to the tree, its check home and `/tmp`. A fresh `/proc` in a
+  new PID namespace hides the runner's processes. bwrap needs user
+  namespaces inside the container; a lane whose bwrap cannot start reports
+  itself unavailable (`sandbox_ready`). The agy lane and the codex and
+  claude lanes stay on the Mac.
+- Egress, fail closed: bwrap narrows no network, so the pod's network
+  policy must (no cloud metadata address, no API server, no cluster-internal
+  ranges; DNS and 443 to the internet only). `sandbox_ready` proves it
+  before every pass. `LOOM_EGRESS_DENY_PROBES` names blocked destinations as
+  literal `IPv4:port` (a name is refused: one that does not resolve would
+  fail to connect and pass as blocked); the API server at
+  `KUBERNETES_SERVICE_HOST` is added to them when the pod has it; each must
+  fail to connect. `LOOM_EGRESS_ALLOW_PROBE` (`host:port`, the provider's
+  HTTPS endpoint) must connect, so a pod with no network or no DNS does not
+  pass because everything fails. Anything else holds the lane unavailable,
+  with the reason in its heartbeat, so a policy the cluster network does not
+  enforce holds the lane too.
+- `LOOM_DROP_TREES=1`: each run's tree, the runner's files beside it and the
+  scratch homes are removed when the run ends, whatever its outcome
+  (`drop_run_scratch`). Logs and the brief stay under `LOOM_HOME`.
+- `LOOM_SSM_DIR`: a folder under HOME holding a copy of each SSM parameter
+  the pod reads, at the parameter's name (`/a/b` is `$LOOM_SSM_DIR/a/b`),
+  kept in step with SSM by the cluster. `ssm_value` reads the file and makes
+  no AWS call, so the pod holds no AWS key. The GitHub App key comes from
+  `LOOM_GITHUB_APP_KEY_FILE`, also under HOME.
+
+Everything the agent must not read (the copied parameters, the App key,
+`LOOM_HOME`) sits under HOME, outside the system folders bwrap binds; the
+agent sees nothing there but its own tree and scratch home. The pod mounts
+no service account token, and its code is read-only and owned by root. The image carries bash, coreutils, git, gh,
+python3, uv, rsync, openssl, netcat, procps, bubblewrap and the opencode
+CLI, plus this repo and the leak scanner at a pinned commit.
+
+How the station hands a pod lane its briefs and reads its reports is the
+second slice of quadseven/loom#1824; until then a pod lane takes no work.
+
 ## Adding a lane
 
 A lane is a name in `lanes/run_lane.sh`, not a directory of its own: that one
@@ -1511,8 +1574,8 @@ runner polls, heartbeats, commits, pushes and opens the PR for every lane.
 Adding one takes:
 
 - In `lanes/run_lane.sh`, a CLI in `lane_ready`, and the name in the header
-  comment's lane list. An API lane also joins the case that wants
-  `sandbox-exec` and a key read from `LOOM_<LANE>_KEY_SSM`; a lane whose CLI
+  comment's lane list. An API lane also joins the case that wants a
+  sandbox (`sandbox_ready`) and a key read from `LOOM_<LANE>_KEY_SSM`; a lane whose CLI
   or key is missing reports itself unavailable and takes no work.
 - A branch in `run_agent` that runs the lane's CLI with the brief and the
   model. An API lane calls `api_agent <key var or -> <CLI...>`

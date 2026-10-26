@@ -1100,6 +1100,41 @@ keeps editing it. Rules:
 - `tickets.parse` leaves the section out of the brief and `with_original` does
   not quote it.
 
+### Fix rounds edited in place
+
+The first fix round on a pull request posts the ticket's `loom:fix` comment, as
+before. Each later round the station sends on the same pull request edits that
+comment instead of posting a new one, so it sends no email (loom#1640; one
+ticket had emailed the same failing check twice within the hour).
+`bus/fixrounds.py` writes it from the station's `_post_fix_comment`; a
+`bus.brain fix` send-back is still a new comment.
+
+- The edited comment starts with the `loom:fix` marker, the pull request line,
+  `<!-- loom:fix-rounds v1 -->` and the newest round's head marker, then one
+  short block per round: its number, UTC time and the reasons that round's
+  comment showed.
+- Each round's whole `loom:fix` body is kept as plain text in a hidden
+  `<!-- loom:fix-round N <UTC time>` block, with `&`, `<`, `>` and `#`
+  escaped: nothing in it can end the block or read as a marker, key or
+  heading. When the comment would pass GitHub's size limit, older rounds keep
+  only their markers and `###` headings.
+- Readers see one comment per round, as before: the GitHub client expands the
+  comment like the status comment, so round counting (`_fix_round_count`,
+  `factory.fixes_of`), the asked threads, the fix key and the lane's fix brief
+  read every round. A ticket whose rounds are older per-round comments keeps
+  them; its next round edits the newest of them, and both forms count.
+- Trust: a comment is read as rounds only when a trusted login wrote it and
+  its real `updated_at` is the one GitHub answered the station's own last
+  edit with, kept in `<home>/state/fix-rounds.json`. Nothing in the body is
+  trusted for that. Any other fix-rounds comment (a stranger's look-alike,
+  one someone else edited, one with no ledger entry) stays one opaque
+  `loom:fix` comment: it counts as one round, and the lane's brief refuses it
+  as an edited `loom:fix` comment. The brain and the dashboard read the same
+  ledger where `LOOM_HOME` names the station's home.
+- A round is a new comment again when the pull request changes, when that
+  comment cannot be vouched for, when the rounds no longer fit, or when GitHub
+  refuses the edit.
+
 ### Lane comments edited in place
 
 A lane that repeats a fact edits one comment instead of posting a new one each
@@ -1159,7 +1194,7 @@ pull request's review thread is not a new issue comment and is not scanned.
 | `answer` | An operator's answer to an ask, posted from the dashboard's Needs you page (`bus/answer.py`, see Operator answers). |
 | `runaway` | A hold or release of a ticket that ran past its attempts. |
 | `proof-refused` | The station stops handing a ticket out to verify after refused proofs. |
-| `fix-brief` | A `loom:fix` brief that sends findings back to a lane (loom#866 and loom#821 own moving it). |
+| `fix-brief` | A `loom:fix` brief; the station's later rounds on the same pull request edit its first one (see Fix rounds edited in place, loom#1640). |
 | `merged` | A pull request merged, or a ticket moved to `loom:merged`. |
 | `shipped` | A ticket moved to `loom:shipped` (loom#866 and loom#821 own moving it). |
 | `verified` | A ticket moved to `loom:verified`. |
@@ -1915,10 +1950,13 @@ spends up to a third of its tick on these items: it writes a proof only from
 evidence it saw in the tick, and otherwise leaves a one-line note on the
 ticket naming what evidence is missing.
 
-Every 6 hours the tick adds a five-line report with the marker
-`<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
-flight, blocked, next. A goal quiet since its last report gets none (Quiet
-goals, below). The report ends with two lines: "Needs you:" (only what only
+Twice a day, for the operator's reading times (10:00 and 21:00 New York),
+the tick adds a short report with the marker `<!-- loom:report v1 -->`: its
+first line and at most five more (progress on the goal's measure, shipped,
+in flight, blocked, next), one line each; `journal` refuses a longer one. A
+goal quiet since its last report gets none (Quiet goals, below), and a
+per-repo backlog goal never gets one: its status is one line in the
+station's twice-daily Discord digest, and `journal` refuses a report there. The report ends with two lines: "Needs you:" (only what only
 the operator can do for this goal, or "nothing new for this goal"; it alone
 decides new comment or edit in place) and "Waiting on you:" (the count of
 open `loom:human` issues by repo and this goal's share, or "nothing"). `status`
@@ -1959,8 +1997,11 @@ homes as above.
 
 ### Report deadlines
 
-Each goal owes its own report every 6 hours, counted from its newest valid
-report or, with none, from when the goal was opened. A valid report is a
+Each goal owes its own report at the next reading time (10:00 or 21:00
+New York, brain.REPORT_TIMES, the station's digest times) after its newest
+valid report or, with none, after the goal was opened; a report written in
+the 2 hours 15 minutes before a reading time counts for it. A backlog goal
+owes none. A valid report is a
 comment on that goal's home that starts with the report marker, from a
 `LOOM_BRIEF_AUTHORS` login when that is set. A marker inside another
 comment, a journal, or a report on another goal (a parent goal included)
@@ -1969,8 +2010,8 @@ does not move the deadline: a parent's report never covers its child goals.
 `python3 -m bus.brain status` shows, per goal, when it last had a journal, a
 valid report, a measurement (a journal or report with a `Measure:` line that
 is not none) and a completed action (a `Shipped:` line that is not none),
-and its report state: ok, due (2 hours past), or overdue (one more tick,
-30 minutes, past that). Due and overdue goals are listed under "Reports
+and its report state: ok, due (from 2 hours 15 minutes before its reading
+time), or overdue (30 minutes past the reading time). Due and overdue goals are listed under "Reports
 owed before unlock"; the tick posts those reports before it unlocks. A due
 or overdue goal that is quiet (below) is not listed there.
 
