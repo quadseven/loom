@@ -1820,7 +1820,11 @@ contain. The station runs an adapter only for repos in
 `LOOM_LIVE_EVIDENCE_REPOS`; the child gets PATH, HOME, LANG, TMPDIR and only
 the variables named in `LOOM_LIVE_EVIDENCE_PASS_ENV`, a timeout of at most
 300 seconds that kills its process group, and at most 64 KiB and 200 lines
-of output. A SQL statement is checked when the step is read and again just
+of output. A
+non-LOOM variable it names, such as `KUBECONFIG`, reaches the station only
+when `LOOM_STATION_PASS_ENV` names it too: `lanes/mac/install.sh` writes
+the variables that setting names into the station plist when they are set
+at install time, so a reinstall keeps them. A SQL statement is checked when the step is read and again just
 before it runs. Loom bounds what it asks and keeps; the routes behind the
 adapter keep themselves read-only (a SELECT-only user, a reader that cannot
 exec). An adapter error, a timeout or too much output is no evidence, and the
