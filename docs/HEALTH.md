@@ -158,6 +158,33 @@ Per finding, on each read:
 ledger: each goal home's count, its top 5 findings by impact, or "not
 looked" with the reason.
 
+## Diagnosis
+
+The endpoint's one line says what is wrong, not why. A goal home can name a
+diagnosis command (`LOOM_HEALTH_DIAGNOSE_CMDS`) that prints the rows, log
+counts and deploy facts behind a finding, so a lane fixes the cause instead
+of the line (loom#1243: a finding came back after three merged fixes, each
+answering the line, while the run table and the logs named the cause).
+
+Each time the station briefs a health ticket, or re-briefs one with
+`--regresses`, it runs the goal's command once under `/bin/sh`, with the
+finding's key in `LOOM_HEALTH_KEY` (never on the command line), stdin closed
+and stderr dropped, for at most 30 seconds. Its output gets the finding's
+rules: any line that is not plain ASCII up to 600 characters or that looks
+like it names a URL, host or address, email or handle, path or credential
+refuses the whole output, which is then not quoted at all, not even in part.
+What remains loses its markdown and HTML control, blank lines are dropped,
+and at most 40 lines are kept (a cut says so). The brief quotes it after the
+finding, under the line "The diagnosis command NAME ran at TIME" and the words
+`untrusted data from the diagnosis command`. NAME is the base name of the
+command's first word when that is a plain file name; the rest of the command
+never reaches GitHub. In a regression re-brief the block is part of the
+evidence lines after `Regresses #N`, so a re-brief in place carries it too.
+
+Without a command for the goal home, or when the command cannot start, exits
+non-zero, times out, prints nothing or prints refused text, the brief is filed
+as before with one line saying which of those happened.
+
 ## Configure
 
 In the station's environment, never in this repo:
@@ -165,6 +192,9 @@ In the station's environment, never in this repo:
 - `LOOM_HEALTH_URLS`: space separated `owner/name#goal=https://...` entries,
   one per goal home. An entry that is not https is ignored with a log line.
 - `LOOM_HEALTH_EVERY`: seconds between reads, at least 60; default 900.
+- `LOOM_HEALTH_DIAGNOSE_CMDS`: optional JSON object from goal home
+  (`owner/name#goal`) to one read-only shell command (see Diagnosis below).
+  A value that is not such an object sets no command, with a log line.
 
 The endpoint's address stays in that private setting. Tickets, comments and
 logs name the goal home, never the URL.
