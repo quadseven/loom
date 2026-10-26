@@ -237,10 +237,11 @@ REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
 # A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
 # writes as that App, never as the operator (loom#1142): lanes opened 58 pull
 # requests as the operator in a day. It clones over https, and each run mints
-# an installation token for gh and git (lane_app_token); the agent gets gh
-# access through an isolated gh config directory, not token environment
-# variables or App settings. LOOM_APP_TOKEN_CMD, when set, prints the token in
-# place of `python3 -m bus app token`.
+# an installation token for gh and git (lane_app_token). The agent never gets
+# the token in its environment, nor the App's settings or git's helper: its gh
+# reads the token from a per-run gh config directory (agent_gh_config, loom#665).
+# LOOM_APP_TOKEN_CMD, when set, prints the token in place of
+# `python3 -m bus app token`.
 if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
   CLONE_BASE="${LOOM_CLONE_BASE:-https://github.com/}"
   # git asks gh for github.com credentials, and gh answers with GH_TOKEN.
@@ -987,12 +988,12 @@ signin_rest_until() {
   [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] && printf '%s' "$until"
 }
 
-# Mint this run's App token into the runner's GH_TOKEN. The agent gets its own
-# gh config directory through gh's stdin interface, never a token in its
-# environment. Installation tokens last an hour: mint again after work.
+# Mint this run's App token into GH_TOKEN. A personal token in the
+# environment is dropped first, so a failed mint leaves gh with nothing to
+# post as. Installation tokens last an hour: a run mints again after its agent.
 lane_app_token() {
   [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
-  local token configure_agent="${1:-agent}"
+  local token
   unset GH_TOKEN GITHUB_TOKEN
   if [ -n "${LOOM_APP_TOKEN_CMD:-}" ]; then
     token="$("$LOOM_APP_TOKEN_CMD" 2>> "$LOG")" || return 1
@@ -1002,17 +1003,42 @@ lane_app_token() {
   # Installation tokens are ghs_ and a JWT-like body: letters, digits, _ . -
   [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
   export GH_TOKEN="$token"
-  [ "$configure_agent" = agent ] || return 0
-  local auth_dir="$LOOM_HOME/run/gh-auth-$SLOT"
-  mkdir -p "$auth_dir" || return 1
-  chmod 700 "$auth_dir" || return 1
-  # gh's error text can echo the token it was handed: mask it before logging.
-  local err
-  if ! err="$(printf '%s' "$token" | GH_CONFIG_DIR="$auth_dir" gh auth login --with-token 2>&1 >/dev/null)"; then
-    printf '%s\n' "${err//"$token"/[redacted]}" >> "$LOG"
+}
+
+# The agent's own gh config directory (loom#665): a fresh one per run, holding
+# this run's App token in the hosts.yml gh reads, so the agent's gh calls bill
+# the App and not the operator. The token never enters the agent's
+# environment and never passes through a gh command whose error text could
+# echo it into the log; printf is a builtin, so it is in no process's argv.
+# Sets AGENT_GH_CONFIG, empty on a lane without App settings.
+agent_gh_config() {
+  AGENT_GH_CONFIG=""
+  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
+  [[ "${GH_TOKEN:-}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  # One runner per lane holds its lock, so this lane's stores are its own:
+  # drop one a killed run left behind before making the next.
+  rm -rf "$LOOM_HOME/run/$SLOT-gh."* || return 1
+  local dir
+  dir="$(mktemp -d "$LOOM_HOME/run/$SLOT-gh.XXXXXX")" || return 1
+  if ! (umask 077 && printf 'github.com:\n    oauth_token: %s\n    git_protocol: https\n' "$GH_TOKEN" > "$dir/hosts.yml"); then
+    rm -rf "$dir"
     return 1
   fi
-  export LANE_GH_CONFIG_DIR="$auth_dir"
+  AGENT_GH_CONFIG="$dir"
+}
+AGENT_GH_WHY="could not write the agent's gh credential store; the agent did not run"
+
+# How many gh commands the agent's output shows (loom#665), counted in the
+# bytes this run added to the log; "unknown" when that slice cannot be read.
+agent_gh_calls() {
+  local out n
+  if ! out="$(tail -c +"$((${LOG_START:-0} + 1))" "$LOG")"; then
+    printf unknown
+    return 0
+  fi
+  n="$(printf '%s\n' "$out" | grep -cE '(^|[[:space:]])gh [a-z]')"
+  # grep -c exits 1 on no match (and prints 0); only 2 is an error.
+  case $? in 0|1) printf '%s' "$n" ;; *) printf unknown ;; esac
 }
 APP_TOKEN_WHY="could not mint the lane's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
 
@@ -3140,6 +3166,7 @@ for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
   drop_build_output
   drop_run_scratch
+  AGENT_GH_CALLS=""
   PR_BODY=""
   PLAN_GAPS=""
   DROPPED_SCRATCH_FILES=""
@@ -3375,27 +3402,22 @@ for BRIEF in "$INBOX"/*.md; do
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
+  if ! agent_gh_config; then park "$BRIEF" "$AGENT_GH_WHY" transient; continue; fi
   ( set -m
     (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
-      { [ -z "${LANE_GH_CONFIG_DIR:-}" ] || export GH_CONFIG_DIR="$LANE_GH_CONFIG_DIR"; } &&
+      { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
       run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
     wait $! ) &
   wait $!
   STATUS=$?
-  if [ -r "$LOG" ] && [ -s "$LOG" ]; then
-    AGENT_GH_CALLS="$(tail -c +$((LOG_START + 1)) "$LOG" 2>/dev/null | grep -cE '(^|[[:space:]])gh [^[:space:]]+' || true)"
-  else
-    AGENT_GH_CALLS=unknown
+  AGENT_GH_CALLS="$(agent_gh_calls)"
+  # The token in the store outlives the agent by up to an hour: remove it now.
+  if [ -n "$AGENT_GH_CONFIG" ] && ! rm -rf "$AGENT_GH_CONFIG"; then
+    park "$BRIEF" "could not remove the agent's gh credential store" transient; continue
   fi
-  if [ -n "${LANE_GH_CONFIG_DIR:-}" ] && ! rm -rf "$LANE_GH_CONFIG_DIR"; then
-    park "$BRIEF" "could not remove the lane's temporary GitHub credential store" transient
-    unset LANE_GH_CONFIG_DIR
-    continue
-  fi
-  unset LANE_GH_CONFIG_DIR
   is_api_lane && archive_transcripts
-  if ! lane_app_token runner; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
+  if ! lane_app_token; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
