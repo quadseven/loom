@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# A stand-in for the AWS CLI that answers one call from LOOM_SSM_DIR:
+#   aws ssm get-parameter [--region R] --name /a/b --with-decryption \
+#     --query Parameter.Value --output text
+# prints the copied value at $LOOM_SSM_DIR/a/b. leak_scan in
+# lanes/run_lane.sh puts this folder first on PATH for the leak scanner only,
+# so a lane pod or cluster runner, which holds copied values and no AWS
+# session, still scans with the shared deny-list. Anything else exits 2.
+set -uo pipefail
+[ "${1:-}" = ssm ] && [ "${2:-}" = get-parameter ] || { echo "only ssm get-parameter is served from LOOM_SSM_DIR" >&2; exit 2; }
+shift 2
+name=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --name) name="${2:-}"; shift 2 ;;
+    --region | --query | --output) shift 2 ;;
+    --with-decryption) shift ;;
+    *) echo "unsupported argument" >&2; exit 2 ;;
+  esac
+done
+[ -n "${LOOM_SSM_DIR:-}" ] || { echo "LOOM_SSM_DIR is not set" >&2; exit 2; }
+case "$name" in /*) ;; *) echo "not an SSM parameter name" >&2; exit 2 ;; esac
+case "/$name/" in */../* | */./*) echo "not an SSM parameter name" >&2; exit 2 ;; esac
+[ -s "$LOOM_SSM_DIR$name" ] || { echo "parameter not copied into LOOM_SSM_DIR" >&2; exit 2; }
+cat "$LOOM_SSM_DIR$name"

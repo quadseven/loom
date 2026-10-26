@@ -20,7 +20,7 @@ KEY = ("-----BEGIN PRIVATE KEY-----\n"
        "-----END PRIVATE KEY-----\n")
 KEY_MARK = "FAKEKEYMATERIAL"
 FULL = {"contents": "write", "issues": "write", "pull_requests": "write",
-        "checks": "read", "actions": "read", "metadata": "read"}
+        "checks": "read", "actions": "write", "metadata": "read"}
 
 
 def run(argv, **kw):

@@ -44,8 +44,10 @@ generated pull request body, with the shared deny-list of names and products
 `../infra-public/.github/scripts/check_private_leaks.py` relative to the Loom
 checkout. A missing scanner, a deny-list the scanner cannot read (it exits 2)
 or a hit blocks the push; a scan that could not run parks the brief
-`[transient]`. A lane pod (`LOOM_SSM_DIR`) holds no AWS key and the scanner
-reads the deny-list only from SSM, so a pod pushes nothing to a public repo.
+`[transient]`. A lane pod or cluster runner (`LOOM_SSM_DIR`) holds no AWS
+key: the scanner reads the deny-list's copy under `LOOM_SSM_DIR` through
+`lanes/k8s/ssm-dir-bin/aws`, a stand-in for the AWS CLI put first on the
+scanner's PATH only. Without that copy it pushes nothing to a public repo.
 Private repositories skip this scan. Test IP addresses in public changes must
 use the documentation ranges `192.0.2.0/24`, `198.51.100.0/24`, or
 `203.0.113.0/24`; add `leak-guard-allow` on a line only when a deliberate
@@ -1615,8 +1617,121 @@ no service account token, and its code is read-only and owned by root. The image
 python3, uv, rsync, openssl, netcat, procps, bubblewrap and the opencode
 CLI, plus this repo and the leak scanner at a pinned commit.
 
-How the station hands a pod lane its briefs and reads its reports is the
-second slice of quadseven/loom#1824; until then a pod lane takes no work.
+A long-lived lane pod takes no work from the station. Lane runs on the
+cluster go through ephemeral runners instead (next section).
+
+## Lanes on cluster runners
+
+A slot named in `LOOM_RUNNER_SLOTS` (space- or comma-separated, empty by
+default) has no runner on the station's machine. Each brief the station
+claims for it is dispatched to the `lane` workflow
+(`.github/workflows/lane.yml`), which runs `lanes/run_lane.sh` once for that
+brief on an ephemeral self-hosted runner, with `LOOM_SANDBOX=bwrap` and
+`LOOM_DROP_TREES=1`. The runner pod and its disk go when the job ends, so no
+tree, cache or session database stays anywhere. API lanes only: opencode-go,
+zen, openrouter, zai, workersai, the free provider slots and spark (both
+through the gateway). codex, claude, agy and anthropic stay local.
+
+The job, step by step (`lanes/k8s/lane_job.py`):
+
+1. Reads the dispatch inputs (slot, ticket key, brief, run id, the slot's
+   `NAME=value` settings and the station's report public key) from the event
+   file, never from the environment, which GitHub prints in the public log.
+2. Proves the runner's egress is narrowed, before any key is read:
+   `sandbox_ready` from `lanes/agent_sandbox.sh` ("Lane pods" above). A runner
+   that fails it runs no agent; its heartbeat reason goes into the report.
+3. Assumes the lane role by OIDC and copies each value the slot's `*_KEY_SSM`
+   settings name, the leak scan deny-list and the lanes App key into files
+   under HOME (the `LOOM_SSM_DIR` layout, mode 600). The AWS session lives in
+   that step only, and nothing printed names a parameter or a value.
+4. Runs `lanes/run_lane.sh <slot>` once, with no Actions token and no AWS
+   session in its environment. Its output goes into the report, not the log.
+5. Seals a report of exactly what the station reads for the run: the
+   brief's `done/` or `failed/` move, the run log with its failure class
+   line, the `.answered` and `.verify` files, the transcripts, answers and
+   the slot's heartbeat. It is a tar.gz encrypted with a random key, and the
+   key is RSA-OAEP encrypted to the station's own key
+   (`state/runners/report-key.pem`, made on first use): a public repository's
+   artifacts can be downloaded by anyone signed in.
+
+Each pass (`bus/runners.py`, after `finish_claims`) the station:
+
+- Dispatches the next brief in each runner slot's inbox with its App token,
+  one run per slot at a time. The run is recorded in
+  `state/runners/runs.json` before the request goes, so a brief is never
+  dispatched twice; a ledger it cannot read stops every dispatch.
+- Reads each run's state, one request per run per pass on the existing
+  cadence (conditional requests, so an unchanged run costs a 304). A run is
+  found by its run id in its name (`lane <slot> <run id>`).
+- When a run ends, downloads and opens its report and writes its files into
+  the loom home where a local runner writes them, then moves the inbox brief
+  to `done/` or `failed/` as the runner did. The factory and the rest of the
+  station read the outcome as for any lane.
+- Parks the brief `[transient]`, so the ticket goes to another lane, when a
+  run ends with no report, a report cannot be read, a report finishes no
+  brief (for example a failed egress proof), a dispatch never appears as a
+  run within 15 minutes, or no runner takes a run within 30 minutes (the run
+  is cancelled and the slot held for 30 minutes).
+- Refuses to dispatch, and parks `[transient]` so a local lane takes the
+  ticket, a brief whose inputs pass GitHub's 65,535-character limit and a
+  brief for a repo that is not public. Runner slots take public repos only:
+  a run's inputs and logs live in this public repository's Actions.
+- Writes the slot's heartbeat each pass, as a runner would: available, or
+  held until the reset a run's heartbeat named (else for 30 minutes), and a
+  keepalive stamp while a run is in flight.
+
+What the cluster side must provide:
+
+- A runner set with the label `arc-loom-lanes`, ephemeral (one job per pod),
+  scaled to zero when idle. Its image carries bash, coreutils, git, gh,
+  python3, uv, rsync, openssl, procps, bubblewrap with user namespaces and
+  the opencode CLI; nothing is installed at run time, and no AWS CLI is
+  needed (the job signs its SSM reads itself). HOME holds the job's files,
+  so nothing under it is shown to an agent.
+- A network policy for the runner pods that the cluster enforces: DNS, the
+  providers and GitHub on 443, the package indexes, AWS STS and SSM, and
+  the gateway's in-cluster service; no cloud metadata address, API server or
+  LAN. Until it is enforced the egress proof fails and no agent runs.
+- An AWS role this repository's `lane` workflow assumes by OIDC, its trust
+  anchored on the repository's numeric ids, the main branch and the
+  workflow file `.github/workflows/lane.yml` on main, allowed to read only
+  the lanes' key parameters, the lanes App key and the leak scan deny-list.
+  The station always dispatches on main, and the job sets no `environment:`
+  (one would change the token's subject).
+- Repository variables `LOOM_LANE_DISPATCHERS`, `LOOM_LANE_ROLE_ARN`, `LOOM_LANE_AWS_REGION`,
+  `LOOM_LANE_EGRESS_ALLOW_PROBE` (`host:port`, the gateway service) and
+  `LOOM_RUNNER_GATEWAY_URL` (the gateway's in-cluster origin; a spark or free
+  slot's endpoint URLs are moved onto it, path kept), and the repository
+  secret `LOOM_LANE_EGRESS_DENY_PROBES` (literal `IPv4:port` addresses the
+  runner must not reach), a secret so its private addresses are masked in
+  the public log.
+- The station App with `actions: write` on this repository, to dispatch and
+  cancel runs (`actions: read` reads them and their artifacts).
+
+What keeps the runners safe. This repository is public, and a repository's
+self-hosted runners cannot be held to one workflow, so a pull request that
+adds a workflow naming `arc-loom-lanes` could start a job there. The `lane`
+job itself runs only when dispatched on main, and its first step refuses a
+dispatcher outside `LOOM_LANE_DISPATCHERS` (a repository variable: the
+station App's login and any trusted operator login), but a rogue workflow
+skips both. The real controls are:
+
+- The OIDC role trusts only `.github/workflows/lane.yml` on main, so any
+  other workflow, or this one from a branch, gets no AWS session and no key.
+- Default-deny egress on the runner pods, enforced by the cluster network.
+- Ephemeral pods: one job each, deleted with their disk when it ends.
+- The repository setting that requires approval before workflows run for
+  any outside collaborator's pull request (managed in the private
+  infrastructure code).
+
+To switch a slot over: set `LOOM_RUNNER_SLOTS` (for example
+`opencode-go-2`) and re-run `lanes/mac/install.sh`. The installer removes
+that slot's launchd runner and gives the station the slot's settings
+(`python3 -m bus.runners station-env`: its `*_KEY_SSM`, `*_URL` and probe
+settings and the lanes App's `LOOM_LANES_GITHUB_APP_*`; never a key). Let the
+slot's inbox empty first: a brief left there is dispatched like a new one.
+To switch back, drop the slot from `LOOM_RUNNER_SLOTS` and re-run the
+installer.
 
 ## Adding a lane
 

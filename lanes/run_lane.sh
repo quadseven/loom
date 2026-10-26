@@ -85,18 +85,24 @@ LEAK_DENY_SSM="${LOOM_LEAK_DENY_SSM:-/infra/leak-scan/deny-list}"
 # The public repo leak scan, the one way the runner calls the scanner, so no
 # scan runs without the deny-list. Arguments are the scanner's (--diff RANGE
 # or --text-file FILE, --allow-repo-ref ...). Exit 0 clean, 1 a hit, 2 no
-# scan: the scanner is missing, the deny-list cannot be read (the scanner
-# exits 2), or this is a lane pod. A pod (LOOM_SSM_DIR) holds no AWS key and
-# the scanner reads the deny-list only from SSM, so a pod scans nothing and
-# pushes nothing to a public repo rather than scan without the list.
+# scan: the scanner is missing, or the deny-list cannot be read (the scanner
+# exits 2). A lane pod or cluster runner (LOOM_SSM_DIR) holds no AWS key: the
+# scanner reads the deny-list's copy under LOOM_SSM_DIR through the stand-in
+# lanes/k8s/ssm-dir-bin/aws, first on its PATH. With no copy there it scans
+# nothing and pushes nothing to a public repo rather than scan without the list.
 leak_scan() {
   if [ ! -f "$LEAK_SCANNER" ]; then
     echo "leak scanner not found: $LEAK_SCANNER" >&2
     return 2
   fi
   if [ -n "${LOOM_SSM_DIR:-}" ]; then
-    echo "a lane pod cannot read the leak scan deny-list $LEAK_DENY_SSM (the scanner reads it only from SSM); nothing scanned" >&2
-    return 2
+    if [ ! -s "$LOOM_SSM_DIR$LEAK_DENY_SSM" ]; then
+      echo "no copy of the leak scan deny-list $LEAK_DENY_SSM under LOOM_SSM_DIR; nothing scanned" >&2
+      return 2
+    fi
+    PATH="$LOOM_ROOT/lanes/k8s/ssm-dir-bin:$PATH" timeout "$NET_TIMEOUT" \
+      python3 -B "$LEAK_SCANNER" "$@" --deny-list-ssm "$LEAK_DENY_SSM"
+    return
   fi
   env ${LOOM_AWS_REGION:+AWS_REGION="$LOOM_AWS_REGION"} timeout "$NET_TIMEOUT" \
     python3 -B "$LEAK_SCANNER" "$@" --deny-list-ssm "$LEAK_DENY_SSM"

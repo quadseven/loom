@@ -26,14 +26,15 @@ from .github import (APP_KEY_FILE, DEFAULT_API, AppToken, GitHub, GitHubError,
                      urllib_transport)
 
 # What the station, the brain and the lanes do with an installation token:
-# read and write issues, labels, comments, branches and pull requests, and
-# read check runs and workflow runs. metadata read comes with every App.
+# read and write issues, labels, comments, branches and pull requests, read
+# check runs, and read, dispatch and cancel workflow runs (the lane runs on
+# cluster runners, bus/runners.py). metadata read comes with every App.
 PERMISSIONS = {
     "contents": "write",
     "issues": "write",
     "pull_requests": "write",
     "checks": "read",
-    "actions": "read",
+    "actions": "write",
     "metadata": "read",
 }
 _LEVEL = {"read": 1, "write": 2, "admin": 3}
