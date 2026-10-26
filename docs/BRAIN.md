@@ -1793,6 +1793,10 @@ adapter keep themselves read-only (a SELECT-only user, a reader that cannot
 exec). An adapter error, a timeout or too much output is no evidence, and the
 status line names it.
 
+On the station machine, `lanes/mac/install.sh` passes `KUBECONFIG` to the
+station only when `LOOM_STATION_PASS_ENV=KUBECONFIG` is set during install;
+the adapter can then pass it through with `LOOM_LIVE_EVIDENCE_PASS_ENV`.
+
 ## Post-merge watch
 
 After a Loom auto-merge (a `loom/` lane pull request merged by a Loom App,

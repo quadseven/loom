@@ -231,6 +231,19 @@ model_env() {
   done
 }
 
+# Only named, explicitly supported non-LOOM variables may cross into the
+# station. Keep this list narrow so an installer's full environment is never
+# copied into a launchd job by accident.
+station_pass_env() {
+  local names=" ${LOOM_STATION_PASS_ENV//,/ } "
+  case "$names" in
+    *" KUBECONFIG "*)
+      [ -n "${KUBECONFIG:-}" ] &&
+        printf '    <key>KUBECONFIG</key><string>%s</string>\n' "$(xml "$KUBECONFIG")"
+      ;;
+  esac
+}
+
 for L in "${LANES[@]}"; do
   LABEL="com.loom.$L"
   if runner_busy "$LOOM_HOME/run/$L.lock"; then
@@ -412,6 +425,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_GITHUB_APP_INSTALLATION_ID</key><string>$(xml "${LOOM_GITHUB_APP_INSTALLATION_ID:-}")</string>
     <key>LOOM_GITHUB_APP_KEY_SSM</key><string>$(xml "${LOOM_GITHUB_APP_KEY_SSM:-}")</string>
     <key>LOOM_GITHUB_APP_KEY_FILE</key><string>$(xml "${LOOM_GITHUB_APP_KEY_FILE:-}")</string>
+$(station_pass_env)
 $(model_env)
   </dict>
 </dict>

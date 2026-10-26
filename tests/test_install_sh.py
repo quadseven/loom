@@ -122,6 +122,23 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_REWRITE_OPENCODE</key><string>%s/.opencode/bin/opencode</string>"
                       % self.home, plist)
 
+    def test_station_passes_kubeconfig_only_when_named_in_the_allow_list(self):
+        result = self.run_install(KUBECONFIG="/tmp/kubeconfig",
+                                  LOOM_STATION_PASS_ENV="KUBECONFIG")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>KUBECONFIG</key><string>/tmp/kubeconfig</string>", plist)
+
+    def test_unlisted_kubeconfig_does_not_change_the_station_plist(self):
+        result = self.run_install(KUBECONFIG="/tmp/kubeconfig")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with_kubeconfig = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_bytes()
+        shutil.rmtree(self.home)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        without_kubeconfig = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_bytes()
+        self.assertEqual(with_kubeconfig, without_kubeconfig)
+
     def test_private_rewrite_defaults_to_the_codex_subscription(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
