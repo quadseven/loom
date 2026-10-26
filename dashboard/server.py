@@ -1158,7 +1158,7 @@ def _dispatch_get(handler, state):
         return _dispatch_usage(handler, state)
     if path == "/tiers":
         return _dispatch_tiers(handler, state)
-    if path in ("/brain", "/hot-spots"):
+    if path in ("/brain", "/brains", "/hot-spots"):
         return _dispatch_brain_hot_spots(handler, state, path)
     if path in ("/", "/goals", "/tickets", "/tree"):
         return _dispatch_view(handler, state, path, parsed)
@@ -1377,7 +1377,15 @@ def _dispatch_brain_hot_spots(handler, state, path):
     from datetime import datetime, timezone
     payload = state.response()
     waits_error = getattr(state, "waits_error", "")
-    if path == "/brain":
+    if path == "/brains":
+        tickets = [row for rows in payload.get("tickets", {}).values() if rows for row in rows]
+        data = brain_view.build_brains(payload.get("brain_step"),
+                                       payload.get("improving", {}).get("journals", []),
+                                       _merge_lane_rows(payload.get("lanes", [])), tickets,
+                                       payload.get("pull_requests", []), payload.get("issue_comments", []),
+                                       datetime.now(timezone.utc))
+        body, title, active = brain_view.render_brains(data), "Brains", "brains"
+    elif path == "/brain":
         data = brain_view.build_brain(payload.get("brain_step"), payload.get("brain_step_error"),
                                       payload.get("improving", {}).get("journals", []),
                                       payload.get("wait_rows"), waits_error)
