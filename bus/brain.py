@@ -580,6 +580,52 @@ def _unbuilt_criteria_reason(body: str) -> str:
     return ""
 
 
+_BACKTICKED = re.compile(r"`([^`\n]+)`")
+_OWNER_NAME = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w.-]*)/([A-Za-z0-9][\w.-]*)(?![\w/-])")
+_REPO_WORD = re.compile(r"[A-Za-z0-9][\w.-]*")
+
+
+def _foreign_repo(text: str, repo: str, known: Sequence[str]) -> str:
+    """The first other repo of `repo`'s owner that a criterion names, as
+    OWNER/NAME, else "". It counts OWNER/NAME with the same owner, and a
+    backticked bare name that is a known repo of that owner (LOOM_REPOS):
+    a backticked file or function name is not a repo name."""
+    owner, _, name = repo.lower().partition("/")
+    siblings = {n for o, _, n in (r.lower().partition("/") for r in known)
+                if o == owner and n and n != name}
+    for match in _OWNER_NAME.finditer(text):
+        if match.group(1).lower() == owner and match.group(2).lower().rstrip(".") != name:
+            return "%s/%s" % (match.group(1), match.group(2).rstrip("."))
+    for match in _BACKTICKED.finditer(text):
+        word = match.group(1).strip()
+        if _REPO_WORD.fullmatch(word) and word.lower() in siblings:
+            return "%s/%s" % (repo.partition("/")[0], word)
+    return ""
+
+
+def _foreign_criteria_reason(body: str, repo: str,
+                             env: Optional[Dict[str, str]] = None) -> str:
+    """Block when a ticked criterion names another repo of the owner: that
+    repo builds it, so this pull request cannot have (loom#1711). A criterion
+    already marked "; not built: belongs in <that repo>" passes."""
+    env = os.environ if env is None else env
+    known = str(env.get("LOOM_REPOS") or "").replace(",", " ").split()
+    for checked, text in proof.criteria(body):
+        if not checked:
+            continue
+        other = _foreign_repo(text, repo, known)
+        if not other:
+            continue
+        short = other.partition("/")[2]
+        moved = re.search(r";\s*not built:\s*belongs in\s+`?([\w./-]+?)`?\s*\.?\s*$", text, re.I)
+        if moved and moved.group(1).lower() in {other.lower(), short.lower()}:
+            continue
+        return ("blocked: ticked criterion names another repo, %s: %r; send a brain fix "
+                "to untick it and end it \"; not built: belongs in %s\""
+                % (other, _one_line(text), short))
+    return ""
+
+
 def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> str:
     return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
 
@@ -596,6 +642,9 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
                     + "blocked: review check has not passed on the head commit")
     if line.endswith(" - READY") and _unbuilt_criteria_reason(str(pr.get("body") or "")):
         return line.removesuffix("READY") + "blocked: no criterion built"
+    foreign = _foreign_criteria_reason(str(pr.get("body") or ""), repo)
+    if line.endswith(" - READY") and foreign:
+        return line.removesuffix("READY") + foreign
     return line
 
 
@@ -3241,6 +3290,9 @@ def merge(gh: GitHub, repo: str, number: int,
             reason = _unbuilt_criteria_reason(str(pr.get("body") or ""))
             if reason:
                 raise ValueError(reason)
+        reason = _foreign_criteria_reason(str(pr.get("body") or ""), repo, env)
+        if reason:
+            raise ValueError(reason)
         tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env, verdict)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
