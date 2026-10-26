@@ -379,7 +379,10 @@ if __name__ == "__main__":
     unittest.main()
 
 
-SWEEP_TICKET = {"number": 42, "title": "Fix the thing", "body": (
+TRUSTED = {"login": "alice-example"}
+STRANGER = {"login": "mallory-example"}
+SWEEP_TICKET = {"number": 42, "title": "Fix the thing", "state": "open", "user": TRUSTED,
+                "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}], "body": (
     "## Why\nThe thing is broken for every user.\n\n## What\nMake the thing work.\n\n"
     "## Acceptance\n- [ ] The thing works\n- [ ] A test covers it\n- [ ] Nothing else changes\n\n"
     "## Size\n**Size:** S\n\n## Out of scope\n- Other things\n")}
@@ -405,12 +408,20 @@ class PlanSweepTest(unittest.TestCase):
     def setUp(self):
         self.edits = []
         self.said = []
+        def pull(number, **extra):
+            pr = {"number": number, "title": "Fix the thing", "body": SWEEP_BODY,
+                  "draft": False, "user": TRUSTED,
+                  "head": {"sha": "a%d" % number, "ref": "loom/42-fix-the-thing",
+                           "repo": {"full_name": "example-owner/example-repo"}}}
+            pr.update(extra)
+            return pr
+        self.pull = pull
         self.pulls = [
-            {"number": 7, "title": "Fix the thing", "body": SWEEP_BODY, "head": {"sha": "a7"}},
+            pull(7),
             # Another check fails too: a lane round is right, not a sweep.
-            {"number": 8, "title": "Other", "body": SWEEP_BODY, "head": {"sha": "a8"}},
+            pull(8),
             # Not a lane pull request: no runner footer.
-            {"number": 9, "title": "By hand", "body": "## Why\nx", "head": {"sha": "a9"}},
+            pull(9, body="## Why\nx"),
         ]
         self.runs = {"a7": [_run(pr_repair.PLAN_CHECK, "failure"), _run("unittest", "success")],
                      "a8": [_run(pr_repair.PLAN_CHECK, "failure"), _run("unittest", "failure")],
@@ -421,14 +432,16 @@ class PlanSweepTest(unittest.TestCase):
         if path.startswith("repos/example-owner/example-repo/pulls?"):
             return self.pulls
         if "/commits/" in path:
-            return {"check_runs": self.runs[path.split("/commits/")[1].split("/")[0]]}
+            return {"check_runs": self.runs.get(path.split("/commits/")[1].split("/")[0],
+                                                self.runs["a7"])}
         if path == "repos/example-owner/example-repo/issues/42":
             return self.ticket
         raise AssertionError(path)
 
     def sweep(self, apply):
         return pr_repair.sweep(["example-owner/example-repo"], apply, api=self.api,
-                               edit=lambda *a: self.edits.append(a), say=self.said.append)
+                               edit=lambda *a: self.edits.append(a), say=self.said.append,
+                               authors=["Alice-Example"])
 
     def test_a_dry_run_lists_what_it_would_repair_and_writes_nothing(self):
         rows = self.sweep(apply=False)
@@ -445,6 +458,36 @@ class PlanSweepTest(unittest.TestCase):
         self.assertIn("- [ ] A test covers it", body)
         self.assertIn("\nSize: S\n", body)
         self.assertIn("Refs " + SWEEP_REF, body)
+
+    def test_only_a_pull_request_the_factory_would_judge_is_repaired(self):
+        # A forged footer and Refs line in a stranger's pull request, a
+        # draft, a branch outside loom/ or in a fork, or a ticket that is not
+        # a trusted loom:ticket at loom:pr is never edited (security review).
+        cases = {
+            "stranger": dict(user=STRANGER),
+            "draft": dict(draft=True),
+            "branch": dict(head={"sha": "a7", "ref": "feature/x",
+                                 "repo": {"full_name": "example-owner/example-repo"}}),
+            "fork": dict(head={"sha": "a7", "ref": "loom/42-fix-the-thing",
+                               "repo": {"full_name": "mallory-example/example-repo"}}),
+        }
+        for name, extra in cases.items():
+            with self.subTest(name=name):
+                self.edits, self.said = [], []
+                self.pulls = [self.pull(7, **extra)]
+                self.assertEqual(self.sweep(apply=True), [])
+                self.assertEqual(self.edits, [])
+                self.assertIn("skipped", self.said[0])
+        for name, ticket in {"stranger ticket": dict(user=STRANGER),
+                             "not at pr": dict(labels=[{"name": "loom:ticket"},
+                                                       {"name": "loom:merged"}]),
+                             "not a ticket": dict(labels=[{"name": "loom:pr"}])}.items():
+            with self.subTest(name=name):
+                self.edits, self.said = [], []
+                self.pulls = [self.pull(7)]
+                self.ticket = dict(SWEEP_TICKET, **ticket)
+                self.assertEqual(self.sweep(apply=True), [])
+                self.assertEqual(self.edits, [])
 
     def test_a_ticket_that_lacks_the_parts_is_reported_not_edited(self):
         self.ticket["body"] = self.ticket["body"].replace("## Acceptance\n", "## Notes\n")

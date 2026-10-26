@@ -508,14 +508,27 @@ def plan_repair(brief: str, title: str, body: str, lane: str, model: str, ticket
     return out
 
 
-def hold_note(number: int, check: str, gaps: Sequence[str]) -> str:
-    """The ticket's one plan-hold note (PLAN_NOTE_MARKER)."""
-    return ("%s\nHeld for the brain: the body of pull request #%d fails the review bot's "
+# In the plan-hold note: the hold added needs-brain itself, so lifting the
+# hold may take it off. Without it the label was already there for another
+# reason and stays (security review).
+PLAN_SET_LABEL = "<!-- loom:plan-hold set-needs-brain pr=%d -->"
+
+
+def hold_note(number: int, check: str, gaps: Sequence[str], set_label: bool = False) -> str:
+    """The ticket's one plan-hold note (PLAN_NOTE_MARKER); set_label records
+    that this hold added needs-brain (PLAN_SET_LABEL)."""
+    return ("%s\n%sHeld for the brain: the body of pull request #%d fails the review bot's "
             "plan check (%s), and this ticket lacks what the runner writes those parts "
             "from:\n\n%s\n\nA lane cannot edit the ticket, so no fix round is sent for it. "
             "Add the missing parts to this ticket; the factory then rebuilds the pull "
             "request body from it on its next pass and lifts the hold."
-            % (PLAN_NOTE_MARKER, number, check, "\n".join("- " + g for g in gaps)))
+            % (PLAN_NOTE_MARKER, (PLAN_SET_LABEL % number + "\n") if set_label else "",
+               number, check, "\n".join("- " + g for g in gaps)))
+
+
+def hold_set_label(note: str) -> bool:
+    """Whether a plan-hold note says its hold added needs-brain."""
+    return bool(re.search(r"^<!-- loom:plan-hold set-needs-brain pr=\d+ -->$", note, re.M))
 
 
 def lifted_note(number: int) -> str:
@@ -618,14 +631,54 @@ def _only_plan_failing(runs: Sequence[Dict[str, object]], check: str) -> bool:
     return len(failed) == 1 and failed[0].get("name") == check
 
 
+def _sweep_ticket(repo: str, pr: Dict[str, object], authors: set,
+                  api) -> Tuple[Optional[Dict[str, object]], str]:
+    """(ticket issue, "") for a pull request the factory would judge, else
+    (None, why it is skipped). The factory's trust gate: not a draft, a
+    loom/ branch in this repo, opened by a trusted login, and linked
+    (brain._ticket_association) to an open loom:ticket at loom:pr that a
+    trusted login filed. A footer or Refs line alone is text anyone can
+    write in a pull request body."""
+    from . import brain, tickets  # brain imports this module
+    head = pr.get("head") or {}
+    if pr.get("draft"):
+        return None, "a draft"
+    if not str(head.get("ref") or "").startswith("loom/"):  # type: ignore[union-attr]
+        return None, "not on a loom/ branch"
+    if str(((head.get("repo") or {}).get("full_name")) or "").lower() != repo.lower():  # type: ignore[union-attr]
+        return None, "its branch is in another repo"
+    if tickets._login(pr.get("user")).lower() not in authors:
+        return None, "not opened by a trusted login"
+    try:
+        association = brain._ticket_association(repo, pr)
+    except ValueError as err:
+        return None, "no ticket: %s" % err
+    if association is None:
+        return None, "no ticket reference"
+    issue = api("repos/%s/issues/%d" % association) or {}
+    if not isinstance(issue, dict):
+        return None, "ticket #%d could not be read" % association[1]
+    refused = brain._ticket_refusal(issue, "pr")
+    if refused:
+        return None, "ticket #%d: %s" % (association[1], refused)
+    if tickets._login(issue.get("user")).lower() not in authors:
+        return None, "ticket #%d was not filed by a trusted login" % association[1]
+    return issue, ""
+
+
 def sweep(repos: Sequence[str], apply: bool, check: str = PLAN_CHECK,
-          api=_gh_api, edit=None, say=print) -> List[Dict[str, object]]:
+          api=_gh_api, edit=None, say=print,
+          authors: Optional[Sequence[str]] = None) -> List[Dict[str, object]]:
     """Find open lane pull requests whose only failing check is the plan
-    check, and rebuild their bodies from their tickets (plan_repair). With
-    apply False nothing is written: each finding is only reported. Returns
-    one row per pull request found: repo, number, before, after, changed."""
+    check, and rebuild their bodies from their tickets (plan_repair). Only a
+    pull request the factory itself would judge is read (_sweep_ticket).
+    With apply False nothing is written: each finding is only reported.
+    Returns one row per pull request found: repo, number, before, after,
+    changed."""
     from . import brain, tickets  # brain imports this module
     edit = edit or _gh_pr_edit
+    trusted = {a.lower() for a in (authors if authors is not None
+                                   else brain.require_trusted_authors(None, "sweep"))}
     rows: List[Dict[str, object]] = []
     for repo in repos:
         pulls = api("repos/%s/pulls?state=open&per_page=100" % repo) or []
@@ -635,39 +688,32 @@ def sweep(repos: Sequence[str], apply: bool, check: str = PLAN_CHECK,
             sha = str((pr.get("head") or {}).get("sha") or "")
             if fields is None or not sha:
                 continue
+            number = int(pr["number"])
             listed = api("repos/%s/commits/%s/check-runs?filter=all&per_page=100" % (repo, sha))
             runs = brain.newest_check_runs((listed or {}).get("check_runs") or [])
             if not _only_plan_failing(runs, check):
                 continue
-            number = int(pr["number"])
-            ref = _REFS_LINE.findall(body)
-            issue_ref = ref[-1].split(" ", 1)[1].strip() if ref else ""
-            where, _, ticket_number = issue_ref.partition("#")
-            row: Dict[str, object] = {"repo": repo, "number": number,
-                                      "before": hunt_plan.problems(body), "after": [],
-                                      "changed": False}
-            if where.lower() != repo.lower() or not ticket_number.isdigit():
-                row["after"] = ["no Refs line to this repo's ticket"]
-                rows.append(row)
-                say("%s#%d: skipped, no Refs line to a ticket in %s" % (repo, number, repo))
+            issue, why = _sweep_ticket(repo, pr, trusted, api)
+            if issue is None:
+                say("%s#%d: skipped, %s" % (repo, number, why))
                 continue
-            issue = api("repos/%s/issues/%s" % (repo, ticket_number)) or {}
+            ticket_number = int(issue["number"])
             ticket, lane, model = fields
             found = plan_repair(tickets.render_brief(repo, issue, lane), str(pr.get("title") or ""),
                                 body, lane, model, ticket, repo=repo)
-            row.update(after=found["after"], changed=found["changed"])
-            rows.append(row)
+            rows.append({"repo": repo, "number": number, "before": found["before"],
+                         "after": found["after"], "changed": found["changed"]})
             if not found["before"]:
                 say("%s#%d: the body passes the plan checks; %s fails on something else"
                     % (repo, number, check))
             elif found["changed"]:
-                say("%s#%d: %s body from ticket #%s (was: %s)"
+                say("%s#%d: %s body from ticket #%d (was: %s)"
                     % (repo, number, "repaired" if apply else "would repair", ticket_number,
                        "; ".join(found["before"])))  # type: ignore[arg-type]
                 if apply:
                     edit(repo, number, str(pr.get("title") or ""), str(found["body"]))
             else:
-                say("%s#%d: not repairable, ticket #%s lacks: %s"
+                say("%s#%d: not repairable, ticket #%d lacks: %s"
                     % (repo, number, ticket_number,
                        "; ".join(ticket_gaps(list(found["after"])))))  # type: ignore[arg-type]
     return rows
@@ -690,7 +736,7 @@ def _sweep_main(argv: Sequence[str]) -> int:
         parser.error("no repos: pass --repo or set LOOM_REPOS")
     try:
         rows = sweep(repos, args.apply, args.check)
-    except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as err:
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as err:
         print("sweep stopped: %s" % err, file=sys.stderr)
         return 3
     print("%d pull request(s) fail only %s; %d %s" % (

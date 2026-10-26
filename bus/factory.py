@@ -2379,16 +2379,19 @@ class Factory:
     def _hold_plan(self, repo: str, number: int, issue: Dict[str, Any],
                    comments: Sequence[Dict[str, Any]], gaps: List[str]) -> None:
         """Hold the ticket for the brain: needs-brain, and the one note naming
-        what the ticket lacks, posted once and edited only when it changes."""
+        what the ticket lacks, posted once and edited only when it changes.
+        The note records whether this hold added needs-brain, so lifting it
+        never takes off a label set for another reason."""
         ticket = int(issue["number"])
-        text = pr_repair.hold_note(number, self.plan_check, gaps)
+        note = self._plan_note(comments)
+        set_label = bool(note is not None and pr_repair.hold_set_label(str(note.get("body") or "")))
         wrote = False
         if "needs-brain" not in _labels(issue):
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, ticket),
                          {"labels": ["needs-brain"]})
             issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
-            wrote = True
-        note = self._plan_note(comments)
+            set_label = wrote = True
+        text = pr_repair.hold_note(number, self.plan_check, gaps, set_label)
         if note is None:
             notify.post(self.gh, repo, ticket, text, notify.HELD)
             wrote = True
@@ -2403,12 +2406,14 @@ class Factory:
 
     def _lift_plan_hold(self, repo: str, number: int, issue: Dict[str, Any],
                         comments: Sequence[Dict[str, Any]]) -> None:
-        """After a repair: lift a plan hold this factory or the runner put on
-        the ticket (its note says so), and say so in the same note."""
+        """After a repair: say in the plan-hold note that the hold is lifted,
+        and take needs-brain off only when that note records the hold added
+        it (pr_repair.PLAN_SET_LABEL); a label set for another reason stays."""
         note = self._plan_note(comments)
         if note is None or str(note.get("body") or "").strip() == pr_repair.lifted_note(number):
             return
-        if "needs-brain" in _labels(issue):
+        if (pr_repair.hold_set_label(str(note.get("body") or ""))
+                and "needs-brain" in _labels(issue)):
             self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/needs-brain" % (repo, int(issue["number"])),
                          ok=(404,))
             issue["labels"] = [x for x in issue.get("labels") or []

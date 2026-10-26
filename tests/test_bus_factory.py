@@ -1630,6 +1630,19 @@ class PlanBodyRepair(Base):
         self.assertEqual(len(notes), 1)
         self.assertIn("hold is lifted", notes[0]["body"])
 
+    def test_a_needs_brain_set_for_another_reason_stays_when_the_hold_lifts(self):
+        # Security review: the plan hold takes off only a needs-brain it
+        # added itself, which its note records.
+        self.held(ticket_body=PLAN_TICKET.replace("## Acceptance\n", "## Notes\n"))
+        self.gh.issues[5]["labels"].append({"name": "needs-brain"})
+        self.go()
+        self.assertNotIn("set-needs-brain", self.notes()[0]["body"])
+        self.gh.issues[5]["body"] = PLAN_TICKET
+        self.go()
+        self.assertEqual(hunt_plan.problems(self.gh.pulls[50]["body"]), [])
+        self.assertIn("needs-brain", factory._labels(self.gh.issues[5]))
+        self.assertIn("hold is lifted", self.notes()[0]["body"])
+
     def test_the_runners_note_is_edited_not_posted_again(self):
         self.held(ticket_body=PLAN_TICKET.replace("## Acceptance\n", "## Notes\n"))
         self.gh.comments[5].append({"id": 77, "body": pr_repair.PLAN_NOTE_MARKER +
