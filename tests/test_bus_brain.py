@@ -1414,8 +1414,8 @@ class SensitiveResumeTests(unittest.TestCase):
                 {"filename": "t/TestOld.cpp", "status": "removed"}])
 
     def test_goal_home_rule_merge_cannot_check_refuses(self):
-        goal = dict(self.CPP_GOAL, body="Merge constraint: proof shape is a realm log line\n# Goal")
-        with self.assertRaisesRegex(ValueError, r"goal home %s#1 rule 'proof shape is a realm "
+        goal = dict(self.CPP_GOAL, body="Merge constraint: proof shape is a service log line\n# Goal")
+        with self.assertRaisesRegex(ValueError, r"goal home %s#1 rule 'proof shape is a service "
                                     r"log line' cannot be checked" % REPO):
             self._refuse(reply(200, goal))
 
