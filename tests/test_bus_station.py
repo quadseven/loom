@@ -2975,7 +2975,7 @@ class HandBackTest(unittest.TestCase):
         self.assertIn("check lint", note)
         self.assertIn(factory.HANDOFF_LABEL, note)
 
-    def test_fix_round_cap_says_so_once_and_never_adds_needs_brain(self):
+    def test_fix_round_cap_says_so_once_in_the_status_comment(self):
         # Replaces the needs-brain hold: at the cap the ticket leaves loom:pr
         # for loom:failed, so the next pass lists it no more and writes no
         # second note (GitHub lists loom:pr tickets by label).
