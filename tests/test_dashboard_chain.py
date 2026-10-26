@@ -21,8 +21,8 @@ NOW = 1_900_000_000.0
 JOURNAL = {"created_at": "2030-01-08T11:00:00Z", "body": "\n".join([
     "<!-- loom:journal v1 -->",
     "Tick 2030-01-08T11:00:00Z, brain-a",
-    "- Briefed: example-owner/sample#42 to codex",
-    "- Next: merge example-owner/sample#41 once its review is clean.",
+    "- Briefed: example-owner/sample#42 to codex",  # leak-guard-allow
+    "- Next: merge example-owner/sample#41 once its review is clean.",  # leak-guard-allow
     "- Cost: 40 requests, 6 minutes"])}
 PAYLOAD = {"tickets": {"example-owner/sample": [
     {"repo": "example-owner/sample", "number": 1, "state": "running", "open": True},
@@ -78,10 +78,10 @@ class ChainViewTest(unittest.TestCase):
         audit = body[body.index("Audit: what Loom did"):]
         acted = audit[audit.index("Loom acted on its own"):audit.index("Held by shadow mode")]
         held = audit[audit.index("Held by shadow mode"):]
-        self.assertLess(acted.index("example-owner/other#8"), acted.index("example-owner/other#7"))
+        self.assertLess(acted.index("example-owner/other#8"), acted.index("example-owner/other#7"))  # leak-guard-allow
         self.assertIn('href="https://github.com/example-owner/other/issues/7"', acted)
         self.assertIn("merge", acted)
-        self.assertLess(held.index("example-owner/sample#41"), held.index("example-owner/sample#40"))
+        self.assertLess(held.index("example-owner/sample#41"), held.index("example-owner/sample#40"))  # leak-guard-allow
         self.assertIn('href="https://github.com/example-owner/sample/issues/40"', held)
 
     def test_no_snapshot_says_no_data_from_the_station_yet(self):
