@@ -48,6 +48,13 @@ class TemplatedAdapterPresence(unittest.TestCase):
         self.assertFalse(outcome.proven)
         self.assertIn("sample", outcome.missing[0][1].lower())
 
+    def test_count_exceeding_sample_lines_is_unproven_even_with_a_match(self):
+        outcome = prove_with(live_proof.Answer([FULL_MATCH], hours=24, count=5),
+                             "Live: after the deploy, `log:worker` shows `%s`." % TEMPLATE)
+
+        self.assertFalse(outcome.proven)
+        self.assertIn("sample", outcome.missing[0][1].lower())
+
 
 class TemplatedAdapterAbsence(unittest.TestCase):
     def test_fixed_piece_only_does_not_fail_absence(self):

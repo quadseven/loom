@@ -318,11 +318,9 @@ def _source_needle(step: Step, needle: str, since: float, now: float,
     safe = [line for line in lines if evidence.safe_line(line)]
     count = answer.count if answer.count is not None else len(lines)
     if pattern is not None and answer.count is not None and answer.count > len(candidates):
-        if needle in step.absent or not safe:
-            return False, ("the `%s` log adapter counted %d candidates but returned only %d "
-                           "sample lines to check `%s`" % (
-                               step.source, answer.count, len(candidates), needle))
-        count = len(safe)
+        return False, ("the `%s` log adapter counted %d candidates but returned only %d "
+                       "sample lines to check `%s`" % (
+                           step.source, answer.count, len(candidates), needle))
     elif pattern is not None:
         count = len(lines)
     if needle in step.absent:
