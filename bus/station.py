@@ -75,7 +75,8 @@ from . import watch
 from . import labels
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, rest_login, unreadable
+from .github import (GitHub, GitHubError, RateLimited, TargetReached, _OPENER,
+                     _next_link, read_ssm, rest_login, unreadable)
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -3005,6 +3006,10 @@ class Station:
                     return
             except RateLimited:
                 raise
+            except TargetReached as err:
+                # Claims made earlier this pass stay made; the rest wait.
+                _say("%s#%s waits for the next pass: %s" % (repo, issue["number"], err))
+                return
             except (GitHubError, OSError) as err:
                 _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
 
@@ -3045,6 +3050,8 @@ class Station:
             self._try_ticket(repo, lane, issue, free)
         except RateLimited:
             raise
+        except TargetReached as err:
+            _say("%s#%s waits for the next pass: %s" % (repo, issue["number"], err))
         except (GitHubError, OSError) as err:
             _say("could not queue %s#%s: %s" % (repo, issue["number"], err))
 
@@ -4342,7 +4349,10 @@ class Station:
                 break
             step = steps[(start + offset) % len(steps)]
             try:
-                self._timed(step)
+                if not self._timed(step):
+                    # The carried-over step starts the next pass's loop.
+                    stopped_at = (start + offset) % len(steps)
+                    break
             except RateLimited:
                 raise
             except (GitHubError, OSError, ValueError) as err:
@@ -4352,17 +4362,23 @@ class Station:
         except OSError as err:
             _say("could not record the step rotation: %s" % err)
 
-    def _timed(self, step: Any) -> None:
+    def _timed(self, step: Any) -> bool:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
-        more, with the requests it made (as the step loop does)."""
+        more, with the requests it made (as the step loop does). False when
+        a read the step needed was carried over at the pass request target:
+        the line names the step, and the rest of it waits for the next pass."""
         started, asked = time.monotonic(), self.gh.requests
         try:
             step()
+        except TargetReached as err:
+            _say("step %s carried over to the next pass: %s" % (step.__name__, err))
+            return False
         finally:
             took = time.monotonic() - started
             if took >= SLOW_STEP_SECONDS:
                 _say("step %s took %ds and %d requests"
                      % (step.__name__, took, self.gh.requests - asked))
+        return True
 
     def reconcile_pull_requests(self) -> None:
         """Repair ticket state from the PR's authoritative terminal state.
@@ -11706,7 +11722,7 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         st = Station(gh, settings, **hooks)
         try:
             st.run_pass()
-        except RateLimited as err:
+        except (RateLimited, TargetReached) as err:
             _say("%s; the pass stopped there" % err)
         except StateError as err:
             _say("stopping: %s" % err)

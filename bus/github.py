@@ -76,6 +76,10 @@ class GitHubError(Exception):
         self.body = body
 
 
+class TargetReached(Exception):
+    """A paginated read was deferred after this pass reached its request target."""
+
+
 class ShadowHeld(GitHubError, ValueError):
     """A merge, close, ship label or branch deletion shadow mode recorded
     instead of sending (bus/shadow.py). Both a GitHubError and a ValueError,
@@ -1068,7 +1072,7 @@ class GitHub:
                 and self.counted >= self.target and kind in DEFERRABLE_KINDS):
             with self._count_lock:
                 self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
-            return []
+            raise TargetReached("%s read carried over at request target" % kind)
         return self._paginate_from(path, self.rest("GET", path))
 
     def _paginate_from(self, path: str, first: Response) -> List[Any]:
@@ -1093,7 +1097,7 @@ class GitHub:
                         and self.counted >= self.target and kind in DEFERRABLE_KINDS):
                     with self._count_lock:
                         self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
-                    break
+                    raise TargetReached("%s read carried over at request target" % kind)
                 resp = self.rest("GET", url)
         return status.resort(items)
 
