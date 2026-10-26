@@ -75,7 +75,8 @@ from . import watch
 from . import labels
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, rest_login, unreadable
+from .github import (GitHub, GitHubError, RateLimited, TargetReached, _OPENER,
+                     _next_link, read_ssm, rest_login, unreadable)
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -2224,7 +2225,10 @@ class Station:
         """Read claim comments after verification, stopping at the pass target."""
         if self._verify_before_build(repo, issue):
             return None
-        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        try:
+            comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        except TargetReached:
+            return None
         return None if self._target_reached() else comments
 
     def _linked_pulls(self, repo: str, number: int) -> List[str]:
@@ -2782,6 +2786,8 @@ class Station:
             try:
                 self._release_one_runaway(repo, issue, free, dead, used)
             except RateLimited:
+                raise
+            except TargetReached:
                 raise
             except (GitHubError, OSError) as err:
                 _say("could not review runaway %s#%s: %s" % (repo, issue.get("number"), err))
@@ -4320,6 +4326,9 @@ class Station:
             step = steps[(start + offset) % len(steps)]
             try:
                 self._timed(step)
+            except TargetReached:
+                stopped_at = (start + offset) % len(steps)
+                break
             except RateLimited:
                 raise
             except (GitHubError, OSError, ValueError) as err:

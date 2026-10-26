@@ -29,7 +29,7 @@ from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
 from bus import labels as labels_module  # noqa: E402
-from bus.github import AppToken, GitHub, GitHubError  # noqa: E402
+from bus.github import AppToken, GitHub, GitHubError, TargetReached  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 REPO = "example-owner/example-repo"
@@ -2168,6 +2168,13 @@ class BudgetTest(Base):
 
     def gets(self, fragment):
         return [p for p in self.fake.paths("GET") if fragment in p]
+
+    def test_paginate_raises_instead_of_returning_a_partial_list_at_target(self):
+        self.fake.events[12] = [{"id": i} for i in range(250)]
+        gh = GitHub("token", transport=self.fake, target=1)
+
+        with self.assertRaises(TargetReached):
+            gh.paginate("/repos/%s/issues/12/events" % REPO)
 
     def test_a_repeated_list_read_sends_the_etag_and_a_304_is_unchanged(self):
         self.fake.add(12, state="pr")
