@@ -10910,11 +10910,22 @@ class Station:
         self._prune_run_scratch(busy)
         self._prune_tree_root(os.path.join(self.s.home, "worktrees"), live, busy)
         if self.s.agy_workdir:
-            self._prune_tree_root(self.s.agy_workdir, live, busy)
+            self._prune_tree_root(self.s.agy_workdir, live, busy, tickets_only=True)
 
-    def _prune_tree_root(self, root: str, live: Set[str],
-                         busy: Set[Tuple[str, int]]) -> None:
-        """Remove the finished trees in one lane tree folder."""
+    def _prune_tree_root(self, root: str, live: Set[str], busy: Set[Tuple[str, int]],
+                         tickets_only: bool = False) -> None:
+        """Remove the finished trees in one lane tree folder. A folder that is
+        a symlink is never read. tickets_only (the agy folder, in another
+        user's home) removes only entries named for a watched repo's ticket."""
+        try:
+            if stat.S_ISLNK(os.lstat(root).st_mode):
+                _say("lane tree folder %s is a symlink, so nothing in it is removed" % root)
+                return
+        except FileNotFoundError:
+            return
+        except OSError as err:
+            _say("cannot stat %s to remove finished lane trees: %s" % (root, err))
+            return
         try:
             names = os.listdir(root)
         except FileNotFoundError:
@@ -10932,7 +10943,7 @@ class Station:
             except OSError as err:
                 _say("cannot stat lane tree %s: %s" % (name, err))
                 continue
-            if name in live:
+            if name in live or (tickets_only and self._tree_ticket(name) is None):
                 continue
             finished = self._tree_done(name, busy)
             if not finished and self.now - st.st_mtime < TREE_KEEP:

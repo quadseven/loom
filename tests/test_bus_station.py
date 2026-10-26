@@ -5996,6 +5996,28 @@ class PruneTest(Base):
         self.assertFalse(os.path.exists(done))
         self.assertTrue(os.path.exists(open_pr))
 
+    def test_the_agy_folder_keeps_other_entries_and_is_never_read_through_a_symlink(self):
+        tp = REPO.replace("/", ".") + "-"
+        self.fake.add(1, state="merged")
+        real = os.path.join(self.home, "elsewhere")
+        stray = self.tree("not-a-ticket", station.TREE_KEEP + 60)
+        os.makedirs(os.path.join(real, tp + "1"))
+        link = os.path.join(self.home, "agy-link")
+        os.symlink(real, link)
+        agy = os.path.join(self.home, "agy-lanes")
+        os.makedirs(agy)
+        other = os.path.join(agy, "notes")
+        os.makedirs(other)
+        old = time.time() - station.TREE_KEEP - 60
+        os.utime(other, (old, old))
+        self.settings.agy_workdir = link
+        self.run_pass()
+        self.assertTrue(os.path.exists(os.path.join(real, tp + "1")))
+        self.settings.agy_workdir = agy
+        self.run_pass()
+        self.assertTrue(os.path.exists(other))
+        self.assertFalse(os.path.exists(stray))
+
     def test_the_agy_lanes_folder_defaults_to_the_one_the_lane_uses(self):
         env = {"LOOM_HOME": self.home, "LOOM_AGY_USER": "example-user"}
         self.assertEqual(station.Settings.from_env(env).agy_workdir,
