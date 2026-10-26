@@ -133,6 +133,12 @@ RUN_SCRATCH_SETTLE = 600
 # temp files a run rebuilds.
 RUN_HOME_CACHES = (".cache", ".cargo", "tmp")
 DISK_EVERY = 3600
+# Local Time Machine snapshots keep every lane tree the station removed:
+# on 2026-10-26 free space fell from 50 to 27 GB in three hours while loom
+# home held under 15 GB, and thinning them freed 40 GB. Below twice the
+# floor the station asks for them to be thinned, at most this often.
+THIN_EVERY = 1800
+THIN_FILE = "snapshot-thin.json"
 GB = 1024 ** 3
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
 ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
@@ -786,8 +792,13 @@ class Settings:
                  settle_claimed: str = "off",
                  settle_claimed_max: int = claimed.PER_RUN,
                  claim_idle_hours: int = 0,
-                 agy_workdir: str = "") -> None:
+                 agy_workdir: str = "",
+                 thin_snapshots: bool = False) -> None:
         self.home = home
+        # LOOM_THIN_SNAPSHOTS: below twice the free-space floor, ask macOS to
+        # thin its local Time Machine snapshots before claims pause. On, from
+        # from_env, unless "0"; off for a Settings built in code.
+        self.thin_snapshots = thin_snapshots
         # The agy lane's tree folder (lanes/run_lane.sh WORKDIR for LANE=agy),
         # pruned beside home/worktrees; empty, the default for a Settings
         # built in code, prunes home/worktrees only.
@@ -979,7 +990,8 @@ class Settings:
                    settle_claimed=claimed.mode(env.get("LOOM_SETTLE_CLAIMED", "")),
                    settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")),
                    claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")),
-                   agy_workdir=_agy_workdir(env))
+                   agy_workdir=_agy_workdir(env),
+                   thin_snapshots=env.get("LOOM_THIN_SNAPSHOTS", "1").strip() != "0")
 
 
 def _agy_workdir(env: Dict[str, str]) -> str:
@@ -1020,6 +1032,17 @@ def _free_floor(raw: str) -> float:
 
 def _gb(n: float) -> str:
     return "%.1f GB" % (n / GB)
+
+
+def _thin_snapshots(path: str, want: int) -> bool:
+    """Ask macOS to thin the local snapshots on path's volume until about
+    want bytes are free (tmutil, urgency 4, no root needed)."""
+    try:
+        done = subprocess.run(["tmutil", "thinlocalsnapshots", path, str(want), "4"],
+                              capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
 
 
 def _tree_stat(path: str) -> Tuple[float, int]:
@@ -11107,7 +11130,8 @@ class Station:
 
     def _disk_free(self) -> Optional[int]:
         """Free bytes on the loom home's disk, read once a pass; None when it
-        cannot be read."""
+        cannot be read. Below twice the floor, local snapshots are thinned
+        first (thin_snapshots) and the free space is read again."""
         if not self._free_read:
             self._free_read = True
             try:
@@ -11115,7 +11139,30 @@ class Station:
             except OSError as err:
                 _say("cannot read the free space on the loom home's disk: %s" % err)
                 self._free = None
+            want = int(2 * self.s.disk_free_min_gb * GB)
+            if self._free is not None and self._free < want and self._thin_due():
+                ok = _thin_snapshots(self.s.home, want - self._free)
+                try:
+                    after = shutil.disk_usage(self.s.home).free
+                except OSError:
+                    after = self._free
+                _say("asked macOS to thin local snapshots (%s): %s free before, %s after"
+                     % ("done" if ok else "refused", _gb(self._free), _gb(after)))
+                self._free = after
         return self._free
+
+    def _thin_due(self) -> bool:
+        """Thinning is on and was last asked for THIN_EVERY or more ago; the
+        time is recorded now."""
+        if not self.s.thin_snapshots:
+            return False
+        path = os.path.join(self.state, THIN_FILE)
+        saved = _read_json(path, {}, strict=False)
+        last = saved.get("at") if isinstance(saved, dict) else None
+        if self._num(last) and self.now - float(last) < THIN_EVERY:
+            return False
+        _write_json(path, {"at": self.now})
+        return True
 
     def disk_low(self) -> bool:
         """True while the loom home's disk has less than disk_free_min_gb
