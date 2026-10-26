@@ -2997,6 +2997,24 @@ class HandBackTest(unittest.TestCase):
         self.assertNotIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
         self.assertIn(factory.HANDOFF_LABEL, [x["name"] for x in self.gh.issue["labels"]])
 
+    def test_a_refused_failure_summary_keeps_the_stop_and_logs_why(self):
+        real = station.brain._check_written_text
+
+        def check(text):
+            if "check lint" in text:
+                raise ValueError("example refusal")
+            return real(text)
+        self.gh.comments.extend({"user": {"login": "alice-example"},
+                                 "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % (str(i) * 40)}
+                                for i in range(1, 4))
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}), \
+                mock.patch.object(station.brain, "_check_written_text", side_effect=check), \
+                mock.patch.object(station, "_say") as say:
+            self.run_hand_back(checks=[("lint", "failed")])
+        [note] = self.stop_notes()
+        self.assertIn("the failures the last fix round names", note)
+        self.assertTrue(any("refused (example refusal)" in str(c.args[0]) for c in say.call_args_list))
+
     def test_markerless_fix_comments_do_not_consume_rounds(self):
         self.gh.comments.extend({"user": {"login": "alice-example"}, "body": tickets.FIX_MARKER}
                                 for _ in range(3))

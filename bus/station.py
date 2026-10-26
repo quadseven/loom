@@ -5618,7 +5618,12 @@ class Station:
                                 "fix round", labels.HANDOFF)
         try:
             brain._check_written_text(note)
-        except ValueError:
+        except ValueError as err:
+            # The failure summary quotes check names and review text; when
+            # that text fails the written-text check, keep the stop and say
+            # so in the log instead of posting it.
+            _say("%s#%d: stop note's failure summary refused (%s); using the plain note"
+                 % (repo, number, err))
             note = FIX_STOP_TEXT % (pr_number, why, "the failures the last fix round names",
                                     labels.HANDOFF)
         brain.move(self.gh, repo, number, "failed", note=note)
