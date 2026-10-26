@@ -6125,6 +6125,21 @@ class PruneTest(Base):
         self.assertEqual(station.Settings.from_env(env).agy_workdir, "/opt/trees")
         self.assertEqual(station.Settings(self.home, [REPO], [], []).agy_workdir, "")
 
+    def test_a_pass_stopped_at_its_request_target_still_ends_locally(self):
+        # From loom#1915 a pass that reached its request target raised out of
+        # run_pass and skipped pruning, the disk, usage and the chain
+        # snapshot: no lane tree was pruned for hours on 2026-10-26.
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        ran = []
+        with mock.patch.object(station.Station, "_run_steps",
+                               side_effect=TargetReached("issues read carried over")), \
+                mock.patch.object(station.Station, "prune_trees", lambda s: ran.append("prune")), \
+                mock.patch.object(station.Station, "tend_disk", lambda s: ran.append("disk")), \
+                mock.patch.object(station.Station, "post_chain", lambda s: ran.append("chain")):
+            with self.assertRaises(TargetReached):
+                runner.run_pass()
+        self.assertEqual(ran, ["prune", "disk", "chain"])
+
     def test_a_tree_waits_for_tree_keep_when_the_pass_did_not_read_its_repo(self):
         tp = REPO.replace("/", ".") + "-"
         fresh = self.tree(tp + "3", 60)
