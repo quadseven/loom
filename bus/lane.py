@@ -181,10 +181,16 @@ def _takes(item: Any, lane: str) -> bool:
     if "loom:queued" not in names or "lane:" + lane not in names:
         return False
     try:
-        difficulty = tickets.parse(item.get("body"))[0].get("Difficulty", "")
+        headers = tickets.parse(item.get("body"))[0]
     except ValueError:
         return False
-    return difficulty in REMOTE_LANES[lane]["tiers"]
+    if not headers:
+        return False  # no brief header at all: not a ticket a lane can run
+    # The factory's reading (its default tier for a ticket with no
+    # Difficulty: line), so a ticket it reserved for this lane is one the
+    # lane takes (a reserved ticket sat unclaimed under four Muse lanes).
+    from .factory import difficulty_of
+    return difficulty_of(item) in REMOTE_LANES[lane]["tiers"]
 
 
 def _take(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
@@ -225,7 +231,10 @@ def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
                 continue
             recent = [at for _, at, _ in _claims(_comments(gh, repo, int(issue["number"])), lane)
                       if now - at < CLAIM_AGE]
-            if len(recent) >= REMOTE_LANES[lane]["slots"]:
+            # One claim per ticket, whatever the lane's slot count: with
+            # several slots, a ticket a hand-back left queued while its claim
+            # is fresh would otherwise be claimed again by another run.
+            if recent:
                 skipped.append("#%s skipped: claim active" % issue["number"])
                 continue
             claimed_result = _take(gh, repo, issue, lane, now)

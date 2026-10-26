@@ -123,8 +123,8 @@ def test_add():
     assert add(1, 2) == 3
 """
         }
-        def run_on_base(path):
-            return path == "tests/test_calculator.py"
+        def run_on_base(path, name):
+            return path == "tests/test_calculator.py" and name == "test_add"
         findings = vacuous.findings(changed, "", "", run_on_base=run_on_base)
         self.assertEqual(len(findings), 1)
         self.assertIn("passes against the base commit", findings[0])
@@ -138,10 +138,36 @@ def test_add():
     assert add(1, 2) == 3
 """
         }
-        def run_on_base(path):
+        def run_on_base(path, name):
             return False
         findings = vacuous.findings(changed, "", "", run_on_base=run_on_base)
         self.assertEqual(findings, [])
+
+    def test_only_added_or_changed_test_names_are_checked(self):
+        changed = {"tests/test_calculator.py": """
+def test_new_regression():
+    assert add(1, 2) == 4
+
+def test_older_case():
+    assert add(2, 2) == 4
+"""}
+        checked = []
+
+        def run_on_base(path, name):
+            checked.append(name)
+            return name == "test_new_regression"
+
+        findings = vacuous.findings(changed, "", "", run_on_base=run_on_base)
+        self.assertEqual(checked, ["test_new_regression", "test_older_case"])
+        self.assertEqual(len(findings), 1)
+        self.assertIn("test_new_regression", findings[0])
+
+    def test_new_test_file_is_checked_on_base(self):
+        changed = {"tests/test_new.py": "def test_new_behavior():\n    assert True\n"}
+        findings = vacuous.findings(changed, "", "",
+                                    run_on_base=lambda path, name: True)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("test_new_behavior", findings[0])
 
     def test_non_test_file_not_flagged(self):
         changed = {

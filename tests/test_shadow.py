@@ -199,19 +199,19 @@ class ChokePointTest(ShadowCase):
         fake = Recorder(items)
         gh = GitHub("t", transport=fake)
         gh.rest("PATCH", "/repos/%s/pulls/19" % REPO, {"state": "closed"})
-        for number in (20, 22):
+        for number in (20, 22, 25):
             gh.rest("PATCH", "/repos/%s/issues/%d" % (REPO, number),
                     {"state": "closed", "state_reason": "not_planned"})
-        # An invariant breach's issue (loom#1551), a ticket, and an issue
-        # Loom cannot tell is its own.
-        for number in (21, 23, 24, 25):
+        # An invariant label with no breach marker in the body, a ticket, and
+        # an issue Loom cannot tell is its own.
+        for number in (21, 23, 24):
             with self.assertRaises(ShadowHeld):
                 gh.rest("PATCH", "/repos/%s/issues/%d" % (REPO, number),
                         {"state": "closed", "state_reason": "not_planned"})
         self.assertEqual([p for _, p, _ in fake.sent],
                          ["/repos/%s/pulls/19" % REPO] +
-                         ["/repos/%s/issues/%d" % (REPO, n) for n in (20, 22)])
-        self.assertEqual(sorted(e["number"] for e in self.entries()), [21, 23, 24, 25])
+                         ["/repos/%s/issues/%d" % (REPO, n) for n in (20, 22, 25)])
+        self.assertEqual(sorted(e["number"] for e in self.entries()), [21, 23, 24])
 
     def test_a_label_already_on_or_already_past_is_no_new_grant(self):
         items = {"/repos/%s/issues/30" % REPO: issue(30, ("loom:ticket", "loom:shipped")),
@@ -828,13 +828,13 @@ class InvariantsCloseTest(ShadowCase):
     NOW = 1_800_000_000.0
     NUMBER = 77
 
-    def wire(self, state="open"):
+    def wire(self, state="open", labels=("loom:triage", "loom:invariant")):
         breach = {"number": self.NUMBER, "state": state, "title": "Lane pull request #5 open",
                   "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW - 86400)),
                   "closed_at": None if state == "open" else time.strftime(
                       "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW - 3600)),
                   "body": invariants.MARKER % "lane-pr-stalled/ad09a1c365b8" + "\nA breach.",
-                  "labels": [{"name": "loom:triage"}, {"name": "loom:invariant"}]}
+                  "labels": [{"name": name} for name in labels]}
         sent = []
 
         def transport(method, url, headers, body):
@@ -859,8 +859,18 @@ class InvariantsCloseTest(ShadowCase):
             invariants.Filer(gh, REPO, 30, {}, self.NOW, said.append).run(list(breaches))
         return said
 
-    def test_the_cleared_close_is_recorded_and_no_close_is_sent(self):
+    def test_a_cleared_breach_closes_in_shadow_too(self):
+        # 2026-10-26: 35 breach issues the station had marked cleared stayed
+        # open under shadow and the operator asked why Loom did not clean up.
         transport, sent = self.wire()
+        said = self.run_filer(transport)
+        self.assertIn(("PATCH", "/repos/%s/issues/%d" % (REPO, self.NUMBER),
+                       {"state": "closed", "state_reason": "not_planned"}), sent)
+        self.assertTrue(any("closed cleared" in line for line in said), said)
+        self.assertEqual(self.entries(), [])
+
+    def test_a_recurring_breach_stays_held_in_shadow(self):
+        transport, sent = self.wire(labels=("loom:triage", "loom:invariant", "loom:recurring"))
         said = self.run_filer(transport)
         closes = [r for r in sent if isinstance(r[2], dict) and r[2].get("state") == "closed"]
         self.assertEqual(closes, [], "shadow mode sent a close: %s" % closes)
@@ -999,7 +1009,7 @@ class EveryPathTest(unittest.TestCase):
                     self.assertIn(asks, before, "%s:%d closes before it asks the guard" % (key[0], line))
         # The choke point every one of them sends through.
         rest = (ROOT / "bus" / "github.py").read_text(encoding="utf-8")
-        self.assertRegex(rest, r"def _rest\(self[^)]*\)[^:]*:\n(?:.*\n){0,4}\s+self\._hold_in_shadow\(")
+        self.assertRegex(rest, r"def _rest\(self[^)]*\)[^:]*:\n(?:.*\n){0,4}\s+(?:acted = )?self\._hold_in_shadow\(")
 
     def test_every_shell_close_asks_the_gh_guard_first(self):
         unguarded = []
@@ -1037,6 +1047,48 @@ class EveryPathTest(unittest.TestCase):
         brain_doc = (ROOT / "docs" / "BRAIN.md").read_text()
         self.assertIn("## Shadow mode", brain_doc)
         self.assertIn("LOOM_SHADOW_REPOS", brain_doc)
+
+
+class ActedTest(ShadowCase):
+    """An irreversible request Loom sends (its repo out of shadow, or a close
+    let through) leaves one line in acted.jsonl, for the /chain audit."""
+
+    ENV = {"LOOM_SHADOW": "1", "LOOM_SHADOW_REPOS": "example-owner/held"}
+
+    def acted(self):
+        return shadow.read_acted(50)
+
+    def test_a_let_through_merge_is_recorded_and_a_held_one_is_not(self):
+        fake = Recorder()
+        GitHub("t", transport=fake).rest("PUT", "/repos/%s/pulls/8/merge" % REPO, {})
+        with self.assertRaises(ShadowHeld):
+            GitHub("t", transport=fake).rest("PUT", "/repos/example-owner/held/pulls/9/merge", {})
+        rows = self.acted()
+        self.assertEqual([(r["action"], r["repo"], r["number"], r["kind"]) for r in rows],
+                         [(shadow.MERGE, REPO, 8, "pr")])
+        self.assertTrue(rows[0]["at"])
+        self.assertTrue(rows[0]["source"])
+        self.assertEqual(shadow.acted_path(), os.path.join(os.path.dirname(self.ledger), "acted.jsonl"))
+        self.assertEqual(shadow.acted_path({"LOOM_HOME": "/srv/loom"}),
+                         "/srv/loom/state/shadow/acted.jsonl")
+
+    def test_a_failed_write_never_blocks_the_request(self):
+        fake = Recorder()
+        with mock.patch.object(shadow, "acted_path", return_value="/dev/null/nope/acted.jsonl"), \
+                mock.patch.object(shadow, "_acted_warned", False), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            GitHub("t", transport=fake).rest("PUT", "/repos/%s/pulls/8/merge" % REPO, {})
+            GitHub("t", transport=fake).rest("PUT", "/repos/%s/pulls/9/merge" % REPO, {})
+        self.assertEqual(len(fake.sent), 2)
+        self.assertEqual(err.getvalue().count("shadow: could not write"), 1)
+
+    def test_the_file_keeps_the_last_500_once_past_1000(self):
+        for number in range(1, shadow.ACTED_MAX + 2):
+            shadow.record_acted(shadow.MERGE, REPO, number, "pr", "test")
+        rows = shadow.read_acted(shadow.ACTED_MAX * 2)
+        self.assertEqual(len(rows), shadow.ACTED_KEEP)
+        self.assertEqual(rows[-1]["number"], shadow.ACTED_MAX + 1)
+        self.assertEqual([r["number"] for r in shadow.read_acted(2)], [shadow.ACTED_MAX, shadow.ACTED_MAX + 1])
 
 
 if __name__ == "__main__":

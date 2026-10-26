@@ -11,10 +11,11 @@ from typing import Optional, Tuple, Dict, Iterable, List
 
 from . import text
 
-# An exact string in the Live criterion, backticked or in double quotes: about
-# one in seven shipped tickets wrote it as "text" and got no log data. A
-# backticked span is matched first, so a quote inside one is not a needle.
-NEEDLE_RE = re.compile(r'`([^`]+)`|"([^"\n]+)"')
+# An exact string in the Live criterion, backticked, in double quotes, or with
+# template placeholders like <name> or ...: about one in seven shipped tickets
+# wrote it as "text" and got no log data. A backticked span is matched first,
+# so a quote inside one is not a needle.
+NEEDLE_RE = re.compile(r'`([^`]+)`|"([^"\n]+)"|<[^>]+>|\\.{3}')
 IP_RE = re.compile(r"\b[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?::[0-9]+)?\b")
 # Live strings are often written as templates: `sync: ... (waiting)`,
 # "left N file(s)", `export <report>: ...`, "account 'X' charges 'Y'". No log
@@ -78,6 +79,8 @@ def absent_needles(live: str) -> List[str]:
     end = 0
     for index, match in enumerate(found):
         value = match.group(1) or match.group(2)
+        if value is None:
+            continue
         before = live[end:match.start()]
         following = found[index + 1].start() if index + 1 < len(found) else len(live)
         after = live[match.end():following]

@@ -113,32 +113,32 @@ def _fixture_findings(changed: Dict[str, str], code_files: List[str],
 
 
 def _base_pass_findings(changed: Dict[str, str], test_files: List[str],
-                        run_on_base: Optional[Callable[[str], bool]]) -> List[str]:
+                        run_on_base: Optional[Callable[[str, str], bool]]) -> List[str]:
     """Finding 3: changed test that passes against base commit code."""
     out: List[str] = []
     if run_on_base is not None and test_files:
         for path in test_files:
-            try:
-                if run_on_base(path):
-                    for name in _test_names(changed[path]):
+            for name in _test_names(changed[path]):
+                try:
+                    if run_on_base(path, name):
                         out.append("test %s passes against the base commit's "
                                    "code, so the fix never made it fail (%s)"
                                    % (name, path))
-            except OSError as e:
-                print("vacuous: base test run failed for %s: %s" % (path, e), flush=True)
-                continue
+                except OSError as e:
+                    print("vacuous: base test run failed for %s: %s" % (path, e), flush=True)
+                    continue
     return out
 
 
 def findings(changed: Dict[str, str], ticket_body: str = "", pr_body: str = "",
-             run_on_base: Optional[Callable[[str], bool]] = None) -> List[str]:
+             run_on_base: Optional[Callable[[str, str], bool]] = None) -> List[str]:
     """Findings for one pull request's changed files.
 
     `changed` maps a changed file path to its new source text. Returns a
     message per finding, each naming the construct that makes a test vacuous;
     empty when the change is not vacuous. `run_on_base`, when given, is called
-    with each changed test file path and must return True when the test passes
-    against the base commit's code (so the fix never made it fail).
+    with each changed test file path and test name, and returns True when that
+    test passes against base code.
     """
     test_files = [path for path in changed if _is_test(path)]
     code_files = [path for path in changed if _is_code(path) and not _is_test(path)]

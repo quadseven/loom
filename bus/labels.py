@@ -7,6 +7,11 @@ from urllib.parse import quote
 
 from .github import GitHub
 
+# The hand-off pool: a ticket no lane of this Loom takes (bus/factory.py
+# NO_LANE_HANDOFF) carries it, leaves its goal's in-flight count, and waits
+# for the second operator's session to claim it (docs/BRAIN.md).
+HANDOFF = "handoff:claude"
+
 LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
          "zai", "workersai", "agy", "spark"]
 # Extra slots: parallel copies of a lane on the same provider (run_lane.sh
@@ -51,7 +56,9 @@ def base_lane(slot: str) -> str:
 # beat_max: seconds a remote worker's last heartbeat counts as up. Muse runs
 # on its own schedule (about every 30 minutes), not every minute like a
 # local runner, so its window is longer than HEARTBEAT_MAX_AGE.
-REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 1,
+# slots: tickets the lane may hold at once; Muse runs four scheduled lane
+# tasks (operator, 2026-10-25).
+REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 4,
                          "beat_max": 2 * 3600}}
 LANES += list(REMOTE_LANES)
 
@@ -87,7 +94,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:factory": {"color": "b60205", "description": "A factory validation incident"},
     "loom:validation-gap": {"color": "fbca04", "description": "A CI job the repo's .loom/validation.conf does not run"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
-    "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},
+    "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
     "loom:regression": {"color": "b60205", "description": "Fixes a measured regression of a shipped ticket"},
     "loom:revert": {"color": "b60205", "description": "Reverts the merge that turned the default branch red"},
@@ -104,6 +111,9 @@ LABELS: Dict[str, Dict[str, str]] = {
     "wait:after": {"color": "fef2c0", "description": "Waiting: another ticket must merge first (After:)"},
     "wait:window": {"color": "fef2c0", "description": "Waiting: a deploy or roll window"},
     "wait:live-event": {"color": "fef2c0", "description": "Waiting: its Live box needs a rare event the log has not shown; held apart from open work"},
+    # The hand-off pool (docs/BRAIN.md): tickets this Loom's lanes do not
+    # take, for the second operator's session to claim.
+    HANDOFF: {"color": "d876e3", "description": "In the hand-off pool for the second operator's session; out of the goal's in-flight count"},
 }
 for _lane in LANES:
     LABELS["lane:" + _lane] = {"color": "bfdadc",
