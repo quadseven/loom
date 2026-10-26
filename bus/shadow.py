@@ -50,6 +50,11 @@ action, head SHA, label) is written once, so a pass that tries again every few
 minutes adds nothing. A ledger that cannot be written never lets the action
 through: the hold does not depend on the record.
 
+Each irreversible request GitHub accepts from Loom (its repo out of shadow, or
+a close let through) is one line of acted.jsonl beside the ledger, cut to its
+last ACTED_KEEP lines past ACTED_MAX; the station sends both files' newest
+lines to the dashboard's /chain page. A failed write never stops a request.
+
     python3 -m bus.shadow report [--since 24h|7d|2026-10-22[T10:00:00Z]]
                                  [--repo OWNER/NAME] [--json]
     python3 -m bus.shadow status
@@ -432,6 +437,54 @@ def ledger_path(env: Optional[Mapping[str, str]] = None) -> str:
     home = str(values.get("LOOM_HOME") or "").strip() or os.path.join(
         os.path.expanduser("~"), "loom")
     return os.path.join(home, "state", "shadow", "ledger.jsonl")
+
+
+def acted_path(env: Optional[Mapping[str, str]] = None) -> str:
+    """acted.jsonl beside the ledger: $LOOM_HOME/state/shadow/acted.jsonl
+    by default, and a test's own folder when it points the ledger there."""
+    return os.path.join(os.path.dirname(ledger_path(env)), "acted.jsonl")
+
+
+# acted.jsonl grows past ACTED_MAX lines only to be cut to its last ACTED_KEEP.
+ACTED_MAX = 1000
+ACTED_KEEP = 500
+_acted_warned = False
+
+
+def record_acted(action: str, repo: str, number: int, kind: str, source: str = "",
+                 now: Optional[float] = None) -> None:
+    """Append one irreversible action GitHub accepted from Loom (its repo out
+    of shadow, or a close let through) to acted.jsonl, for the dashboard's
+    /chain audit. A failure of any kind is said once on stderr and never
+    raised: the request already went."""
+    global _acted_warned
+    entry = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if now is None else now)),
+             "action": action, "repo": repo or "", "number": int(number or 0), "kind": kind,
+             "source": source or caller()}
+    path = acted_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+        if len(lines) > ACTED_MAX:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines[-ACTED_KEEP:]) + "\n")
+            os.replace(tmp, path)
+    except Exception as err:  # noqa: BLE001 - the record never decides the request
+        if not _acted_warned:
+            _acted_warned = True
+            print("shadow: could not write %s (%s); actions are not recorded as acted"
+                  % (path, type(err).__name__), file=sys.stderr)
+
+
+def read_acted(limit: int, path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """The last `limit` entries of acted.jsonl, oldest first; empty when it
+    is missing. An unreadable line is skipped."""
+    return read(path or acted_path())[-limit:] if limit > 0 else []
 
 
 def link(repo: str, number: int, kind: str) -> str:
