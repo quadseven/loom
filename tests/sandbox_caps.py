@@ -5,6 +5,8 @@ sandbox that lanes/run_lane.sh builds in check mode. That sandbox cannot start
 a sandbox of its own, run ps, or connect to a localhost port, so the tests
 that need one skip there. CI runs outside it and fails on any skip, so a
 probe that is wrong on CI shows up as a failed CI run, never a hidden test.
+The Linux CI job and the cluster lanes' pre-ticket check run with
+--allow-skips: off macOS the seatbelt and keychain tests skip on SEATBELT.
 """
 
 import shutil
@@ -31,11 +33,15 @@ def _connects_to_localhost():
         return False
 
 
-NESTED_SANDBOX = bool(shutil.which("sandbox-exec")) and _runs(
+# macOS sandbox-exec is on PATH (it need not work: the lane check sandbox has
+# it but cannot nest it). Off macOS there is none, nor the security keychain.
+SEATBELT = bool(shutil.which("sandbox-exec"))
+NESTED_SANDBOX = SEATBELT and _runs(
     ["sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"])
 PROCESS_TABLE = _runs(["ps", "-o", "pid=", "-p", "1"])
 LOCALHOST = _connects_to_localhost()
 
+NO_SEATBELT = "needs macOS sandbox-exec and the security keychain, which only the Mac lanes have"
 NO_NESTED_SANDBOX = "needs a working sandbox-exec: none on this host, or inside the lane check sandbox"
 NO_PROCESS_TABLE = "needs ps, which the lane check sandbox cannot run"
 NO_LOCALHOST = "needs a localhost connection, which the lane check sandbox denies"
