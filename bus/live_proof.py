@@ -182,18 +182,31 @@ def _adapter_step(text: str, spans: List[str], hours: float) -> Tuple[Optional[S
                 return None, why
             rest = tuple(s for s in spans if s != span)
             return Step(QUERY, statement, rest, hours, source="adapter"), ""
-    for span in spans:
-        if span.lower().startswith(_LOG_PREFIX):
-            source = span[len(_LOG_PREFIX):].strip()
-            if not SOURCE_RE.match(source):
-                return None, "`%s` names no log source a repo adapter can serve" % span
-            absent = tuple(n for n in evidence.absent_needles(text) if n != span)
-            present = [n for n in evidence.needles(text) if n != span and n not in absent]
-            if not present and not absent:
-                return None, "`%s` names no string to find in that log" % span
-            target = present[0] if present else ""
-            return Step(LOG, target, tuple(present[1:]), hours, source=source,
-                        absent=absent), ""
+        for span in spans:
+            if span.lower().startswith(_LOG_PREFIX):
+                source = span[len(_LOG_PREFIX):].strip()
+                if not SOURCE_RE.match(source):
+                    return None, "`%s` names no log source a repo adapter can serve" % span
+                absent = tuple(n for n in evidence.absent_needles(text) if n != span)
+                present = [n for n in evidence.needles(text) if n != span and n not in absent]
+                if not present and not absent:
+                    return None, "`%s` names no string to find in that log" % span
+                # Templates are strings with angle brackets or ellipsis. Use the first non-template
+                # present needle as the search target.
+                target = ""
+                for p in present:
+                    if not (p.startswith('<') or p.endswith('>') or p == '...'):
+                        target = p
+                        break
+                if not target:
+                    # All present needles are templates, which should not happen in valid tickets.
+                    # Fall back to the first one, which will fail during execution.
+                    if present:
+                        target = present[0]
+                    elif not absent:
+                        return None, "`%s` names no string to find in that log" % span
+                return Step(LOG, target, tuple(present[1:]), hours, source=source,
+                            absent=absent), ""
     return None, ""
 
 
@@ -289,9 +302,9 @@ def _quoted(safe: List[str]) -> str:
 
 
 def _source_needle(step: Step, needle: str, since: float, now: float,
-                   sources: Sources) -> Tuple[bool, str]:
+                    sources: Sources) -> Tuple[bool, str]:
     """(passed, what was seen) for one string of an adapter log step."""
-    literal, _ = evidence.needle_pattern(needle)
+    literal, pattern = evidence.needle_pattern(needle)
     if not literal:
         return False, "`%s` is too general to search" % needle
     answer = sources.source_log(step.source, literal, since)
@@ -299,16 +312,30 @@ def _source_needle(step: Step, needle: str, since: float, now: float,
         return False, "the `%s` log adapter gave no answer for `%s` (%s)" % (
             step.source, needle, answer.error or "no reason given")
     # A line stamped before the deploy is never its evidence.
-    lines = [line for line in _matching(answer.lines, needle)
-             if (evidence.line_time(line) or since) >= since]
+    candidates = [line for line in answer.lines
+                  if (evidence.line_time(line) or since) >= since]
+    lines = _matching(candidates, needle)
     safe = [line for line in lines if evidence.safe_line(line)]
     count = answer.count if answer.count is not None else len(lines)
+    if pattern is not None and answer.count is not None and answer.count > len(candidates):
+        return False, ("the `%s` log adapter counted %d candidates but returned only %d "
+                       "sample lines to check `%s`" % (
+                           step.source, answer.count, len(candidates), needle))
+    elif pattern is not None:
+        count = len(lines)
     if needle in step.absent:
         return _absence(step, needle, answer, lines, safe, count, since, now)
-    if not count and not safe:
+    # A templated string must match the full template, not just the fixed piece.
+    if pattern is None:
+        # No template parts - use the count unchanged
+        if not count and not safe:
+            return False, "no `%s` log line since the deploy names `%s`" % (step.source, needle)
+        return True, "`%s` named %d times in the `%s` log since the deploy%s" % (
+            needle, count, step.source, _quoted(safe))
+    if not safe:
         return False, "no `%s` log line since the deploy names `%s`" % (step.source, needle)
     return True, "`%s` named %d times in the `%s` log since the deploy%s" % (
-        needle, count, step.source, _quoted(safe))
+        needle, len(safe), step.source, _quoted(safe))
 
 
 def _source_log_step(step: Step, since: float, now: float,

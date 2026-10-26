@@ -76,6 +76,10 @@ class GitHubError(Exception):
         self.body = body
 
 
+class TargetReached(Exception):
+    """A paginated read was deferred after this pass reached its request target."""
+
+
 class ShadowHeld(GitHubError, ValueError):
     """A merge, close, ship label or branch deletion shadow mode recorded
     instead of sending (bus/shadow.py). Both a GitHubError and a ValueError,
@@ -189,6 +193,9 @@ def request_kind(method: str, url: str) -> str:
     if re.search(r"^/repos/[^/]+/[^/]+/pulls$", path):
         return "pulls list"
     return "other"
+
+
+DEFERRABLE_KINDS = {"events", "comments", "other"}
 
 
 def _int(value: Any) -> Optional[int]:
@@ -495,7 +502,8 @@ class GitHub:
                  transport: Optional[Transport] = None,
                  cache_dir: Optional[str] = None,
                  sleep: Callable[[float], None] = time.sleep,
-                 unsubscribe: bool = False) -> None:
+                 unsubscribe: bool = False,
+                 target: Optional[int] = None) -> None:
         # A personal token string, or an AppToken minted on first use.
         self._token = token
         # With a personal token, leave each issue this client opens or
@@ -531,6 +539,10 @@ class GitHub:
         self.not_modified = 0
         # Requests by request_kind, 304s left out: what the budget counted.
         self.kinds: Dict[str, int] = {}
+        # Counted request ceiling per pass; None leaves it unconstrained.
+        self.target = target
+        # Deferrable reads carried over when counted reached the target.
+        self.carried_over: Dict[str, int] = {}
         self.issue_writes: set[Tuple[str, int]] = set()
         self.comment_edits = False
         # resource (core, graphql, ...) -> (remaining, limit, reset epoch),
@@ -539,6 +551,10 @@ class GitHub:
         # Set by a budget refusal: until then every call fails at once with
         # RateLimited and spends nothing (loom#666).
         self.limited_until: Optional[int] = None
+
+    @property
+    def counted(self) -> int:
+        return self.requests - self.not_modified
 
     def _url(self, path: str) -> str:
         # Absolute URLs (pagination's next links) must stay on the API host:
@@ -1051,12 +1067,30 @@ class GitHub:
     def paginate(self, path: str) -> List[Any]:
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"
+        self._stop_at_target(request_kind("GET", path))
         return self._paginate_from(path, self.rest("GET", path))
+
+    def _has_target(self) -> bool:
+        return isinstance(self.target, int) and not isinstance(self.target, bool)
+
+    def _stop_at_target(self, kind: str) -> None:
+        """Raise TargetReached, counting the read as carried over, when a
+        deferrable read would go past the pass target. The check and the
+        count share one hold of the lock so threads read one snapshot."""
+        with self._count_lock:
+            target = self.target
+            over = (isinstance(target, int) and not isinstance(target, bool)
+                    and kind in DEFERRABLE_KINDS and self.counted >= target)
+            if over:
+                self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
+        if over:
+            raise TargetReached("%s read carried over at request target" % kind)
 
     def _paginate_from(self, path: str, first: Response) -> List[Any]:
         items: List[Any] = []
         url: Optional[str] = path
         resp = first
+        kind = request_kind("GET", path)
         while url:
             page = resp.data if isinstance(resp.data, list) else []
             items.extend(page)
@@ -1070,6 +1104,7 @@ class GitHub:
                 nxt = _with_page(url, _page_of(url) + 1)
             url = nxt
             if url:
+                self._stop_at_target(kind)
                 resp = self.rest("GET", url)
         return status.resort(items)
 
@@ -1077,6 +1112,8 @@ class GitHub:
         """Read known pages concurrently, preserving their page order."""
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"
+        if self._has_target() and request_kind("GET", path) in DEFERRABLE_KINDS:
+            return self.paginate(path)
         first = self.rest("GET", path)
         last = _last_link(first.headers.get("link", ""))
         if not last or _page_of(last) <= 1:
