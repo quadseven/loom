@@ -9790,13 +9790,16 @@ class Station:
             STANDUP_FOOTER])
 
     @staticmethod
-    def _standup_summary(groups: Dict[str, List[Dict[str, Any]]]) -> str:
+    def _standup_summary(groups: Dict[str, List[Dict[str, Any]]], station: "Station") -> str:
         """"3 merged, 2 in flight": the counts of a standup's groups, or ""."""
         counts = [(len(groups[k]), word) for k, word in (
             ("merged", "merged"), ("verified", "verified"), ("sent_back", "shipped"),
             ("failed", "failed"), ("regressed", "regressed"), ("aged_pr", "stuck"),
             ("in_flight", "in flight"), ("queued", "queued"), ("asks", "waiting on you"))]
-        return ", ".join("%d %s" % (n, word) for n, word in counts if n)
+        summary = ", ".join("%d %s" % (n, word) for n, word in counts if n)
+        if station._stale_asks_withdrawn > 0:
+            summary += ", %d stale asks withdrawn" % station._stale_asks_withdrawn
+        return summary
 
     def _standup_ticket_groups(self, children: List[Any], since: Optional[float] = None
                                ) -> Dict[str, List[Dict[str, Any]]]:
@@ -9888,7 +9891,7 @@ class Station:
                 return True
         return False
 
-    def _withdraw_stale_ask(self, repo: str, issue: Dict[str, Any], reason: str) -> bool:
+        def _withdraw_stale_ask(self, repo: str, issue: Dict[str, Any], reason: str) -> bool:
         """Withdraw a stale ask: post a note and remove needs:<login> label.
         Returns True if the ask was withdrawn, False otherwise."""
         labels = [str(l.get("name", "")) for l in issue.get("labels", []) if isinstance(l, dict)]
@@ -9910,7 +9913,7 @@ class Station:
             self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, issue.get("number")),
                         {"labels": [{"name": l["name"]} for l in current_labels]})
             return True
-        except Exception:
+        except Exception as e:
             return False
 
     def _check_and_withdraw_stale_asks(self, issues: List[Dict[str, Any]],
@@ -9936,7 +9939,7 @@ class Station:
             if stale_when_commit:
                 commit_sha = stale_when_commit.group(1).lower()
                 if commit_sha in deployed_commits:
-                    repo = str(issue.get("repository", {}).get("full_name") or "").split("/")[0]
+                    repo = issue.get("repository", {}).get("full_name") or ""
                     if self._withdraw_stale_ask(repo, issue, "commit %s is live" % commit_sha[:12]):
                         withdrawn += 1
                         continue
@@ -9944,8 +9947,8 @@ class Station:
             # Check for stale-when: issue exists
             if self.ISSUE_EXISTS_PATTERN.search(comment_body):
                 for deployed_repo, deployed_num in deployed_issues:
-                    repo = str(issue.get("repository", {}).get("full_name") or "").split("/")[0]
                     if self._check_issue_exists(deployed_repo, deployed_num):
+                        repo = str(issue.get("repository", {}).get("full_name") or "").split("/")[0]
                         if self._withdraw_stale_ask(repo, issue, "issue %s exists" % deployed_num):
                             withdrawn += 1
                             break
