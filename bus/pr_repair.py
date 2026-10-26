@@ -666,6 +666,48 @@ def _sweep_ticket(repo: str, pr: Dict[str, object], authors: set,
     return issue, ""
 
 
+def _sweep_fields(repo: str, pr: Dict[str, object], check: str,
+                  api) -> Optional[Tuple[str, str, str]]:
+    """The runner footer of a pull request whose head has finished every
+    check and fails only `check`, else None."""
+    from . import brain  # brain imports this module
+    fields = footer_fields(str(pr.get("body") or ""))
+    sha = str((pr.get("head") or {}).get("sha") or "")  # type: ignore[union-attr]
+    if fields is None or not sha:
+        return None
+    listed = api("repos/%s/commits/%s/check-runs?filter=all&per_page=100" % (repo, sha))
+    runs = brain.newest_check_runs((listed or {}).get("check_runs") or [])
+    return fields if _only_plan_failing(runs, check) else None
+
+
+def _sweep_one(repo: str, pr: Dict[str, object], issue: Dict[str, object],
+               fields: Tuple[str, str, str], apply: bool, check: str, edit,
+               say) -> Dict[str, object]:
+    """Rebuild one pull request's body from its ticket, report it, and edit
+    it when `apply` and the new body passes. Returns the sweep row."""
+    from . import tickets  # tickets imports the factory, which imports this module
+    number, ticket_number = int(pr["number"]), int(issue["number"])  # type: ignore[arg-type]
+    ticket, lane, model = fields
+    title, body = str(pr.get("title") or ""), str(pr.get("body") or "")
+    found = plan_repair(tickets.render_brief(repo, issue, lane), title, body, lane, model,
+                        ticket, repo=repo)
+    before, after = list(found["before"]), list(found["after"])  # type: ignore[call-overload]
+    if not before:
+        say("%s#%d: the body passes the plan checks; %s fails on something else"
+            % (repo, number, check))
+    elif found["changed"]:
+        say("%s#%d: %s body from ticket #%d (was: %s)"
+            % (repo, number, "repaired" if apply else "would repair", ticket_number,
+               "; ".join(before)))
+        if apply:
+            edit(repo, number, title, str(found["body"]))
+    else:
+        say("%s#%d: not repairable, ticket #%d lacks: %s"
+            % (repo, number, ticket_number, "; ".join(ticket_gaps(after))))
+    return {"repo": repo, "number": number, "before": before, "after": after,
+            "changed": found["changed"]}
+
+
 def sweep(repos: Sequence[str], apply: bool, check: str = PLAN_CHECK,
           api=_gh_api, edit=None, say=print,
           authors: Optional[Sequence[str]] = None) -> List[Dict[str, object]]:
@@ -675,7 +717,7 @@ def sweep(repos: Sequence[str], apply: bool, check: str = PLAN_CHECK,
     With apply False nothing is written: each finding is only reported.
     Returns one row per pull request found: repo, number, before, after,
     changed."""
-    from . import brain, tickets  # brain imports this module
+    from . import brain  # brain imports this module
     edit = edit or _gh_pr_edit
     trusted = {a.lower() for a in (authors if authors is not None
                                    else brain.require_trusted_authors(None, "sweep"))}
@@ -683,39 +725,14 @@ def sweep(repos: Sequence[str], apply: bool, check: str = PLAN_CHECK,
     for repo in repos:
         pulls = api("repos/%s/pulls?state=open&per_page=100" % repo) or []
         for pr in pulls if isinstance(pulls, list) else []:
-            body = str(pr.get("body") or "")
-            fields = footer_fields(body)
-            sha = str((pr.get("head") or {}).get("sha") or "")
-            if fields is None or not sha:
-                continue
-            number = int(pr["number"])
-            listed = api("repos/%s/commits/%s/check-runs?filter=all&per_page=100" % (repo, sha))
-            runs = brain.newest_check_runs((listed or {}).get("check_runs") or [])
-            if not _only_plan_failing(runs, check):
+            fields = _sweep_fields(repo, pr, check, api)
+            if fields is None:
                 continue
             issue, why = _sweep_ticket(repo, pr, trusted, api)
             if issue is None:
-                say("%s#%d: skipped, %s" % (repo, number, why))
+                say("%s#%d: skipped, %s" % (repo, int(pr["number"]), why))
                 continue
-            ticket_number = int(issue["number"])
-            ticket, lane, model = fields
-            found = plan_repair(tickets.render_brief(repo, issue, lane), str(pr.get("title") or ""),
-                                body, lane, model, ticket, repo=repo)
-            rows.append({"repo": repo, "number": number, "before": found["before"],
-                         "after": found["after"], "changed": found["changed"]})
-            if not found["before"]:
-                say("%s#%d: the body passes the plan checks; %s fails on something else"
-                    % (repo, number, check))
-            elif found["changed"]:
-                say("%s#%d: %s body from ticket #%d (was: %s)"
-                    % (repo, number, "repaired" if apply else "would repair", ticket_number,
-                       "; ".join(found["before"])))  # type: ignore[arg-type]
-                if apply:
-                    edit(repo, number, str(pr.get("title") or ""), str(found["body"]))
-            else:
-                say("%s#%d: not repairable, ticket #%d lacks: %s"
-                    % (repo, number, ticket_number,
-                       "; ".join(ticket_gaps(list(found["after"])))))  # type: ignore[arg-type]
+            rows.append(_sweep_one(repo, pr, issue, fields, apply, check, edit, say))
     return rows
 
 
