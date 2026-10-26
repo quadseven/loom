@@ -879,6 +879,11 @@ class InvariantsCloseTest(ShadowCase):
         self.assertEqual((entry["action"], entry["number"], entry["source"]),
                          (shadow.CLOSE, self.NUMBER, "station invariants"))
         self.assertTrue(any("would close" in line for line in said), said)
+        self.assertFalse(any("closed cleared" in line for line in said), said)
+        # The next pass tries again and adds nothing to the ledger or the log.
+        said = self.run_filer(transport)
+        self.assertEqual((sent, len(self.entries())), ([], 1))
+        self.assertFalse(any("would close" in line for line in said), said)
 
     def test_with_shadow_off_the_cleared_issue_closes(self):
         transport, sent = self.wire()
