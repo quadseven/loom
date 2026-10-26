@@ -117,6 +117,11 @@ Neither needs a model:
   easy), and says so in its note. The ticket's Difficulty: line is kept, so
   its next move takes its own tier again once a lane of it is up.
 - Past the last rung the ticket is left failed for the brain, with a note.
+- A ticket waiting with no lane that takes it (NO_LANE_RE) for
+  LOOM_NO_LANE_REROUTE hours (default 6) is rerouted to the first rung the
+  climb rules allow with a free lane in its tier; with none, by
+  NO_LANE_HANDOFF it goes to the hand-off pool (HANDOFF_LABEL), out of its
+  goal's in-flight count, with one note (loom#1831, docs/BRAIN.md).
 - A revert ticket (bus/revert.py, REVERT_LABEL) lands first when its own
   pull request is green, even while the default branch is red. Its medium
   and low findings are deferred at once instead of after a fix round, and
@@ -155,6 +160,45 @@ from .tickets import FIX_MARKER, PRIORITIES, priority_of
 FACTORY_CHECK = 300
 STUCK_AGE = 6 * 3600
 BRIEFED_STALL = 2 * 3600
+# A ticket the factory leaves waiting with no lane that takes it (NO_LANE_RE)
+# this long is rerouted to another rung of the model ladder with a free lane
+# in its tier; LOOM_NO_LANE_REROUTE sets the hours (no_lane_reroute). On
+# 2026-10-25, 89 tickets waited so, some since 10-23, and held their goals'
+# in-flight caps the whole time (loom#1831).
+NO_LANE_REROUTE = 6 * 3600
+# By this long with no reroute allowed, the ticket leaves the queue and its
+# goal's in-flight count for the hand-off pool (HANDOFF_LABEL).
+NO_LANE_HANDOFF = 24 * 3600
+# The wait reasons (Factory.waits) that mean no lane takes the ticket: a
+# queued ticket no free lane of its model or tier takes, a briefed one stalled
+# with no other lane of its rung or tier, or one on a lane at a limit or down
+# with no free lane in its rung or tier.
+NO_LANE_RE = re.compile(r"(no free lane takes model |no free lane in tier "
+                        r"|stalled on lane \S+: no other lane of its "
+                        r"|on lane \S+, .*: no free lane in its )")
+# The hand-off pool the second operator's session works (docs/BRAIN.md).
+HANDOFF_LABEL = labels.HANDOFF
+# The states in which a lane has taken the ticket: its no-lane wait is over.
+LANED_STATES = ("running", "pr", "answered", "merged", "shipped", "verified")
+
+
+def no_lane_reroute(env: Optional[Dict[str, str]] = None) -> float:
+    """Seconds a ticket waits with no lane before a reroute: the hours in
+    LOOM_NO_LANE_REROUTE (a positive number, at most NO_LANE_HANDOFF's),
+    else NO_LANE_REROUTE."""
+    raw = str((os.environ if env is None else env).get("LOOM_NO_LANE_REROUTE", "")).strip()
+    try:
+        hours = float(raw)
+    except ValueError:
+        return float(NO_LANE_REROUTE)
+    if not 0 < hours < float("inf"):
+        return float(NO_LANE_REROUTE)
+    return min(hours * 3600, float(NO_LANE_HANDOFF))
+
+
+def no_lane(reason: str) -> bool:
+    """Whether a wait reason (Factory.waits) says no lane takes the ticket."""
+    return bool(NO_LANE_RE.match(str(reason or "")))
 # A ticket held by its After: line this long, with none of the tickets it
 # waits for merged, is reported to the brain once like a stuck ticket.
 HOLD_STUCK = 48 * 3600
@@ -1360,6 +1404,12 @@ def agy_takes_header(issue: Dict[str, Any], rung_only: bool = False) -> bool:
     return lane_takes_model("agy", model)
 
 
+def _placements(found: Dict[str, Dict[int, Dict[str, Any]]]) -> Dict[str, Tuple[str, str]]:
+    """"OWNER/NAME#N" -> (state, lane) for each ticket, before a pass moves any."""
+    return {"%s#%s" % (repo, number): (_state(issue), _lane(issue))
+            for repo, issues in found.items() for number, issue in issues.items()}
+
+
 class Factory:
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
@@ -1385,7 +1435,9 @@ class Factory:
                  plan_check: str = DEFAULT_PLAN_CHECK,
                  scope: Optional[scope_fit.Ask] = None,
                  demoted: Optional[Dict[str, str]] = None,
-                 operators: Optional[Sequence[str]] = None) -> None:
+                 operators: Optional[Sequence[str]] = None,
+                 no_lane_since: Optional[Dict[str, float]] = None,
+                 reroute_after: Optional[float] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1439,6 +1491,15 @@ class Factory:
         # The same map as the last pass left it (the station's saved waits): a
         # ticket whose reason is unchanged is not announced again.
         self.known_waits = dict(known_waits or {})
+        # "OWNER/NAME#N" -> when the ticket first waited with no lane that
+        # takes it (the station's ticket-waits.json, no_lane_since): past
+        # reroute_after it is rerouted, past NO_LANE_HANDOFF handed off.
+        self.no_lane_since = dict(no_lane_since or {})
+        self.reroute_after = no_lane_reroute() if reroute_after is None else reroute_after
+        # The tickets whose no-lane wait ended this pass: a lane took them,
+        # they were rerouted, or they went to the hand-off pool. The station
+        # clears their no_lane_since.
+        self.settled: set = set()
         # The operators whose answers on the dashboard (bus/answer.py) count:
         # LOOM_OPERATORS, else the person logins among the trusted ones.
         self.operators = [o.lower() for o in (operators if operators is not None
@@ -3309,12 +3370,15 @@ class Factory:
         how many wait and why the first does."""
         found_by_repo = {repo: self._tickets(repo) for repo in self.repos}
         self.count_load(found_by_repo)
+        before = _placements(found_by_repo)
+        # A ticket in the hand-off pool is the second operator's session's.
         queued = [(repo, issue) for repo, found in found_by_repo.items() for issue in found.values()
-                  if _state(issue) == "queued"]
+                  if _state(issue) == "queued" and HANDOFF_LABEL not in _labels(issue)]
         waits = [self._assign_queued_ticket(repo, issue)
                  for repo, issue in sorted(queued, key=lambda item: tickets.work_order(*item))]
         if waits and all(waits):
             _say("assigned 0 of %d queued: %s" % (len(waits), waits[0]))
+        self._no_lane_moves(found_by_repo, before)
 
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
@@ -3465,6 +3529,109 @@ class Factory:
         self.load[lane] = self.load.get(lane, 0) + 1
         _say("gave queued %s#%d lane %s (tier %s)" % (repo, number, lane, tier))
 
+    # -- tickets no lane takes (loom#1831) --------------------------------
+    def _no_lane_moves(self, found: Dict[str, Dict[int, Dict[str, Any]]],
+                       before: Dict[str, Tuple[str, str]]) -> None:
+        """End the no-lane waits this pass can end. A ticket a lane took
+        (LANED_STATES, or a new lane while briefed) is settled. One that has
+        waited with no lane (no_lane) for reroute_after is rerouted to another
+        ladder rung with a free lane in its tier (_reroute); with none, by
+        NO_LANE_HANDOFF it goes to the hand-off pool (_hand_off)."""
+        for repo, issues in found.items():
+            for number, issue in issues.items():
+                key = "%s#%s" % (repo, number)
+                placed = (_state(issue), _lane(issue))
+                if (placed[0] in LANED_STATES or HANDOFF_LABEL in _labels(issue)
+                        or (placed[0] == "briefed" and placed != before.get(key))):
+                    self.settled.add(key)
+        for key, reason in sorted(self.waits.items()):
+            age = self.now - self.no_lane_since.get(key, self.now)
+            if not no_lane(reason) or age < self.reroute_after:
+                continue
+            repo, _, number = key.rpartition("#")
+            issue = found.get(repo, {}).get(int(number)) if number.isdigit() else None
+            if issue is None or {RUNAWAY, "needs-brain", HANDOFF_LABEL} & set(_labels(issue)):
+                continue  # held for the brain, or already handed off
+            if self.actions >= MAX_ACTIONS:
+                return
+            moved: List[bool] = []
+            if not self._guarded(lambda r, i: moved.append(self._reroute(r, i, reason, age)),
+                                 repo, issue):
+                continue
+            if not (moved and moved[0]):
+                if age < NO_LANE_HANDOFF or not self._guarded(
+                        lambda r, i: self._hand_off(r, i, reason, age), repo, issue):
+                    continue
+            self.waits.pop(key, None)
+            self.settled.add(key)
+
+    def _reroute(self, repo: str, issue: Dict[str, Any], reason: str, age: float) -> bool:
+        """Move a queued or briefed ticket pinned to a model no lane takes to
+        the first rung climb_rungs allows (never down from a strong model)
+        that has a free lane in the ticket's difficulty tier, for its repo
+        (PUBLIC_ONLY) and up for the rung's model (_up_lanes: not at a limit,
+        not benched, not out of credit). The note carries the rung marker, as
+        a "Not a failure" climb does. True when it moved."""
+        number, state, old = int(issue["number"]), _state(issue), _lane(issue)
+        match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+        if state not in ("queued", "briefed") or not match:
+            return False  # an unpinned ticket's tier moves are the queue's own
+        here = next((n for n, (_, model) in enumerate(CLIMB, 1) if model == match.group(1)), 0)
+        tier = set(lanes_of(difficulty_of(issue), self._is_private(repo)))
+        up = self._up_lanes(repo)
+        free = {rung: [x for x in lanes if x in tier and x != old and self._free(x)]
+                for rung, lanes in up.items() if rung != here}
+        if not any(free.values()):
+            return False  # nothing to move to: no comment read, every pass
+        tried, reached = self._tried(issue, self._comments(repo, number), failed_here=False)
+        found = next(((rung, free[rung][0]) for rung in climb_rungs(tried | ({here} - {0}), reached)
+                      if free.get(rung)), None)
+        if found is None:
+            return False
+        rung, lane = found
+        model = CLIMB[rung - 1][1]
+        body = with_model(str(issue.get("body") or ""), model)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+        issue["body"] = body
+        self._status_note(repo, number, "%s\nNot a failure (no lane took it for %.0f hours: %s): "
+                          "the factory rerouted this ticket to rung %d, %s on lane %s." % (
+                              RUNG_MARKER % rung, age / 3600, reason, rung, model, lane))
+        if state == "queued":
+            self._assign_queued_one(repo, issue, lane, "%s, rerouted to model %s" % (
+                difficulty_of(issue), model))
+        else:
+            self._relabel(repo, issue, [x for x in _labels(issue) if not x.startswith("lane:")]
+                          + ["lane:" + lane])
+            self.load[old] = self.load.get(old, 0) - 1
+            self.load[lane] = self.load.get(lane, 0) + 1
+        self.actions += 1
+        _say("rerouted %s#%d after %.0f hours with no lane (%s): %s on lane %s"
+             % (repo, number, age / 3600, reason, model, lane))
+        return True
+
+    def _hand_off(self, repo: str, issue: Dict[str, Any], reason: str, age: float) -> None:
+        """Put a ticket no lane took for NO_LANE_HANDOFF, with no reroute
+        allowed, in the hand-off pool: queued with no lane and HANDOFF_LABEL,
+        so it leaves its goal's in-flight count (brain._in_flight) and the
+        factory moves it no more. One note on its status comment, edited in
+        place; a handed-off ticket is never handed off again."""
+        number, old = int(issue["number"]), _lane(issue)
+        if _state(issue) not in ("queued", "briefed"):
+            return
+        kept = [x for x in brain._moved_labels(_labels(issue), "queued", None)
+                if not x.startswith("lane:")] + [HANDOFF_LABEL]
+        self._relabel(repo, issue, kept)
+        if old:
+            self.load[old] = self.load.get(old, 0) - 1
+        self._status_note(repo, number, (
+            "No lane of this Loom took this ticket in %.0f hours (%s), and no other lane or "
+            "model rung its tier allows is free. It leaves the goal's in-flight count for the "
+            "hand-off pool (%s): the second operator's session may claim it. Taking the label "
+            "off returns it to this Loom's queue.") % (age / 3600, reason, HANDOFF_LABEL))
+        self.actions += 1
+        _say("handed off %s#%d after %.0f hours with no lane (%s)"
+             % (repo, number, age / 3600, reason))
+
     def tier_lane(self, repo: str, difficulty: str) -> Optional[str]:
         """The first free lane of the difficulty tier the repo may use, else
         its least-loaded lane that is up and not at a limit; None when the
@@ -3480,8 +3647,10 @@ class Factory:
     def run(self) -> None:
         tickets = {repo: self._tickets(repo) for repo in self.repos}
         self.count_load(tickets)
+        before = _placements(tickets)
         for repo in self.repos:
             self._repo_pass(repo, tickets[repo])
+        self._no_lane_moves(tickets, before)
 
     def _repo_pass(self, repo: str, tickets: Dict[int, Dict[str, Any]]) -> None:
         # GitHub.paginate asks for 100 a page and follows every page.
@@ -3503,6 +3672,9 @@ class Factory:
             step = steps.get(_state(issue))
             if self.actions >= MAX_ACTIONS:
                 return
+            if HANDOFF_LABEL in _labels(issue) and _state(issue) in (
+                    "queued", "briefed", "running", "failed"):
+                continue  # the second operator's session has it (docs/BRAIN.md)
             if step is not None:
                 self._guarded(step, repo, issue)
 

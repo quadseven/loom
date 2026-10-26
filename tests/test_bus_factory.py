@@ -260,7 +260,8 @@ class Base(unittest.TestCase):
         self.placed = []
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
-           down=(), limit_until=None, scope=None, known_waits=None, demoted=None):
+           down=(), limit_until=None, scope=None, known_waits=None, demoted=None,
+           no_lane_since=None):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
@@ -292,7 +293,8 @@ class Base(unittest.TestCase):
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
                             silent=silent, down=down, limit_until=limit_until, scope=scope,
-                            known_waits=known_waits, demoted=demoted)
+                            known_waits=known_waits, demoted=demoted,
+                            no_lane_since=no_lane_since)
         f.run()
         return f
 
@@ -3519,8 +3521,10 @@ class Helpers(unittest.TestCase):
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
                          model_limits=None, silent=None, down=(), limit_until=None,
-                         benched=(), known_waits=None, plan_check=None, demoted=None):
+                         benched=(), known_waits=None, plan_check=None, demoted=None,
+                         no_lane_since=None):
                 self.silent_running, self.silent, self.waits = {}, silent, {}
+                self.settled = set()
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))
 
@@ -3718,6 +3722,130 @@ class ForbiddenModels(unittest.TestCase):
         self.assertTrue(station.lane_takes_model("agy", "gemini-3.8-flash-high"))
         for model in ("gemini-4-argon-high", "claude-opus-5-5", "gpt-oss-120b"):
             self.assertFalse(station.lane_takes_model("agy", model), model)
+
+
+class NoLane(Base):
+    """Tickets no lane takes are rerouted, then handed off (loom#1831)."""
+    SONNET = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+    OPUS = "Model: claude-opus-5-5\nDifficulty: medium\n\n## Why\nx\n"
+
+    def queued(self, number, body):
+        self.gh.ticket(number, "queued", body=body)
+        self.gh.issues[number]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"}]
+        self.gh.issues[number]["created_at"] = iso(0)
+
+    def assign(self, waited, available, **kwargs):
+        key = "%s#7" % REPO
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=available, no_lane_since={key: NOW - waited},
+                                 **kwargs)
+        worker.assign_queued()
+        return worker
+
+    def notes(self, number):
+        return "".join(c["body"] for c in self.gh.comments.get(number, []))
+
+    def test_the_reroute_hours_come_from_the_environment(self):
+        self.assertEqual(factory.no_lane_reroute({}), 6 * 3600)
+        self.assertEqual(factory.no_lane_reroute({"LOOM_NO_LANE_REROUTE": "2"}), 2 * 3600)
+        self.assertEqual(factory.no_lane_reroute({"LOOM_NO_LANE_REROUTE": "0.5"}), 1800)
+        for bad in ("", "x", "0", "-3", "nan", "inf"):
+            self.assertEqual(factory.no_lane_reroute({"LOOM_NO_LANE_REROUTE": bad}), 6 * 3600, bad)
+        # Never past the hand-off: by 24 hours at the latest it leaves.
+        self.assertEqual(factory.no_lane_reroute({"LOOM_NO_LANE_REROUTE": "48"}), 24 * 3600)
+
+    def test_no_lane_reasons_are_told_from_other_waits(self):
+        for reason in ("no free lane takes model claude-sonnet-5-5", "no free lane in tier medium",
+                       "stalled on lane claude: no other lane of its rung is available",
+                       "on lane codex, at a limit: no free lane in its tier"):
+            self.assertTrue(factory.no_lane(reason), reason)
+        for reason in ("waits for #5 to merge (After:)", "waits for a person (loom:human)",
+                       "stalled on lane codex: another lane of its tier waits as long"):
+            self.assertFalse(factory.no_lane(reason), reason)
+
+    def test_a_queued_ticket_no_lane_takes_for_six_hours_moves_to_another_rung(self):
+        # 2026-10-25: 89 tickets waited on "no free lane takes model
+        # claude-sonnet-5-5", some since 10-23, while codex had room.
+        self.queued(7, self.SONNET)
+        self.gh.ticket(8, "running", lane="claude")
+        worker = self.assign(7 * 3600, ["claude", "codex"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7), self.model(7)),
+                         ("briefed", "codex", "gpt-6-luna"))
+        self.assertIn(factory.RUNG_MARKER % 2, self.notes(7))
+        self.assertIn("rerouted this ticket to rung 2", self.notes(7))
+        self.assertNotIn("%s#7" % REPO, worker.waits)
+        self.assertIn("%s#7" % REPO, worker.settled)
+
+    def test_a_queued_ticket_waiting_under_six_hours_stays_where_it_is(self):
+        self.queued(7, self.SONNET)
+        self.gh.ticket(8, "running", lane="claude")
+        worker = self.assign(5 * 3600, ["claude", "codex"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-sonnet-5-5"))
+        self.assertEqual(worker.waits["%s#7" % REPO], "no free lane takes model claude-sonnet-5-5")
+        self.assertNotIn("%s#7" % REPO, worker.settled)
+
+    def test_a_reroute_never_leaves_the_tickets_tier(self):
+        # Easy work never runs on a ladder lane (TIERS): no reroute, it waits.
+        self.queued(7, "Model: claude-sonnet-5-5\nDifficulty: easy\n\n## Why\nx\n")
+        self.gh.ticket(8, "running", lane="claude")
+        self.assign(7 * 3600, ["claude", "codex"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-sonnet-5-5"))
+
+    def test_a_stalled_briefed_ticket_is_rerouted_after_six_hours(self):
+        self.gh.private = False
+        self.stalled(7)
+        f = self.go(available=["claude", "codex"], no_lane_since={"%s#7" % REPO: NOW - 7 * 3600})
+        self.assertEqual((self.lane(7), self.model(7)), ("codex", "gpt-6-luna"))
+        self.assertIn("%s#7" % REPO, f.settled)
+
+    def stalled(self, number):
+        self.gh.ticket(number, "briefed", lane="claude", body=self.SONNET)
+        self.gh.events[number] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                                   "created_at": iso(factory.BRIEFED_STALL + 600)}]
+
+    def test_a_ticket_no_lane_takes_for_a_day_goes_to_the_hand_off_pool_once(self):
+        # Opus is the strong rung: no reroute is allowed below it.
+        self.queued(7, self.OPUS)
+        worker = self.assign(25 * 3600, [])
+        names = [x["name"] for x in self.gh.issues[7]["labels"]]
+        self.assertIn(factory.HANDOFF_LABEL, names)
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertFalse([x for x in names if x.startswith("lane:")])
+        self.assertIn("hand-off pool", self.notes(7))
+        self.assertIn("%s#7" % REPO, worker.settled)
+        self.assertFalse(brain._in_flight(self.gh.issues[7]))
+        comments = [dict(c) for c in self.gh.comments[7]]
+        # The next pass leaves it alone: no second note, no lane, no wait.
+        again = self.assign(26 * 3600, ["claude"])
+        self.assertEqual(self.gh.comments[7], comments)
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertNotIn("%s#7" % REPO, again.waits)
+
+    def test_a_ticket_with_no_reroute_waits_until_its_day_is_out(self):
+        self.queued(7, self.OPUS)
+        worker = self.assign(23 * 3600, [])
+        self.assertNotIn(factory.HANDOFF_LABEL, [x["name"] for x in self.gh.issues[7]["labels"]])
+        self.assertIn("%s#7" % REPO, worker.waits)
+
+    def test_a_ticket_a_lane_takes_settles_its_wait(self):
+        self.queued(7, self.SONNET)
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["claude"])
+        worker.assign_queued()
+        self.assertEqual(self.lane(7), "claude")
+        self.assertIn("%s#7" % REPO, worker.settled)
+
+    def test_the_hand_off_pool_leaves_the_cap_but_a_pr_ticket_still_counts(self):
+        def ticket(state, *extra):
+            return {"state": "open", "labels": [{"name": x} for x in
+                                                ("loom:ticket", "loom:" + state) + extra]}
+        self.assertTrue(brain._in_flight(ticket("queued")))
+        self.assertFalse(brain._in_flight(ticket("queued", factory.HANDOFF_LABEL)))
+        self.assertFalse(brain._in_flight(ticket("briefed", factory.HANDOFF_LABEL)))
+        self.assertTrue(brain._in_flight(ticket("pr")))
+        self.assertTrue(brain._in_flight(ticket("pr", factory.HANDOFF_LABEL)))
 
 
 if __name__ == "__main__":

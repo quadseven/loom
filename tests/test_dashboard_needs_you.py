@@ -179,6 +179,51 @@ class RefKeyTest(unittest.TestCase):
         self.assertNotEqual(needs_you.ref_key("grug", 1, names), needs_you.ref_key("one-owner/grug", 1, names))
 
 
+class GoalCapsTest(NeedsYouPageTest):
+    """The station's goals stuck at their in-flight cap (loom#1831)."""
+    GOAL = {"goal": "%s#5" % REPO, "since": 0.0, "in_flight": 32, "cap": 28, "no_lane": 20}
+
+    def post(self, body, auth="Bearer YOUR_UPLOAD_TOKEN_HERE"):
+        import io
+        from email.message import Message
+        handler_type = server._handler_for(self.store)
+        handler = handler_type.__new__(handler_type)
+        handler.path = "/api/goal-caps"
+        handler.headers = Message()
+        raw = json.dumps(body).encode()
+        handler.headers["Content-Length"] = str(len(raw))
+        if auth:
+            handler.headers["Authorization"] = auth
+        handler.rfile = io.BytesIO(raw)
+        result = []
+        handler.send_json = lambda code, value: result.append((code, value))
+        with mock.patch.dict(os.environ, {"LOOM_UPLOAD_TOKEN": "YOUR_UPLOAD_TOKEN_HERE"}):
+            handler.do_POST()
+        return result[0]
+
+    def test_a_goal_stuck_at_its_cap_shows_with_its_no_lane_count(self):
+        now = 10 * 3600.0
+        with mock.patch.object(server.time, "time", return_value=now):
+            self.assertEqual(self.post({"goals": [self.GOAL]}, auth="")[0], 401)
+            self.assertEqual(self.post({"goals": [self.GOAL]}), (201, {"goals": 1}))
+            body = self.page()
+        self.assertIn("Goals stuck at their cap (1)", body)
+        self.assertIn("%s#5</strong> stuck at its cap for 10 hours: 32 of 28 in "
+                      "flight, 20 blocked on no lane." % REPO, body)
+
+    def test_an_old_or_empty_report_shows_nothing(self):
+        self.assertEqual(needs_you.goal_caps_section({"goals": [self.GOAL], "received_at": 0.0},
+                                                     needs_you.GOAL_CAPS_MAX_AGE + 1), "")
+        self.assertEqual(needs_you.goal_caps_section({"goals": [], "received_at": 0.0}, 1.0), "")
+        self.assertEqual(needs_you.goal_caps_section(None, 1.0), "")
+
+    def test_a_malformed_report_is_refused(self):
+        for body in ({}, {"goals": "x"}, {"goals": [dict(self.GOAL, goal="<b>x</b>")]},
+                     {"goals": [dict(self.GOAL, no_lane="3")]},
+                     {"goals": [dict(self.GOAL, cap=True)]}):
+            self.assertEqual(self.post(body)[0], 400, body)
+
+
 if __name__ == "__main__":
     unittest.main()
 

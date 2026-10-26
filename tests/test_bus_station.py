@@ -5220,6 +5220,26 @@ class SilentLaneTest(Base):
         self.assertEqual(st._factory().known_waits,
                          {key: "stalled on lane claude: no other lane of its rung is available"})
 
+    def test_a_no_lane_wait_keeps_its_first_time_until_a_lane_takes_the_ticket(self):
+        # loom#1831: the time a ticket first waited with no lane that takes
+        # it lasts across its no-lane reasons, and goes when a lane takes it.
+        st = self.station()
+        start = st.now
+        key = "%s#12" % REPO
+        st._record_waits({key: "no free lane takes model claude-sonnet-5-5"})
+        st.now = start + 3 * 3600
+        st._record_waits({key: "stalled on lane claude: no other lane of its rung is available"})
+        self.assertEqual(st._no_lane_since(), {key: start})
+        self.assertEqual(st._factory().no_lane_since, {key: start})
+        st._record_waits({key: "waits for #5 to merge (After:)"})
+        self.assertEqual(st._no_lane_since(), {})
+        st._record_waits({key: "no free lane in tier medium"})
+        self.assertEqual(st._no_lane_since(), {key: st.now})
+        st.now += 600
+        st._record_waits({}, settled={key})
+        self.assertEqual(st._no_lane_since(), {})
+        self.assertEqual(st._invariant_waits(), [])
+
     def test_a_wait_reason_that_could_carry_ticket_text_never_reaches_the_invariant(self):
         st = self.station()
         st._record_waits({"%s#12" % REPO: "no free lane takes model `x` <img src=y>",
