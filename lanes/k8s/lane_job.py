@@ -338,14 +338,17 @@ def report() -> None:
     with open(secret, "wb") as fh:
         os.chmod(secret, 0o600)
         fh.write(os.urandom(32).hex().encode("ascii"))
+    step = "encrypt the files"
     try:
         subprocess.run(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt", "-pass",
                         "file:" + secret, "-out", os.path.join(out, "report.enc")],
                        input=buf.getvalue(), check=True, capture_output=True, timeout=120)
+        step = "seal the key to the station's report key"
         subprocess.run(["openssl", "pkeyutl", "-encrypt", "-pubin", "-inkey",
                         os.path.join(d, "report-key.pem"), "-pkeyopt", "rsa_padding_mode:oaep",
                         "-in", secret, "-out", os.path.join(out, "key.enc")],
                        check=True, capture_output=True, timeout=120)
+        step = "MAC the report"
         with open(os.path.join(d, "report-mac-key"), encoding="ascii") as fh:
             mac_key = fh.read().strip()
         with open(os.path.join(out, "key.enc"), "rb") as fh:
@@ -356,10 +359,19 @@ def report() -> None:
                 digest.update(chunk)
         _write(os.path.join(out, "report.mac"),
                runners.Runners.report_mac(mac_key, job["run_id"], sealed_key, digest.hexdigest()) + "\n")
-    except (OSError, subprocess.SubprocessError):
-        raise JobError("could not seal the report") from None
+    except subprocess.CalledProcessError as err:
+        # openssl's own text may name paths; its exit status does not.
+        raise JobError("could not seal the report: %s failed (openssl exit %d)"
+                       % (step, err.returncode)) from err
+    except (OSError, subprocess.SubprocessError) as err:
+        raise JobError("could not seal the report: %s failed (%s)" % (step, type(err).__name__)) from err
     finally:
         os.remove(secret)
+        # The run's MAC key has done its work; it does not outlive the job.
+        try:
+            os.remove(os.path.join(d, "report-mac-key"))
+        except FileNotFoundError:
+            pass
     print("sealed the report")
 
 

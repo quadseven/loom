@@ -80,7 +80,13 @@ class LaneWorkflow(unittest.TestCase):
     def test_the_report_is_uploaded_whatever_the_run_did(self):
         upload = next(s for s in self.steps() if "actions/upload-artifact@" in s)
         self.assertIn("name: lane-report-${{ inputs.run_id }}", upload)
-        self.assertIn("if: ${{ !cancelled() }}", upload)
+        # Uploaded whatever the run did, but only once prepare checked the
+        # run_id that names it.
+        self.assertIn("if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}", upload)
+        seal = next(s for s in self.steps() if "lane_job.py report" in s)
+        self.assertIn("steps.prepare.outcome == 'success'", seal)
+        prepare = next(s for s in self.steps() if "lane_job.py prepare" in s)
+        self.assertIn("id: prepare", prepare)
 
 
 if __name__ == "__main__":

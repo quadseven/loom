@@ -21,5 +21,11 @@ done
 [ -n "${LOOM_SSM_DIR:-}" ] || { echo "LOOM_SSM_DIR is not set" >&2; exit 2; }
 case "$name" in /*) ;; *) echo "not an SSM parameter name" >&2; exit 2 ;; esac
 case "/$name/" in */../* | */./*) echo "not an SSM parameter name" >&2; exit 2 ;; esac
-[ -s "$LOOM_SSM_DIR$name" ] || { echo "parameter not copied into LOOM_SSM_DIR" >&2; exit 2; }
-cat "$LOOM_SSM_DIR$name"
+# Resolved, not only lexical: no part of the path may be a link, and the
+# folder it resolves to must lie inside LOOM_SSM_DIR.
+file="$LOOM_SSM_DIR$name"
+[ -s "$file" ] && [ ! -L "$file" ] || { echo "parameter not copied into LOOM_SSM_DIR" >&2; exit 2; }
+root="$(cd -P "$LOOM_SSM_DIR" 2> /dev/null && pwd -P)" || { echo "LOOM_SSM_DIR is not a folder" >&2; exit 2; }
+dir="$(cd -P "$(dirname "$file")" 2> /dev/null && pwd -P)" || { echo "parameter not copied into LOOM_SSM_DIR" >&2; exit 2; }
+case "$dir/" in "$root"/*) ;; *) echo "parameter resolves outside LOOM_SSM_DIR" >&2; exit 2 ;; esac
+cat "$dir/$(basename "$file")"

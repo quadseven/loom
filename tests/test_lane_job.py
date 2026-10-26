@@ -249,5 +249,68 @@ class LaneJobTest(unittest.TestCase):
             self.assertTrue(r.allowed_path("opencode-go-2", "owner.app-7", rel), rel)
 
 
+    def real_key(self):
+        """A real report public key in the job dir (openssl, as the station makes it)."""
+        priv = self.tmp / "station.pem"
+        subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048",
+                        "-out", str(priv)], check=True, capture_output=True)
+        pub = subprocess.run(["openssl", "pkey", "-in", str(priv), "-pubout"], check=True,
+                             capture_output=True, text=True).stdout
+        (self.job / "report-key.pem").write_text(pub)
+
+    def test_sealing_drops_the_runs_mac_key(self):
+        self.assertEqual(self.step("prepare").returncode, 0)
+        self.assertEqual(self.step("run").returncode, 0)
+        self.real_key()
+        result = self.step("report")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.job / "report" / "report.mac").exists())
+        self.assertFalse((self.job / "report-mac-key").exists())
+
+    def test_a_seal_that_fails_names_its_step(self):
+        self.assertEqual(self.step("prepare").returncode, 0)
+        self.assertEqual(self.step("run").returncode, 0)
+        result = self.step("report")   # report-key.pem is not a usable key
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("could not seal the report: seal the key to the station's report key failed "
+                      "(openssl exit", result.stderr)
+        self.assertFalse((self.job / "report-mac-key").exists())
+
+
+class SsmDirAwsTest(unittest.TestCase):
+    """lanes/k8s/ssm-dir-bin/aws, the AWS CLI stand-in the leak scanner reads
+    the deny-list through: a value is read only from inside LOOM_SSM_DIR."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.ssm = self.tmp / "ssm"
+        (self.ssm / "infra").mkdir(parents=True)
+        (self.ssm / "infra" / "deny").write_text("terms\n")
+        (self.tmp / "outside").write_text("not a parameter\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def get(self, name):
+        return subprocess.run(["bash", str(ROOT / "lanes" / "k8s" / "ssm-dir-bin" / "aws"), "ssm",
+                               "get-parameter", "--name", name, "--with-decryption",
+                               "--query", "Parameter.Value", "--output", "text"],
+                              env={"PATH": os.environ["PATH"], "LOOM_SSM_DIR": str(self.ssm)},
+                              capture_output=True, text=True, timeout=30)
+
+    def test_a_copied_value_is_served(self):
+        got = self.get("/infra/deny")
+        self.assertEqual((got.returncode, got.stdout), (0, "terms\n"), got.stderr)
+
+    def test_a_link_out_of_the_folder_is_refused(self):
+        (self.ssm / "infra" / "link").symlink_to(self.tmp / "outside")
+        (self.ssm / "away").symlink_to(self.tmp, target_is_directory=True)
+        for name in ("/infra/link", "/away/outside", "/../outside", "/infra/../../outside"):
+            got = self.get(name)
+            self.assertEqual(got.returncode, 2, name)
+            self.assertNotIn("not a parameter", got.stdout, name)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -113,6 +113,7 @@ jobs:
           persist-credentials: false
 
       - name: Read the dispatch
+        id: prepare
         env:
           LOOM_RUNNER_GATEWAY_URL: ${{ vars.LOOM_RUNNER_GATEWAY_URL }}
         run: python3 -B loom/lanes/k8s/lane_job.py prepare
@@ -152,12 +153,14 @@ jobs:
           LOOM_LEAK_SCANNER: ${{ github.workspace }}/infra-public/.github/scripts/check_private_leaks.py
         run: python3 -B loom/lanes/k8s/lane_job.py run
 
+      # Only after the dispatch was read: its run_id is then checked as 32
+      # hex digits before it names the artifact.
       - name: Seal the report
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: python3 -B loom/lanes/k8s/lane_job.py report
 
       - name: Upload the report
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lane-report-${{ inputs.run_id }}
