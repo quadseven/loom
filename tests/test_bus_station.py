@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import audit, brain, factory, invariants, proof, spend, station, status, tickets  # noqa: E402
+from bus import audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
@@ -3044,6 +3044,238 @@ class HandBackTest(unittest.TestCase):
         self.run_hand_back()
         self.assertEqual(len(self.gh.comments), 1)
         self.assertEqual(self.ready_events(), [READY % ("b" * 40), READY % ("a" * 40)])
+
+
+class StampedReviewFake(ReviewFake):
+    """ReviewFake whose comments carry the times GitHub gives them: a post
+    sets created_at and updated_at, an edit moves updated_at. It counts the
+    new comments, the writes that email the operator. Its comment list reads
+    as the GitHub client reads it: fix-rounds comments expanded against the
+    ledger the station names in fix_ledger."""
+
+    def __init__(self):
+        super().__init__()
+        self.new_comments = 0
+        self.next_id = 100
+        self.fix_ledger = None
+
+    def paginate(self, path):
+        raw = super().paginate(path)
+        return fixrounds.expand([dict(c) for c in raw], AUTHORS,
+                                fixrounds.load_ledger(self.fix_ledger))
+
+    def _post_comment(self, data):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.next_id += 1
+        self.new_comments += 1
+        self.comments.append({"id": self.next_id, "body": data["body"],
+                              "user": {"login": "alice-example"},
+                              "created_at": stamp, "updated_at": stamp})
+        return mock.Mock(data={"id": self.next_id})
+
+    def _patch_comment(self, comment_id, data):
+        comment = next(c for c in self.comments if c.get("id") == comment_id)
+        comment["body"] = data["body"]
+        comment["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return mock.Mock(data=dict(comment))
+
+    def _get(self, path):
+        if path == "/repos/%s/pulls/%d" % (REPO, self.pr["number"]):
+            return mock.Mock(data=self.pr)
+        return super()._get(path)
+
+
+class FixRoundsInPlaceTest(unittest.TestCase):
+    """loom#1640: every new comment emails the operator, and each fix round
+    posted one. A later round on the same pull request edits the first one."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.gh = StampedReviewFake()
+        self.station = station.Station(self.gh, station.Settings(self.temp.name, [REPO], AUTHORS, OWNERS))
+        self.authors = {a.lower() for a in AUTHORS}
+        self.claims = 0
+        # The ticket's status comment, where each claim is an edit.
+        status.add(self.gh, REPO, 12, "Lane codex given", time.time(), AUTHORS)
+        self.gh.new_comments = 0
+
+    def thread(self, ident):
+        return {"id": ident, "path": "a.py", "line": 4,
+                "comments": {"nodes": [{"databaseId": 9, "body": "change this",
+                                         "author": {"login": "grug-tribe[bot]"}}]}}
+
+    def lane_pushes(self, sha):
+        """The lane claimed the round, ran it and pushed: the ticket is back
+        at loom:pr."""
+        self.claims += 1
+        status.add(self.gh, REPO, 12, "Claimed for lane codex (body sha256 %012x)" % self.claims,
+                   time.time() + 60 * self.claims, AUTHORS)
+        self.gh.pr["head"]["sha"] = sha
+        self.gh.issue["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                                   {"name": "lane:codex"}]
+
+    def round(self, n, rounds="10"):
+        self.lane_pushes(str(n) * 40)
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": rounds}), \
+             mock.patch("bus.brain._failing_checks", return_value=[("lint-%d" % n, "log %d" % n)]), \
+             mock.patch("bus.brain._open_threads", return_value=[self.thread("PRRT_%d" % n)]):
+            self.station.hand_back()
+
+    def fixes(self):
+        return [c for c in self.gh.comments if str(c["body"]).startswith(tickets.FIX_MARKER)]
+
+    def test_three_rounds_on_one_pull_request_are_one_comment_listing_all_three(self):
+        for n in (1, 2, 3):
+            self.round(n)
+        fixes = self.fixes()
+        self.assertEqual(len(fixes), 1)
+        self.assertEqual(self.gh.new_comments, 1)
+        body = fixes[0]["body"]
+        for n in (1, 2, 3):
+            self.assertIn("Round %d, " % n, body)
+            self.assertIn("- Check `lint-%d` failed" % n, body)
+        self.assertLess(len(body), 65536)
+        self.assertEqual(body, body.encode("ascii").decode("ascii"))
+
+    def test_round_counting_and_the_fix_brief_still_see_three_rounds(self):
+        for n in (1, 2, 3):
+            self.round(n)
+        comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
+        self.assertEqual(station.Station._fix_round_count(comments, self.authors), 3)
+        self.assertEqual(factory.fixes_of(comments), 3)
+        self.assertEqual(factory.asked_threads(comments), {"PRRT_1", "PRRT_2", "PRRT_3"})
+        fix, ident = self.station._fix_for(REPO, comments)
+        self.assertEqual((fix.pr, fix.branch), (7, "loom/12-fix"))
+        self.assertIn("lint-3", fix.findings)
+        self.assertNotIn("lint-2", fix.findings)
+        self.assertEqual(ident, self.fixes()[0]["id"])
+        # The cap counts them too: a fourth round with a cap of 3 holds instead.
+        self.round(4, rounds="3")
+        self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual(station.Station._fix_round_count(
+            self.gh.paginate("/repos/%s/issues/12/comments" % REPO), self.authors), 3)
+
+    def test_an_old_ticket_with_three_per_round_comments_still_counts_three(self):
+        for n in (1, 2, 3):
+            self.gh._post_comment({"body": tickets.FIX_MARKER + "\nPull request: %s#7, branch "
+                                   "loom/12-fix\n<!-- loom:fix-head %s -->" % (REPO, str(n) * 40)})
+        comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
+        self.assertEqual(station.Station._fix_round_count(comments, self.authors), 3)
+        self.assertEqual(factory.fixes_of(comments), 3)
+        before = self.gh.new_comments
+        self.round(4, rounds="5")
+        self.assertEqual(self.gh.new_comments, before)
+        comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
+        self.assertEqual(station.Station._fix_round_count(comments, self.authors), 4)
+        self.round(5, rounds="4")
+        self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_a_simulated_day_of_passes_with_fix_rounds_posts_at_most_one_comment(self):
+        start = time.time()
+        for hour in range(24):
+            if "loom:briefed" in [x["name"] for x in self.gh.issue["labels"]]:
+                self.lane_pushes("%040x" % (hour + 1))
+            day = station.Station(self.gh, station.Settings(self.temp.name, [REPO], AUTHORS, OWNERS),
+                                  now=start + hour * 3600)
+            with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "100"}), \
+                 mock.patch("bus.brain._failing_checks", return_value=[("lint", "log %d" % hour)]), \
+                 mock.patch("bus.brain._open_threads", return_value=[]):
+                day.hand_back()
+        comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
+        self.assertEqual(station.Station._fix_round_count(comments, self.authors), 24)
+        self.assertLessEqual(self.gh.new_comments, 1)
+
+    def test_a_rounds_comment_edited_by_someone_else_is_refused_and_not_built_on(self):
+        for n in (1, 2):
+            self.round(n)
+        self.fixes()[0]["updated_at"] = "2099-01-01T00:00:00Z"
+        comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
+        with self.assertRaisesRegex(ValueError, "edited after it was posted"):
+            self.station._fix_for(REPO, comments)
+        # Read per comment: the edited one is one round, never its rounds.
+        self.assertEqual(station.Station._fix_round_count(comments, self.authors), 1)
+        self.round(3)
+        self.assertEqual(self.gh.new_comments, 2)
+        self.assertEqual(station.Station._fix_round_count(
+            self.gh.paginate("/repos/%s/issues/12/comments" % REPO), self.authors), 2)
+
+    def test_forged_rounds_with_fresh_body_times_are_not_read(self):
+        # A writer who can edit the comment adds rounds and stamps the newest
+        # with the comment's new update time. Only the station's own record
+        # of its last edit says whether the comment is still its own.
+        for n in (1, 2):
+            self.round(n)
+        comment = self.fixes()[0]
+        stamp = "2099-01-01T00:00:00Z"
+        forged = "\n".join(tickets.FIX_MARKER + "\nPull request: %s#7, branch loom/12-fix\n"
+                           "<!-- loom:fix-head %s -->" % (REPO, "f" * 40) for _ in range(1))
+        comment["body"] += "<!-- loom:fix-round 3 %s\n%s\n-->\n" % (stamp, forged.replace(">", "&gt;"))
+        comment["updated_at"] = stamp
+        comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
+        self.assertEqual(station.Station._fix_round_count(comments, self.authors), 1)
+        with self.assertRaisesRegex(ValueError, "edited after it was posted"):
+            self.station._fix_for(REPO, comments)
+
+    def test_round_counters_never_read_a_strangers_rounds(self):
+        self.round(1)
+        self.round(2)
+        body = self.fixes()[0]["body"]
+        stranger = [{"id": 5, "user": {"login": "mallory-example"}, "body": body,
+                     "created_at": "2030-01-01T00:00:00Z", "updated_at": "2030-01-01T00:00:00Z"}]
+        self.assertEqual(factory.fixes_of(stranger), 1)
+        self.assertEqual(factory.asked_threads(stranger), set())
+
+    def test_a_round_body_round_trips_through_its_hidden_block(self):
+        body = (tickets.FIX_MARKER + "\nPull request: %s#7, branch loom/12-fix\n"
+                "- Check `x` failed\n\n<!-- loom:fix-detail\nquoted --> and --!> and &gt; "
+                "and &amp;\n-->\n<!-- loom:fix-head %s -->" % (REPO, "a" * 40))
+        text = fixrounds.render((REPO, 7), "loom/12-fix",
+                                [(1, "2030-01-01T00:00:00Z", body), (2, "2030-01-01T01:00:00Z", body)])
+        self.assertEqual([r[2] for r in fixrounds.parse(text)], [body, body])
+
+    def test_an_encoded_round_is_never_decompressed(self):
+        # The first form kept rounds zlib-compressed: a small line could
+        # inflate without bound. Rounds are plain text now.
+        import zlib
+        blob = base64.b64encode(zlib.compress(b"0" * (8 << 20), 9)).decode()
+        body = (tickets.FIX_MARKER + "\nPull request: %s#7, branch loom/12-fix\n"
+                % REPO + fixrounds.MARKER + "\n<!-- loom:fix-round 1 2030-01-01T00:00:00Z %s -->\n" % blob)
+        self.assertEqual(fixrounds.parse(body), [])
+
+    def test_a_new_pull_request_gets_its_own_comment(self):
+        self.round(1)
+        self.gh.pr["number"] = 8
+        self.gh.pr["head"]["ref"] = "loom/12-again"
+        self.round(2)
+        self.assertEqual(self.gh.new_comments, 2)
+
+    def test_a_strangers_look_alike_is_not_expanded(self):
+        self.round(1)
+        self.round(2)
+        comment = dict(self.fixes()[0])
+        ledger = fixrounds.load_ledger(self.gh.fix_ledger)
+        self.assertEqual(len(fixrounds.expand([comment], AUTHORS, ledger)), 2)
+        stranger = [dict(comment, user={"login": "mallory-example"})]
+        self.assertEqual(fixrounds.expand(stranger, AUTHORS, ledger), stranger)
+
+    def test_the_github_client_reads_a_rounds_comment_as_one_comment_per_round(self):
+        self.round(1)
+        self.round(2)
+        raw = [dict(c) for c in self.gh.comments]
+
+        def transport(method, url, headers, body):
+            return reply(200, raw)
+        client = GitHub("token", transport=transport)
+        client.status_authors = set(AUTHORS)
+        got = client.rest("GET", "/repos/%s/issues/12/comments" % REPO).data
+        fixes = [c for c in got if str(c.get("body") or "").startswith(tickets.FIX_MARKER)]
+        self.assertEqual(len(fixes), 1)  # no ledger: one opaque comment
+        client.fix_ledger = self.gh.fix_ledger
+        got = GitHub.rest(client, "GET", "/repos/%s/issues/12/comments?x=1" % REPO).data
+        fixes = [c for c in got if str(c.get("body") or "").startswith(tickets.FIX_MARKER)]
+        self.assertEqual(len(fixes), 2)
+        self.assertIn("lint-2", fixes[-1]["body"])
 
 
 RBAC_WORKFLOW = """name: rbac
