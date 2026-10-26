@@ -35,6 +35,7 @@ from . import bench
 from . import ci_gap
 from . import converge
 from . import brain_memory
+from . import brain_hold
 from . import claimed
 from . import fabric
 from . import fixrounds
@@ -252,6 +253,10 @@ GOAL_CAP_STUCK = 6 * 3600
 GOAL_CAP_SEEN = 2 * 3600
 GOAL_CAPS_PATH = "/api/goal-caps"
 GOAL_CAPS_EVERY = 600
+# needs-brain holds older than a day (loom#1872): each run's counts, a repo a
+# row, go to the dashboard's Needs-you page; the run's stamp is kept here.
+BRAIN_HOLDS_PATH = "/api/brain-holds"
+BRAIN_HOLDS_FILE = "brain-holds.json"
 # A recorded ticket wait the factory has not repeated for this long is gone:
 # the ticket moved, or left the factory (invariants.ticket_waiting).
 WAIT_UNSEEN = 3600
@@ -4240,7 +4245,7 @@ class Station:
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
                      self.watch_default_branches, self.watch_deploys, self.score_lanes,
-                     self.refresh_bench, self.run_factory,
+                     self.refresh_bench, self.run_factory, self.lift_brain_holds,
                      # The move first, so the invariants read a goal whose
                      # tickets sit under an epic.
                      self.move_outside_tickets, self.check_invariants,
@@ -10229,6 +10234,55 @@ class Station:
         self._record_waits(runner.waits, runner.settled)
         self._record_silent(runner.silent_running, runner.silent)
         self._return_silent_briefs(runner.silent_running)
+
+    def lift_brain_holds(self) -> None:
+        """Resolve the needs-brain holds older than a day that Loom set
+        (bus/factory.py brain_holds, loom#1872), at most
+        brain_hold.LIFT_PER_RUN a run and a run at most every
+        brain_hold.LIFT_EVERY seconds, and send the dashboard each repo's
+        count. The run is stamped however it ends: stamped only on success,
+        a capped or failing run would repeat every pass (2026-10-20, 91
+        sources in minutes). LOOM_FACTORY=0 turns it off."""
+        if not self.s.factory_on or self._deferred():
+            return
+        path = os.path.join(self.state, BRAIN_HOLDS_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        last = state.get("_at")
+        if isinstance(last, (int, float)) and 0 <= self.now - last < brain_hold.LIFT_EVERY:
+            return
+        report: Dict[str, Dict[str, int]] = {}
+        try:
+            report = self._factory().brain_holds(brain_hold.LIFT_PER_RUN)
+        finally:
+            state["_at"] = self.now
+            _write_json(path, state)
+        lifted = sum(c.get("lifted", 0) for c in report.values())
+        left = sum(c.get("old", 0) for c in report.values()) - lifted
+        if lifted or left:
+            _say("needs-brain holds past a day: resolved %d, %d left (%d a person set, %d by "
+                 "an unknown setter)" % (lifted, left,
+                                         sum(c.get(brain_hold.PERSON, 0) for c in report.values()),
+                                         sum(c.get(brain_hold.UNKNOWN, 0) for c in report.values())))
+        self._post_brain_holds(report)
+
+    def _post_brain_holds(self, report: Dict[str, Dict[str, int]]) -> None:
+        """Send the dashboard (POST BRAIN_HOLDS_PATH) each repo's holds older
+        than a day that this run left; a failed send waits for the next run."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return
+        token = self._transcript_token()
+        if token is None:
+            return
+        rows = brain_hold.report_rows({repo: dict(c, old=c.get("old", 0) - c.get("lifted", 0))
+                                       for repo, c in report.items()})
+        try:
+            self.upload(brain_memory.dashboard_url(self.s.transcript_url, BRAIN_HOLDS_PATH), token,
+                        {"repos": rows, "at": self.now})
+        # Deliberately broad, as in post_stuck_goals: only the type is logged.
+        except Exception as err:  # noqa: BLE001
+            _say("could not send the needs-brain hold counts (%s); next run"
+                 % type(err).__name__)
 
     def _silent_lanes(self) -> Dict[str, float]:
         """Local lane -> seconds since its last heartbeat, for each lane
