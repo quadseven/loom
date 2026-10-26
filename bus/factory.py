@@ -126,6 +126,11 @@ Neither needs a model:
   climb rules allow with a free lane in its tier; with none, by
   NO_LANE_HANDOFF it goes to the hand-off pool (HANDOFF_LABEL), out of its
   goal's in-flight count, with one note (loom#1831, docs/BRAIN.md).
+- A needs-brain hold older than a day that Loom set (bus/brain_hold.py,
+  brain_holds; the station runs it at most every half hour, 5 a run) is
+  resolved: a loom:pr ticket whose pull request fails only the plan check on
+  its body has the body rebuilt and the hold lifted; any other goes to the
+  hand-off pool with one note (loom#1872). A person's hold is never lifted.
 - A revert ticket (bus/revert.py, REVERT_LABEL) lands first when its own
   pull request is green, even while the default branch is red. Its medium
   and low findings are deferred at once instead of after a fix round, and
@@ -156,7 +161,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, bench, brain, brief_check, change_class, converge, criteria_gate, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brain_hold, brief_check, change_class, converge, criteria_gate, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -1557,6 +1562,8 @@ class Factory:
         # pull requests are still open, read once a pass.
         self._depends: Dict[str, Optional[Dict[str, Any]]] = {}
         self._merged_prs: Dict[str, Dict[int, int]] = {}
+        # Each repo's open pull requests, read once a pass by _open_lane_pull.
+        self._open_pulls: Dict[str, List[Dict[str, Any]]] = {}
 
     # -- reads -----------------------------------------------------------
     def _trusted(self, item: Dict[str, Any]) -> bool:
@@ -2453,7 +2460,6 @@ class Factory:
         failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
         if len(failed) != 1 or failed[0].get("name") != self.plan_check:
             return False
-        body = str(full.get("body") or "")
         ticket = int(issue["number"])
         marker = PLAN_REPAIR_MARKER % sha
         repaired_at = max((_ts(c.get("created_at")) for c in comments
@@ -2465,25 +2471,11 @@ class Factory:
                      "it again" % (repo, number, ticket, self.plan_check))
                 return True
             return False  # read again and still failing: the usual paths
-        if not hunt_plan.problems(body):
-            return False
-        fields = pr_repair.footer_fields(body)
-        if fields is None:
-            return False
-        name, lane, model = fields
-        found = pr_repair.plan_repair(tickets.render_brief(repo, issue, lane),
-                                      str(full.get("title") or ""), body, lane, model, name,
-                                      repo=repo, public=not self._is_private(repo))
-        if found["reason"]:
-            _say("%s#%d: plan body repair refused (%s)" % (repo, number, found["reason"]))
+        found = self._plan_found(repo, number, full, issue)
+        if found is None:
             return False
         if found["changed"]:
-            self.gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number), {"body": found["body"]})
-            self._status_note(repo, ticket, "%s\n%s failed on pull request #%d only on its "
-                              "body (%s), which the runner writes from this ticket, so the "
-                              "factory rebuilt it from the ticket instead of sending a lane "
-                              "round." % (marker, self.plan_check, number,
-                                          "; ".join(found["before"])))  # type: ignore[arg-type]
+            self._apply_plan_body(repo, number, issue, found, marker)
             self._lift_plan_hold(repo, number, issue, comments)
             self.actions += 1
             _say("rebuilt %s#%d's body from ticket #%d after a body-only %s failure"
@@ -2492,6 +2484,38 @@ class Factory:
         self._hold_plan(repo, number, issue, comments,
                         pr_repair.ticket_gaps(list(found["after"])))  # type: ignore[arg-type]
         return True
+
+    def _plan_found(self, repo: str, number: int, full: Dict[str, Any],
+                    issue: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """bus/pr_repair.plan_repair's answer for a pull request body that
+        fails the plan check and carries the runner's footer; None when the
+        body passes, has no footer, or the text checks refuse the repair."""
+        body = str(full.get("body") or "")
+        if not hunt_plan.problems(body):
+            return None
+        fields = pr_repair.footer_fields(body)
+        if fields is None:
+            return None
+        name, lane, model = fields
+        found = pr_repair.plan_repair(tickets.render_brief(repo, issue, lane),
+                                      str(full.get("title") or ""), body, lane, model, name,
+                                      repo=repo, public=not self._is_private(repo))
+        if found["reason"]:
+            _say("%s#%d: plan body repair refused (%s)" % (repo, number, found["reason"]))
+            return None
+        return found
+
+    def _apply_plan_body(self, repo: str, number: int, issue: Dict[str, Any],
+                         found: Dict[str, Any], marker: str, also: str = "") -> None:
+        """Edit the rebuilt body onto the pull request, and say so (with
+        `also`, a further line) in one event on the ticket's status comment."""
+        self.gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number), {"body": found["body"]})
+        self._status_note(repo, int(issue["number"]), "%s\n%s failed on pull request #%d only "
+                          "on its body (%s), which the runner writes from this ticket, so the "
+                          "factory rebuilt it from the ticket instead of sending a lane "
+                          "round.%s" % (marker, self.plan_check, number,
+                                        "; ".join(found["before"]),
+                                        "\n" + also if also else ""))
 
     @staticmethod
     def _plan_note(comments: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -3698,6 +3722,165 @@ class Factory:
         self.actions += 1
         _say("handed off %s#%d after %.0f hours with no lane (%s)"
              % (repo, number, age / 3600, reason))
+
+    # -- needs-brain holds nothing resolves (loom#1872) ------------------
+    def brain_holds(self, limit: int = brain_hold.LIFT_PER_RUN,
+                    write: bool = True) -> Dict[str, Dict[str, int]]:
+        """Resolve up to `limit` needs-brain holds older than
+        brain_hold.HOLD_AGE that Loom set (brain_hold.setter), oldest first
+        (_lift_hold). A hold a person set, or one whose setter is unknown, is
+        left and counted. Each repo's counts (brain_hold.counts) come back;
+        with write False nothing is written and the LOOM count says how many
+        holds a run could resolve. A hold that errors still uses its turn,
+        so a run never writes more than `limit` times however it ends."""
+        report: Dict[str, Dict[str, int]] = {}
+        loom = brain_hold.loom_logins(self.trusted)
+        due: List[Tuple[float, str, Dict[str, Any], brain_hold.Setter]] = []
+        for repo in self.repos:
+            counts = report[repo] = brain_hold.counts()
+            try:
+                held = [i for i in self._tickets(repo).values() if brain_hold.LABEL in _labels(i)]
+            except GitHubError as err:
+                _say("could not read the held tickets of %s: %s" % (repo, err))
+                continue
+            for issue in held:
+                number = int(issue["number"])
+                try:
+                    found = brain_hold.setter(self.gh.paginate(
+                        "/repos/%s/issues/%d/events" % (repo, number)), loom)
+                except GitHubError as err:
+                    _say("could not read who held %s#%d: %s" % (repo, number, err))
+                    found = brain_hold.Setter(brain_hold.UNKNOWN, "", 0.0)
+                age = brain_hold.age(found, issue, self.now)
+                if age < brain_hold.HOLD_AGE:
+                    continue
+                counts["old"] += 1
+                counts[found.kind] += 1
+                if found.kind == brain_hold.LOOM:
+                    due.append((age, repo, issue, found))
+        for age, repo, issue, found in sorted(due, key=lambda d: -d[0]):
+            if not write or limit <= 0:
+                break
+            done: List[bool] = []
+            ok = self._guarded(self._lift_hold, repo, issue, found, age, done)
+            if done and done[0]:
+                report[repo]["lifted"] += 1
+            if not ok or done[:1] == [True]:
+                limit -= 1
+        return report
+
+    def _lift_hold(self, repo: str, issue: Dict[str, Any], found: brain_hold.Setter,
+                   age: float, done: List[bool]) -> None:
+        """Resolve one hold Loom set: a loom:pr ticket whose pull request
+        fails only the plan check on its body has the body rebuilt
+        (_hold_repair) and the hold lifted; any other ticket goes to the
+        hand-off pool (_hold_hand_off). One event on the ticket's status
+        comment either way, naming why it was held. Appends True when it
+        resolved the hold, False when it waits (checks still running, or a
+        rebuilt body the plan check has not read yet)."""
+        comments = self._comments(repo, int(issue["number"]))
+        why = brain_hold.reason(comments, found.at, _state(issue))
+        hours = age / 3600
+        if _state(issue) == "pr":
+            repaired = self._hold_repair(repo, issue, comments,
+                                         brain_hold.repair_note(found, hours, why))
+            if repaired is None:
+                done.append(False)
+                return
+            if repaired:
+                self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                             % (repo, int(issue["number"]), brain_hold.LABEL), ok=(404,))
+                issue["labels"] = [{"name": x} for x in _labels(issue) if x != brain_hold.LABEL]
+                _say("lifted %s#%d's needs-brain hold: its body was rebuilt for %s"
+                     % (repo, int(issue["number"]), self.plan_check))
+                done.append(True)
+                return
+        self._hold_hand_off(repo, issue, brain_hold.handoff_note(found, hours, why, HANDOFF_LABEL))
+        done.append(True)
+
+    def _open_lane_pull(self, repo: str, ticket: int) -> Optional[Dict[str, Any]]:
+        """The ticket's open trusted lane pull request, from one read of the
+        repo's open pull requests a pass; None when it has none."""
+        if repo not in self._open_pulls:
+            self._open_pulls[repo] = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
+                                      if isinstance(p, dict)]
+        for pr in self._open_pulls[repo]:
+            if self._trusted(pr) and self._is_lane_pr(pr):
+                association = self._association(repo, pr)
+                if association and association[1] == ticket:
+                    return pr
+        return None
+
+    def _hold_repair(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
+                     note: str) -> Optional[bool]:
+        """For a held loom:pr ticket: True when its pull request's body was
+        rebuilt from the ticket (bus/pr_repair.py, as _repair_plan_body) or
+        was rebuilt on this head and now passes every check; None while its
+        checks run or a rebuilt body waits for the plan check to read it
+        (REVIEW_GRACE); False otherwise: no lane pull request, another
+        failing check, or a body the ticket cannot fill."""
+        ticket = int(issue["number"])
+        pr = self._open_lane_pull(repo, ticket)
+        if pr is None:
+            return False
+        number = int(pr["number"])
+        full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+        sha = str((full.get("head") or {}).get("sha") or "")
+        if not sha:
+            return False
+        runs = self._runs[sha] = self._check_runs(repo, sha)
+        if any(r.get("status") != "completed" for r in runs):
+            return None
+        failing = [str(r.get("name") or "") for r in runs if r.get("conclusion") not in GREEN]
+        marker = PLAN_REPAIR_MARKER % sha
+        repaired_at = max((_ts(c.get("created_at")) for c in comments
+                           if marker in str(c.get("body") or "")), default=0.0)
+        if repaired_at:
+            return self._repaired_before(repo, ticket, failing, repaired_at, note)
+        if failing != [self.plan_check]:
+            return False
+        found = self._plan_found(repo, number, full, issue)
+        if found is None or not found["changed"]:
+            return False
+        self._apply_plan_body(repo, number, issue, found, marker, also=note)
+        self._lift_plan_hold(repo, number, issue, comments)
+        return True
+
+    def _repaired_before(self, repo: str, ticket: int, failing: Sequence[str],
+                         repaired_at: float, note: str) -> Optional[bool]:
+        """_hold_repair for a body already rebuilt on this head: True (with
+        the note) once every check passes, None while the plan check may not
+        have read it yet (REVIEW_GRACE), else False."""
+        if not failing:
+            self._status_note(repo, ticket, note)
+            return True
+        if list(failing) == [self.plan_check] and self.now - repaired_at <= REVIEW_GRACE:
+            return None
+        return False
+
+    def _hold_hand_off(self, repo: str, issue: Dict[str, Any], note: str) -> None:
+        """Put a held ticket in the hand-off pool (HANDOFF_LABEL) without
+        needs-brain, out of its goal's in-flight count (brain._in_flight): a
+        queued or briefed ticket goes back to queued with no lane, as
+        _hand_off does; a running, pr or failed one is left loom:failed, as
+        the station's stopped fix rounds are; any other state keeps its
+        state. One note on its status comment, edited in place."""
+        number, state, old = int(issue["number"]), _state(issue), _lane(issue)
+        names = _labels(issue)
+        if state in ("queued", "briefed"):
+            kept = [x for x in brain._moved_labels(names, "queued", None)
+                    if not x.startswith("lane:")]
+        elif state in ("running", "pr", "failed"):
+            kept = brain._moved_labels(names, "failed", None)
+        else:
+            kept = [x for x in names if x != brain_hold.LABEL]
+        kept = list(dict.fromkeys(kept + [HANDOFF_LABEL]))
+        self._relabel(repo, issue, kept)
+        if old and "lane:" + old not in kept:
+            self.load[old] = self.load.get(old, 0) - 1
+        self._status_note(repo, number, note)
+        _say("handed off %s#%d: its needs-brain hold went unanswered past %d hours"
+             % (repo, number, brain_hold.HOLD_AGE // 3600))
 
     def tier_lane(self, repo: str, difficulty: str) -> Optional[str]:
         """The first free lane of the difficulty tier the repo may use, else

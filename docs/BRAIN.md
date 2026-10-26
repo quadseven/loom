@@ -1379,6 +1379,30 @@ no-lane reasons and dropped when a lane takes it), and the factory acts on it:
   station sends the stuck goals to the dashboard (`POST /api/goal-caps`),
   whose Needs-you page lists each with that count.
 
+## needs-brain holds nothing answers
+
+`needs-brain` holds a ticket for the brain, and the factory moves it no more.
+The remote brain that answered these holds retired on 2026-10-24; on
+2026-10-26 96 open tickets carried the label, the oldest since 2026-10-19
+(loom#1872). The station's `lift_brain_holds` step (bus/brain_hold.py, the
+factory's `brain_holds`) resolves a hold older than 24 hours that Loom set:
+
+- Who set it is read from the issue's newest `labeled` event for the label: a
+  `LOOM_BRIEF_AUTHORS` login that is a GitHub App (`<slug>[bot]`) is Loom. A
+  hold any other login set (the operator, a person) is never lifted; one with
+  no readable setter is left too. Both are counted.
+- A `loom:pr` ticket whose pull request fails only the plan check on its body
+  gets the body rebuilt from the ticket (as for a body-only plan failure) and
+  the hold taken off. Any other goes to the hand-off pool (`handoff:claude`)
+  without `needs-brain`: queued or briefed back to `loom:queued` with no lane,
+  running, pr or failed to `loom:failed`, out of the goal's in-flight count.
+  Either way one event on the status comment, edited in place, names who held
+  it, for how long and why (the note beside the label event, else its state).
+- At most 5 a run, oldest first, and a run at most every 30 minutes, stamped
+  however it ends. The run sends each repo's count of holds older than a day
+  that it left (`POST /api/brain-holds`), and the dashboard's Needs-you page
+  lists them with how many a person set or nobody can tell who set.
+
 ## Regression slot
 
 A cap meant to bound new work must not block the fix for something already
