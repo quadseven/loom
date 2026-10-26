@@ -17,10 +17,14 @@ Neither needs a model:
 - One with a failing check, an unresolved thread or a conflict goes back to
   a lane as a fix brief (bus.brain.fix). It stays on the ticket's lane while
   the rounds make progress. It climbs the model ladder (docs/MUSE.md) only
-  when it is stuck: a review thread survived a fix round, checks still fail
-  after a round that was asked to fix them, or the pull request is older
-  than STUCK_AGE. A review that finds new things is progress, and a conflict
-  is mechanical (the fix brief's runner merges the base), so neither climbs.
+  when it is stuck: a review thread survived a fix round (the same thread, or
+  the same finding posted again: bus/converge.py compares path, a nearby
+  line and the rule, never ids alone), checks still fail after a round that
+  was asked to fix them, or the pull request is older than STUCK_AGE. A
+  review that finds new things is progress, and a conflict is mechanical
+  (the fix brief's runner merges the base), so neither climbs. The station's
+  hand-back (bus/station.py _post_fix_or_escalate), which usually sends a
+  round before this pass sees the pull request, applies the same test.
 - Landing keeps the default branch green and nothing stale. A ready pull
   request that is behind its base is brought up to date first (GitHub's
   update-branch), and lands only once its checks and review pass again on
@@ -152,7 +156,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, bench, brain, brief_check, change_class, criteria_gate, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brief_check, change_class, converge, criteria_gate, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -443,9 +447,14 @@ BRIEF_RES = (
     re.compile(r"the factory moved this ticket up the model ladder to rung \d+, \S+ on lane ([a-z0-9-]+)\."),
 )
 RUNAWAY = "loom:runaway"
+# The hand-off pool: tickets whose fix rounds stopped with the same failures
+# (no rung left, or the round cap reached on its rung), left loom:failed for
+# the second operator's session (its goal issue, loom#1036, works them). The
+# factory never re-briefs one; that session claims it before working it.
+HANDOFF_LABEL = "handoff:claude"
 NO_REASON = "agent made no commit and wrote no reason"
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
-                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved isOutdated path'
+                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved isOutdated path line originalLine'
                  ' root: comments(first:1) { nodes { author { __typename login } body url } }'
                  ' comments(last:20) { nodes { author { __typename login } body } } } } } } }')
 RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
@@ -618,6 +627,9 @@ def _ts(value: Any) -> float:
         return 0.0
 
 
+ts_of = _ts
+
+
 def _labels(issue: Dict[str, Any]) -> List[str]:
     return [str(x.get("name") if isinstance(x, dict) else x)
             for x in issue.get("labels") or []]
@@ -654,10 +666,14 @@ def last_climb(comments: Sequence[Dict[str, Any]]) -> float:
 
 def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
           checks_failing: bool, age: float, now: float = 0.0,
-          no_test: bool = False, unticked: Sequence[str] = ()) -> bool:
+          no_test: bool = False, unticked: Sequence[str] = (),
+          threads: Sequence[Dict[str, Any]] = ()) -> bool:
     """Did the last fix round fail to move this pull request? True when a
-    thread it was asked to fix is still open, when checks it was asked to fix
-    still fail, when it was asked for a test and still has none, or when the
+    thread it was asked to fix is still open, or an open one in `threads`
+    holds the same finding (bus/converge.py: same path, a nearby line, the
+    same rule; the review bot may post it again as a new thread), when
+    checks it was asked to fix still fail, when it was asked for a test and
+    still has none, or when the
     pull request is older than STUCK_AGE and has not moved on the ladder for
     STUCK_AGE (age alone climbs once per window, not on every round)."""
     if age > STUCK_AGE and now - last_climb(comments) > STUCK_AGE:
@@ -667,6 +683,8 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     if last is None:
         return False
     if set(FIX_THREAD_RE.findall(last)) & set(open_threads):
+        return True
+    if converge.persistent(last, (), threads):
         return True
     if no_test and NO_TEST_HEADING in last:
         return True
@@ -1884,6 +1902,17 @@ class Factory:
                            "operator one exact question." % (why, ", ".join(ran) or "none"))
         _say("%s#%d is past the last rung; left failed for the brain" % (repo, number))
 
+    def _hand_off(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Put a ticket whose fix rounds stopped in the hand-off pool
+        (HANDOFF_LABEL)."""
+        names = _labels(issue)
+        if HANDOFF_LABEL in names:
+            return
+        kept = names + [HANDOFF_LABEL]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+                     {"labels": kept})
+        issue["labels"] = [{"name": x} for x in kept]
+
     def _close_past_ladder_pr(self, repo: str, pr: Dict[str, Any]) -> None:
         """Close an open lane pull request whose ticket is past the last rung of
         the model ladder, naming why, so the lane does not stall on it
@@ -1913,7 +1942,10 @@ class Factory:
         if checks_failing and self._past_no_change(repo, issue, comments):
             return
         age = self.now - _ts(pr.get("created_at"))
-        if stuck(comments, open_threads, checks_failing, age, self.now, no_test, unticked):
+        threads = ([t for t in self._threads(repo, int(pr["number"])) if not t.get("isResolved")]
+                   if open_threads else [])
+        if stuck(comments, open_threads, checks_failing, age, self.now, no_test, unticked,
+                 threads):
             footer = self._footer(repo, pr)
             if self._climb(repo, issue, comments, why, footer=footer) is None:
                 if RUNAWAY in _labels(issue):
@@ -1934,6 +1966,7 @@ class Factory:
                 self._close_past_ladder_pr(repo, pr)
                 self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
                                                  if 1 <= n <= len(CLIMB)])
+                self._hand_off(repo, issue)
                 return
         lane = None
         # A ticket with no lane label (a silent-lane requeue drops it, and the
@@ -2829,6 +2862,8 @@ class Factory:
 
     def failed(self, repo: str, issue: Dict[str, Any],
                prs: Dict[int, Dict[str, Any]]) -> None:
+        if HANDOFF_LABEL in _labels(issue):
+            return  # in the hand-off pool: the second operator's session has it
         number = int(issue["number"])
         comments = self._comments(repo, number)
         if repeated_no_reason(comments):

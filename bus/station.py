@@ -33,6 +33,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 from . import audit
 from . import bench
 from . import ci_gap
+from . import converge
 from . import brain_memory
 from . import claimed
 from . import fabric
@@ -193,8 +194,12 @@ DIGEST_MARKER = "<!-- loom:digest v1 -->"
 MENTION_ROOM = 40
 ASK_GOAL_REF_RE = re.compile(r"(?<![\w/])#([0-9]+)\b")
 FIX_ROUNDS_DEFAULT = 3
-FIX_CAP_TEXT = ("The fix round cap (%d) is reached, so this ticket is held for the brain "
-                "(needs-brain) and gets no further fix rounds.")
+# A ticket whose fix rounds stop (bus/converge.py: no rung left above a stuck
+# round, or the round cap reached on its rung) is left loom:failed with this
+# note and factory.HANDOFF_LABEL, the pool the second operator's session works.
+FIX_STOP_TEXT = ("The station stopped the fix rounds on pull request #%d: %s. Still failing: %s. "
+                 "The ticket is left loom:failed with the %s label for the second operator's "
+                 "session, which claims it before working it.")
 REPORT_MARKER = "<!-- loom:report v1 -->"
 # The last line of a quiet standup the station edits in place, and of a
 # standup that repeats an earlier one word for word.
@@ -5534,18 +5539,84 @@ class Station:
                               detail: Dict[str, Any], sha: str, comments: List[Any],
                               names: List[str], failed: List[Any], threads: List[Any],
                               rounds: int) -> None:
+        """Send the next fix round, unless the last one moved nothing. Each
+        round went to the same lane until the cap, with no look at whether
+        the last one fixed anything (2026-10-26: four rounds on a local model
+        left the same checks failing and the same finding open). A round whose
+        failures persist by signature (bus/converge.py) climbs the model
+        ladder at once; with no rung left, or with the round cap reached on
+        its rung, the rounds stop (_stop_fix_rounds)."""
         authors = {author.lower() for author in self.s.authors}
-        if self._fix_round_count(comments, authors) >= rounds:
-            self._escalate_fix(repo, number, names)
+        failing = [name for name, _ in failed]
+        persisted = converge.persistent(
+            converge.last_fix_body(comments, authors, (repo, pr_number)),
+            failing, threads, ignore=(self.s.review_check,))
+        if persisted:
+            lane = self._climb_stuck(repo, number, pr_number, detail, comments, persisted)
+            if lane is None:
+                return
+            names = _label_names(self._issue(repo, number))
+        elif self._rung_round_count(comments, authors) >= rounds:
+            self._stop_fix_rounds(repo, number, pr_number,
+                                  "the fix round cap (%d) is reached on its rung" % rounds,
+                                  converge.describe(failing, threads, (self.s.review_check,)))
             return
         self._post_fix_comment(repo, number, pr_number, detail, sha, failed, threads, comments)
         self._move_fix_to_lane(repo, number, lane, names)
 
-    def _escalate_fix(self, repo: str, number: int, names: List[str]) -> None:
-        if "needs-brain" not in names:
-            self._add_label(repo, number, "needs-brain")
-            # One status event (an edit, no email), on the pass that holds it.
-            self._routine(repo, number, FIX_CAP_TEXT % _fix_round_limit())
+    @staticmethod
+    def _rung_round_count(comments: List[Any], authors: set) -> int:
+        """The fix rounds sent since the ticket last moved on the model ladder
+        (its newest rung marker): a climb gives the stronger model rounds of
+        its own. Every round counts when it never climbed."""
+        since = factory.last_climb(comments)
+        return Station._fix_round_count(
+            [c for c in comments if not since
+             or (isinstance(c, dict) and factory.ts_of(c.get("created_at")) > since)], authors)
+
+    def _climb_stuck(self, repo: str, number: int, pr_number: int, detail: Dict[str, Any],
+                     comments: List[Any], persisted: List[str]) -> Optional[str]:
+        """Move a ticket whose last fix round left the same failures up the
+        model ladder (factory.Factory._climb, which keeps the operator's
+        model and private-repo rules). The new lane, or None when it waits for
+        a lane of its next rung or its rounds stopped with no rung left."""
+        runner = self._factory()
+        issue = self._issue(repo, number)
+        found = converge.summary(persisted)
+        footer = runner._footer(repo, detail)
+        lane = runner._climb(repo, issue, comments, "the same failures came back after a fix "
+                             "round: %s" % found, head="Stuck fix round", footer=footer)
+        if lane is not None:
+            _say("%s#%d: its fix round left the same failures (%s); next round on lane %s"
+                 % (repo, number, found, lane))
+            return lane
+        if factory.RUNAWAY in _label_names(issue):
+            return None
+        if runner._rungs_left(repo, issue, comments, footer):
+            _say("%s#%d: its fix round left the same failures (%s); waits for a lane of its "
+                 "next rung" % (repo, number, found))
+            return None
+        self._stop_fix_rounds(repo, number, pr_number,
+                              "the same failures came back and no rung of the model ladder "
+                              "is left above it", persisted)
+        return None
+
+    def _stop_fix_rounds(self, repo: str, number: int, pr_number: int, why: str,
+                         failures: List[str]) -> None:
+        """No more fix rounds: the ticket goes to loom:failed with one note
+        naming what still fails, and into the hand-off pool
+        (factory.HANDOFF_LABEL). Another round would repeat the last one."""
+        note = FIX_STOP_TEXT % (pr_number, why, converge.summary(failures) or "see the last "
+                                "fix round", factory.HANDOFF_LABEL)
+        try:
+            brain._check_written_text(note)
+        except ValueError:
+            note = FIX_STOP_TEXT % (pr_number, why, "the failures the last fix round names",
+                                    factory.HANDOFF_LABEL)
+        brain.move(self.gh, repo, number, "failed", note=note)
+        self._add_label(repo, number, factory.HANDOFF_LABEL)
+        _say("%s#%d: fix rounds stopped (%s); left failed for the hand-off pool"
+             % (repo, number, why))
 
     def _post_fix_comment(self, repo: str, number: int, pr_number: int,
                           detail: Dict[str, Any], sha: str, failed: List[Any],

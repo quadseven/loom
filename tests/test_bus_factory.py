@@ -2354,6 +2354,17 @@ class Queued(Base):
 
 
 class Tickets(Base):
+    def test_a_ticket_in_the_hand_off_pool_is_never_rebriefed(self):
+        # Its fix rounds stopped on the same failures: the second operator's
+        # session has it, so the factory leaves it failed.
+        self.gh.ticket(6, "failed", lane="spark")
+        self.gh.issues[6]["labels"].append({"name": factory.HANDOFF_LABEL})
+        self.gh.pull(60, 6, runs=(("unittest", "in_progress"),))
+        self.go()
+        self.assertEqual(self.moved, [])
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.lane(6), "spark")
+
     def test_a_failed_ticket_without_a_pull_request_is_rebriefed_a_rung_up(self):
         self.gh.ticket(6, "failed", lane="zai")
         self.go()
@@ -3341,6 +3352,20 @@ class SilentLane(Base):
 
 
 class Helpers(unittest.TestCase):
+    def test_a_finding_reposted_under_a_new_thread_id_still_counts_as_stuck(self):
+        # The review bot may post the same finding again as a new thread, a
+        # few lines lower after the round's edits: comparing ids alone read
+        # that as progress.
+        last = {"body": "%s\nPull request: %s#7, branch loom/12-x\n\n"
+                        "### Thread PRRT_old (comment 5) at web/staged.js:54\n\n"
+                        "    grug-tribe: high | _security_ | `unvalidated-external-input` | quick"
+                        % (FIX_MARKER, REPO), "user": ME}
+        new = {"id": "PRRT_new", "path": "web/staged.js", "line": 59,
+               "root": {"nodes": [{"body": "high | _security_ | `unvalidated-external-input` |"}]}}
+        other = dict(new, line=59 + 40)
+        self.assertTrue(factory.stuck([last], ["PRRT_new"], False, 0.0, NOW, threads=[new]))
+        self.assertFalse(factory.stuck([last], ["PRRT_new"], False, 0.0, NOW, threads=[other]))
+
     def test_with_model_replaces_or_inserts_the_header(self):
         self.assertEqual(factory.with_model("Difficulty: hard\nModel: a\n\n## Why\nModel: x", "b"),
                          "Difficulty: hard\nModel: b\n\n## Why\nModel: x")

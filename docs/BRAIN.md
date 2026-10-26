@@ -48,7 +48,8 @@ that talks to GitHub about tickets.
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
 | `loom:answered` | The runner posted a diagnosis answer, or a run found its work already done or no longer applying and no merged pull request carries it (see Claim and outcome); the brain reviews it, then closes/verifies the ticket or briefs it again. |
 | `loom:ready` | Checks passed and review-bot threads are resolved for the current PR head. |
-| `needs-brain` | The automatic fix round limit was reached, or a ticket failed a second time with no commit and no reason; review this ticket in full. |
+| `needs-brain` | A ticket failed a second time with no commit and no reason, or went past the model ladder; review this ticket in full. |
+| `handoff:claude` | The hand-off pool: the fix rounds stopped on the same failures (no rung of the model ladder left, or the round cap reached on its rung), so the ticket is `loom:failed` with one note naming what still fails. The second operator's session works this pool (its goal issue, #1036), claiming each ticket first; the factory never re-briefs one. |
 | `loom:failed` | The runner gave up and the station did not retry it; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:closed-unmerged` | The linked pull request closed without merging. |
@@ -883,9 +884,16 @@ The station polls lane PRs once per pass. Once checks finish, failed checks
 and unresolved threads started by `grug-tribe[bot]` are sent back to the same
 lane as a `loom:fix` comment, using the same findings format as
 `python3 -m bus.brain fix`. The ticket returns to `loom:briefed`; the runner
-pushes fixes to the existing branch. `LOOM_FIX_ROUNDS` caps automatic rounds
-per ticket (default 3), after which the station adds `needs-brain` and records
-one status event saying the cap was reached. A clean
+pushes fixes to the existing branch. Before each round after the first, the
+station asks whether the last one moved anything (`bus/converge.py`): the same
+check names still failing, or a review-bot finding at the same path within 10
+lines under the same rule (a new thread id or check run id does not make it
+new), is a stuck round. A stuck round climbs the model ladder at once
+(`factory.Factory._climb`, which keeps the model and private-repo rules); a
+new finding is progress and stays on its lane. `LOOM_FIX_ROUNDS` caps the
+rounds per rung (default 3). With no rung left above a stuck round, or the cap
+reached, the rounds stop: the ticket moves to `loom:failed` with one note
+naming what still fails and gets `handoff:claude`. A clean
 PR receives `loom:ready`; a later push removes that label until the new head
 has finished checks and review again. A degraded or partial result of the
 review check (its summary says `Degraded review (...): not a verdict`, or its

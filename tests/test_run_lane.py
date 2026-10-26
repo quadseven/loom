@@ -1526,9 +1526,10 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
 
     FIX_BRANCH = "loom/42-fix-the-thing"
 
-    def fix_brief(self):
+    def fix_brief(self, with_head=False, check="lint"):
         """A station fix brief for PR 7, whose branch is already on the remote
-        with the lane's first commit."""
+        with the lane's first commit. `with_head`: the brief names that commit
+        as the head its checks failed on, as the station's does."""
         work = Path(self._tmp.name) / "pr-work"
         git("clone", "-q", str(self.remote), str(work))
         git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
@@ -1539,11 +1540,13 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
         issue = {"number": 42, "title": "Fix the thing",
                  "body": "Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n"}
+        marker = ("\n<!-- loom:fix-head %s -->\n" % self.remote_head(self.FIX_BRANCH)
+                  if with_head else "")
         fix = tickets.parse_fix("example/repo", (
             "<!-- loom:fix v1 -->\nPull request: example/repo#7, branch %s\n\n"
-            "### Check: lint\n\n    E501 line too long\n\n"
-            "### Thread PRRT_1 (comment 11) at a.py:3\n\n    reviewer: rename this\n"
-            % self.FIX_BRANCH))
+            "### Check: %s\n\n    E501 line too long\n\n"
+            "### Thread PRRT_1 (comment 11) at a.py:3\n\n    reviewer: rename this\n%s"
+            % (self.FIX_BRANCH, check, marker)))
         name = tickets.ticket_name("example/repo", 42, 2)
         self.drop_brief(name + ".md", tickets.render_brief("example/repo", issue, "codex", 2, fix))
         return name, self.remote_head(self.FIX_BRANCH)
@@ -1669,6 +1672,45 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any("addPullRequestReviewThreadReply" in c or "resolveReviewThread" in c
                              for c in self.calls()))
+
+    def test_a_fix_round_with_no_commit_on_the_head_its_checks_failed_on_is_a_failed_round(self):
+        # 2026-10-26: four rounds of one ticket answered a thread or repaired
+        # the PR text, committed nothing, and each reported done with both
+        # failing checks still red on the same head.
+        name, before = self.fix_brief(with_head=True)
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_AGENT="replies-only",
+                               FAKE_REPLIES='[{"thread":"PRRT_fake","reply":"Not applicable.","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertFalse((self.inbox / "done" / (name + ".md")).exists())
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("failed: [work] fix round made no commit, so the checks it was asked to fix "
+                      "still fail on %s, the head CI failed them on: lint; nothing pushed"
+                      % before[:12], log)
+        self.assertFalse(any("addPullRequestReviewThreadReply" in c for c in self.calls()))
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+
+    def test_a_round_that_only_answers_the_review_checks_findings_is_still_done(self):
+        # The review check fails while its findings stand; a round may answer
+        # a finding instead of changing code, so it alone never fails a
+        # no-commit round.
+        name, before = self.fix_brief(with_head=True, check="Grug - Elder")
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_AGENT="replies-only",
+                               FAKE_REPLIES='[{"thread":"PRRT_fake","reply":"Not applicable.","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c for c in self.calls()))
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+
+    def test_a_fix_round_log_says_when_no_contract_check_maps_to_the_failing_checks(self):
+        name, _ = self.fix_brief(with_head=True)
+        result = self.run_lane(FAKE_GH_EXISTING="7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("%s: no validation contract check maps to the failing checks (lint): the "
+                      "repo has no .loom/validation.conf, so CI is the first to run them on the "
+                      "new head" % name, log)
 
     def test_reply_only_fix_posts_replies_without_a_commit_or_push(self):
         name, before = self.fix_brief()
