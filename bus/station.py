@@ -265,6 +265,14 @@ GOAL_CAPS_EVERY = 600
 # row, go to the dashboard's Needs-you page; the run's stamp is kept here.
 BRAIN_HOLDS_PATH = "/api/brain-holds"
 BRAIN_HOLDS_FILE = "brain-holds.json"
+# The dashboard's /chain page: each repo's shadow mode and the last actions
+# Loom held and took, from bus.shadow, every CHAIN_EVERY seconds; the
+# send's stamp is kept here. The dashboard pod has neither the station's
+# shadow switch nor its state folder, so the station is the one source.
+CHAIN_PATH = "/api/chain"
+CHAIN_FILE = "chain.json"
+CHAIN_EVERY = 600
+CHAIN_ROWS = 20
 # A recorded ticket wait the factory has not repeated for this long is gone:
 # the ticket moved, or left the factory (invariants.ticket_waiting).
 WAIT_UNSEEN = 3600
@@ -10372,6 +10380,37 @@ class Station:
             _say("could not send the needs-brain hold counts (%s); next run"
                  % type(err).__name__)
 
+    def post_chain(self) -> None:
+        """Send the dashboard (POST CHAIN_PATH) each watched repo's shadow
+        mode and the last CHAIN_ROWS held and acted entries, at most every
+        CHAIN_EVERY seconds. Read from bus.shadow and local files alone: no
+        GitHub request. The send is stamped however it ends, and a failed
+        one waits for the next run."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return
+        path = os.path.join(self.state, CHAIN_FILE)
+        stamp = _read_json(path, {}, strict=False)
+        last = stamp.get("at") if isinstance(stamp, dict) else None
+        if isinstance(last, (int, float)) and 0 <= self.now - last < CHAIN_EVERY:
+            return
+        _write_json(path, {"at": self.now})
+        token = self._transcript_token()
+        if token is None:
+            return
+        held = [{"action": e.get("action"), "repo": e.get("repo"), "number": e.get("number"),
+                 "at": e.get("time"), "source": e.get("source")}
+                for e in shadow.read(shadow.ledger_path())[-CHAIN_ROWS:]]
+        acted = [{key: e.get(key) for key in ("action", "repo", "number", "at", "source")}
+                 for e in shadow.read_acted(CHAIN_ROWS)]
+        body = {"at": self.now, "shadow_on": shadow.scope()[0],
+                "repos": [{"repo": repo, "shadow": shadow.active(repo)} for repo in self.s.repos],
+                "held": held, "acted": acted}
+        try:
+            self.upload(brain_memory.dashboard_url(self.s.transcript_url, CHAIN_PATH), token, body)
+        # Deliberately broad, as in _post_brain_holds: only the type is logged.
+        except Exception as err:  # noqa: BLE001
+            _say("could not send the command chain snapshot (%s); next run" % type(err).__name__)
+
     def _silent_lanes(self) -> Dict[str, float]:
         """Local lane -> seconds since its last heartbeat, for each lane
         without a live one (_heartbeat_ok false) that has ever reported and
@@ -11623,6 +11662,10 @@ class Station:
             self.upload_usage_limits(records)
         except OSError as err:
             _say("could not write usage limits: %s" % err)
+        try:
+            self.post_chain()
+        except OSError as err:
+            _say("could not send the command chain snapshot: %s" % err)
 
     def tend_runners(self) -> None:
         """The slots in LOOM_RUNNER_SLOTS: dispatch their briefs to cluster

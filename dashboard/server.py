@@ -46,7 +46,7 @@ from bus.github import GitHubError
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 from . import views
-from . import brain_view, hot_spots
+from . import brain_view, chain_view, hot_spots
 
 def _all_tickets(state):
     payload = state.response()
@@ -1052,6 +1052,18 @@ def _handle_brain_holds_post(handler, state):
     return handler.send_json(201, {"repos": len(state.brain_holds["repos"])})
 
 
+def _handle_chain_post(handler, state):
+    """POST /api/chain: the station's shadow mode per repo and its last held
+    and acted entries, with the upload token, shown on /chain."""
+    if not _authorized(handler):
+        return handler.send_json(401, {"error": "unauthorized"})
+    try:
+        state.chain = chain_view.chain_snapshot(_json_body(handler), time.time())
+    except (ValueError, json.JSONDecodeError) as exc:
+        return handler.send_json(400, {"error": str(exc)})
+    return handler.send_json(201, {"repos": len(state.chain["repos"])})
+
+
 # Brain memory (dashboard/brain_memory.py): the station writes ticks,
 # closings and rules with the upload token. Every brain reads the handoff
 # packet with it or with LOOM_HANDOFF_TOKEN, which can only read.
@@ -1100,6 +1112,8 @@ def _handler_for(state):
                 return _handle_goal_caps_post(self, state)
             if path == "/api/brain-holds":
                 return _handle_brain_holds_post(self, state)
+            if path == "/api/chain":
+                return _handle_chain_post(self, state)
             if path == "/api/needs-you/answer":
                 return _handle_answer_post(self, state)
             if path in BRAIN_WRITES:
@@ -1160,6 +1174,8 @@ def _dispatch_get(handler, state):
         return _dispatch_tiers(handler, state)
     if path in ("/brain", "/hot-spots"):
         return _dispatch_brain_hot_spots(handler, state, path)
+    if path == "/chain":
+        return _dispatch_chain(handler, state)
     if path in ("/", "/goals", "/tickets", "/tree"):
         return _dispatch_view(handler, state, path, parsed)
     if re.fullmatch(r"/t/[^/]+/[^/]+/[0-9]+", path):
@@ -1387,6 +1403,15 @@ def _dispatch_brain_hot_spots(handler, state, path):
         data = hot_spots.build_hot_spots(payload, waits_error, datetime.now(timezone.utc), bot)
         body, title, active = hot_spots.render_hot_spots(data), "Hot spots", "hot-spots"
     return handler.send_page(page(title, active, body, status="stale" if payload.get("stale") else "live"))
+
+
+def _dispatch_chain(handler, state):
+    """The command chain. Its station and audit layers are the station's
+    last POST /api/chain snapshot; the page itself makes no GitHub request."""
+    payload = state.response()
+    data = chain_view.build_chain(payload, getattr(state, "chain", None), time.time())
+    return handler.send_page(page("Command chain", "chain", chain_view.render_chain(data),
+                                  status="stale" if payload.get("stale") else "live"))
 
 
 def _dispatch_results(handler, state):
