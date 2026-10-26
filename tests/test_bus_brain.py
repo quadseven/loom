@@ -1379,35 +1379,89 @@ class SensitiveResumeTests(unittest.TestCase):
         issue = {"body": "Goal overview\nMerge constraint: C++ unit test required\n\n# Details\nMerge constraint: ignored"}
         self.assertEqual(["C++ unit test required"], brain.goal_merge_constraints(issue))
 
-    def test_goal_home_cpp_unit_test_constraint_blocks_without_test_file(self):
-        goal = {"number": 1, "state": "open", "labels": [{"name": "loom:goal"}],
+    CPP_GOAL = {"number": 1, "state": "open", "labels": [{"name": "loom:goal"}],
                 "body": "Merge constraint: C++ unit test required\n# Goal"}
-        ticket = {"body": "Part of #1\n"}
-        gh = GitHub("t", transport=Fake(reply(200, goal), reply(200, [
-            {"filename": "bus/change.cpp"}, {"filename": "tests/test_change.py"}])))
-        with self.assertRaisesRegex(ValueError, r"goal home #1 rule 'C\+\+ unit test required'"):
-            brain._refuse_merge_constraints(gh, REPO, 8, (REPO, 9), ticket)
+
+    def _refuse(self, goal_reply, files=None):
+        replies = [goal_reply] + ([] if files is None else [reply(200, files)])
+        fake = Fake(*replies)
+        brain._refuse_merge_constraints(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                                        {"body": "Part of #1\n"})
+        fake.assert_all_used()
+
+    def test_goal_home_cpp_unit_test_constraint_blocks_without_test_file(self):
+        with self.assertRaisesRegex(ValueError, r"goal home %s#1 rule 'C\+\+ unit test required' "
+                                    r"is not met" % REPO):
+            self._refuse(reply(200, self.CPP_GOAL), [
+                {"filename": "src/change.cpp"}, {"filename": "tests/test_change.py"}])
 
     def test_goal_home_cpp_unit_test_constraint_accepts_tests_cpp(self):
-        goal = {"number": 1, "state": "open", "labels": [{"name": "loom:goal"}],
-                "body": "Merge constraint: C++ unit test required\n# Goal"}
-        ticket = {"body": "Part of #1\n"}
-        gh = GitHub("t", transport=Fake(reply(200, goal), reply(200, [
-            {"filename": "bus/change.cpp"}, {"filename": "tests/test_change.cpp"}])))
-        brain._refuse_merge_constraints(gh, REPO, 8, (REPO, 9), ticket)
+        self._refuse(reply(200, self.CPP_GOAL), [
+            {"filename": "src/change.cpp"}, {"filename": "tests/test_change.cpp"}])
+
+    def test_goal_home_cpp_unit_test_constraint_accepts_the_t_layout(self):
+        # The C++ module repos keep their unit tests under t/ (loom#1435).
+        self._refuse(reply(200, self.CPP_GOAL), [
+            {"filename": "src/Boss.cpp"}, {"filename": "t/TestBlackfathomDeeps.cpp"}])
+        self._refuse(reply(200, self.CPP_GOAL), [
+            {"filename": "modules/x/t/unit/TestBoss.cpp", "status": "added"}])
+
+    def test_goal_home_cpp_unit_test_constraint_ignores_a_removed_test(self):
+        with self.assertRaisesRegex(ValueError, "is not met"):
+            self._refuse(reply(200, self.CPP_GOAL), [
+                {"filename": "t/TestOld.cpp", "status": "removed"}])
+
+    def test_goal_home_rule_merge_cannot_check_refuses(self):
+        goal = dict(self.CPP_GOAL, body="Merge constraint: proof shape is a realm log line\n# Goal")
+        with self.assertRaisesRegex(ValueError, r"goal home %s#1 rule 'proof shape is a realm "
+                                    r"log line' cannot be checked" % REPO):
+            self._refuse(reply(200, goal))
+
+    def test_goal_home_unreadable_refuses(self):
+        with self.assertRaisesRegex(ValueError, r"goal home unreadable for ticket %s#9" % REPO):
+            self._refuse(reply(403, {"message": "Resource not accessible by integration"}))
+
+    def test_goal_home_without_constraints_reads_no_files(self):
+        self._refuse(reply(200, dict(self.CPP_GOAL, body="# Goal\nMerge constraint: x")))
+
+    def test_merge_refuses_a_pull_request_that_breaks_a_goal_home_rule(self):
+        pr, query = self._merge_replies()
+        issue = {"state": "open", "body": "Part of #1\n",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, self.CPP_GOAL),
+                    reply(200, [{"filename": "src/change.cpp"}]))
+        with self.assertRaisesRegex(ValueError, "rule 'C\\+\\+ unit test required' is not met"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse([c for c in fake.calls if c[0] == "PUT"])
+        fake.assert_all_used()
+
+    def test_merge_lands_a_pull_request_that_meets_its_goal_home_rule(self):
+        pr, query = self._merge_replies()
+        issue = {"state": "open", "body": "Part of #1\n",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, self.CPP_GOAL),
+                    reply(200, [{"filename": "src/change.cpp"}, {"filename": "t/TestChange.cpp"}]),
+                    reply(200, {"merged": True}), reply(204), reply(200, []),
+                    reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertEqual(fake.calls[5][2], {"merge_method": "squash", "sha": "checked"})
+        self.assertTrue(result["merged"])
 
     def test_status_shows_goal_home_merge_constraint(self):
         ticket_issue = {"number": 4, "state": "open",
                         "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}],
-                        "body": "Part of #1\\n"}
+                        "body": "Part of #1\n"}
         goal = {"number": 1, "state": "open", "labels": [{"name": "loom:goal"}],
-                "body": "Merge constraint: C++ unit test required\\n# Goal"}
+                "body": "Merge constraint: C++ unit test required\n"
+                        "Merge constraint: proof shape is a log line\n# Goal"}
         pr = {"number": 8, "title": "Change", "head": {"ref": "loom/4-work"}}
         gh = GitHub("t", transport=Fake(*merge_takes(ticket=4), reply(200, ticket_issue),
                                          reply(200, goal)))
         lines = brain._pull_request_lines(gh, REPO, [pr], {"prs": {8: ready_node()}},
                                           "grug-tribe")
-        self.assertIn("rule: C++ unit test required", lines[1])
+        self.assertEqual(lines[1], "- #8 Change - READY - rule: C++ unit test required; "
+                                   "rule: proof shape is a log line (merge cannot check it, "
+                                   "so merge refuses)")
 
     def test_merge_refusals_do_not_call_merge(self):
         cases = [

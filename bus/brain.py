@@ -781,15 +781,18 @@ def _goal_constraint_suffix(gh: GitHub, repo: str,
     if ticket_issue.get("state") != "open" or "loom:ticket" not in _labels(ticket_issue):
         return ""
     try:
-        goal_home = _goal_home_for_ticket(gh, repo, ticket_issue)
+        goal_home = _goal_home_for_ticket(gh, ticket[0], ticket_issue)
     except GitHubError:
-        return ""
+        return " - rule: goal home unreadable"
     if goal_home is None:
         return ""
     constraints = goal_merge_constraints(goal_home)
     if not constraints:
         return ""
-    return " - " + "; ".join("rule: %s" % constraint for constraint in constraints)
+    return " - " + "; ".join(
+        "rule: %s" % constraint if _normalized_rule(constraint) in _MERGE_RULE_CHECKS
+        else "rule: %s (merge cannot check it, so merge refuses)" % constraint
+        for constraint in constraints)
 
 
 def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
@@ -3301,7 +3304,6 @@ def merge(gh: GitHub, repo: str, number: int,
         _refuse_pending_fix(gh, association, env)
         verdict = _verdict_reader(gh, repo, number, details, association, env)
         _refuse_operator_hold(gh, repo, number, pr, details, association, issue, verdict)
-        _refuse_merge_constraints(gh, repo, number, association, issue)
         if not ({x.lower() for x in _labels(issue)} & {"docs", "documentation"}):
             reason = _unbuilt_criteria_reason(str(pr.get("body") or ""))
             if reason:
@@ -3398,30 +3400,63 @@ def _changed_files(details: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
              "status": str(n.get("changeType") or "").lower()} for n in nodes]
 
 
+# A C++ unit test: a .cpp file under a tests/, test/ or t/ directory at any
+# depth. The C++ module repos keep theirs under t/ (t/TestSomething.cpp) or
+# tests/ (tests/test_something.cpp).
+_CPP_UNIT_TEST_RE = re.compile(r"(?:^|.*/)(?:tests?|t)/(?:[^/]+/)*[^/]+\.cpp")
+
+
+def _has_cpp_unit_test(files: Sequence[Any]) -> bool:
+    """True when the pull request adds or changes a C++ unit test file."""
+    return any(isinstance(item, dict)
+               and str(item.get("status") or "") != "removed"
+               and _CPP_UNIT_TEST_RE.fullmatch(str(item.get("filename") or ""))
+               for item in files)
+
+
+# The goal-home rules bus.brain merge can check, keyed by the normalized rule
+# text. A rule not listed here is one merge cannot check, so merge refuses it
+# instead of passing it silently.
+_MERGE_RULE_CHECKS: Dict[str, Callable[[Sequence[Any]], bool]] = {
+    "c++ unit test required": _has_cpp_unit_test,
+}
+
+
+def _normalized_rule(constraint: str) -> str:
+    return " ".join(constraint.lower().split()).rstrip(".")
+
+
 def _refuse_merge_constraints(gh: GitHub, repo: str, number: int,
-                             association: Optional[Tuple[str, int]], ticket_issue: Dict[str, Any]) -> None:
-    """Enforce recognized merge rules named by the ticket's goal home."""
+                              association: Optional[Tuple[str, int]],
+                              ticket_issue: Dict[str, Any]) -> None:
+    """Refuse a merge that breaks a rule its ticket's goal home names.
+
+    Fails closed: an unreadable goal home, or a rule merge has no check for,
+    refuses the merge with the rule and the goal home named. A ticket whose
+    goal home names no rule merges exactly as before.
+    """
     if association is None:
         return
     try:
-        goal_home = _goal_home_for_ticket(gh, repo, ticket_issue)
-    except GitHubError:
-        # If we can't read the goal home, skip constraint checking
-        return
-    if goal_home is None:
-        return
-    constraints = goal_merge_constraints(goal_home)
+        goal_home = _goal_home_for_ticket(gh, association[0], ticket_issue)
+    except GitHubError as exc:
+        raise ValueError("goal home unreadable for ticket %s#%d: %s; merge refused "
+                         "until its merge constraints can be checked"
+                         % (association[0], association[1], exc)) from exc
+    constraints = goal_merge_constraints(goal_home) if goal_home else []
     if not constraints:
         return
+    home = "%s#%s" % (association[0], (goal_home or {}).get("number", "unknown"))
+    files: Optional[List[Any]] = None
     for constraint in constraints:
-        if constraint.lower() == "c++ unit test required":
+        rule_check = _MERGE_RULE_CHECKS.get(_normalized_rule(constraint))
+        if rule_check is None:
+            raise ValueError("goal home %s rule '%s' cannot be checked by bus.brain "
+                             "merge; check it and merge by hand" % (home, constraint))
+        if files is None:
             files = gh.paginate("/repos/%s/pulls/%d/files" % (repo, number))
-            has_test = any(isinstance(item, dict) and
-                           re.fullmatch(r"tests/[^/]+\.cpp", str(item.get("filename") or ""))
-                           for item in files)
-            if not has_test:
-                raise ValueError("goal home #%s rule '%s' is not met" %
-                                 (goal_home.get("number", "unknown"), constraint))
+        if not rule_check(files):
+            raise ValueError("goal home %s rule '%s' is not met" % (home, constraint))
 
 
 def _verdict_reader(gh: GitHub, repo: str, number: int, details: Dict[str, Any],
