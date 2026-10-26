@@ -11261,4 +11261,4 @@ class RemoteClaimCountTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             runner = self.runner()
             body = runner._lanes_body(runner._lane_rows())
-        self.assertIn("Remote claims: muse 1/1", body)
+        self.assertIn("Remote claims: muse 1/4", body)
