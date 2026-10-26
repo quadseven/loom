@@ -1635,8 +1635,9 @@ through the gateway). codex, claude, agy and anthropic stay local.
 The job, step by step (`lanes/k8s/lane_job.py`):
 
 1. Reads the dispatch inputs (slot, ticket key, brief, run id, the slot's
-   `NAME=value` settings and the station's report public key) from the event
-   file, never from the environment, which GitHub prints in the public log.
+   `NAME=value` settings, the station's report public key and the run's
+   own report MAC key, masked at once) from the event file, never from the
+   environment, which GitHub prints in the public log.
 2. Proves the runner's egress is narrowed, before any key is read:
    `sandbox_ready` from `lanes/agent_sandbox.sh` ("Lane pods" above). A runner
    that fails it runs no agent; its heartbeat reason goes into the report.
@@ -1649,10 +1650,12 @@ The job, step by step (`lanes/k8s/lane_job.py`):
 5. Seals a report of exactly what the station reads for the run: the
    brief's `done/` or `failed/` move, the run log with its failure class
    line, the `.answered` and `.verify` files, the transcripts, answers and
-   the slot's heartbeat. It is a tar.gz encrypted with a random key, and the
+   the slot's heartbeat. It is a tar.gz encrypted with a random key, the
    key is RSA-OAEP encrypted to the station's own key
-   (`state/runners/report-key.pem`, made on first use): a public repository's
-   artifacts can be downloaded by anyone signed in.
+   (`state/runners/report-key.pem`, made on first use), because a public
+   repository's artifacts can be downloaded by anyone signed in, and both
+   carry an HMAC-SHA256 under the run's MAC key, so a report sealed by
+   anyone else does not pass.
 
 Each pass (`bus/runners.py`, after `finish_claims`) the station:
 
@@ -1661,17 +1664,22 @@ Each pass (`bus/runners.py`, after `finish_claims`) the station:
   `state/runners/runs.json` before the request goes, so a brief is never
   dispatched twice; a ledger it cannot read stops every dispatch.
 - Reads each run's state, one request per run per pass on the existing
-  cadence (conditional requests, so an unchanged run costs a 304). A run is
-  found by its run id in its name (`lane <slot> <run id>`).
-- When a run ends, downloads and opens its report and writes its files into
+  cadence (conditional requests, so an unchanged run costs a 304). It
+  follows only the run id the dispatch returned, and believes a run only
+  when it ran `.github/workflows/lane.yml` on main, as a workflow_dispatch
+  the station's own App triggered.
+- When a run ends, downloads its report, checks its MAC before decrypting,
+  bounds every size before reading (each zip member, the decrypted file and
+  all files together, 128 MB), and writes its files into
   the loom home where a local runner writes them, then moves the inbox brief
   to `done/` or `failed/` as the runner did. The factory and the rest of the
   station read the outcome as for any lane.
 - Parks the brief `[transient]`, so the ticket goes to another lane, when a
   run ends with no report, a report cannot be read, a report finishes no
-  brief (for example a failed egress proof), a dispatch never appears as a
-  run within 15 minutes, or no runner takes a run within 30 minutes (the run
-  is cancelled and the slot held for 30 minutes).
+  brief (for example a failed egress proof), a run fails the checks above, a
+  dispatch gets no answer or no run id (never sent again), or no runner
+  takes a run within 30 minutes (the run is cancelled and the slot held for
+  30 minutes).
 - Refuses to dispatch, and parks `[transient]` so a local lane takes the
   ticket, a brief whose inputs pass GitHub's 65,535-character limit and a
   brief for a repo that is not public. Runner slots take public repos only:
@@ -1706,7 +1714,9 @@ What the cluster side must provide:
   runner must not reach), a secret so its private addresses are masked in
   the public log.
 - The station App with `actions: write` on this repository, to dispatch and
-  cancel runs (`actions: read` reads them and their artifacts).
+  cancel runs (`python3 -m bus app manifest --role station`; `app ids
+  --role station` checks it). The lanes' and the brain's Apps keep
+  `actions: read`.
 
 What keeps the runners safe. This repository is public, and a repository's
 self-hosted runners cannot be held to one workflow, so a pull request that

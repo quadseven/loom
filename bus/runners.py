@@ -15,22 +15,31 @@ Rules:
   dispatch request is sent, and a ledger that cannot be read stops every
   dispatch.
 - A run that ends with no report, a run no runner takes within QUEUE_MAX, a
-  dispatch never seen as a run, and a report that cannot be read each park
-  the brief [transient], so the station re-briefs the ticket elsewhere.
+  dispatch with no answer or no run id, a run from elsewhere and a report
+  that cannot be read or verified each park the brief [transient], so the
+  station re-briefs the ticket elsewhere.
 - A brief whose inputs exceed GitHub's INPUT_LIMIT, or that names a repo
   that is not public, is not dispatched: it is parked [transient] and the
   ticket goes to a local lane. Runner slots take public repos only, because
   a run's inputs and logs live in this public repository's Actions.
 - The report is encrypted to this station's own key (state/runners/), so
-  the artifact a public repository stores reads as noise to anyone else.
+  the artifact a public repository stores reads as noise to anyone else,
+  and MACed with a key made for the run, so no one else can forge one. Its
+  sizes are bounded before each read.
+- Only the run id the dispatch returned is followed, and a run is believed
+  only when it ran the lane workflow on main as a workflow_dispatch the
+  station's own App triggered.
 
 Only API lanes run there (RUNNER_LANES); codex, claude, agy and anthropic
 stay on this machine. docs/LANES.md, "Lanes on cluster runners".
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import io
 import json
+import secrets
 import os
 import re
 import subprocess
@@ -42,6 +51,7 @@ import urllib.request
 import uuid
 import sys
 import zipfile
+import zlib
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .github import RateLimited
@@ -60,13 +70,22 @@ RUNNER_LANES = ("opencode-go", "zen", "openrouter", "zai", "workersai", "free", 
 # A run no runner has taken after this many seconds is cancelled and parked:
 # the runner set may be scaled to zero.
 QUEUE_MAX = 1800
-# A dispatch whose run is not found after this many seconds is parked.
-UNSEEN_MAX = 900
 # How long a slot stays held after a run reported it unavailable with no
 # reset time, or after no runner took its run.
 HOLD_SECONDS = 1800
 # The most bytes read for one report artifact.
 ARTIFACT_MAX = 64 * 1024 * 1024
+# Bounds on what one report may unpack to, checked before each read: the
+# sealed key, the MAC, the files in all and their count.
+KEY_MAX = 4096
+MAC_MAX = 128
+UNPACKED_MAX = 128 * 1024 * 1024
+MEMBERS_MAX = 20000
+CHUNK = 1024 * 1024
+# What the job's MAC covers comes after this label (lanes/k8s/lane_job.py).
+MAC_LABEL = b"loom-lane-report-v1\n"
+MAC_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
+WORKFLOW_PATH = ".github/workflows/" + WORKFLOW
 FETCH_TIMEOUT = 120
 OPENSSL_TIMEOUT = 60
 # Ledger entries whose brief has left the inbox are dropped after this long.
@@ -213,6 +232,7 @@ class Runners:
     def __init__(self, gh: Any, home: str, repo: str, slots: List[str],
                  env: Dict[str, str], public: Callable[[str], bool],
                  say: Callable[[str], None],
+                 actor: Optional[str] = None,
                  now: Optional[float] = None,
                  fetch: Callable[[str], bytes] = _https_fetch,
                  openssl: str = "openssl") -> None:
@@ -223,12 +243,13 @@ class Runners:
         self.env = env
         self.public = public
         self.say = say
+        # The station App's login: only a run it triggered is believed.
+        self.actor = actor
         self.now = _now() if now is None else now
         self.fetch = fetch
         self.openssl = openssl
         self.dir = os.path.join(home, "state", "runners")
         self.ledger_path = os.path.join(self.dir, "runs.json")
-        self._listed: Optional[List[Dict[str, Any]]] = None
 
     # -- ledger -----------------------------------------------------------
     def load(self) -> Dict[str, Any]:
@@ -259,6 +280,10 @@ class Runners:
     # -- the pass ----------------------------------------------------------
     def tend(self) -> None:
         if not self.slots:
+            return
+        if not self.actor:
+            self.say("runner slots need the station's GitHub App, whose runs alone are believed; "
+                     "nothing dispatched")
             return
         ledger = self.load()
         for key in sorted(ledger["runs"]):
@@ -322,9 +347,10 @@ class Runners:
                        % (repo or "the brief's repo"), "transient")
             return
         run_id = uuid.uuid4().hex
+        mac_key = secrets.token_hex(32)
         inputs = {"slot": slot, "ticket": ticket, "brief": brief, "run_id": run_id,
                   "settings": encode_settings(lane_settings(slot, self.env)),
-                  "report_key": self.public_key()}
+                  "report_key": self.public_key(), "report_mac_key": mac_key}
         size = input_size(inputs)
         if size > INPUT_LIMIT:
             entry["state"] = "refused"
@@ -333,7 +359,7 @@ class Runners:
                        "(%d of %d input characters); a local lane takes it" % (size, INPUT_LIMIT),
                        "transient")
             return
-        entry.update({"state": "dispatched", "run_id": run_id})
+        entry.update({"state": "dispatched", "run_id": run_id, "mac": mac_key})
         # Recorded before the request: a request that lands but whose answer
         # is lost must not lead to a second dispatch.
         self.save(ledger)
@@ -354,48 +380,56 @@ class Runners:
                 self._park(slot, ticket, "GitHub refused the runner dispatch (HTTP %d)" % status,
                            "transient")
                 return
-            # No answer or a server error: the run may exist. It is looked
-            # for by its run id and parked if never seen (UNSEEN_MAX).
-            self.say("runner dispatch of %s may not have landed: %s" % (key, err))
+            # No answer or a server error: the run may exist, but with no run
+            # id it cannot be followed. Parked, never sent again; a run that
+            # did start finds its branch's pull request, as any second lane.
+            entry["state"] = "lost"
+            self.save(ledger)
+            self._park(slot, ticket, "the runner dispatch got no answer (%s); not sent again"
+                       % (status or "no connection"), "transient")
             return
         data = resp.data if isinstance(resp.data, dict) else {}
         run = data.get("workflow_run_id")
-        if isinstance(run, int) and not isinstance(run, bool):
-            entry["run"] = run
+        if not isinstance(run, int) or isinstance(run, bool):
+            entry["state"] = "lost"
+            self.save(ledger)
+            self._park(slot, ticket, "GitHub returned no run id for the runner dispatch", "transient")
+            return
+        entry["run"] = run
         self.say("dispatched %s to a cluster runner (run id %s)" % (key, run_id))
 
     # -- following a run ---------------------------------------------------
-    def _list_runs(self) -> List[Dict[str, Any]]:
-        if self._listed is None:
-            data = self.gh.rest("GET", "/repos/%s/actions/workflows/%s/runs?event=workflow_dispatch&per_page=100"
-                                % (self.repo, WORKFLOW)).data
-            runs = data.get("workflow_runs") if isinstance(data, dict) else None
-            self._listed = [r for r in runs or [] if isinstance(r, dict)]
-        return self._listed
-
-    def _find_run(self, entry: Dict[str, Any]) -> Optional[int]:
-        title = "lane %s %s" % (entry["slot"], entry["run_id"])
-        for run in self._list_runs():
-            if str(run.get("display_title") or run.get("name") or "") == title:
-                found = run.get("id")
-                if isinstance(found, int) and not isinstance(found, bool):
-                    return found
-        return None
+    def provenance(self, run: Dict[str, Any]) -> str:
+        """Why a run is not one this station dispatched; empty when it is:
+        the lane workflow file on main, a workflow_dispatch, triggered by the
+        station's own App."""
+        if run.get("head_branch") != REF:
+            return "it ran on %r, not %s" % (str(run.get("head_branch"))[:60], REF)
+        if str(run.get("path") or "").split("@", 1)[0] != WORKFLOW_PATH:
+            return "it ran another workflow file"
+        if run.get("event") != "workflow_dispatch":
+            return "it was not a workflow_dispatch"
+        actor = run.get("triggering_actor")
+        login = actor.get("login") if isinstance(actor, dict) else None
+        if not self.actor or login != self.actor:
+            return "it was triggered by %r, not the station's App" % str(login)[:60]
+        return ""
 
     def _follow(self, ledger: Dict[str, Any], entry: Dict[str, Any]) -> None:
         slot, ticket = entry["slot"], entry["ticket"]
         age = self.now - float(entry.get("at") or self.now)
-        if not entry.get("run"):
-            found = self._find_run(entry)
-            if found is None:
-                if age > UNSEEN_MAX:
-                    entry["state"] = "lost"
-                    self._park(slot, ticket, "the runner dispatch never appeared as a run in %d minutes"
-                               % (UNSEEN_MAX // 60), "transient")
-                return
-            entry["run"] = found
+        if not entry.get("run") or not entry.get("mac"):
+            entry["state"] = "lost"
+            self._park(slot, ticket, "the runner dispatch has no run id to follow", "transient")
+            return
         run = self.gh.rest("GET", "/repos/%s/actions/runs/%d" % (self.repo, entry["run"])).data
         if not isinstance(run, dict):
+            return
+        why = self.provenance(run)
+        if why:
+            entry["state"] = "refused"
+            self._park(slot, ticket, "runner run %s is not this station's: %s" % (entry["run"], why),
+                       "transient")
             return
         status = str(run.get("status") or "")
         if status != "completed":
@@ -433,7 +467,7 @@ class Runners:
             resp = self.gh.rest("GET", "/repos/%s/actions/artifacts/%d/zip"
                                 % (self.repo, int(found["id"])), ok=(302,))
             location = str((resp.headers or {}).get("location") or "")
-            files = self.open_report(self.fetch(location))
+            files = self.open_report(self.fetch(location), entry["run_id"], entry["mac"])
             beat = self.apply(slot, ticket, files)
         except ReportError as err:
             self._park(slot, ticket, "could not read the runner's report: %s" % err, "transient")
@@ -488,35 +522,96 @@ class Runners:
             raise ReportError("openssl %s failed (exit %d)" % (args[0], out.returncode))
         return out.stdout
 
-    def open_report(self, archive: bytes) -> Dict[str, bytes]:
-        """The files of a report artifact: a zip of key.enc (the run's random
-        key, RSA-OAEP to this station's key) and report.enc (a tar.gz,
-        AES-256-CBC with that key through PBKDF2), as relative path -> bytes."""
-        try:
-            with zipfile.ZipFile(io.BytesIO(archive)) as zf:
-                sealed_key = zf.read("key.enc")
-                sealed = zf.read("report.enc")
-        except (zipfile.BadZipFile, KeyError, OSError) as err:
-            raise ReportError("not a lane report artifact (%s)" % type(err).__name__) from None
-        secret = self._openssl(["pkeyutl", "-decrypt", "-inkey", self.key_path(),
-                                "-pkeyopt", "rsa_padding_mode:oaep"], sealed_key)
+    @staticmethod
+    def _bounded(stream: Any, limit: int, out: Any) -> int:
+        """Copy `stream` to `out` in CHUNK reads, at most `limit` bytes:
+        ReportError past it. Returns the bytes copied."""
+        total = 0
+        while True:
+            chunk = stream.read(min(CHUNK, limit - total + 1))
+            if not chunk:
+                return total
+            total += len(chunk)
+            if total > limit:
+                raise ReportError("the report unpacks past %d bytes" % limit)
+            out.write(chunk)
+
+    def _zip_member(self, zf: zipfile.ZipFile, name: str, limit: int, out: Any) -> None:
+        info = zf.getinfo(name)
+        if info.file_size > limit:
+            raise ReportError("%s is larger than %d bytes" % (name, limit))
+        with zf.open(info) as stream:
+            self._bounded(stream, limit, out)
+
+    @staticmethod
+    def report_mac(mac_key: str, run_id: str, sealed_key: bytes, sealed_digest: str) -> str:
+        """The report's HMAC-SHA256 under the run's own key: over the run id,
+        the sealed key and the sealed report's SHA-256."""
+        text = MAC_LABEL + ("%s\n%s\n%s\n" % (run_id, hashlib.sha256(sealed_key).hexdigest(),
+                                               sealed_digest)).encode("ascii")
+        return hmac.new(mac_key.encode("ascii"), text, hashlib.sha256).hexdigest()
+
+    def open_report(self, archive: bytes, run_id: str, mac_key: str) -> Dict[str, bytes]:
+        """The files of a report artifact, as relative path -> bytes. The zip
+        holds key.enc (the run's random key, RSA-OAEP to this station's
+        key), report.enc (a tar.gz, AES-256-CBC with that key through PBKDF2)
+        and report.mac (report_mac under the key sent with the dispatch).
+        The MAC is checked before anything is decrypted, and every size is
+        bounded before it is read: the zip members, openssl's output (a
+        file, not memory) and the files in all (UNPACKED_MAX)."""
+        if not MAC_KEY_RE.fullmatch(str(mac_key or "")):
+            raise ReportError("no report key recorded for this run")
         with tempfile.TemporaryDirectory() as tmp:
+            sealed_path = os.path.join(tmp, "report.enc")
+            key_buf, mac_buf = io.BytesIO(), io.BytesIO()
+            try:
+                with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+                    self._zip_member(zf, "key.enc", KEY_MAX, key_buf)
+                    self._zip_member(zf, "report.mac", MAC_MAX, mac_buf)
+                    with open(sealed_path, "wb") as fh:
+                        self._zip_member(zf, "report.enc", ARTIFACT_MAX, fh)
+            except (zipfile.BadZipFile, KeyError, OSError, RuntimeError) as err:
+                raise ReportError("not a lane report artifact (%s)" % type(err).__name__) from None
+            digest = hashlib.sha256()
+            with open(sealed_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(CHUNK), b""):
+                    digest.update(chunk)
+            want = self.report_mac(mac_key, run_id, key_buf.getvalue(), digest.hexdigest())
+            got = mac_buf.getvalue().decode("ascii", "replace").strip()
+            if not hmac.compare_digest(want, got):
+                raise ReportError("the report's MAC does not match this run's key")
+            secret = self._openssl(["pkeyutl", "-decrypt", "-inkey", self.key_path(),
+                                    "-pkeyopt", "rsa_padding_mode:oaep"], key_buf.getvalue())
             pass_file = os.path.join(tmp, "k")
             _write(pass_file, secret, 0o600)
-            plain = self._openssl(["enc", "-d", "-aes-256-cbc", "-pbkdf2",
-                                   "-pass", "file:" + pass_file], sealed)
+            plain = os.path.join(tmp, "report.tgz")
+            self._openssl(["enc", "-d", "-aes-256-cbc", "-pbkdf2", "-pass", "file:" + pass_file,
+                           "-in", sealed_path, "-out", plain])
+            if os.path.getsize(plain) > ARTIFACT_MAX:
+                raise ReportError("the decrypted report is larger than %d bytes" % ARTIFACT_MAX)
+            return self._untar(plain)
+
+    def _untar(self, path: str) -> Dict[str, bytes]:
         files: Dict[str, bytes] = {}
+        total = 0
         try:
-            with tarfile.open(fileobj=io.BytesIO(plain), mode="r:gz") as tar:
-                for member in tar.getmembers():
+            with tarfile.open(path, mode="r|gz") as tar:
+                for count, member in enumerate(tar, 1):
+                    if count > MEMBERS_MAX:
+                        raise ReportError("the report holds more than %d entries" % MEMBERS_MAX)
                     if member.isdir():
                         continue
                     if not member.isfile():
                         raise ReportError("the report holds a link or device: %s" % member.name[:80])
+                    if member.size < 0 or total + member.size > UNPACKED_MAX:
+                        raise ReportError("the report unpacks past %d bytes" % UNPACKED_MAX)
+                    buf = io.BytesIO()
                     fh = tar.extractfile(member)
+                    if fh is not None:
+                        total += self._bounded(fh, UNPACKED_MAX - total, buf)
                     name = member.name[2:] if member.name.startswith("./") else member.name
-                    files[name] = fh.read() if fh else b""
-        except (tarfile.TarError, OSError, EOFError) as err:
+                    files[name] = buf.getvalue()
+        except (tarfile.TarError, OSError, EOFError, zlib.error) as err:
             raise ReportError("the report is not a readable archive (%s)" % type(err).__name__) from None
         return files
 

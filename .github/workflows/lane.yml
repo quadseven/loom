@@ -50,6 +50,10 @@ on:
         description: The station's report public key (PEM)
         required: true
         type: string
+      report_mac_key:
+        description: The run's report MAC key (masked by the job)
+        required: true
+        type: string
 
 run-name: lane ${{ inputs.slot }} ${{ inputs.run_id }}
 

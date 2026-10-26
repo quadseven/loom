@@ -11349,8 +11349,15 @@ class Station:
         if not slots:
             return
         repo = os.environ.get("LOOM_RUNNER_REPO", "").strip() or self.s.self_repo
+        try:
+            actor = self.gh.app_login()
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read the station App's login for its runner slots: %s" % err)
+            actor = None
         runners.Runners(self.gh, self.s.home, repo, slots, dict(os.environ), self._public, _say,
-                        now=self.now).tend()
+                        actor=actor, now=self.now).tend()
 
     def upload_usage_limits(self, records: List[Dict[str, Any]]) -> None:
         """Send the current limits snapshot using the transcript upload token."""

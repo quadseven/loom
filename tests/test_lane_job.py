@@ -29,6 +29,7 @@ from bus import runners  # noqa: E402
 BRIEF = "Repo: owner/app\nBranch: loom/owner.app-7\n\nDo the thing.\n"
 PUB = "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n"
 RUN_ID = "0123456789abcdef0123456789abcdef"
+MAC_KEY = "ab" * 32
 
 FAKE_RUNNER = """#!/usr/bin/env bash
 env | sort > "$LOOM_HOME/../runner.env"
@@ -71,7 +72,7 @@ class LaneJobTest(unittest.TestCase):
 
     def inputs(self, **over):
         inputs = {"slot": "opencode-go-2", "ticket": "owner.app-7", "brief": BRIEF,
-                  "run_id": RUN_ID, "settings": "", "report_key": PUB}
+                  "run_id": RUN_ID, "settings": "", "report_key": PUB, "report_mac_key": MAC_KEY}
         inputs.update(over)
         self.event.write_text(json.dumps({"inputs": inputs}))
 
@@ -91,6 +92,9 @@ class LaneJobTest(unittest.TestCase):
         self.assertIn("LOOM_OPENCODE_GO_KEY_SSM=/x/oc\n", (self.job / "lane.env").read_text())
         self.assertEqual(stat.S_IMODE((self.job / "lane.env").stat().st_mode), 0o600)
         self.assertNotIn("Do the thing", result.stdout + result.stderr)
+        # The run's MAC key is masked in the log before anything else.
+        self.assertIn("::add-mask::%s" % MAC_KEY, result.stdout)
+        self.assertEqual((self.job / "report-mac-key").read_text(), MAC_KEY)
 
     def test_prepare_refuses_a_setting_a_slot_may_not_take(self):
         # LOOM_<SLOT>_OPENCODE names the binary a slot runs: never from inputs.
@@ -101,7 +105,8 @@ class LaneJobTest(unittest.TestCase):
         self.assertFalse((self.job / "lane.env").exists())
 
     def test_prepare_refuses_bad_names(self):
-        for over in ({"slot": "codex"}, {"ticket": "../x"}, {"run_id": "1"}, {"report_key": "x"}):
+        for over in ({"slot": "codex"}, {"ticket": "../x"}, {"run_id": "1"}, {"report_key": "x"},
+                     {"report_mac_key": "short"}):
             self.inputs(**over)
             self.assertEqual(self.step("prepare").returncode, 1, over)
 

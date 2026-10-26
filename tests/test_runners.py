@@ -25,6 +25,7 @@ from bus import runners, station  # noqa: E402
 from bus.github import GitHubError, RateLimited, Response  # noqa: E402
 
 REPO = "owner/loom"
+APP = "loom-station[bot]"
 TICKET = "owner.app-7"
 BRIEF = ("# Ticket\n\nRepo: owner/app\nBranch: loom/owner.app-7\n"
          "Lane: opencode-go\n\nDo the thing.\n")
@@ -44,7 +45,6 @@ class FakeGitHub:
         self.calls = []
         self.dispatch_error = None
         self.runs = {}          # run id -> run dict
-        self.listed = []        # workflow runs list
         self.artifacts = {}     # run id -> [artifact]
         self.zips = {}          # artifact id -> bytes
         self.next_run = 900
@@ -57,12 +57,13 @@ class FakeGitHub:
             self.next_run += 1
             title = "lane %s %s" % (body["inputs"]["slot"], body["inputs"]["run_id"])
             self.runs[self.next_run] = {"id": self.next_run, "status": "queued",
-                                        "display_title": title}
+                                        "display_title": title, "head_branch": "main",
+                                        "path": ".github/workflows/lane.yml",
+                                        "event": "workflow_dispatch",
+                                        "triggering_actor": {"login": APP}}
             return Response(200, {"workflow_run_id": self.next_run})
         if method == "POST" and path.endswith("/cancel"):
             return Response(202, {})
-        if path.startswith("/repos/%s/actions/workflows/lane.yml/runs" % REPO):
-            return Response(200, {"workflow_runs": self.listed})
         parts = path.split("/")
         if path.endswith("/artifacts"):
             return Response(200, {"artifacts": self.artifacts.get(int(parts[-2]), [])})
@@ -95,10 +96,10 @@ class RunnersTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def runner(self, now=None):
+    def runner(self, now=None, actor=APP):
         return runners.Runners(self.gh, str(self.home), REPO, ["opencode-go-2"], self.env,
                                lambda repo: self.public.get(repo, False), self.said.append,
-                               now=self.now if now is None else now, fetch=self.fetch)
+                               actor=actor, now=self.now if now is None else now, fetch=self.fetch)
 
     def fetch(self, url):
         return self.gh.zips[int(url.rsplit("/", 1)[1])]
@@ -169,13 +170,18 @@ class RunnersTest(unittest.TestCase):
         self.gh.dispatch_error = GitHubError("request failed: timeout", 0, "")
         self.runner().tend()
         self.gh.dispatch_error = None
+        # Parked so another lane takes the ticket; the same brief put back
+        # in the inbox is still not sent again.
+        self.assertTrue((self.inbox / "failed" / (TICKET + ".md")).exists())
+        self.assertIn("failed: [transient] the runner dispatch got no answer", self.failure_line())
+        self.drop_brief()
         self.runner(now=self.now + 120).tend()
         self.assertEqual(len(self.gh.posts("/dispatches")), 1)
-        # Never seen as a run: parked so another lane takes the ticket.
-        self.runner(now=self.now + runners.UNSEEN_MAX + 1).tend()
-        self.assertEqual(len(self.gh.posts("/dispatches")), 1)
-        self.assertTrue((self.inbox / "failed" / (TICKET + ".md")).exists())
-        self.assertIn("failed: [transient] the runner dispatch never appeared", self.failure_line())
+
+    def test_runner_slots_need_the_station_app(self):
+        self.drop_brief()
+        self.runner(actor=None).tend()
+        self.assertEqual(self.gh.calls, [])
 
     def test_a_budget_refusal_sends_the_brief_on_a_later_pass(self):
         self.drop_brief()
@@ -214,10 +220,11 @@ class RunnersTest(unittest.TestCase):
     def dispatched(self):
         self.drop_brief()
         self.runner().tend()
-        run_id = self.gh.posts("/dispatches")[0][2]["inputs"]["run_id"]
-        return self.gh.next_run, run_id
+        inputs = self.gh.posts("/dispatches")[0][2]["inputs"]
+        self.mac_key = inputs["report_mac_key"]
+        return self.gh.next_run, inputs["run_id"]
 
-    def seal(self, run_id, files, beat=None):
+    def seal(self, run_id, files, beat=None, mac_key=None):
         """A report artifact as the lane job seals it: `files` written under a
         job's loom home, then lane_job.py report."""
         job = load_job()
@@ -234,12 +241,13 @@ class RunnersTest(unittest.TestCase):
                                                         "run_id": run_id}))
         key = self.home / "state" / "runners" / "report-key.pem.pub"
         shutil.copy(key, jobdir / "report-key.pem")
+        (jobdir / "report-mac-key").write_text(mac_key or self.mac_key)
         with mock.patch.dict(os.environ, {"LOOM_JOB_DIR": str(jobdir)}), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(job.main(["lane_job.py", "report"]), 0)
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
-            for name in ("key.enc", "report.enc"):
+            for name in ("key.enc", "report.enc", "report.mac"):
                 zf.write(jobdir / "report" / name, name)
         return buf.getvalue()
 
@@ -322,7 +330,7 @@ class RunnersTest(unittest.TestCase):
         self.assertIn("failed: [transient] no cluster runner took the run", self.failure_line())
         self.assertFalse(self.beat()["available"])
 
-    def test_a_run_whose_id_was_not_returned_is_found_by_its_name(self):
+    def test_a_dispatch_with_no_run_id_is_parked_not_searched_for(self):
         self.drop_brief()
         real = self.gh.rest
 
@@ -331,11 +339,56 @@ class RunnersTest(unittest.TestCase):
             return Response(204, None) if path.endswith("/dispatches") else resp
         self.gh.rest = no_id
         self.runner().tend()
-        run = self.gh.next_run
-        self.gh.listed = [self.gh.runs[run]]
-        self.gh.runs[run]["status"] = "in_progress"
+        self.assertTrue((self.inbox / "failed" / (TICKET + ".md")).exists())
+        self.assertIn("failed: [transient] GitHub returned no run id", self.failure_line())
         self.runner(now=self.now + 60).tend()
-        self.assertIn(("GET", "/repos/owner/loom/actions/runs/%d" % run, None), self.gh.calls)
+        self.assertEqual(len(self.gh.posts("/dispatches")), 1)
+        self.assertFalse([c for c in self.gh.calls if c[0] == "GET"])
+
+    def test_a_run_from_elsewhere_is_not_believed(self):
+        for field, value in (("head_branch", "feature"), ("path", ".github/workflows/other.yml"),
+                             ("event", "pull_request"), ("triggering_actor", {"login": "someone"})):
+            self.setUp()
+            run, run_id = self.dispatched()
+            artifact = self.seal(run_id, {"briefs/opencode-go-2/done/%s.md" % TICKET: BRIEF})
+            self.finish(run, run_id, artifact)
+            self.gh.runs[run][field] = value
+            self.runner(now=self.now + 600).tend()
+            self.assertTrue((self.inbox / "failed" / (TICKET + ".md")).exists(), field)
+            self.assertIn("is not this station's", self.failure_line())
+            self.assertFalse([c for c in self.gh.calls if c[1].endswith("/artifacts")], field)
+            self.tearDown()
+        self.setUp()
+
+    def test_a_report_sealed_without_the_runs_mac_key_is_refused(self):
+        # Anyone can encrypt to the station's public key; only the job holds
+        # the run's MAC key.
+        run, run_id = self.dispatched()
+        artifact = self.seal(run_id, {"briefs/opencode-go-2/done/%s.md" % TICKET: BRIEF},
+                             mac_key="f" * 64)
+        self.finish(run, run_id, artifact)
+        self.runner(now=self.now + 600).tend()
+        self.assertFalse((self.inbox / "done" / (TICKET + ".md")).exists())
+        self.assertIn("the report's MAC does not match", self.failure_line())
+
+    def test_a_report_that_unpacks_past_the_bound_is_refused(self):
+        run, run_id = self.dispatched()
+        artifact = self.seal(run_id, {"briefs/opencode-go-2/done/%s.md" % TICKET: BRIEF,
+                                      "logs/opencode-go-2/%s.log" % TICKET: "x" * 5000})
+        self.finish(run, run_id, artifact)
+        with mock.patch.object(runners, "UNPACKED_MAX", 4000):
+            self.runner(now=self.now + 600).tend()
+        self.assertFalse((self.home / "logs" / "opencode-go-2" / (TICKET + ".log")).read_text().startswith("x"))
+        self.assertIn("the report unpacks past 4000 bytes", self.failure_line())
+
+    def test_an_oversized_zip_member_is_refused_before_it_is_read(self):
+        run, run_id = self.dispatched()
+        artifact = self.seal(run_id, {"logs/opencode-go-2/%s.log" % TICKET: os.urandom(4000).hex()})
+        self.finish(run, run_id, artifact)
+        with mock.patch.object(runners, "ARTIFACT_MAX", 1000):
+            self.runner(now=self.now + 600).tend()
+        # The declared size refuses it, before a byte of it is read.
+        self.assertIn("report.enc is larger than 1000 bytes", self.failure_line())
 
 
 class StationHookTest(unittest.TestCase):

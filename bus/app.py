@@ -26,28 +26,41 @@ from .github import (APP_KEY_FILE, DEFAULT_API, AppToken, GitHub, GitHubError,
                      urllib_transport)
 
 # What the station, the brain and the lanes do with an installation token:
-# read and write issues, labels, comments, branches and pull requests, read
-# check runs, and read, dispatch and cancel workflow runs (the lane runs on
-# cluster runners, bus/runners.py). metadata read comes with every App.
+# read and write issues, labels, comments, branches and pull requests, and
+# read check runs and workflow runs. metadata read comes with every App.
 PERMISSIONS = {
     "contents": "write",
     "issues": "write",
     "pull_requests": "write",
     "checks": "read",
-    "actions": "write",
+    "actions": "read",
     "metadata": "read",
 }
 _LEVEL = {"read": 1, "write": 2, "admin": 3}
+# Each writer has its own App (loom#1142). Only the station's dispatches and
+# cancels the lane runs on cluster runners (bus/runners.py), so only it needs
+# actions write; the lanes' and the brain's read runs as before.
+ROLES = ("station", "lanes", "brain")
+
+
+def permissions(role: str = "station") -> Dict[str, str]:
+    """The permissions the App of one writer needs."""
+    if role not in ROLES:
+        raise ValueError("unknown App role %r" % role)
+    found = dict(PERMISSIONS)
+    if role == "station":
+        found["actions"] = "write"
+    return found
 HOMEPAGE = "https://github.com/quadseven/loom"
 
 
-def manifest(owner: str, name: Optional[str] = None) -> Dict[str, Any]:
+def manifest(owner: str, name: Optional[str] = None, role: str = "station") -> Dict[str, Any]:
     """The GitHub App manifest: a private App with no webhook (Loom polls)."""
     return {
         "name": name or "loom-%s" % owner,
         "url": HOMEPAGE,
         "public": False,
-        "default_permissions": dict(PERMISSIONS),
+        "default_permissions": permissions(role),
         "default_events": [],
     }
 
@@ -59,9 +72,9 @@ def create_url(owner: str, org: bool) -> str:
     return "https://github.com/settings/apps/new"
 
 
-def form(owner: str, org: bool, name: Optional[str] = None) -> str:
+def form(owner: str, org: bool, name: Optional[str] = None, role: str = "station") -> str:
     """A local HTML page whose one button posts the manifest to GitHub."""
-    body = html.escape(json.dumps(manifest(owner, name), sort_keys=True), quote=True)
+    body = html.escape(json.dumps(manifest(owner, name, role), sort_keys=True), quote=True)
     return ("<!doctype html>\n<meta charset=\"utf-8\">\n<title>Create the Loom App</title>\n"
             "<form action=\"%s\" method=\"post\">\n"
             "<input type=\"hidden\" name=\"manifest\" value=\"%s\">\n"
@@ -70,16 +83,16 @@ def form(owner: str, org: bool, name: Optional[str] = None) -> str:
 
 
 def print_manifest(owner: str, org: bool, name: Optional[str], as_form: bool,
-                   out: TextIO) -> int:
+                   out: TextIO, role: str = "station") -> int:
     if as_form:
-        out.write(form(owner, org, name))
+        out.write(form(owner, org, name, role))
         return 0
     out.write("Create the App: POST this manifest as the form field `manifest` to\n"
               "%s\n(or rerun with --form, save the page and open it in a browser).\n"
               "Then install it on the repos in LOOM_REPOS only, generate a private\n"
               "key, and run `python3 -m bus app ids --app-id N`.\n\n"
               % create_url(owner, org))
-    out.write(json.dumps(manifest(owner, name), indent=2, sort_keys=True) + "\n")
+    out.write(json.dumps(manifest(owner, name, role), indent=2, sort_keys=True) + "\n")
     return 0
 
 
@@ -174,9 +187,10 @@ def _repos(app_id: str, inst_id: str, read_key: Callable[[], str],
     return sorted(repos)
 
 
-def _permission_warnings(inst_id: str, granted: Dict[str, Any]) -> List[str]:
+def _permission_warnings(inst_id: str, granted: Dict[str, Any],
+                         role: str = "station") -> List[str]:
     out = []
-    for perm, need in PERMISSIONS.items():
+    for perm, need in permissions(role).items():
         have = granted.get(perm)
         if not have:
             out.append("installation %s has no %s permission; Loom needs %s"
@@ -190,9 +204,11 @@ def _permission_warnings(inst_id: str, granted: Dict[str, Any]) -> List[str]:
 def ids(app_id: str, env: Optional[Dict[str, str]] = None,
         transport: Optional[Transport] = None,
         sign: Callable[[bytes, str], bytes] = openssl_sign,
-        out: Optional[TextIO] = None, err: Optional[TextIO] = None) -> int:
+        out: Optional[TextIO] = None, err: Optional[TextIO] = None,
+        role: str = "station") -> int:
     """List the App's installations and print the settings for the one that
-    covers the most LOOM_REPOS. 0 printed, 1 the App has no installation."""
+    covers the most LOOM_REPOS, checked against the permissions the App of
+    `role` needs. 0 printed, 1 the App has no installation."""
     env = dict(os.environ) if env is None else env
     out = out or sys.stdout
     err = err or sys.stderr
@@ -230,7 +246,7 @@ def ids(app_id: str, env: Optional[Dict[str, str]] = None,
         for repo in sorted(set(repos) - wanted):
             warnings.append("installation %s covers %s, which is not in LOOM_REPOS"
                             % (inst_id, repo))
-    warnings.extend(_permission_warnings(inst_id, inst.get("permissions") or {}))
+    warnings.extend(_permission_warnings(inst_id, inst.get("permissions") or {}, role))
     for line in warnings:
         err.write("warning: %s\n" % line)
     return 0

@@ -122,6 +122,10 @@ def prepare() -> None:
     key = inputs.get("report_key", "")
     if not key.startswith("-----BEGIN PUBLIC KEY-----"):
         raise JobError("report_key is not a PEM public key")
+    mac_key = inputs.get("report_mac_key", "")
+    if not runners.MAC_KEY_RE.fullmatch(mac_key):
+        raise JobError("report_mac_key must be 64 lowercase hex digits")
+    _mask(mac_key)
     try:
         settings = runners.parse_settings(slot, inputs.get("settings", ""))
     except ValueError as err:
@@ -134,6 +138,7 @@ def prepare() -> None:
     _write(os.path.join(d, "lane.env"), runners.encode_settings(settings))
     _write(os.path.join(d, "brief.md"), brief)
     _write(os.path.join(d, "report-key.pem"), key)
+    _write(os.path.join(d, "report-mac-key"), mac_key)
     print("prepared %s for slot %s" % (ticket, slot))
 
 
@@ -311,9 +316,11 @@ def report_files(home: str, slot: str, ticket: str) -> List[str]:
 
 
 def report() -> None:
-    """report/key.enc and report/report.enc: the run's files as a tar.gz,
-    AES-256-CBC (PBKDF2) with a random key, and that key RSA-OAEP to the
-    station's report key (bus/runners.py open_report reverses it)."""
+    """report/key.enc, report/report.enc and report/report.mac: the run's
+    files as a tar.gz, AES-256-CBC (PBKDF2) with a random key, that key
+    RSA-OAEP to the station's report key, and an HMAC-SHA256 of both under
+    the run's own MAC key, which only the station and this job hold
+    (bus/runners.py open_report checks and reverses it)."""
     job = _job()
     d = job_dir()
     home = os.path.join(d, "home")
@@ -336,6 +343,16 @@ def report() -> None:
                         os.path.join(d, "report-key.pem"), "-pkeyopt", "rsa_padding_mode:oaep",
                         "-in", secret, "-out", os.path.join(out, "key.enc")],
                        check=True, capture_output=True, timeout=120)
+        with open(os.path.join(d, "report-mac-key"), encoding="ascii") as fh:
+            mac_key = fh.read().strip()
+        with open(os.path.join(out, "key.enc"), "rb") as fh:
+            sealed_key = fh.read()
+        digest = hashlib.sha256()
+        with open(os.path.join(out, "report.enc"), "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        _write(os.path.join(out, "report.mac"),
+               runners.Runners.report_mac(mac_key, job["run_id"], sealed_key, digest.hexdigest()) + "\n")
     except (OSError, subprocess.SubprocessError):
         raise JobError("could not seal the report") from None
     finally:

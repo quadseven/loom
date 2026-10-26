@@ -22,7 +22,7 @@ class LaneWorkflow(unittest.TestCase):
 
     def test_it_is_dispatched_with_the_runs_inputs(self):
         self.assertIn("  workflow_dispatch:\n", self.text)
-        for name in ("slot", "ticket", "brief", "run_id", "settings", "report_key"):
+        for name in ("slot", "ticket", "brief", "run_id", "settings", "report_key", "report_mac_key"):
             self.assertRegex(self.text, r"\n      %s:\n" % name)
         # The station finds a run by this name (bus/runners.py _find_run).
         self.assertIn("run-name: lane ${{ inputs.slot }} ${{ inputs.run_id }}\n", self.text)
