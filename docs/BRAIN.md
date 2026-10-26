@@ -1441,6 +1441,13 @@ merge` refuses on, through the same functions merge uses (loom#1643): a
 ticket not at `loom:pr` (`ticket at loom:running, not loom:pr`), a REST
 `mergeable_state` of `dirty` (`conflicts with the default branch`), and a
 risk tier outside `LOOM_AUTO_MERGE_TIERS` (`held for the operator: <tier>`).
+A ticked acceptance criterion that names another repo of the same owner
+(`OWNER/NAME`, or a backticked name that is a `LOOM_REPOS` repo of that owner)
+was not built by this pull request: that repo builds it. Status prints
+`blocked: ticked criterion names another repo, ...` for it, and `bus.brain
+merge` refuses with the same reason (loom#1711). Send a brain fix asking the
+lane to untick it and end it `; not built: belongs in <repo>`, so the station
+files the follow-up in that repo; a criterion already ending that way passes.
 
 Status also prints a "Waiting on the brain" section: every open lane pull
 request whose ticket carries `needs-brain`, oldest first, with its ticket,
