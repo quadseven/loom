@@ -512,6 +512,9 @@ class GitHub:
         # client's own App bot login is added on first use; a caller adds its
         # trusted writers (the station its LOOM_BRIEF_AUTHORS).
         self.status_authors: set = set()
+        # The ledger of this Loom's own fix-rounds edits (bus/fixrounds.py);
+        # without one no fix-rounds comment reads as its rounds.
+        self.fix_ledger: Optional[str] = None
         # Whether this client keeps a ticket's routine events in the issue
         # body's status section and reads them back (bus/status.py, loom#1341).
         # The station, the brain and the dashboard turn it on, together: a
@@ -565,7 +568,9 @@ class GitHub:
             # A pull request's one fix comment reads as one comment per
             # round, so round counting and the lane's brief see every round
             # (loom#1640).
-            expanded = fixrounds.expand(expanded, writers)
+            if fixrounds.has_rounds(expanded):
+                expanded = fixrounds.expand(expanded, writers,
+                                            fixrounds.load_ledger(self.fix_ledger))
             if expanded is not resp.data:
                 resp = Response(resp.status, expanded, resp.etag, resp.headers)
         return resp

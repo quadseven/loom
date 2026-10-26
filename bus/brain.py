@@ -607,7 +607,7 @@ def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
     # edits that one comment in place, so the line's stamp - not the
     # comment's position - is what the fix ask is measured against (loom#1203).
     claim_stamp = fix_stamp = ""
-    for i, comment in enumerate(fixrounds.expand(list(comments), allowed)):
+    for i, comment in enumerate(comments):
         if not isinstance(comment, dict):
             continue
         body = str(comment.get("body") or "")
@@ -4369,7 +4369,7 @@ def _repeats_last_fix(gh: GitHub, ticket: Tuple[str, int], issue: Dict[str, Any]
     these same findings? (loom#1106 got six byte-identical ones in a day.)"""
     if not int(issue.get("comments") or 0):
         return False
-    for comment in reversed(fixrounds.expand(gh.paginate("/repos/%s/issues/%d/comments" % ticket))):
+    for comment in reversed(gh.paginate("/repos/%s/issues/%d/comments" % ticket)):
         body = str(comment.get("body") or "") if isinstance(comment, dict) else ""
         if body.startswith(FIX_MARKER):
             found = FIX_KEY_RE.search(body)
@@ -4427,9 +4427,7 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     kept = _moved_labels(_labels(issue), "briefed", lane) if state in ("pr", "failed") else None
     if model is not None:
         _set_model(gh, ticket[0], ticket[1], issue, model)
-    # One comment per pull request, edited for each later round (loom#1640).
-    posted = fixrounds.post_round(gh, ticket[0], ticket[1], body, trusted_authors(),
-                                  None if int(issue.get("comments") or 0) else [])
+    posted = notify.post(gh, ticket[0], ticket[1], body, notify.FIX_BRIEF)
     comment_id = posted.data.get("id") if isinstance(posted.data, dict) else None
     print("brain: posted loom:fix comment %s on %s#%d"
           % (comment_id if comment_id is not None else "with unknown id", ticket[0], ticket[1]),
@@ -5016,7 +5014,7 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
     labelled = [(str(e.get("event")), str((e.get("label") or {}).get("name") or ""), _when(e.get("created_at")))
                 for e in events if isinstance(e, dict)]
     failed = sum(1 for kind, name, _ in labelled if kind == "labeled" and name == "loom:failed")
-    fixes = fixrounds.count(comments)
+    fixes = sum(1 for body, _ in bodies if body.startswith(FIX_MARKER))
     tried = _tried_models(_first_model(issue, bodies), bodies, footer)
     reasons = _stuck_reasons(issue, labelled, failed, fixes, _claim_times(bodies), now, held)
     rungs = _trusted_rungs(comments, authors or trusted_authors())
@@ -5392,6 +5390,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gh.status_in_body = True  # read the events in the issue body (loom#1341)
         # Status comments by the trusted writers read as events (bus/status.py).
         gh.status_authors |= {a.lower() for a in os.environ.get("LOOM_BRIEF_AUTHORS", "").split()}
+        # The station's fix-rounds comments read as their rounds (loom#1640).
+        gh.fix_ledger = fixrounds.ledger_from_env()
         COMMANDS[args.command](gh, args)
         return 0
     except (ValueError, OSError, GitHubError) as exc:

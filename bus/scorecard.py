@@ -274,7 +274,7 @@ class Scorecard:
                     bot: str) -> None:
         """The review outcome and send-backs, read once: a closed pull
         request gets no new review."""
-        from . import brain, fixrounds
+        from . import brain, tickets
         threads = merge_tier.review_threads(gh, repo, int(pr["number"]))
         sent = 0
         try:
@@ -283,7 +283,8 @@ class Scorecard:
             ticket = None
         if ticket is not None:
             comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
-            sent = fixrounds.count(comments)
+            sent = sum(1 for c in comments if isinstance(c, dict)
+                       and str(c.get("body") or "").startswith(tickets.FIX_MARKER))
         record["sent_back"] = sent
         record["review"] = review_outcome(threads, lambda c: brain.by_bot(dict(c), bot), self.env)
         record["findings"] = len(review_findings(threads, lambda c: brain.by_bot(dict(c), bot)))

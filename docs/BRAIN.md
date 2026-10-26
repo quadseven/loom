@@ -1103,27 +1103,37 @@ keeps editing it. Rules:
 ### Fix rounds edited in place
 
 The first fix round on a pull request posts the ticket's `loom:fix` comment, as
-before. Each later round on the same pull request edits that comment instead of
-posting a new one, so it sends no email (loom#1640; one ticket had emailed the
-same failing check twice within the hour). `bus/fixrounds.py` writes it, from
-the station (`_post_fix_comment`) and from `bus.brain fix`.
+before. Each later round the station sends on the same pull request edits that
+comment instead of posting a new one, so it sends no email (loom#1640; one
+ticket had emailed the same failing check twice within the hour).
+`bus/fixrounds.py` writes it from the station's `_post_fix_comment`; a
+`bus.brain fix` send-back is still a new comment.
 
-- The edited comment starts with the `loom:fix` marker, the pull request line
-  and `<!-- loom:fix-rounds v1 -->`, then one short block per round: its number,
-  UTC time and the reasons that round's comment showed.
-- Each round's whole `loom:fix` body is kept in a hidden
-  `<!-- loom:fix-round N <UTC time> <base64> -->` line (zlib, then base64, so
-  the body's own HTML comments cannot end it). When the comment would pass
-  GitHub's size limit, older rounds keep only their markers and `###` headings.
+- The edited comment starts with the `loom:fix` marker, the pull request line,
+  `<!-- loom:fix-rounds v1 -->` and the newest round's head marker, then one
+  short block per round: its number, UTC time and the reasons that round's
+  comment showed.
+- Each round's whole `loom:fix` body is kept as plain text in a hidden
+  `<!-- loom:fix-round N <UTC time>` block, with `&`, `<`, `>` and `#`
+  escaped: nothing in it can end the block or read as a marker, key or
+  heading. When the comment would pass GitHub's size limit, older rounds keep
+  only their markers and `###` headings.
 - Readers see one comment per round, as before: the GitHub client expands the
-  comment like the status comment, and the round counters (`_fix_round_count`,
-  `factory.fixes_of`, `asked_threads`, the fix key, the lane's fix brief) expand
-  a raw list themselves. A ticket whose rounds are older per-round comments
-  keeps them; its next round edits the newest of them, and both forms count.
-- A round is a new comment again when the pull request changes, when the
-  comment was edited by anyone else (its update time is past its newest round,
-  and the lane's brief refuses it as an edited `loom:fix` comment), when the
-  rounds no longer fit, or when GitHub refuses the edit.
+  comment like the status comment, so round counting (`_fix_round_count`,
+  `factory.fixes_of`), the asked threads, the fix key and the lane's fix brief
+  read every round. A ticket whose rounds are older per-round comments keeps
+  them; its next round edits the newest of them, and both forms count.
+- Trust: a comment is read as rounds only when a trusted login wrote it and
+  its real `updated_at` is the one GitHub answered the station's own last
+  edit with, kept in `<home>/state/fix-rounds.json`. Nothing in the body is
+  trusted for that. Any other fix-rounds comment (a stranger's look-alike,
+  one someone else edited, one with no ledger entry) stays one opaque
+  `loom:fix` comment: it counts as one round, and the lane's brief refuses it
+  as an edited `loom:fix` comment. The brain and the dashboard read the same
+  ledger where `LOOM_HOME` names the station's home.
+- A round is a new comment again when the pull request changes, when that
+  comment cannot be vouched for, when the rounds no longer fit, or when GitHub
+  refuses the edit.
 
 ### Lane comments edited in place
 
@@ -1184,7 +1194,7 @@ pull request's review thread is not a new issue comment and is not scanned.
 | `answer` | An operator's answer to an ask, posted from the dashboard's Needs you page (`bus/answer.py`, see Operator answers). |
 | `runaway` | A hold or release of a ticket that ran past its attempts. |
 | `proof-refused` | The station stops handing a ticket out to verify after refused proofs. |
-| `fix-brief` | The first `loom:fix` brief on a pull request; later rounds edit it (see Fix rounds edited in place, loom#1640). |
+| `fix-brief` | A `loom:fix` brief; the station's later rounds on the same pull request edit its first one (see Fix rounds edited in place, loom#1640). |
 | `merged` | A pull request merged, or a ticket moved to `loom:merged`. |
 | `shipped` | A ticket moved to `loom:shipped` (loom#866 and loom#821 own moving it). |
 | `verified` | A ticket moved to `loom:verified`. |

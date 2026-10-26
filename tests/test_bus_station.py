@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import audit, brain, factory, invariants, proof, spend, station, status, tickets  # noqa: E402
+from bus import audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
@@ -3030,12 +3030,20 @@ class HandBackTest(unittest.TestCase):
 class StampedReviewFake(ReviewFake):
     """ReviewFake whose comments carry the times GitHub gives them: a post
     sets created_at and updated_at, an edit moves updated_at. It counts the
-    new comments, the writes that email the operator."""
+    new comments, the writes that email the operator. Its comment list reads
+    as the GitHub client reads it: fix-rounds comments expanded against the
+    ledger the station names in fix_ledger."""
 
     def __init__(self):
         super().__init__()
         self.new_comments = 0
         self.next_id = 100
+        self.fix_ledger = None
+
+    def paginate(self, path):
+        raw = super().paginate(path)
+        return fixrounds.expand([dict(c) for c in raw], AUTHORS,
+                                fixrounds.load_ledger(self.fix_ledger))
 
     def _post_comment(self, data):
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -3123,14 +3131,11 @@ class FixRoundsInPlaceTest(unittest.TestCase):
         self.assertIn("lint-3", fix.findings)
         self.assertNotIn("lint-2", fix.findings)
         self.assertEqual(ident, self.fixes()[0]["id"])
-        # The client's own expansion reads the same three rounds.
-        expanded = github_module.fixrounds.expand(comments, AUTHORS)
-        self.assertEqual(station.Station._fix_round_count(expanded, self.authors), 3)
         # The cap counts them too: a fourth round with a cap of 3 holds instead.
         self.round(4, rounds="3")
         self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
-        self.assertEqual(github_module.fixrounds.count(
-            self.gh.paginate("/repos/%s/issues/12/comments" % REPO)), 3)
+        self.assertEqual(station.Station._fix_round_count(
+            self.gh.paginate("/repos/%s/issues/12/comments" % REPO), self.authors), 3)
 
     def test_an_old_ticket_with_three_per_round_comments_still_counts_three(self):
         for n in (1, 2, 3):
@@ -3169,10 +3174,55 @@ class FixRoundsInPlaceTest(unittest.TestCase):
         comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
         with self.assertRaisesRegex(ValueError, "edited after it was posted"):
             self.station._fix_for(REPO, comments)
+        # Read per comment: the edited one is one round, never its rounds.
+        self.assertEqual(station.Station._fix_round_count(comments, self.authors), 1)
         self.round(3)
         self.assertEqual(self.gh.new_comments, 2)
         self.assertEqual(station.Station._fix_round_count(
-            self.gh.paginate("/repos/%s/issues/12/comments" % REPO), self.authors), 3)
+            self.gh.paginate("/repos/%s/issues/12/comments" % REPO), self.authors), 2)
+
+    def test_forged_rounds_with_fresh_body_times_are_not_read(self):
+        # A writer who can edit the comment adds rounds and stamps the newest
+        # with the comment's new update time. Only the station's own record
+        # of its last edit says whether the comment is still its own.
+        for n in (1, 2):
+            self.round(n)
+        comment = self.fixes()[0]
+        stamp = "2099-01-01T00:00:00Z"
+        forged = "\n".join(tickets.FIX_MARKER + "\nPull request: %s#7, branch loom/12-fix\n"
+                           "<!-- loom:fix-head %s -->" % (REPO, "f" * 40) for _ in range(1))
+        comment["body"] += "<!-- loom:fix-round 3 %s\n%s\n-->\n" % (stamp, forged.replace(">", "&gt;"))
+        comment["updated_at"] = stamp
+        comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
+        self.assertEqual(station.Station._fix_round_count(comments, self.authors), 1)
+        with self.assertRaisesRegex(ValueError, "edited after it was posted"):
+            self.station._fix_for(REPO, comments)
+
+    def test_round_counters_never_read_a_strangers_rounds(self):
+        self.round(1)
+        self.round(2)
+        body = self.fixes()[0]["body"]
+        stranger = [{"id": 5, "user": {"login": "mallory-example"}, "body": body,
+                     "created_at": "2030-01-01T00:00:00Z", "updated_at": "2030-01-01T00:00:00Z"}]
+        self.assertEqual(factory.fixes_of(stranger), 1)
+        self.assertEqual(factory.asked_threads(stranger), set())
+
+    def test_a_round_body_round_trips_through_its_hidden_block(self):
+        body = (tickets.FIX_MARKER + "\nPull request: %s#7, branch loom/12-fix\n"
+                "- Check `x` failed\n\n<!-- loom:fix-detail\nquoted --> and --!> and &gt; "
+                "and &amp;\n-->\n<!-- loom:fix-head %s -->" % (REPO, "a" * 40))
+        text = fixrounds.render((REPO, 7), "loom/12-fix",
+                                [(1, "2030-01-01T00:00:00Z", body), (2, "2030-01-01T01:00:00Z", body)])
+        self.assertEqual([r[2] for r in fixrounds.parse(text)], [body, body])
+
+    def test_an_encoded_round_is_never_decompressed(self):
+        # The first form kept rounds zlib-compressed: a small line could
+        # inflate without bound. Rounds are plain text now.
+        import zlib
+        blob = base64.b64encode(zlib.compress(b"0" * (8 << 20), 9)).decode()
+        body = (tickets.FIX_MARKER + "\nPull request: %s#7, branch loom/12-fix\n"
+                % REPO + fixrounds.MARKER + "\n<!-- loom:fix-round 1 2030-01-01T00:00:00Z %s -->\n" % blob)
+        self.assertEqual(fixrounds.parse(body), [])
 
     def test_a_new_pull_request_gets_its_own_comment(self):
         self.round(1)
@@ -3184,10 +3234,11 @@ class FixRoundsInPlaceTest(unittest.TestCase):
     def test_a_strangers_look_alike_is_not_expanded(self):
         self.round(1)
         self.round(2)
-        body = self.fixes()[0]["body"]
-        stranger = [{"id": 5, "user": {"login": "mallory-example"}, "body": body}]
-        self.assertEqual(github_module.fixrounds.expand(stranger, AUTHORS), stranger)
-        self.assertEqual(len(github_module.fixrounds.expand(stranger)), 2)
+        comment = dict(self.fixes()[0])
+        ledger = fixrounds.load_ledger(self.gh.fix_ledger)
+        self.assertEqual(len(fixrounds.expand([comment], AUTHORS, ledger)), 2)
+        stranger = [dict(comment, user={"login": "mallory-example"})]
+        self.assertEqual(fixrounds.expand(stranger, AUTHORS, ledger), stranger)
 
     def test_the_github_client_reads_a_rounds_comment_as_one_comment_per_round(self):
         self.round(1)
@@ -3199,6 +3250,10 @@ class FixRoundsInPlaceTest(unittest.TestCase):
         client = GitHub("token", transport=transport)
         client.status_authors = set(AUTHORS)
         got = client.rest("GET", "/repos/%s/issues/12/comments" % REPO).data
+        fixes = [c for c in got if str(c.get("body") or "").startswith(tickets.FIX_MARKER)]
+        self.assertEqual(len(fixes), 1)  # no ledger: one opaque comment
+        client.fix_ledger = self.gh.fix_ledger
+        got = GitHub.rest(client, "GET", "/repos/%s/issues/12/comments?x=1" % REPO).data
         fixes = [c for c in got if str(c.get("body") or "").startswith(tickets.FIX_MARKER)]
         self.assertEqual(len(fixes), 2)
         self.assertIn("lint-2", fixes[-1]["body"])

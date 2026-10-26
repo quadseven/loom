@@ -140,7 +140,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, bench, brain, brief_check, change_class, criteria_gate, fixrounds, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -608,7 +608,7 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     STUCK_AGE (age alone climbs once per window, not on every round)."""
     if age > STUCK_AGE and now - last_climb(comments) > STUCK_AGE:
         return True
-    last = next((str(c.get("body") or "") for c in reversed(fixrounds.expand(list(comments)))
+    last = next((str(c.get("body") or "") for c in reversed(comments)
                  if str(c.get("body") or "").startswith(FIX_MARKER)), None)
     if last is None:
         return False
@@ -667,9 +667,8 @@ def review_again() -> str:
 
 
 def asked_threads(comments: Sequence[Dict[str, Any]]) -> set:
-    """Every thread id a loom:fix comment on the ticket asked a lane to fix,
-    each round of a fix-rounds comment read on its own (loom#1640)."""
-    return {t for c in fixrounds.expand(list(comments)) if str(c.get("body") or "").startswith(FIX_MARKER)
+    """Every thread id a loom:fix comment on the ticket asked a lane to fix."""
+    return {t for c in comments if str(c.get("body") or "").startswith(FIX_MARKER)
             for t in FIX_THREAD_RE.findall(str(c.get("body") or ""))}
 
 
@@ -706,7 +705,7 @@ def finding_line(thread: Dict[str, Any]) -> str:
 
 def no_change_at(comments: Sequence[Dict[str, Any]]) -> float:
     """When the last fix round ended with no commit, 0 when it did not."""
-    for c in reversed(fixrounds.expand(list(comments))):
+    for c in reversed(comments):
         body = str(c.get("body") or "")
         if body.startswith(FIX_MARKER):
             return 0.0
@@ -722,7 +721,7 @@ def no_change_rounds(comments: Sequence[Dict[str, Any]]) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     asked: set = set()
     answered = True
-    for c in fixrounds.expand(list(comments)):
+    for c in comments:
         body = str(c.get("body") or "")
         if body.startswith(FIX_MARKER):
             names = {n.strip() for n in re.findall(r"^### Check: (.*)$", body, re.M)}
@@ -738,8 +737,7 @@ def no_change_rounds(comments: Sequence[Dict[str, Any]]) -> Dict[str, int]:
 
 
 def fixes_of(comments: Sequence[Dict[str, Any]]) -> int:
-    """The fix rounds on the ticket, each round of a fix-rounds comment one."""
-    return fixrounds.count(comments)
+    return sum(1 for c in comments if str(c.get("body") or "").startswith(FIX_MARKER))
 
 
 def pick_lane(lanes: Sequence[str], load: Dict[str, int]) -> str:

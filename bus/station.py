@@ -1566,6 +1566,10 @@ class Station:
         writers = getattr(gh, "status_authors", None)
         if isinstance(writers, set):
             writers |= {a.lower() for a in settings.authors}
+        # A fix-rounds comment reads as its rounds only while it is exactly
+        # as this Loom last wrote it (bus/fixrounds.py ledger, loom#1640).
+        if hasattr(gh, "fix_ledger"):
+            gh.fix_ledger = fixrounds.ledger_path(settings.home)
         self.s = settings
         self._live_budget = LIVE_CHECKS_PER_PASS
         self._proof_budget = LIVE_PROOFS_PER_PASS
@@ -1997,9 +2001,7 @@ class Station:
         later non-fix comments. Raises ValueError for an unusable fix."""
         allowed = {a.lower() for a in self.s.authors}
         last_claim, newest_fix = -1, None
-        # A fix-rounds comment is one fix per round, its newest the newest
-        # (loom#1640); the client expands it already, and this reads a raw list.
-        for i, c in enumerate(fixrounds.expand(comments, allowed)):
+        for i, c in enumerate(comments):
             if not isinstance(c, dict):
                 continue
             body = str(c.get("body") or "")
@@ -5376,8 +5378,7 @@ class Station:
         return any(isinstance(comment, dict)
                    and tickets._login(comment.get("user")) in authors
                    and str(comment.get("body") or "").startswith(tickets.FIX_MARKER)
-                   and marker in str(comment.get("body") or "")
-                   for comment in fixrounds.expand(comments, authors))
+                   and marker in str(comment.get("body") or "") for comment in comments)
 
     def _clear_stale_ready(self, repo: str, number: int, names: List[str],
                            ready: Optional[str], sha: str) -> None:
@@ -5428,8 +5429,7 @@ class Station:
         marker is one round, whether or not the round moved the head. Counting
         distinct heads let a round that failed [transient] and pushed nothing
         repeat without end (grug#1315: 15 rounds, 9 on one head, 2026-10-24)."""
-        # Each round of a fix-rounds comment is one round (loom#1640).
-        return sum(1 for comment in fixrounds.expand(comments, authors)
+        return sum(1 for comment in comments
                    if isinstance(comment, dict)
                    and tickets._login(comment.get("user")) in authors
                    and Station._fix_head(str(comment.get("body") or "")))
@@ -5470,7 +5470,8 @@ class Station:
         body = body.rstrip() + marker
         # A later round on the same pull request edits that one comment, so it
         # sends no email (loom#1640).
-        fixrounds.post_round(self.gh, repo, number, body, self.s.authors, comments)
+        fixrounds.post_round(self.gh, repo, number, body, self.s.authors,
+                             fixrounds.ledger_path(self.s.home), comments)
 
     def _move_fix_to_lane(self, repo: str, number: int, lane: str,
                           names: List[str]) -> None:

@@ -54,7 +54,7 @@ KINDS = {
     ASK: "the exact thing only a person can do (loom:human)",
     RUNAWAY: "a hold or release of a ticket that ran past its attempts",
     PROOF_REFUSED: "the station stops handing a ticket out to verify after refused proofs",
-    FIX_BRIEF: "the first loom:fix brief on a pull request (later rounds edit it, bus/fixrounds.py)",
+    FIX_BRIEF: "a loom:fix brief (the station edits later rounds into it, bus/fixrounds.py)",
     MERGED: "a pull request merged, or a ticket moved to loom:merged",
     SHIPPED: "a ticket moved to loom:shipped",
     VERIFIED: "a ticket moved to loom:verified",
