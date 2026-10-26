@@ -34,7 +34,7 @@ from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from . import proof, shadow, status, text as _text
+from . import fixrounds, proof, shadow, status, text as _text
 
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
@@ -512,6 +512,9 @@ class GitHub:
         # client's own App bot login is added on first use; a caller adds its
         # trusted writers (the station its LOOM_BRIEF_AUTHORS).
         self.status_authors: set = set()
+        # The ledger of this Loom's own fix-rounds edits (bus/fixrounds.py);
+        # without one no fix-rounds comment reads as its rounds.
+        self.fix_ledger: Optional[str] = None
         # Whether this client keeps a ticket's routine events in the issue
         # body's status section and reads them back (bus/status.py, loom#1341).
         # The station, the brain and the dashboard turn it on, together: a
@@ -559,8 +562,15 @@ class GitHub:
         if method == "GET" and status.COMMENTS_RE.search(path):
             # A ticket's status comment reads as one comment per event, so
             # every reader of those events sees them as before (loom#866).
-            expanded = status.expand(resp.data, self._status_logins())
+            writers = self._status_logins()
+            expanded = status.expand(resp.data, writers)
             expanded = self._with_body_events(path, expanded)
+            # A pull request's one fix comment reads as one comment per
+            # round, so round counting and the lane's brief see every round
+            # (loom#1640).
+            if fixrounds.has_rounds(expanded):
+                expanded = fixrounds.expand(expanded, writers,
+                                            fixrounds.load_ledger(self.fix_ledger))
             if expanded is not resp.data:
                 resp = Response(resp.status, expanded, resp.etag, resp.headers)
         return resp

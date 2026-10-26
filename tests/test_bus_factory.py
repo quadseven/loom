@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 from unittest import mock
 
-from bus import brain, factory, labels, merge_tier, station, status, tickets
+from bus import brain, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
 from bus.github import GitHubError, Response
 from bus.tickets import FIX_MARKER
 
@@ -1498,6 +1498,166 @@ class OrphanTicketEpic(Base):
 BOT = {"__typename": "Bot", "login": "grug-tribe"}
 FIXED = "Fixed in 1234567: the flagged code changed and this review does not raise it again."
 NO_CHANGE = "Lane claude made no change for the fix to #50 and said why on the pull request"
+
+
+PLAN_TICKET = """Difficulty: medium
+
+## Why
+The page query is slow for every visitor on the home page.
+
+## What
+Cache the page query.
+
+## Acceptance
+- [ ] The query runs once per minute.
+- [ ] A stale entry is dropped.
+- [ ] A test fails without the cache.
+
+## Size
+**Size:** S
+
+## Out of scope
+- Other pages.
+"""
+
+# The body the runner wrote for PLAN_TICKET before #1838 and the size fix:
+# an empty criteria section and the size's label as its letter (two lane
+# pull requests in other repos, 2026-10-25).
+PLAN_BODY = """Intent: logic.
+
+## Why
+The page query is slow for every visitor on the home page.
+
+## Summary
+Cache the page query.
+
+## Acceptance criteria
+
+
+Size: **Size:**
+
+## Out of scope
+- Other pages.
+
+## Operator steps before merge
+none stated
+
+---
+Loom ticket example-org.example-repo-5, lane codex, model gpt-6-luna.
+Refs %s""" % ("%s#%d" % (REPO, 5))
+
+BODY_FAIL = ("what good look like", "fail", "## Acceptance criteria has 0 non-empty bullets")
+SIZE_FAIL = ("how big", "fail", "no Size: XS/S/M/L/XL in body")
+
+
+class PlanBodyRepair(Base):
+    """loom#1837: a pull request held by the plan check on its body alone is
+    rebuilt from its ticket, never sent to a lane whose agent edits code."""
+
+    def held(self, ticket_body=PLAN_TICKET, chief_done=None, extra_runs=()):
+        self.gh.ticket(5, "pr", body=ticket_body)
+        self.gh.pull(50, 5, green=False, body=PLAN_BODY)
+        chief = {"name": CHIEF, "status": "completed", "conclusion": "failure",
+                 "output": {"title": "Hunt Plan hold",
+                            "summary": chief_summary([BODY_FAIL, SIZE_FAIL])}}
+        if chief_done is not None:
+            chief["completed_at"] = chief_done
+        self.gh.runs["sha50"] = [chief, {"name": factory.DEFAULT_REVIEW_CHECK,
+                                         "status": "completed", "conclusion": "success"}
+                                 ] + list(extra_runs)
+
+    def body_edits(self):
+        return [w for w in self.gh.writes if w[0] == "PATCH" and w[1].endswith("/pulls/50")]
+
+    def notes(self):
+        return [c for c in self.gh.comments[5]
+                if c["body"].startswith(pr_repair.PLAN_NOTE_MARKER)]
+
+    def test_a_body_only_failure_rebuilds_the_body_from_the_ticket_and_sends_no_round(self):
+        self.held()
+        self.go()
+        self.assertEqual(self.fixed, [])
+        body = self.gh.pulls[50]["body"]
+        self.assertEqual(hunt_plan.problems(body), [])
+        self.assertIn("- [ ] A stale entry is dropped.", body)
+        self.assertIn("\nSize: S\n", body)
+        self.assertTrue(body.startswith("Intent: logic."))
+        self.assertEqual(len(self.body_edits()), 1)
+        events = [c["body"] for c in status.expand(self.gh.comments[5], [ME["login"]])]
+        self.assertTrue(any(factory.PLAN_REPAIR_MARKER % "sha50" in e for e in events))
+        # Kept on the status comment: one comment, no new one per attempt.
+        self.assertEqual(len(self.gh.comments[5]), 1)
+
+    def test_the_repair_runs_once_per_head_then_waits_for_the_check_to_read_it_again(self):
+        self.held()
+        self.go()
+        self.gh.pulls[50]["body"] = PLAN_BODY  # as if the edit had not reached the check
+        self.go()
+        self.assertEqual(len(self.body_edits()), 1)
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(len(self.gh.comments[5]), 1)
+
+    def test_a_check_that_read_the_repaired_body_and_still_fails_goes_the_usual_way(self):
+        self.held()
+        self.go()
+        self.gh.runs["sha50"][0]["completed_at"] = iso(-60)
+        self.go()
+        self.assertEqual(len(self.body_edits()), 1)
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_ticket_that_cannot_fill_the_body_is_held_with_one_note_and_no_round(self):
+        self.held(ticket_body=PLAN_TICKET.replace("## Acceptance\n", "## Notes\n"))
+        self.go()
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.body_edits(), [])
+        self.assertIn("needs-brain", factory._labels(self.gh.issues[5]))
+        notes = self.notes()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("## Acceptance criteria", notes[0]["body"])
+        self.assertNotIn("## Size", notes[0]["body"])  # the ticket fills the size
+        self.assertEqual(len(self.gh.comments[5]), 1)
+
+    def test_the_hold_lifts_once_the_ticket_gains_what_it_lacked(self):
+        self.held(ticket_body=PLAN_TICKET.replace("## Acceptance\n", "## Notes\n"))
+        self.go()
+        self.gh.issues[5]["body"] = PLAN_TICKET
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(hunt_plan.problems(self.gh.pulls[50]["body"]), [])
+        self.assertNotIn("needs-brain", factory._labels(self.gh.issues[5]))
+        notes = self.notes()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("hold is lifted", notes[0]["body"])
+
+    def test_a_needs_brain_set_for_another_reason_stays_when_the_hold_lifts(self):
+        # Security review: the plan hold takes off only a needs-brain it
+        # added itself, which its note records.
+        self.held(ticket_body=PLAN_TICKET.replace("## Acceptance\n", "## Notes\n"))
+        self.gh.issues[5]["labels"].append({"name": "needs-brain"})
+        self.go()
+        self.assertNotIn("set-needs-brain", self.notes()[0]["body"])
+        self.gh.issues[5]["body"] = PLAN_TICKET
+        self.go()
+        self.assertEqual(hunt_plan.problems(self.gh.pulls[50]["body"]), [])
+        self.assertIn("needs-brain", factory._labels(self.gh.issues[5]))
+        self.assertIn("hold is lifted", self.notes()[0]["body"])
+
+    def test_the_runners_note_is_edited_not_posted_again(self):
+        self.held(ticket_body=PLAN_TICKET.replace("## Acceptance\n", "## Notes\n"))
+        self.gh.comments[5].append({"id": 77, "body": pr_repair.PLAN_NOTE_MARKER +
+                                    "\nThe runner's words.", "user": ME, "created_at": iso(60)})
+        self.go()
+        notes = self.notes()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Held for the brain", notes[0]["body"])
+
+    def test_another_failing_check_still_goes_back_to_the_lane(self):
+        self.held(extra_runs=[{"name": "unittest", "status": "completed",
+                               "conclusion": "failure"}])
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.body_edits(), [])
 
 
 class ReviewBotThreads(Base):

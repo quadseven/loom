@@ -6,7 +6,7 @@ import re
 import sys
 from typing import Callable, List, Optional
 
-from . import app, brain, journal, labels, lock, station
+from . import app, brain, journal, labels, lock, naming, station
 from .github import GitHub, GitHubError, Transport, auth_from_env, openssl_sign
 
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
@@ -74,6 +74,13 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _backlog_home(gh: GitHub, repo: str, number: int) -> bool:
+    """Whether issue `number` is a per-repo backlog goal home, which posts no
+    report (its status is one line in the station's digest)."""
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+    return isinstance(issue, dict) and naming.is_backlog_home(issue)
+
+
 def _run(args: argparse.Namespace, gh: GitHub) -> int:
     if args.command == "labels":
         for repo in args.repos:
@@ -94,8 +101,9 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
     authors = brain.trusted_authors()
     try:
         journal.post(gh, repo, int(num), text, args.holder, authors,
-                     quiet=lambda: brain.goal_quiet(gh, repo, int(num), authors))
-    except (journal.ReportTooSoon, journal.ReportQuiet) as held:
+                     quiet=lambda: brain.goal_quiet(gh, repo, int(num), authors),
+                     backlog=lambda: _backlog_home(gh, repo, int(num)))
+    except (journal.ReportTooSoon, journal.ReportQuiet, journal.ReportBacklog) as held:
         # The goal is already reported, or quiet since its last report
         # (loom#1534): not a failed step, so exit 0.
         print("not posted: %s" % held)

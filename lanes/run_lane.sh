@@ -51,7 +51,13 @@
 # LOOM_<SLOT>_PROBE_URL and _PROBE_HEADER (API lanes: the provider's chat
 # endpoint, asked for a usage limit before each run and after a timeout; see
 # provider_at_limit),
-# LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
+# LOOM_SANDBOX (seatbelt, the default, or bwrap in a lane pod, which also
+# needs LOOM_EGRESS_DENY_PROBES, IPv4:port addresses the pod's egress policy
+# blocks, and LOOM_EGRESS_ALLOW_PROBE, a host:port it must reach; see
+# egress_denied),
+# LOOM_DROP_TREES (1: each run's scratch goes when it ends), LOOM_SSM_DIR (a
+# folder of copied SSM values read in place of SSM; docs/LANES.md, "Lane
+# pods"), LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
 # LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
 # (docs/LANES.md, "Anthropic spend"), and for the spark lane LOOM_SPARK_URL
 # (the OpenAI-compatible base URL of the local vLLM coder, e.g.
@@ -72,6 +78,29 @@ export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_ROOT/../infra-public/.github/scripts/check_private_leaks.py}"
+# The SSM parameter of the shared deny-list: names and products with no
+# generic shape, which only this list catches. Every scan passes it.
+LEAK_DENY_SSM="${LOOM_LEAK_DENY_SSM:-/infra/leak-scan/deny-list}"
+
+# The public repo leak scan, the one way the runner calls the scanner, so no
+# scan runs without the deny-list. Arguments are the scanner's (--diff RANGE
+# or --text-file FILE, --allow-repo-ref ...). Exit 0 clean, 1 a hit, 2 no
+# scan: the scanner is missing, the deny-list cannot be read (the scanner
+# exits 2), or this is a lane pod. A pod (LOOM_SSM_DIR) holds no AWS key and
+# the scanner reads the deny-list only from SSM, so a pod scans nothing and
+# pushes nothing to a public repo rather than scan without the list.
+leak_scan() {
+  if [ ! -f "$LEAK_SCANNER" ]; then
+    echo "leak scanner not found: $LEAK_SCANNER" >&2
+    return 2
+  fi
+  if [ -n "${LOOM_SSM_DIR:-}" ]; then
+    echo "a lane pod cannot read the leak scan deny-list $LEAK_DENY_SSM (the scanner reads it only from SSM); nothing scanned" >&2
+    return 2
+  fi
+  env ${LOOM_AWS_REGION:+AWS_REGION="$LOOM_AWS_REGION"} timeout "$NET_TIMEOUT" \
+    python3 -B "$LEAK_SCANNER" "$@" --deny-list-ssm "$LEAK_DENY_SSM"
+}
 INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
 
@@ -121,6 +150,24 @@ echo $$ > "$LOCK/pid"
 # built its caches) goes with the runner, before the lock is let go, so run/
 # holds one only while its lane is running (loom#643).
 drop_check_home() { [ -z "${CHECK_HOME:-}" ] || rm -rf "$CHECK_HOME"; }
+# LOOM_DROP_TREES=1 (a lane pod; docs/LANES.md, "Lane pods"): a run's scratch
+# goes when the run ends, whatever its outcome: its tree, the runner's files
+# beside it, the agent's scratch home and the check's. The station prunes
+# trees on the Mac (prune_trees) but cannot see a pod's disk, and a pod's
+# scratch volume is sized for the runs in flight, not for kept trees. Logs and
+# the brief stay where the station reads them. Called before each brief and
+# when the runner exits.
+drop_run_scratch() {
+  [ "${LOOM_DROP_TREES:-}" = 1 ] && [ "$LANE" != agy ] || return 0
+  drop_check_home
+  [ -z "${CHECK_HOME:-}" ] || rm -rf "$CHECK_HOME-default"
+  [ -z "${AGENT_HOME:-}" ] || rm -rf "$AGENT_HOME"
+  [[ "${TICKET:-}" =~ ^[A-Za-z0-9._-]+$ ]] && [ -n "${WORKDIR:-}" ] || return 0
+  local f
+  for f in "" -default-check .answers .described-step .final-message .no-change.md .opencode-events .run.md .summary.md; do
+    rm -rf "${WORKDIR:?}/$TICKET$f"
+  done
+}
 # The runner writes its usage heartbeat between runs, not during one, and a
 # run can take over an hour (loom#1281). While this runner lives, a background
 # loop stamps state/usage/<slot>.alive with the time every
@@ -148,7 +195,7 @@ stop_keepalive() {
 mkdir -p "$LOOM_HOME/state/usage"
 keepalive_loop $$ > /dev/null 2>&1 &
 KEEPALIVE_PID=$!
-trap 'drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
+trap 'drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
@@ -267,6 +314,18 @@ utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
 # Body of one "## <name>" section of the brief, blank lines dropped.
 section() {
   awk -v h="## $1" '$0 == h {on=1; next} /^#+ / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
+}
+
+# The acceptance criteria of $1, blank lines dropped: its "## Acceptance
+# criteria" section, in any case, or its "## Acceptance" section. Tickets
+# write either heading; read as exactly "## Acceptance criteria", a ticket
+# with "## Acceptance" opened a pull request with an empty section that the
+# review bot's plan check failed on every fix round (2026-10-25).
+# bus/pr_repair.py::_brief_criteria reads the same headings.
+criteria_section() {
+  awk '{h = tolower($0); sub(/[ \t]+$/, "", h)}
+       h == "## acceptance criteria" || h == "## acceptance" {on=1; next}
+       /^#+ / {on=0} on' "$1" | sed '/^[[:space:]]*$/d'
 }
 
 # Chief's format: ## Intent (the change class), ## Why, ## Summary,
@@ -420,9 +479,9 @@ pr_body() {
   # The lane's checklist, from the summary the runner moved out of the tree
   # before committing: read from the tree, every lane pull request carried
   # the ticket's unticked criteria and went back for them (2026-10-20).
-  criteria="$(section 'Acceptance criteria' "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
-  [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$TREE/$SUMMARY_FILE" 2>/dev/null)"
-  [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$1")"
+  criteria="$(criteria_section "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
+  [ -n "$criteria" ] || criteria="$(criteria_section "$TREE/$SUMMARY_FILE" 2>/dev/null)"
+  [ -n "$criteria" ] || criteria="$(criteria_section "$1")"
   # The lane's own word on operator steps, else the ticket's; a body with
   # neither says so, and the factory's keyword backstop still reads both.
   ops="$(section "$OPERATOR_SECTION" "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
@@ -436,6 +495,60 @@ pr_body() {
     "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$criteria" \
     "$size" "$(section 'Out of scope' "$1")" "$OPERATOR_SECTION" "$ops" "$bugs" \
     "$2" "$LANE" "$MODEL" "$validated" "$refs"
+}
+
+# The markers bus/pr_repair.py names PLAN_HOLD_MARKER (in a pull request
+# body) and PLAN_NOTE_MARKER (the ticket's one plan-hold note).
+PLAN_HOLD_MARKER="<!-- loom:plan-hold v1 -->"
+PLAN_NOTE_MARKER="<!-- loom:plan-hold-note v1 -->"
+
+# The body of a new pull request, in PR_BODY. A body that fails the review
+# bot's plan checks (bus/hunt_plan.py) has the failing parts rebuilt from the
+# brief by bus/pr_repair.py, the code the factory and fix rounds use. What the
+# brief still lacks goes in PLAN_GAPS, one per line: the pull request opens
+# anyway (the work is done), marked so the factory sends it no lane round,
+# whose agent edits code and never the body (loom#1837).
+compose_pr_body() {
+  local problems body_file out_file summary=() private=()
+  PLAN_GAPS=""
+  PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+  problems="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)" && return 0
+  echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$problems" | tr '\n' ';')" >> "$LOG"
+  if ! body_file="$(mktemp)" || ! out_file="$(mktemp)"; then
+    PLAN_GAPS="$problems"; return 0
+  fi
+  printf '%s\n' "$PR_BODY" > "$body_file"
+  if [ -f "$WORKDIR/$TICKET.summary.md" ]; then
+    summary=(--summary "$WORKDIR/$TICKET.summary.md")
+  elif [ -f "$TREE/$SUMMARY_FILE" ]; then
+    summary=(--summary "$TREE/$SUMMARY_FILE")
+  fi
+  repo_is_public || private=(--private)
+  if PLAN_GAPS="$(NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -B -m bus.pr_repair plan \
+       "$BRIEF" "$body_file" "$LANE" "$MODEL" "$TICKET" --out "$out_file" --repo "$REPO" \
+       ${summary[@]+"${summary[@]}"} ${private[@]+"${private[@]}"} 2>> "$LOG")"; then
+    PR_BODY="$(cat "$out_file")"
+    PLAN_GAPS=""
+    echo "[$(date -u +%FT%TZ)] $TICKET pull request body rebuilt from the brief; it passes the plan checks" >> "$LOG"
+  else
+    [ -n "$PLAN_GAPS" ] || PLAN_GAPS="$problems"
+    echo "[$(date -u +%FT%TZ)] $TICKET the brief lacks for the plan checks: $(printf '%s' "$PLAN_GAPS" | tr '\n' ';')" >> "$LOG"
+  fi
+  rm -f "$body_file" "$out_file"
+}
+
+# The ticket's one plan-hold note, edited in place on every later pull
+# request of the ticket: the factory holds the ticket for the brain and keeps
+# the same comment. Argument: the new pull request's URL.
+note_plan_hold() {
+  local number="${1##*/}"
+  [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || return 0
+  printf 'The ticket lacks what the runner writes these parts of the body from:\n%s\n\nA lane cannot edit the ticket, so the factory sends no fix round for it. Add the missing parts to this ticket; the factory then rebuilds the pull request body from it.\n' \
+    "$(printf '%s\n' "$PLAN_GAPS" | sed 's/^/- /')" |
+    upsert_sticky_comment "$REPO" "$ISSUE_NUMBER" "$PLAN_NOTE_MARKER" repeat \
+      --headline "Held for the brain: a pull request body fails the review bot's plan check" \
+      --items-label "Pull requests" --item "#$number" ||
+    echo "[$(date -u +%FT%TZ)] $TICKET: the plan-hold note on the ticket failed" >> "$LOG"
 }
 
 # A fix brief's PR must still be open on the brief's branch. Returns 1 with
@@ -1767,7 +1880,7 @@ incident_text_clean() {  # text
   local text_file rc=0
   text_file="$(mktemp "${TMPDIR:-/tmp}/loom-incident.XXXXXX")" || return 1
   printf '%s\n' "$1" > "$text_file"
-  [ -f "$LEAK_SCANNER" ] && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$text_file" \
+  leak_scan --text-file "$text_file" \
     --allow-repo-ref "$FACTORY_REPO" --allow-repo-ref "$REPO" >> "$LOG" 2>&1 || rc=1
   rm -f "$text_file"
   return "$rc"
@@ -1854,6 +1967,7 @@ contract_run() {
     uv_bins="${uv_bins:+$uv_bins }$uv_bin"
   done
   profile="$(AGENT_HOME="$CHECK_HOME" CHECK_UV_BINS="$uv_bins" sandbox_profile "$TREE" "$CHECK_CLI" check)" || return 125
+  sandbox_command "$profile" || return 125
   # shellcheck disable=SC2030,SC2031 # deliberately local to the check's subshell
   (
     cd "$TREE" || exit 125
@@ -1874,7 +1988,7 @@ contract_run() {
       LOOM_CHANGED_FILES="$(cat "$input")" || exit 125
       export LOOM_CHANGED_FILES
     fi
-    exec timeout "$CHECK_TIMEOUT" sandbox-exec -p "$profile" /bin/bash -c "$1" < "$input"
+    exec timeout "$CHECK_TIMEOUT" "${SANDBOX_CMD[@]}" /bin/bash -c "$1" < "$input"
   ) 2>&1 | timeout "$((CHECK_TIMEOUT + 60))" cat >> "$LOG"
 }
 
@@ -1982,9 +2096,9 @@ prepare_validation() {
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
   what="interpreter ${C_INTERP:-none}; submodules $C_SUBMODULES"
-  if ! command -v sandbox-exec > /dev/null; then
-    SETUP_REASON="sandbox-exec not available"
-    note_factory_incident environment "sandbox-exec not available" SETUP_REASON
+  if ! sandbox_ready; then
+    SETUP_REASON="$SANDBOX_WHY"
+    note_factory_incident environment "$SANDBOX_WHY" SETUP_REASON
   elif [ -n "$C_INTERP" ] && ! interp="$(command -v "$C_INTERP")"; then
     SETUP_REASON="interpreter $C_INTERP is not on PATH"
     note_factory_incident environment "interpreter: $C_INTERP" SETUP_REASON
@@ -2207,7 +2321,7 @@ final_affected() {
 # changes tracked files; 2 when the runner cannot run a check at all.
 run_committed_contract() {
   local base_setup="$1" rc changed rev
-  command -v sandbox-exec > /dev/null || { CONTRACT_REFUSAL="sandbox-exec not available"; return 2; }
+  sandbox_ready || { CONTRACT_REFUSAL="$SANDBOX_WHY"; return 2; }
   if [ -n "$C_INTERP" ] && ! command -v "$C_INTERP" > /dev/null; then
     CONTRACT_REFUSAL="the contract names interpreter $C_INTERP, which is not on the lane machine's PATH"
     return 1
@@ -2279,8 +2393,7 @@ push_side() {
   if [ "${REPO_PRIVATE:-}" != true ]; then
     range="$BASE..$from"
     [ -n "${FIX_UPSTREAM:-}" ] && range="$FIX_UPSTREAM...$from"
-    if [ ! -f "$LEAK_SCANNER" ] || ! (cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" \
-         --diff "$range" --allow-repo-ref "$REPO") >> "$LOG" 2>&1; then
+    if ! (cd "$TREE" && leak_scan --diff "$range" --allow-repo-ref "$REPO") >> "$LOG" 2>&1; then
       printf 'the public repo leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree'
       return 1
     fi
@@ -2757,7 +2870,7 @@ lane_ready() {
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
   [ "$LANE" = anthropic ] && ! anthropic_credit_ok && return 1
   case "$LANE" in codex|claude) return 0 ;; esac
-  command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
+  sandbox_ready || { READY_REASON="$SANDBOX_WHY"; return 1; }
   case "$LANE" in zen) return 0 ;; spark|free) spark_ready; return ;; esac
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
@@ -2910,7 +3023,9 @@ fi
 
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
+  drop_run_scratch
   PR_BODY=""
+  PLAN_GAPS=""
   DROPPED_SCRATCH_FILES=""
   TICKET="$(basename "$BRIEF" .md)"
   REPO="$(field Repo "$BRIEF")"
@@ -2944,6 +3059,17 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   if [ "$DELIVERABLE" = answer ] && ! [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
     park "$BRIEF" "answer brief needs Issue: owner/name#number"; continue
+  fi
+  # A brief that opens a pull request needs criteria for its body: without
+  # them the body's ## Acceptance criteria is empty, the review bot's plan
+  # check fails it, and no fix round can change that (they edit code). Like
+  # every other brief the runner cannot build, it is parked before the agent
+  # runs. Fix briefs edit an open pull request, and answer and verify briefs
+  # open none.
+  if [ -z "$DELIVERABLE" ] && [ -z "$(field Fix-PR "$BRIEF" || true)" ] &&
+     [ -z "$(criteria_section "$BRIEF")" ]; then
+    park "$BRIEF" "ticket has no acceptance criteria: add an ## Acceptance criteria section with - [ ] checkboxes; the agent did not run"
+    continue
   fi
   BASE_ARGS=()
   [ -n "$BASE_BRANCH" ] && BASE_ARGS=(--branch "$BASE_BRANCH")
@@ -3392,7 +3518,14 @@ for BRIEF in "$INBOX"/*.md; do
     [ -n "$FIX_UPSTREAM" ] && SCAN_RANGE="$FIX_UPSTREAM...HEAD"
     # The repo's own issue refs (OWNER/NAME#N and NAME#N in code or tests)
     # name nothing private; the scanner exempts exactly this repo for them.
-    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$SCAN_RANGE" --allow-repo-ref "$REPO" 2>&1)"; then
+    # Exit 2 is no scan (the deny-list could not be read), not a hit in the
+    # lane's work: transient, so another lane may take the ticket.
+    LEAK_RC=0
+    LEAK_OUT="$(cd "$TREE" && leak_scan --diff "$SCAN_RANGE" --allow-repo-ref "$REPO" 2>&1)" || LEAK_RC=$?
+    if [ "$LEAK_RC" -eq 2 ]; then
+      park "$BRIEF" "public repo leak scan could not run; nothing pushed: $LEAK_OUT" transient
+      continue
+    elif [ "$LEAK_RC" -ne 0 ]; then
       park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
       continue
     fi
@@ -3409,7 +3542,7 @@ for BRIEF in "$INBOX"/*.md; do
         INTENT_TEXT="${INTENT_TEXT}
 - Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
       fi
-      PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+      compose_pr_body
       PR_BODY="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
         'import sys; from bus.factory import SCAN_REF_RE; owner, name = sys.argv[1].lower().split("/", 1); f = lambda m: m.group(0) if m.group(2).lower() == name and (m.group(1) or owner).lower() == owner else "issue %s of another repo" % m.group(3); print("\n".join(SCAN_REF_RE.sub(f, x) for x in sys.stdin.read().splitlines()))' "$REPO")" || {
         park "$BRIEF" "could not prepare public repo PR text; nothing pushed" transient; continue
@@ -3420,7 +3553,7 @@ for BRIEF in "$INBOX"/*.md; do
       # --allow-repo-ref exempts exactly those two forms, as for the diff:
       # rewriting only OWNER/NAME#N to #N left NAME#N flagged (2026-10-21).
       printf '%s\n' "$PR_BODY" > "$BODY_FILE"
-      if ! LEAK_OUT="$(timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$BODY_FILE" --allow-repo-ref "$REPO" 2>&1)"; then
+      if ! LEAK_OUT="$(leak_scan --text-file "$BODY_FILE" --allow-repo-ref "$REPO" 2>&1)"; then
         rm -f "$BODY_FILE"
         park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $LEAK_OUT"
         continue
@@ -3577,18 +3710,18 @@ Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
   fi
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
-  [ -n "${PR_BODY:-}" ] || PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
-  # Briefs are checked when filed, so this only fires on a brief filed
-  # before that check or edited by hand: the PR still opens (the work is
-  # done), and the log names what the review bot will hold it for.
-  if ! PLAN_PROBLEMS="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)"; then
-    echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$PLAN_PROBLEMS" | tr '\n' ';')" >> "$LOG"
-  fi
+  # Briefs are checked when filed, so a failing body comes from a brief filed
+  # before that check, edited by hand, or read differently by the shell and
+  # Python readers: compose_pr_body rebuilds it, and marks the pull request
+  # when the brief cannot fill it.
+  [ -n "${PR_BODY:-}" ] || compose_pr_body
+  [ -z "$PLAN_GAPS" ] || PR_BODY="$PR_BODY"$'\n\n'"$PLAN_HOLD_MARKER"
   if ! PR_URL="$(timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
        --body "$PR_BODY" 2>> "$LOG")"; then
     park "$BRIEF" "pr create failed; branch $BRANCH is pushed" transient; continue
   fi
   echo "$PR_URL" >> "$LOG"
+  [ -z "$PLAN_GAPS" ] || note_plan_hold "$PR_URL"
   if [ -n "$INTENT_CLASS" ] && ! timeout "$NET_TIMEOUT" gh pr edit "$PR_URL" -R "$REPO" --add-label "class:$INTENT_CLASS" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] could not add label class:$INTENT_CLASS to $PR_URL; the PR stands" >> "$LOG"
   fi
