@@ -27,6 +27,12 @@ from tests.local_http import LocalHTTPServer  # noqa: E402
 ROUND_MARKER = "<!-- loom:lane-round v1 -->"
 RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
 INSTALL_LOCK = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "lock.sh"
+# The sandbox helpers contract_run and sandbox_profile call, for the tests
+# that run those functions alone (the default seatbelt sandbox).
+SANDBOX_HELPERS = "".join(
+    re.search(r"^%s\(\) \{\n.*?^\}\n" % name,
+              (RUNNER.parent / "agent_sandbox.sh").read_text(), re.S | re.M).group(0)
+    for name in ("sandbox_kind", "sandbox_command"))
 
 BRIEF = """# Brief: T042-fix-the-thing
 
@@ -109,10 +115,12 @@ if [ "$1" = api ]; then
       exit 0 ;;
   esac
   # The shadow guard reads an issue before it lets a close go: the issue
-  # carries the one label $FAKE_GH_ISSUE_LABEL (a factory incident's default).
+  # carries the one label $FAKE_GH_ISSUE_LABEL (a factory incident's default)
+  # and is in state $FAKE_GH_ISSUE_STATE (default open); issue 404 is missing.
   case "$#:$2" in
+    "2:repos/"*"/issues/404") echo "HTTP 404: Not Found" >&2; exit 1 ;;
     "2:repos/"*"/issues/"[0-9]*)
-      printf '{"number":%s,"labels":[{"name":"%s"}]}\\n' "${2##*/}" "${FAKE_GH_ISSUE_LABEL:-loom:factory}"
+      printf '{"number":%s,"state":"%s","labels":[{"name":"%s"}]}\\n' "${2##*/}" "${FAKE_GH_ISSUE_STATE:-open}" "${FAKE_GH_ISSUE_LABEL:-loom:factory}"
       exit 0 ;;
   esac
   [ "$*" = "api repos/example/repo --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
@@ -183,6 +191,7 @@ fi
 # config the brief never names when $FAKE_HOOK is set ($FAKE_AGENT=say).
 # $FAKE_AGENT=stray also commits files no brief here names (a hook config,
 # a scratch file under .loom/, a top-level test script).
+# $FAKE_AGENT=manifest commits $FAKE_MANIFEST as deploy.yaml.
 # $FAKE_AGENT=contract-edit commits $FAKE_CONTRACT_TEXT as the validation
 # contract. The file holds $FAKE_AGENT_TEXT (default "fixed"); $FAKE_AGENT_WEAKEN
 # rewrites the validation contract.
@@ -297,6 +306,12 @@ if [ "${FAKE_AGENT:-commit}" = binref ]; then
   printf 'fixed\\n' > fix.txt
   git add -A
   git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
+if [ "${FAKE_AGENT:-commit}" = manifest ]; then
+  printf '%s' "$FAKE_MANIFEST" > deploy.yaml
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Place the thing"
   exit 0
 fi
 if [ "${FAKE_AGENT:-commit}" = contract-edit ]; then
@@ -585,9 +600,27 @@ class LaneRunnerTest(unittest.TestCase):
         self.write_tool(self.bin / "curl", FAKE_CURL)
         self.scanner = root / "check_private_leaks.py"
         self.scanner.write_text("""#!/usr/bin/env python3
-import re, subprocess, sys
+import os, re, subprocess, sys
 args = sys.argv[1:]
 mode, value = args[0], args[1]
+# Each call's arguments, one a line, for the tests that check what it was asked.
+with open(os.environ['FAKE_LOG'] + '.scanner', 'a', encoding='utf-8') as calls:
+    calls.write(' '.join(args) + '\\n')
+# The real scanner exits 2 when it cannot read the deny-list it was asked for.
+if '--deny-list-ssm' in args and os.environ.get('FAKE_DENY_UNREADABLE'):
+    print('FATAL: could not read deny-list from SSM', file=sys.stderr)
+    sys.exit(2)
+# As the real scanner reads it: the AWS CLI on PATH, the value on stdout.
+if '--deny-list-ssm' in args and os.environ.get('FAKE_SCANNER_READS_DENY'):
+    name = args[args.index('--deny-list-ssm') + 1]
+    got = subprocess.run(['aws', 'ssm', 'get-parameter', '--name', name, '--with-decryption',
+                          '--query', 'Parameter.Value', '--output', 'text'],
+                         capture_output=True, text=True)
+    if got.returncode != 0 or not got.stdout.strip():
+        print('FATAL: could not read deny-list from SSM', file=sys.stderr)
+        sys.exit(2)
+    with open(os.environ['FAKE_LOG'] + '.deny', 'a', encoding='utf-8') as fh:
+        fh.write(got.stdout)
 # The real scanner's private-issue-ref rule: an issue reference to any repo
 # but the ones named with --allow-repo-ref may name a private repo.
 allowed = [args[i + 1] for i, a in enumerate(args) if a == '--allow-repo-ref']
@@ -699,6 +732,101 @@ print('leak guard: clean (shape patterns only)')
 
     def run_log(self, name="T042-fix-the-thing.log"):
         return (self.loom / "logs" / "codex" / name).read_text()
+
+    def scanner_calls(self):
+        """The fake leak scanner's calls, each its argument string."""
+        calls = Path(str(self.log) + ".scanner")
+        return calls.read_text().splitlines() if calls.exists() else []
+
+    DENY = " --deny-list-ssm /infra/leak-scan/deny-list"
+
+    def test_every_leak_scan_before_a_push_checks_the_deny_list(self):
+        # Every scan ran in shape-only mode, so names and products reached
+        # public branches unchecked (quadseven/loom#1826).
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.scanner_calls()
+        self.assertEqual([c.split()[0] for c in calls], ["--diff", "--text-file"], calls)
+        for call in calls:
+            self.assertTrue(call.endswith(self.DENY), call)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_the_deny_list_parameter_is_a_setting(self):
+        self.drop_brief()
+        self.run_lane(LOOM_LEAK_DENY_SSM="/other/deny-list")
+        calls = self.scanner_calls()
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertTrue(call.endswith(" --deny-list-ssm /other/deny-list"), call)
+
+    def test_an_unreadable_deny_list_pushes_nothing(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_DENY_UNREADABLE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        line = self.failure_line()
+        self.assertTrue(line.startswith("[transient] public repo leak scan could not run"), line)
+        self.assertIn("could not read deny-list", line)
+
+    # A workload that selects a node label, for the live-cluster check
+    # (bus/live_cluster.py, loom#1832).
+    MANIFEST = ("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
+                "  template:\n    spec:\n      nodeSelector:\n        tier: %s\n"
+                "      containers:\n      - name: app\n        image: example/app:1\n")
+    # Fake kubectl: records the call, then prints one Ready node labelled
+    # tier=web, or exits $FAKE_KUBECTL_EXIT as a cluster it cannot reach.
+    FAKE_KUBECTL = """#!/usr/bin/env bash
+printf 'kubectl %s\\n' "$*" >> "$FAKE_LOG"
+[ -z "${FAKE_KUBECTL_EXIT:-}" ] || { echo "connection refused" >&2; exit "$FAKE_KUBECTL_EXIT"; }
+printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}'
+"""
+
+    def run_manifest_lane(self, tier, **env):
+        self.write_tool(self.bin / "kubectl", self.FAKE_KUBECTL)
+        self.drop_brief(text=BRIEF.replace("Make the thing work.", "Make the thing work in deploy.yaml."))
+        return self.run_lane(FAKE_AGENT="manifest", FAKE_MANIFEST=self.MANIFEST % tier, **env)
+
+    def test_a_manifest_selecting_a_label_no_node_carries_pushes_nothing(self):
+        result = self.run_manifest_lane("edge")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue(any(c.startswith("kubectl get nodes") for c in self.calls()))
+        self.assertEqual(self.failure_line(),
+                         "[work] live-cluster check refused the change: node label tier=edge (Deployment/web) "
+                         "is on no Ready node; nothing pushed")
+
+    def test_a_manifest_whose_labels_exist_opens_its_pull_request(self):
+        result = self.run_manifest_lane("web")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertNotIn("live-cluster check could not run", self.body.read_text())
+        self.assertIn("live-cluster check passed: 1 pod template(s) against 1 Ready node(s)",
+                      self.run_log())
+
+    def test_a_cluster_it_cannot_reach_is_noted_and_the_pull_request_opens(self):
+        result = self.run_manifest_lane("edge", FAKE_KUBECTL_EXIT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+        note = ("live-cluster check could not run: kubectl get nodes: kubectl exited 1, "
+                "so node selectors were not checked")
+        self.assertIn(note, self.body.read_text())
+        self.assertIn(note, self.run_log())
+        self.assertNotIn("connection refused", self.body.read_text())
+
+    def test_the_live_cluster_check_runs_only_after_the_leak_scan_passes(self):
+        # It looks up names the agent wrote from outside the agent's sandbox.
+        result = self.run_manifest_lane("edge", FAKE_DENY_UNREADABLE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("kubectl") for c in self.calls()))
+        self.assertTrue(self.failure_line().startswith("[transient] public repo leak scan could not run"))
 
     def test_probe_files_are_dropped_before_the_pr_opens(self):
         self.drop_brief()
@@ -833,6 +961,79 @@ print('leak guard: clean (shape patterns only)')
         self.assertNotIn("[x]", intent)
         self.assertEqual(body.count("## Acceptance criteria"), 1)
 
+    def body_criteria(self):
+        return self.body.read_text().split("## Acceptance criteria\n", 1)[1].split("\n\n", 1)[0]
+
+    def test_a_ticket_under_an_acceptance_heading_fills_the_body_criteria(self):
+        # A ticket that wrote "## Acceptance" opened a pull request whose
+        # ## Acceptance criteria was empty when the lane wrote no checklist;
+        # the review bot's plan check failed it and every fix round edited
+        # code, never the body (2026-10-25).
+        for heading in ("## Acceptance", "## Acceptance Criteria", "## ACCEPTANCE CRITERIA  "):
+            with self.subTest(heading=heading):
+                name = "T%d-fix-the-thing" % (50 + len(heading))
+                self.drop_brief(name + ".md", BRIEF.replace("T042-fix-the-thing", name)
+                                .replace("## Acceptance criteria\n", heading + "\n"))
+                result = self.run_lane()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+                self.assertEqual(self.body_criteria(), "- [ ] The thing works\n"
+                                 "- [ ] A test covers the thing\n- [ ] Nothing else changes")
+                self.assertEqual(hunt_plan.problems(self.body.read_text()), [])
+
+    def test_a_body_failing_the_plan_checks_is_rebuilt_from_the_brief_before_it_opens(self):
+        # A lane checklist that drops a criterion left two bullets in the
+        # body, which the plan check fails; the runner logged it and opened
+        # the pull request anyway, and every fix round edited code
+        # (loom#1837). The brief's checklist, with the lane's ticks, fills it.
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY="Fix the thing so it works\n\n## Acceptance criteria\n"
+                                            "- [x] The thing works\n- [x] A test covers the thing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertEqual(hunt_plan.problems(body), [])
+        self.assertEqual(self.body_criteria(), "- [x] The thing works\n"
+                         "- [x] A test covers the thing\n- [ ] Nothing else changes")
+        self.assertNotIn(pr_repair.PLAN_HOLD_MARKER, body)
+        self.assertIn("pull request body rebuilt from the brief", self.run_log())
+        self.assertEqual(self.sticky_bodies(), [])
+
+    def test_a_brief_that_cannot_fill_the_body_opens_a_marked_pull_request_and_notes_the_ticket(self):
+        brief = BRIEF.replace("S: one function.", "big")
+        self.drop_brief(text=brief)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        body = self.body.read_text()
+        self.assertTrue(body.rstrip().endswith(pr_repair.PLAN_HOLD_MARKER))
+        self.assertIn("no Size", " ".join(hunt_plan.problems(body)))
+        notes = self.sticky_bodies()
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0].startswith(pr_repair.PLAN_NOTE_MARKER))
+        self.assertIn("- ## Size (XS, S, M or L)", notes[0])
+        self.assertIn("Pull requests: #7", notes[0])
+        # Found by its marker first, so a later pull request edits this note.
+        self.assertTrue(any(c.startswith("gh api --paginate repos/example/repo/issues/42/comments")
+                            for c in self.calls()))
+
+    def test_a_lane_checklist_under_an_acceptance_heading_reaches_the_body(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY=self.TICKED.replace(
+            "## Acceptance criteria", "## Acceptance"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.body_criteria().startswith("- [x] The thing works\n"))
+
+    def test_a_ticket_without_acceptance_criteria_is_parked_before_the_agent_runs(self):
+        # With no criteria anywhere the body's section could only be empty,
+        # which the review bot's plan check fails and no fix round repairs.
+        self.drop_brief(text=re.sub(r"## Acceptance criteria\n(- \[ \] .*\n)+\n", "", BRIEF))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: [work] ticket has no acceptance criteria", self.run_log())
+
     def test_the_lanes_operator_steps_reach_the_pull_request_body(self):
         # A lane pull request whose deploy needed a VM resize and a data
         # migration merged on green checks (2026-10-22): the body now carries
@@ -846,6 +1047,29 @@ print('leak guard: clean (shape patterns only)')
                       body)
         self.assertIn("## Operator steps before merge", self.log.read_text())
         self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_only_bugs_that_cite_a_real_issue_reach_the_pull_request_body(self):
+        # A lane's "Bugs discovered" line that cites no issue, or one that
+        # does not exist, is a dead end nobody triages (loom#1779).
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY=self.TICKED + "\n\n## Bugs discovered\n"
+                               "- The parser drops a trailing tab, #7\n"
+                               "- The cache never expires\n"
+                               "- The retry loop spins, #404")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("\n## Bugs discovered\n- The parser drops a trailing tab, #7\n\n---\n", body)
+        self.assertNotIn("cache never expires", body)
+        self.assertNotIn("#404", body)
+        log = self.run_log()
+        self.assertIn("Bugs discovered line 2 left out: the line cites no issue", log)
+        self.assertIn("Bugs discovered line 3 left out: the cited issue could not be looked up", log)
+        self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_a_body_without_bugs_has_no_bugs_section(self):
+        self.drop_brief()
+        self.run_lane(FAKE_SUMMARY=self.TICKED)
+        self.assertNotIn("Bugs discovered", self.body.read_text())
 
     def test_a_body_without_a_declaration_says_none_was_stated(self):
         self.drop_brief()
@@ -1295,8 +1519,11 @@ print('leak guard: clean (shape patterns only)')
         self.assertNotIn("Refs ", self.body.read_text())
 
     def test_a_brief_rendered_by_the_station_is_accepted_and_refs_its_issue(self):
+        # The station briefs only tickets with criteria (bus/brain.py
+        # acceptance_refusal); a brief without them is parked unrun.
         issue = {"number": 42, "title": "Fix the thing",
-                 "body": "Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n"}
+                 "body": ("Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n\n"
+                          "## Acceptance criteria\n- [ ] The thing works\n")}
         name = tickets.ticket_name("example/repo", 42, 1)
         self.drop_brief(name + ".md", tickets.render_brief("example/repo", issue, "codex", 1))
         result = self.run_lane()
@@ -1310,9 +1537,10 @@ print('leak guard: clean (shape patterns only)')
 
     FIX_BRANCH = "loom/42-fix-the-thing"
 
-    def fix_brief(self):
+    def fix_brief(self, with_head=False, check="lint"):
         """A station fix brief for PR 7, whose branch is already on the remote
-        with the lane's first commit."""
+        with the lane's first commit. `with_head`: the brief names that commit
+        as the head its checks failed on, as the station's does."""
         work = Path(self._tmp.name) / "pr-work"
         git("clone", "-q", str(self.remote), str(work))
         git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
@@ -1323,11 +1551,13 @@ print('leak guard: clean (shape patterns only)')
         git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
         issue = {"number": 42, "title": "Fix the thing",
                  "body": "Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n"}
+        marker = ("\n<!-- loom:fix-head %s -->\n" % self.remote_head(self.FIX_BRANCH)
+                  if with_head else "")
         fix = tickets.parse_fix("example/repo", (
             "<!-- loom:fix v1 -->\nPull request: example/repo#7, branch %s\n\n"
-            "### Check: lint\n\n    E501 line too long\n\n"
-            "### Thread PRRT_1 (comment 11) at a.py:3\n\n    reviewer: rename this\n"
-            % self.FIX_BRANCH))
+            "### Check: %s\n\n    E501 line too long\n\n"
+            "### Thread PRRT_1 (comment 11) at a.py:3\n\n    reviewer: rename this\n%s"
+            % (self.FIX_BRANCH, check, marker)))
         name = tickets.ticket_name("example/repo", 42, 2)
         self.drop_brief(name + ".md", tickets.render_brief("example/repo", issue, "codex", 2, fix))
         return name, self.remote_head(self.FIX_BRANCH)
@@ -1453,6 +1683,45 @@ print('leak guard: clean (shape patterns only)')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any("addPullRequestReviewThreadReply" in c or "resolveReviewThread" in c
                              for c in self.calls()))
+
+    def test_a_fix_round_with_no_commit_on_the_head_its_checks_failed_on_is_a_failed_round(self):
+        # 2026-10-26: four rounds of one ticket answered a thread or repaired
+        # the PR text, committed nothing, and each reported done with both
+        # failing checks still red on the same head.
+        name, before = self.fix_brief(with_head=True)
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_AGENT="replies-only",
+                               FAKE_REPLIES='[{"thread":"PRRT_fake","reply":"Not applicable.","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertFalse((self.inbox / "done" / (name + ".md")).exists())
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("failed: [work] fix round made no commit, so the checks it was asked to fix "
+                      "still fail on %s, the head CI failed them on: lint; nothing pushed"
+                      % before[:12], log)
+        self.assertFalse(any("addPullRequestReviewThreadReply" in c for c in self.calls()))
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+
+    def test_a_round_that_only_answers_the_review_checks_findings_is_still_done(self):
+        # The review check fails while its findings stand; a round may answer
+        # a finding instead of changing code, so it alone never fails a
+        # no-commit round.
+        name, before = self.fix_brief(with_head=True, check="Grug - Elder")
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_AGENT="replies-only",
+                               FAKE_REPLIES='[{"thread":"PRRT_fake","reply":"Not applicable.","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c for c in self.calls()))
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+
+    def test_a_fix_round_log_says_when_no_contract_check_maps_to_the_failing_checks(self):
+        name, _ = self.fix_brief(with_head=True)
+        result = self.run_lane(FAKE_GH_EXISTING="7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("%s: no validation contract check maps to the failing checks (lint): the "
+                      "repo has no .loom/validation.conf, so CI is the first to run them on the "
+                      "new head" % name, log)
 
     def test_reply_only_fix_posts_replies_without_a_commit_or_push(self):
         name, before = self.fix_brief()
@@ -1834,6 +2103,17 @@ print('leak guard: clean (shape patterns only)')
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("-timedout-", heads)
         self.assertIn("leak scan refused or could not check the edits", self.failure_line())
+        self.assertEqual(len(self.scanner_calls()), 1, self.scanner_calls())
+        self.assertTrue(self.scanner_calls()[0].endswith(self.DENY), self.scanner_calls())
+
+    def test_a_timeout_keeps_no_branch_on_a_public_repo_when_the_deny_list_is_unreadable(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EDIT="1", FAKE_EXIT="124",
+                      FAKE_DENY_UNREADABLE="1")
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-timedout-", heads)
+        self.assertIn("leak scan refused or could not check the edits", self.failure_line())
 
     def test_a_timeout_after_editing_keeps_the_edits_on_a_timedout_branch(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
@@ -2064,6 +2344,54 @@ exec /usr/bin/git "$@"
         self.assertIn("A reviewer note at the top.", new_body)
         self.assertIn("- [ ] A test covers the thing", new_body)
         self.assertIn("Loom ticket %s, lane codex, model gpt-test-default." % name, new_body)
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_fills_an_empty_criteria_section_from_an_acceptance_heading(self):
+        # The pull request opened with an empty ## Acceptance criteria (its
+        # ticket wrote "## Acceptance"), so the plan check failed it. A fix
+        # round now writes the ticket's criteria into the body; before, it
+        # rendered the section empty again every round (2026-10-25).
+        work = Path(self._tmp.name) / "pr-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
+        (work / "first.txt").write_text("first try\n")
+        git("add", "first.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "First try", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        issue = {"number": 42, "title": "Fix the thing",
+                 "body": ("Difficulty: medium\n\n## Why\nThe thing is broken for every user.\n\n"
+                          "## What\nFix it.\n\n## Acceptance\n- [ ] The thing works\n"
+                          "- [ ] A test covers the thing\n- [ ] Nothing else changes\n\n"
+                          "## Size\nS\n\n## Out of scope\n- Nothing else\n")}
+        fix = tickets.parse_fix("example/repo", (
+            "<!-- loom:fix v1 -->\nPull request: example/repo#7, branch %s\n\n"  # leak-guard-allow: fixture repo
+            "### Check: Grug - Chief\n\n    Acceptance criteria has 0 non-empty bullets\n"
+            % self.FIX_BRANCH))
+        name = tickets.ticket_name("example/repo", 42, 2)
+        brief = tickets.render_brief("example/repo", issue, "codex", 2, fix)
+        self.drop_brief(name + ".md", brief)
+        empty_body = pr_repair._render_generated(
+            pr_repair._normalise(brief), "codex", "gpt-test-default", name, acceptance="")
+        self.assertIn("## Acceptance criteria\n\n\nSize:", empty_body)
+        pr_title_file = Path(self._tmp.name) / "pr_title"
+        pr_body_file = Path(self._tmp.name) / "pr_body"
+        new_body_file = Path(self._tmp.name) / "new_body"
+        pr_title_file.write_text("Fix the thing")
+        pr_body_file.write_text(empty_body)
+        result = self.run_lane(
+            FAKE_AGENT="noop",
+            FAKE_GH_EXISTING="7",
+            FAKE_GH_PR_TITLE=str(pr_title_file),
+            FAKE_GH_PR_BODY=str(pr_body_file),
+            FAKE_PR_TITLE=str(Path(self._tmp.name) / "new_title"),
+            FAKE_PR_BODY=str(new_body_file),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        new_body = new_body_file.read_text()
+        self.assertIn("## Acceptance criteria\n- [ ] The thing works\n"
+                      "- [ ] A test covers the thing\n- [ ] Nothing else changes\n", new_body)
+        self.assertEqual(hunt_plan.problems(new_body), [])
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
     def test_a_fix_brief_refuses_invalid_pr_text_with_a_reason(self):
@@ -2549,6 +2877,25 @@ exec /usr/bin/git "$@"
         kind, _, credit = self.classified(whole, "FAILED (failures=2)\nagent: tests still fail")
         self.assertEqual((kind, credit), ("work", "none"))
 
+    # A codex run that exited 0 with a written answer read a Makefile that
+    # echoes "Rate-limiting wrapper deployed", another a test named
+    # test_the_pass_is_rate_limited, and both lanes were parked until midnight
+    # (2026-10-25). A run that exits 0 is limited only by what its CLI said last.
+    def test_a_limit_phrase_in_a_clean_runs_output_is_not_a_limit(self):
+        answer = "No files changed and no commit created: the work lives in another repo."
+        for read in ('\t@echo "Rate-limiting wrapper deployed. Calls queue instead of failing."',
+                     "    def test_the_pass_is_rate_limited(self):"):
+            with self.subTest(read=read):
+                whole = "\n".join(["reading Makefile", read, "tokens used", answer])
+                kind, _, credit = self.classified(whole, answer, status=0)
+                self.assertEqual((kind, credit), ("work", "none"))
+
+    def test_a_clean_run_whose_cli_ends_on_a_limit_is_still_a_limit(self):
+        limit = ("ERROR: You've hit your usage limit. Upgrade to Pro, visit the usage page to "
+                 "purchase more credits or try again at 10:28 AM.")
+        kind, _, _ = self.classified("\n".join(["working", limit]), limit, status=0)
+        self.assertEqual(kind, "limit")
+
     def test_a_stated_reset_time_wins_over_a_credit_pattern(self):
         limit = ("ERROR: You've hit your usage limit. Upgrade to Pro, visit the usage page to "
                  "purchase more credits or try again at 10:28 AM.")
@@ -2661,6 +3008,164 @@ exec /usr/bin/git "$@"
         self.assertNotIn(f"home={self.home} ", agent[0])
         self.assertIn("lane openrouter, model openrouter/vendor/model:free", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def pod_lane(self, **env):
+        """A lane pod pass (bwrap, copied SSM values, egress proved) on
+        opencode-go. Returns the inbox and the result."""
+        # The egress probes are localhost sockets, which the lane check
+        # sandbox denies: there these tests would see a lane that never
+        # proves its egress and fail the base check on unmodified main.
+        if not sandbox_caps.LOCALHOST:
+            self.skipTest(sandbox_caps.NO_LOCALHOST)
+        self.write_tool(self.bin / "bwrap", "#!/usr/bin/env bash\n"
+                        "while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n"
+                        "[ $# -gt 0 ] || exit 0\nshift\nexec \"$@\"\n")
+        ssm = self.home / ".ssm" / "k"
+        ssm.mkdir(parents=True)
+        (ssm / "oc").write_text("fake-oc-key")
+        inbox = self.loom / "briefs" / "opencode-go"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: opencode-go"))
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = "127.0.0.1:%d" % probe.getsockname()[1]
+        reachable = socket.socket()
+        reachable.bind(("127.0.0.1", 0))
+        reachable.listen(8)
+        self.addCleanup(reachable.close)
+        result = self.run_lane("opencode-go", LOOM_SANDBOX="bwrap", LOOM_EGRESS_DENY_PROBES=closed,
+                               LOOM_EGRESS_ALLOW_PROBE="127.0.0.1:%d" % reachable.getsockname()[1],
+                               LOOM_SSM_DIR=str(self.home / ".ssm"), LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
+                               LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash", **env)
+        return inbox, result
+
+    def test_a_pod_lane_pushes_nothing_to_a_public_repo_without_the_deny_list(self):
+        # A pod holds no AWS key and the scanner reads the deny-list only
+        # from SSM, so a pod scan would run without it (quadseven/loom#1826).
+        inbox, result = self.pod_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertEqual(self.scanner_calls(), [])
+        line = self.failure_line(lane="opencode-go")
+        self.assertTrue(line.startswith("[transient] public repo leak scan could not run"), line)
+        self.assertIn("no copy of the leak scan deny-list", line)
+
+    def test_a_pod_lane_scans_with_its_copied_deny_list_and_pushes_to_a_public_repo(self):
+        # A cluster runner copies the deny-list into LOOM_SSM_DIR with the
+        # keys (quadseven/loom#1824): the scanner reads that copy through
+        # the AWS CLI stand-in, never the real CLI, and the push goes ahead.
+        deny = self.home / ".ssm" / "infra" / "leak-scan"
+        deny.mkdir(parents=True)
+        (deny / "deny-list").write_text("secret-product-name\n")
+        inbox, result = self.pod_lane(FAKE_SCANNER_READS_DENY="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), self.calls())
+        calls = self.scanner_calls()
+        self.assertEqual([c.split()[0] for c in calls], ["--diff", "--text-file"], calls)
+        for call in calls:
+            self.assertTrue(call.endswith(self.DENY), call)
+        self.assertEqual(Path(str(self.log) + ".deny").read_text(), "secret-product-name\n" * 2)
+        self.assertFalse([c for c in self.calls() if c.startswith("aws ")], self.calls())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_a_pod_lane_pushes_to_a_private_repo(self):
+        inbox, result = self.pod_lane(FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), self.calls())
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+
+    def test_a_pod_lane_runs_under_bwrap_reads_its_key_from_files_and_drops_its_scratch(self):
+        # A lane pod (docs/LANES.md, "Lane pods"): no sandbox-exec, no AWS
+        # key, and a scratch volume that holds no finished run. A private
+        # repo: a pod pushes nothing public (see the test above).
+        if not sandbox_caps.LOCALHOST:
+            self.skipTest(sandbox_caps.NO_LOCALHOST)
+        record = Path(self._tmp.name) / "bwrap.calls"
+        # Each call: its options up to --, the command and its first argument,
+        # and the key it was handed, one a line, then a blank line.
+        self.write_tool(self.bin / "bwrap", "#!/usr/bin/env bash\n"
+                        "out=" + shlex.quote(str(record)) + "\n"
+                        "while [ $# -gt 0 ] && [ \"$1\" != -- ]; do printf '%s\\n' \"$1\" >> \"$out\"; shift; done\n"
+                        "printf '%s\\n' \"${1:-}\" \"${2:-}\" \"${3:-}\" \"key=${OPENCODE_API_KEY:-none}\" '' >> \"$out\"\n"
+                        "[ $# -gt 0 ] || exit 0\nshift\nexec \"$@\"\n")
+        self.write_tool(self.bin / "sandbox-exec", "#!/bin/sh\necho sandbox-exec >> \"$FAKE_LOG\"\nexit 97\n")
+        ssm = self.home / ".ssm" / "k"
+        ssm.mkdir(parents=True)
+        (ssm / "oc").write_text("fake-oc-key")
+        inbox = self.loom / "briefs" / "opencode-go"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: opencode-go"))
+        # Leftovers of a check a killed runner never finished.
+        (self.loom / "worktrees" / "T042-fix-the-thing-default-check").mkdir(parents=True)
+        (self.loom / "run" / "opencode-go-check-default").mkdir(parents=True)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = "127.0.0.1:%d" % probe.getsockname()[1]
+        reachable = socket.socket()
+        reachable.bind(("127.0.0.1", 0))
+        reachable.listen(8)
+        self.addCleanup(reachable.close)
+        result = self.run_lane("opencode-go", LOOM_SANDBOX="bwrap", LOOM_DROP_TREES="1",
+                               LOOM_EGRESS_DENY_PROBES=closed,
+                               LOOM_EGRESS_ALLOW_PROBE="127.0.0.1:%d" % reachable.getsockname()[1],
+                               LOOM_SSM_DIR=str(self.home / ".ssm"),
+                               LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
+                               LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash",
+                               FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), self.calls())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+        calls = self.calls()
+        self.assertNotIn("sandbox-exec", calls)
+        self.assertFalse([c for c in calls if c.startswith("aws ")], calls)
+        runs = [call.splitlines() for call in record.read_text().split("\n\n")
+                if "\n--\nopencode\nrun\n" in call]
+        self.assertEqual(len(runs), 1, record.read_text())
+        words = runs[0]
+        home = str(self.home.resolve())
+        tree = str((self.loom / "worktrees" / "T042-fix-the-thing").resolve())
+        self.assertEqual(words[-1], "key=fake-oc-key")
+        triples = [words[i:i + 3] for i in range(len(words))]
+        # No bind of / and nothing of HOME but the tree and scratch home.
+        self.assertFalse([t for t in triples if t[0] in ("--bind", "--ro-bind", "--ro-bind-try") and t[1] in ("/", home)])
+        self.assertIn("/var/run/secrets", [words[i + 1] for i, w in enumerate(words) if w == "--tmpfs"])
+        self.assertIn(["--bind", tree, tree], [words[i:i + 3] for i in range(len(words))])
+        self.assertIn(["--ro-bind", tree + "/.git", tree + "/.git"], [words[i:i + 3] for i in range(len(words))])
+        # The run's scratch is gone; its log and the brief stay.
+        self.assertEqual(sorted(p.name for p in (self.loom / "worktrees").iterdir()), [])
+        self.assertFalse((self.loom / "run" / "opencode-go-home").exists())
+        self.assertFalse((self.loom / "run" / "opencode-go-check").exists())
+        self.assertFalse((self.loom / "run" / "opencode-go-check-default").exists())
+        self.assertIn("T042-fix-the-thing done", (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text())
+
+    def test_a_pod_lane_without_narrowed_egress_runs_no_agent(self):
+        self.write_tool(self.bin / "bwrap", "#!/bin/sh\necho bwrap >> \"$FAKE_LOG\"\nexit 0\n")
+        ssm = self.home / ".ssm" / "k"
+        ssm.mkdir(parents=True)
+        (ssm / "oc").write_text("fake-oc-key")
+        inbox = self.loom / "briefs" / "opencode-go"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: opencode-go"))
+        result = self.run_lane("opencode-go", LOOM_SANDBOX="bwrap", LOOM_SSM_DIR=str(self.home / ".ssm"),
+                               LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
+                               LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        self.assertFalse([c for c in self.calls() if c.startswith("opencode run")])
+        beat = json.loads((self.loom / "state" / "usage" / "opencode-go.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("bwrap narrows no network", beat["reason"])
+
+    def test_without_drop_trees_a_lane_keeps_its_tree_for_the_station_to_prune(self):
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.loom / "worktrees" / "T042-fix-the-thing").is_dir())
 
     def test_opencode_temp_paths_and_external_directory_denial_keep_the_sandbox_boundary(self):
         profile_file = str(Path(self._tmp.name) / "sandbox.profile")
@@ -5116,6 +5621,53 @@ exit %d
         self.assertFalse((self.loom / "run" / "codex-check").exists())
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_codex_agent_runs_uv_offline_from_a_copy_of_the_base_checks_cache(self):
+        # loom#1665: a codex agent has no network, so uv could not fetch the
+        # packages its tests need ("dns error" from the package index) while
+        # the base check, outside the agent's sandbox, had downloaded them.
+        # The base check here leaves a uv cache entry; the agent must get a
+        # writable copy of it, uv's offline settings and that one extra
+        # writable directory, and its writes must not reach the check's cache.
+        # The check fails when it finds the agent's write in its own cache.
+        self.contract_repo(CONTRACT.replace("check: ", (
+            "check: loom-test-python -c 'import os; d = os.path.expanduser(\"~/.cache/uv\"); "
+            "os.makedirs(d, exist_ok=True); p = d + \"/pkg\"; "
+            "assert not os.path.exists(p) or open(p).read() == \"cached\"; "
+            "open(p, \"w\").write(\"cached\")' && ")))
+        self.drop_brief()
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace("cat > /dev/null\n", (
+            "cat > /dev/null\n"
+            'printf "uv-env cache=%s python=%s offline=%s managed=%s pip=%s\\n" '
+            '"${UV_CACHE_DIR:-unset}" "${UV_PYTHON_INSTALL_DIR:-unset}" "${UV_OFFLINE:-unset}" '
+            '"${UV_MANAGED_PYTHON:-unset}" "${PIP_NO_INDEX:-unset}" >> "$FAKE_LOG"\n'
+            'printf "uv-pkg %s\\n" "$(cat "$UV_CACHE_DIR/pkg" 2>&1)" >> "$FAKE_LOG"\n'
+            'echo agent > "$UV_CACHE_DIR/pkg"\n'), 1))
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        check_home = self.loom / "run" / "codex-check"
+        calls = self.calls()
+        agent = [c for c in calls if c.startswith("codex exec")]
+        self.assertEqual(len(agent), 1, calls)
+        self.assertIn("--sandbox workspace-write --add-dir %s/agent-uv --model" % check_home, agent[0])
+        self.assertIn("uv-env cache=%s/agent-uv/cache python=%s/.local/share/uv/python "
+                      "offline=1 managed=1 pip=1" % (check_home, check_home), calls)
+        self.assertIn("uv-pkg cached", calls)
+        # The final check read its own cache, not the agent's copy.
+        self.assertEqual([(r["phase"], r["ok"]) for r in self.records()][-1], ("final", True))
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_codex_agent_without_a_uv_cache_runs_as_before(self):
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agent = [c for c in self.calls() if c.startswith("codex exec")]
+        self.assertEqual(len(agent), 1, self.calls())
+        self.assertIn("--sandbox workspace-write --model", agent[0])
+        self.assertNotIn("--add-dir", agent[0])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_an_edit_inside_a_submodule_is_refused_before_the_check(self):
         # The push carries only the submodule's pinned commit, so a check that
         # passed on the agent's edits inside it passed on code CI never sees:
@@ -5226,6 +5778,55 @@ exec /usr/bin/git "$@"
         path = self.loom / "logs" / "codex" / (name + ".validation.jsonl")
         records = [json.loads(line) for line in path.read_text().splitlines()]
         self.assertEqual(records[-1]["command"], "test -f .prepared && loom-test-python check.py")
+
+    # loom#1773: a lane pull request passed its check and failed two
+    # per-directory suites in CI that the contract never ran. An affected:
+    # command runs after the check with the changed files.
+    AFFECTED_SEES_FIX = ("affected: grep -qx fix.txt && "
+                         "printf '%s\\n' \"$LOOM_CHANGED_FILES\" | grep -qx fix.txt\n")
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_an_affected_command_gets_the_changed_files_and_runs_after_the_check(self):
+        self.contract_repo(CONTRACT + self.AFFECTED_SEES_FIX)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        records = self.records()
+        self.assertEqual([(r["phase"], r["exit"], r["ok"]) for r in records][-2:],
+                         [("final", 0, True), ("affected", 0, True)])
+        self.assertTrue(records[-1]["command"].startswith("grep -qx fix.txt"))
+        self.assertIn("affected check exited 0", self.body.read_text())
+        self.assertIn("After the check passes it runs this affected command", self.log.read_text())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_failing_affected_command_blocks_the_push_like_the_check(self):
+        self.contract_repo(CONTRACT + "affected: ! grep -qx fix.txt\n")
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        self.assertIn("validation failed: the affected check exited 1", self.lane_log())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", self.remote_heads())
+        self.assertEqual([(r["phase"], r["ok"]) for r in self.records()][-2:],
+                         [("final", True), ("affected", False)])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_fix_rounds_affected_command_gets_what_the_pull_request_changes(self):
+        # The round's own commit and the pull request's earlier one, never a
+        # file the branch shares with the default branch.
+        listed = "printf '%s\\n' \"$LOOM_CHANGED_FILES\""
+        self.contract_repo(CONTRACT + "affected: %s | grep -qx first.txt && %s | grep -qx fix.txt"
+                           " && ! %s | grep -qx check.py\n" % (listed, listed, listed))
+        name, before = self.fix_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = self.loom / "logs" / "codex" / (name + ".validation.jsonl")
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual([(r["phase"], r["ok"]) for r in records][-2:],
+                         [("final", True), ("affected", True)])
+        self.assertNotEqual(self.remote_head(self.FIX_BRANCH), before)
 
     def contract_edit_lane(self, text):
         self.contract_repo()
@@ -5361,6 +5962,18 @@ exec /usr/bin/git "$@"
         body = Path(f"{self.body}.issue").read_text()
         self.assertNotIn(address, body)
         self.assertIn("Repo: example/repo", body)
+        self.assertIn("withheld", body)
+        self.assertTrue(self.scanner_calls())
+        for call in self.scanner_calls():
+            self.assertTrue(call.endswith(self.DENY), call)
+
+    def test_a_public_repo_incident_detail_is_withheld_when_the_deny_list_is_unreadable(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_DENY_UNREADABLE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = Path(f"{self.body}.issue").read_text()
+        self.assertNotIn("python: 3.12", body)
         self.assertIn("withheld", body)
 
     def test_a_second_still_failing_edits_the_existing_incident_comment(self):
@@ -5653,7 +6266,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(tmp / "log"), "TREE": str(tmp),
                "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30"}
         result = subprocess.run(["bash", "-c", script, "test", f"true\x1b[2K; touch {marker}"],
@@ -5683,7 +6296,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
         log = tmp / "log"
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log), "TREE": str(tmp),
                "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30",
@@ -5716,7 +6329,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
         log = tmp / "log"
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(tmp / "home"), "LOG": str(log),
                "TREE": str(tmp), "CHECK_HOME": str(tmp), "CHECK_CLI": "bash",
@@ -5796,13 +6409,77 @@ exec /usr/bin/git "$@"
         self.assertTrue((tree / ".venv" / "untracked.txt").exists())
         self.assertFalse(untracked.exists())
 
+    def test_a_finished_run_drops_only_git_ignored_build_output(self):
+        # loom#1808: an infra run left 17 ignored .venv folders, about 2 GB a
+        # tree, kept for an hour after the run. Only folders git ignores and
+        # that hold no tracked path go; the tracked tree stays for fix rounds.
+        text = RUNNER.read_text()
+        function = re.search(r"^drop_build_output\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        workdir = Path(self._tmp.name) / "worktrees"
+        tree = workdir / "example.repo-7"
+        check = workdir / "example.repo-7-default-check"
+        for t in (tree, check):
+            t.mkdir(parents=True)
+            git("init", "-q", str(t))
+            (t / ".gitignore").write_text(".venv/\nnode_modules/\n__pycache__/\n.pytest_cache/\n")
+            (t / "app.py").write_text("x = 1\n")
+            (t / "pinned" / "node_modules").mkdir(parents=True)
+            (t / "pinned" / "node_modules" / "tracked.js").write_text("tracked\n")
+            git("add", "-f", ".gitignore", "app.py", "pinned/node_modules/tracked.js", cwd=t)
+            git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "seed", cwd=t)
+        ignored = [tree / "stacks" / "a" / ".venv", tree / "web" / "node_modules",
+                   tree / "pkg" / "__pycache__", tree / ".pytest_cache", check / ".venv"]
+        for d in ignored:
+            d.mkdir(parents=True)
+            (d / "big").write_text("x" * 1000)
+        # Not ignored: a .venv the ignore rules exclude again is kept.
+        nested = tree / "vendor"
+        nested.mkdir()
+        (nested / ".gitignore").write_text("!.venv/\n")
+        (nested / ".venv").mkdir()
+        (nested / ".venv" / "keep").write_text("keep\n")
+        outside = Path(self._tmp.name) / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("keep\n")
+        (tree / "linked").mkdir()
+        os.symlink(outside, tree / "linked" / "node_modules")
+        script = function + "drop_build_output\n"
+        result = subprocess.run(["bash", "-c", script],
+                                env={"PATH": os.environ["PATH"], "WORKDIR": str(workdir),
+                                     "TICKET": "example.repo-7"},
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for d in ignored:
+            self.assertFalse(d.exists(), d)
+        self.assertEqual((tree / "app.py").read_text(), "x = 1\n")
+        self.assertTrue((tree / "pinned" / "node_modules" / "tracked.js").exists())
+        self.assertTrue((tree / ".git").is_dir())
+        self.assertTrue((nested / ".venv" / "keep").exists())
+        self.assertTrue((outside / "keep").exists())
+
+    def test_a_lane_run_drops_ignored_build_output_from_its_tree_when_it_ends(self):
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            'cat > /dev/null\n',
+            'cat > /dev/null\n'
+            'printf \'node_modules/\\n__pycache__/\\n\' >> .git/info/exclude\n'
+            'mkdir -p web/node_modules pkg/__pycache__\n'
+            'echo big > web/node_modules/dep.js; echo big > pkg/__pycache__/m.pyc\n', 1))
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tree = self.loom / "worktrees" / "T042-fix-the-thing"
+        self.assertIn("T042-fix-the-thing done", self.lane_log())
+        self.assertTrue((tree / "fix.txt").exists())
+        self.assertFalse((tree / "web" / "node_modules").exists())
+        self.assertFalse((tree / "pkg" / "__pycache__").exists())
+
     def test_the_check_profile_allows_the_uv_files_but_not_their_directory(self):
         # The check profile lets the contract read and execute the runner's
         # uv and uvx while still refusing every other file under the
         # runner's home: the two binaries get file literals, their directory
         # gets no subpath rule.
         text = (Path(__file__).resolve().parent.parent / "lanes" / "agent_sandbox.sh").read_text()
-        funcs = re.search(r"^sandbox_profile\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        funcs = SANDBOX_HELPERS + re.search(r"^sandbox_profile\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
         tmp = Path(self._tmp.name)
         home = tmp / "home"
         tree = tmp / "tree"

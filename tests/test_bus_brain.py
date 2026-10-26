@@ -87,6 +87,15 @@ def ready_node(checks="SUCCESS", reviews=(), threads=()):
             "reviews": {"nodes": list(reviews)}, "reviewThreads": {"nodes": list(threads)}}
 
 
+def merge_takes(ticket=4):
+    """The reads status makes for a READY lane pull request (loom#1643): its
+    ticket at loom:pr, a mergeable REST answer and an app-code file."""
+    return (reply(200, {"number": ticket, "state": "open",
+                        "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}),
+            reply(200, {"mergeable": True, "mergeable_state": "clean"}),
+            reply(200, [{"filename": "bus/a.py", "patch": "+x"}]))
+
+
 class BrainTests(unittest.TestCase):
     def test_prioritize_sets_and_replaces_priority_without_changing_body_content(self):
         original = "Difficulty: medium\n\n## Why\nExact text.  \n\n## What\nKeep this.\n"
@@ -386,8 +395,9 @@ class SensitiveResumeTests(unittest.TestCase):
             self.assertIn(section, report)
         # Project repo: issues, pulls, one GraphQL request, the goal's
         # unproven-work read and epic list; lane repo: issues (no loom:lanes
-        # issue here, so no comments read). The fake has no replies left.
-        self.assertEqual(gh.requests, 6)
+        # issue here, so no comments read). Plus ticket issue fetch for goal
+        # home constraint checking. The fake has no replies left.
+        self.assertEqual(gh.requests, 7)
 
     def test_status_ranks_open_tickets_across_repos_in_work_order(self):
         def t(number, priority=None, created="2030-01-01T00:00:00Z", labels=("loom:queued",)):
@@ -442,6 +452,7 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(gh.requests, 4)
 
     def test_status_lists_a_sensitive_pull_request(self):
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}], "body": ""}
         gh = GitHub("t", transport=Fake(
             reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
                          "created_at": "2030-01-01T00:00:00Z"}]),
@@ -449,7 +460,8 @@ class SensitiveResumeTests(unittest.TestCase):
                          "labels": [{"name": "class:sensitive"}]}]),
             reply(200, {"data": {"repository": {"p4": ready_node(),
                                                 "g1": {"comments": {"nodes": []}}}}}),
-            reply(200, []), reply(200, [])))
+            reply(200, []), reply(200, []),
+            reply(200, ticket_issue)))
         lines = brain.status(gh, [REPO], REPO, env={}, authors=()).splitlines()
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
@@ -457,11 +469,13 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_status_blocks_a_sensitive_pr_with_a_neutral_review(self):
         pr = {"number": 4, "title": "Sensitive", "head": {"ref": "loom/4-work", "sha": "head1"},
               "labels": [{"name": "class:sensitive"}]}
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}], "body": ""}
         fake = Fake(reply(200, []), reply(200, [pr]),
                     reply(200, {"data": {"repository": {"p4": ready_node()}}}),
                     reply(200, {"check_runs": [
                         {"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]}),
-                    reply(200, []))
+                    reply(200, []),
+                    reply(200, ticket_issue))
         report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={}, authors=())
         self.assertIn("- #4 Sensitive - blocked: review check has not passed on the head commit",
                       report)
@@ -470,9 +484,10 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_status_lists_a_docs_pr_with_a_neutral_review_as_ready(self):
         pr = {"number": 4, "title": "Docs", "head": {"ref": "loom/4-work", "sha": "head1"},
               "labels": [{"name": "class:docs"}]}
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}], "body": ""}
         fake = Fake(reply(200, []), reply(200, [pr]),
                     reply(200, {"data": {"repository": {"p4": ready_node()}}}),
-                    reply(200, []))
+                    *merge_takes(), reply(200, []), reply(200, ticket_issue))
 
         def transport(method, url, headers, body):
             if "/check-runs?" in url:
@@ -488,15 +503,18 @@ class SensitiveResumeTests(unittest.TestCase):
         authors = ["alice-example"]
         comments_with = [{"user": {"login": "alice-example"},
                           "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}], "body": ""}
         fake_with = Fake(
             reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
                          "created_at": "2030-01-01T00:00:00Z"}]),
             reply(200, [pr]),
             reply(200, {"data": {"repository": {"p4": ready_node(),
-                                                "g1": {"comments": {"nodes": []}}}}}),
+                                                "g1": {"comments": {"nodes": []}}}}}) ,
             reply(200, []),
+            *merge_takes(),
             reply(200, comments_with),
-            reply(200, []))
+            reply(200, []),
+            reply(200, ticket_issue))
         report_with = brain.status(GitHub("t", transport=fake_with), [REPO], REPO,
                                    env=TRUSTED, authors=authors)
         lines = report_with.splitlines()
@@ -510,10 +528,12 @@ class SensitiveResumeTests(unittest.TestCase):
                          "created_at": "2030-01-01T00:00:00Z"}]),
             reply(200, [pr]),
             reply(200, {"data": {"repository": {"p4": ready_node(),
-                                                "g1": {"comments": {"nodes": []}}}}}),
+                                                "g1": {"comments": {"nodes": []}}}}}) ,
             reply(200, []),
+            *merge_takes(),
             reply(200, comments_without),
-            reply(200, []))
+            reply(200, []),
+            reply(200, ticket_issue))
         report_without = brain.status(GitHub("t", transport=fake_without), [REPO], REPO,
                                       env=TRUSTED, authors=authors)
         lines = report_without.splitlines()
@@ -525,26 +545,27 @@ class SensitiveResumeTests(unittest.TestCase):
         data = {"prs": {4: ready_node()}}
         bot = "grug-tribe"
         authors = ["alice-example"]
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}], "body": ""}
 
         with_fix = [{"user": {"login": "alice-example"},
                      "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
-        gh_fix = GitHub("t", transport=Fake(reply(200, with_fix)))
+        gh_fix = GitHub("t", transport=Fake(*merge_takes(), reply(200, with_fix), reply(200, ticket_issue)))
         lines_with = brain._pull_request_lines(gh_fix, REPO, [pr], data, bot, authors)
         self.assertEqual(lines_with, ["### Pull requests", "- #4 PR - blocked: pending brain fix"])
 
         blocked = {"prs": {4: ready_node(checks="FAILURE")}}
-        gh_blocked = GitHub("t", transport=Fake(reply(200, with_fix)))
+        gh_blocked = GitHub("t", transport=Fake(reply(200, with_fix), reply(200, ticket_issue)))
         lines_blocked = brain._pull_request_lines(gh_blocked, REPO, [pr], blocked, bot, authors)
         self.assertEqual(lines_blocked,
                          ["### Pull requests", "- #4 PR - blocked: checks failure, pending brain fix"])
 
         without_fix = [{"user": {"login": "alice-example"},
                         "body": "%s normal fix" % tickets.FIX_MARKER}]
-        gh_without = GitHub("t", transport=Fake(reply(200, without_fix)))
+        gh_without = GitHub("t", transport=Fake(*merge_takes(), reply(200, without_fix), reply(200, ticket_issue)))
         lines_without = brain._pull_request_lines(gh_without, REPO, [pr], data, bot, authors)
         self.assertEqual(lines_without, ["### Pull requests", "- #4 PR - READY"])
 
-        no_authors = GitHub("t", transport=Fake())
+        no_authors = GitHub("t", transport=Fake(*merge_takes(), reply(200, ticket_issue)))
         lines_pure = brain._pull_request_lines(no_authors, REPO, [pr], data, bot)
         self.assertEqual(lines_pure, ["### Pull requests", "- #4 PR - READY"])
 
@@ -621,9 +642,9 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertIn("#1 Fresh - latest journal 2030-01-01T19:45:00Z, report 2030-01-01T19:00:00Z, "
                       "measure 2030-01-01T19:45:00Z, action 2030-01-01T19:45:00Z - report ok", report)
         self.assertIn("#2 Stale - latest journal 2030-01-01T19:50:00Z, report 2030-01-01T10:26:00Z, "
-                      "measure none, action none - report overdue (due 2030-01-01T16:26:00Z)", report)
+                      "measure none, action none - report overdue (due 2030-01-01T15:00:00Z)", report)
         owed = report.split("### Reports owed before unlock")[1].split("###")[0]
-        self.assertIn("#2 report OVERDUE since 2030-01-01T16:26:00Z", owed)
+        self.assertIn("#2 report OVERDUE since 2030-01-01T15:00:00Z", owed)
         self.assertNotIn("#1", owed)
 
     def test_a_goal_the_app_reported_minutes_ago_is_held_not_owed(self):
@@ -652,7 +673,8 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_only_a_marked_report_on_the_goal_advances_its_deadline(self):
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
-        issue = {"number": 3, "created_at": "2030-01-01T13:00:00Z"}
+        # Opened at 05:00 New York, so its first report is due at 10:00 there.
+        issue = {"number": 3, "created_at": "2030-01-01T10:00:00Z"}
         bot = {"login": "brain-bot"}
         ignored = [
             {"body": "<!-- loom:journal v1 -->\nquoting <!-- loom:report v1 -->", "createdAt": "2030-01-01T19:55:00Z", "author": bot},
@@ -661,13 +683,13 @@ class SensitiveResumeTests(unittest.TestCase):
         ]
         led = brain.goal_ledger(issue, {"comments": {"nodes": ignored}}, now, ["brain-bot"])
         self.assertNotIn("report", led)
-        self.assertEqual((led["state"], led["due"]), ("overdue", "2030-01-01T19:00:00Z"))
-        earlier = brain.datetime(2030, 1, 1, 19, 15, tzinfo=brain.timezone.utc)
+        self.assertEqual((led["state"], led["due"]), ("overdue", "2030-01-01T15:00:00Z"))
+        earlier = brain.datetime(2030, 1, 1, 15, 15, tzinfo=brain.timezone.utc)
         self.assertEqual(brain.goal_ledger(issue, {"comments": {"nodes": ignored}}, earlier, ["brain-bot"])["state"], "due")
         marked = ignored + [{"body": "<!-- loom:report v1 -->\n- Measure: 1", "createdAt": "2030-01-01T19:58:00Z", "author": bot}]
         led = brain.goal_ledger(issue, {"comments": {"nodes": marked}}, now, ["brain-bot"])
         self.assertEqual((led["report"], led["state"], led["due"]),
-                         ("2030-01-01T19:58:00Z", "ok", "2030-01-02T01:58:00Z"))
+                         ("2030-01-01T19:58:00Z", "ok", "2030-01-02T02:00:00Z"))
 
     def test_goal_without_any_stamp_is_unknown_not_young(self):
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
@@ -676,7 +698,8 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_report_deadline_changes_state_at_due_and_grace(self):
         last = brain.datetime(2030, 1, 1, 17, 0, tzinfo=brain.timezone.utc)
-        due = last + brain.timedelta(seconds=brain.REPORT_EVERY)
+        due = brain.next_report_due(last)
+        self.assertEqual(due, brain.datetime(2030, 1, 2, 2, 0, tzinfo=brain.timezone.utc))
         grace = brain.timedelta(seconds=brain.REPORT_GRACE)
         owed = due - brain.timedelta(seconds=brain.REPORT_OWED_EARLY)
         for now, state in ((owed - brain.timedelta(seconds=1), "ok"),
@@ -695,7 +718,7 @@ class SensitiveResumeTests(unittest.TestCase):
         # with time to write it first.
         from bus import station
         last = brain.datetime(2030, 1, 1, 17, 0, tzinfo=brain.timezone.utc)
-        station_posts = (last + brain.timedelta(seconds=brain.REPORT_EVERY)
+        station_posts = (brain.next_report_due(last)
                          - brain.timedelta(seconds=station.STANDUP_LEAD))
         a_tick_earlier = station_posts - brain.timedelta(hours=1)
         self.assertEqual(brain._report_deadline(last, a_tick_earlier)[1], "due")
@@ -730,6 +753,77 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
+    # loom#1711: a ticked criterion that another repo of the owner must build.
+    FOREIGN = "`other-repo` converts the two groups into one"
+    SIBLINGS = {"LOOM_REPOS": "%s example-owner/other-repo" % REPO}
+
+    def _criteria_pr(self, *criteria):
+        return ("Refs %s#9\n## Acceptance criteria\n" % REPO
+                + "".join("- [x] %s\n" % c for c in criteria))
+
+    def test_merge_refuses_a_ticked_criterion_naming_another_repo(self):
+        body = self._criteria_pr(self.FOREIGN, "local feature works")
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                                {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []))
+        with self.assertRaises(ValueError) as ctx:
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env=self.SIBLINGS)
+        msg = str(ctx.exception)
+        self.assertIn("ticked criterion names another repo, example-owner/other-repo", msg)
+        self.assertIn(self.FOREIGN, msg)
+        self.assertIn('"; not built: belongs in other-repo"', msg)
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def _merged(self, body, env):
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204),
+                    reply(200, []), reply(200, issue), reply(200, {}))
+        return brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env=env)
+
+    def test_merge_passes_the_criterion_marked_belongs_in_the_other_repo(self):
+        body = self._criteria_pr(self.FOREIGN + "; not built: belongs in other-repo",
+                                 "local feature works")
+        self.assertTrue(self._merged(body, self.SIBLINGS)["merged"])
+
+    def test_merge_passes_a_ticked_criterion_naming_its_own_repo(self):
+        body = self._criteria_pr("`example-repo` sends the new field",
+                                 "example-owner/example-repo reads it back")
+        self.assertTrue(self._merged(body, self.SIBLINGS)["merged"])
+
+    def test_status_prints_the_foreign_criterion_blocker_instead_of_ready(self):
+        pr = {"number": 8, "title": "Lane work",
+              "body": self._criteria_pr(self.FOREIGN, "local feature works")}
+        with unittest.mock.patch.dict(os.environ, self.SIBLINGS):
+            line = brain._status_pr_line(None, REPO, pr, ready_node(),
+                                         "grug-tribe", "Grug - Elder")
+        self.assertEqual(line, "- #8 Lane work - "
+                         + brain._foreign_criteria_reason(pr["body"], REPO, self.SIBLINGS))
+        self.assertIn("names another repo, example-owner/other-repo", line)
+
+    def test_foreign_criterion_forms(self):
+        cases = [
+            # OWNER/NAME with the PR's owner needs no repo list.
+            ("- [x] example-owner/other-repo stores the row", {}, True),
+            # A backticked bare name counts only when it is a known repo.
+            ("- [x] `other-repo` stores the row", {}, False),
+            ("- [x] `other-repo` stores the row", self.SIBLINGS, True),
+            ("- [x] `helper.py` stores the row", self.SIBLINGS, False),
+            # Another owner's repo, an unticked box, a wrong belongs-in repo.
+            ("- [x] someone-else/other-repo stores the row", {}, False),
+            ("- [ ] `other-repo` stores the row", self.SIBLINGS, False),
+            ("- [x] `other-repo` stores the row; not built: belongs in third-repo",
+             self.SIBLINGS, True),
+            ("- [x] `other-repo` stores the row; not built: belongs in "
+             "example-owner/other-repo", self.SIBLINGS, False),
+        ]
+        for line, env, blocked in cases:
+            with self.subTest(line=line, env=env):
+                reason = brain._foreign_criteria_reason(
+                    "## Acceptance criteria\n%s\n" % line, REPO, env)
+                self.assertEqual(bool(reason), blocked, reason)
+
     def test_merge_ready_names_each_blocker(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}
         cases = [
@@ -763,11 +857,12 @@ class SensitiveResumeTests(unittest.TestCase):
             threads=[{"isResolved": True, "root": {"nodes": [{"author": bot, "createdAt": "2030-01-01T08:06:00Z"}]}},
                      {"isResolved": True, "root": {"nodes": [{"author": operator, "createdAt": "2030-01-01T11:37:00Z"}]}}])
         pulls = [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}], "body": ""}
 
         def run():
             gh = GitHub("t", transport=Fake(reply(200, []), reply(200, pulls),
                                             reply(200, {"data": {"repository": {"p4": node}}}),
-                                            reply(200, [])))
+                                            *merge_takes(), reply(200, ticket_issue), reply(200, [])))
             return [line for line in brain.status(gh, [REPO], REPO, env={}, authors=()).splitlines()
                     if line.startswith("- #4 ")]
 
@@ -779,8 +874,10 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(run(), ["- #4 PR - blocked: grug changes_requested"])
 
     def test_status_asks_for_every_field_merge_ready_reads(self):
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}], "body": ""}
         fake = Fake(reply(200, []), reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
-                    reply(200, {"data": {"repository": {"p4": None}}}), reply(200, []))
+                    reply(200, {"data": {"repository": {"p4": None}}}), reply(200, []),
+                    reply(200, ticket_issue))
         report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={}, authors=())
         self.assertIn("- #4 PR - blocked: checks unknown", report)
         query = fake.calls[2][2]["query"]
@@ -1350,6 +1447,154 @@ class SensitiveResumeTests(unittest.TestCase):
             pr.update(changes.get("pr", {}))
             details.update(changes.get("details", {}))
         return reply(200, pr), reply(200, {"data": {"repository": {"pullRequest": details}}})
+
+    def test_goal_constraints_scan_until_first_heading(self):
+        issue = {"body": "Goal overview\nMerge constraint: C++ unit test required\n\n# Details\nMerge constraint: ignored"}
+        self.assertEqual(["C++ unit test required"], brain.goal_merge_constraints(issue))
+
+    CPP_GOAL = {"number": 1, "state": "open", "labels": [{"name": "loom:goal"}],
+                "body": "Merge constraint: C++ unit test required\n# Goal"}
+
+    def _refuse(self, goal_reply, files=None):
+        replies = [goal_reply] + ([] if files is None else [reply(200, files)])
+        fake = Fake(*replies)
+        brain._refuse_merge_constraints(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                                        {"body": "Part of #1\n"})
+        fake.assert_all_used()
+
+    def test_goal_home_cpp_unit_test_constraint_blocks_without_test_file(self):
+        with self.assertRaisesRegex(ValueError, r"goal home %s#1 rule 'C\+\+ unit test required' "
+                                    r"is not met" % REPO):
+            self._refuse(reply(200, self.CPP_GOAL), [
+                {"filename": "src/change.cpp"}, {"filename": "tests/test_change.py"}])
+
+    def test_goal_home_cpp_unit_test_constraint_accepts_tests_cpp(self):
+        self._refuse(reply(200, self.CPP_GOAL), [
+            {"filename": "src/change.cpp"}, {"filename": "tests/test_change.cpp"}])
+
+    def test_goal_home_cpp_unit_test_constraint_accepts_the_t_layout(self):
+        # The C++ module repos keep their unit tests under t/ (loom#1435).
+        self._refuse(reply(200, self.CPP_GOAL), [
+            {"filename": "src/Boss.cpp"}, {"filename": "t/TestBlackfathomDeeps.cpp"}])
+        self._refuse(reply(200, self.CPP_GOAL), [
+            {"filename": "modules/x/t/unit/TestBoss.cpp", "status": "added"}])
+
+    def test_goal_home_cpp_unit_test_constraint_ignores_a_removed_test(self):
+        with self.assertRaisesRegex(ValueError, "is not met"):
+            self._refuse(reply(200, self.CPP_GOAL), [
+                {"filename": "t/TestOld.cpp", "status": "removed"}])
+
+    def test_goal_home_rule_merge_cannot_check_refuses(self):
+        goal = dict(self.CPP_GOAL, body="Merge constraint: proof shape is a service log line\n# Goal")
+        with self.assertRaisesRegex(ValueError, r"goal home %s#1 rule 'proof shape is a service "
+                                    r"log line' cannot be checked" % REPO):
+            self._refuse(reply(200, goal))
+
+    def test_goal_home_unreadable_refuses(self):
+        with self.assertRaisesRegex(ValueError, r"goal home unreadable for ticket %s#9" % REPO):
+            self._refuse(reply(403, {"message": "Resource not accessible by integration"}))
+
+    def test_goal_home_without_constraints_reads_no_files(self):
+        self._refuse(reply(200, dict(self.CPP_GOAL, body="# Goal\nMerge constraint: x")))
+
+    def test_merge_refuses_a_pull_request_that_breaks_a_goal_home_rule(self):
+        pr, query = self._merge_replies()
+        issue = {"state": "open", "body": "Part of #1\n",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, self.CPP_GOAL),
+                    reply(200, [{"filename": "src/change.cpp"}]))
+        with self.assertRaisesRegex(ValueError, "rule 'C\\+\\+ unit test required' is not met"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse([c for c in fake.calls if c[0] == "PUT"])
+        fake.assert_all_used()
+
+    def test_merge_lands_a_pull_request_that_meets_its_goal_home_rule(self):
+        pr, query = self._merge_replies()
+        issue = {"state": "open", "body": "Part of #1\n",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, self.CPP_GOAL),
+                    reply(200, [{"filename": "src/change.cpp"}, {"filename": "t/TestChange.cpp"}]),
+                    reply(200, {"merged": True}), reply(204), reply(200, []),
+                    reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertEqual(fake.calls[5][2], {"merge_method": "squash", "sha": "checked"})
+        self.assertTrue(result["merged"])
+
+    def test_status_shows_goal_home_merge_constraint(self):
+        ticket_issue = {"number": 4, "state": "open",
+                        "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}],
+                        "body": "Part of #1\n"}
+        goal = {"number": 1, "state": "open", "labels": [{"name": "loom:goal"}],
+                "body": "Merge constraint: C++ unit test required\n"
+                        "Merge constraint: proof shape is a log line\n# Goal"}
+        pr = {"number": 8, "title": "Change", "head": {"ref": "loom/4-work"}}
+        gh = GitHub("t", transport=Fake(*merge_takes(ticket=4), reply(200, ticket_issue),
+                                         reply(200, goal),
+                                         reply(200, [{"filename": "src/a.cpp"},
+                                                     {"filename": "t/TestA.cpp"}])))
+        lines = brain._pull_request_lines(gh, REPO, [pr], {"prs": {8: ready_node()}},
+                                          "grug-tribe")
+        # Merge refuses a rule it cannot check, so status must not say READY.
+        self.assertEqual(lines[1], "- #8 Change - blocked: goal home %s#1 rule merge cannot "
+                                   "check: proof shape is a log line - rule: C++ unit test "
+                                   "required" % REPO)
+
+    def _status_line_for(self, files):
+        ticket_issue = {"number": 4, "state": "open",
+                        "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}],
+                        "body": "Part of #1\n"}
+        pr = {"number": 8, "title": "Change", "head": {"ref": "loom/4-work"}}
+        fake = Fake(*merge_takes(ticket=4), reply(200, ticket_issue),
+                    reply(200, self.CPP_GOAL), reply(200, files))
+        lines = brain._pull_request_lines(GitHub("t", transport=fake), REPO, [pr],
+                                          {"prs": {8: ready_node()}}, "grug-tribe")
+        fake.assert_all_used()
+        return lines[1]
+
+    def test_status_blocks_a_pull_request_that_breaks_a_goal_home_rule(self):
+        # loom#1435: status printed "READY - rule: ..." here while merge refused.
+        self.assertEqual(self._status_line_for([{"filename": "src/change.cpp"}]),
+                         "- #8 Change - blocked: goal home %s#1 rule not met: "
+                         "C++ unit test required" % REPO)
+
+    def test_status_shows_a_met_goal_home_rule_as_ready(self):
+        self.assertEqual(self._status_line_for([{"filename": "src/change.cpp"},
+                                                {"filename": "tests/test_change.cpp"}]),
+                         "- #8 Change - READY - rule: C++ unit test required")
+
+    def test_status_blocks_on_an_unreadable_goal_home(self):
+        ticket_issue = {"number": 4, "state": "open",
+                        "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}],
+                        "body": "Part of #1\n"}
+        pr = {"number": 8, "title": "Change", "head": {"ref": "loom/4-work"}}
+        fake = Fake(*merge_takes(ticket=4), reply(200, ticket_issue),
+                    reply(403, {"message": "Resource not accessible by integration"}))
+        lines = brain._pull_request_lines(GitHub("t", transport=fake), REPO, [pr],
+                                          {"prs": {8: ready_node()}}, "grug-tribe")
+        self.assertEqual(lines[1], "- #8 Change - blocked: goal home unreadable")
+
+    def test_cpp_unit_test_rule_does_not_apply_without_a_cpp_source_change(self):
+        # loom#1435: a docs or script change under a C++ goal home is not a
+        # C++ code change, so it needs no C++ unit test.
+        self._refuse(reply(200, self.CPP_GOAL), [
+            {"filename": "README.md"}, {"filename": "scripts/build.sh"},
+            {"filename": "CMakeLists.txt"}])
+
+    def test_cpp_unit_test_rule_applies_to_a_header_change(self):
+        with self.assertRaisesRegex(ValueError, "is not met"):
+            self._refuse(reply(200, self.CPP_GOAL), [{"filename": "src/Boss.h"}])
+        with self.assertRaisesRegex(ValueError, "is not met"):
+            self._refuse(reply(200, self.CPP_GOAL), [{"filename": "src/Boss.hpp"},
+                                                     {"filename": "tests/test_boss.py"}])
+
+    def test_brain_doc_documents_the_merge_constraint_line(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                               "docs", "BRAIN.md"), encoding="utf-8") as handle:
+            doc = handle.read()
+        self.assertIn("### Merge constraints", doc)
+        self.assertIn("`Merge constraint: <rule>`", doc)
+        self.assertIn("above\nthe body's first heading", doc)
+        self.assertIn("C++ unit test required", doc)
 
     def test_merge_refusals_do_not_call_merge(self):
         cases = [
@@ -2253,6 +2498,44 @@ class Routed:
 
     def sent(self, method, suffix):
         return [c[2] for c in self.calls if c[0] == method and c[1].split("?")[0].endswith(suffix)]
+
+
+class StatusMergeRefusalTests(unittest.TestCase):
+    """loom#1643: status prints READY only for a pull request merge would
+    take; each refusal merge makes before it merges is a blocker."""
+
+    PR = {"number": 9, "title": "Work", "head": {"ref": "loom/7-work", "sha": "h"},
+          "labels": [{"name": "class:logic"}]}
+
+    def lines(self, state="pr", mergeable=True, mergeable_state="clean",
+              files=("bus/a.py", "tests/test_a.py"), env=None):
+        issue = {"number": 7, "state": "open", "body": "",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]}
+        routes = {
+            ("GET", "/issues/7"): reply(200, issue),
+            ("GET", "/pulls/9"): reply(200, {"number": 9, "mergeable": mergeable,
+                                             "mergeable_state": mergeable_state}),
+            ("GET", "/pulls/9/files"): reply(200, [{"filename": f, "patch": "+x"} for f in files]),
+        }
+        gh = GitHub("t", transport=Routed(routes))
+        with unittest.mock.patch.dict(os.environ, env or {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}):
+            return brain._pull_request_lines(gh, REPO, [self.PR], {"prs": {9: ready_node()}},
+                                             "grug-tribe")
+
+    def test_a_ticket_not_at_pr_blocks(self):
+        self.assertEqual(self.lines(state="running")[1],
+                         "- #9 Work - blocked: ticket at loom:running, not loom:pr")
+
+    def test_a_dirty_pull_request_blocks_as_a_conflict(self):
+        self.assertEqual(self.lines(mergeable=False, mergeable_state="dirty")[1],
+                         "- #9 Work - blocked: conflicts with the default branch")
+
+    def test_a_tier_outside_the_auto_tiers_is_held_for_the_operator(self):
+        line = self.lines(files=("deploy/app.yaml",))[1]
+        self.assertEqual(line, "- #9 Work - blocked: held for the operator: deploy-config")
+
+    def test_a_pull_request_merge_would_take_is_ready(self):
+        self.assertEqual(self.lines()[1], "- #9 Work - READY")
 
 
 class ModelFlagTests(unittest.TestCase):
@@ -4084,10 +4367,27 @@ class LogExcerptTests(unittest.TestCase):
 
 
 class ReportCadenceTest(unittest.TestCase):
-    def test_a_goal_report_is_due_every_six_hours(self):
+    def test_a_goal_report_is_due_at_the_two_reading_times(self):
         # 2026-10-18: 2-hourly reports on 13 goals sent the operator about 13
-        # emails an hour; the operator chose every 6 hours.
-        self.assertEqual(brain.REPORT_EVERY, 6 * 3600)
+        # emails an hour; 6-hourly ones on 26 goals sent up to a hundred a
+        # day. 2026-10-25: twice a day, 10:00 and 21:00 New York, the digest's
+        # times.
+        from bus import station
+        self.assertEqual(brain.REPORT_TIMES, ((10, 0), (21, 0)))
+        self.assertEqual(station.DIGEST_TIMES, "10:00,21:00")
+        utc = brain.timezone.utc
+        for last, due in (
+                # Winter (UTC-5): 10:00 is 15:00Z, 21:00 is 02:00Z next day.
+                ((2030, 1, 1, 2, 0), (2030, 1, 1, 15, 0)),
+                ((2030, 1, 1, 12, 44), (2030, 1, 1, 15, 0)),
+                # Written in the 2h15m before 10:00, it counts for 10:00.
+                ((2030, 1, 1, 12, 45), (2030, 1, 2, 2, 0)),
+                ((2030, 1, 1, 23, 50), (2030, 1, 2, 15, 0)),
+                # Summer (UTC-4): 10:00 is 14:00Z.
+                ((2030, 7, 1, 3, 0), (2030, 7, 1, 14, 0))):
+            with self.subTest(last=last):
+                self.assertEqual(brain.next_report_due(brain.datetime(*last, tzinfo=utc)),
+                                 brain.datetime(*due, tzinfo=utc))
 
 class LiveCriterionTest(unittest.TestCase):
     """2026-10-18: 3 of 72 merged tickets verified; most verify runs found no

@@ -39,6 +39,10 @@ from . import tickets_table
 from . import tree as tree_view
 from . import operators as operators_view
 from . import needs_you as needs_you_view
+from . import answers as answers_view
+from bus import answer as bus_answer
+from .github import AskBudget
+from bus.github import GitHubError
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 from . import views
@@ -773,26 +777,116 @@ def _empty_epics(empty):
             html.escape(_repo_number(epic))) for epic in empty))
 
 
-def _needs_you(document, state, *, source_missing=False, who=""):
-    """Everything waiting on a person (loom#810): needs-operator asks from
-    Hunt's document and the store, and needs:<login> items from the
-    Operators pass, each once, filtered by ?who=."""
+def _needs_sources(document, state):
+    """(asks, claims, repos) the Needs-you page reads: needs-operator and
+    loom:human asks from Hunt's document and the store, and the Operators
+    pass's needs:<login> and answered items."""
     asks = list(document.get("needs_operator") or []) + list(getattr(state, "operator_items", []))
     response = getattr(state, "response", None)
     claims = (response() if callable(response) else {}).get("operator_claims") or {}
     repos = list(getattr(state, "repos", None) or [])
-    found, cards = needs_you_view.render(asks, claims, who, repos)
+    return asks, claims, repos
+
+
+def _answer_bar(mode):
+    """Who answers from this page and how: the token kept in this browser and
+    the operator it answers as (loom#1777)."""
+    esc = html.escape
+    if mode == "off":
+        return ""
+    if mode == "header":
+        return '<p class="answer-bar machine-fact" data-answer-mode="header">Answers post as the signed-in operator.</p>'
+    ops = bus_answer.operators()
+    choices = "".join('<option value="%s">%s</option>' % (esc(login, quote=True), esc(login)) for login in ops)
+    return ('<details class="answer-bar card" data-answer-mode="token"><summary>Answering from this browser'
+            '</summary><form class="answer-auth" data-answer-auth><label>Answer as <select name="as">%s</select>'
+            '</label><label>Answer token <input name="token" type="password" autocomplete="off" '
+            'placeholder="LOOM_ANSWER_TOKEN"></label><button type="submit">Keep in this browser</button>'
+            '<p class="answer-status" role="status" aria-live="polite"></p></form></details>') % choices
+
+
+def _needs_you(document, state, *, source_missing=False, who=""):
+    """Everything waiting on a person (loom#810): needs-operator and
+    loom:human asks from Hunt's document and the store, and needs:<login>
+    items from the Operators pass, each once, filtered by ?who=. Each card
+    takes an answer (loom#1777)."""
+    asks, claims, repos = _needs_sources(document, state)
+    mode = answers_view.mode(state)
+    found, cards = needs_you_view.render(asks, claims, who, repos, answers_view.posted(state), mode)
     out = ['<p class="page-lede">Only what only a person can do: each item names who it waits on. '
-           'Everything else the brain does itself.</p>']
+           'Everything else the brain does itself.</p>', _answer_bar(mode)]
     if source_missing:
         out.append('<p class="card">Backlog source unavailable: Hunt\'s items are not shown.</p>')
+    out.append(needs_you_view.goal_caps_section(getattr(state, "goal_caps", None), time.time()))
+    out.append(needs_you_view.brain_holds_section(getattr(state, "brain_holds", None), time.time()))
     out.append(cards)
     if not who:
         out.append(_backlog_asks(document, found, repos))
     counts = getattr(state, "human_counts", None) or document.get("loom_human_counts") or {}
     out.append('<footer>loom:human counts by repo: %s</footer>' % html.escape(
         ", ".join("%s: %s" % (repo, count) for repo, count in counts.items()) or "none"))
-    return page("Needs you", "needs-you", "".join(out), status="Read only")
+    return page("Needs you", "needs-you", "".join(out),
+                status="Read only" if mode == "off" else "Answers on")
+
+
+def _needs_entry(state, repo, number):
+    raw = _backlog_bytes()
+    asks, claims, repos = _needs_sources(_backlog_document(raw or b"{}"), state)
+    return needs_you_view.find(asks, claims, repo, number, repos, answers_view.posted(state))
+
+
+def _handle_answer_post(handler, state):
+    """POST /api/needs-you/answer (loom#1777): one operator's answer to one
+    listed item, posted as one comment by the Loom App."""
+    try:
+        body = _json_body(handler)
+        if not isinstance(body, dict):
+            raise ValueError("the request is a JSON object")
+    except (ValueError, json.JSONDecodeError) as exc:
+        return handler.send_json(400, {"error": str(exc)})
+    try:
+        login = answers_view.identify(handler.headers, body)
+        repo, number = answers_view.parse_target(body)
+        entry = _needs_entry(state, repo, number)
+        if entry is None:
+            raise answers_view.Refused(404, "%s#%d is not on the Needs you page" % (repo, number))
+        if entry.get("pending"):
+            raise answers_view.Refused(409, "%s#%d is answered; the station has not applied it yet"
+                                       % (repo, number))
+        result = answers_view.post(state, entry, login, body.get("choice"), body.get("note"))
+    except answers_view.Refused as exc:
+        return handler.send_json(exc.code, {"error": str(exc)})
+    entry = _needs_entry(state, repo, number)
+    result["card"] = needs_you_view.card(entry, answers_view.mode(state)) if entry else ""
+    return handler.send_json(200, result)
+
+
+def _handle_ask_get(handler, state, parsed):
+    """GET /api/needs-you/ask?repo=&number= (loom#1777): read one card's ask
+    now, when the refresh pass has not, under its budget rules; answers the
+    card's HTML."""
+    query = parse_qs(parsed.query)
+    try:
+        repo, number = answers_view.parse_target({"repo": query.get("repo", [""])[0],
+                                                  "number": query.get("number", [""])[0]})
+    except answers_view.Refused as exc:
+        return handler.send_json(exc.code, {"error": str(exc)})
+    reader = getattr(state, "read_ask_now", None)
+    if not callable(reader):
+        return handler.send_json(503, {"error": "no ask reader"})
+    try:
+        reader(repo, number)
+    except KeyError as exc:
+        return handler.send_json(404, {"error": str(exc).strip("'\"")})
+    except AskBudget as exc:
+        return handler.send_json(429, {"error": str(exc)})
+    except (GitHubError, OSError, ValueError) as exc:
+        return handler.send_json(502, {"error": str(exc)})
+    entry = _needs_entry(state, repo, number)
+    if entry is None:
+        return handler.send_json(404, {"error": "%s#%d is not on the Needs you page" % (repo, number)})
+    return handler.send_json(200, {"card": needs_you_view.card(entry, answers_view.mode(state)),
+                                   "ask": needs_you_view.ask_text(entry)})
 
 
 def _backlog_asks(document, found, repos):
@@ -933,6 +1027,31 @@ def _handle_usage_post(handler, state):
         return handler.send_json(400, {"error": str(exc)})
 
 
+def _handle_goal_caps_post(handler, state):
+    """POST /api/goal-caps (loom#1831): the station's goals stuck at their
+    in-flight cap, with the upload token, shown on the Needs-you page."""
+    if not _authorized(handler):
+        return handler.send_json(401, {"error": "unauthorized"})
+    try:
+        state.goal_caps = needs_you_view.goal_caps(_json_body(handler), time.time())
+    except (ValueError, json.JSONDecodeError) as exc:
+        return handler.send_json(400, {"error": str(exc)})
+    return handler.send_json(201, {"goals": len(state.goal_caps["goals"])})
+
+
+def _handle_brain_holds_post(handler, state):
+    """POST /api/brain-holds (loom#1872): the station's per-repo counts of
+    needs-brain holds older than a day, with the upload token, shown on the
+    Needs-you page."""
+    if not _authorized(handler):
+        return handler.send_json(401, {"error": "unauthorized"})
+    try:
+        state.brain_holds = needs_you_view.brain_holds(_json_body(handler), time.time())
+    except (ValueError, json.JSONDecodeError) as exc:
+        return handler.send_json(400, {"error": str(exc)})
+    return handler.send_json(201, {"repos": len(state.brain_holds["repos"])})
+
+
 # Brain memory (dashboard/brain_memory.py): the station writes ticks,
 # closings and rules with the upload token. Every brain reads the handoff
 # packet with it or with LOOM_HANDOFF_TOKEN, which can only read.
@@ -977,6 +1096,12 @@ def _handler_for(state):
             path = self.path.split("?", 1)[0]
             if path == "/api/usage":
                 return _handle_usage_post(self, state)
+            if path == "/api/goal-caps":
+                return _handle_goal_caps_post(self, state)
+            if path == "/api/brain-holds":
+                return _handle_brain_holds_post(self, state)
+            if path == "/api/needs-you/answer":
+                return _handle_answer_post(self, state)
             if path in BRAIN_WRITES:
                 return _handle_brain(self, state, BRAIN_WRITES[path])
             if path != "/api/transcripts":
@@ -1019,6 +1144,8 @@ def _dispatch_get(handler, state):
         return _dispatch_ticket_api(handler, state, parsed)
     if path in ("/backlog", "/backlog.json", "/needs-you"):
         return _dispatch_backlog(handler, state, path, parsed)
+    if path == "/api/needs-you/ask":
+        return _handle_ask_get(handler, state, parsed)
     if path in STATIC_ASSETS:
         return _dispatch_static(handler, path)
     if path in ("/improving", "/lanes"):

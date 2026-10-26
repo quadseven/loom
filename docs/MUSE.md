@@ -197,7 +197,7 @@ tickets and pull requests like any other work.
   `- Friction:` line each (docs/BRAIN.md, Journal): a lane PR that failed
   for a reason the runner could catch, a step done by hand that the station
   could do, a rule a brief kept missing, a check that wasted a reply.
-- Every 6 hours, with the report, brief the single biggest such problem as a
+- Twice a day, with the report, brief the single biggest such problem as a
   ticket on loom#30 (or on the review bot's goal, quadseven/grug#1143, when
   the review bot caused it), with the evidence. End its Why with a
   `Noticed in <journal comment link>: "<the Friction line>"` line
@@ -307,10 +307,14 @@ this tick"; a step with no note shows nothing there.
    for each goal, its latest journal, report, measurement and completed
    action, and its report deadline. Every goal under "Reports owed before
    unlock" gets its report in the report step this tick, in every scope,
-   including live. A report is owed from 3 hours 45 minutes after the last
-   one. If the brain has not written it, the station posts the data-only
-   report once the last report is 5 hours 45 minutes old, so no goal's
-   report passes 6 hours; never hand an owed report to another brain.
+   including live. Reports go out twice a day, for the operator's reading
+   times, 10:00 and 21:00 New York: a report is owed from 2 hours 15
+   minutes before the next reading time after the last one. If the brain
+   has not written it, the station posts the data-only report 15 minutes
+   before the reading time; never hand an owed report to another brain. A
+   per-repo backlog goal (labelled `loom:backlog`) is never owed a report:
+   its status is one line in the station's twice-daily Discord digest, and
+   `journal` refuses a report there (`not posted:`, exit 0).
    A goal listed as `report HELD` already has a report under 90 minutes old
    (the station's included): skip it this tick. A goal whose line says
    `quiet since <time>` is quiet since its last report (no ticket opened,
@@ -368,7 +372,10 @@ this tick"; a step with no note shows nothing there.
    live claim: its last run has ended, and once the hold is cleared the
    factory moves it up the model ladder.
 3. First run `python3 -m bus.brain step merge --holder muse`. The station hands failed checks and unresolved review-bot threads back to
-   the authoring lane automatically, up to `LOOM_FIX_ROUNDS` (default 3).
+   the authoring lane automatically, up to `LOOM_FIX_ROUNDS` (default 3) per
+   rung. A round that leaves the same failures climbs the model ladder at
+   once; with no rung left the rounds stop, and the ticket is `loom:failed`
+   with `handoff:claude` (docs/BRAIN.md).
    The factory pass (bus/factory.py) moves stuck and failed tickets up the
    model ladder every 5 minutes. Review in full only tickets labeled
    `needs-brain`: read the whole diff against the ticket and acceptance
@@ -516,30 +523,39 @@ this tick"; a step with no note shows nothing there.
    the step's name from the list above (lock, status, merge, verify, failed,
    asks, brief, triage, journal, unlock): the station files a ticket when one
    brain's two ticks in a row carry such a line (docs/LANES.md, Invariants).
-   Every 6 hours per goal (when status lists the goal under "Reports owed
-   before unlock" as due, overdue or heartbeat; a quiet goal is not
-   listed and gets no report), also post the report: a separate comment on the goal
+   Twice a day per goal (when status lists the goal under "Reports owed
+   before unlock" as due, overdue or heartbeat; a quiet goal and a backlog
+   goal are not listed and get no report), also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line
    `<!-- loom:report v1 -->` followed by the report itself, written as a
-   standup the operator can read in thirty seconds on a phone:
+   standup the operator can read in thirty seconds on a phone. It is the
+   first line and at most five more, one line each, then "Needs you:" and
+   "Waiting on you:"; no headings, no lists, no blank-line sections.
+   `journal` refuses a longer report (exit 2, a failed step to rewrite):
    - First line: one sentence on how the goal is doing since the last report
      (better, the same, or worse, and the one number that shows it).
-   - Going well: one to three things that moved, in plain words.
-   - Not going well: one to three things that got worse or failed, and
-     on the goal home the station files invariant breaches on, every issue
-     `status` lists under "Invariants broken".
-   - Still stuck since last report: anything the previous report already
-     named as stuck or blocked and still is, with how long; say "nothing"
-     when the list is empty. Read the previous report to fill this in.
-   - Next: what the brain will do before the next report.
-   - Needs you: only what only the operator can do, or "nothing", then the
-     count of open `loom:human` issues by repo (for example "loom:human: 12
-     in OWNER/NAME, 3 in OWNER/OTHER"); the daily digest lists them, so do
-     not list them here.
+   - `Going well:` one line, the one to three things that moved, in plain words.
+   - `Not going well:` one line, the one to three things that got worse or
+     failed, and on the goal home the station files invariant breaches on,
+     the issues `status` lists under "Invariants broken".
+   - `Still stuck:` one line, anything the previous report already named as
+     stuck or blocked and still is, with how long; "nothing" when the list
+     is empty. Read the previous report to fill this in.
+   - `Next:` one line, what the brain will do before the next report.
+   - Needs you: only what only the operator can do for THIS goal, or
+     "nothing new for this goal". Never a count: this line is what `journal`
+     compares to tell a new ask from an unchanged one.
+   - Waiting on you: the next line, always. Copy it from the "## Waiting on
+     you" section of `status`, which fills it from data: "Waiting on you: 28
+     open loom:human (25 in OWNER/NAME, 3 in OWNER/OTHER; 4 of them under
+     this goal), listed in the daily digest", or "Waiting on you: nothing"
+     when none is open. The daily digest lists them, so do not list them here.
+     "nothing" never sits beside a count on one line (the operator read
+     "Needs you: nothing. loom:human: 28 in OWNER/NAME." as both, 2026-10-25).
    Write sentences, not ticket lists: name a ticket only where the operator
    may want to open it, and never more than one or two per line. Numbers
-   over adjectives. A goal home may ask for extra lines; add them after
-   these. The station sends every report to the operator's phone, so it
+   over adjectives. A goal home that asks for an extra line gets it in place
+   of one of these, never past the five. The station sends every report to the operator's phone, so it
    must stand on its own. Each goal needs its own report on its own home:
    a report on a parent goal does not cover its child goals, and a journal
    or a report quoted inside another comment does not count. `journal`
@@ -552,7 +568,12 @@ this tick"; a step with no note shows nothing there.
    heartbeat (once a quiet week) is edited into the last report in place,
    and so is a report whose "Needs you:" line asks the same as the last
    report's: only a new ask posts a new comment (loom#1560). Keep the
-   "Needs you:" line exact, so an unchanged ask reads as unchanged.
+   "Needs you:" line exact, so an unchanged ask reads as unchanged. Only
+   that line is compared: a "Waiting on you:" count that moved alone edits
+   the last report in place (loom#1775). A report whose "Needs you:" line
+   carries a `loom:human` count, or whose "Waiting on you:" line says
+   "nothing" beside a number, is refused: `journal` posts nothing, prints
+   `not posted:` and the reason, and exits 2, a failed step to rewrite.
 10. First run `python3 -m bus.brain step unlock --holder muse`. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
     failure as well.
 11. End the tick's chat reply in the same standup shape as the reports

@@ -25,6 +25,8 @@ PLACEHOLDER_RE = re.compile(r"\.\.\.|<[A-Za-z][A-Za-z0-9_-]*>|(?<=')[A-Z](?=')|(
 # A template whose longest fixed part is shorter than this matches too much.
 MIN_LITERAL = 6
 MAX_NEEDLES = 5
+# Spans that name a live-evidence adapter step, not a string to find.
+TEMPLATE_PREFIXES = ("log:", "sql:")
 # A log command may print this line to say how many hours of log it could read
 # (a pod restart cuts the log short of the window it was asked for).
 WINDOW_RE = re.compile(r"^loom-evidence-window-hours:\s*([0-9]+(?:\.[0-9]+)?)\s*$")
@@ -51,10 +53,17 @@ def _eligible(value: str) -> bool:
             and all(32 <= ord(char) < 127 for char in value))
 
 
+def template(value: str) -> bool:
+    """Whether a span is a live-evidence adapter template (`log:<source>`,
+    `sql:<SELECT ...>`, bus/live_proof.py) rather than a string to find."""
+    return value.strip().lower().startswith(TEMPLATE_PREFIXES)
+
+
 def needles(live: str) -> List[str]:
     """Eligible exact strings named by the ticket's Live criterion."""
     found = (tick or quoted for tick, quoted in NEEDLE_RE.findall(live))
-    return list(dict.fromkeys(value for value in found if _eligible(value)))[:MAX_NEEDLES]
+    return list(dict.fromkeys(value for value in found
+                              if _eligible(value) and not template(value)))[:MAX_NEEDLES]
 
 
 def absent_needles(live: str) -> List[str]:
@@ -77,7 +86,7 @@ def absent_needles(live: str) -> List[str]:
         flag = (previous if joined
                 else bool(_BEFORE_ABSENT_RE.search(clause)))
         flag = flag or bool(_AFTER_ABSENT_RE.search(after[:60]))
-        if flag and _eligible(value) and value not in absent:
+        if flag and _eligible(value) and not template(value) and value not in absent:
             absent.append(value)
         previous = flag
         end = match.end()
