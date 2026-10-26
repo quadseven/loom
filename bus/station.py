@@ -1763,7 +1763,7 @@ class Station:
         self._issue_stamps: Dict[Tuple[str, int], str] = {}
         saved_reads = _read_json(os.path.join(self.state, "ticket_reads.json"), {}, strict=False)
         self._ticket_reads: Dict[str, Any] = saved_reads if isinstance(saved_reads, dict) else {}
-        if getattr(self.gh, "target", None) is None:
+        if hasattr(self.gh, "target") and self.gh.target is None:
             self.gh.target = PASS_REQUEST_TARGET
 
     # -- paths ---------------------------------------------------------
@@ -2171,10 +2171,8 @@ class Station:
         or when its newest claim's brief is still waiting or running in a
         lane inbox (left for the next pass)."""
         number = int(issue["number"])
-        if self._verify_before_build(repo, issue):
-            return False
-        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
-        if self._target_reached():
+        comments = self._claim_comments(repo, issue, number)
+        if comments is None:
             return False
         try:
             fix_source = self._fix_for(repo, comments)
@@ -2220,6 +2218,14 @@ class Station:
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
+
+    def _claim_comments(self, repo: str, issue: Dict[str, Any],
+                        number: int) -> Optional[List[Any]]:
+        """Read claim comments after verification, stopping at the pass target."""
+        if self._verify_before_build(repo, issue):
+            return None
+        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        return None if self._target_reached() else comments
 
     def _linked_pulls(self, repo: str, number: int) -> List[str]:
         """The pull requests in any repo that reference the ticket, from the
@@ -11316,8 +11322,12 @@ class Station:
 
     def _target_reached(self) -> bool:
         target = getattr(self.gh, "target", None)
-        counted = getattr(self.gh, "counted", self.gh.requests - self.gh.not_modified)
-        return target is not None and counted >= target
+        if not isinstance(target, int) or isinstance(target, bool):
+            return False
+        counted = getattr(self.gh, "counted", None)
+        if counted is None:
+            counted = getattr(self.gh, "requests", 0) - getattr(self.gh, "not_modified", 0)
+        return counted >= target
 
     def _deferred(self) -> bool:
         """True when the budget is low or the pass request target has been

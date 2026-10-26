@@ -1064,7 +1064,8 @@ class GitHub:
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"
         kind = request_kind("GET", path)
-        if self.target is not None and self.counted >= self.target and kind in DEFERRABLE_KINDS:
+        if (isinstance(self.target, int) and not isinstance(self.target, bool)
+                and self.counted >= self.target and kind in DEFERRABLE_KINDS):
             with self._count_lock:
                 self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
             return []
@@ -1088,7 +1089,8 @@ class GitHub:
                 nxt = _with_page(url, _page_of(url) + 1)
             url = nxt
             if url:
-                if self.target is not None and self.counted >= self.target and kind in DEFERRABLE_KINDS:
+                if (isinstance(self.target, int) and not isinstance(self.target, bool)
+                        and self.counted >= self.target and kind in DEFERRABLE_KINDS):
                     with self._count_lock:
                         self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
                     break
@@ -1099,6 +1101,9 @@ class GitHub:
         """Read known pages concurrently, preserving their page order."""
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"
+        if (isinstance(self.target, int) and not isinstance(self.target, bool)
+                and request_kind("GET", path) in DEFERRABLE_KINDS):
+            return self.paginate(path)
         first = self.rest("GET", path)
         last = _last_link(first.headers.get("link", ""))
         if not last or _page_of(last) <= 1:
