@@ -8,12 +8,14 @@ Held while a repo is in shadow:
   merge` (the station's and Muse's), the deploy-watch revert path and the
   roll pin;
 - an issue close (PATCH state=closed, GraphQL closeIssue or an update to
-  CLOSED) and an issue reopen (PATCH state=open, GraphQL reopenIssue), an
-  invariant breach's own issue included (loom#1551), except Loom's own
-  factory incidents and health signatures that carry no work label: an open
-  incident holds the tickets behind it. Closing or reopening a pull request
-  is let through: it can be undone, its branch stays, and the factory closes
-  superseded lane pull requests so lanes do not work twice;
+  CLOSED) and an issue reopen (PATCH state=open, GraphQL reopenIssue),
+  except Loom's own factory incidents, health signatures and invariant
+  breach issues that carry no work label (an open incident holds the
+  tickets behind it; a cleared breach is Loom's own report, and the
+  invariants step reopens it if it comes back); a recurring breach stays
+  held. Closing or reopening a pull request is let through: it can be
+  undone, its branch stays, and the factory closes superseded lane pull
+  requests so lanes do not work twice;
 - a label that grants a merge or marks a ticket shipped
   (MERGE_LABELS), and a GraphQL label write, whose label ids it cannot read;
 - an approving pull request review (REST or GraphQL);
@@ -92,10 +94,15 @@ MERGE_LABELS: Dict[str, Tuple[str, ...]] = {
 }
 # A close of an issue with one of these is a decision about work: held.
 WORK_LABELS = ("loom:ticket", "loom:goal", "loom:backlog", "loom:rewritten")
-# An invariant breach's issue gates no ticket (only reports read it), so its
-# close on the invariants step's own rule is a decision shadow mode records
-# like any other (loom#1551): held, whatever other label it carries.
-HELD_SIGNAL_LABELS = ("loom:invariant", "loom:recurring")
+# A breach that keeps coming back stays open for a fix: its close is held.
+HELD_SIGNAL_LABELS = ("loom:recurring",)
+# An invariant breach's own issue, filed by the invariants step (its body
+# carries INVARIANT_MARKER), closes and reopens in shadow on that step's
+# rule. loom#1551 held it; on 2026-10-26 35 such issues the station had
+# marked cleared stayed open and the operator asked why Loom did not clean
+# up after itself. A close can be undone by the reopen the same rule makes.
+INVARIANT_LABEL = "loom:invariant"
+INVARIANT_MARKER = "<!-- loom:invariant v1 key="
 # A factory incident whose check passed again closes in shadow too: holding
 # it would hold every ticket it blocks (wait:incident). Only an issue with one
 # of these, no work label and no held signal label is let through.
@@ -369,10 +376,10 @@ def label_is_new(label: str, have: Sequence[str]) -> bool:
 def close_let_through(issue: Any) -> bool:
     """Whether a close or reopen of `issue` (as read just now; None when the
     read failed) goes through in shadow: a pull request (closed unmerged, it
-    can be reopened), or a factory incident or a watcher's health signature
-    closing on its rule (no work label, no invariant label). An invariant
-    breach's issue is held (loom#1551), and so is an issue whose labels
-    cannot be read."""
+    can be reopened), a factory incident or a watcher's health signature
+    closing on its rule (no work label), or an invariant breach's own issue
+    (its marker in the body, no work label, not recurring). An issue whose
+    labels cannot be read is held."""
     if not isinstance(issue, dict):
         return False
     if "pull_request" in issue:
@@ -382,6 +389,8 @@ def close_let_through(issue: Any) -> bool:
         return False
     if set(names) & set(SIGNAL_LABELS):
         return True
+    if INVARIANT_LABEL in names:
+        return INVARIANT_MARKER in str(issue.get("body") or "")
     return TRIAGE_LABEL in names and WATCH_MARKER in str(issue.get("body") or "")
 
 

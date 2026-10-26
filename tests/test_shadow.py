@@ -199,19 +199,19 @@ class ChokePointTest(ShadowCase):
         fake = Recorder(items)
         gh = GitHub("t", transport=fake)
         gh.rest("PATCH", "/repos/%s/pulls/19" % REPO, {"state": "closed"})
-        for number in (20, 22):
+        for number in (20, 22, 25):
             gh.rest("PATCH", "/repos/%s/issues/%d" % (REPO, number),
                     {"state": "closed", "state_reason": "not_planned"})
-        # An invariant breach's issue (loom#1551), a ticket, and an issue
-        # Loom cannot tell is its own.
-        for number in (21, 23, 24, 25):
+        # An invariant label with no breach marker in the body, a ticket, and
+        # an issue Loom cannot tell is its own.
+        for number in (21, 23, 24):
             with self.assertRaises(ShadowHeld):
                 gh.rest("PATCH", "/repos/%s/issues/%d" % (REPO, number),
                         {"state": "closed", "state_reason": "not_planned"})
         self.assertEqual([p for _, p, _ in fake.sent],
                          ["/repos/%s/pulls/19" % REPO] +
-                         ["/repos/%s/issues/%d" % (REPO, n) for n in (20, 22)])
-        self.assertEqual(sorted(e["number"] for e in self.entries()), [21, 23, 24, 25])
+                         ["/repos/%s/issues/%d" % (REPO, n) for n in (20, 22, 25)])
+        self.assertEqual(sorted(e["number"] for e in self.entries()), [21, 23, 24])
 
     def test_a_label_already_on_or_already_past_is_no_new_grant(self):
         items = {"/repos/%s/issues/30" % REPO: issue(30, ("loom:ticket", "loom:shipped")),
@@ -828,13 +828,13 @@ class InvariantsCloseTest(ShadowCase):
     NOW = 1_800_000_000.0
     NUMBER = 77
 
-    def wire(self, state="open"):
+    def wire(self, state="open", labels=("loom:triage", "loom:invariant")):
         breach = {"number": self.NUMBER, "state": state, "title": "Lane pull request #5 open",
                   "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW - 86400)),
                   "closed_at": None if state == "open" else time.strftime(
                       "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW - 3600)),
                   "body": invariants.MARKER % "lane-pr-stalled/ad09a1c365b8" + "\nA breach.",
-                  "labels": [{"name": "loom:triage"}, {"name": "loom:invariant"}]}
+                  "labels": [{"name": name} for name in labels]}
         sent = []
 
         def transport(method, url, headers, body):
@@ -859,8 +859,18 @@ class InvariantsCloseTest(ShadowCase):
             invariants.Filer(gh, REPO, 30, {}, self.NOW, said.append).run(list(breaches))
         return said
 
-    def test_the_cleared_close_is_recorded_and_no_close_is_sent(self):
+    def test_a_cleared_breach_closes_in_shadow_too(self):
+        # 2026-10-26: 35 breach issues the station had marked cleared stayed
+        # open under shadow and the operator asked why Loom did not clean up.
         transport, sent = self.wire()
+        said = self.run_filer(transport)
+        self.assertIn(("PATCH", "/repos/%s/issues/%d" % (REPO, self.NUMBER),
+                       {"state": "closed", "state_reason": "not_planned"}), sent)
+        self.assertTrue(any("closed cleared" in line for line in said), said)
+        self.assertEqual(self.entries(), [])
+
+    def test_a_recurring_breach_stays_held_in_shadow(self):
+        transport, sent = self.wire(labels=("loom:triage", "loom:invariant", "loom:recurring"))
         said = self.run_filer(transport)
         closes = [r for r in sent if isinstance(r[2], dict) and r[2].get("state") == "closed"]
         self.assertEqual(closes, [], "shadow mode sent a close: %s" % closes)
