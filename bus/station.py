@@ -768,6 +768,7 @@ class Settings:
                  report_digest: Sequence[Tuple[int, int]] = (),
                  health_urls: str = "",
                  health_every: int = health.EVERY,
+                 health_diagnose: Optional[Dict[str, str]] = None,
                  friction_mode: str = "",
                  evidence_cmds: Optional[Dict[str, str]] = None,
                  evidence_window_hours: float = EVIDENCE_WINDOW_HOURS,
@@ -784,8 +785,13 @@ class Settings:
                  disk_free_min_gb: float = DISK_FREE_MIN_GB,
                  settle_claimed: str = "off",
                  settle_claimed_max: int = claimed.PER_RUN,
-                 claim_idle_hours: int = 0) -> None:
+                 claim_idle_hours: int = 0,
+                 agy_workdir: str = "") -> None:
         self.home = home
+        # The agy lane's tree folder (lanes/run_lane.sh WORKDIR for LANE=agy),
+        # pruned beside home/worktrees; empty, the default for a Settings
+        # built in code, prunes home/worktrees only.
+        self.agy_workdir = agy_workdir
         # LOOM_CLAIM_IDLE_HOURS: another operator's claim its claimer has left
         # alone this long comes back to this Loom (bus/stale_claims.py); 0, the
         # default for a Settings built in code, is off; from_env defaults to 24.
@@ -819,6 +825,9 @@ class Settings:
         # endpoint (bus/health.py, docs/HEALTH.md), read every health_every s.
         self.health_urls = health_urls
         self.health_every = health_every
+        # "owner/name#goal" -> the goal home's read-only diagnosis command,
+        # whose output every health brief quotes (docs/HEALTH.md, loom#1243).
+        self.health_diagnose = health_diagnose or {}
         # LOOM_FRICTION_INTAKE: "on" files a ticket for a slowdown the tick
         # journals keep naming, "dry" logs what it would file, "" is off
         # (bus/friction_intake.py).
@@ -955,6 +964,7 @@ class Settings:
                        env.get("LOOM_LIVE_EVIDENCE_PASS_ENV", ""), env),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
+                   health_diagnose=_health_diagnose(env),
                    friction_mode=friction_intake.mode(env.get("LOOM_FRICTION_INTAKE", "")),
                    roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")),
                    pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"),
@@ -968,7 +978,16 @@ class Settings:
                                                 or env.get("LOOM_DISK_FREE_MIN_GB", "")),
                    settle_claimed=claimed.mode(env.get("LOOM_SETTLE_CLAIMED", "")),
                    settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")),
-                   claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")))
+                   claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")),
+                   agy_workdir=_agy_workdir(env))
+
+
+def _agy_workdir(env: Dict[str, str]) -> str:
+    """The agy lane's tree folder, with lanes/run_lane.sh's defaults."""
+    if env.get("LOOM_AGY_WORKDIR"):
+        return env["LOOM_AGY_WORKDIR"]
+    home = env.get("LOOM_AGY_HOME") or "/Users/%s" % (env.get("LOOM_AGY_USER") or "loom")
+    return os.path.join(home, "lanes")
 
 
 def _keep_days(raw: str) -> int:
@@ -1140,6 +1159,13 @@ def _workflow_run_steps(path: str, workflow: str) -> List[Tuple[str, str]]:
         if command:
             found.append(("%s, step %s" % (path, step_name or str(run_number)), command))
     return found
+
+
+def _health_diagnose(env: Dict[str, str]) -> Dict[str, str]:
+    commands, problem = health.diagnose_commands(env.get("LOOM_HEALTH_DIAGNOSE_CMDS", ""))
+    if problem:
+        _say("ignoring LOOM_HEALTH_DIAGNOSE_CMDS: %s" % problem)
+    return commands
 
 
 def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
@@ -8871,7 +8897,7 @@ class Station:
         last = state.get("last")
         if isinstance(last, (int, float)) and 0 <= self.now - last < self.s.health_every:
             return
-        sources, problems = health.parse_sources(self.s.health_urls)
+        sources, problems = health.parse_sources(self.s.health_urls, self.s.health_diagnose)
         for problem in problems:
             _say("ignoring a LOOM_HEALTH_URLS entry: %s" % problem)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now))
@@ -10869,7 +10895,6 @@ class Station:
         reconcile read it) goes at once with its check copy and the runner's
         files beside it, unless a brief of that ticket is still in an inbox
         (loom#1808); so does an idle lane's run scratch from that ticket."""
-        root = os.path.join(self.s.home, "worktrees")
         live = set()
         for lane in LANES:
             try:
@@ -10883,37 +10908,58 @@ class Station:
                 return
         busy = {t for t in (self._tree_ticket(n) for n in live) if t is not None}
         self._prune_run_scratch(busy)
+        self._prune_tree_root(os.path.join(self.s.home, "worktrees"), live, busy)
+        if self.s.agy_workdir:
+            self._prune_tree_root(self.s.agy_workdir, live, busy, tickets_only=True)
+
+    def _prune_tree_root(self, root: str, live: Set[str], busy: Set[Tuple[str, int]],
+                         tickets_only: bool = False) -> None:
+        """Remove the finished trees in one lane tree folder. The folder is
+        opened once, never through a symlink, and every entry is listed and
+        removed relative to that open folder, so nothing resolves the path
+        again. tickets_only (the agy folder, in another user's home) also
+        refuses a path with a symlink in any part and removes only entries
+        named for a watched repo's ticket."""
+        if tickets_only and os.path.realpath(root) != os.path.abspath(root):
+            _say("lane tree folder %s passes through a symlink, so nothing in it is removed"
+                 % root)
+            return
         try:
-            names = os.listdir(root)
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except FileNotFoundError:
             return
         except OSError as err:
-            _say("cannot list %s to remove finished lane trees: %s" % (root, err))
+            _say("cannot open %s to remove finished lane trees (a symlink is never "
+                 "followed): %s" % (root, err))
             return
         removed = done = 0
-        for name in names:
-            path = os.path.join(root, name)
-            try:
-                st = os.lstat(path)
-            except FileNotFoundError:
-                continue
-            except OSError as err:
-                _say("cannot stat lane tree %s: %s" % (name, err))
-                continue
-            if name in live:
-                continue
-            finished = self._tree_done(name, busy)
-            if not finished and self.now - st.st_mtime < TREE_KEEP:
-                continue
-            if stat.S_ISDIR(st.st_mode):
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                os.unlink(path)
-            removed += 1
-            done += finished
+        try:
+            for name in os.listdir(fd):
+                if name in live or (tickets_only and self._tree_ticket(name) is None):
+                    continue
+                try:
+                    st = os.lstat(name, dir_fd=fd)
+                except FileNotFoundError:
+                    continue
+                except OSError as err:
+                    _say("cannot stat lane tree %s: %s" % (name, err))
+                    continue
+                finished = self._tree_done(name, busy)
+                if not finished and self.now - st.st_mtime < TREE_KEEP:
+                    continue
+                if stat.S_ISDIR(st.st_mode):
+                    shutil.rmtree(name, ignore_errors=True, dir_fd=fd)
+                else:
+                    os.unlink(name, dir_fd=fd)
+                removed += 1
+                done += finished
+        except OSError as err:
+            _say("cannot list %s to remove finished lane trees: %s" % (root, err))
+        finally:
+            os.close(fd)
         if removed:
-            _say("removed %d finished lane tree(s)%s" % (
-                removed, " (%d of tickets done)" % done if done else ""))
+            _say("removed %d finished lane tree(s) from %s%s" % (
+                removed, root, " (%d of tickets done)" % done if done else ""))
 
     def _tree_ticket(self, name: str) -> Optional[Tuple[str, int]]:
         """(repo, number) of a lane tree or brief name (tickets.ticket_name,
