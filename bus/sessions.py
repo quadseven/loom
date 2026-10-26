@@ -21,9 +21,13 @@ validated, SQLite is opened read-only and immutable, and nothing is executed.
 
 from __future__ import annotations
 
+import gzip
 import json
+import os
 import re
+import shutil
 import sqlite3
+import tempfile
 import time
 from pathlib import Path
 
@@ -73,8 +77,12 @@ def session_events(slot: str, ticket: str, loom: Path, claude_projects: Path,
         events = claude_dir(archive)
     elif lane in ("openrouter", "opencode-go"):
         db = archive / ".local" / "share" / "opencode" / "opencode.db"
+        packed = db.with_name("opencode.db.gz")
         if db.is_file():
             events = opencode_events(db)
+        elif packed.is_file() and not packed.is_symlink():
+            # The station compresses a finished run's store (loom#1808).
+            events = opencode_gz_events(packed)
     elif lane == "codex":
         rollout = _codex_rollout(codex_sessions, loom / "worktrees" / ticket)
         if rollout:
@@ -185,6 +193,23 @@ def claude_events(lines: list[str]) -> list[dict]:
                 if ev:
                     events.append(ev)
     return events
+
+
+def opencode_gz_events(packed: Path) -> list[dict]:
+    """opencode_events of a gzip-compressed store, unpacked to a private
+    temporary file that is removed after the read."""
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    try:
+        with os.fdopen(fd, "wb") as out, gzip.open(packed, "rb") as src:
+            shutil.copyfileobj(src, out, 1 << 20)
+        return opencode_events(Path(tmp))
+    except (OSError, EOFError, gzip.BadGzipFile):
+        return []
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def opencode_events(db: Path) -> list[dict]:

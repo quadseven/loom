@@ -311,9 +311,10 @@ done
 # docs/BRAIN.md), and
 # LOOM_EVIDENCE_CMDS (private JSON map of repo to read-only log command for
 # verify briefs, docs/LANES.md Verify runs), and
-# LOOM_LOG_KEEP_DAYS and LOOM_DISK_FREE_MIN_GB (days a lane's logs are kept,
-# default 7, 0 forever; and the free disk under which every pass warns,
-# default 10 GB, docs/LANES.md Disk), and
+# LOOM_LOG_KEEP_DAYS and LOOM_MIN_FREE_GB (days a lane's logs are kept,
+# default 7, 0 forever; and the free disk under which the station claims no
+# new work, default 15 GB, the older name LOOM_DISK_FREE_MIN_GB still read,
+# docs/LANES.md Disk), and
 # LOOM_INVARIANT_GOAL and LOOM_PLAN_CHECK (the goal home invariant breaches
 # are filed on, and the review bot's plan check, docs/LANES.md Invariants), and
 # LOOM_NO_TOPUP (provider lanes whose credit is never topped up: their slots
@@ -373,7 +374,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_SHIP_WORKFLOWS</key><string>$(xml "${LOOM_SHIP_WORKFLOWS:-}")</string>
     <key>LOOM_SHIP_PATH_WORKFLOWS</key><string>$(xml "${LOOM_SHIP_PATH_WORKFLOWS:-}")</string>
     <key>LOOM_LOG_KEEP_DAYS</key><string>$(xml "${LOOM_LOG_KEEP_DAYS:-}")</string>
-    <key>LOOM_DISK_FREE_MIN_GB</key><string>$(xml "${LOOM_DISK_FREE_MIN_GB:-}")</string>
+    <key>LOOM_MIN_FREE_GB</key><string>$(xml "${LOOM_MIN_FREE_GB:-${LOOM_DISK_FREE_MIN_GB:-}}")</string>
     <key>LOOM_SETTLE_CLAIMED</key><string>$(xml "${LOOM_SETTLE_CLAIMED:-}")</string>
     <key>LOOM_SETTLE_CLAIMED_MAX</key><string>$(xml "${LOOM_SETTLE_CLAIMED_MAX:-}")</string>
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>

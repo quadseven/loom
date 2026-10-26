@@ -4,6 +4,7 @@ import calendar
 import base64
 import contextlib
 import fcntl
+import gzip
 import hashlib
 import io
 import json
@@ -5766,6 +5767,152 @@ class PruneTest(Base):
         self.run_pass()
         self.assertFalse(os.path.lexists(link))
         self.assertTrue(os.path.exists(os.path.join(outside, "f")))
+    def fresh_file(self, name):
+        path = os.path.join(self.home, "worktrees", name)
+        self.write(path, "x\n")
+        return path
+
+    def test_a_done_tickets_tree_goes_at_once_with_its_check_copy(self):
+        # loom#1808: a merged or closed ticket's tree no longer waits for
+        # TREE_KEEP; an open ticket's tree, or one with a brief in an inbox,
+        # does.
+        tp = REPO.replace("/", ".") + "-"
+        self.fake.add(1, state="merged")
+        self.fake.add(2, state="pr")
+        self.fake.add(4, state="shipped")
+        merged = [self.tree(tp + "1", 60), self.tree(tp + "1-default-check", 60),
+                  self.fresh_file(tp + "1.summary.md")]
+        closed = self.tree(tp + "3-r2", 60)
+        open_pr = self.tree(tp + "2", 60)
+        verifying = [self.tree(tp + "4-verify-99", 60),
+                     self.fresh_file(tp + "4-verify-99.opencode-events")]
+        self.write(self.inbox("claude", tp + "4-verify-99.md"), "brief\n")
+        self.run_pass()
+        for path in merged + [closed]:
+            self.assertFalse(os.path.lexists(path), path)
+        self.assertTrue(os.path.exists(open_pr))
+        for path in verifying:
+            self.assertTrue(os.path.exists(path), path)
+
+    def test_a_tree_waits_for_tree_keep_when_the_pass_did_not_read_its_repo(self):
+        tp = REPO.replace("/", ".") + "-"
+        fresh = self.tree(tp + "3", 60)
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        runner.prune_trees()
+        self.assertTrue(os.path.exists(fresh))
+        runner._open_work = {"example-owner/other": set()}
+        runner.prune_trees()
+        self.assertTrue(os.path.exists(fresh))
+        runner._open_work = {REPO: set()}
+        runner.prune_trees()
+        self.assertFalse(os.path.exists(fresh))
+
+    def run_home(self, slot="codex", age=3600):
+        home = os.path.join(self.home, "run", slot + "-home")
+        for name in (".cache/uv/x", ".cargo/registry/y", "tmp/z", "keep.txt"):
+            self.write(os.path.join(home, name), "x\n")
+        old = time.time() - age
+        os.utime(home, (old, old))
+        return home
+
+    def lock(self, slot, pid):
+        lock = os.path.join(self.home, "run", slot + ".lock")
+        os.makedirs(lock, exist_ok=True)
+        self.write(os.path.join(lock, "pid"), "%d\n" % pid)
+
+    def test_an_idle_lanes_home_drops_its_caches_and_keeps_the_rest(self):
+        home = self.run_home()
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        runner.prune_trees()
+        self.assertEqual(sorted(os.listdir(home)), ["keep.txt"])
+
+    def test_a_lane_whose_lock_holds_a_live_pid_keeps_its_caches(self):
+        home = self.run_home()
+        self.lock("codex", os.getpid())
+        station.Station(GitHub("token", transport=self.fake), self.settings).prune_trees()
+        self.assertEqual(sorted(os.listdir(home)), [".cache", ".cargo", "keep.txt", "tmp"])
+
+    def test_a_stale_lock_of_a_dead_runner_does_not_keep_the_caches(self):
+        home = self.run_home()
+        child = subprocess.Popen(["true"])
+        child.wait()
+        self.lock("codex", child.pid)
+        station.Station(GitHub("token", transport=self.fake), self.settings).prune_trees()
+        self.assertEqual(sorted(os.listdir(home)), ["keep.txt"])
+
+    def test_a_freshly_made_home_is_left_alone(self):
+        home = self.run_home(age=10)
+        station.Station(GitHub("token", transport=self.fake), self.settings).prune_trees()
+        self.assertIn(".cache", os.listdir(home))
+
+    def test_an_idle_lanes_run_scratch_goes_once_its_last_ticket_is_done(self):
+        tp = REPO.replace("/", ".") + "-"
+        home = self.run_home()
+        check = os.path.join(self.home, "run", "codex-check-default")
+        os.makedirs(check)
+        old = time.time() - 3600
+        os.utime(check, (old, old))
+        self.write(self.inbox("codex", "done", tp + "5.md"), "brief\n")
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        runner._open_work = {REPO: {5}}
+        runner.prune_trees()
+        self.assertTrue(os.path.exists(os.path.join(home, "keep.txt")))
+        runner._open_work = {REPO: set()}
+        runner.prune_trees()
+        self.assertFalse(os.path.exists(home))
+        self.assertFalse(os.path.exists(check))
+
+
+class DiskGuardTest(Base):
+    """The station claims no new work while the loom home's disk is under
+    LOOM_MIN_FREE_GB free, and says so once per change (loom#1808)."""
+
+    def pass_with(self, free):
+        usage = mock.Mock(free=free, total=500 * 1024 ** 3, used=0)
+        with mock.patch.object(station.shutil, "disk_usage", return_value=usage), \
+                mock.patch("bus.station._say") as say:
+            self.run_pass()
+        return [c.args[0] for c in say.call_args_list]
+
+    def test_low_disk_stops_claims_and_says_so_once_until_it_recovers(self):
+        self.fake.add(12)
+        said = self.pass_with(9 * 1024 ** 3)
+        self.assertEqual(self.listing(), [])
+        paused = [s for s in said if s.startswith("claims paused: only 9.0 GB free")]
+        self.assertEqual(len(paused), 1, said)
+        self.assertFalse(watch_module.KEEP_RE.search(paused[0]))
+        said = self.pass_with(9 * 1024 ** 3)
+        self.assertEqual(self.listing(), [])
+        self.assertFalse(any(s.startswith("claims ") for s in said), said)
+        said = self.pass_with(40 * 1024 ** 3)
+        self.assertTrue(any(s.startswith("claims resumed: 40.0 GB free") for s in said), said)
+        self.assertTrue(any(n.endswith(".md") for n in self.listing()), self.listing())
+        said = self.pass_with(40 * 1024 ** 3)
+        self.assertFalse(any(s.startswith("claims ") for s in said), said)
+
+    def test_the_lane_status_shows_the_pause(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        usage = mock.Mock(free=2 * 1024 ** 3, total=500 * 1024 ** 3, used=0)
+        with mock.patch.object(station.shutil, "disk_usage", return_value=usage), \
+                mock.patch("bus.station._say"):
+            self.assertTrue(runner.disk_low())
+        self.assertIn("Claims paused: 2.0 GB free on the loom home's disk, under 15.0 GB",
+                      runner._lanes_body([]))
+
+    def test_unreadable_free_space_keeps_the_last_state(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(station.shutil, "disk_usage", side_effect=OSError("gone")), \
+                mock.patch("bus.station._say"):
+            self.assertFalse(runner.disk_low())
+
+    def test_settings_read_the_floor_under_both_names(self):
+        self.assertEqual(station.Settings.from_env({}).disk_free_min_gb, 15)
+        self.assertEqual(station.Settings.from_env({"LOOM_MIN_FREE_GB": "20"}).disk_free_min_gb, 20)
+        self.assertEqual(station.Settings.from_env({"LOOM_DISK_FREE_MIN_GB": "12"}).disk_free_min_gb, 12)
+        self.assertEqual(station.Settings.from_env({"LOOM_MIN_FREE_GB": "20",
+                                                    "LOOM_DISK_FREE_MIN_GB": "12"}).disk_free_min_gb, 20)
+
+
 class LogRetentionTest(Base):
     """Lane logs past LOOM_LOG_KEEP_DAYS are removed, and the loom home's
     size and free disk are reported (loom#643)."""
@@ -5895,27 +6042,82 @@ class LogRetentionTest(Base):
         self.assertIn("100.0 GB free on its disk", line[0])
         self.assertFalse(any(s.startswith("loom home holds ") for s in self.tend()))
 
-    def test_low_free_disk_warns_every_pass(self):
-        for _ in range(2):
-            said = self.tend(free=3 * 1024 ** 3)
-            self.assertTrue(any(s.startswith("warning: only 3.0 GB free on the loom home's disk")
-                                for s in said), said)
-        self.assertFalse(any(s.startswith("warning:") for s in self.tend()))
+    def session_run(self, slot, name, days=3, text=b"SQLite format 3\x00" + b"x" * 5000):
+        run = os.path.join(self.home, "logs", slot, name)
+        folder = os.path.join(run, ".local", "share", "opencode")
+        os.makedirs(folder)
+        db = os.path.join(folder, "opencode.db")
+        with open(db, "wb") as fh:
+            fh.write(text)
+        self.write(db + "-wal", "wal\n")
+        old = time.time() - days * self.DAY
+        for path in (db, db + "-wal", folder):
+            os.utime(path, (old, old))
+        return db
 
-    def test_the_warning_never_reads_as_an_error_to_the_log_watcher(self):
-        said = self.tend(free=1024 ** 3)
-        warning = [s for s in said if s.startswith("warning:")]
-        self.assertTrue(warning)
-        self.assertFalse(watch_module.KEEP_RE.search(warning[0]))
+    def test_a_finished_runs_session_store_is_compressed_and_keeps_its_time(self):
+        # loom#1808: these stores held 14 GB of the 17 GB in logs/.
+        db = self.session_run("opencode-go-2", "example.repo-1")
+        with open(db, "rb") as fh:
+            original = fh.read()
+        mtime = os.lstat(db).st_mtime
+        said = self.tend()
+        self.assertFalse(os.path.exists(db))
+        self.assertFalse(os.path.exists(db + "-wal"))
+        with gzip.open(db + ".gz", "rb") as fh:
+            self.assertEqual(fh.read(), original)
+        self.assertAlmostEqual(os.lstat(db + ".gz").st_mtime, mtime, delta=1)
+        self.assertAlmostEqual(os.lstat(os.path.dirname(db)).st_mtime, mtime, delta=1)
+        self.assertTrue(any(s.startswith("compressed 1 finished run session store") for s in said), said)
+
+    def test_a_running_or_unsent_runs_session_store_is_not_compressed(self):
+        self.settings.transcript_url = "https://dashboard.example.com/api/transcripts"
+        self.settings.transcript_token_ssm = "/loom/token"
+        running = self.session_run("openrouter", "example.repo-3")
+        self.write(self.inbox("openrouter", "example.repo-3.md"), "brief\n")
+        unsent = self.session_run("openrouter", "example.repo-4")
+        sent = self.session_run("openrouter", "example.repo-5")
+        for name in ("example.repo-4", "example.repo-5"):
+            self.write(self.inbox("openrouter", "done", name + ".md"), "brief\n")
+        self.write(os.path.join(self.home, "state", "station", "transcripts.json"),
+                   json.dumps({"openrouter/example.repo-5": "sent"}))
+        self.tend()
+        self.assertTrue(os.path.exists(running))
+        self.assertTrue(os.path.exists(unsent))
+        self.assertFalse(os.path.exists(sent))
+        self.assertTrue(os.path.exists(sent + ".gz"))
+
+    def test_a_compressed_store_goes_with_its_run_after_retention(self):
+        db = self.session_run("opencode-go", "example.repo-6", days=3)
+        self.tend()
+        self.assertTrue(os.path.exists(db + ".gz"))
+        old = time.time() - 8 * self.DAY
+        for root, dirs, files in os.walk(os.path.join(self.home, "logs", "opencode-go")):
+            for n in dirs + files:
+                os.utime(os.path.join(root, n), (old, old))
+        os.remove(os.path.join(self.home, "state", "station", "disk.json"))
+        self.tend()
+        self.assertFalse(os.path.exists(os.path.join(self.home, "logs", "opencode-go", "example.repo-6")))
+
+    def test_a_linked_session_store_is_never_followed(self):
+        outside = os.path.join(self._tmp.name, "outside.db")
+        self.write(outside, "keep\n")
+        folder = os.path.join(self.home, "logs", "opencode-go", "example.repo-7",
+                              ".local", "share", "opencode")
+        os.makedirs(folder)
+        os.symlink(outside, os.path.join(folder, "opencode.db"))
+        self.tend()
+        self.assertTrue(os.path.islink(os.path.join(folder, "opencode.db")))
+        self.assertFalse(os.path.exists(os.path.join(folder, "opencode.db.gz")))
 
     def test_settings_read_the_retention_and_the_free_disk_floor(self):
         self.assertEqual(station.Settings.from_env({}).log_keep_days, 7)
-        self.assertEqual(station.Settings.from_env({}).disk_free_min_gb, 10)
+        self.assertEqual(station.Settings.from_env({}).disk_free_min_gb, 15)
         self.assertEqual(station.Settings.from_env({"LOOM_LOG_KEEP_DAYS": "14"}).log_keep_days, 14)
         self.assertEqual(station.Settings.from_env({"LOOM_LOG_KEEP_DAYS": "0"}).log_keep_days, 0)
         with mock.patch("bus.station._say"):
             self.assertEqual(station.Settings.from_env({"LOOM_LOG_KEEP_DAYS": "x"}).log_keep_days, 7)
-            self.assertEqual(station.Settings.from_env({"LOOM_DISK_FREE_MIN_GB": "-1"}).disk_free_min_gb, 10)
+            self.assertEqual(station.Settings.from_env({"LOOM_DISK_FREE_MIN_GB": "-1"}).disk_free_min_gb, 15)
         self.assertEqual(station.Settings.from_env({"LOOM_DISK_FREE_MIN_GB": "2.5"}).disk_free_min_gb, 2.5)
 
 

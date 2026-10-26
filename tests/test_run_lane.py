@@ -6276,6 +6276,70 @@ exec /usr/bin/git "$@"
         self.assertTrue((tree / ".venv" / "untracked.txt").exists())
         self.assertFalse(untracked.exists())
 
+    def test_a_finished_run_drops_only_git_ignored_build_output(self):
+        # loom#1808: an infra run left 17 ignored .venv folders, about 2 GB a
+        # tree, kept for an hour after the run. Only folders git ignores and
+        # that hold no tracked path go; the tracked tree stays for fix rounds.
+        text = RUNNER.read_text()
+        function = re.search(r"^drop_build_output\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        workdir = Path(self._tmp.name) / "worktrees"
+        tree = workdir / "example.repo-7"
+        check = workdir / "example.repo-7-default-check"
+        for t in (tree, check):
+            t.mkdir(parents=True)
+            git("init", "-q", str(t))
+            (t / ".gitignore").write_text(".venv/\nnode_modules/\n__pycache__/\n.pytest_cache/\n")
+            (t / "app.py").write_text("x = 1\n")
+            (t / "pinned" / "node_modules").mkdir(parents=True)
+            (t / "pinned" / "node_modules" / "tracked.js").write_text("tracked\n")
+            git("add", "-f", ".gitignore", "app.py", "pinned/node_modules/tracked.js", cwd=t)
+            git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "seed", cwd=t)
+        ignored = [tree / "stacks" / "a" / ".venv", tree / "web" / "node_modules",
+                   tree / "pkg" / "__pycache__", tree / ".pytest_cache", check / ".venv"]
+        for d in ignored:
+            d.mkdir(parents=True)
+            (d / "big").write_text("x" * 1000)
+        # Not ignored: a .venv the ignore rules exclude again is kept.
+        nested = tree / "vendor"
+        nested.mkdir()
+        (nested / ".gitignore").write_text("!.venv/\n")
+        (nested / ".venv").mkdir()
+        (nested / ".venv" / "keep").write_text("keep\n")
+        outside = Path(self._tmp.name) / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("keep\n")
+        (tree / "linked").mkdir()
+        os.symlink(outside, tree / "linked" / "node_modules")
+        script = function + "drop_build_output\n"
+        result = subprocess.run(["bash", "-c", script],
+                                env={"PATH": os.environ["PATH"], "WORKDIR": str(workdir),
+                                     "TICKET": "example.repo-7"},
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for d in ignored:
+            self.assertFalse(d.exists(), d)
+        self.assertEqual((tree / "app.py").read_text(), "x = 1\n")
+        self.assertTrue((tree / "pinned" / "node_modules" / "tracked.js").exists())
+        self.assertTrue((tree / ".git").is_dir())
+        self.assertTrue((nested / ".venv" / "keep").exists())
+        self.assertTrue((outside / "keep").exists())
+
+    def test_a_lane_run_drops_ignored_build_output_from_its_tree_when_it_ends(self):
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            'cat > /dev/null\n',
+            'cat > /dev/null\n'
+            'printf \'node_modules/\\n__pycache__/\\n\' >> .git/info/exclude\n'
+            'mkdir -p web/node_modules pkg/__pycache__\n'
+            'echo big > web/node_modules/dep.js; echo big > pkg/__pycache__/m.pyc\n', 1))
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tree = self.loom / "worktrees" / "T042-fix-the-thing"
+        self.assertIn("T042-fix-the-thing done", self.lane_log())
+        self.assertTrue((tree / "fix.txt").exists())
+        self.assertFalse((tree / "web" / "node_modules").exists())
+        self.assertFalse((tree / "pkg" / "__pycache__").exists())
+
     def test_the_check_profile_allows_the_uv_files_but_not_their_directory(self):
         # The check profile lets the contract read and execute the runner's
         # uv and uvx while still refusing every other file under the
