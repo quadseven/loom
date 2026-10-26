@@ -52,8 +52,10 @@ class AgentSandboxTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def bash(self, script, *args, lane="opencode-go", **env):
-        full = dict(os.environ, HOME=str(self.home), AGENT_HOME=str(self.scratch), LANE=lane,
-                    AGY_HOME=str(self.scratch), SKILLS=str(self.root / "no-skills"), **env)
+        full = dict(os.environ)
+        full.update(HOME=str(self.home), AGENT_HOME=str(self.scratch), LANE=lane,
+                    AGY_HOME=str(self.scratch), SKILLS=str(self.root / "no-skills"))
+        full.update(env)
         return subprocess.run(["bash", "-c", '. "$1"; shift; ' + script, "bash", str(SANDBOX),
                                str(self.tree), *args],
                               capture_output=True, text=True, env=full, timeout=60)
@@ -134,6 +136,28 @@ class AgentSandboxTest(unittest.TestCase):
                 self.assertIn('(literal "/usr/bin/security")', profile)
                 if lane == "agy":
                     self.assertIn(folder, profile)
+
+    def test_agy_outer_profile_allows_only_its_token_file_inside_library(self):
+        token = self.home / "Library" / "Application Support" / "antigravity" / "antigravity-oauth-token"
+        token.parent.mkdir(parents=True)
+        token.write_text("test-token")
+        profile = self.profile("", lane="agy", AGY_HOME=str(self.home))
+        self.assertIn(f'(allow file-read* (literal "{token}"))', profile)
+        self.assertNotIn(f'(allow file-read* (subpath "{token.parent}"))', profile)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_nested_agy_command_profile_cannot_read_the_token(self):
+        token = self.home / "Library" / "Application Support" / "antigravity" / "antigravity-oauth-token"
+        token.parent.mkdir(parents=True)
+        token.write_text("fixture-token")
+        inner = f'(version 1)\n(allow default)\n(deny file-read* (literal "{token}"))\n'
+        result = self.bash(
+            'outer="$(sandbox_profile "$1" bash "")" || exit 9\n'
+            'sandbox-exec -p "$outer" /bin/bash -c '
+            '"sandbox-exec -p \'$2\' /bin/cat \'$3\' >/dev/null 2>&1 && echo read=allowed || echo read=denied"',
+            inner, str(token), lane="agy", AGY_HOME=str(self.home))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "read=denied")
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_inside_the_agy_profile_connections_and_security_stay_confined(self):

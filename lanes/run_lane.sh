@@ -1139,22 +1139,36 @@ AGY_SETTINGS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/agy/settings.json
 agy_settings() {
   # shellcheck disable=SC2016 # expanded by the lane user's shell
   "${AGY_RUNAS[@]}" /bin/bash -c '
-    s="$1"; f="$s/settings.json"; t="$s/.settings.json.new"
+    s="$1"; mode="$2"; token="$3"; f="$s/settings.json"; t="$s/.settings.json.new"
     mkdir -p "$s" && rm -f "$t" || exit 1
     (set -C; cat > "$t") || exit 1
-    if [ "$2" = merge ] && [ -f "$f" ] && [ ! -L "$f" ] &&
+    if [ "$mode" = merge ] && [ -f "$f" ] && [ ! -L "$f" ] &&
       tw="$(plutil -extract trustedWorkspaces json -o - "$f" 2> /dev/null)"; then
       plutil -replace trustedWorkspaces -json "$tw" "$t" || exit 1
     fi
-    mv -f "$t" "$f" && cat "$f"' agy-settings "$AGY_HOME/.gemini/antigravity-cli" "$1"
+    python3 - "$t" "$token" <<PYTHON || exit 1
+import json, sys
+path, token = sys.argv[1:]
+with open(path, encoding="utf-8") as source:
+    settings = json.load(source)
+settings["enableTerminalSandbox"] = True
+settings["toolPermission"] = "proceed-in-sandbox"
+denied = settings["permissions"]["deny"]
+rules = ["read_file(" + token + ")", "write_file(" + token + ")"]
+denied[0:0] = [rule for rule in rules if rule not in denied]
+with open(path, "w", encoding="utf-8") as target:
+    json.dump(settings, target, indent=2)
+    target.write("\\n")
+PYTHON
+    mv -f "$t" "$f" && cat "$f"' agy-settings "$AGY_HOME/.gemini/antigravity-cli" "$1" \
+    "$AGY_HOME/Library/Application Support/antigravity/antigravity-oauth-token"
 }
 
-# agy stores its token so that /usr/bin/security may read it without a
-# prompt, and agy itself reads it that way, so the sandbox cannot forbid that
-# tool, and a shell command could read the token. The settings deny commands
-# that start with security, a speed bump rather than a wall. The lane never
-# passes --dangerously-skip-permissions. Slash commands and skill expansion in
-# the prompt stay off; the agent can still load a skill it decides to use.
+# The outer Seatbelt profile lets agy read its token. The CLI's terminal
+# sandbox runs shell commands in a nested profile that denies token file tools
+# and runs commands only inside that sandbox. The lane never passes
+# --dangerously-skip-permissions. Slash commands and skill expansion in the
+# prompt stay off; the agent can still load a skill it decides to use.
 AGY_TOOLS_NOTE="Tools on this lane: run the repo's tests and lint with your shell tool, as the brief asks, and edit files only inside this tree. Web fetching is not available here."
 
 # The agy lane: unlock the lane user's keychain (password on stdin to a shell

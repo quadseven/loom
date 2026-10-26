@@ -1,8 +1,8 @@
 {
-  "enableTerminalSandbox": false,
+  "enableTerminalSandbox": true,
+  "toolPermission": "proceed-in-sandbox",
   "permissions": {
     "allow": [
-      "command(*)",
       "read_file(*)",
       "write_file(*)"
     ],

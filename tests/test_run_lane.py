@@ -1992,6 +1992,25 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn('(subpath "%s/Library/Application Support/antigravity")' % h, result.stdout)
         self.assertNotIn("Library/Keychains", result.stdout)
 
+    def test_agy_settings_confine_terminal_commands_away_from_its_token(self):
+        home = self.home / "agy-home"
+        state = home / ".gemini" / "antigravity-cli"
+        state.mkdir(parents=True)
+        token = home / "Library" / "Application Support" / "antigravity" / "antigravity-oauth-token"
+        token.parent.mkdir(parents=True)
+        token.write_text("fixture-token")
+        script = ('AGY_RUNAS=(); ' + self.source_functions("agy_settings")
+                  + 'agy_settings merge < "$1"')
+        result = subprocess.run(["bash", "-c", script, "bash", str(RUNNER.parent / "agy" / "settings.json")],
+                                env=dict(os.environ, AGY_HOME=str(home)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        settings = json.loads(result.stdout)
+        self.assertTrue(settings["enableTerminalSandbox"])
+        self.assertEqual(settings["toolPermission"], "proceed-in-sandbox")
+        self.assertNotIn("command(*)", settings["permissions"]["allow"])
+        self.assertIn(f"read_file({token})", settings["permissions"]["deny"])
+        self.assertIn(f"write_file({token})", settings["permissions"]["deny"])
+
     def test_free_slots_use_distinct_pinned_gateway_routes(self):
         script = self.source_functions("setting_var", "lane_var", "lane_setting") + 'lane_setting URL'
         routes = {
@@ -3581,16 +3600,20 @@ exec /usr/bin/git "$@"
         state = workdir.parent / ".gemini" / "antigravity-cli"
         template = json.loads((RUNNER.parent / "agy" / "settings.json").read_text())
         expected = {**template, "trustedWorkspaces": [str(workdir)]}
+        token = workdir.parent / "Library" / "Application Support" / "antigravity" / "antigravity-oauth-token"
+        expected["permissions"]["deny"] = [
+            f"read_file({token})", f"write_file({token})", *template["permissions"]["deny"]]
         # What the run saw: the template's rules, the operator's trusted work
         # folder kept, the older file's wider rule and other keys gone.
         seen = json.loads((workdir.parent / "tmp" / "agy-settings-seen.json").read_text())
         self.assertEqual(seen, expected)
-        self.assertIn("command(*)", seen["permissions"]["allow"])
         self.assertIn("read_url(*)", seen["permissions"]["deny"])
         self.assertNotIn("read_url(*)", seen["permissions"]["allow"])
-        # agy's own terminal sandbox denied commands the lane's rules allow
-        # (infra#5522), so it is off; sandbox-exec stays the boundary.
-        self.assertIs(seen["enableTerminalSandbox"], False)
+        self.assertIs(seen["enableTerminalSandbox"], True)
+        self.assertEqual(seen["toolPermission"], "proceed-in-sandbox")
+        self.assertIn(f"read_file({token})", seen["permissions"]["deny"])
+        self.assertIn(f"write_file({token})", seen["permissions"]["deny"])
+        self.assertNotIn("command(*)", seen["permissions"]["allow"])
         # The file is restored after the run, whatever it did, and the
         # sandbox kept the run from widening it in the first place.
         self.assertEqual(json.loads((state / "settings.json").read_text()), expected)
@@ -3639,7 +3662,9 @@ exec /usr/bin/git "$@"
         inbox, workdir, result, agy = self.agy_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(victim.read_text(), "keep")
-        self.assertIn("command(*)", json.loads((state / "settings.json").read_text())["permissions"]["allow"])
+        settings = json.loads((state / "settings.json").read_text())
+        self.assertNotIn("command(*)", settings["permissions"]["allow"])
+        self.assertEqual(settings["toolPermission"], "proceed-in-sandbox")
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_agy_lane_user_gets_the_skills_where_agy_reads_them_read_only(self):
