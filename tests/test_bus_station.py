@@ -6140,6 +6140,17 @@ class PruneTest(Base):
                 runner.run_pass()
         self.assertEqual(ran, ["prune", "disk", "chain"])
 
+    def test_a_pass_with_no_budget_left_does_no_local_end_either(self):
+        # The early return stays as it was: a pass that never starts its
+        # GitHub part runs nothing else.
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        ran = []
+        with mock.patch.object(station.Station, "_budget_exhausted", return_value=True), \
+                mock.patch.object(station.Station, "prune_trees", lambda s: ran.append("prune")), \
+                mock.patch.object(station.Station, "post_chain", lambda s: ran.append("chain")):
+            runner.run_pass()
+        self.assertEqual(ran, [])
+
     def test_a_tree_waits_for_tree_keep_when_the_pass_did_not_read_its_repo(self):
         tp = REPO.replace("/", ".") + "-"
         fresh = self.tree(tp + "3", 60)
