@@ -1703,6 +1703,37 @@ class ReviewBotThreads(Base):
         self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
         self.assertEqual(self.merged, [])
 
+    def stuck_case(self, author, lane="codex", model=None):
+        """Ticket 5's last round asked about a finding at a.py:3; the open
+        thread, under a new id, holds the same rule at a.py:5."""
+        self.gh.ticket(5, "pr", lane=lane)
+        if model:
+            self.gh.issues[5]["body"] = "Model: %s\n" % model + self.gh.issues[5]["body"]
+        self.gh.comments[5].append({"body": FIX_MARKER + "\nPull request: x#50\n\n"
+                                    "### Thread PRRT_old (comment 1) at a.py:3\n\n"
+                                    "    grug-tribe: high | `rule-x` | quick win", "user": ME})
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((author, "high | `rule-x` | quick win"))
+        self.gh.details[50]["reviewThreads"]["nodes"][0].update(path="a.py", line=5)
+        self.go()
+
+    def test_the_review_bots_finding_posted_again_climbs_the_ladder(self):
+        self.stuck_case(BOT)
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+
+    def test_a_stuck_send_back_past_the_last_rung_goes_to_the_hand_off_pool(self):
+        self.stuck_case(BOT, lane="claude", model="claude-opus-5-5")
+        self.assertIn((5, "failed", None), self.moved)
+        self.assertIn(factory.HANDOFF_LABEL, [x["name"] for x in self.gh.issues[5]["labels"]])
+        self.assertEqual(self.fixed, [])
+
+    def test_a_strangers_thread_at_the_same_place_never_counts_toward_stuck(self):
+        # On a public repo anyone can open a thread: one copying a finding's
+        # path, line and rule must not climb the ticket or stop its rounds.
+        self.stuck_case({"__typename": "User", "login": "a-stranger"})
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+        self.assertEqual(self.lane(5), "codex")
+
     def test_a_no_change_round_waits_for_the_review_it_asked_for(self):
         self.gh.ticket(5, "pr", lane="claude")
         self.gh.comments[5] += [{"body": FIX_ASKED, "user": ME, "created_at": iso(600)},
@@ -2354,6 +2385,17 @@ class Queued(Base):
 
 
 class Tickets(Base):
+    def test_a_ticket_in_the_hand_off_pool_is_never_rebriefed(self):
+        # Its fix rounds stopped on the same failures: the second operator's
+        # session has it, so the factory leaves it failed.
+        self.gh.ticket(6, "failed", lane="spark")
+        self.gh.issues[6]["labels"].append({"name": factory.HANDOFF_LABEL})
+        self.gh.pull(60, 6, runs=(("unittest", "in_progress"),))
+        self.go()
+        self.assertEqual(self.moved, [])
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.lane(6), "spark")
+
     def test_a_failed_ticket_without_a_pull_request_is_rebriefed_a_rung_up(self):
         self.gh.ticket(6, "failed", lane="zai")
         self.go()
@@ -3341,6 +3383,20 @@ class SilentLane(Base):
 
 
 class Helpers(unittest.TestCase):
+    def test_a_finding_reposted_under_a_new_thread_id_still_counts_as_stuck(self):
+        # The review bot may post the same finding again as a new thread, a
+        # few lines lower after the round's edits: comparing ids alone read
+        # that as progress.
+        last = {"body": "%s\nPull request: %s#7, branch loom/12-x\n\n"
+                        "### Thread PRRT_old (comment 5) at web/staged.js:54\n\n"
+                        "    grug-tribe: high | _security_ | `unvalidated-external-input` | quick"
+                        % (FIX_MARKER, REPO), "user": ME}
+        new = {"id": "PRRT_new", "path": "web/staged.js", "line": 59,
+               "root": {"nodes": [{"body": "high | _security_ | `unvalidated-external-input` |"}]}}
+        other = dict(new, line=59 + 40)
+        self.assertTrue(factory.stuck([last], ["PRRT_new"], False, 0.0, NOW, threads=[new]))
+        self.assertFalse(factory.stuck([last], ["PRRT_new"], False, 0.0, NOW, threads=[other]))
+
     def test_with_model_replaces_or_inserts_the_header(self):
         self.assertEqual(factory.with_model("Difficulty: hard\nModel: a\n\n## Why\nModel: x", "b"),
                          "Difficulty: hard\nModel: b\n\n## Why\nModel: x")

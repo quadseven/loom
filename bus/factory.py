@@ -17,10 +17,14 @@ Neither needs a model:
 - One with a failing check, an unresolved thread or a conflict goes back to
   a lane as a fix brief (bus.brain.fix). It stays on the ticket's lane while
   the rounds make progress. It climbs the model ladder (docs/MUSE.md) only
-  when it is stuck: a review thread survived a fix round, checks still fail
-  after a round that was asked to fix them, or the pull request is older
-  than STUCK_AGE. A review that finds new things is progress, and a conflict
-  is mechanical (the fix brief's runner merges the base), so neither climbs.
+  when it is stuck: a review thread survived a fix round (the same thread, or
+  the same finding posted again: bus/converge.py compares path, a nearby
+  line and the rule, never ids alone), checks still fail after a round that
+  was asked to fix them, or the pull request is older than STUCK_AGE. A
+  review that finds new things is progress, and a conflict is mechanical
+  (the fix brief's runner merges the base), so neither climbs. The station's
+  hand-back (bus/station.py _post_fix_or_escalate), which usually sends a
+  round before this pass sees the pull request, applies the same test.
 - Landing keeps the default branch green and nothing stale. A ready pull
   request that is behind its base is brought up to date first (GitHub's
   update-branch), and lands only once its checks and review pass again on
@@ -152,7 +156,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, bench, brain, brief_check, change_class, criteria_gate, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brief_check, change_class, converge, criteria_gate, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -445,7 +449,7 @@ BRIEF_RES = (
 RUNAWAY = "loom:runaway"
 NO_REASON = "agent made no commit and wrote no reason"
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
-                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved isOutdated path'
+                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved isOutdated path line originalLine'
                  ' root: comments(first:1) { nodes { author { __typename login } body url } }'
                  ' comments(last:20) { nodes { author { __typename login } body } } } } } } }')
 RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
@@ -618,6 +622,9 @@ def _ts(value: Any) -> float:
         return 0.0
 
 
+ts_of = _ts
+
+
 def _labels(issue: Dict[str, Any]) -> List[str]:
     return [str(x.get("name") if isinstance(x, dict) else x)
             for x in issue.get("labels") or []]
@@ -654,10 +661,14 @@ def last_climb(comments: Sequence[Dict[str, Any]]) -> float:
 
 def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
           checks_failing: bool, age: float, now: float = 0.0,
-          no_test: bool = False, unticked: Sequence[str] = ()) -> bool:
+          no_test: bool = False, unticked: Sequence[str] = (),
+          threads: Sequence[Dict[str, Any]] = ()) -> bool:
     """Did the last fix round fail to move this pull request? True when a
-    thread it was asked to fix is still open, when checks it was asked to fix
-    still fail, when it was asked for a test and still has none, or when the
+    thread it was asked to fix is still open, or an open one in `threads`
+    holds the same finding (bus/converge.py: same path, a nearby line, the
+    same rule; the review bot may post it again as a new thread), when
+    checks it was asked to fix still fail, when it was asked for a test and
+    still has none, or when the
     pull request is older than STUCK_AGE and has not moved on the ladder for
     STUCK_AGE (age alone climbs once per window, not on every round)."""
     if age > STUCK_AGE and now - last_climb(comments) > STUCK_AGE:
@@ -666,13 +677,28 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
                  if str(c.get("body") or "").startswith(FIX_MARKER)), None)
     if last is None:
         return False
-    if set(FIX_THREAD_RE.findall(last)) & set(open_threads):
+    if _finding_survived(last, open_threads, threads):
         return True
     if no_test and NO_TEST_HEADING in last:
         return True
-    if unticked and UNTICKED_HEADING in last and any("- " + c in last for c in unticked):
+    if _unticked_left(last, unticked):
         return True
     return checks_failing and bool(FIX_CHECK_RE.search(last))
+
+
+def _unticked_left(last: str, unticked: Sequence[str]) -> bool:
+    """The last fix round named a criterion that is still unticked."""
+    return bool(unticked) and UNTICKED_HEADING in last and any("- " + c in last for c in unticked)
+
+
+def _finding_survived(last: str, open_threads: Sequence[str],
+                      threads: Sequence[Dict[str, Any]]) -> bool:
+    """A thread the last fix round asked about is still open, by its id or,
+    posted again, by its finding's signature (bus/converge.py). Failing
+    checks are judged by stuck() itself: any check the round was asked to fix
+    while checks still fail."""
+    return (bool(set(FIX_THREAD_RE.findall(last)) & set(open_threads))
+            or bool(converge.persistent(last, (), threads)))
 
 
 def _end(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
@@ -688,6 +714,19 @@ def bot_marked_fixed(thread: Dict[str, Any], bot: str) -> bool:
     return (not thread.get("isResolved") and brain.by_bot(_end(thread, "root", 0), bot)
             and brain.by_bot(last, bot)
             and str(last.get("body") or "").startswith(BOT_FIXED_PREFIX))
+
+
+def trusted_threads(threads: Sequence[Dict[str, Any]], bot: str,
+                    trusted: set) -> List[Dict[str, Any]]:
+    """The open threads whose root comment the review bot or a trusted login
+    wrote: the only ones that may count toward stuck(). On a public repo
+    anyone can open a thread, and a stranger's thread at a finding's path and
+    line must not climb the ticket's ladder or stop its rounds."""
+    def ours(t: Dict[str, Any]) -> bool:
+        root = _end(t, "root", 0) or _end(t, "comments", 0)
+        return (brain.by_bot(root, bot)
+                or rest_login(root.get("author")).lower() in trusted)
+    return [t for t in threads if not t.get("isResolved") and ours(t)]
 
 
 def bot_fixed(threads: Sequence[Dict[str, Any]], bot: str) -> List[str]:
@@ -1884,6 +1923,27 @@ class Factory:
                            "operator one exact question." % (why, ", ".join(ran) or "none"))
         _say("%s#%d is past the last rung; left failed for the brain" % (repo, number))
 
+    def _trusted_open(self, repo: str, pr: Dict[str, Any],
+                      open_threads: Sequence[str]) -> List[Dict[str, Any]]:
+        """The pull request's open threads that may count toward stuck
+        (trusted_threads); read only when it has open threads at all."""
+        if not open_threads:
+            return []
+        return trusted_threads(self._threads(repo, int(pr["number"])), self.review_bot,
+                               self.trusted)
+
+    def _hand_off_failed(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Put a ticket whose fix rounds stopped past the ladder in the
+        hand-off pool (HANDOFF_LABEL), left loom:failed; _hand_off is the
+        no-lane route, which leaves it queued."""
+        names = _labels(issue)
+        if HANDOFF_LABEL in names:
+            return
+        kept = names + [HANDOFF_LABEL]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+                     {"labels": kept})
+        issue["labels"] = [{"name": x} for x in kept]
+
     def _close_past_ladder_pr(self, repo: str, pr: Dict[str, Any]) -> None:
         """Close an open lane pull request whose ticket is past the last rung of
         the model ladder, naming why, so the lane does not stall on it
@@ -1913,7 +1973,9 @@ class Factory:
         if checks_failing and self._past_no_change(repo, issue, comments):
             return
         age = self.now - _ts(pr.get("created_at"))
-        if stuck(comments, open_threads, checks_failing, age, self.now, no_test, unticked):
+        threads = self._trusted_open(repo, pr, open_threads)
+        if stuck(comments, open_threads, checks_failing, age, self.now, no_test, unticked,
+                 threads):
             footer = self._footer(repo, pr)
             if self._climb(repo, issue, comments, why, footer=footer) is None:
                 if RUNAWAY in _labels(issue):
@@ -1934,6 +1996,7 @@ class Factory:
                 self._close_past_ladder_pr(repo, pr)
                 self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
                                                  if 1 <= n <= len(CLIMB)])
+                self._hand_off_failed(repo, issue)
                 return
         lane = None
         # A ticket with no lane label (a silent-lane requeue drops it, and the
