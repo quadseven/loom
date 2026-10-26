@@ -1728,6 +1728,7 @@ class Station:
         self._claimed_rereviews: Dict[str, Any] = {}
         self._claimed_writes = 0
         self._branch_cache: Dict[str, str] = {}
+        self._stale_asks_withdrawn = 0
         # Per pass: each path-scoped repo's workflow filters, and its deploy runs.
         self._path_filters: Dict[str, Dict[str, List[str]]] = {}
         self._manual_listed: Dict[str, List[str]] = {}
@@ -9846,6 +9847,111 @@ class Station:
         more = len(items) - STANDUP_ROWS_MAX
         return shown + (" and %d more" % more if more > 0 else "")
 
+    # -- stale ask detection -----------------------------------------------
+    STALE_ASK_PATTERN = re.compile(r"stale-when:\s*commit\s+([0-9a-f]{7,40})\s+live", re.I)
+    ISSUE_EXISTS_PATTERN = re.compile(r"stale-when:\s*issue\s+exists", re.I)
+    NEEDS_LABEL_PATTERN = re.compile(r"^needs:([a-z0-9_.-]+)$", re.I)
+
+    def _parse_stale_when(self, comment_body: str) -> Optional[str]:
+        """Parse an ask comment for a stale-when line: 'stale-when: commit <sha> live' or
+        'stale-when: issue exists'. Returns the login name from needs:<login>, or None."""
+        stale_when = self.STALE_ASK_PATTERN.search(comment_body)
+        if stale_when:
+            return stale_when.group(1).lower()
+        if self.ISSUE_EXISTS_PATTERN.search(comment_body):
+            return None
+        return None
+
+    def _check_commit_live(self, repo: str, commit_sha: str) -> bool:
+        """Check if a commit SHA exists in the repo's default branch git history."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/commits/%s" % (repo, commit_sha)).data or {}
+            return bool(data.get("sha"))
+        except Exception:
+            return False
+
+    def _check_issue_exists(self, repo: str, issue_number: int) -> bool:
+        """Check if an issue number exists in a repo."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, issue_number)).data or {}
+            return bool(data.get("number"))
+        except Exception:
+            return False
+
+    def _has_ask_comment(self, issue: Dict[str, Any]) -> bool:
+        """Check if an issue has an ask comment with a stale-when line."""
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100" %
+                                    (issue.get("repository", {}).get("full_name") or self.s.repos[0],
+                                     issue.get("number")))
+        for comment in comments:
+            if self._parse_stale_when(str(comment.get("body") or "")) is not None:
+                return True
+        return False
+
+    def _withdraw_stale_ask(self, repo: str, issue: Dict[str, Any], reason: str) -> bool:
+        """Withdraw a stale ask: post a note and remove needs:<login> label.
+        Returns True if the ask was withdrawn, False otherwise."""
+        labels = [str(l.get("name", "")) for l in issue.get("labels", []) if isinstance(l, dict)]
+        needs_match = self.NEEDS_LABEL_PATTERN.search(labels[0]) if labels else None
+        if not needs_match:
+            return False
+
+        login = needs_match.group(1)
+        body = "Stale ask withdrawn: %s" % reason
+
+        try:
+            # Post a comment
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, issue.get("number")),
+                        {"body": body})
+
+            # Remove the needs:<login> label
+            current_labels = [{"name": name} for name in labels]
+            current_labels = [l for l in current_labels if not self.NEEDS_LABEL_PATTERN.match(l.get("name", ""))]
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, issue.get("number")),
+                        {"labels": [{"name": l["name"]} for l in current_labels]})
+            return True
+        except Exception:
+            return False
+
+    def _check_and_withdraw_stale_asks(self, issues: List[Dict[str, Any]],
+                                       deployed_commits: Set[str],
+                                       deployed_issues: Set[Tuple[str, int]],
+                                       last_check: float) -> int:
+        """Check all issues with needs:<login> labels and withdraw stale ones.
+        Returns the number of asks withdrawn as stale."""
+        withdrawn = 0
+        for issue in issues:
+            if issue.get("state") != "open":
+                continue
+            labels = [str(l.get("name", "")) for l in issue.get("labels", []) if isinstance(l, dict)]
+            needs_match = self.NEEDS_LABEL_PATTERN.search(labels[0]) if labels else None
+            if not needs_match:
+                continue
+
+            login = needs_match.group(1)
+            comment_body = str(issue.get("body") or "")
+
+            # Check for stale-when: commit <sha> live
+            stale_when_commit = self.STALE_ASK_PATTERN.search(comment_body)
+            if stale_when_commit:
+                commit_sha = stale_when_commit.group(1).lower()
+                if commit_sha in deployed_commits:
+                    repo = str(issue.get("repository", {}).get("full_name") or "").split("/")[0]
+                    if self._withdraw_stale_ask(repo, issue, "commit %s is live" % commit_sha[:12]):
+                        withdrawn += 1
+                        continue
+
+            # Check for stale-when: issue exists
+            if self.ISSUE_EXISTS_PATTERN.search(comment_body):
+                for deployed_repo, deployed_num in deployed_issues:
+                    repo = str(issue.get("repository", {}).get("full_name") or "").split("/")[0]
+                    if self._check_issue_exists(deployed_repo, deployed_num):
+                        if self._withdraw_stale_ask(repo, issue, "issue %s exists" % deployed_num):
+                            withdrawn += 1
+                            break
+
+        return withdrawn
+
     # -- the brain -------------------------------------------------------
     def _brain(self) -> Optional[Tuple[Dict[str, Any], Optional[float]]]:
         """The last brain tick (lanes/mac/brain.sh) and when a tick last ended
@@ -11380,6 +11486,36 @@ class Station:
             raise GitHubError("no operator access ask was created in %s" % home)
         state[key] = int(made["number"])
 
+    def _get_deployed_items(self) -> Tuple[Set[str], Set[Tuple[str, int]]]:
+        """Get the set of deployed commits and issue numbers from roll and bridge ship events."""
+        deployed_commits: Set[str] = set()
+        deployed_issues: Set[Tuple[str, int]] = set()
+
+        try:
+            from . import deploy_watch
+            from . import roll_pin
+
+            ledger_path = os.path.join(self.state, "deploy-watch.json")
+            ledger = _read_json(ledger_path, {}, strict=False)
+
+            if isinstance(ledger, dict):
+                for key, entry in ledger.get("merges", {}).items():
+                    if isinstance(entry, dict):
+                        sha = str(entry.get("sha") or "")
+                        if sha and len(sha) >= 7:
+                            deployed_commits.add(sha[:12])
+
+                    ticket = entry.get("ticket") if isinstance(entry, dict) else None
+                    if ticket and isinstance(ticket, (int, str)):
+                        issue_num = int(ticket)
+                        repo = str(entry.get("repo") or "")
+                        if repo and issue_num:
+                            deployed_issues.add((repo, issue_num))
+        except Exception:
+            pass
+
+        return deployed_commits, deployed_issues
+
     def roll_source_pins(self) -> None:
         if self.s.roll_ship_docs:
             try:
@@ -11389,6 +11525,32 @@ class Station:
                 raise GitHubError("invalid roll ship document or pin: %s" % err) from err
             except health.NotLooked as err:
                 raise GitHubError("roll family gate could not be read: %s" % err) from err
+        # The bridge ship watch's own run method posts its own messages, so the
+        # station does not need to track it separately (the deploy_watch module
+        # edits the journal on the goal home).
+        try:
+            from . import deploy_watch
+            deploy_watch.watch(self.gh, self.s.repos, self.env, self.s.post_merge_watch)
+        except (RateLimited, GitHubError, ValueError, OSError) as err:
+            _say("bridge ship watch: could not run: %s" % err)
+
+    def _check_stale_asks(self, last_check: float) -> int:
+        """Check and withdraw stale needs:login asks after each deploy event and daily.
+        Returns the number of asks withdrawn as stale."""
+        try:
+            deployed_commits, deployed_issues = self._get_deployed_items()
+            issues = self._all_open_issues()
+
+            if self.now - last_check >= 86400:
+                withdrawn = self._check_and_withdraw_stale_asks(issues, deployed_commits, deployed_issues, last_check)
+                self._stale_asks_withdrawn += withdrawn
+                _say("stale ask detection: withdrew %d asks" % withdrawn)
+                return withdrawn
+
+            return 0
+        except Exception as err:
+            _say("stale ask detection failed: %s" % err)
+            return 0
 
     @staticmethod
     def label_digest() -> str:
@@ -11422,6 +11584,12 @@ class Station:
         except (GitHubError, OSError, runners.ReportError) as err:
             _say("tend_runners failed: %s" % err)
         self.report_outcomes()
+
+        # Check for stale asks (after deploy events and daily)
+        stale_asks_path = os.path.join(self.state, "stale_asks_check.json")
+        saved = _read_json(stale_asks_path, {}, strict=False)
+        last_check = saved.get("at") if isinstance(saved, dict) else 0
+        self._check_stale_asks(last_check)
         if not self._deferred():
             try:
                 self._timed(self.reconcile_pull_requests)
