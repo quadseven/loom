@@ -10914,46 +10914,49 @@ class Station:
 
     def _prune_tree_root(self, root: str, live: Set[str], busy: Set[Tuple[str, int]],
                          tickets_only: bool = False) -> None:
-        """Remove the finished trees in one lane tree folder. A folder that is
-        a symlink is never read. tickets_only (the agy folder, in another
-        user's home) removes only entries named for a watched repo's ticket."""
+        """Remove the finished trees in one lane tree folder. The folder is
+        opened once, never through a symlink, and every entry is listed and
+        removed relative to that open folder, so nothing resolves the path
+        again. tickets_only (the agy folder, in another user's home) also
+        refuses a path with a symlink in any part and removes only entries
+        named for a watched repo's ticket."""
+        if tickets_only and os.path.realpath(root) != os.path.abspath(root):
+            _say("lane tree folder %s passes through a symlink, so nothing in it is removed"
+                 % root)
+            return
         try:
-            if stat.S_ISLNK(os.lstat(root).st_mode):
-                _say("lane tree folder %s is a symlink, so nothing in it is removed" % root)
-                return
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except FileNotFoundError:
             return
         except OSError as err:
-            _say("cannot stat %s to remove finished lane trees: %s" % (root, err))
-            return
-        try:
-            names = os.listdir(root)
-        except FileNotFoundError:
-            return
-        except OSError as err:
-            _say("cannot list %s to remove finished lane trees: %s" % (root, err))
+            _say("cannot open %s to remove finished lane trees (a symlink is never "
+                 "followed): %s" % (root, err))
             return
         removed = done = 0
-        for name in names:
-            path = os.path.join(root, name)
-            try:
-                st = os.lstat(path)
-            except FileNotFoundError:
-                continue
-            except OSError as err:
-                _say("cannot stat lane tree %s: %s" % (name, err))
-                continue
-            if name in live or (tickets_only and self._tree_ticket(name) is None):
-                continue
-            finished = self._tree_done(name, busy)
-            if not finished and self.now - st.st_mtime < TREE_KEEP:
-                continue
-            if stat.S_ISDIR(st.st_mode):
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                os.unlink(path)
-            removed += 1
-            done += finished
+        try:
+            for name in os.listdir(fd):
+                if name in live or (tickets_only and self._tree_ticket(name) is None):
+                    continue
+                try:
+                    st = os.lstat(name, dir_fd=fd)
+                except FileNotFoundError:
+                    continue
+                except OSError as err:
+                    _say("cannot stat lane tree %s: %s" % (name, err))
+                    continue
+                finished = self._tree_done(name, busy)
+                if not finished and self.now - st.st_mtime < TREE_KEEP:
+                    continue
+                if stat.S_ISDIR(st.st_mode):
+                    shutil.rmtree(name, ignore_errors=True, dir_fd=fd)
+                else:
+                    os.unlink(name, dir_fd=fd)
+                removed += 1
+                done += finished
+        except OSError as err:
+            _say("cannot list %s to remove finished lane trees: %s" % (root, err))
+        finally:
+            os.close(fd)
         if removed:
             _say("removed %d finished lane tree(s) from %s%s" % (
                 removed, root, " (%d of tickets done)" % done if done else ""))

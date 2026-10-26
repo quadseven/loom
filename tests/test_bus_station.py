@@ -5984,7 +5984,7 @@ class PruneTest(Base):
         # The agy lane keeps its trees in its own user's folder
         # (lanes/run_lane.sh WORKDIR): 386 trees, 15 GB on 2026-10-26.
         tp = REPO.replace("/", ".") + "-"
-        agy = os.path.join(self.home, "agy-lanes")
+        agy = os.path.join(os.path.realpath(self.home), "agy-lanes")
         self.settings.agy_workdir = agy
         self.fake.add(1, state="merged")
         self.fake.add(2, state="pr")
@@ -5998,21 +5998,27 @@ class PruneTest(Base):
 
     def test_the_agy_folder_keeps_other_entries_and_is_never_read_through_a_symlink(self):
         tp = REPO.replace("/", ".") + "-"
+        old = time.time() - station.TREE_KEEP - 60
         self.fake.add(1, state="merged")
         real = os.path.join(self.home, "elsewhere")
         stray = self.tree("not-a-ticket", station.TREE_KEEP + 60)
         os.makedirs(os.path.join(real, tp + "1"))
         link = os.path.join(self.home, "agy-link")
         os.symlink(real, link)
-        agy = os.path.join(self.home, "agy-lanes")
+        agy = os.path.join(os.path.realpath(self.home), "agy-lanes")
         os.makedirs(agy)
         other = os.path.join(agy, "notes")
         os.makedirs(other)
-        old = time.time() - station.TREE_KEEP - 60
         os.utime(other, (old, old))
         self.settings.agy_workdir = link
         self.run_pass()
         self.assertTrue(os.path.exists(os.path.join(real, tp + "1")))
+        # A symlink in a parent part of the path is refused too.
+        os.makedirs(os.path.join(real, "sub", tp + "1"))
+        os.utime(os.path.join(real, "sub", tp + "1"), (old, old))
+        self.settings.agy_workdir = os.path.join(link, "sub")
+        self.run_pass()
+        self.assertTrue(os.path.exists(os.path.join(real, "sub", tp + "1")))
         self.settings.agy_workdir = agy
         self.run_pass()
         self.assertTrue(os.path.exists(other))
