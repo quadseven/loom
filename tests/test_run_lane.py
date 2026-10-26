@@ -2862,6 +2862,11 @@ exec /usr/bin/git "$@"
     def pod_lane(self, **env):
         """A lane pod pass (bwrap, copied SSM values, egress proved) on
         opencode-go. Returns the inbox and the result."""
+        # The egress probes are localhost sockets, which the lane check
+        # sandbox denies: there these tests would see a lane that never
+        # proves its egress and fail the base check on unmodified main.
+        if not sandbox_caps.LOCALHOST:
+            self.skipTest(sandbox_caps.NO_LOCALHOST)
         self.write_tool(self.bin / "bwrap", "#!/usr/bin/env bash\n"
                         "while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n"
                         "[ $# -gt 0 ] || exit 0\nshift\nexec \"$@\"\n")
@@ -2909,6 +2914,8 @@ exec /usr/bin/git "$@"
         # A lane pod (docs/LANES.md, "Lane pods"): no sandbox-exec, no AWS
         # key, and a scratch volume that holds no finished run. A private
         # repo: a pod pushes nothing public (see the test above).
+        if not sandbox_caps.LOCALHOST:
+            self.skipTest(sandbox_caps.NO_LOCALHOST)
         record = Path(self._tmp.name) / "bwrap.calls"
         # Each call: its options up to --, the command and its first argument,
         # and the key it was handed, one a line, then a blank line.
