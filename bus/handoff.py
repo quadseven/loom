@@ -88,6 +88,19 @@ def split_journal(body: str) -> List[Tuple[str, str]]:
     return sorted(found, key=lambda part: part[0])
 
 
+def _tick_time_from_comment(comment: Any, tick_time: str, at_key: str = "at") -> Optional[str]:
+    """Try to parse tick_time as %Y-%m-%dT%H:%M:%SZ; if it has no date, use the
+    comment's created_at or updated_at (at_key is the timestamp field to use)."""
+    parsed = _parse(tick_time)
+    if parsed is not None:
+        return tick_time
+    timestamp = str(comment.get(at_key) or comment.get("created_at") or comment.get("createdAt") or "")
+    if timestamp:
+        day = timestamp[:10]
+        return f"{day}T{tick_time}"
+    return None
+
+
 def expand_journals(comments: Iterable[Any], at_key: str = "at",
                     id_key: str = "id") -> List[Any]:
     """Each journal comment edited in place as one comment per tick, oldest
@@ -110,9 +123,12 @@ def expand_journals(comments: Iterable[Any], at_key: str = "at",
         parts = split_journal(body)
         for index, (at, part) in enumerate(parts):
             item = dict(comment, body=part)
+            if at:
+                # Try to infer the full date when tick has no date
+                at = _tick_time_from_comment(comment, at, at_key)
             item[at_key] = at or comment.get(at_key)
             if index < len(parts) - 1 and comment.get(id_key) is not None:
-                item[id_key] = "%s@%s" % (comment[id_key], at)
+                item[id_key] = "%s@%s" % (comment[id_key], at or comment.get(id_key))
             out.append(item)
     return out
 
@@ -275,16 +291,27 @@ def journal_holder(comment: Dict[str, Any]) -> str:
 
 
 def peer_journals(found: Iterable[Dict[str, Any]], holder: str,
-                  now: datetime) -> List[Dict[str, Any]]:
+                   now: datetime) -> List[Dict[str, Any]]:
     """Journals from any other brain within QUIET of now. A journal naming no
     holder counts as another brain's, and so does one whose time cannot be
     read: GitHub always stamps a comment, so an unreadable time is a fault,
-    and the safe reading is "fresh", which keeps broad work closed."""
+    and the safe reading is "fresh", which keeps broad work closed.
+    When the time cannot be read, the comment must have been created or
+    updated within QUIET."""
     out = []
     for comment in found:
         at = _parse(str(comment.get("at") or ""))
-        if journal_holder(comment) != holder and (at is None or now - at <= QUIET):
-            out.append(comment)
+        if journal_holder(comment) != holder:
+            if at is None:
+                # Unreadable time: check if the comment itself is fresh
+                ts = (str(comment.get("updated_at") or comment.get("updatedAt") or "")
+                      or str(comment.get("created_at") or comment.get("createdAt") or ""))
+                if ts:
+                    ts_parsed = _parse(ts)
+                    if ts_parsed is not None and now - ts_parsed <= QUIET:
+                        out.append(comment)
+            elif now - at <= QUIET:
+                out.append(comment)
     return out
 
 

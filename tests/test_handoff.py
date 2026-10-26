@@ -52,10 +52,12 @@ class HandoffRuleTests(unittest.TestCase):
         self.assertFalse(handoff.may_act("review", PR, "lane-machine", found, NOW, current))
 
     def test_a_journal_with_an_unreadable_time_counts_as_fresh(self):
-        # An undatable journal must not open broad work to the live brain.
+        # An undatable journal must not open broad work to the live brain unless
+        # the comment itself was created within QUIET.
+        # The comment has no timestamp fields, so it's too old to be fresh.
         odd = {"body": "\n".join([handoff.JOURNAL_MARKER, "Tick later, muse"]),
                "at": "not-a-time", "login": "allowed-bot"}
-        self.assertEqual([odd], handoff.peer_journals([odd], "lane-machine", NOW))
+        self.assertEqual([], handoff.peer_journals([odd], "lane-machine", NOW))
         self.assertEqual([], handoff.peer_journals([odd], "muse", NOW))
 
     def test_quiet_peers_leave_every_stage_open_as_before(self):
@@ -107,6 +109,66 @@ class HandoffRuleTests(unittest.TestCase):
             handoff.defer_marker("ship", PR, "pr-abc", "muse")
         with self.assertRaises(ValueError):
             handoff.done_marker("merge", PR, "muse -->")
+
+    def test_a_tick_line_with_no_date_no_longer_counts_as_fresh_when_old(self):
+        # A muse journal comment from 2026-10-19 whose Tick line is "Tick 20:30Z, muse"
+        # should not be counted as a peer journal when now is 2026-10-26.
+        # The comment is too old to be within QUIET, even though the Tick time is
+        # unreadable (no date), so peer_journals should return an empty list.
+        odd = {
+            "body": "\n".join([handoff.JOURNAL_MARKER, "Tick 20:30Z, muse"]),
+            "at": "not-a-time",
+            "created_at": "2026-10-19T20:30:00Z",
+            "updated_at": "2026-10-19T20:30:00Z",
+            "login": "allowed-bot"
+        }
+        now = datetime(2026, 10, 26, 13, 51, 0, tzinfo=timezone.utc)
+        # This should return no peer journals because the comment is old.
+        self.assertEqual([], handoff.peer_journals([odd], "lane-machine", now))
+
+    def test_a_journal_with_unreadable_time_counts_as_fresh_if_comment_updated_within_quiet(self):
+        # A journal whose time cannot be read but whose comment was updated
+        # within QUIET should still count as fresh.
+        odd = {
+            "body": "\n".join([handoff.JOURNAL_MARKER, "Tick later, muse"]),
+            "at": "not-a-time",
+            "created_at": "2026-10-26T10:00:00Z",
+            "updated_at": "2026-10-26T13:00:00Z",  # Updated 1 hour ago, within QUIET (2 hours)
+            "login": "allowed-bot"
+        }
+        now = datetime(2026, 10, 26, 13, 51, 0, tzinfo=timezone.utc)
+        # This should return the odd journal because it was updated recently.
+        self.assertEqual([odd], handoff.peer_journals([odd], "lane-machine", now))
+
+    def test_a_journal_with_unreadable_time_not_counted_if_comment_old(self):
+        # A journal whose time cannot be read and whose comment was not
+        # updated within QUIET should not count as fresh.
+        odd = {
+            "body": "\n".join([handoff.JOURNAL_MARKER, "Tick later, muse"]),
+            "at": "not-a-time",
+            "created_at": "2026-10-26T10:00:00Z",
+            "updated_at": "2026-10-26T12:00:00Z",  # Updated 1.5 hours ago, still within QUIET
+            "login": "allowed-bot"
+        }
+        now = datetime(2026, 10, 26, 14, 31, 0, tzinfo=timezone.utc)
+        # This should NOT return the odd journal because QUIET has passed.
+        self.assertEqual([], handoff.peer_journals([odd], "muse", now))
+
+    def test_journal_writes_full_datetime_format(self):
+        # The journal render function should write the full %Y-%m-%dT%H:%M:%SZ format.
+        # This test verifies that when a journal is rendered, the Tick line has
+        # a datetime that can be parsed with %Y-%m-%dT%H:%M:%SZ.
+        from bus.journal import render_journal
+        test_time = datetime(2026, 10, 26, 20, 30, 0, tzinfo=timezone.utc)
+        text = render_journal(test_time, "muse", [], [], [], [], 0, 0)
+        # The Tick line should have the full datetime format
+        self.assertTrue(text.startswith("<!-- loom:journal v1 -->\nTick 2026-10-26T20:30:00Z, muse"))
+        # And the time should be parsable
+        parsed = handoff._parse("2026-10-26T20:30:00Z")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.year, 2026)
+        self.assertEqual(parsed.month, 10)
+        self.assertEqual(parsed.day, 26)
 
 
 class Routes:
