@@ -117,6 +117,13 @@ class ReportError(Exception):
     """A report artifact that could not be read or applied."""
 
 
+def _fault(err: BaseException) -> str:
+    """An exception as "Type: message" for a parked brief's reason: one
+    line, at most 200 characters (an archive's text is untrusted)."""
+    text = " ".join(str(err).split())[:200]
+    return "%s: %s" % (type(err).__name__, text) if text else type(err).__name__
+
+
 def provider(slot: str) -> str:
     """The provider lane of a slot, as run_lane.sh maps it."""
     if re.fullmatch(r"free-[a-z]+", slot):
@@ -571,7 +578,7 @@ class Runners:
         except ReportError:
             raise
         except Exception as err:  # noqa: BLE001 - an untrusted archive may raise anything
-            raise ReportError("the report could not be opened (%s)" % type(err).__name__) from None
+            raise ReportError("the report could not be opened (%s)" % _fault(err)) from err
 
     def _open_report(self, archive: bytes, run_id: str, mac_key: str) -> Dict[str, bytes]:
         """The files of a report artifact, as relative path -> bytes. The zip
@@ -594,7 +601,7 @@ class Runners:
                         self._zip_member(zf, "report.enc", ARTIFACT_MAX, fh)
             except (zipfile.BadZipFile, zipfile.LargeZipFile, KeyError, OSError, RuntimeError,
                     EOFError, zlib.error, NotImplementedError, ValueError) as err:
-                raise ReportError("not a lane report artifact (%s)" % type(err).__name__) from None
+                raise ReportError("not a lane report artifact (%s)" % _fault(err)) from err
             digest = hashlib.sha256()
             with open(sealed_path, "rb") as fh:
                 for chunk in iter(lambda: fh.read(CHUNK), b""):
@@ -638,7 +645,7 @@ class Runners:
                     files[name] = buf.getvalue()
         except (tarfile.TarError, OSError, EOFError, zlib.error, NotImplementedError,
                 ValueError) as err:
-            raise ReportError("the report is not a readable archive (%s)" % type(err).__name__) from None
+            raise ReportError("the report is not a readable archive (%s)" % _fault(err)) from err
         return files
 
     @staticmethod

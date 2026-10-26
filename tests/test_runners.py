@@ -392,7 +392,7 @@ class RunnersTest(unittest.TestCase):
         self.finish(run, run_id, b"not a zip")
         with mock.patch.object(runners.Runners, "_open_report", side_effect=TypeError("odd")):
             self.runner(now=self.now + 600).tend()
-        self.assertIn("could not read the runner's report: the report could not be opened (TypeError)",
+        self.assertIn("could not read the runner's report: the report could not be opened (TypeError: odd)",
                       self.failure_line())
 
     def test_a_report_that_unpacks_past_the_bound_is_refused(self):
