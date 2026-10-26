@@ -17,9 +17,9 @@ from urllib.parse import quote
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
-from . import answer, ci_facts, ci_gap, merge_tier, naming, operator_hold, shadow
+from . import answer, ci_facts, ci_gap, fixrounds, merge_tier, naming, operator_hold, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
-from .labels import LANES, REMOTE_LANES
+from .labels import HANDOFF, LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
@@ -115,6 +115,24 @@ def goal_trunk(issue: Dict[str, Any]) -> Optional[str]:
     """The Trunk: branch named in a goal home's body, or None."""
     match = _TRUNK_RE.search(str(issue.get("body") or ""))
     return match.group(1) if match else None
+
+
+# A goal home may name merge constraints in its body's header area (before the
+# first heading). Each constraint is a "Merge constraint:" line that names a
+# rule that must be satisfied for any pull request whose ticket belongs to this
+# goal. Multiple constraints are allowed, one per line.
+_MERGE_CONSTRAINT_RE = re.compile(r"^Merge constraint:[ \t]*(.+)[ \t]*$", re.M)
+
+
+def goal_merge_constraints(issue: Dict[str, Any]) -> List[str]:
+    """The merge constraints named in a goal home's body header, in order."""
+    lines = []
+    for line in str(issue.get("body") or "").splitlines():
+        if line.startswith("#"):
+            break
+        lines.append(line)
+    header = "\n".join(lines)
+    return [m.group(1).strip() for m in _MERGE_CONSTRAINT_RE.finditer(header)]
 
 
 def _repo(value: str) -> str:
@@ -580,6 +598,52 @@ def _unbuilt_criteria_reason(body: str) -> str:
     return ""
 
 
+_BACKTICKED = re.compile(r"`([^`\n]+)`")
+_OWNER_NAME = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w.-]*)/([A-Za-z0-9][\w.-]*)(?![\w/-])")
+_REPO_WORD = re.compile(r"[A-Za-z0-9][\w.-]*")
+
+
+def _foreign_repo(text: str, repo: str, known: Sequence[str]) -> str:
+    """The first other repo of `repo`'s owner that a criterion names, as
+    OWNER/NAME, else "". It counts OWNER/NAME with the same owner, and a
+    backticked bare name that is a known repo of that owner (LOOM_REPOS):
+    a backticked file or function name is not a repo name."""
+    owner, _, name = repo.lower().partition("/")
+    siblings = {n for o, _, n in (r.lower().partition("/") for r in known)
+                if o == owner and n and n != name}
+    for match in _OWNER_NAME.finditer(text):
+        if match.group(1).lower() == owner and match.group(2).lower().rstrip(".") != name:
+            return "%s/%s" % (match.group(1), match.group(2).rstrip("."))
+    for match in _BACKTICKED.finditer(text):
+        word = match.group(1).strip()
+        if _REPO_WORD.fullmatch(word) and word.lower() in siblings:
+            return "%s/%s" % (repo.partition("/")[0], word)
+    return ""
+
+
+def _foreign_criteria_reason(body: str, repo: str,
+                             env: Optional[Dict[str, str]] = None) -> str:
+    """Block when a ticked criterion names another repo of the owner: that
+    repo builds it, so this pull request cannot have (loom#1711). A criterion
+    already marked "; not built: belongs in <that repo>" passes."""
+    env = os.environ if env is None else env
+    known = str(env.get("LOOM_REPOS") or "").replace(",", " ").split()
+    for checked, text in proof.criteria(body):
+        if not checked:
+            continue
+        other = _foreign_repo(text, repo, known)
+        if not other:
+            continue
+        short = other.partition("/")[2]
+        moved = re.search(r";\s*not built:\s*belongs in\s+`?([\w./-]+?)`?\s*\.?\s*$", text, re.I)
+        if moved and moved.group(1).lower() in {other.lower(), short.lower()}:
+            continue
+        return ("blocked: ticked criterion names another repo, %s: %r; send a brain fix "
+                "to untick it and end it \"; not built: belongs in %s\""
+                % (other, _one_line(text), short))
+    return ""
+
+
 def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> str:
     return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
 
@@ -596,6 +660,9 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
                     + "blocked: review check has not passed on the head commit")
     if line.endswith(" - READY") and _unbuilt_criteria_reason(str(pr.get("body") or "")):
         return line.removesuffix("READY") + "blocked: no criterion built"
+    foreign = _foreign_criteria_reason(str(pr.get("body") or ""), repo)
+    if line.endswith(" - READY") and foreign:
+        return line.removesuffix("READY") + foreign
     return line
 
 
@@ -729,28 +796,80 @@ def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
     loom pull request, including a pending brain fix as a blocker."""
     lines = ["### Pull requests"]
     for pr in prs:
-        line = _status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check)
-        try:
-            ticket = _ticket_association(repo, pr)
-        except ValueError:
-            ticket = None
-        if (ticket is not None and line.endswith("blocked: no criterion built")):
-            issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
-            if {x.lower() for x in _labels(issue)} & {"docs", "documentation"}:
-                line = line.removesuffix("blocked: no criterion built") + "READY"
-        if line.endswith(" - READY"):
-            for blocker in _merge_refusals(gh, repo, pr, ticket):
-                line = _add_blocker(line, blocker)
-        if ticket is not None and authors:
-            comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
-            if _pending_brain_fix(comments, authors):
-                line = _add_blocker(line, "pending brain fix")
-        if operator_hold.operator_steps(str(pr.get("body") or "")):
-            # bus.brain merge refuses it and asks the operator; status says
-            # so first, from the body it already holds (2026-10-22).
-            line = _add_blocker(line, "held for the operator: operator steps before merge")
-        lines.append(line)
+        lines.append(_pull_request_line(gh, repo, pr, data, bot, authors, check))
     return lines
+
+
+def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
+                       data: Dict[str, Any], bot: str, authors: Sequence[str],
+                       check: str) -> str:
+    """Build one status line, including brain and goal-home blockers."""
+    node = data["prs"].get(int(pr["number"]))
+    line = _status_pr_line(gh, repo, pr, node, bot, check)
+    ticket = _safe_ticket_association(repo, pr)
+    line = _docs_criterion_override(gh, repo, ticket, line)
+    if line.endswith(" - READY"):
+        for blocker in _merge_refusals(gh, repo, pr, ticket):
+            line = _add_blocker(line, blocker)
+    line = _pending_fix_blocker(gh, ticket, authors, line)
+    if operator_hold.operator_steps(str(pr.get("body") or "")):
+        line = _add_blocker(line, "held for the operator: operator steps before merge")
+    return _goal_rule_line(gh, repo, pr, ticket, line)
+
+
+def _safe_ticket_association(repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+    """Return the associated ticket, ignoring an invalid association."""
+    try:
+        return _ticket_association(repo, pr)
+    except ValueError:
+        return None
+
+
+def _docs_criterion_override(gh: GitHub, repo: str,
+                             ticket: Optional[Tuple[str, int]], line: str) -> str:
+    """Docs tickets do not require a built acceptance criterion."""
+    if ticket is None or not line.endswith("blocked: no criterion built"):
+        return line
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+    if {x.lower() for x in _labels(issue)} & {"docs", "documentation"}:
+        return line.removesuffix("blocked: no criterion built") + "READY"
+    return line
+
+
+def _pending_fix_blocker(gh: GitHub, ticket: Optional[Tuple[str, int]],
+                         authors: Sequence[str], line: str) -> str:
+    """Add a blocker while a brain fix still awaits its author."""
+    if ticket is not None and authors:
+        comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
+        if _pending_brain_fix(comments, authors):
+            return _add_blocker(line, "pending brain fix")
+    return line
+
+
+def _goal_rule_line(gh: GitHub, repo: str, pr: Dict[str, Any],
+                    ticket: Optional[Tuple[str, int]], line: str) -> str:
+    """Add the goal-home rules to a status line the way merge reads them: a
+    met rule is shown as `rule: <rule>`, and a rule that is not met, one merge
+    cannot check, or an unreadable goal home is a blocker (loom#1435)."""
+    if ticket is None:
+        return line
+    try:
+        ticket_issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+    except GitHubError:
+        return _add_blocker(line, "goal home unreadable")
+    if ticket_issue.get("state") != "open" or "loom:ticket" not in _labels(ticket_issue):
+        return line
+    try:
+        home, results = _goal_rule_results(gh, repo, int(pr["number"]), ticket[0], ticket_issue)
+    except GitHubError:
+        return _add_blocker(line, "goal home unreadable")
+    for rule, met in results:
+        if met is False:
+            line = _add_blocker(line, "goal home %s rule not met: %s" % (home, rule))
+        elif met is None:
+            line = _add_blocker(line, "goal home %s rule merge cannot check: %s" % (home, rule))
+    met_rules = [rule for rule, met in results if met]
+    return line + (" - " + "; ".join("rule: %s" % rule for rule in met_rules) if met_rules else "")
 
 
 def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
@@ -1199,6 +1318,31 @@ def _parent_number(issue: Dict[str, Any]) -> Optional[int]:
         return int(match.group(1))
     match = re.search(r"/issues/(\d+)(?:[/?#]|$)", str(issue.get("parent_issue_url") or ""))
     return int(match.group(1)) if match else None
+
+
+def _goal_home_for_ticket(gh: GitHub, repo: str, ticket: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The goal home issue for a ticket, or None if it cannot be resolved.
+
+    A ticket's "Part of #N" line names either a goal home or an epic.
+    If it names an epic, the epic's own "Part of #N" names the goal home.
+    """
+    parent = _parent_number(ticket)
+    if parent is None:
+        return None
+    parent_issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, parent)).data or {}
+    if parent_issue.get("state") != "open":
+        return None
+    parent_labels = _labels(parent_issue)
+    if "loom:goal" in parent_labels:
+        return parent_issue
+    if "epic" in parent_labels:
+        # Epic: its Part of names the goal home
+        epic_parent = _parent_number(parent_issue)
+        if epic_parent is not None:
+            goal_issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, epic_parent)).data or {}
+            if goal_issue.get("state") == "open" and "loom:goal" in _labels(goal_issue):
+                return goal_issue
+    return None
 
 
 def is_repair(repo: str, issue: Dict[str, Any], env: Optional[Dict[str, str]] = None) -> bool:
@@ -1873,15 +2017,28 @@ def _link_to_goal(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any],
 
 
 def _in_flight(issue: Dict[str, Any]) -> bool:
+    """An open ticket in an IN_FLIGHT state. A ticket in the hand-off pool
+    (labels.HANDOFF) is not, unless it is at loom:pr: no lane of this Loom
+    takes it, so it must not hold the goal's cap (loom#1831). A pr-state
+    ticket counts as it always has."""
     names = _labels(issue)
+    if HANDOFF in names and "loom:pr" not in names:
+        return False
     return (issue.get("state") == "open" and "loom:ticket" in names
             and any(state in names for state in IN_FLIGHT))
+
+
+def goal_flying(gh: GitHub, repo: str, goal: int,
+                issue: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """The tickets in flight under an open loom:goal issue; ValueError for
+    anything else."""
+    return [i for i in _goal_children(gh, repo, goal, issue) if _in_flight(i)]
 
 
 def _goal_in_flight(gh: GitHub, repo: str, goal: int,
                     issue: Optional[Dict[str, Any]] = None) -> int:
     """Tickets in flight under an open loom:goal issue; ValueError for anything else."""
-    return sum(1 for i in _goal_children(gh, repo, goal, issue) if _in_flight(i))
+    return len(goal_flying(gh, repo, goal, issue))
 
 
 def _check_goal_capacity(children: List[Dict[str, Any]], goal: int) -> None:
@@ -3241,6 +3398,10 @@ def merge(gh: GitHub, repo: str, number: int,
             reason = _unbuilt_criteria_reason(str(pr.get("body") or ""))
             if reason:
                 raise ValueError(reason)
+        reason = _foreign_criteria_reason(str(pr.get("body") or ""), repo, env)
+        if reason:
+            raise ValueError(reason)
+        _refuse_merge_constraints(gh, repo, number, association, issue)
         tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env, verdict)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
@@ -3330,6 +3491,100 @@ def _changed_files(details: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         return None  # GraphQL gives no old path: REST names it (previous_filename)
     return [{"filename": str(n.get("path") or ""), "deletions": int(n.get("deletions") or 0),
              "status": str(n.get("changeType") or "").lower()} for n in nodes]
+
+
+# A C++ unit test: a .cpp file under a tests/, test/ or t/ directory at any
+# depth. The C++ module repos keep theirs under t/ (t/TestSomething.cpp) or
+# tests/ (tests/test_something.cpp).
+_CPP_UNIT_TEST_RE = re.compile(r"(?:^|.*/)(?:tests?|t)/(?:[^/]+/)*[^/]+\.cpp")
+
+
+def _has_cpp_unit_test(files: Sequence[Any]) -> bool:
+    """True when the pull request adds or changes a C++ unit test file."""
+    return any(isinstance(item, dict)
+               and str(item.get("status") or "") != "removed"
+               and _CPP_UNIT_TEST_RE.fullmatch(str(item.get("filename") or ""))
+               for item in files)
+
+
+# C++ source: implementation and header files. A pull request that touches
+# none of them (docs, build files, scripts) changes no C++ code, so a rule
+# asking for a C++ unit test on every code change does not apply to it.
+_CPP_SOURCE_RE = re.compile(r".+\.(?:cpp|cc|cxx|c\+\+|h|hh|hpp|hxx|ipp|inl|tpp)", re.I)
+
+
+def _changes_cpp_source(files: Sequence[Any]) -> bool:
+    """True when the pull request adds, changes or removes a C++ source file."""
+    return any(isinstance(item, dict)
+               and _CPP_SOURCE_RE.fullmatch(str(item.get("filename") or ""))
+               for item in files)
+
+
+def _cpp_unit_test_rule(files: Sequence[Any]) -> bool:
+    """Met when the pull request changes no C++ source, or carries a C++ unit test."""
+    return not _changes_cpp_source(files) or _has_cpp_unit_test(files)
+
+
+# The goal-home rules bus.brain merge can check, keyed by the normalized rule
+# text. A rule not listed here is one merge cannot check, so merge refuses it
+# instead of passing it silently.
+_MERGE_RULE_CHECKS: Dict[str, Callable[[Sequence[Any]], bool]] = {
+    "c++ unit test required": _cpp_unit_test_rule,
+}
+
+
+def _normalized_rule(constraint: str) -> str:
+    return " ".join(constraint.lower().split()).rstrip(".")
+
+
+def _goal_rule_results(gh: GitHub, repo: str, number: int, ticket_repo: str,
+                       ticket_issue: Dict[str, Any]) -> Tuple[str, List[Tuple[str, Optional[bool]]]]:
+    """The goal home (as OWNER/NAME#N) and each rule it names, with True when
+    the pull request meets it, False when it does not, and None when merge has
+    no check for it. Reads the goal home, and the pull request's files only
+    when a rule needs them. A failed read raises GitHubError."""
+    goal_home = _goal_home_for_ticket(gh, ticket_repo, ticket_issue)
+    constraints = goal_merge_constraints(goal_home) if goal_home else []
+    if not constraints:
+        return "", []
+    home = "%s#%s" % (ticket_repo, (goal_home or {}).get("number", "unknown"))
+    files: Optional[List[Any]] = None
+    results: List[Tuple[str, Optional[bool]]] = []
+    for constraint in constraints:
+        rule_check = _MERGE_RULE_CHECKS.get(_normalized_rule(constraint))
+        if rule_check is None:
+            results.append((constraint, None))
+            continue
+        if files is None:
+            files = gh.paginate("/repos/%s/pulls/%d/files" % (repo, number))
+        results.append((constraint, bool(rule_check(files))))
+    return home, results
+
+
+def _refuse_merge_constraints(gh: GitHub, repo: str, number: int,
+                              association: Optional[Tuple[str, int]],
+                              ticket_issue: Dict[str, Any]) -> None:
+    """Refuse a merge that breaks a rule its ticket's goal home names.
+
+    Fails closed: an unreadable goal home, or a rule merge has no check for,
+    refuses the merge with the rule and the goal home named. A ticket with a
+    parent still costs the goal-home read; one whose goal home names no rule
+    then merges as before, with no file read.
+    """
+    if association is None:
+        return
+    try:
+        home, results = _goal_rule_results(gh, repo, number, association[0], ticket_issue)
+    except GitHubError as exc:
+        raise ValueError("goal home unreadable for ticket %s#%d: %s; merge refused "
+                         "until its merge constraints can be checked"
+                         % (association[0], association[1], exc)) from exc
+    for constraint, met in results:
+        if met is None:
+            raise ValueError("goal home %s rule '%s' cannot be checked by bus.brain "
+                             "merge; check it and merge by hand" % (home, constraint))
+        if not met:
+            raise ValueError("goal home %s rule '%s' is not met" % (home, constraint))
 
 
 def _verdict_reader(gh: GitHub, repo: str, number: int, details: Dict[str, Any],
@@ -5390,6 +5645,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gh.status_in_body = True  # read the events in the issue body (loom#1341)
         # Status comments by the trusted writers read as events (bus/status.py).
         gh.status_authors |= {a.lower() for a in os.environ.get("LOOM_BRIEF_AUTHORS", "").split()}
+        # The station's fix-rounds comments read as their rounds (loom#1640).
+        gh.fix_ledger = fixrounds.ledger_from_env()
         COMMANDS[args.command](gh, args)
         return 0
     except (ValueError, OSError, GitHubError) as exc:

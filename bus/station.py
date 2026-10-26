@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 import errno
 import fcntl
 import fnmatch
+import gzip
 import hashlib
 import json
 import math
@@ -32,9 +33,12 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 from . import audit
 from . import bench
 from . import ci_gap
+from . import converge
 from . import brain_memory
 from . import claimed
 from . import fabric
+from . import fixrounds
+from . import runners
 from . import scope_fit
 from . import shadow
 from . import stale_claims
@@ -103,12 +107,30 @@ TREE_KEEP = 3600
 # The loom home is kept bounded (loom#643): a lane's logs (logs/<slot>/) are
 # removed once nothing in them changed for LOOM_LOG_KEEP_DAYS days (0 keeps
 # them all), unless a brief of that name is waiting or running or its
-# transcript has not reached the dashboard yet. Every pass warns when the
-# home's disk has less than LOOM_DISK_FREE_MIN_GB free; every DISK_EVERY
-# seconds the old logs go and the home's size is logged. On 2026-10-17 logs/
-# held 4.2 GB, growing 0.6 GB a day, and the disk was down to 8 GB free.
+# transcript has not reached the dashboard yet. Every DISK_EVERY seconds the
+# old logs go, finished runs' session stores are compressed, and the home's
+# size is logged. On 2026-10-17 logs/ held 4.2 GB, growing 0.6 GB a day, and
+# the disk was down to 8 GB free.
 LOG_KEEP_DAYS = 7
-DISK_FREE_MIN_GB = 10.0
+# While the home's disk has less than LOOM_MIN_FREE_GB free the station claims
+# no new work (loom#1808): on 2026-10-25 the disk fell to 300 MB free and every
+# lane run failed at once. The older name LOOM_DISK_FREE_MIN_GB is still read.
+DISK_FREE_MIN_GB = 15.0
+DISK_GUARD_FILE = "disk-guard.json"
+# A finished opencode run's session store under its log folder (lanes/
+# run_lane.sh archive_transcripts): 100-440 MB a run on 2026-10-25, 14 GB of
+# the 17 GB in logs/ (loom#1808). Compressed once its transcript is uploaded.
+SESSION_DB_PARTS = (".local", "share", "opencode", "opencode.db")
+# The ticket states after which a lane tree serves no fix round: its tree,
+# check copy and idle run scratch go at once, not after TREE_KEEP.
+TREE_DONE_STATES = frozenset(("loom:merged", "loom:shipped", "loom:verified",
+                              "loom:closed-unmerged"))
+# A lane's run scratch (run/<slot>-home, -check, -check-default) younger than
+# this is never removed: a runner may have just made it.
+RUN_SCRATCH_SETTLE = 600
+# The folders an idle lane's run home drops each pass: package caches and
+# temp files a run rebuilds.
+RUN_HOME_CACHES = (".cache", ".cargo", "tmp")
 DISK_EVERY = 3600
 GB = 1024 ** 3
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
@@ -173,8 +195,12 @@ DIGEST_MARKER = "<!-- loom:digest v1 -->"
 MENTION_ROOM = 40
 ASK_GOAL_REF_RE = re.compile(r"(?<![\w/])#([0-9]+)\b")
 FIX_ROUNDS_DEFAULT = 3
-FIX_CAP_TEXT = ("The fix round cap (%d) is reached, so this ticket is held for the brain "
-                "(needs-brain) and gets no further fix rounds.")
+# A ticket whose fix rounds stop (bus/converge.py: no rung left above a stuck
+# round, or the round cap reached on its rung) is left loom:failed with this
+# note and labels.HANDOFF, the pool the second operator's session works.
+FIX_STOP_TEXT = ("The station stopped the fix rounds on pull request #%d: %s. Still failing: %s. "
+                 "The ticket is left loom:failed with the %s label for the second operator's "
+                 "session, which claims it before working it.")
 REPORT_MARKER = "<!-- loom:report v1 -->"
 # The last line of a quiet standup the station edits in place, and of a
 # standup that repeats an earlier one word for word.
@@ -219,6 +245,14 @@ DEAD_BRIEF_AGE = 3600
 # running, whatever its heartbeat's age. Several missed stamps still count.
 ALIVE_MAX_AGE = 300
 REWRITE_PER_PASS = 5
+# A goal at its in-flight cap this long is stuck: the rewrite skip line and
+# the dashboard's Needs-you page say so, with how many of its in-flight
+# tickets wait with no lane (loom#1831). A record the rewrite step has not
+# refreshed in GOAL_CAP_SEEN is not sent.
+GOAL_CAP_STUCK = 6 * 3600
+GOAL_CAP_SEEN = 2 * 3600
+GOAL_CAPS_PATH = "/api/goal-caps"
+GOAL_CAPS_EVERY = 600
 # A recorded ticket wait the factory has not repeated for this long is gone:
 # the ticket moved, or left the factory (invariants.ticket_waiting).
 WAIT_UNSEEN = 3600
@@ -925,7 +959,8 @@ class Settings:
                    ship_path_workflows=words("LOOM_SHIP_PATH_WORKFLOWS"),
                    no_topup=words("LOOM_NO_TOPUP"),
                    log_keep_days=_keep_days(env.get("LOOM_LOG_KEEP_DAYS", "")),
-                   disk_free_min_gb=_free_floor(env.get("LOOM_DISK_FREE_MIN_GB", "")),
+                   disk_free_min_gb=_free_floor(env.get("LOOM_MIN_FREE_GB", "").strip()
+                                                or env.get("LOOM_DISK_FREE_MIN_GB", "")),
                    settle_claimed=claimed.mode(env.get("LOOM_SETTLE_CLAIMED", "")),
                    settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")),
                    claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")))
@@ -944,7 +979,8 @@ def _keep_days(raw: str) -> int:
 
 
 def _free_floor(raw: str) -> float:
-    """LOOM_DISK_FREE_MIN_GB: a non-negative number of GB, else the default."""
+    """LOOM_MIN_FREE_GB (or the older LOOM_DISK_FREE_MIN_GB): a non-negative
+    number of GB, else the default."""
     raw = raw.strip()
     if not raw:
         return DISK_FREE_MIN_GB
@@ -953,7 +989,7 @@ def _free_floor(raw: str) -> float:
     except ValueError:
         value = -1.0
     if not (value >= 0 and math.isfinite(value)):
-        _say("ignoring LOOM_DISK_FREE_MIN_GB %r: not a number of GB" % raw)
+        _say("ignoring LOOM_MIN_FREE_GB %r: not a number of GB" % raw)
         return DISK_FREE_MIN_GB
     return value
 
@@ -989,6 +1025,55 @@ def _remove(path: str) -> None:
         shutil.rmtree(path, ignore_errors=True)
     else:
         os.unlink(path)
+
+
+def _gzip_session_db(run: str) -> Optional[Tuple[int, int]]:
+    """gzip a run log folder's opencode.db (SESSION_DB_PARTS) in place:
+    (bytes before, bytes after), or None when it holds no store. Every folder
+    on the way must be a real folder and the store a regular file: nothing
+    is followed through a link. The store's and its folder's times are
+    kept."""
+    parent = run
+    for part in SESSION_DB_PARTS[:-1]:
+        try:
+            st = os.lstat(parent)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISDIR(st.st_mode):
+            return None
+        parent = os.path.join(parent, part)
+    try:
+        folder = os.lstat(parent)
+        if not stat.S_ISDIR(folder.st_mode):
+            return None
+        db = os.path.join(parent, SESSION_DB_PARTS[-1])
+        st = os.lstat(db)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    target = db + ".gz"
+    tmp = target + ".tmp"
+    fd = os.open(db, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        with os.fdopen(fd, "rb") as src, gzip.open(tmp, "wb", compresslevel=6) as dst:
+            shutil.copyfileobj(src, dst, 1 << 20)
+        os.utime(tmp, (st.st_atime, st.st_mtime))
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.unlink(db)
+    for side in ("-wal", "-shm"):
+        try:
+            os.unlink(db + side)
+        except FileNotFoundError:
+            pass
+    os.utime(parent, (folder.st_atime, folder.st_mtime))
+    return st.st_size, os.lstat(target).st_size
 
 
 def _ship_workflows(items: List[str]) -> Dict[str, str]:
@@ -1435,6 +1520,10 @@ def needs_public_repo(lane: str, model: str) -> bool:
     take private repos."""
     if lane in factory.PUBLIC_ONLY:
         return True
+    # A cluster runner's inputs and logs live in this public repo's Actions
+    # (bus/runners.py).
+    if lane in runners.runner_slots():
+        return True
     lane = provider(lane)
     return (lane in FREE_LANES or lane in REMOTE_LANES or lane == "agy"
             or (lane == "opencode-go" and fnmatch.fnmatchcase(model, "*muse-spark*contributor*")))
@@ -1565,6 +1654,10 @@ class Station:
         writers = getattr(gh, "status_authors", None)
         if isinstance(writers, set):
             writers |= {a.lower() for a in settings.authors}
+        # A fix-rounds comment reads as its rounds only while it is exactly
+        # as this Loom last wrote it (bus/fixrounds.py ledger, loom#1640).
+        if hasattr(gh, "fix_ledger"):
+            gh.fix_ledger = fixrounds.ledger_path(settings.home)
         self.s = settings
         self._live_budget = LIVE_CHECKS_PER_PASS
         self._proof_budget = LIVE_PROOFS_PER_PASS
@@ -1610,6 +1703,12 @@ class Station:
         # goal key -> the count and limit the gate hit, the briefed tickets
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
+        # Free bytes on the loom home's disk, read once a pass (_disk_free).
+        self._free: Optional[int] = None
+        self._free_read = False
+        # repo -> open ticket numbers whose lane trees may still serve a fix
+        # round, from this pass's reconcile read (prune_trees).
+        self._open_work: Dict[str, Set[int]] = {}
         # Log data sections the verify gate already read this pass, by ticket.
         self._evidence_text: Dict[str, str] = {}
         # This pass's factory-repair tickets over the unproven-work limit, per
@@ -2019,11 +2118,13 @@ class Station:
         fix in the same pass, after self.now, and a claim sorted before its
         fix left the fix unclaimed, so the next pass sent the same round
         again (39 duplicate fix rounds, 2026-10-21)."""
-        for c in comments if fix_comment_id is not None else ():
-            if isinstance(c, dict) and c.get("id") == fix_comment_id:
-                posted = self._epoch(str(c.get("created_at") or ""))
-                if posted is not None and posted >= self.now:
-                    return posted + 1
+        # The rounds of one fix-rounds comment share its id: the newest counts.
+        times = [self._epoch(str(c.get("created_at") or ""))
+                 for c in (comments if fix_comment_id is not None else ())
+                 if isinstance(c, dict) and c.get("id") == fix_comment_id]
+        posted = max((t for t in times if t is not None), default=None)
+        if posted is not None and posted >= self.now:
+            return posted + 1
         return self.now
 
     def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
@@ -3938,6 +4039,11 @@ class Station:
         tickets_by_number = {int(i["number"]): i for i in self._pr_tickets(repo)
                              if "loom:ticket" in _label_names(i)}
         open_tickets = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        self._open_work[repo] = {
+            int(i["number"]) for i in open_tickets
+            if isinstance(i, dict) and "pull_request" not in i and "number" in i
+            and "loom:ticket" in _label_names(i)
+            and not TREE_DONE_STATES.intersection(_label_names(i))}
         self._reconcile_adoptions(repo, open_tickets)
         # Only a closed pull request changes a ticket. Those PRs are the most
         # recently updated closed ones, so one page of them is read, never the
@@ -5286,10 +5392,17 @@ class Station:
             self._mark_ready(repo, number, sha, names, ready)
             return
         self._remove_ready_if_present(repo, number, names)
-        if not failed and not threads:
+        if self._no_round(failed, threads):
             return
         self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
                                    comments, names, failed, threads, rounds)
+
+    def _no_round(self, failed: List[Tuple[str, str]], threads: List[Any]) -> bool:
+        """Nothing a lane round could fix: no failure at all, or the plan check
+        alone, which fails on the pull request's body; the factory rebuilds
+        that from the ticket (factory._judge, loom#1837), so it is also no
+        round to judge stuck."""
+        return not threads and all(name == self.s.plan_check for name, _ in failed)
 
     def _note_first_push(self, repo: str, pr_number: int, comments: List[Any],
                          failed: List[Tuple[str, str]]) -> None:
@@ -5438,22 +5551,94 @@ class Station:
                               detail: Dict[str, Any], sha: str, comments: List[Any],
                               names: List[str], failed: List[Any], threads: List[Any],
                               rounds: int) -> None:
+        """Send the next fix round, unless the last one moved nothing. Each
+        round went to the same lane until the cap, with no look at whether
+        the last one fixed anything (2026-10-26: four rounds on a local model
+        left the same checks failing and the same finding open). A round whose
+        failures persist by signature (bus/converge.py) climbs the model
+        ladder at once; with no rung left, or with the round cap reached on
+        its rung, the rounds stop (_stop_fix_rounds)."""
         authors = {author.lower() for author in self.s.authors}
-        if self._fix_round_count(comments, authors) >= rounds:
-            self._escalate_fix(repo, number, names)
+        failing = [name for name, _ in failed]
+        persisted = converge.persistent(
+            converge.last_fix_body(comments, authors, (repo, pr_number)),
+            failing, threads, ignore=(self.s.review_check, self.s.plan_check))
+        if persisted:
+            lane = self._climb_stuck(repo, number, pr_number, detail, comments, persisted)
+            if lane is None:
+                return
+            names = _label_names(self._issue(repo, number))
+        elif self._rung_round_count(comments, authors) >= rounds:
+            self._stop_fix_rounds(repo, number, pr_number,
+                                  "the fix round cap (%d) is reached on its rung" % rounds,
+                                  converge.describe(failing, threads, (self.s.review_check,
+                                                                       self.s.plan_check)))
             return
-        self._post_fix_comment(repo, number, pr_number, detail, sha, failed, threads)
+        self._post_fix_comment(repo, number, pr_number, detail, sha, failed, threads, comments)
         self._move_fix_to_lane(repo, number, lane, names)
 
-    def _escalate_fix(self, repo: str, number: int, names: List[str]) -> None:
-        if "needs-brain" not in names:
-            self._add_label(repo, number, "needs-brain")
-            # One status event (an edit, no email), on the pass that holds it.
-            self._routine(repo, number, FIX_CAP_TEXT % _fix_round_limit())
+    @staticmethod
+    def _rung_round_count(comments: List[Any], authors: set) -> int:
+        """The fix rounds sent since the ticket last moved on the model ladder
+        (its newest rung marker): a climb gives the stronger model rounds of
+        its own. Every round counts when it never climbed."""
+        since = factory.last_climb(comments)
+        return Station._fix_round_count(
+            [c for c in comments if not since
+             or (isinstance(c, dict) and factory.ts_of(c.get("created_at")) > since)], authors)
+
+    def _climb_stuck(self, repo: str, number: int, pr_number: int, detail: Dict[str, Any],
+                     comments: List[Any], persisted: List[str]) -> Optional[str]:
+        """Move a ticket whose last fix round left the same failures up the
+        model ladder (factory.Factory._climb, which keeps the operator's
+        model and private-repo rules). The new lane, or None when it waits for
+        a lane of its next rung or its rounds stopped with no rung left."""
+        runner = self._factory()
+        issue = self._issue(repo, number)
+        found = converge.summary(persisted)
+        footer = runner._footer(repo, detail)
+        lane = runner._climb(repo, issue, comments, "the same failures came back after a fix "
+                             "round: %s" % found, head="Stuck fix round", footer=footer)
+        if lane is not None:
+            _say("%s#%d: its fix round left the same failures (%s); next round on lane %s"
+                 % (repo, number, found, lane))
+            return lane
+        if factory.RUNAWAY in _label_names(issue):
+            return None
+        if runner._rungs_left(repo, issue, comments, footer):
+            _say("%s#%d: its fix round left the same failures (%s); waits for a lane of its "
+                 "next rung" % (repo, number, found))
+            return None
+        self._stop_fix_rounds(repo, number, pr_number,
+                              "the same failures came back and no rung of the model ladder "
+                              "is left above it", persisted)
+        return None
+
+    def _stop_fix_rounds(self, repo: str, number: int, pr_number: int, why: str,
+                         failures: List[str]) -> None:
+        """No more fix rounds: the ticket goes to loom:failed with one note
+        naming what still fails, and into the hand-off pool
+        (labels.HANDOFF). Another round would repeat the last one."""
+        note = FIX_STOP_TEXT % (pr_number, why, converge.summary(failures) or "see the last "
+                                "fix round", labels.HANDOFF)
+        try:
+            brain._check_written_text(note)
+        except ValueError as err:
+            # The failure summary quotes check names and review text; when
+            # that text fails the written-text check, keep the stop and say
+            # so in the log instead of posting it.
+            _say("%s#%d: stop note's failure summary refused (%s); using the plain note"
+                 % (repo, number, err))
+            note = FIX_STOP_TEXT % (pr_number, why, "the failures the last fix round names",
+                                    labels.HANDOFF)
+        brain.move(self.gh, repo, number, "failed", note=note)
+        self._add_label(repo, number, labels.HANDOFF)
+        _say("%s#%d: fix rounds stopped (%s); left failed for the hand-off pool"
+             % (repo, number, why))
 
     def _post_fix_comment(self, repo: str, number: int, pr_number: int,
                           detail: Dict[str, Any], sha: str, failed: List[Any],
-                          threads: List[Any]) -> None:
+                          threads: List[Any], comments: Optional[List[Any]] = None) -> None:
         branch = str((detail.get("head") or {}).get("ref") or "")
         notes = self._validation_gaps(repo, pr_number, detail, sha, failed)
         body = brain._fix_body(repo, pr_number, branch, notes, failed, threads)
@@ -5461,7 +5646,10 @@ class Station:
         if len(body) > MAX_FIX_BODY:  # the API rejects comments over 65536 characters
             body = body[:MAX_FIX_BODY].rstrip() + "\n\n(findings truncated)"
         body = body.rstrip() + marker
-        notify.post(self.gh, repo, number, body, notify.FIX_BRIEF)
+        # A later round on the same pull request edits that one comment, so it
+        # sends no email (loom#1640).
+        fixrounds.post_round(self.gh, repo, number, body, self.s.authors,
+                             fixrounds.ledger_path(self.s.home), comments)
 
     def _move_fix_to_lane(self, repo: str, number: int, lane: str,
                           names: List[str]) -> None:
@@ -6326,9 +6514,11 @@ class Station:
 
     def _lanes_body(self, rows: List[Tuple[str, str, str]]) -> str:
         summary = self._spend_shown()
+        disk = self._disk_status_line()
         body = "\n".join(
-            [LANES_MARKER, "Updated " + self._utc(self.now), "",
-             "| lane | available | heartbeat (UTC) |", "|---|---|---|"]
+            [LANES_MARKER, "Updated " + self._utc(self.now), ""]
+            + ([disk, ""] if disk else [])
+            + ["| lane | available | heartbeat (UTC) |", "|---|---|---|"]
             + ["| %s | %s | %s |" % row for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
@@ -6406,6 +6596,8 @@ class Station:
         # A changed scorecard (bus/scorecard.py) republishes too.
         values["scorecard"] = hashlib.sha256("\n".join(
             self._scorecard_lines()).encode("utf-8")).hexdigest()[:16]
+        # Claims paused or resumed for disk republishes (loom#1808).
+        values["disk"] = "paused" if self._disk_status_line() else "ok"
         if self._lanes_unchanged(repo, values):
             return
         number = self._lanes_issue(repo)
@@ -7387,13 +7579,13 @@ class Station:
         # Intake refuses a brief at the goal's in-flight cap, so a model run
         # then writes nothing (17 of 72 rewrites on 2026-10-21).
         try:
-            in_flight = brain._goal_in_flight(self.gh, repo, goal)
+            flying = brain.goal_flying(self.gh, repo, goal)
         except ValueError:
-            in_flight = 0  # not an open goal: intake says why per issue
-        if in_flight >= brain.goal_cap():
-            _say("rewrite %s: goal has %d tickets in flight (cap %d); skipped"
-                 % (key, in_flight, brain.goal_cap()))
+            flying = []  # not an open goal: intake says why per issue
+        if len(flying) >= brain.goal_cap():
+            _say(self._at_cap(key, repo, rec, flying, brain.goal_cap()))
             return 0
+        rec.pop("cap", None)
         done = 0
         for issue in rewrite.candidates(self.gh, repo):
             if done >= room or self._deferred():
@@ -7501,6 +7693,64 @@ class Station:
         _say("rewrite %s#%d: %s" % (repo, number, action))
         self._event("rewrite_succeeded", action, "%s#%d" % (repo, number))
 
+    def _at_cap(self, key: str, repo: str, rec: Dict[str, Any],
+                flying: List[Dict[str, Any]], cap: int) -> str:
+        """Keep in the goal's rewrite record since when it has been at its
+        in-flight cap and how many of its in-flight tickets wait with no lane
+        that takes them (ticket-waits.json no_lane_since), and return the skip
+        line: past GOAL_CAP_STUCK it says the goal is stuck (loom#1831)."""
+        waiting = self._no_lane_since()
+        blocked = sum(1 for issue in flying if "%s#%s" % (repo, issue.get("number")) in waiting)
+        old = rec.get("cap") if isinstance(rec.get("cap"), dict) else {}
+        since = old["since"] if self._num(old.get("since")) else self.now
+        rec["cap"] = {"since": since, "seen": self.now, "in_flight": len(flying), "cap": cap,
+                      "no_lane": blocked}
+        counts = "%d tickets in flight (cap %d), %d blocked on no lane" % (len(flying), cap, blocked)
+        if self.now - since > GOAL_CAP_STUCK:
+            return "rewrite %s: goal stuck at its cap for %.0f hours: %s; skipped" % (
+                key, (self.now - since) / 3600, counts)
+        return "rewrite %s: goal has %s; skipped" % (key, counts)
+
+    def _stuck_goals(self, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The goals the rewrite step found at their cap for over
+        GOAL_CAP_STUCK and saw so within GOAL_CAP_SEEN, from rewrite.json."""
+        out = []
+        for key, rec in sorted(state.items()):
+            cap = rec.get("cap") if isinstance(rec, dict) else None
+            if not (isinstance(cap, dict) and self._num(cap.get("since"))
+                    and self._num(cap.get("seen")) and self.now - cap["seen"] <= GOAL_CAP_SEEN
+                    and self.now - cap["since"] > GOAL_CAP_STUCK):
+                continue
+            out.append({"goal": key, "since": cap["since"],
+                        **{field: int(cap.get(field) or 0) for field in ("in_flight", "cap", "no_lane")}})
+        return out
+
+    def post_stuck_goals(self, state: Dict[str, Any]) -> None:
+        """Send the dashboard (POST GOAL_CAPS_PATH) the goals stuck at their
+        cap, for its Needs-you page: when the list changes, else at most every
+        GOAL_CAPS_EVERY seconds. A failed send is tried again next pass."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return
+        goals = self._stuck_goals(state)
+        path = os.path.join(self.state, "goal-caps.json")
+        posted = _read_json(path, {}, strict=False)
+        posted = posted if isinstance(posted, dict) else {}
+        shown = sorted(g["goal"] for g in goals)
+        if (posted.get("goals") == shown and self._num(posted.get("at"))
+                and 0 <= self.now - posted["at"] < GOAL_CAPS_EVERY):
+            return
+        token = self._transcript_token()
+        if token is None:
+            return
+        try:
+            self.upload(brain_memory.dashboard_url(self.s.transcript_url, GOAL_CAPS_PATH), token,
+                        {"goals": goals, "at": self.now})
+        # Deliberately broad, as in upload_usage_limits: only the type is logged.
+        except Exception as err:  # noqa: BLE001
+            _say("could not send the goals stuck at their cap (%s); next pass" % type(err).__name__)
+            return
+        _write_json(path, {"goals": shown, "at": self.now})
+
     def rewrite_triaged(self) -> None:
         """Rewrite loom:triage issues in backlog goal homes with the agent
         command from LOOM_REWRITE_CMD (public repos) or
@@ -7553,6 +7803,7 @@ class Station:
                 self._collect_rewrites(state, REWRITE_WAIT)
             finally:
                 _write_json(path, state)
+        self.post_stuck_goals(state)
 
     def close_done_tickets(self) -> None:
         """Close each done ticket, by the operator's rule (2026-10-19): a
@@ -9980,7 +10231,7 @@ class Station:
             return
         runner = self._factory()
         runner.run()
-        self._record_waits(runner.waits)
+        self._record_waits(runner.waits, runner.settled)
         self._record_silent(runner.silent_running, runner.silent)
         self._return_silent_briefs(runner.silent_running)
 
@@ -10078,24 +10329,34 @@ class Station:
         if self.s.factory_on:
             runner = self._factory()
             runner.assign_queued()
-            self._record_waits(runner.waits)
+            self._record_waits(runner.waits, runner.settled)
 
-    def _record_waits(self, found: Dict[str, str]) -> None:
+    def _record_waits(self, found: Dict[str, str], settled: Iterable[str] = ()) -> None:
         """Time each ticket the factory left where it is: a reason it repeats
         keeps its start, a new reason starts again, and a ticket it has not
-        named for WAIT_UNSEEN is dropped (invariants.ticket_waiting)."""
+        named for WAIT_UNSEEN is dropped (invariants.ticket_waiting). A ticket
+        waiting with no lane that takes it (factory.no_lane) also keeps
+        no_lane_since, the first time it so waited, across its no-lane
+        reasons; a ticket whose wait the factory settled (a lane took it, a
+        reroute, the hand-off pool) is dropped (loom#1831)."""
         path = os.path.join(self.state, "ticket-waits.json")
         saved = _read_json(path, {}, strict=False)
         saved = saved if isinstance(saved, dict) else {}
+        dropped = [key for key in settled if saved.pop(key, None) is not None]
         for key, reason in found.items():
             old = saved.get(key)
             if isinstance(old, dict) and old.get("reason") == reason and self._num(old.get("since")):
                 old["seen"] = self.now
             else:
                 saved[key] = {"reason": reason, "since": self.now, "seen": self.now}
+            entry, kept_since = saved[key], old.get("no_lane_since") if isinstance(old, dict) else None
+            if factory.no_lane(reason):
+                entry["no_lane_since"] = kept_since if self._num(kept_since) else self.now
+            else:
+                entry.pop("no_lane_since", None)
         kept = {key: info for key, info in saved.items() if isinstance(info, dict)
                 and self._num(info.get("seen")) and self.now - info["seen"] <= WAIT_UNSEEN}
-        if kept or saved:
+        if kept or saved or dropped:
             _write_json(path, kept)
 
     def _invariant_waits(self) -> List[invariants.Wait]:
@@ -10211,7 +10472,15 @@ class Station:
                                demoted=self.demoted_lanes(),
                                benched=pairs,
                                limit_until=self.limit_until(),
-                               known_waits=self._saved_waits(), **extra)
+                               known_waits=self._saved_waits(),
+                               no_lane_since=self._no_lane_since(), **extra)
+
+    def _no_lane_since(self) -> Dict[str, float]:
+        """Each ticket's first no-lane wait as _record_waits kept it."""
+        saved = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
+        return {str(key): float(info["no_lane_since"]) for key, info in
+                (saved.items() if isinstance(saved, dict) else [])
+                if isinstance(info, dict) and self._num(info.get("no_lane_since"))}
 
     def _saved_waits(self) -> Dict[str, str]:
         """Each ticket's wait reason as the last pass recorded it (_record_waits)."""
@@ -10541,15 +10810,12 @@ class Station:
         """Remove lane trees whose brief is no longer in a lane inbox (waiting
         or running) and that have not changed for TREE_KEEP seconds. A
         finished run's log stays in logs/; its tree is a clone the next
-        attempt makes again."""
+        attempt makes again. A tree whose ticket is done (its pull request
+        merged or closed, or the ticket closed or dropped, as this pass's
+        reconcile read it) goes at once with its check copy and the runner's
+        files beside it, unless a brief of that ticket is still in an inbox
+        (loom#1808); so does an idle lane's run scratch from that ticket."""
         root = os.path.join(self.s.home, "worktrees")
-        try:
-            names = os.listdir(root)
-        except FileNotFoundError:
-            return
-        except OSError as err:
-            _say("cannot list %s to remove finished lane trees: %s" % (root, err))
-            return
         live = set()
         for lane in LANES:
             try:
@@ -10561,7 +10827,16 @@ class Station:
                 # remove nothing rather than a tree still in use.
                 _say("cannot list lane %s's inbox, so no lane tree is removed: %s" % (lane, err))
                 return
-        removed = 0
+        busy = {t for t in (self._tree_ticket(n) for n in live) if t is not None}
+        self._prune_run_scratch(busy)
+        try:
+            names = os.listdir(root)
+        except FileNotFoundError:
+            return
+        except OSError as err:
+            _say("cannot list %s to remove finished lane trees: %s" % (root, err))
+            return
+        removed = done = 0
         for name in names:
             path = os.path.join(root, name)
             try:
@@ -10571,37 +10846,206 @@ class Station:
             except OSError as err:
                 _say("cannot stat lane tree %s: %s" % (name, err))
                 continue
-            if name in live or self.now - st.st_mtime < TREE_KEEP:
+            if name in live:
+                continue
+            finished = self._tree_done(name, busy)
+            if not finished and self.now - st.st_mtime < TREE_KEEP:
                 continue
             if stat.S_ISDIR(st.st_mode):
                 shutil.rmtree(path, ignore_errors=True)
             else:
                 os.unlink(path)
             removed += 1
+            done += finished
         if removed:
-            _say("removed %d finished lane tree(s)" % removed)
+            _say("removed %d finished lane tree(s)%s" % (
+                removed, " (%d of tickets done)" % done if done else ""))
+
+    def _tree_ticket(self, name: str) -> Optional[Tuple[str, int]]:
+        """(repo, number) of a lane tree or brief name (tickets.ticket_name,
+        with its -rN, -verify-N, -default-check or .summary.md tail), the
+        longest matching watched repo first; None for any other name."""
+        for repo in sorted(self.s.repos, key=len, reverse=True):
+            prefix = repo.replace("/", ".") + "-"
+            if name.startswith(prefix):
+                match = re.match(r"([0-9]+)(?=$|[-.])", name[len(prefix):])
+                if match:
+                    return repo, int(match.group(1))
+        return None
+
+    def _tree_done(self, name: str, busy: Set[Tuple[str, int]]) -> bool:
+        """The tree's ticket is in a repo this pass read and is no longer an
+        open ticket that may take a fix round, and no brief of it is in an
+        inbox."""
+        ticket = self._tree_ticket(name)
+        if ticket is None or ticket in busy:
+            return False
+        repo, number = ticket
+        return repo in self._open_work and number not in self._open_work[repo]
+
+    def _prune_run_scratch(self, busy: Set[Tuple[str, int]]) -> None:
+        """Tend each idle lane's run scratch (run/<slot>-home, -check,
+        -check-default). Idle: no runner lock with a live pid, no brief in
+        its inbox, and the folder unchanged for RUN_SCRATCH_SETTLE. Its
+        home's package caches and temp files (RUN_HOME_CACHES) go every pass:
+        on 2026-10-25 single homes held 3.3 GB of .cache, 1.8 GB of .cargo
+        and 1.3 GB of tmp. The whole scratch goes once the ticket the lane
+        last ran is done (loom#1808). Anything else in a home is kept."""
+        run = os.path.join(self.s.home, "run")
+        removed = caches = 0
+        for slot in LANES:
+            if not self._lane_idle(run, slot):
+                continue
+            last = self._last_finished(slot)
+            finished = last is not None and self._tree_done(last, busy)
+            for suffix in ("-home", "-check", "-check-default"):
+                path = os.path.join(run, slot + suffix)
+                try:
+                    st = os.lstat(path)
+                except OSError:
+                    continue
+                if self.now - st.st_mtime < RUN_SCRATCH_SETTLE:
+                    continue
+                if finished:
+                    _remove(path)
+                    removed += 1
+                elif suffix == "-home" and stat.S_ISDIR(st.st_mode):
+                    caches += self._drop_home_caches(run, slot, path, st)
+        if removed:
+            _say("removed %d idle lane run folder(s) of tickets done" % removed)
+        if caches:
+            _say("removed %d cache folder(s) from idle lane homes" % caches)
+
+    def _lane_idle(self, run: str, slot: str) -> bool:
+        """No runner holds the slot and no brief waits in its inbox."""
+        if self._lane_locked(run, slot):
+            return False
+        try:
+            return not any(e.endswith(".md") for e in os.listdir(self.inbox(slot)))
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    def _drop_home_caches(self, run: str, slot: str, home: str, st: os.stat_result) -> int:
+        """Remove RUN_HOME_CACHES from an idle lane's home, checking the lock
+        again before each; the home keeps its time, so the settle check still
+        reads it as idle on the next pass. The number removed."""
+        dropped = 0
+        for name in RUN_HOME_CACHES:
+            cache = os.path.join(home, name)
+            if not os.path.lexists(cache):
+                continue
+            if self._lane_locked(run, slot):
+                break
+            _remove(cache)
+            dropped += 1
+        if dropped:
+            os.utime(home, (st.st_atime, st.st_mtime), follow_symlinks=False)
+        return dropped
+
+    @staticmethod
+    def _lane_locked(run: str, slot: str) -> bool:
+        """A runner holds the slot: its lock folder (lanes/run_lane.sh LOCK)
+        exists and names a live pid, or no pid yet (a runner just took it)."""
+        lock = os.path.join(run, slot + ".lock")
+        if not os.path.lexists(lock):
+            return False
+        try:
+            with open(os.path.join(lock, "pid"), encoding="ascii") as fh:
+                pid = int(fh.read().strip())
+        except (OSError, ValueError):
+            return True
+        if pid <= 0:
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    def _last_finished(self, slot: str) -> Optional[str]:
+        """The name of the brief a lane slot finished last (newest in its
+        done/ or failed/), None when it has none."""
+        newest: Optional[Tuple[float, str]] = None
+        for kind in ("done", "failed"):
+            folder = os.path.join(self.inbox(slot), kind)
+            try:
+                entries = os.listdir(folder)
+            except OSError:
+                continue
+            for entry in entries:
+                if not entry.endswith(".md"):
+                    continue
+                try:
+                    mtime = os.lstat(os.path.join(folder, entry)).st_mtime
+                except OSError:
+                    continue
+                if newest is None or mtime > newest[0]:
+                    newest = (mtime, entry[:-3])
+        return newest[1] if newest else None
+
+    def _disk_free(self) -> Optional[int]:
+        """Free bytes on the loom home's disk, read once a pass; None when it
+        cannot be read."""
+        if not self._free_read:
+            self._free_read = True
+            try:
+                self._free = shutil.disk_usage(self.s.home).free
+            except OSError as err:
+                _say("cannot read the free space on the loom home's disk: %s" % err)
+                self._free = None
+        return self._free
+
+    def disk_low(self) -> bool:
+        """True while the loom home's disk has less than disk_free_min_gb
+        free: the pass claims no new work (loom#1808). The state is kept in
+        state/disk-guard.json and said in the log only when it changes, and
+        the lane status shows it; a free space that cannot be read keeps the
+        last state."""
+        path = os.path.join(self.state, DISK_GUARD_FILE)
+        saved = _read_json(path, {}, strict=False)
+        was = bool(saved.get("low")) if isinstance(saved, dict) else False
+        free = self._disk_free()
+        floor = self.s.disk_free_min_gb * GB
+        low = was if free is None else free < floor
+        if free is not None and low != was:
+            # Worded so the log watcher (bus/watch.py KEEP_RE) does not count it.
+            if low:
+                _say("claims paused: only %s free on the loom home's disk (under %s); "
+                     "no new work is claimed until it has more" % (_gb(free), _gb(floor)))
+            else:
+                _say("claims resumed: %s free on the loom home's disk (at least %s)"
+                     % (_gb(free), _gb(floor)))
+            _write_json(path, {"low": low, "free": free, "floor": floor, "at": self.now})
+        return low
+
+    def _disk_status_line(self) -> Optional[str]:
+        """The lane status line while claims are paused for disk, else None."""
+        saved = _read_json(os.path.join(self.state, DISK_GUARD_FILE), {}, strict=False)
+        if not (isinstance(saved, dict) and saved.get("low")):
+            return None
+        free, floor = saved.get("free"), saved.get("floor")
+        if not (self._num(free) and self._num(floor)):
+            return "Claims paused: the loom home's disk is low on free space"
+        return "Claims paused: %s free on the loom home's disk, under %s" % (_gb(free), _gb(floor))
 
     def tend_disk(self) -> None:
         """Keep the loom home bounded and say how big it is (loom#643). Every
-        pass warns when its disk has less than disk_free_min_gb free. Every
-        DISK_EVERY seconds the lane logs past retention go (prune_logs) and
-        the home's size is logged, by top-level folder."""
-        try:
-            free: Optional[int] = shutil.disk_usage(self.s.home).free
-        except OSError as err:
-            _say("cannot read the free space on the loom home's disk: %s" % err)
-            free = None
-        if free is not None and free < self.s.disk_free_min_gb * GB:
-            # Worded so the log watcher (bus/watch.py KEEP_RE) does not count
-            # it: the line repeats every pass until space is freed.
-            _say("warning: only %s free on the loom home's disk (under %s); "
-                 "lanes keep writing" % (_gb(free), _gb(self.s.disk_free_min_gb * GB)))
+        DISK_EVERY seconds the lane logs past retention go (prune_logs),
+        finished runs' session stores are compressed (compress_sessions), and
+        the home's size is logged, by top-level folder. The free space below
+        the floor stops claims instead (disk_low)."""
+        free = self._disk_free()
         path = os.path.join(self.state, "disk.json")
         saved = _read_json(path, {}, strict=False)
         last = saved.get("at") if isinstance(saved, dict) else None
         if self._num(last) and 0 <= self.now - last < DISK_EVERY:
             return
         self.prune_logs()
+        self.compress_sessions()
         sizes: Dict[str, int] = {}
         try:
             names = os.listdir(self.s.home)
@@ -10620,6 +11064,48 @@ class Station:
         _say("loom home holds %s (%s); %s free on its disk"
              % (_gb(total), parts or "empty", "unknown" if free is None else _gb(free)))
         _write_json(path, {"at": self.now, "bytes": total, "free": free, "folders": sizes})
+
+    def compress_sessions(self) -> None:
+        """gzip each finished run's opencode session store (SESSION_DB_PARTS
+        under logs/<slot>/<run>/) to opencode.db.gz, once no brief of that
+        name is waiting or running and its transcript is not waiting for the
+        dashboard (_logs_kept). bus/sessions.py reads the compressed store,
+        and prune_logs removes it with the run's other logs after
+        log_keep_days. The -wal and -shm files go too: the readers open the
+        store immutable and never read them. Times are kept, so retention
+        still counts from the run."""
+        kept = self._logs_kept()
+        if kept is None:
+            return
+        live, pending = kept
+        count = before = after = 0
+        for slot in LANES:
+            folder = os.path.join(self.s.home, "logs", slot)
+            try:
+                if not stat.S_ISDIR(os.lstat(folder).st_mode):
+                    continue
+                names = os.listdir(folder)
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                _say("cannot list lane %s's logs to compress session stores: %s" % (slot, err))
+                continue
+            keep = live | {k.split("/", 1)[1] for k in pending if k.startswith(slot + "/")}
+            for name in names:
+                if name in keep:
+                    continue
+                try:
+                    sizes = _gzip_session_db(os.path.join(folder, name))
+                except OSError as err:
+                    _say("cannot compress the session store of %s/%s: %s" % (slot, name, err))
+                    continue
+                if sizes is not None:
+                    count += 1
+                    before += sizes[0]
+                    after += sizes[1]
+        if count:
+            _say("compressed %d finished run session store(s): %s to %s"
+                 % (count, _gb(before), _gb(after)))
 
     def _logs_kept(self) -> Optional[Tuple[Set[str], Set[str]]]:
         """(names, slot/name keys) whose lane logs stay however old: every
@@ -10875,6 +11361,12 @@ class Station:
             return
         self.sync_labels()
         self.finish_claims()
+        try:
+            self._timed(self.tend_runners)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, runners.ReportError) as err:
+            _say("tend_runners failed: %s" % err)
         self.report_outcomes()
         if not self._deferred():
             try:
@@ -10890,7 +11382,10 @@ class Station:
                 raise
             except (GitHubError, OSError) as err:
                 _say("hand_back failed: %s" % err)
-        self._timed(self.claim_new)
+        # A disk under the floor takes no new work (loom#1808); a pass
+        # still finishes half-done claims, reconciles and prunes.
+        if not self.disk_low():
+            self._timed(self.claim_new)
         if not self._deferred():
             try:
                 self._timed(self.assign_queued)
@@ -10930,6 +11425,23 @@ class Station:
             self.upload_usage_limits(records)
         except OSError as err:
             _say("could not write usage limits: %s" % err)
+
+    def tend_runners(self) -> None:
+        """The slots in LOOM_RUNNER_SLOTS: dispatch their briefs to cluster
+        runners and write back what each run reported (bus/runners.py)."""
+        slots = runners.runner_slots(os.environ)
+        if not slots:
+            return
+        repo = os.environ.get("LOOM_RUNNER_REPO", "").strip() or self.s.self_repo
+        try:
+            actor = self.gh.app_login()
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read the station App's login for its runner slots: %s" % err)
+            actor = None
+        runners.Runners(self.gh, self.s.home, repo, slots, dict(os.environ), self._public, _say,
+                        actor=actor, now=self.now).tend()
 
     def upload_usage_limits(self, records: List[Dict[str, Any]]) -> None:
         """Send the current limits snapshot using the transcript upload token."""

@@ -21,9 +21,14 @@ validated, SQLite is opened read-only and immutable, and nothing is executed.
 
 from __future__ import annotations
 
+import gzip
 import json
+import os
 import re
+import shutil
 import sqlite3
+import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -72,9 +77,7 @@ def session_events(slot: str, ticket: str, loom: Path, claude_projects: Path,
     elif lane == "anthropic":
         events = claude_dir(archive)
     elif lane in ("openrouter", "opencode-go"):
-        db = archive / ".local" / "share" / "opencode" / "opencode.db"
-        if db.is_file():
-            events = opencode_events(db)
+        events = opencode_archive_events(archive)
     elif lane == "codex":
         rollout = _codex_rollout(codex_sessions, loom / "worktrees" / ticket)
         if rollout:
@@ -185,6 +188,38 @@ def claude_events(lines: list[str]) -> list[dict]:
                 if ev:
                     events.append(ev)
     return events
+
+
+def opencode_archive_events(archive: Path) -> list[dict]:
+    """The events of a run's archived opencode store: opencode.db, or the
+    opencode.db.gz the station compresses it to after the run (loom#1808)."""
+    db = archive / ".local" / "share" / "opencode" / "opencode.db"
+    packed = db.with_name("opencode.db.gz")
+    if db.is_file():
+        return opencode_events(db)
+    if packed.is_file() and not packed.is_symlink():
+        return opencode_gz_events(packed)
+    return []
+
+
+def opencode_gz_events(packed: Path) -> list[dict]:
+    """opencode_events of a gzip-compressed store, unpacked to a private
+    temporary file that is removed after the read."""
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    try:
+        with os.fdopen(fd, "wb") as out, gzip.open(packed, "rb") as src:
+            shutil.copyfileobj(src, out, 1 << 20)
+        return opencode_events(Path(tmp))
+    except (OSError, EOFError) as err:
+        # A store that cannot be unpacked reads as none, as an unreadable
+        # SQLite store does in opencode_events, and the reason is said.
+        print(f"cannot unpack session store {packed}: {err}", file=sys.stderr)
+        return []
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def opencode_events(db: Path) -> list[dict]:
