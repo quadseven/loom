@@ -82,6 +82,16 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("---\nLoom ticket T42, lane codex, model gpt-test.", body)
         self.assertIn("\nRefs example-owner/example-repo#42", body)
 
+    def test_criteria_under_an_acceptance_heading_render_as_the_runner_renders_them(self):
+        # lanes/run_lane.sh::criteria_section reads the same headings: a
+        # repair that read only "## Acceptance criteria" emptied the section
+        # the runner had filled (2026-10-25).
+        for heading in ("## Acceptance", "## Acceptance Criteria"):
+            with self.subTest(heading=heading):
+                brief = BRIEF.replace("## Acceptance criteria\n", heading + "\n")
+                body = pr_repair._render_generated(brief, "codex", "gpt-test", "T42")
+                self.assertEqual(body, RUNNER_BODY)
+
     TICKED_BODY = RUNNER_BODY.replace("- [ ] The thing works", "- [x] The thing works").replace(
         "- [ ] Nothing else changes", "- [ ] Nothing else changes; not built: out of reach")
 

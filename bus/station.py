@@ -180,25 +180,28 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 # standup that repeats an earlier one word for word.
 QUIET_STAMP = quiet_rule.HEARTBEAT_STAMP
 SAME_STAMP = "Unchanged as of %s; this report is edited in place until something changes."
-# Reports come every REPORT_EVERY (6 hours), so the goal homes are read at most this often,
+# Reports come at the reading times (brain.REPORT_TIMES), so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
 # comment ids keeps a report from going out twice).
 REPORT_CHECK = 300
-# The station's standup goes out this long before a goal's report turns
-# REPORT_EVERY old. Posting only once a goal was overdue (past REPORT_EVERY and its
-# grace) left every report 2.0 to 2.4 hours old before the next one, so the
-# visibility number (each goal report at most 2 hours old) could never pass.
+# The station's standup goes out this long before a goal's report is due
+# (brain.next_report_due, the next reading time), so the operator finds it at
+# the reading time. Posting only once a goal was overdue left every report
+# late for the visibility number.
 STANDUP_LEAD = 15 * 60
 # A goal quiet since its last report (bus/quiet.py) is owed no standup; it is
 # read again this often, so a standup still goes out soon after it moves.
 QUIET_RECHECK = 3600
 # The last line of every station standup, which is how the station finds its
 # own report to edit for a quiet goal's heartbeat.
+# A standup line names at most this many tickets, then "and N more".
+STANDUP_ROWS_MAX = 5
 STANDUP_FOOTER = "Written by the station from ticket data, because no brain reported in time."
 # The operator's two reading times (2026-10-14: "Twice a day. Morning and
 # evening. 10am and 9pm"): one digest of every goal's reports each, instead of
-# each report as it is posted. LOOM_REPORT_DIGEST_TIMES="" turns it off.
-DIGEST_TIMES = "10:00,21:00"
+# each report as it is posted. LOOM_REPORT_DIGEST_TIMES="" turns it off. The
+# goal reports on GitHub are due at the same times (brain.REPORT_TIMES).
+DIGEST_TIMES = ",".join("%02d:%02d" % t for t in brain.REPORT_TIMES)
 DIGEST_FIRST_LOOKBACK = 12 * 3600
 REPORT_OVERLAP = 3600
 REPORT_FIRST_LOOKBACK = 24 * 3600
@@ -7057,7 +7060,7 @@ class Station:
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
                 continue
-            issues = self._goal_issues(repo)
+            issues = [i for i in self._goal_issues(repo) if not naming.is_backlog_home(i)]
             latest: Dict[int, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
             for ident, issue, comment in self._report_comments(repo, issues, since):
                 author = str((comment.get("user") or {}).get("login") or "").lower()
@@ -7082,6 +7085,27 @@ class Station:
                     self._short_name(issue), first[:SHORT_LINE_MAX],
                     self._report_link(issue, comment)))
         return moving, quiet, top
+
+    def _digest_backlog_lines(self, since: float) -> List[str]:
+        """One line per backlog goal home: they post no report on GitHub
+        (2026-10-25), so this is where their status shows, from ticket data.
+        One that cannot be read says so rather than reading as empty."""
+        lines = []
+        for repo, goal in self._readable_goal_homes():
+            if not naming.is_backlog_home(goal):
+                continue
+            try:
+                loose, tree = brain.goal_tree(self.gh, repo, int(goal["number"]))
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                lines.append("- **%s** could not be read (%s)" % (self._short_name(goal),
+                                                                  type(err).__name__))
+                continue
+            summary = self._standup_summary(
+                self._standup_ticket_groups(brain._flatten(loose, tree), since))
+            lines.append("- **%s** %s" % (self._short_name(goal), summary or "nothing moved"))
+        return lines
 
     def _digest_factory_line(self) -> str:
         ref = re.fullmatch(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)",
@@ -7163,6 +7187,10 @@ class Station:
             lines.append("No goal moved since the last digest.")
         if quiet:
             lines.append("Quiet: %d goal%s, nothing moved." % (quiet, "" if quiet == 1 else "s"))
+        backlogs = self._digest_backlog_lines(start)
+        if backlogs:
+            lines.append("Backlogs, %d:" % len(backlogs))
+            lines += backlogs
         benched = bench.digest_lines(self._bench_list(), start, self.now)
         if benched:
             lines.append("Benched and returned models (%d):" % len(benched))
@@ -9337,6 +9365,10 @@ class Station:
         # the stamps of the goals already posted this pass (loom#201), and one
         # unreadable repo must not skip the other repos' goals (loom#1071).
         for repo, goal in self._readable_goal_homes():
+            if naming.is_backlog_home(goal):
+                # A backlog goal posts no report on GitHub: its status is one
+                # line in the twice-daily digest (_digest_backlog_lines).
+                continue
             try:
                 self._post_overdue_goal_standup(repo, goal, state, authors, now)
             except RateLimited:
@@ -9352,7 +9384,11 @@ class Station:
         key = "%s#%d" % (repo, number)
         sent = state.get(key)
         if isinstance(sent, (int, float)) and not isinstance(sent, bool) \
-                and 0 <= self.now - sent < brain.REPORT_EVERY - STANDUP_LEAD:
+                and sent <= self.now < self._report_due(sent) - STANDUP_LEAD:
+            return
+        held = state.get(key + " quiet")
+        if isinstance(held, (int, float)) and not isinstance(held, bool) \
+                and 0 <= self.now - held < QUIET_RECHECK:
             return
         comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100" %
                                     (repo, number))
@@ -9362,8 +9398,10 @@ class Station:
             for c in comments if isinstance(c, dict)]}}
         ledger = brain.goal_ledger(goal, node, now, authors)
         last = self._epoch(str(ledger.get("report") or ""))
+        due_at = self._epoch(str(ledger.get("due") or ""))
         due = (ledger["state"] == "overdue"
-               or (last is not None and self.now - last >= brain.REPORT_EVERY - STANDUP_LEAD))
+               or (last is not None and due_at is not None
+                   and self.now >= due_at - STANDUP_LEAD))
         if not due:
             return
         loose, tree = brain.goal_tree(self.gh, repo, number)
@@ -9377,7 +9415,7 @@ class Station:
         brain._check_written_text(body)
         if hold is None and self._quiet_standup(repo, comments, children, named, body,
                                                 authors, now):
-            state[key] = self.now - (brain.REPORT_EVERY - STANDUP_LEAD) + QUIET_RECHECK
+            state[key + " quiet"] = self.now
             return
         quiet = hold is None and body == self._overdue_standup_body(
             [], None, None if breaches is None else [])
@@ -9392,6 +9430,12 @@ class Station:
         else:
             notify.post(self.gh, repo, number, body, notify.REPORT)
         state[key] = self.now
+
+    @staticmethod
+    def _report_due(at: float) -> float:
+        """The epoch of the reading time a report posted at `at` is followed by."""
+        return brain.next_report_due(
+            brain.datetime.fromtimestamp(at, brain.timezone.utc)).timestamp()
 
     def _quiet_standup(self, repo: str, comments: List[Any], children: List[Any],
                        named: List[Dict[str, Any]], body: str, authors: List[str],
@@ -9466,11 +9510,7 @@ class Station:
                               finished: Optional[List[Dict[str, Any]]] = None) -> str:
         groups = self._standup_ticket_groups(children, since)
         rows = self._standup_rows
-        counts = [(len(groups[k]), word) for k, word in (
-            ("merged", "merged"), ("verified", "verified"), ("sent_back", "shipped"),
-            ("failed", "failed"), ("regressed", "regressed"), ("aged_pr", "stuck"),
-            ("in_flight", "in flight"), ("queued", "queued"), ("asks", "waiting on you"))]
-        summary = ", ".join("%d %s" % (n, word) for n, word in counts if n)
+        summary = self._standup_summary(groups)
         first = ("%s since the last report." % summary) if summary else "Nothing moved since the last report."
         stuck = "Past the stuck age in PR: %s." % rows(groups["aged_pr"])
         if gate_hold is not None:
@@ -9479,23 +9519,32 @@ class Station:
                       "%d lanes idle." % (gate_hold["goal"], gate_hold["count"],
                                           gate_hold["limit"], len(gate_hold["tickets"]),
                                           gate_hold["idle"]))
-        return "\n".join([REPORT_MARKER, first,
-            "", "### Going well", "Merged: %s. Verified: %s. Shipped: %s." %
-            (rows(groups["merged"]), rows(groups["verified"]),
-             rows(groups["sent_back"])), "",
-            "### Not going well", "Failed: %s." % rows(groups["failed"]),
-            "Regressed after shipping: %s." % rows(groups["regressed"])]
-            + (["Invariants broken: %s." % rows(breaches)] if breaches is not None else [])
-            + ["",
-            "### Still stuck", stuck, "",
-            "### Next", "In flight: %s." % rows(groups["in_flight"]),
-            "Queued for a lane: %s." % rows(groups["queued"]),
-            "Needs difficulty: %s." % rows(groups["needs_difficulty"])]
-            + (["Epics with every ticket closed (check the done-when, then close): %s."
-                % rows(finished)] if finished else [])
-            + ["",
-            "### Needs you", "Open asks: %s." % rows(groups["asks"]), "",
+        # Headline, at most five lines and the footer (2026-10-25, "info
+        # overload"): one line per heading, as journal.REPORT_LINES_MAX holds
+        # a brain's report to.
+        return "\n".join([
+            REPORT_MARKER, first,
+            "Going well: Merged: %s. Verified: %s. Shipped: %s." %
+            (rows(groups["merged"]), rows(groups["verified"]), rows(groups["sent_back"])),
+            "Not going well: Failed: %s. Regressed after shipping: %s." %
+            (rows(groups["failed"]), rows(groups["regressed"]))
+            + (" Invariants broken: %s." % rows(breaches) if breaches is not None else ""),
+            "Still stuck: " + stuck,
+            "Next: In flight: %s. Queued for a lane: %s. Needs difficulty: %s." %
+            (rows(groups["in_flight"]), rows(groups["queued"]), rows(groups["needs_difficulty"]))
+            + (" Epics with every ticket closed (check the done-when, then close): %s."
+               % rows(finished) if finished else ""),
+            "Needs you: Open asks: %s." % rows(groups["asks"]), "",
             STANDUP_FOOTER])
+
+    @staticmethod
+    def _standup_summary(groups: Dict[str, List[Dict[str, Any]]]) -> str:
+        """"3 merged, 2 in flight": the counts of a standup's groups, or ""."""
+        counts = [(len(groups[k]), word) for k, word in (
+            ("merged", "merged"), ("verified", "verified"), ("sent_back", "shipped"),
+            ("failed", "failed"), ("regressed", "regressed"), ("aged_pr", "stuck"),
+            ("in_flight", "in flight"), ("queued", "queued"), ("asks", "waiting on you"))]
+        return ", ".join("%d %s" % (n, word) for n, word in counts if n)
 
     def _standup_ticket_groups(self, children: List[Any], since: Optional[float] = None
                                ) -> Dict[str, List[Dict[str, Any]]]:
@@ -9540,8 +9589,11 @@ class Station:
 
     @staticmethod
     def _standup_rows(items: List[Dict[str, Any]]) -> str:
-        return ", ".join("#%s %s" % (issue.get("number"),
-            " ".join(str(issue.get("title") or "").split())) for issue in items) or "none"
+        shown = ", ".join("#%s %s" % (issue.get("number"),
+            " ".join(str(issue.get("title") or "").split()))
+            for issue in items[:STANDUP_ROWS_MAX]) or "none"
+        more = len(items) - STANDUP_ROWS_MAX
+        return shown + (" and %d more" % more if more > 0 else "")
 
     # -- the brain -------------------------------------------------------
     def _brain(self) -> Optional[Tuple[Dict[str, Any], Optional[float]]]:

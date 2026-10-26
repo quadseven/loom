@@ -75,16 +75,22 @@ REGRESSION_REBRIEFS_DEFAULT = 3
 SECTIONS = ("## Why", "## What", "## Acceptance criteria", "## Size", "## Out of scope")
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 REPORT_MARKER = "<!-- loom:report v1 -->"
-# Every goal owes its own report every REPORT_EVERY seconds, counted from its
-# newest valid report or, with none, from when the goal was opened. A report
-# that is one tick (REPORT_GRACE) past due is overdue.
-REPORT_EVERY = 6 * 3600
+# Every goal owes its own report at the operator's two reading times
+# (2026-10-25: "slow the standups down... twice a day 10am 9pm eastern... info
+# overload"), the same times as the station's Discord digest. A report is due
+# at the first reading time after its newest valid report (or, with none,
+# after the goal was opened), and one tick (REPORT_GRACE) past that it is
+# overdue. Every report comment emails the goal's author, so at six hours 26
+# goal homes sent up to a hundred emails a day.
+REPORT_TIMES = ((10, 0), (21, 0))
+REPORT_ZONE = "America/New_York"
 REPORT_GRACE = 30 * 60
 # A report is owed to the brain this long before it is due. The station posts
 # its data-only standup 15 minutes before due (station.STANDUP_LEAD), and that
 # report restarts the clock: owed only from due, no brain ever wrote one, and
 # one goal home went a day and a half on the station's reports (2026-10-21).
 # Two hours and a quarter gives an hourly tick two chances to write it first.
+# A report written in this window counts for the reading time it precedes.
 REPORT_OWED_EARLY = 2 * 3600 + 15 * 60
 TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage", "journal", "unlock")
 RUNAWAY = "loom:runaway"
@@ -254,10 +260,27 @@ def _comment_kinds(body: str) -> List[str]:
     return kinds
 
 
+def next_report_due(last: datetime) -> datetime:
+    """The reading time (REPORT_TIMES in REPORT_ZONE, as UTC) a report written
+    at `last` is followed by: the first one after `last` plus
+    REPORT_OWED_EARLY, so a report written early counts for the reading time
+    it precedes."""
+    from zoneinfo import ZoneInfo
+    zone = ZoneInfo(REPORT_ZONE)
+    at = (last + timedelta(seconds=REPORT_OWED_EARLY)).astimezone(zone)
+    for days in range(3):
+        day = at.date() + timedelta(days=days)
+        for hour, minute in REPORT_TIMES:
+            slot = datetime(day.year, day.month, day.day, hour, minute, tzinfo=zone)
+            if slot > at:
+                return slot.astimezone(timezone.utc)
+    raise ValueError("REPORT_TIMES is empty")
+
+
 def _report_deadline(last: datetime, now: datetime) -> Tuple[datetime, str]:
     """The next report deadline counted from `last`, and whether it is ok,
     due, or overdue at `now`."""
-    due = last + timedelta(seconds=REPORT_EVERY)
+    due = next_report_due(last)
     if now >= due + timedelta(seconds=REPORT_GRACE):
         return due, "overdue"
     if now >= due - timedelta(seconds=REPORT_OWED_EARLY):
@@ -407,7 +430,12 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
             still = quiet.quiet(comments, _flatten(loose, tree),
                                 goal_breaches(issues, int(issue["number"])), now, authors)
             lines += _quiet_lines(still)
-        if led["state"] != "ok":
+        if naming.is_backlog_home(issue):
+            # A backlog goal posts no report on GitHub: its line is in the
+            # station's twice-daily Discord digest (2026-10-25).
+            lines.append("  - backlog goal: no report owed; its status is one line in the "
+                         "twice-daily digest")
+        elif led["state"] != "ok":
             owed += _owed_lines(issue, led, comments, now, authors, still)
         found = handoff.journals(
             [{"body": c.get("body"), "at": c.get("createdAt"),
