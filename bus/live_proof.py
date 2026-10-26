@@ -47,6 +47,8 @@ from . import criteria_gate, evidence
 
 LOG = "log"
 QUERY = "query"
+# What step_of says of a criterion that names no step at all: prose.
+NO_PROOF = "no proof Loom can run"
 # A failed or missing proof is read again after this long, as the station's
 # live checks are (station.LIVE_CHECK_RETRY).
 RETRY = 6 * 3600
@@ -249,7 +251,25 @@ def step_of(text: str) -> Tuple[Optional[Step], str]:
     found = evidence.needles(text)
     if found:
         return Step(LOG, found[0], tuple(found[1:]), hours), ""
-    return None, "no proof Loom can run"
+    return None, NO_PROOF
+
+
+def is_prose(text: str) -> bool:
+    """Whether a live criterion names no check or step at all: only a verify
+    run can turn it into one (loom#1855)."""
+    step, why = step_of(text)
+    return step is None and why == NO_PROOF
+
+
+def adapter_step(text: str) -> Tuple[Optional[Step], str]:
+    """(the adapter step a verify run's answer names, or None; why it is not
+    one): only the templated `log:<source>` and `sql:<SELECT ...>` forms
+    count, so the lane's answer never names a URL, a command or a bare log
+    string for the station to run."""
+    step, why = step_of(text)
+    if step is not None and step.source and step.kind in (LOG, QUERY):
+        return step, ""
+    return None, why or "it is not a `log:<source>` or `sql:<SELECT ...>` step"
 
 
 def _step_refusal(step: Step) -> str:
