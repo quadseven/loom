@@ -203,7 +203,7 @@ def _adapter_step(text: str, spans: List[str], hours: float) -> Tuple[Optional[S
                     # Fall back to the first one, which will fail during execution.
                     if present:
                         target = present[0]
-                    else:
+                    elif not absent:
                         return None, "`%s` names no string to find in that log" % span
                 return Step(LOG, target, tuple(present[1:]), hours, source=source,
                             absent=absent), ""
@@ -312,22 +312,28 @@ def _source_needle(step: Step, needle: str, since: float, now: float,
         return False, "the `%s` log adapter gave no answer for `%s` (%s)" % (
             step.source, needle, answer.error or "no reason given")
     # A line stamped before the deploy is never its evidence.
-    lines = [line for line in _matching(answer.lines, needle)
-             if (evidence.line_time(line) or since) >= since]
+    candidates = [line for line in answer.lines
+                  if (evidence.line_time(line) or since) >= since]
+    lines = _matching(candidates, needle)
     safe = [line for line in lines if evidence.safe_line(line)]
     count = answer.count if answer.count is not None else len(lines)
+    if pattern is not None and answer.count is not None and answer.count > len(candidates):
+        if needle in step.absent or not safe:
+            return False, ("the `%s` log adapter counted %d candidates but returned only %d "
+                           "sample lines to check `%s`" % (
+                               step.source, answer.count, len(candidates), needle))
+        count = len(safe)
+    elif pattern is not None:
+        count = len(lines)
     if needle in step.absent:
         return _absence(step, needle, answer, lines, safe, count, since, now)
     # A templated string must match the full template, not just the fixed piece.
-    # Re-filter lines against the full pattern when the needle is templated.
     if pattern is None:
         # No template parts - use the count unchanged
         if not count and not safe:
             return False, "no `%s` log line since the deploy names `%s`" % (step.source, needle)
         return True, "`%s` named %d times in the `%s` log since the deploy%s" % (
             needle, count, step.source, _quoted(safe))
-    # Templated string: re-filter lines against the full pattern and count only matches.
-    safe = [line for line in safe if pattern.search(line)]
     if not safe:
         return False, "no `%s` log line since the deploy names `%s`" % (step.source, needle)
     return True, "`%s` named %d times in the `%s` log since the deploy%s" % (
