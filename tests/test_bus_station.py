@@ -319,49 +319,70 @@ class FakeGitHub:
         return reply(201, {"id": 77})
 
     def _get_issues(self, query, headers):
-        if "labels=loom:audit-failed&" in query:
-            return reply(200, [i for i in self.issues.values()
-                               if "loom:audit-failed" in self.names(i["number"])])
-        if "labels=loom%3Apr" in query or "labels=loom:pr&" in query:
-            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
-                               and "loom:pr" in self.names(i["number"])])
-        if "labels=loom%3Amerged" in query or "labels=loom:merged&" in query:
-            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
-                               and "loom:merged" in self.names(i["number"])])
-        if "labels=loom:runaway" in query:
-            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
-                               and "loom:runaway" in self.names(i["number"])])
-        if "labels=loom:invariant" in query:
-            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
-                               and "loom:invariant" in self.names(i["number"])])
-        if "labels=loom%3Ashipped" in query or "labels=loom:shipped&" in query:
-            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
-                               and "loom:shipped" in self.names(i["number"])])
-        if "labels=loom:rewritten&" in query:
-            if getattr(self, "rewritten_status", 200) != 200:
-                return reply(self.rewritten_status, {"message": "Not Found"})
-            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
-                               and "loom:rewritten" in self.names(i["number"])])
-        if "labels=loom%3Aticket" in query or "labels=loom:ticket&" in query:
-            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
-                               and "loom:ticket" in self.names(i["number"])])
-        if "needs-operator" in query:
-            return self._list_asks(headers)
-        if "loom:human" in query:
-            return reply(200, self.humans)
-        if "grug:idle" in query:
-            return reply(200, getattr(self, "grug_idle_prs", []))
-        if "loom:goal" in query:
-            return self._get_goals()
-        if "labels=epic&" in query:
-            return reply(200, list(getattr(self, "epics", [])))
-        if "loom:lanes" in query:
-            return reply(200, self.lanes_issues)
-        if "loom:digest" in query:
-            return reply(200, self.digest_issues)
-        if "sort=created&direction=asc" in query:
-            return reply(200, self.open_issues)
+        handlers = [
+            ("labels=loom:audit-failed&", lambda: reply(200, [i for i in self.issues.values()
+                                   if "loom:audit-failed" in self.names(i["number"])])),
+
+            ("labels=loom%3Apr", lambda: reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and "loom:pr" in self.names(i["number"])])),
+
+            ("labels=loom:pr&", lambda: reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and "loom:pr" in self.names(i["number"])])),
+
+            ("labels=loom%3Amerged", lambda: reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and "loom:merged" in self.names(i["number"])])),
+
+            ("labels=loom:merged&", lambda: reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and "loom:merged" in self.names(i["number"])])),
+
+            ("labels=loom:runaway", lambda: reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and "loom:runaway" in self.names(i["number"])])),
+
+            ("labels=loom:invariant", lambda: reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and "loom:invariant" in self.names(i["number"])])),
+
+            ("labels=loom%3Ashipped", lambda: reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and "loom:shipped" in self.names(i["number"])])),
+
+            ("labels=loom:shipped&", lambda: reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and "loom:shipped" in self.names(i["number"])])),
+
+            ("labels=loom:rewritten&", self._handle_rewritten),
+
+            ("labels=loom%3Aticket", lambda: reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and "loom:ticket" in self.names(i["number"])])),
+
+            ("labels=loom:ticket&", lambda: reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and "loom:ticket" in self.names(i["number"])])),
+
+            ("needs-operator", lambda: self._list_asks(headers)),
+
+            ("loom:human", lambda: reply(200, self.humans)),
+
+            ("grug:idle", lambda: reply(200, getattr(self, "grug_idle_prs", []))),
+
+            ("loom:goal", self._get_goals),
+
+            ("labels=epic&", lambda: reply(200, list(getattr(self, "epics", [])))),
+
+            ("loom:lanes", lambda: reply(200, self.lanes_issues)),
+
+            ("loom:digest", lambda: reply(200, self.digest_issues)),
+
+            ("sort=created&direction=asc", lambda: reply(200, self.open_issues)),
+        ]
+
+        for pattern, handler in handlers:
+            if pattern in query:
+                return handler()
+
         return self._list_briefed(headers)
+
+    def _handle_rewritten(self):
+        if getattr(self, "rewritten_status", 200) != 200:
+            return reply(self.rewritten_status, {"message": "Not Found"})
+        return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                           and "loom:rewritten" in self.names(i["number"])])
 
     def _get_goals(self):
         if self.goal_error:

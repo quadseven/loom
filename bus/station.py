@@ -6823,6 +6823,7 @@ class Station:
                 return None
         # A loom:human issue waits in the digest's own list, never alone.
         asks = [a for a in asks if HUMAN not in _label_names(a[1])]
+        asks = [a for a in asks if "number" in a[1]]
         asks.sort(key=lambda a: (str(a[1].get("created_at") or ""), a[0], int(a[1]["number"])))
         keyed = [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
 
@@ -11522,6 +11523,25 @@ class Station:
                 _say("labels changed in %s: %s" % (repo, ", ".join(changed)))
         _write_json(path, {"digest": digest})
 
+    def _safe_run(self, method, *exceptions, msg: str) -> None:
+        """Run a method, catching and logging exceptions except RateLimited."""
+        try:
+            method()
+        except RateLimited:
+            raise
+        except exceptions as err:
+            _say("%s: %s" % (msg, err))
+
+    def _safe_run_deferred(self, method, *exceptions, msg: str) -> None:
+        """Run a method if not deferred, catching and logging exceptions except RateLimited."""
+        if not self._deferred():
+            self._safe_run(method, *exceptions, msg=msg)
+
+    def _safe_run_conditional(self, condition: bool, method, *exceptions, msg: str) -> None:
+        """Run a method if condition is true, catching and logging exceptions except RateLimited."""
+        if condition:
+            self._safe_run(method, *exceptions, msg=msg)
+
     def run_pass(self) -> None:
         if self._budget_exhausted():
             return
@@ -11529,76 +11549,42 @@ class Station:
             return
         self.sync_labels()
         self.finish_claims()
-        try:
-            self._timed(self.tend_runners)
-        except RateLimited:
-            raise
-        except (GitHubError, OSError, runners.ReportError) as err:
-            _say("tend_runners failed: %s" % err)
+        self._safe_run(self.tend_runners, GitHubError, OSError, runners.ReportError,
+                       msg="tend_runners failed")
         self.report_outcomes()
-        if not self._deferred():
-            try:
-                self._timed(self.reconcile_pull_requests)
-            except RateLimited:
-                raise
-            except (GitHubError, OSError) as err:
-                _say("pull request reconciliation failed: %s" % err)
-        if not self._deferred():
-            try:
-                self._timed(self.hand_back)
-            except RateLimited:
-                raise
-            except (GitHubError, OSError) as err:
-                _say("hand_back failed: %s" % err)
+        self._safe_run_deferred(self.reconcile_pull_requests, GitHubError, OSError,
+                                msg="pull request reconciliation failed")
+        self._safe_run_deferred(self.hand_back, GitHubError, OSError,
+                                msg="hand_back failed")
         # A disk under the floor takes no new work (loom#1808); a pass
         # still finishes half-done claims, reconciles and prunes.
-        if not self.disk_low():
-            self._timed(self.claim_new)
-        if not self._deferred():
-            try:
-                self._timed(self.assign_queued)
-            except RateLimited:
-                raise
-            except (GitHubError, OSError) as err:
-                _say("assign_queued failed: %s" % err)
-        try:
-            self.record_scans()
-        except OSError as err:
-            _say("could not record the repo scans: %s" % err)
-        try:
-            self._scan_grug_idle()
-        except RateLimited:
-            raise
-        except (GitHubError, OSError) as err:
-            _say("grug:idle scan failed: %s" % err)
+        self._safe_run_conditional(not self.disk_low(), self.claim_new, OSError,
+                                   msg="claim_new failed")
+        self._safe_run_deferred(self.assign_queued, GitHubError, OSError,
+                                msg="assign_queued failed")
+        self._safe_run(self.record_scans, OSError,
+                       msg="could not record the repo scans")
+        self._safe_run(self._scan_grug_idle, GitHubError, OSError,
+                       msg="grug:idle scan failed")
         self._run_steps()
         # The day's metrics line goes out even below the budget floor: one post
         # a day, and on 2026-10-18 the floor deferred it every pass, so the
         # operator got no numbers for the day. Only a spent budget stops it.
-        try:
-            self.post_metrics()
-        except RateLimited:
-            raise
-        except (GitHubError, OSError, ValueError) as err:
-            _say("post_metrics failed: %s" % err)
-        try:
-            self.watch_logs()
-        except RateLimited:
-            raise
-        except (GitHubError, OSError) as err:
-            _say("watch_logs failed: %s" % err)
+        self._safe_run(self.post_metrics, GitHubError, OSError, ValueError,
+                       msg="post_metrics failed")
+        self._safe_run(self.watch_logs, GitHubError, OSError,
+                       msg="watch_logs failed")
         # Local housekeeping: finished lane trees, old lane logs, the disk.
         for local in (self.prune_trees, self.tend_disk):
-            try:
-                local()
-            except OSError as err:
-                _say("%s failed: %s" % (local.__name__, err))
-        try:
-            records = usage.collect(self.s.home, now=self.now)
-            usage.write(self.s.home, records)
-            self.upload_usage_limits(records)
-        except OSError as err:
-            _say("could not write usage limits: %s" % err)
+            self._safe_run(local, OSError, msg="%s failed" % local.__name__)
+        self._safe_run(lambda: self._collect_and_write_usage(), OSError,
+                       msg="could not write usage limits")
+
+    def _collect_and_write_usage(self) -> None:
+        """Collect and write usage limits, then upload them."""
+        records = usage.collect(self.s.home, now=self.now)
+        usage.write(self.s.home, records)
+        self.upload_usage_limits(records)
 
     def tend_runners(self) -> None:
         """The slots in LOOM_RUNNER_SLOTS: dispatch their briefs to cluster
