@@ -1006,7 +1006,12 @@ lane_app_token() {
   local auth_dir="$LOOM_HOME/run/gh-auth-$SLOT"
   mkdir -p "$auth_dir" || return 1
   chmod 700 "$auth_dir" || return 1
-  printf '%s' "$token" | GH_CONFIG_DIR="$auth_dir" gh auth login --with-token >/dev/null 2>> "$LOG" || return 1
+  # gh's error text can echo the token it was handed: mask it before logging.
+  local err
+  if ! err="$(printf '%s' "$token" | GH_CONFIG_DIR="$auth_dir" gh auth login --with-token 2>&1 >/dev/null)"; then
+    printf '%s\n' "${err//"$token"/[redacted]}" >> "$LOG"
+    return 1
+  fi
   export LANE_GH_CONFIG_DIR="$auth_dir"
 }
 APP_TOKEN_WHY="could not mint the lane's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"

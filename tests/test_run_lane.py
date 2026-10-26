@@ -164,6 +164,7 @@ if [ "$1 $2" = "pr create" ]; then
   echo "https://github.com/example/repo/pull/7"
 fi
 if [ "$1 $2" = "auth login" ]; then
+  [ -z "${FAKE_GH_AUTH_FAIL:-}" ] || { echo "invalid token: $(cat)" >&2; exit 1; }
   [ -z "${FAKE_GH_AUTH_TOKEN:-}" ] || cat > "$FAKE_GH_AUTH_TOKEN"
   exit 0
 fi
@@ -5043,6 +5044,17 @@ exit %d
         self.assertTrue(agent_env[3].endswith("gh-auth-codex"))
         self.assertEqual(auth_token.read_text(), "ghs_lanes.tok-en")
         self.assertFalse((self.loom / "run" / "gh-auth-codex").exists())
+
+    def test_a_failed_gh_login_keeps_the_app_token_out_of_the_lane_log(self):
+        # gh's error text can echo the token it was handed.
+        self.drop_brief()
+        self.run_lane(LOOM_GITHUB_APP_ID="124",
+                      LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo ghs_lanes.tok-en"),
+                      FAKE_GH_AUTH_FAIL="1")
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("could not mint the lane's GitHub App token", log)
+        self.assertNotIn("ghs_lanes.tok-en", log)
 
     def test_agent_gh_call_count_is_unknown_when_the_log_is_missing_or_empty(self):
         source = RUNNER.read_text()
