@@ -566,6 +566,15 @@ class GitHub:
 
     def rest(self, method: str, path: str, body: Any = None,
              etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
+        if (method or "").upper() == "GET":
+            kind = request_kind(method, path)
+            if (self.target is not None and self.counted >= self.target
+                    and kind in DEFERRABLE_KINDS):
+                with self._count_lock:
+                    self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
+                if kind in ("events", "comments"):
+                    return Response(200, [])
+                return Response(200, {})
         body = self._without_mentions(method, body)
         body = self._keep_status_section(method, path, body)
         resp = self._rest(method, path, body, etag, ok)
@@ -1099,6 +1108,11 @@ class GitHub:
         """Read known pages concurrently, preserving their page order."""
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"
+        kind = request_kind("GET", path)
+        if self.target is not None and self.counted >= self.target and kind in DEFERRABLE_KINDS:
+            with self._count_lock:
+                self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
+            return []
         first = self.rest("GET", path)
         last = _last_link(first.headers.get("link", ""))
         if not last or _page_of(last) <= 1:
