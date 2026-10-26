@@ -682,15 +682,28 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
                  if str(c.get("body") or "").startswith(FIX_MARKER)), None)
     if last is None:
         return False
-    if set(FIX_THREAD_RE.findall(last)) & set(open_threads):
-        return True
-    if converge.persistent(last, (), threads):
+    if _finding_survived(last, open_threads, threads):
         return True
     if no_test and NO_TEST_HEADING in last:
         return True
-    if unticked and UNTICKED_HEADING in last and any("- " + c in last for c in unticked):
+    if _unticked_left(last, unticked):
         return True
     return checks_failing and bool(FIX_CHECK_RE.search(last))
+
+
+def _unticked_left(last: str, unticked: Sequence[str]) -> bool:
+    """The last fix round named a criterion that is still unticked."""
+    return bool(unticked) and UNTICKED_HEADING in last and any("- " + c in last for c in unticked)
+
+
+def _finding_survived(last: str, open_threads: Sequence[str],
+                      threads: Sequence[Dict[str, Any]]) -> bool:
+    """A thread the last fix round asked about is still open, by its id or,
+    posted again, by its finding's signature (bus/converge.py). Failing
+    checks are judged by stuck() itself: any check the round was asked to fix
+    while checks still fail."""
+    return (bool(set(FIX_THREAD_RE.findall(last)) & set(open_threads))
+            or bool(converge.persistent(last, (), threads)))
 
 
 def _end(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
@@ -1915,6 +1928,15 @@ class Factory:
                            "operator one exact question." % (why, ", ".join(ran) or "none"))
         _say("%s#%d is past the last rung; left failed for the brain" % (repo, number))
 
+    def _trusted_open(self, repo: str, pr: Dict[str, Any],
+                      open_threads: Sequence[str]) -> List[Dict[str, Any]]:
+        """The pull request's open threads that may count toward stuck
+        (trusted_threads); read only when it has open threads at all."""
+        if not open_threads:
+            return []
+        return trusted_threads(self._threads(repo, int(pr["number"])), self.review_bot,
+                               self.trusted)
+
     def _hand_off(self, repo: str, issue: Dict[str, Any]) -> None:
         """Put a ticket whose fix rounds stopped in the hand-off pool
         (HANDOFF_LABEL)."""
@@ -1955,8 +1977,7 @@ class Factory:
         if checks_failing and self._past_no_change(repo, issue, comments):
             return
         age = self.now - _ts(pr.get("created_at"))
-        threads = (trusted_threads(self._threads(repo, int(pr["number"])), self.review_bot,
-                                   self.trusted) if open_threads else [])
+        threads = self._trusted_open(repo, pr, open_threads)
         if stuck(comments, open_threads, checks_failing, age, self.now, no_test, unticked,
                  threads):
             footer = self._footer(repo, pr)

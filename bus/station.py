@@ -5387,15 +5387,17 @@ class Station:
             self._mark_ready(repo, number, sha, names, ready)
             return
         self._remove_ready_if_present(repo, number, names)
-        if not failed and not threads:
-            return
-        if not threads and all(name == self.s.plan_check for name, _ in failed):
-            # A plan check failure alone is the pull request's body, which the
-            # factory rebuilds from the ticket (factory._judge, loom#1837): a
-            # lane round cannot change it, and it is no round to judge stuck.
+        if self._no_round(failed, threads):
             return
         self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
                                    comments, names, failed, threads, rounds)
+
+    def _no_round(self, failed: List[Tuple[str, str]], threads: List[Any]) -> bool:
+        """Nothing a lane round could fix: no failure at all, or the plan check
+        alone, which fails on the pull request's body; the factory rebuilds
+        that from the ticket (factory._judge, loom#1837), so it is also no
+        round to judge stuck."""
+        return not threads and all(name == self.s.plan_check for name, _ in failed)
 
     def _note_first_push(self, repo: str, pr_number: int, comments: List[Any],
                          failed: List[Tuple[str, str]]) -> None:
