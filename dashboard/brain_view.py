@@ -200,6 +200,12 @@ def _age(value, now):
 def build_brains(record, journals, lanes, tickets, pull_requests, comments=(), now=None):
     """Build the read-only brain, lane and hand-off map from dashboard snapshot data."""
     now = now or datetime.now(timezone.utc)
+    brains = _build_brain_cards(record, journals, now)
+    lane_cards = _build_lane_cards(lanes, tickets, pull_requests, comments, now)
+    return {"brains": brains, "lanes": lane_cards, "now": now}
+
+
+def _build_brain_cards(record, journals, now):
     holders = _journal_holders(journals)
     for holder in ("operator session", "muse", "lane machine"):
         holders.setdefault(holder, None)
@@ -213,6 +219,10 @@ def build_brains(record, journals, lanes, tickets, pull_requests, comments=(), n
                        "at": (record or {}).get("started_at") if state == "running" else (tick or {}).get("at"),
                        "age": _age((record or {}).get("started_at") if state == "running"
                                    else (tick or {}).get("at"), now)})
+    return brains
+
+
+def _build_lane_cards(lanes, tickets, pull_requests, comments, now):
     ticket_by_lane = {}
     for ticket in tickets or []:
         if ticket.get("lane") and ticket.get("state") in ("running", "pr"):
@@ -237,7 +247,7 @@ def build_brains(record, journals, lanes, tickets, pull_requests, comments=(), n
         ticket = lane["ticket"]
         lane["pull_request"] = next((pr for ref, pr in prs if ticket and ref ==
                                       (ticket.get("repo"), str(ticket.get("number")))), None)
-    return {"brains": brains, "lanes": lane_cards, "now": now}
+    return lane_cards
 
 
 def _ticket_key(ticket):
@@ -266,13 +276,29 @@ def _lane_pr_ticket(pr):
 
 def render_brains(data):
     """Render the current brain and lane snapshot without page-time reads."""
+    brains = _render_brain_cards(data.get("brains", []))
+    lane_html = _render_lane_cards(data.get("lanes", []))
+    incident_html = _render_incidents(data.get("lanes", []))
+    return ('<p class="page-lede">Brains, their lanes and the work each lane holds now.</p>'
+            '<section class="section"><h2 class="label">Brains</h2><div class="lane-grid">%s</div></section>'
+            '<section class="section"><h2 class="label">Lanes and hand-offs</h2><div class="lane-grid">%s</div></section>'
+            '<section class="section"><h2 class="label">Factory incident holds</h2>%s</section>') % (
+                brains, lane_html, incident_html)
+
+
+def _render_brain_cards(brain_rows):
     esc = html.escape
     brains = "".join('<article class="card"><h2>%s</h2><p>%s</p><p>%s</p></article>' % (
         esc(brain["holder"]), esc(brain["state"]),
         esc((brain.get("step") or "step unavailable") + " / last posted " + brain["age"]))
-        for brain in data.get("brains", [])) or '<p class="empty-state">No brain ticks have been recorded.</p>'
+        for brain in brain_rows) or '<p class="empty-state">No brain ticks have been recorded.</p>'
+    return brains
+
+
+def _render_lane_cards(lane_rows):
+    esc = html.escape
     lanes = []
-    for lane in data.get("lanes", []):
+    for lane in lane_rows:
         ticket = lane.get("ticket")
         if ticket:
             href = "/t/%s/%s" % (esc(str(ticket.get("repo") or "")), esc(str(ticket.get("number") or "")))
@@ -291,18 +317,19 @@ def render_brains(data):
             esc("busy" if ticket else "idle"), doing, pr_link,
             esc("last heartbeat " + lane["age"])))
     lane_html = "".join(lanes) or '<p class="empty-state">No lane heartbeats have been recorded.</p>'
-    incidents = [ticket for lane in data.get("lanes", []) for ticket in [lane.get("ticket")]
+    return lane_html
+
+
+def _render_incidents(lane_rows):
+    esc = html.escape
+    incidents = [ticket for lane in lane_rows for ticket in [lane.get("ticket")]
                  if ticket and "needs-brain" in (ticket.get("labels") or [])]
     incident_html = "".join('<p><a href="/t/%s/%s">%s</a> held for brain review</p>' % (
         esc(str(ticket.get("repo") or "")), esc(str(ticket.get("number") or "")),
         esc(ticket.get("title") or "ticket")) for ticket in incidents)
     if not incident_html:
         incident_html = '<p class="empty-state">No factory incident holds are recorded.</p>'
-    return ('<p class="page-lede">Brains, their lanes and the work each lane holds now.</p>'
-            '<section class="section"><h2 class="label">Brains</h2><div class="lane-grid">%s</div></section>'
-            '<section class="section"><h2 class="label">Lanes and hand-offs</h2><div class="lane-grid">%s</div></section>'
-            '<section class="section"><h2 class="label">Factory incident holds</h2>%s</section>') % (
-                brains, lane_html, incident_html)
+    return incident_html
 
 
 TAG_LABELS = {None: "note"}
