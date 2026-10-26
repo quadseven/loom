@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 import errno
 import fcntl
 import fnmatch
+import gzip
 import hashlib
 import json
 import math
@@ -104,12 +105,30 @@ TREE_KEEP = 3600
 # The loom home is kept bounded (loom#643): a lane's logs (logs/<slot>/) are
 # removed once nothing in them changed for LOOM_LOG_KEEP_DAYS days (0 keeps
 # them all), unless a brief of that name is waiting or running or its
-# transcript has not reached the dashboard yet. Every pass warns when the
-# home's disk has less than LOOM_DISK_FREE_MIN_GB free; every DISK_EVERY
-# seconds the old logs go and the home's size is logged. On 2026-10-17 logs/
-# held 4.2 GB, growing 0.6 GB a day, and the disk was down to 8 GB free.
+# transcript has not reached the dashboard yet. Every DISK_EVERY seconds the
+# old logs go, finished runs' session stores are compressed, and the home's
+# size is logged. On 2026-10-17 logs/ held 4.2 GB, growing 0.6 GB a day, and
+# the disk was down to 8 GB free.
 LOG_KEEP_DAYS = 7
-DISK_FREE_MIN_GB = 10.0
+# While the home's disk has less than LOOM_MIN_FREE_GB free the station claims
+# no new work (loom#1808): on 2026-10-25 the disk fell to 300 MB free and every
+# lane run failed at once. The older name LOOM_DISK_FREE_MIN_GB is still read.
+DISK_FREE_MIN_GB = 15.0
+DISK_GUARD_FILE = "disk-guard.json"
+# A finished opencode run's session store under its log folder (lanes/
+# run_lane.sh archive_transcripts): 100-440 MB a run on 2026-10-25, 14 GB of
+# the 17 GB in logs/ (loom#1808). Compressed once its transcript is uploaded.
+SESSION_DB_PARTS = (".local", "share", "opencode", "opencode.db")
+# The ticket states after which a lane tree serves no fix round: its tree,
+# check copy and idle run scratch go at once, not after TREE_KEEP.
+TREE_DONE_STATES = frozenset(("loom:merged", "loom:shipped", "loom:verified",
+                              "loom:closed-unmerged"))
+# A lane's run scratch (run/<slot>-home, -check, -check-default) younger than
+# this is never removed: a runner may have just made it.
+RUN_SCRATCH_SETTLE = 600
+# The folders an idle lane's run home drops each pass: package caches and
+# temp files a run rebuilds.
+RUN_HOME_CACHES = (".cache", ".cargo", "tmp")
 DISK_EVERY = 3600
 GB = 1024 ** 3
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
@@ -934,7 +953,8 @@ class Settings:
                    ship_path_workflows=words("LOOM_SHIP_PATH_WORKFLOWS"),
                    no_topup=words("LOOM_NO_TOPUP"),
                    log_keep_days=_keep_days(env.get("LOOM_LOG_KEEP_DAYS", "")),
-                   disk_free_min_gb=_free_floor(env.get("LOOM_DISK_FREE_MIN_GB", "")),
+                   disk_free_min_gb=_free_floor(env.get("LOOM_MIN_FREE_GB", "").strip()
+                                                or env.get("LOOM_DISK_FREE_MIN_GB", "")),
                    settle_claimed=claimed.mode(env.get("LOOM_SETTLE_CLAIMED", "")),
                    settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")),
                    claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")))
@@ -953,7 +973,8 @@ def _keep_days(raw: str) -> int:
 
 
 def _free_floor(raw: str) -> float:
-    """LOOM_DISK_FREE_MIN_GB: a non-negative number of GB, else the default."""
+    """LOOM_MIN_FREE_GB (or the older LOOM_DISK_FREE_MIN_GB): a non-negative
+    number of GB, else the default."""
     raw = raw.strip()
     if not raw:
         return DISK_FREE_MIN_GB
@@ -962,7 +983,7 @@ def _free_floor(raw: str) -> float:
     except ValueError:
         value = -1.0
     if not (value >= 0 and math.isfinite(value)):
-        _say("ignoring LOOM_DISK_FREE_MIN_GB %r: not a number of GB" % raw)
+        _say("ignoring LOOM_MIN_FREE_GB %r: not a number of GB" % raw)
         return DISK_FREE_MIN_GB
     return value
 
@@ -998,6 +1019,55 @@ def _remove(path: str) -> None:
         shutil.rmtree(path, ignore_errors=True)
     else:
         os.unlink(path)
+
+
+def _gzip_session_db(run: str) -> Optional[Tuple[int, int]]:
+    """gzip a run log folder's opencode.db (SESSION_DB_PARTS) in place:
+    (bytes before, bytes after), or None when it holds no store. Every folder
+    on the way must be a real folder and the store a regular file: nothing
+    is followed through a link. The store's and its folder's times are
+    kept."""
+    parent = run
+    for part in SESSION_DB_PARTS[:-1]:
+        try:
+            st = os.lstat(parent)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISDIR(st.st_mode):
+            return None
+        parent = os.path.join(parent, part)
+    try:
+        folder = os.lstat(parent)
+        if not stat.S_ISDIR(folder.st_mode):
+            return None
+        db = os.path.join(parent, SESSION_DB_PARTS[-1])
+        st = os.lstat(db)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    target = db + ".gz"
+    tmp = target + ".tmp"
+    fd = os.open(db, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        with os.fdopen(fd, "rb") as src, gzip.open(tmp, "wb", compresslevel=6) as dst:
+            shutil.copyfileobj(src, dst, 1 << 20)
+        os.utime(tmp, (st.st_atime, st.st_mtime))
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.unlink(db)
+    for side in ("-wal", "-shm"):
+        try:
+            os.unlink(db + side)
+        except FileNotFoundError:
+            pass
+    os.utime(parent, (folder.st_atime, folder.st_mtime))
+    return st.st_size, os.lstat(target).st_size
 
 
 def _ship_workflows(items: List[str]) -> Dict[str, str]:
@@ -1623,6 +1693,12 @@ class Station:
         # goal key -> the count and limit the gate hit, the briefed tickets
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
+        # Free bytes on the loom home's disk, read once a pass (_disk_free).
+        self._free: Optional[int] = None
+        self._free_read = False
+        # repo -> open ticket numbers whose lane trees may still serve a fix
+        # round, from this pass's reconcile read (prune_trees).
+        self._open_work: Dict[str, Set[int]] = {}
         # Log data sections the verify gate already read this pass, by ticket.
         self._evidence_text: Dict[str, str] = {}
         # This pass's factory-repair tickets over the unproven-work limit, per
@@ -3953,6 +4029,11 @@ class Station:
         tickets_by_number = {int(i["number"]): i for i in self._pr_tickets(repo)
                              if "loom:ticket" in _label_names(i)}
         open_tickets = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        self._open_work[repo] = {
+            int(i["number"]) for i in open_tickets
+            if isinstance(i, dict) and "pull_request" not in i and "number" in i
+            and "loom:ticket" in _label_names(i)
+            and not TREE_DONE_STATES.intersection(_label_names(i))}
         self._reconcile_adoptions(repo, open_tickets)
         # Only a closed pull request changes a ticket. Those PRs are the most
         # recently updated closed ones, so one page of them is read, never the
@@ -6344,9 +6425,11 @@ class Station:
 
     def _lanes_body(self, rows: List[Tuple[str, str, str]]) -> str:
         summary = self._spend_shown()
+        disk = self._disk_status_line()
         body = "\n".join(
-            [LANES_MARKER, "Updated " + self._utc(self.now), "",
-             "| lane | available | heartbeat (UTC) |", "|---|---|---|"]
+            [LANES_MARKER, "Updated " + self._utc(self.now), ""]
+            + ([disk, ""] if disk else [])
+            + ["| lane | available | heartbeat (UTC) |", "|---|---|---|"]
             + ["| %s | %s | %s |" % row for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
@@ -6424,6 +6507,8 @@ class Station:
         # A changed scorecard (bus/scorecard.py) republishes too.
         values["scorecard"] = hashlib.sha256("\n".join(
             self._scorecard_lines()).encode("utf-8")).hexdigest()[:16]
+        # Claims paused or resumed for disk republishes (loom#1808).
+        values["disk"] = "paused" if self._disk_status_line() else "ok"
         if self._lanes_unchanged(repo, values):
             return
         number = self._lanes_issue(repo)
@@ -10636,15 +10721,12 @@ class Station:
         """Remove lane trees whose brief is no longer in a lane inbox (waiting
         or running) and that have not changed for TREE_KEEP seconds. A
         finished run's log stays in logs/; its tree is a clone the next
-        attempt makes again."""
+        attempt makes again. A tree whose ticket is done (its pull request
+        merged or closed, or the ticket closed or dropped, as this pass's
+        reconcile read it) goes at once with its check copy and the runner's
+        files beside it, unless a brief of that ticket is still in an inbox
+        (loom#1808); so does an idle lane's run scratch from that ticket."""
         root = os.path.join(self.s.home, "worktrees")
-        try:
-            names = os.listdir(root)
-        except FileNotFoundError:
-            return
-        except OSError as err:
-            _say("cannot list %s to remove finished lane trees: %s" % (root, err))
-            return
         live = set()
         for lane in LANES:
             try:
@@ -10656,7 +10738,16 @@ class Station:
                 # remove nothing rather than a tree still in use.
                 _say("cannot list lane %s's inbox, so no lane tree is removed: %s" % (lane, err))
                 return
-        removed = 0
+        busy = {t for t in (self._tree_ticket(n) for n in live) if t is not None}
+        self._prune_run_scratch(busy)
+        try:
+            names = os.listdir(root)
+        except FileNotFoundError:
+            return
+        except OSError as err:
+            _say("cannot list %s to remove finished lane trees: %s" % (root, err))
+            return
+        removed = done = 0
         for name in names:
             path = os.path.join(root, name)
             try:
@@ -10666,37 +10757,206 @@ class Station:
             except OSError as err:
                 _say("cannot stat lane tree %s: %s" % (name, err))
                 continue
-            if name in live or self.now - st.st_mtime < TREE_KEEP:
+            if name in live:
+                continue
+            finished = self._tree_done(name, busy)
+            if not finished and self.now - st.st_mtime < TREE_KEEP:
                 continue
             if stat.S_ISDIR(st.st_mode):
                 shutil.rmtree(path, ignore_errors=True)
             else:
                 os.unlink(path)
             removed += 1
+            done += finished
         if removed:
-            _say("removed %d finished lane tree(s)" % removed)
+            _say("removed %d finished lane tree(s)%s" % (
+                removed, " (%d of tickets done)" % done if done else ""))
+
+    def _tree_ticket(self, name: str) -> Optional[Tuple[str, int]]:
+        """(repo, number) of a lane tree or brief name (tickets.ticket_name,
+        with its -rN, -verify-N, -default-check or .summary.md tail), the
+        longest matching watched repo first; None for any other name."""
+        for repo in sorted(self.s.repos, key=len, reverse=True):
+            prefix = repo.replace("/", ".") + "-"
+            if name.startswith(prefix):
+                match = re.match(r"([0-9]+)(?=$|[-.])", name[len(prefix):])
+                if match:
+                    return repo, int(match.group(1))
+        return None
+
+    def _tree_done(self, name: str, busy: Set[Tuple[str, int]]) -> bool:
+        """The tree's ticket is in a repo this pass read and is no longer an
+        open ticket that may take a fix round, and no brief of it is in an
+        inbox."""
+        ticket = self._tree_ticket(name)
+        if ticket is None or ticket in busy:
+            return False
+        repo, number = ticket
+        return repo in self._open_work and number not in self._open_work[repo]
+
+    def _prune_run_scratch(self, busy: Set[Tuple[str, int]]) -> None:
+        """Tend each idle lane's run scratch (run/<slot>-home, -check,
+        -check-default). Idle: no runner lock with a live pid, no brief in
+        its inbox, and the folder unchanged for RUN_SCRATCH_SETTLE. Its
+        home's package caches and temp files (RUN_HOME_CACHES) go every pass:
+        on 2026-10-25 single homes held 3.3 GB of .cache, 1.8 GB of .cargo
+        and 1.3 GB of tmp. The whole scratch goes once the ticket the lane
+        last ran is done (loom#1808). Anything else in a home is kept."""
+        run = os.path.join(self.s.home, "run")
+        removed = caches = 0
+        for slot in LANES:
+            if not self._lane_idle(run, slot):
+                continue
+            last = self._last_finished(slot)
+            finished = last is not None and self._tree_done(last, busy)
+            for suffix in ("-home", "-check", "-check-default"):
+                path = os.path.join(run, slot + suffix)
+                try:
+                    st = os.lstat(path)
+                except OSError:
+                    continue
+                if self.now - st.st_mtime < RUN_SCRATCH_SETTLE:
+                    continue
+                if finished:
+                    _remove(path)
+                    removed += 1
+                elif suffix == "-home" and stat.S_ISDIR(st.st_mode):
+                    caches += self._drop_home_caches(run, slot, path, st)
+        if removed:
+            _say("removed %d idle lane run folder(s) of tickets done" % removed)
+        if caches:
+            _say("removed %d cache folder(s) from idle lane homes" % caches)
+
+    def _lane_idle(self, run: str, slot: str) -> bool:
+        """No runner holds the slot and no brief waits in its inbox."""
+        if self._lane_locked(run, slot):
+            return False
+        try:
+            return not any(e.endswith(".md") for e in os.listdir(self.inbox(slot)))
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    def _drop_home_caches(self, run: str, slot: str, home: str, st: os.stat_result) -> int:
+        """Remove RUN_HOME_CACHES from an idle lane's home, checking the lock
+        again before each; the home keeps its time, so the settle check still
+        reads it as idle on the next pass. The number removed."""
+        dropped = 0
+        for name in RUN_HOME_CACHES:
+            cache = os.path.join(home, name)
+            if not os.path.lexists(cache):
+                continue
+            if self._lane_locked(run, slot):
+                break
+            _remove(cache)
+            dropped += 1
+        if dropped:
+            os.utime(home, (st.st_atime, st.st_mtime), follow_symlinks=False)
+        return dropped
+
+    @staticmethod
+    def _lane_locked(run: str, slot: str) -> bool:
+        """A runner holds the slot: its lock folder (lanes/run_lane.sh LOCK)
+        exists and names a live pid, or no pid yet (a runner just took it)."""
+        lock = os.path.join(run, slot + ".lock")
+        if not os.path.lexists(lock):
+            return False
+        try:
+            with open(os.path.join(lock, "pid"), encoding="ascii") as fh:
+                pid = int(fh.read().strip())
+        except (OSError, ValueError):
+            return True
+        if pid <= 0:
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    def _last_finished(self, slot: str) -> Optional[str]:
+        """The name of the brief a lane slot finished last (newest in its
+        done/ or failed/), None when it has none."""
+        newest: Optional[Tuple[float, str]] = None
+        for kind in ("done", "failed"):
+            folder = os.path.join(self.inbox(slot), kind)
+            try:
+                entries = os.listdir(folder)
+            except OSError:
+                continue
+            for entry in entries:
+                if not entry.endswith(".md"):
+                    continue
+                try:
+                    mtime = os.lstat(os.path.join(folder, entry)).st_mtime
+                except OSError:
+                    continue
+                if newest is None or mtime > newest[0]:
+                    newest = (mtime, entry[:-3])
+        return newest[1] if newest else None
+
+    def _disk_free(self) -> Optional[int]:
+        """Free bytes on the loom home's disk, read once a pass; None when it
+        cannot be read."""
+        if not self._free_read:
+            self._free_read = True
+            try:
+                self._free = shutil.disk_usage(self.s.home).free
+            except OSError as err:
+                _say("cannot read the free space on the loom home's disk: %s" % err)
+                self._free = None
+        return self._free
+
+    def disk_low(self) -> bool:
+        """True while the loom home's disk has less than disk_free_min_gb
+        free: the pass claims no new work (loom#1808). The state is kept in
+        state/disk-guard.json and said in the log only when it changes, and
+        the lane status shows it; a free space that cannot be read keeps the
+        last state."""
+        path = os.path.join(self.state, DISK_GUARD_FILE)
+        saved = _read_json(path, {}, strict=False)
+        was = bool(saved.get("low")) if isinstance(saved, dict) else False
+        free = self._disk_free()
+        floor = self.s.disk_free_min_gb * GB
+        low = was if free is None else free < floor
+        if free is not None and low != was:
+            # Worded so the log watcher (bus/watch.py KEEP_RE) does not count it.
+            if low:
+                _say("claims paused: only %s free on the loom home's disk (under %s); "
+                     "no new work is claimed until it has more" % (_gb(free), _gb(floor)))
+            else:
+                _say("claims resumed: %s free on the loom home's disk (at least %s)"
+                     % (_gb(free), _gb(floor)))
+            _write_json(path, {"low": low, "free": free, "floor": floor, "at": self.now})
+        return low
+
+    def _disk_status_line(self) -> Optional[str]:
+        """The lane status line while claims are paused for disk, else None."""
+        saved = _read_json(os.path.join(self.state, DISK_GUARD_FILE), {}, strict=False)
+        if not (isinstance(saved, dict) and saved.get("low")):
+            return None
+        free, floor = saved.get("free"), saved.get("floor")
+        if not (self._num(free) and self._num(floor)):
+            return "Claims paused: the loom home's disk is low on free space"
+        return "Claims paused: %s free on the loom home's disk, under %s" % (_gb(free), _gb(floor))
 
     def tend_disk(self) -> None:
         """Keep the loom home bounded and say how big it is (loom#643). Every
-        pass warns when its disk has less than disk_free_min_gb free. Every
-        DISK_EVERY seconds the lane logs past retention go (prune_logs) and
-        the home's size is logged, by top-level folder."""
-        try:
-            free: Optional[int] = shutil.disk_usage(self.s.home).free
-        except OSError as err:
-            _say("cannot read the free space on the loom home's disk: %s" % err)
-            free = None
-        if free is not None and free < self.s.disk_free_min_gb * GB:
-            # Worded so the log watcher (bus/watch.py KEEP_RE) does not count
-            # it: the line repeats every pass until space is freed.
-            _say("warning: only %s free on the loom home's disk (under %s); "
-                 "lanes keep writing" % (_gb(free), _gb(self.s.disk_free_min_gb * GB)))
+        DISK_EVERY seconds the lane logs past retention go (prune_logs),
+        finished runs' session stores are compressed (compress_sessions), and
+        the home's size is logged, by top-level folder. The free space below
+        the floor stops claims instead (disk_low)."""
+        free = self._disk_free()
         path = os.path.join(self.state, "disk.json")
         saved = _read_json(path, {}, strict=False)
         last = saved.get("at") if isinstance(saved, dict) else None
         if self._num(last) and 0 <= self.now - last < DISK_EVERY:
             return
         self.prune_logs()
+        self.compress_sessions()
         sizes: Dict[str, int] = {}
         try:
             names = os.listdir(self.s.home)
@@ -10715,6 +10975,48 @@ class Station:
         _say("loom home holds %s (%s); %s free on its disk"
              % (_gb(total), parts or "empty", "unknown" if free is None else _gb(free)))
         _write_json(path, {"at": self.now, "bytes": total, "free": free, "folders": sizes})
+
+    def compress_sessions(self) -> None:
+        """gzip each finished run's opencode session store (SESSION_DB_PARTS
+        under logs/<slot>/<run>/) to opencode.db.gz, once no brief of that
+        name is waiting or running and its transcript is not waiting for the
+        dashboard (_logs_kept). bus/sessions.py reads the compressed store,
+        and prune_logs removes it with the run's other logs after
+        log_keep_days. The -wal and -shm files go too: the readers open the
+        store immutable and never read them. Times are kept, so retention
+        still counts from the run."""
+        kept = self._logs_kept()
+        if kept is None:
+            return
+        live, pending = kept
+        count = before = after = 0
+        for slot in LANES:
+            folder = os.path.join(self.s.home, "logs", slot)
+            try:
+                if not stat.S_ISDIR(os.lstat(folder).st_mode):
+                    continue
+                names = os.listdir(folder)
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                _say("cannot list lane %s's logs to compress session stores: %s" % (slot, err))
+                continue
+            keep = live | {k.split("/", 1)[1] for k in pending if k.startswith(slot + "/")}
+            for name in names:
+                if name in keep:
+                    continue
+                try:
+                    sizes = _gzip_session_db(os.path.join(folder, name))
+                except OSError as err:
+                    _say("cannot compress the session store of %s/%s: %s" % (slot, name, err))
+                    continue
+                if sizes is not None:
+                    count += 1
+                    before += sizes[0]
+                    after += sizes[1]
+        if count:
+            _say("compressed %d finished run session store(s): %s to %s"
+                 % (count, _gb(before), _gb(after)))
 
     def _logs_kept(self) -> Optional[Tuple[Set[str], Set[str]]]:
         """(names, slot/name keys) whose lane logs stay however old: every
@@ -10985,7 +11287,10 @@ class Station:
                 raise
             except (GitHubError, OSError) as err:
                 _say("hand_back failed: %s" % err)
-        self._timed(self.claim_new)
+        # A disk under the floor takes no new work (loom#1808); a pass
+        # still finishes half-done claims, reconciles and prunes.
+        if not self.disk_low():
+            self._timed(self.claim_new)
         if not self._deferred():
             try:
                 self._timed(self.assign_queued)

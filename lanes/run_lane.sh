@@ -168,6 +168,33 @@ drop_run_scratch() {
     rm -rf "${WORKDIR:?}/$TICKET$f"
   done
 }
+# When a run ends, drop the build output git ignores from its tree and its
+# default-branch check copy: .venv, node_modules, __pycache__ and
+# .pytest_cache folders that `git check-ignore` confirms and that hold no
+# tracked path. The tracked tree stays for fix rounds. On 2026-10-25 an infra
+# run left 17 ignored .venv folders, about 2 GB a tree, kept for TREE_KEEP
+# (loom#1808). find never follows a link, so a linked folder is never entered
+# or matched, and rm -rf removes links inside without following them. Called
+# before each brief (for the run before it) and when the runner exits.
+drop_build_output() {
+  [[ "${TICKET:-}" =~ ^[A-Za-z0-9._-]+$ ]] && [ -n "${WORKDIR:-}" ] || return 0
+  local tree path tracked
+  for tree in "$WORKDIR/$TICKET" "$WORKDIR/$TICKET-default-check"; do
+    [ -d "$tree" ] && [ ! -L "$tree" ] && [ -e "$tree/.git" ] || continue
+    while IFS= read -r -d '' path; do
+      # find names every path ./..., so none reads as an option.
+      [[ "$path" == ./* ]] || continue
+      git -C "$tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+        check-ignore -q -- "$path" 2> /dev/null || continue
+      tracked="$(git -C "$tree" -c core.fsmonitor=false ls-files -- "$path" 2> /dev/null)" || continue
+      [ -z "$tracked" ] || continue
+      rm -rf -- "${tree:?}/$path" 2> /dev/null || true
+    done < <(cd "$tree" && find . -name .git -prune -o -type d \( -name .venv -o -name node_modules \
+               -o -name __pycache__ -o -name .pytest_cache \) -prune -print0 2> /dev/null)
+  done
+  return 0
+}
+
 # The runner writes its usage heartbeat between runs, not during one, and a
 # run can take over an hour (loom#1281). While this runner lives, a background
 # loop stamps state/usage/<slot>.alive with the time every
@@ -195,7 +222,7 @@ stop_keepalive() {
 mkdir -p "$LOOM_HOME/state/usage"
 keepalive_loop $$ > /dev/null 2>&1 &
 KEEPALIVE_PID=$!
-trap 'drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
+trap 'drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
@@ -3023,6 +3050,7 @@ fi
 
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
+  drop_build_output
   drop_run_scratch
   PR_BODY=""
   PLAN_GAPS=""
