@@ -5,6 +5,7 @@ keychain and /usr/bin/security denied), and the validation run keeps its own
 rules."""
 
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -338,8 +339,13 @@ class BwrapSandboxTest(unittest.TestCase):
     def test_sandbox_ready_says_why_bwrap_cannot_run(self):
         good = {"LOOM_EGRESS_DENY_PROBES": "127.0.0.1:%d" % self.closed_port(),
                 "LOOM_EGRESS_ALLOW_PROBE": self.setUpListener()}
+        # A PATH with bash and nothing else: a Linux host has a real bwrap in
+        # /usr/bin, so the system folders cannot stand in for "no bwrap".
+        no_bwrap = self.root / "no-bwrap"
+        no_bwrap.mkdir()
+        (no_bwrap / "bash").symlink_to(shutil.which("bash", path="/usr/bin:/bin"))
         result = self.bash('sandbox_ready && echo ready || echo "$SANDBOX_WHY"',
-                           PATH=f"{self.bin}:/usr/bin:/bin", **good)
+                           PATH=str(no_bwrap), **good)
         self.assertEqual(result.stdout.strip(), "bwrap not available")
         self.assertIn("bwrap cannot start a sandbox here", self.ready(bwrap_exit=1, **good))
         self.assertEqual(self.ready(**good), "ready")

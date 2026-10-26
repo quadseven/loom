@@ -11596,61 +11596,73 @@ class Station:
             return
         if not self.check_repo_access():
             return
-        self.sync_labels()
-        self.finish_claims()
+        # The local end of the pass runs however the GitHub part ends: a pass
+        # that stops at its request target (TargetReached) or a rate limit
+        # still prunes lane trees, tends the disk and sends its snapshots.
+        # From loom#1915 until this change every such pass skipped them, and
+        # no lane tree was pruned for hours on 2026-10-26.
         try:
-            self._timed(self.tend_runners)
-        except RateLimited:
-            raise
-        except (GitHubError, OSError, runners.ReportError) as err:
-            _say("tend_runners failed: %s" % err)
-        self.report_outcomes()
-        if not self._deferred():
+            self.sync_labels()
+            self.finish_claims()
             try:
-                self._timed(self.reconcile_pull_requests)
+                self._timed(self.tend_runners)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, runners.ReportError) as err:
+                _say("tend_runners failed: %s" % err)
+            self.report_outcomes()
+            if not self._deferred():
+                try:
+                    self._timed(self.reconcile_pull_requests)
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError) as err:
+                    _say("pull request reconciliation failed: %s" % err)
+            if not self._deferred():
+                try:
+                    self._timed(self.hand_back)
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError) as err:
+                    _say("hand_back failed: %s" % err)
+            # A disk under the floor takes no new work (loom#1808); a pass
+            # still finishes half-done claims, reconciles and prunes.
+            if not self.disk_low():
+                self._timed(self.claim_new)
+            if not self._deferred():
+                try:
+                    self._timed(self.assign_queued)
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError) as err:
+                    _say("assign_queued failed: %s" % err)
+            try:
+                self.record_scans()
+            except OSError as err:
+                _say("could not record the repo scans: %s" % err)
+            self._run_steps()
+            # The day's metrics line goes out even below the budget floor: one post
+            # a day, and on 2026-10-18 the floor deferred it every pass, so the
+            # operator got no numbers for the day. Only a spent budget stops it.
+            try:
+                self.post_metrics()
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("post_metrics failed: %s" % err)
+            try:
+                self.watch_logs()
             except RateLimited:
                 raise
             except (GitHubError, OSError) as err:
-                _say("pull request reconciliation failed: %s" % err)
-        if not self._deferred():
-            try:
-                self._timed(self.hand_back)
-            except RateLimited:
-                raise
-            except (GitHubError, OSError) as err:
-                _say("hand_back failed: %s" % err)
-        # A disk under the floor takes no new work (loom#1808); a pass
-        # still finishes half-done claims, reconciles and prunes.
-        if not self.disk_low():
-            self._timed(self.claim_new)
-        if not self._deferred():
-            try:
-                self._timed(self.assign_queued)
-            except RateLimited:
-                raise
-            except (GitHubError, OSError) as err:
-                _say("assign_queued failed: %s" % err)
-        try:
-            self.record_scans()
-        except OSError as err:
-            _say("could not record the repo scans: %s" % err)
-        self._run_steps()
-        # The day's metrics line goes out even below the budget floor: one post
-        # a day, and on 2026-10-18 the floor deferred it every pass, so the
-        # operator got no numbers for the day. Only a spent budget stops it.
-        try:
-            self.post_metrics()
-        except RateLimited:
-            raise
-        except (GitHubError, OSError, ValueError) as err:
-            _say("post_metrics failed: %s" % err)
-        try:
-            self.watch_logs()
-        except RateLimited:
-            raise
-        except (GitHubError, OSError) as err:
-            _say("watch_logs failed: %s" % err)
-        # Local housekeeping: finished lane trees, old lane logs, the disk.
+                _say("watch_logs failed: %s" % err)
+        finally:
+            self._end_pass_locally()
+
+    def _end_pass_locally(self) -> None:
+        """Local housekeeping that needs no GitHub request: finished lane
+        trees, old lane logs, the disk, the usage snapshot and the command
+        chain snapshot."""
         for local in (self.prune_trees, self.tend_disk):
             try:
                 local()

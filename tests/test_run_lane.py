@@ -1373,6 +1373,10 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
     def test_agent_owned_commit_is_validated_and_pushed_without_touching_main(self):
+        if not sandbox_caps.SEATBELT:
+            # The commit flow under test is the same off macOS; only the
+            # seatbelt around the check is missing, so a pass-through stands in.
+            self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         self.contract_repo()
         self.drop_brief()
         result = self.run_contract_lane(FAKE_AGENT="detached")
@@ -2816,6 +2820,9 @@ exec /usr/bin/git "$@"
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     def test_opencode_go_model_mismatch_is_transient(self):
+        # The brief is parked before any agent runs; a host without
+        # sandbox-exec would report the lane unavailable and claim nothing.
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         inbox = self.loom / "briefs" / "opencode-go"
         inbox.mkdir(parents=True)
         (inbox / "T042-fix-the-thing.md").write_text(
@@ -3652,6 +3659,7 @@ exec /usr/bin/git "$@"
         self.assertEqual(sorted(p.name for p in copy.iterdir()), ["impeccable", "tdd"])
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    @unittest.skipUnless(sandbox_caps.SEATBELT, sandbox_caps.NO_SEATBELT)
     def test_agy_lane_is_unavailable_when_its_keychain_will_not_unlock(self):
         inbox, _, result, agy = self.agy_lane(FAKE_KC_PW="some-other-password")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -3661,6 +3669,7 @@ exec /usr/bin/git "$@"
         self.assertFalse(beat["available"])
         self.assertIn("unlock", beat["reason"])
 
+    @unittest.skipUnless(sandbox_caps.SEATBELT, sandbox_caps.NO_SEATBELT)
     def test_agy_lane_refuses_a_keychain_password_security_would_split(self):
         pw = "two words"
         inbox, _, result, agy = self.agy_lane(FAKE_KC_PW=pw, FAKE_SECRET__k_kc=pw)
@@ -6211,6 +6220,9 @@ exec /usr/bin/git "$@"
     def test_a_default_branch_checkout_that_still_fails_is_a_factory_incident_not_work(self):
         # A [work] failure here spent a ladder attempt, and counted toward
         # the runaway hold, for a fault in the runner's own clone (2026-10-20).
+        # A pass-through sandbox-exec: on a host without one the lane stops at
+        # sandbox_ready, before the default branch checkout this test fails.
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         real_git = shutil.which("git")
         self.write_tool(self.bin / "git", "#!/bin/sh\ncase \" $* \" in *\" checkout -q --detach \"*) "
                         "echo 'fatal: unable to read tree' >&2; exit 128;; esac\n"
