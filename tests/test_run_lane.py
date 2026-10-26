@@ -191,6 +191,7 @@ fi
 # config the brief never names when $FAKE_HOOK is set ($FAKE_AGENT=say).
 # $FAKE_AGENT=stray also commits files no brief here names (a hook config,
 # a scratch file under .loom/, a top-level test script).
+# $FAKE_AGENT=manifest commits $FAKE_MANIFEST as deploy.yaml.
 # $FAKE_AGENT=contract-edit commits $FAKE_CONTRACT_TEXT as the validation
 # contract. The file holds $FAKE_AGENT_TEXT (default "fixed"); $FAKE_AGENT_WEAKEN
 # rewrites the validation contract.
@@ -305,6 +306,12 @@ if [ "${FAKE_AGENT:-commit}" = binref ]; then
   printf 'fixed\\n' > fix.txt
   git add -A
   git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
+if [ "${FAKE_AGENT:-commit}" = manifest ]; then
+  printf '%s' "$FAKE_MANIFEST" > deploy.yaml
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Place the thing"
   exit 0
 fi
 if [ "${FAKE_AGENT:-commit}" = contract-edit ]; then
@@ -754,6 +761,61 @@ print('leak guard: clean (shape patterns only)')
         line = self.failure_line()
         self.assertTrue(line.startswith("[transient] public repo leak scan could not run"), line)
         self.assertIn("could not read deny-list", line)
+
+    # A workload that selects a node label, for the live-cluster check
+    # (bus/live_cluster.py, loom#1832).
+    MANIFEST = ("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
+                "  template:\n    spec:\n      nodeSelector:\n        tier: %s\n"
+                "      containers:\n      - name: app\n        image: example/app:1\n")
+    # Fake kubectl: records the call, then prints one Ready node labelled
+    # tier=web, or exits $FAKE_KUBECTL_EXIT as a cluster it cannot reach.
+    FAKE_KUBECTL = """#!/usr/bin/env bash
+printf 'kubectl %s\\n' "$*" >> "$FAKE_LOG"
+[ -z "${FAKE_KUBECTL_EXIT:-}" ] || { echo "connection refused" >&2; exit "$FAKE_KUBECTL_EXIT"; }
+printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}'
+"""
+
+    def run_manifest_lane(self, tier, **env):
+        self.write_tool(self.bin / "kubectl", self.FAKE_KUBECTL)
+        self.drop_brief(text=BRIEF.replace("Make the thing work.", "Make the thing work in deploy.yaml."))
+        return self.run_lane(FAKE_AGENT="manifest", FAKE_MANIFEST=self.MANIFEST % tier, **env)
+
+    def test_a_manifest_selecting_a_label_no_node_carries_pushes_nothing(self):
+        result = self.run_manifest_lane("edge")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue(any(c.startswith("kubectl get nodes") for c in self.calls()))
+        self.assertEqual(self.failure_line(),
+                         "[work] live-cluster check refused the change: node label tier=edge (Deployment/web) "
+                         "is on no Ready node; nothing pushed")
+
+    def test_a_manifest_whose_labels_exist_opens_its_pull_request(self):
+        result = self.run_manifest_lane("web")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertNotIn("live-cluster check could not run", self.body.read_text())
+        self.assertIn("live-cluster check passed: 1 pod template(s) against 1 Ready node(s)",
+                      self.run_log())
+
+    def test_a_cluster_it_cannot_reach_is_noted_and_the_pull_request_opens(self):
+        result = self.run_manifest_lane("edge", FAKE_KUBECTL_EXIT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+        note = ("live-cluster check could not run: kubectl get nodes: kubectl exited 1, "
+                "so node selectors were not checked")
+        self.assertIn(note, self.body.read_text())
+        self.assertIn(note, self.run_log())
+        self.assertNotIn("connection refused", self.body.read_text())
+
+    def test_the_live_cluster_check_runs_only_after_the_leak_scan_passes(self):
+        # It looks up names the agent wrote from outside the agent's sandbox.
+        result = self.run_manifest_lane("edge", FAKE_DENY_UNREADABLE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("kubectl") for c in self.calls()))
+        self.assertTrue(self.failure_line().startswith("[transient] public repo leak scan could not run"))
 
     def test_probe_files_are_dropped_before_the_pr_opens(self):
         self.drop_brief()

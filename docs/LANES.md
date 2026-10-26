@@ -169,6 +169,39 @@ redirect, such as `tool --render-rbac > rbac.yaml`), the comment's first line
 after its header says to run that command and commit what it writes
 (`bus/ci_facts.py`).
 
+### Live-cluster check
+
+Before a lane opens a pull request, or pushes to one in a fix round, whose
+commits change a Kubernetes manifest, the runner checks what the added lines
+name against the live cluster (`bus/live_cluster.py`, over the range the
+leak scan reads):
+
+- every pod template's `nodeSelector` pair and required node affinity
+  expression must match a Ready node's labels in `kubectl get nodes -o
+  json`, and some Ready node must match them all and carry no NoSchedule or
+  NoExecute taint the pod does not tolerate;
+- every SSM parameter an ExternalSecret key (an SSM path), an
+  ssm-secret-sync JSON file or an `aws ssm ... --name` line names must exist,
+  by `aws ssm describe-parameters` (names only, never a value);
+- every host a probe, an analysis template or a smoke or canary check calls
+  must resolve (getaddrinfo, 3 seconds); in-cluster names are skipped. The
+  agent wrote these names and the lookup leaves its sandbox, so only names
+  under a zone in `LOOM_LIVE_CHECK_ZONES` (comma or space separated, the
+  operator's own domains), plain ASCII (no Unicode or punycode label), of at
+  most six labels and 100 characters, are looked up. With no zones set, no
+  name is.
+
+The check runs after the public repo leak scan passes. Its git reads of the
+agent's tree run no repo-configured program (external diff, textconv,
+fsmonitor, hooks), reach no remote, and carry no GitHub, App or AWS
+credential; kubectl and aws keep the runner's own environment.
+
+A miss fails the run as work, names each missing label, key or host, and
+pushes nothing, so the lane or the next rung fixes it. A kubectl, AWS or DNS
+that cannot be reached at all, and a lane pod (no kubeconfig, no AWS key),
+does not stop the run: the log and the pull request body (or the round's
+comment) carry `live-cluster check could not run: <reason>`.
+
 ## The brain tick
 
 `lanes/mac/install.sh` also installs `com.loom.brain`, which runs
