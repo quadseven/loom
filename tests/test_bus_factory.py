@@ -1703,6 +1703,29 @@ class ReviewBotThreads(Base):
         self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
         self.assertEqual(self.merged, [])
 
+    def stuck_case(self, author):
+        """Ticket 5's last round asked about a finding at a.py:3; the open
+        thread, under a new id, holds the same rule at a.py:5."""
+        self.gh.ticket(5, "pr", lane="codex")
+        self.gh.comments[5].append({"body": FIX_MARKER + "\nPull request: x#50\n\n"
+                                    "### Thread PRRT_old (comment 1) at a.py:3\n\n"
+                                    "    grug-tribe: high | `rule-x` | quick win", "user": ME})
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((author, "high | `rule-x` | quick win"))
+        self.gh.details[50]["reviewThreads"]["nodes"][0].update(path="a.py", line=5)
+        self.go()
+
+    def test_the_review_bots_finding_posted_again_climbs_the_ladder(self):
+        self.stuck_case(BOT)
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+
+    def test_a_strangers_thread_at_the_same_place_never_counts_toward_stuck(self):
+        # On a public repo anyone can open a thread: one copying a finding's
+        # path, line and rule must not climb the ticket or stop its rounds.
+        self.stuck_case({"__typename": "User", "login": "a-stranger"})
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+        self.assertEqual(self.lane(5), "codex")
+
     def test_a_no_change_round_waits_for_the_review_it_asked_for(self):
         self.gh.ticket(5, "pr", lane="claude")
         self.gh.comments[5] += [{"body": FIX_ASKED, "user": ME, "created_at": iso(600)},

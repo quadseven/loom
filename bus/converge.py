@@ -136,7 +136,10 @@ def persistent(last_body: Optional[str], failing: Iterable[str],
     line each: "check <name>" and "finding <rule> at <path>:<line>". Empty
     when there was no earlier round or it moved everything. Checks in
     `ignore` (the review check, whose failure is its findings) are left out:
-    a review that finds new things is progress."""
+    a review that finds new things is progress. `threads` must hold only
+    threads the review bot or a trusted login opened (the station's
+    _bot_threads, factory.trusted_threads): anyone can open a thread on a
+    public repo."""
     if not last_body:
         return []
     skip = {" ".join(str(n).split()) for n in ignore}

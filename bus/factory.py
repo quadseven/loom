@@ -708,6 +708,19 @@ def bot_marked_fixed(thread: Dict[str, Any], bot: str) -> bool:
             and str(last.get("body") or "").startswith(BOT_FIXED_PREFIX))
 
 
+def trusted_threads(threads: Sequence[Dict[str, Any]], bot: str,
+                    trusted: set) -> List[Dict[str, Any]]:
+    """The open threads whose root comment the review bot or a trusted login
+    wrote: the only ones that may count toward stuck(). On a public repo
+    anyone can open a thread, and a stranger's thread at a finding's path and
+    line must not climb the ticket's ladder or stop its rounds."""
+    def ours(t: Dict[str, Any]) -> bool:
+        root = _end(t, "root", 0) or _end(t, "comments", 0)
+        return (brain.by_bot(root, bot)
+                or rest_login(root.get("author")).lower() in trusted)
+    return [t for t in threads if not t.get("isResolved") and ours(t)]
+
+
 def bot_fixed(threads: Sequence[Dict[str, Any]], bot: str) -> List[str]:
     return [str(t.get("id")) for t in threads if bot_marked_fixed(t, bot)]
 
@@ -1942,8 +1955,8 @@ class Factory:
         if checks_failing and self._past_no_change(repo, issue, comments):
             return
         age = self.now - _ts(pr.get("created_at"))
-        threads = ([t for t in self._threads(repo, int(pr["number"])) if not t.get("isResolved")]
-                   if open_threads else [])
+        threads = (trusted_threads(self._threads(repo, int(pr["number"])), self.review_bot,
+                                   self.trusted) if open_threads else [])
         if stuck(comments, open_threads, checks_failing, age, self.now, no_test, unticked,
                  threads):
             footer = self._footer(repo, pr)
