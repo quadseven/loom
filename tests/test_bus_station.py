@@ -6042,6 +6042,17 @@ class LogRetentionTest(Base):
         self.assertIn("100.0 GB free on its disk", line[0])
         self.assertFalse(any(s.startswith("loom home holds ") for s in self.tend()))
 
+    def test_the_warning_never_reads_as_an_error_to_the_log_watcher(self):
+        # The low-disk line is now the claim guard's (loom#1808).
+        runner = self.reader()
+        usage = mock.Mock(free=1024 ** 3, total=500 * 1024 ** 3, used=0)
+        with mock.patch.object(station.shutil, "disk_usage", return_value=usage), \
+                mock.patch("bus.station._say") as say:
+            runner.disk_low()
+        warning = [c.args[0] for c in say.call_args_list if c.args[0].startswith("claims paused:")]
+        self.assertTrue(warning)
+        self.assertFalse(watch_module.KEEP_RE.search(warning[0]))
+
     def test_low_free_disk_is_said_by_the_claim_guard_not_every_pass(self):
         # loom#1808 replaced the warning that repeated every pass: the claim
         # guard (DiskGuardTest) says a low disk once per change instead.
