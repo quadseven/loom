@@ -765,7 +765,7 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     line = _pending_fix_blocker(gh, ticket, authors, line)
     if operator_hold.operator_steps(str(pr.get("body") or "")):
         line = _add_blocker(line, "held for the operator: operator steps before merge")
-    return line + _goal_constraint_suffix(gh, repo, ticket)
+    return _goal_rule_line(gh, repo, pr, ticket, line)
 
 
 def _safe_ticket_association(repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
@@ -797,30 +797,30 @@ def _pending_fix_blocker(gh: GitHub, ticket: Optional[Tuple[str, int]],
     return line
 
 
-def _goal_constraint_suffix(gh: GitHub, repo: str,
-                            ticket: Optional[Tuple[str, int]]) -> str:
-    """Format the applicable goal-home rules for a status line."""
+def _goal_rule_line(gh: GitHub, repo: str, pr: Dict[str, Any],
+                    ticket: Optional[Tuple[str, int]], line: str) -> str:
+    """Add the goal-home rules to a status line the way merge reads them: a
+    met rule is shown as `rule: <rule>`, and a rule that is not met, one merge
+    cannot check, or an unreadable goal home is a blocker (loom#1435)."""
     if ticket is None:
-        return ""
+        return line
     try:
         ticket_issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
     except GitHubError:
-        return ""
+        return _add_blocker(line, "goal home unreadable")
     if ticket_issue.get("state") != "open" or "loom:ticket" not in _labels(ticket_issue):
-        return ""
+        return line
     try:
-        goal_home = _goal_home_for_ticket(gh, ticket[0], ticket_issue)
+        home, results = _goal_rule_results(gh, repo, int(pr["number"]), ticket[0], ticket_issue)
     except GitHubError:
-        return " - rule: goal home unreadable"
-    if goal_home is None:
-        return ""
-    constraints = goal_merge_constraints(goal_home)
-    if not constraints:
-        return ""
-    return " - " + "; ".join(
-        "rule: %s" % constraint if _normalized_rule(constraint) in _MERGE_RULE_CHECKS
-        else "rule: %s (merge cannot check it, so merge refuses)" % constraint
-        for constraint in constraints)
+        return _add_blocker(line, "goal home unreadable")
+    for rule, met in results:
+        if met is False:
+            line = _add_blocker(line, "goal home %s rule not met: %s" % (home, rule))
+        elif met is None:
+            line = _add_blocker(line, "goal home %s rule merge cannot check: %s" % (home, rule))
+    met_rules = [rule for rule, met in results if met]
+    return line + (" - " + "; ".join("rule: %s" % rule for rule in met_rules) if met_rules else "")
 
 
 def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
@@ -3442,16 +3442,58 @@ def _has_cpp_unit_test(files: Sequence[Any]) -> bool:
                for item in files)
 
 
+# C++ source: implementation and header files. A pull request that touches
+# none of them (docs, build files, scripts) changes no C++ code, so a rule
+# asking for a C++ unit test on every code change does not apply to it.
+_CPP_SOURCE_RE = re.compile(r".+\.(?:cpp|cc|cxx|c\+\+|h|hh|hpp|hxx|ipp|inl|tpp)", re.I)
+
+
+def _changes_cpp_source(files: Sequence[Any]) -> bool:
+    """True when the pull request adds, changes or removes a C++ source file."""
+    return any(isinstance(item, dict)
+               and _CPP_SOURCE_RE.fullmatch(str(item.get("filename") or ""))
+               for item in files)
+
+
+def _cpp_unit_test_rule(files: Sequence[Any]) -> bool:
+    """Met when the pull request changes no C++ source, or carries a C++ unit test."""
+    return not _changes_cpp_source(files) or _has_cpp_unit_test(files)
+
+
 # The goal-home rules bus.brain merge can check, keyed by the normalized rule
 # text. A rule not listed here is one merge cannot check, so merge refuses it
 # instead of passing it silently.
 _MERGE_RULE_CHECKS: Dict[str, Callable[[Sequence[Any]], bool]] = {
-    "c++ unit test required": _has_cpp_unit_test,
+    "c++ unit test required": _cpp_unit_test_rule,
 }
 
 
 def _normalized_rule(constraint: str) -> str:
     return " ".join(constraint.lower().split()).rstrip(".")
+
+
+def _goal_rule_results(gh: GitHub, repo: str, number: int, ticket_repo: str,
+                       ticket_issue: Dict[str, Any]) -> Tuple[str, List[Tuple[str, Optional[bool]]]]:
+    """The goal home (as OWNER/NAME#N) and each rule it names, with True when
+    the pull request meets it, False when it does not, and None when merge has
+    no check for it. Reads the goal home, and the pull request's files only
+    when a rule needs them. A failed read raises GitHubError."""
+    goal_home = _goal_home_for_ticket(gh, ticket_repo, ticket_issue)
+    constraints = goal_merge_constraints(goal_home) if goal_home else []
+    if not constraints:
+        return "", []
+    home = "%s#%s" % (ticket_repo, (goal_home or {}).get("number", "unknown"))
+    files: Optional[List[Any]] = None
+    results: List[Tuple[str, Optional[bool]]] = []
+    for constraint in constraints:
+        rule_check = _MERGE_RULE_CHECKS.get(_normalized_rule(constraint))
+        if rule_check is None:
+            results.append((constraint, None))
+            continue
+        if files is None:
+            files = gh.paginate("/repos/%s/pulls/%d/files" % (repo, number))
+        results.append((constraint, bool(rule_check(files))))
+    return home, results
 
 
 def _refuse_merge_constraints(gh: GitHub, repo: str, number: int,
@@ -3460,30 +3502,23 @@ def _refuse_merge_constraints(gh: GitHub, repo: str, number: int,
     """Refuse a merge that breaks a rule its ticket's goal home names.
 
     Fails closed: an unreadable goal home, or a rule merge has no check for,
-    refuses the merge with the rule and the goal home named. A ticket whose
-    goal home names no rule merges exactly as before.
+    refuses the merge with the rule and the goal home named. A ticket with a
+    parent still costs the goal-home read; one whose goal home names no rule
+    then merges as before, with no file read.
     """
     if association is None:
         return
     try:
-        goal_home = _goal_home_for_ticket(gh, association[0], ticket_issue)
+        home, results = _goal_rule_results(gh, repo, number, association[0], ticket_issue)
     except GitHubError as exc:
         raise ValueError("goal home unreadable for ticket %s#%d: %s; merge refused "
                          "until its merge constraints can be checked"
                          % (association[0], association[1], exc)) from exc
-    constraints = goal_merge_constraints(goal_home) if goal_home else []
-    if not constraints:
-        return
-    home = "%s#%s" % (association[0], (goal_home or {}).get("number", "unknown"))
-    files: Optional[List[Any]] = None
-    for constraint in constraints:
-        rule_check = _MERGE_RULE_CHECKS.get(_normalized_rule(constraint))
-        if rule_check is None:
+    for constraint, met in results:
+        if met is None:
             raise ValueError("goal home %s rule '%s' cannot be checked by bus.brain "
                              "merge; check it and merge by hand" % (home, constraint))
-        if files is None:
-            files = gh.paginate("/repos/%s/pulls/%d/files" % (repo, number))
-        if not rule_check(files):
+        if not met:
             raise ValueError("goal home %s rule '%s' is not met" % (home, constraint))
 
 
