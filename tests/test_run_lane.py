@@ -197,7 +197,8 @@ fi
 # rewrites the validation contract.
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
-[ -z "${FAKE_AGENT_ENV:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" "${LOOM_GITHUB_APP_ID:-none}" "${GIT_CONFIG_COUNT:-none}" >> "$FAKE_AGENT_ENV"
+[ -z "${FAKE_AGENT_ENV:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" "${LOOM_GITHUB_APP_ID:-none}" "${GIT_CONFIG_COUNT:-none}" "${GH_CONFIG_DIR:-none}" "$(cat "${GH_CONFIG_DIR:-/nonexistent}/hosts.yml" 2>/dev/null | tr '\\n' ' ')" >> "$FAKE_AGENT_ENV"
+[ -z "${FAKE_AGENT_SAYS:-}" ] || printf '%s\\n' "$FAKE_AGENT_SAYS"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = say ]; then
@@ -5023,6 +5024,9 @@ exit %d
         seen_gh = Path(self._tmp.name) / "gh-tokens"
         seen_agent = Path(self._tmp.name) / "agent-tokens"
         self.drop_brief()
+        stale = self.loom / "run" / "codex-gh.KILLED"
+        stale.mkdir(parents=True)
+        (stale / "hosts.yml").write_text("oauth_token: ghs_old\n")
         self.run_lane(LOOM_GITHUB_APP_ID="124",
                       # Installation tokens carry dots and dashes (2026-10-20: 383
                       # characters, ghs_ then a JWT-like body).
@@ -5031,8 +5035,53 @@ exit %d
                       FAKE_AGENT_ENV=str(seen_agent))
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.calls())
         self.assertEqual(set(seen_gh.read_text().split()), {"ghs_lanes.tok-en"})
-        # Nor the App's settings to mint one, nor git's helper to borrow one.
-        self.assertEqual(seen_agent.read_text().split(), ["none", "none", "none"])
+        # No token in its environment, nor the App's settings to mint one, nor
+        # git's helper to borrow one.
+        agent_env = seen_agent.read_text().splitlines()
+        self.assertEqual(agent_env[:3], ["none", "none", "none"])
+        # loom#665: its gh reads the minted App token, never the operator's,
+        # from a per-run config directory the runner removes after the agent.
+        store = Path(agent_env[3])
+        self.assertEqual(store.parent, self.loom / "run")
+        self.assertTrue(store.name.startswith("codex-gh."), store)
+        self.assertIn("oauth_token: ghs_lanes.tok-en ", agent_env[4])
+        self.assertNotIn("ghp_personal", agent_env[4])
+        self.assertFalse(store.exists())
+        self.assertFalse(stale.exists())
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertNotIn("ghs_lanes.tok-en", log)
+
+    def test_a_lane_without_app_settings_leaves_the_agent_gh_config_alone(self):
+        seen_agent = Path(self._tmp.name) / "agent-tokens"
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT_ENV=str(seen_agent))
+        self.assertEqual(seen_agent.read_text().splitlines()[3], "none")
+        self.assertEqual(list((self.loom / "run").glob("codex-gh.*")), [])
+
+    def test_the_brief_says_not_to_poll_and_the_run_reports_its_gh_calls(self):
+        # loom#665: agents polled their own pull requests hundreds of times.
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT_SAYS="$ gh pr checks 7\nrunning gh api rate_limit\nno ghost here")
+        self.assertIn("Do not poll pull request checks or reviews", self.log.read_text())
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertRegex(log, r"T042-fix-the-thing agent gh calls: 2\n")
+
+    def test_a_failed_run_reports_its_gh_calls_too(self):
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="gh pr view 7", FAKE_EXIT="3")
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("agent gh calls: 1", log)
+
+    def test_agent_launch_chain_stops_when_the_tree_cannot_be_entered(self):
+        # The agent must never start outside its tree with the runner's token.
+        source = RUNNER.read_text()
+        self.assertRegex(
+            source,
+            r'cd "\$TREE" && unset GH_TOKEN GITHUB_TOKEN "\$\{!LOOM_GITHUB_APP_@\}" '
+            r'"\$\{!GIT_CONFIG_@\}" &&\s*\{ \[ -z "\$AGENT_GH_CONFIG" \] '
+            r'\|\| export GH_CONFIG_DIR="\$AGENT_GH_CONFIG"; \} &&\s*'
+            r'run_agent "\$RUN_BRIEF"',
+        )
 
     def test_a_lane_whose_app_token_cannot_be_minted_posts_nothing_as_anyone(self):
         self.drop_brief()
