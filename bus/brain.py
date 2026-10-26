@@ -3662,8 +3662,10 @@ def _risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
             return merge_tier.REVERT, ""
         print("brain: %s#%d is not exempt as a revert: %s" % (repo, number, refused),
               file=sys.stderr)
+    default_branch = pr.get("base", {}).get("ref")
     return merge_tier.classify(repo, entries, str(issue.get("body") or ""),
-                               change_class.class_of(pr) == "sensitive")
+                               change_class.class_of(pr) == "sensitive",
+                               default_branch=default_branch)
 
 
 def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
