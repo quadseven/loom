@@ -563,3 +563,51 @@ def goal_caps_section(stored: Any, now: float) -> str:
             'lane takes are rerouted after hours and go to the hand-off pool within a day</p>'
             '<ul>%s</ul></section>') % (len(stored["goals"]), rows)
 
+
+
+# The station's needs-brain holds older than a day, a repo a row (bus/station.py
+# lift_brain_holds, loom#1872): kept while the station refreshes them (a run
+# every half hour), dropped once a report is this old.
+BRAIN_HOLDS_MAX_AGE = 2 * 3600
+BRAIN_HOLDS_MAX = 200
+_REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+
+
+def brain_holds(body: Any, now: float) -> Dict[str, Any]:
+    """The stored form of a POST /api/brain-holds body: each repo as
+    OWNER/NAME with its whole-number counts, and when it was received;
+    ValueError for a body that is not that shape."""
+    repos = body.get("repos") if isinstance(body, dict) else None
+    if not isinstance(repos, list) or len(repos) > BRAIN_HOLDS_MAX:
+        raise ValueError("repos must be a list of at most %d entries" % BRAIN_HOLDS_MAX)
+    kept = []
+    for row in repos:
+        if not (isinstance(row, dict) and _REPO_RE.fullmatch(str(row.get("repo") or ""))):
+            raise ValueError("each row needs repo as OWNER/NAME")
+        counts = {field: row.get(field) for field in ("old", "person", "unknown")}
+        if not all(isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 1e6
+                   for v in counts.values()):
+            raise ValueError("old, person and unknown must be whole numbers")
+        kept.append({"repo": row["repo"], **counts})
+    return {"repos": kept, "received_at": now}
+
+
+def brain_holds_section(stored: Any, now: float) -> str:
+    """A Needs-you section with each repo's count of needs-brain holds
+    older than a day, and how many of them a person set or nobody can tell
+    who set (the factory never lifts those). Nothing when no repo has one,
+    or the report is older than BRAIN_HOLDS_MAX_AGE."""
+    if not isinstance(stored, dict) or not isinstance(stored.get("received_at"), (int, float)):
+        return ""
+    rows = [r for r in stored.get("repos") or [] if r.get("old")]
+    if now - stored["received_at"] > BRAIN_HOLDS_MAX_AGE or not rows:
+        return ""
+    esc = html.escape
+    items = "".join(
+        '<li class="card"><strong>%s</strong>: %d held over a day (%d set by a person, %d by '
+        'an unknown setter).</li>' % (esc(row["repo"]), row["old"], row["person"], row["unknown"])
+        for row in rows)
+    return ('<section class="needs-group needs-brain-holds" data-kind="brain-holds"><h2>needs-brain '
+            'holds older than a day (%d)</h2><p class="muted">the factory resolves the ones Loom set, a '
+            'few each half hour; a hold a person set, or one nobody can tell who set, waits for a '
+            'person</p><ul>%s</ul></section>') % (sum(r["old"] for r in rows), items)
