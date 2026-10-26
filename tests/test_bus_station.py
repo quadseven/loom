@@ -5980,6 +5980,32 @@ class PruneTest(Base):
         for path in verifying:
             self.assertTrue(os.path.exists(path), path)
 
+    def test_a_done_tickets_tree_in_the_agy_lanes_folder_goes_too(self):
+        # The agy lane keeps its trees in its own user's folder
+        # (lanes/run_lane.sh WORKDIR): 386 trees, 15 GB on 2026-10-26.
+        tp = REPO.replace("/", ".") + "-"
+        agy = os.path.join(self.home, "agy-lanes")
+        self.settings.agy_workdir = agy
+        self.fake.add(1, state="merged")
+        self.fake.add(2, state="pr")
+        done = os.path.join(agy, tp + "1-r3")
+        open_pr = os.path.join(agy, tp + "2")
+        for path in (done, open_pr):
+            os.makedirs(os.path.join(path, ".git"))
+        self.run_pass()
+        self.assertFalse(os.path.exists(done))
+        self.assertTrue(os.path.exists(open_pr))
+
+    def test_the_agy_lanes_folder_defaults_to_the_one_the_lane_uses(self):
+        env = {"LOOM_HOME": self.home, "LOOM_AGY_USER": "example-user"}
+        self.assertEqual(station.Settings.from_env(env).agy_workdir,
+                         "/Users/example-user/lanes")
+        env["LOOM_AGY_HOME"] = "/opt/agy"
+        self.assertEqual(station.Settings.from_env(env).agy_workdir, "/opt/agy/lanes")
+        env["LOOM_AGY_WORKDIR"] = "/opt/trees"
+        self.assertEqual(station.Settings.from_env(env).agy_workdir, "/opt/trees")
+        self.assertEqual(station.Settings(self.home, [REPO], [], []).agy_workdir, "")
+
     def test_a_tree_waits_for_tree_keep_when_the_pass_did_not_read_its_repo(self):
         tp = REPO.replace("/", ".") + "-"
         fresh = self.tree(tp + "3", 60)
