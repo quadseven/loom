@@ -333,7 +333,8 @@ CLI (key on stdin, never on the command line or on disk), and
 `POST /app/installations/<id>/access_tokens` returns a token kept in memory
 until 5 minutes before its `expires_at`. The station runs one pass per process
 and GitHub's ETags differ per token, so it also keeps the token in
-`state/station/app-token.json` (mode 0600, the only place a token is written)
+`state/station/app-token.json` (mode 0600; the only other place a token is
+written is a lane agent's per-run gh store, below)
 and the next pass reuses it until 5 minutes before expiry; the ETags cached on
 the last pass then answer 304 (loom#1306). A 401 deletes the file. Mints count under `app token` in the
 requests line, and the budget line reads `GitHub App budget`. With any of the
@@ -376,8 +377,14 @@ settings name, and fails with no output without them. A lane with the
 settings drops any personal `GH_TOKEN` or `GITHUB_TOKEN`, mints a token at the
 start of each run and again after its agent (a token lasts an hour), clones
 over https with `gh` as git's credential helper, and runs its agent without
-the token, the App settings or that helper; a failed mint parks the run
-`[transient]` before anything is posted. `lanes/mac/brain.sh` mints once per
+the token in its environment, the App settings or that helper; a failed mint
+parks the run `[transient]` before anything is posted. So that the agent's own
+`gh` calls spend the App's budget and not the operator's (loom#665), each run
+writes the token into a fresh gh config directory, `$LOOM_HOME/run/<lane>-gh.*`
+(mode 700, the token in its `hosts.yml`), points the agent's `GH_CONFIG_DIR`
+at it and removes it when the agent exits. The brief tells the agent not to
+poll pull request checks or reviews, and the run's log records
+`<ticket> agent gh calls: N`, the `gh` commands counted in the agent's output. `lanes/mac/brain.sh` mints once per
 tick, after the lock, and gives every rung that token as `GH_TOKEN`,
 `GITHUB_TOKEN` and `LOOM_GITHUB_TOKEN`; a failed mint, or a
 `LOOM_BRAIN_MINUTES` over 50, runs no rung. The station trusts its own App's
