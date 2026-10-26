@@ -5092,6 +5092,62 @@ class MoveOutsideEpicTests(unittest.TestCase):
         self.move(fake)
         self.assertEqual(fake.issues[10]["body"], "## Why\nwhy\n\nPart of #60\n")
 
+    def test_an_open_ticket_under_a_closed_epic_moves_to_an_open_intake_epic(self):
+        # Closed epic #20 with one open ticket #10
+        closed_epic = dict(item(20, body="Part of #1\n", labels=("epic",), state="closed"),
+                           title="Epic: closed work")
+        ticket_under_closed = dict(item(10, body="## Why\nwhy\n\nPart of #20\n", labels=("loom:ticket",)),
+                                   parent_issue_url="https://api.github.com/repos/%s/issues/20" % REPO)
+        # Open intake epic #60 with room
+        fake = self.repo(tickets=[ticket_under_closed], epics=[(60, 1)])
+        # Add the closed epic to the epics list so it's returned by the epic query
+        fake.epics.append(closed_epic)
+        fake.issues[20] = closed_epic
+        fake.subs[1].append(20)
+        fake.subs[20] = [10]
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (1, 0))
+        # Ticket moved to intake epic #60
+        self.assertEqual(fake.subs[60][-1], 10)
+        # Part of line updated to name the intake epic
+        self.assertIn("Part of #60", fake.issues[10]["body"])
+        # The closed epic stays closed
+        self.assertEqual(fake.issues[20]["state"], "closed")
+
+    def test_tickets_under_open_epic_are_not_moved(self):
+        # Open epic #20 with one open ticket #10
+        open_epic = dict(item(20, body="Part of #1\n", labels=("epic",)), title="Epic: open work")
+        ticket_under_open = dict(item(10, body="## Why\nwhy\n\nPart of #20\n", labels=("loom:ticket",)),
+                                 parent_issue_url="https://api.github.com/repos/%s/issues/20" % REPO)
+        fake = self.repo(tickets=[ticket_under_open], epics=[(60, 1)])
+        # Add the open epic to the epics list so it's returned by the epic query
+        fake.epics.append(open_epic)
+        fake.issues[20] = open_epic
+        fake.subs[1].append(20)
+        fake.subs[20] = [10]
+        moved, left = self.move(fake)
+        # Only tickets directly under the goal are moved, not those under an open epic
+        self.assertEqual((moved, left), (0, 0))
+        self.assertEqual(fake.subs[20], [10])
+
+    def test_a_closed_epic_and_its_tickets_are_not_moved_when_goal_at_epic_cap(self):
+        # Closed epic #20 with open ticket #10
+        closed_epic = dict(item(20, body="Part of #1\n", labels=("epic",), state="closed"),
+                           title="Epic: closed work")
+        ticket_under_closed = dict(item(10, body="## Why\nwhy\n\nPart of #20\n", labels=("loom:ticket",)),
+                                   parent_issue_url="https://api.github.com/repos/%s/issues/20" % REPO)
+        # Goal at epic cap (6 open epics), all full
+        fake = self.repo(tickets=[ticket_under_closed],
+                         epics=[(60 + n, brain.EPIC_TICKET_CAP) for n in range(6)])
+        # Add the closed epic to the epics list so it's returned by the epic query
+        fake.epics.append(closed_epic)
+        fake.issues[20] = closed_epic
+        fake.subs[1].append(20)
+        fake.subs[20] = [10]
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (0, 1))
+        self.assertEqual(fake.writes(), [])
+
 
 class CloseEpicTests(unittest.TestCase):
     """loom#638: the brain closes a finished epic with a one-line note."""

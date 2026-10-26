@@ -1786,18 +1786,44 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1) -> int:
     return int(made["number"])
 
 
+def _closed_epic_tickets(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
+                        ) -> List[Dict[str, Any]]:
+    """Open loom:ticket issues under closed epics of the goal, oldest first.
+    An epic, an ask and a closed issue are never included."""
+    found: List[Dict[str, Any]] = []
+    for epic, tickets in tree:
+        if epic.get("state", "open") != "closed":
+            continue
+        for issue in tickets:
+            if issue.get("state") != "open" or "pull_request" in issue:
+                continue
+            names = _labels(issue)
+            if "loom:ticket" not in names or "epic" in names or "needs-operator" in names:
+                continue
+            if not issue.get("id"):
+                continue
+            found.append(issue)
+    found.sort(key=lambda issue: (str(issue.get("created_at") or ""),
+                                  int(issue.get("number") or 0)))
+    return found
+
+
 def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
-    """Move the goal's own open tickets that sit under no epic into an open
-    intake epic of the goal, oldest ticket first.
+    """Move the goal's own open tickets that sit under no epic, and open
+    tickets under closed epics, into an open intake epic of the goal, oldest
+    ticket first.
 
     A ticket that is a goal's own sub-issue and belongs to no epic breaks
-    decision 0003 (every ticket belongs to an epic). Each moves to an open
-    intake epic of the goal with room; when no intake epic has room and the
-    goal is under its open epic cap, a new intake epic opens the way triage
-    opens one; otherwise the rest stay where they are. An epic, an ask and a
-    closed issue are never moved. Returns (moved, left)."""
+    decision 0003 (every ticket belongs to an epic). An open ticket whose epic
+    is closed is also moved, because the closed epic will never receive new
+    tickets. Each moves to an open intake epic of the goal with room; when no
+    intake epic has room and the goal is under its open epic cap, a new intake
+    epic opens the way triage opens one; otherwise the rest stay where they
+    are. An epic, an ask and a closed issue are never moved. The closed epic
+    stays closed. Returns (moved, left)."""
     loose, tree = goal_tree(gh, repo, goal)
     tickets = _outside_tickets(loose, goal)
+    tickets += _closed_epic_tickets(tree)
     if not tickets:
         return (0, 0)
     moved = 0
@@ -1872,10 +1898,10 @@ def _open_intake_epic(gh: GitHub, repo: str, goal: int) -> Optional[Tuple[int, i
 
 def _move_to_epic(gh: GitHub, repo: str, epic: int, ticket: Dict[str, Any], goal: int) -> bool:
     """Move the ticket under the epic: the epic's sub-issue link replaces the
-    goal as its parent, and the ticket's Part of line names the epic. False
-    when GitHub refuses the link."""
+    current parent (the goal or a closed epic) as its parent, and the ticket's
+    Part of line names the epic. False when GitHub refuses the link."""
     parent = _sub_issue_parent(ticket)
-    if not _link_to_goal(gh, repo, epic, ticket, under=goal if parent == goal else None):
+    if not _link_to_goal(gh, repo, epic, ticket, under=parent):
         return False
     body = str(ticket.get("body") or "")
     named = _reparented_body(body, goal, epic)
