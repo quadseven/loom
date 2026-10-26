@@ -673,7 +673,7 @@ class GitHub:
 
     def _rest(self, method: str, path: str, body: Any = None,
               etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
-        self._hold_in_shadow(method, path, body)
+        acted = self._hold_in_shadow(method, path, body)
         self._refuse_incomplete_close(method, path, body)
         url = self._url(path)
         # A caller's own ETag means the caller keeps the answer; otherwise
@@ -682,6 +682,8 @@ class GitHub:
         headers, payload = self._request(body, etag or (cached or {}).get("etag"))
         status, resp_headers, text = self._send(method, url, headers, payload)
         self._check_status(method, path, status, text, ok)
+        if acted is not None and 200 <= status < 300:
+            shadow.record_acted(acted.action, acted.repo, acted.number, acted.kind)
         if status == 304 and cached is not None:
             return self._from_cache(url, cached, resp_headers)
         data = _json_or_none(text)
@@ -742,25 +744,26 @@ class GitHub:
             else:
                 self.comment_edits = True
 
-    def _hold_in_shadow(self, method: str, path: str, body: Any) -> None:
+    def _hold_in_shadow(self, method: str, path: str, body: Any) -> Optional["shadow.Request"]:
         """Record and refuse a merge, close, ship or merge label, approving
         review, write onto a branch Loom does not own, or branch deletion in a
         repo in shadow mode (bus/shadow.py). Every Python write to GitHub
         passes through here, whichever caller sent it. An exemption (a signal
         issue's close, a label the item already has) needs the item read: a
         read that fails in any way, or an item whose labels cannot be read,
-        holds the whole request."""
+        holds the whole request. Returns the irreversible request it lets
+        through, so _rest records it as acted once GitHub accepts it."""
         if str(method or "").upper() == "GET":
-            return
+            return None
         text = str(path or "")
         if "://" in text and text.startswith(self.api + "/"):
             text = text[len(self.api):]   # an API under a path prefix routes the rest
         found = shadow.classify(method, text, body)
         if found is None or not shadow.active(found.repo or None):
-            return
+            return found
         held = shadow.held_after_read(found, self._shadow_item(found))
         if held is None:
-            return
+            return found
         action, new_labels = held
         reason = "%s %s%s" % (str(method).upper(), shadow.api_path(text),
                               " (%s)" % found.detail if found.detail else "")
