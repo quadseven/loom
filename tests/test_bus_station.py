@@ -6147,6 +6147,7 @@ class PruneTest(Base):
         ran = []
         with mock.patch.object(station.Station, "_budget_exhausted", return_value=True), \
                 mock.patch.object(station.Station, "prune_trees", lambda s: ran.append("prune")), \
+                mock.patch.object(station.Station, "tend_disk", lambda s: ran.append("disk")), \
                 mock.patch.object(station.Station, "post_chain", lambda s: ran.append("chain")):
             runner.run_pass()
         self.assertEqual(ran, [])
