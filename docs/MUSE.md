@@ -372,7 +372,10 @@ this tick"; a step with no note shows nothing there.
    live claim: its last run has ended, and once the hold is cleared the
    factory moves it up the model ladder.
 3. First run `python3 -m bus.brain step merge --holder muse`. The station hands failed checks and unresolved review-bot threads back to
-   the authoring lane automatically, up to `LOOM_FIX_ROUNDS` (default 3).
+   the authoring lane automatically, up to `LOOM_FIX_ROUNDS` (default 3) per
+   rung. A round that leaves the same failures climbs the model ladder at
+   once; with no rung left the rounds stop, and the ticket is `loom:failed`
+   with `handoff:claude` (docs/BRAIN.md).
    The factory pass (bus/factory.py) moves stuck and failed tickets up the
    model ladder every 5 minutes. Review in full only tickets labeled
    `needs-brain`: read the whole diff against the ticket and acceptance

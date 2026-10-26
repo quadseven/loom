@@ -21,6 +21,8 @@ KEY = ("-----BEGIN PRIVATE KEY-----\n"
 KEY_MARK = "FAKEKEYMATERIAL"
 FULL = {"contents": "write", "issues": "write", "pull_requests": "write",
         "checks": "read", "actions": "read", "metadata": "read"}
+# The station's App also dispatches and cancels lane runs (bus/runners.py).
+STATION = dict(FULL, actions="write")
 
 
 def run(argv, **kw):
@@ -33,7 +35,7 @@ def run(argv, **kw):
 class Manifest(unittest.TestCase):
     def test_names_exactly_the_permissions_and_no_webhook(self):
         m = app.manifest("acme")
-        self.assertEqual(m["default_permissions"], FULL)
+        self.assertEqual(m["default_permissions"], STATION)
         self.assertNotIn("hook_attributes", m)
         self.assertEqual(m["default_events"], [])
         self.assertFalse(m["public"])
@@ -50,7 +52,14 @@ class Manifest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("https://github.com/organizations/acme/settings/apps/new", out)
         body = out[out.index("{"):]
-        self.assertEqual(json.loads(body)["default_permissions"], FULL)
+        self.assertEqual(json.loads(body)["default_permissions"], STATION)
+
+    def test_only_the_station_app_may_write_actions(self):
+        self.assertEqual(app.PERMISSIONS, FULL)
+        for role in ("lanes", "brain"):
+            self.assertEqual(app.manifest("acme", role=role)["default_permissions"], FULL)
+            code, out, _ = run(["app", "manifest", "--owner", "acme", "--role", role], gh=object())
+            self.assertEqual(json.loads(out[out.index("{"):])["default_permissions"], FULL)
 
     def test_form_is_one_submit(self):
         code, out, _ = run(["app", "manifest", "--owner", "acme", "--form"], gh=object())
@@ -95,7 +104,7 @@ class FakeApi:
 def installation(num, login="acme", permissions=None, selection="selected"):
     return {"id": num, "account": {"login": login},
             "repository_selection": selection,
-            "permissions": dict(FULL if permissions is None else permissions)}
+            "permissions": dict(STATION if permissions is None else permissions)}
 
 
 class Ids(unittest.TestCase):
@@ -155,6 +164,14 @@ class Ids(unittest.TestCase):
         fake = FakeApi([installation(7)], {"7": ["acme/a", "acme/b", "acme/c"]})
         _, _, err = self.ids(fake)
         self.assertIn("warning: installation 7 covers acme/c, which is not in LOOM_REPOS", err)
+
+    def test_the_station_app_needs_actions_write_and_the_lanes_app_does_not(self):
+        fake = FakeApi([installation(7, permissions=FULL)], {"7": ["acme/a", "acme/b"]})
+        _, _, err = self.ids(fake)
+        self.assertIn("warning: installation 7 has actions: read; Loom needs write", err)
+        fake = FakeApi([installation(7, permissions=FULL)], {"7": ["acme/a", "acme/b"]})
+        _, _, err = self.ids(fake, extra=("--role", "lanes"))
+        self.assertNotIn("warning", err)
 
     def test_warns_about_a_missing_or_weaker_permission(self):
         perms = dict(FULL, issues="read")
