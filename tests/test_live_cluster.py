@@ -220,9 +220,11 @@ class CheckTest(unittest.TestCase):
              node("n3", {"disk": "nvme"}, taints=[{"key": "dedicated", "value": "storage",
                                                   "effect": "NoSchedule"}])]
 
-    def run_check(self, files, tools, resolver=lambda h: "ok", pod=False):
+    ZONES = ("example.com", "example.org", "example.net")
+
+    def run_check(self, files, tools, resolver=lambda h: "ok", pod=False, zones=ZONES):
         named, _ = lc.named_in(change(files))
-        return lc.check(named, run=tools, resolver=resolver, pod=pod)
+        return lc.check(named, run=tools, resolver=resolver, pod=pod, zones=zones)
 
     def test_a_label_only_a_not_ready_node_carries_is_a_miss(self):
         result = self.run_check({"web.yaml": DEPLOYMENT.format(tier="edge")}, FakeTools(self.NODES))
@@ -300,6 +302,38 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(result.notes, [
             "live-cluster check could not run: a lane pod has no kubeconfig, so node selectors were not checked",
             "live-cluster check could not run: a lane pod has no AWS key, so SSM parameters were not checked"])
+
+    def test_with_no_zones_set_no_name_is_resolved(self):
+        asked = []
+        with mock.patch.dict(os.environ, {"LOOM_LIVE_CHECK_ZONES": ""}):
+            named, _ = lc.named_in(change({"a.yaml": ANALYSIS}))
+            result = lc.check(named, run=FakeTools(), resolver=asked.append, pod=False)
+        self.assertEqual(asked, [])
+        self.assertEqual(result.notes, ["live-cluster check could not run: LOOM_LIVE_CHECK_ZONES "
+                                        "is not set, so 2 host(s) were not resolved"])
+
+    def test_names_outside_the_zones_or_long_enough_to_carry_data_are_never_resolved(self):
+        # The agent writes these names; a lookup from the runner leaves its
+        # sandbox, so a name could carry data out through DNS.
+        long_label = "a" * 41 + ".example.com"
+        many_labels = "a.b.c.d.e.example.com"
+        smoke = ("apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: smoke\nspec:\n  template:\n"
+                 "    spec:\n      containers:\n      - name: smoke\n        image: x\n        args:\n"
+                 + "".join("        - https://%s/\n" % h for h in (
+                     "app.example.com", "leak.attacker.test", long_label, many_labels)))
+        asked = []
+
+        def resolver(host):
+            asked.append(host)
+            return "ok"
+
+        with mock.patch.dict(os.environ, {"LOOM_LIVE_CHECK_ZONES": "example.com, other.test"}):
+            named, _ = lc.named_in(change({"s.yaml": smoke}))
+            result = lc.check(named, run=FakeTools(), resolver=resolver, pod=False)
+        self.assertEqual(asked, ["app.example.com"])
+        self.assertEqual(result.misses, [])
+        self.assertEqual(result.notes, ["live-cluster check could not run: 3 host(s) are outside "
+                                        "LOOM_LIVE_CHECK_ZONES or too long, so they were not resolved"])
 
     def test_resolve_tells_a_missing_name_from_a_dns_failure(self):
         def fail(code):
@@ -415,6 +449,30 @@ class MainTest(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertIn("node label tier=edge (Deployment/web)", done.stdout)
         self.assertFalse(marker.exists())
+
+    def test_git_gets_no_credentials_and_no_network(self):
+        # git reads a local range: it needs no token, no AWS key and no
+        # remote, and the tree's config must not reach one (lazy fetch).
+        real = subprocess.run(["which", "git"], capture_output=True, text=True, check=True).stdout.strip()
+        seen = Path(self._tmp.name) / "git-seen"
+        (self.bin / "git").write_text(
+            "#!/bin/sh\nprintf '%%s|%%s|%%s|%%s|%%s\\n' \"${GH_TOKEN:-}\" \"${AWS_SECRET_ACCESS_KEY:-}\" "
+            "\"${LOOM_GITHUB_APP_KEY:-}\" \"${GIT_NO_LAZY_FETCH:-}\" \"$*\" >> '%s'\nexec '%s' \"$@\"\n"
+            % (seen, real))
+        (self.bin / "git").chmod(0o755)
+        (self.tree / "web.yaml").write_text(DEPLOYMENT.format(tier="web"))
+        self.commit("add web")
+        done = self.run_main(GH_TOKEN="t0ken", AWS_SECRET_ACCESS_KEY="s3cret", LOOM_GITHUB_APP_KEY="k3y")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        calls = seen.read_text().splitlines()
+        self.assertTrue(calls)
+        for call in calls:
+            token, aws, app, lazy, args = call.split("|", 4)
+            self.assertEqual((token, aws, app, lazy), ("", "", "", "1"), call)
+            self.assertIn("protocol.allow=never", args)
+            self.assertIn("core.sshCommand=false", args)
+        # kubectl and aws still get their own environment.
+        self.assertIn("kubectl get nodes", self.log.read_text())
 
     def test_a_bad_range_exits_2(self):
         done = subprocess.run([sys.executable, "-B", "-m", "bus.live_cluster", str(self.tree), "nope..HEAD"],

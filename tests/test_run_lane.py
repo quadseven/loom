@@ -810,6 +810,13 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn(note, self.run_log())
         self.assertNotIn("connection refused", self.body.read_text())
 
+    def test_the_live_cluster_check_runs_only_after_the_leak_scan_passes(self):
+        # It looks up names the agent wrote from outside the agent's sandbox.
+        result = self.run_manifest_lane("edge", FAKE_DENY_UNREADABLE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("kubectl") for c in self.calls()))
+        self.assertTrue(self.failure_line().startswith("[transient] public repo leak scan could not run"))
+
     def test_probe_files_are_dropped_before_the_pr_opens(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="probes")

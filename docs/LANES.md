@@ -184,7 +184,16 @@ leak scan reads):
   ssm-secret-sync JSON file or an `aws ssm ... --name` line names must exist,
   by `aws ssm describe-parameters` (names only, never a value);
 - every host a probe, an analysis template or a smoke or canary check calls
-  must resolve (getaddrinfo, 3 seconds); in-cluster names are skipped.
+  must resolve (getaddrinfo, 3 seconds); in-cluster names are skipped. The
+  agent wrote these names and the lookup leaves its sandbox, so only names
+  under a zone in `LOOM_LIVE_CHECK_ZONES` (comma or space separated, the
+  operator's own domains), of at most six labels and 100 characters, are
+  looked up. With no zones set, no name is.
+
+The check runs after the public repo leak scan passes. Its git reads of the
+agent's tree run no repo-configured program (external diff, textconv,
+fsmonitor, hooks), reach no remote, and carry no GitHub, App or AWS
+credential; kubectl and aws keep the runner's own environment.
 
 A miss fails the run as work, names each missing label, key or host, and
 pushes nothing, so the lane or the next rung fixes it. A kubectl, AWS or DNS

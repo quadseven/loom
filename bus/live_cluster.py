@@ -20,8 +20,14 @@ lane's commits, and it checks what the added lines name:
 - every hostname in a URL that a probe, an Argo Rollouts analysis template,
   or a smoke or canary check (a manifest, container or file whose name holds
   ``smoke`` or ``canary``) calls, and every probe ``httpGet.host``, with
-  getaddrinfo under a short timeout. In-cluster names (one label, or under
-  ``.svc``, ``.cluster.local`` or ``.local``) and IP literals are skipped.
+  getaddrinfo under a short timeout. The agent wrote these names, and a
+  lookup leaves its sandbox, so only names under a zone in
+  ``LOOM_LIVE_CHECK_ZONES`` (the operator's own domains), of at most
+  MAX_LABELS labels and MAX_HOST_LENGTH characters, are ever sent; with no
+  zones set, no name is. The runner calls this after the public repo leak
+  scan passes. In-cluster names (one label, or under ``.svc``,
+  ``.cluster.local`` or ``.local``), which the runner's resolver cannot
+  answer, and IP literals are skipped.
 
 A Kubernetes manifest is a YAML file with a document that has ``apiVersion``
 and ``kind``; a kustomization's added ``resources`` files are read whole.
@@ -57,6 +63,9 @@ REFUSED = "live-cluster check refused the change: "
 TOOL_TIMEOUT = 30
 DNS_TIMEOUT = 3.0
 MAX_MISSES = 20
+MAX_LABELS = 6
+MAX_LABEL_LENGTH = 40
+MAX_HOST_LENGTH = 100
 SSM_FILTER_BATCH = 50
 PROBE_KEYS = ("livenessProbe", "readinessProbe", "startupProbe")
 ANALYSIS_KINDS = ("AnalysisTemplate", "ClusterAnalysisTemplate")
@@ -493,13 +502,19 @@ class GitError(RuntimeError):
 # The tree holds the agent's work, and its .git/config is the agent's to
 # write: no repo setting may run a program while git reads the change (an
 # external diff, a textconv filter, an fsmonitor hook, a hook).
-SAFE_GIT = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "diff.external=")
+SAFE_GIT = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "diff.external=",
+            "-c", "protocol.allow=never", "-c", "core.sshCommand=false")
+# Credentials git never needs to read a local range; it gets none of them.
+GIT_DROPPED_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "KUBECONFIG", "GIT_EXTERNAL_DIFF", "GIT_ASKPASS",
+                   "SSH_ASKPASS", "SSH_AUTH_SOCK")
+GIT_DROPPED_PREFIXES = ("LOOM_GITHUB_APP_", "AWS_")
 SAFE_DIFF = ("--no-ext-diff", "--no-textconv")
 
 
 def _git_env() -> Dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k != "GIT_EXTERNAL_DIFF"}
-    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env = {k: v for k, v in os.environ.items()
+           if k not in GIT_DROPPED_ENV and not k.startswith(GIT_DROPPED_PREFIXES)}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0")
     return env
 
 
@@ -761,16 +776,37 @@ def resolve(host: str) -> str:
 
 
 def _checked_host(host: str) -> bool:
+    """A name the runner's resolver can answer: not an IP literal, not one
+    label, not an in-cluster name."""
     if re.fullmatch(r"[\d.]+", host) or "." not in host:
         return False
     return not host.endswith(IN_CLUSTER_SUFFIXES)
 
 
+def live_zones() -> List[str]:
+    """The DNS zones the operator lets the check resolve names under
+    (LOOM_LIVE_CHECK_ZONES, comma or space separated)."""
+    raw = os.environ.get("LOOM_LIVE_CHECK_ZONES", "")
+    return [z.strip(".").lower() for z in re.split(r"[,\s]+", raw) if z.strip(".")]
+
+
+def resolvable(host: str, zones: Sequence[str]) -> bool:
+    """Whether the runner may look a name up. The agent wrote it, and a
+    lookup from the runner leaves the agent's sandbox: a name outside the
+    operator's zones, or one long enough to carry data, is never sent."""
+    labels = host.split(".")
+    if (len(labels) > MAX_LABELS or len(host) > MAX_HOST_LENGTH
+            or any(not label or len(label) > MAX_LABEL_LENGTH for label in labels)):
+        return False
+    return any(host == z or host.endswith("." + z) for z in zones)
+
+
 def resolve_all(hosts: Iterable[str], resolver: Resolver) -> Tuple[List[str], int]:
     """The hosts that do not resolve, and how many could not be looked up.
-    Lookups run at once on daemon threads, so a hung resolver costs
-    DNS_TIMEOUT once and never holds the process open."""
-    wanted = sorted(h for h in set(hosts) if _checked_host(h))
+    The caller passes only resolvable() names. Lookups run at once on
+    daemon threads, so a hung resolver costs DNS_TIMEOUT once and never
+    holds the process open."""
+    wanted = sorted(set(hosts))
     answers: Dict[str, str] = {}
 
     def look(host: str) -> None:
@@ -828,23 +864,35 @@ def _check_params(named: Named, run: Runner, pod: bool, result: Result) -> None:
     result.checked.append("%d SSM parameter(s)" % len(named.params))
 
 
-def _check_hosts(named: Named, resolver: Resolver, result: Result) -> None:
-    missing, unknown = resolve_all(named.hosts, resolver)
+def _check_hosts(named: Named, resolver: Resolver, zones: Sequence[str], result: Result) -> None:
+    hosts = sorted(h for h in named.hosts if _checked_host(h))
+    if not hosts:
+        return
+    if not zones:
+        result.notes.append(NOTE + "LOOM_LIVE_CHECK_ZONES is not set, so %d host(s) were not "
+                            "resolved" % len(hosts))
+        return
+    allowed = [h for h in hosts if resolvable(h, zones)]
+    if len(allowed) < len(hosts):
+        result.notes.append(NOTE + "%d host(s) are outside LOOM_LIVE_CHECK_ZONES or too long, so they "
+                            "were not resolved" % (len(hosts) - len(allowed)))
+    missing, unknown = resolve_all(allowed, resolver)
     result.misses += ["host %s does not resolve" % h for h in missing]
     if unknown:
         result.notes.append(NOTE + "DNS gave no answer for %d host(s), so they were not checked" % unknown)
-    if named.hosts:
-        result.checked.append("%d host(s)" % len(named.hosts))
+    if allowed:
+        result.checked.append("%d host(s)" % len(allowed))
 
 
 def check(named: Named, run: Runner = run_tool, resolver: Resolver = resolve,
-          pod: Optional[bool] = None) -> Result:
+          pod: Optional[bool] = None, zones: Optional[Sequence[str]] = None) -> Result:
     """Check what a change names against the live cluster, SSM and DNS."""
     pod = bool(os.environ.get("LOOM_SSM_DIR")) if pod is None else pod
+    zones = live_zones() if zones is None else zones
     result = Result(notes=[NOTE + n for n in named.notes])
     _check_nodes(named, run, pod, result)
     _check_params(named, run, pod, result)
-    _check_hosts(named, resolver, result)
+    _check_hosts(named, resolver, zones, result)
     return result
 
 

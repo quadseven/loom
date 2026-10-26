@@ -410,7 +410,9 @@ check_scope() {
 # SSM and DNS (bus/live_cluster.py), over the range the leak scan reads. A
 # miss parks the brief as work and returns 1, so nothing is pushed. A check
 # that cannot run at all, or a part of it, sets LIVE_NOTES, which the log and
-# the pull request body or round comment carry.
+# the pull request body or round comment carry. Hosts are looked up only
+# under the zones in LOOM_LIVE_CHECK_ZONES (docs/LANES.md, "Live-cluster
+# check").
 LIVE_NOTES=""
 live_cluster_check() {
   local range="$BASE..HEAD" out rc=0
@@ -3530,11 +3532,6 @@ for BRIEF in "$INBOX"/*.md; do
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
   fi
-  # Node labels, SSM parameters and hosts a manifest change names must exist
-  # live before anything is pushed (bus/live_cluster.py, loom#1832). A miss
-  # is the lane's work to fix; a check that cannot run is a note, not a stop.
-  LIVE_NOTES=""
-  if [ "$COMMITTED" -eq 1 ]; then live_cluster_check || continue; fi
   if [ "$REPO_PRIVATE" = false ]; then
     if [ ! -f "$LEAK_SCANNER" ]; then
       park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed" transient
@@ -3591,6 +3588,13 @@ for BRIEF in "$INBOX"/*.md; do
       printf '%s\n' "$LEAK_OUT" >> "$LOG"
     fi
   fi
+  # Node labels, SSM parameters and hosts a manifest change names must exist
+  # live before anything is pushed (bus/live_cluster.py, loom#1832). It runs
+  # after the leak scan: it looks up names the agent wrote, outside its
+  # sandbox. A miss is the lane's work to fix; a check that cannot run is a
+  # note, not a stop.
+  LIVE_NOTES=""
+  if [ "$COMMITTED" -eq 1 ]; then live_cluster_check || continue; fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
   if [ -n "$FIX_PR" ] && ! fix_pr_open; then
