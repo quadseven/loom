@@ -5231,6 +5231,14 @@ class SilentLaneTest(Base):
         st._record_waits({key: "no free lane in tier medium"})
         self.assertEqual(st._factory().wait_since, {key: start})
 
+    def test_a_saved_wait_start_that_is_not_a_number_is_left_out(self):
+        st = self.station()
+        os.makedirs(st.state, exist_ok=True)
+        with open(os.path.join(st.state, "ticket-waits.json"), "w") as fh:
+            json.dump({"a#1": {"since": 0}, "a#2": {"since": "12"}, "a#3": {"since": None},
+                       "a#4": {"since": True}, "a#5": {}, "a#6": "x", "a#7": {"since": 5.5}}, fh)
+        self.assertEqual(st._saved_wait_since(), {"a#1": 0.0, "a#7": 5.5})
+
     def test_a_wait_reason_that_could_carry_ticket_text_never_reaches_the_invariant(self):
         st = self.station()
         st._record_waits({"%s#12" % REPO: "no free lane takes model `x` <img src=y>",

@@ -10234,9 +10234,9 @@ class Station:
     def _saved_wait_since(self) -> Dict[str, float]:
         """When each ticket's saved wait reason began (_record_waits)."""
         saved = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
-        return {str(key): float(info["since"]) for key, info in
-                (saved.items() if isinstance(saved, dict) else [])
-                if isinstance(info, dict) and self._num(info.get("since"))}
+        starts = {str(key): info.get("since") for key, info in
+                  (saved.items() if isinstance(saved, dict) else []) if isinstance(info, dict)}
+        return {key: float(since) for key, since in starts.items() if self._num(since)}
 
     def watch_default_branches(self) -> None:
         """Fix forward after a red lane merge, then revert if it stays red.
