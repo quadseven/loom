@@ -187,8 +187,9 @@ leak scan reads):
   must resolve (getaddrinfo, 3 seconds); in-cluster names are skipped. The
   agent wrote these names and the lookup leaves its sandbox, so only names
   under a zone in `LOOM_LIVE_CHECK_ZONES` (comma or space separated, the
-  operator's own domains), of at most six labels and 100 characters, are
-  looked up. With no zones set, no name is.
+  operator's own domains), plain ASCII (no Unicode or punycode label), of at
+  most six labels and 100 characters, are looked up. With no zones set, no
+  name is.
 
 The check runs after the public repo leak scan passes. Its git reads of the
 agent's tree run no repo-configured program (external diff, textconv,

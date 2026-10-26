@@ -335,6 +335,25 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(result.notes, ["live-cluster check could not run: 3 host(s) are outside "
                                         "LOOM_LIVE_CHECK_ZONES or too long, so they were not resolved"])
 
+    def test_unicode_and_punycode_names_are_refused_without_a_lookup(self):
+        # getaddrinfo IDNA-encodes a Unicode name into a longer, different
+        # one than the zone and length checks saw.
+        named = lc.Named(hosts={"\u00e4pp.example.com", "xn--pp-qla.example.com",
+                                "-bad.example.com", "ok.example.com"})
+        asked = []
+
+        def resolver(host):
+            asked.append(host)
+            return "ok"
+
+        result = lc.check(named, run=FakeTools(), resolver=resolver, pod=False, zones=("example.com",))
+        self.assertEqual(asked, ["ok.example.com"])
+        self.assertEqual(result.notes, ["live-cluster check could not run: 3 host(s) are outside "
+                                        "LOOM_LIVE_CHECK_ZONES or too long, so they were not resolved"])
+        for host in ("\u00e4pp.example.com", "xn--pp-qla.example.com", "-bad.example.com",
+                     "ok.example.com\n"):
+            self.assertFalse(lc.resolvable(host, ("example.com",)), host)
+
     def test_resolve_tells_a_missing_name_from_a_dns_failure(self):
         def fail(code):
             return mock.patch.object(socket, "getaddrinfo", side_effect=socket.gaierror(code, "x"))

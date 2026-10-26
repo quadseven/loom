@@ -66,6 +66,10 @@ MAX_MISSES = 20
 MAX_LABELS = 6
 MAX_LABEL_LENGTH = 40
 MAX_HOST_LENGTH = 100
+# A plain ASCII hostname: letter-digit-hyphen labels, no hyphen at either
+# end of a label, no punycode label.
+ASCII_HOST = re.compile(
+    r"(?!xn--)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.(?!xn--)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*", re.ASCII)
 SSM_FILTER_BATCH = 50
 PROBE_KEYS = ("livenessProbe", "readinessProbe", "startupProbe")
 ANALYSIS_KINDS = ("AnalysisTemplate", "ClusterAnalysisTemplate")
@@ -793,7 +797,12 @@ def live_zones() -> List[str]:
 def resolvable(host: str, zones: Sequence[str]) -> bool:
     """Whether the runner may look a name up. The agent wrote it, and a
     lookup from the runner leaves the agent's sandbox: a name outside the
-    operator's zones, or one long enough to carry data, is never sent."""
+    operator's zones, or one long enough to carry data, is never sent. Only
+    a plain ASCII hostname passes, never Unicode or punycode (``xn--``):
+    getaddrinfo would IDNA-encode a Unicode name into a longer, different
+    one than the caps and zones were checked on."""
+    if not ASCII_HOST.fullmatch(host):
+        return False
     labels = host.split(".")
     if (len(labels) > MAX_LABELS or len(host) > MAX_HOST_LENGTH
             or any(not label or len(label) > MAX_LABEL_LENGTH for label in labels)):
