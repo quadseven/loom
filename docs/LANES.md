@@ -169,6 +169,39 @@ redirect, such as `tool --render-rbac > rbac.yaml`), the comment's first line
 after its header says to run that command and commit what it writes
 (`bus/ci_facts.py`).
 
+### Live-cluster check
+
+Before a lane opens a pull request, or pushes to one in a fix round, whose
+commits change a Kubernetes manifest, the runner checks what the added lines
+name against the live cluster (`bus/live_cluster.py`, over the range the
+leak scan reads):
+
+- every pod template's `nodeSelector` pair and required node affinity
+  expression must match a Ready node's labels in `kubectl get nodes -o
+  json`, and some Ready node must match them all and carry no NoSchedule or
+  NoExecute taint the pod does not tolerate;
+- every SSM parameter an ExternalSecret key (an SSM path), an
+  ssm-secret-sync JSON file or an `aws ssm ... --name` line names must exist,
+  by `aws ssm describe-parameters` (names only, never a value);
+- every host a probe, an analysis template or a smoke or canary check calls
+  must resolve (getaddrinfo, 3 seconds); in-cluster names are skipped. The
+  agent wrote these names and the lookup leaves its sandbox, so only names
+  under a zone in `LOOM_LIVE_CHECK_ZONES` (comma or space separated, the
+  operator's own domains), plain ASCII (no Unicode or punycode label), of at
+  most six labels and 100 characters, are looked up. With no zones set, no
+  name is.
+
+The check runs after the public repo leak scan passes. Its git reads of the
+agent's tree run no repo-configured program (external diff, textconv,
+fsmonitor, hooks), reach no remote, and carry no GitHub, App or AWS
+credential; kubectl and aws keep the runner's own environment.
+
+A miss fails the run as work, names each missing label, key or host, and
+pushes nothing, so the lane or the next rung fixes it. A kubectl, AWS or DNS
+that cannot be reached at all, and a lane pod (no kubeconfig, no AWS key),
+does not stop the run: the log and the pull request body (or the round's
+comment) carry `live-cluster check could not run: <reason>`.
+
 ## The brain tick
 
 `lanes/mac/install.sh` also installs `com.loom.brain`, which runs
@@ -909,10 +942,31 @@ The loom home is kept bounded by the station and the runner (loom#643).
   station's own logs at the top of `logs/` are not touched.
 - The runner removes a check's scratch home (`run/<slot>-check`) after the
   final check and when it exits, so `run/` holds one only while that lane runs.
-- Every pass logs a warning to `station.log` while the home's disk has less
-  than `LOOM_DISK_FREE_MIN_GB` free (default 10). Every hour the station
-  removes the old lane logs and logs the home's size by top-level folder
-  (`loom home holds ...`), kept in `state/station/disk.json`.
+- While the home's disk has less than `LOOM_MIN_FREE_GB` free (default 15;
+  the older name `LOOM_DISK_FREE_MIN_GB` is still read) the station claims no
+  new work (loom#1808). It says `claims paused: ...` in `station.log` once
+  when the state changes, `claims resumed: ...` once when the disk has that
+  much free again, and the lane status shows a `Claims paused` line
+  meanwhile. The state is kept in `state/station/disk-guard.json`.
+- When a run ends the runner drops the build output git ignores from its
+  tree and its default-branch check copy: `.venv`, `node_modules`,
+  `__pycache__` and `.pytest_cache` folders that `git check-ignore`
+  confirms and that hold no tracked path. The tracked tree stays for fix
+  rounds.
+- A lane tree is removed `TREE_KEEP` (an hour) after its run, or at once,
+  with its `-default-check` copy and the runner's files beside it, when its
+  ticket is done: its pull request merged or closed, or the ticket closed or
+  dropped, as that pass read it. A tree whose ticket has a brief in a lane
+  inbox stays. An idle lane (no runner lock with a live pid, an empty inbox)
+  loses its run scratch (`run/<slot>-home`, `-check`, `-check-default`) once
+  the ticket it last ran is done, and its home's `.cache`, `.cargo` and `tmp`
+  every pass meanwhile.
+- Every hour the station removes the old lane logs, compresses each finished
+  run's opencode session store (`logs/<slot>/<run>/.local/share/opencode/
+  opencode.db`, to `opencode.db.gz`, once its transcript is uploaded; the
+  readers read either), and logs the home's size by top-level folder
+  (`loom home holds ...`), kept in `state/station/disk.json`. A compressed
+  store goes with its run's other logs after `LOOM_LOG_KEEP_DAYS`.
 
 ## Log watch
 
