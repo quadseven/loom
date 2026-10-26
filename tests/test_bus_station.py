@@ -6139,6 +6139,39 @@ class DiskGuardTest(Base):
         self.assertIn("Claims paused: 2.0 GB free on the loom home's disk, under 15.0 GB",
                       runner._lanes_body([]))
 
+    def test_low_disk_thins_local_snapshots_before_pausing_claims(self):
+        # 2026-10-26: local Time Machine snapshots held deleted lane trees;
+        # free fell 50 -> 27 GB in three hours and thinning by hand freed 40.
+        self.settings.thin_snapshots = True
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        before = mock.Mock(free=10 * 1024 ** 3, total=500 * 1024 ** 3, used=0)
+        after = mock.Mock(free=45 * 1024 ** 3, total=500 * 1024 ** 3, used=0)
+        with mock.patch.object(station.shutil, "disk_usage", side_effect=[before, after]), \
+                mock.patch("bus.station._thin_snapshots", return_value=True) as thin, \
+                mock.patch("bus.station._say"):
+            self.assertFalse(runner.disk_low())
+        thin.assert_called_once_with(self.settings.home, 20 * 1024 ** 3)
+
+    def test_snapshots_are_thinned_at_most_once_per_interval(self):
+        self.settings.thin_snapshots = True
+        usage = mock.Mock(free=10 * 1024 ** 3, total=500 * 1024 ** 3, used=0)
+        with mock.patch.object(station.shutil, "disk_usage", return_value=usage), \
+                mock.patch("bus.station._thin_snapshots", return_value=False) as thin, \
+                mock.patch("bus.station._say"):
+            station.Station(GitHub("token", transport=self.fake), self.settings).disk_low()
+            station.Station(GitHub("token", transport=self.fake), self.settings).disk_low()
+        self.assertEqual(thin.call_count, 1)
+
+    def test_a_code_built_station_never_thins_and_from_env_does_by_default(self):
+        usage = mock.Mock(free=2 * 1024 ** 3, total=500 * 1024 ** 3, used=0)
+        with mock.patch.object(station.shutil, "disk_usage", return_value=usage), \
+                mock.patch("bus.station._thin_snapshots") as thin, \
+                mock.patch("bus.station._say"):
+            station.Station(GitHub("token", transport=self.fake), self.settings).disk_low()
+        thin.assert_not_called()
+        self.assertTrue(station.Settings.from_env({}).thin_snapshots)
+        self.assertFalse(station.Settings.from_env({"LOOM_THIN_SNAPSHOTS": "0"}).thin_snapshots)
+
     def test_unreadable_free_space_keeps_the_last_state(self):
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
         with mock.patch.object(station.shutil, "disk_usage", side_effect=OSError("gone")), \
