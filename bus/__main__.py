@@ -65,12 +65,16 @@ def _parser() -> argparse.ArgumentParser:
     a.add_argument("--name", help="the App's name (default loom-OWNER)")
     a.add_argument("--form", action="store_true",
                    help="print an HTML page whose one button creates the App")
+    a.add_argument("--role", choices=app.ROLES, default="station",
+                   help="which writer's App: only the station's may dispatch workflow runs")
     app_sub.add_parser("token", help="print the installation token of the App the "
                        "LOOM_GITHUB_APP_* settings name, for gh and git (loom#1142)")
     app_sub.add_parser("login", help="print the \"<slug>[bot]\" login of the App the "
                        "LOOM_GITHUB_APP_* settings name, for the brain's journal")
     a = app_sub.add_parser("ids", help="list the App's installations and print its id settings")
     a.add_argument("--app-id", required=True, type=_number)
+    a.add_argument("--role", choices=app.ROLES, default="station",
+                   help="which writer's App the permissions are checked for")
     return p
 
 
@@ -120,13 +124,14 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
 def _app(args: argparse.Namespace, transport: Optional[Transport],
          sign: Optional[Callable[[bytes, str], bytes]]) -> int:
     if args.app_command == "manifest":
-        return app.print_manifest(args.owner, args.org, args.name, args.form, sys.stdout)
+        return app.print_manifest(args.owner, args.org, args.name, args.form, sys.stdout,
+                                  args.role)
     try:
         if args.app_command == "token":
             return app.print_token(sys.stdout, transport=transport, sign=sign or openssl_sign)
         if args.app_command == "login":
             return app.print_login(sys.stdout, transport=transport, sign=sign or openssl_sign)
-        return app.ids(args.app_id, transport=transport, sign=sign or openssl_sign)
+        return app.ids(args.app_id, transport=transport, sign=sign or openssl_sign, role=args.role)
     except GitHubError as err:
         print("error: %s" % err, file=sys.stderr)
         return 2

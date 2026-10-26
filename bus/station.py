@@ -38,6 +38,7 @@ from . import brain_memory
 from . import claimed
 from . import fabric
 from . import fixrounds
+from . import runners
 from . import scope_fit
 from . import shadow
 from . import stale_claims
@@ -1518,6 +1519,10 @@ def needs_public_repo(lane: str, model: str) -> bool:
     slots that may train (infra#5617), while free-ollama and free-gemma may
     take private repos."""
     if lane in factory.PUBLIC_ONLY:
+        return True
+    # A cluster runner's inputs and logs live in this public repo's Actions
+    # (bus/runners.py).
+    if lane in runners.runner_slots():
         return True
     lane = provider(lane)
     return (lane in FREE_LANES or lane in REMOTE_LANES or lane == "agy"
@@ -11356,6 +11361,12 @@ class Station:
             return
         self.sync_labels()
         self.finish_claims()
+        try:
+            self._timed(self.tend_runners)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, runners.ReportError) as err:
+            _say("tend_runners failed: %s" % err)
         self.report_outcomes()
         if not self._deferred():
             try:
@@ -11414,6 +11425,23 @@ class Station:
             self.upload_usage_limits(records)
         except OSError as err:
             _say("could not write usage limits: %s" % err)
+
+    def tend_runners(self) -> None:
+        """The slots in LOOM_RUNNER_SLOTS: dispatch their briefs to cluster
+        runners and write back what each run reported (bus/runners.py)."""
+        slots = runners.runner_slots(os.environ)
+        if not slots:
+            return
+        repo = os.environ.get("LOOM_RUNNER_REPO", "").strip() or self.s.self_repo
+        try:
+            actor = self.gh.app_login()
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read the station App's login for its runner slots: %s" % err)
+            actor = None
+        runners.Runners(self.gh, self.s.home, repo, slots, dict(os.environ), self._public, _say,
+                        actor=actor, now=self.now).tend()
 
     def upload_usage_limits(self, records: List[Dict[str, Any]]) -> None:
         """Send the current limits snapshot using the transcript upload token."""

@@ -610,6 +610,17 @@ with open(os.environ['FAKE_LOG'] + '.scanner', 'a', encoding='utf-8') as calls:
 if '--deny-list-ssm' in args and os.environ.get('FAKE_DENY_UNREADABLE'):
     print('FATAL: could not read deny-list from SSM', file=sys.stderr)
     sys.exit(2)
+# As the real scanner reads it: the AWS CLI on PATH, the value on stdout.
+if '--deny-list-ssm' in args and os.environ.get('FAKE_SCANNER_READS_DENY'):
+    name = args[args.index('--deny-list-ssm') + 1]
+    got = subprocess.run(['aws', 'ssm', 'get-parameter', '--name', name, '--with-decryption',
+                          '--query', 'Parameter.Value', '--output', 'text'],
+                         capture_output=True, text=True)
+    if got.returncode != 0 or not got.stdout.strip():
+        print('FATAL: could not read deny-list from SSM', file=sys.stderr)
+        sys.exit(2)
+    with open(os.environ['FAKE_LOG'] + '.deny', 'a', encoding='utf-8') as fh:
+        fh.write(got.stdout)
 # The real scanner's private-issue-ref rule: an issue reference to any repo
 # but the ones named with --allow-repo-ref may name a private repo.
 allowed = [args[i + 1] for i, a in enumerate(args) if a == '--allow-repo-ref']
@@ -3041,7 +3052,25 @@ exec /usr/bin/git "$@"
         self.assertEqual(self.scanner_calls(), [])
         line = self.failure_line(lane="opencode-go")
         self.assertTrue(line.startswith("[transient] public repo leak scan could not run"), line)
-        self.assertIn("cannot read the leak scan deny-list", line)
+        self.assertIn("no copy of the leak scan deny-list", line)
+
+    def test_a_pod_lane_scans_with_its_copied_deny_list_and_pushes_to_a_public_repo(self):
+        # A cluster runner copies the deny-list into LOOM_SSM_DIR with the
+        # keys (quadseven/loom#1824): the scanner reads that copy through
+        # the AWS CLI stand-in, never the real CLI, and the push goes ahead.
+        deny = self.home / ".ssm" / "infra" / "leak-scan"
+        deny.mkdir(parents=True)
+        (deny / "deny-list").write_text("secret-product-name\n")
+        inbox, result = self.pod_lane(FAKE_SCANNER_READS_DENY="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), self.calls())
+        calls = self.scanner_calls()
+        self.assertEqual([c.split()[0] for c in calls], ["--diff", "--text-file"], calls)
+        for call in calls:
+            self.assertTrue(call.endswith(self.DENY), call)
+        self.assertEqual(Path(str(self.log) + ".deny").read_text(), "secret-product-name\n" * 2)
+        self.assertFalse([c for c in self.calls() if c.startswith("aws ")], self.calls())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
 
     def test_a_pod_lane_pushes_to_a_private_repo(self):
         inbox, result = self.pod_lane(FAKE_GH_PRIVATE="true")

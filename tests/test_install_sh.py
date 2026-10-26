@@ -46,7 +46,7 @@ class InstallScriptTest(unittest.TestCase):
         self.lock.parent.mkdir(parents=True, exist_ok=True)
         self.lock.write_text("%s\n" % pid)
 
-    def run_install(self, **env):
+    def run_install(self, *lanes, **env):
         # The watched repos, status repo and App settings come only from the
         # test: an operator's own settings in the environment would trip the
         # owner check or the App check.
@@ -62,8 +62,33 @@ class InstallScriptTest(unittest.TestCase):
                     FAKE_LOG=str(self.log))
         full.update(env)
         return subprocess.run(
-            ["bash", str(self.checkout / "lanes" / "mac" / "install.sh"), "codex"],
+            ["bash", str(self.checkout / "lanes" / "mac" / "install.sh"), *(lanes or ("codex",))],
             env=full, capture_output=True, text=True, timeout=60)
+
+    def test_a_runner_slot_gets_no_local_runner_and_the_station_gets_its_settings(self):
+        # LOOM_RUNNER_SLOTS (docs/LANES.md, "Lanes on cluster runners"): the
+        # station dispatches the slot's briefs, so no launchd runner may take
+        # them, and the station needs the slot's settings to send.
+        shutil.copytree(INSTALL.parents[2] / "bus", self.checkout / "bus",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        (agents / "com.loom.zen.plist").write_text("old")
+        result = self.run_install("zen", "codex", LOOM_RUNNER_SLOTS="zen",
+                                  LOOM_ZEN_KEY_SSM="/x/zen", LOOM_LANES_GITHUB_APP_ID="42",
+                                  LOOM_LANES_GITHUB_APP_INSTALLATION_ID="7",
+                                  LOOM_LANES_GITHUB_APP_KEY_SSM="/x/lanes-app")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((agents / "com.loom.zen.plist").exists())
+        self.assertIn("no com.loom.zen: zen runs on cluster runners", result.stdout)
+        self.assertIn("launchctl bootout gui/%d/com.loom.zen" % os.getuid(), self.log.read_text())
+        self.assertTrue((agents / "com.loom.codex.plist").exists())
+        station = (agents / "com.loom.station.plist").read_text()
+        for key, value in (("LOOM_RUNNER_SLOTS", "zen"), ("LOOM_ZEN_KEY_SSM", "/x/zen"),
+                           ("LOOM_LANES_GITHUB_APP_ID", "42"),
+                           ("LOOM_LANES_GITHUB_APP_KEY_SSM", "/x/lanes-app")):
+            self.assertIn("<key>%s</key><string>%s</string>" % (key, value), station)
+        self.assertEqual(station.count("<key>LOOM_ZEN_MODEL</key>"), 1)
 
     def test_a_held_lock_is_waited_for_then_the_station_installs(self):
         # A live pid (this test process) holds the lock; a helper frees it
