@@ -888,6 +888,44 @@ print('leak guard: clean (shape patterns only)')
         self.assertNotIn("[x]", intent)
         self.assertEqual(body.count("## Acceptance criteria"), 1)
 
+    def body_criteria(self):
+        return self.body.read_text().split("## Acceptance criteria\n", 1)[1].split("\n\n", 1)[0]
+
+    def test_a_ticket_under_an_acceptance_heading_fills_the_body_criteria(self):
+        # A ticket that wrote "## Acceptance" opened a pull request whose
+        # ## Acceptance criteria was empty when the lane wrote no checklist;
+        # the review bot's plan check failed it and every fix round edited
+        # code, never the body (2026-10-25).
+        for heading in ("## Acceptance", "## Acceptance Criteria", "## ACCEPTANCE CRITERIA  "):
+            with self.subTest(heading=heading):
+                name = "T%d-fix-the-thing" % (50 + len(heading))
+                self.drop_brief(name + ".md", BRIEF.replace("T042-fix-the-thing", name)
+                                .replace("## Acceptance criteria\n", heading + "\n"))
+                result = self.run_lane()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+                self.assertEqual(self.body_criteria(), "- [ ] The thing works\n"
+                                 "- [ ] A test covers the thing\n- [ ] Nothing else changes")
+                self.assertEqual(hunt_plan.problems(self.body.read_text()), [])
+
+    def test_a_lane_checklist_under_an_acceptance_heading_reaches_the_body(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY=self.TICKED.replace(
+            "## Acceptance criteria", "## Acceptance"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.body_criteria().startswith("- [x] The thing works\n"))
+
+    def test_a_ticket_without_acceptance_criteria_is_parked_before_the_agent_runs(self):
+        # With no criteria anywhere the body's section could only be empty,
+        # which the review bot's plan check fails and no fix round repairs.
+        self.drop_brief(text=re.sub(r"## Acceptance criteria\n(- \[ \] .*\n)+\n", "", BRIEF))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: [work] ticket has no acceptance criteria", self.run_log())
+
     def test_the_lanes_operator_steps_reach_the_pull_request_body(self):
         # A lane pull request whose deploy needed a VM resize and a data
         # migration merged on green checks (2026-10-22): the body now carries
@@ -1373,8 +1411,11 @@ print('leak guard: clean (shape patterns only)')
         self.assertNotIn("Refs ", self.body.read_text())
 
     def test_a_brief_rendered_by_the_station_is_accepted_and_refs_its_issue(self):
+        # The station briefs only tickets with criteria (bus/brain.py
+        # acceptance_refusal); a brief without them is parked unrun.
         issue = {"number": 42, "title": "Fix the thing",
-                 "body": "Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n"}
+                 "body": ("Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n\n"
+                          "## Acceptance criteria\n- [ ] The thing works\n")}
         name = tickets.ticket_name("example/repo", 42, 1)
         self.drop_brief(name + ".md", tickets.render_brief("example/repo", issue, "codex", 1))
         result = self.run_lane()
@@ -2153,6 +2194,54 @@ exec /usr/bin/git "$@"
         self.assertIn("A reviewer note at the top.", new_body)
         self.assertIn("- [ ] A test covers the thing", new_body)
         self.assertIn("Loom ticket %s, lane codex, model gpt-test-default." % name, new_body)
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_fills_an_empty_criteria_section_from_an_acceptance_heading(self):
+        # The pull request opened with an empty ## Acceptance criteria (its
+        # ticket wrote "## Acceptance"), so the plan check failed it. A fix
+        # round now writes the ticket's criteria into the body; before, it
+        # rendered the section empty again every round (2026-10-25).
+        work = Path(self._tmp.name) / "pr-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
+        (work / "first.txt").write_text("first try\n")
+        git("add", "first.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "First try", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        issue = {"number": 42, "title": "Fix the thing",
+                 "body": ("Difficulty: medium\n\n## Why\nThe thing is broken for every user.\n\n"
+                          "## What\nFix it.\n\n## Acceptance\n- [ ] The thing works\n"
+                          "- [ ] A test covers the thing\n- [ ] Nothing else changes\n\n"
+                          "## Size\nS\n\n## Out of scope\n- Nothing else\n")}
+        fix = tickets.parse_fix("example/repo", (
+            "<!-- loom:fix v1 -->\nPull request: example/repo#7, branch %s\n\n"  # leak-guard-allow: fixture repo
+            "### Check: Grug - Chief\n\n    Acceptance criteria has 0 non-empty bullets\n"
+            % self.FIX_BRANCH))
+        name = tickets.ticket_name("example/repo", 42, 2)
+        brief = tickets.render_brief("example/repo", issue, "codex", 2, fix)
+        self.drop_brief(name + ".md", brief)
+        empty_body = pr_repair._render_generated(
+            pr_repair._normalise(brief), "codex", "gpt-test-default", name, acceptance="")
+        self.assertIn("## Acceptance criteria\n\n\nSize:", empty_body)
+        pr_title_file = Path(self._tmp.name) / "pr_title"
+        pr_body_file = Path(self._tmp.name) / "pr_body"
+        new_body_file = Path(self._tmp.name) / "new_body"
+        pr_title_file.write_text("Fix the thing")
+        pr_body_file.write_text(empty_body)
+        result = self.run_lane(
+            FAKE_AGENT="noop",
+            FAKE_GH_EXISTING="7",
+            FAKE_GH_PR_TITLE=str(pr_title_file),
+            FAKE_GH_PR_BODY=str(pr_body_file),
+            FAKE_PR_TITLE=str(Path(self._tmp.name) / "new_title"),
+            FAKE_PR_BODY=str(new_body_file),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        new_body = new_body_file.read_text()
+        self.assertIn("## Acceptance criteria\n- [ ] The thing works\n"
+                      "- [ ] A test covers the thing\n- [ ] Nothing else changes\n", new_body)
+        self.assertEqual(hunt_plan.problems(new_body), [])
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
     def test_a_fix_brief_refuses_invalid_pr_text_with_a_reason(self):

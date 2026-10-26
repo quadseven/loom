@@ -316,6 +316,18 @@ section() {
   awk -v h="## $1" '$0 == h {on=1; next} /^#+ / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
 }
 
+# The acceptance criteria of $1, blank lines dropped: its "## Acceptance
+# criteria" section, in any case, or its "## Acceptance" section. Tickets
+# write either heading; read as exactly "## Acceptance criteria", a ticket
+# with "## Acceptance" opened a pull request with an empty section that the
+# review bot's plan check failed on every fix round (2026-10-25).
+# bus/pr_repair.py::_brief_criteria reads the same headings.
+criteria_section() {
+  awk '{h = tolower($0); sub(/[ \t]+$/, "", h)}
+       h == "## acceptance criteria" || h == "## acceptance" {on=1; next}
+       /^#+ / {on=0} on' "$1" | sed '/^[[:space:]]*$/d'
+}
+
 # Chief's format: ## Intent (the change class), ## Why, ## Summary,
 # ## Acceptance criteria, Size:, ## Out of scope.
 INTENT_CLASS=""
@@ -467,9 +479,9 @@ pr_body() {
   # The lane's checklist, from the summary the runner moved out of the tree
   # before committing: read from the tree, every lane pull request carried
   # the ticket's unticked criteria and went back for them (2026-10-20).
-  criteria="$(section 'Acceptance criteria' "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
-  [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$TREE/$SUMMARY_FILE" 2>/dev/null)"
-  [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$1")"
+  criteria="$(criteria_section "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
+  [ -n "$criteria" ] || criteria="$(criteria_section "$TREE/$SUMMARY_FILE" 2>/dev/null)"
+  [ -n "$criteria" ] || criteria="$(criteria_section "$1")"
   # The lane's own word on operator steps, else the ticket's; a body with
   # neither says so, and the factory's keyword backstop still reads both.
   ops="$(section "$OPERATOR_SECTION" "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
@@ -2992,6 +3004,17 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   if [ "$DELIVERABLE" = answer ] && ! [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
     park "$BRIEF" "answer brief needs Issue: owner/name#number"; continue
+  fi
+  # A brief that opens a pull request needs criteria for its body: without
+  # them the body's ## Acceptance criteria is empty, the review bot's plan
+  # check fails it, and no fix round can change that (they edit code). Like
+  # every other brief the runner cannot build, it is parked before the agent
+  # runs. Fix briefs edit an open pull request, and answer and verify briefs
+  # open none.
+  if [ -z "$DELIVERABLE" ] && [ -z "$(field Fix-PR "$BRIEF" || true)" ] &&
+     [ -z "$(criteria_section "$BRIEF")" ]; then
+    park "$BRIEF" "ticket has no acceptance criteria: add an ## Acceptance criteria section with - [ ] checkboxes; the agent did not run"
+    continue
   fi
   BASE_ARGS=()
   [ -n "$BASE_BRANCH" ] && BASE_ARGS=(--branch "$BASE_BRANCH")
