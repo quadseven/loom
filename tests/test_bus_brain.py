@@ -753,6 +753,77 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
+    # loom#1711: a ticked criterion that another repo of the owner must build.
+    FOREIGN = "`other-repo` converts the two groups into one"
+    SIBLINGS = {"LOOM_REPOS": "%s example-owner/other-repo" % REPO}
+
+    def _criteria_pr(self, *criteria):
+        return ("Refs %s#9\n## Acceptance criteria\n" % REPO
+                + "".join("- [x] %s\n" % c for c in criteria))
+
+    def test_merge_refuses_a_ticked_criterion_naming_another_repo(self):
+        body = self._criteria_pr(self.FOREIGN, "local feature works")
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                                {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []))
+        with self.assertRaises(ValueError) as ctx:
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env=self.SIBLINGS)
+        msg = str(ctx.exception)
+        self.assertIn("ticked criterion names another repo, example-owner/other-repo", msg)
+        self.assertIn(self.FOREIGN, msg)
+        self.assertIn('"; not built: belongs in other-repo"', msg)
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def _merged(self, body, env):
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204),
+                    reply(200, []), reply(200, issue), reply(200, {}))
+        return brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env=env)
+
+    def test_merge_passes_the_criterion_marked_belongs_in_the_other_repo(self):
+        body = self._criteria_pr(self.FOREIGN + "; not built: belongs in other-repo",
+                                 "local feature works")
+        self.assertTrue(self._merged(body, self.SIBLINGS)["merged"])
+
+    def test_merge_passes_a_ticked_criterion_naming_its_own_repo(self):
+        body = self._criteria_pr("`example-repo` sends the new field",
+                                 "example-owner/example-repo reads it back")
+        self.assertTrue(self._merged(body, self.SIBLINGS)["merged"])
+
+    def test_status_prints_the_foreign_criterion_blocker_instead_of_ready(self):
+        pr = {"number": 8, "title": "Lane work",
+              "body": self._criteria_pr(self.FOREIGN, "local feature works")}
+        with unittest.mock.patch.dict(os.environ, self.SIBLINGS):
+            line = brain._status_pr_line(None, REPO, pr, ready_node(),
+                                         "grug-tribe", "Grug - Elder")
+        self.assertEqual(line, "- #8 Lane work - "
+                         + brain._foreign_criteria_reason(pr["body"], REPO, self.SIBLINGS))
+        self.assertIn("names another repo, example-owner/other-repo", line)
+
+    def test_foreign_criterion_forms(self):
+        cases = [
+            # OWNER/NAME with the PR's owner needs no repo list.
+            ("- [x] example-owner/other-repo stores the row", {}, True),
+            # A backticked bare name counts only when it is a known repo.
+            ("- [x] `other-repo` stores the row", {}, False),
+            ("- [x] `other-repo` stores the row", self.SIBLINGS, True),
+            ("- [x] `helper.py` stores the row", self.SIBLINGS, False),
+            # Another owner's repo, an unticked box, a wrong belongs-in repo.
+            ("- [x] someone-else/other-repo stores the row", {}, False),
+            ("- [ ] `other-repo` stores the row", self.SIBLINGS, False),
+            ("- [x] `other-repo` stores the row; not built: belongs in third-repo",
+             self.SIBLINGS, True),
+            ("- [x] `other-repo` stores the row; not built: belongs in "
+             "example-owner/other-repo", self.SIBLINGS, False),
+        ]
+        for line, env, blocked in cases:
+            with self.subTest(line=line, env=env):
+                reason = brain._foreign_criteria_reason(
+                    "## Acceptance criteria\n%s\n" % line, REPO, env)
+                self.assertEqual(bool(reason), blocked, reason)
+
     def test_merge_ready_names_each_blocker(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}
         cases = [
