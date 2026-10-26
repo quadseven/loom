@@ -817,6 +817,7 @@ def _needs_you(document, state, *, source_missing=False, who=""):
            'Everything else the brain does itself.</p>', _answer_bar(mode)]
     if source_missing:
         out.append('<p class="card">Backlog source unavailable: Hunt\'s items are not shown.</p>')
+    out.append(needs_you_view.goal_caps_section(getattr(state, "goal_caps", None), time.time()))
     out.append(cards)
     if not who:
         out.append(_backlog_asks(document, found, repos))
@@ -1025,6 +1026,18 @@ def _handle_usage_post(handler, state):
         return handler.send_json(400, {"error": str(exc)})
 
 
+def _handle_goal_caps_post(handler, state):
+    """POST /api/goal-caps (loom#1831): the station's goals stuck at their
+    in-flight cap, with the upload token, shown on the Needs-you page."""
+    if not _authorized(handler):
+        return handler.send_json(401, {"error": "unauthorized"})
+    try:
+        state.goal_caps = needs_you_view.goal_caps(_json_body(handler), time.time())
+    except (ValueError, json.JSONDecodeError) as exc:
+        return handler.send_json(400, {"error": str(exc)})
+    return handler.send_json(201, {"goals": len(state.goal_caps["goals"])})
+
+
 # Brain memory (dashboard/brain_memory.py): the station writes ticks,
 # closings and rules with the upload token. Every brain reads the handoff
 # packet with it or with LOOM_HANDOFF_TOKEN, which can only read.
@@ -1069,6 +1082,8 @@ def _handler_for(state):
             path = self.path.split("?", 1)[0]
             if path == "/api/usage":
                 return _handle_usage_post(self, state)
+            if path == "/api/goal-caps":
+                return _handle_goal_caps_post(self, state)
             if path == "/api/needs-you/answer":
                 return _handle_answer_post(self, state)
             if path in BRAIN_WRITES:

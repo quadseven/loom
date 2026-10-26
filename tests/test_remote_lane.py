@@ -302,6 +302,29 @@ class RemoteLaneTests(unittest.TestCase):
         self.assertEqual(data["number"], 4)
 
 
+class MuseSlotsTests(unittest.TestCase):
+    """Four Muse lanes (operator, 2026-10-25: "Yes I want muse lanes... Like 4")."""
+
+    def test_a_fourth_claim_is_taken_and_a_fifth_is_refused(self):
+        gh = FakeGitHub()
+        with mock.patch.object(lane, "_recover_and_count", return_value=3):
+            self.assertEqual(lane.claim(gh, ["example/project"], now=1000)["number"], 4)
+        gh = FakeGitHub()
+        with mock.patch.object(lane, "_recover_and_count", return_value=4):
+            self.assertIsNone(lane.claim(gh, ["example/project"], now=1000))
+
+    def test_a_ticket_with_a_fresh_claim_is_never_claimed_twice_while_slots_are_free(self):
+        gh = FakeGitHub()
+        self.assertEqual(lane.claim(gh, ["example/project"], now=1000)["number"], 4)
+        # A hand-back race leaves the ticket queued while its claim is still fresh.
+        gh.issues[4]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"},
+                                  {"name": "lane:muse"}]
+        with mock.patch.object(lane, "_recover_and_count", return_value=1):
+            self.assertIsNone(lane.claim(gh, ["example/project"], now=1001))
+        self.assertEqual(sum("loom:claim" in c["body"] or "claim" in c["body"].lower()
+                             for c in gh.comments[4]), 1)
+
+
 class TakesTest(unittest.TestCase):
     def test_a_queued_ticket_with_no_or_empty_body_is_skipped_not_a_crash(self):
         # tickets.parse returns (headers, rest) for any body, so [0] is a

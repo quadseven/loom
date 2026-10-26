@@ -168,6 +168,33 @@ drop_run_scratch() {
     rm -rf "${WORKDIR:?}/$TICKET$f"
   done
 }
+# When a run ends, drop the build output git ignores from its tree and its
+# default-branch check copy: .venv, node_modules, __pycache__ and
+# .pytest_cache folders that `git check-ignore` confirms and that hold no
+# tracked path. The tracked tree stays for fix rounds. On 2026-10-25 an infra
+# run left 17 ignored .venv folders, about 2 GB a tree, kept for TREE_KEEP
+# (loom#1808). find never follows a link, so a linked folder is never entered
+# or matched, and rm -rf removes links inside without following them. Called
+# before each brief (for the run before it) and when the runner exits.
+drop_build_output() {
+  [[ "${TICKET:-}" =~ ^[A-Za-z0-9._-]+$ ]] && [ -n "${WORKDIR:-}" ] || return 0
+  local tree path tracked
+  for tree in "$WORKDIR/$TICKET" "$WORKDIR/$TICKET-default-check"; do
+    [ -d "$tree" ] && [ ! -L "$tree" ] && [ -e "$tree/.git" ] || continue
+    while IFS= read -r -d '' path; do
+      # find names every path ./..., so none reads as an option.
+      [[ "$path" == ./* ]] || continue
+      git -C "$tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+        check-ignore -q -- "$path" 2> /dev/null || continue
+      tracked="$(git -C "$tree" -c core.fsmonitor=false ls-files -- "$path" 2> /dev/null)" || continue
+      [ -z "$tracked" ] || continue
+      rm -rf -- "${tree:?}/$path" 2> /dev/null || true
+    done < <(cd "$tree" && find . -name .git -prune -o -type d \( -name .venv -o -name node_modules \
+               -o -name __pycache__ -o -name .pytest_cache \) -prune -print0 2> /dev/null)
+  done
+  return 0
+}
+
 # The runner writes its usage heartbeat between runs, not during one, and a
 # run can take over an hour (loom#1281). While this runner lives, a background
 # loop stamps state/usage/<slot>.alive with the time every
@@ -195,7 +222,7 @@ stop_keepalive() {
 mkdir -p "$LOOM_HOME/state/usage"
 keepalive_loop $$ > /dev/null 2>&1 &
 KEEPALIVE_PID=$!
-trap 'drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
+trap 'drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
@@ -406,6 +433,32 @@ check_scope() {
   STRAY_FILES="$(timeout "$NET_TIMEOUT" env PYTHONPATH="$REPO_ROOT" python3 -B -m bus.scope_check "$TREE" "$BASE" HEAD "$1" ${FIX_UPSTREAM:+"$FIX_UPSTREAM"})"
 }
 
+# Checks the commits' Kubernetes manifest changes against the live cluster,
+# SSM and DNS (bus/live_cluster.py), over the range the leak scan reads. A
+# miss parks the brief as work and returns 1, so nothing is pushed. A check
+# that cannot run at all, or a part of it, sets LIVE_NOTES, which the log and
+# the pull request body or round comment carry. Hosts are looked up only
+# under the zones in LOOM_LIVE_CHECK_ZONES (docs/LANES.md, "Live-cluster
+# check").
+LIVE_NOTES=""
+live_cluster_check() {
+  local range="$BASE..HEAD" out rc=0
+  LIVE_NOTES=""
+  [ -n "$FIX_UPSTREAM" ] && range="$FIX_UPSTREAM...HEAD"
+  out="$(timeout "$NET_TIMEOUT" env PYTHONPATH="$REPO_ROOT" ${LOOM_AWS_REGION:+AWS_REGION="$LOOM_AWS_REGION"} \
+    python3 -B -m bus.live_cluster "$TREE" "$range" 2>> "$LOG")" || rc=$?
+  if [ "$rc" -eq 1 ]; then
+    park "$BRIEF" "$out; nothing pushed"
+    return 1
+  fi
+  [ -z "$out" ] || printf '%s\n' "$out" >> "$LOG"
+  if [ "$rc" -ne 0 ]; then
+    out="live-cluster check could not run: the check exited $rc"
+    printf '%s\n' "$out" >> "$LOG"
+  fi
+  LIVE_NOTES="$(printf '%s\n' "$out" | grep '^live-cluster check could not run: ' || true)"
+}
+
 # STRAY_FILES as one comma-separated line, at most ten names.
 stray_list() {
   local n
@@ -495,6 +548,60 @@ pr_body() {
     "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$criteria" \
     "$size" "$(section 'Out of scope' "$1")" "$OPERATOR_SECTION" "$ops" "$bugs" \
     "$2" "$LANE" "$MODEL" "$validated" "$refs"
+}
+
+# The markers bus/pr_repair.py names PLAN_HOLD_MARKER (in a pull request
+# body) and PLAN_NOTE_MARKER (the ticket's one plan-hold note).
+PLAN_HOLD_MARKER="<!-- loom:plan-hold v1 -->"
+PLAN_NOTE_MARKER="<!-- loom:plan-hold-note v1 -->"
+
+# The body of a new pull request, in PR_BODY. A body that fails the review
+# bot's plan checks (bus/hunt_plan.py) has the failing parts rebuilt from the
+# brief by bus/pr_repair.py, the code the factory and fix rounds use. What the
+# brief still lacks goes in PLAN_GAPS, one per line: the pull request opens
+# anyway (the work is done), marked so the factory sends it no lane round,
+# whose agent edits code and never the body (loom#1837).
+compose_pr_body() {
+  local problems body_file out_file summary=() private=()
+  PLAN_GAPS=""
+  PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+  problems="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)" && return 0
+  echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$problems" | tr '\n' ';')" >> "$LOG"
+  if ! body_file="$(mktemp)" || ! out_file="$(mktemp)"; then
+    PLAN_GAPS="$problems"; return 0
+  fi
+  printf '%s\n' "$PR_BODY" > "$body_file"
+  if [ -f "$WORKDIR/$TICKET.summary.md" ]; then
+    summary=(--summary "$WORKDIR/$TICKET.summary.md")
+  elif [ -f "$TREE/$SUMMARY_FILE" ]; then
+    summary=(--summary "$TREE/$SUMMARY_FILE")
+  fi
+  repo_is_public || private=(--private)
+  if PLAN_GAPS="$(NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -B -m bus.pr_repair plan \
+       "$BRIEF" "$body_file" "$LANE" "$MODEL" "$TICKET" --out "$out_file" --repo "$REPO" \
+       ${summary[@]+"${summary[@]}"} ${private[@]+"${private[@]}"} 2>> "$LOG")"; then
+    PR_BODY="$(cat "$out_file")"
+    PLAN_GAPS=""
+    echo "[$(date -u +%FT%TZ)] $TICKET pull request body rebuilt from the brief; it passes the plan checks" >> "$LOG"
+  else
+    [ -n "$PLAN_GAPS" ] || PLAN_GAPS="$problems"
+    echo "[$(date -u +%FT%TZ)] $TICKET the brief lacks for the plan checks: $(printf '%s' "$PLAN_GAPS" | tr '\n' ';')" >> "$LOG"
+  fi
+  rm -f "$body_file" "$out_file"
+}
+
+# The ticket's one plan-hold note, edited in place on every later pull
+# request of the ticket: the factory holds the ticket for the brain and keeps
+# the same comment. Argument: the new pull request's URL.
+note_plan_hold() {
+  local number="${1##*/}"
+  [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || return 0
+  printf 'The ticket lacks what the runner writes these parts of the body from:\n%s\n\nA lane cannot edit the ticket, so the factory sends no fix round for it. Add the missing parts to this ticket; the factory then rebuilds the pull request body from it.\n' \
+    "$(printf '%s\n' "$PLAN_GAPS" | sed 's/^/- /')" |
+    upsert_sticky_comment "$REPO" "$ISSUE_NUMBER" "$PLAN_NOTE_MARKER" repeat \
+      --headline "Held for the brain: a pull request body fails the review bot's plan check" \
+      --items-label "Pull requests" --item "#$number" ||
+    echo "[$(date -u +%FT%TZ)] $TICKET: the plan-hold note on the ticket failed" >> "$LOG"
 }
 
 # A fix brief's PR must still be open on the brief's branch. Returns 1 with
@@ -2969,8 +3076,10 @@ fi
 
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
+  drop_build_output
   drop_run_scratch
   PR_BODY=""
+  PLAN_GAPS=""
   DROPPED_SCRATCH_FILES=""
   TICKET="$(basename "$BRIEF" .md)"
   REPO="$(field Repo "$BRIEF")"
@@ -3487,7 +3596,7 @@ for BRIEF in "$INBOX"/*.md; do
         INTENT_TEXT="${INTENT_TEXT}
 - Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
       fi
-      PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+      compose_pr_body
       PR_BODY="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
         'import sys; from bus.factory import SCAN_REF_RE; owner, name = sys.argv[1].lower().split("/", 1); f = lambda m: m.group(0) if m.group(2).lower() == name and (m.group(1) or owner).lower() == owner else "issue %s of another repo" % m.group(3); print("\n".join(SCAN_REF_RE.sub(f, x) for x in sys.stdin.read().splitlines()))' "$REPO")" || {
         park "$BRIEF" "could not prepare public repo PR text; nothing pushed" transient; continue
@@ -3507,6 +3616,13 @@ for BRIEF in "$INBOX"/*.md; do
       printf '%s\n' "$LEAK_OUT" >> "$LOG"
     fi
   fi
+  # Node labels, SSM parameters and hosts a manifest change names must exist
+  # live before anything is pushed (bus/live_cluster.py, loom#1832). It runs
+  # after the leak scan: it looks up names the agent wrote, outside its
+  # sandbox. A miss is the lane's work to fix; a check that cannot run is a
+  # note, not a stop.
+  LIVE_NOTES=""
+  if [ "$COMMITTED" -eq 1 ]; then live_cluster_check || continue; fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
   if [ -n "$FIX_PR" ] && ! fix_pr_open; then
@@ -3624,6 +3740,11 @@ $CHECKED"
     else
       COMMENT="Lane $SLOT repaired the PR text for: ${ITEMS:-the findings on the ticket}"
     fi
+    if [ -n "$LIVE_NOTES" ]; then
+      COMMENT="$COMMENT
+
+$LIVE_NOTES"
+    fi
     if [ -n "$DROPPED_SCRATCH_FILES" ]; then
       COMMENT="$COMMENT
 
@@ -3655,18 +3776,19 @@ Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
   fi
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
-  [ -n "${PR_BODY:-}" ] || PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
-  # Briefs are checked when filed, so this only fires on a brief filed
-  # before that check or edited by hand: the PR still opens (the work is
-  # done), and the log names what the review bot will hold it for.
-  if ! PLAN_PROBLEMS="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)"; then
-    echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$PLAN_PROBLEMS" | tr '\n' ';')" >> "$LOG"
-  fi
+  # Briefs are checked when filed, so a failing body comes from a brief filed
+  # before that check, edited by hand, or read differently by the shell and
+  # Python readers: compose_pr_body rebuilds it, and marks the pull request
+  # when the brief cannot fill it.
+  [ -n "${PR_BODY:-}" ] || compose_pr_body
+  [ -z "$LIVE_NOTES" ] || PR_BODY="$PR_BODY"$'\n\n'"$LIVE_NOTES"
+  [ -z "$PLAN_GAPS" ] || PR_BODY="$PR_BODY"$'\n\n'"$PLAN_HOLD_MARKER"
   if ! PR_URL="$(timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
        --body "$PR_BODY" 2>> "$LOG")"; then
     park "$BRIEF" "pr create failed; branch $BRANCH is pushed" transient; continue
   fi
   echo "$PR_URL" >> "$LOG"
+  [ -z "$PLAN_GAPS" ] || note_plan_hold "$PR_URL"
   if [ -n "$INTENT_CLASS" ] && ! timeout "$NET_TIMEOUT" gh pr edit "$PR_URL" -R "$REPO" --add-label "class:$INTENT_CLASS" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] could not add label class:$INTENT_CLASS to $PR_URL; the PR stands" >> "$LOG"
   fi

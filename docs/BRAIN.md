@@ -59,6 +59,7 @@ that talks to GitHub about tickets.
 | `loom:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
 | `loom:answer-pending` | An operator answered the item's ask on the dashboard's Needs you page (`<!-- loom:answer v1 -->` comment, `bus/answer.py`); the station has not read it yet. The factory reads it on its next pass and takes the label off (see Operator answers). |
 | `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:window`, `wait:live-event` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, a deploy or roll window, or (`wait:live-event`, on a shipped ticket) its Live box needs a rare event the log has not shown in 7 days since it shipped. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
+| `handoff:claude` | The hand-off pool, machine-readable: a ticket no lane of this Loom took for a day, with no other lane or model rung its tier allows free (see Tickets no lane takes). It is `loom:queued` with no lane, holds no slot of its goal's in-flight cap (one at `loom:pr` still counts), and the factory moves it no more. The second operator's session works this pool (its goal issue, #1036) and may claim such a ticket at any state; taking the label off returns the ticket to this Loom's queue. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs-operator` | An ask for the operator (see Asks). |
@@ -292,6 +293,40 @@ declared Trunk, so the operator knows to add the line.
 
 `bus.brain onboard` does not write a Trunk line; add it by hand once you know
 where the repo's work actually lands.
+
+### Merge constraints
+
+A goal home may name rules that every pull request for one of its tickets
+must meet before it lands, one `Merge constraint: <rule>` line each, above
+the body's first heading (a line after the first heading is ignored):
+
+```markdown
+Merge constraint: C++ unit test required
+
+## Destination
+...
+```
+
+The rule text is matched ignoring case, repeated spaces and a trailing full
+stop. A ticket's goal home is the open `loom:goal` issue its `Part of #N`
+names, directly or through an open epic. Checked today (loom#1435):
+
+- `C++ unit test required`: met when the pull request changes no C++ source
+  (`.cpp`, `.cc`, `.cxx`, `.c++`, `.h`, `.hh`, `.hpp`, `.hxx`, `.ipp`,
+  `.inl`, `.tpp`), or when it adds or changes a `.cpp` file under a `tests/`,
+  `test/` or `t/` directory at any depth (a removed test does not count).
+
+`bus.brain merge` reads the ticket's goal home (one read for its parent, one
+more when the parent is an epic) on every merge of a ticket with a `Part of`
+line, and the pull request's files only when a rule needs them. It refuses,
+naming the goal home and the rule, when a rule is not met, when a rule has
+no check (fail closed: check it and merge by hand), or when the goal home
+cannot be read. `bus.brain status` reads the same way for each open ticket's
+pull request: a met rule is shown as ` - rule: <rule>` at the end of the
+line, and a rule not met (`goal home OWNER/NAME#N rule not met: <rule>`), a
+rule merge cannot check (`... rule merge cannot check: <rule>`), or an
+unreadable goal home (`goal home unreadable`) is a blocker, so status never
+says READY for a pull request merge would refuse on these rules.
 
 ## Onboarding a repo
 
@@ -1303,10 +1338,37 @@ current head and checks are green;
 verify shipped work live and close only then; pick the next problems by
 impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 16)
 tickets in flight per goal (queued, briefed, running, pr or failed; merged
-and shipped tickets hold no slot), except one regression slot (see
+and shipped tickets hold no slot, nor does a ticket in the hand-off pool
+unless it is at pr), except one regression slot (see
 Regression slot);
 write the journal; report when due; release the lock. No retry loops: a
 failed step is journalled and left for the next tick.
+
+## Tickets no lane takes
+
+A ticket the factory leaves waiting because no lane takes it (no free lane
+takes its model, no free lane in its tier, stalled with no other lane of its
+rung or tier, or on a lane at a limit with no free lane in its rung or tier)
+holds its goal's in-flight cap without moving. On 2026-10-25, 89 tickets
+waited so, some for two days, and a goal at its cap had every triage rewrite
+skipped (loom#1831). The station keeps when each such ticket first waited
+(`no_lane_since` in `state/station/ticket-waits.json`, kept across its
+no-lane reasons and dropped when a lane takes it), and the factory acts on it:
+
+- After `LOOM_NO_LANE_REROUTE` hours (default 6, at most 24) a ticket pinned
+  to a model moves to the first rung of the model ladder the climb rules allow
+  (never down from a strong model) that has a free lane in its difficulty
+  tier, for its repo (public-only lanes never take a private repo's work) and
+  up for the rung's model (not at a limit, benched or out of credit). So codex
+  runs gpt-6-luna and no lane outside the ladder is chosen. The status
+  comment says `Not a failure` with the rung marker, as a ladder move does.
+- By 24 hours, with no reroute allowed, it goes to the hand-off pool
+  (`handoff:claude`): back to `loom:queued` with no lane, out of the goal's
+  in-flight count, and one note on its status comment, edited in place.
+- The rewrite skip line names how many of a goal's in-flight tickets wait with
+  no lane, and says `goal stuck at its cap for N hours` past 6 hours; the
+  station sends the stuck goals to the dashboard (`POST /api/goal-caps`),
+  whose Needs-you page lists each with that count.
 
 ## Regression slot
 
@@ -1441,6 +1503,13 @@ merge` refuses on, through the same functions merge uses (loom#1643): a
 ticket not at `loom:pr` (`ticket at loom:running, not loom:pr`), a REST
 `mergeable_state` of `dirty` (`conflicts with the default branch`), and a
 risk tier outside `LOOM_AUTO_MERGE_TIERS` (`held for the operator: <tier>`).
+A ticked acceptance criterion that names another repo of the same owner
+(`OWNER/NAME`, or a backticked name that is a `LOOM_REPOS` repo of that owner)
+was not built by this pull request: that repo builds it. Status prints
+`blocked: ticked criterion names another repo, ...` for it, and `bus.brain
+merge` refuses with the same reason (loom#1711). Send a brain fix asking the
+lane to untick it and end it `; not built: belongs in <repo>`, so the station
+files the follow-up in that repo; a criterion already ending that way passes.
 
 Status also prints a "Waiting on the brain" section: every open lane pull
 request whose ticket carries `needs-brain`, oldest first, with its ticket,

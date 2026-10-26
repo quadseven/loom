@@ -194,7 +194,7 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_LOG_KEEP_DAYS</key><string>14</string>", plist)
-        self.assertIn("<key>LOOM_DISK_FREE_MIN_GB</key><string>20</string>", plist)
+        self.assertIn("<key>LOOM_MIN_FREE_GB</key><string>20</string>", plist)
 
     def test_claimed_settle_settings_are_written_to_station_plist(self):
         result = self.run_install(LOOM_SETTLE_CLAIMED="on", LOOM_SETTLE_CLAIMED_MAX="5")
@@ -212,13 +212,17 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn(entry, (agents / "com.loom.brain.plist").read_text())
 
     def test_goal_limits_are_written_to_station_and_brain_plists(self):
-        result = self.run_install(LOOM_GOAL_CAP="28", LOOM_UNVERIFIED_LIMIT="60")
+        result = self.run_install(LOOM_GOAL_CAP="28", LOOM_UNVERIFIED_LIMIT="60",
+                                  LOOM_NO_LANE_REROUTE="4")
         self.assertEqual(result.returncode, 0, result.stderr)
         agents = self.home / "Library" / "LaunchAgents"
         for label in ("com.loom.station", "com.loom.brain"):
             plist = (agents / (label + ".plist")).read_text()
             self.assertIn("<key>LOOM_GOAL_CAP</key><string>28</string>", plist)
             self.assertIn("<key>LOOM_UNVERIFIED_LIMIT</key><string>60</string>", plist)
+        # The factory runs in the station (bus/factory.py no_lane_reroute).
+        self.assertIn("<key>LOOM_NO_LANE_REROUTE</key><string>4</string>",
+                      (agents / "com.loom.station.plist").read_text())
 
     def test_lane_model_settings_are_written_to_station_plist(self):
         # The factory reads what a lane ran from its setting (bus/brain.py
