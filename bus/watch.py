@@ -1079,17 +1079,18 @@ class Watcher:
                         # closes it, not a quiet signature (loom#1934). The
                         # link is kept so a return is counted there.
                         continue
-                    close = {"state": "closed",
-                             "state_reason": "completed" if shipped else "not_planned"}
+                    reason = "completed" if shipped else "not_planned"
                     # Before the note, so a close shadow mode holds (the
                     # signature became a ticket) says nothing (loom#1551).
                     if shadow.guard("PATCH", "/repos/%s/issues/%d" % (self.repo, int(number)),
-                                    close, issue, source="watch quiet close") is not None:
+                                    {"state": "closed", "state_reason": reason}, issue,
+                                    source="watch quiet close") is not None:
                         continue
                     body = self._quiet_body(rec, shipped)
                     _text.check(body)
                     notify.post(self.gh, self.repo, number, body, notify.CLOSED)
-                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number), close)
+                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                                 {"state": "closed", "state_reason": reason})
                     self.writes += 2
                     self.say("watch: closed quiet %s#%d" % (self.repo, number))
             except (GitHubError, OSError, ValueError) as err:
