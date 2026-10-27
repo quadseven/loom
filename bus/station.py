@@ -39,6 +39,7 @@ from . import brain_hold
 from . import claimed
 from . import fabric
 from . import fixrounds
+from . import flake
 from . import runners
 from . import scope_fit
 from . import shadow
@@ -5486,6 +5487,14 @@ class Station:
                 if not (name == self.s.review_check and factory.degraded_review(tail, tail))]
         degraded = len(kept) != len(failed)
         failed = kept
+        # An infra timeout (bus/flake.py) is no lane's to fix: it is re-run
+        # once before any round, whatever else fails, and never reads as a
+        # stuck failure after (loom#1962).
+        flaky = [name for name, tail in failed if name not in (
+            self.s.review_check, self.s.plan_check) and flake.infra_flake(tail)]
+        if flaky and self._rerun_flaky(repo, number, pr_number, sha, flaky):
+            self._remove_ready_if_present(repo, number, names)
+            return
         self._note_first_push(repo, pr_number, comments, failed)
         threads = self._bot_threads(repo, pr_number)
         if not failed and not threads and not degraded:
@@ -5495,7 +5504,20 @@ class Station:
         if self._no_round(failed, threads):
             return
         self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
-                                   comments, names, failed, threads, rounds)
+                                   comments, names, failed, threads, rounds, flaky)
+
+    def _rerun_flaky(self, repo: str, number: int, pr_number: int, sha: str,
+                     flaky: List[str]) -> bool:
+        """Re-run the workflow runs of the infra-failed checks on this head
+        once (flake.rerun_once). False when each was already re-run."""
+        runs = brain.newest_check_runs((self.gh.rest(
+            "GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data
+            or {}).get("check_runs") or [])
+        if not flake.rerun_once(self.gh, repo, runs, flaky):
+            return False
+        _say("%s#%d: re-ran %s on %s#%d once before a fix round: an infra failure"
+             % (repo, number, ", ".join(sorted(flaky)), repo, pr_number))
+        return True
 
     def _no_round(self, failed: List[Tuple[str, str]], threads: List[Any]) -> bool:
         """Nothing a lane round could fix: no failure at all, or the plan check
@@ -5650,19 +5672,21 @@ class Station:
     def _post_fix_or_escalate(self, repo: str, number: int, pr_number: int, lane: str,
                               detail: Dict[str, Any], sha: str, comments: List[Any],
                               names: List[str], failed: List[Any], threads: List[Any],
-                              rounds: int) -> None:
+                              rounds: int, flaky: Sequence[str] = ()) -> None:
         """Send the next fix round, unless the last one moved nothing. Each
         round went to the same lane until the cap, with no look at whether
         the last one fixed anything (2026-10-26: four rounds on a local model
         left the same checks failing and the same finding open). A round whose
         failures persist by signature (bus/converge.py) climbs the model
         ladder at once; with no rung left, or with the round cap reached on
-        its rung, the rounds stop (_stop_fix_rounds)."""
+        its rung, the rounds stop (_stop_fix_rounds). A check in `flaky`
+        failed on the infrastructure (bus/flake.py) and is never read as a
+        failure the last round left."""
         authors = {author.lower() for author in self.s.authors}
         failing = [name for name, _ in failed]
         persisted = converge.persistent(
             converge.last_fix_body(comments, authors, (repo, pr_number)),
-            failing, threads, ignore=(self.s.review_check, self.s.plan_check))
+            failing, threads, ignore=(self.s.review_check, self.s.plan_check) + tuple(flaky))
         if persisted:
             lane = self._climb_stuck(repo, number, pr_number, detail, comments, persisted)
             if lane is None:

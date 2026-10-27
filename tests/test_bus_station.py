@@ -3187,10 +3187,12 @@ class StuckFixRoundTest(unittest.TestCase):
     (2026-10-26: four rounds of one ticket on a local model, each "done",
     each leaving the same two checks failing and the same finding open)."""
 
+    fake = LadderReviewFake
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.gh = LadderReviewFake()
+        self.gh = self.fake()
         self.gh.issue["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
                                    {"name": "lane:spark"}]
         self.station = station.Station(self.gh, station.Settings(self.temp.name, [REPO],
@@ -3280,6 +3282,75 @@ class StuckFixRoundTest(unittest.TestCase):
                   if str(c["body"]).startswith("The station stopped the fix rounds")]
         self.assertIn("check pytest", note)
         self.assertIn("no rung of the model ladder is left", note)
+
+
+class FlakyLadderFake(LadderReviewFake):
+    """LadderReviewFake whose head has an Actions job and answers the reads
+    and writes of a re-run: the workflow run's attempt and rerun-failed-jobs."""
+
+    def __init__(self):
+        super().__init__()
+        self.attempts = {}
+        self.check_runs = [
+            {"id": 501, "name": "adapter", "status": "completed", "conclusion": "failure",
+             "details_url": "https://github.com/%s/actions/runs/88/job/501" % REPO},
+            {"id": 502, "name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+             "conclusion": "failure", "details_url": "https://grug.example"}]
+
+    def rest(self, method, path, data=None):
+        m = re.search(r"/actions/runs/(\d+)$", path)
+        if method == "GET" and m:
+            return mock.Mock(data={"run_attempt": self.attempts.get(m.group(1), 1)})
+        if method == "POST" and path.endswith("/rerun-failed-jobs"):
+            self.writes.append((method, path, data))
+            return mock.Mock(data={})
+        return super().rest(method, path, data)
+
+
+INSTALL_TIMEOUT = ("##[error]The action 'Install what the core's own Dockerfile installs' "
+                   "has timed out after 10 minutes.")
+
+
+class InfraFlakeHandBackTest(unittest.TestCase):
+    """An infra timeout is re-run before a fix round, whatever else fails,
+    and never reads as the same failure coming back (loom#1962: three pull
+    requests had an install step time out beside a failing review; no job
+    was re-run and each round read the timeout as stuck)."""
+
+    setUp = StuckFixRoundTest.setUp
+    last_round = StuckFixRoundTest.last_round
+    run_hand_back = StuckFixRoundTest.run_hand_back
+    names = StuckFixRoundTest.names
+    rounds = StuckFixRoundTest.rounds
+    fake = FlakyLadderFake
+
+    def reruns(self):
+        return [w[1] for w in self.gh.writes if str(w[1]).endswith("/rerun-failed-jobs")]
+
+    def test_an_infra_timeout_beside_a_failed_review_is_run_again_with_no_round(self):
+        self.last_round("### Check: adapter\n\n    timed out")
+        self.run_hand_back(checks=[("adapter", INSTALL_TIMEOUT),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(self.reruns(), ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertEqual(self.names(), ["loom:ticket", "loom:pr", "lane:spark"])
+
+    def test_an_infra_timeout_that_came_back_after_its_rerun_is_not_a_stuck_round(self):
+        self.gh.attempts["88"] = 2
+        self.last_round("### Check: adapter\n\n    timed out")
+        self.run_hand_back(checks=[("adapter", INSTALL_TIMEOUT),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(self.reruns(), [])
+        self.assertIn("lane:spark", self.names())
+        self.assertNotIn("lane:claude", self.names())
+        self.assertEqual(len(self.rounds()), 2)
+
+    def test_a_real_failure_that_came_back_still_climbs(self):
+        self.last_round("### Check: adapter\n\n    1 failed")
+        self.run_hand_back(checks=[("adapter", "FAILED test_x\n##[error]Process completed "
+                                               "with exit code 1.")])
+        self.assertEqual(self.reruns(), [])
+        self.assertIn("lane:claude", self.names())
 
 
 class StampedReviewFake(ReviewFake):

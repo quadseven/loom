@@ -1021,6 +1021,46 @@ class PullRequests(Base):
         self.assertEqual(len(self.fixed), 1)
         self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
 
+    INSTALL_TIMEOUT = ("Setting up build-essential ...\n"
+                       "##[error]The action 'Install what the core's own Dockerfile installs' "
+                       "has timed out after 10 minutes.")
+
+    def flaky_head(self, log):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"id": 501, "name": "adapter", "status": "completed", "conclusion": "failure",
+             "details_url": "https://github.com/%s/actions/runs/88/job/501" % REPO},
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
+             "output": {"title": "FAIL Elder found 1 problem", "summary": "Fix the null check."},
+             "details_url": "https://grug.example"}]
+        self.gh.logs["501"] = log
+
+    def test_an_infra_timeout_is_run_again_even_when_the_review_also_failed(self):
+        # loom#1962: the adapter job timed out installing packages beside a
+        # failing review; _run_again refused on the review and the job was
+        # never re-run, so the fix round read it as a stuck failure.
+        self.flaky_head(self.INSTALL_TIMEOUT)
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertIn(("POST", "/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO, None),
+                      self.gh.writes)
+        self.assertEqual(self.merged, [])
+
+    def test_an_infra_timeout_on_its_second_attempt_goes_back_as_before(self):
+        self.flaky_head(self.INSTALL_TIMEOUT)
+        self.gh.attempts["88"] = 2
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
+
+    def test_a_real_test_failure_beside_a_failed_review_is_not_run_again(self):
+        self.flaky_head("FAILED tests/test_a.py::test_x - assert 1 == 2\n##[error]Process completed "
+                        "with exit code 1.")
+        self.go()
+        self.assertEqual(len(self.fixed), 1)
+        self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
+
     def test_a_partial_review_asks_for_improve_instead_of_a_fix_round(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, green=False)
