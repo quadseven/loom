@@ -3194,53 +3194,75 @@ class Station:
         path = os.path.join(self.state, UNMEETABLE_FILE)
         state = _read_json(path, {}, strict=False)
         state = state if isinstance(state, dict) else {}
-        seen = state.get(ticket)
-        if isinstance(seen, dict) and seen.get("key") == box:
-            if seen.get("reasons"):
-                return True
-            at = seen.get("at")
-            if isinstance(at, (int, float)) and 0 <= self.now - at < UNMEETABLE_RECHECK:
-                return False
-        unknown = [False]
-
-        def state_of(where: str, ref: int) -> Optional[Tuple[str, bool]]:
-            try:
-                data = self.gh.rest("GET", "/repos/%s/issues/%d" % (where, ref)).data
-            except RateLimited:
-                raise
-            except GitHubError:
-                return None
-            if not isinstance(data, dict):
-                return None
-            pull = data.get("pull_request")
-            merged = bool(isinstance(pull, dict) and pull.get("merged_at"))
-            return str(data.get("state") or ""), merged
-
-        def present(text: str) -> Optional[bool]:
-            if searches[0] <= 0:
-                unknown[0] = True
-                return None
-            searches[0] -= 1
-            try:
-                data = self.gh.rest("GET", "/search/code?q=%s+repo:%s" % (
-                    quote('"%s"' % text, safe=""), repo)).data
-            except GitHubError:
-                # The search budget is apart from the core one: a refused
-                # search proves nothing and ends this pass's searches.
-                searches[0] = 0
-                unknown[0] = True
-                return None
-            if not isinstance(data, dict) or data.get("incomplete_results") \
-                    or not isinstance(data.get("total_count"), int):
-                return None
-            return data["total_count"] > 0
-
-        found = unmeetable.reasons(live, repo, number, state_of, present)
+        known = self._unmeetable_known(state.get(ticket), box)
+        if known is not None:
+            return known
+        unknown: List[bool] = []
+        found = unmeetable.reasons(live, repo, number, self._issue_state,
+                                   lambda text: self._source_has(repo, text, searches, unknown))
         if not found:
-            if not unknown[0]:
+            if not unknown:
                 state[ticket] = {"key": box, "reasons": [], "at": self.now}
                 _write_json(path, state)
             return False
+        if self._ask_restate(repo, number, live, found):
+            state[ticket] = {"key": box, "reasons": found, "at": self.now}
+            _write_json(path, state)
+            _say("not verifying %s: its Live box cannot be met as written (%s)"
+                 % (ticket, "; ".join(found)))
+        return True
+
+    def _unmeetable_known(self, seen: Any, box: str) -> Optional[bool]:
+        """The recorded answer for this box text: True when it was flagged,
+        False when it was clean within UNMEETABLE_RECHECK, else None."""
+        if not isinstance(seen, dict) or seen.get("key") != box:
+            return None
+        if seen.get("reasons"):
+            return True
+        at = seen.get("at")
+        if isinstance(at, (int, float)) and 0 <= self.now - at < UNMEETABLE_RECHECK:
+            return False
+        return None
+
+    def _issue_state(self, repo: str, number: int) -> Optional[Tuple[str, bool]]:
+        """(state, merged) of an issue or pull request, None when unreadable."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+        except RateLimited:
+            raise
+        except GitHubError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        pull = data.get("pull_request")
+        return str(data.get("state") or ""), bool(isinstance(pull, dict) and pull.get("merged_at"))
+
+    def _source_has(self, repo: str, text: str, searches: List[int],
+                    unknown: List[bool]) -> Optional[bool]:
+        """Whether a code search finds `text` in the repo; None when the
+        search was not run, failed or was incomplete (`unknown` is marked)."""
+        if searches[0] <= 0:
+            unknown.append(True)
+            return None
+        searches[0] -= 1
+        try:
+            data = self.gh.rest("GET", "/search/code?q=%s+repo:%s" % (
+                quote('"%s"' % text, safe=""), repo)).data
+        except GitHubError:
+            # The search budget is apart from the core one: a refused search
+            # proves nothing and ends this pass's searches.
+            searches[0] = 0
+            unknown.append(True)
+            return None
+        if not isinstance(data, dict) or data.get("incomplete_results") \
+                or not isinstance(data.get("total_count"), int):
+            unknown.append(True)
+            return None
+        return data["total_count"] > 0
+
+    def _ask_restate(self, repo: str, number: int, live: str, found: List[str]) -> bool:
+        """Post the one restate ask for this box text unless a comment
+        already carries it; False when GitHub refused (tried next pass)."""
         try:
             comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
             if not unmeetable.asked(list(comments), live):
@@ -3249,12 +3271,8 @@ class Station:
         except RateLimited:
             raise
         except GitHubError as err:
-            _say("could not ask to restate the Live box of %s: %s" % (ticket, err))
-            return True
-        state[ticket] = {"key": box, "reasons": found, "at": self.now}
-        _write_json(path, state)
-        _say("not verifying %s: its Live box cannot be met as written (%s)"
-             % (ticket, "; ".join(found)))
+            _say("could not ask to restate the Live box of %s#%d: %s" % (repo, number, err))
+            return False
         return True
 
     def _audit_holds(self) -> Dict[str, float]:

@@ -210,12 +210,7 @@ class FakeGitHub:
                                           for l in i.get("labels", []))])
             return reply(200, self.factory_incidents)
         if method == "GET" and parts.path == "/search/code":
-            term = unquote(parts.query[len("q="):]).rsplit(" repo:", 1)[0].rsplit("+repo:", 1)[0]
-            term = term.strip('"')
-            self.code_searches.append(term)
-            hits = 0 if term in self.code_absent else 1
-            return reply(200, {"total_count": hits, "incomplete_results": False,
-                               "items": [{"path": "src/app.py"}] * hits})
+            return self._code_search(parts.query)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if method == "GET" and rest == "labels":
             return reply(200, [{"name": name, "color": value["color"],
@@ -262,6 +257,14 @@ class FakeGitHub:
         if method == "GET" and rest == "git/ref/heads/loom-lock/brain":
             return reply(404, {"message": "Not Found"})
         raise AssertionError("unexpected call %s %s" % (method, path))
+
+    def _code_search(self, query):
+        """A code search: one hit unless the term is in code_absent."""
+        term = unquote(query[len("q="):]).rsplit("+repo:", 1)[0].strip('"')
+        self.code_searches.append(term)
+        hits = 0 if term in self.code_absent else 1
+        return reply(200, {"total_count": hits, "incomplete_results": False,
+                           "items": [{"path": "src/app.py"}] * hits})
 
     def _post_page(self, data):
         if self.page_error:
