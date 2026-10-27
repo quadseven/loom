@@ -98,7 +98,9 @@ class StatusReadsEachIssueOnce(unittest.TestCase):
         for pr in (14, 15):
             line = next(x for x in report.splitlines() if x.startswith("- #%d " % pr))
             self.assertIn("goal home %s#1 rule merge cannot check" % REPO, line)
-        self.assertEqual(fake.issue_reads(), {1: 1, 2: 1, 4: 1, 5: 1})
+        # Each is read at most once; all four are in the open listing, which
+        # answers them, so none is read on its own (loom#2078).
+        self.assertEqual(fake.issue_reads(), {})
 
     def test_the_status_text_is_the_same_as_reading_every_time(self):
         once = _status(PathFake())
