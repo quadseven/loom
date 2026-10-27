@@ -318,17 +318,34 @@ def _norm(text: str) -> str:
     return " ".join(text.split())
 
 
+# Where a command's output goes, not what it checks: a stream merge, a
+# redirect to a file and a trailing tee into a log (loom#1977).
+_PLUMBING = re.compile(r"\s*(?:\d?>&\d|\d?>>?\s*[^\s&|;]+)(?=\s|$)")
+_TEE = re.compile(r"\s*\|\s*tee(?:\s+-\S+)*\s+[^\s|]+\s*$")
+# python3 and python3.12 run what python runs on a lane.
+_PYTHON = re.compile(r"(?<![\w./-])python3(?:\.\d+)?(?=\s|$)")
+
+
+def _plain(text: str) -> str:
+    """Text as coverage compares it: spaces collapsed, output plumbing
+    dropped and the python interpreter named one way."""
+    text = _TEE.sub("", _norm(text))
+    return _norm(_PYTHON.sub("python", _PLUMBING.sub("", text)))
+
+
 def covered(command: str, contract_text: str, workdir: str = "") -> bool:
     """Whether the contract runs the command: every part of it that checks
     something (not cd, echo, set, export) appears in the contract's setup,
     check or affected text, and so does the step's working directory when it
     has one (the same command run from the root runs another suite). A part
-    with a ${{ }} expression counts by its text before the expression."""
-    have = _norm(contract_text)
-    if workdir and _norm(workdir.split("${{", 1)[0]).rstrip("/") not in have:
+    with a ${{ }} expression counts by its text before the expression.
+    Output plumbing (2>&1, > file, a trailing | tee log) and python3 for
+    python do not change what a part runs (loom#1977)."""
+    have = " ".join(_plain(line) for line in contract_text.splitlines())
+    if workdir and _norm(workdir.split("${{", 1)[0]).rstrip("/") not in _norm(contract_text):
         return False
     for part in _parts(command):
-        part = _norm(part.split("${{", 1)[0])
+        part = _plain(part.split("${{", 1)[0])
         if part and part not in have:
             return False
     return True
