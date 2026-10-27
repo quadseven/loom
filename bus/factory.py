@@ -2261,6 +2261,7 @@ class Factory:
                 or self._repair_body_leak(repo, number, full, issue, comments, sha)
                 or self._repair_ticket_epic(repo, number, issue, comments, sha)
                 or self._repair_plan_body(repo, number, full, issue, comments, sha)
+                or self._update_base_fixed(repo, number, full, sha)
                 or self._run_again(repo, number, sha)
                 or self._review_again(repo, number, full, sha)):
             return
@@ -2745,6 +2746,45 @@ class Factory:
             "title": title, "body": body, "labels": ["loom:ticket", "loom:queued"]}).data or {}
         if placed:
             self._link_filed(repo, placed, made, body)
+
+    def _update_base_fixed(self, repo: str, number: int, full: Dict[str, Any],
+                           sha: str) -> bool:
+        """Bring a pull request up to date with its base, pinned to its head,
+        when it is behind and every check it fails passed on the base's
+        current head: the failure came from the old base and is already fixed
+        there. A re-run reuses the old merge commit and a fix round waits for
+        a lane, so neither clears it (loom#1961: four macchina pull requests
+        briefed for a test main had fixed). False when a review check failed,
+        when a failed check did not pass on the base head, when the pull
+        request is not behind, or when GitHub refuses the update; the usual
+        re-run and fix round follow. The update moves the head, so every
+        check and the review run again before it can land."""
+        failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
+        if not failed or any(r.get("name") == self.review_check for r in failed):
+            return False
+        if not self._behind(repo, full):
+            return False
+        base = str((full.get("base") or {}).get("ref") or "")
+        if not base:
+            return False
+        base_sha = str((self.gh.rest("GET", "/repos/%s/commits/%s"
+                                     % (repo, quote(base, safe=""))).data or {}).get("sha") or "")
+        if not base_sha:
+            return False
+        on_base = {str(r.get("name") or ""): r for r in self._check_runs(repo, base_sha)}
+        for run in failed:
+            found = on_base.get(str(run.get("name") or ""))
+            if (found is None or found.get("status") != "completed"
+                    or found.get("conclusion") != "success"):
+                return False
+        done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
+                            {"expected_head_sha": sha}, ok=(422,))
+        if done.status == 422:
+            return False
+        self.actions += 1
+        _say("brought %s#%d up to date with its base: %s passed on the base head, so "
+             "no fix round" % (repo, number, ", ".join(sorted(str(r.get("name")) for r in failed))))
+        return True
 
     def _run_again(self, repo: str, number: int, sha: str) -> bool:
         """Re-run the failed Actions jobs on this commit once. False when a
