@@ -1335,6 +1335,30 @@ def body_leak_hits(log: Sequence[str]) -> Optional[Dict[int, str]]:
     return hits or None
 
 
+def leak_scan_hits_in_diff(log: Sequence[str]) -> Dict[int, str]:
+    """Extract hits from the leak scan's diff section.
+    
+    Returns {line: rule} for findings in the diff section of a leak scan log.
+    Returns empty dict when there are no findings in the diff section.
+    """
+    hits: Dict[int, str] = {}
+    marks = [l.strip() for l in log]
+    
+    if LEAK_TEXT_MARK not in marks or LEAK_DIFF_MARK not in marks:
+        return hits
+        
+    cut = len(marks) - 1 - marks[::-1].index(LEAK_TEXT_MARK)
+    start = max((i for i in range(cut) if marks[i] == LEAK_DIFF_MARK), default=-1)
+    diff, text = marks[start + 1:cut], log[cut + 1:]
+    
+    for line in diff:
+        m = LEAK_HIT_RE.match(line)
+        if m:
+            hits[int(m.group(1))] = m.group(2)
+            
+    return hits
+
+
 def refs_in_words(line: str, repo: str) -> str:
     """The line with each [owner/]name#N in words: "issue N of this repo" for
     the repo's own, "issue N of another repo" for any other."""
@@ -2420,7 +2444,15 @@ class Factory:
                           sha: str) -> bool:
         """Rewrite the flagged lines of the pull request's text when every
         failing check is a leak scan that failed on that text alone; once per
-        head commit. False leaves the pull request to the usual paths."""
+        head commit. False leaves the pull request to the usual paths.
+        
+        When the only red check on a lane pull request's head is the leak scan
+        and its findings name the pull request's title or body (not a file of the
+        diff), the body is rebuilt from the ticket the way bus/pr_repair.py does
+        for the plan check, with the flagged text left out, and re-run the leak
+        scan, instead of opening a fix round. A finding in the diff still
+        opens a fix round.
+        """
         marker = BODY_LEAK_MARKER % sha
         if any(marker in str(c.get("body") or "") for c in comments):
             return False
@@ -2439,22 +2471,64 @@ class Factory:
             if found is None:
                 return False
             hits.update(found)
-        fixed = repair_leak_text(str(full.get("title") or ""), str(full.get("body") or ""),
-                                 hits, repo)
-        if fixed is None:
+        
+        # Extract hits from the diff section
+        diff_hits: Dict[int, str] = {}
+        for run in failed:
+            try:
+                log = brain._job_log(self.gh, repo, int(run["id"]))
+            except (GitHubError, KeyError, TypeError, ValueError):
+                return False
+            diff_hits.update(leak_scan_hits_in_diff(log or []))
+        
+        # If there are ANY findings in the diff, send to fix rounds
+        if diff_hits:
             return False
-        title, body, changed = fixed
+        
+        # All findings are in title/body only - rebuild body from ticket
+        ticket = int(issue["number"])
+        title = str(full.get("title") or "")
+        body = str(full.get("body") or "")
+        
+        # Get lane and model from the pull request's footer
+        fields = pr_repair.footer_fields(body)
+        if fields is None:
+            _say("%s#%d: leak scan body repair refused: no footer" % (repo, number))
+            return False
+        name, lane, model = fields
+        
+        # Get the ticket's brief from the issue body
+        brief = tickets.render_brief(repo, issue, lane)
+        
+        # Call plan_repair to rebuild the body from the ticket
+        result = pr_repair.plan_repair(brief, title, body, lane, model, name,
+                                       repo=repo, public=not self._is_private(repo))
+        
+        if result["reason"]:
+            _say("%s#%d: leak scan body repair refused (%s)" % (repo, number, result["reason"]))
+            return False
+            
+        if not result["changed"]:
+            _say("%s#%d: body already current after leak scan failure" % (repo, number))
+            return True
+            
+        # Edit the PR body with the rebuilt body
+        new_title = str(result["title"]) if result.get("title") else title
+        new_body = str(result["body"])
         self.gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number),
-                     {"title": title, "body": body})
-        notify.post(self.gh, repo, int(issue["number"]),
-                    "%s\nThe leak scan on #%d failed on its title and body only, "
-                    "which the runner writes from this ticket, so the factory "
-                    "edited the text instead of sending it back:\n%s"
-                    % (marker, number, "\n".join("- " + c for c in changed)),
-                    notify.REPAIR)
+                     {"title": new_title, "body": new_body})
+        
+        # Post a note on the ticket about the rebuild
+        repaired_at = _ts((failed[0].get("completed_at") or datetime.now(timezone.utc)).isoformat())
+        if repaired_at:
+            note = "%s\nThe leak scan on #%d failed on its title and body only, " \
+                   "which the runner writes from this ticket, so the factory " \
+                   "rebuilt it from the ticket instead of sending it back: %s" \
+                   % (marker, number, "; ".join(result["before"]))
+            notify.post(self.gh, repo, ticket, note, notify.REPAIR)
+        
         self.actions += 1
-        _say("rewrote %d flagged line(s) of %s#%d's text after a body-only leak scan"
-             % (len(changed), repo, number))
+        _say("rebuilt %s#%d's body from ticket #%d after a body-only leak scan failure" % (repo, number, ticket))
         return True
 
     def _repair_ticket_epic(self, repo: str, number: int, issue: Dict[str, Any],
