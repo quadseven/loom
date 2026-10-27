@@ -2779,10 +2779,17 @@ class Factory:
         """Re-run, once, the failed Actions jobs on this head that failed on
         the infrastructure (bus/flake.py), even when the review check failed
         too: its findings still go back to the lane on a later pass, with the
-        flake gone. False when no such job is on its first attempt."""
+        flake gone. False when no such job is on its first attempt, or when
+        GitHub refused a read or the re-run: the pull request then goes the
+        usual paths, as it did before this re-run existed."""
         runs = self._runs.get(sha, [])
-        names = flake.flaky_names(self.gh, repo, runs, (self.review_check, self.plan_check))
-        if not names or not flake.rerun_once(self.gh, repo, runs, names):
+        try:
+            names = flake.flaky_names(self.gh, repo, runs, (self.review_check, self.plan_check))
+            if not names or not flake.rerun_once(self.gh, repo, runs, names):
+                return False
+        except GitHubError as err:
+            _say("could not re-run infra-failed jobs on %s#%d (%s); judged as usual"
+                 % (repo, number, err))
             return False
         self.actions += 1
         _say("re-ran %s on %s#%d once: an infra failure, not the change"

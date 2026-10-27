@@ -1056,6 +1056,18 @@ class PullRequests(Base):
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
         self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
 
+    def test_a_refused_rerun_of_an_infra_timeout_is_judged_as_usual(self):
+        self.flaky_head(self.INSTALL_TIMEOUT)
+        write = self.gh._write
+
+        def refuse(method, path, body):
+            if path.endswith("/rerun-failed-jobs"):
+                raise GitHubError("POST %s -> 500" % path, 500)
+            return write(method, path, body)
+        self.gh._write = refuse
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
     def test_a_real_test_failure_beside_a_failed_review_is_not_run_again(self):
         self.flaky_head("FAILED tests/test_a.py::test_x - assert 1 == 2\n##[error]Process completed "
                         "with exit code 1.")

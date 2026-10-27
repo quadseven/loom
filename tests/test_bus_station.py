@@ -3345,6 +3345,20 @@ class InfraFlakeHandBackTest(unittest.TestCase):
         self.assertNotIn("lane:claude", self.names())
         self.assertEqual(len(self.rounds()), 2)
 
+    def test_a_refused_rerun_still_sends_the_fix_round(self):
+        rest = self.gh.rest
+
+        def refuse(method, path, data=None):
+            if path.endswith("/rerun-failed-jobs"):
+                raise GitHubError("POST %s -> 502" % path, 502)
+            return rest(method, path, data)
+        self.gh.rest = refuse
+        self.last_round("### Check: adapter\n\n    timed out")
+        self.run_hand_back(checks=[("adapter", INSTALL_TIMEOUT),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(len(self.rounds()), 2)
+        self.assertIn("lane:spark", self.names())
+
     def test_a_real_failure_that_came_back_still_climbs(self):
         self.last_round("### Check: adapter\n\n    1 failed")
         self.run_hand_back(checks=[("adapter", "FAILED test_x\n##[error]Process completed "

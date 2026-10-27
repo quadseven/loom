@@ -5509,11 +5509,18 @@ class Station:
     def _rerun_flaky(self, repo: str, number: int, pr_number: int, sha: str,
                      flaky: List[str]) -> bool:
         """Re-run the workflow runs of the infra-failed checks on this head
-        once (flake.rerun_once). False when each was already re-run."""
-        runs = brain.newest_check_runs((self.gh.rest(
-            "GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data
-            or {}).get("check_runs") or [])
-        if not flake.rerun_once(self.gh, repo, runs, flaky):
+        once (flake.rerun_once). False when each was already re-run, or when
+        GitHub refused the read or the re-run: the fix round then goes as it
+        did before this re-run existed."""
+        try:
+            runs = brain.newest_check_runs((self.gh.rest(
+                "GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data
+                or {}).get("check_runs") or [])
+            if not flake.rerun_once(self.gh, repo, runs, flaky):
+                return False
+        except GitHubError as err:
+            _say("%s#%d: could not re-run %s on %s#%d (%s); the fix round goes as usual"
+                 % (repo, number, ", ".join(sorted(flaky)), repo, pr_number, err))
             return False
         _say("%s#%d: re-ran %s on %s#%d once before a fix round: an infra failure"
              % (repo, number, ", ".join(sorted(flaky)), repo, pr_number))
