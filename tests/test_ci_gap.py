@@ -77,6 +77,22 @@ class CoverageTest(unittest.TestCase):
         self.assertTrue(ci_gap.covered("python -m pytest -q \\\n  tests",
                                        "cd deploy/rbac && python -m pytest -q tests", "deploy/rbac"))
 
+    def test_output_plumbing_and_the_python3_name_do_not_make_a_gap(self):
+        # The suite CI tees to a log under pipefail is the suite the contract
+        # runs; python and python3 are the same interpreter on a lane
+        # (loom#1977: the lane contract already ran this command).
+        contract = "python3 -B .github/unittest_parallel.py --allow-skips"
+        self.assertTrue(ci_gap.covered(
+            "set -o pipefail\npython -B .github/unittest_parallel.py --allow-skips 2>&1 | tee unittest.out",
+            contract))
+        self.assertTrue(ci_gap.covered("python3 -m pytest -q > out.log 2>&1", "python -m pytest -q"))
+        # A pipe into another check is not plumbing, and a flag the contract
+        # leaves out is still a gap.
+        self.assertFalse(ci_gap.covered("make t | grep -q ok", "make t"))
+        self.assertFalse(ci_gap.covered(
+            "python -B .github/unittest_parallel.py --strict 2>&1 | tee unittest.out",
+            "python3 -B .github/unittest_parallel.py --allow-skips"))
+
     def test_a_command_or_directory_the_contract_does_not_run_is_a_gap(self):
         self.assertFalse(ci_gap.covered("ruff check . && mypy .", "ruff check ."))
         # The same command from the root runs another suite.
