@@ -927,6 +927,25 @@ no_change_reason() {
   [ -z "$NO_CHANGE_WHY" ]
 }
 
+# Label the ticket loom:answered. gh refuses a label its repo lacks ("'X'
+# not found"), and a repo enrolled after the station's last label sync lacked
+# loom:answered, so an answer was posted and its ticket left with no state
+# (loom#2032). On a failure, create each Loom label the edit names from the
+# canonical set (bus/labels.py; one that exists already is left as it is)
+# and retry once.
+mark_answered() {
+  local names=(loom:answered loom:running loom:briefed loom:queued) name spec
+  timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered \
+    --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1 && return 0
+  for name in "${names[@]}"; do
+    spec="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.labels spec "$name" 2>> "$LOG")" || return 1
+    timeout "$NET_TIMEOUT" gh label create "$name" -R "$REPO" --color "${spec%%$'\t'*}" \
+      --description "${spec#*$'\t'}" >> "$LOG" 2>&1 || true
+  done
+  timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered \
+    --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1
+}
+
 # Hand an answered run's reason and its thread answers to whoever reports
 # it. The reason goes into the .answered marker. A station brief (an `Issue:
 # OWNER/NAME#N` line) is reported by the station, which records the reason as
@@ -943,7 +962,7 @@ post_no_change() {
     if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$NO_CHANGE_TEXT" >> "$LOG" 2>&1; then
       echo "answer comment failed"; return 1
     fi
-    if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
+    if ! mark_answered; then
       echo "answer posted but ticket label update failed"; return 1
     fi
   fi
@@ -3601,7 +3620,7 @@ for BRIEF in "$INBOX"/*.md; do
     if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$ANSWER_TEXT" >> "$LOG" 2>&1; then
       park "$BRIEF" "answer comment failed" transient; continue
     fi
-    if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
+    if ! mark_answered; then
       park "$BRIEF" "answer posted but ticket label update failed" transient; continue
     fi
     echo "[$(date -u +%FT%TZ)] $TICKET done, answer posted" >> "$LOG"

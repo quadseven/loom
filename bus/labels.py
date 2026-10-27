@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from typing import Dict, List
 from urllib.parse import quote
 
@@ -150,3 +151,30 @@ def ensure_labels(gh: GitHub, repo: str) -> List[str]:
                     {"color": want["color"], "description": want["description"]})
             changed.append(name)
     return changed
+
+
+def spec(name: str) -> str:
+    """One canonical label as "<color>\\t<description>", for a runner that
+    must create a label its repo lacks before it sets it (lanes/run_lane.sh,
+    loom#2032). ValueError when the name is not a Loom label."""
+    want = LABELS.get(name)
+    if want is None:
+        raise ValueError("not a Loom label: %s" % name)
+    return "%s\t%s" % (want["color"], want["description"])
+
+
+def main(argv: List[str]) -> int:
+    """`python3 -m bus.labels spec NAME` prints NAME's color and description."""
+    if len(argv) != 2 or argv[0] != "spec":
+        print("usage: python3 -m bus.labels spec NAME", file=sys.stderr)
+        return 2
+    try:
+        print(spec(argv[1]))
+    except ValueError as err:
+        print(err, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

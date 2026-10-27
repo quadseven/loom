@@ -1298,6 +1298,29 @@ def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
     return missing
 
 
+def unproven_criteria(ticket_body: str, answer: str) -> List[str]:
+    """Ticket code criteria a lane's no-change answer leaves unproven: not
+    ticked on the ticket and not ticked in the answer's own Acceptance
+    criteria checklist (the answer quotes the lane's summary, so its lines
+    start with "> "). A "not built: <reason>" mark proves nothing here: the
+    answer says the work is already done. Live and operator criteria are left
+    to the verifier and the operator, as for a pull request (loom#2032)."""
+    unquoted = "\n".join(re.sub(r"^>[ \t]?", "", line) for line in (answer or "").splitlines())
+    ticked = set()
+    for criterion in acceptance_criteria(unquoted):
+        checked, _, text = criterion.partition(" ")
+        if checked == "x" and not NOT_BUILT_RE.search(text):
+            ticked.add(text.strip().casefold())
+    missing = []
+    for criterion in acceptance_criteria(ticket_body):
+        checked, _, text = criterion.partition(" ")
+        if checked == "x" or criteria_gate.kind(text) != criteria_gate.CODE:
+            continue
+        if text.strip().casefold() not in ticked:
+            missing.append(text)
+    return missing
+
+
 def not_built_criteria(ticket_body: str, pull_body: str) -> List[str]:
     """Ticket criteria explicitly marked not built with a reason in a PR."""
     ticket = [item.partition(" ")[2] for item in acceptance_criteria(ticket_body)]
