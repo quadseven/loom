@@ -5523,7 +5523,12 @@ class Station:
             return
         self._note_first_push(repo, pr_number, comments, failed)
         threads = self._bot_threads(repo, pr_number)
-        if not failed and not threads and not degraded:
+        # A conflicting pull request is not ready, however green its checks
+        # (loom#1963): status read READY for pull requests GitHub reported as
+        # DIRTY after hand merges moved main. Its conflict brief is the
+        # factory's (Factory._send_back), so no round is sent from here.
+        conflict = detail.get("mergeable") is False
+        if not failed and not threads and not degraded and not conflict:
             self._mark_ready(repo, number, sha, names, ready)
             return
         self._remove_ready_if_present(repo, number, names)

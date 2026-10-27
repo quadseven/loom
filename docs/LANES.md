@@ -434,7 +434,11 @@ conflict goes back to a lane as a fix brief. It stays on its lane while the
 rounds make progress, and climbs the model ladder only when stuck: a review
 thread survived a fix round, checks it was asked to fix still fail, or the
 pull request is over 6 hours old and has not climbed in 6 hours (a review that finds new things, or a
-conflict alone, never climbs). Failed tickets and briefed tickets no lane
+conflict alone, never climbs, by age either: a conflict-only pull request is
+sent back on its lane however old it is, and the station never marks a
+conflicting pull request `loom:ready`). A ready pull request held for the
+operator is brought up to date with its base while it waits, and still never
+merges on the factory's say-so. Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
 starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then

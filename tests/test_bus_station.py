@@ -3123,6 +3123,24 @@ class HandBackTest(unittest.TestCase):
         self.run_hand_back()
         self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
 
+    def test_a_conflicting_green_pr_is_not_ready_and_loses_a_stale_ready(self):
+        # loom#1963: hand merges moved main under a ready pull request and it
+        # conflicted; the station kept loom:ready on it, so status read READY.
+        self.run_hand_back()
+        self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.gh.pr["mergeable"] = False
+        self.run_hand_back()
+        self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertNotIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual([c for c in self.gh.comments
+                          if str(c["body"]).startswith(tickets.FIX_MARKER)], [])
+
+    def test_a_conflicting_green_pr_is_never_marked_ready(self):
+        self.gh.pr["mergeable"] = False
+        self.run_hand_back()
+        self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual(self.ready_events(), [])
+
     def test_each_new_clean_head_is_one_event_in_the_one_status_comment(self):
         self.run_hand_back()
         self.run_hand_back()
