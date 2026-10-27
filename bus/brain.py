@@ -6286,6 +6286,30 @@ def _nothing_to_fix(gh: GitHub, repo: str, pr: int,
             "%s passed on it, and no review thread is open)" % (pr, sha[:12], check))
 
 
+def _rung_by_load(left: Sequence[int], lanes_of: Callable[[int], Tuple[str, ...]],
+                  load: Dict[str, int]) -> Tuple[Optional[Tuple[int, str]],
+                                                 Optional[Tuple[int, str, int]]]:
+    """(rung, lane) for the first rung in `left` with an available lane, on
+    its least-loaded lane (factory.pick_lane), and the (rung, lane, load) it
+    skipped or None. A rung whose one lane holds more than
+    factory.ONE_LANE_MAX gives way to the next rung whose least-loaded lane
+    holds three or more fewer, as the factory's _spread does; with none that
+    much lower the ticket still takes the first rung."""
+    from . import factory  # factory imports this module
+    rungs = [(n, lanes) for n, lanes in ((n, lanes_of(n)) for n in left) if lanes]
+    if not rungs:
+        return None, None
+    n, lanes = rungs[0]
+    lane = factory.pick_lane(lanes, load)
+    held = load.get(lane, 0)
+    if len(lanes) == 1 and held > factory.ONE_LANE_MAX:
+        for later, later_lanes in rungs[1:]:
+            target = factory.pick_lane(later_lanes, load)
+            if load.get(target, 0) <= held - 3:
+                return (later, target), (n, lane, held)
+    return (n, lane), None
+
+
 def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
              lanes_repo: str = "quadseven/loom") -> str:
     """Move a repeatedly stuck ticket to the lowest untried rung of the model
@@ -6355,31 +6379,11 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     free = _available_lanes(gh, lanes_repo)
     load_counter = factory.Factory(gh, [repo], time.time(), trusted=trusted_authors())
     load_counter.count_load()
-    choice = None
-    skipped_load = None
-    for n in left:
-        lanes = tuple(x for x in rung_lanes(n) if x in free)
-        lane = factory.pick_lane(lanes, load_counter.load) if lanes else None
-        if lane:
-            lane_load = load_counter.load.get(lane, 0)
-            if (len(lanes) == 1 and lane_load > factory.ONE_LANE_MAX):
-                for candidate in left:
-                    if candidate <= n:
-                        continue
-                    target_lanes = tuple(x for x in rung_lanes(candidate) if x in free)
-                    if not target_lanes:
-                        continue
-                    target_lane = factory.pick_lane(target_lanes, load_counter.load)
-                    target_load = load_counter.load.get(target_lane, 0)
-                    if target_load <= lane_load - 3:
-                        skipped_load = (n, lane, lane_load)
-                        n, lanes, lane = candidate, target_lanes, target_lane
-                        break
-            choice = (n - 1, lane)
-            break
+    choice, skipped_load = _rung_by_load(
+        left, lambda n: tuple(x for x in rung_lanes(n) if x in free), load_counter.load)
     if choice is None:
         raise ValueError("no untried rung has an available lane")
-    rung, lane = choice
+    rung, lane = choice[0] - 1, choice[1]
     model = factory.CLIMB[rung][1]
     reason = "; ".join(history.reasons)
     comment_lines = [ESCALATE_MARKER]

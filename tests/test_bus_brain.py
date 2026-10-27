@@ -2910,6 +2910,15 @@ def lane_models(**models):
 LADDER_LANES = {"claude": "claude-sonnet-5-5", "codex": "gpt-6-luna"}
 
 
+def briefed_on(load):
+    """Open briefed tickets, `load[lane]` on each lane, as the factory reads
+    them, so its own count_load counts the lane load escalate weighs."""
+    lanes = [lane for lane, count in load.items() for _ in range(count)]
+    return {100 + i: {"number": 100 + i, "labels": [
+        {"name": "loom:ticket"}, {"name": "loom:briefed"}, {"name": "lane:" + lane}]}
+        for i, lane in enumerate(lanes)}
+
+
 class EscalateTests(unittest.TestCase):
     def run_escalate(self, routes):
         fake = Routed(routes)
@@ -3047,12 +3056,11 @@ class EscalateTests(unittest.TestCase):
             stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")],
             free=("claude", "codex")))
 
-        def count_load(instance):
-            instance.load.update({"codex": 5, "claude": 1})
+        tickets = briefed_on({"codex": 5, "claude": 1})
 
         authors = (os.environ.get("LOOM_BRIEF_AUTHORS", "") + " " + BRAIN).strip()
         with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": authors}), \
-                unittest.mock.patch.object(factory.Factory, "count_load", count_load):
+                unittest.mock.patch.object(factory.Factory, "_tickets", lambda _self, _repo: tickets):
             outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
         self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
         note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
@@ -3062,12 +3070,11 @@ class EscalateTests(unittest.TestCase):
         from bus import factory
         fake = Routed(ticket_routes(stuck_ticket("failed"), TWICE, [], free=("claude", "codex")))
 
-        def count_load(instance):
-            instance.load.update({"claude": 5, "codex": 1})
+        tickets = briefed_on({"claude": 5, "codex": 1})
 
         authors = (os.environ.get("LOOM_BRIEF_AUTHORS", "") + " " + BRAIN).strip()
         with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": authors}), \
-                unittest.mock.patch.object(factory.Factory, "count_load", count_load):
+                unittest.mock.patch.object(factory.Factory, "_tickets", lambda _self, _repo: tickets):
             outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
         self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
         note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
@@ -3079,12 +3086,11 @@ class EscalateTests(unittest.TestCase):
             stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")],
             free=("claude", "codex")))
 
-        def count_load(instance):
-            instance.load.update({"codex": factory.ONE_LANE_MAX - 1, "claude": 1})
+        tickets = briefed_on({"codex": factory.ONE_LANE_MAX - 1, "claude": 1})
 
         authors = (os.environ.get("LOOM_BRIEF_AUTHORS", "") + " " + BRAIN).strip()
         with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": authors}), \
-                unittest.mock.patch.object(factory.Factory, "count_load", count_load):
+                unittest.mock.patch.object(factory.Factory, "_tickets", lambda _self, _repo: tickets):
             outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
         self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
 
