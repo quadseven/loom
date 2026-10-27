@@ -3602,9 +3602,9 @@ def _post_proof(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
 def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     owner, name = repo.split("/", 1)
     query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
-              ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
-              ' reviews(last:100) { nodes { author { __typename login } state submittedAt } } } '
-              ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
+             ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
+             ' reviews(last:100) { nodes { author { __typename login } state submittedAt } } '
+             ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
              ' reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes {'
              ' databaseId author { __typename login } body createdAt } } } }'
              ' files(first:100) { totalCount nodes { path deletions changeType } }'

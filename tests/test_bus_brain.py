@@ -941,7 +941,8 @@ class SensitiveResumeTests(unittest.TestCase):
         pr, query = self._merge_replies(changes={"details": {"reviews": {"nodes": [
             {"author": person, "state": "CHANGES_REQUESTED",
              "submittedAt": "2030-01-01T13:00:00Z"}]}}})
-        fake = Fake(pr, query)
+        # The first reply is the open pull list: no pull request holds the landing lock.
+        fake = Fake(reply(200, []), pr, query)
         client = GitHub("t", transport=fake)
         err = io.StringIO()
         with unittest.mock.patch("bus.brain.auth_from_env", return_value="t"), \
@@ -951,6 +952,22 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("error: changes requested by a person (reviewer-one)", err.getvalue())
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_pr_graphql_query_braces_balance_and_keep_fields_inside_the_pull_request(self):
+        # GraphQL is mocked elsewhere, so check the query text merge() really sends.
+        sent = []
+        gh = types.SimpleNamespace(graphql=lambda query: sent.append(query) or {})
+        brain._pr_graphql(gh, REPO, 8)
+        query = sent[0]
+        self.assertEqual(query.count("{"), query.count("}"))
+        start = query.index("{", query.index("pullRequest(number:"))
+        depth, end = 1, start + 1
+        while depth and end < len(query):
+            depth += {"{": 1, "}": -1}.get(query[end], 0)
+            end += 1
+        selection = query[start:end]
+        for field in ("commits(last:1)", "reviewThreads(", "files(", "reviews(last:100)"):
+            self.assertIn(field, selection)
 
     def test_status_asks_for_every_field_merge_ready_reads(self):
         ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}], "body": ""}
