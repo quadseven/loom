@@ -738,7 +738,9 @@ To set a model by hand on a first attempt or any other move, use
 Every lane pull request carries one change class (`class:<name>`, set by the
 runner from its changed files; docs/LANES.md). The merge rule follows it, so
 a cheap change lands fast and a dangerous one never lands on the factory's
-say-so alone:
+say-so alone. The runner sets the class when it opens the pull request; a fix
+round can add files of a higher class, so the factory reclassifies each new
+head commit from its files and raises the label to match, never lowering it:
 
 - `docs` and `tests`: the factory lands them on green checks and a review
   pass on the head commit alone.
