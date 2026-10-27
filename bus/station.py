@@ -9341,9 +9341,53 @@ class Station:
             issues = state.get("issues")
             if not isinstance(issues, dict):
                 issues = state["issues"] = {}
+            subjects = state.get("subjects")
+            if not isinstance(subjects, dict):
+                subjects = state["subjects"] = {}
             invariants.Filer(self.gh, goal[0], goal[1], issues, self.now, _say,
-                             write=not self._deferred(), authors=self.s.authors).run(breaches)
+                             write=not self._deferred(), authors=self.s.authors,
+                             subjects=subjects,
+                             settled=lambda inv, subject: self._invariant_settled(
+                                 facts, inv, subject)).run(breaches)
         invariants.save(path, state)
+
+    def _invariant_settled(self, facts: invariants.Facts, invariant: str,
+                           subject: str) -> Optional[str]:
+        """Why a gone breach's subject is settled for good, in words a public
+        issue may carry, or None (loom#2022): a lane pull request merged or
+        closed unmerged, an epic back at its ticket cap."""
+        ref = re.fullmatch(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)", subject)
+        if ref is None:
+            return None
+        if invariant == "lane-pr-stalled":
+            return self._lane_pull_settled(ref.group(1), int(ref.group(2)))
+        if invariant == "epic-over-cap":
+            return self._epic_settled(facts, subject)
+        return None
+
+    def _lane_pull_settled(self, repo: str, number: int) -> Optional[str]:
+        """How a lane pull request left the open set, or None while it is open."""
+        if any(isinstance(p, dict) and p.get("number") == number
+               for p in self._pulls.get(repo, [])):
+            return None
+        pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+        if not isinstance(pr, dict) or pr.get("state") != "closed":
+            return None
+        label = self._invariant_ref(repo, number, "pull request").label
+        if pr.get("merged_at"):
+            return "lane %s merged at %s" % (label, pr["merged_at"])
+        return "lane %s was closed unmerged at %s" % (
+            label, pr.get("closed_at") or "an unknown time")
+
+    @staticmethod
+    def _epic_settled(facts: invariants.Facts, subject: str) -> Optional[str]:
+        """An epic this pass read at or under its ticket cap, or None."""
+        for shape in facts.shapes or []:
+            for epic in shape.epics:
+                if epic.epic.key == subject and epic.tickets <= invariants.EPIC_TICKETS:
+                    return "epic %s holds %d tickets, within the cap of %d" % (
+                        epic.epic.label, epic.tickets, invariants.EPIC_TICKETS)
+        return None
 
     def _invariant_goal(self) -> Optional[Tuple[str, int]]:
         """(repo, number) of the goal home breaches are filed on: the
