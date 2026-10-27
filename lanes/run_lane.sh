@@ -127,8 +127,7 @@ keep_scanner_current() {
   if [ -d "$INFRA_PUBLIC/.git" ]; then
     if [ $((now - stamp)) -ge 3600 ]; then
       (cd "$INFRA_PUBLIC" && timeout "$NET_TIMEOUT" git fetch -q origin \
-          && timeout "$NET_TIMEOUT" git merge -q --ff-only FETCH_HEAD) >> "$LOG" 2>&1 || true
-      date +%s > "$INFRA_PUBLIC_STAMP"
+          && timeout "$NET_TIMEOUT" git merge -q --ff-only FETCH_HEAD) >> "$LOG" 2>&1 && date +%s > "$INFRA_PUBLIC_STAMP"
     fi
     return 0
   fi
