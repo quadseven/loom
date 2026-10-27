@@ -3058,6 +3058,21 @@ class EscalateTests(unittest.TestCase):
         note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
         self.assertIn("Skipped rung 2: lane codex load is 5", note)
 
+    def test_escalate_spreads_rung_one_overflow_to_rung_two(self):
+        from bus import factory
+        fake = Routed(ticket_routes(stuck_ticket("failed"), TWICE, [], free=("claude", "codex")))
+
+        def count_load(instance):
+            instance.load.update({"claude": 5, "codex": 1})
+
+        authors = (os.environ.get("LOOM_BRIEF_AUTHORS", "") + " " + BRAIN).strip()
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": authors}), \
+                unittest.mock.patch.object(factory.Factory, "count_load", count_load):
+            outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
+        note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
+        self.assertIn("Skipped rung 1: lane claude load is 5", note)
+
     def test_escalate_keeps_rung_order_when_one_lane_is_at_the_limit(self):
         from bus import factory
         fake = Routed(ticket_routes(
