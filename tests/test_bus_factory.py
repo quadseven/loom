@@ -263,6 +263,7 @@ class Base(unittest.TestCase):
         self.gh = FakeGitHub()
         # Each test's pull request reuses head shas; the reclass memo is per station process.
         factory._CLASSED.clear()
+        factory._KEPT_AT.clear()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
         self.humans = []
         self.placed = []
@@ -992,6 +993,23 @@ class PullRequests(Base):
             self.go()
         self.assertEqual((self.merged, self.fixed), ([], []))
         self.assertEqual([w for w in self.gh.writes if w[1].endswith("/update-branch")], [])
+
+    def test_held_pull_requests_behind_their_base_take_turns_being_kept_current(self):
+        # 2026-10-27: one held pull request (the first in landing order) took
+        # the repo's one keep-current slot pass after pass as merges kept
+        # putting it behind again, so green sensitive ones fell 10 to 71
+        # commits behind and never reached the brain's merge gate.
+        for ticket, number, created in ((5, 50, 7200), (6, 60, 3600)):
+            self.gh.ticket(ticket, "pr")
+            self.gh.pull(number, ticket, created=created)
+            self.gh.behind[number] = 3
+        with mock.patch.object(factory.Factory, "_operator_holds", return_value=True):
+            self.go()
+            self.go()
+        updated = [w[1] for w in self.gh.writes if w[1].endswith("/update-branch")]
+        self.assertEqual(updated, ["/repos/%s/pulls/50/update-branch" % REPO,
+                                   "/repos/%s/pulls/60/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
 
     def test_a_held_pull_request_whose_update_is_refused_is_not_sent_back(self):
         self.gh.ticket(5, "pr")
