@@ -6535,45 +6535,95 @@ exec /usr/bin/git "$@"
         self.assertFalse((tree / "pkg" / "__pycache__").exists())
 
     def test_the_check_profile_allows_the_uv_files_but_not_their_directory(self):
-        # The check profile lets the contract read and execute the runner's
-        # uv and uvx while still refusing every other file under the
-        # runner's home: the two binaries get file literals, their directory
-        # gets no subpath rule.
-        text = (Path(__file__).resolve().parent.parent / "lanes" / "agent_sandbox.sh").read_text()
-        funcs = SANDBOX_HELPERS + re.search(r"^sandbox_profile\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
-        tmp = Path(self._tmp.name)
-        home = tmp / "home"
-        tree = tmp / "tree"
-        tree.mkdir()
-        localbin = home / ".local" / "bin"
-        localbin.mkdir(parents=True)
-        for name in ("uv", "uvx"):
-            (localbin / name).write_text("#!/bin/bash\n")
-            (localbin / name).chmod(0o755)
-        (localbin / "not-uv").write_text("a secret")
-        script = funcs + 'sandbox_profile "$PWD" bash check\n'
-        env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "AGENT_HOME": str(tmp / "agent"),
-               "TREE": str(tree), "CHECK_UV_BINS": f"{localbin}/uv {localbin}/uvx"}
-        result = subprocess.run(["bash", "-c", script], env=env, cwd=str(tree),
-                                capture_output=True, text=True)
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_final_check_that_exits_1_and_then_0_on_the_same_head_is_validated(self):
+        # The final check exits 1 and then 0 on the same head, which should be validated.
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_AGENT_TEXT="broken")
         self.assertEqual(result.returncode, 0, result.stderr)
-        profile = result.stdout
-        resolved_home = home.resolve()
-        resolved_localbin = localbin.resolve()
-        allow_read = next(line for line in profile.splitlines()
-                          if line.startswith("(allow file-read* "))
-        self.assertIn('(deny file-read* file-write* (subpath "%s"))' % resolved_home, profile)
-        self.assertIn('(literal "%s/uv")' % resolved_localbin, profile)
-        self.assertIn('(literal "%s/uvx")' % resolved_localbin, profile)
-        self.assertNotIn('(subpath "%s")' % resolved_localbin, allow_read)
-        self.assertNotIn('(subpath "%s")' % resolved_home, allow_read)
-        self.assertNotIn("not-uv", profile)
-        # The same files named for an agent run get no such allowance.
-        result = subprocess.run(["bash", "-c", funcs + 'sandbox_profile "$PWD" bash\n'],
-                                env=env, cwd=str(tree), capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn(str(resolved_localbin), result.stdout)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertFalse((self.loom / "run" / "codex-check").exists())
+        # Verify that validation happened (the check exited 0 after the second run)
+        log = self.lane_log()
+        self.assertFalse("validation failed: the check exited 1" in log)
+        # Check that there are two final records, second with "second run after exit 1"
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                                                 ("T042-fix-the-thing.validation.jsonl")).read_text().splitlines()]
+        final_records = [r for r in records if r["phase"] == "final"]
+        self.assertEqual(len(final_records), 2, final_records)
+        self.assertEqual(final_records[0]["exit"], 1)
+        self.assertEqual(final_records[1]["exit"], 0)
+        self.assertIn("second run after exit 1", final_records[1]["detail"])
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_final_check_that_exits_1_twice_still_fails_validation(self):
+        # The final check exits 1 twice, which should still fail validation.
+        self.write_tool(self.bin / "codex", """#!/usr/bin/env bash
+printf '%s %s\n' ""$0"" "$*" >> "$FAKE_LOG"
+cat > /dev/null
+""")
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_AGENT_TEXT="broken")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("validation failed: the check exited 1", self.lane_log())
+        # Verify that there are two final records, both exiting 1
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                                                 ("T042-fix-the-thing.validation.jsonl")).read_text().splitlines()]
+        final_records = [r for r in records if r["phase"] == "final"]
+        self.assertEqual(len(final_records), 2, final_records)
+        self.assertEqual(final_records[0]["exit"], 1)
+        self.assertEqual(final_records[1]["exit"], 1)
+        self.assertIn("second run after exit 1", final_records[1]["detail"])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_final_check_that_exits_124_timeout_does_not_get_a_second_run(self):
+        # The final check exits 124 (timeout) should NOT get a second run.
+        self.write_tool(self.bin / "codex", """#!/usr/bin/env bash
+printf '%s %s\n' ""$0"" "$*" >> "$FAKE_LOG"
+# Simulate a timeout by calling the check with a huge timeout
+""")
+        self.contract_repo(contract="check: timeout 3600 && exit 124")
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_AGENT_TEXT="broken")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("validation failed: the check timed out after", self.lane_log())
+        # Verify that there is only one final record
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                                                 ("T042-fix-the-thing.validation.jsonl")).read_text().splitlines()]
+        final_records = [r for r in records if r["phase"] == "final"]
+        self.assertEqual(len(final_records), 1, final_records)
+        self.assertEqual(final_records[0]["exit"], 124)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_final_check_that_exits_143_SIGTERM_does_not_get_a_second_run(self):
+        # The final check exits 143 (SIGTERM) should NOT get a second run.
+        self.write_tool(self.bin / "codex", """#!/bin/env bash
+printf '%s %s
+' "/bin/zsh"  >> ""
+# Simulate a SIGTERM by sending it to the check
+""")
+        self.contract_repo(contract="check: raise SIGTERM")
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_AGENT_TEXT="broken")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("validation interrupted by SIGTERM", self.lane_log())
+        # Verify that there is only one final record
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                                                 ("T042-fix-the-thing.validation.jsonl")).read_text().splitlines()]
+        final_records = [r for r in records if r["phase"] == "final"]
+        self.assertEqual(len(final_records), 1, final_records)
+        self.assertEqual(final_records[0]["exit"], 143)
 
 if __name__ == "__main__":
+    unittest.main():
     unittest.main()

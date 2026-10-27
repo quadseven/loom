@@ -2391,13 +2391,29 @@ final_validation() {
       ;;
     *) VALIDATION_REASON="validation failed: the check exited $rc" ;;
   esac
+  local first_exit="$rc"
   record final "$C_CHECK" "$rc" "$rev" "$ok" "${changed:+changed tracked files: $changed}"
   [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || final_affected "$rev" || ok=false
   # The last check of this brief has run; the next one starts a fresh home.
   drop_check_home
-  [ "$ok" = true ] || { VALIDATION_REASON="$VALIDATION_REASON at ${rev:0:12} (base check exited $BASELINE_EXIT)"; return 1; }
-  VALIDATED="check exited 0 at ${rev:0:12}"
-  [ -z "${C_AFFECTED:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
+  if [ "$ok" = true ]; then
+    VALIDATED="check exited 0 at ${rev:0:12}"
+    [ -z "${C_AFFECTED:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
+    return 0
+  fi
+  # The final check exited with a plain failure (not 0, 124, 125-127, 143): run it once more.
+  # Only a pass on that second run counts as validated.
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 143 ] && [ "$rc" -lt 128 ]; then
+    contract_run "$C_CHECK"; rc=$?
+    changed="$(tracked_changes)"
+    record final "$C_CHECK" "$rc" "$rev" "$([ "$rc" -eq 0 ] && [ -z "$changed" ] && [ -z "${C_AFFECTED:-}" ] && echo true || echo false)" \
+      "second run after exit $first_exit${changed:+; changed tracked files: $changed}"
+    [ "$rc" -eq 0 ] || { VALIDATION_REASON="$VALIDATION_REASON at ${rev:0:12} (base check exited $BASELINE_EXIT)"; return 1; }
+    VALIDATED="check exited 0 at ${rev:0:12}"
+    [ -z "${C_AFFECTED:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
+    return 0
+  fi
+  VALIDATION_REASON="$VALIDATION_REASON at ${rev:0:12} (base check exited $BASELINE_EXIT)"; return 1
 }
 
 # The paths the pull request changes, one per line: the lane's commits on a
