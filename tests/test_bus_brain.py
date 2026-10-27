@@ -3050,7 +3050,9 @@ class EscalateTests(unittest.TestCase):
         def count_load(instance):
             instance.load.update({"codex": 5, "claude": 1})
 
-        with unittest.mock.patch.object(factory.Factory, "count_load", count_load):
+        authors = (os.environ.get("LOOM_BRIEF_AUTHORS", "") + " " + BRAIN).strip()
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": authors}), \
+                unittest.mock.patch.object(factory.Factory, "count_load", count_load):
             outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
         self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
         note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
@@ -3065,7 +3067,9 @@ class EscalateTests(unittest.TestCase):
         def count_load(instance):
             instance.load.update({"codex": factory.ONE_LANE_MAX - 1, "claude": 1})
 
-        with unittest.mock.patch.object(factory.Factory, "count_load", count_load):
+        authors = (os.environ.get("LOOM_BRIEF_AUTHORS", "") + " " + BRAIN).strip()
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": authors}), \
+                unittest.mock.patch.object(factory.Factory, "count_load", count_load):
             outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
         self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
 
