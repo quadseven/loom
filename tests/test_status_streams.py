@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import time
+import types
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
@@ -14,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import audit, brain, per_repo
+from bus.github import GitHubError
 
 FAST = "example-owner/fast"
 HANG = "example-owner/hang"
@@ -217,3 +219,62 @@ class ReadsSideBySideTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SideBySideKeepsPerItemOutcomesTest(unittest.TestCase):
+    """Reading items side by side keeps each item's outcome as the loop that
+    read them in turn had it (loom#2058 review): an item GitHub will not show
+    is named and the others are read; any other error still ends the read,
+    as loom#800 requires."""
+
+    @staticmethod
+    def marks(*numbers: int) -> list:
+        return [types.SimpleNamespace(item=(FAST, n)) for n in numbers]
+
+    def test_an_unreadable_item_among_several_is_named_and_the_others_read_in_order(self) -> None:
+        def revision(gh, repo, number):
+            if number == 2:
+                raise GitHubError("gone", 404, '{"message": "Not Found"}')
+            return "rev-%d" % number
+        with mock.patch.object(brain, "item_revision", revision):
+            current, gone = brain._item_revisions(None, self.marks(1, 2, 3, 1), {})
+        self.assertEqual(list(current.items()), [((FAST, 1), "rev-1"), ((FAST, 3), "rev-3")])
+        self.assertEqual(gone, {(FAST, 2): "HTTP 404 Not Found"})
+
+    def test_an_item_in_a_skipped_repo_is_not_read(self) -> None:
+        with mock.patch.object(brain, "item_revision", mock.Mock(side_effect=AssertionError)):
+            current, gone = brain._item_revisions(None, self.marks(1), {FAST: "HTTP 404 x"})
+        self.assertEqual((current, gone), ({}, {(FAST, 1): "HTTP 404 x"}))
+
+    def test_any_other_github_error_still_ends_the_item_read(self) -> None:
+        def revision(gh, repo, number):
+            if number == 2:
+                raise GitHubError("server", 502, "")
+            return "rev"
+        with mock.patch.object(brain, "item_revision", revision):
+            with self.assertRaises(GitHubError):
+                brain._item_revisions(None, self.marks(1, 2, 3), {})
+
+    def test_a_history_error_ends_the_histories_read_as_the_loop_did(self) -> None:
+        # _history never caught a GitHubError per ticket: the old dict
+        # comprehension let the first one end the repo's read, so a fault
+        # never reads as a ticket with no history. That stays.
+        def history(gh, repo, issue, *args):
+            if issue["number"] == 2:
+                raise GitHubError("gone", 404, "")
+            return issue["number"]
+        found = [{"number": n, "labels": [{"name": "loom:failed"}], "updated_at": str(n)}
+                 for n in (1, 2, 3)]
+        with mock.patch.object(brain, "_history", history):
+            with self.assertRaises(GitHubError):
+                brain._histories(None, FAST, found, NOW)
+
+    def test_histories_keep_the_ticket_order(self) -> None:
+        def history(gh, repo, issue, *args):
+            time.sleep(0.05 if issue["number"] == 1 else 0)
+            return "h%d" % issue["number"]
+        found = [{"number": n, "labels": [{"name": "loom:failed"}], "updated_at": str(n)}
+                 for n in (1, 2, 3)]
+        with mock.patch.object(brain, "_history", history):
+            got, _ = brain._histories(None, FAST, found, NOW)
+        self.assertEqual(list(got.items()), [(1, "h1"), (2, "h2"), (3, "h3")])
