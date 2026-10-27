@@ -4209,14 +4209,10 @@ class Station:
 
     @staticmethod
     def _unbuilt_criteria(ticket: dict, merged: Sequence[dict]) -> List[str]:
-        """The ticket's criteria that no merged pull request for it ticks or
-        marks "not built: <reason>" (the factory's own reading of a body)."""
-        body = str(ticket.get("body") or "")
-        left = factory.missing_criteria(body, str(merged[0].get("body") or ""))
-        for other in merged[1:]:
-            answered = set(left) - set(factory.missing_criteria(body, str(other.get("body") or "")))
-            left = [text for text in left if text not in answered]
-        return left
+        """The ticket's code criteria that no merged pull request for it ticks
+        built: a box marked "not built: <reason>" is still unbuilt (loom#2026)."""
+        return factory.unbuilt_criteria(str(ticket.get("body") or ""),
+                                        [str(pr.get("body") or "") for pr in merged])
 
     def _reconcile_adoptions(self, repo: str, open_tickets: List[Dict[str, Any]]) -> None:
         """Move each open adoption ticket to loom:merged once the pull
