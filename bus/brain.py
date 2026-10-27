@@ -1084,12 +1084,16 @@ def _verify_due_lines(due: List[Tuple[datetime, Dict[str, Any]]], now: datetime)
     return lines if due else lines + ["- none"]
 
 
-def _lane_status(gh: GitHub, lanes_repo: str) -> str:
+def _lane_status(gh: GitHub, lanes_repo: str,
+                 authors: Optional[Sequence[str]] = None) -> str:
+    """The newest lane status comment a trusted login wrote: a stranger's
+    copy of the marker is not printed, nor picks a lane."""
     found = [i for i in _issues(gh, lanes_repo) if "loom:lanes" in _labels(i)]
     if not found:
         return "no lane status yet"
-    comments = gh.paginate("/repos/%s/issues/%s/comments" % (lanes_repo, found[0]["number"]))
-    marked = [c for c in comments if c.get("body", "").startswith(LANES_MARKER)]
+    comments = trusted_comments(
+        gh.paginate("/repos/%s/issues/%s/comments" % (lanes_repo, found[0]["number"])), authors)
+    marked = [c for c in comments if str(c.get("body") or "").startswith(LANES_MARKER)]
     if not marked:
         return "no lane status yet"
     return max(marked, key=lambda c: c.get("created_at", ""))["body"]
@@ -1127,7 +1131,7 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     out += [""] + validation_gap_lines(env)
     for section in sections:
         out += section
-    out += ["", "## Lane status", _lane_status(gh, lanes_repo)]
+    out += ["", "## Lane status", _lane_status(gh, lanes_repo, authors)]
     return "\n".join(out)
 
 
@@ -1795,20 +1799,32 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     intake epic of the goal with room; when no intake epic has room and the
     goal is under its open epic cap, a new intake epic opens the way triage
     opens one; otherwise the rest stay where they are. An epic, an ask and a
-    closed issue are never moved. Returns (moved, left)."""
+    closed issue are never moved.
+
+    An open ticket under an epic that is closed (a person's tool closes an
+    epic once its sub-issues are closed, but a ticket that names the epic by
+    its Part of line stays open under it) moves the same way, and its Part of
+    line then names the new epic; the closed epic stays closed (loom#1925).
+    A ticket that also sits under an open epic stays there. Returns (moved,
+    left)."""
     loose, tree = goal_tree(gh, repo, goal)
-    tickets = _outside_tickets(loose, goal)
+    tickets = [(t, goal) for t in _outside_tickets(loose, goal)]
+    seen = {int(t.get("number") or 0) for t, _ in tickets}
+    tickets += [(t, old) for t, old in _closed_epic_tickets(tree)
+                if int(t.get("number") or 0) not in seen]
     if not tickets:
         return (0, 0)
+    tickets.sort(key=lambda pair: (str(pair[0].get("created_at") or ""),
+                                   int(pair[0].get("number") or 0)))
     moved = 0
     epic, held = _intake_with_room(tree)
-    for ticket in tickets:
+    for ticket, old in tickets:
         if epic is None or held >= EPIC_TICKET_CAP:
             opened = _open_intake_epic(gh, repo, goal)
             if opened is None:
                 break
             epic, held = opened
-        if _move_to_epic(gh, repo, epic, ticket, goal):
+        if _move_to_epic(gh, repo, epic, ticket, old):
             moved += 1
             held += 1
     return (moved, len(tickets) - moved)
@@ -1820,14 +1836,7 @@ def _outside_tickets(loose: List[Dict[str, Any]], goal: int) -> List[Dict[str, A
     whose parent is the goal itself or nobody."""
     found: List[Dict[str, Any]] = []
     for issue in loose:
-        if issue.get("state") != "open" or "pull_request" in issue:
-            continue
-        names = _labels(issue)
-        if "loom:ticket" not in names or "epic" in names or "needs-operator" in names:
-            continue
-        if not issue.get("id"):
-            # GitHub names every issue an id; one read without it cannot be
-            # linked as a sub-issue, so it stays where it is.
+        if not _movable_ticket(issue):
             continue
         parent = _sub_issue_parent(issue)
         if parent is not None and parent != goal:
@@ -1836,6 +1845,44 @@ def _outside_tickets(loose: List[Dict[str, Any]], goal: int) -> List[Dict[str, A
     found.sort(key=lambda issue: (str(issue.get("created_at") or ""),
                                   int(issue.get("number") or 0)))
     return found
+
+
+def _movable_ticket(issue: Dict[str, Any]) -> bool:
+    """An open loom:ticket that is not an epic, an ask or a pull request, and
+    that GitHub named an id: GitHub names every issue an id, and one read
+    without it cannot be linked as a sub-issue, so it stays where it is."""
+    if issue.get("state") != "open" or "pull_request" in issue:
+        return False
+    names = _labels(issue)
+    if "loom:ticket" not in names or "epic" in names or "needs-operator" in names:
+        return False
+    return bool(issue.get("id"))
+
+
+def _closed_epic_tickets(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
+                         ) -> List[Tuple[Dict[str, Any], int]]:
+    """(ticket, its closed epic) for each open ticket of a closed epic of the
+    goal: a sub-issue of the closed epic, or a ticket whose Part of line names
+    it and that is a sub-issue of nothing else. A ticket that an open epic
+    also holds is left out: it already sits under an open epic."""
+    held_open = {int(t.get("number") or 0) for e, found in tree
+                 if e.get("state", "open") == "open" for t in found}
+    out: List[Tuple[Dict[str, Any], int]] = []
+    seen = set()
+    for epic, found in tree:
+        if epic.get("state", "open") == "open":
+            continue
+        number = int(epic.get("number") or 0)
+        for issue in found:
+            n = int(issue.get("number") or 0)
+            if not n or n in seen or n in held_open or not _movable_ticket(issue):
+                continue
+            parent = _sub_issue_parent(issue)
+            if parent is not None and parent != number:
+                continue
+            out.append((issue, number))
+            seen.add(n)
+    return out
 
 
 def _open_count(tickets: List[Dict[str, Any]]) -> int:
@@ -1871,8 +1918,9 @@ def _open_intake_epic(gh: GitHub, repo: str, goal: int) -> Optional[Tuple[int, i
 
 
 def _move_to_epic(gh: GitHub, repo: str, epic: int, ticket: Dict[str, Any], goal: int) -> bool:
-    """Move the ticket under the epic: the epic's sub-issue link replaces the
-    goal as its parent, and the ticket's Part of line names the epic. False
+    """Move the ticket under the epic: the epic's sub-issue link replaces its
+    old parent `goal` (the goal, or the closed epic it sat under), and the
+    ticket's Part of line names the epic instead of the old parent. False
     when GitHub refuses the link."""
     parent = _sub_issue_parent(ticket)
     if not _link_to_goal(gh, repo, epic, ticket, under=goal if parent == goal else None):
@@ -3960,6 +4008,64 @@ def trusted_authors(env: Optional[Dict[str, str]] = None) -> List[str]:
     return raw.replace(",", " ").split()
 
 
+def comment_login(comment: Any) -> str:
+    """The login that wrote a comment, in the form LOOM_BRIEF_AUTHORS uses:
+    REST's user.login, else GraphQL's author.login (rest_login, so an App
+    reads as "<slug>[bot]" and a person with the bare slug does not)."""
+    if not isinstance(comment, dict):
+        return ""
+    user = comment.get("user")
+    if isinstance(user, dict) and user.get("login"):
+        return str(user.get("login"))
+    author = comment.get("author")
+    return rest_login(author if isinstance(author, dict) else None)
+
+
+def trusted_comments(comments: Any, authors: Optional[Sequence[str]] = None
+                     ) -> List[Dict[str, Any]]:
+    """The comments a trusted login wrote (case-insensitive), in order;
+    `authors` defaults to trusted_authors(). Anyone can comment on a public
+    repo, and docs/BRAIN.md reads every other comment as data, never as an
+    instruction or a marker. Applied where a reader takes a marker or a body,
+    never inside GitHub.paginate: some readers read other Apps' comments."""
+    trusted = {a.lower() for a in (trusted_authors() if authors is None else authors) if a}
+    return [c for c in comments or ()
+            if isinstance(c, dict) and comment_login(c).lower() in trusted]
+
+
+def _by_review_bot(comment: Dict[str, Any], bot: str) -> bool:
+    """Written by the review bot: by_bot (a Bot author with the bare login),
+    or a login already in the "<slug>[bot]" form, which no person can take."""
+    bare = bot.strip()
+    bare = bare[:-5] if bare.lower().endswith("[bot]") else bare
+    return (by_bot(comment, bare)
+            or comment_login(comment).lower() == (bare + "[bot]").lower())
+
+
+def trusted_review_threads(threads: Sequence[Dict[str, Any]], bot: str,
+                           authors: Sequence[str]) -> List[Dict[str, Any]]:
+    """The open threads factory.trusted_threads keeps (the root comment by the
+    review bot or a trusted login), each with only the comments the review
+    bot or a trusted login wrote: a stranger's thread, or a stranger's reply
+    on a bot thread, is never quoted into a fix brief."""
+    trusted = {a.lower() for a in authors if a}
+
+    def ours(comment: Any) -> bool:
+        return isinstance(comment, dict) and (
+            _by_review_bot(comment, bot) or comment_login(comment).lower() in trusted)
+
+    out = []
+    for thread in threads:
+        if thread.get("isResolved"):
+            continue
+        nodes = (thread.get("comments") or {}).get("nodes") or []
+        if not nodes or not ours(nodes[0]):
+            continue
+        kept = [c for c in nodes if ours(c)]
+        out.append(dict(thread, comments=dict(thread.get("comments") or {}, nodes=kept)))
+    return out
+
+
 _NO_TRUST = ("%s trusts no login: LOOM_BRIEF_AUTHORS is empty. Set it to the operator's "
              "login and the Loom App's bot login (<app-slug>[bot]); without it every "
              "journal, report and handoff is skipped and every stage reads as open")
@@ -4075,7 +4181,8 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
     kept = closing_labels(names, trusted_authors(env))
     if kept != names:
         gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
-    return settle_source(gh, repo, number, issue.get("body"), reason, proof_url)
+    return settle_source(gh, repo, number, issue.get("body"), reason, proof_url,
+                         authors=trusted_authors(env))
 
 
 # The close-completeness guard's escape hatch (bus/github.py): a close by
@@ -4109,11 +4216,13 @@ def _said_for(comments: List[Dict[str, Any]], ticket: int) -> Optional[str]:
     return said[-1] if said else None
 
 
-def _paired_source(gh: GitHub, repo: str, number: int, body: Any
+def _paired_source(gh: GitHub, repo: str, number: int, body: Any,
+                   authors: Optional[Sequence[str]] = None
                    ) -> Optional[Tuple[int, Dict[str, Any], List[Dict[str, Any]]]]:
     """The issue ticket #number was rewritten from, with its comments, when
     the ticket names it and the issue proves the pairing: labelled
-    loom:rewritten and carrying the rewrite comment that names this ticket.
+    loom:rewritten and carrying the rewrite comment that names this ticket,
+    written by a trusted login (`authors`, default trusted_authors()).
     A "Refs #M" line to any other issue is not a source."""
     source = rewritten_from(body)
     if source is None or source == number:
@@ -4121,8 +4230,9 @@ def _paired_source(gh: GitHub, repo: str, number: int, body: Any
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, source)).data or {}
     if "pull_request" in issue or "loom:rewritten" not in _labels(issue):
         return None
-    comments = [c for c in gh.paginate("/repos/%s/issues/%d/comments" % (repo, source))
-                if isinstance(c, dict)]
+    # Trusted comments only: the pairing and what Loom said on the source.
+    comments = trusted_comments(gh.paginate("/repos/%s/issues/%d/comments" % (repo, source)),
+                                authors)
     said = "Rewritten as ticket #%d," % number
     if not any(TRIAGE_MARKER in str(c.get("body") or "") and said in str(c.get("body") or "")
                for c in comments):
@@ -4131,7 +4241,8 @@ def _paired_source(gh: GitHub, repo: str, number: int, body: Any
 
 
 def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
-                  proof_url: str = "", unproven: bool = False) -> Optional[str]:
+                  proof_url: str = "", unproven: bool = False,
+                  authors: Optional[Sequence[str]] = None) -> Optional[str]:
     """Settle the issue ticket #number was rewritten from, once the ticket is
     verified or closed. Completed (verified, or closed as completed) closes
     the source as completed with a comment naming the ticket and its proof;
@@ -4147,7 +4258,7 @@ def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
     if reason not in ("completed", "not_planned"):
         raise ValueError("reason is completed or not_planned")
     try:
-        found = _paired_source(gh, repo, number, body)
+        found = _paired_source(gh, repo, number, body, authors)
         if found is None:
             return None
         source, issue, comments = found
@@ -4207,12 +4318,13 @@ def _proof_words(number: int, proof_url: str) -> str:
     return "its proof is on ticket #%d" % number
 
 
-def reopen_source(gh: GitHub, repo: str, number: int, body: Any) -> Optional[str]:
+def reopen_source(gh: GitHub, repo: str, number: int, body: Any,
+                  authors: Optional[Sequence[str]] = None) -> Optional[str]:
     """Reopen the issue ticket #number was rewritten from when Loom closed it
     for that ticket's proof and an audit has since failed that proof. A
     source a person closed, or one Loom never closed, is left alone."""
     try:
-        found = _paired_source(gh, repo, number, body)
+        found = _paired_source(gh, repo, number, body, authors)
         if found is None:
             return None
         source, issue, comments = found
@@ -4274,7 +4386,7 @@ def audit_proof(gh: GitHub, repo: str, number: int, result: str, note: str,
     move(gh, repo, number, "shipped", note=comment)
     said = "audit of %s#%d failed: back to shipped, lane %s held" % (
         repo, number, audit.lane_of(found[1]))
-    source = reopen_source(gh, repo, number, issue.get("body"))
+    source = reopen_source(gh, repo, number, issue.get("body"), authors)
     return said if source is None else "%s; %s" % (said, source)
 
 
@@ -4417,7 +4529,14 @@ def _failing_checks(gh: GitHub, repo: str, sha: str) -> List[Tuple[str, str]]:
     return found
 
 
-def _open_threads(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
+def _open_threads(gh: GitHub, repo: str, number: int, bot: Optional[str] = None,
+                  authors: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
+    """The unresolved review threads a fix brief may quote: those
+    trusted_review_threads keeps, with only trusted comments. `bot` defaults
+    to LOOM_REVIEW_BOT (else the factory's), `authors` to trusted_authors()."""
+    from . import factory  # factory imports this module
+    if bot is None:
+        bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     owner, name = repo.split("/", 1)
     query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
              ' reviewThreads(first:100) { nodes { id isResolved path line originalLine'
@@ -4426,7 +4545,8 @@ def _open_threads(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
     data = gh.graphql(query) or {}
     pr = (data.get("repository") or {}).get("pullRequest") or {}
     threads = (pr.get("reviewThreads") or {}).get("nodes") or []
-    return [t for t in threads if not t.get("isResolved")]
+    return trusted_review_threads(threads, bot,
+                                  trusted_authors() if authors is None else authors)
 
 
 _TICKET_REF = re.compile(r"^Refs ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)[ \t]*$", re.M)
@@ -4619,13 +4739,15 @@ def _generic_fix_notes(notes: str) -> bool:
 
 
 def _repeats_last_fix(gh: GitHub, ticket: Tuple[str, int], issue: Dict[str, Any],
-                      digest: str) -> bool:
-    """Is the newest loom:fix comment on the ticket for this same head and
-    these same findings? (loom#1106 got six byte-identical ones in a day.)"""
+                      digest: str, authors: Optional[Sequence[str]] = None) -> bool:
+    """Is the newest trusted loom:fix comment on the ticket for this same head
+    and these same findings? (loom#1106 got six byte-identical ones in a day.)
+    A stranger's copy of the marker does not suppress a send-back."""
     if not int(issue.get("comments") or 0):
         return False
-    for comment in reversed(gh.paginate("/repos/%s/issues/%d/comments" % ticket)):
-        body = str(comment.get("body") or "") if isinstance(comment, dict) else ""
+    comments = trusted_comments(gh.paginate("/repos/%s/issues/%d/comments" % ticket), authors)
+    for comment in reversed(comments):
+        body = str(comment.get("body") or "")
         if body.startswith(FIX_MARKER):
             found = FIX_KEY_RE.search(body)
             return bool(found) and found.group(1) == digest
@@ -4633,19 +4755,21 @@ def _repeats_last_fix(gh: GitHub, ticket: Tuple[str, int], issue: Dict[str, Any]
 
 
 def _fix_refusal(gh: GitHub, ticket: Tuple[str, int], issue: Dict[str, Any], notes: str,
-                 found: Tuple[List[Any], List[Any], bool], sha: str, digest: str) -> str:
+                 found: Tuple[List[Any], List[Any], bool], sha: str, digest: str,
+                 authors: Optional[Sequence[str]] = None) -> str:
     """Why a send-back would say nothing new, or "": the stock notes with no
     failing check, no open thread and no conflict; or the same head, findings
     and worker as the newest loom:fix comment on the ticket."""
     if not any(found) and _generic_fix_notes(notes):
         return "it has no failing check, no open thread and no conflict"
-    if sha and _repeats_last_fix(gh, ticket, issue, digest):
+    if sha and _repeats_last_fix(gh, ticket, issue, digest, authors):
         return "the newest loom:fix comment holds this head and these findings"
     return ""
 
 
 def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
-        lane: Optional[str] = None, model: Optional[str] = None) -> bool:
+        lane: Optional[str] = None, model: Optional[str] = None,
+        authors: Optional[Sequence[str]] = None) -> bool:
     """Send a lane's pull request back to the lane: the failing checks and the
     unresolved review threads go on the ticket as a loom:fix comment, and the
     ticket moves from loom:pr back to loom:briefed on the same lane, or on
@@ -4655,7 +4779,10 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     stderr and no comment, label or model change, when the stock notes are all
     there is (no failing check, no open thread, no conflict), and when the
     newest loom:fix comment on the ticket already holds this head and these
-    findings. Returns True when it sent the pull request back."""
+    findings. Returns True when it sent the pull request back.
+
+    Only trusted comments count (trusted_comments, trusted_review_threads):
+    `authors` defaults to trusted_authors(); the factory passes its own."""
     if lane is not None and lane not in LANES:
         raise ValueError("unknown lane")
     if lane is not None and lane in REMOTE_LANES:
@@ -4667,10 +4794,11 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     _check_fix(repo, pr, ticket, issue, lane)
     sha = str((pr.get("head") or {}).get("sha") or "")
     checks = _failing_checks(gh, repo, sha) if sha else []
-    threads = _open_threads(gh, repo, number)
+    threads = _open_threads(gh, repo, number, authors=authors)
     conflict = pr.get("mergeable") is False
     digest = _fix_digest(sha, notes, checks, threads, conflict, lane, model)
-    why = _fix_refusal(gh, ticket, issue, notes, (checks, threads, conflict), sha, digest)
+    why = _fix_refusal(gh, ticket, issue, notes, (checks, threads, conflict), sha, digest,
+                       authors)
     if why:
         print("brain: not sending %s#%d back for %s#%d: %s"
               % (repo, number, ticket[0], ticket[1], why), file=sys.stderr)
@@ -5265,7 +5393,8 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
     number = int(issue["number"])
     events = gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
     comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-    bodies = _bodies(comments)
+    # Fixes, tried models, claim times and rungs count trusted comments only.
+    bodies = _bodies(trusted_comments(comments, authors or trusted_authors()))
     labelled = [(str(e.get("event")), str((e.get("label") or {}).get("name") or ""), _when(e.get("created_at")))
                 for e in events if isinstance(e, dict)]
     failed = sum(1 for kind, name, _ in labelled if kind == "labeled" and name == "loom:failed")
@@ -5325,8 +5454,10 @@ def _stuck_marks(histories: Dict[int, History], skipped: List[int]) -> Dict[int,
     return marks
 
 
-def _available_lanes(gh: GitHub, lanes_repo: str) -> List[str]:
-    rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", _lane_status(gh, lanes_repo), re.M)
+def _available_lanes(gh: GitHub, lanes_repo: str,
+                     authors: Optional[Sequence[str]] = None) -> List[str]:
+    rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", _lane_status(gh, lanes_repo, authors),
+                      re.M)
     return rows
 
 

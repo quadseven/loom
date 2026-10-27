@@ -526,7 +526,7 @@ bugs_part() {
 }
 
 pr_body() {
-  local size issue refs="" criteria ops bugs
+  local size issue refs="" criteria ops bugs why summary
   issue="$(field Issue "$1" || true)"
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
   # The size as the review bot's letter (Medium -> M), so its plan check
@@ -552,8 +552,15 @@ pr_body() {
   # Command substitution drops the trailing blank line the format needs.
   bugs="$(bugs_part)"
   [ -z "$bugs" ] || bugs="$bugs"$'\n\n'
+  # Briefs write the change under "## What" or "## Summary"; an empty Why
+  # takes that change, so the plan check's ## Why is not empty (loom#1468).
+  # Keep in step with bus/pr_repair.py::_render_generated.
+  why="$(section Why "$1")"
+  summary="$(section What "$1")"
+  [ -n "$summary" ] || summary="$(section Summary "$1")"
+  [ -n "$why" ] || why="$summary"
   printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n## %s\n%s\n\n%s---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
-    "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$criteria" \
+    "$INTENT_TEXT" "$why" "$summary" "$criteria" \
     "$size" "$(section 'Out of scope' "$1")" "$OPERATOR_SECTION" "$ops" "$bugs" \
     "$2" "$LANE" "$MODEL" "$validated" "$refs"
 }
@@ -2076,6 +2083,21 @@ note_factory_incident() {  # kind, detail, reason_var_name
   printf -v "$3" '%s; %s' "${!3}" "$ref"
 }
 
+# A red base check, before the agent. On a cluster runner (LOOM_CLUSTER_RUNNER,
+# set by lanes/k8s/lane_job.py) it is often the runner image, and the station
+# retries the ticket on another lane, which files the incident if the base is
+# red there too: filed from the runner, it held nothing and waited for a
+# person to close it.
+note_base_check_failure() {  # kind, detail, reason_var_name
+  if [ "${LOOM_CLUSTER_RUNNER:-}" = 1 ]; then
+    PARK_CLASS=factory
+    printf -v "$3" '%s; %s' "${!3}" "no incident filed on a cluster runner: another lane runs the base check"
+    echo "base check failed on a cluster runner; no incident filed" >> "$LOG"
+    return 0
+  fi
+  note_factory_incident "$@"
+}
+
 # Run one contract command in the tree the way an API-lane agent runs: an
 # emptied environment with a scratch HOME, under the sandbox profile (its
 # second argument is the interpreter, whose directory stays readable). The
@@ -2264,7 +2286,7 @@ prepare_validation() {
     fi
     if [ "$BASELINE_EXIT" -ne 0 ]; then
       SETUP_REASON="base check exited $BASELINE_EXIT on the default branch"
-      note_factory_incident base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
       return 1
     fi
     return 0
@@ -2299,7 +2321,7 @@ prepare_validation() {
   case "$BASELINE_EXIT" in
     125|126|127)
       SETUP_REASON="validation environment unavailable: the check exited $BASELINE_EXIT on the unmodified base"
-      note_factory_incident environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+      note_base_check_failure environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
       return 1 ;;
   esac
   # One red run does not make the base red: Loom's own check timed out
@@ -2346,7 +2368,7 @@ prepare_validation() {
       BASELINE_EXIT="$DEFAULT_EXIT"
     fi
     SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
-    note_factory_incident base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+    note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
     return 1
   fi
   [ -z "$changed" ] || { SETUP_REASON="setup or check changed tracked files on the base: $changed"; return 1; }
@@ -2356,7 +2378,7 @@ prepare_validation() {
 # After the agent, on the committed branch head: the same check again. Sets
 # VALIDATION_REASON when it did not pass.
 final_validation() {
-  local rc rev changed ok=false
+  local rc first_exit rev changed ok=false
   VALIDATION_REASON=""
   safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
   rev="$(safe_git rev-parse HEAD)"
@@ -2375,6 +2397,22 @@ final_validation() {
     drop_check_home
     return 1
   fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 143 ] &&
+     [ "$rc" -ne 125 ] && [ "$rc" -ne 126 ] && [ "$rc" -ne 127 ]; then
+    first_exit="$rc"
+    record final "$C_CHECK" "$rc" "$rev" false
+    contract_run "$C_CHECK"; rc=$?
+    if validation_interpreter_denied "$rc" "$(tail -c +$((LOG_START + 1)) "$LOG")"; then
+      VALIDATION_REASON="validation environment unavailable: Python interpreter query was denied by the sandbox"
+      note_factory_incident environment "$VALIDATION_REASON" VALIDATION_REASON
+      record final "$C_CHECK" "$rc" "$rev" false "second run after exit $first_exit"
+      drop_check_home
+      return 1
+    fi
+    echo "final check exited $first_exit, then $( [ "$rc" -eq 0 ] && echo passed || printf 'exited %s' "$rc") on a second run" >> "$LOG"
+  else
+    first_exit=""
+  fi
   changed="$(tracked_changes)"
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
@@ -2391,12 +2429,13 @@ final_validation() {
       ;;
     *) VALIDATION_REASON="validation failed: the check exited $rc" ;;
   esac
-  record final "$C_CHECK" "$rc" "$rev" "$ok" "${changed:+changed tracked files: $changed}"
+  record final "$C_CHECK" "$rc" "$rev" "$ok" "${first_exit:+second run after exit $first_exit}${changed:+${first_exit:+; }changed tracked files: $changed}"
   [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || final_affected "$rev" || ok=false
   # The last check of this brief has run; the next one starts a fresh home.
   drop_check_home
   [ "$ok" = true ] || { VALIDATION_REASON="$VALIDATION_REASON at ${rev:0:12} (base check exited $BASELINE_EXIT)"; return 1; }
   VALIDATED="check exited 0 at ${rev:0:12}"
+  [ -z "$first_exit" ] || VALIDATED="final check passed on a second run at ${rev:0:12}"
   [ -z "${C_AFFECTED:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
 }
 
