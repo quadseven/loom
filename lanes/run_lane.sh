@@ -222,10 +222,8 @@ keepalive_loop() {
   rm -f "$tmp"
 }
 stop_keepalive() {
-  # Stop the loop first and reap it: killing its sleep first lets it start
-  # another round and stamp again after the rm below.
-  [ -z "$KEEPALIVE_PID" ] || { kill "$KEEPALIVE_PID" 2>/dev/null; pkill -P "$KEEPALIVE_PID" 2>/dev/null; wait "$KEEPALIVE_PID" 2>/dev/null; }
-  rm -f "$ALIVE" "$ALIVE.$$"
+  [ -z "$KEEPALIVE_PID" ] || { pkill -P "$KEEPALIVE_PID" 2>/dev/null; kill "$KEEPALIVE_PID" 2>/dev/null; }
+  rm -f "$ALIVE"
 }
 mkdir -p "$LOOM_HOME/state/usage"
 keepalive_loop $$ > /dev/null 2>&1 &
