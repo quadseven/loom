@@ -20,7 +20,9 @@ with the count and the first and last example lines (redacted, then passed
 through the written-text check). A signature already open as an issue gets a
 count comment at most once an hour, with when it was last seen: one rolling
 issue per signature. A signature not seen for a DAY has its open issue closed as
-not planned, with one comment that says when it was last seen. The issue a signature was filed on is remembered until
+not planned, with one comment that says when it was last seen; an issue that
+became a ticket closes as completed once it carries loom:shipped or
+loom:verified, and is left open to its own state machine before that. The issue a signature was filed on is remembered until
 it closes, so a signature that comes back after a quiet day, on an issue the
 brain has since retitled or relabelled, is counted there, not filed twice. Offsets and signatures are kept in the
 station's state directory (watch.json); no model is involved.
@@ -53,6 +55,7 @@ import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import handoff
+from . import naming
 from . import notify
 from . import shadow
 from . import text as _text
@@ -78,6 +81,11 @@ TITLE_MAX = 200
 EXAMPLE_MAX = 2000
 EXAMPLE_HEAD = 1200
 LABEL = "loom:triage"
+# A signature that became a ticket and shipped closes as completed, not as
+# not planned: its fix shipped (loom#1934). A ticket not yet shipped is left
+# open for its own state machine.
+SHIPPED_LABELS = ("loom:shipped", "loom:verified")
+TICKET_LABEL = "loom:ticket"
 MARKER = "<!-- loom:watch v1 -->"
 # The station prints the watcher's own lines with this prefix; they name
 # signatures (which say "error") and must never count as hits themselves.
@@ -1038,18 +1046,22 @@ class Watcher:
         self._told(rec)
         return "counted"
 
-    def _quiet_body(self, rec: Dict[str, Any]) -> str:
+    def _quiet_body(self, rec: Dict[str, Any], shipped: bool = False) -> str:
+        close = ("Its fix shipped. Closing as completed. A new sighting files or reopens it."
+                 if shipped else "Closing as not planned. A new sighting files or reopens it.")
         return "\n".join([
             MARKER,
             "This signature has not been seen for %d hours. Last seen %s."
             % (DAY // 3600,
                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_num(rec.get("last")) or self.now))),
             "",
-            "Closing as not planned. A new sighting files or reopens it."])
+            close])
 
     def _close_quiet(self, sigs: Dict[str, Any]) -> None:
         """Close the open issue of each signature not seen for a DAY, as not
-        planned. A signature that comes back files again as usual."""
+        planned, or as completed when it became a ticket that shipped. An
+        unshipped ticket is left open. A signature that comes back files
+        again as usual."""
         for key, rec in sorted(sigs.items(), key=lambda kv: kv[1].get("first", 0)):
             number = _num(rec.get("issue")) if isinstance(rec, dict) else None
             last = _num(rec.get("last")) if isinstance(rec, dict) else None
@@ -1060,17 +1072,24 @@ class Watcher:
             try:
                 issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (self.repo, int(number))).data
                 if isinstance(issue, dict) and issue.get("state") == "open":
+                    labels = set(naming.label_names(issue))
+                    shipped = bool(labels.intersection(SHIPPED_LABELS))
+                    if not shipped and TICKET_LABEL in labels:
+                        # A ticket not yet shipped: its own state machine
+                        # closes it, not a quiet signature (loom#1934). The
+                        # link is kept so a return is counted there.
+                        continue
+                    close = {"state": "closed",
+                             "state_reason": "completed" if shipped else "not_planned"}
                     # Before the note, so a close shadow mode holds (the
                     # signature became a ticket) says nothing (loom#1551).
                     if shadow.guard("PATCH", "/repos/%s/issues/%d" % (self.repo, int(number)),
-                                    {"state": "closed", "state_reason": "not_planned"}, issue,
-                                    source="watch quiet close") is not None:
+                                    close, issue, source="watch quiet close") is not None:
                         continue
-                    body = self._quiet_body(rec)
+                    body = self._quiet_body(rec, shipped)
                     _text.check(body)
                     notify.post(self.gh, self.repo, number, body, notify.CLOSED)
-                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
-                                 {"state": "closed", "state_reason": "not_planned"})
+                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number), close)
                     self.writes += 2
                     self.say("watch: closed quiet %s#%d" % (self.repo, number))
             except (GitHubError, OSError, ValueError) as err:
