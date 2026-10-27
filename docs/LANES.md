@@ -1669,10 +1669,12 @@ zen, openrouter, zai, workersai, the free provider slots and spark (both
 through the gateway). codex, claude, agy and anthropic stay local.
 
 The runner image carries the lane runner's tools, not every tool a repo's
-check calls. A check that cannot start there (exit 125 to 127 on the
-unmodified base, such as `make` or `ruff` not installed) is not held behind
-its factory incident, which that runner could never clear: the station
-retries the ticket on another lane as a transient ending.
+check calls. A base check that fails there before the agent runs (exit 125
+to 127, or any red exit on the unmodified repo or default branch: a script
+that calls a missing `g++` exits 1) is not held behind its factory incident,
+which that runner could never clear: the station retries the ticket on
+another lane as a transient ending, and that lane holds it if the base is
+red there too. The runner files no incident for it (`LOOM_CLUSTER_RUNNER`).
 
 The job, step by step (`lanes/k8s/lane_job.py`):
 
