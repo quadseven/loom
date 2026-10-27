@@ -186,6 +186,13 @@ USAGE_RETRY_PAUSE = 2
 DIGEST_HEAD = "Asks waiting for you:"
 # Open loom:human issues wait for the daily digest.
 HUMAN = "loom:human"
+# A needs-brain ticket whose open lane pull request has waited this long is
+# escalated once to a person, below the 6-hour lane-pr-stalled limit.
+NEEDS_BRAIN_AGE = 4 * 3600
+# One escalation comment per pull request head: this ledger keeps the heads
+# the station has already asked a person about, so a pass never posts twice
+# for the same head and never spams the ticket (the loom#1267 attempt did).
+HUMAN_ESCALATIONS_FILE = "human-escalations.json"
 # Why a ticket waits (bus/labels.py): one wait:* label at a time.
 WAIT = "wait:"
 HUMAN_HEAD = "Waiting on you"
@@ -5838,6 +5845,101 @@ class Station:
         issue = self._issue(repo, number)
         names = [n for n in _label_names(issue) if n != label]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": names})
+
+    # -- needs-brain escalation -------------------------------------------
+    def escalate_needs_brain_tickets(self) -> None:
+        """Escalate once to a person each needs-brain ticket whose open lane
+        pull request has carried needs-brain for NEEDS_BRAIN_AGE or more.
+        One escalation comment per pull request head, recorded so a later
+        pass posts nothing more for the same head."""
+        ledger = self._human_escalations_ledger()
+        dirty = False
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            already = set(self._human_escalated(ledger, repo))
+            if self._escalate_repo(repo, ledger, already):
+                dirty = True
+        if dirty:
+            _write_json(self._human_escalations_path(), ledger)
+
+    def _escalate_repo(self, repo: str, ledger: Dict[str, Any], already: Set[str]) -> bool:
+        """Escalate the due needs-brain tickets of one repo. Returns True when
+        at least one ticket was escalated (so the ledger is written once)."""
+        tickets = self._needs_brain_tickets(repo)
+        escalated_any = False
+        for pr in self._open_pulls(repo):
+            if not isinstance(pr, dict) or pr.get("state") != "open":
+                continue
+            ticket = self._ticket_for_pr(repo, pr, tickets)
+            if ticket is None:
+                continue
+            created = self._epoch(ticket.get("created_at") or "")
+            if created is None or self.now - created < NEEDS_BRAIN_AGE:
+                continue
+            sha = str((pr.get("head") or {}).get("sha") or "")
+            if not sha or sha in already:
+                continue
+            self._escalate_to_human(repo, ticket, pr, sha)
+            already.add(sha)
+            ledger.setdefault(repo, []).append(sha)
+            escalated_any = True
+        return escalated_any
+
+    def _needs_brain_tickets(self, repo: str) -> List[Dict[str, Any]]:
+        """Open loom:ticket issues that carry needs-brain and a lane PR."""
+        found = []
+        for issue in self._paginate("/repos/%s/issues?labels=loom:ticket&state=open&per_page=100" % repo):
+            if not isinstance(issue, dict) or "pull_request" in issue:
+                continue
+            names = _label_names(issue)
+            if "needs-brain" in names and "loom:pr" in names:
+                found.append(issue)
+        return found
+
+    def _ticket_for_pr(self, repo: str, pr: Dict[str, Any],
+                       tickets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """The needs-brain ticket an open lane pull request carries, or None."""
+        return next((t for t in tickets if _linked_pr(t, repo, pr)), None)
+
+    def _escalate_to_human(self, repo: str, ticket: Dict[str, Any], pr: Dict[str, Any],
+                           sha: str) -> None:
+        """Add loom:human to the ticket and post one escalation comment on it."""
+        number = int(ticket["number"])
+        self._add_label(repo, number, HUMAN)
+        body = self._human_escalation_body(repo, number, pr)
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
+
+    def _human_escalation_body(self, repo: str, number: int,
+                               pr: Dict[str, Any]) -> str:
+        """The body of the one escalation comment: names the PR and the ask."""
+        pr_number = int(pr["number"])
+        return "\n".join([
+            HUMAN_MARKER,
+            "",
+            "This lane pull request has carried needs-brain for four hours: the brain has not "
+            "taken it, so it waits on a person before the six-hour stall limit fires.",
+            "",
+            "Pull request: %s#%d" % (repo, pr_number),
+            "",
+            "Ask a person to unstick it:",
+            "- merge it: python3 -m bus.brain merge %s#%d" % (repo, pr_number),
+            "- or send it back: python3 -m bus.brain fix %s#%d --ticket %s#%d --file FIX.md"
+            % (repo, pr_number, repo, number),
+        ])
+
+    def _human_escalations_path(self) -> str:
+        return os.path.join(self.state, HUMAN_ESCALATIONS_FILE)
+
+    def _human_escalations_ledger(self) -> Dict[str, Any]:
+        data = _read_json(self._human_escalations_path(), {}, strict=False)
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _human_escalated(ledger: Dict[str, Any], repo: str) -> List[str]:
+        value = ledger.get(repo)
+        return value if isinstance(value, list) else []
+
 
     def _field(self, text: str, name: str) -> str:
         m = re.search(r"^%s:[ \t]*(.*?)[ \t]*$" % name, text, re.M)
