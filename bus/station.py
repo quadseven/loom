@@ -2173,10 +2173,11 @@ class Station:
             if not isinstance(c, dict):
                 continue
             body = str(c.get("body") or "")
-            if CLAIM_RE.fullmatch(body.strip()):
+            trusted = tickets._login(c.get("user")) in allowed
+            # A stranger's claim marker must not hide a trusted fix.
+            if trusted and CLAIM_RE.fullmatch(body.strip()):
                 last_claim = i
-            if (tickets._login(c.get("user")) in allowed
-                    and body.startswith(tickets.FIX_MARKER)):
+            if trusted and body.startswith(tickets.FIX_MARKER):
                 newest_fix = (i, c, body)
         if newest_fix is None or newest_fix[0] < last_claim:
             return None
@@ -2622,10 +2623,11 @@ class Station:
             return None
         latest = None
         pattern = re.compile(r"^<!-- loom:remote-heartbeat v1 ([a-z0-9-]+) ([0-9.]+) -->$")
-        for comment in self._paginate("/repos/%s/issues/%d/comments" %
-                                        (repo, int(issues[0]["number"]))):
-            match = pattern.fullmatch(str(comment.get("body") or "").strip()) \
-                if isinstance(comment, dict) else None
+        # A trusted heartbeat only: a stranger's copy must not mark a lane alive.
+        for comment in brain.trusted_comments(self._paginate(
+                "/repos/%s/issues/%d/comments" % (repo, int(issues[0]["number"]))),
+                self.s.authors):
+            match = pattern.fullmatch(str(comment.get("body") or "").strip())
             if match and match.group(1) == lane:
                 try:
                     at = float(match.group(2))
@@ -5599,7 +5601,8 @@ class Station:
             status.get("state") == "pending" for status in statuses)
 
     def _bot_threads(self, repo: str, pr_number: int) -> List[Dict[str, Any]]:
-        threads = brain._open_threads(self.gh, repo, pr_number)
+        threads = brain._open_threads(self.gh, repo, pr_number, bot=self.s.review_bot,
+                                      authors=self.s.authors)
         return [thread for thread in threads if self._thread_starts_with_bot(thread)]
 
     def _thread_starts_with_bot(self, thread: Dict[str, Any]) -> bool:
@@ -8378,7 +8381,7 @@ class Station:
             return 0
         said = brain.settle_source(self.gh, repo, ticket, issue.get("body"),
                                    "completed" if completed else "not_planned",
-                                   unproven=completed)
+                                   unproven=completed, authors=self.s.authors)
         if said is None or not completed:
             pairs[key] = 0  # nothing more to do for this source
         if said is None:
@@ -9089,7 +9092,7 @@ class Station:
             if not isinstance(issues, dict):
                 issues = state["issues"] = {}
             invariants.Filer(self.gh, goal[0], goal[1], issues, self.now, _say,
-                             write=not self._deferred()).run(breaches)
+                             write=not self._deferred(), authors=self.s.authors).run(breaches)
         invariants.save(path, state)
 
     def _invariant_goal(self) -> Optional[Tuple[str, int]]:

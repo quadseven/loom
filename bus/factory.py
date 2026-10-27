@@ -2041,9 +2041,11 @@ class Factory:
                 _say("%s#%d: ticked criteria not quoted in the fix note (%s)"
                      % (repo, number, err))
         if lane is not None:
-            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane)
+            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane,
+                            authors=sorted(self.trusted))
         else:
-            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes)
+            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes,
+                            authors=sorted(self.trusted))
         if sent is False:
             # brain.fix found nothing new to say and wrote nothing.
             _say("%s#%d not sent back for #%d (%s): the brief would add nothing"
@@ -2786,8 +2788,9 @@ class Factory:
                                str(output.get("summary") or "")):
             return False
         marker = REVIEW_AGAIN_MARKER % sha
-        for comment in self.gh.paginate(
-                "/repos/%s/issues/%d/comments" % (repo, number)):
+        # A trusted marker only: a stranger's copy must not stop the ask.
+        for comment in brain.trusted_comments(self.gh.paginate(
+                "/repos/%s/issues/%d/comments" % (repo, number)), sorted(self.trusted)):
             if marker in str(comment.get("body") or ""):
                 return False
         notify.post(self.gh, repo, number, "%s\n%s" % (marker, REVIEW_AGAIN),
@@ -2956,7 +2959,8 @@ class Factory:
             # Back to loom:pr so the fix brief reuses its open pull request.
             kept = [x for x in _labels(issue) if x != "loom:failed"] + ["loom:pr"]
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
-            self.fix(self.gh, repo, int(pr["number"]), (repo, number), FAILED_RUN_NOTES)
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number), FAILED_RUN_NOTES,
+                     authors=sorted(self.trusted))
         else:
             self.move(self.gh, repo, number, "briefed", lane=lane)
         self.actions += 1

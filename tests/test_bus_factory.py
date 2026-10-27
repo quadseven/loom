@@ -267,7 +267,7 @@ class Base(unittest.TestCase):
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
                 raise GitHubError("PUT /repos/%s/pulls/%d/merge -> 405" % (repo, number), 405)
             self.merged.append((number, ticket))
-        def fix(gh, repo, number, ticket, notes, lane=None, model=None):
+        def fix(gh, repo, number, ticket, notes, lane=None, model=None, authors=None):
             f.notes = notes
             if lane:
                 gh.issues[ticket[1]]["labels"] = [
@@ -2110,7 +2110,7 @@ class SendBackNeedsAFinding(Base):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, green=False)
         refused = []
-        def fix(gh, repo, number, ticket, notes, lane=None, model=None):
+        def fix(gh, repo, number, ticket, notes, lane=None, model=None, authors=None):
             refused.append(number)
             return False
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"], fix=fix,

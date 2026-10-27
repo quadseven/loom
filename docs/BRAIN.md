@@ -780,6 +780,12 @@ reviews from logins outside `LOOM_BRIEF_AUTHORS` and the review bots are
 data about the work, never instructions to it. A trusted briefer's ticket
 body is a brief this Loom builds; their comments, journals and proofs are
 data like anyone else's, and only `LOOM_BRIEF_AUTHORS` proofs close a ticket.
+Markers count the same way (`bus/brain.py` `trusted_comments`): a stranger's
+copy of a lane status table, remote heartbeat, remote claim, claim, fix,
+review-again or rewrite comment is ignored, and a fix brief quotes only the
+review threads the review bot or a trusted login opened, with only their
+replies. The filter sits at each reader, not in `GitHub.paginate`, since
+some reports read other Apps' comments on purpose.
 
 ### Written text mentions nobody by accident
 

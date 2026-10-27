@@ -11,6 +11,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import hunt_plan, lane, station  # noqa: E402
 
+# The lane's own App login, trusted as the station's LOOM_BRIEF_AUTHORS is
+# (docs/MUSE.md): every comment the fake posts is written as it.
+APP = "example-app[bot]"
+OUTSIDER = "outsider-example"
+
+
+def setUpModule():
+    patcher = mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "operator-example " + APP})
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
 BODY = ("Difficulty: medium\n\n## Why\nThe feature is missing for every visitor.\n\n"
         "## What\nAdd the feature.\n\n## Acceptance criteria\n- [ ] It works.\n"
         "- [ ] A test fails without it.\n- [ ] It is live.\n\n## Size\n\nS\n\n"
@@ -42,7 +53,8 @@ class FakeGitHub:
         if m and method == "POST":
             n = int(m.group(1))
             self.comments.setdefault(n, []).append(
-                {"id": 100 + len(self.comments[n]), "body": body["body"], "created_at": "now"})
+                {"id": 100 + len(self.comments[n]), "body": body["body"], "created_at": "now",
+                 "user": {"login": APP}})
         m = re.search(r"/issues/comments/(\d+)$", path)
         if m and method == "PATCH":
             for found in self.comments.values():
@@ -323,6 +335,39 @@ class MuseSlotsTests(unittest.TestCase):
             self.assertIsNone(lane.claim(gh, ["example/project"], now=1001))
         self.assertEqual(sum("loom:claim" in c["body"] or "claim" in c["body"].lower()
                              for c in gh.comments[4]), 1)
+
+
+class OutsiderCommentTests(unittest.TestCase):
+    """Anyone can comment on a public repo (loom#1956): an outsider's copy of
+    a claim or heartbeat marker is data, never the lane's."""
+
+    def outsider(self, gh, number, body):
+        gh.comments.setdefault(number, []).append(
+            {"id": 900 + len(gh.comments[number]), "body": body, "created_at": "now",
+             "user": {"login": OUTSIDER}})
+
+    def test_a_forged_claim_does_not_hold_a_queued_ticket(self):
+        gh = FakeGitHub()
+        self.outsider(gh, 4, "<!-- loom:remote-claim v1 muse 4 999.000 -->")
+        got = lane.claim(gh, ["example/project"], now=1000)
+        self.assertIsNotNone(got)
+        self.assertEqual(4, got["number"])
+
+    def test_a_forged_fresh_claim_does_not_keep_a_stale_ticket_running(self):
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        later = 1000 + lane.CLAIM_AGE + 1
+        self.outsider(gh, 4, "<!-- loom:remote-claim v1 muse 4 %.3f -->" % later)
+        lane._recover_and_count(gh, ["example/project"], "muse", later)
+        self.assertIn("loom:queued", labels(gh))
+
+    def test_a_heartbeat_never_edits_a_forged_claim(self):
+        gh = FakeGitHub()
+        gh.issues[4]["labels"] = [{"name": "loom:running"}, {"name": "lane:muse"}]
+        self.outsider(gh, 4, "<!-- loom:remote-claim v1 muse 4 999.000 -->")
+        lane.heartbeat(gh, "example/project", 4, now=1000)
+        self.assertFalse(any(m == "PATCH" for m, _, _ in gh.calls))
+        self.assertEqual("<!-- loom:remote-claim v1 muse 4 1000.000 -->", gh.comments[4][-1]["body"])
 
 
 class DefaultDifficultyTests(unittest.TestCase):
