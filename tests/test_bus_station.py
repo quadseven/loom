@@ -4507,9 +4507,21 @@ class FixTest(Base):
     def test_a_fix_comment_older_than_the_last_claim_is_ignored(self):
         self.fake.add(12)
         self.comment(12, FIX_BODY)
-        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)", author="station-example")
+        # The station's claim, written as a trusted login.
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)", author="bob-example")
         self.run_pass()
         self.assert_plain_brief()
+
+    def test_a_strangers_claim_after_the_fix_does_not_hide_it(self):
+        # loom#1956: a forged claim marker is data; it never ends the round.
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)", author="bob-example")
+        self.comment(12, "Lane codex opened a pull request: https://example.com/pull/99")
+        self.comment(12, FIX_BODY)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)", author="stranger")
+        self.run_pass()
+        # The brief's name counts every claim comment; its content is the fix.
+        self.assertIn("Fix-PR: 99\n", self.claimed_brief("example-owner.example-repo-12-r3"))
 
     def test_a_fix_followed_by_a_later_trusted_comment_still_renders_a_fix(self):
         self.fake.add(12)
@@ -11859,7 +11871,7 @@ class RemoteClaimCountTest(unittest.TestCase):
         def paginate(self, path):
             if path == "/repos/%s/issues/9/comments" % self.outer.STATUS_REPO:
                 return [{"body": "<!-- loom:remote-heartbeat v1 muse %d -->"
-                                 % int(self.outer.now)}]
+                                 % int(self.outer.now), "user": {"login": AUTHORS[0]}}]
             raise AssertionError("unexpected paginate %s" % path)
 
     def setUp(self):
@@ -11896,6 +11908,14 @@ class RemoteClaimCountTest(unittest.TestCase):
         self.gh.rest = fail
         with self.assertRaises(GitHubError):
             self.runner()._read_remote_claim_count("muse")
+
+    def test_a_forged_heartbeat_does_not_mark_a_remote_lane_alive(self):
+        # loom#1956: anyone can comment on the lane status issue.
+        beat = "<!-- loom:remote-heartbeat v1 muse %d -->" % int(self.now)
+        self.gh.paginate = lambda path: [{"body": beat, "user": {"login": "stranger"}}]
+        self.assertIsNone(self.runner()._read_remote_heartbeat("muse"))
+        self.gh.paginate = lambda path: [{"body": beat, "user": {"login": AUTHORS[0]}}]
+        self.assertEqual(int(self.now), self.runner()._read_remote_heartbeat("muse"))
 
     def test_lanes_body_builds_and_shows_remote_claims(self):
         out = io.StringIO()
