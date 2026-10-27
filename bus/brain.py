@@ -17,7 +17,7 @@ from urllib.parse import quote
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
-from . import answer, ci_facts, ci_gap, fixrounds, merge_tier, naming, operator_hold, per_repo, shadow
+from . import answer, ci_facts, ci_gap, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import HANDOFF, LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -978,7 +978,9 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     """The repo's status section; with into, its open tickets are kept
     there under the repo's name for the cross-repo Priorities section. With
     waiting, so are the repo's open loom:human count and, per goal, the share
-    under that goal (waiting_lines)."""
+    under that goal (waiting_lines). Each issue is read once per repo
+    (loom#2057): every helper below shares the first answer."""
+    gh = issue_reads.once(gh)
     issues = _issues(gh, repo)
     shares: Dict[int, int] = {}
     if waiting is not None:
@@ -1126,6 +1128,9 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     bot = env.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     now = now or datetime.now(timezone.utc)
     seconds = per_repo.budget(env, budget)
+    # One pass reads each issue, issue listing, comments and events once,
+    # across every repo and the lane status (loom#2078).
+    gh = issue_reads.once(gh)
     # Explicit `authors` are the caller's choice; read from the environment,
     # an empty list is refused, as it would trust no journal (loom#783).
     if authors is None:
@@ -1484,6 +1489,39 @@ def _sub_issue_of(issue: Dict[str, Any], repo: str, goal: int) -> bool:
     return str(issue.get("parent_issue_url") or "").endswith("/repos/%s/issues/%d" % (repo, goal))
 
 
+# GitHub search allows five operators: four ORs join five Part of phrases.
+PART_OF_BATCH = 5
+
+
+def part_of_linked(gh: GitHub, repo: str, epics: Sequence[int]
+                   ) -> Dict[int, List[Dict[str, Any]]]:
+    """For each epic, the loom:ticket issues, open or closed, whose body has
+    a Part of line naming it: one search per PART_OF_BATCH epics. goal_tree
+    reads only open ones, so a closed ticket linked by its Part of line alone
+    went uncounted (loom#2023: 13 sub-issues and 4 such links read as 16)."""
+    out: Dict[int, List[Dict[str, Any]]] = {int(n): [] for n in epics}
+    numbers = sorted(out)
+    for start in range(0, len(numbers), PART_OF_BATCH):
+        chunk = numbers[start:start + PART_OF_BATCH]
+        phrases = " OR ".join('"%s"' % part_of_line(n) for n in chunk)
+        q = quote("repo:%s is:issue label:loom:ticket in:body %s" % (repo, phrases))
+        url: Optional[str] = "/search/issues?q=%s&per_page=100" % q
+        for _ in range(SEARCH_PAGES):
+            if not url:
+                break
+            resp = gh.rest("GET", url)
+            data = resp.data if isinstance(resp.data, dict) else {}
+            for item in data.get("items") or []:
+                if (not isinstance(item, dict) or "pull_request" in item
+                        or "loom:ticket" not in _labels(item)):
+                    continue
+                for n in chunk:
+                    if _names_goal(item.get("body"), n):
+                        out[n].append(item)
+            url = _next_link(resp.headers.get("link", ""))
+    return out
+
+
 def unassociated_tickets(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
     """loom:ticket issues that say Part of #goal but are neither its sub-issues
     nor carry the line on a line of its own, nor sit under one of its epics, so
@@ -1644,6 +1682,16 @@ REPAIRS_BODY = (
     "15-ticket cap, is not counted against the goal's open epic cap, and is never "
     "flagged as finished.\n\n"
     "Size: no cap (a standing epic).\n")
+# Every factory repairs epic's title starts so: the standing one, and the
+# batch epics repairs roll over to once it holds GitHub's sub-issue limit.
+REPAIRS_PREFIX = "Epic: factory repairs"
+REPAIRS_BATCH_TITLE = "Epic: factory repairs for this goal, next batch"
+REPAIRS_BATCH_BODY = (
+    "Done when: every ticket under this epic is closed. It holds at most %d tickets; "
+    "the next factory repair past that opens a new batch.\n\n"
+    "Size: at most %d tickets.\n\n"
+    "The goal's standing factory repairs epic holds GitHub's limit of 100 sub-issues, "
+    "so the station files new factory repairs in batch epics like this one.\n")
 
 
 def standing_epic(epic: Dict[str, Any]) -> bool:
@@ -2013,13 +2061,18 @@ def placement_epic(gh: GitHub, repo: str, named: int, room: int = 1) -> int:
         if not isinstance(issue, dict) or "pull_request" in issue:
             break
         if _epic_label(issue):
+            standing = standing_epic(issue)
             if issue.get("state", "open") == "open" and (
-                    standing_epic(issue)
-                    or len(_epic_tickets(gh, repo, number)) + room <= EPIC_TICKET_CAP):
+                    (standing and sub_issue_count(gh, repo, issue) < SUB_ISSUE_LIMIT)
+                    or (not standing
+                        and len(_epic_tickets(gh, repo, number)) + room <= EPIC_TICKET_CAP)):
                 return number
             parent = _issue_goal(issue)
             if parent is None or parent == number:
                 break
+            if standing or repairs_batch(issue):
+                # A full repairs epic: the repair goes to a batch with room.
+                return repairs_epic(gh, repo, parent, room, full=(number,))
             return intake_epic(gh, repo, parent, room)
         if "loom:goal" in _labels(issue):
             return intake_epic(gh, repo, number, room)
@@ -2041,17 +2094,97 @@ def repo_goal(gh: GitHub, repo: str) -> Optional[int]:
     return homes[0][1] if homes else None
 
 
-def repairs_epic(gh: GitHub, repo: str, goal: int) -> int:
+def repairs_epic(gh: GitHub, repo: str, goal: int, room: int = 1,
+                 full: Sequence[int] = ()) -> int:
     """The goal's standing "Factory repairs" epic, opened when it has none
     (outside the epic cap): where breach invariants, revert, fix-forward and
-    red-check tickets are filed."""
+    red-check tickets are filed. Once it holds GitHub's limit of
+    SUB_ISSUE_LIMIT sub-issues, or is named in `full` (GitHub just refused a
+    link to it), repairs roll over to the newest open factory repairs batch
+    epic with room for `room` more tickets, and a next batch epic opens when
+    none has room (loom#2023: the standing epic sat at 100 sub-issues and new
+    repairs got only a Part of line naming it)."""
     _, tree = goal_tree(gh, repo, goal)
-    for found, _ in tree:
+    for found, held in tree:
         if found.get("state", "open") == "open" and standing_epic(found):
-            return int(found["number"])
+            number = int(found["number"])
+            if number not in full and sub_issue_count(gh, repo, found, held) < SUB_ISSUE_LIMIT:
+                return number
+            return repairs_batch_epic(gh, repo, goal, tree, room, full)
     made = file_epic(gh, repo, goal, REPAIRS_TITLE, REPAIRS_BODY, standing=True)
     if not made.get("number"):
         raise ValueError("GitHub named no number for the repairs epic of goal #%d" % goal)
+    return int(made["number"])
+
+
+def sub_issue_count(gh: GitHub, repo: str, epic: Dict[str, Any],
+                    held: Optional[List[Dict[str, Any]]] = None) -> int:
+    """How many sub-issues GitHub holds under the epic: its
+    sub_issues_summary total, else its listed tickets (`held`, read when not
+    given)."""
+    summary = epic.get("sub_issues_summary")
+    total = summary.get("total") if isinstance(summary, dict) else None
+    if isinstance(total, int) and not isinstance(total, bool):
+        return total
+    if held is None:
+        held = [c for c in gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
+                                       % (repo, int(epic["number"]))) if isinstance(c, dict)]
+    return len(held)
+
+
+def repairs_batch(epic: Dict[str, Any]) -> bool:
+    """A factory repairs batch epic: an epic titled for factory repairs that
+    is not the standing one. It holds at most EPIC_TICKET_CAP tickets."""
+    title = str(epic.get("title") or "").strip()
+    return title.startswith(REPAIRS_PREFIX) and not standing_epic(epic)
+
+
+def _repairs_batches(gh: GitHub, repo: str,
+                     tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
+                     ) -> Dict[int, Dict[str, Any]]:
+    """The open factory repairs batch epics: the goal's own (from its walk)
+    and any other open one in the repo, by number."""
+    found = [epic for epic, _ in tree] + list(
+        gh.paginate("/repos/%s/issues?labels=epic&state=open&per_page=100" % repo))
+    batches: Dict[int, Dict[str, Any]] = {}
+    for epic in found:
+        if (isinstance(epic, dict) and "pull_request" not in epic
+                and epic.get("state", "open") == "open" and repairs_batch(epic)):
+            batches.setdefault(int(epic.get("number") or 0), epic)
+    batches.pop(0, None)
+    return batches
+
+
+def _batch_room(gh: GitHub, repo: str, epic: Dict[str, Any],
+                held: Optional[List[Dict[str, Any]]], room: int) -> bool:
+    """A batch epic has room for `room` more tickets: under EPIC_TICKET_CAP
+    tickets and under GitHub's sub-issue limit."""
+    if held is None:
+        held = _epic_tickets(gh, repo, int(epic["number"]))
+    return (len(held) + room <= EPIC_TICKET_CAP
+            and sub_issue_count(gh, repo, epic, held) < SUB_ISSUE_LIMIT)
+
+
+def repairs_batch_epic(gh: GitHub, repo: str, goal: int,
+                       tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
+                       room: int = 1, full: Sequence[int] = ()) -> int:
+    """The newest open factory repairs batch epic with room for `room` more
+    tickets, the goal's own or any other in the repo, opened outside the
+    epic cap (as the standing epic is) when none has room. A batch in `full`
+    is skipped."""
+    held_by = {int(e.get("number") or 0): held for e, held in tree}
+    batches = _repairs_batches(gh, repo, tree)
+    for number in sorted(batches, reverse=True):
+        if number not in full and _batch_room(gh, repo, batches[number],
+                                              held_by.get(number), room):
+            return number
+    print("goal #%d: the factory repairs epic and every batch epic are full; opening the "
+          "next batch" % goal, file=sys.stderr)
+    made = file_epic(gh, repo, goal, REPAIRS_BATCH_TITLE,
+                     REPAIRS_BATCH_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP), standing=True)
+    if not made.get("number"):
+        raise ValueError("GitHub named no number for the next repairs batch epic of goal #%d"
+                         % goal)
     return int(made["number"])
 
 
@@ -5292,6 +5425,9 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     authors = require_trusted_authors(env, "resume")
     seconds = per_repo.budget(env, budget)
     _lock_holder(gh, lock_repo, holder, now)
+    # Resume is read-only past the lock check: one pass reads each issue,
+    # issue listing, comments and events once (loom#2078).
+    gh = issue_reads.once(gh)
     out: List[str] = []
     goals, unread, timed = _resume_journals(gh, repos, authors, seconds)
     # A moved or forbidden repo is named once and left out of every later
@@ -5941,7 +6077,16 @@ def _cmd_close(gh: GitHub, args: argparse.Namespace) -> None:
 def _cmd_merge(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.pull_request, "pull request")
     ticket = _ref(args.ticket, "ticket") if args.ticket else None
+    # The landing lock (bus/landing.py): while another pull request in the
+    # repo is being landed, merging this one would move main under it.
+    held = landing.holder(gh, repo, time.time())
+    if held is not None and held != number:
+        raise ValueError("%s#%d holds the repo's landing lock (%s, up to %d minutes); "
+                         "merge #%d after it lands" % (repo, held, landing.LABEL,
+                                                       landing.HOLD // 60, number))
     merge(gh, repo, number, ticket, args.adopt)
+    if held == number:
+        landing.release(gh, repo, number)
 
 
 def _cmd_reply(gh: GitHub, args: argparse.Namespace) -> None:

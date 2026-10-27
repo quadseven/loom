@@ -104,6 +104,12 @@ AFTER_RELEASE_RE = re.compile(r"^<!-- loom:after-release ([0-9]+) -->")
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
 # The runner's reason when a lane run ends with nothing committed.
 NO_COMMIT = "agent made no commit"
+# Elder review check output parsing: individual markings like "removed-guarded-path"
+# are listed in the summary. Each marking line looks like:
+# "- `removed-guarded-path`: This PR deletes \`path/to/file.md\`, which removes KIND. /grug accept-removal path/to/file.md SHA"
+# The accept-removal line may be on the same line or the next line.
+_ELDER_MARKING_RE = re.compile(r"^\s*-\s+`([a-z0-9-]+)`:\s*(.*)$", re.M)
+_ACCEPT_REMOVAL_RE = re.compile(r"/grug accept-removal\s+(\S+)\s+(\S+)")
 # A pull request a brief names in words, as a settle-findings ticket names the
 # one its findings were left on.
 NAMED_PR_RE = re.compile(r"\b(?:PR|pull request) #([0-9]+)\b")
@@ -370,6 +376,16 @@ SHIP_XREF_MAX = 3
 SHIP_LOOKUP_RETRY = 6 * 3600
 SHIP_LOOKUPS_FILE = "ship_lookups.json"
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+# An open issue at one of these states whose linked pull request merged and
+# deployed ships too: only loom:pr tickets are reconciled from their pull
+# request, so a triage or queued issue a pull request named sat there after
+# the deploy (loom#2025).
+EARLY_SHIP_STATES = ("loom:triage", "loom:queued")
+SETTLE_LANDED_SET = frozenset(SETTLE_LANDED)
+# A ticket the ship rules found deployed but that stayed at loom:merged (its
+# move failed) is kept in DEPLOYED_SEEN_FILE with when it was first found;
+# past MERGED_UNSHIPPED_AFTER it is a merged-not-shipped invariant breach.
+DEPLOYED_SEEN_FILE = "deployed_seen.json"
 # The handoff packet is rebuilt at most this often, or sooner when a brain
 # tick on this machine just ended (publish_handoff).
 HANDOFF_EVERY = 600
@@ -395,6 +411,20 @@ SHIP_RUNS_URL = ("/repos/%s/actions/workflows/%s/runs?status=success&event=push"
 PUBLISHED_RE = re.compile(r"^\+\s*#\s*Published from\s+([A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?)"
                           r"[\s,][^\n]*?\bmerge\s+([0-9a-f]{7,40})\b", re.M)
 PIN_SHIP_LOOKBACK = 7 * 24 * 3600
+# Shipping through a downstream roll (loom#2025): a repo that deploys only when
+# another repo rolls it declares that in ROLL_SIGNAL_FILE on its default
+# branch, one roll record a line: `<OWNER/NAME> <path> <key>`. The record is
+# the file at <path> on that repo's default branch; its `<key>=<sha>` (or
+# `<key>: <sha>`) line names the source commit the roll deployed. Each pass,
+# the repo's open loom:merged tickets whose merge commit that commit carries
+# move to loom:shipped.
+ROLL_SIGNAL_FILE = ".loom/ship-roll"
+# Each repo's ROLL_SIGNAL_FILE is read at most every ROLL_SIGNAL_EVERY seconds
+# (ROLL_SIGNALS_FILE keeps the text, or None for a repo without one), so a
+# repo that declares no roll costs one request an hour, not two a pass.
+ROLL_SIGNALS_FILE = "roll_signals.json"
+ROLL_SIGNAL_EVERY = 3600
+ROLL_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,99}")
 PIN_SHIP_SETTLE = 3600
 PIN_SHIPS_FILE = "pin_ships.json"
 SHIP_PATH_FILES = "ship_path_files.json"
@@ -1195,6 +1225,15 @@ def _has_pull_request_trigger(workflow: str) -> bool:
     return bool(_PULL_REQUEST_TRIGGER.search(workflow))
 
 
+def _is_code_scanning_check(name: str, run: Dict[str, Any]) -> bool:
+    """Whether a check run is code scanning, not the repo's own lane CI."""
+    low = str(name).lower()
+    if "code scanning" in low or "codeql" in low:
+        return True
+    app = run.get("app") or {}
+    return str(app.get("slug") or "").lower() in ("codeql", "code-scanning")
+
+
 def _block_scalar(lines: List[str], index: int, indent: int) -> Tuple[str, int]:
     """Join a run: | block's lines deeper than indent; return it and the next index."""
     block = []
@@ -1825,6 +1864,37 @@ READY_RE = re.compile(r"Ready: checks and review passed on head ([0-9a-f]{40})\b
 # A ticket marked ready before the status event kept a ready-head comment of
 # its own; it is still read.
 OLD_READY_RE = re.compile(r"<!-- loom:ready-head ([0-9a-f]+) -->")
+
+
+
+def parse_roll_signals(text: str) -> List[Tuple[str, str, str]]:
+    """The roll records a ROLL_SIGNAL_FILE declares: (repo, path, key), one
+    a line, `#` comments. Raises on a malformed line, so a typo is never read
+    as 'nothing rolls this repo'."""
+    found = []
+    for raw in text.splitlines():
+        words = raw.split("#", 1)[0].split()
+        if not words:
+            continue
+        if len(words) != 3:
+            raise ValueError("%s: a line is <OWNER/NAME> <path> <key>" % ROLL_SIGNAL_FILE)
+        repo, path, key = words
+        if (not tickets.REPO_RE.fullmatch(repo) or path.startswith("/")
+                or any(part in ("", ".", "..") for part in path.split("/"))
+                or not ROLL_KEY_RE.fullmatch(key)):
+            raise ValueError("%s: %r is not <OWNER/NAME> <path> <key>"
+                             % (ROLL_SIGNAL_FILE, raw.strip()))
+        found.append((repo, path, key))
+    return found
+
+
+def rolled_commit(record: str, key: str) -> str:
+    """The full commit a roll record's `<key>=<sha>` or `<key>: <sha>` line
+    names (quotes allowed); "" when it names none, or two different ones."""
+    pattern = re.compile(r"^\s*(?:export\s+)?%s\s*[=:]\s*[\"']?([0-9a-f]{40})[\"']?\s*(?:#.*)?$"
+                         % re.escape(key), re.M)
+    shas = set(pattern.findall(record))
+    return shas.pop() if len(shas) == 1 else ""
 
 
 class Station:
@@ -4458,7 +4528,8 @@ class Station:
         loop step a pass and a full turn of the loop took hours."""
         loop_started = time.monotonic()
         # Below the budget floor these wait for the reset; trees are local.
-        steps = (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_merged,
+        steps = (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_rolls,
+                     self.ship_merged,
                      self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
@@ -4865,7 +4936,8 @@ class Station:
         return revision, float(at)
 
     def _merged_pulls(self, repo: str, wanted: set,
-                      seen: Optional[List[Dict[str, Any]]] = None) -> Dict[int, Dict[str, Any]]:
+                      seen: Optional[List[Dict[str, Any]]] = None,
+                      beyond: Optional[set] = None) -> Dict[int, Dict[str, Any]]:
         """Each wanted ticket's latest merged pull request, found by its Refs
         line or loom branch in the most recently updated closed pull requests
         (the URL reconciliation reads), stopping once every one is found, then
@@ -4873,7 +4945,10 @@ class Station:
         ticket names or one past the window (_ticket_pull_beyond_window): every
         ship rule reads this, and only the deploy rule looked those up, so 33
         adoption tickets in other repos never shipped (2026-10-20).
-        Every merged pull request read is added to seen when it is given."""
+        Every merged pull request read is added to seen when it is given.
+        With beyond given, only those tickets are looked up past the window:
+        an open triage or queued issue mostly has no merged pull request, and
+        looking each one up every pass would spend the API budget."""
         found: Dict[int, Dict[str, Any]] = {}
         url: Optional[str] = ("/repos/%s/pulls?state=closed&sort=updated"
                               "&direction=desc&per_page=100" % repo)
@@ -4896,13 +4971,21 @@ class Station:
         # ticket whose newest merged pull request is one stays merged
         # (a ticket shipped through its own revert, 2026-10-21).
         found = {n: pr for n, pr in found.items() if not revert.looks_like_revert(pr)}
-        for number in sorted(wanted - set(found))[:SHIP_PER_PASS]:
+        missing = wanted - set(found)
+        self._add_beyond_window(repo, missing if beyond is None else missing & beyond,
+                                found, seen)
+        return found
+
+    def _add_beyond_window(self, repo: str, missing: set, found: Dict[int, Dict[str, Any]],
+                           seen: Optional[List[Dict[str, Any]]]) -> None:
+        """Add the merged pull request of up to SHIP_PER_PASS missing tickets
+        found past the closed pull window (_ticket_pull_beyond_window)."""
+        for number in sorted(missing)[:SHIP_PER_PASS]:
             pr = self._ticket_pull_beyond_window(repo, number)
             if pr is not None and not revert.looks_like_revert(pr):
                 found[number] = pr
                 if seen is not None:
                     seen.append(pr)
-        return found
 
     def ship_deployed(self) -> None:
         """Move each open merged ticket of the repo this checkout deploys
@@ -4915,9 +4998,10 @@ class Station:
             return
         revision, at = deployed
         merged = self._merged_tickets(repo)
-        if not merged:
+        early = self._early_tickets(repo)
+        if not merged and not early:
             return
-        latest = self._merged_pulls(repo, merged)
+        latest = self._merged_pulls(repo, merged | set(early), beyond=merged)
         groups = self._ticket_pulls(repo, set(latest))
         hands = self._hand_reverts(repo, self._closed_pulls(repo))
         carried = sorted((str(pr["merged_at"]), number, pr)
@@ -4925,11 +5009,57 @@ class Station:
                          if self.ancestor(str(pr["merge_commit_sha"]), revision)
                          and not self._all_reverted(groups.get(number) or [pr], hands,
                                                     revision, self.ancestor))
-        for _, number, pr in carried[:SHIP_PER_PASS]:
-            self._ship_one(repo, number, pr,
-                           "the station deployed revision %s at %s" % (
-                               revision[:12], self._utc(at)),
-                           "deployed %s" % revision[:12])
+        shipped = 0
+        for _, number, pr in carried:
+            if shipped >= SHIP_PER_PASS:
+                break
+            if number in early and not self._early_ships(repo, early[number], pr):
+                continue
+            how = "the station deployed revision %s at %s" % (revision[:12], self._utc(at))
+            if self._ship_one(repo, number, pr, how, "deployed %s" % revision[:12]):
+                shipped += 1
+                if number in early:
+                    self._drop_triage(repo, number, early[number])
+
+    def _early_tickets(self, repo: str) -> Dict[int, Dict[str, Any]]:
+        """The repo's open issues at a state before a pull request
+        (EARLY_SHIP_STATES), by number: a pull request that names one can
+        merge and deploy while the issue waits there, and only loom:pr
+        tickets are reconciled from their pull request (loom#2025)."""
+        found: Dict[int, Dict[str, Any]] = {}
+        for label in EARLY_SHIP_STATES:
+            for issue in self._paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                        % (repo, label)):
+                if (isinstance(issue, dict) and "pull_request" not in issue
+                        and isinstance(issue.get("number"), int)
+                        and label in _label_names(issue)
+                        and not SETTLE_LANDED_SET.intersection(_label_names(issue))):
+                    found[int(issue["number"])] = issue
+        return found
+
+    def _early_ships(self, repo: str, issue: Dict[str, Any], pr: Dict[str, Any]) -> bool:
+        """Whether a triage or queued issue ships with this deployed pull
+        request: not another operator's, not a regression re-opened after it,
+        and not sent back for work after it merged (a merge that left
+        criteria unbuilt requeues the ticket, tickets.merged_before_requeue)."""
+        names = _label_names(issue)
+        if "loom:regression" in names or brain.owned_elsewhere(issue) is not None:
+            return False
+        events = self._paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
+        return not tickets.merged_before_requeue(pr.get("merged_at"), events)
+
+    def _drop_triage(self, repo: str, number: int, issue: Dict[str, Any]) -> None:
+        """Remove loom:triage from an issue that shipped: a move keeps it, and
+        the rewrite step would then turn shipped work into a new ticket."""
+        if "loom:triage" not in _label_names(issue):
+            return
+        try:
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                         % (repo, number, quote("loom:triage", safe="")), ok=(404,))
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not drop loom:triage from %s#%d: %s" % (repo, number, err))
 
     def _ticket_pull_beyond_window(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
         """The merged pull request of a merged ticket that _merged_pulls did
@@ -5026,15 +5156,59 @@ class Station:
         pull request's merge commit was deployed; whether it moved."""
         note = "Shipped: %s, which carries pull request #%d (merge commit %s)." % (
             how, int(pr["number"]), str(pr["merge_commit_sha"])[:12])
+        key = "%s#%d" % (repo, number)
         try:
             brain.move(self.gh, repo, number, "shipped", note=note)
         except RateLimited:
             raise
         except (GitHubError, ValueError) as err:
             _say("could not ship %s#%d: %s" % (repo, number, err))
+            self._deployed_seen(key, True)
             return False
+        self._deployed_seen(key, False)
         _say("shipped %s#%d: %s carries #%d" % (repo, number, what, int(pr["number"])))
         return True
+
+    def _deployed_seen(self, key: str, seen: bool) -> None:
+        """Keep when a ship rule first found the ticket deployed
+        (DEPLOYED_SEEN_FILE) until it moves; the merged-not-shipped
+        invariant reads what is left (loom#2025)."""
+        path = os.path.join(self.state, DEPLOYED_SEEN_FILE)
+        saved = _read_json(path, {}, strict=False)
+        ledger = {k: v for k, v in (saved.items() if isinstance(saved, dict) else ())
+                  if isinstance(k, str) and self._num(v)}
+        if seen == (key in ledger):
+            return
+        if seen:
+            ledger[key] = self.now
+        else:
+            ledger.pop(key, None)
+        _write_json(path, ledger)
+
+    def _invariant_unshipped(self) -> List[Tuple[invariants.Ref, float]]:
+        """Each ticket a ship rule found deployed that is still an open
+        loom:merged ticket, with when it was first found deployed. A ticket
+        that moved, closed or left loom:merged by other hands is dropped."""
+        path = os.path.join(self.state, DEPLOYED_SEEN_FILE)
+        saved = _read_json(path, {}, strict=False)
+        ledger = {k: v for k, v in (saved.items() if isinstance(saved, dict) else ())
+                  if isinstance(k, str) and self._num(v)}
+        by_repo: Dict[str, List[Tuple[int, float]]] = {}
+        for key, at in ledger.items():
+            repo, _, number = key.rpartition("#")
+            if tickets.REPO_RE.fullmatch(repo) and number.isdigit():
+                by_repo.setdefault(repo, []).append((int(number), float(at)))
+        kept: Dict[str, float] = {}
+        found: List[Tuple[invariants.Ref, float]] = []
+        for repo, items in sorted(by_repo.items()):
+            merged = self._merged_tickets(repo)
+            for number, at in sorted(items):
+                if number in merged:
+                    kept["%s#%d" % (repo, number)] = at
+                    found.append((self._invariant_ref(repo, number), at))
+        if kept != ledger:
+            _write_json(path, kept)
+        return found
 
     # -- shipping on merge or on a deploy workflow --------------------------
     def ship_merged(self) -> None:
@@ -5271,6 +5445,64 @@ class Station:
                 and run.get("event") == "push" and run.get("head_branch") == branch
                 and str(head.get("full_name") or "").lower() == repo.lower()
                 and bool(COMMIT_RE.fullmatch(str(run.get("head_sha") or ""))))
+
+    # -- shipping through a downstream roll -------------------------------
+    def ship_rolls(self) -> None:
+        """Move the open merged tickets of each watched repo that declares a
+        roll record (ROLL_SIGNAL_FILE) to loom:shipped once the source commit
+        the record names carries their pull request's merge commit, unless a
+        later revert the commit also carries undid it (loom#2025)."""
+        path = os.path.join(self.state, ROLL_SIGNALS_FILE)
+        saved = _read_json(path, {}, strict=False)
+        known = saved if isinstance(saved, dict) else {}
+        kept: Dict[str, Any] = {}
+        try:
+            for repo in [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]:
+                try:
+                    text = self._roll_signal(repo, known.get(repo), kept)
+                    merged = self._merged_tickets(repo) if text else set()
+                    if not merged:
+                        continue
+                    for deploy, where, key in parse_roll_signals(text or ""):
+                        self._ship_roll(repo, merged, deploy, where, key)
+                except RateLimited:
+                    raise
+                except (GitHubError, ValueError) as err:
+                    _say("could not ship %s by its roll record: %s" % (repo, err))
+        finally:
+            _write_json(path, kept)
+
+    def _roll_signal(self, repo: str, cached: Any, kept: Dict[str, Any]) -> Optional[str]:
+        """The repo's ROLL_SIGNAL_FILE text, None when it has none: read
+        again only ROLL_SIGNAL_EVERY after the last read."""
+        if (isinstance(cached, dict) and self._num(cached.get("at"))
+                and 0 <= self.now - cached["at"] < ROLL_SIGNAL_EVERY
+                and isinstance(cached.get("text"), (str, type(None)))):
+            kept[repo] = cached
+            return cached["text"]
+        text = self._contents_text(repo, ROLL_SIGNAL_FILE)
+        kept[repo] = {"text": text, "at": self.now}
+        return text
+
+    def _ship_roll(self, repo: str, merged: set, deploy: str, path: str, key: str) -> None:
+        record = self._contents_text(deploy, path)
+        revision = rolled_commit(record or "", key)
+        if not revision:
+            _say("%s: the roll record names no %s commit" % (repo, key))
+            return
+        seen: List[Dict[str, Any]] = []
+        latest = self._merged_pulls(repo, merged, seen)
+        carried = sorted((str(pr["merged_at"]), number, pr) for number, pr in latest.items()
+                         if self._carries(repo, str(pr["merge_commit_sha"]), revision)
+                         and not self._reverted(repo, pr, seen, revision))
+        for name in (deploy, repo):
+            if name not in self._publics:
+                self._publics[name] = self._public(name)
+        # A ship note on a public ticket never names a private repo.
+        where = deploy if (self._publics[deploy] or not self._publics[repo]) else "a private repo"
+        how = "a roll record in %s names %s revision %s" % (where, repo, revision[:12])
+        for _, number, pr in carried[:SHIP_PER_PASS]:
+            self._ship_one(repo, number, pr, how, "roll %s" % revision[:12])
 
     # -- shipping through a pin pull request ------------------------------
     def ship_pins(self) -> None:
@@ -5589,6 +5821,45 @@ class Station:
             self._pulls[repo] = data if isinstance(data, list) else []
         return self._pulls[repo]
 
+    def _elder_markings(self, summary: str) -> List[Tuple[str, List[str]]]:
+        """Parse Elder review markings from a review check summary.
+        Returns list of (marking_kind, paths) tuples."""
+        text = str(summary or "")
+        return [(m.group(1), [p.strip("` ") for p in re.findall(r"`([^`]+)`", m.group(2))])
+                for m in _ELDER_MARKING_RE.finditer(text)]
+
+    def _elder_markings_with_accept(self, summary: str, sha: str) -> List[Tuple[str, List[str], List[str]]]:
+        """Parse Elder review markings and their accept-removal lines.
+        Returns list of (marking_kind, paths, accept_removal_lines) tuples.
+        Each accept_removal_line is the exact '/grug accept-removal PATH SHA' line.
+        If not found in the summary, builds it from the path and the given SHA."""
+        text = str(summary or "")
+        markings = []
+        for m in _ELDER_MARKING_RE.finditer(text):
+            kind = m.group(1)
+            rest = m.group(2)
+            paths = [p.strip("` ") for p in re.findall(r"`([^`]+)`", rest)]
+            # Find accept-removal lines for these paths in the full text
+            accept_lines = []
+            for path in paths:
+                found = False
+                for am in _ACCEPT_REMOVAL_RE.finditer(text):
+                    if am.group(1) == path:
+                        accept_lines.append(f"/grug accept-removal {am.group(1)} {am.group(2)}")
+                        found = True
+                        break
+                if not found:
+                    accept_lines.append(f"/grug accept-removal {path} {sha}")
+            markings.append((kind, paths, accept_lines))
+        return markings
+
+    def _is_removed_guarded_path_named(self, marking: Tuple[str, List[str]], ticket_body: str) -> bool:
+        """True when a removed-guarded-path marking only names paths the ticket names."""
+        kind, paths = marking
+        if kind != "removed-guarded-path":
+            return False
+        return all(operator_hold._named(path, ticket_body) for path in paths)
+
     def _hand_back_ticket(self, repo: str, issue: Dict[str, Any], prs: List[Dict[str, Any]],
                           rounds: int) -> None:
         number = int(issue["number"])
@@ -5623,6 +5894,32 @@ class Station:
                 if not (name == self.s.review_check and factory.degraded_review(tail, tail))]
         degraded = len(kept) != len(failed)
         failed = kept
+        # Check for the special case: only the review check failed, and all
+        # its blocking Elder markings are "removed-guarded-path" on paths the
+        # ticket names for removal. In this case, ask the maintainer for
+        # /grug accept-removal approval instead of a fix round.
+        if (len(failed) == 1 and failed[0][0] == self.s.review_check):
+            review_summary = failed[0][1]
+            markings = self._elder_markings_with_accept(review_summary, sha)
+            ticket_body = str(issue.get("body") or "")
+            blocking_markings = [m for m in markings if m[0] != "reviewability"]
+            if (blocking_markings and
+                    all(self._is_removed_guarded_path_named((m[0], m[1]), ticket_body) for m in blocking_markings)):
+                # Only removed-guarded-path on named paths: no fix round, no runaway,
+                # ask maintainer for /grug accept-removal with exact lines
+                accept_lines = []
+                for m in blocking_markings:
+                    accept_lines.extend(m[2])
+                accept_block = "\n".join(accept_lines)
+                paths = ", ".join(p for m in blocking_markings for p in m[1])
+                ask = operator_hold.ask(number, [
+                    f"it deletes or mostly replaces {paths}, which its ticket names for removal"
+                ])
+                ask += f"\n\n{accept_block}"
+                brain.human(self.gh, repo, number, ask)
+                _say("%s#%d: only removed-guarded-path on named paths; moved to loom:human for accept-removal"
+                     % (repo, number))
+                return
         # An infra timeout (bus/flake.py) is no lane's to fix: it is re-run
         # once before any round, whatever else fails, and never reads as a
         # stuck failure after (loom#1962).
@@ -5639,6 +5936,24 @@ class Station:
         # factory's (Factory._send_back), so no round is sent from here.
         conflict = detail.get("mergeable") is False
         if not failed and not threads and not degraded and not conflict:
+            # A lane pull request is ready only on its goal home's trunk (or
+            # the repo's default branch when the goal home names no trunk).
+            base_ref = str((detail.get("base") or {}).get("ref") or "")
+            if base_ref:
+                trunk = self._trunk_for(repo, issue)
+                if trunk and base_ref != trunk:
+                    self._remove_ready_if_present(repo, number, names)
+                    self._routine(repo, number, "base %s is not the trunk %s"
+                                  % (base_ref, trunk))
+                    return
+            # The repo's own CI must have run green on the head, but only in a
+            # repo that has a pull-request-triggered workflow. When none ran,
+            # the status says so and the pull request stays not ready.
+            if self._has_pull_request_workflow(repo) \
+                    and not self._repo_ci_green_on_head(repo, sha):
+                self._remove_ready_if_present(repo, number, names)
+                self._routine(repo, number, "repo CI did not run on head %s" % sha)
+                return
             self._mark_ready(repo, number, sha, names, ready)
             return
         self._remove_ready_if_present(repo, number, names)
@@ -5767,6 +6082,71 @@ class Station:
         statuses = (self.gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data or {}).get("statuses") or []
         return not any(run.get("status") != "completed" for run in runs) and not any(
             status.get("state") == "pending" for status in statuses)
+
+    def _trunk_for(self, repo: str, issue: Dict[str, Any]) -> str:
+        """The goal home's Trunk branch, else the repo's default branch, else
+        "". An unreadable goal home or repo reads as no trunk, so a pull
+        request whose base cannot be compared is not blocked here."""
+        trunk = ""
+        try:
+            goal = brain._goal_home_for_ticket(self.gh, repo, issue)
+            if isinstance(goal, dict):
+                trunk = str(brain.goal_trunk(goal) or "")
+        except (GitHubError, ValueError, TypeError):
+            trunk = ""
+        if not trunk:
+            try:
+                trunk = self._default_branch(repo)
+            except (GitHubError, ValueError, TypeError):
+                trunk = ""
+        return trunk
+
+    def _has_pull_request_workflow(self, repo: str) -> bool:
+        """Whether the repo has a workflow that runs on pull_request: only then
+        does the repo's own CI need to have run on a lane pull request's head
+        for it to be ready. An unreadable workflow list reads as none."""
+        try:
+            listing = self.gh.rest("GET", "/repos/%s/contents/.github/workflows" % repo).data
+        except (GitHubError, ValueError, TypeError, AssertionError):
+            return False
+        if not isinstance(listing, list):
+            return False
+        for item in listing:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "")
+            if not path.endswith((".yml", ".yaml")):
+                continue
+            try:
+                workflow = self._contents_text(repo, path)
+            except (GitHubError, ValueError, TypeError, AssertionError):
+                continue
+            if workflow is not None and _has_pull_request_trigger(workflow):
+                return True
+        return False
+
+    def _repo_ci_green_on_head(self, repo: str, sha: str) -> bool:
+        """Whether at least one check from the repo's own workflows - not the
+        review bot and not code scanning - concluded success on the head
+        commit."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
+                                % (repo, sha)).data or {}
+        except (GitHubError, ValueError, TypeError, AssertionError):
+            return False
+        runs = data.get("check_runs") or []
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            if str(run.get("conclusion") or "") != "success":
+                continue
+            name = str(run.get("name") or "")
+            if not name or name == self.s.review_check:
+                continue
+            if _is_code_scanning_check(name, run):
+                continue
+            return True
+        return False
 
     def _bot_threads(self, repo: str, pr_number: int) -> List[Dict[str, Any]]:
         threads = brain._open_threads(self.gh, repo, pr_number, bot=self.s.review_bot,
@@ -9553,13 +9933,24 @@ class Station:
         ref = lambda issue: self._invariant_ref(repo, int(issue["number"]))  # noqa: E731
         outside = tuple(ref(i) for i in loose if i.get("state") == "open"
                         and "loom:ticket" in _label_names(i))
-        epics = tuple(invariants.EpicShape(
-            ref(epic), epic.get("state", "open") == "open", len(found),
-            tuple(ref(t) for t in found if t.get("state") != "closed"),
-            brain.standing_epic(epic))
-            for epic, found in tree)
+        # An open epic's tickets are its sub-issues and every issue whose Part
+        # of line names it, closed ones too, each once (loom#2023). The
+        # standing repairs epic has no ticket cap, so it costs no search.
+        linked = brain.part_of_linked(self.gh, repo, [
+            int(epic["number"]) for epic, _ in tree
+            if epic.get("state", "open") == "open" and not brain.standing_epic(epic)])
+        epics = []
+        for epic, found in tree:
+            union = {int(t.get("number") or 0): t for t in found}
+            for t in linked.get(int(epic["number"]), []):
+                union.setdefault(int(t.get("number") or 0), t)
+            union.pop(0, None)
+            epics.append(invariants.EpicShape(
+                ref(epic), epic.get("state", "open") == "open", len(union),
+                tuple(ref(t) for t in union.values() if t.get("state") != "closed"),
+                brain.standing_epic(epic), brain.sub_issue_count(self.gh, repo, epic, found)))
         return invariants.GoalShape(self._invariant_ref(repo, number),
-                                    brain.goal_epic_cap(goal), epics, outside)
+                                    brain.goal_epic_cap(goal), tuple(epics), outside)
 
     def _roll_goals(self, homes: List[Tuple[str, Dict[str, Any]]]) -> List[invariants.Ref]:
         """The goal homes whose body names a roll that no LOOM_ROLL_SHIP_DOCS
@@ -9602,6 +9993,7 @@ class Station:
                            ("runs", self._invariant_runs),
                            ("silent_runs", self._invariant_silent),
                            ("waits", self._invariant_waits),
+                           ("unshipped", self._invariant_unshipped),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):
             try:

@@ -36,6 +36,8 @@ _BEFORE_ABSENT_RE = re.compile(r"\b(?:no|never|zero|without|not)\b|n't\b", re.I)
 _AFTER_ABSENT_RE = re.compile(
     r"\bnever\b|\babsent\b|n't\b|\b(?:does|do|did|is|are|was|were|must|should|will|would)"
     r"\s+not\b", re.I)
+_AFTER_PRESENT_RE = re.compile(
+    r"\b(?:appears?|shows?|returns?|answers?|contains?|becomes?|remains?)\b", re.I)
 _CONNECTOR_RE = re.compile(r"^[\s,]*(?:(?:and|or|nor)\b)?[\s,]*$", re.I)
 _SPAN_RE = re.compile(
     r"(\d+(?:\.\d+)?)[- ]?(hours?|hrs?|h|days?|d|weeks?|w)\b|\b(?:a|an|one)\s+(hour|day|week)\b",
@@ -72,7 +74,8 @@ def absent_needles(live: str) -> List[str]:
     log: "no `X` line appears", "never logs `X`", "`X` does not appear". A
     string is read with the words before it (back to the clause start) and
     after it (up to the next string); a string joined to an absent one by
-    "and"/"or" alone shares its wording."""
+    "and"/"or" alone shares its wording unless a positive predicate starts
+    the next clause."""
     found = list(NEEDLE_RE.finditer(live))
     absent: List[str] = []
     previous = False
@@ -88,7 +91,11 @@ def absent_needles(live: str) -> List[str]:
         joined = bool(_CONNECTOR_RE.match(before)) and index > 0
         flag = (previous if joined
                 else bool(_BEFORE_ABSENT_RE.search(clause)))
-        flag = flag or bool(_AFTER_ABSENT_RE.search(after[:60]))
+        after_clause = after[:60]
+        flag = flag or bool(_AFTER_ABSENT_RE.search(after_clause))
+        if joined and _AFTER_PRESENT_RE.search(after_clause) \
+                and not _AFTER_ABSENT_RE.search(after_clause):
+            flag = False
         if flag and _eligible(value) and not template(value) and value not in absent:
             absent.append(value)
         previous = flag

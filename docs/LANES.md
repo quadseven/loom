@@ -1178,6 +1178,10 @@ Each invariant is one function returning breaches with evidence:
   every such goal): the station opens no source-pin pull request when their
   module changes merge (README.md, Roll source pins). The issue says when
   the setting is empty, which turns the pass off.
+- Tickets still at `loom:merged` 24 hours after a ship rule found their merge
+  commit deployed, because the move to `loom:shipped` failed
+  (`merged-not-shipped`, one rolling issue, a line per ticket; docs/BRAIN.md,
+  Shipping through a downstream roll).
 
 The failing-streak, lane-held and silent-lane invariants are one rolling
 issue each, a line per lane, rewritten in place while the list changes, as

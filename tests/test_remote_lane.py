@@ -69,6 +69,10 @@ class FakeGitHub:
             return type("Response", (), {"data": {"number": 9, "html_url": "https://example.com/pr/9"}})()
         return type("Response", (), {"data": {}})()
 
+    def app_login(self):
+        # The App identity the lane authenticates as, as GitHub.app_login reads it.
+        return APP
+
     def paginate(self, path):
         names = [x["name"] for x in self.issues[4]["labels"]]
         if "issues?state=open&labels=loom:queued" in path:
@@ -368,6 +372,63 @@ class OutsiderCommentTests(unittest.TestCase):
         lane.heartbeat(gh, "example/project", 4, now=1000)
         self.assertFalse(any(m == "PATCH" for m, _, _ in gh.calls))
         self.assertEqual("<!-- loom:remote-claim v1 muse 4 1000.000 -->", gh.comments[4][-1]["body"])
+
+
+class OwnAppLoginTests(unittest.TestCase):
+    """The lane trusts its own App login even when LOOM_BRIEF_AUTHORS omits
+    it (loom#2008): otherwise it never finds its last marker and posts a new
+    comment, and a notification email, every tick."""
+
+    ENVS = ({"LOOM_BRIEF_AUTHORS": "operator-example"}, {"LOOM_BRIEF_AUTHORS": ""}, None)
+
+    def env(self, values):
+        if values is None:
+            patcher = mock.patch.dict(os.environ, {}, clear=False)
+            patcher.start()
+            os.environ.pop("LOOM_BRIEF_AUTHORS", None)
+        else:
+            patcher = mock.patch.dict(os.environ, values)
+            patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_two_lane_heartbeats_leave_one_status_comment(self):
+        for values in self.ENVS:
+            with self.subTest(env=values):
+                self.env(values)
+                gh = FakeGitHub()
+                lane.lane_heartbeat(gh, "example/project", now=1000)
+                lane.lane_heartbeat(gh, "example/project", now=2000)
+                self.assertEqual(len(gh.comments[9]), 1)
+                self.assertIn(" 2000.000 ", gh.comments[9][0]["body"])
+
+    def test_repeated_claim_beats_edit_one_claim_comment(self):
+        for values in self.ENVS:
+            with self.subTest(env=values):
+                self.env(values)
+                gh = FakeGitHub()
+                gh.issues[4]["labels"] = [{"name": "loom:running"}, {"name": "lane:muse"}]
+                for at in (1000, 1100, 1200):
+                    lane.heartbeat(gh, "example/project", 4, now=at)
+                self.assertEqual(len(gh.comments[4]), 1)
+                self.assertEqual(gh.comments[4][0]["body"],
+                                 "<!-- loom:remote-claim v1 muse 4 1200.000 1000.000 -->")
+
+    def test_an_outsider_marker_still_does_not_count(self):
+        self.env({"LOOM_BRIEF_AUTHORS": "operator-example"})
+        gh = FakeGitHub()
+        gh.comments[9].append({"id": 900, "body": "<!-- loom:remote-heartbeat v1 muse 1.000 -->",
+                               "created_at": "now", "user": {"login": OUTSIDER}})
+        lane.lane_heartbeat(gh, "example/project", now=1000)
+        self.assertEqual(gh.comments[9][0]["body"], "<!-- loom:remote-heartbeat v1 muse 1.000 -->")
+        self.assertEqual(len(gh.comments[9]), 2)
+
+    def test_a_client_without_an_app_login_trusts_only_the_configured_logins(self):
+        self.env({"LOOM_BRIEF_AUTHORS": "operator-example"})
+        gh = FakeGitHub()
+        gh.app_login = lambda: None
+        lane.lane_heartbeat(gh, "example/project", now=1000)
+        lane.lane_heartbeat(gh, "example/project", now=2000)
+        self.assertEqual(len(gh.comments[9]), 2)
 
 
 class DefaultDifficultyTests(unittest.TestCase):

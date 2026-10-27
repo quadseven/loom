@@ -777,6 +777,12 @@ head commit from its files and raises the label to match, never lowering it:
 - A pull request with no class label keeps the `logic` rule.
 - A medium or low finding from a bad-work rule is never deferred (below).
 
+One lane pull request lands at a time in a repo: the factory marks the one it
+is landing `loom:landing`, and for up to 40 minutes from the mark no other
+pull request there is updated or merged, by the factory or by `bus.brain
+merge`, which refuses it (docs/BRAIN.md, Landing lock). Merge the marked one,
+or wait for it; do not merge around it.
+
 ## Merge by risk tier
 
 The change class says how a change is reviewed; the risk tier says who may
