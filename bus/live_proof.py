@@ -287,14 +287,24 @@ def _absence(step: Step, needle: str, answer: Answer, lines: List[str],
     if answer.hours is None:
         return False, ("the `%s` log adapter did not say how much log it read, so "
                        "`%s` cannot be shown absent" % (step.source, needle))
-    if answer.hours + 1e-6 < needed:
-        return False, ("the `%s` log adapter read %.1f hours, short of the %.1f "
-                       "needed to show `%s` absent" % (step.source, answer.hours, needed, needle))
+    stamped = [evidence.line_time(line) for line in answer.lines or []]
+    stamped = [at for at in stamped if at is not None]
+    covered = min(answer.hours, (max(stamped) - min(stamped)) / 3600) if stamped else answer.hours
+    span = ""
+    if stamped:
+        span = " (lines cover %s to %s)" % (_when(min(stamped)), _when(max(stamped)))
+    if covered + 1e-6 < needed:
+        return False, ("the `%s` log covers %.1f hours%s, short of the %.1f hours "
+                       "needed to show `%s` absent" % (step.source, covered, span, needed, needle))
     if count or lines:
         return False, "the `%s` log names `%s` %d times since the deploy%s" % (
             step.source, needle, max(count, len(lines)), _quoted(safe))
-    return True, "`%s` absent from the `%s` log over the %.1f hours read" % (
-        needle, step.source, answer.hours)
+    return True, "`%s` absent from the `%s` log over the %.1f hours read%s" % (
+        needle, step.source, covered, span)
+
+
+def _when(at: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
 
 
 def _quoted(safe: List[str]) -> str:

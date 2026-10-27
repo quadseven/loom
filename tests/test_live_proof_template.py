@@ -88,7 +88,19 @@ class TemplatedAdapterAbsence(unittest.TestCase):
 
         self.assertFalse(outcome.proven)
         self.assertIn("0.5 hours", outcome.missing[0][1])
-        self.assertIn("2.0 needed", outcome.missing[0][1])
+        self.assertIn("2.0 hours needed", outcome.missing[0][1])
+
+    def test_absence_uses_timestamps_when_claimed_window_is_longer(self):
+        live = ("Live: over 2 hours after the deploy, `log:worker` never shows "
+                "`refused: already complete`.")
+        first = "2030-01-02T01:00:00Z worker: normal"
+        last = "2030-01-02T01:30:00Z worker: normal"
+        answer = live_proof.Answer([first, last], hours=2, count=0)
+        outcome = prove_with(answer, live)
+
+        self.assertFalse(outcome.proven)
+        self.assertIn("0.5 hours", outcome.missing[0][1])
+        self.assertIn("2.0 hours", outcome.missing[0][1])
 
     def test_full_window_and_evidence_for_each_clause_pass(self):
         live = ("Live: over 2 hours after the deploy, `log:worker` never shows "

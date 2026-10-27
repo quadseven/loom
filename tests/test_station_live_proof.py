@@ -100,6 +100,10 @@ class StationLiveProofTest(tbs.Base):
         self.assertIn(self.sha, proofs[0])
         # The record carries the quoted line as the live criterion's evidence.
         record = proof.read(proofs[0])
+        self.assertEqual(record["observed"], {
+            "start": stamp(self.now - 2 * HOUR),
+            "end": stamp(self.now - 2 * HOUR),
+        })
         [live] = [c for c in record["criteria"] if c["criterion"].startswith("Live:")]
         self.assertIn("> %s worker: daily status ready" % stamp(self.now - 2 * HOUR), live["evidence"])
         [note] = [c for c in self.plain_comments() if "Every acceptance criterion has evidence" in c]

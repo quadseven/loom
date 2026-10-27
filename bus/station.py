@@ -8494,6 +8494,13 @@ class Station:
                         "baseline": "0 of %d" % live, "target": "%d of %d" % (live, live),
                         "after": "%d of %d" % (live, live)},
         }
+        # Adapter evidence may cover less than deploy-to-now. Keep the proof's
+        # stated observation interval inside the timestamps actually quoted.
+        stamps = re.findall(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\b",
+                            "\n".join(outcome.evidence.values()))
+        if stamps:
+            start, end = min(stamps), max(stamps)
+            record["observed"] = {"start": start, "end": end}
         return record, verify_data.proof_facts(branch, pulls), ""
 
     def _live_ask_room(self) -> bool:
