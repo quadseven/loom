@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import unittest
+import unittest.mock
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -104,6 +105,11 @@ class SourceTests(unittest.TestCase):
     def setUp(self):
         self.repo = Repo()
         self.gh = GitHub("t", transport=self.repo)
+        # move() reads LOOM_BRIEF_AUTHORS from the environment: only a
+        # trusted rewrite comment pairs a ticket with its source (loom#1956).
+        patcher = unittest.mock.patch.dict(os.environ, ENV)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def given(self, ticket_state="shipped", line="Rewritten from issue %d." % SOURCE,
               source_labels=("loom:rewritten",), source_comments=None,
