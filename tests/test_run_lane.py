@@ -774,6 +774,46 @@ print('leak guard: clean (shape patterns only)')
         self.assertTrue(line.startswith("[transient] public repo leak scan could not run"), line)
         self.assertIn("could not read deny-list", line)
 
+    def test_a_missing_leak_scanner_is_a_factory_incident(self):
+        # No infra-public checkout and no remote to clone it from: the scanner
+        # cannot be had, so a public-repo push is a factory incident (one issue
+        # filed, the ticket held) instead of a transient failure that the
+        # station re-briefs endlessly (quadseven/loom#1143).
+        self.drop_brief()
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        line = self.failure_line()
+        self.assertTrue(line.startswith("[factory] "), line)
+        self.assertIn("scanner not found", line)
+        self.assertEqual(len([c for c in self.calls() if c.startswith("gh issue create")]), 1)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+        # With an infra-public remote holding the scanner but no local
+        # checkout, the lane clones it before the scan and the push opens.
+        root = Path(self._tmp.name)
+        remotes = root / "remotes"
+        remote = remotes / "quadseven" / "infra-public"
+        remote.parent.mkdir(parents=True)
+        git("init", "-q", "-b", "main", str(remote))
+        scripts = remote / ".github" / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "check_private_leaks.py").write_text(self.scanner.read_text())
+        git("add", ".github/scripts/check_private_leaks.py", cwd=remote)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "scanner", cwd=remote)
+        self.log.write_text("")
+        self.drop_brief("T043-next.md", BRIEF.replace("T042-fix-the-thing", "T043-next"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.loom / "infra-public").exists())
+        self.assertTrue((self.loom / "infra-public" / ".github" / "scripts" / "check_private_leaks.py").exists())
+        self.assertTrue((self.inbox / "done" / "T043-next.md").exists())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+
     # A workload that selects a node label, for the live-cluster check
     # (bus/live_cluster.py, loom#1832).
     MANIFEST = ("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
