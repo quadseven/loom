@@ -30,9 +30,22 @@ def _names(issue: Dict[str, Any]) -> List[str]:
 
 
 def _comments(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
-    """The comments a LOOM_BRIEF_AUTHORS login wrote: a stranger's claim or
-    heartbeat marker neither holds a ticket nor is edited as the lane's."""
-    return brain.trusted_comments(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)))
+    """The comments a LOOM_BRIEF_AUTHORS login wrote, plus this client's
+    own: a stranger's claim or heartbeat marker neither holds a ticket nor
+    is edited as the lane's, but the lane's own marker counts even when the
+    launch environment never named its App login in LOOM_BRIEF_AUTHORS
+    (loom#2008) -- the same own-login GitHub._status_logins adds."""
+    authors = brain.trusted_authors()
+    app_login = getattr(gh, "app_login", None)
+    if callable(app_login):
+        try:
+            own = app_login()
+        except GitHubError:
+            own = None
+        if own and own not in authors:
+            authors = authors + [own]
+    return brain.trusted_comments(
+        gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)), authors)
 
 
 def _claims(comments: Sequence[Dict[str, Any]], lane: str) -> List[Tuple[int, float, float]]:
