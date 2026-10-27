@@ -59,7 +59,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import change_class
+from . import change_class, status
 from .github import GitHubError
 
 DOCS_TESTS = "docs-tests"
@@ -105,6 +105,11 @@ _OWNER_REPO_RE = re.compile(r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9.
 _CITATION_RE = re.compile(r"^\s*(?:Refs?|Part of|Rewritten from|Follows|See|Source)\b.*$",
                           re.I | re.M)
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+# The status section Loom keeps on a ticket is Loom's own log, not the
+# ticket's words: a line such as "Factory incident owner/loom#N is closed"
+# names a repo without asking for a change there (loom#1959).
+_STATUS_RE = re.compile("%s.*?%s" % (re.escape(status.BODY_BEGIN), re.escape(status.BODY_END)),
+                        re.S)
 
 # The review bot opens each finding with "<symbol> <severity> | _<category>_ |
 # `<rule>` | <effort>".
@@ -184,9 +189,10 @@ def entry_tier(entry: Mapping[str, Any]) -> str:
 
 def other_repos(repo: str, ticket_body: str) -> List[str]:
     """Other repos of the same owner the ticket's own words name (citation
-    lines and HTML comments aside)."""
+    lines, HTML comments and Loom's status section aside)."""
     owner, _, name = repo.partition("/")
-    text = _CITATION_RE.sub("", _COMMENT_RE.sub("", ticket_body or ""))
+    text = _STATUS_RE.sub("", ticket_body or "")
+    text = _CITATION_RE.sub("", _COMMENT_RE.sub("", text))
     found = []
     for who, what in _OWNER_REPO_RE.findall(text):
         what = what.rstrip(".")

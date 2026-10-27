@@ -20,7 +20,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bus import brain, factory, merge_tier  # noqa: E402
+from bus import brain, factory, merge_tier, status  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 from test_bus_factory import Base, REPO as REPO_F  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
@@ -113,6 +113,20 @@ class Tiers(unittest.TestCase):
         # A citation line alone names no change in another repo.
         self.assertEqual(merge_tier.classify(REPO, entries(APP_CHANGE),
                                              cite)[0], merge_tier.APP_CODE)
+
+    def test_a_repo_named_only_in_the_loom_status_section_is_not_cross_repo(self):
+        # loom#1959: the status section is Loom's log, not the ticket's words.
+        log = ("%s\n---\n\n- 2026-10-26T13:33:57Z Factory incident example-owner/loom#7 "
+               "is closed: the ticket is back in the queue.\n%s\n" % (
+                   status.BODY_BEGIN, status.BODY_END))
+        ticket = "## What\nCount timed-out runs as progress.\n\n" + log
+        self.assertEqual(merge_tier.classify(REPO, entries(APP_CHANGE), ticket)[0],
+                         merge_tier.APP_CODE)
+        # A repo the ticket's own words name is still cross-repo.
+        asked = "## What\nAlso change example-owner/other-repo to match.\n\n" + log
+        self.assertEqual(merge_tier.classify(REPO, entries(APP_CHANGE), asked),
+                         (merge_tier.CROSS_REPO,
+                          "its ticket names another repo (example-owner/other-repo)"))
 
     def test_a_test_or_doc_named_deploy_file_is_never_low_risk(self):
         # Security review: docs and tests were matched before deploy rules.
