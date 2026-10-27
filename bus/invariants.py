@@ -1248,16 +1248,23 @@ class Filer:
                 # Rewritten into work: the ticket path closes it.
                 self.subjects.pop(key, None)
                 continue
-            try:
-                why = self.settled(invariant, subject) if self.settled else None
-            except GitHubError as err:
-                if isinstance(err, RateLimited):
-                    raise
-                self.say("invariants: could not tell whether %s#%d settled: %s"
-                         % (self.repo, number, err))
-                continue
+            why = self._settled_why(invariant, subject, number)
             if why and self._close_settled(number, issue, why):
                 self.subjects.pop(key, None)
+
+    def _settled_why(self, invariant: str, subject: str, number: int) -> Optional[str]:
+        """The caller's word on whether the subject settled; None when it has
+        none or cannot read it this pass (a rate limit still stops the pass)."""
+        if self.settled is None:
+            return None
+        try:
+            return self.settled(invariant, subject)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            self.say("invariants: could not tell whether %s#%d settled: %s"
+                     % (self.repo, number, err))
+            return None
 
     def _close_settled(self, number: int, issue: Dict[str, Any], why: str) -> bool:
         """Close an issue whose subject settled, with one note saying how.
