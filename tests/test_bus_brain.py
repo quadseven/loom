@@ -3041,6 +3041,34 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
         self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: claude-opus-5-5\n\n" + BODY}])
 
+    def test_escalate_spreads_one_lane_overflow_to_a_less_loaded_rung(self):
+        from bus import factory
+        fake = Routed(ticket_routes(
+            stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")],
+            free=("claude", "codex")))
+
+        def count_load(instance):
+            instance.load.update({"codex": 5, "claude": 1})
+
+        with unittest.mock.patch.object(factory.Factory, "count_load", count_load):
+            outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
+        note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
+        self.assertIn("Skipped rung 2: lane codex load is 5", note)
+
+    def test_escalate_keeps_rung_order_when_one_lane_is_at_the_limit(self):
+        from bus import factory
+        fake = Routed(ticket_routes(
+            stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")],
+            free=("claude", "codex")))
+
+        def count_load(instance):
+            instance.load.update({"codex": factory.ONE_LANE_MAX - 1, "claude": 1})
+
+        with unittest.mock.patch.object(factory.Factory, "count_load", count_load):
+            outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
+
     def test_escalate_uses_the_codex_standin_and_anthropic_slot(self):
         _, outcome = self.run_escalate(ticket_routes(
             stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")], free=("codex-2",)))
