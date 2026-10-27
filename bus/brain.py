@@ -544,15 +544,32 @@ def _checks_blocker(head: Dict[str, Any]) -> Optional[str]:
     return None if checks == "SUCCESS" else "checks %s" % checks.lower()
 
 
-def _review_blocker(node: Dict[str, Any], bot: str) -> Optional[str]:
-    # The newest submitted review decides; an older CHANGES_REQUESTED that a
-    # later review from the bot superseded no longer blocks.
+def _review_blocker(node: Dict[str, Any], bot: str) -> List[str]:
+    # One blocker per reviewer whose newest submitted review still asks for
+    # changes: the review bot's newest review (its rule is unchanged), and each
+    # person's newest review. A later APPROVED or DISMISSED review from the same
+    # person clears it; an older CHANGES_REQUESTED that a later review
+    # superseded no longer blocks. A person can take the bot's login without
+    # being the bot, so the author type must be Bot as well.
     reviews = [r for r in (node.get("reviews") or {}).get("nodes") or []
-               if by_bot(r, bot) and r.get("submittedAt")]
-    latest = max(reviews, key=lambda r: str(r["submittedAt"]), default=None)
-    if latest and latest.get("state") == "CHANGES_REQUESTED":
-        return "grug changes_requested"
-    return None
+               if r.get("submittedAt")]
+    newest: Dict[str, Dict[str, Any]] = {}
+    for r in reviews:
+        author = r.get("author") or {}
+        login = str(author.get("login") or "")
+        stamp = str(r.get("submittedAt") or "")
+        cur = newest.get(login)
+        if cur is None or stamp > str(cur.get("submittedAt") or ""):
+            newest[login] = r
+    blockers: List[str] = []
+    for login, r in newest.items():
+        state = str(r.get("state") or "")
+        if by_bot(r, bot):
+            if state == "CHANGES_REQUESTED":
+                blockers.append("grug changes_requested")
+        elif state == "CHANGES_REQUESTED":
+            blockers.append("changes requested by a person (%s)" % login)
+    return blockers
 
 
 def _threads_blocker(threads: List[Dict[str, Any]]) -> Optional[str]:
@@ -580,7 +597,7 @@ def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
     node = node or {}
     head = _head_commit(node)
     threads = (node.get("reviewThreads") or {}).get("nodes") or []
-    blockers = [b for b in (_checks_blocker(head), _review_blocker(node, bot),
+    blockers = [b for b in (_checks_blocker(head), *_review_blocker(node, bot),
                             _threads_blocker(threads),
                             _unfixed_blocker(threads, head, bot)) if b]
     return "blocked: " + ", ".join(blockers) if blockers else "READY"
@@ -3406,8 +3423,9 @@ def _post_proof(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
 def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     owner, name = repo.split("/", 1)
     query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
-             ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
-             ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
+              ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
+              ' reviews(last:100) { nodes { author { __typename login } state submittedAt } } } '
+              ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
              ' reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes {'
              ' databaseId author { __typename login } body createdAt } } } }'
              ' files(first:100) { totalCount nodes { path deletions changeType } }'
@@ -3433,11 +3451,17 @@ def merge(gh: GitHub, repo: str, number: int,
     else:
         pr, details = _await_settled(gh, repo, number, pr, details, env)
         _validate_merge_pr(repo, pr, details, env)
+        from . import factory
+        bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
+               or factory.DEFAULT_REVIEW_BOT)
         if change_class.class_of(pr) == "sensitive":
-            from . import factory
-            bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
-                   or factory.DEFAULT_REVIEW_BOT)
             _validate_sensitive_merge(gh, repo, details, bot, review_check_name(env))
+        # A person's newest CHANGES_REQUESTED review blocks the merge before
+        # the PUT call, with the same words status shows, instead of a bare 405.
+        person = [b for b in _review_blocker(details, bot)
+                  if b.startswith("changes requested by a person")]
+        if person:
+            raise ValueError(", ".join(person))
         association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
         _refuse_pending_fix(gh, association, env)
         verdict = _verdict_reader(gh, repo, number, details, association, env)

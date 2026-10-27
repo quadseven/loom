@@ -842,9 +842,10 @@ class SensitiveResumeTests(unittest.TestCase):
             # A resolved finding posted after the head commit has no fix-up commit.
             (ready_node(threads=[{"isResolved": True, "root": {"nodes": [{"author": bot, "createdAt": "2030-01-01T13:00:00Z"}]}}]),
              "blocked: 1 grug findings with no fix-up commit after them"),
-            # A person with the bot's login is not the bot.
+            # A person with the bot's login is not the bot: their own change
+            # request blocks, it is just not the bot's rule.
             (ready_node(reviews=[{"author": {"__typename": "User", "login": "grug-tribe"}, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"}]),
-             "READY"),
+             "blocked: changes requested by a person (grug-tribe)"),
             (ready_node(checks="PENDING", threads=[{"isResolved": False}]), "blocked: checks pending, 1 unresolved threads"),
         ]
         for node, want in cases:
@@ -878,6 +879,61 @@ class SensitiveResumeTests(unittest.TestCase):
         # Had the stale review been the newest, the same data would block.
         node["reviews"]["nodes"][0]["state"] = "CHANGES_REQUESTED"
         self.assertEqual(run(), ["- #4 PR - blocked: grug changes_requested"])
+
+    def test_merge_ready_blocks_a_person_changes_requested_and_a_later_review_clears_it(self):
+        person = {"__typename": "User", "login": "reviewer-one"}
+        bot = {"__typename": "Bot", "login": "grug-tribe"}
+        node = ready_node(reviews=[{"author": person, "state": "CHANGES_REQUESTED",
+                                    "submittedAt": "2030-01-01T13:00:00Z"}])
+        self.assertEqual(brain.merge_ready(node, "grug-tribe"),
+                         "blocked: changes requested by a person (reviewer-one)")
+        # A later APPROVED from the same login clears it.
+        node["reviews"]["nodes"].append(
+            {"author": person, "state": "APPROVED", "submittedAt": "2030-01-01T14:00:00Z"})
+        self.assertEqual(brain.merge_ready(node, "grug-tribe"), "READY")
+        # A later DISMISSED from the same login also clears it.
+        node["reviews"]["nodes"].append(
+            {"author": person, "state": "DISMISSED", "submittedAt": "2030-01-01T15:00:00Z"})
+        self.assertEqual(brain.merge_ready(node, "grug-tribe"), "READY")
+        # The bot's own rule is unchanged.
+        self.assertEqual(brain.merge_ready(ready_node(reviews=[{"author": bot,
+                                                                "state": "CHANGES_REQUESTED",
+                                                                "submittedAt": "2030-01-01T08:06:00Z"}]),
+                                                 "grug-tribe"),
+                         "blocked: grug changes_requested")
+        # Two people each blocked list both blockers.
+        other = {"__typename": "User", "login": "reviewer-two"}
+        self.assertEqual(
+            brain.merge_ready(ready_node(reviews=[{"author": person, "state": "CHANGES_REQUESTED",
+                                                   "submittedAt": "2030-01-01T13:00:00Z"},
+                                                  {"author": other, "state": "CHANGES_REQUESTED",
+                                                   "submittedAt": "2030-01-01T14:00:00Z"}]),
+            "grug-tribe"),
+            "blocked: changes requested by a person (reviewer-one), changes requested by a person (reviewer-two)")
+
+    def test_status_shows_a_person_changes_requested_blocker(self):
+        person = {"__typename": "User", "login": "reviewer-one"}
+        node = ready_node(reviews=[{"author": person, "state": "CHANGES_REQUESTED",
+                                    "submittedAt": "2030-01-01T13:00:00Z"}])
+        pulls = [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}], "body": ""}
+        gh = GitHub("t", transport=Fake(reply(200, []), reply(200, pulls),
+                                        reply(200, {"data": {"repository": {"p4": node}}}),
+                                        *merge_takes(), reply(200, ticket_issue), reply(200, [])))
+        lines = [line for line in brain.status(gh, [REPO], REPO, env={}, authors=()).splitlines()
+                 if line.startswith("- #4 ")]
+        self.assertEqual(lines,
+                         ["- #4 PR - blocked: changes requested by a person (reviewer-one)"])
+
+    def test_merge_refuses_a_person_changes_requested_and_makes_no_merge_request(self):
+        person = {"__typename": "User", "login": "reviewer-one"}
+        pr, query = self._merge_replies(changes={"details": {"reviews": {"nodes": [
+            {"author": person, "state": "CHANGES_REQUESTED",
+             "submittedAt": "2030-01-01T13:00:00Z"}]}}})
+        fake = Fake(pr, query)
+        with self.assertRaisesRegex(ValueError, "changes requested by a person \\(reviewer-one\\)"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
     def test_status_asks_for_every_field_merge_ready_reads(self):
         ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}], "body": ""}
