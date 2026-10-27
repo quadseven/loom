@@ -184,6 +184,14 @@ class StatusTest(unittest.TestCase):
                       "2 of them under this goal), listed in the daily digest" % (REPO, GOAL, REPO),
                       "\n".join(lines))
 
+    def test_status_passes_repo_visibility_to_waiting_lines(self):
+        home = GoalHome([report_comment(1, ago(7))], [human(41)], issues=[human(41)])
+        gh = GitHub("t", transport=home)
+        with mock.patch.object(brain, "waiting_lines", wraps=brain.waiting_lines) as lines:
+            brain.status(gh, [REPO], REPO, env={"LOOM_BRIEF_AUTHORS": ME}, now=NOW,
+                         authors=[ME], public={REPO: True})
+        self.assertEqual(lines.call_args.args[2], {REPO: True})
+
 
 if __name__ == "__main__":
     unittest.main()

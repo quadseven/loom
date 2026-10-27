@@ -80,7 +80,7 @@ from .brain import HUMAN_MARKER
 from . import brain
 from .github import (GitHub, GitHubError, RateLimited, TargetReached, _OPENER,
                      _next_link, read_ssm, rest_login, unreadable)
-from .journal import REPLY_RE
+from .journal import REPLY_RE, waiting_line
 from .labels import LANES
 from .labels import REMOTE_LANES
 
@@ -9941,6 +9941,9 @@ class Station:
         body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")),
                                           breaches, gate_hold=hold,
                                           finished=brain.finished_epics(tree))
+        body = body.replace("\n\n" + STANDUP_FOOTER,
+                            "\n" + self._standup_waiting_line(repo, children)
+                            + "\n\n" + STANDUP_FOOTER)
         brain._check_written_text(body)
         if hold is None and self._quiet_standup(repo, comments, children, named, body,
                                                 authors, now):
@@ -9959,6 +9962,23 @@ class Station:
         else:
             notify.post(self.gh, repo, number, body, notify.REPORT)
         state[key] = self.now
+
+    def _standup_waiting_line(self, home: str, children: List[Any]) -> str:
+        counts: Dict[str, int] = {}
+        visibility: Dict[str, bool] = {}
+        home_waiting = set()
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            issues = brain._issues(self.gh, repo)
+            waiting = brain.open_human(issues)
+            counts[repo] = len(waiting)
+            visibility[repo] = self._public(repo)
+            if repo == home:
+                home_waiting = {int(issue.get("number") or 0) for issue in waiting}
+        share = len(home_waiting & {int(child.get("number") or 0)
+                                    for child in children if isinstance(child, dict)})
+        return waiting_line(counts, share, visibility)
 
     @staticmethod
     def _report_due(at: float) -> float:

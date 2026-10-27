@@ -1099,9 +1099,24 @@ def _lane_status(gh: GitHub, lanes_repo: str,
     return max(marked, key=lambda c: c.get("created_at", ""))["body"]
 
 
+def repo_visibility(gh: GitHub, repos: Sequence[str]) -> Dict[str, bool]:
+    """Whether each repo may be named in a public report; unreadable is private."""
+    visibility = {}
+    for repo in repos:
+        try:
+            details = gh.rest("GET", "/repos/%s" % repo).data
+        except RateLimited:
+            raise
+        except GitHubError:
+            details = None
+        visibility[repo] = isinstance(details, dict) and details.get("private") is False
+    return visibility
+
+
 def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
            env: Optional[Dict[str, str]] = None, now: Optional[datetime] = None,
-           authors: Optional[Sequence[str]] = None) -> str:
+           authors: Optional[Sequence[str]] = None,
+           public: Optional[Dict[str, bool]] = None) -> str:
     from . import factory  # factory imports this module
     env = os.environ if env is None else env
     bot = env.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
@@ -1126,7 +1141,7 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     out += [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
         repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
     out += [""] + priority_lines(found, now)
-    out += [""] + waiting_lines(waiting, repos)
+    out += [""] + waiting_lines(waiting, repos, public)
     out += [""] + _health_lines(env)
     out += [""] + validation_gap_lines(env)
     for section in sections:
@@ -5658,7 +5673,8 @@ def _read(path: str) -> str:
 
 
 def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
-    print(status(gh, [_repo(x) for x in args.repos], _repo(args.lanes_repo)))
+    repos = [_repo(x) for x in args.repos]
+    print(status(gh, repos, _repo(args.lanes_repo), public=repo_visibility(gh, repos)))
 
 
 def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
