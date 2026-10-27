@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from bus import hunt_plan, pr_repair, text, tickets  # noqa: E402
+from bus import hunt_plan, labels, pr_repair, text, tickets  # noqa: E402
 from tests import sandbox_caps  # noqa: E402
 from tests.local_http import LocalHTTPServer  # noqa: E402
 
@@ -156,6 +156,18 @@ fi
 if [ "$1 $2" = "pr comment" ] && [ -n "${FAKE_COMMENT:-}" ]; then
   while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_COMMENT"; shift; done
   exit 0
+fi
+# A repo that lacks the label $FAKE_GH_MISSING_LABEL: `issue edit` refuses it,
+# as real gh does, until `label create` makes it ($FAKE_LOG.labels lists
+# each label made); $FAKE_GH_LABEL_CREATE_FAIL makes every create fail.
+if [ "$1 $2" = "label create" ]; then
+  [ -z "${FAKE_GH_LABEL_CREATE_FAIL:-}" ] || { echo "HTTP 403" >&2; exit 1; }
+  printf '%s\n' "$3" >> "$FAKE_LOG.labels"
+  exit 0
+fi
+if [ "$1 $2" = "issue edit" ] && [ -n "${FAKE_GH_MISSING_LABEL:-}" ] &&
+   ! grep -qxF "$FAKE_GH_MISSING_LABEL" "$FAKE_LOG.labels" 2>/dev/null; then
+  echo "could not add label: '$FAKE_GH_MISSING_LABEL' not found" >&2; exit 1
 fi
 if [ "$1 $2" = "pr create" ]; then
   [ -z "${FAKE_GH_CREATE_FAIL:-}" ] || { echo "pr create blew up" >&2; exit 1; }
@@ -1166,6 +1178,31 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
                                 text=True, check=True).stdout
         self.assertEqual(pushed, "")
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_missing_answered_label_is_created_from_the_canonical_set_and_retried_once(self):
+        # loom#2032: a repo enrolled after the last label sync lacked
+        # loom:answered; the answer was posted and the ticket left stateless.
+        self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer"))
+        result = self.run_lane(FAKE_AGENT="answer-file", FAKE_GH_MISSING_LABEL="loom:answered")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        edits = [c for c in calls if c.startswith("gh issue edit 42")]
+        self.assertEqual(len(edits), 2, calls)
+        made = [c for c in calls if c.startswith("gh label create loom:answered")]
+        self.assertEqual(len(made), 1, calls)
+        self.assertIn("--color %s" % labels.LABELS["loom:answered"]["color"], made[0])
+        self.assertIn(labels.LABELS["loom:answered"]["description"], made[0])
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_label_that_still_cannot_be_set_is_retried_only_once(self):
+        self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer"))
+        result = self.run_lane(FAKE_AGENT="answer-file", FAKE_GH_MISSING_LABEL="loom:answered",
+                               FAKE_GH_LABEL_CREATE_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        edits = [c for c in self.calls() if c.startswith("gh issue edit 42")]
+        self.assertEqual(len(edits), 2)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("answer posted but ticket label update failed", log)
 
     def test_answer_deliverable_refuses_local_paths_and_closing_keywords(self):
         for answer, reason in (("See /Users/person/private/file", "absolute path"),
