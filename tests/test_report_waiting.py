@@ -64,6 +64,27 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(journal.waiting_line({"o/a": 0}), "Waiting on you: nothing")
         self.assertEqual(journal.waiting_line({}), "Waiting on you: nothing")
 
+    def test_a_public_home_folds_private_repos_into_one_count(self):
+        self.assertEqual(
+            journal.waiting_line({"pub/a": 25, "pub/b": 3, "priv/c": 7, "priv/d": 2}, 4,
+                                 public={"pub/a": True, "pub/b": True, "priv/c": False,
+                                         "priv/d": False}),
+            "Waiting on you: 37 open loom:human (25 in pub/a, 3 in pub/b, 9 in private repos; 4 "
+            "of them under this goal), listed in the daily digest")
+
+    def test_a_private_home_keeps_every_repo_named(self):
+        self.assertEqual(
+            journal.waiting_line({"pub/a": 25, "priv/c": 7}, 4,
+                                 public={"pub/a": True, "priv/c": True}),
+            "Waiting on you: 32 open loom:human (25 in pub/a, 7 in priv/c; 4 of them under this "
+            "goal), listed in the daily digest")
+
+    def test_a_repo_whose_visibility_cannot_be_read_counts_as_private(self):
+        self.assertEqual(
+            journal.waiting_line({"pub/a": 25, "unk/b": 7}, 4, public={"pub/a": True}),
+            "Waiting on you: 32 open loom:human (25 in pub/a, 7 in private repos; 4 of them "
+            "under this goal), listed in the daily digest")
+
     def test_a_needs_you_with_nothing_after_it_does_not_read_the_next_line(self):
         text = quiet.REPORT_MARKER + "\nNeeds you:\n" + journal.waiting_line({REPO: 3}, 1)
         self.assertEqual(journal._ask(text), "")
@@ -144,6 +165,24 @@ class StatusTest(unittest.TestCase):
         closed = dict(human(41), state="closed")
         home = GoalHome([report_comment(1, ago(7))], [closed], issues=[])
         self.assertIn("Waiting on you: nothing", self.status(home))
+
+    def test_waiting_lines_folds_private_repos_for_a_public_home(self):
+        waiting = {REPO: {"count": 3, "goals": {GOAL: 2}},
+                   "priv/other": {"count": 7, "goals": {}}}
+        lines = brain.waiting_lines(waiting, [REPO, "priv/other"],
+                                    public={REPO: True, "priv/other": False})
+        self.assertIn("- %s#%d: Waiting on you: 10 open loom:human (3 in %s, 7 in private repos; "
+                      "2 of them under this goal), listed in the daily digest" % (REPO, GOAL, REPO),
+                      "\n".join(lines))
+
+    def test_waiting_lines_names_every_repo_for_a_private_home(self):
+        waiting = {REPO: {"count": 3, "goals": {GOAL: 2}},
+                   "priv/other": {"count": 7, "goals": {}}}
+        lines = brain.waiting_lines(waiting, [REPO, "priv/other"],
+                                    public={REPO: False, "priv/other": False})
+        self.assertIn("- %s#%d: Waiting on you: 10 open loom:human (7 in priv/other, 3 in %s; "
+                      "2 of them under this goal), listed in the daily digest" % (REPO, GOAL, REPO),
+                      "\n".join(lines))
 
 
 if __name__ == "__main__":
