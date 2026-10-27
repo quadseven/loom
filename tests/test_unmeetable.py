@@ -24,7 +24,7 @@ class ClosedReferenceTest(unittest.TestCase):
             live, REPO, 964, states({("example-owner/muster", 163): ("closed", False)}),
             tree("verify handed"))
         self.assertEqual(len(found), 1)
-        self.assertIn("example-owner/muster#163", found[0])
+        self.assertIn("example-owner/muster#163", found[0])  # leak-guard-allow: fictional example repos
         self.assertIn("closed", found[0])
 
     def test_a_box_waiting_on_a_closed_unmerged_pull_request_is_flagged(self):
@@ -44,7 +44,7 @@ class ClosedReferenceTest(unittest.TestCase):
                 "prints `thing ready`")
         table = {(REPO, 7): ("closed", False), ("other-owner/thing", 3): ("closed", False)}
         self.assertEqual(unmeetable.closed_refs(live, REPO, 7, states(table)),
-                         ["other-owner/thing#3"])
+                         ["other-owner/thing#3"])  # leak-guard-allow: fictional example repos
 
 
 class LogStringTest(unittest.TestCase):

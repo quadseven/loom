@@ -10573,7 +10573,7 @@ class VerifyDispatchTest(Base):
         self.run_pass()
         self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
         self.assertEqual(len(self.fake.comments[2]), 1)
-        self.assertIn("example-owner/muster#163", self.fake.comments[2][0]["body"])
+        self.assertIn("example-owner/muster#163", self.fake.comments[2][0]["body"])  # leak-guard-allow: fictional example repos
         self.unmeetable_pass()
         self.assertEqual(len(self.fake.comments[2]), 1)
         self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
