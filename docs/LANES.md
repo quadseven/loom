@@ -111,9 +111,12 @@ unset variables.
   exits non-zero or changes tracked files, or a missing interpreter parks the
   brief as `commit refused: ...; nothing pushed`. The records are the
   `contract-setup` and `contract-check` phases.
-- After the agent: the runner commits, then runs `check` on that commit. It
-  passes only with exit 0 and no tracked file changed (a formatter that has
-  to rewrite the agent's files is a failure). Only then is the branch pushed
+- After the agent: the runner commits, then runs `check` on that commit. A
+  plain non-zero exit gets one retry on the same commit; only a pass on that
+  retry validates, and the pull request says the check passed on a second
+  run. Timeouts, environment errors and SIGTERM are not retried. The check
+  must pass with exit 0 and no tracked file changed (a formatter that has to
+  rewrite the agent's files is a failure). Only then is the branch pushed
   and the pull request opened, with a `Validation:` line naming the commit.
 - A failed check parks the brief as `validation failed: ...` (exit 125 to
   127 as `validation environment unavailable: ...`), opens no pull request

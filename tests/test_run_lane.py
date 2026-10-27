@@ -6418,6 +6418,46 @@ exec /usr/bin/git "$@"
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
         self.assertFalse(self.records()[-1]["ok"] is False, self.lane_log())
 
+    def final_retry_lane(self, exits):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        counter = Path(self._tmp.name) / "check-count"
+        check = Path(self._tmp.name) / "flaky-check"
+        cases = " ".join(f"{index}) exit {code} ;;" for index, code in enumerate(exits, 1))
+        self.write_tool(check, "#!/bin/sh\n"
+                        f"n=0; [ ! -f '{counter}' ] || n=$(cat '{counter}'); n=$((n+1)); "
+                        f"echo $n > '{counter}'; case $n in {cases} esac; exit 0\n")
+        self.contract_repo(contract=f"interpreter: loom-test-python\ncheck: {check}\n")
+        self.drop_brief()
+        return self.run_contract_lane()
+
+    def test_final_check_retries_plain_failure_and_mentions_second_run_in_pr(self):
+        result = self.final_retry_lane([0, 1, 0])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        finals = [record for record in self.records() if record["phase"] == "final"]
+        self.assertEqual([record["exit"] for record in finals], [1, 0])
+        self.assertEqual(finals[1]["detail"], "second run after exit 1")
+        self.assertIn("final check passed on a second run", self.body.read_text())
+
+    def test_final_check_fails_after_two_plain_failures(self):
+        result = self.final_retry_lane([0, 1, 1])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        finals = [record for record in self.records() if record["phase"] == "final"]
+        self.assertEqual([record["exit"] for record in finals], [1, 1])
+        self.assertEqual(finals[1]["detail"], "second run after exit 1")
+        self.assertIn("validation failed: the check exited 1", self.lane_log())
+
+    def test_final_check_does_not_retry_timeout_environment_or_sigterm_exits(self):
+        for code in (124, 125, 126, 127, 143):
+            with self.subTest(exit=code):
+                self.tearDown()
+                self.setUp()
+                result = self.final_retry_lane([0, code, 0])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                finals = [record for record in self.records() if record["phase"] == "final"]
+                self.assertEqual([record["exit"] for record in finals], [code])
+
     def test_final_validation_classifies_denied_python_interpreter_as_factory(self):
         text = RUNNER.read_text()
         function = re.search(r"^validation_interpreter_denied\(\) \{\n.*?^\}\n",
