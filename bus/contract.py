@@ -2,8 +2,8 @@
 print it as the "key: value" lines lanes/run_lane.sh runs.
 
 Three forms are in use (2026-10-16):
-- key: value lines (interpreter, submodules, setup, check), which pass
-  through unchanged;
+- key: value lines (interpreter, submodules, setup, check, affected), which
+  pass through unchanged;
 - one "<kind> | <command> | <workflow> | <step>" line per command;
 - "[kind]" or "[kind.name]" tables, or "[[kind]]" array tables (one per
   command), with a command = "..." key.
@@ -14,16 +14,23 @@ under HOME), else the first command's program. A contract that lists no
 command checks nothing: "check: true". Before this, the runner refused the
 other two forms as "an unknown line", and infra-public's lane tickets failed
 setup four times without the agent running.
+
+An "affected" command (an `affected:` line, an `affected | <command>` line or
+an `[affected]` table) is not part of the check: the runner runs it after the
+check with the pull request's changed files on stdin, so a repo can run the
+per-directory suites its path-scoped CI jobs run (loom#1773). In the last two
+forms the affected commands become one `affected:` line joined with " && ".
 """
 from __future__ import annotations
 
 import re
 import shlex
 import sys
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 KINDS = ("lint", "format", "type", "test")
-LEGACY = re.compile(r"^(interpreter|submodules|setup|check)\s*:")
+AFFECTED = "affected"
+LEGACY = re.compile(r"^(interpreter|submodules|setup|check|affected)\s*:")
 TABLE = re.compile(r"^(?:\[([a-z]+)(?:\.[A-Za-z0-9_-]+)*\]|\[\[([a-z]+)(?:\.[A-Za-z0-9_-]+)*\]\])$")
 COMMAND = re.compile(r'^command\s*=\s*"((?:[^"\\]|\\.)*)"$')
 
@@ -35,7 +42,7 @@ def _lines(text: str) -> List[str]:
 
 def _ordered(found: List[Tuple[str, str]]) -> List[str]:
     for kind, _ in found:
-        if kind not in KINDS:
+        if kind not in KINDS and kind != AFFECTED:
             raise ValueError("unknown kind %r (expected one of %s)" % (kind, ", ".join(KINDS)))
     return [cmd for kind in KINDS for k, cmd in found if k == kind and cmd]
 
@@ -97,10 +104,25 @@ def normalize(text: str) -> str:
     if any(LEGACY.match(line) for line in lines):
         return _key_value(lines)
     tables = any(TABLE.match(line) for line in lines)
-    commands = _ordered(_from_tables(lines) if tables else _from_pipes(lines))
+    found = _from_tables(lines) if tables else _from_pipes(lines)
+    commands = _ordered(found)
+    affected = [cmd for kind, cmd in found if kind == AFFECTED and cmd]
+    tail = "affected: %s\n" % " && ".join(affected) if affected else ""
     if not commands:
-        return "check: true\n"
-    return "interpreter: %s\ncheck: %s\n" % (_interpreter(commands), " && ".join(commands))
+        return "check: true\n" + tail
+    return "interpreter: %s\ncheck: %s\n%s" % (_interpreter(commands + affected),
+                                               " && ".join(commands), tail)
+
+
+def fields(text: str) -> Dict[str, str]:
+    """The key: value lines of a contract in any form, as a dict (the station
+    reads the check and affected commands from it, bus/ci_gap.py). Raises
+    ValueError like normalize."""
+    found: Dict[str, str] = {}
+    for line in normalize(text).splitlines():
+        key, _, value = line.partition(":")
+        found[key.strip()] = value.strip()
+    return found
 
 
 def main() -> int:

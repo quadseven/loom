@@ -70,6 +70,12 @@ class FakeGitHub:
             return self.pulls(method, path, body)
         raise AssertionError((method, path, body))
 
+    def paginate(self, path):
+        self.calls.append(("PAGINATE", path, None))
+        if path.startswith("/repos/%s/pulls?state=open" % TARGET):
+            return [self.pull] if self.pull else []
+        raise AssertionError(path)
+
     def contents(self, method, path, body):
         if method == "GET":
             value = self.branch if "?ref=" in path and self.branch is not None else self.base
@@ -147,23 +153,15 @@ class PinTest(unittest.TestCase):
         pin.run(gh, SOURCE, NEXT, "unittest", [SPEC], lambda _: b"archive2", logs.append)
         self.assertEqual(len([call for call in gh.calls if call[0] in ("PUT", "PATCH", "POST")]), writes)
 
-    def test_a_refused_create_raises_githubs_422_and_labels_nothing(self):
+    def test_a_pin_pass_finds_an_existing_pull_request_past_the_first_page(self):
         gh = FakeGitHub()
         pin.run(gh, SOURCE, NEW, "unittest", [SPEC], lambda _: b"archive", lambda _: None)
-        # The open pull request sits past the first page of 100, so the pass
-        # does not see it and asks GitHub to create a second one.
+        # The first page does not contain the open pull request.
         gh.list_hides_pull = True
-        logs = []
-        with self.assertRaises(GitHubError) as caught:
-            pin.run(gh, SOURCE, NEXT, "unittest", [SPEC], lambda _: b"archive2", logs.append)
-        self.assertEqual(caught.exception.status, 422)
-        self.assertEqual(str(caught.exception), "POST /repos/%s/pulls -> 422" % TARGET)
-        answer = json.loads(caught.exception.body)
-        self.assertEqual(answer["message"], "Validation Failed")
-        self.assertIn("A pull request already exists", answer["errors"][0]["message"])
+        pin.run(gh, SOURCE, NEXT, "unittest", [SPEC], lambda _: b"archive2", lambda _: None)
         self.assertEqual(gh.created, 1)
         self.assertEqual(gh.labels, [pin.PIN_LABEL])
-        self.assertFalse(any("opened pull request" in line for line in logs), logs)
+        self.assertTrue(any(call[0] == "PAGINATE" for call in gh.calls))
 
     def test_changed_tarball_or_red_ci_opens_nothing_and_logs_reason(self):
         for red in (False, True):

@@ -14,6 +14,12 @@ the diff adds is in scope when either holds:
   RUNNABLE_DIRS. A pull request runs its own workflow files, so a new
   workflow or action must be named in the brief.
 
+- it sits at the top level beside tracked top-level files of its
+  extension (Python only), and a line the diff adds to a tracked file
+  imports it: ``import <stem>`` or ``from <stem> import``. A repo
+  that keeps its modules at the top level had every new module refused,
+  since no brief can name a file the agent has not chosen yet (loom#1705).
+
 Everything else is stray: a new file at the top level, under a new
 top-level directory, or under a hidden one, that the brief never names.
 Only added files count; an edit to a tracked file is never stray. A file
@@ -41,7 +47,7 @@ import os
 import re
 import subprocess
 import sys
-from typing import Iterable, List, Sequence, Set
+from typing import Iterable, List, Optional, Sequence, Set
 
 # Characters that may sit inside a path token in the brief's prose.
 _PATH_CHAR = r"[\w./-]"
@@ -123,6 +129,57 @@ def in_known_hidden_subdir(path: str, tracked: Set[str]) -> bool:
     return any(name.startswith(parent) for name in tracked)
 
 
+def edited_files(tree: str, base: str, head: str) -> List[str]:
+    """Tracked paths the diff edits between base and head."""
+    return _names(_git(tree, "diff", "-z", "--no-renames", "--diff-filter=M",
+                       "--name-only", base, head))
+
+
+# Extensions a new top-level file may be wired in with. Python only: its
+# import line is the proof, while other toolchains load files by naming
+# convention alone (build.rs, *_test.go, *.config.js), so those files and all
+# config or tool-entry files must be named in the brief.
+WIRED_EXTENSIONS = frozenset(("py",))
+
+# Source files that tools load or run on their own: never in scope unnamed.
+AUTO_RUN_NAMES = frozenset(("conftest.py", "setup.py", "sitecustomize.py",
+                            "usercustomize.py", "noxfile.py", "__init__.py",
+                            "__main__.py", "tasks.py", "fabfile.py", "dodo.py",
+                            "manage.py"))
+
+
+def added_lines(tree: str, base: str, head: str, paths: Sequence[str]) -> List[str]:
+    """The lines the diff adds to these paths."""
+    # No external diff driver or textconv: the agent's tree must not choose
+    # a program for this check to run or a filter that rewrites its lines.
+    out = _git(tree, "diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff",
+               "--no-textconv", base, head, "--",
+               *(":(literal)" + p for p in paths))
+    return [line[1:] for line in out.splitlines()
+            if line.startswith("+") and not line.startswith("+++")]
+
+
+def wired_top_level(path: str, tracked: Set[str], lines: Sequence[str]) -> bool:
+    """True when a new top-level Python file sits beside tracked top-level
+    Python files and a line the diff adds to an edited tracked file
+    imports it. Only those lines count, so two new files
+    cannot vouch for each other and an old mention vouches for nothing;
+    hidden, auto-run and standard-library names never qualify."""
+    name, dot, suffix = path.rpartition(".")
+    if ("/" in path or not dot or not name or path.startswith(".")
+            or not path.isprintable() or suffix not in WIRED_EXTENSIONS
+            or path.casefold() in AUTO_RUN_NAMES):
+        return False
+    if name.casefold() in getattr(sys, "stdlib_module_names", ()):
+        return False
+    if not any("/" not in t and t.endswith(dot + suffix) for t in tracked):
+        return False
+    if not name.isidentifier():
+        return False
+    imported = re.compile(r"^\s*(from|import)\s+%s(\s|\.|,|$)" % re.escape(name))
+    return any(imported.match(line) for line in lines)
+
+
 def stray_files(tree: str, base: str, head: str, brief_text: str,
                 also: Sequence[str] = ()) -> List[str]:
     """Paths the agent's commits added that the brief does not allow."""
@@ -133,10 +190,17 @@ def stray_files(tree: str, base: str, head: str, brief_text: str,
         dirs |= top_dirs(tree, rev)
         elsewhere |= tracked_files(tree, rev)
     stray = []
+    lines: Optional[List[str]] = None
     for path in added_files(tree, base, head):
         if (path in elsewhere or named(brief_text, path) or in_known_dir(path, dirs)
                 or in_known_hidden_subdir(path, tracked)):
             continue
+        if "/" not in path:
+            if lines is None:
+                edited = edited_files(tree, base, head)
+                lines = added_lines(tree, base, head, edited) if edited else []
+            if wired_top_level(path, tracked, lines):
+                continue
         stray.append(path)
     return stray
 

@@ -11,10 +11,11 @@ from typing import Optional, Tuple, Dict, Iterable, List
 
 from . import text
 
-# An exact string in the Live criterion, backticked or in double quotes: about
-# one in seven shipped tickets wrote it as "text" and got no log data. A
-# backticked span is matched first, so a quote inside one is not a needle.
-NEEDLE_RE = re.compile(r'`([^`]+)`|"([^"\n]+)"')
+# An exact string in the Live criterion, backticked, in double quotes, or with
+# template placeholders like <name> or ...: about one in seven shipped tickets
+# wrote it as "text" and got no log data. A backticked span is matched first,
+# so a quote inside one is not a needle.
+NEEDLE_RE = re.compile(r'`([^`]+)`|"([^"\n]+)"|<[^>]+>|\\.{3}')
 IP_RE = re.compile(r"\b[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?::[0-9]+)?\b")
 # Live strings are often written as templates: `sync: ... (waiting)`,
 # "left N file(s)", `export <report>: ...`, "account 'X' charges 'Y'". No log
@@ -25,6 +26,8 @@ PLACEHOLDER_RE = re.compile(r"\.\.\.|<[A-Za-z][A-Za-z0-9_-]*>|(?<=')[A-Z](?=')|(
 # A template whose longest fixed part is shorter than this matches too much.
 MIN_LITERAL = 6
 MAX_NEEDLES = 5
+# Spans that name a live-evidence adapter step, not a string to find.
+TEMPLATE_PREFIXES = ("log:", "sql:")
 # A log command may print this line to say how many hours of log it could read
 # (a pod restart cuts the log short of the window it was asked for).
 WINDOW_RE = re.compile(r"^loom-evidence-window-hours:\s*([0-9]+(?:\.[0-9]+)?)\s*$")
@@ -51,10 +54,17 @@ def _eligible(value: str) -> bool:
             and all(32 <= ord(char) < 127 for char in value))
 
 
+def template(value: str) -> bool:
+    """Whether a span is a live-evidence adapter template (`log:<source>`,
+    `sql:<SELECT ...>`, bus/live_proof.py) rather than a string to find."""
+    return value.strip().lower().startswith(TEMPLATE_PREFIXES)
+
+
 def needles(live: str) -> List[str]:
     """Eligible exact strings named by the ticket's Live criterion."""
     found = (tick or quoted for tick, quoted in NEEDLE_RE.findall(live))
-    return list(dict.fromkeys(value for value in found if _eligible(value)))[:MAX_NEEDLES]
+    return list(dict.fromkeys(value for value in found
+                              if _eligible(value) and not template(value)))[:MAX_NEEDLES]
 
 
 def absent_needles(live: str) -> List[str]:
@@ -69,6 +79,8 @@ def absent_needles(live: str) -> List[str]:
     end = 0
     for index, match in enumerate(found):
         value = match.group(1) or match.group(2)
+        if value is None:
+            continue
         before = live[end:match.start()]
         following = found[index + 1].start() if index + 1 < len(found) else len(live)
         after = live[match.end():following]
@@ -77,7 +89,7 @@ def absent_needles(live: str) -> List[str]:
         flag = (previous if joined
                 else bool(_BEFORE_ABSENT_RE.search(clause)))
         flag = flag or bool(_AFTER_ABSENT_RE.search(after[:60]))
-        if flag and _eligible(value) and value not in absent:
+        if flag and _eligible(value) and not template(value) and value not in absent:
             absent.append(value)
         previous = flag
         end = match.end()

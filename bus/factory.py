@@ -17,15 +17,22 @@ Neither needs a model:
 - One with a failing check, an unresolved thread or a conflict goes back to
   a lane as a fix brief (bus.brain.fix). It stays on the ticket's lane while
   the rounds make progress. It climbs the model ladder (docs/MUSE.md) only
-  when it is stuck: a review thread survived a fix round, checks still fail
-  after a round that was asked to fix them, or the pull request is older
-  than STUCK_AGE. A review that finds new things is progress, and a conflict
-  is mechanical (the fix brief's runner merges the base), so neither climbs.
+  when it is stuck: a review thread survived a fix round (the same thread, or
+  the same finding posted again: bus/converge.py compares path, a nearby
+  line and the rule, never ids alone), checks still fail after a round that
+  was asked to fix them, or the pull request is older than STUCK_AGE. A
+  review that finds new things is progress, and a conflict is mechanical
+  (the fix brief's runner merges the base), so neither climbs; a conflict
+  alone is sent back however old the pull request is (loom#1963). The station's
+  hand-back (bus/station.py _post_fix_or_escalate), which usually sends a
+  round before this pass sees the pull request, applies the same test.
 - Landing keeps the default branch green and nothing stale. A ready pull
   request that is behind its base is brought up to date first (GitHub's
   update-branch), and lands only once its checks and review pass again on
   the new head. Each repo lands at most one pull request a pass, so the
-  next one is checked against the base that includes it. Pull requests of
+  next one is checked against the base that includes it. A ready pull
+  request held for the operator is brought up to date the same way while it
+  waits, so it does not drift into a conflict; it still never lands here. Pull requests of
   loom:urgent and loom:regression tickets land first, then by priority,
   then the oldest.
 - A pull request that changes a code file and no test file goes back to its
@@ -68,9 +75,17 @@ Neither needs a model:
   "issue N of another repo" in words, or dropped when it cannot be; editing
   the body reruns the scan. Once per head commit, with a comment on the
   ticket saying which lines changed.
+- A pull request whose only failing check is the plan check, failing on its
+  body (bus/hunt_plan.py), has the failing parts rebuilt from its ticket
+  (bus/pr_repair.py plan_repair) instead of a lane round whose agent edits
+  code (loom#1837): the body edit makes the review bot read it again. Once
+  per head commit, on the ticket's status comment. A ticket that lacks the
+  parts is held for the brain with one note naming them, edited in place;
+  the hold lifts when the ticket gains them.
 - The review bot replies "Fixed in <sha>" on a thread whose flagged code
-  changed, but GitHub does not let its app resolve threads, so the thread
-  stays open. Such a thread, with nobody writing after the bot's reply, is
+  changed (or edits its root comment to start with "Fixed in <sha>" when it
+  collapses it), but GitHub does not let its app resolve threads, so the
+  thread stays open. Such a thread, with nobody writing after the bot, is
   resolved here before the pull request is judged; otherwise it would count
   as a finding that survived the round (77 of 218 open threads on
   2026-10-13 were the bot's own "Fixed in" threads).
@@ -110,6 +125,16 @@ Neither needs a model:
   easy), and says so in its note. The ticket's Difficulty: line is kept, so
   its next move takes its own tier again once a lane of it is up.
 - Past the last rung the ticket is left failed for the brain, with a note.
+- A ticket waiting with no lane that takes it (NO_LANE_RE) for
+  LOOM_NO_LANE_REROUTE hours (default 6) is rerouted to the first rung the
+  climb rules allow with a free lane in its tier; with none, by
+  NO_LANE_HANDOFF it goes to the hand-off pool (HANDOFF_LABEL), out of its
+  goal's in-flight count, with one note (loom#1831, docs/BRAIN.md).
+- A needs-brain hold older than a day that Loom set (bus/brain_hold.py,
+  brain_holds; the station runs it at most every half hour, 5 a run) is
+  resolved: a loom:pr ticket whose pull request fails only the plan check on
+  its body has the body rebuilt and the hold lifted; any other goes to the
+  hand-off pool with one note (loom#1872). A person's hold is never lifted.
 - A revert ticket (bus/revert.py, REVERT_LABEL) lands first when its own
   pull request is green, even while the default branch is red. Its medium
   and low findings are deferred at once instead of after a fix round, and
@@ -140,14 +165,54 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import bench, brain, brief_check, change_class, criteria_gate, labels, merge_tier, naming, notify, operator_hold, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brain_hold, brief_check, change_class, converge, criteria_gate, flake, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
+from . import runners
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
 
 FACTORY_CHECK = 300
 STUCK_AGE = 6 * 3600
 BRIEFED_STALL = 2 * 3600
+# A ticket the factory leaves waiting with no lane that takes it (NO_LANE_RE)
+# this long is rerouted to another rung of the model ladder with a free lane
+# in its tier; LOOM_NO_LANE_REROUTE sets the hours (no_lane_reroute). On
+# 2026-10-25, 89 tickets waited so, some since 10-23, and held their goals'
+# in-flight caps the whole time (loom#1831).
+NO_LANE_REROUTE = 6 * 3600
+# By this long with no reroute allowed, the ticket leaves the queue and its
+# goal's in-flight count for the hand-off pool (HANDOFF_LABEL).
+NO_LANE_HANDOFF = 24 * 3600
+# The wait reasons (Factory.waits) that mean no lane takes the ticket: a
+# queued ticket no free lane of its model or tier takes, a briefed one stalled
+# with no other lane of its rung or tier, or one on a lane at a limit or down
+# with no free lane in its rung or tier.
+NO_LANE_RE = re.compile(r"(no free lane takes model |no free lane in tier "
+                        r"|stalled on lane \S+: no other lane of its "
+                        r"|on lane \S+, .*: no free lane in its )")
+# The hand-off pool the second operator's session works (docs/BRAIN.md).
+HANDOFF_LABEL = labels.HANDOFF
+# The states in which a lane has taken the ticket: its no-lane wait is over.
+LANED_STATES = ("running", "pr", "answered", "merged", "shipped", "verified")
+
+
+def no_lane_reroute(env: Optional[Dict[str, str]] = None) -> float:
+    """Seconds a ticket waits with no lane before a reroute: the hours in
+    LOOM_NO_LANE_REROUTE (a positive number, at most NO_LANE_HANDOFF's),
+    else NO_LANE_REROUTE."""
+    raw = str((os.environ if env is None else env).get("LOOM_NO_LANE_REROUTE", "")).strip()
+    try:
+        hours = float(raw)
+    except ValueError:
+        return float(NO_LANE_REROUTE)
+    if not 0 < hours < float("inf"):
+        return float(NO_LANE_REROUTE)
+    return min(hours * 3600, float(NO_LANE_HANDOFF))
+
+
+def no_lane(reason: str) -> bool:
+    """Whether a wait reason (Factory.waits) says no lane takes the ticket."""
+    return bool(NO_LANE_RE.match(str(reason or "")))
 # A ticket held by its After: line this long, with none of the tickets it
 # waits for merged, is reported to the brain once like a stuck ticket.
 HOLD_STUCK = 48 * 3600
@@ -156,6 +221,9 @@ HOLD_STUCK = 48 * 3600
 REVIEW_GRACE = 1800
 # At most this many merges, send-backs and climbs per pass.
 MAX_ACTIONS = 12
+# At most this many dashboard answers (loom:answer-pending issues) are read in
+# one repo a pass; the rest wait for the next.
+ANSWERS_PER_PASS = 10
 DEFAULT_REVIEW_CHECK = "Grug - Elder"
 # The review bot's plan check (same default as bus/invariants.py).
 DEFAULT_PLAN_CHECK = "Grug - Chief"
@@ -391,7 +459,7 @@ BRIEF_RES = (
 RUNAWAY = "loom:runaway"
 NO_REASON = "agent made no commit and wrote no reason"
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
-                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved isOutdated path'
+                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved isOutdated path line originalLine'
                  ' root: comments(first:1) { nodes { author { __typename login } body url } }'
                  ' comments(last:20) { nodes { author { __typename login } body } } } } } } }')
 RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
@@ -451,6 +519,9 @@ SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
 BODY_LEAK_MARKER = "<!-- loom:body-leak-repaired %s -->"
 # On the ticket: the station put it under an epic for this head commit.
 EPIC_REPAIR_MARKER = "<!-- loom:epic-repaired %s -->"
+# On the ticket's status comment: the factory rebuilt the pull request body
+# from the ticket for this head commit after a body-only plan check failure.
+PLAN_REPAIR_MARKER = "<!-- loom:plan-repaired %s -->"
 # The plan check's summary table names this row for a ticket under no epic.
 EPIC_ROW = "which epic"
 _ORPHAN_NUMBER_RE = re.compile(r"#(\d+)")
@@ -507,6 +578,13 @@ def unticked_notes(missing: Sequence[str]) -> str:
 TICKED_HEADING = "### Live or operator criteria ticked by the lane"
 
 
+def _last_ask(comments: Sequence[Dict[str, Any]]) -> str:
+    """The newest loom:human ask among the comments, or ""."""
+    asks = [str(c.get("body") or "") for c in comments
+            if str(c.get("body") or "").startswith(answer.HUMAN_MARKER)]
+    return asks[-1] if asks else ""
+
+
 def ticked_notes(ticked: Sequence[str]) -> str:
     """The fix note for live or operator criteria a lane ticked in its pull
     request body (bus/criteria_gate.py): only the verifier ticks those."""
@@ -554,6 +632,9 @@ def _ts(value: Any) -> float:
         return 0.0
 
 
+ts_of = _ts
+
+
 def _labels(issue: Dict[str, Any]) -> List[str]:
     return [str(x.get("name") if isinstance(x, dict) else x)
             for x in issue.get("labels") or []]
@@ -590,10 +671,14 @@ def last_climb(comments: Sequence[Dict[str, Any]]) -> float:
 
 def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
           checks_failing: bool, age: float, now: float = 0.0,
-          no_test: bool = False, unticked: Sequence[str] = ()) -> bool:
+          no_test: bool = False, unticked: Sequence[str] = (),
+          threads: Sequence[Dict[str, Any]] = ()) -> bool:
     """Did the last fix round fail to move this pull request? True when a
-    thread it was asked to fix is still open, when checks it was asked to fix
-    still fail, when it was asked for a test and still has none, or when the
+    thread it was asked to fix is still open, or an open one in `threads`
+    holds the same finding (bus/converge.py: same path, a nearby line, the
+    same rule; the review bot may post it again as a new thread), when
+    checks it was asked to fix still fail, when it was asked for a test and
+    still has none, or when the
     pull request is older than STUCK_AGE and has not moved on the ladder for
     STUCK_AGE (age alone climbs once per window, not on every round)."""
     if age > STUCK_AGE and now - last_climb(comments) > STUCK_AGE:
@@ -602,13 +687,28 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
                  if str(c.get("body") or "").startswith(FIX_MARKER)), None)
     if last is None:
         return False
-    if set(FIX_THREAD_RE.findall(last)) & set(open_threads):
+    if _finding_survived(last, open_threads, threads):
         return True
     if no_test and NO_TEST_HEADING in last:
         return True
-    if unticked and UNTICKED_HEADING in last and any("- " + c in last for c in unticked):
+    if _unticked_left(last, unticked):
         return True
     return checks_failing and bool(FIX_CHECK_RE.search(last))
+
+
+def _unticked_left(last: str, unticked: Sequence[str]) -> bool:
+    """The last fix round named a criterion that is still unticked."""
+    return bool(unticked) and UNTICKED_HEADING in last and any("- " + c in last for c in unticked)
+
+
+def _finding_survived(last: str, open_threads: Sequence[str],
+                      threads: Sequence[Dict[str, Any]]) -> bool:
+    """A thread the last fix round asked about is still open, by its id or,
+    posted again, by its finding's signature (bus/converge.py). Failing
+    checks are judged by stuck() itself: any check the round was asked to fix
+    while checks still fail."""
+    return (bool(set(FIX_THREAD_RE.findall(last)) & set(open_threads))
+            or bool(converge.persistent(last, (), threads)))
 
 
 def _end(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
@@ -618,12 +718,34 @@ def _end(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
 
 def bot_marked_fixed(thread: Dict[str, Any], bot: str) -> bool:
     """An open thread the review bot opened whose newest comment is its own
-    "Fixed in" reply. A thread a person opened, or any reply after the
-    bot's, stays open for a person or the brain."""
-    last = _end(thread, "comments", -1)
-    return (not thread.get("isResolved") and brain.by_bot(_end(thread, "root", 0), bot)
-            and brain.by_bot(last, bot)
-            and str(last.get("body") or "").startswith(BOT_FIXED_PREFIX))
+    "Fixed in" reply, or whose root comment starts with "Fixed in <sha>"
+    when no one wrote after it. A thread a person opened, or any reply
+    after the bot's, stays open for a person or the brain."""
+    if thread.get("isResolved"):
+        return False
+    comments = (thread.get("comments") or {}).get("nodes") or []
+    root = _end(thread, "root", 0)
+    if not root and comments:
+        root = comments[0] or {}
+    if not brain.by_bot(root, bot):
+        return False
+    if len(comments) <= 1:
+        return str(root.get("body") or "").startswith(BOT_FIXED_PREFIX)
+    last = comments[-1] or {}
+    return brain.by_bot(last, bot) and str(last.get("body") or "").startswith(BOT_FIXED_PREFIX)
+
+
+def trusted_threads(threads: Sequence[Dict[str, Any]], bot: str,
+                    trusted: set) -> List[Dict[str, Any]]:
+    """The open threads whose root comment the review bot or a trusted login
+    wrote: the only ones that may count toward stuck(). On a public repo
+    anyone can open a thread, and a stranger's thread at a finding's path and
+    line must not climb the ticket's ladder or stop its rounds."""
+    def ours(t: Dict[str, Any]) -> bool:
+        root = _end(t, "root", 0) or _end(t, "comments", 0)
+        return (brain.by_bot(root, bot)
+                or rest_login(root.get("author")).lower() in trusted)
+    return [t for t in threads if not t.get("isResolved") and ours(t)]
 
 
 def bot_fixed(threads: Sequence[Dict[str, Any]], bot: str) -> List[str]:
@@ -1316,10 +1438,17 @@ def difficulty_of(issue: Dict[str, Any]) -> str:
     return str(tickets.parse(issue.get("body"))[0]["Difficulty"]).strip().lower()
 
 
+def public_only(lane: str) -> bool:
+    """Whether the lane takes public repos only: PUBLIC_ONLY, or a slot sent to
+    cluster runners (LOOM_RUNNER_SLOTS), whose inputs and logs live in this
+    public repository's Actions, so the dispatch refuses a private repo."""
+    return lane in PUBLIC_ONLY or lane in runners.runner_slots()
+
+
 def lanes_of(difficulty: str, private: bool) -> Tuple[str, ...]:
     """The lanes of a difficulty tier a repo may run on, best first."""
     return tuple(x for x in TIERS.get(difficulty, ())
-                 if not (private and x in PUBLIC_ONLY))
+                 if not (private and public_only(x)))
 
 
 def tier_lanes(issue: Dict[str, Any], private: bool) -> Tuple[str, ...]:
@@ -1338,6 +1467,12 @@ def agy_takes_header(issue: Dict[str, Any], rung_only: bool = False) -> bool:
         return True
     from .station import lane_takes_model
     return lane_takes_model("agy", model)
+
+
+def _placements(found: Dict[str, Dict[int, Dict[str, Any]]]) -> Dict[str, Tuple[str, str]]:
+    """"OWNER/NAME#N" -> (state, lane) for each ticket, before a pass moves any."""
+    return {"%s#%s" % (repo, number): (_state(issue), _lane(issue))
+            for repo, issues in found.items() for number, issue in issues.items()}
 
 
 class Factory:
@@ -1364,7 +1499,10 @@ class Factory:
                  place: Callable[..., Any] = brain.place_under_epic,
                  plan_check: str = DEFAULT_PLAN_CHECK,
                  scope: Optional[scope_fit.Ask] = None,
-                 demoted: Optional[Dict[str, str]] = None) -> None:
+                 demoted: Optional[Dict[str, str]] = None,
+                 operators: Optional[Sequence[str]] = None,
+                 no_lane_since: Optional[Dict[str, float]] = None,
+                 reroute_after: Optional[float] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1418,6 +1556,19 @@ class Factory:
         # The same map as the last pass left it (the station's saved waits): a
         # ticket whose reason is unchanged is not announced again.
         self.known_waits = dict(known_waits or {})
+        # "OWNER/NAME#N" -> when the ticket first waited with no lane that
+        # takes it (the station's ticket-waits.json, no_lane_since): past
+        # reroute_after it is rerouted, past NO_LANE_HANDOFF handed off.
+        self.no_lane_since = dict(no_lane_since or {})
+        self.reroute_after = no_lane_reroute() if reroute_after is None else reroute_after
+        # The tickets whose no-lane wait ended this pass: a lane took them,
+        # they were rerouted, or they went to the hand-off pool. The station
+        # clears their no_lane_since.
+        self.settled: set = set()
+        # The operators whose answers on the dashboard (bus/answer.py) count:
+        # LOOM_OPERATORS, else the person logins among the trusted ones.
+        self.operators = [o.lower() for o in (operators if operators is not None
+                                              else answer.operators(trusted=trusted))]
         self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
         # Sends the scope check's prompt to a cheap model (bus/scope_fit.py);
@@ -1427,11 +1578,16 @@ class Factory:
         self.load: Dict[str, int] = {}
         self.landed: set = set()
         self.updated: set = set()
+        # Repos where a held pull request was brought up to date this pass
+        # (_keep_current), apart from `updated` so it never delays a landing.
+        self.kept_current: set = set()
         self._runs: Dict[str, List[Dict[str, Any]]] = {}
         # The tickets named by After: lines, and closed tickets whose lane
         # pull requests are still open, read once a pass.
         self._depends: Dict[str, Optional[Dict[str, Any]]] = {}
         self._merged_prs: Dict[str, Dict[int, int]] = {}
+        # Each repo's open pull requests, read once a pass by _open_lane_pull.
+        self._open_pulls: Dict[str, List[Dict[str, Any]]] = {}
 
     # -- reads -----------------------------------------------------------
     def _trusted(self, item: Dict[str, Any]) -> bool:
@@ -1732,7 +1888,7 @@ class Factory:
         that takes public repos only never takes a private repo's."""
         lanes = CLIMB[rung - 1][0]
         if self._is_private(repo):
-            lanes = tuple(lane for lane in lanes if lane not in PUBLIC_ONLY)
+            lanes = tuple(lane for lane in lanes if not public_only(lane))
         return lanes
 
     def _up_lanes(self, repo: str) -> Dict[int, Tuple[str, ...]]:
@@ -1798,6 +1954,27 @@ class Factory:
                            "operator one exact question." % (why, ", ".join(ran) or "none"))
         _say("%s#%d is past the last rung; left failed for the brain" % (repo, number))
 
+    def _trusted_open(self, repo: str, pr: Dict[str, Any],
+                      open_threads: Sequence[str]) -> List[Dict[str, Any]]:
+        """The pull request's open threads that may count toward stuck
+        (trusted_threads); read only when it has open threads at all."""
+        if not open_threads:
+            return []
+        return trusted_threads(self._threads(repo, int(pr["number"])), self.review_bot,
+                               self.trusted)
+
+    def _hand_off_failed(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Put a ticket whose fix rounds stopped past the ladder in the
+        hand-off pool (HANDOFF_LABEL), left loom:failed; _hand_off is the
+        no-lane route, which leaves it queued."""
+        names = _labels(issue)
+        if HANDOFF_LABEL in names:
+            return
+        kept = names + [HANDOFF_LABEL]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+                     {"labels": kept})
+        issue["labels"] = [{"name": x} for x in kept]
+
     def _close_past_ladder_pr(self, repo: str, pr: Dict[str, Any]) -> None:
         """Close an open lane pull request whose ticket is past the last rung of
         the model ladder, naming why, so the lane does not stall on it
@@ -1814,7 +1991,7 @@ class Factory:
                    comments: List[Dict[str, Any]], why: str,
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
                    no_test: bool = False, unticked: Sequence[str] = (),
-                   ticked: Sequence[str] = ()) -> None:
+                   ticked: Sequence[str] = (), conflict_only: bool = False) -> None:
         number = int(issue["number"])
         held = SEND_BACK_HOLDS & set(_labels(issue))
         if held:
@@ -1827,28 +2004,16 @@ class Factory:
         if checks_failing and self._past_no_change(repo, issue, comments):
             return
         age = self.now - _ts(pr.get("created_at"))
-        if stuck(comments, open_threads, checks_failing, age, self.now, no_test, unticked):
-            footer = self._footer(repo, pr)
-            if self._climb(repo, issue, comments, why, footer=footer) is None:
-                if RUNAWAY in _labels(issue):
-                    return
-                if self._rungs_left(repo, issue, comments, footer):
-                    # Not past the ladder: no lane of an untried rung is up.
-                    # It waits, with no comment, and climbs on a later pass.
-                    # An answered thread is judged by the review bot instead:
-                    # it re-reviews the head with the reply in view.
-                    asked = self._ask_reviewer(repo, pr)
-                    note = ("; the review bot was asked to judge the answer on #%d"
-                            % int(pr["number"])) if asked else ""
-                    self._waiting(repo, number, "no lane is up for its next rung")
-                    _say("%s#%d waits: no lane is up for its next rung%s"
-                         % (repo, number, note))
-                    return
-                tried, _ = self._tried(issue, comments, footer=footer)
-                self._close_past_ladder_pr(repo, pr)
-                self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
-                                                 if 1 <= n <= len(CLIMB)])
-                return
+        threads = self._trusted_open(repo, pr, open_threads)
+        # A conflict alone is mechanical (the fix brief's runner merges the
+        # base), so it never climbs, waits for a rung or closes the pull
+        # request past the ladder, however old the pull request is
+        # (loom#1963): a ready pull request that hand merges left
+        # conflicting got no brief at all once its age read as stuck.
+        if (not conflict_only and stuck(comments, open_threads, checks_failing, age, self.now,
+                                        no_test, unticked, threads)
+                and not self._climb_or_stop(repo, pr, issue, comments, why)):
+            return
         lane = None
         # A ticket with no lane label (a silent-lane requeue drops it, and the
         # run's pull request opens after; loom#1095, 2026-10-21) failed every
@@ -1875,9 +2040,11 @@ class Factory:
                 _say("%s#%d: ticked criteria not quoted in the fix note (%s)"
                      % (repo, number, err))
         if lane is not None:
-            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane)
+            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane,
+                            authors=sorted(self.trusted))
         else:
-            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes)
+            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes,
+                            authors=sorted(self.trusted))
         if sent is False:
             # brain.fix found nothing new to say and wrote nothing.
             _say("%s#%d not sent back for #%d (%s): the brief would add nothing"
@@ -1885,6 +2052,37 @@ class Factory:
             return
         self.actions += 1
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
+
+    def _climb_or_stop(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
+                       comments: List[Dict[str, Any]], why: str) -> bool:
+        """Climb a stuck pull request's ticket one rung. True when it climbed,
+        so the send-back goes on to the new lane; False when it waits for a
+        lane of its next rung, is a runaway, or is past the ladder (its pull
+        request closed and the ticket given up), so nothing is sent."""
+        number = int(issue["number"])
+        footer = self._footer(repo, pr)
+        if self._climb(repo, issue, comments, why, footer=footer) is not None:
+            return True
+        if RUNAWAY in _labels(issue):
+            return False
+        if self._rungs_left(repo, issue, comments, footer):
+            # Not past the ladder: no lane of an untried rung is up.
+            # It waits, with no comment, and climbs on a later pass.
+            # An answered thread is judged by the review bot instead:
+            # it re-reviews the head with the reply in view.
+            asked = self._ask_reviewer(repo, pr)
+            note = ("; the review bot was asked to judge the answer on #%d"
+                    % int(pr["number"])) if asked else ""
+            self._waiting(repo, number, "no lane is up for its next rung")
+            _say("%s#%d waits: no lane is up for its next rung%s"
+                 % (repo, number, note))
+            return False
+        tried, _ = self._tried(issue, comments, footer=footer)
+        self._close_past_ladder_pr(repo, pr)
+        self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
+                                         if 1 <= n <= len(CLIMB)])
+        self._hand_off_failed(repo, issue)
+        return False
 
     def _past_no_change(self, repo: str, issue: Dict[str, Any],
                         comments: Sequence[Dict[str, Any]]) -> bool:
@@ -2090,16 +2288,24 @@ class Factory:
                                       True)):
             details = brain._pr_graphql(self.gh, repo, number)
             faults = pr_faults(details, full, runs)
+        # An infra timeout is re-run whatever else fails on the head: the
+        # review check failing beside it kept _run_again from ever re-running
+        # it, and the fix round then read it as a stuck failure (loom#1962).
+        if "failing checks" in faults and self._rerun_infra_flakes(repo, number, sha):
+            return
         if faults == ["failing checks"] and (
                 self._split_pr(repo, number, full, issue, comments, sha)
                 or self._repair_body_leak(repo, number, full, issue, comments, sha)
                 or self._repair_ticket_epic(repo, number, issue, comments, sha)
+                or self._repair_plan_body(repo, number, full, issue, comments, sha)
+                or self._update_base_fixed(repo, number, full, sha)
                 or self._run_again(repo, number, sha)
                 or self._review_again(repo, number, full, sha)):
             return
         if faults:
             self._send_back(repo, full, issue, comments,
-                            ", ".join(faults), open_thread_ids(details), "failing checks" in faults)
+                            ", ".join(faults), open_thread_ids(details), "failing checks" in faults,
+                            conflict_only=faults == ["a conflict"])
         elif review == "reviewed":
             self._land_or_ask_test(repo, number, full, issue, comments, sensitive)
 
@@ -2286,6 +2492,132 @@ class Factory:
         _say("put %s#%d under epic #%d after %s held #%d" % (repo, ticket, epic, self.plan_check, number))
         return True
 
+    def _repair_plan_body(self, repo: str, number: int, full: Dict[str, Any],
+                          issue: Dict[str, Any], comments: List[Dict[str, Any]],
+                          sha: str) -> bool:
+        """When the plan check is the only failing check and the body fails
+        it (bus/hunt_plan.problems), rebuild the failing parts from the
+        ticket with bus/pr_repair.py and edit the body, which makes the review
+        bot read it again, instead of a fix round that runs an agent on code
+        that cannot change the body (loom#1837). Once per head commit, kept
+        on the ticket's status comment, which sends no email. When the ticket
+        itself lacks the parts, the ticket is held for the brain with one
+        note, edited in place, naming them; no lane round is sent. False
+        leaves the pull request to the usual paths: another failing check, a
+        body that passes (the check failed on something else), a body with no
+        runner footer to rebuild from, or a repair the text checks refuse."""
+        failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
+        if len(failed) != 1 or failed[0].get("name") != self.plan_check:
+            return False
+        ticket = int(issue["number"])
+        marker = PLAN_REPAIR_MARKER % sha
+        repaired_at = max((_ts(c.get("created_at")) for c in comments
+                           if marker in str(c.get("body") or "")), default=0.0)
+        if repaired_at:
+            if (_ts(failed[0].get("completed_at")) < repaired_at
+                    and self.now - repaired_at <= REVIEW_GRACE):
+                _say("%s#%d waits: its body was rebuilt from ticket #%d and %s has not read "
+                     "it again" % (repo, number, ticket, self.plan_check))
+                return True
+            return False  # read again and still failing: the usual paths
+        found = self._plan_found(repo, number, full, issue)
+        if found is None:
+            return False
+        if found["changed"]:
+            self._apply_plan_body(repo, number, issue, found, marker)
+            self._lift_plan_hold(repo, number, issue, comments)
+            self.actions += 1
+            _say("rebuilt %s#%d's body from ticket #%d after a body-only %s failure"
+                 % (repo, number, ticket, self.plan_check))
+            return True
+        self._hold_plan(repo, number, issue, comments,
+                        pr_repair.ticket_gaps(list(found["after"])))  # type: ignore[arg-type]
+        return True
+
+    def _plan_found(self, repo: str, number: int, full: Dict[str, Any],
+                    issue: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """bus/pr_repair.plan_repair's answer for a pull request body that
+        fails the plan check and carries the runner's footer; None when the
+        body passes, has no footer, or the text checks refuse the repair."""
+        body = str(full.get("body") or "")
+        if not hunt_plan.problems(body):
+            return None
+        fields = pr_repair.footer_fields(body)
+        if fields is None:
+            return None
+        name, lane, model = fields
+        found = pr_repair.plan_repair(tickets.render_brief(repo, issue, lane),
+                                      str(full.get("title") or ""), body, lane, model, name,
+                                      repo=repo, public=not self._is_private(repo))
+        if found["reason"]:
+            _say("%s#%d: plan body repair refused (%s)" % (repo, number, found["reason"]))
+            return None
+        return found
+
+    def _apply_plan_body(self, repo: str, number: int, issue: Dict[str, Any],
+                         found: Dict[str, Any], marker: str, also: str = "") -> None:
+        """Edit the rebuilt body onto the pull request, and say so (with
+        `also`, a further line) in one event on the ticket's status comment."""
+        self.gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number), {"body": found["body"]})
+        self._status_note(repo, int(issue["number"]), "%s\n%s failed on pull request #%d only "
+                          "on its body (%s), which the runner writes from this ticket, so the "
+                          "factory rebuilt it from the ticket instead of sending a lane "
+                          "round.%s" % (marker, self.plan_check, number,
+                                        "; ".join(found["before"]),
+                                        "\n" + also if also else ""))
+
+    @staticmethod
+    def _plan_note(comments: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """The ticket's plan-hold note (bus/pr_repair.PLAN_NOTE_MARKER), a
+        real comment the runner or the factory wrote, or None."""
+        return next((c for c in comments if c.get("id") and not c.get(status.EXPANDED)
+                     and str(c.get("body") or "").startswith(pr_repair.PLAN_NOTE_MARKER)), None)
+
+    def _hold_plan(self, repo: str, number: int, issue: Dict[str, Any],
+                   comments: Sequence[Dict[str, Any]], gaps: List[str]) -> None:
+        """Hold the ticket for the brain: needs-brain, and the one note naming
+        what the ticket lacks, posted once and edited only when it changes.
+        The note records whether this hold added needs-brain, so lifting it
+        never takes off a label set for another reason."""
+        ticket = int(issue["number"])
+        note = self._plan_note(comments)
+        set_label = bool(note is not None and pr_repair.hold_set_label(str(note.get("body") or "")))
+        wrote = False
+        if "needs-brain" not in _labels(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, ticket),
+                         {"labels": ["needs-brain"]})
+            issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
+            set_label = wrote = True
+        text = pr_repair.hold_note(number, self.plan_check, gaps, set_label)
+        if note is None:
+            notify.post(self.gh, repo, ticket, text, notify.HELD)
+            wrote = True
+        elif str(note.get("body") or "").strip() != text.strip():
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(note["id"])),
+                         {"body": text})
+            wrote = True
+        if wrote:
+            self.actions += 1
+            _say("held %s#%d for the brain: its body fails %s and ticket #%d lacks %s"
+                 % (repo, number, self.plan_check, ticket, "; ".join(gaps)))
+
+    def _lift_plan_hold(self, repo: str, number: int, issue: Dict[str, Any],
+                        comments: Sequence[Dict[str, Any]]) -> None:
+        """After a repair: say in the plan-hold note that the hold is lifted,
+        and take needs-brain off only when that note records the hold added
+        it (pr_repair.PLAN_SET_LABEL); a label set for another reason stays."""
+        note = self._plan_note(comments)
+        if note is None or str(note.get("body") or "").strip() == pr_repair.lifted_note(number):
+            return
+        if (pr_repair.hold_set_label(str(note.get("body") or ""))
+                and "needs-brain" in _labels(issue)):
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/needs-brain" % (repo, int(issue["number"])),
+                         ok=(404,))
+            issue["labels"] = [x for x in issue.get("labels") or []
+                               if (x.get("name") if isinstance(x, dict) else x) != "needs-brain"]
+        self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(note["id"])),
+                     {"body": pr_repair.lifted_note(number)})
+
     def _land_or_ask_test(self, repo: str, number: int, full: Dict[str, Any],
                           issue: Dict[str, Any], comments: List[Dict[str, Any]],
                           sensitive: bool = False) -> None:
@@ -2308,23 +2640,54 @@ class Factory:
         elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
-        elif (not sensitive and not self._operator_holds(repo, number, full, issue)
-              and not self._risk_holds(repo, number, full, issue)):
+        elif sensitive:
+            return
+        elif (self._operator_holds(repo, number, full, issue, comments)
+              or self._risk_holds(repo, number, full, issue, comments)):
+            self._keep_current(repo, number, full)
+        else:
             self._file_criterion_follow_up(repo, number, issue, full)
             self._land(repo, number, full, issue, comments)
 
+    def _keep_current(self, repo: str, number: int, full: Dict[str, Any]) -> None:
+        """Bring a ready pull request held for the operator up to date with
+        its base when it is behind, so it does not drift into a conflict
+        while it waits (loom#1963). The same update-branch call as _land,
+        pinned to the head it judged, at most one a repo a pass; it never
+        merges. A refused update (422) is left for the next pass: a held
+        pull request is not sent back to a lane."""
+        if repo in self.kept_current or not self._behind(repo, full):
+            return
+        sha = str((full.get("head") or {}).get("sha") or "")
+        done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
+                            {"expected_head_sha": sha}, ok=(422,))
+        self.kept_current.add(repo)
+        if done.status == 422:
+            _say("%s#%d is held and could not be brought up to date with its base"
+                 % (repo, number))
+            return
+        self.actions += 1
+        _say("brought held %s#%d up to date with its base; it still waits for the operator"
+             % (repo, number))
+
     def _operator_holds(self, repo: str, number: int, full: Dict[str, Any],
-                        issue: Dict[str, Any]) -> bool:
+                        issue: Dict[str, Any], comments: Sequence[Dict[str, Any]] = ()) -> bool:
         """Whether the pull request waits for the operator instead of landing
         (bus/operator_hold.py): it or its ticket declares operator steps
         before merge, it changes placement, or it deletes or mostly replaces
         a doc its ticket does not name. The ticket goes
         to loom:human with one exact ask, once; the pull request never lands
-        on the factory's say-so, whatever later passes find."""
+        on the factory's say-so, whatever later passes find. The operator's
+        own answer to that ask (bus/answer.py) decides instead: Merge lifts
+        this hold only, so every other gate still runs; Hold keeps it held
+        and asks nothing more."""
         why = operator_hold.reasons(self.gh, repo, full, str(issue.get("body") or ""),
                                     operator_hold.pull_files(self.gh, repo, number))
         if not why:
             return False
+        settled = self._operator_verdict(repo, number, full, issue, comments)
+        if settled is not None:
+            return settled
         outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, why,
                                      self.human)
         if outcome == "asked":
@@ -2335,7 +2698,7 @@ class Factory:
         return True
 
     def _risk_holds(self, repo: str, number: int, full: Dict[str, Any],
-                    issue: Dict[str, Any]) -> bool:
+                    issue: Dict[str, Any], comments: Sequence[Dict[str, Any]] = ()) -> bool:
         """Whether the pull request's risk tier (bus/merge_tier.py) is one
         Loom may not merge on its own: its ticket goes to loom:human with one
         ask, once, and the operator merges it. A revert ticket's own pull
@@ -2357,6 +2720,9 @@ class Factory:
                                         change_class.class_of(full) == "sensitive")
         if tier in merge_tier.auto_tiers():
             return False
+        settled = self._operator_verdict(repo, number, full, issue, comments)
+        if settled is not None:
+            return settled
         reason = merge_tier.operator_why(tier, why)
         outcome = operator_hold.hold(self.gh, repo, int(issue["number"]), number, [reason],
                                      self.human)
@@ -2366,6 +2732,59 @@ class Factory:
         elif outcome != "already":
             _say("held %s#%d for the operator, but %s" % (repo, number, outcome))
         return True
+
+    def _operator_verdict(self, repo: str, number: int, full: Dict[str, Any],
+                          issue: Dict[str, Any],
+                          comments: Sequence[Dict[str, Any]]) -> Optional[bool]:
+        """The operator's answer to the hold ask on this pull request
+        (answer.pr_verdict), as the hold's outcome: False (Merge: the hold is
+        lifted and the other gates decide), True (Hold: held, no new ask), or
+        None (no answer: the hold asks as before). Each verdict is written to
+        the shadow ledger as the operator's."""
+        verdict = answer.pr_verdict(list(comments), number, self.trusted, self.operators)
+        if verdict is None:
+            return None
+        sha = str((full.get("head") or {}).get("sha") or "")
+        answer.record_verdict(repo, number, verdict, sha, (repo, int(issue["number"])),
+                              source="bus.factory")
+        if answer.is_merge(verdict):
+            _say("%s#%d: the operator %s answered merge; its operator hold is lifted and its "
+                 "other gates decide" % (repo, number, verdict.login))
+            return False
+        _say("%s#%d stays held: the operator %s answered hold" % (repo, number, verdict.login))
+        return True
+
+    def _settle_answers(self, repo: str) -> None:
+        """Read each answer the dashboard posted (an open issue labelled
+        loom:answer-pending, bus/answer.py) and take the label off: the
+        answer is now the operator's newest comment, which the brief, the
+        stale-brief check and the merge gates read. A Hold on a lane pull
+        request held for the operator puts loom:human back, so it keeps
+        waiting on a person. An issue whose label no operator answer backs
+        loses the label too."""
+        items = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                 % (repo, quote(answer.ANSWERED_LABEL, safe="")))
+        for issue in [i for i in items if isinstance(i, dict)][:ANSWERS_PER_PASS]:
+            if self.actions >= MAX_ACTIONS:
+                return
+            number = int(issue.get("number") or 0)
+            comments = self._comments(repo, number)
+            found = answer.newest(comments, self.trusted, self.operators)
+            if found is None:
+                _say("%s#%d is labelled %s, but no operator answer backs it; label removed"
+                     % (repo, number, answer.ANSWERED_LABEL))
+            elif answer.is_hold(found) and answer.held_pr(_last_ask(comments)) is not None:
+                if "loom:human" not in _labels(issue):
+                    self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                                 {"labels": ["loom:human"]})
+                _say("%s#%d: the operator %s answered hold; it keeps waiting on a person"
+                     % (repo, number, found.login))
+            else:
+                _say("%s#%d: read the operator %s's answer (%s)"
+                     % (repo, number, found.login, found.choice))
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                         % (repo, number, quote(answer.ANSWERED_LABEL, safe="")), ok=(404,))
+            self.actions += 1
 
     def _file_criterion_follow_up(self, repo: str, number: int,
                                   issue: Dict[str, Any], full: Dict[str, Any]) -> None:
@@ -2391,6 +2810,49 @@ class Factory:
         if placed:
             self._link_filed(repo, placed, made, body)
 
+    def _update_base_fixed(self, repo: str, number: int, full: Dict[str, Any],
+                           sha: str) -> bool:
+        """Bring a pull request up to date with its base, pinned to its head,
+        when it is behind and every check it fails passed on the base's
+        current head: the failure came from the old base and is already fixed
+        there. A re-run reuses the old merge commit and a fix round waits for
+        a lane, so neither clears it (loom#1961: four pull requests in one repo
+        briefed for a test main had fixed). False when a review check failed,
+        when a failed check did not pass on the base head, when the pull
+        request is not behind, or when GitHub refuses the update; the usual
+        re-run and fix round follow. The update moves the head, so every
+        check and the review run again before it can land."""
+        failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
+        if not failed or any(r.get("name") == self.review_check for r in failed):
+            return False
+        if not self._behind(repo, full) or not self._green_on_base(repo, full, failed):
+            return False
+        done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
+                            {"expected_head_sha": sha}, ok=(422,))
+        if done.status == 422:
+            return False
+        self.actions += 1
+        _say("brought %s#%d up to date with its base: %s passed on the base head, so "
+             "no fix round" % (repo, number, ", ".join(sorted(str(r.get("name")) for r in failed))))
+        return True
+
+    def _green_on_base(self, repo: str, full: Dict[str, Any],
+                       failed: Sequence[Dict[str, Any]]) -> bool:
+        """Did every one of these checks pass on the base branch's current
+        head? False when the base head cannot be read, or when a check is
+        missing there, still running, or not a success."""
+        base = str((full.get("base") or {}).get("ref") or "")
+        if not base:
+            return False
+        base_sha = str((self.gh.rest("GET", "/repos/%s/commits/%s"
+                                     % (repo, quote(base, safe=""))).data or {}).get("sha") or "")
+        if not base_sha:
+            return False
+        on_base = {str(r.get("name") or ""): r for r in self._check_runs(repo, base_sha)}
+        found = [on_base.get(str(r.get("name") or "")) or {} for r in failed]
+        return all(f.get("status") == "completed" and f.get("conclusion") == "success"
+                   for f in found)
+
     def _run_again(self, repo: str, number: int, sha: str) -> bool:
         """Re-run the failed Actions jobs on this commit once. False when a
         review check failed (its findings are real), when a failed check is
@@ -2415,6 +2877,27 @@ class Factory:
         _say("re-ran failed jobs on %s#%d once before sending it back" % (repo, number))
         return True
 
+    def _rerun_infra_flakes(self, repo: str, number: int, sha: str) -> bool:
+        """Re-run, once, the failed Actions jobs on this head that failed on
+        the infrastructure (bus/flake.py), even when the review check failed
+        too: its findings still go back to the lane on a later pass, with the
+        flake gone. False when no such job is on its first attempt, or when
+        GitHub refused a read or the re-run: the pull request then goes the
+        usual paths, as it did before this re-run existed."""
+        runs = self._runs.get(sha, [])
+        try:
+            names = flake.flaky_names(self.gh, repo, runs, (self.review_check, self.plan_check))
+            if not names or not flake.rerun_once(self.gh, repo, runs, names):
+                return False
+        except GitHubError as err:
+            _say("could not re-run infra-failed jobs on %s#%d (%s); judged as usual"
+                 % (repo, number, err))
+            return False
+        self.actions += 1
+        _say("re-ran %s on %s#%d once: an infra failure, not the change"
+             % (", ".join(sorted(names)), repo, number))
+        return True
+
     def _review_again(self, repo: str, number: int, full: Dict[str, Any],
                       sha: str) -> bool:
         """Ask the review bot to look at this head again, once per head
@@ -2431,8 +2914,9 @@ class Factory:
                                str(output.get("summary") or "")):
             return False
         marker = REVIEW_AGAIN_MARKER % sha
-        for comment in self.gh.paginate(
-                "/repos/%s/issues/%d/comments" % (repo, number)):
+        # A trusted marker only: a stranger's copy must not stop the ask.
+        for comment in brain.trusted_comments(self.gh.paginate(
+                "/repos/%s/issues/%d/comments" % (repo, number)), sorted(self.trusted)):
             if marker in str(comment.get("body") or ""):
                 return False
         notify.post(self.gh, repo, number, "%s\n%s" % (marker, REVIEW_AGAIN),
@@ -2601,7 +3085,8 @@ class Factory:
             # Back to loom:pr so the fix brief reuses its open pull request.
             kept = [x for x in _labels(issue) if x != "loom:failed"] + ["loom:pr"]
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
-            self.fix(self.gh, repo, int(pr["number"]), (repo, number), FAILED_RUN_NOTES)
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number), FAILED_RUN_NOTES,
+                     authors=sorted(self.trusted))
         else:
             self.move(self.gh, repo, number, "briefed", lane=lane)
         self.actions += 1
@@ -3112,12 +3597,15 @@ class Factory:
         how many wait and why the first does."""
         found_by_repo = {repo: self._tickets(repo) for repo in self.repos}
         self.count_load(found_by_repo)
+        before = _placements(found_by_repo)
+        # A ticket in the hand-off pool is the second operator's session's.
         queued = [(repo, issue) for repo, found in found_by_repo.items() for issue in found.values()
-                  if _state(issue) == "queued"]
+                  if _state(issue) == "queued" and HANDOFF_LABEL not in _labels(issue)]
         waits = [self._assign_queued_ticket(repo, issue)
                  for repo, issue in sorted(queued, key=lambda item: tickets.work_order(*item))]
         if waits and all(waits):
             _say("assigned 0 of %d queued: %s" % (len(waits), waits[0]))
+        self._no_lane_moves(found_by_repo, before)
 
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
@@ -3268,6 +3756,272 @@ class Factory:
         self.load[lane] = self.load.get(lane, 0) + 1
         _say("gave queued %s#%d lane %s (tier %s)" % (repo, number, lane, tier))
 
+    # -- tickets no lane takes (loom#1831) --------------------------------
+    def _no_lane_moves(self, found: Dict[str, Dict[int, Dict[str, Any]]],
+                       before: Dict[str, Tuple[str, str]]) -> None:
+        """End the no-lane waits this pass can end. A ticket a lane took
+        (LANED_STATES, or a new lane while briefed) is settled. One that has
+        waited with no lane (no_lane) for reroute_after is rerouted to another
+        ladder rung with a free lane in its tier (_reroute); with none, by
+        NO_LANE_HANDOFF it goes to the hand-off pool (_hand_off)."""
+        for repo, issues in found.items():
+            for number, issue in issues.items():
+                key = "%s#%s" % (repo, number)
+                placed = (_state(issue), _lane(issue))
+                if (placed[0] in LANED_STATES or HANDOFF_LABEL in _labels(issue)
+                        or (placed[0] == "briefed" and placed != before.get(key))):
+                    self.settled.add(key)
+        for key, reason in sorted(self.waits.items()):
+            age = self.now - self.no_lane_since.get(key, self.now)
+            if not no_lane(reason) or age < self.reroute_after:
+                continue
+            repo, _, number = key.rpartition("#")
+            issue = found.get(repo, {}).get(int(number)) if number.isdigit() else None
+            if issue is None or {RUNAWAY, "needs-brain", HANDOFF_LABEL} & set(_labels(issue)):
+                continue  # held for the brain, or already handed off
+            if self.actions >= MAX_ACTIONS:
+                return
+            moved: List[bool] = []
+            if not self._guarded(self._reroute_into, repo, issue, reason, age, moved):
+                continue
+            if not (moved and moved[0]):
+                if age < NO_LANE_HANDOFF or not self._guarded(
+                        self._hand_off, repo, issue, reason, age):
+                    continue
+            self.waits.pop(key, None)
+            self.settled.add(key)
+
+    def _reroute_into(self, repo: str, issue: Dict[str, Any], reason: str, age: float,
+                      moved: List[bool]) -> None:
+        """_reroute for _guarded, which keeps no return value: appends it."""
+        moved.append(self._reroute(repo, issue, reason, age))
+
+    def _reroute(self, repo: str, issue: Dict[str, Any], reason: str, age: float) -> bool:
+        """Move a queued or briefed ticket pinned to a model no lane takes to
+        the first rung climb_rungs allows (never down from a strong model)
+        that has a free lane in the ticket's difficulty tier, for its repo
+        (PUBLIC_ONLY) and up for the rung's model (_up_lanes: not at a limit,
+        not benched, not out of credit). The note carries the rung marker, as
+        a "Not a failure" climb does. True when it moved."""
+        number, state, old = int(issue["number"]), _state(issue), _lane(issue)
+        match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+        if state not in ("queued", "briefed") or not match:
+            return False  # an unpinned ticket's tier moves are the queue's own
+        here = next((n for n, (_, model) in enumerate(CLIMB, 1) if model == match.group(1)), 0)
+        tier = set(lanes_of(difficulty_of(issue), self._is_private(repo)))
+        up = self._up_lanes(repo)
+        free = {rung: [x for x in lanes if x in tier and x != old and self._free(x)]
+                for rung, lanes in up.items() if rung != here}
+        if not any(free.values()):
+            return False  # nothing to move to: no comment read, every pass
+        tried, reached = self._tried(issue, self._comments(repo, number), failed_here=False)
+        found = next(((rung, free[rung][0]) for rung in climb_rungs(tried | ({here} - {0}), reached)
+                      if free.get(rung)), None)
+        if found is None:
+            return False
+        rung, lane = found
+        model = CLIMB[rung - 1][1]
+        body = with_model(str(issue.get("body") or ""), model)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+        issue["body"] = body
+        self._status_note(repo, number, "%s\nNot a failure (no lane took it for %.0f hours: %s): "
+                          "the factory rerouted this ticket to rung %d, %s on lane %s." % (
+                              RUNG_MARKER % rung, age / 3600, reason, rung, model, lane))
+        if state == "queued":
+            self._assign_queued_one(repo, issue, lane, "%s, rerouted to model %s" % (
+                difficulty_of(issue), model))
+        else:
+            self._relabel(repo, issue, [x for x in _labels(issue) if not x.startswith("lane:")]
+                          + ["lane:" + lane])
+            self.load[old] = self.load.get(old, 0) - 1
+            self.load[lane] = self.load.get(lane, 0) + 1
+        self.actions += 1
+        _say("rerouted %s#%d after %.0f hours with no lane (%s): %s on lane %s"
+             % (repo, number, age / 3600, reason, model, lane))
+        return True
+
+    def _hand_off(self, repo: str, issue: Dict[str, Any], reason: str, age: float) -> None:
+        """Put a ticket no lane took for NO_LANE_HANDOFF, with no reroute
+        allowed, in the hand-off pool: queued with no lane and HANDOFF_LABEL,
+        so it leaves its goal's in-flight count (brain._in_flight) and the
+        factory moves it no more. One note on its status comment, edited in
+        place; a handed-off ticket is never handed off again."""
+        number, old = int(issue["number"]), _lane(issue)
+        if _state(issue) not in ("queued", "briefed"):
+            return
+        kept = [x for x in brain._moved_labels(_labels(issue), "queued", None)
+                if not x.startswith("lane:")] + [HANDOFF_LABEL]
+        self._relabel(repo, issue, kept)
+        if old:
+            self.load[old] = self.load.get(old, 0) - 1
+        self._status_note(repo, number, (
+            "No lane of this Loom took this ticket in %.0f hours (%s), and no other lane or "
+            "model rung its tier allows is free. It leaves the goal's in-flight count for the "
+            "hand-off pool (%s): the second operator's session may claim it. Taking the label "
+            "off returns it to this Loom's queue.") % (age / 3600, reason, HANDOFF_LABEL))
+        self.actions += 1
+        _say("handed off %s#%d after %.0f hours with no lane (%s)"
+             % (repo, number, age / 3600, reason))
+
+    # -- needs-brain holds nothing resolves (loom#1872) ------------------
+    def brain_holds(self, limit: int = brain_hold.LIFT_PER_RUN,
+                    write: bool = True) -> Dict[str, Dict[str, int]]:
+        """Resolve up to `limit` needs-brain holds older than
+        brain_hold.HOLD_AGE that Loom set (brain_hold.setter), oldest first
+        (_lift_hold). A hold a person set, or one whose setter is unknown, is
+        left and counted. Each repo's counts (brain_hold.counts) come back;
+        with write False nothing is written and the LOOM count says how many
+        holds a run could resolve. A hold that errors still uses its turn,
+        so a run never writes more than `limit` times however it ends."""
+        report: Dict[str, Dict[str, int]] = {}
+        loom = brain_hold.loom_logins(self.trusted)
+        due: List[Tuple[float, str, Dict[str, Any], brain_hold.Setter]] = []
+        for repo in self.repos:
+            counts = report[repo] = brain_hold.counts()
+            try:
+                held = [i for i in self._tickets(repo).values() if brain_hold.LABEL in _labels(i)]
+            except GitHubError as err:
+                _say("could not read the held tickets of %s: %s" % (repo, err))
+                continue
+            for issue in held:
+                number = int(issue["number"])
+                try:
+                    found = brain_hold.setter(self.gh.paginate(
+                        "/repos/%s/issues/%d/events" % (repo, number)), loom)
+                except GitHubError as err:
+                    _say("could not read who held %s#%d: %s" % (repo, number, err))
+                    found = brain_hold.Setter(brain_hold.UNKNOWN, "", 0.0)
+                age = brain_hold.age(found, issue, self.now)
+                if age < brain_hold.HOLD_AGE:
+                    continue
+                counts["old"] += 1
+                counts[found.kind] += 1
+                if found.kind == brain_hold.LOOM:
+                    due.append((age, repo, issue, found))
+        for age, repo, issue, found in sorted(due, key=lambda d: -d[0]):
+            if not write or limit <= 0:
+                break
+            done: List[bool] = []
+            ok = self._guarded(self._lift_hold, repo, issue, found, age, done)
+            if done and done[0]:
+                report[repo]["lifted"] += 1
+            if not ok or done[:1] == [True]:
+                limit -= 1
+        return report
+
+    def _lift_hold(self, repo: str, issue: Dict[str, Any], found: brain_hold.Setter,
+                   age: float, done: List[bool]) -> None:
+        """Resolve one hold Loom set: a loom:pr ticket whose pull request
+        fails only the plan check on its body has the body rebuilt
+        (_hold_repair) and the hold lifted; any other ticket goes to the
+        hand-off pool (_hold_hand_off). One event on the ticket's status
+        comment either way, naming why it was held. Appends True when it
+        resolved the hold, False when it waits (checks still running, or a
+        rebuilt body the plan check has not read yet)."""
+        comments = self._comments(repo, int(issue["number"]))
+        why = brain_hold.reason(comments, found.at, _state(issue))
+        hours = age / 3600
+        if _state(issue) == "pr":
+            repaired = self._hold_repair(repo, issue, comments,
+                                         brain_hold.repair_note(found, hours, why))
+            if repaired is None:
+                done.append(False)
+                return
+            if repaired:
+                self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                             % (repo, int(issue["number"]), brain_hold.LABEL), ok=(404,))
+                issue["labels"] = [{"name": x} for x in _labels(issue) if x != brain_hold.LABEL]
+                _say("lifted %s#%d's needs-brain hold: its body was rebuilt for %s"
+                     % (repo, int(issue["number"]), self.plan_check))
+                done.append(True)
+                return
+        self._hold_hand_off(repo, issue, brain_hold.handoff_note(found, hours, why, HANDOFF_LABEL))
+        done.append(True)
+
+    def _open_lane_pull(self, repo: str, ticket: int) -> Optional[Dict[str, Any]]:
+        """The ticket's open trusted lane pull request, from one read of the
+        repo's open pull requests a pass; None when it has none."""
+        if repo not in self._open_pulls:
+            self._open_pulls[repo] = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
+                                      if isinstance(p, dict)]
+        for pr in self._open_pulls[repo]:
+            if self._trusted(pr) and self._is_lane_pr(pr):
+                association = self._association(repo, pr)
+                if association and association[1] == ticket:
+                    return pr
+        return None
+
+    def _hold_repair(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
+                     note: str) -> Optional[bool]:
+        """For a held loom:pr ticket: True when its pull request's body was
+        rebuilt from the ticket (bus/pr_repair.py, as _repair_plan_body) or
+        was rebuilt on this head and now passes every check; None while its
+        checks run or a rebuilt body waits for the plan check to read it
+        (REVIEW_GRACE); False otherwise: no lane pull request, another
+        failing check, or a body the ticket cannot fill."""
+        ticket = int(issue["number"])
+        pr = self._open_lane_pull(repo, ticket)
+        if pr is None:
+            return False
+        number = int(pr["number"])
+        full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+        sha = str((full.get("head") or {}).get("sha") or "")
+        if not sha:
+            return False
+        runs = self._runs[sha] = self._check_runs(repo, sha)
+        if any(r.get("status") != "completed" for r in runs):
+            return None
+        failing = [str(r.get("name") or "") for r in runs if r.get("conclusion") not in GREEN]
+        marker = PLAN_REPAIR_MARKER % sha
+        repaired_at = max((_ts(c.get("created_at")) for c in comments
+                           if marker in str(c.get("body") or "")), default=0.0)
+        if repaired_at:
+            return self._repaired_before(repo, ticket, failing, repaired_at, note)
+        if failing != [self.plan_check]:
+            return False
+        found = self._plan_found(repo, number, full, issue)
+        if found is None or not found["changed"]:
+            return False
+        self._apply_plan_body(repo, number, issue, found, marker, also=note)
+        self._lift_plan_hold(repo, number, issue, comments)
+        return True
+
+    def _repaired_before(self, repo: str, ticket: int, failing: Sequence[str],
+                         repaired_at: float, note: str) -> Optional[bool]:
+        """_hold_repair for a body already rebuilt on this head: True (with
+        the note) once every check passes, None while the plan check may not
+        have read it yet (REVIEW_GRACE), else False."""
+        if not failing:
+            self._status_note(repo, ticket, note)
+            return True
+        if list(failing) == [self.plan_check] and self.now - repaired_at <= REVIEW_GRACE:
+            return None
+        return False
+
+    def _hold_hand_off(self, repo: str, issue: Dict[str, Any], note: str) -> None:
+        """Put a held ticket in the hand-off pool (HANDOFF_LABEL) without
+        needs-brain, out of its goal's in-flight count (brain._in_flight): a
+        queued or briefed ticket goes back to queued with no lane, as
+        _hand_off does; a running, pr or failed one is left loom:failed, as
+        the station's stopped fix rounds are; any other state keeps its
+        state. One note on its status comment, edited in place."""
+        number, state, old = int(issue["number"]), _state(issue), _lane(issue)
+        names = _labels(issue)
+        if state in ("queued", "briefed"):
+            kept = [x for x in brain._moved_labels(names, "queued", None)
+                    if not x.startswith("lane:")]
+        elif state in ("running", "pr", "failed"):
+            kept = brain._moved_labels(names, "failed", None)
+        else:
+            kept = [x for x in names if x != brain_hold.LABEL]
+        kept = list(dict.fromkeys(kept + [HANDOFF_LABEL]))
+        self._relabel(repo, issue, kept)
+        if old and "lane:" + old not in kept:
+            self.load[old] = self.load.get(old, 0) - 1
+        self._status_note(repo, number, note)
+        _say("handed off %s#%d: its needs-brain hold went unanswered past %d hours"
+             % (repo, number, brain_hold.HOLD_AGE // 3600))
+
     def tier_lane(self, repo: str, difficulty: str) -> Optional[str]:
         """The first free lane of the difficulty tier the repo may use, else
         its least-loaded lane that is up and not at a limit; None when the
@@ -3283,13 +4037,16 @@ class Factory:
     def run(self) -> None:
         tickets = {repo: self._tickets(repo) for repo in self.repos}
         self.count_load(tickets)
+        before = _placements(tickets)
         for repo in self.repos:
             self._repo_pass(repo, tickets[repo])
+        self._no_lane_moves(tickets, before)
 
     def _repo_pass(self, repo: str, tickets: Dict[int, Dict[str, Any]]) -> None:
         # GitHub.paginate asks for 100 a page and follows every page.
         all_prs = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
                    if isinstance(p, dict)]
+        self._guarded(lambda r, _: self._settle_answers(r), repo, {})
         closed_numbers = self._close_superseded_prs(repo, all_prs, tickets)
         prs = [p for p in all_prs if self._trusted(p) and int(p.get("number") or 0) not in closed_numbers]
         linked = {a[1]: pr for pr in prs for a in [self._association(repo, pr)] if a}
@@ -3305,6 +4062,9 @@ class Factory:
             step = steps.get(_state(issue))
             if self.actions >= MAX_ACTIONS:
                 return
+            if HANDOFF_LABEL in _labels(issue) and _state(issue) in (
+                    "queued", "briefed", "running", "failed"):
+                continue  # the second operator's session has it (docs/BRAIN.md)
             if step is not None:
                 self._guarded(step, repo, issue)
 

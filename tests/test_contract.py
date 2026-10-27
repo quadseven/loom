@@ -78,3 +78,27 @@ class LoomOwnContractTests(unittest.TestCase):
             workflow = fh.read()
         self.assertIn(".github/unittest_parallel.py", workflow)
         self.assertIn(".github/unittest_parallel.py", check)
+
+
+class AffectedContractTests(unittest.TestCase):
+    """loom#1773: an affected command runs after the check with the pull
+    request's changed files, so it is kept apart from the check."""
+
+    def test_an_affected_line_passes_through_with_the_check(self):
+        text = "check: make test\naffected: scripts/affected.sh\n"
+        self.assertEqual(contract.normalize(text), text)
+        self.assertEqual(contract.fields(text),
+                         {"check": "make test", "affected": "scripts/affected.sh"})
+
+    def test_an_affected_pipe_line_or_table_is_not_joined_into_the_check(self):
+        pipes = ("test | python3 t.py | a.yml | tests\n"
+                 "affected | python3 affected.py | b.yml | per-dir\n")
+        self.assertEqual(contract.normalize(pipes),
+                         "interpreter: python3\ncheck: python3 t.py\naffected: python3 affected.py\n")
+        tables = '[test]\ncommand = "make t"\n\n[affected]\ncommand = "make affected"\n'
+        self.assertEqual(contract.normalize(tables),
+                         "interpreter: make\ncheck: make t\naffected: make affected\n")
+
+    def test_a_contract_with_only_an_affected_command_checks_nothing_else(self):
+        self.assertEqual(contract.normalize("affected | ./per-dir.sh\n"),
+                         "check: true\naffected: ./per-dir.sh\n")

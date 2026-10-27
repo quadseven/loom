@@ -10,9 +10,145 @@
 
 # The decrypted value of the SSM parameter named $1, or nothing when it
 # cannot be read. The value goes to stdout only: callers capture it.
+# With LOOM_SSM_DIR set (a lane pod), the value is the file at the parameter's
+# name under that folder (/a/b -> $LOOM_SSM_DIR/a/b), a copy of the parameter
+# that the cluster keeps in step with SSM, and no AWS call is made: the pod
+# holds no AWS key. The folder must sit under HOME, which no sandbox shows.
 ssm_value() {
+  if [ -n "${LOOM_SSM_DIR:-}" ]; then
+    case "$1" in /*) ;; *) return 1 ;; esac
+    case "/$1/" in */../*|*/./*) return 1 ;; esac
+    cat "$LOOM_SSM_DIR$1" 2> /dev/null
+    return
+  fi
   timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
     --name "$1" --with-decryption --query Parameter.Value --output text 2> /dev/null
+}
+
+# The sandbox that confines agents and validation runs: LOOM_SANDBOX=seatbelt
+# (macOS sandbox-exec, the default) or bwrap (Linux bubblewrap, for a lane
+# pod on the cluster). Prints the kind, or says why not and returns 1.
+sandbox_kind() {
+  case "${LOOM_SANDBOX:-seatbelt}" in
+    seatbelt | bwrap) printf '%s' "${LOOM_SANDBOX:-seatbelt}" ;;
+    *) echo "unknown LOOM_SANDBOX '${LOOM_SANDBOX}': seatbelt or bwrap" >&2; return 1 ;;
+  esac
+}
+
+# Whether this machine can start the sandbox. SANDBOX_WHY says why not. A
+# bwrap that cannot make its namespaces here (a container without user
+# namespaces, or with a masked /proc) is found before any run, so the lane
+# says it is unavailable instead of failing every brief.
+# bwrap narrows no network, so it also fails closed unless the pod's own
+# egress is narrowed, proved before every pass by egress_denied.
+# shellcheck disable=SC2034 # SANDBOX_WHY is read by the callers
+sandbox_ready() {
+  local kind
+  SANDBOX_WHY=""
+  kind="$(sandbox_kind 2>&1)" || { SANDBOX_WHY="$kind"; return 1; }
+  case "$kind" in
+    seatbelt) command -v sandbox-exec > /dev/null || { SANDBOX_WHY="sandbox-exec not available"; return 1; } ;;
+    bwrap)
+      command -v bwrap > /dev/null || { SANDBOX_WHY="bwrap not available"; return 1; }
+      bwrap --die-with-parent --unshare-pid --ro-bind / / --dev /dev --proc /proc true > /dev/null 2>&1 ||
+        { SANDBOX_WHY="bwrap cannot start a sandbox here (user namespaces or /proc denied)"; return 1; }
+      egress_denied || return 1 ;;
+  esac
+}
+
+# Whether the pod's egress is narrowed, proved, not assumed. Every
+# must-be-blocked destination must fail to connect: those in
+# LOOM_EGRESS_DENY_PROBES (IPv4:port, literal addresses only, so a name that
+# does not resolve can never pass as blocked; separated by spaces or commas,
+# as the cluster's secret holds them), plus the API server at
+# KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT when the pod has them. And
+# the positive control LOOM_EGRESS_ALLOW_PROBE (host:port, the provider's or
+# gateway's HTTPS endpoint) must connect, so a pod with no network or no DNS
+# does not pass because every connection fails. Each try takes at most
+# LOOM_EGRESS_PROBE_SECONDS (default 3). Sets SANDBOX_WHY when it fails.
+# shellcheck disable=SC2034 # SANDBOX_WHY is read by sandbox_ready's callers
+egress_denied() {
+  local target host port wait="${LOOM_EGRESS_PROBE_SECONDS:-3}" denied allow="${LOOM_EGRESS_ALLOW_PROBE:-}"
+  local ipv4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
+  [[ "$wait" =~ ^[1-9][0-9]?$ ]] || wait=3
+  denied="${LOOM_EGRESS_DENY_PROBES:-}"
+  denied="${denied//,/ }"
+  [[ "$denied" =~ [^[:space:]] ]] ||
+    { SANDBOX_WHY="bwrap narrows no network: set LOOM_EGRESS_DENY_PROBES to the addresses the pod's egress policy blocks"; return 1; }
+  [ -n "$allow" ] ||
+    { SANDBOX_WHY="bwrap narrows no network: set LOOM_EGRESS_ALLOW_PROBE to an HTTPS endpoint the lane must reach"; return 1; }
+  if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+    denied="$denied $KUBERNETES_SERVICE_HOST:${KUBERNETES_SERVICE_PORT:-443}"
+  fi
+  for target in $denied; do
+    host="${target%:*}" port="${target##*:}"
+    [[ "$host" =~ $ipv4 && "$port" =~ ^[1-9][0-9]{0,4}$ ]] ||
+      { SANDBOX_WHY="egress probe '$target' is not IPv4:port (a name could fail to resolve and pass as blocked)"; return 1; }
+    if probe_connects "$host" "$port" "$wait"; then
+      SANDBOX_WHY="egress not narrowed: $target accepts connections, so no agent runs here"
+      return 1
+    fi
+  done
+  host="${allow%:*}" port="${allow##*:}"
+  [[ "$host" =~ ^[A-Za-z0-9.-]+$ && "$port" =~ ^[1-9][0-9]{0,4}$ ]] ||
+    { SANDBOX_WHY="LOOM_EGRESS_ALLOW_PROBE '$allow' is not host:port"; return 1; }
+  probe_connects "$host" "$port" "$wait" ||
+    { SANDBOX_WHY="egress unproven: $allow did not connect, so the blocked probes prove nothing"; return 1; }
+}
+
+# Whether a TCP connection to $1:$2 opens within $3 seconds.
+probe_connects() {
+  # shellcheck disable=SC2016 # $1 and $2 expand in the child shell
+  timeout "$3" bash -c 'exec 3<> "/dev/tcp/$1/$2"' _ "$1" "$2" > /dev/null 2>&1
+}
+
+# SANDBOX_CMD: the command words that run a command inside the profile $1
+# (from sandbox_profile), to be followed by the command and its arguments.
+# Seatbelt takes the profile text; bwrap takes the profile's lines as its
+# arguments, ending with --.
+sandbox_command() {
+  local kind line
+  kind="$(sandbox_kind)" || return 1
+  SANDBOX_CMD=()
+  if [ "$kind" = seatbelt ]; then
+    SANDBOX_CMD=(sandbox-exec -p "$1")
+    return 0
+  fi
+  SANDBOX_CMD=(bwrap)
+  while IFS= read -r line; do
+    [ -n "$line" ] && SANDBOX_CMD+=("$line")
+  done <<< "$1"
+  SANDBOX_CMD+=(--)
+}
+
+# The bubblewrap form of sandbox_profile, one argument per line. The variables
+# are sandbox_profile's, already canonical and checked. The root is an empty
+# tmpfs: only the system folders (BWRAP_SYSTEM_DIRS) are bound in, read-only,
+# so nothing else on the machine is there at all (HOME with the loom home and
+# the copied SSM values, /run/secrets, /var/run/secrets, the loom checkout).
+# Then the tree and the scratch home are bound writable, .git read-only, and
+# the CLI's folder, the skill snapshot and the check's uv files read-only.
+# /tmp is a private tmpfs; the root itself is read-only. Check runs get the same root as agent runs: their
+# writes go to the tree, the check home and /tmp only. A fresh /proc in a new
+# PID namespace hides the runner's processes and their environments.
+# /run/secrets and /var/run/secrets are masked again with empty tmpfs in case
+# a system folder ever reaches them. The network is the pod's (sandbox_ready
+# requires its egress narrowed).
+BWRAP_SYSTEM_DIRS="/usr /bin /sbin /lib /lib32 /lib64 /libx32 /etc /opt"
+bwrap_profile() {
+  local p
+  printf '%s\n' --die-with-parent --new-session --unshare-pid --unshare-ipc --unshare-uts
+  for p in $BWRAP_SYSTEM_DIRS; do printf '%s\n' --ro-bind-try "$p" "$p"; done
+  printf '%s\n' --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run/secrets --tmpfs /var/run/secrets
+  printf '%s\n' --bind "$tree" "$tree"
+  [ -e "$tree/.git" ] && printf '%s\n' --ro-bind "$tree/.git" "$tree/.git"
+  printf '%s\n' --bind "$agent_home" "$agent_home"
+  for p in "$cli_root" "$cli_link" ${skills:+"$skills"} $uv_files; do
+    printf '%s\n' --ro-bind "$p" "$p"
+  done
+  # The root tmpfs itself takes no writes (remount-ro does not reach the
+  # binds and /tmp, which are mounts of their own).
+  printf '%s\n' --remount-ro / --chdir "$tree"
 }
 
 # The ports an API-lane agent may connect to, space-separated: 443, its
@@ -88,6 +224,12 @@ sandbox_profile() {
     *) echo "refusing sandbox: unknown mode $3" >&2; return 1 ;;
   esac
   [ "$LANE" = agy ] && [ "${3:-}" != check ] && { api_network="$(api_rules network)" || return 1; agy_lane=1; }
+  local kind
+  kind="$(sandbox_kind)" || return 1
+  if [ "$kind" = bwrap ] && [ "${3:-}" != api ] && [ "${3:-}" != check ]; then
+    echo "refusing sandbox: bwrap serves api and check runs only, not mode '${3:-}' (lane $LANE)" >&2
+    return 1
+  fi
   local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule="" agy_keychain_deny=""
   if [ -n "${4:-}" ]; then
     [[ "$4" =~ ^[0-9]+$ ]] && [ "$4" -ge 49152 ] && [ "$4" -le 65535 ] ||
@@ -106,7 +248,7 @@ sandbox_profile() {
   # Paths go into the profile's string grammar: refuse any that could close it.
   for p in "$home" "$tree" "$cli_link" "$cli_real" "$AGENT_HOME" "$skills"; do
     # shellcheck disable=SC1003 # matching a literal backslash
-    case "$p" in *'"'*|*'\'*) echo "refusing sandbox: unsafe path $p" >&2; return 1 ;; esac
+    case "$p" in *'"'*|*'\'*|*$'\n'*) echo "refusing sandbox: unsafe path $p" >&2; return 1 ;; esac
   done
   # Never let the CLI's directory cover HOME itself.
   case "$home/" in "$cli_root"/*) echo "refusing sandbox: $cli_real sits at or above HOME" >&2; return 1 ;; esac
@@ -134,6 +276,19 @@ sandbox_profile() {
   [ -n "$skills" ] && skills_rules="(allow file-read* (subpath \"$skills\"))
 (deny file-write* (subpath \"$skills\"))
 "
+  if [ "$kind" = bwrap ]; then
+    local agent_home
+    agent_home="$(cd "$AGENT_HOME" && pwd -P)" || return 1
+    # A bind at or above HOME would hand the agent all of HOME (the loom
+    # home, the copied SSM values): writable for the tree or scratch home,
+    # readable for the rest. Every bind must sit below HOME or beside it.
+    for p in "$tree" "$agent_home" "$cli_root" ${skills:+"$skills"} $uv_files; do
+      case "$p" in /) echo "refusing sandbox: $p is the root" >&2; return 1 ;; esac
+      case "$home/" in "$p"/*) echo "refusing sandbox: $p sits at or above HOME" >&2; return 1 ;; esac
+    done
+    bwrap_profile
+    return 0
+  fi
   for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"} $uv_files; do
     p="$(dirname "$p")"
     while [ "${p#"$home"}" != "$p" ] && [ "$p" != "/" ]; do
@@ -170,6 +325,7 @@ api_agent() {
   fi
   mkdir -p "$AGENT_HOME/tmp"
   profile="$(sandbox_profile "$PWD" "$cli" api "${OPENCODE_SERVER_PORT:-}")" || return 3
+  sandbox_command "$profile" || return 3
   (
     keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" key="$API_KEY" extra="$AGENT_EXTRA_ENV" server_port="${OPENCODE_SERVER_PORT:-}"
     for v in $(compgen -e); do unset "$v"; done
@@ -183,7 +339,7 @@ api_agent() {
     if [ -n "$server_port" ]; then
       OPENCODE_PASSWORD="$(openssl rand -hex 32)" || exit 3
       export OPENCODE_PASSWORD
-      sandbox-exec -p "$profile" "$cli" serve --hostname 127.0.0.1 \
+      "${SANDBOX_CMD[@]}" "$cli" serve --hostname 127.0.0.1 \
         --port "$server_port" > /dev/null 2>&1 < /dev/null &
       server_pid=$!
       trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
@@ -194,14 +350,14 @@ api_agent() {
       deadline=$((SECONDS + 15))
       while [ "$SECONDS" -lt "$deadline" ]; do
         kill -0 "$server_pid" 2>/dev/null || { echo "opencode server stopped before it was ready" >&2; exit 3; }
-        if sandbox-exec -p "$profile" /usr/bin/nc -z -w 1 127.0.0.1 "$server_port" \
+        if "${SANDBOX_CMD[@]}" /usr/bin/nc -z -w 1 127.0.0.1 "$server_port" \
           > /dev/null 2>&1; then ready=1; break; fi
         sleep 0.1
       done
       [ -n "$ready" ] || { echo "opencode server was not ready within 15 seconds" >&2; exit 3; }
-      timeout -k 5 "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < "${AGENT_STDIN:-/dev/null}"
+      timeout -k 5 "$AGENT_TIMEOUT" "${SANDBOX_CMD[@]}" "${@:2}" < "${AGENT_STDIN:-/dev/null}"
     else
-      exec timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < "${AGENT_STDIN:-/dev/null}"
+      exec timeout "$AGENT_TIMEOUT" "${SANDBOX_CMD[@]}" "${@:2}" < "${AGENT_STDIN:-/dev/null}"
     fi
   ) 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
   # The agent writes into a pipe, not the log file: the log lives under HOME,
@@ -228,7 +384,10 @@ opencode_config() {
   # The free lane (a free provider's route on the spark-gateway) is declared the
   # same way, as provider free serving the model after "free/".
   local provider="" id="${MODEL#*/}" permission="${OPENCODE_PERMISSION:-}"
-  [ -n "$permission" ] || permission='{"external_directory": "deny"}'
+  # Reads in the tree are allowed: opencode asks before a *.env read by
+  # default, a run cannot answer, and a tracked pin file stopped two runs
+  # (loom#1728). The tree is a fresh clone, and reads outside it stay denied.
+  [ -n "$permission" ] || permission='{"external_directory": "deny", "read": {"*": "allow"}}'
   # The window the endpoint serves (LOOM_SPARK_CONTEXT, LOOM_SPARK_OUTPUT;
   # whole numbers, else the vLLM defaults below). A window smaller than the
   # server's makes the agent compact and lose its place on a large repo: the

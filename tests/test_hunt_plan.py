@@ -98,6 +98,33 @@ class BriefToPullRequestTest(unittest.TestCase):
         self.assertTrue(brain.plan_problems(BRIEF % "XL"))
         self.assertEqual(brain.plan_problems(BRIEF % "Medium"), [])
 
+    def test_why_opening_with_issue_reference_is_read_as_text(self):
+        # A brief whose Why section opens with an issue reference like
+        # "#214 (Routes 2-4) ..." should be read as body text, not as a heading.
+        # The plan check must find the words in the Why section.
+        brief = """## Why
+#214 (Routes 2-4) The page query is slow for every visitor.
+
+## What
+Cache the query.
+
+## Acceptance criteria
+- [ ] The page loads in under a second.
+- [ ] A test fails without the cache.
+- [ ] The query runs once a minute.
+
+## Size
+Medium
+
+## Out of scope
+- Other pages.
+"""
+        body = pr_repair._render_generated(brief, "lane", "model", "T1")
+        self.assertEqual(hunt_plan.problems(body), [])
+        why = hunt_plan._section_text(body, "Why", "Summary")
+        self.assertIsNotNone(why)
+        self.assertGreaterEqual(len(why.split()), 5)
+
 
 class OneSizeParserTest(unittest.TestCase):
     """#668: triage, the Hunt Plan gate and PR repair read the size through
@@ -142,6 +169,32 @@ class OneSizeParserTest(unittest.TestCase):
                 generated = pr_repair._render_generated(body, "lane", "model", "T1")
                 self.assertIn("\nSize: %s\n" % hunt_plan.size_letter(word), generated)
                 self.assertEqual(hunt_plan.problems(generated), [])
+
+    def test_a_size_section_in_markdown_or_with_a_label_reads_as_the_letter(self):
+        # A lane pull request in another repo (2026-10-25): its ticket's
+        # ## Size section said "**Size:** S", brief_size kept its first
+        # word, and the body read
+        # "Size: **Size:**", which the plan check held. Every reader goes
+        # through size_letter, so each form gives the letter everywhere.
+        forms = {"**Size:** S": "S", "Size: S": "S", "**S**": "S", "S (small)": "S",
+                 "Small": "S", "M - medium": "M", "**Size: M**": "M", "`L`": "L",
+                 "- XS": "XS", "Size - M": "M", "__Size__: L": "L"}
+        for line, letter in forms.items():
+            with self.subTest(line=line):
+                body = BRIEF % line
+                self.assertEqual(hunt_plan.size_letter(line), letter)
+                self.assertEqual(hunt_plan.size_letter(hunt_plan.stated_size(body)), letter)
+                self.assertEqual(hunt_plan.brief_size(body), letter)
+                self.assertEqual(pr_repair._brief_size(body), letter)
+                self.assertIn("## Size\n\n%s\n" % letter, hunt_plan.with_size_letter(body))
+                generated = pr_repair._render_generated(body, "lane", "model", "T1")
+                self.assertIn("\nSize: %s\n" % letter, generated)
+                self.assertEqual(hunt_plan.problems(generated), [])
+
+    def test_an_xl_written_with_a_label_is_still_too_big(self):
+        with self.assertRaises(ValueError):
+            hunt_plan.size_letter("**Size:** XL")
+        self.assertEqual(hunt_plan.brief_size(BRIEF % "**Size:** XL"), "XL")
 
     def test_inline_xl_size_is_refused(self):
         # XL on an inline Size: line is still too big: stated_size skips it.
