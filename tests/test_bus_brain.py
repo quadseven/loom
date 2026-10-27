@@ -3781,7 +3781,7 @@ class FakeRepo:
             return reply(200, [i for i in self.issues
                                if any(l["name"] == "epic" for l in i["labels"])])
         if path.startswith("/issues?labels=epic&state=open"):
-            return reply(200, [i for i in self.issues if i["state"] == "open"
+            return reply(200, [i for i in self.issues if i.get("state", "open") == "open"
                                and any(l["name"] == "epic" for l in i["labels"])])
         if path.startswith("/issues?"):
             self.assertIn_("labels=loom%3Agoal", path)
@@ -5049,6 +5049,8 @@ class OutsideEpicRepo:
             return reply(200, self.open_tickets)
         if path.startswith("/repos/%s/issues?labels=epic&state=all" % REPO):
             return reply(200, self.epics)
+        if path.startswith("/repos/%s/issues?labels=epic&state=open" % REPO):
+            return reply(200, [e for e in self.epics if e.get("state", "open") == "open"])
         if path == "/repos/%s/issues/1" % REPO:
             return reply(200, self.issues[1])
         raise AssertionError("unexpected read %s" % path)
