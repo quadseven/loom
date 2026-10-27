@@ -756,7 +756,9 @@ head commit from its files and raises the label to match, never lowering it:
   finding still sends the pull request back.
 - `sensitive`: the factory never merges it. It marks the pull request
   `needs-brain`, lists it in `bus.brain status` under "Sensitive pull
-  requests", and leaves the merge to the brain. Its conflicts, failing
+  requests", and leaves the merge to the brain. While a clean one waits, the
+  factory brings it up to date with its base when it falls behind (one a
+  repo a pass), so the brain's merge gate does not refuse it as behind. Its conflicts, failing
   checks, high findings and missing tests still go back to its lane, and its
   medium and low findings are deferred, as for any class. A brain merges it with
   `python3 -m bus.brain merge`, which for this class also requires that the
