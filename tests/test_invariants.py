@@ -1496,6 +1496,20 @@ class StandingEpicTest(unittest.TestCase):
         self.assertEqual(invariants.goal_epics_over_cap(f), [])
 
 
+class ClosedEpicOverCapTest(unittest.TestCase):
+    def test_a_closed_epic_over_the_cap_yields_no_breach(self):
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        epic = invariants.EpicShape(Ref("%s#40" % REPO, "#40"), False, 40, ())
+        f = Facts(T0, shapes=[invariants.GoalShape(goal, 6, (epic,), ())])
+        self.assertEqual(invariants.epic_over_cap(f), [])
+
+    def test_an_open_non_standing_epic_over_the_cap_still_yields_the_breach(self):
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        epic = invariants.EpicShape(Ref("%s#40" % REPO, "#40"), True, 40, ())
+        f = Facts(T0, shapes=[invariants.GoalShape(goal, 6, (epic,), ())])
+        self.assertEqual(len(invariants.epic_over_cap(f)), 1)
+
+
 class RollPinOffTest(StationBase):
     """A goal home whose ship rules name a roll, with no roll ship document
     naming it: its merged module changes get no source-pin pull request, and

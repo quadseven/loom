@@ -602,7 +602,7 @@ def epic_over_cap(f: Facts) -> List[Breach]:
                         epic.epic.label, shape.goal.label, epic.tickets, EPIC_TICKETS),),
                    f.now)
             for shape in f.shapes for epic in shape.epics
-            if epic.tickets > EPIC_TICKETS and not epic.standing]
+            if epic.open and epic.tickets > EPIC_TICKETS and not epic.standing]
 
 
 def goal_epics_over_cap(f: Facts) -> List[Breach]:
