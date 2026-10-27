@@ -2753,7 +2753,7 @@ class Factory:
         when it is behind and every check it fails passed on the base's
         current head: the failure came from the old base and is already fixed
         there. A re-run reuses the old merge commit and a fix round waits for
-        a lane, so neither clears it (loom#1961: four macchina pull requests
+        a lane, so neither clears it (loom#1961: four pull requests in one repo
         briefed for a test main had fixed). False when a review check failed,
         when a failed check did not pass on the base head, when the pull
         request is not behind, or when GitHub refuses the update; the usual

@@ -1029,7 +1029,7 @@ class PullRequests(Base):
     UPDATE = ("PUT", "/repos/%s/pulls/50/update-branch" % REPO, {"expected_head_sha": "sha50"})
 
     def test_a_check_red_from_the_base_and_green_on_main_is_updated_not_sent_back(self):
-        # loom#1961: macchina#2449 and three more failed tests main had fixed;
+        # loom#1961: four pull requests failed tests their main had fixed;
         # a re-run reuses the old merge commit, and a fix round waits on a lane.
         self._red_from_base()
         f = self.go()
