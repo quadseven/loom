@@ -71,10 +71,16 @@ def push_paths(workflow: str) -> List[str]:
     push trigger or no paths filter (such a workflow is not path-scoped).
     A paths-ignore filter comes back inverted, as the equivalent paths
     filter: every path counts unless a pattern ignores it."""
+    return trigger_paths(workflow, ("push",))
+
+
+def trigger_paths(workflow: str, triggers) -> List[str]:
+    """push_paths for the first of `triggers` the workflow has (the
+    validation-gap reader asks for pull_request, bus/ci_gap.py)."""
     lines = workflow.splitlines()
     on_at = next((i for i, indent, line in _content(lines, 0)
                   if not indent and _name(line)[0] in ("on", "true")), None)
-    push = _child(lines, on_at, 0, ("push",)) if on_at is not None else None
+    push = _child(lines, on_at, 0, tuple(triggers)) if on_at is not None else None
     paths = _child(lines, push[0], push[1], ("paths", "paths-ignore")) if push else None
     if not paths:
         return []

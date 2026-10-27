@@ -341,11 +341,74 @@ class StationRewriteTest(Base):
         # 17 of 72 rewrites ran the model only for intake to refuse the brief
         # at the goal's in-flight cap (2026-10-21).
         self.fake.add_triage(7)
-        with mock.patch.object(brain, "_goal_in_flight", return_value=brain.goal_cap()):
+        with mock.patch.object(brain, "goal_flying",
+                               return_value=[{"number": n} for n in range(brain.goal_cap())]):
             err = self.run_station(self.station(cmd=self.agent(BRIEF)))
         self.assertFalse(os.path.exists(self.prompt_file))
         self.assertEqual(self.fake.created, [])
         self.assertIn("tickets in flight", err)
+
+    def at_cap(self, st, blocked=()):
+        """Run the rewrite step with the goal at its cap and tickets 1.. in
+        flight, of which `blocked` wait with no lane (ticket-waits.json)."""
+        os.makedirs(st.state, exist_ok=True)
+        with open(os.path.join(st.state, "ticket-waits.json"), "w") as fh:
+            json.dump({"%s#%d" % (REPO, n): {"reason": "no free lane takes model claude-sonnet-5-5",
+                                             "since": st.now, "seen": st.now,
+                                             "no_lane_since": st.now} for n in blocked}, fh)
+        flying = [{"number": n} for n in range(1, brain.goal_cap() + 1)]
+        with mock.patch.object(brain, "goal_flying", return_value=flying):
+            return self.run_station(st)
+
+    def test_the_cap_skip_names_the_tickets_blocked_on_no_lane_and_a_stuck_goal(self):
+        # loom#1831: a goal sat at 32 of 28 all day, most of it tickets no
+        # lane takes, and the skip line said only the count.
+        self.fake.add_triage(7)
+        st = self.station(cmd=self.agent(BRIEF))
+        err = self.at_cap(st, blocked=(1, 2, 3))
+        self.assertIn("goal has %d tickets in flight (cap %d), 3 blocked on no lane; skipped"
+                      % (brain.goal_cap(), brain.goal_cap()), err)
+        self.assertNotIn("stuck", err)
+        st.now += station.GOAL_CAP_STUCK + 3600
+        err = self.at_cap(st, blocked=(1, 2))
+        self.assertIn("goal stuck at its cap for 7 hours: %d tickets in flight (cap %d), "
+                      "2 blocked on no lane; skipped" % (brain.goal_cap(), brain.goal_cap()), err)
+        state = json.load(open(os.path.join(st.state, "rewrite.json")))
+        (stuck,) = st._stuck_goals(state)
+        self.assertEqual((stuck["goal"], stuck["no_lane"], stuck["cap"]),
+                         ("%s#%d" % (REPO, GOAL), 2, brain.goal_cap()))
+
+    def test_a_goal_back_under_its_cap_starts_its_clock_again(self):
+        self.fake.add_triage(7)
+        st = self.station(cmd=self.agent(BRIEF))
+        self.at_cap(st)
+        st.now += station.GOAL_CAP_STUCK + 3600
+        with mock.patch.object(brain, "goal_flying", return_value=[]):
+            self.run_station(st)
+        state = json.load(open(os.path.join(st.state, "rewrite.json")))
+        self.assertEqual(st._stuck_goals(state), [])
+        self.assertNotIn("cap", state["%s#%d" % (REPO, GOAL)])
+
+    def test_the_stuck_goals_go_to_the_dashboard(self):
+        self.fake.add_triage(7)
+        st = self.station(cmd=self.agent(BRIEF))
+        st.s.transcript_url, st.s.transcript_token_ssm = "https://dash.example.com/api/transcripts", "/x"
+        sent = []
+        st._transcript_token = lambda: "token"
+        st.upload = lambda url, token, body: sent.append((url, body))
+        self.at_cap(st, blocked=(1,))
+        self.assertEqual(sent[-1][1]["goals"], [])
+        st.now += station.GOAL_CAP_STUCK + 3600
+        self.at_cap(st, blocked=(1,))
+        url, body = sent[-1]
+        self.assertTrue(url.endswith(station.GOAL_CAPS_PATH), url)
+        self.assertEqual([(g["goal"], g["no_lane"]) for g in body["goals"]],
+                         [("%s#%d" % (REPO, GOAL), 1)])
+        # The same list is not sent again within GOAL_CAPS_EVERY.
+        count = len(sent)
+        st.now += 60
+        self.at_cap(st, blocked=(1,))
+        self.assertEqual(len(sent), count)
 
     def test_a_private_repo_with_an_empty_private_command_is_skipped(self):
         self.fake.private = True
@@ -444,6 +507,53 @@ class StationRewriteTest(Base):
             ledger = json.load(fh)
         key = "%s#%d" % (REPO, GOAL)
         self.assertNotIn("7", ledger[key]["tried"])
+
+    def test_a_slow_agent_does_not_hold_the_pass(self):
+        # loom#1663: five inline rewrites of up to ten minutes each held the
+        # pass (305 s of one), and with it claims, fix rounds and deploys.
+        self.fake.add_triage(7)
+        gate = os.path.join(self._tmp.name, "gate")
+        script = os.path.join(self._tmp.name, "slow.py")
+        with open(script, "w") as fh:
+            fh.write("import os, sys, time\nsys.stdin.read()\nend = time.time() + 8\n"
+                     "while not os.path.exists(%r) and time.time() < end:\n"
+                     "    time.sleep(0.05)\nprint(%r)\n" % (gate, json.dumps(BRIEF)))
+        cmd = "%s %s" % (shlex.quote(sys.executable), shlex.quote(script))
+        st = self.station(cmd=cmd)
+        began = time.monotonic()
+        with mock.patch.object(station, "REWRITE_WAIT", 0.3, create=True):
+            err = self.run_station(st)
+        self.assertLess(time.monotonic() - began, 5)
+        self.assertEqual(self.fake.created, [])
+        self.assertIn("rewrite %s#7: the agent still runs" % REPO, err)
+        open(gate, "w").close()
+        folder = st._rewrite_folder(REPO, 7)
+        for proc in st._rewrite_procs.values():
+            proc.wait(timeout=20)
+        self.assertIsNotNone(rewrite.job_result(folder))
+        err = self.run_station(self.station(cmd=cmd, now=60))
+        self.assertEqual(len(self.fake.created), 1)
+        self.assertIn("rewrite %s#7: brief" % REPO, err)
+        self.assertFalse(os.path.exists(folder))
+        with open(os.path.join(st.state, "rewrite.json")) as fh:
+            self.assertEqual(json.load(fh)["_jobs"], {})
+
+    def test_a_job_that_left_no_result_is_dropped_after_its_timeout(self):
+        self.fake.add_triage(7)
+        st = self.station(cmd=self.agent(BRIEF))
+        os.makedirs(st.state, exist_ok=True)
+        key = "%s#%d" % (REPO, GOAL)
+        job = {"goal_key": key, "repo": REPO, "goal": GOAL, "number": 7, "started": self.start}
+        with open(os.path.join(st.state, "rewrite.json"), "w") as fh:
+            json.dump({"_jobs": {"%s#7" % REPO: job}, key: {"tried": {"7": self.start}}}, fh)
+        err = self.run_station(self.station(cmd=self.agent(BRIEF), now=60))
+        self.assertNotIn("wrote nothing", err)
+        self.assertEqual(self.fake.created, [])
+        err = self.run_station(self.station(
+            cmd=self.agent(BRIEF), now=station.REWRITE_TIMEOUT + station.REWRITE_JOB_GRACE + 1))
+        self.assertIn("rewrite %s#7 wrote nothing: the agent command could not run: no result"
+                      % REPO, err)
+        self.assertEqual(self.fake.created, [])
 
     def test_a_backlog_nobody_triaged_is_left_alone(self):
         self.fake.add_triage(7)

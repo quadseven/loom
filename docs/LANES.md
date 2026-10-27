@@ -36,10 +36,18 @@ only), and commit. On 2026-10-14, 27 of 95 tickets took six or more
 rounds, and no lane ran a test before opening its pull request.
 
 Before pushing a branch or opening a pull request on a public repository, the
-lane runner uses infra-public's `check_private_leaks.py` in shape-only mode on
-the diff and generated pull request body. Set `LOOM_LEAK_SCANNER` to that
-script's path when it is not at `../infra-public/.github/scripts/check_private_leaks.py`
-relative to the Loom checkout. A missing scanner or a hit blocks the push.
+lane runner uses infra-public's `check_private_leaks.py` on the diff and
+generated pull request body, with the shared deny-list of names and products
+(`--deny-list-ssm`, the SSM parameter `LOOM_LEAK_DENY_SSM`, default
+`/infra/leak-scan/deny-list`). Every scan goes through `leak_scan`. Set
+`LOOM_LEAK_SCANNER` to that script's path when it is not at
+`../infra-public/.github/scripts/check_private_leaks.py` relative to the Loom
+checkout. A missing scanner, a deny-list the scanner cannot read (it exits 2)
+or a hit blocks the push; a scan that could not run parks the brief
+`[transient]`. A lane pod or cluster runner (`LOOM_SSM_DIR`) holds no AWS
+key: the scanner reads the deny-list's copy under `LOOM_SSM_DIR` through
+`lanes/k8s/ssm-dir-bin/aws`, a stand-in for the AWS CLI put first on the
+scanner's PATH only. Without that copy it pushes nothing to a public repo.
 Private repositories skip this scan. Test IP addresses in public changes must
 use the documentation ranges `192.0.2.0/24`, `198.51.100.0/24`, or
 `203.0.113.0/24`; add `leak-guard-allow` on a line only when a deliberate
@@ -55,6 +63,7 @@ interpreter: python3.12
 submodules: yes
 setup: scripts/setup.sh
 check: scripts/check.sh
+affected: scripts/affected.sh
 ```
 
 `interpreter` is a command that must be on the lane machine's PATH,
@@ -63,11 +72,25 @@ prepares the tree (a venv, locked dependencies, a pinned linter) and `check`
 is the required check. Point the repo's CI at the same two scripts so the
 lane and CI cannot drift apart. Unknown lines are refused.
 
+`affected` is optional: a command for the suites the repo's CI runs only for
+some paths (a per-directory unit suite, a generated file compared with its
+source), which a repo-wide `check` leaves out. The runner runs it after
+`check` passes on the committed tree, with the pull request's changed files,
+one path per line, on stdin and in `LOOM_CHANGED_FILES` (the lane's commits
+on a new run; what the pull request adds to the default branch on a fix
+round). It passes like `check` (exit 0, no tracked file changed), a failure
+parks the brief as `validation failed: the affected check exited N` and
+pushes nothing, and its record is the `affected` phase. A lane pull request
+in the deploy repo passed its check and went red in CI on two such suites
+(loom#1773).
+
 The runner's reader (`bus/contract.py`) also accepts a list of
 `<kind> | <command>` lines, or `[kind]`, `[kind.name]` and `[[kind]]` tables
 with a `command = "..."` key, for the kinds lint, format, type and test. It
-joins the commands, in that order, into one `check`. List only commands that
-run on a lane machine with no secrets, simulators or unset variables.
+joins the commands, in that order, into one `check`. The kind `affected`
+(`affected | <command>`, `[affected]`) becomes the `affected` command instead.
+List only commands that run on a lane machine with no secrets, simulators or
+unset variables.
 
 - The runner reads the file from the base revision before the agent starts
   (on a fix run, from the base branch, not the pull request's branch);
@@ -88,9 +111,12 @@ run on a lane machine with no secrets, simulators or unset variables.
   exits non-zero or changes tracked files, or a missing interpreter parks the
   brief as `commit refused: ...; nothing pushed`. The records are the
   `contract-setup` and `contract-check` phases.
-- After the agent: the runner commits, then runs `check` on that commit. It
-  passes only with exit 0 and no tracked file changed (a formatter that has
-  to rewrite the agent's files is a failure). Only then is the branch pushed
+- After the agent: the runner commits, then runs `check` on that commit. A
+  plain non-zero exit gets one retry on the same commit; only a pass on that
+  retry validates, and the pull request says the check passed on a second
+  run. Timeouts, environment errors and SIGTERM are not retried. The check
+  must pass with exit 0 and no tracked file changed (a formatter that has to
+  rewrite the agent's files is a failure). Only then is the branch pushed
   and the pull request opened, with a `Validation:` line naming the commit.
 - A failed check parks the brief as `validation failed: ...` (exit 125 to
   127 as `validation environment unavailable: ...`), opens no pull request
@@ -104,10 +130,82 @@ run on a lane machine with no secrets, simulators or unset variables.
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
 - `logs/<lane>/<ticket>.validation.jsonl` holds one line per step: phase
-  (`prepare`, `setup`, `baseline`, `contract-setup`, `contract-check`, `final`), command, exit code, tree
+  (`prepare`, `setup`, `baseline`, `contract-setup`, `contract-check`, `final`, `affected`), command, exit code, tree
   revision, `ok` and detail (the interpreter's version, the submodule
   revisions).
 - A repo without the file is not validated by the runner; CI still is.
+
+### Validation gaps
+
+When a lane pull request goes back for a fix round on a red CI job, the
+station checks whether the contract runs that job's command
+(`bus/ci_gap.py`). It maps each failing GitHub Actions check run to its
+workflow file, job and failing step (the Actions job API), reads the step's
+`run:` command and working directory from the workflow at the pull request's
+head, and looks for it in the contract's `setup`, `check` and `affected` text
+on the base branch. A command the contract does not run is a validation gap:
+
+- The station files one issue per repo per gap in that repo, labelled
+  `loom:validation-gap`, with a `<!-- loom:validation-gap v1 key=... -->`
+  marker. It names the job, the workflow and step, the command CI runs, the
+  workflow's `on.pull_request` paths filter and the changed files it matched,
+  and the line to add: `affected: <command>` for a path-scoped job, else
+  `check: <check> && <command>`. A gap already in
+  `state/station/validation_gaps.json`, or on an issue with its marker (open
+  or closed), is not filed again.
+- The fix round's comment tells the lane to run the command in the tree
+  before it pushes, naming the gap issue.
+- The station records once per lane pull request whether CI was red on its
+  first push (its checks finished before any fix round; the review bot's
+  check is not counted). `bus.brain status` shows, per repo, the first-push
+  CI red rate and the gaps filed, under "Validation gaps".
+
+A gap is judged only for a repo with a contract; a repo without one gets the
+"Add the repository validation contract" ticket instead.
+
+### What a fix round is told about a red job
+
+The loom:fix comment quotes each failing check's log excerpt and, above it,
+the failing test names (pytest, unittest, go test and TAP forms) and up to
+eight assertion lines from the excerpt. When the failure text names a command
+that regenerates a file (a quoted command on a line that says a file is stale
+or must be regenerated, or a command that renders into a file with a
+redirect, such as `tool --render-rbac > rbac.yaml`), the comment's first line
+after its header says to run that command and commit what it writes
+(`bus/ci_facts.py`).
+
+### Live-cluster check
+
+Before a lane opens a pull request, or pushes to one in a fix round, whose
+commits change a Kubernetes manifest, the runner checks what the added lines
+name against the live cluster (`bus/live_cluster.py`, over the range the
+leak scan reads):
+
+- every pod template's `nodeSelector` pair and required node affinity
+  expression must match a Ready node's labels in `kubectl get nodes -o
+  json`, and some Ready node must match them all and carry no NoSchedule or
+  NoExecute taint the pod does not tolerate;
+- every SSM parameter an ExternalSecret key (an SSM path), an
+  ssm-secret-sync JSON file or an `aws ssm ... --name` line names must exist,
+  by `aws ssm describe-parameters` (names only, never a value);
+- every host a probe, an analysis template or a smoke or canary check calls
+  must resolve (getaddrinfo, 3 seconds); in-cluster names are skipped. The
+  agent wrote these names and the lookup leaves its sandbox, so only names
+  under a zone in `LOOM_LIVE_CHECK_ZONES` (comma or space separated, the
+  operator's own domains), plain ASCII (no Unicode or punycode label), of at
+  most six labels and 100 characters, are looked up. With no zones set, no
+  name is.
+
+The check runs after the public repo leak scan passes. Its git reads of the
+agent's tree run no repo-configured program (external diff, textconv,
+fsmonitor, hooks), reach no remote, and carry no GitHub, App or AWS
+credential; kubectl and aws keep the runner's own environment.
+
+A miss fails the run as work, names each missing label, key or host, and
+pushes nothing, so the lane or the next rung fixes it. A kubectl, AWS or DNS
+that cannot be reached at all, and a lane pod (no kubeconfig, no AWS key),
+does not stop the run: the log and the pull request body (or the round's
+comment) carry `live-cluster check could not run: <reason>`.
 
 ## The brain tick
 
@@ -238,7 +336,8 @@ CLI (key on stdin, never on the command line or on disk), and
 `POST /app/installations/<id>/access_tokens` returns a token kept in memory
 until 5 minutes before its `expires_at`. The station runs one pass per process
 and GitHub's ETags differ per token, so it also keeps the token in
-`state/station/app-token.json` (mode 0600, the only place a token is written)
+`state/station/app-token.json` (mode 0600; the only other place a token is
+written is a lane agent's per-run gh store, below)
 and the next pass reuses it until 5 minutes before expiry; the ETags cached on
 the last pass then answer 304 (loom#1306). A 401 deletes the file. Mints count under `app token` in the
 requests line, and the budget line reads `GitHub App budget`. With any of the
@@ -281,8 +380,14 @@ settings name, and fails with no output without them. A lane with the
 settings drops any personal `GH_TOKEN` or `GITHUB_TOKEN`, mints a token at the
 start of each run and again after its agent (a token lasts an hour), clones
 over https with `gh` as git's credential helper, and runs its agent without
-the token, the App settings or that helper; a failed mint parks the run
-`[transient]` before anything is posted. `lanes/mac/brain.sh` mints once per
+the token in its environment, the App settings or that helper; a failed mint
+parks the run `[transient]` before anything is posted. So that the agent's own
+`gh` calls spend the App's budget and not the operator's (loom#665), each run
+writes the token into a fresh gh config directory, `$LOOM_HOME/run/<lane>-gh.*`
+(mode 700, the token in its `hosts.yml`), points the agent's `GH_CONFIG_DIR`
+at it and removes it when the agent exits. The brief tells the agent not to
+poll pull request checks or reviews, and the run's log records
+`<ticket> agent gh calls: N`, the `gh` commands counted in the agent's output. `lanes/mac/brain.sh` mints once per
 tick, after the lock, and gives every rung that token as `GH_TOKEN`,
 `GITHUB_TOKEN` and `LOOM_GITHUB_TOKEN`; a failed mint, or a
 `LOOM_BRAIN_MINUTES` over 50, runs no rung. The station trusts its own App's
@@ -332,7 +437,11 @@ conflict goes back to a lane as a fix brief. It stays on its lane while the
 rounds make progress, and climbs the model ladder only when stuck: a review
 thread survived a fix round, checks it was asked to fix still fail, or the
 pull request is over 6 hours old and has not climbed in 6 hours (a review that finds new things, or a
-conflict alone, never climbs). Failed tickets and briefed tickets no lane
+conflict alone, never climbs, by age either: a conflict-only pull request is
+sent back on its lane however old it is, and the station never marks a
+conflicting pull request `loom:ready`). A ready pull request held for the
+operator is brought up to date with its base while it waits, and still never
+merges on the factory's say-so. Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
 starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
@@ -462,6 +571,28 @@ a retry sends the same one; once sent, `covered` holds each ask's revision
 except the numeric user id in `LOOM_DISCORD_MENTION`; a failed post is retried
 on the next pass.
 
+Urgency score (`bus/urgency.py`, loom#1787): before routing, the station can
+score each ask with one request to a System One model (TypeSafe Jev): an
+`urgency` Score on five levels (0 weekly look to 4 now) and three yes
+probabilities, `needs_person`, `duplicate` and `public_exposure`, over the
+ask's repo, title, body excerpt, labels, age, filer and the other open asks.
+`LOOM_URGENCY_MODE` is `off`, `shadow` (the default: score and record, route by
+the labels as above) or `act`. In act, `public_exposure` >= 0.7, or `urgency` >=
+3.2 with `needs_person` >= 0.6, adds `loom:urgent` and forwards it now;
+`duplicate` >= 0.8 leaves it out of the digest as a repeat; `urgency` >= 1.5
+puts it in the digest, highest score first; lower stays out of the digest.
+The thresholds are `LOOM_URGENCY_EXPOSURE`, `LOOM_URGENCY_URGENT`,
+`LOOM_URGENCY_URGENT_PERSON`, `LOOM_URGENCY_DIGEST` and
+`LOOM_URGENCY_DUPLICATE`. The key comes from the SSM parameter named by
+`LOOM_URGENCY_KEY_SSM` (empty: no request); `LOOM_URGENCY_MODEL` defaults to
+`jev-latest`. Each ask is scored once per revision; the scores sit in
+`state/station/urgency.json` and every score is appended to
+`state/station/urgency.jsonl` beside the route the labels gave.
+`LOOM_URGENCY_DAILY_TOKENS` (default 200000 input tokens a UTC day) caps the
+spend: past it no request is sent, and past it or on any API error the ask
+routes by the labels and `fallbacks` in `urgency.json` goes up. A failed ask is
+tried again after an hour.
+
 Metrics: set `LOOM_METRICS_GOAL=owner/name#N` to name a goal home in
 `LOOM_REPOS`. Once a day after `LOOM_DIGEST_HOUR`, the station measures the
 last 24 hours, comments with `<!-- loom:metrics v1 -->`, and sends a short
@@ -476,7 +607,9 @@ Reports: by default the station sends a digest, not each report:
 `LOOM_REPORT_DIGEST_TIMES` (default `10:00,21:00`, local time) names when.
 At each time it sends one message: every goal home whose latest report since
 the last digest says something moved, as its short name, the report's first
-line and a link; a count of the goal homes where nothing moved; and the
+line and a link; a count of the goal homes where nothing moved; one line
+per backlog goal home (labelled `loom:backlog`), counted from its tickets,
+since a backlog goal posts no report on GitHub; and the
 factory's daily numbers, which then no longer go out on their own. Each time
 is sent once, and a failed send is tried again on the next pass. Switching
 the digest on sends nothing until the next digest time. Setting
@@ -847,10 +980,31 @@ The loom home is kept bounded by the station and the runner (loom#643).
   station's own logs at the top of `logs/` are not touched.
 - The runner removes a check's scratch home (`run/<slot>-check`) after the
   final check and when it exits, so `run/` holds one only while that lane runs.
-- Every pass logs a warning to `station.log` while the home's disk has less
-  than `LOOM_DISK_FREE_MIN_GB` free (default 10). Every hour the station
-  removes the old lane logs and logs the home's size by top-level folder
-  (`loom home holds ...`), kept in `state/station/disk.json`.
+- While the home's disk has less than `LOOM_MIN_FREE_GB` free (default 15;
+  the older name `LOOM_DISK_FREE_MIN_GB` is still read) the station claims no
+  new work (loom#1808). It says `claims paused: ...` in `station.log` once
+  when the state changes, `claims resumed: ...` once when the disk has that
+  much free again, and the lane status shows a `Claims paused` line
+  meanwhile. The state is kept in `state/station/disk-guard.json`.
+- When a run ends the runner drops the build output git ignores from its
+  tree and its default-branch check copy: `.venv`, `node_modules`,
+  `__pycache__` and `.pytest_cache` folders that `git check-ignore`
+  confirms and that hold no tracked path. The tracked tree stays for fix
+  rounds.
+- A lane tree is removed `TREE_KEEP` (an hour) after its run, or at once,
+  with its `-default-check` copy and the runner's files beside it, when its
+  ticket is done: its pull request merged or closed, or the ticket closed or
+  dropped, as that pass read it. A tree whose ticket has a brief in a lane
+  inbox stays. An idle lane (no runner lock with a live pid, an empty inbox)
+  loses its run scratch (`run/<slot>-home`, `-check`, `-check-default`) once
+  the ticket it last ran is done, and its home's `.cache`, `.cargo` and `tmp`
+  every pass meanwhile.
+- Every hour the station removes the old lane logs, compresses each finished
+  run's opencode session store (`logs/<slot>/<run>/.local/share/opencode/
+  opencode.db`, to `opencode.db.gz`, once its transcript is uploaded; the
+  readers read either), and logs the home's size by top-level folder
+  (`loom home holds ...`), kept in `state/station/disk.json`. A compressed
+  store goes with its run's other logs after `LOOM_LOG_KEEP_DAYS`.
 
 ## Log watch
 
@@ -1286,6 +1440,9 @@ lookup leaves the brief for the next pass. The rule covers:
 
 - Tool: `codex exec --sandbox workspace-write` on a logged-in box: no network and
  no .git writes, so the agent edits and the runner commits and pushes.
+ When the base check left a uv cache, the agent gets a copy of it and runs uv
+ offline (`UV_OFFLINE`, `PIP_NO_INDEX`), so tests that need packages run
+ without network (loom#1665).
 - Best for: scoped implementation, CI failure repair, `codex review` passes.
 - Models per ticket: Astra (hardest), Sol (default building), Luna (volume).
 
@@ -1444,6 +1601,194 @@ unchanged for a run that did not end on a described step.
   a kept entry is removed, never followed, so deletion cannot reach into
   the keychain folder or another ticket's tree.
 
+## Lane pods: an API lane on a Linux cluster
+
+An API lane can run in a container on a Kubernetes cluster instead of on
+the station Mac, so each run's checkout and agent state live on the
+cluster's disk, not the Mac's (quadseven/loom#1824). The pod runs the same
+`lanes/run_lane.sh`; `lanes/k8s/pod.sh` starts it for each slot in
+`LOOM_POD_SLOTS` every `LOOM_POD_INTERVAL` seconds (default 60), as launchd
+does on the Mac.
+
+What changes in a pod:
+
+- `LOOM_SANDBOX=bwrap`: the agent and the validation run are confined by
+  bubblewrap instead of `sandbox-exec`. The sandbox root is an empty tmpfs
+  with only the system folders (`/usr`, `/bin`, `/lib*`, `/etc`, `/opt`)
+  bound in read-only, so HOME, `/run/secrets`, `/var/run/secrets` and the
+  loom checkout are not there at all (the two secret folders are also masked
+  with empty tmpfs). The run's tree and scratch home are the only writable
+  binds, `.git` stays read-only, the CLI's folder and the skill snapshot are
+  read-only, and `/tmp` is private. A validation run gets the same root:
+  its writes go to the tree, its check home and `/tmp`. A fresh `/proc` in a
+  new PID namespace hides the runner's processes. bwrap needs user
+  namespaces inside the container; a lane whose bwrap cannot start reports
+  itself unavailable (`sandbox_ready`). The agy lane and the codex and
+  claude lanes stay on the Mac.
+- Egress, fail closed: bwrap narrows no network, so the pod's network
+  policy must (no cloud metadata address, no API server, no cluster-internal
+  ranges; DNS and 443 to the internet only). `sandbox_ready` proves it
+  before every pass. `LOOM_EGRESS_DENY_PROBES` names blocked destinations as
+  literal `IPv4:port` (a name is refused: one that does not resolve would
+  fail to connect and pass as blocked); the API server at
+  `KUBERNETES_SERVICE_HOST` is added to them when the pod has it; each must
+  fail to connect. `LOOM_EGRESS_ALLOW_PROBE` (`host:port`, the provider's
+  HTTPS endpoint) must connect, so a pod with no network or no DNS does not
+  pass because everything fails. Anything else holds the lane unavailable,
+  with the reason in its heartbeat, so a policy the cluster network does not
+  enforce holds the lane too.
+- `LOOM_DROP_TREES=1`: each run's tree, the runner's files beside it and the
+  scratch homes are removed when the run ends, whatever its outcome
+  (`drop_run_scratch`). Logs and the brief stay under `LOOM_HOME`.
+- `LOOM_SSM_DIR`: a folder under HOME holding a copy of each SSM parameter
+  the pod reads, at the parameter's name (`/a/b` is `$LOOM_SSM_DIR/a/b`),
+  kept in step with SSM by the cluster. `ssm_value` reads the file and makes
+  no AWS call, so the pod holds no AWS key. The GitHub App key comes from
+  `LOOM_GITHUB_APP_KEY_FILE`, also under HOME.
+
+Everything the agent must not read (the copied parameters, the App key,
+`LOOM_HOME`) sits under HOME, outside the system folders bwrap binds; the
+agent sees nothing there but its own tree and scratch home. The pod mounts
+no service account token, and its code is read-only and owned by root. The image carries bash, coreutils, git, gh,
+python3, uv, rsync, openssl, netcat, procps, bubblewrap and the opencode
+CLI, plus this repo and the leak scanner at a pinned commit.
+
+A long-lived lane pod takes no work from the station. Lane runs on the
+cluster go through ephemeral runners instead (next section).
+
+## Lanes on cluster runners
+
+A slot named in `LOOM_RUNNER_SLOTS` (space- or comma-separated, empty by
+default) has no runner on the station's machine. Each brief the station
+claims for it is dispatched to the `lane` workflow
+(`.github/workflows/lane.yml`), which runs `lanes/run_lane.sh` once for that
+brief on an ephemeral self-hosted runner, with `LOOM_SANDBOX=bwrap` and
+`LOOM_DROP_TREES=1`. The runner pod and its disk go when the job ends, so no
+tree, cache or session database stays anywhere. API lanes only: opencode-go,
+zen, openrouter, zai, workersai, the free provider slots and spark (both
+through the gateway). codex, claude, agy and anthropic stay local.
+
+The runner image carries the lane runner's tools, not every tool a repo's
+check calls. A base check that fails there before the agent runs (exit 125
+to 127, or any red exit on the unmodified repo or default branch: a script
+that calls a missing `g++` exits 1) is not held behind its factory incident,
+which that runner could never clear: the station retries the ticket on
+another lane as a transient ending, and that lane holds it if the base is
+red there too. The runner files no incident for it (`LOOM_CLUSTER_RUNNER`).
+
+The job, step by step (`lanes/k8s/lane_job.py`):
+
+1. Reads the dispatch inputs (slot, ticket key, brief, run id, the slot's
+   `NAME=value` settings, the station's report public key and the run's
+   own report MAC key, masked at once) from the event file, never from the
+   environment, which GitHub prints in the public log.
+2. Proves the runner's egress is narrowed, before any key is read:
+   `sandbox_ready` from `lanes/agent_sandbox.sh` ("Lane pods" above). A runner
+   that fails it runs no agent; its heartbeat reason goes into the report.
+3. Assumes the lane role by OIDC and copies each value the slot's `*_KEY_SSM`
+   settings name, the leak scan deny-list and the lanes App key into files
+   under HOME (the `LOOM_SSM_DIR` layout, mode 600). The AWS session lives in
+   that step only, and nothing printed names a parameter or a value.
+4. Runs `lanes/run_lane.sh <slot>` once, with no Actions token and no AWS
+   session in its environment. Its output goes into the report, not the log.
+5. Seals a report of exactly what the station reads for the run: the
+   brief's `done/` or `failed/` move, the run log with its failure class
+   line, the `.answered` and `.verify` files, the transcripts, answers and
+   the slot's heartbeat. It is a tar.gz encrypted with a random key, the
+   key is RSA-OAEP encrypted to the station's own key
+   (`state/runners/report-key.pem`, made on first use), because a public
+   repository's artifacts can be downloaded by anyone signed in, and both
+   carry an HMAC-SHA256 under the run's MAC key, so a report sealed by
+   anyone else does not pass.
+
+Each pass (`bus/runners.py`, after `finish_claims`) the station:
+
+- Dispatches the next brief in each runner slot's inbox with its App token,
+  one run per slot at a time. The run is recorded in
+  `state/runners/runs.json` before the request goes, so a brief is never
+  dispatched twice; a ledger it cannot read stops every dispatch.
+- Reads each run's state, one request per run per pass on the existing
+  cadence (conditional requests, so an unchanged run costs a 304). It
+  follows only the run id the dispatch returned, and believes a run only
+  when it ran `.github/workflows/lane.yml` on main, as a workflow_dispatch
+  the station's own App triggered.
+- When a run ends, downloads its report, checks its MAC before decrypting,
+  bounds every size before reading (each zip member, the decrypted file and
+  all files together, 128 MB), and writes its files into
+  the loom home where a local runner writes them, then moves the inbox brief
+  to `done/` or `failed/` as the runner did. The factory and the rest of the
+  station read the outcome as for any lane.
+- Parks the brief `[transient]`, so the ticket goes to another lane, when a
+  run ends with no report, a report cannot be read, a report finishes no
+  brief (for example a failed egress proof), a run fails the checks above, a
+  dispatch gets no answer or no run id (never sent again), or no runner
+  takes a run within 30 minutes (the run is cancelled and the slot held for
+  30 minutes).
+- Refuses to dispatch, and parks `[transient]` so a local lane takes the
+  ticket, a brief whose inputs pass GitHub's 65,535-character limit and a
+  brief for a repo that is not public. Runner slots take public repos only:
+  a run's inputs and logs live in this public repository's Actions.
+- Writes the slot's heartbeat each pass, as a runner would: available, or
+  held until the reset a run's heartbeat named (else for 30 minutes), and a
+  keepalive stamp while a run is in flight.
+
+What the cluster side must provide:
+
+- A runner set with the label `arc-loom-lanes`, ephemeral (one job per pod),
+  scaled to zero when idle. Its image carries bash, coreutils, git, gh,
+  python3, uv, rsync, openssl, procps, bubblewrap with user namespaces and
+  the opencode CLI; nothing is installed at run time, and no AWS CLI is
+  needed (the job signs its SSM reads itself). The job keeps its files,
+  trees and scratch under the workspace (`LOOM_JOB_DIR`), which sits under
+  HOME, so no agent sees it, and on the runner's large work volume, not its
+  small `/tmp`.
+- A network policy for the runner pods that the cluster enforces: DNS, the
+  providers and GitHub on 443, the package indexes, AWS STS and SSM, and
+  the gateway's in-cluster service; no cloud metadata address, API server or
+  LAN. Until it is enforced the egress proof fails and no agent runs.
+- An AWS role this repository's `lane` workflow assumes by OIDC, its trust
+  anchored on the repository's numeric ids, the main branch and the
+  workflow file `.github/workflows/lane.yml` on main, allowed to read only
+  the lanes' key parameters, the lanes App key and the leak scan deny-list.
+  The station always dispatches on main, and the job sets no `environment:`
+  (one would change the token's subject).
+- Repository variables `LOOM_LANE_DISPATCHERS`, `LOOM_LANE_ROLE_ARN`, `LOOM_LANE_AWS_REGION`,
+  `LOOM_LANE_EGRESS_ALLOW_PROBE` (`host:port`, the gateway service) and
+  `LOOM_RUNNER_GATEWAY_URL` (the gateway's in-cluster origin; a spark or free
+  slot's endpoint URLs are moved onto it, path kept), and the repository
+  secret `LOOM_LANE_EGRESS_DENY_PROBES` (literal `IPv4:port` addresses the
+  runner must not reach), a secret so its private addresses are masked in
+  the public log.
+- The station App with `actions: write` on this repository, to dispatch and
+  cancel runs (`python3 -m bus app manifest --role station`; `app ids
+  --role station` checks it). The lanes' and the brain's Apps keep
+  `actions: read`.
+
+What keeps the runners safe. This repository is public, and a repository's
+self-hosted runners cannot be held to one workflow, so a pull request that
+adds a workflow naming `arc-loom-lanes` could start a job there. The `lane`
+job itself runs only when dispatched on main, and its first step refuses a
+dispatcher outside `LOOM_LANE_DISPATCHERS` (a repository variable: the
+station App's login and any trusted operator login), but a rogue workflow
+skips both. The real controls are:
+
+- The OIDC role trusts only `.github/workflows/lane.yml` on main, so any
+  other workflow, or this one from a branch, gets no AWS session and no key.
+- Default-deny egress on the runner pods, enforced by the cluster network.
+- Ephemeral pods: one job each, deleted with their disk when it ends.
+- The repository setting that requires approval before workflows run for
+  any outside collaborator's pull request (managed in the private
+  infrastructure code).
+
+To switch a slot over: set `LOOM_RUNNER_SLOTS` (for example
+`opencode-go-2`) and re-run `lanes/mac/install.sh`. The installer removes
+that slot's launchd runner and gives the station the slot's settings
+(`python3 -m bus.runners station-env`: its `*_KEY_SSM`, `*_URL` and probe
+settings and the lanes App's `LOOM_LANES_GITHUB_APP_*`; never a key). Let the
+slot's inbox empty first: a brief left there is dispatched like a new one.
+To switch back, drop the slot from `LOOM_RUNNER_SLOTS` and re-run the
+installer.
+
 ## Adding a lane
 
 A lane is a name in `lanes/run_lane.sh`, not a directory of its own: that one
@@ -1451,8 +1796,8 @@ runner polls, heartbeats, commits, pushes and opens the PR for every lane.
 Adding one takes:
 
 - In `lanes/run_lane.sh`, a CLI in `lane_ready`, and the name in the header
-  comment's lane list. An API lane also joins the case that wants
-  `sandbox-exec` and a key read from `LOOM_<LANE>_KEY_SSM`; a lane whose CLI
+  comment's lane list. An API lane also joins the case that wants a
+  sandbox (`sandbox_ready`) and a key read from `LOOM_<LANE>_KEY_SSM`; a lane whose CLI
   or key is missing reports itself unavailable and takes no work.
 - A branch in `run_agent` that runs the lane's CLI with the brief and the
   model. An API lane calls `api_agent <key var or -> <CLI...>`
@@ -1517,3 +1862,19 @@ or disk resize, scaling a workload down), one per line, or the single word
 copies the ticket's section of that name, else writes `none stated`.
 A pull request that lists a step is never merged by Loom (docs/BRAIN.md,
 Operator holds).
+
+## Bugs discovered
+
+A lane that finds a bug outside its ticket writes a `## Bugs discovered`
+section in `.loom/summary.md` (also read as "Bugs found", "Found bugs" or
+"Discovered bugs"), one bug per line. Each line must cite an issue: `#N`
+in the pull request's own repo, or OWNER/NAME#N. `bus/bug_refs.py` looks
+each cited issue up and keeps the line only when the issue exists, is an
+issue rather than a pull request, and is open or was filed in the last two
+days; a failed lookup rejects the line. A new pull request body carries the
+kept lines under `## Bugs discovered`, after the operator steps, and the
+lane log names each line left out. On a fix round the PR text repair
+refuses while any line is rejected, with a reason asking the lane to file
+the issue and cite it, or drop the line; a round whose summary has no such
+section keeps the body's earlier one. In a public repo another repo's
+citation is written as "issue N of another repo".

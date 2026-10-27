@@ -7,6 +7,11 @@ from urllib.parse import quote
 
 from .github import GitHub
 
+# The hand-off pool: a ticket no lane of this Loom takes (bus/factory.py
+# NO_LANE_HANDOFF) carries it, leaves its goal's in-flight count, and waits
+# for the second operator's session to claim it (docs/BRAIN.md).
+HANDOFF = "handoff:claude"
+
 LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
          "zai", "workersai", "agy", "spark"]
 # Extra slots: parallel copies of a lane on the same provider (run_lane.sh
@@ -17,7 +22,11 @@ LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
 # Contributor (LOOM_OPENCODE_GO_4_MODEL), which trains on prompts, so it
 # takes public repos only.
 SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-6",
-         "anthropic-7", "anthropic-8", "codex-2", "opencode-go-2", "opencode-go-3",
+         "anthropic-7", "anthropic-8", "codex-2",
+         # Six more codex slots, all on gpt-6-luna, so the Codex allowance is
+         # used rather than left to reset (operator, 2026-10-25).
+         "codex-3", "codex-4", "codex-5", "codex-6", "codex-7", "codex-8",
+         "opencode-go-2", "opencode-go-3",
          "opencode-go-4",
          # A second local coder: the other Spark box, at LOOM_SPARK_2_URL.
          "spark-2",
@@ -47,7 +56,9 @@ def base_lane(slot: str) -> str:
 # beat_max: seconds a remote worker's last heartbeat counts as up. Muse runs
 # on its own schedule (about every 30 minutes), not every minute like a
 # local runner, so its window is longer than HEARTBEAT_MAX_AGE.
-REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 1,
+# slots: tickets the lane may hold at once; Muse runs four scheduled lane
+# tasks (operator, 2026-10-25).
+REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 4,
                          "beat_max": 2 * 3600}}
 LANES += list(REMOTE_LANES)
 
@@ -63,6 +74,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:running": {"color": "fbca04", "description": "Handed to the lane's runner"},
     "loom:pr": {"color": "0075ca", "description": "The runner opened a pull request"},
     "loom:answered": {"color": "5319e7", "description": "The runner posted an answer for brain review"},
+    "loom:answer-pending": {"color": "c5def5", "description": "An operator answered on the dashboard; the station has not read it yet"},
     "loom:ready": {"color": "0e8a16", "description": "Checks passed and review-bot threads are resolved"},
     "loom:failed": {"color": "d93f0b", "description": "The runner gave up; see the ticket"},
     "loom:merged": {"color": "8fd19e", "description": "Merged, not deployed yet"},
@@ -80,8 +92,9 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:runaway": {"color": "b60205", "description": "Held for brain review after repeated or regressive attempts"},
     "loom:recurring": {"color": "fbca04", "description": "Invariant breached repeatedly; keep open for a fix"},
     "loom:factory": {"color": "b60205", "description": "A factory validation incident"},
+    "loom:validation-gap": {"color": "fbca04", "description": "A CI job the repo's .loom/validation.conf does not run"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
-    "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},
+    "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
     "loom:regression": {"color": "b60205", "description": "Fixes a measured regression of a shipped ticket"},
     "loom:revert": {"color": "b60205", "description": "Reverts the merge that turned the default branch red"},
@@ -98,6 +111,9 @@ LABELS: Dict[str, Dict[str, str]] = {
     "wait:after": {"color": "fef2c0", "description": "Waiting: another ticket must merge first (After:)"},
     "wait:window": {"color": "fef2c0", "description": "Waiting: a deploy or roll window"},
     "wait:live-event": {"color": "fef2c0", "description": "Waiting: its Live box needs a rare event the log has not shown; held apart from open work"},
+    # The hand-off pool (docs/BRAIN.md): tickets this Loom's lanes do not
+    # take, for the second operator's session to claim.
+    HANDOFF: {"color": "d876e3", "description": "In the hand-off pool for the second operator's session; out of the goal's in-flight count"},
 }
 for _lane in LANES:
     LABELS["lane:" + _lane] = {"color": "bfdadc",

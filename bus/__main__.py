@@ -6,7 +6,7 @@ import re
 import sys
 from typing import Callable, List, Optional
 
-from . import app, brain, journal, labels, lock, station
+from . import app, brain, journal, labels, lock, naming, station
 from .github import GitHub, GitHubError, Transport, auth_from_env, openssl_sign
 
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
@@ -65,13 +65,24 @@ def _parser() -> argparse.ArgumentParser:
     a.add_argument("--name", help="the App's name (default loom-OWNER)")
     a.add_argument("--form", action="store_true",
                    help="print an HTML page whose one button creates the App")
+    a.add_argument("--role", choices=app.ROLES, default="station",
+                   help="which writer's App: only the station's may dispatch workflow runs")
     app_sub.add_parser("token", help="print the installation token of the App the "
                        "LOOM_GITHUB_APP_* settings name, for gh and git (loom#1142)")
     app_sub.add_parser("login", help="print the \"<slug>[bot]\" login of the App the "
                        "LOOM_GITHUB_APP_* settings name, for the brain's journal")
     a = app_sub.add_parser("ids", help="list the App's installations and print its id settings")
     a.add_argument("--app-id", required=True, type=_number)
+    a.add_argument("--role", choices=app.ROLES, default="station",
+                   help="which writer's App the permissions are checked for")
     return p
+
+
+def _backlog_home(gh: GitHub, repo: str, number: int) -> bool:
+    """Whether issue `number` is a per-repo backlog goal home, which posts no
+    report (its status is one line in the station's digest)."""
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+    return isinstance(issue, dict) and naming.is_backlog_home(issue)
 
 
 def _run(args: argparse.Namespace, gh: GitHub) -> int:
@@ -94,12 +105,18 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
     authors = brain.trusted_authors()
     try:
         journal.post(gh, repo, int(num), text, args.holder, authors,
-                     quiet=lambda: brain.goal_quiet(gh, repo, int(num), authors))
-    except (journal.ReportTooSoon, journal.ReportQuiet) as held:
+                     quiet=lambda: brain.goal_quiet(gh, repo, int(num), authors),
+                     backlog=lambda: _backlog_home(gh, repo, int(num)))
+    except (journal.ReportTooSoon, journal.ReportQuiet, journal.ReportBacklog) as held:
         # The goal is already reported, or quiet since its last report
         # (loom#1534): not a failed step, so exit 0.
         print("not posted: %s" % held)
         return 0
+    except journal.ReportInvalid as bad:
+        # A report that contradicts itself is the brain's to rewrite, so this
+        # is a failed step: nothing is posted and the exit is non-zero.
+        print("not posted: %s" % bad)
+        return 2
     print("posted to %s" % args.target)
     return 0
 
@@ -107,13 +124,14 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
 def _app(args: argparse.Namespace, transport: Optional[Transport],
          sign: Optional[Callable[[bytes, str], bytes]]) -> int:
     if args.app_command == "manifest":
-        return app.print_manifest(args.owner, args.org, args.name, args.form, sys.stdout)
+        return app.print_manifest(args.owner, args.org, args.name, args.form, sys.stdout,
+                                  args.role)
     try:
         if args.app_command == "token":
             return app.print_token(sys.stdout, transport=transport, sign=sign or openssl_sign)
         if args.app_command == "login":
             return app.print_login(sys.stdout, transport=transport, sign=sign or openssl_sign)
-        return app.ids(args.app_id, transport=transport, sign=sign or openssl_sign)
+        return app.ids(args.app_id, transport=transport, sign=sign or openssl_sign, role=args.role)
     except GitHubError as err:
         print("error: %s" % err, file=sys.stderr)
         return 2

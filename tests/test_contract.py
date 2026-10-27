@@ -61,3 +61,44 @@ class ContractFormTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LoomOwnContractTests(unittest.TestCase):
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_loom_s_own_check_runs_the_suite_the_way_ci_does(self):
+        # 2026-10-24: the contract ran `unittest discover` serially (808 s for
+        # 3596 tests) while CI runs .github/unittest_parallel.py (about 140 s).
+        # A lane runs the check twice per ticket, so every Loom ticket spent
+        # about 27 minutes in checks before and after the agent's own work.
+        with open(os.path.join(self.ROOT, ".loom", "validation.conf"), encoding="utf-8") as fh:
+            check = next(line.split(":", 1)[1].strip() for line in fh
+                         if line.startswith("check:"))
+        with open(os.path.join(self.ROOT, ".github", "workflows", "test.yml"), encoding="utf-8") as fh:
+            workflow = fh.read()
+        self.assertIn(".github/unittest_parallel.py", workflow)
+        self.assertIn(".github/unittest_parallel.py", check)
+
+
+class AffectedContractTests(unittest.TestCase):
+    """loom#1773: an affected command runs after the check with the pull
+    request's changed files, so it is kept apart from the check."""
+
+    def test_an_affected_line_passes_through_with_the_check(self):
+        text = "check: make test\naffected: scripts/affected.sh\n"
+        self.assertEqual(contract.normalize(text), text)
+        self.assertEqual(contract.fields(text),
+                         {"check": "make test", "affected": "scripts/affected.sh"})
+
+    def test_an_affected_pipe_line_or_table_is_not_joined_into_the_check(self):
+        pipes = ("test | python3 t.py | a.yml | tests\n"
+                 "affected | python3 affected.py | b.yml | per-dir\n")
+        self.assertEqual(contract.normalize(pipes),
+                         "interpreter: python3\ncheck: python3 t.py\naffected: python3 affected.py\n")
+        tables = '[test]\ncommand = "make t"\n\n[affected]\ncommand = "make affected"\n'
+        self.assertEqual(contract.normalize(tables),
+                         "interpreter: make\ncheck: make t\naffected: make affected\n")
+
+    def test_a_contract_with_only_an_affected_command_checks_nothing_else(self):
+        self.assertEqual(contract.normalize("affected | ./per-dir.sh\n"),
+                         "check: true\naffected: ./per-dir.sh\n")

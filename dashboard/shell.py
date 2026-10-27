@@ -9,6 +9,7 @@ VIEWS = (
     ("goals", "Goals", "/goals"),
     ("tree", "Tree", "/tree"),
     ("tickets", "Tickets", "/tickets"),
+    ("chain", "Command chain", "/chain"),
     ("brain", "Brain", "/brain"),
     ("hot-spots", "Hot spots", "/hot-spots"),
     ("results", "Results", "/results"),

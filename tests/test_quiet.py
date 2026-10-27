@@ -200,19 +200,19 @@ class StatusTest(unittest.TestCase):
         return report, report.split("### Reports owed before unlock")[1].split("###")[0]
 
     def test_status_owes_no_report_for_a_quiet_goal(self):
-        home = GoalHome([report_comment(1, ago(7))],
+        home = GoalHome([report_comment(1, ago(13))],
                         [ticket(41, "loom:queued", created_at=ago(30), updated_at=ago(30))])
         report, owed = self.status(home)
-        self.assertIn("report overdue", report)  # the 6-hour clock alone would owe it
+        self.assertIn("report overdue", report)  # the reading-time clock alone would owe it
         self.assertEqual(owed.strip(), "- none")
         self.assertIn("  - quiet since %s: no report owed; heartbeat from %s"
-                      % (ago(7), ago(7 - 24 * 7)), report)
+                      % (ago(13), ago(13 - 24 * 7)), report)
 
     def test_status_still_owes_a_report_for_a_goal_that_moved(self):
         # The ticket's merge is what makes the report owed: without it the
         # same goal is quiet.
-        home = GoalHome([report_comment(1, ago(7))],
-                        [ticket(41, "loom:merged", state="closed", updated_at=ago(8))])
+        home = GoalHome([report_comment(1, ago(13))],
+                        [ticket(41, "loom:merged", state="closed", updated_at=ago(14))])
         self.assertEqual(self.status(home)[1].strip(), "- none")
         home.children = [ticket(41, "loom:merged", state="closed", updated_at=ago(1))]
         report, owed = self.status(home)
@@ -327,7 +327,7 @@ class JournalTest(unittest.TestCase):
 
 class VisibilityTest(unittest.TestCase):
     def test_a_quiet_goal_keeps_the_visibility_number_passing(self):
-        # The daily number wants each goal report under 6 hours old; a quiet
+        # The daily number wants each goal reported by its reading time; a quiet
         # goal is owed none, so its older report still counts as current.
         home = GoalHome([report_comment(1, ago(30))])
         total = metrics.Totals()

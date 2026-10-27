@@ -7,7 +7,7 @@ import os
 import unittest
 from unittest import mock
 
-from dashboard import server
+from dashboard import needs_you, server
 from dashboard.github import OPERATOR_CLAIMS_SECONDS, TicketStore
 from tests.test_dashboard_operators_page import ENV, FakeGitHub, _issue
 
@@ -141,7 +141,7 @@ class NeedsYouPageTest(unittest.TestCase):
         code, filtered = handler.result
         self.assertEqual(code, 200)
         self.assertEqual(sorted(card.split(" -")[0].rsplit("#", 1)[-1] for card in
-                                (c.split("<span>", 1)[1] for c in self.cards(filtered))), ["40", "43"])
+                                (c.split("<span class=\"ask-ref\">", 1)[1] for c in self.cards(filtered))), ["40", "43"])
         self.assertIn('href="/needs-you?who=%s" aria-current="true"' % OWNER, filtered)
         operator = self.page(who=needs_you.who_param("operator"))
         self.assertEqual(len(self.cards(operator)), 2)
@@ -179,5 +179,140 @@ class RefKeyTest(unittest.TestCase):
         self.assertNotEqual(needs_you.ref_key("grug", 1, names), needs_you.ref_key("one-owner/grug", 1, names))
 
 
+class GoalCapsTest(NeedsYouPageTest):
+    """The station's goals stuck at their in-flight cap (loom#1831)."""
+    GOAL = {"goal": "%s#5" % REPO, "since": 0.0, "in_flight": 32, "cap": 28, "no_lane": 20}
+    PATH = "/api/goal-caps"
+
+    def post(self, body, auth="Bearer YOUR_UPLOAD_TOKEN_HERE"):
+        import io
+        from email.message import Message
+        handler_type = server._handler_for(self.store)
+        handler = handler_type.__new__(handler_type)
+        handler.path = self.PATH
+        handler.headers = Message()
+        raw = json.dumps(body).encode()
+        handler.headers["Content-Length"] = str(len(raw))
+        if auth:
+            handler.headers["Authorization"] = auth
+        handler.rfile = io.BytesIO(raw)
+        result = []
+        handler.send_json = lambda code, value: result.append((code, value))
+        with mock.patch.dict(os.environ, {"LOOM_UPLOAD_TOKEN": "YOUR_UPLOAD_TOKEN_HERE"}):
+            handler.do_POST()
+        return result[0]
+
+    def test_a_goal_stuck_at_its_cap_shows_with_its_no_lane_count(self):
+        now = 10 * 3600.0
+        with mock.patch.object(server.time, "time", return_value=now):
+            self.assertEqual(self.post({"goals": [self.GOAL]}, auth="")[0], 401)
+            self.assertEqual(self.post({"goals": [self.GOAL]}), (201, {"goals": 1}))
+            body = self.page()
+        self.assertIn("Goals stuck at their cap (1)", body)
+        self.assertIn("%s#5</strong> stuck at its cap for 10 hours: 32 of 28 in "
+                      "flight, 20 blocked on no lane." % REPO, body)
+
+    def test_an_old_or_empty_report_shows_nothing(self):
+        self.assertEqual(needs_you.goal_caps_section({"goals": [self.GOAL], "received_at": 0.0},
+                                                     needs_you.GOAL_CAPS_MAX_AGE + 1), "")
+        self.assertEqual(needs_you.goal_caps_section({"goals": [], "received_at": 0.0}, 1.0), "")
+        self.assertEqual(needs_you.goal_caps_section(None, 1.0), "")
+
+    def test_a_malformed_report_is_refused(self):
+        for body in ({}, {"goals": "x"}, {"goals": [dict(self.GOAL, goal="<b>x</b>")]},
+                     {"goals": [dict(self.GOAL, no_lane="3")]},
+                     {"goals": [dict(self.GOAL, cap=True)]}):
+            self.assertEqual(self.post(body)[0], 400, body)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecutiveSummaryTest(NeedsYouPageTest):
+    """loom#810 follow-up: the page reads as an executive summary. A headline
+    says how much waits and on whom, a short list says where to start, and
+    the items are grouped by the kind of action they need, oldest first."""
+
+    def test_the_page_opens_with_a_headline_naming_the_counts_and_the_oldest_item(self):
+        body = self.page()
+        summary = body.split('<section class="needs-summary', 1)[1].split("</section>", 1)[0]
+        self.assertIn("4 items wait on people", summary)
+        self.assertIn("2 on %s" % OWNER, summary)
+        self.assertIn("Oldest: %s#40" % REPO, summary)
+        self.assertLess(body.index("needs-summary"), body.index('class="card ask-card"'))
+
+    def test_start_here_lists_at_most_three_items(self):
+        body = self.page()
+        start = body.split('<ol class="needs-start">', 1)[1].split("</ol>", 1)[0]
+        self.assertEqual(start.count("<li>"), 3)
+        self.assertIn("%s#40" % REPO, start)
+
+    def test_items_are_grouped_by_the_action_they_need_oldest_first(self):
+        body = self.page()
+        self.assertIn("Access and credentials (3)", body)
+        self.assertIn("Decisions (1)", body)
+        access = body.split("Access and credentials (3)", 1)[1].split("</section>", 1)[0]
+        order = [access.index("%s#%d -" % (REPO, n)) for n in (40, 41, 43)]
+        self.assertEqual(order, sorted(order))
+        self.assertNotIn("%s#42 -" % REPO, access)
+
+    def test_each_item_is_one_line_that_opens_to_the_whole_ask(self):
+        card = needs_you.card({"repo": REPO, "number": 7, "title": "Long ask", "who": [OWNER],
+                               "unblocks": 0, "body_ask": "Rotate the key. Then paste its id here.",
+                               "comment_ask": None, "comment_url": ""})
+        line, rest = card.split("</summary>", 1)
+        self.assertIn("Long ask", line)
+        self.assertIn("Rotate the key.", line)
+        self.assertNotIn("paste its id", line)
+        self.assertIn("<blockquote>Rotate the key. Then paste its id here.</blockquote>", rest)
+
+    def test_start_here_names_the_longest_waiting_items(self):
+        start = self.page().split('<ol class="needs-start">', 1)[1].split("</ol>", 1)[0]
+        self.assertLess(start.index("%s#40" % REPO), start.index("%s#41" % REPO))
+
+    def test_the_action_kind_comes_from_the_ask(self):
+        kind = needs_you.action_kind
+        self.assertEqual(kind({"body_ask": "Plug a monitor into the box and power it on."}), "device")
+        self.assertEqual(kind({"body_ask": "Create an OAuth client and paste its id."}), "access")
+        self.assertEqual(kind({"body_ask": "Reply yes or no."}), "decide")
+        self.assertEqual(kind({"body_ask": "Merge PR 12 as is, or reply hold."}), "decide")
+        self.assertEqual(kind({"body_ask": "", "comment_ask": ""}), "missing")
+        self.assertEqual(kind({"body_ask": "Look at the log."}), "other")
+
+    def test_the_lead_skips_the_lead_in_that_only_says_who_it_waits_on(self):
+        lead = needs_you.first_sentence
+        self.assertEqual(lead("**Needs the operator (one ask).** Merge PR 12 as is, or reply hold. More."),
+                         "Merge PR 12 as is, or reply hold.")
+        self.assertEqual(lead("Exact ask (owner): open Accounts and reconnect it. Then sync."),
+                         "open Accounts and reconnect it.")
+        self.assertEqual(lead("Ask (needs:ccqw): one open box is left."), "one open box is left.")
+
+
+class BrainHoldsTest(NeedsYouPageTest):
+    """The station's needs-brain holds older than a day, a repo a row (loom#1872)."""
+    ROW = {"repo": REPO, "old": 7, "person": 1, "unknown": 2}
+    PATH = "/api/brain-holds"
+    post = GoalCapsTest.post
+
+    def test_each_repos_old_holds_show_with_who_set_them(self):
+        with mock.patch.object(server.time, "time", return_value=1000.0):
+            self.assertEqual(self.post({"repos": [self.ROW]}, auth="")[0], 401)
+            self.assertEqual(self.post({"repos": [self.ROW]}), (201, {"repos": 1}))
+            body = self.page()
+        self.assertIn("needs-brain holds older than a day (7)", body)
+        self.assertIn("%s</strong>: 7 held over a day (1 set by a person, 2 by an unknown "
+                      "setter)." % REPO, body)
+
+    def test_an_old_or_empty_report_shows_nothing(self):
+        self.assertEqual(needs_you.brain_holds_section({"repos": [self.ROW], "received_at": 0.0},
+                                                       needs_you.BRAIN_HOLDS_MAX_AGE + 1), "")
+        self.assertEqual(needs_you.brain_holds_section(
+            {"repos": [dict(self.ROW, old=0)], "received_at": 0.0}, 1.0), "")
+        self.assertEqual(needs_you.brain_holds_section(None, 1.0), "")
+
+    def test_a_malformed_report_is_refused(self):
+        for body in ({}, {"repos": "x"}, {"repos": [dict(self.ROW, repo="<b>x</b>")]},
+                     {"repos": [dict(self.ROW, old="3")]},
+                     {"repos": [dict(self.ROW, person=True)]}):
+            self.assertEqual(self.post(body)[0], 400, body)
