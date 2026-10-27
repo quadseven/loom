@@ -3080,18 +3080,39 @@ class EscalateTests(unittest.TestCase):
         note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
         self.assertIn("Skipped rung 1: lane claude load is 5", note)
 
-    def test_escalate_keeps_rung_order_when_one_lane_is_at_the_limit(self):
+    def escalate_with_load(self, load, history=()):
+        """escalate on a failed ticket with claude and codex free and
+        `load[lane]` open briefed tickets on each lane: (fake, outcome)."""
         from bus import factory
-        fake = Routed(ticket_routes(
-            stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")],
-            free=("claude", "codex")))
-
-        tickets = briefed_on({"codex": factory.ONE_LANE_MAX - 1, "claude": 1})
-
+        fake = Routed(ticket_routes(stuck_ticket("failed"), TWICE, list(history), free=("claude", "codex")))
+        tickets = briefed_on(load)
         authors = (os.environ.get("LOOM_BRIEF_AUTHORS", "") + " " + BRAIN).strip()
         with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": authors}), \
                 unittest.mock.patch.object(factory.Factory, "_tickets", lambda _self, _repo: tickets):
             outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        return fake, outcome
+
+    def test_escalate_keeps_rung_order_when_one_lane_is_under_the_limit(self):
+        from bus import factory
+        fake, outcome = self.escalate_with_load({"claude": factory.ONE_LANE_MAX - 1, "codex": 0})
+        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+        self.assertNotIn("Skipped rung", fake.sent("POST", "/issues/9/comments")[-1]["body"])
+
+    def test_escalate_keeps_rung_order_when_one_lane_is_at_the_limit(self):
+        from bus import factory
+        fake, outcome = self.escalate_with_load({"claude": factory.ONE_LANE_MAX, "codex": 0})
+        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+        self.assertNotIn("Skipped rung", fake.sent("POST", "/issues/9/comments")[-1]["body"])
+
+    def test_escalate_keeps_an_overflowing_rung_when_no_later_lane_is_three_lower(self):
+        fake, outcome = self.escalate_with_load({"claude": 5, "codex": 3})
+        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+        self.assertNotIn("Skipped rung", fake.sent("POST", "/issues/9/comments")[-1]["body"])
+
+    def test_escalate_keeps_rung_two_after_rung_one_was_tried(self):
+        from bus import factory
+        _, outcome = self.escalate_with_load(
+            {"codex": factory.ONE_LANE_MAX - 1, "claude": 1}, [claim("2030-01-01T00:11:00Z")])
         self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
 
     def test_escalate_uses_the_codex_standin_and_anthropic_slot(self):
