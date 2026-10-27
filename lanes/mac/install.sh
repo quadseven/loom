@@ -244,6 +244,21 @@ runner_env() {
   done
 }
 
+# LOOM_STATION_PASS_ENV: the non-LOOM variables, comma or space separated,
+# the station plist keeps from the installing environment when set (for
+# example KUBECONFIG, which LOOM_LIVE_EVIDENCE_PASS_ENV hands the live
+# evidence adapter). PATH, HOME and LOOM_* names are written elsewhere and
+# skipped. Each entry starts its own line, so an empty list adds no byte.
+station_pass_env() {
+  local n
+  for n in $(printf '%s' "${LOOM_STATION_PASS_ENV:-}" | tr ',\t\n' '   '); do
+    case "$n" in PATH|HOME|LOOM_*) continue ;; esac
+    [[ "$n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [ -n "${!n+x}" ] || continue
+    printf '\n    <key>%s</key><string>%s</string>' "$n" "$(xml "${!n}")"
+  done
+}
+
 for L in "${LANES[@]}"; do
   LABEL="com.loom.$L"
   if runner_busy "$LOOM_HOME/run/$L.lock"; then
@@ -350,7 +365,8 @@ done
 # LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and LOOM_GITHUB_APP_KEY_SSM
 # or LOOM_GITHUB_APP_KEY_FILE (a GitHub App installation token instead of the
 # personal one, minted from the key in that SSM parameter or that mode-600
-# file, docs/LANES.md; all or none, checked above). Runs from
+# file, docs/LANES.md; all or none, checked above), and the variables
+# LOOM_STATION_PASS_ENV names (station_pass_env above). Runs from
 # this checkout, like the lanes, through
 # lanes/mac/station.sh, which first fast-forwards the checkout to its default
 # branch once that head passed CI (LOOM_DEPLOY=0 turns it off).
@@ -433,7 +449,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_GITHUB_APP_KEY_SSM</key><string>$(xml "${LOOM_GITHUB_APP_KEY_SSM:-}")</string>
     <key>LOOM_GITHUB_APP_KEY_FILE</key><string>$(xml "${LOOM_GITHUB_APP_KEY_FILE:-}")</string>
 $(model_env)
-$(runner_env)
+$(runner_env)$(station_pass_env)
   </dict>
 </dict>
 </plist>

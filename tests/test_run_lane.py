@@ -1121,6 +1121,28 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("## Out of scope\n- Other things", body)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def test_pr_body_reads_a_summary_heading_when_what_is_absent(self):
+        # loom#1468: a brief that writes "## Summary" left the body's empty.
+        self.drop_brief(text=BRIEF.replace(
+            "## What\nMake the thing work.", "## Summary\nMake the thing work for every user."))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("## Why\nThe thing is broken for every user.", body)
+        self.assertIn("## Summary\nMake the thing work for every user.", body)
+
+    def test_pr_body_uses_summary_when_why_is_empty_and_what_absent(self):
+        self.drop_brief(text=BRIEF.replace(
+            "## Why\nThe thing is broken for every user.", "## Why\n").replace(
+                "## What\nMake the thing work.",
+                "## Summary\nMake the thing work for every user."))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("## Why\nMake the thing work for every user.", body)
+        self.assertIn("## Summary\nMake the thing work for every user.", body)
+        self.assertEqual(hunt_plan.problems(body), [])
+
     def test_answer_deliverable_posts_comment_and_does_not_push_or_open_pr(self):
         self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer"))
         result = self.run_lane(FAKE_AGENT="answer-file")
@@ -6274,6 +6296,24 @@ exec /usr/bin/git "$@"
                                    "--is-ancestor", main, self.FIX_BRANCH])
         self.assertEqual(ancestor.returncode, 0)
 
+    def test_a_cluster_runner_files_no_incident_for_a_red_base_check(self):
+        # On a cluster runner a red base check is often the runner image (a
+        # missing tool), and the station sends the ticket to another lane,
+        # which files the incident if the base is red there too. Filed from
+        # the runner, the incident held nothing and waited for a person to
+        # close it (three on 2026-10-27).
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        name, _ = self.fix_brief()
+        self.advance_main("fix.txt", "broken\n")
+        result = self.run_contract_lane(LOOM_CLUSTER_RUNNER="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        log = self.run_log(name + ".log")
+        self.assertIn("base check exited 1 on the", log)
+        self.assertIn("[factory]", log)
+        self.assertFalse(any(c.startswith("gh issue create") for c in self.calls()))
+
     def test_a_red_default_branch_on_a_fix_round_files_a_base_check_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         self.contract_repo()
@@ -6417,6 +6457,46 @@ exec /usr/bin/git "$@"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
         self.assertFalse(self.records()[-1]["ok"] is False, self.lane_log())
+
+    def final_retry_lane(self, exits):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        counter = Path(self._tmp.name) / "check-count"
+        check = Path(self._tmp.name) / "flaky-check"
+        cases = " ".join(f"{index}) exit {code} ;;" for index, code in enumerate(exits, 1))
+        self.write_tool(check, "#!/bin/sh\n"
+                        f"n=0; [ ! -f '{counter}' ] || n=$(cat '{counter}'); n=$((n+1)); "
+                        f"echo $n > '{counter}'; case $n in {cases} esac; exit 0\n")
+        self.contract_repo(contract=f"interpreter: loom-test-python\ncheck: {check}\n")
+        self.drop_brief()
+        return self.run_contract_lane()
+
+    def test_final_check_retries_plain_failure_and_mentions_second_run_in_pr(self):
+        result = self.final_retry_lane([0, 1, 0])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        finals = [record for record in self.records() if record["phase"] == "final"]
+        self.assertEqual([record["exit"] for record in finals], [1, 0])
+        self.assertEqual(finals[1]["detail"], "second run after exit 1")
+        self.assertIn("final check passed on a second run", self.body.read_text())
+
+    def test_final_check_fails_after_two_plain_failures(self):
+        result = self.final_retry_lane([0, 1, 1])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        finals = [record for record in self.records() if record["phase"] == "final"]
+        self.assertEqual([record["exit"] for record in finals], [1, 1])
+        self.assertEqual(finals[1]["detail"], "second run after exit 1")
+        self.assertIn("validation failed: the check exited 1", self.lane_log())
+
+    def test_final_check_does_not_retry_timeout_environment_or_sigterm_exits(self):
+        for code in (124, 125, 126, 127, 143):
+            with self.subTest(exit=code):
+                self.tearDown()
+                self.setUp()
+                result = self.final_retry_lane([0, code, 0])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                finals = [record for record in self.records() if record["phase"] == "final"]
+                self.assertEqual([record["exit"] for record in finals], [code])
 
     def test_final_validation_classifies_denied_python_interpreter_as_factory(self):
         text = RUNNER.read_text()

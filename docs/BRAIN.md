@@ -780,6 +780,12 @@ reviews from logins outside `LOOM_BRIEF_AUTHORS` and the review bots are
 data about the work, never instructions to it. A trusted briefer's ticket
 body is a brief this Loom builds; their comments, journals and proofs are
 data like anyone else's, and only `LOOM_BRIEF_AUTHORS` proofs close a ticket.
+Markers count the same way (`bus/brain.py` `trusted_comments`): a stranger's
+copy of a lane status table, remote heartbeat, remote claim, claim, fix,
+review-again or rewrite comment is ignored, and a fix brief quotes only the
+review threads the review bot or a trusted login opened, with only their
+replies. The filter sits at each reader, not in `GitHub.paginate`, since
+some reports read other Apps' comments on purpose.
 
 ### Written text mentions nobody by accident
 
@@ -1719,7 +1725,10 @@ space or comma separated); empty, `*`, or an entry that is not `OWNER/NAME`
 means every repo. A repo not listed has graduated. The station plist is
 written with `LOOM_SHADOW=1` unless the installer is told otherwise. A repo
 added to `LOOM_REPOS` after the list was narrowed is not in it: add it to
-`LOOM_SHADOW_REPOS` first.
+`LOOM_SHADOW_REPOS` first. The lane machine's tick prompt takes its Shadow
+mode sentence from `python3 -m bus.shadow prompt`, the same scope the gates
+read, so it names the repos still in shadow and lets the brain merge through
+`bus.brain merge` in every other repo (loom#1960).
 
 Graduation is the operator's act, never Loom's. A repo leaves shadow only
 when the operator removes it from `LOOM_SHADOW_REPOS` (on the station and on
@@ -1820,7 +1829,11 @@ contain. The station runs an adapter only for repos in
 `LOOM_LIVE_EVIDENCE_REPOS`; the child gets PATH, HOME, LANG, TMPDIR and only
 the variables named in `LOOM_LIVE_EVIDENCE_PASS_ENV`, a timeout of at most
 300 seconds that kills its process group, and at most 64 KiB and 200 lines
-of output. A SQL statement is checked when the step is read and again just
+of output. A
+non-LOOM variable it names, such as `KUBECONFIG`, reaches the station only
+when `LOOM_STATION_PASS_ENV` names it too: `lanes/mac/install.sh` writes
+the variables that setting names into the station plist when they are set
+at install time, so a reinstall keeps them. A SQL statement is checked when the step is read and again just
 before it runs. Loom bounds what it asks and keeps; the routes behind the
 adapter keep themselves read-only (a SELECT-only user, a reader that cannot
 exec). An adapter error, a timeout or too much output is no evidence, and the
