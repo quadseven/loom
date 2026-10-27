@@ -58,6 +58,7 @@ lines to the dashboard's /chain page. A failed write never stops a request.
     python3 -m bus.shadow report [--since 24h|7d|2026-10-22[T10:00:00Z]]
                                  [--repo OWNER/NAME] [--json]
     python3 -m bus.shadow status
+    python3 -m bus.shadow prompt        # the brain tick's Shadow mode sentence
     python3 -m bus.shadow gh-guard [--lane] CWD GH-ARGS...   # exit 1: held
 """
 from __future__ import annotations
@@ -198,6 +199,38 @@ def describe(env: Optional[Mapping[str, str]] = None) -> str:
         return "shadow mode off (%s=0): Loom merges and closes" % SWITCH
     which = "every repo" if repos is None else ", ".join(sorted(repos))
     return "shadow mode on for %s: merges and closes are recorded, not taken" % which
+
+
+# The brain tick's own words for "in shadow" (lanes/mac/brain.sh). The
+# fallback the wrapper uses when `prompt` cannot run is this same sentence.
+_HELD_WORDS = ("never merge, close an issue, approve a pull request, or add "
+               "ready-to-land or loom:shipped by any route (gh, curl, the API); "
+               "bus.brain merge and bus.brain close run their gates and record "
+               "what they would do")
+
+
+def prompt_line(env: Optional[Mapping[str, str]] = None) -> str:
+    """The Shadow mode sentence of the brain tick's prompt, read from scope()
+    so the prompt and the gates agree (loom#1960). The prompt used to say
+    "unless LOOM_SHADOW is 0, never merge", which ignored LOOM_SHADOW_REPOS:
+    the brain refused merges bus.brain merge would have made, in repos the
+    operator had taken out of shadow. Fails closed to every repo."""
+    try:
+        on, repos = scope(env)
+    except Exception:  # noqa: BLE001 - scope() already fails closed
+        on, repos = True, None
+    if not on:
+        return ("Shadow mode (MUSE.md) is off (LOOM_SHADOW=0) for every repo: "
+                "merge and close only through bus.brain merge and bus.brain "
+                "close, once their gates pass.")
+    if repos is None:
+        return "Shadow mode (MUSE.md) is on for every repo: %s." % _HELD_WORDS
+    held = ", ".join(sorted(repos))
+    return ("Shadow mode (MUSE.md) is on only for %s (LOOM_SHADOW_REPOS): in "
+            "those repos %s. Every other repo is out of shadow: merge and close "
+            "there through bus.brain merge and bus.brain close once their gates "
+            "pass, never any other way; a ready pull request there is not a shadow "
+            "defer." % (held, _HELD_WORDS))
 
 
 def api_path(path: Any) -> str:
@@ -994,7 +1027,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rep.add_argument("--ledger", default="")
     rep.add_argument("--json", action="store_true")
     sub.add_parser("status", help="say which repos are in shadow and where the ledger is")
+    sub.add_parser("prompt", help="print the brain tick prompt's Shadow mode sentence")
     args = parser.parse_args(argv)
+    if args.command == "prompt":
+        print(prompt_line())
+        return 0
     if args.command == "status":
         print(describe())
         print("ledger: %s" % ledger_path())
