@@ -118,6 +118,36 @@ class SwitchTest(unittest.TestCase):
                 env = {"LOOM_SHADOW": "1", "LOOM_SHADOW_REPOS": listed}
                 self.assertTrue(shadow.active("example-owner/z", env))
 
+    def test_the_brain_prompt_line_reads_the_same_scope_as_the_gates(self):
+        # loom#1960: the tick prompt must not call a graduated repo in shadow.
+        listed = shadow.prompt_line({"LOOM_SHADOW": "1",
+                                     "LOOM_SHADOW_REPOS": "example-owner/b example-owner/a"})
+        self.assertIn("is on only for example-owner/a, example-owner/b", listed)
+        self.assertIn("never merge, close an issue", listed)
+        self.assertIn("Every other repo is out of shadow", listed)
+        for env in ({}, {"LOOM_SHADOW": "1"}, {"LOOM_SHADOW": "1", "LOOM_SHADOW_REPOS": "*"},
+                    {"LOOM_SHADOW": "yes", "LOOM_SHADOW_REPOS": "bad"}):
+            with self.subTest(env=env):
+                line = shadow.prompt_line(env)
+                self.assertIn("is on for every repo: never merge", line)
+                self.assertNotIn("out of shadow", line)
+        off = shadow.prompt_line({"LOOM_SHADOW": "0", "LOOM_SHADOW_REPOS": "example-owner/a"})
+        self.assertIn("is off (LOOM_SHADOW=0) for every repo", off)
+        self.assertIn("only through bus.brain merge", off)
+        for line in (listed, off):
+            self.assertTrue(line.startswith("Shadow mode (MUSE.md) "), line)
+            self.assertNotIn("\n", line)
+
+    def test_the_prompt_command_prints_the_line(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"LOOM_SHADOW": "1",
+                                          "LOOM_SHADOW_REPOS": "example-owner/a"}), \
+                redirect_stdout(out):
+            self.assertEqual(0, shadow.main(["prompt"]))
+        self.assertEqual(shadow.prompt_line({"LOOM_SHADOW": "1",
+                                             "LOOM_SHADOW_REPOS": "example-owner/a"}),
+                         out.getvalue().strip())
+
     def test_off_ends_shadow_for_every_repo_whatever_the_list(self):
         env = {"LOOM_SHADOW": "0", "LOOM_SHADOW_REPOS": "example-owner/a"}
         self.assertFalse(shadow.active("example-owner/a", env))

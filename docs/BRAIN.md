@@ -1719,7 +1719,10 @@ space or comma separated); empty, `*`, or an entry that is not `OWNER/NAME`
 means every repo. A repo not listed has graduated. The station plist is
 written with `LOOM_SHADOW=1` unless the installer is told otherwise. A repo
 added to `LOOM_REPOS` after the list was narrowed is not in it: add it to
-`LOOM_SHADOW_REPOS` first.
+`LOOM_SHADOW_REPOS` first. The lane machine's tick prompt takes its Shadow
+mode sentence from `python3 -m bus.shadow prompt`, the same scope the gates
+read, so it names the repos still in shadow and lets the brain merge through
+`bus.brain merge` in every other repo (loom#1960).
 
 Graduation is the operator's act, never Loom's. A repo leaves shadow only
 when the operator removes it from `LOOM_SHADOW_REPOS` (on the station and on
