@@ -1639,6 +1639,12 @@ tree, cache or session database stays anywhere. API lanes only: opencode-go,
 zen, openrouter, zai, workersai, the free provider slots and spark (both
 through the gateway). codex, claude, agy and anthropic stay local.
 
+The runner image carries the lane runner's tools, not every tool a repo's
+check calls. A check that cannot start there (exit 125 to 127 on the
+unmodified base, such as `make` or `ruff` not installed) is not held behind
+its factory incident, which that runner could never clear: the station
+retries the ticket on another lane as a transient ending.
+
 The job, step by step (`lanes/k8s/lane_job.py`):
 
 1. Reads the dispatch inputs (slot, ticket key, brief, run id, the slot's
