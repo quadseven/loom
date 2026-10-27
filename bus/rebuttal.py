@@ -110,6 +110,68 @@ def _called_outside_def(text: str, name: str) -> bool:
     return any(_calls(line, name) for line in text.splitlines() if not defs.match(line))
 
 
+class _Head:
+    """The head's files, each read once."""
+
+    def __init__(self, read: Read) -> None:
+        self._read = read
+        self._files: Dict[str, Optional[str]] = {}
+
+    def text(self, path: str) -> Optional[str]:
+        if path not in self._files:
+            self._files[path] = self._read(path)
+        return self._files[path]
+
+
+def _cited(answer: str, thread_path: str) -> List[Tuple[str, int, int]]:
+    """(path, first line, last line) for each file the answer cites; a bare
+    "line N" belongs to the last cited file, else the thread's own file."""
+    cited = [(m.group(1), int(m.group(2) or 0), int(m.group(3) or m.group(2) or 0))
+             for m in _PATH_RE.finditer(answer)]
+    last = cited[-1][0] if cited else thread_path
+    if last:
+        cited += [(last, int(m.group(1)), int(m.group(2) or m.group(1)))
+                  for m in _LINE_RE.finditer(answer)]
+    return cited
+
+
+def _files_refusal(cited: List[Tuple[str, int, int]], head: _Head) -> str:
+    for path, start, end in cited:
+        text = head.text(path)
+        if text is None:
+            return "%s does not exist on the head" % path
+        if max(start, end) > len(text.splitlines()):
+            return "%s has no line %d on the head" % (path, max(start, end))
+    return ""
+
+
+def _symbols_refusal(symbols: List[str], head: _Head, where: List[str]) -> str:
+    for symbol in symbols:
+        word = re.compile(r"(?<![\w])%s(?![\w])" % re.escape(symbol))
+        if not any(word.search(head.text(p) or "") for p in where):
+            return "`%s` is not in %s on the head" % (symbol, ", ".join(where) or "any cited file")
+    return ""
+
+
+def _claims_refusal(answer: str, subject: str, head: _Head, where: List[str]) -> str:
+    for m in _CALLED.finditer(answer):
+        called = m.group(1) or subject
+        if not called:
+            return "the answer names a caller but not what it calls"
+        reason = _call_refusal(called, m.group(3) or m.group(4), head, where)
+        if reason:
+            return reason
+    return ""
+
+
+def _dead_code_refusal(finding: str, subject: str, head: _Head, where: List[str]) -> str:
+    if _kind(finding) != "dead-code" or not subject:
+        return ""
+    if any(_called_outside_def(head.text(p) or "", subject) for p in where):
+        return ""
+    return "no call of `%s` in %s on the head" % (subject, ", ".join(where))
+
+
 def refusal(answer: str, read: Read, ancestor: Ancestor, thread_path: str = "",
             finding: str = "") -> str:
     """"" when the answer holds on the head, else the reason it does not."""
@@ -117,76 +179,44 @@ def refusal(answer: str, read: Read, ancestor: Ancestor, thread_path: str = "",
     sha = fixed_sha(answer)
     if sha:
         return "" if ancestor(sha) else "Fixed in %s names a commit that is not on the head" % sha
-    files: Dict[str, Optional[str]] = {}
-
-    def text_of(path: str) -> Optional[str]:
-        if path not in files:
-            files[path] = read(path)
-        return files[path]
-
-    cited: List[Tuple[str, int, int]] = []
-    for m in _PATH_RE.finditer(answer):
-        start = int(m.group(2) or 0)
-        cited.append((m.group(1), start, int(m.group(3) or start)))
-    last = cited[-1][0] if cited else thread_path
-    for m in _LINE_RE.finditer(answer):
-        if last:
-            start = int(m.group(1))
-            cited.append((last, start, int(m.group(2) or start)))
-    symbols = _symbols(answer)
+    cited, symbols = _cited(answer, thread_path), _symbols(answer)
     if not cited and not symbols:
         return "the answer cites no file, line or symbol to check on the head"
-    for path, start, end in cited:
-        text = text_of(path)
-        if text is None:
-            return "%s does not exist on the head" % path
-        if max(start, end) > len(text.splitlines()):
-            return "%s has no line %d on the head" % (path, max(start, end))
-    where: List[str] = []
-    for path in [p for p, _, _ in cited] + ([thread_path] if thread_path else []):
-        if path not in where and text_of(path) is not None:
-            where.append(path)
-    for symbol in symbols:
-        if not any(re.search(r"(?<![\w])%s(?![\w])" % re.escape(symbol), text_of(p) or "")
-                   for p in where):
-            return "`%s` is not in %s on the head" % (symbol, ", ".join(where) or "any cited file")
-    subject_default = finding_symbol(finding)
-    for m in _CALLED.finditer(answer):
-        subject = m.group(1) or subject_default
-        target = m.group(3) or m.group(4)
-        if not subject:
-            return "the answer names a caller but not what it calls"
-        reason = _call_refusal(subject, target, text_of, where)
-        if reason:
-            return reason
-    if _kind(finding) == "dead-code" and subject_default:
-        if not any(_called_outside_def(text_of(p) or "", subject_default) for p in where):
-            return "no call of `%s` in %s on the head" % (subject_default, ", ".join(where))
-    return ""
+    head = _Head(read)
+    reason = _files_refusal(cited, head)
+    if reason:
+        return reason
+    where = [p for p in dict.fromkeys([c[0] for c in cited] + [thread_path])
+             if p and head.text(p) is not None]
+    subject = finding_symbol(finding)
+    return (_symbols_refusal(symbols, head, where)
+            or _claims_refusal(answer, subject, head, where)
+            or _dead_code_refusal(finding, subject, head, where))
 
 
-def _call_refusal(subject: str, target: str, text_of: Callable[[str], Optional[str]],
-                  where: List[str]) -> str:
+def _line_call_refusal(subject: str, path: str, line: str, text: str) -> str:
+    if not line:
+        return "" if _called_outside_def(text, subject) else (
+            "%s does not call `%s` on the head" % (path, subject))
+    lines = text.splitlines()
+    n = int(line)
+    if 1 <= n <= len(lines) and _calls(lines[n - 1], subject):
+        return ""
+    return "%s:%s does not call `%s` on the head" % (path, line, subject)
+
+
+def _call_refusal(subject: str, target: str, head: _Head, where: List[str]) -> str:
     path, _, line = target.partition(":")
     if _PATH_RE.fullmatch(path):
-        text = text_of(path)
+        text = head.text(path)
         if text is None:
             return "%s does not exist on the head" % path
-        if line:
-            lines = text.splitlines()
-            n = int(line)
-            if not 1 <= n <= len(lines) or not _calls(lines[n - 1], subject):
-                return "%s:%s does not call `%s` on the head" % (path, line, subject)
-            return ""
-        if not _called_outside_def(text, subject):
-            return "%s does not call `%s` on the head" % (path, subject)
-        return ""
+        return _line_call_refusal(subject, path, line, text)
     for p in where:
-        body = _body(text_of(p) or "", target)
+        body = _body(head.text(p) or "", target)
         if body is not None:
-            if _calls(body, subject):
-                return ""
-            return "`%s` does not call `%s` on the head" % (target, subject)
+            return "" if _calls(body, subject) else (
+                "`%s` does not call `%s` on the head" % (target, subject))
     return "`%s` is not defined in %s on the head" % (target, ", ".join(where) or "any cited file")
 
 
@@ -197,47 +227,45 @@ def quoted(reply: str) -> str:
     return "\n".join(x[1:].lstrip() if x.startswith(">") else x for x in lines).strip()
 
 
+def _get(gh: Any, path: str) -> Any:
+    """One API read; a failure is None. A rate limit is raised, not read as
+    a missing file: the brain would reopen a sound thread on it."""
+    from .github import GitHubError, RateLimited
+    try:
+        return gh.rest("GET", path, ok=(404,)).data
+    except RateLimited:
+        raise
+    except GitHubError:
+        return None
+
+
+def _decoded(raw: Any) -> Optional[str]:
+    if not raw:
+        return None
+    try:
+        return base64.b64decode(raw).decode("utf-8", errors="replace")
+    except ValueError:
+        return None
+
+
 def head_reader(gh: Any, repo: str, head: str) -> Tuple[Read, Ancestor]:
     """read and ancestor over the GitHub API at the head commit. A failed
     read is a file the head cannot show, so a check that cannot read keeps
-    the thread open (the safe side). A rate limit is raised, not read as a
-    missing file: the brain would reopen a sound thread on it."""
-    from .github import GitHubError, RateLimited
+    the thread open (the safe side)."""
 
     def read(path: str) -> Optional[str]:
-        try:
-            data = gh.rest("GET", "/repos/%s/contents/%s?ref=%s"
-                           % (repo, quote(path, safe="/"), head), ok=(404,)).data
-        except RateLimited:
-            raise
-        except GitHubError:
-            return None
+        data = _get(gh, "/repos/%s/contents/%s?ref=%s" % (repo, quote(path, safe="/"), head))
         if not isinstance(data, dict) or data.get("type", "file") != "file":
             return None
         raw = data.get("content")
         if not raw and data.get("sha"):
             # Files over 1 MB come back without content; the blob has it.
-            try:
-                blob = gh.rest("GET", "/repos/%s/git/blobs/%s" % (repo, data["sha"])).data
-            except RateLimited:
-                raise
-            except GitHubError:
-                return None
-            raw = (blob or {}).get("content") if isinstance(blob, dict) else None
-        if not raw:
-            return None
-        try:
-            return base64.b64decode(raw).decode("utf-8", errors="replace")
-        except ValueError:
-            return None
+            blob = _get(gh, "/repos/%s/git/blobs/%s" % (repo, data["sha"]))
+            raw = blob.get("content") if isinstance(blob, dict) else None
+        return _decoded(raw)
 
     def ancestor(sha: str) -> bool:
-        try:
-            data = gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, sha, head), ok=(404,)).data
-        except RateLimited:
-            raise
-        except GitHubError:
-            return False
+        data = _get(gh, "/repos/%s/compare/%s...%s" % (repo, sha, head))
         return isinstance(data, dict) and data.get("status") in ("ahead", "identical")
 
     return read, ancestor

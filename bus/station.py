@@ -6839,17 +6839,8 @@ class Station:
             return
         self.gh.graphql(REPLY_MUTATION, {"id": thread_id, "body": body})
         root = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
-        settled = strong and _bot_minor(root, self.s.review_bot)
-        if settled:
-            # The answer settles the thread only when what it cites holds on
-            # the head (loom#2081): a false "it has a caller" merged dead code.
-            head = str((node.get("pullRequest") or {}).get("headRefOid") or "")
-            why = rebuttal.check_on_head(self.gh, repo, head, said,
-                                         str(node.get("path") or ""), str(root.get("body") or ""))
-            if why:
-                settled = False
-                _say("left %s on %s#%d open: lane %s's answer does not hold on the head: %s"
-                     % (thread_id, repo, pr, lane, why))
+        settled = (strong and _bot_minor(root, self.s.review_bot)
+                   and self._answer_holds(repo, pr, lane, thread_id, node, said))
         if settled:
             try:
                 self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
@@ -6862,6 +6853,20 @@ class Station:
                 _say("could not resolve %s on %s#%d: %s" % (thread_id, repo, pr, err))
         _say("posted lane %s's answer on %s#%d thread %s%s" % (
             lane, repo, pr, thread_id, " and resolved it" if settled else ""))
+
+    def _answer_holds(self, repo: str, pr: int, lane: str, thread_id: str,
+                      node: Dict[str, Any], said: str) -> bool:
+        """The answer settles its thread only when what it cites holds on
+        the head (bus/rebuttal.py, loom#2081): a false "it has a caller"
+        answer once merged dead code."""
+        root = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
+        head = str((node.get("pullRequest") or {}).get("headRefOid") or "")
+        why = rebuttal.check_on_head(self.gh, repo, head, said,
+                                     str(node.get("path") or ""), str(root.get("body") or ""))
+        if why:
+            _say("left %s on %s#%d open: lane %s's answer does not hold on the head: %s"
+                 % (thread_id, repo, pr, lane, why))
+        return not why
 
     def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str) -> None:
         """A fix brief that ended with nothing committed. Most often the lane

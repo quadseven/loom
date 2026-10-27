@@ -4058,36 +4058,50 @@ UNRESOLVE_MUTATION = ('mutation($id:ID!) { unresolveReviewThread(input:{threadId
                       ' { thread { isResolved } } }')
 
 
+def _first(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
+    nodes = (thread.get(field) or {}).get("nodes") or [{}]
+    return nodes[index] or {}
+
+
+def _unheld_answer(gh: GitHub, repo: str, head: str, thread: Dict[str, Any],
+                   bot: str, trusted: set) -> str:
+    """Why a resolved bot thread whose newest comment is a lane's answer was
+    resolved on an answer that does not hold on the head, else ""."""
+    from . import factory  # factory imports this module
+    root, latest = _first(thread, "comments", 0), _first(thread, "latest", -1)
+    if not (thread.get("isResolved") and by_bot(root, bot)
+            and factory.lane_answered(latest, trusted)):
+        return ""
+    return rebuttal.check_on_head(gh, repo, head, rebuttal.quoted(str(latest.get("body") or "")),
+                                  str(thread.get("path") or ""), str(root.get("body") or ""))
+
+
+def _reopen(gh: GitHub, thread_id: str) -> None:
+    try:
+        gh.graphql(UNRESOLVE_MUTATION, {"id": thread_id})
+    except RateLimited:
+        raise
+    except GitHubError as err:
+        # The merge is refused anyway; the next tick tries again.
+        print("could not reopen review thread %s: %s" % (thread_id, err), file=sys.stderr)
+
+
 def _refuse_unheld_answers(gh: GitHub, repo: str, details: Dict[str, Any],
                            env: Optional[Dict[str, str]] = None) -> None:
     """Refuse the merge when a review bot thread was resolved on a lane's
-    answer that does not hold on the head (bus/rebuttal.py, loom#2081): its
-    newest comment is the lane's answer, and what the answer cites is not
-    there. The thread is reopened, so the factory reads it as a finding that
-    survived and moves it on, and the next merge sees it unresolved."""
+    answer that does not hold on the head (bus/rebuttal.py, loom#2081). The
+    thread is reopened, so the factory reads it as a finding that survived
+    and moves it on, and the next merge sees it unresolved."""
     from . import factory  # factory imports this module
     bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     trusted = {a.lower() for a in trusted_authors(env)}
     head = str(details.get("headRefOid") or "")
     for thread in (details.get("reviewThreads") or {}).get("nodes") or []:
-        root = (((thread.get("comments") or {}).get("nodes") or [None])[0]) or {}
-        latest = (((thread.get("latest") or {}).get("nodes") or [None])[-1]) or {}
-        if (not thread.get("isResolved") or not by_bot(root, bot)
-                or not factory.lane_answered(latest, trusted)):
-            continue
-        why = rebuttal.check_on_head(gh, repo, head, rebuttal.quoted(str(latest.get("body") or "")),
-                                     str(thread.get("path") or ""), str(root.get("body") or ""))
-        if not why:
-            continue
-        try:
-            gh.graphql(UNRESOLVE_MUTATION, {"id": str(thread.get("id") or "")})
-        except RateLimited:
-            raise
-        except GitHubError as err:
-            # The refusal below still stops the merge; the next tick retries.
-            print("could not reopen review thread %s: %s" % (thread.get("id"), err), file=sys.stderr)
-        raise ValueError("review thread %s was resolved on a lane answer that does not hold "
-                         "on the head: %s" % (thread.get("id"), why))
+        why = _unheld_answer(gh, repo, head, thread, bot, trusted)
+        if why:
+            _reopen(gh, str(thread.get("id") or ""))
+            raise ValueError("review thread %s was resolved on a lane answer that does not "
+                             "hold on the head: %s" % (thread.get("id"), why))
 
 
 # A sensitive change (bus/change_class.py) is never merged by the factory; the

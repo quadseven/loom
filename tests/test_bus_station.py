@@ -193,13 +193,7 @@ class FakeGitHub:
         if method == "GET" and parts.path.startswith("/repos/%s/contents/" % REPO):
             if parts.path.endswith("/.github/workflows"):
                 return reply(200, [])
-            # Files on a pull request head, for a lane answer's citations
-            # (bus/rebuttal.py): path -> text, read at any ref.
-            text = self.head_files.get(parts.path[len("/repos/%s/contents/" % REPO):])
-            if text is not None:
-                return reply(200, {"type": "file", "encoding": "base64",
-                                   "content": base64.b64encode(text.encode()).decode()})
-            return reply(404, {"message": "Not Found"})
+            return self._head_file(parts.path[len("/repos/%s/contents/" % REPO):])
         other = re.match(r"/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/issues/(\d+)$", parts.path)
         if other and other.group(1) != REPO:
             found = self.foreign.get((other.group(1), int(other.group(2))))
@@ -262,6 +256,15 @@ class FakeGitHub:
         if method == "GET" and rest == "git/ref/heads/loom-lock/brain":
             return reply(404, {"message": "Not Found"})
         raise AssertionError("unexpected call %s %s" % (method, path))
+
+    def _head_file(self, path):
+        """A file on a pull request head, for a lane answer's citations
+        (bus/rebuttal.py): head_files maps path to text, read at any ref."""
+        text = self.head_files.get(path)
+        if text is None:
+            return reply(404, {"message": "Not Found"})
+        return reply(200, {"type": "file", "encoding": "base64",
+                           "content": base64.b64encode(text.encode()).decode()})
 
     def _post_page(self, data):
         if self.page_error:
