@@ -182,6 +182,10 @@ class FakeGitHub:
         data = json.loads(body) if body else None
         if method == "POST" and parts.path == "/graphql":
             return self._graphql(data)
+        if method == "GET" and parts.path == "/search/issues":
+            # The epic shape's Part of search (loom#2023): no issue here is
+            # linked to an epic by its Part of line alone.
+            return reply(200, {"items": []})
         if method == "GET" and parts.path == "/repos/%s" % REPO:
             return reply(200, {"full_name": REPO, "private": self.private,
                                "default_branch": "main"})
