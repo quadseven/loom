@@ -513,7 +513,10 @@ a live pid, as running. The stamp says nothing of availability. When the
 factory does find a lane silent with a running ticket, the station log names
 what it saw of the runner (its lock and the stamp's age).
 A failed or stalled
-ticket climbs, and past the last rung it is left `loom:failed` for the brain. Landing
+ticket climbs, and past the last rung it is left `loom:failed` for the brain. Its
+open lane pull request is closed then, or on any later pass, as is one whose
+open ticket was rewritten as a newer ticket, each with one comment naming the
+ticket (loom#2027); a ticket still in a fix round keeps its pull request. Landing
 keeps the default branch green: a ready pull request that is behind its base
 is brought up to date first (GitHub's update-branch) and lands only after its
 checks and review pass again on the new head; each repo lands at most one a
