@@ -935,6 +935,23 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
+    def test_merge_command_reports_a_person_changes_requested_and_exits_one(self):
+        # The refusal reaches the operator: main() prints it and exits 1.
+        person = {"__typename": "User", "login": "reviewer-one"}
+        pr, query = self._merge_replies(changes={"details": {"reviews": {"nodes": [
+            {"author": person, "state": "CHANGES_REQUESTED",
+             "submittedAt": "2030-01-01T13:00:00Z"}]}}})
+        fake = Fake(pr, query)
+        client = GitHub("t", transport=fake)
+        err = io.StringIO()
+        with unittest.mock.patch("bus.brain.auth_from_env", return_value="t"), \
+                unittest.mock.patch("bus.brain.GitHub", return_value=client), \
+                contextlib.redirect_stderr(err):
+            code = brain.main(["merge", "%s#8" % REPO, "--ticket", "%s#9" % REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("error: changes requested by a person (reviewer-one)", err.getvalue())
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
     def test_status_asks_for_every_field_merge_ready_reads(self):
         ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}], "body": ""}
         fake = Fake(reply(200, []), reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
