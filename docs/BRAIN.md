@@ -48,6 +48,7 @@ that talks to GitHub about tickets.
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
 | `loom:answered` | The runner posted a diagnosis answer, or a run found its work already done or no longer applying and no merged pull request carries it (see Claim and outcome); the brain reviews it, then closes/verifies the ticket or briefs it again. |
 | `loom:ready` | Checks passed and review-bot threads are resolved for the current PR head. |
+| `loom:landing` | On the one lane pull request the factory is landing in its repo (see Landing lock). Comes off when it merges or after 40 minutes. |
 | `needs-brain` | A ticket failed a second time with no commit and no reason, or went past the model ladder; review this ticket in full. |
 | `loom:failed` | The runner gave up and the station did not retry it; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
@@ -432,6 +433,17 @@ the repo's oldest goal home that is not a backlog (else its backlog home).
 It holds any number of tickets, does not count against the 6 open epics, and
 is never flagged as finished. The asks digest groups an ask that names an
 epic under that epic's goal.
+
+GitHub holds at most 100 sub-issues under one issue. Once the standing epic
+holds that many, or GitHub answers 422 to a link under it, repairs roll over
+to the newest open factory repairs batch epic (an epic whose title starts
+"Epic: factory repairs", the goal's own or another in the repo) holding fewer
+than 15 tickets; when none has room, "Epic: factory repairs for this goal,
+next batch" opens even when the goal is at its open epic cap. The filer
+logs each rollover, and the filed issue's `Part of` line names the batch
+epic. `epic-over-cap` counts an epic's tickets as its sub-issues and every
+loom:ticket issue, open or closed, whose `Part of` line names it, each once,
+and flags any open epic, the standing one too, that holds 100 sub-issues.
 
 Triage, the rewriter, health intake, validation contracts and pull request
 adoption file under the goal's intake epic ("Epic: work that triage,
@@ -1574,6 +1586,22 @@ when a ticket runs out of fix rounds as well as for a sensitive change, and a
 logic pull request with failing checks appeared in no other section, so it
 waited until the `lane-pr-stalled` invariant filed it (loom#1411). The brain
 takes these first: merge it, or send it back with `bus.brain fix`.
+
+### Landing lock
+
+One green lane pull request lands at a time in a repo (`bus/landing.py`,
+loom#2066). Main used to move faster than an update, its checks and its
+review (about 25 minutes), so a pull request brought up to date was behind
+again before it could land. The factory takes the first ready pull request
+in landing order, brings it up to date once and marks it `loom:landing`.
+While a pull request carries that label and was marked less than 40 minutes
+ago, the factory updates and lands no other pull request in that repo, and
+`bus.brain merge` refuses to merge any other one there. The marked one lands
+as soon as it is current and green; if main moves under it, the factory
+updates it again and it keeps the lock. The lock ends when it merges or
+closes, or 40 minutes after the mark (from the label's event on GitHub),
+when the label comes off and the next pass picks again. Operators merging
+by hand follow the same cadence.
 
 ## Merge by change class
 
