@@ -439,6 +439,10 @@ RETRY_MAX = 2
 # FACTORY_REPO), and the marker and ticket line their bodies carry.
 FACTORY_REPO = "quadseven/loom"
 INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
+# A base check that could not start (exit 125 to 127: a tool the repo's check
+# calls is not installed). On a cluster runner that is the runner image, not
+# the factory: no fix to the repo or to Loom clears it there.
+CHECK_CANNOT_RUN_RE = re.compile(r"the check exited 12[5-7] on the unmodified base")
 HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)")
 # A [factory] hold whose reason names no incident (the incident filing failed)
 # has nothing that can close it, so the station releases it after this long:
@@ -5876,6 +5880,14 @@ class Station:
         if fix_pr.isdigit() and bare.startswith(NO_COMMIT):
             self._post_answers(repo, int(fix_pr), lane, name, text)
             self._nothing_to_fix(repo, number, int(fix_pr), lane, name)
+            return True
+        if (klass == "factory" and lane in runners.runner_slots()
+                and CHECK_CANNOT_RUN_RE.search(bare)):
+            # Held behind the incident, the ticket went back to the same
+            # runner, which can never clear it: another lane runs the check.
+            note = self._retry(repo, number, lane, "transient", reason)
+            if note:
+                self._requeue_transient(repo, number, lane, reason, note)
             return True
         if klass == "factory":
             # The validation environment the factory broke, not the ticket's
