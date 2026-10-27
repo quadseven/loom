@@ -2843,6 +2843,76 @@ class Tickets(Base):
         self.assertIn("past the last rung of the model ladder", self.gh.pulls[70]["body"])
         self.assertNotIn("close this pull request", self.gh.pulls[70]["body"])
 
+    def test_a_handed_off_ticket_past_the_ladder_closes_its_lane_pull_request(self):
+        # loom#2027: the hand-off pool skips the failed step, so its pull
+        # request stayed open for days and kept a lane-pr-stalled finding open.
+        self.gh.ticket(7, "failed")
+        self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
+        self.gh.comments[7] += ALL_RUNGS + [
+            {"body": factory.GAVE_UP + " (x; ran on none).", "user": ME}]
+        self.gh.pull(70, 7, resolved=False)
+        self.go()
+        self.assertEqual([c[0] for c in self.closed], [70])
+        note = self.closed[0][1]
+        self.assertIn("#7", note)
+        self.assertIn("past the last rung of the model ladder", note)
+        self.assertIn("hand-off pool (%s)" % factory.HANDOFF_LABEL, note)
+        self.assertEqual(self.gh.pulls[70]["state"], "closed")
+        self.assertEqual(self.gh.comments.get(70, []), [])
+        self.assertEqual((self.moved, self.fixed, self.merged), ([], [], []))
+        self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
+        self.go()  # once: nothing more on the next pass
+        self.assertEqual(len(self.closed), 1)
+
+    def test_a_ticket_rewritten_as_a_newer_ticket_closes_its_lane_pull_request(self):
+        self.gh.ticket(7, "pr")
+        self.gh.pull(70, 7)
+        self.gh.ticket(9, "queued", body="Difficulty: medium\n\n## Why\nx\n\n"
+                                         "Rewritten from issue 7.\n")
+        self.go()
+        self.assertEqual(len(self.closed), 1)
+        number, note = self.closed[0]
+        self.assertEqual(number, 70)
+        self.assertIn("superseded", note)
+        self.assertIn("#7 was rewritten as ticket #9", note)
+        self.assertEqual(self.merged, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "closed")
+
+    def test_a_ticket_labelled_rewritten_closes_its_pull_request_naming_the_new_ticket(self):
+        self.gh.ticket(7, "pr")
+        self.gh.issues[7]["labels"].append({"name": "loom:rewritten"})
+        self.gh.comments[7].append({"body": brain.TRIAGE_MARKER + "\nRewritten as ticket #12, "
+                                            "which refs this issue.", "user": ME})
+        self.gh.pull(70, 7)
+        self.go()
+        self.assertEqual([c[0] for c in self.closed], [70])
+        self.assertIn("rewritten as ticket #12", self.closed[0][1])
+
+    def test_a_strangers_rewritten_comment_closes_nothing(self):
+        self.gh.ticket(7, "pr")
+        self.gh.issues[7]["labels"].append({"name": "loom:rewritten"})
+        self.gh.comments[7].append({"body": "Rewritten as ticket #12, which refs this issue.",
+                                    "user": STRANGER})
+        self.gh.pull(70, 7)
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+
+    def test_a_lane_pull_request_whose_ticket_is_in_a_fix_round_stays_open(self):
+        # A failed ticket with rungs left goes back for a fix round on its
+        # open pull request; nothing closes it.
+        self.gh.ticket(7, "failed", lane="zai")
+        self.gh.comments[7].append(self.ZAI_CLAIM)
+        self.gh.pull(70, 7, resolved=False)
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+        self.assertEqual([f[:2] for f in self.fixed], [(70, (REPO, 7))])
+        # And on its next pass, at loom:pr with the round queued.
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+
     def test_a_failed_ticket_climbed_to_the_last_ladder_rung_alerts(self):
         said = []
         with mock.patch.object(factory, "_say", said.append):
