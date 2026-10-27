@@ -2085,6 +2085,32 @@ def repairs_batch(epic: Dict[str, Any]) -> bool:
     return title.startswith(REPAIRS_PREFIX) and not standing_epic(epic)
 
 
+def _repairs_batches(gh: GitHub, repo: str,
+                     tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
+                     ) -> Dict[int, Dict[str, Any]]:
+    """The open factory repairs batch epics: the goal's own (from its walk)
+    and any other open one in the repo, by number."""
+    found = [epic for epic, _ in tree] + list(
+        gh.paginate("/repos/%s/issues?labels=epic&state=open&per_page=100" % repo))
+    batches: Dict[int, Dict[str, Any]] = {}
+    for epic in found:
+        if (isinstance(epic, dict) and "pull_request" not in epic
+                and epic.get("state", "open") == "open" and repairs_batch(epic)):
+            batches.setdefault(int(epic.get("number") or 0), epic)
+    batches.pop(0, None)
+    return batches
+
+
+def _batch_room(gh: GitHub, repo: str, epic: Dict[str, Any],
+                held: Optional[List[Dict[str, Any]]], room: int) -> bool:
+    """A batch epic has room for `room` more tickets: under EPIC_TICKET_CAP
+    tickets and under GitHub's sub-issue limit."""
+    if held is None:
+        held = _epic_tickets(gh, repo, int(epic["number"]))
+    return (len(held) + room <= EPIC_TICKET_CAP
+            and sub_issue_count(gh, repo, epic, held) < SUB_ISSUE_LIMIT)
+
+
 def repairs_batch_epic(gh: GitHub, repo: str, goal: int,
                        tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
                        room: int = 1, full: Sequence[int] = ()) -> int:
@@ -2093,22 +2119,10 @@ def repairs_batch_epic(gh: GitHub, repo: str, goal: int,
     epic cap (as the standing epic is) when none has room. A batch in `full`
     is skipped."""
     held_by = {int(e.get("number") or 0): held for e, held in tree}
-    batches: Dict[int, Dict[str, Any]] = {}
-    for epic, _ in tree:
-        if epic.get("state", "open") == "open" and repairs_batch(epic):
-            batches[int(epic.get("number") or 0)] = epic
-    for epic in gh.paginate("/repos/%s/issues?labels=epic&state=open&per_page=100" % repo):
-        if (isinstance(epic, dict) and "pull_request" not in epic
-                and epic.get("state", "open") == "open" and repairs_batch(epic)):
-            batches.setdefault(int(epic.get("number") or 0), epic)
+    batches = _repairs_batches(gh, repo, tree)
     for number in sorted(batches, reverse=True):
-        if not number or number in full:
-            continue
-        held = held_by.get(number)
-        if held is None:
-            held = _epic_tickets(gh, repo, number)
-        if (len(held) + room <= EPIC_TICKET_CAP
-                and sub_issue_count(gh, repo, batches[number], held) < SUB_ISSUE_LIMIT):
+        if number not in full and _batch_room(gh, repo, batches[number],
+                                              held_by.get(number), room):
             return number
     print("goal #%d: the factory repairs epic and every batch epic are full; opening the "
           "next batch" % goal, file=sys.stderr)
