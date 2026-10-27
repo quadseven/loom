@@ -17,7 +17,7 @@ from urllib.parse import quote
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
-from . import answer, ci_facts, ci_gap, fixrounds, landing, merge_tier, naming, operator_hold, per_repo, shadow
+from . import answer, ci_facts, ci_gap, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import HANDOFF, LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -978,7 +978,9 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     """The repo's status section; with into, its open tickets are kept
     there under the repo's name for the cross-repo Priorities section. With
     waiting, so are the repo's open loom:human count and, per goal, the share
-    under that goal (waiting_lines)."""
+    under that goal (waiting_lines). Each issue is read once per repo
+    (loom#2057): every helper below shares the first answer."""
+    gh = issue_reads.once(gh)
     issues = _issues(gh, repo)
     shares: Dict[int, int] = {}
     if waiting is not None:
@@ -1126,6 +1128,9 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     bot = env.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     now = now or datetime.now(timezone.utc)
     seconds = per_repo.budget(env, budget)
+    # One pass reads each issue, issue listing, comments and events once,
+    # across every repo and the lane status (loom#2078).
+    gh = issue_reads.once(gh)
     # Explicit `authors` are the caller's choice; read from the environment,
     # an empty list is refused, as it would trust no journal (loom#783).
     if authors is None:
@@ -5474,6 +5479,9 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     authors = require_trusted_authors(env, "resume")
     seconds = per_repo.budget(env, budget)
     _lock_holder(gh, lock_repo, holder, now)
+    # Resume is read-only past the lock check: one pass reads each issue,
+    # issue listing, comments and events once (loom#2078).
+    gh = issue_reads.once(gh)
     out: List[str] = []
     goals, unread, timed = _resume_journals(gh, repos, authors, seconds)
     # A moved or forbidden repo is named once and left out of every later
