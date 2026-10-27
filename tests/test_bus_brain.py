@@ -1665,9 +1665,11 @@ class SensitiveResumeTests(unittest.TestCase):
                                   "ticket": (REPO, 9), "head_sha": "checked"})
         self.assertTrue(fake.calls[-2][1].endswith("/repos/%s/issues/9" % REPO))
 
-    def _merge_with_files(self, files, labels=("loom:ticket", "loom:pr"), search_items=None):
-        pr, query = self._merge_replies()
-        issue = {"state": "open", "labels": [{"name": x} for x in labels]}
+    def _merge_with_files(self, files, labels=("loom:ticket", "loom:pr"), search_items=None,
+                          ticket_body="", pull_body=None):
+        pr, query = self._merge_replies(
+            None if pull_body is None else {"pr": {"body": "Refs %s#9\n\n%s" % (REPO, pull_body)}})
+        issue = {"state": "open", "labels": [{"name": x} for x in labels], "body": ticket_body}
         replies = [pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204)]
         if "documentation" not in labels:
             replies.append(reply(200, files))
@@ -1701,6 +1703,33 @@ class SensitiveResumeTests(unittest.TestCase):
         patch = "+def decide(x):\n+    return x"
         labels, _ = self._merge_with_files(
             [{"filename": "bus/a.py", "patch": patch}], search_items=["bus/b.py"])
+        self.assertEqual(labels, ["loom:ticket", "loom:merged"])
+
+    FOUR_BOXES = ("## Acceptance criteria\n- [ ] First works; test.\n- [ ] Second works.\n"
+                  "- [ ] Third works.\n- [ ] Fourth works.\n")
+    CALLED = [{"filename": "bus/a.py", "patch": "+def decide(x):\n+    return x\n+y = decide(1)"}]
+
+    def test_merge_of_a_pull_request_that_builds_one_of_four_boxes_requeues_its_ticket(self):
+        # loom#2026: the brain merged a pull request that built 1 of 4 boxes
+        # and marked the rest not built, and moved its ticket to loom:merged.
+        pull = ("## Acceptance criteria\n- [x] First works; test.\n"
+                "- [ ] Second works.; not built: needs a key\n"
+                "- [ ] Third works.; not built: needs a key\n"
+                "- [ ] Fourth works.; not built: needs a key\n")
+        labels, fake = self._merge_with_files(self.CALLED, ticket_body=self.FOUR_BOXES,
+                                              pull_body=pull)
+        self.assertEqual(labels, ["loom:ticket", "loom:queued"])
+        note = [c[2]["body"] for c in fake.calls if c[1].endswith("/issues/9/comments")][0]
+        self.assertIn("Pull request #8 merged and left ticket criteria unbuilt", note)
+        for text in ("Second works.", "Third works.", "Fourth works."):
+            self.assertIn(text, note)
+        self.assertNotIn("First works", note)
+
+    def test_merge_of_a_pull_request_that_builds_every_box_marks_merged(self):
+        pull = ("## Acceptance criteria\n- [x] First works; test.\n- [x] Second works.\n"
+                "- [x] `Third` works\n- [x] Fourth  works.\n")
+        labels, _ = self._merge_with_files(self.CALLED, ticket_body=self.FOUR_BOXES,
+                                           pull_body=pull)
         self.assertEqual(labels, ["loom:ticket", "loom:merged"])
 
     def test_merge_of_a_docs_pull_request_for_a_docs_ticket_marks_merged(self):

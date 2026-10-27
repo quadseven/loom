@@ -160,7 +160,10 @@ class BrainVerdict(unittest.TestCase):
         return any(path.endswith("/pulls/8/merge") for _, path, _ in fake.writes)
 
     def asked(self, fake):
-        return [b for m, p, b in fake.writes if p.endswith("/issues/9/comments")]
+        # Only the operator asks: this pull request's boxes are not the
+        # ticket's, so a merge also writes a requeue note (loom#2026).
+        return [b for m, p, b in fake.writes if p.endswith("/issues/9/comments")
+                and brain.HUMAN_MARKER in str((b or {}).get("body") or "")]
 
     def test_merge_lifts_the_operator_hold(self):
         fake, refused = self.merge(self.ask(), self.said("Merge"))

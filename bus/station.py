@@ -11,6 +11,7 @@ import calendar
 import base64
 from datetime import date, datetime, timedelta, timezone
 import errno
+import faulthandler
 import fcntl
 import fnmatch
 import gzip
@@ -576,6 +577,16 @@ VERIFY_RESERVE_FILE = "verify-reserve.json"
 # start, the remaining steps wait for the next pass (STEP_ROTATION_FILE keeps
 # where it stopped). On 2026-10-24 every pass ran 25 to 40 minutes.
 PASS_STEP_BUDGET = 300
+# A whole pass's wall-clock bound (LOOM_PASS_DEADLINE, seconds; 0 turns it
+# off). Past it faulthandler writes every thread's Python stack to the station
+# log and exits, so launchd starts a fresh pass (loom#1921): on 2026-10-26 a
+# pass sat for 27 minutes with nothing in the log to say where. The default
+# sits above a legitimate daily metrics build (about 30 minutes on 2026-10-26)
+# until that build is bounded on its own (loom#1924). DEADLINE_MARKER_FILE,
+# written when the deadline is armed and removed when the pass ends, lets the
+# next pass say the last one overran.
+PASS_DEADLINE = 3600
+DEADLINE_MARKER_FILE = "pass-deadline.json"
 STEP_ROTATION_FILE = "step-rotation.json"
 # A pass step that takes this long is logged with its time and requests, so a
 # long pass names its cause: on 2026-10-24 passes ran 25 to 98 minutes and
@@ -821,8 +832,13 @@ class Settings:
                  claim_idle_hours: int = 0,
                  agy_workdir: str = "",
                  thin_snapshots: bool = False,
-                 urgency_config: Optional[urgency.Config] = None) -> None:
+                 urgency_config: Optional[urgency.Config] = None,
+                 pass_deadline: int = 0) -> None:
         self.home = home
+        # LOOM_PASS_DEADLINE: seconds a whole pass may run before it dumps its
+        # stack and exits (PASS_DEADLINE). 0, the default for a Settings
+        # built in code, arms nothing.
+        self.pass_deadline = pass_deadline
         # LOOM_URGENCY_*: score each ask before it is routed (bus/urgency.py,
         # loom#1787). Off for a Settings built in code; from_env defaults to
         # shadow, which records scores and still routes by the label rules.
@@ -1024,7 +1040,8 @@ class Settings:
                    claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")),
                    agy_workdir=_agy_workdir(env),
                    thin_snapshots=env.get("LOOM_THIN_SNAPSHOTS", "1").strip() != "0",
-                   urgency_config=urgency.Config.from_env(env))
+                   urgency_config=urgency.Config.from_env(env),
+                   pass_deadline=_pass_deadline(env.get("LOOM_PASS_DEADLINE", "")))
 
 
 def _agy_workdir(env: Dict[str, str]) -> str:
@@ -1259,6 +1276,90 @@ def _seconds(raw: str, default: int) -> int:
     """A whole number of seconds of at least 60, else default."""
     raw = raw.strip()
     return int(raw) if raw.isdigit() and int(raw) >= 60 else default
+
+
+def _pass_deadline(raw: str) -> int:
+    """LOOM_PASS_DEADLINE: 0 turns the deadline off; a whole number of
+    seconds of at least 60 is used; anything else is PASS_DEADLINE."""
+    raw = raw.strip()
+    if raw == "0":
+        return 0
+    if raw:
+        value = _seconds(raw, 0)
+        if value:
+            return value
+        _say("ignoring LOOM_PASS_DEADLINE %r: not a whole number of seconds, at least 60"
+             % raw)
+    return PASS_DEADLINE
+
+
+def _deadline_stream() -> Any:
+    """The stream faulthandler writes to: the station log (stderr, as launchd
+    runs the station), or the process's own stderr when sys.stderr has no
+    file descriptor (a test capturing it)."""
+    try:
+        sys.stderr.fileno()
+        return sys.stderr
+    except (AttributeError, OSError, ValueError):
+        return sys.__stderr__
+
+
+def _arm_pass_deadline(state: str, seconds: int, now: float) -> Optional[str]:
+    """Say whether the last pass overran, then arm this pass's deadline and
+    write its marker. Returns the marker's path, or None when off."""
+    path = os.path.join(state, "station", DEADLINE_MARKER_FILE)
+    last = _read_json(path, None, strict=False)
+    if isinstance(last, dict):
+        started = last.get("started")
+        limit = last.get("deadline")
+        if isinstance(started, (int, float)) and isinstance(limit, int):
+            ran = int(now - started)
+            if ran >= limit:
+                _say("the last pass (pid %s, started %s) overran its %ds deadline: its stack is "
+                     "in this log above" % (last.get("pid"), time.strftime(
+                         "%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)), limit))
+            else:
+                _say("the last pass (pid %s) ended %ds into its %ds deadline without a clean "
+                     "finish (killed or crashed)" % (last.get("pid"), ran, limit))
+    if seconds <= 0:
+        _discard(path)
+        return None
+    _write_json(path, {"pid": os.getpid(), "started": now, "deadline": seconds})
+    faulthandler.dump_traceback_later(seconds, exit=True, file=_deadline_stream())
+    return path
+
+
+def _discard(path: str) -> None:
+    """Remove a file that may already be gone."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _try_arm_pass_deadline(state: str, seconds: int, now: float) -> Optional[str]:
+    """_arm_pass_deadline, but a failure to arm is logged and the pass runs
+    unarmed rather than dying before it starts: the deadline is a backstop,
+    and losing it must not stop the station."""
+    try:
+        return _arm_pass_deadline(state, seconds, now)
+    except Exception as err:  # noqa: BLE001 - any arm failure must not stop the pass
+        _say("could not arm the pass deadline (%s: %s); this pass runs without one"
+             % (type(err).__name__, err))
+        try:
+            faulthandler.cancel_dump_traceback_later()
+            _discard(os.path.join(state, "station", DEADLINE_MARKER_FILE))
+        except OSError as cleanup:
+            _say("could not clear the pass deadline marker: %s" % cleanup)
+        return None
+
+
+def _disarm_pass_deadline(path: Optional[str]) -> None:
+    """Cancel this pass's deadline and remove its marker."""
+    if path is None:
+        return
+    faulthandler.cancel_dump_traceback_later()
+    _discard(path)
 
 
 def _origin_repo() -> str:
@@ -4119,14 +4220,10 @@ class Station:
 
     @staticmethod
     def _unbuilt_criteria(ticket: dict, merged: Sequence[dict]) -> List[str]:
-        """The ticket's criteria that no merged pull request for it ticks or
-        marks "not built: <reason>" (the factory's own reading of a body)."""
-        body = str(ticket.get("body") or "")
-        left = factory.missing_criteria(body, str(merged[0].get("body") or ""))
-        for other in merged[1:]:
-            answered = set(left) - set(factory.missing_criteria(body, str(other.get("body") or "")))
-            left = [text for text in left if text not in answered]
-        return left
+        """The ticket's code criteria that no merged pull request for it ticks
+        built: a box marked "not built: <reason>" is still unbuilt (loom#2026)."""
+        return factory.unbuilt_criteria(str(ticket.get("body") or ""),
+                                        [str(pr.get("body") or "") for pr in merged])
 
     def _reconcile_adoptions(self, repo: str, open_tickets: List[Dict[str, Any]]) -> None:
         """Move each open adoption ticket to loom:merged once the pull
@@ -12164,29 +12261,39 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         os.ftruncate(fd, 0)
         os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
-        if gh is None:
-            from .github import auth_from_env
-            gh = GitHub(auth_from_env())
-            gh.status_in_body = True
-        _trust_app_login(settings, gh)
-        if gh.cache_dir is None:
-            # Every GET is conditional: a list re-read each pass costs a 304.
-            gh.cache_dir = os.path.join(state, "station", "etags")
-        app = getattr(gh, "app", None)
-        if app is not None and getattr(app, "state_file", None) is None:
-            # GitHub's ETags differ per token: keep the App token across
-            # passes (0600) so last pass's ETags still answer 304 (loom#1306).
-            app.state_file = os.path.join(state, "station", "app-token.json")
-        st = Station(gh, settings, **hooks)
+        deadline = _try_arm_pass_deadline(state, settings.pass_deadline, time.time())
         try:
-            st.run_pass()
-        except (RateLimited, TargetReached) as err:
-            _say("%s; the pass stopped there" % err)
-        except StateError as err:
-            _say("stopping: %s" % err)
-            return 1
+            return _locked_pass(settings, state, gh, hooks)
         finally:
-            st.end_pass()
-        return 0
+            _disarm_pass_deadline(deadline)
     finally:
         os.close(fd)
+
+
+def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
+                 hooks: Dict[str, Any]) -> int:
+    """The pass run() starts once it holds the lock."""
+    if gh is None:
+        from .github import auth_from_env
+        gh = GitHub(auth_from_env())
+        gh.status_in_body = True
+    _trust_app_login(settings, gh)
+    if gh.cache_dir is None:
+        # Every GET is conditional: a list re-read each pass costs a 304.
+        gh.cache_dir = os.path.join(state, "station", "etags")
+    app = getattr(gh, "app", None)
+    if app is not None and getattr(app, "state_file", None) is None:
+        # GitHub's ETags differ per token: keep the App token across
+        # passes (0600) so last pass's ETags still answer 304 (loom#1306).
+        app.state_file = os.path.join(state, "station", "app-token.json")
+    st = Station(gh, settings, **hooks)
+    try:
+        st.run_pass()
+    except (RateLimited, TargetReached) as err:
+        _say("%s; the pass stopped there" % err)
+    except StateError as err:
+        _say("stopping: %s" % err)
+        return 1
+    finally:
+        st.end_pass()
+    return 0
