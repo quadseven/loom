@@ -3467,26 +3467,32 @@ def merge(gh: GitHub, repo: str, number: int,
     gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe="/")),
             ok=(404, 422))
     if association:
-        reason = _unbuilt_reason(gh, repo, number, issue) or _unbuilt_boxes(pr, issue)
-        if reason:
-            move(gh, association[0], association[1], "queued",
-                 note=tickets.UNBUILT_NOTE % (number, reason))
-        else:
-            move(gh, association[0], association[1], "merged")
+        _settle_merged_ticket(gh, repo, number, str(pr.get("body") or ""), association, issue)
     if adopt:
         notify.post(gh, repo, number, ADOPT_COMMENT, notify.MERGED)
     return {"merged": True, "pull_request": (repo, number),
             "ticket": association, "head_sha": sha}
 
 
-def _unbuilt_boxes(pr: Dict[str, Any], issue: Dict[str, Any]) -> str:
-    """The ticket's code boxes this merged pull request left unbuilt, joined
-    for the requeue note, else "". A partial merge goes back to loom:queued
-    for the rest instead of loom:merged (loom#2026), as the station's own
-    reading of a merged pull request does."""
+def _settle_merged_ticket(gh: GitHub, repo: str, number: int, pr_body: str,
+                          association: Tuple[str, int], issue: Dict[str, Any]) -> None:
+    """Move the ticket of the pull request just merged: to loom:queued with a
+    note when the diff or the boxes left it unbuilt, else to loom:merged."""
+    reason = _unbuilt_reason(gh, repo, number, issue) or _unbuilt_boxes(pr_body, issue)
+    if reason:
+        move(gh, association[0], association[1], "queued",
+             note=tickets.UNBUILT_NOTE % (number, reason))
+    else:
+        move(gh, association[0], association[1], "merged")
+
+
+def _unbuilt_boxes(pr_body: str, issue: Dict[str, Any]) -> str:
+    """The ticket's code boxes the merged pull request body leaves unbuilt,
+    joined for the requeue note, else "". A partial merge goes back to
+    loom:queued for the rest instead of loom:merged (loom#2026), as the
+    station's own reading of a merged pull request does."""
     from . import factory
-    return "; ".join(factory.unbuilt_criteria(str(issue.get("body") or ""),
-                                              [str(pr.get("body") or "")]))
+    return "; ".join(factory.unbuilt_criteria(str(issue.get("body") or ""), [pr_body]))
 
 
 def _unbuilt_reason(gh: GitHub, repo: str, number: int, issue: Dict[str, Any]) -> str:
