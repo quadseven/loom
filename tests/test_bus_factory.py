@@ -146,8 +146,12 @@ class FakeGitHub:
             # A one-line change, unless the test gave the file its own patch.
             return Response(200, [{"filename": n, "patch": self.patches.get(
                 n, "@@ -1 +1 @@\n-old\n+new")} for n in names])
+        if path == "/repos/%s/commits/main" % REPO:
+            return Response(200, {"sha": "shamain"})
         m = re.search(r"/commits/(\w+)/check-runs", path)
         if m:
+            if m.group(1) == "shamain":
+                return Response(200, {"check_runs": self.runs.get("shamain", [])})
             return Response(200, {"check_runs": self.runs[m.group(1)]})
         m = re.search(r"/compare/main\.\.\.sha(\d+)$", path)
         if m:
@@ -1012,6 +1016,67 @@ class PullRequests(Base):
         self.gh.attempts["77"] = 2
         self.go()
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def _red_from_base(self, base_conclusion="success", behind=2, failing="unittest"):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": failing, "status": "completed", "conclusion": "failure",
+             "details_url": "https://github.com/%s/actions/runs/77/job/1" % REPO},
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "success"}]
+        self.gh.behind[50] = behind
+        self.gh.runs["shamain"] = [
+            {"name": "unittest", "status": "completed", "conclusion": base_conclusion}]
+
+    UPDATE = ("PUT", "/repos/%s/pulls/50/update-branch" % REPO, {"expected_head_sha": "sha50"})
+
+    def test_a_check_red_from_the_base_and_green_on_main_is_updated_not_sent_back(self):
+        # loom#1961: four pull requests failed tests their main had fixed;
+        # a re-run reuses the old merge commit, and a fix round waits on a lane.
+        self._red_from_base()
+        f = self.go()
+        self.assertIn(self.UPDATE, self.gh.writes)
+        self.assertEqual((self.fixed, self.merged), ([], []))
+        self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
+        self.assertEqual(f.actions, 1)
+
+    def test_a_check_also_red_on_main_is_run_again_not_updated(self):
+        self._red_from_base(base_conclusion="failure")
+        self.go()
+        self.assertNotIn(self.UPDATE, self.gh.writes)
+        self.assertIn(("POST", "/repos/%s/actions/runs/77/rerun-failed-jobs" % REPO, None),
+                      self.gh.writes)
+
+    def test_a_check_that_never_ran_on_main_is_not_updated(self):
+        self._red_from_base(failing="e2e")
+        self.go()
+        self.assertNotIn(self.UPDATE, self.gh.writes)
+        self.assertIn(("POST", "/repos/%s/actions/runs/77/rerun-failed-jobs" % REPO, None),
+                      self.gh.writes)
+
+    def test_a_red_pull_request_up_to_date_with_main_is_not_updated(self):
+        self._red_from_base(behind=0)
+        self.gh.attempts["77"] = 2
+        self.go()
+        self.assertNotIn(self.UPDATE, self.gh.writes)
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_failed_review_never_takes_the_update_path(self):
+        self._red_from_base()
+        self.gh.runs["sha50"][1]["conclusion"] = "failure"
+        self.gh.runs["shamain"].append(
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "success"})
+        self.go()
+        self.assertNotIn(self.UPDATE, self.gh.writes)
+        self.assertEqual(len(self.fixed), 1)
+
+    def test_a_refused_update_of_a_base_red_check_falls_back_to_the_old_path(self):
+        self._red_from_base()
+        self.gh.update_status = 422
+        self.gh.attempts["77"] = 2
+        self.go()
+        self.assertIn(self.UPDATE, self.gh.writes)
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
 
     def test_a_failed_review_is_never_run_again(self):
         self.gh.ticket(5, "pr")
