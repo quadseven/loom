@@ -30,7 +30,10 @@ Neither needs a model:
   request that is behind its base is brought up to date first (GitHub's
   update-branch), and lands only once its checks and review pass again on
   the new head. Each repo lands at most one pull request a pass, so the
-  next one is checked against the base that includes it. A ready pull
+  next one is checked against the base that includes it. The one brought up
+  to date holds the repo's landing lock (bus/landing.py, loom:landing) for
+  up to 40 minutes, and no other pull request there is updated or landed
+  meanwhile, so main does not move under it (loom#2066). A ready pull
   request held for the operator is brought up to date the same way while it
   waits, so it does not drift into a conflict; it still never lands here. Pull requests of
   loom:urgent and loom:regression tickets land first, then by priority,
@@ -169,7 +172,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, bench, brain, brain_hold, brief_check, change_class, converge, criteria_gate, flake, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brain_hold, brief_check, change_class, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from . import runners
@@ -1282,6 +1285,39 @@ def acceptance_criteria(body: str) -> List[str]:
     return found
 
 
+_MD_LINK_RE = re.compile(r"\[([^\]\n]*)\]\([^)\n]*\)")
+_MD_MARK_RE = re.compile(r"[`*_~]")
+
+
+def criterion_key(text: str) -> str:
+    """A box's text for matching a pull request box to a ticket box: without
+    a "not built: <reason>" suffix, markdown links, emphasis and code marks,
+    runs of whitespace or trailing punctuation, and case (loom#2026)."""
+    text = _MD_MARK_RE.sub("", _MD_LINK_RE.sub(r"\1", NOT_BUILT_RE.sub("", text)))
+    return " ".join(text.split()).rstrip(".;:,").strip().casefold()
+
+
+def unbuilt_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
+    """The ticket's code boxes that a merge left unbuilt: neither ticked on the
+    ticket nor ticked (without "not built") in any of these merged pull request
+    bodies. A box marked "not built: <reason>" answers a lane's gate but is
+    still unbuilt, so a partial merge sends its ticket back (loom#2026). Live
+    and operator boxes are the verify path's, never named here."""
+    built = set()
+    for criterion in [c for body in pull_bodies for c in acceptance_criteria(body)]:
+        checked, _, text = criterion.partition(" ")
+        if checked == "x" and not NOT_BUILT_RE.search(text):
+            built.add(criterion_key(text))
+    left = []
+    for criterion in acceptance_criteria(ticket_body):
+        checked, _, text = criterion.partition(" ")
+        if checked == "x" or criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE:
+            continue
+        if criterion_key(text) not in built:
+            left.append(text)
+    return left
+
+
 def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
     """Ticket criteria that a lane PR leaves unticked, excluding live checks
     and operator actions (bus/criteria_gate.py): only the station's verifier
@@ -1291,15 +1327,13 @@ def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
     states = {}
     for criterion in pull:
         checked, _, text = criterion.partition(" ")
-        clean = NOT_BUILT_RE.sub("", text).strip().casefold()
-        states[clean] = (checked == "x", bool(NOT_BUILT_RE.search(text)))
+        states[criterion_key(text)] = (checked == "x", bool(NOT_BUILT_RE.search(text)))
     missing = []
     for criterion in ticket:
         _, _, text = criterion.partition(" ")
         if criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE:
             continue
-        clean = NOT_BUILT_RE.sub("", text).strip().casefold()
-        checked, not_built = states.get(clean, (False, False))
+        checked, not_built = states.get(criterion_key(text), (False, False))
         if not checked and not not_built:
             missing.append(text)
     return missing
@@ -1599,6 +1633,9 @@ class Factory:
         self.load: Dict[str, int] = {}
         self.landed: set = set()
         self.updated: set = set()
+        # Repo -> the pull request holding its landing lock, or None; read
+        # once a pass (bus/landing.py).
+        self.locks: Dict[str, Optional[int]] = {}
         # Repos where a held pull request was brought up to date this pass
         # (_keep_current), apart from `updated` so it never delays a landing.
         self.kept_current: set = set()
@@ -3067,31 +3104,59 @@ class Factory:
         """Merge a ready pull request that is up to date with its base, one a
         repo a pass; bring one that is behind up to date instead. A pull
         request that cannot be brought up to date cleanly goes back for a
-        fix round, as a conflict does."""
+        fix round, as a conflict does. The one brought up to date takes the
+        repo's landing lock; while another holds it, this does neither."""
         if repo in self.landed:
             return
+        held = self._lock(repo)
+        if held is not None and held != number:
+            return  # another pull request holds the repo's landing lock
         if self._behind(repo, full):
-            if repo in self.updated:
-                return
-            self.updated.add(repo)
-            sha = str((full.get("head") or {}).get("sha") or "")
-            done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
-                                {"expected_head_sha": sha}, ok=(422,))
-            if done.status == 422:
-                self._send_back(repo, full, issue, comments,
-                                "could not be brought up to date with its base")
-                # keep repo in updated to retry on next pass
-                return
-            # reset updated for future merges
-            self.updated.remove(repo)
-            self.actions += 1
-            _say("brought %s#%d up to date with its base; it lands once its checks "
-                 "and review pass on the new head" % (repo, number))
+            if repo not in self.updated:
+                self._update_to_land(repo, number, full, issue, comments, held)
             return
         if self._scope_holds(repo, number, full, issue):
             return
         if self._merge(repo, number, issue, str((full.get("head") or {}).get("sha") or "")):
             self.landed.add(repo)
+            if held == number:
+                self._unlock(repo, number)
+
+    def _update_to_land(self, repo: str, number: int, full: Dict[str, Any],
+                        issue: Dict[str, Any], comments: List[Dict[str, Any]],
+                        held: Optional[int]) -> None:
+        """_land's update: bring the pull request up to date and take the
+        repo's landing lock, or send it back when GitHub refuses."""
+        self.updated.add(repo)
+        sha = str((full.get("head") or {}).get("sha") or "")
+        done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
+                            {"expected_head_sha": sha}, ok=(422,))
+        if done.status == 422:
+            self._send_back(repo, full, issue, comments,
+                            "could not be brought up to date with its base")
+            if held == number:
+                self._unlock(repo, number)
+            # keep repo in updated to retry on next pass
+            return
+        # reset updated for future merges
+        self.updated.remove(repo)
+        if held is None:
+            landing.mark(self.gh, repo, number)
+            self.locks[repo] = number
+        self.actions += 1
+        _say("brought %s#%d up to date with its base; it lands once its checks "
+             "and review pass on the new head" % (repo, number))
+
+    def _lock(self, repo: str, pulls: Optional[List[Dict[str, Any]]] = None) -> Optional[int]:
+        """The pull request holding the repo's landing lock, read once a pass
+        (bus/landing.py releases an expired one as it reads)."""
+        if repo not in self.locks:
+            self.locks[repo] = landing.holder(self.gh, repo, self.now, pulls)
+        return self.locks[repo]
+
+    def _unlock(self, repo: str, number: int) -> None:
+        landing.release(self.gh, repo, number)
+        self.locks[repo] = None
 
     def _scope_holds(self, repo: str, number: int, full: Dict[str, Any],
                      issue: Dict[str, Any]) -> bool:
@@ -4207,6 +4272,8 @@ class Factory:
         closed_numbers = self._close_superseded_prs(repo, all_prs, tickets)
         prs = [p for p in all_prs if self._trusted(p) and int(p.get("number") or 0) not in closed_numbers]
         linked = {a[1]: pr for pr in prs for a in [self._association(repo, pr)] if a}
+        # Read first, so an expired lock comes off even when nothing lands.
+        self._guarded(lambda r, _: self._lock(r, prs), repo, {})
         for pr in landing_order(prs, tickets, linked):
             if self.actions >= MAX_ACTIONS:
                 return
