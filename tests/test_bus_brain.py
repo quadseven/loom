@@ -399,10 +399,11 @@ class SensitiveResumeTests(unittest.TestCase):
         for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "#4 PR - blocked: 1 unresolved threads"):
             self.assertIn(section, report)
         # Project repo: issues, pulls, one GraphQL request, the goal's
-        # unproven-work read and epic list; lane repo: issues (no loom:lanes
-        # issue here, so no comments read). Plus ticket issue fetch for goal
-        # home constraint checking. The fake has no replies left.
-        self.assertEqual(gh.requests, 7)
+        # unproven-work read and epic list; the lane repo is the same repo,
+        # so its issue list is the one already read (loom#2078), and with no
+        # loom:lanes issue there is no comments read. Plus ticket issue fetch
+        # for goal home constraint checking.
+        self.assertEqual(gh.requests, 6)
 
     def test_status_ranks_open_tickets_across_repos_in_work_order(self):
         def t(number, priority=None, created="2030-01-01T00:00:00Z", labels=("loom:queued",)):
@@ -448,14 +449,15 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_status_reads_lane_comments_with_one_more_request(self):
         lanes_issue = {"number": 9, "title": "Loom lane status", "labels": [{"name": "loom:lanes"}]}
+        # The lane repo is the project repo: one issue list serves both
+        # (loom#2078), then the pull requests, then the lane comments.
         gh = GitHub("t", transport=Fake(
-            reply(200, []), reply(200, []),
-            reply(200, [lanes_issue]),
+            reply(200, [lanes_issue]), reply(200, []),
             reply(200, [{"body": "<!-- loom:lanes v1 -->\n| codex | yes |", "created_at": "2030-01-01T00:00:00Z",
                          "user": {"login": "example-brain"}}])))
         report = brain.status(gh, [REPO], REPO, env=TRUSTED)
         self.assertIn("| codex | yes |", report)
-        self.assertEqual(gh.requests, 4)
+        self.assertEqual(gh.requests, 3)
 
     def test_status_lists_a_sensitive_pull_request(self):
         ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}], "body": ""}
