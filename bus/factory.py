@@ -2254,18 +2254,20 @@ class Factory:
             newest = max(prs, key=lambda p: (_ts(p.get("created_at")), int(p["number"])))
             self._close_all_but(repo, prs, int(newest["number"]), closed)
 
-    def _superseding_ticket(self, repo: str, ticket: Dict[str, Any],
-                            ticket_map: Dict[int, Dict[str, Any]]) -> Optional[int]:
+    def _superseding_ticket(self, ticket: Dict[str, Any],
+                            ticket_map: Dict[int, Dict[str, Any]],
+                            comments: Callable[[], List[Dict[str, Any]]]) -> Optional[int]:
         """The newest open ticket that supersedes this one, or None: an open
         loom:ticket whose body says "Rewritten from issue N." (what
         bus.brain brief --refs writes), or, for a ticket labelled
         loom:rewritten, the ticket a trusted "Rewritten as ticket #M," comment
-        names. The comments are read only for such a label."""
+        names. `comments` reads the ticket's trusted comments, called only
+        for such a label."""
         number = int(ticket["number"])
         found = [n for n, t in ticket_map.items()
                  if n != number and tickets.rewritten_source(t.get("body")) == number]
         if "loom:rewritten" in _labels(ticket):
-            found += [int(m.group(1)) for c in self._comments(repo, number)
+            found += [int(m.group(1)) for c in comments()
                       for m in REWRITTEN_AS_RE.finditer(str(c.get("body") or ""))
                       if int(m.group(1)) != number]
         return max(found) if found else None
@@ -2281,12 +2283,19 @@ class Factory:
         if ticket.get("state") != "open":
             return None
         number = int(ticket["number"])
-        newer = self._superseding_ticket(repo, ticket, ticket_map)
+        read: List[List[Dict[str, Any]]] = []
+
+        def comments() -> List[Dict[str, Any]]:
+            # One read a ticket, shared by both checks below.
+            if not read:
+                read.append(self._comments(repo, number))
+            return read[0]
+
+        newer = self._superseding_ticket(ticket, ticket_map, comments)
         if newer is not None:
             return ("Closed by the station as superseded: its ticket #%d was rewritten as "
                     "ticket #%d, which a lane builds on its own branch." % (number, newer))
-        if _state(ticket) != "failed" or not self._gave_up_since_claim(
-                self._comments(repo, number)):
+        if _state(ticket) != "failed" or not self._gave_up_since_claim(comments()):
             return None
         where = ("in the hand-off pool (%s), where the second operator's session takes it"
                  % HANDOFF_LABEL) if HANDOFF_LABEL in _labels(ticket) else "for the brain"

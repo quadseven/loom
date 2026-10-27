@@ -2888,6 +2888,18 @@ class Tickets(Base):
         self.assertEqual([c[0] for c in self.closed], [70])
         self.assertIn("rewritten as ticket #12", self.closed[0][1])
 
+    def test_a_rewritten_failed_ticket_reads_its_comments_once_for_both_checks(self):
+        self.gh.ticket(7, "failed")
+        self.gh.issues[7]["labels"].append({"name": "loom:rewritten"})
+        self.gh.comments[7] += ALL_RUNGS + [
+            {"body": factory.GAVE_UP + " (x; ran on none).", "user": ME}]
+        self.gh.pull(70, 7)
+        f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"])
+        with mock.patch.object(f, "_comments", wraps=f._comments) as read:
+            note = f._ended_note(REPO, self.gh.issues[7], {})
+        self.assertIn("past the last rung", note)
+        self.assertEqual(read.call_count, 1)
+
     def test_a_strangers_rewritten_comment_closes_nothing(self):
         self.gh.ticket(7, "pr")
         self.gh.issues[7]["labels"].append({"name": "loom:rewritten"})
