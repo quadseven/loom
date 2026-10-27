@@ -192,6 +192,24 @@ api_rules() {
   esac
 }
 
+# The rules that keep agy's oauth token file ($1 is the lane user's home, $2
+# the real path of agy's binary) from every process but agy's own binary. The
+# sandbox cannot tell agy from the commands it launches by where they run, but
+# a rule can name the process: a shell command agy runs (bash, cat, curl) is
+# not agy, so it can neither read the file nor link, move or delete it, or move
+# its folder, to read it from another path (a symlink to it is read through
+# the same rule). A command could still write over it, which costs agy its
+# sign-in, not a leak.
+agy_token_rules() {
+  local dir="$1/Library/Application Support/antigravity" bin="$2" p
+  for p in "$dir" "$bin"; do
+    # shellcheck disable=SC1003 # matching a literal backslash
+    case "$p" in *'"'*|*'\'*|*$'\n'*|"") echo "refusing sandbox: unsafe agy path '$p'" >&2; return 1 ;; esac
+  done
+  printf '(deny file-read* file-write-unlink file-link (require-all (literal "%s/antigravity-oauth-token") (require-not (process-path "%s"))))\n' "$dir" "$bin"
+  printf '(deny file-write-unlink file-link (require-all (literal "%s") (require-not (process-path "%s"))))' "$dir" "$bin"
+}
+
 # Seatbelt profile for agents, in one of three modes ($3): api for every API
 # lane, the triage rewriter and the brain's spark rung; empty for the agy
 # lane; check for a validation run. In every mode: no reads or writes anywhere
@@ -230,7 +248,7 @@ sandbox_profile() {
     echo "refusing sandbox: bwrap serves api and check runs only, not mode '${3:-}' (lane $LANE)" >&2
     return 1
   fi
-  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule="" agy_keychain_deny=""
+  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule="" agy_keychain_deny="" agy_token_deny="" agy_home=""
   if [ -n "${4:-}" ]; then
     [[ "$4" =~ ^[0-9]+$ ]] && [ "$4" -ge 49152 ] && [ "$4" -le 65535 ] ||
       { echo "refusing sandbox: loopback port $4 is not in 49152-65535" >&2; return 1; }
@@ -239,7 +257,9 @@ sandbox_profile() {
   home="$(cd "$HOME" && pwd -P)"
   tree="$(cd "$1" && pwd -P)"
   if [ "$LANE" = agy ] && [ -n "${AGY_HOME:-}" ]; then
-    agy_keychain_deny="(deny file-read* (subpath \"$(cd "$AGY_HOME" && pwd -P)/Library/Keychains\"))"
+    agy_home="$(cd "$AGY_HOME" && pwd -P)" || return 1
+    agy_keychain_deny="(deny file-read* (subpath \"$agy_home/Library/Keychains\"))"
+    agy_token_deny="$(agy_token_rules "$agy_home" "$(realpath "$(command -v "$2")" 2> /dev/null)")" || return 1
   fi
   [ -d "$SKILLS" ] && skills="$(cd "$SKILLS" && pwd -P)"
   cli_link="$(command -v "$2")" && [ -n "$cli_link" ] || { echo "refusing sandbox: $2 not on PATH" >&2; return 1; }
@@ -300,7 +320,7 @@ sandbox_profile() {
   [ -n "$agy_lane" ] && agy_rules="$(agy_write_rules "$allow_rw")"
   printf '(version 1)\n(allow default)\n%s(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n%s(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su") (literal "/usr/bin/security"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n%s%s\n' \
     "$api_writes" "$home" "$allow_rw" "$agy_rules" "$tree" "$allow_ro" "$skills_rules" "$meta" "$keychain_deny" "$api_network" "$loopback_rule"
-  [ -z "$agy_keychain_deny" ] || printf '%s\n' "$agy_keychain_deny"
+  [ -z "$agy_keychain_deny" ] || printf '%s\n%s\n' "$agy_keychain_deny" "$agy_token_deny"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a

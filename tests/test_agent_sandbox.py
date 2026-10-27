@@ -37,6 +37,18 @@ if /usr/bin/nc -z -w 1 192.0.2.1 80 > /dev/null 2>&1; then echo net=reachable; e
 if /usr/bin/security --help > /dev/null 2>&1; then echo security=ran; else echo security=denied; fi
 """
 
+# Run inside the agy profile as a command agy launched (not agy's own binary):
+# try to read the oauth token file directly, through a link, through a symlink,
+# and after moving the file or its folder. $1 is the tree, $2 the token file.
+TOKEN_PROBE = r"""
+r() { if /usr/bin/head -c 1 "$2" > /dev/null 2>&1; then echo "$1=read"; else echo "$1=denied"; fi; }
+r direct "$TOKEN"
+ln "$TOKEN" "$TREE/hard" 2> /dev/null; r hardlink "$TREE/hard"
+ln -s "$TOKEN" "$TREE/soft" 2> /dev/null; r symlink "$TREE/soft"
+mv "$TOKEN" "$TREE/moved" 2> /dev/null; r moved "$TREE/moved"
+mv "$(dirname "$TOKEN")" "$TREE/dir" 2> /dev/null; r folder "$TREE/dir/$(basename "$TOKEN")"
+"""
+
 
 class AgentSandboxTest(unittest.TestCase):
     def setUp(self):
@@ -144,6 +156,31 @@ class AgentSandboxTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.split(),
                          ["net=denied", "security=denied"])
+
+    def test_only_the_agy_lane_profile_names_the_oauth_token(self):
+        token = "Library/Application Support/antigravity/antigravity-oauth-token"
+        self.assertIn(f'(literal "{self.scratch}/{token}")', self.profile("", lane="agy"))
+        for mode, lane in (("check", "agy"), ("", "codex"), ("api", "opencode-go")):
+            with self.subTest(mode=mode, lane=lane):
+                self.assertNotIn("antigravity-oauth-token", self.profile(mode, lane=lane))
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_inside_the_agy_profile_a_command_cannot_read_the_oauth_token(self):
+        # The CLI here is /bin/cat, standing in for agy's binary: it alone may
+        # read the token; /usr/bin/head, as a command agy launched, may not.
+        token = self.scratch / "Library" / "Application Support" / "antigravity" / "antigravity-oauth-token"
+        token.parent.mkdir(parents=True)
+        token.write_text("not-a-real-token\n")
+        script = ('export TOKEN="$2" TREE="$1"\n'
+                  'p="$(sandbox_profile "$1" cat "")" || exit 9\n'
+                  'sandbox-exec -p "$p" /bin/bash -c "$3"\n'
+                  'sandbox-exec -p "$p" /bin/cat "$2" > /dev/null && echo agy=read || echo agy=denied')
+        result = self.bash(script, str(token), TOKEN_PROBE, lane="agy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(),
+                         ["direct=denied", "hardlink=denied", "symlink=denied", "moved=denied",
+                          "folder=denied", "agy=read"])
+        self.assertTrue(token.exists())
 
     def test_an_unknown_mode_is_refused(self):
         result = self.bash('sandbox_profile "$1" bash agent')
