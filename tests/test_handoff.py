@@ -73,20 +73,27 @@ class HandoffRuleTests(unittest.TestCase):
         # comment's createdAt day. A muse journal from 2026-10-19 with
         # "Tick 20:30Z, muse" should not appear fresh at 2026-10-26T13:51Z.
         now = datetime(2026, 10, 26, 13, 51, tzinfo=timezone.utc)
-        # GitHub's comment timestamps date the time-only Tick line.
-        created_at = "2026-10-19T20:30:00Z"
-        updated_at = "2026-10-19T20:30:00Z"
+        # GitHub's comment timestamps date the time-only Tick lines. The
+        # journal was edited in place, so each tick's own time is its `at`.
+        created_at = "2026-10-19T19:30:00Z"
+        updated_at = "2026-10-19T20:31:00Z"
         body = "\n".join([handoff.JOURNAL_MARKER, "Tick 20:30Z, muse",
-                          "- Waiting: merge deferred for budget"])
+                          "- Waiting: merge deferred for budget",
+                          handoff.EARLIER_OPEN, "Tick 19:30Z, muse",
+                          "- Waiting: merge deferred for budget", handoff.EARLIER_CLOSE])
         comment = {"body": body, "at": created_at, "login": "allowed-bot",
                    "createdAt": created_at, "updatedAt": updated_at}
         expanded = handoff.journals([comment], AUTHORS)
-        self.assertEqual(len(expanded), 1)
-        # The tick time should be parsed as 2026-10-19T20:30:00Z
-        self.assertEqual(expanded[0]["at"], "2026-10-19T20:30:00Z")
+        self.assertEqual(["2026-10-19T19:30:00Z", "2026-10-19T20:30:00Z"],
+                         [c["at"] for c in expanded])
         # peer_journals should not count it as fresh (7 days old)
         peers = handoff.peer_journals(expanded, "lane-machine", now)
         self.assertEqual([], peers)
+        # The resume path passes only body, at (the comment's createdAt) and
+        # login: the comment's own time still dates the Tick line.
+        bare = {"body": body, "at": created_at, "login": "allowed-bot"}
+        self.assertEqual([], handoff.peer_journals(handoff.journals([bare], AUTHORS),
+                                                   "lane-machine", now))
 
     def test_tick_time_without_date_uses_day_before_if_after_updated_at(self):
         # If dating from createdAt day would put the tick after updated_at,
