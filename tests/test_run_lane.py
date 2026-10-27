@@ -6296,6 +6296,24 @@ exec /usr/bin/git "$@"
                                    "--is-ancestor", main, self.FIX_BRANCH])
         self.assertEqual(ancestor.returncode, 0)
 
+    def test_a_cluster_runner_files_no_incident_for_a_red_base_check(self):
+        # On a cluster runner a red base check is often the runner image (a
+        # missing tool), and the station sends the ticket to another lane,
+        # which files the incident if the base is red there too. Filed from
+        # the runner, the incident held nothing and waited for a person to
+        # close it (three on 2026-10-27).
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        name, _ = self.fix_brief()
+        self.advance_main("fix.txt", "broken\n")
+        result = self.run_contract_lane(LOOM_CLUSTER_RUNNER="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        log = self.run_log(name + ".log")
+        self.assertIn("base check exited 1 on the", log)
+        self.assertIn("[factory]", log)
+        self.assertFalse(any(c.startswith("gh issue create") for c in self.calls()))
+
     def test_a_red_default_branch_on_a_fix_round_files_a_base_check_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         self.contract_repo()
