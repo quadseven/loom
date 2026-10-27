@@ -2063,6 +2063,19 @@ such repos under "Skipped repos (fix LOOM_REPOS)". Any other GitHub error
 (5xx, a rate limit, a dropped connection) still ends the command, so a
 fault never reads as an empty repo.
 
+`status` and `resume` print as they go (loom#2049): the heading first, then
+each repo's section as soon as that repo's reads finish (in the order the
+repos finish), then the sections that span every repo (Runaway tickets,
+Priorities, Waiting on you and the rest for `status`; Sensitive pull
+requests, Finished epics, Verify due and Lane proof audit for `resume`).
+Each repo's reads have a budget, `--repo-budget SECONDS` or
+`LOOM_REPO_BUDGET`, 120 seconds by default; a repo past it prints
+`skipped <repo>: timed out after ...` and is left out of the cross-repo
+sections, and the run goes on with the other repos. Within a repo, the
+reads per pull request, per stuck ticket and per epic run side by side, so
+one repo's status takes about a third of the time it did when they ran one
+after another.
+
 `resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`
 tickets across the repos, oldest ship first, each with how long ago it
 shipped and its Live criterion (the acceptance line that starts with
