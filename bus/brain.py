@@ -1799,20 +1799,32 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     intake epic of the goal with room; when no intake epic has room and the
     goal is under its open epic cap, a new intake epic opens the way triage
     opens one; otherwise the rest stay where they are. An epic, an ask and a
-    closed issue are never moved. Returns (moved, left)."""
+    closed issue are never moved.
+
+    An open ticket under an epic that is closed (a person's tool closes an
+    epic once its sub-issues are closed, but a ticket that names the epic by
+    its Part of line stays open under it) moves the same way, and its Part of
+    line then names the new epic; the closed epic stays closed (loom#1925).
+    A ticket that also sits under an open epic stays there. Returns (moved,
+    left)."""
     loose, tree = goal_tree(gh, repo, goal)
-    tickets = _outside_tickets(loose, goal)
+    tickets = [(t, goal) for t in _outside_tickets(loose, goal)]
+    seen = {int(t.get("number") or 0) for t, _ in tickets}
+    tickets += [(t, old) for t, old in _closed_epic_tickets(tree)
+                if int(t.get("number") or 0) not in seen]
     if not tickets:
         return (0, 0)
+    tickets.sort(key=lambda pair: (str(pair[0].get("created_at") or ""),
+                                   int(pair[0].get("number") or 0)))
     moved = 0
     epic, held = _intake_with_room(tree)
-    for ticket in tickets:
+    for ticket, old in tickets:
         if epic is None or held >= EPIC_TICKET_CAP:
             opened = _open_intake_epic(gh, repo, goal)
             if opened is None:
                 break
             epic, held = opened
-        if _move_to_epic(gh, repo, epic, ticket, goal):
+        if _move_to_epic(gh, repo, epic, ticket, old):
             moved += 1
             held += 1
     return (moved, len(tickets) - moved)
@@ -1824,14 +1836,7 @@ def _outside_tickets(loose: List[Dict[str, Any]], goal: int) -> List[Dict[str, A
     whose parent is the goal itself or nobody."""
     found: List[Dict[str, Any]] = []
     for issue in loose:
-        if issue.get("state") != "open" or "pull_request" in issue:
-            continue
-        names = _labels(issue)
-        if "loom:ticket" not in names or "epic" in names or "needs-operator" in names:
-            continue
-        if not issue.get("id"):
-            # GitHub names every issue an id; one read without it cannot be
-            # linked as a sub-issue, so it stays where it is.
+        if not _movable_ticket(issue):
             continue
         parent = _sub_issue_parent(issue)
         if parent is not None and parent != goal:
@@ -1840,6 +1845,44 @@ def _outside_tickets(loose: List[Dict[str, Any]], goal: int) -> List[Dict[str, A
     found.sort(key=lambda issue: (str(issue.get("created_at") or ""),
                                   int(issue.get("number") or 0)))
     return found
+
+
+def _movable_ticket(issue: Dict[str, Any]) -> bool:
+    """An open loom:ticket that is not an epic, an ask or a pull request, and
+    that GitHub named an id: GitHub names every issue an id, and one read
+    without it cannot be linked as a sub-issue, so it stays where it is."""
+    if issue.get("state") != "open" or "pull_request" in issue:
+        return False
+    names = _labels(issue)
+    if "loom:ticket" not in names or "epic" in names or "needs-operator" in names:
+        return False
+    return bool(issue.get("id"))
+
+
+def _closed_epic_tickets(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
+                         ) -> List[Tuple[Dict[str, Any], int]]:
+    """(ticket, its closed epic) for each open ticket of a closed epic of the
+    goal: a sub-issue of the closed epic, or a ticket whose Part of line names
+    it and that is a sub-issue of nothing else. A ticket that an open epic
+    also holds is left out: it already sits under an open epic."""
+    held_open = {int(t.get("number") or 0) for e, found in tree
+                 if e.get("state", "open") == "open" for t in found}
+    out: List[Tuple[Dict[str, Any], int]] = []
+    seen = set()
+    for epic, found in tree:
+        if epic.get("state", "open") == "open":
+            continue
+        number = int(epic.get("number") or 0)
+        for issue in found:
+            n = int(issue.get("number") or 0)
+            if not n or n in seen or n in held_open or not _movable_ticket(issue):
+                continue
+            parent = _sub_issue_parent(issue)
+            if parent is not None and parent != number:
+                continue
+            out.append((issue, number))
+            seen.add(n)
+    return out
 
 
 def _open_count(tickets: List[Dict[str, Any]]) -> int:
@@ -1875,8 +1918,9 @@ def _open_intake_epic(gh: GitHub, repo: str, goal: int) -> Optional[Tuple[int, i
 
 
 def _move_to_epic(gh: GitHub, repo: str, epic: int, ticket: Dict[str, Any], goal: int) -> bool:
-    """Move the ticket under the epic: the epic's sub-issue link replaces the
-    goal as its parent, and the ticket's Part of line names the epic. False
+    """Move the ticket under the epic: the epic's sub-issue link replaces its
+    old parent `goal` (the goal, or the closed epic it sat under), and the
+    ticket's Part of line names the epic instead of the old parent. False
     when GitHub refuses the link."""
     parent = _sub_issue_parent(ticket)
     if not _link_to_goal(gh, repo, epic, ticket, under=goal if parent == goal else None):
