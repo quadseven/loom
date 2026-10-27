@@ -1764,7 +1764,14 @@ criterion is one of three kinds:
   station check, or, for a `Live:` line with log strings, the station's own
   log search that dispatched the verify run.
 - operator: something only a person does (signs off, approves, acts by
-  hand, checks a handset). Loom never closes it.
+  hand, checks a handset). Loom never closes it. A decision box is one: its
+  text starts with "Operator decides" or "Decision:", or carries
+  `<!-- loom:decision -->`. Only an operator ticks it. When a lane's run
+  ends, the station unticks a decision box that was open in the brief and is
+  ticked now, unless an operator made the last body edit, and posts one
+  incident note naming it. A no-change report on a ticket with an open
+  decision box does not move it to `loom:merged`, whatever merged: it goes to
+  `loom:human` with a `Kind: decision` ask (loom#2029).
 
 A tick is nobody's evidence: not the ticket's, not the lane's pull request
 body's. The station's done close leaves a shipped ticket open while a live
