@@ -7141,6 +7141,17 @@ class Station:
         key = self.read_secret(self.s.urgency.key_ssm, self.s.region)
         return urgency.http_client(key, self.s.urgency.model) if key else None
 
+    def _label_urgent(self, key: str, repo: str, issue: Dict[str, Any]) -> None:
+        """Add loom:urgent beside the ask's labels (act mode); a failed write
+        is said and the ask is still forwarded this pass."""
+        try:
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+                         {"labels": [URGENT]})
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not label %s %s: %s" % (key, URGENT, err))
+
     def _route_asks(self, keyed: List[Tuple[str, str, Dict[str, Any]]]
                     ) -> Dict[str, urgency.Decision]:
         """key -> where each ask goes this pass (bus/urgency.py). Off, or
@@ -7160,14 +7171,7 @@ class Station:
                                       [t for k, t in titles.items() if k != key])
             decision = scorer.decide(key, state, labels)
             if decision.route == urgency.URGENT and URGENT not in labels:
-                try:
-                    # POST adds the label beside the ones the ask carries.
-                    self.gh.rest("POST", "/repos/%s/issues/%d/labels"
-                                 % (repo, int(issue["number"])), {"labels": [URGENT]})
-                except RateLimited:
-                    raise
-                except GitHubError as err:
-                    _say("could not label %s %s: %s" % (key, URGENT, err))
+                self._label_urgent(key, repo, issue)
             out[key] = decision
         if cfg.mode != urgency.OFF:
             scorer.prune(set(out))
