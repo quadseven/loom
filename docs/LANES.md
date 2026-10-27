@@ -1674,7 +1674,7 @@ to 127, or any red exit on the unmodified repo or default branch: a script
 that calls a missing `g++` exits 1) is not held behind its factory incident,
 which that runner could never clear: the station retries the ticket on
 another lane as a transient ending, and that lane holds it if the base is
-red there too.
+red there too. The runner files no incident for it (`LOOM_CLUSTER_RUNNER`).
 
 The job, step by step (`lanes/k8s/lane_job.py`):
 
