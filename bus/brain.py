@@ -1572,16 +1572,22 @@ def goal_tree(gh: GitHub, repo: str, goal: int
     subs = _read_each(lambda epic: gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
                                                % (repo, int(epic.get("number") or 0))), epics)
     for epic, sub in zip(epics, subs, strict=True):
-        number = int(epic.get("number") or 0)
-        tickets_ = [c for c in sub if isinstance(c, dict)]
-        seen = {int(c.get("number") or 0) for c in tickets_}
-        for item in open_tickets:
-            n = int(item.get("number") or 0)
-            if n and n not in seen and _names_goal(item.get("body"), number):
-                tickets_.append(item)
-                seen.add(n)
-        tree.append((epic, tickets_))
+        tree.append((epic, _tree_tickets(int(epic.get("number") or 0), sub, open_tickets)))
     return loose, tree
+
+
+def _tree_tickets(number: int, sub: Sequence[Any], open_tickets: Sequence[Dict[str, Any]]
+                  ) -> List[Dict[str, Any]]:
+    """The epic's sub-issues, then the open tickets whose Part of line names
+    it that are not already among them."""
+    tickets_ = [c for c in sub if isinstance(c, dict)]
+    seen = {int(c.get("number") or 0) for c in tickets_}
+    for item in open_tickets:
+        n = int(item.get("number") or 0)
+        if n and n not in seen and _names_goal(item.get("body"), number):
+            tickets_.append(item)
+            seen.add(n)
+    return tickets_
 
 
 def goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
@@ -5255,6 +5261,36 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     seconds = per_repo.budget(env, budget)
     _lock_holder(gh, lock_repo, holder, now)
     out: List[str] = []
+    goals, unread, timed = _resume_journals(gh, repos, authors, seconds)
+    # A moved or forbidden repo is named once and left out of every later
+    # section, so one stale LOOM_REPOS entry does not end the run (loom#800).
+    # A timed-out repo is left out the same way.
+    repos = [r for r in dict.fromkeys(repos) if r not in unread and r not in timed]
+    _say(out, emit, _resume_head(holder, authors, goals, unread, timed, seconds, now))
+    latest = _latest_marks(goals)
+    gone = dict(unread)  # a snapshot: a late read never sees a later change
+    check, trusted = review_check_name(env), trusted_authors(env)
+    read: Dict[str, Dict[str, Any]] = {}
+
+    def gather(repo: str) -> Dict[str, Any]:
+        return _resume_repo(gh, repo, goals, latest, gone, now, check, trusted)
+
+    for repo, done, value in per_repo.each(repos, gather, seconds, READ_WORKERS):
+        if not done:
+            _say(out, emit, ["", _skip_line(repo, per_repo.timed_out(seconds))])
+            continue
+        read[repo] = value
+        if value["lines"]:
+            _say(out, emit, value["lines"])
+    _say(out, emit, _resume_tail(gh, [r for r in repos if r in read], read, now, env))
+    return "\n".join(out)
+
+
+def _resume_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str], seconds: float
+                     ) -> Tuple[List[GoalJournals], Dict[str, str], List[str]]:
+    """Every goal's journals across `repos`, in the order of `repos`, read
+    repo by repo under the budget: (goals, unreadable repos with the reason,
+    timed-out repos)."""
     unread: Dict[str, str] = {}
     timed: List[str] = []
 
@@ -5264,23 +5300,30 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
 
     by_repo: Dict[str, List[GoalJournals]] = {}
     for repo, done, value in per_repo.each(repos, journals, seconds, READ_WORKERS):
-        if not done:
+        if done:
+            by_repo[repo], skipped = value
+            unread.update(skipped)
+        else:
             timed.append(repo)
-            continue
-        by_repo[repo], skipped = value
-        unread.update(skipped)
-    # Every goal in the order of `repos`, as when the journals were read in turn.
-    goals = [g for repo in repos for g in by_repo.pop(repo, [])]
-    # A moved or forbidden repo is named once and left out of every later
-    # section, so one stale LOOM_REPOS entry does not end the run (loom#800).
-    # A timed-out repo is left out the same way.
-    repos = [r for r in dict.fromkeys(repos) if r not in unread and r not in timed]
+    return [g for repo in dict.fromkeys(repos) for g in by_repo.get(repo, [])], unread, timed
+
+
+def _latest_marks(goals: Sequence[GoalJournals]
+                  ) -> Dict[Tuple[str, Tuple[str, int], str], handoff.Mark]:
+    """The newest mark of each handoff across every goal's journals."""
     latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark] = {}
     for _, _, found, _ in goals:
         for mark in handoff.marks(found):
             key = (mark.stage, mark.item, mark.key if mark.stage == "brief" else "")
             if key not in latest or mark.at >= latest[key].at:
                 latest[key] = mark
+    return latest
+
+
+def _resume_head(holder: str, authors: Sequence[str], goals: Sequence[GoalJournals],
+                 unread: Dict[str, str], timed: Sequence[str], seconds: float,
+                 now: datetime) -> List[str]:
+    """The heading, the freshness line, and the repos left out."""
     head = ["# Resume for %s" % holder, "", trusted_line(authors), "",
             _freshness_line(handoff.peer_journals(
                 [j for _, _, found, _ in goals for j in found], holder, now))]
@@ -5290,40 +5333,36 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     if timed:
         head += ["", "## Timed-out repos (read again next tick)"]
         head += [_skip_line(repo, per_repo.timed_out(seconds)) for repo in timed]
-    _say(out, emit, head)
-    check = review_check_name(env)
-    trusted = trusted_authors(env)
-    gone = dict(unread)  # a snapshot: a late read never sees a later change
+    return head
 
-    def gather(repo: str) -> Dict[str, Any]:
-        mine = [g for g in goals if g[0] == repo]
-        lines: List[str] = []
-        for r, issue, found, skipped in mine:
-            lines += _goal_resume_lines(gh, r, issue, found, latest, skipped, gone)
-        return {"lines": lines,
-                "sensitive": _ready_sensitive_in(gh, repo, now, check),
-                "epics": _finished_epic_lines(gh, [(r, i) for r, i, _, _ in mine]),
-                "verify": _verify_due_in(gh, repo, now),
-                "audit": audit.due(gh, [repo], trusted, now.timestamp())}
 
-    read: Dict[str, Dict[str, Any]] = {}
-    for repo, done, value in per_repo.each(repos, gather, seconds, READ_WORKERS):
-        if not done:
-            _say(out, emit, ["", _skip_line(repo, per_repo.timed_out(seconds))])
-            continue
-        read[repo] = value
-        if value["lines"]:
-            _say(out, emit, value["lines"])
-    done_repos = [r for r in repos if r in read]
-    tail = _sensitive_resume_lines(gh, done_repos, now, env,
-                                   [x for r in done_repos for x in read[r]["sensitive"]])
-    tail += _finished_epic_resume_lines(gh, [], [x for r in done_repos for x in read[r]["epics"]])
-    tail += _verify_resume_lines(gh, done_repos, now,
-                                 [x for r in done_repos for x in read[r]["verify"]])
-    tail += _audit_resume_lines(gh, done_repos, now, env,
-                                [x for r in done_repos for x in read[r]["audit"]])
-    _say(out, emit, tail)
-    return "\n".join(out)
+def _resume_repo(gh: GitHub, repo: str, goals: Sequence[GoalJournals],
+                 latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark],
+                 gone: Dict[str, str], now: datetime, check: str,
+                 trusted: Sequence[str]) -> Dict[str, Any]:
+    """One repo's resume reads: its goals' resume lines, printed as the repo
+    finishes, and its share of each cross-repo section."""
+    mine = [g for g in goals if g[0] == repo]
+    lines: List[str] = []
+    for r, issue, found, skipped in mine:
+        lines += _goal_resume_lines(gh, r, issue, found, latest, skipped, gone)
+    return {"lines": lines,
+            "sensitive": _ready_sensitive_in(gh, repo, now, check),
+            "epics": _finished_epic_lines(gh, [(r, i) for r, i, _, _ in mine]),
+            "verify": _verify_due_in(gh, repo, now),
+            "audit": audit.due(gh, [repo], trusted, now.timestamp())}
+
+
+def _resume_tail(gh: GitHub, repos: Sequence[str], read: Dict[str, Dict[str, Any]],
+                 now: datetime, env: Optional[Dict[str, str]]) -> List[str]:
+    """The sections that span every repo, from each repo's reads, with the
+    caps and order they had when they were read in one pass."""
+    def joined(key: str) -> List[Any]:
+        return [x for r in repos for x in read[r][key]]
+    return (_sensitive_resume_lines(gh, repos, now, env, joined("sensitive"))
+            + _finished_epic_resume_lines(gh, [], joined("epics"))
+            + _verify_resume_lines(gh, repos, now, joined("verify"))
+            + _audit_resume_lines(gh, repos, now, env, joined("audit")))
 
 
 def _finished_epic_resume_lines(gh: GitHub, goals: Sequence[Tuple[str, Dict[str, Any]]],

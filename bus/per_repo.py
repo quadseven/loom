@@ -16,7 +16,7 @@ import os
 import queue
 import threading
 import time
-from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 # Seconds one repo's read may take before it is reported as timed out. A
 # brain tick reads status in a few minutes at most; one repo's status took
@@ -45,6 +45,47 @@ def timed_out(seconds: float) -> str:
     return "timed out after %gs (per-repo budget, %s)" % (seconds, BUDGET_ENV)
 
 
+class _Run:
+    """The workers and answers of one each() call."""
+
+    def __init__(self, order: List[str], read: Callable[[str], Any],
+                 clock: Callable[[], float]) -> None:
+        self.read = read
+        self.clock = clock
+        self.todo: "queue.Queue[str]" = queue.Queue()
+        for repo in order:
+            self.todo.put(repo)
+        self.answers: "queue.Queue[Tuple[str, Any, Optional[BaseException]]]" = queue.Queue()
+        self.started: Dict[str, float] = {}
+        self.lock = threading.Lock()
+
+    def work(self) -> None:
+        while True:
+            try:
+                repo = self.todo.get_nowait()
+            except queue.Empty:
+                return
+            with self.lock:
+                self.started[repo] = self.clock()
+            try:
+                self.answers.put((repo, self.read(repo), None))
+            except BaseException as exc:  # handed to the caller's thread
+                self.answers.put((repo, None, exc))
+
+    def spawn(self) -> None:
+        threading.Thread(target=self.work, name="per-repo-read", daemon=True).start()
+
+    def deadlines(self, pending: Set[str], seconds: float) -> Dict[str, float]:
+        with self.lock:
+            return {r: self.started[r] + seconds for r in pending if r in self.started}
+
+    def answer(self, wait: float) -> Optional[Tuple[str, Any, Optional[BaseException]]]:
+        try:
+            return self.answers.get(timeout=max(0.01, wait))
+        except queue.Empty:
+            return None
+
+
 def each(repos: Sequence[str], read: Callable[[str], Any], seconds: float,
          workers: int, clock: Callable[[], float] = time.monotonic
          ) -> Iterator[Tuple[str, bool, Any]]:
@@ -54,52 +95,22 @@ def each(repos: Sequence[str], read: Callable[[str], Any], seconds: float,
     repos already yielded keep their output. The budget counts from the
     moment a worker starts the repo, not from the start of the run."""
     order = list(dict.fromkeys(repos))
-    if not order:
-        return
-    todo: "queue.Queue[str]" = queue.Queue()
-    for repo in order:
-        todo.put(repo)
-    answers: "queue.Queue[Tuple[str, Any, Optional[BaseException]]]" = queue.Queue()
-    started: Dict[str, float] = {}
-    lock = threading.Lock()
-
-    def work() -> None:
-        while True:
-            try:
-                repo = todo.get_nowait()
-            except queue.Empty:
-                return
-            with lock:
-                started[repo] = clock()
-            try:
-                answers.put((repo, read(repo), None))
-            except BaseException as exc:  # handed to the caller's thread
-                answers.put((repo, None, exc))
-
-    def spawn() -> None:
-        threading.Thread(target=work, name="per-repo-read", daemon=True).start()
-
-    for _ in range(max(1, min(workers, len(order)))):
-        spawn()
+    run = _Run(order, read, clock)
+    for _ in range(min(workers, len(order))):
+        run.spawn()
     pending = set(order)
     while pending:
         now = clock()
-        with lock:
-            deadlines = {r: started[r] + seconds for r in pending if r in started}
-        for repo in [r for r in order if r in deadlines and deadlines[r] <= now]:
+        deadlines = run.deadlines(pending, seconds)
+        for repo in [r for r in order if deadlines.get(r, now + 1) <= now]:
             pending.discard(repo)
-            spawn()  # the stuck worker keeps its thread; the queue still needs one
+            run.spawn()  # the stuck worker keeps its thread; the queue still needs one
             yield repo, False, None
-        if not pending:
-            return
-        left = [d - now for r, d in deadlines.items() if r in pending and d > now]
-        try:
-            repo, value, exc = answers.get(timeout=max(0.01, min(left, default=seconds)))
-        except queue.Empty:
-            continue
-        if repo not in pending:
-            continue  # a timed-out read that finished late: already reported
-        pending.discard(repo)
-        if exc is not None:
-            raise exc
-        yield repo, True, value
+        left = [d - now for d in deadlines.values() if d > now]
+        got = run.answer(min(left, default=seconds)) if pending else None
+        if got is None or got[0] not in pending:
+            continue  # nothing yet, or a timed-out read that finished late
+        pending.discard(got[0])
+        if got[2] is not None:
+            raise got[2]
+        yield got[0], True, got[1]
