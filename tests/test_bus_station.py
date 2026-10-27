@@ -9619,14 +9619,22 @@ class TranscriptUploadTest(Base):
         self.go()
         self.assertEqual(self.sent, [])
 
+    def fetch(self, url, token):
+        self.fetched = getattr(self, "fetched", []) + [url]
+        return {}
+
     def test_the_pass_runs_with_the_station(self):
         self.go()
         self.finish(lane="codex")
         gh = GitHub("token", transport=self.fake)
-        st = station.Station(gh, self.settings, read_secret=self.read_secret, upload=self.upload)
-        with contextlib.redirect_stderr(io.StringIO()):
-            st.run_pass()
+        with mock.patch.object(station.brain_memory, "fetch_handoff",
+                               side_effect=AssertionError("the pass reached the real dashboard fetch")):
+            st = station.Station(gh, self.settings, read_secret=self.read_secret,
+                                 upload=self.upload, fetch=self.fetch)
+            with contextlib.redirect_stderr(io.StringIO()):
+                st.run_pass()
         self.assertEqual([b["slot"] for _, _, b in self.sent], ["codex"])
+        self.assertTrue(self.fetched)
 
     def test_settings_come_from_the_environment(self):
         s = station.Settings.from_env({"LOOM_TRANSCRIPT_URL": " %s " % UPLOAD_URL,
