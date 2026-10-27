@@ -22,14 +22,17 @@ Neither needs a model:
   line and the rule, never ids alone), checks still fail after a round that
   was asked to fix them, or the pull request is older than STUCK_AGE. A
   review that finds new things is progress, and a conflict is mechanical
-  (the fix brief's runner merges the base), so neither climbs. The station's
+  (the fix brief's runner merges the base), so neither climbs; a conflict
+  alone is sent back however old the pull request is (loom#1963). The station's
   hand-back (bus/station.py _post_fix_or_escalate), which usually sends a
   round before this pass sees the pull request, applies the same test.
 - Landing keeps the default branch green and nothing stale. A ready pull
   request that is behind its base is brought up to date first (GitHub's
   update-branch), and lands only once its checks and review pass again on
   the new head. Each repo lands at most one pull request a pass, so the
-  next one is checked against the base that includes it. Pull requests of
+  next one is checked against the base that includes it. A ready pull
+  request held for the operator is brought up to date the same way while it
+  waits, so it does not drift into a conflict; it still never lands here. Pull requests of
   loom:urgent and loom:regression tickets land first, then by priority,
   then the oldest.
 - A pull request that changes a code file and no test file goes back to its
@@ -1567,6 +1570,9 @@ class Factory:
         self.load: Dict[str, int] = {}
         self.landed: set = set()
         self.updated: set = set()
+        # Repos where a held pull request was brought up to date this pass
+        # (_keep_current), apart from `updated` so it never delays a landing.
+        self.kept_current: set = set()
         self._runs: Dict[str, List[Dict[str, Any]]] = {}
         # The tickets named by After: lines, and closed tickets whose lane
         # pull requests are still open, read once a pass.
@@ -1977,7 +1983,7 @@ class Factory:
                    comments: List[Dict[str, Any]], why: str,
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
                    no_test: bool = False, unticked: Sequence[str] = (),
-                   ticked: Sequence[str] = ()) -> None:
+                   ticked: Sequence[str] = (), conflict_only: bool = False) -> None:
         number = int(issue["number"])
         held = SEND_BACK_HOLDS & set(_labels(issue))
         if held:
@@ -1991,8 +1997,13 @@ class Factory:
             return
         age = self.now - _ts(pr.get("created_at"))
         threads = self._trusted_open(repo, pr, open_threads)
-        if stuck(comments, open_threads, checks_failing, age, self.now, no_test, unticked,
-                 threads):
+        # A conflict alone is mechanical (the fix brief's runner merges the
+        # base), so it never climbs, waits for a rung or closes the pull
+        # request past the ladder, however old the pull request is
+        # (loom#1963): a ready pull request that hand merges left
+        # conflicting got no brief at all once its age read as stuck.
+        if not conflict_only and stuck(comments, open_threads, checks_failing, age, self.now,
+                                       no_test, unticked, threads):
             footer = self._footer(repo, pr)
             if self._climb(repo, issue, comments, why, footer=footer) is None:
                 if RUNAWAY in _labels(issue):
@@ -2266,7 +2277,8 @@ class Factory:
             return
         if faults:
             self._send_back(repo, full, issue, comments,
-                            ", ".join(faults), open_thread_ids(details), "failing checks" in faults)
+                            ", ".join(faults), open_thread_ids(details), "failing checks" in faults,
+                            conflict_only=faults == ["a conflict"])
         elif review == "reviewed":
             self._land_or_ask_test(repo, number, full, issue, comments, sensitive)
 
@@ -2601,10 +2613,35 @@ class Factory:
         elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
-        elif (not sensitive and not self._operator_holds(repo, number, full, issue, comments)
-              and not self._risk_holds(repo, number, full, issue, comments)):
+        elif sensitive:
+            return
+        elif (self._operator_holds(repo, number, full, issue, comments)
+              or self._risk_holds(repo, number, full, issue, comments)):
+            self._keep_current(repo, number, full)
+        else:
             self._file_criterion_follow_up(repo, number, issue, full)
             self._land(repo, number, full, issue, comments)
+
+    def _keep_current(self, repo: str, number: int, full: Dict[str, Any]) -> None:
+        """Bring a ready pull request held for the operator up to date with
+        its base when it is behind, so it does not drift into a conflict
+        while it waits (loom#1963). The same update-branch call as _land,
+        pinned to the head it judged, at most one a repo a pass; it never
+        merges. A refused update (422) is left for the next pass: a held
+        pull request is not sent back to a lane."""
+        if repo in self.kept_current or not self._behind(repo, full):
+            return
+        sha = str((full.get("head") or {}).get("sha") or "")
+        done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
+                            {"expected_head_sha": sha}, ok=(422,))
+        self.kept_current.add(repo)
+        if done.status == 422:
+            _say("%s#%d is held and could not be brought up to date with its base"
+                 % (repo, number))
+            return
+        self.actions += 1
+        _say("brought held %s#%d up to date with its base; it still waits for the operator"
+             % (repo, number))
 
     def _operator_holds(self, repo: str, number: int, full: Dict[str, Any],
                         issue: Dict[str, Any], comments: Sequence[Dict[str, Any]] = ()) -> bool:

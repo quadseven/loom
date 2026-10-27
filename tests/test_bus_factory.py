@@ -692,10 +692,12 @@ class PullRequests(Base):
         self.assertEqual(self.model(6), "claude-sonnet-5-5")
 
     def test_age_climbs_once_per_window_not_every_round(self):
+        # An open thread, not a conflict: a conflict alone never climbs, by
+        # age either (loom#1963).
         self.gh.ticket(5, "pr")
         self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME,
                                  "created_at": iso(3600)}, CLAIM]
-        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 2)
+        self.gh.pull(50, 5, resolved=False, created=factory.STUCK_AGE * 2)
         self.go()
         self.assertEqual(self.model(5), None, "climbed an hour after the last climb")
         self.assertEqual(len(self.fixed), 1)
@@ -706,10 +708,37 @@ class PullRequests(Base):
 
     def test_an_old_pull_request_climbs_on_its_first_send_back(self):
         self.gh.ticket(5, "pr")
-        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE + 60)
+        self.gh.pull(50, 5, resolved=False, created=factory.STUCK_AGE + 60)
         self.go()
         self.assertEqual(self.model(5), "claude-sonnet-5-5")
         self.assertEqual(len(self.fixed), 1)
+
+    def test_an_old_conflicting_pull_request_gets_a_brief_on_its_lane_without_climbing(self):
+        # loom#1963: a ready pull request that hand merges left conflicting
+        # read as stuck by age, and waited for a rung instead of a brief.
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.issues[5]["labels"].append({"name": "loom:ready"})
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM]
+        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 3)
+        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.model(5), None)
+        self.assertEqual((self.moved, self.closed), ([], []))
+
+    def test_a_conflict_past_the_last_rung_gets_a_brief_not_a_give_up(self):
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.comments[5] += ALL_RUNGS
+        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 3)
+        self.go()
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual((self.moved, self.closed), ([], []))
+
+    def test_a_conflict_on_a_ticket_a_person_holds_gets_no_brief(self):
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5]["labels"].append({"name": "loom:human"})
+        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 3)
+        self.go()
+        self.assertEqual((self.fixed, self.moved, self.closed, self.merged), ([], [], [], []))
 
     def test_the_rungs_go_sonnet_then_sol_then_opus(self):
         self.gh.ticket(5, "pr")
@@ -923,6 +952,53 @@ class PullRequests(Base):
         say.assert_called_once_with(
             "brought %s#50 up to date with its base; it lands once its checks "
             "and review pass on the new head" % REPO)
+
+    def test_a_held_ready_pull_request_behind_its_base_is_kept_current_never_merged(self):
+        # loom#1963: a pull request held for the operator never reached
+        # _land, the only update-branch call, so it drifted into a conflict.
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 4
+        with mock.patch.object(factory.Factory, "_operator_holds", return_value=True):
+            self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+        self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
+                       {"expected_head_sha": "sha50"}), self.gh.writes)
+
+    def test_a_held_pull_request_up_to_date_with_its_base_is_left_alone(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        with mock.patch.object(factory.Factory, "_risk_holds", return_value=True):
+            self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+        self.assertEqual([w for w in self.gh.writes if w[1].endswith("/update-branch")], [])
+
+    def test_a_held_pull_request_whose_update_is_refused_is_not_sent_back(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 1
+        self.gh.update_status = 422
+        with mock.patch.object(factory.Factory, "_operator_holds", return_value=True):
+            self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_a_held_update_does_not_stop_another_pull_request_landing(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=7200)
+        self.gh.behind[50] = 2
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6, created=3600)
+        self.gh.behind[60] = 2
+        real = factory.Factory._operator_holds
+        with mock.patch.object(factory.Factory, "_operator_holds", autospec=True,
+                               side_effect=lambda f, repo, number, *a, **k:
+                               number == 50 or real(f, repo, number, *a, **k)):
+            self.go()
+        self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
+                       {"expected_head_sha": "sha50"}), self.gh.writes)
+        self.assertIn(("PUT", "/repos/%s/pulls/60/update-branch" % REPO,
+                       {"expected_head_sha": "sha60"}), self.gh.writes)
+        self.assertEqual(self.merged, [])
 
     def test_a_refused_update_goes_back_for_a_fix_round_like_a_conflict(self):
         # 2026-10-20: an update that cannot be applied cleanly goes back for
