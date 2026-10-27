@@ -182,6 +182,10 @@ class FakeGitHub:
         data = json.loads(body) if body else None
         if method == "POST" and parts.path == "/graphql":
             return self._graphql(data)
+        if method == "GET" and parts.path == "/search/issues":
+            # The epic shape's Part of search (loom#2023): no issue here is
+            # linked to an epic by its Part of line alone.
+            return reply(200, {"items": []})
         if method == "GET" and parts.path == "/repos/%s" % REPO:
             return reply(200, {"full_name": REPO, "private": self.private,
                                "default_branch": "main"})
@@ -1494,6 +1498,102 @@ class ShipDeployedTest(Base):
         self.assertEqual(station.run(self.settings, gh, ancestor=self.ancestor), 0)
         self.assertIn("loom:shipped", self.fake.names(12))
 
+    def early(self, number, pr, label, events=(), merged_at="2030-01-02T00:00:00Z"):
+        """An open issue at an early state (loom:triage, loom:queued) whose
+        Refs-linked pull request merged and is carried by the deploy."""
+        self.merged(number, pr, merged_at=merged_at)
+        extra = [] if label == "loom:triage" else [{"name": "loom:ticket"}]
+        self.fake.issues[number]["labels"] = extra + [{"name": label}]
+        self.fake.events[number] = list(events)
+
+    def early_transport(self):
+        """The fake, answering the early-state issue listings it leaves to
+        its briefed listing."""
+        real = self.fake
+
+        def transport(method, url, headers, body):
+            query = urlsplit(url).query
+            for label in station.EARLY_SHIP_STATES:
+                if method == "GET" and "labels=%s&" % label in query:
+                    return reply(200, [i for i in real.issues.values() if i["state"] == "open"
+                                       and label in real.names(i["number"])])
+            return real(method, url, headers, body)
+        return transport
+
+    def test_a_triage_or_queued_issue_whose_pull_request_deployed_ships_with_one_comment(self):
+        # Six issues sat at loom:triage after their pull requests merged and
+        # the station deployed them (loom#2025).
+        self.early(12, 99, "loom:triage")
+        self.early(13, 100, "loom:queued")
+        self.record_deploy()
+        self.ship(self.early_transport())
+        for number, pr in ((12, 99), (13, 100)):
+            names = self.fake.names(number)
+            self.assertIn("loom:shipped", names)
+            self.assertNotIn("loom:triage", names)
+            self.assertNotIn("loom:queued", names)
+            self.assertEqual(len(self.fake.comments[number]), 1)
+            self.assertIn("#%d" % pr, self.fake.comments[number][0]["body"])
+            self.assertIn(DEPLOYED[:12], self.fake.comments[number][0]["body"])
+
+    def test_an_early_issue_whose_commit_is_not_deployed_stays(self):
+        self.early(12, 99, "loom:triage")
+        self.carried.discard("%040x" % 99)
+        self.record_deploy()
+        self.ship(self.early_transport())
+        self.assertEqual(self.fake.names(12), ["loom:triage"])
+        self.assertEqual(self.fake.comments[12], [])
+
+    def test_a_ticket_requeued_after_its_merge_stays_queued(self):
+        # A merge that left criteria unbuilt sends the ticket back to
+        # loom:queued for the rest: that merge does not ship it.
+        requeue = {"event": "labeled", "label": {"name": "loom:queued"},
+                   "actor": {"login": "alice-example"}, "created_at": "2030-01-02T01:00:00Z"}
+        self.early(13, 100, "loom:queued", events=[requeue])
+        self.record_deploy()
+        self.ship(self.early_transport())
+        self.assertIn("loom:queued", self.fake.names(13))
+        self.assertNotIn("loom:shipped", self.fake.names(13))
+        self.assertEqual(self.fake.comments[13], [])
+
+    def test_a_regression_ticket_at_queued_does_not_ship_on_an_old_merge(self):
+        self.early(13, 100, "loom:queued")
+        self.fake.issues[13]["labels"].append({"name": "loom:regression"})
+        self.record_deploy()
+        self.ship(self.early_transport())
+        self.assertNotIn("loom:shipped", self.fake.names(13))
+
+    def test_a_failed_move_is_kept_for_the_merged_not_shipped_invariant(self):
+        self.merged(12, 99)
+        self.record_deploy()
+        real = self.fake
+
+        def refusing(method, url, headers, body):
+            if method == "PUT" and urlsplit(url).path.endswith("/issues/12/labels"):
+                return reply(422, {"message": "refused"})
+            return real(method, url, headers, body)
+        with mock.patch("bus.station.time.time", return_value=DEPLOYED_AT + 60):
+            gh = GitHub("token", transport=refusing)
+            st = station.Station(gh, self.settings, ancestor=self.ancestor)
+            st.ship_deployed()
+        self.assertIn("loom:merged", self.fake.names(12))
+        gh = GitHub("token", transport=self.fake)
+        st = station.Station(gh, self.settings, ancestor=self.ancestor)
+        st._invariant_repo = REPO
+        (found,) = st._invariant_unshipped()
+        ref, at = found
+        self.assertEqual(ref.key, "%s#12" % REPO)
+        facts = invariants.Facts(now=at + 25 * 3600, unshipped=[found])
+        (breach,) = invariants.merged_not_shipped(facts)
+        self.assertTrue(breach.rolling)
+        self.assertIn("#12", "\n".join(breach.evidence))
+        self.assertEqual(invariants.merged_not_shipped(
+            invariants.Facts(now=at + 23 * 3600, unshipped=[found])), [])
+        # Once it ships, the ledger forgets it.
+        st.ship_deployed()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertEqual(st._invariant_unshipped(), [])
+
     def test_self_repo_defaults_to_the_lanes_repo(self):
         env = {"LOOM_HOME": self.home, "LOOM_REPOS": REPO,
                "LOOM_STATUS_REPO": "example-owner/lanes"}
@@ -1510,6 +1610,91 @@ class ShipDeployedTest(Base):
         sha = head.stdout.strip()
         self.assertTrue(station._is_ancestor(sha, sha))
         self.assertFalse(station._is_ancestor("0" * 40, sha))
+
+
+class ShipRollTest(Base):
+    """A repo that deploys only when another repo rolls it declares the roll
+    record in .loom/ship-roll; its merged tickets ship once the record's
+    source commit carries their merge commit (loom#2025)."""
+
+    DEPLOY = "example-owner/deploy"
+    PATH = "pins/UPSTREAM-PINS.env"
+
+    def setUp(self):
+        super().setUp()
+        self.signal = "%s %s EXAMPLE_REPO_SHA\n" % (self.DEPLOY, self.PATH)
+        self.record = ""
+        self.compares = []
+
+    def merged(self, number, pr, merged_at="2030-01-02T00:00:00Z"):
+        self.fake.add(number, state="merged")
+        sha = "%040x" % pr
+        self.fake.pulls.append({"number": pr, "state": "closed", "merged_at": merged_at,
+                                "merge_commit_sha": sha, "title": "Fix the thing",
+                                "body": "Refs %s#%d" % (REPO, number),
+                                "head": {"ref": "loom/%d-fix" % number}})
+        return sha
+
+    def transport(self, method, url, headers, body):
+        path = urlsplit(url).path
+        if method == "GET" and path == "/repos/%s/contents/%s" % (REPO, station.ROLL_SIGNAL_FILE):
+            return reply(200, {"content": base64.b64encode(self.signal.encode()).decode()})
+        if method == "GET" and path == "/repos/%s/contents/%s" % (self.DEPLOY, self.PATH):
+            if not self.record:
+                return reply(404, {"message": "Not Found"})
+            return reply(200, {"content": base64.b64encode(self.record.encode()).decode()})
+        if method == "GET" and path == "/repos/%s" % self.DEPLOY:
+            return reply(200, {"full_name": self.DEPLOY, "private": True})
+        compare = re.match(r"/repos/%s/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)$" % REPO, path)
+        if compare:
+            self.compares.append(compare.groups())
+            return reply(200, {"status": "ahead" if compare.groups() in self.carried
+                               else "diverged"})
+        return self.fake(method, url, headers, body)
+
+    def ship(self):
+        station.Station(GitHub("token", transport=self.transport), self.settings).ship_rolls()
+
+    def test_a_merged_ticket_ships_when_the_roll_record_carries_its_merge_commit(self):
+        rolled = "e" * 40
+        sha = self.merged(12, 99)
+        self.merged(13, 100)
+        self.carried = {(sha, rolled)}
+        self.record = "OTHER_SHA=%s\nEXAMPLE_REPO_SHA=%s  # roll 70\n" % ("f" * 40, rolled)
+        self.fake.private = False
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        note = self.fake.comments[12][-1]["body"]
+        self.assertIn(rolled[:12], note)
+        self.assertIn("#99", note)
+        # A private deployment repo is never named on the ticket.
+        self.assertNotIn(self.DEPLOY, note)
+        self.assertIn("loom:merged", self.fake.names(13))
+        self.assertEqual(self.fake.comments[13], [])
+
+    def test_a_record_that_names_no_commit_ships_nothing(self):
+        self.merged(12, 99)
+        self.carried = set()
+        for record in ("", "EXAMPLE_REPO_SHA=abc\n",
+                       "EXAMPLE_REPO_SHA=%s\nEXAMPLE_REPO_SHA=%s\n" % ("e" * 40, "f" * 40)):
+            self.record = record
+            self.ship()
+            self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.compares, [])
+
+    def test_a_repo_with_no_roll_signal_reads_no_record(self):
+        self.merged(12, 99)
+        self.signal = ""
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_a_malformed_roll_signal_is_refused(self):
+        with self.assertRaises(ValueError):
+            station.parse_roll_signals("example-owner/deploy pins.env\n")
+        with self.assertRaises(ValueError):
+            station.parse_roll_signals("example-owner/deploy ../pins.env KEY\n")
+        self.assertEqual(station.parse_roll_signals("# a comment\n%s" % self.signal),
+                         [(self.DEPLOY, self.PATH, "EXAMPLE_REPO_SHA")])
 
 
 class ShipRuleTest(Base):
@@ -2866,8 +3051,10 @@ class ReviewFake:
         self.statuses = []
         self.comments = []
         self.writes = []
+        self.workflows = []
+        self.workflow_texts = {}
 
-    def rest(self, method, path, data=None):
+    def rest(self, method, path, data=None, etag=None, ok=()):
         # Writes are only accepted at the exact ticket paths; any other PUT or POST
         # falls through to the AssertionError below, so a wrong path fails the test.
         if method == "GET":
@@ -2875,6 +3062,8 @@ class ReviewFake:
             if response is not None:
                 return response
         if method == "PUT" and path == "/repos/%s/issues/12/labels" % REPO:
+            return self._put_labels(data)
+        if method == "POST" and path == "/repos/%s/issues/12/labels" % REPO:
             return self._put_labels(data)
         if method == "POST" and path == "/repos/%s/issues/12/comments" % REPO:
             return self._post_comment(data)
@@ -2898,12 +3087,23 @@ class ReviewFake:
         return mock.Mock(data={})
 
     def _get(self, path):
+        if path == "/repos/%s" % REPO:
+            return mock.Mock(data={"default_branch": "main"})
         if path.startswith("/repos/%s/issues?labels=loom:pr" % REPO):
             return mock.Mock(data=[dict(self.issue)])
         if path.startswith("/repos/%s/pulls?" % REPO):
             return mock.Mock(data=[self.pr])
         if path == "/repos/%s/pulls/7" % REPO:
             return mock.Mock(data=self.pr)
+        if path == "/repos/%s/contents/.github/workflows" % REPO:
+            return mock.Mock(data=self.workflows)
+        m = re.match(r"/repos/%s/contents/.github/workflows/(.+)$" % REPO, path)
+        if m:
+            name = m.group(1)
+            text = self.workflow_texts.get(name)
+            if text is None:
+                return mock.Mock(data=None)
+            return mock.Mock(data={"content": base64.b64encode(text.encode()).decode()})
         if path.endswith("/check-runs?per_page=100"):
             return mock.Mock(data={"check_runs": self.check_runs})
         if path.endswith("/status"):
@@ -2998,6 +3198,59 @@ class HandBackTest(unittest.TestCase):
         self.assertNotIn("Degraded review", body)
         self.assertNotIn(factory.DEFAULT_REVIEW_CHECK, body)
         self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_only_removed_guarded_path_on_named_path_moves_to_human_for_accept_removal(self):
+        # Ticket names README.md for removal
+        self.gh.issue["body"] = "## Why\nx\n\n## Acceptance criteria\n- [ ] Remove README.md\n"
+        # Review check fails only on removed-guarded-path for README.md
+        # Real Elder format includes the accept-removal line
+        sha = "a" * 40
+        review_output = (
+            "Elder markings - 1 blocking, 1 total\n\n"
+            "- `removed-guarded-path`: This PR deletes `README.md`, which removes a CI workflow. "
+            f"/grug accept-removal README.md {sha}"
+        )
+        self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK, review_output)])
+        names = [x["name"] for x in self.gh.issue["labels"]]
+        self.assertIn("loom:human", names)
+        self.assertNotIn("loom:briefed", names)
+        # No fix round was sent (no FIX_MARKER comment)
+        self.assertFalse(any(str(c.get("body") or "").startswith(tickets.FIX_MARKER)
+                             for c in self.gh.comments))
+        # Check the note contains the exact accept-removal ask with path and SHA
+        note_comment = next(c for c in self.gh.comments if "Kind: decision" in c["body"])
+        self.assertIn(f"/grug accept-removal README.md {sha}", note_comment["body"])
+
+    def test_removed_guarded_path_on_unnamed_path_still_gets_fix_round(self):
+        # Ticket does NOT name the path
+        self.gh.issue["body"] = "## Why\nx\n\n## Acceptance criteria\n- [ ] Do something else\n"
+        # Review check fails on removed-guarded-path for unnamed path
+        sha = "a" * 40
+        review_output = (
+            "Elder markings - 1 blocking, 1 total\n\n"
+            "- `removed-guarded-path`: This PR deletes `docs/old.md`, which removes a CI workflow. "
+            f"/grug accept-removal docs/old.md {sha}"
+        )
+        self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK, review_output)])
+        names = [x["name"] for x in self.gh.issue["labels"]]
+        self.assertIn("loom:briefed", names)
+        self.assertNotIn("loom:human", names)
+
+    def test_removed_guarded_path_mixed_with_other_marking_gets_fix_round(self):
+        # Ticket names README.md for removal
+        self.gh.issue["body"] = "## Why\nx\n\n## Acceptance criteria\n- [ ] Remove README.md\n"
+        # Review check fails on removed-guarded-path AND another marking
+        sha = "a" * 40
+        review_output = (
+            "Elder markings - 2 blocking, 2 total\n\n"
+            "- `removed-guarded-path`: This PR deletes `README.md`, which removes a CI workflow. "
+            f"/grug accept-removal README.md {sha}\n"
+            "- `unmet-criterion`: Paths: `a.py`"
+        )
+        self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK, review_output)])
+        names = [x["name"] for x in self.gh.issue["labels"]]
+        self.assertIn("loom:briefed", names)
+        self.assertNotIn("loom:human", names)
 
     def test_unresolved_review_bot_thread_is_sent_back(self):
         thread = {"id": "PRRT_fake", "path": "a.py", "line": 4,
@@ -3155,6 +3408,48 @@ class HandBackTest(unittest.TestCase):
         self.gh.check_runs = [{"status": "in_progress"}]
         self.run_hand_back()
         self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+    def status_says(self, phrase):
+        return any(status.is_status(c.get("body")) and phrase in str(c.get("body") or "")
+                   for c in self.gh.comments)
+
+    def test_a_pr_with_only_review_bot_checks_is_not_ready_when_repo_ci_did_not_run(self):
+        # loom#1860: a lane pull request whose head carries only the review
+        # bot's checks, in a repo with a pull-request workflow, is not ready;
+        # the status says the repo CI did not run.
+        self.gh.check_runs = [{"name": factory.DEFAULT_REVIEW_CHECK,
+                               "status": "completed", "conclusion": "success"}]
+        self.gh.workflows = [{"path": ".github/workflows/test.yml"}]
+        self.gh.workflow_texts = {"test.yml": ("on:\n  pull_request:\n  push:\n"
+                                               "    branches: [main]\njobs:\n  test:\n"
+                                               "    runs-on: ubuntu-latest\n"
+                                               "    run: python3 -m unittest\n")}
+        self.run_hand_back()
+        self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual(self.ready_events(), [])
+        self.assertTrue(self.status_says("repo CI did not run"))
+
+    def test_a_pr_whose_base_is_not_the_trunk_is_not_ready_and_names_the_base(self):
+        # loom#1860: a lane pull request whose base is not the trunk is not
+        # ready, and the status names the base.
+        self.gh.pr["base"] = {"ref": "side-branch"}
+        self.gh.check_runs = [{"name": "test", "status": "completed", "conclusion": "success"}]
+        self.gh.workflows = [{"path": ".github/workflows/test.yml"}]
+        self.gh.workflow_texts = {"test.yml": "on:\n  pull_request:\n"}
+        self.run_hand_back()
+        self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual(self.ready_events(), [])
+        self.assertTrue(self.status_says("side-branch"))
+
+    def test_a_pr_with_repo_ci_green_on_its_head_is_ready(self):
+        # loom#1860: a lane pull request with the repo's CI green on its head
+        # is ready, as before.
+        self.gh.check_runs = [{"name": "test", "status": "completed", "conclusion": "success"}]
+        self.gh.workflows = [{"path": ".github/workflows/test.yml"}]
+        self.gh.workflow_texts = {"test.yml": "on:\n  pull_request:\n"}
+        self.run_hand_back()
+        self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual(self.ready_events(), [READY % ("a" * 40)])
 
     def test_a_conflicting_green_pr_is_not_ready_and_loses_a_stale_ready(self):
         # loom#1963: hand merges moved main under a ready pull request and it
@@ -3886,10 +4181,10 @@ class CorruptStateTest(Base):
         # reconciliation's read of the open tickets (loom#784) and the
         # done-ticket close step's, the hourly read of rewritten sources, and
         # the changed label-set sync, and the hourly read of open tickets for
-        # ones with no state label (loom#1653), and the hourly label pass's
-        # reads of open issues and of closed ones still at loom:triage
-        # (loom#2024).
-        self.assertEqual(self.run_pass().requests, 15)
+        # ones with no state label (loom#1653), the hourly label pass's reads
+        # of open issues and of closed ones still at loom:triage (loom#2024),
+        # and the hourly read of the repo's roll record declaration (loom#2025).
+        self.assertEqual(self.run_pass().requests, 16)
 
 
 class TicketsTest(unittest.TestCase):
@@ -4203,6 +4498,31 @@ class ClaimTest(Base):
         self.assertIn("loom:running", self.fake.names(12))
         self.assertFalse([n for n in self.fake.names(12) if n.startswith("wait:")])
         self.assertEqual(self.fake.paths("PUT"), ["/repos/%s/issues/12/labels" % REPO])
+
+    def claimed_brief(self, body):
+        self.fake.add(12, body=body)
+        self.run_pass()
+        name = "example-owner.example-repo-12"
+        self.assertEqual(self.listing(), [name + ".md"])
+        with open(self.inbox("codex", name + ".md")) as fh:
+            return fh.read()
+
+    def test_a_brief_for_a_ticket_that_reads_stored_rows_names_the_fixture_source(self):
+        # loom#1860: a lane built its fixture rows by hand with an ended reason
+        # the live writer never writes; a ticket whose criteria read stored
+        # rows tells the lane where fixture rows come from.
+        text = self.claimed_brief(
+            "Difficulty: medium\n\n## Why\nTest\n\n## What\nDo it\n\n"
+            "## Acceptance criteria\n- [ ] A test: the report reads each run row "
+            "from the runs table.\n")
+        self.assertIn(tickets.FIXTURE_NOTE, text)
+        self.assertNotIn("Fixture-Source", text)
+
+    def test_a_brief_for_a_ticket_that_reads_no_rows_has_no_fixture_line(self):
+        text = self.claimed_brief(
+            "Difficulty: medium\n\n## Why\nTest\n\n## What\nDo it\n\n"
+            "## Acceptance criteria\n- [ ] A test: the status line names the base.\n")
+        self.assertNotIn(tickets.FIXTURE_NOTE, text)
 
     def test_a_limit_on_another_model_or_one_that_lifted_does_not_hold_the_claim(self):
         self.heartbeat("codex", limited_models={"model-y": int(time.time()) + 3600,
@@ -9690,13 +10010,29 @@ class TranscriptUploadTest(Base):
         self.assertEqual(self.sent, [])
 
     def test_the_pass_runs_with_the_station(self):
+        # The pass also reads the bench list and the handoff packet from the
+        # dashboard. transcript_url here is a fake host, so a Station built
+        # without fetch= would dial it for real (loom#2010): inject a fake
+        # fetch, and trip if the real brain_memory.fetch_handoff is reached.
+        fetched = []
+
+        def fetch(url, token):
+            fetched.append(url)
+            return {}
+
+        def tripwire(url, token):
+            raise AssertionError("the pass reached the real dashboard fetch")
         self.go()
         self.finish(lane="codex")
         gh = GitHub("token", transport=self.fake)
-        st = station.Station(gh, self.settings, read_secret=self.read_secret, upload=self.upload)
-        with contextlib.redirect_stderr(io.StringIO()):
-            st.run_pass()
+        with mock.patch.object(station.brain_memory, "fetch_handoff", tripwire):
+            st = station.Station(gh, self.settings, read_secret=self.read_secret,
+                                 upload=self.upload, fetch=fetch)
+            with contextlib.redirect_stderr(io.StringIO()):
+                st.run_pass()
         self.assertEqual([b["slot"] for _, _, b in self.sent], ["codex"])
+        self.assertTrue(fetched)
+        self.assertTrue(all(u.startswith("https://dashboard.example.com/") for u in fetched))
 
     def test_settings_come_from_the_environment(self):
         s = station.Settings.from_env({"LOOM_TRANSCRIPT_URL": " %s " % UPLOAD_URL,

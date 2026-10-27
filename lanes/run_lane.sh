@@ -210,19 +210,24 @@ drop_build_output() {
 # a stamp left by a runner killed hard goes stale after the station's window.
 # The stamp is no heartbeat: it says nothing of availability, so a busy lane
 # is not offered more work and no limit or hold is hidden.
+# The loop sleeps through `wait` so a TERM ends it at once, and the runner
+# waits for it to exit before removing the stamp: a loop still mid-write
+# after the remove left the stamp behind.
 ALIVE="$LOOM_HOME/state/usage/$SLOT.alive"
 KEEPALIVE_PID=""
 keepalive_loop() {
-  local parent="$1" every="${LOOM_KEEPALIVE_SECONDS:-60}" tmp="$ALIVE.$1"
+  local parent="$1" every="${LOOM_KEEPALIVE_SECONDS:-60}" tmp="$ALIVE.$1" sleeper=""
   [[ "$every" =~ ^[1-9][0-9]*$ ]] || every=60
+  trap '[ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null; rm -f "$tmp"; exit 0' TERM
   while kill -0 "$parent" 2>/dev/null; do
     date +%s > "$tmp" 2>/dev/null && mv -f "$tmp" "$ALIVE" 2>/dev/null
-    sleep "$every"
+    sleep "$every" & sleeper=$!
+    wait "$sleeper"
   done
   rm -f "$tmp"
 }
 stop_keepalive() {
-  [ -z "$KEEPALIVE_PID" ] || { pkill -P "$KEEPALIVE_PID" 2>/dev/null; kill "$KEEPALIVE_PID" 2>/dev/null; }
+  [ -z "$KEEPALIVE_PID" ] || { kill "$KEEPALIVE_PID" 2>/dev/null; wait "$KEEPALIVE_PID" 2>/dev/null; }
   rm -f "$ALIVE"
 }
 mkdir -p "$LOOM_HOME/state/usage"
