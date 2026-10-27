@@ -569,6 +569,7 @@ VERIFY_RESERVE_FILE = "verify-reserve.json"
 # start, the remaining steps wait for the next pass (STEP_ROTATION_FILE keeps
 # where it stopped). On 2026-10-24 every pass ran 25 to 40 minutes.
 PASS_STEP_BUDGET = 300
+MAX_CAPTURE_LINES = 100000
 STEP_ROTATION_FILE = "step-rotation.json"
 # A pass step that takes this long is logged with its time and requests, so a
 # long pass names its cause: on 2026-10-24 passes ran 25 to 98 minutes and
@@ -4438,18 +4439,27 @@ class Station:
                 continue
             path = os.path.join(self.s.home, "logs", "capture", name + ".log")
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            existing = Path(path).read_text(encoding="utf-8") if os.path.exists(path) else ""
+            try:
+                existing = Path(path).read_text(encoding="utf-8") if os.path.exists(path) else ""
+            except OSError as err:
+                _say("could not read capture for %s: %s" % (name, err))
+                continue
             previous = [evidence.line_time(line) for line in existing.splitlines()]
             previous = [stamp for stamp in previous if stamp is not None]
             since = max(previous) if previous else self.now - 48 * 3600
-            result = subprocess.run(
+            try:
+                result = subprocess.run(
                     ["kubectl", "-n", spec["namespace"], "logs", "-l", spec["selector"],
                      "--all-containers=true", "--timestamps=true",
                      "--since-time=" + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))],
                     check=True, capture_output=True, text=True, timeout=120)
-            seen = set(existing.splitlines())
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
+                _say("could not capture log for %s: %s" % (name, type(err).__name__))
+                continue
+            recent = existing.splitlines()[-MAX_CAPTURE_LINES:]
+            seen = set(recent)
             added = [line for line in result.stdout.splitlines() if line not in seen]
-            lines = existing.splitlines() + added
+            lines = recent + added
             first_new = next((evidence.line_time(line) for line in added
                               if evidence.line_time(line) is not None), None)
             if previous and first_new is not None and first_new - since > 3600:
@@ -4460,7 +4470,9 @@ class Station:
             cutoff = self.now - self.s.log_capture_retention_hours * 3600
             kept = [line for line in lines if evidence.line_time(line) is None or
                     evidence.line_time(line) >= cutoff]
-            Path(path).write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+            temp = path + ".tmp"
+            Path(temp).write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+            os.replace(temp, path)
             if kept:
                 _say("log capture: %s holds %s" % (name, kept[0].split(" ", 1)[0]))
 
