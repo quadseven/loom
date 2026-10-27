@@ -1553,14 +1553,19 @@ class LeakScanText(Base):
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
         self.assertEqual(self.pr_edits(), [])
 
-    def test_a_second_failure_on_the_same_head_is_not_edited_again(self):
+    def test_a_repeated_text_failure_is_held_for_the_brain_with_its_location(self):
         self.leaky(BODY_ONLY)
         self.go()
         self.assertEqual(len(self.pr_edits()), 1)
         self.gh.pulls[50]["body"] = LEAK_BODY
         self.go()
         self.assertEqual(len(self.pr_edits()), 1)
-        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.fixed, [])
+        self.assertIn("needs-brain", factory._labels(self.gh.issues[5]))
+        notes = [c["body"] for c in self.gh.comments[5]
+                 if factory.BODY_LEAK_HOLD_MARKER % "sha50" in c["body"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("line 4 (private-issue-ref)", notes[0])
 
     def test_another_failing_check_goes_back_to_the_lane(self):
         self.leaky(BODY_ONLY)
