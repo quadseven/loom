@@ -350,6 +350,9 @@ done
 # default 7, 0 forever; and the free disk under which the station claims no
 # new work, default 15 GB, the older name LOOM_DISK_FREE_MIN_GB still read,
 # docs/LANES.md Disk), and
+# LOOM_PASS_DEADLINE (seconds a station pass may run before it writes its
+# stack to the station log and exits, default 3600, 0 off, docs/LANES.md
+# Pass deadline), and
 # LOOM_INVARIANT_GOAL and LOOM_PLAN_CHECK (the goal home invariant breaches
 # are filed on, and the review bot's plan check, docs/LANES.md Invariants), and
 # LOOM_NO_TOPUP (provider lanes whose credit is never topped up: their slots
@@ -411,6 +414,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_SHIP_WORKFLOWS</key><string>$(xml "${LOOM_SHIP_WORKFLOWS:-}")</string>
     <key>LOOM_SHIP_PATH_WORKFLOWS</key><string>$(xml "${LOOM_SHIP_PATH_WORKFLOWS:-}")</string>
     <key>LOOM_LOG_KEEP_DAYS</key><string>$(xml "${LOOM_LOG_KEEP_DAYS:-}")</string>
+    <key>LOOM_PASS_DEADLINE</key><string>$(xml "${LOOM_PASS_DEADLINE:-}")</string>
     <key>LOOM_MIN_FREE_GB</key><string>$(xml "${LOOM_MIN_FREE_GB:-${LOOM_DISK_FREE_MIN_GB:-}}")</string>
     <key>LOOM_SETTLE_CLAIMED</key><string>$(xml "${LOOM_SETTLE_CLAIMED:-}")</string>
     <key>LOOM_SETTLE_CLAIMED_MAX</key><string>$(xml "${LOOM_SETTLE_CLAIMED_MAX:-}")</string>
