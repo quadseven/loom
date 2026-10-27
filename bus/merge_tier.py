@@ -104,6 +104,7 @@ _OWNER_REPO_RE = re.compile(r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9.
 # asking for a change there.
 _CITATION_RE = re.compile(r"^\s*(?:Refs?|Part of|Rewritten from|Follows|See|Source)\b.*$",
                           re.I | re.M)
+_BASE_RE = re.compile(r"^\s*Base\s*:.*$", re.I | re.M)
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 
 # The review bot opens each finding with "<symbol> <severity> | _<category>_ |
@@ -186,7 +187,7 @@ def other_repos(repo: str, ticket_body: str, default_branch: Optional[str] = Non
     """Other repos of the same owner the ticket's own words name (citation
     lines and HTML comments aside)."""
     owner, _, name = repo.partition("/")
-    text = _CITATION_RE.sub("", _COMMENT_RE.sub("", ticket_body or ""))
+    text = _BASE_RE.sub("", _CITATION_RE.sub("", _COMMENT_RE.sub("", ticket_body or "")))
     found = []
     for who, what in _OWNER_REPO_RE.findall(text):
         what = what.rstrip(".")

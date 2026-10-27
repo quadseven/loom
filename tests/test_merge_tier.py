@@ -114,22 +114,16 @@ class Tiers(unittest.TestCase):
         self.assertEqual(merge_tier.classify(REPO, entries(APP_CHANGE),
                                              cite)[0], merge_tier.APP_CODE)
 
-    def test_a_ticket_naming_default_branch_does_not_classify_cross_repo(self):
-        # Test case for T1926: when repo has default branch "owner/name", a ticket
-        # naming that branch as "Base: owner/name" should NOT be treated as cross-repo.
-        # Example: mod-dungeon-clear has default branch quadseven/prod, but quadseven/prod
-        # is not a separate repo, it's just the default branch name.
-        ticket = "## What\nAlso change this\n\nBase: quadseven/prod\n"
-        got, why = merge_tier.classify("quadseven/mod-dungeon-clear", entries(APP_CHANGE), ticket)
+    def test_a_base_branch_name_does_not_classify_cross_repo(self):
+        ticket = "## What\nUpdate the example.\n\nBase: quadseven/prod\n"
+        got, _ = merge_tier.classify("quadseven/example", entries(("app.py",)), ticket)
         self.assertEqual(got, merge_tier.APP_CODE)
-        self.assertNotIn("another repo", why)
 
     def test_a_ticket_naming_different_repo_classifies_cross_repo(self):
-        # Test that a real cross-repo reference still works.
-        ticket = "## What\nAlso change example-owner/other-repo's deploy to match.\n\n"
-        got, why = merge_tier.classify(REPO, entries(APP_CHANGE), ticket)
+        ticket = "## What\nAlso update quadseven/other to match.\n\n"
+        got, why = merge_tier.classify("quadseven/example", entries(("app.py",)), ticket)
         self.assertEqual((got, why), (merge_tier.CROSS_REPO,
-                                      "its ticket names another repo (example-owner/other-repo)"))
+                                      "its ticket names another repo (quadseven/other)"))
 
     def test_a_test_or_doc_named_deploy_file_is_never_low_risk(self):
         # Security review: docs and tests were matched before deploy rules.
