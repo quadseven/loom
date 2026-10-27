@@ -95,31 +95,41 @@ def parent_mismatch(issue: Dict[str, Any]) -> str:
             % (said.group(1), linked.group(1)))
 
 
+def _state_removals(names: List[str], events: Optional[Iterable[Any]],
+                    station: Iterable[str]) -> List[Removal]:
+    """Every state label but the newest the station set."""
+    states = [n for n in names if n in STATE_LABELS]
+    if len(states) < 2:
+        return []
+    kept = newest_state(states, events or [], station)
+    return [Removal(n, "%s is the newest state label" % kept) for n in states if n != kept]
+
+
+def _held_removals(issue: Dict[str, Any], names: List[str]) -> List[Removal]:
+    """needs-brain once a person holds the issue; loom:triage once it is a
+    ticket or closed."""
+    found: List[Removal] = []
+    holder = next((n for n in names if n == HUMAN or NEEDS_LOGIN_RE.match(n)), "")
+    if NEEDS_BRAIN in names and holder:
+        found.append(Removal(NEEDS_BRAIN, "%s says a person holds it" % holder))
+    if TRIAGE in names and TICKET in names:
+        found.append(Removal(TRIAGE, "it is a loom:ticket"))
+    elif TRIAGE in names and str(issue.get("state") or "open") == "closed":
+        found.append(Removal(TRIAGE, "it is closed"))
+    return found
+
+
 def plan(issue: Dict[str, Any], events: Optional[Iterable[Any]] = None,
          station: Iterable[str] = ()) -> Plan:
     """The labels to remove from `issue` and its health note. `events` (the
     issue's events, oldest first) is read only when it carries two or more
     state labels; pass them then."""
     names = names_of(issue)
-    remove: List[Removal] = []
-    states = [n for n in names if n in STATE_LABELS]
-    kept_state = ""
-    if len(states) > 1:
-        kept_state = newest_state(states, events or [], station)
-        remove += [Removal(n, "%s is the newest state label" % kept_state)
-                   for n in states if n != kept_state]
-    elif states:
-        kept_state = states[0]
-    if NEEDS_BRAIN in names:
-        holder = next((n for n in names if n == HUMAN or NEEDS_LOGIN_RE.match(n)), "")
-        if holder:
-            remove.append(Removal(NEEDS_BRAIN, "%s says a person holds it" % holder))
-    if TRIAGE in names:
-        if TICKET in names:
-            remove.append(Removal(TRIAGE, "it is a loom:ticket"))
-        elif str(issue.get("state") or "open") == "closed":
-            remove.append(Removal(TRIAGE, "it is closed"))
-    if kept_state == ANSWERED:
+    remove = _state_removals(names, events, station)
+    gone = {r.label for r in remove}
+    left = [n for n in names if n in STATE_LABELS and n not in gone]
+    remove += _held_removals(issue, names)
+    if left == [ANSWERED]:
         remove += [Removal(n, "its lane answered no change") for n in names
                    if n.startswith(LANE_PREFIX)]
     return Plan(remove, parent_mismatch(issue))
