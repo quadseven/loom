@@ -69,6 +69,9 @@ class FakeGitHub:
             return type("Response", (), {"data": {"number": 9, "html_url": "https://example.com/pr/9"}})()
         return type("Response", (), {"data": {}})()
 
+    def app_login(self):
+        return APP
+
     def paginate(self, path):
         names = [x["name"] for x in self.issues[4]["labels"]]
         if "issues?state=open&labels=loom:queued" in path:
@@ -241,6 +244,50 @@ class RemoteLaneTests(unittest.TestCase):
 
     def test_the_lane_heartbeat_edits_one_comment(self):
         gh = FakeGitHub()
+        lane.lane_heartbeat(gh, "example/project", now=1000)
+        lane.lane_heartbeat(gh, "example/project", now=2000)
+        self.assertEqual(len(gh.comments[9]), 1)
+        self.assertIn(" 2000.000 ", gh.comments[9][0]["body"])
+
+    def test_the_lane_heartbeat_edits_its_comment_when_the_env_never_named_its_app(self):
+        # loom#2008: a lane launched without LOOM_BRIEF_AUTHORS naming its
+        # App login posted a fresh status comment every tick (58 duplicates
+        # in 7 hours, each emailed to the status issue's author). The lane's
+        # own comments count as its own, whoever the environment named.
+        gh = FakeGitHub()
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "operator-example"}):
+            lane.lane_heartbeat(gh, "example/project", now=1000)
+            lane.lane_heartbeat(gh, "example/project", now=2000)
+        self.assertEqual(len(gh.comments[9]), 1)
+        self.assertIn(" 2000.000 ", gh.comments[9][0]["body"])
+
+    def test_heartbeats_edit_the_claim_when_the_env_never_named_its_app(self):
+        # loom#2008, the claim path: same environment, a held ticket's beats
+        # edit the one claim comment instead of posting one per beat.
+        gh = FakeGitHub()
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "operator-example"}):
+            lane.claim(gh, ["example/project"], now=1000)
+            for at in (1500, 2000):
+                lane.heartbeat(gh, "example/project", 4, now=at)
+        self.assertEqual(len(gh.comments[4]), 1)
+        self.assertEqual(lane._claims(gh.comments[4], "muse"), [(0, 2000.0, 1000.0)])
+
+    def test_the_lane_heartbeat_edits_its_comment_when_the_env_is_unset(self):
+        # loom#2008 with LOOM_BRIEF_AUTHORS absent entirely, not just
+        # missing the App login.
+        gh = FakeGitHub()
+        with mock.patch.dict(os.environ):
+            os.environ.pop("LOOM_BRIEF_AUTHORS", None)
+            lane.lane_heartbeat(gh, "example/project", now=1000)
+            lane.lane_heartbeat(gh, "example/project", now=2000)
+        self.assertEqual(len(gh.comments[9]), 1)
+        self.assertIn(" 2000.000 ", gh.comments[9][0]["body"])
+
+    def test_a_failed_app_login_read_falls_back_to_the_env_authors(self):
+        # GitHub.app_login raises GitHubError when GET /app fails; the beat
+        # still lands on the env-trusted comment instead of crashing.
+        gh = FakeGitHub()
+        gh.app_login = mock.Mock(side_effect=lane.GitHubError("no app"))
         lane.lane_heartbeat(gh, "example/project", now=1000)
         lane.lane_heartbeat(gh, "example/project", now=2000)
         self.assertEqual(len(gh.comments[9]), 1)
