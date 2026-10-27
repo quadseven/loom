@@ -97,6 +97,10 @@ class FakeGitHub:
         # every other search finds one file.
         self.code_absent = set()
         self.code_searches = []
+        # The default branch's files the code search index skips (over
+        # 384 KB): path -> text, read through the git trees and blobs API.
+        self.big_files = {}
+        self.tree_status = 200
 
     def add_foreign(self, repo, number, labels=("loom:pr",), state="open", reason=None):
         """An issue in another repo, as an After: line that names one reads it."""
@@ -255,6 +259,20 @@ class FakeGitHub:
         if method == "GET" and files:
             return reply(200, self.pull_files.get(int(files.group(1)), []))
         if method == "GET" and rest == "git/ref/heads/loom-lock/brain":
+            return reply(404, {"message": "Not Found"})
+        if method == "GET" and rest == "git/trees/HEAD" and parts.query == "recursive=1":
+            if self.tree_status != 200:
+                return reply(self.tree_status, {"message": "refused"})
+            tree = [{"path": "src/app.py", "type": "blob", "sha": "a" * 40, "size": 2000}]
+            tree += [{"path": name, "type": "blob", "sha": hashlib.sha1(name.encode()).hexdigest(),
+                      "size": 640000} for name in self.big_files]
+            return reply(200, {"tree": tree, "truncated": False})
+        blob = re.match(r"git/blobs/([0-9a-f]{40})$", rest)
+        if method == "GET" and blob:
+            for name, text in self.big_files.items():
+                if hashlib.sha1(name.encode()).hexdigest() == blob.group(1):
+                    return reply(200, {"encoding": "base64", "content": base64.b64encode(
+                        text.encode()).decode()})
             return reply(404, {"message": "Not Found"})
         raise AssertionError("unexpected call %s %s" % (method, path))
 
@@ -10582,6 +10600,52 @@ class VerifyDispatchTest(Base):
         self.unmeetable_pass()
         self.assertEqual(len(self.fake.comments[2]), 1)
         self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+
+    def test_a_log_string_only_a_file_too_big_for_code_search_prints_is_verified(self):
+        # loom#2050: GitHub's code search skips files over 384 KB, so a
+        # string printed only from such a file (the station's own
+        # "trusting briefing logins") searched as absent and was flagged.
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"trusting briefing logins"}
+        self.fake.big_files = {"bus/big.py": 'x = 1\n_say("trusting briefing logins: %s" % who)\n'}
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "`daily status ready`", "`trusting briefing logins`")
+        self.run_pass()
+        self.assertIn("trusting briefing logins", self.fake.code_searches)
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_quoted_log_line_with_filled_in_values_matches_its_template(self):
+        # loom#2050: a box quoting the line as printed ("claimed
+        # example-owner/loom#528 for lane") is matched against the source
+        # template ("claimed %s for lane"), not searched literally.
+        self.fake.issues.pop(1)
+        quoted = "claimed example-owner/loom#528 for lane at 1a2b3c4d"  # leak-guard-allow: fictional example repos
+        self.fake.code_absent = {quoted, "for lane at"}
+        self.fake.big_files = {"bus/big.py": '_say("claimed %s for lane at %s" % (ref, sha))\n'}
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "`daily status ready`", "`%s`" % quoted)
+        self.run_pass()
+        self.assertNotIn(quoted, self.fake.code_searches)
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_log_string_neither_the_search_nor_the_big_files_hold_is_flagged(self):
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.fake.big_files = {"bus/big.py": '_say("daily status is ready")\n'}
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertIn("`daily status ready`", self.fake.comments[2][0]["body"])
+
+    def test_a_search_zero_with_an_unreadable_tree_flags_nothing(self):
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.fake.tree_status = 502
+        self.run_pass()
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
 
     def test_a_lost_state_file_does_not_ask_twice_for_the_same_box(self):
         self.fake.issues.pop(1)

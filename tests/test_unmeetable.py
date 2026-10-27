@@ -12,8 +12,8 @@ def states(table):
 
 
 def tree(*held):
-    """A present() over a source tree holding these strings."""
-    return lambda text: any(text in line for line in held)
+    """A present() over a source tree holding these lines."""
+    return lambda term: unmeetable.holds(term, held)
 
 
 class ClosedReferenceTest(unittest.TestCase):
@@ -38,6 +38,23 @@ class ClosedReferenceTest(unittest.TestCase):
         found = unmeetable.closed_refs(live, REPO, 1, states({
             (REPO, 10): ("open", False), (REPO, 11): ("closed", True)}))
         self.assertEqual(found, [])
+
+    def test_a_closed_reference_worded_as_history_is_not_waited_on(self):
+        table = {(REPO, 40): ("closed", False), (REPO, 41): ("closed", False),
+                 (REPO, 42): ("closed", False), (REPO, 43): ("closed", False)}
+        for live in ("Live: the crash fixed in #40 no longer shows; the log prints `ok now here`",
+                     "Live: after #41 merged, the log prints `ok now here`",
+                     "Live: since #42 was closed the log prints `ok now here`",
+                     "Live: the bug resolved by #43 stays gone and the log prints `ok now`"):
+            self.assertEqual(unmeetable.closed_refs(live, REPO, 1, states(table)), [], live)
+
+    def test_a_closed_reference_still_waited_on_is_flagged(self):
+        table = {(REPO, 40): ("closed", False)}
+        for live in ("Live: once #40 is verified, the log prints `ok now here`",
+                     "Live: after #40 merges the log prints `ok now here`",
+                     "Live: fixed in #40; then #40 is checked and the log prints `ok now`"):
+            self.assertEqual(unmeetable.closed_refs(live, REPO, 1, states(table)),
+                             ["%s#40" % REPO], live)
 
     def test_the_ticket_itself_and_a_url_reference(self):
         live = ("Live: #7 is shown and https://github.com/other-owner/thing/issues/3 "
@@ -73,8 +90,30 @@ class LogStringTest(unittest.TestCase):
     def test_a_template_is_searched_by_its_longest_fixed_part(self):
         seen = []
         unmeetable.missing_strings("Live: the log prints `sync: ... (waiting for peers)`",
-                                   lambda text: seen.append(text) or True)
+                                   lambda term: seen.append(term.literal) or True)
         self.assertEqual(seen, ["(waiting for peers)"])
+
+    def test_filled_in_values_match_the_source_template(self):
+        # loom#2050: the box quotes the line as printed; the source holds a
+        # placeholder where the values go.
+        live = ("Live: the station log shows `claimed example-owner/loom#528 for lane` "  # leak-guard-allow: fictional example repos
+                "and `merged 1a2b3c4 after 3 tries`")
+        self.assertEqual(unmeetable.missing_strings(live, tree(
+            '_say("claimed %s for lane" % ticket)',
+            'log.info("merged {} after {} tries".format(sha, n))')), [])
+        self.assertEqual(unmeetable.missing_strings(live, tree('_say("claimed it")')),
+                         ["claimed example-owner/loom#528 for lane",  # leak-guard-allow: fictional example repos
+                          "merged 1a2b3c4 after 3 tries"])
+
+    def test_a_search_is_by_the_longest_fixed_part_around_filled_in_values(self):
+        seen = []
+        unmeetable.missing_strings("Live: the log prints `claimed #528 for lane now`",
+                                   lambda term: seen.append(term.literal) or True)
+        self.assertEqual(seen, ["for lane now"])
+
+    def test_filled_in_values_that_leave_too_little_flag_nothing(self):
+        self.assertEqual(unmeetable.missing_strings(
+            "Live: the log prints `took 12 ms`", tree()), [])
 
 
 class AskTest(unittest.TestCase):
