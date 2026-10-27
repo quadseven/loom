@@ -25,11 +25,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
+from bus import urgency  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
 from bus import labels as labels_module  # noqa: E402
-from bus.github import AppToken, GitHub, GitHubError  # noqa: E402
+from bus.github import AppToken, GitHub, GitHubError, TargetReached  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 REPO = "example-owner/example-repo"
@@ -205,6 +206,10 @@ class FakeGitHub:
         data = json.loads(body) if body else None
         if method == "POST" and parts.path == "/graphql":
             return self._graphql(data)
+        if method == "GET" and parts.path == "/search/issues":
+            # The epic shape's Part of search (loom#2023): no issue here is
+            # linked to an epic by its Part of line alone.
+            return reply(200, {"items": []})
         if method == "GET" and parts.path == "/repos/%s" % REPO:
             return reply(200, {"full_name": REPO, "private": self.private,
                                "default_branch": "main"})
@@ -249,7 +254,7 @@ class FakeGitHub:
             return reply(200, getattr(self, "timelines", {}).get(int(tl.group(1)), []))
         m = re.match(r"issues/(\d+)(?:/(\w+))?$", rest)
         if m:
-            return self._issue_call(method, int(m.group(1)), m.group(2), data)
+            return self._issue_call(method, int(m.group(1)), m.group(2), data, parts.query)
         if method == "POST" and rest == "labels":
             self.made_labels = getattr(self, "made_labels", []) + [data["name"]]
             return reply(201, data)
@@ -439,14 +444,31 @@ class FakeGitHub:
         self.version += 1
         return reply(201 if method == "POST" else 200, [])
 
-    def _get_issue(self, n, sub):
+    def _get_issue(self, n, sub, query=""):
         if sub == "sub_issues":
             return reply(200, self.sub_issues.get(n, []))
         found = {None: self.issues, "events": self.events, "comments": self.comments}
         if sub in found:
             if sub is None and n not in found[sub]:
                 return reply(404, {"message": "Not Found"})
-            return reply(200, found[sub][n])
+            items = found[sub].get(n, [])
+            if sub in ("events", "comments") and isinstance(items, list):
+                page_match = re.search(r"(?:^|&)page=(\d+)", query)
+                page = int(page_match.group(1)) if page_match else 1
+                per_page_match = re.search(r"(?:^|&)per_page=(\d+)", query)
+                per_page = int(per_page_match.group(1)) if per_page_match else 100
+                if len(items) > per_page:
+                    start = (page - 1) * per_page
+                    end = start + per_page
+                    page_items = items[start:end]
+                    headers = {}
+                    if end < len(items):
+                        clean_query = re.sub(r"(?:^|&)page=\d+", "", query).strip("&")
+                        nxt_query = clean_query + ("&" if clean_query else "") + ("page=%d" % (page + 1))
+                        headers["Link"] = "<https://api.github.com/repos/%s/issues/%d/%s?%s>; rel=\"next\"" % (
+                            REPO, n, sub, nxt_query)
+                    return reply(200, page_items, headers)
+            return reply(200, items)
         return None
 
     def _patch_issue(self, n, data):
@@ -455,9 +477,9 @@ class FakeGitHub:
                 self.issues[n][key] = data[key]
         return reply(200, {})
 
-    def _issue_call(self, method, n, sub, data):
+    def _issue_call(self, method, n, sub, data, query=""):
         if method == "GET":
-            result = self._get_issue(n, sub)
+            result = self._get_issue(n, sub, query)
             if result is not None:
                 return result
         if method == "POST" and sub == "comments":
@@ -816,10 +838,25 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("Third works.", note)
         self.assertNotIn("First works", note)
 
-    def test_a_criterion_marked_not_built_with_a_reason_counts_as_answered(self):
+    def test_a_criterion_marked_not_built_is_left_unbuilt(self):
+        # loom#2026: "not built: <reason>" answers the lane's gate, but the
+        # box is still unbuilt, so the merge sends the ticket back for it.
         self.merged_with("- [x] First works; test.\n- [ ] Second works.; not built: needs a key\n"
                          "- [x] Third works.\n")
-        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        note = [c["body"] for c in status.expand(self.fake.comments[12], AUTHORS)][0]
+        self.assertIn("Second works.", note)
+        self.assertNotIn("Third works", note)
+
+    def test_a_merge_that_builds_one_box_names_the_rest_and_not_the_built_one(self):
+        self.merged_with("- [ ] First works; test.; not built: needs a key\n"
+                         "- [x] `Second`   works\n- [ ] Third works.; not built: needs a key\n")
+        self.assertIn("loom:queued", self.fake.names(12))
+        note = [c["body"] for c in status.expand(self.fake.comments[12], AUTHORS)][0]
+        self.assertIn("First works; test.", note)
+        self.assertIn("Third works.", note)
+        self.assertNotIn("Second works", note)
 
     def test_a_pr_merged_before_the_requeue_does_not_requeue_the_ticket_again(self):
         self.merged_with("- [x] First works; test.\n")
@@ -2199,6 +2236,33 @@ class BudgetTest(Base):
     def gets(self, fragment):
         return [p for p in self.fake.paths("GET") if fragment in p]
 
+    def test_paginate_raises_instead_of_returning_a_partial_list_at_target(self):
+        self.fake.events[12] = [{"id": i} for i in range(250)]
+        gh = GitHub("token", transport=self.fake, target=1)
+
+        with self.assertRaises(TargetReached):
+            gh.paginate("/repos/%s/issues/12/events" % REPO)
+
+    def test_the_target_check_reads_the_count_under_the_count_lock(self):
+        # brain.status reads on several threads: the check and the
+        # carry-over count must see one snapshot of requests and 304s.
+        seen = []
+
+        class Watched(GitHub):
+            @property
+            def counted(self):
+                seen.append(self._count_lock.locked())
+                return GitHub.counted.fget(self)
+
+        self.fake.events[12] = [{"id": i} for i in range(250)]
+        gh = Watched("token", transport=self.fake, target=1)
+
+        with self.assertRaises(TargetReached):
+            gh.paginate("/repos/%s/issues/12/events" % REPO)
+        self.assertTrue(seen)
+        self.assertTrue(all(seen), seen)
+        self.assertEqual(gh.carried_over, {"events": 1})
+
     def test_a_repeated_list_read_sends_the_etag_and_a_304_is_unchanged(self):
         self.fake.add(12, state="pr")
         sent = []
@@ -2338,6 +2402,53 @@ class BudgetTest(Base):
             self.passes(now=start + 60 * n)
         self.assertEqual(len(self.gets("loom:briefed")), 3)
         self.assertEqual(len(self.gets("loom:pr")), 6)
+
+    def test_a_station_pass_stops_deferrable_reads_at_target_and_next_pass_reads_the_rest(self):
+        self.heartbeat("claude")
+        self.fake.add(12, lane="codex", state="briefed")
+        self.fake.events[12] = [
+            labeled("lane:codex", "bob-example"), labeled("loom:briefed", "alice-example")
+        ] + [labeled("lane:codex", "bob-example") for _ in range(30000)]
+        self.fake.comments[12] = [
+            {"id": i, "body": "comment %d" % i, "user": {"login": "alice-example"}}
+            for i in range(30000)
+        ]
+        self.fake.add(13, lane="claude", state="briefed")
+        self.fake.events[13] = [
+            labeled("lane:claude", "bob-example"), labeled("loom:briefed", "alice-example")
+        ] + [labeled("lane:claude", "bob-example") for _ in range(5000)]
+        self.fake.comments[13] = [
+            {"id": i, "body": "comment %d" % i, "user": {"login": "alice-example"}}
+            for i in range(5000)
+        ]
+        gh1, err1 = self.passes()
+        writes1 = gh1.kinds.get("writes", 0)
+        self.assertLessEqual(gh1.counted, station.PASS_REQUEST_TARGET + writes1)
+        self.assertIn("carried over", err1)
+        self.assertRegex(err1, r"carried over.*comments")
+        self.assertRegex(err1, r"carried over.*events")
+        ticket_reads_path = os.path.join(self.home, "state", "station", "ticket_reads.json")
+        st_reads1 = station._read_json(ticket_reads_path, {}, strict=False)
+        self.assertNotIn("%s#12/comments" % REPO, st_reads1)
+        self.assertNotIn("%s#13/events" % REPO, st_reads1)
+        gh2 = GitHub("token", transport=self.fake, target=100000)
+        gh2, err2 = self.passes(gh=gh2)
+        self.assertNotIn("carried over", err2)
+        self.assertGreater(gh2.kinds.get("comments", 0), 100)
+        self.assertGreater(gh2.kinds.get("events", 0), 50)
+
+    def test_a_pass_log_line_names_the_reads_carried_over_when_target_reached(self):
+        self.fake.add(12, state="briefed")
+        self.fake.events[12] = [labeled("l%d" % i, "alice-example") for i in range(1500)]
+        self.fake.comments[12] = [
+            {"id": i, "body": "c%d" % i, "user": {"login": "alice-example"}}
+            for i in range(1500)
+        ]
+        gh = GitHub("token", transport=self.fake, target=10)
+        gh, err = self.passes(gh=gh)
+        self.assertIn("target 10 counted", err)
+        self.assertIn("carried over", err)
+        self.assertRegex(err, r"carried over.*(comments|events)")
 
 
 READY_BODY = ("## Why\nThe page query is slow for every visitor.\n## What\nwhat\n"
@@ -3078,6 +3189,24 @@ class HandBackTest(unittest.TestCase):
         self.run_hand_back()
         self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
 
+    def test_a_conflicting_green_pr_is_not_ready_and_loses_a_stale_ready(self):
+        # loom#1963: hand merges moved main under a ready pull request and it
+        # conflicted; the station kept loom:ready on it, so status read READY.
+        self.run_hand_back()
+        self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.gh.pr["mergeable"] = False
+        self.run_hand_back()
+        self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertNotIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual([c for c in self.gh.comments
+                          if str(c["body"]).startswith(tickets.FIX_MARKER)], [])
+
+    def test_a_conflicting_green_pr_is_never_marked_ready(self):
+        self.gh.pr["mergeable"] = False
+        self.run_hand_back()
+        self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual(self.ready_events(), [])
+
     def test_each_new_clean_head_is_one_event_in_the_one_status_comment(self):
         self.run_hand_back()
         self.run_hand_back()
@@ -3143,10 +3272,12 @@ class StuckFixRoundTest(unittest.TestCase):
     (2026-10-26: four rounds of one ticket on a local model, each "done",
     each leaving the same two checks failing and the same finding open)."""
 
+    fake = LadderReviewFake
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.gh = LadderReviewFake()
+        self.gh = self.fake()
         self.gh.issue["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
                                    {"name": "lane:spark"}]
         self.station = station.Station(self.gh, station.Settings(self.temp.name, [REPO],
@@ -3236,6 +3367,89 @@ class StuckFixRoundTest(unittest.TestCase):
                   if str(c["body"]).startswith("The station stopped the fix rounds")]
         self.assertIn("check pytest", note)
         self.assertIn("no rung of the model ladder is left", note)
+
+
+class FlakyLadderFake(LadderReviewFake):
+    """LadderReviewFake whose head has an Actions job and answers the reads
+    and writes of a re-run: the workflow run's attempt and rerun-failed-jobs."""
+
+    def __init__(self):
+        super().__init__()
+        self.attempts = {}
+        self.check_runs = [
+            {"id": 501, "name": "adapter", "status": "completed", "conclusion": "failure",
+             "details_url": "https://github.com/%s/actions/runs/88/job/501" % REPO},
+            {"id": 502, "name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+             "conclusion": "failure", "details_url": "https://grug.example"}]
+
+    def rest(self, method, path, data=None):
+        m = re.search(r"/actions/runs/(\d+)$", path)
+        if method == "GET" and m:
+            return mock.Mock(data={"run_attempt": self.attempts.get(m.group(1), 1)})
+        if method == "POST" and path.endswith("/rerun-failed-jobs"):
+            self.writes.append((method, path, data))
+            return mock.Mock(data={})
+        return super().rest(method, path, data)
+
+
+INSTALL_TIMEOUT = ("##[error]The action 'Install what the core's own Dockerfile installs' "
+                   "has timed out after 10 minutes.")
+
+
+class InfraFlakeHandBackTest(unittest.TestCase):
+    """An infra timeout is re-run before a fix round, whatever else fails,
+    and never reads as the same failure coming back (loom#1962: three pull
+    requests had an install step time out beside a failing review; no job
+    was re-run and each round read the timeout as stuck)."""
+
+    setUp = StuckFixRoundTest.setUp
+    last_round = StuckFixRoundTest.last_round
+    run_hand_back = StuckFixRoundTest.run_hand_back
+    names = StuckFixRoundTest.names
+    rounds = StuckFixRoundTest.rounds
+    fake = FlakyLadderFake
+
+    def reruns(self):
+        return [w[1] for w in self.gh.writes if str(w[1]).endswith("/rerun-failed-jobs")]
+
+    def test_an_infra_timeout_beside_a_failed_review_is_run_again_with_no_round(self):
+        self.last_round("### Check: adapter\n\n    timed out")
+        self.run_hand_back(checks=[("adapter", INSTALL_TIMEOUT),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(self.reruns(), ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertEqual(self.names(), ["loom:ticket", "loom:pr", "lane:spark"])
+
+    def test_an_infra_timeout_that_came_back_after_its_rerun_is_not_a_stuck_round(self):
+        self.gh.attempts["88"] = 2
+        self.last_round("### Check: adapter\n\n    timed out")
+        self.run_hand_back(checks=[("adapter", INSTALL_TIMEOUT),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(self.reruns(), [])
+        self.assertIn("lane:spark", self.names())
+        self.assertNotIn("lane:claude", self.names())
+        self.assertEqual(len(self.rounds()), 2)
+
+    def test_a_refused_rerun_still_sends_the_fix_round(self):
+        rest = self.gh.rest
+
+        def refuse(method, path, data=None):
+            if path.endswith("/rerun-failed-jobs"):
+                raise GitHubError("POST %s -> 502" % path, 502)
+            return rest(method, path, data)
+        self.gh.rest = refuse
+        self.last_round("### Check: adapter\n\n    timed out")
+        self.run_hand_back(checks=[("adapter", INSTALL_TIMEOUT),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(len(self.rounds()), 2)
+        self.assertIn("lane:spark", self.names())
+
+    def test_a_real_failure_that_came_back_still_climbs(self):
+        self.last_round("### Check: adapter\n\n    1 failed")
+        self.run_hand_back(checks=[("adapter", "FAILED test_x\n##[error]Process completed "
+                                               "with exit code 1.")])
+        self.assertEqual(self.reruns(), [])
+        self.assertIn("lane:claude", self.names())
 
 
 class StampedReviewFake(ReviewFake):
@@ -3704,9 +3918,10 @@ class CorruptStateTest(Base):
         # open pull requests (their plan checks) still run, and so does
         # reconciliation's read of the open tickets (loom#784) and the
         # done-ticket close step's, the hourly read of rewritten sources, and
-        # the changed label-set sync, and the hourly read of open tickets for
-        # ones with no state label (loom#1653).
-        self.assertEqual(self.run_pass().requests, 14)
+        # the changed label-set sync, the hourly read of open tickets for
+        # tickets with no state label (loom#1653), and the hourly label pass's
+        # reads of open issues and closed issues still at loom:triage (loom#2024).
+        self.assertEqual(self.run_pass().requests, 15)
 
 
 class TicketsTest(unittest.TestCase):
@@ -4463,9 +4678,21 @@ class FixTest(Base):
     def test_a_fix_comment_older_than_the_last_claim_is_ignored(self):
         self.fake.add(12)
         self.comment(12, FIX_BODY)
-        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)", author="station-example")
+        # The station's claim, written as a trusted login.
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)", author="bob-example")
         self.run_pass()
         self.assert_plain_brief()
+
+    def test_a_strangers_claim_after_the_fix_does_not_hide_it(self):
+        # loom#1956: a forged claim marker is data; it never ends the round.
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)", author="bob-example")
+        self.comment(12, "Lane codex opened a pull request: https://example.com/pull/99")
+        self.comment(12, FIX_BODY)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)", author="stranger")
+        self.run_pass()
+        # The brief's name counts every claim comment; its content is the fix.
+        self.assertIn("Fix-PR: 99\n", self.claimed_brief("example-owner.example-repo-12-r3"))
 
     def test_a_fix_followed_by_a_later_trusted_comment_still_renders_a_fix(self):
         self.fake.add(12)
@@ -5721,6 +5948,47 @@ class FactoryIncidentTest(Base):
         self.assertIn("keeps its rung", hold[0])
         self.assertIn("factory incident %s#99" % REPO, hold[0])
 
+    def test_a_cluster_runner_whose_check_cannot_run_moves_the_ticket_to_another_lane(self):
+        # The runner image lacks a tool the repo's check calls (make, ruff):
+        # exit 127 on the unmodified base. Held behind the incident, the
+        # ticket went back to the same runner, which can never clear it
+        # (three tickets held so on 2026-10-27).
+        self.heartbeat("anthropic")
+        with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
+            self.heartbeat("free-gemma")
+            self.failed(lane="free-gemma")
+            self.run_pass()
+        names = self.fake.names(12)
+        self.assertNotIn("wait:incident", names)
+        self.assertNotIn("lane:free-gemma", names)
+        self.assertIn("lane:anthropic", names)
+        retry = [b for b in self.bodies() if b.startswith("Automatic retry")]
+        self.assertEqual(len(retry), 1, self.bodies())
+        self.assertIn("(transient): moved from lane free-gemma to lane anthropic", retry[0])
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        held = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
+        self.assertNotIn("%s#12" % REPO, held)
+
+    def test_a_cluster_runner_whose_base_check_fails_with_any_exit_moves_the_ticket(self):
+        # A missing tool inside a script exits 1, not 127 (mod-overseer's
+        # check without g++ on the runner image, 2026-10-27): the runner
+        # still cannot tell its image from a red base, so another lane runs
+        # the base check and files the incident if the base is red there too.
+        for reason in ("[factory] setup failed: base check exited 1 on the unmodified repo; "
+                       "factory incident %s#99" % REPO,
+                       "[factory] setup failed: base check exited 2 on the default branch; "
+                       "factory incident %s#99" % REPO):
+            with self.subTest(reason=reason):
+                self.setUp()
+                self.heartbeat("anthropic")
+                with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
+                    self.heartbeat("free-gemma")
+                    self.failed(lane="free-gemma", reason=reason)
+                    self.run_pass()
+                names = self.fake.names(12)
+                self.assertNotIn("wait:incident", names)
+                self.assertIn("lane:anthropic", names)
+
     def test_incident_filing_failure_is_named_in_ticket_status(self):
         self.heartbeat("muse")
         self.failed(reason="[factory] setup failed: incident filing failed")
@@ -6027,6 +6295,87 @@ class PruneTest(Base):
         for path in verifying:
             self.assertTrue(os.path.exists(path), path)
 
+    def test_a_done_tickets_tree_in_the_agy_lanes_folder_goes_too(self):
+        # The agy lane keeps its trees in its own user's folder
+        # (lanes/run_lane.sh WORKDIR): 386 trees, 15 GB on 2026-10-26.
+        tp = REPO.replace("/", ".") + "-"
+        agy = os.path.join(os.path.realpath(self.home), "agy-lanes")
+        self.settings.agy_workdir = agy
+        self.fake.add(1, state="merged")
+        self.fake.add(2, state="pr")
+        done = os.path.join(agy, tp + "1-r3")
+        open_pr = os.path.join(agy, tp + "2")
+        for path in (done, open_pr):
+            os.makedirs(os.path.join(path, ".git"))
+        self.run_pass()
+        self.assertFalse(os.path.exists(done))
+        self.assertTrue(os.path.exists(open_pr))
+
+    def test_the_agy_folder_keeps_other_entries_and_is_never_read_through_a_symlink(self):
+        tp = REPO.replace("/", ".") + "-"
+        old = time.time() - station.TREE_KEEP - 60
+        self.fake.add(1, state="merged")
+        real = os.path.join(self.home, "elsewhere")
+        stray = self.tree("not-a-ticket", station.TREE_KEEP + 60)
+        os.makedirs(os.path.join(real, tp + "1"))
+        link = os.path.join(self.home, "agy-link")
+        os.symlink(real, link)
+        agy = os.path.join(os.path.realpath(self.home), "agy-lanes")
+        os.makedirs(agy)
+        other = os.path.join(agy, "notes")
+        os.makedirs(other)
+        os.utime(other, (old, old))
+        self.settings.agy_workdir = link
+        self.run_pass()
+        self.assertTrue(os.path.exists(os.path.join(real, tp + "1")))
+        # A symlink in a parent part of the path is refused too.
+        os.makedirs(os.path.join(real, "sub", tp + "1"))
+        os.utime(os.path.join(real, "sub", tp + "1"), (old, old))
+        self.settings.agy_workdir = os.path.join(link, "sub")
+        self.run_pass()
+        self.assertTrue(os.path.exists(os.path.join(real, "sub", tp + "1")))
+        self.settings.agy_workdir = agy
+        self.run_pass()
+        self.assertTrue(os.path.exists(other))
+        self.assertFalse(os.path.exists(stray))
+
+    def test_the_agy_lanes_folder_defaults_to_the_one_the_lane_uses(self):
+        env = {"LOOM_HOME": self.home, "LOOM_AGY_USER": "example-user"}
+        self.assertEqual(station.Settings.from_env(env).agy_workdir,
+                         "/Users/example-user/lanes")
+        env["LOOM_AGY_HOME"] = "/opt/agy"
+        self.assertEqual(station.Settings.from_env(env).agy_workdir, "/opt/agy/lanes")
+        env["LOOM_AGY_WORKDIR"] = "/opt/trees"
+        self.assertEqual(station.Settings.from_env(env).agy_workdir, "/opt/trees")
+        self.assertEqual(station.Settings(self.home, [REPO], [], []).agy_workdir, "")
+
+    def test_a_pass_stopped_at_its_request_target_still_ends_locally(self):
+        # From loom#1915 a pass that reached its request target raised out of
+        # run_pass and skipped pruning, the disk, usage and the chain
+        # snapshot: no lane tree was pruned for hours on 2026-10-26.
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        ran = []
+        with mock.patch.object(station.Station, "_run_steps",
+                               side_effect=TargetReached("issues read carried over")), \
+                mock.patch.object(station.Station, "prune_trees", lambda s: ran.append("prune")), \
+                mock.patch.object(station.Station, "tend_disk", lambda s: ran.append("disk")), \
+                mock.patch.object(station.Station, "post_chain", lambda s: ran.append("chain")):
+            with self.assertRaises(TargetReached):
+                runner.run_pass()
+        self.assertEqual(ran, ["prune", "disk", "chain"])
+
+    def test_a_pass_with_no_budget_left_does_no_local_end_either(self):
+        # The early return stays as it was: a pass that never starts its
+        # GitHub part runs nothing else.
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        ran = []
+        with mock.patch.object(station.Station, "_budget_exhausted", return_value=True), \
+                mock.patch.object(station.Station, "prune_trees", lambda s: ran.append("prune")), \
+                mock.patch.object(station.Station, "tend_disk", lambda s: ran.append("disk")), \
+                mock.patch.object(station.Station, "post_chain", lambda s: ran.append("chain")):
+            runner.run_pass()
+        self.assertEqual(ran, [])
+
     def test_a_tree_waits_for_tree_keep_when_the_pass_did_not_read_its_repo(self):
         tp = REPO.replace("/", ".") + "-"
         fresh = self.tree(tp + "3", 60)
@@ -6131,6 +6480,39 @@ class DiskGuardTest(Base):
             self.assertTrue(runner.disk_low())
         self.assertIn("Claims paused: 2.0 GB free on the loom home's disk, under 15.0 GB",
                       runner._lanes_body([]))
+
+    def test_low_disk_thins_local_snapshots_before_pausing_claims(self):
+        # 2026-10-26: local Time Machine snapshots held deleted lane trees;
+        # free fell 50 -> 27 GB in three hours and thinning by hand freed 40.
+        self.settings.thin_snapshots = True
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        before = mock.Mock(free=10 * 1024 ** 3, total=500 * 1024 ** 3, used=0)
+        after = mock.Mock(free=45 * 1024 ** 3, total=500 * 1024 ** 3, used=0)
+        with mock.patch.object(station.shutil, "disk_usage", side_effect=[before, after]), \
+                mock.patch("bus.station._thin_snapshots", return_value=True) as thin, \
+                mock.patch("bus.station._say"):
+            self.assertFalse(runner.disk_low())
+        thin.assert_called_once_with(self.settings.home, 20 * 1024 ** 3)
+
+    def test_snapshots_are_thinned_at_most_once_per_interval(self):
+        self.settings.thin_snapshots = True
+        usage = mock.Mock(free=10 * 1024 ** 3, total=500 * 1024 ** 3, used=0)
+        with mock.patch.object(station.shutil, "disk_usage", return_value=usage), \
+                mock.patch("bus.station._thin_snapshots", return_value=False) as thin, \
+                mock.patch("bus.station._say"):
+            station.Station(GitHub("token", transport=self.fake), self.settings).disk_low()
+            station.Station(GitHub("token", transport=self.fake), self.settings).disk_low()
+        self.assertEqual(thin.call_count, 1)
+
+    def test_a_code_built_station_never_thins_and_from_env_does_by_default(self):
+        usage = mock.Mock(free=2 * 1024 ** 3, total=500 * 1024 ** 3, used=0)
+        with mock.patch.object(station.shutil, "disk_usage", return_value=usage), \
+                mock.patch("bus.station._thin_snapshots") as thin, \
+                mock.patch("bus.station._say"):
+            station.Station(GitHub("token", transport=self.fake), self.settings).disk_low()
+        thin.assert_not_called()
+        self.assertTrue(station.Settings.from_env({}).thin_snapshots)
+        self.assertFalse(station.Settings.from_env({"LOOM_THIN_SNAPSHOTS": "0"}).thin_snapshots)
 
     def test_unreadable_free_space_keeps_the_last_state(self):
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
@@ -7332,7 +7714,7 @@ class AsksTest(Base):
         self.fail_post = False
         self.read = []
 
-    def go(self, now=NOON):
+    def go(self, now=NOON, urgency_client=None):
         def post(url, payload):
             if self.fail_post:
                 raise OSError("down")
@@ -7342,7 +7724,72 @@ class AsksTest(Base):
             self.read.append((name, region))
             return URL
         gh = GitHub("token", transport=self.fake)
-        station.Station(gh, self.settings, now=now, read_secret=secret, post=post).run_pass()
+        station.Station(gh, self.settings, now=now, read_secret=secret, post=post,
+                        urgency_client=urgency_client).run_pass()
+
+    def scored(self, by_title):
+        """A stub urgency client answering by the ask's title; it records
+        every request."""
+        asked = []
+
+        def client(request):
+            asked.append(request)
+            score, person = by_title[request["state"]["title"]]
+            return {"usage": {"input_tokens": 100}, "answers": {
+                "urgency": {"type": "score", "score": score},
+                "needs_person": {"type": "noul", "noul": person},
+                "duplicate": {"type": "noul", "noul": 0.0},
+                "public_exposure": {"type": "noul", "noul": 0.0}}}
+        return client, asked
+
+    def test_shadow_scores_each_ask_and_routes_by_the_labels(self):
+        self.settings.urgency = urgency.Config(mode=urgency.SHADOW)
+        self.fake.add_ask(5, title="Site down", created="2030-01-01T00:00:00Z")
+        self.fake.add_ask(6, title="Pick a name", created="2030-01-02T00:00:00Z")
+        client, asked = self.scored({"Site down": (4.0, 0.9), "Pick a name": (0.3, 0.1)})
+        self.go(urgency_client=client)
+        self.assertEqual(len(asked), 2)
+        # No label written, no urgent send, and the digest holds both asks
+        # in today's order (newest first).
+        self.assertFalse(any(p.endswith("/labels") for p in self.fake.paths()))
+        self.assertEqual(len(self.sent), 1)
+        lines = self.sent[0][1]["content"].splitlines()[1:]
+        self.assertEqual([ln.rsplit("/", 1)[1] for ln in lines], ["6", "5"])
+        with open(os.path.join(self.home, "state", "station", "urgency.json")) as fh:
+            scores = json.load(fh)["scores"]
+        self.assertEqual(scores["%s#5" % REPO]["route"], urgency.URGENT)
+        self.assertEqual(scores["%s#5" % REPO]["today_route"], urgency.DIGEST)
+        self.assertEqual(scores["%s#6" % REPO]["route"], urgency.STATUS)
+        # The next pass asks nothing again for the same revisions.
+        self.go(NOON + 60, urgency_client=client)
+        self.assertEqual(len(asked), 2)
+
+    def test_act_forwards_by_the_score_and_ranks_the_digest(self):
+        self.settings.urgency = urgency.Config(mode=urgency.ACT)
+        self.fake.add_ask(5, title="Site down", created="2030-01-01T00:00:00Z")
+        self.fake.add_ask(6, title="Pick a name", created="2030-01-02T00:00:00Z")
+        self.fake.add_ask(7, title="Rename a file", created="2030-01-03T00:00:00Z")
+        self.fake.asks[0]["state"] = "open"
+        self.fake.issues[5] = self.fake.asks[0]
+        client, _ = self.scored({"Site down": (4.0, 0.9), "Pick a name": (2.0, 0.9),
+                                 "Rename a file": (0.5, 0.0)})
+        self.go(urgency_client=client)
+        self.assertEqual([p for p in self.fake.paths("POST") if p.endswith("/labels")],
+                         ["/repos/%s/issues/5/labels" % REPO])
+        self.assertIn("loom:urgent", self.fake.names(5))
+        contents = [p["content"] for _, p in self.sent]
+        self.assertEqual(contents[0],
+                         "Urgent ask: Site down https://github.com/%s/issues/5" % REPO)
+        lines = contents[1].splitlines()[1:]
+        # Status-only asks stay out; the rest highest score first.
+        self.assertEqual([ln.rsplit("/", 1)[1] for ln in lines], ["5", "6"])
+
+    def test_off_sends_no_urgency_request(self):
+        self.settings.urgency = urgency.Config(mode=urgency.OFF)
+        self.fake.add_ask(5, title="Site down")
+        client, asked = self.scored({"Site down": (4.0, 0.9)})
+        self.go(urgency_client=client)
+        self.assertEqual(asked, [])
 
     def test_untrusted_asks_are_ignored(self):
         self.fake.add_ask(5, author="stranger", urgent=True)
@@ -11680,7 +12127,7 @@ class RemoteClaimCountTest(unittest.TestCase):
         def paginate(self, path):
             if path == "/repos/%s/issues/9/comments" % self.outer.STATUS_REPO:
                 return [{"body": "<!-- loom:remote-heartbeat v1 muse %d -->"
-                                 % int(self.outer.now)}]
+                                 % int(self.outer.now), "user": {"login": AUTHORS[0]}}]
             raise AssertionError("unexpected paginate %s" % path)
 
     def setUp(self):
@@ -11718,11 +12165,20 @@ class RemoteClaimCountTest(unittest.TestCase):
         with self.assertRaises(GitHubError):
             self.runner()._read_remote_claim_count("muse")
 
+    def test_a_forged_heartbeat_does_not_mark_a_remote_lane_alive(self):
+        # loom#1956: anyone can comment on the lane status issue.
+        beat = "<!-- loom:remote-heartbeat v1 muse %d -->" % int(self.now)
+        self.gh.paginate = lambda path: [{"body": beat, "user": {"login": "stranger"}}]
+        self.assertIsNone(self.runner()._read_remote_heartbeat("muse"))
+        self.gh.paginate = lambda path: [{"body": beat, "user": {"login": AUTHORS[0]}}]
+        self.assertEqual(int(self.now), self.runner()._read_remote_heartbeat("muse"))
+
     def test_lanes_body_builds_and_shows_remote_claims(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             runner = self.runner()
             body = runner._lanes_body(runner._lane_rows())
+        self.assertIn("Remote claims: muse 1/4", body)
 
 
 class GrugIdleTest(Base):
@@ -11748,7 +12204,7 @@ class GrugIdleTest(Base):
     def test_lane_pr_with_grug_idle_gets_needs_brain_label(self):
         """Lane PR (loom/ branch) with grug:idle should get needs-brain label."""
         # Add a PR with grug:idle label on a loom/ branch (lane PR)
-        self.fake.add_grug_idle_pr(42, title="Fix something", branch="loom/42-fix", body="Refs quadseven/loom#42")
+        self.fake.add_grug_idle_pr(42, title="Fix something", branch="loom/42-fix", body="Refs issue #42")
         self._run_pass()
         # Verify needs-brain label was added
         issue = self.fake.issues.get(42)
@@ -11783,3 +12239,39 @@ class GrugIdleTest(Base):
             scans = json.load(fh)
         # The scan time should be updated on first and third run, not second
         self.assertAlmostEqual(scans[REPO]["at"], NOON + 3600 + 1, delta=10)
+
+
+class RunnerSlotClaimTest(Base):
+    """A slot on cluster runners takes public repos only: a private ticket
+    labeled for one is sent back to the queue, never briefed there
+    (loom#1917)."""
+
+    MEDIUM = "Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n"
+
+    def claim(self):
+        with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
+            self.heartbeat("free-gemma")
+            self.fake.add(12, lane="free-gemma", body=self.MEDIUM)
+            self.run_pass()
+
+    def test_a_private_ticket_labeled_for_a_runner_slot_is_not_briefed_there(self):
+        self.fake.private = True
+        self.claim()
+        self.assertEqual(self.listing("free-gemma"), [])
+        names = self.fake.names(12)
+        self.assertNotIn("lane:free-gemma", names)
+        self.assertNotIn("loom:running", names)
+        self.assertIn("loom:queued", names)
+
+    def test_a_public_ticket_labeled_for_a_runner_slot_is_claimed_there(self):
+        self.fake.private = False
+        self.claim()
+        self.assertEqual(len(self.listing("free-gemma")), 1)
+        self.assertIn("lane:free-gemma", self.fake.names(12))
+
+    def test_a_private_ticket_for_free_gemma_is_claimed_when_it_runs_locally(self):
+        self.fake.private = True
+        self.heartbeat("free-gemma")
+        self.fake.add(12, lane="free-gemma", body=self.MEDIUM)
+        self.run_pass()
+        self.assertEqual(len(self.listing("free-gemma")), 1)

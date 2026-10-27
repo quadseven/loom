@@ -42,7 +42,7 @@ from . import notify
 from . import shadow
 from . import text as _text
 from . import watch
-from .github import GitHubError
+from .github import GitHubError, RateLimited
 from .labels import REMOTE_LANES
 
 DAY = 24 * 3600
@@ -73,6 +73,8 @@ EVENT_WINDOW = 2 * REPEATED_FAILURE
 FAILURE_KINDS = ("rewrite_failed", "rewrite_skipped", "model_wait", "not_claiming")
 # Decision 0003: an epic holds at most EPIC_TICKETS tickets.
 EPIC_TICKETS = 15
+# GitHub refuses a sub-issue past this many under one issue.
+SUB_ISSUE_LIMIT = brain.SUB_ISSUE_LIMIT
 PLAN_FAILED_AGE = 30 * 60
 # More than LABELER_REFUSALS_MAX refusals of briefed tickets for one untrusted
 # labeler within LABELER_WINDOW seconds is a trust gap (loom#660).
@@ -151,8 +153,19 @@ HOLD_LOG_MAX = 20
 HELD_LINE_RE = re.compile(r"^- ([A-Za-z0-9._-]+): held by a limit since (\S+?);", re.M)
 LOG_LINE_RE = re.compile(r"^- [A-Za-z0-9._-]+: held since \S+, cleared \S+$")
 WITHHELD = "(withheld: the line fails the written-text check)"
+# Invariants whose subject can be gone for good: a lane pull request merged or
+# closed, an epic back at its cap. The filer keeps each breach's subject in
+# its local state and, once the breach is gone, asks the caller's settled()
+# whether the subject itself settled; one that did closes its issue on that
+# pass, before any other clear, whatever labels it carries (loom#2022: five
+# lane-pr-stalled issues stayed open up to a day after their pull requests
+# merged or closed, and an operator closed them by hand).
+SETTLES = ("lane-pr-stalled", "epic-over-cap")
 
 Say = Callable[[str], None]
+# (invariant, subject) -> why the subject is settled, in words a public issue
+# may carry, or None while it is not (or cannot be read).
+Settled = Callable[[str, str], Optional[str]]
 
 
 class Ref(NamedTuple):
@@ -222,6 +235,9 @@ class EpicShape(NamedTuple):
     # The goal's standing "Factory repairs" epic: no ticket cap, and not
     # counted against the goal's open epic cap.
     standing: bool = False
+    # How many sub-issues GitHub holds under it: at SUB_ISSUE_LIMIT it takes
+    # no more links, standing or not (loom#2023).
+    sub_issues: int = 0
 
 
 class GoalShape(NamedTuple):
@@ -591,18 +607,35 @@ def ticket_outside_epic(f: Facts) -> List[Breach]:
 
 
 def epic_over_cap(f: Facts) -> List[Breach]:
-    """An epic holding more than EPIC_TICKETS tickets."""
+    """An epic holding more than EPIC_TICKETS tickets (its sub-issues and
+    the issues whose Part of line names it, each once), or any epic, the
+    standing repairs epic too, holding GitHub's limit of sub-issues: GitHub
+    refuses its next link (loom#2023)."""
     if f.shapes is None:
         return []
-    return [Breach("epic-over-cap", epic.epic.key,
-                   "Epic %s holds %d tickets (cap %d)" % (epic.epic.label, epic.tickets,
-                                                          EPIC_TICKETS),
-                   ("Epic %s of goal home %s holds %d tickets; an epic holds at most %d, "
-                    "and more work goes into a next epic" % (
-                        epic.epic.label, shape.goal.label, epic.tickets, EPIC_TICKETS),),
-                   f.now)
-            for shape in f.shapes for epic in shape.epics
-            if epic.tickets > EPIC_TICKETS and not epic.standing]
+    out = []
+    for shape in f.shapes:
+        for epic in shape.epics:
+            if epic.open and epic.sub_issues >= SUB_ISSUE_LIMIT:
+                out.append(Breach(
+                    "epic-over-cap", epic.epic.key,
+                    "Epic %s holds %d sub-issues (GitHub's limit %d)"
+                    % (epic.epic.label, epic.sub_issues, SUB_ISSUE_LIMIT),
+                    ("Epic %s of goal home %s holds %d sub-issues; GitHub refuses a sub-issue "
+                     "past %d, so new work goes into a next epic" % (
+                         epic.epic.label, shape.goal.label, epic.sub_issues,
+                         SUB_ISSUE_LIMIT),),
+                    f.now))
+            elif epic.tickets > EPIC_TICKETS and not epic.standing:
+                out.append(Breach(
+                    "epic-over-cap", epic.epic.key,
+                    "Epic %s holds %d tickets (cap %d)" % (epic.epic.label, epic.tickets,
+                                                           EPIC_TICKETS),
+                    ("Epic %s of goal home %s holds %d tickets; an epic holds at most %d, "
+                     "and more work goes into a next epic" % (
+                         epic.epic.label, shape.goal.label, epic.tickets, EPIC_TICKETS),),
+                    f.now))
+    return out
 
 
 def goal_epics_over_cap(f: Facts) -> List[Breach]:
@@ -931,10 +964,18 @@ def _checked(line: str) -> str:
 
 class Filer:
     def __init__(self, gh: Any, repo: str, goal: int, state: Dict[str, Any], now: float,
-                 say: Say, write: bool = True) -> None:
+                 say: Say, write: bool = True,
+                 authors: Optional[Sequence[str]] = None,
+                 subjects: Optional[Dict[str, Any]] = None,
+                 settled: Optional[Settled] = None) -> None:
         """gh files in repo under goal home #goal. state maps a breach key to
         its issue number and is changed in place (the caller keeps it);
-        write False (the GitHub budget is low) files nothing this pass."""
+        write False (the GitHub budget is low) files nothing this pass.
+        `authors` (default brain.trusted_authors()) are the logins whose
+        comments it reads: a stranger's marker is data. `subjects` maps the
+        key of each SETTLES breach to its subject (kept by the caller, never
+        written to GitHub), and `settled` says whether a gone breach's
+        subject is settled for good."""
         self.gh = gh
         self.repo = repo
         self.goal = goal
@@ -942,6 +983,9 @@ class Filer:
         self.now = now
         self.say = say
         self.write = write
+        self.authors = list(brain.trusted_authors() if authors is None else authors)
+        self.subjects = subjects if subjects is not None else {}
+        self.settled = settled
         self.writes = 0
         self._listed: Optional[Dict[str, int]] = None
         # Issue numbers the listing found closed: clearing skips them unread.
@@ -1081,12 +1125,47 @@ class Filer:
         try:
             self.gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (self.repo, self._home()),
                          {"sub_issue_id": made["id"]})
-        except (GitHubError, KeyError) as err:
-            # A refused link (a goal at GitHub's sub-issue limit): the Part
-            # of line still names where it belongs.
+        except GitHubError as err:
+            if err.status == 422:
+                self._roll_over(number, made, body, err)
+            else:
+                self.say("invariants: %s#%d is linked to #%d by its Part of line only: %s"
+                         % (self.repo, number, self._home(), err))
+        except KeyError as err:
             self.say("invariants: %s#%d is linked to #%d by its Part of line only: %s"
                      % (self.repo, number, self._home(), err))
         self.say("invariants: filed %s#%d: %s" % (self.repo, number, title))
+
+    def _roll_over(self, number: int, made: Dict[str, Any], body: str, err: GitHubError) -> None:
+        """GitHub refused the issue as a sub-issue of the repairs epic (HTTP
+        422: the epic holds GitHub's limit of sub-issues). The issue moves to
+        the next factory repairs batch epic with room, its Part of line names
+        that epic, and later filings this pass go there too (loom#2023)."""
+        home = self._home()
+        self.say("invariants: #%d refused %s#%d as a sub-issue (HTTP 422: %s); rolling over "
+                 "to a factory repairs batch epic" % (home, self.repo, number, err))
+        try:
+            batch = brain.repairs_epic(self.gh, self.repo, self.goal, full=(home,))
+        except (GitHubError, ValueError, KeyError) as exc:
+            self.say("invariants: %s#%d is linked to #%d by its Part of line only, no batch "
+                     "epic to roll over to: %s" % (self.repo, number, home, exc))
+            return
+        if batch == home:
+            return
+        self._repairs = batch
+        moved = re.sub(r"^Part of #%d[ \t]*$" % home, "Part of #%d" % batch, body, flags=re.M)
+        if moved != body:
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number), {"body": moved})
+            self.writes += 1
+        try:
+            self.gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (self.repo, batch),
+                         {"sub_issue_id": made["id"]})
+        except GitHubError as exc:
+            self.say("invariants: %s#%d is linked to batch epic #%d by its Part of line only: %s"
+                     % (self.repo, number, batch, exc))
+            return
+        self.say("invariants: %s#%d filed under factory repairs batch epic #%d"
+                 % (self.repo, number, batch))
 
     @staticmethod
     def _broken_note(comment: Dict[str, Any]) -> Optional[float]:
@@ -1170,8 +1249,8 @@ class Filer:
         return True
 
     def _comments(self, number: int) -> List[Dict[str, Any]]:
-        return [c for c in self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100"
-                                            % (self.repo, number)) if isinstance(c, dict)]
+        return brain.trusted_comments(self.gh.paginate(
+            "/repos/%s/issues/%d/comments?per_page=100" % (self.repo, number)), self.authors)
 
     def _rolled_into(self, key: str, current: Dict[str, Breach]) -> Optional[int]:
         """The open rolling issue an older issue of the same invariant now
@@ -1202,7 +1281,67 @@ class Filer:
         self.writes += 1
         self.say("invariants: folded %s#%d into #%d" % (self.repo, number, into))
 
+    def _settle(self, current: Dict[str, Breach]) -> None:
+        """Close the open issue of each gone SETTLES breach whose subject
+        settled for good, with one note naming how. Runs before the other
+        clears, so a pass short of writes still spends them here first, and
+        reads no comments (a deferred comment read stopped the whole clear)."""
+        listing = self._listing()
+        for key, subject in list(self.subjects.items()):
+            if self.writes + 2 > WRITES_MAX:
+                return
+            invariant = key.split("/", 1)[0]
+            if key in current or invariant not in SETTLES or not isinstance(subject, str):
+                continue
+            number = listing.get(key)
+            if number is None or number in self._listed_closed:
+                self.subjects.pop(key, None)
+                continue
+            issue = self._issue(number)
+            if issue is None or issue.get("state") != "open":
+                self.subjects.pop(key, None)
+                continue
+            if TICKET_LABEL in self._label_names(issue):
+                # Rewritten into work: the ticket path closes it.
+                self.subjects.pop(key, None)
+                continue
+            why = self._settled_why(invariant, subject, number)
+            if why and self._close_settled(number, issue, why):
+                self.subjects.pop(key, None)
+
+    def _settled_why(self, invariant: str, subject: str, number: int) -> Optional[str]:
+        """The caller's word on whether the subject settled; None when it has
+        none or cannot read it this pass (a rate limit still stops the pass)."""
+        if self.settled is None:
+            return None
+        try:
+            return self.settled(invariant, subject)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            self.say("invariants: could not tell whether %s#%d settled: %s"
+                     % (self.repo, number, err))
+            return None
+
+    def _close_settled(self, number: int, issue: Dict[str, Any], why: str) -> bool:
+        """Close an issue whose subject settled, with one note saying how.
+        False when shadow mode holds it (recorded in the ledger)."""
+        if self._held(number, {"state": "closed", "state_reason": "not_planned"}, issue,
+                      "settled: " + why):
+            return False
+        body = "%s%s: %s." % (CLEARED_TEXT, utc(self.now), why.rstrip("."))
+        _text.check(body)
+        notify.post(self.gh, self.repo, number, body, notify.CLOSED)
+        self.writes += 1
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                     {"state": "closed", "state_reason": "not_planned"})
+        self.writes += 1
+        self._listed_closed.add(number)
+        self.say("invariants: closed settled %s#%d: %s" % (self.repo, number, why))
+        return True
+
     def _clear_stale(self, current: Dict[str, Breach]) -> None:
+        self._settle(current)
         for key, number in self._listing().items():
             if self.writes >= WRITES_MAX:
                 return
@@ -1350,6 +1489,9 @@ class Filer:
 
     def run(self, breaches: Iterable[Breach]) -> None:
         current = {b.key: b for b in breaches}
+        for b in current.values():
+            if b.invariant in SETTLES:
+                self.subjects[b.key] = b.subject
         for b in current.values():
             if not self.write or self.writes >= WRITES_MAX:
                 return

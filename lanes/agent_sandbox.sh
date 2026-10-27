@@ -59,7 +59,8 @@ sandbox_ready() {
 # Whether the pod's egress is narrowed, proved, not assumed. Every
 # must-be-blocked destination must fail to connect: those in
 # LOOM_EGRESS_DENY_PROBES (IPv4:port, literal addresses only, so a name that
-# does not resolve can never pass as blocked), plus the API server at
+# does not resolve can never pass as blocked; separated by spaces or commas,
+# as the cluster's secret holds them), plus the API server at
 # KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT when the pod has them. And
 # the positive control LOOM_EGRESS_ALLOW_PROBE (host:port, the provider's or
 # gateway's HTTPS endpoint) must connect, so a pod with no network or no DNS
@@ -71,7 +72,8 @@ egress_denied() {
   local ipv4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
   [[ "$wait" =~ ^[1-9][0-9]?$ ]] || wait=3
   denied="${LOOM_EGRESS_DENY_PROBES:-}"
-  [ -n "$denied" ] ||
+  denied="${denied//,/ }"
+  [[ "$denied" =~ [^[:space:]] ]] ||
     { SANDBOX_WHY="bwrap narrows no network: set LOOM_EGRESS_DENY_PROBES to the addresses the pod's egress policy blocks"; return 1; }
   [ -n "$allow" ] ||
     { SANDBOX_WHY="bwrap narrows no network: set LOOM_EGRESS_ALLOW_PROBE to an HTTPS endpoint the lane must reach"; return 1; }

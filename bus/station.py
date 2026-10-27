@@ -11,6 +11,7 @@ import calendar
 import base64
 from datetime import date, datetime, timedelta, timezone
 import errno
+import faulthandler
 import fcntl
 import fnmatch
 import gzip
@@ -30,6 +31,7 @@ from pathlib import Path
 from urllib.parse import quote
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from . import answer
 from . import audit
 from . import bench
 from . import ci_gap
@@ -39,10 +41,13 @@ from . import brain_hold
 from . import claimed
 from . import fabric
 from . import fixrounds
+from . import flake
 from . import runners
 from . import scope_fit
 from . import shadow
+from . import urgency
 from . import stale_claims
+from . import label_pass
 from . import factory
 from . import friction_intake
 from . import evidence
@@ -75,7 +80,8 @@ from . import watch
 from . import labels
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, rest_login, unreadable
+from .github import (GitHub, GitHubError, RateLimited, TargetReached, _OPENER,
+                     _next_link, read_ssm, rest_login, unreadable)
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -133,6 +139,12 @@ RUN_SCRATCH_SETTLE = 600
 # temp files a run rebuilds.
 RUN_HOME_CACHES = (".cache", ".cargo", "tmp")
 DISK_EVERY = 3600
+# Local Time Machine snapshots keep every lane tree the station removed:
+# on 2026-10-26 free space fell from 50 to 27 GB in three hours while loom
+# home held under 15 GB, and thinning them freed 40 GB. Below twice the
+# floor the station asks for them to be thinned, at most this often.
+THIN_EVERY = 1800
+THIN_FILE = "snapshot-thin.json"
 GB = 1024 ** 3
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
 ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
@@ -258,6 +270,14 @@ GOAL_CAPS_EVERY = 600
 # row, go to the dashboard's Needs-you page; the run's stamp is kept here.
 BRAIN_HOLDS_PATH = "/api/brain-holds"
 BRAIN_HOLDS_FILE = "brain-holds.json"
+# The dashboard's /chain page: each repo's shadow mode and the last actions
+# Loom held and took, from bus.shadow, every CHAIN_EVERY seconds; the
+# send's stamp is kept here. The dashboard pod has neither the station's
+# shadow switch nor its state folder, so the station is the one source.
+CHAIN_PATH = "/api/chain"
+CHAIN_FILE = "chain.json"
+CHAIN_EVERY = 600
+CHAIN_ROWS = 20
 # A recorded ticket wait the factory has not repeated for this long is gone:
 # the ticket moved, or left the factory (invariants.ticket_waiting).
 WAIT_UNSEEN = 3600
@@ -424,6 +444,20 @@ RETRY_MAX = 2
 # FACTORY_REPO), and the marker and ticket line their bodies carry.
 FACTORY_REPO = "quadseven/loom"
 INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
+# The note that says the station unticked a decision box a lane ticked.
+DECISION_REVERT_MARKER = "<!-- loom:decision-revert v1 -->"
+DECISION_ASK = ("Kind: decision\nA merged pull request already carries this ticket's work, "
+                "but these boxes ask for an operator decision: %s. Decide, tick each box, "
+                "and move the ticket on, or say what to change.")
+# A base check that failed before the agent ran: it could not start (exit
+# 125 to 127) or it was red on the unmodified repo or default branch. On a
+# cluster runner that is often the runner image (a tool the repo's check
+# calls is not installed, which a script may report as exit 1), and the
+# runner cannot tell it from a red base: another lane runs the check, and
+# holds the ticket behind an incident if the base is red there too.
+CHECK_CANNOT_RUN_RE = re.compile(r"the check exited 12[5-7] on the unmodified base"
+                                 r"|base check exited [0-9]+ on the (?:unmodified repo"
+                                 r"|default branch)")
 HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)")
 # A [factory] hold whose reason names no incident (the incident filing failed)
 # has nothing that can close it, so the station releases it after this long:
@@ -545,6 +579,16 @@ VERIFY_RESERVE_FILE = "verify-reserve.json"
 # start, the remaining steps wait for the next pass (STEP_ROTATION_FILE keeps
 # where it stopped). On 2026-10-24 every pass ran 25 to 40 minutes.
 PASS_STEP_BUDGET = 300
+# A whole pass's wall-clock bound (LOOM_PASS_DEADLINE, seconds; 0 turns it
+# off). Past it faulthandler writes every thread's Python stack to the station
+# log and exits, so launchd starts a fresh pass (loom#1921): on 2026-10-26 a
+# pass sat for 27 minutes with nothing in the log to say where. The default
+# sits above a legitimate daily metrics build (about 30 minutes on 2026-10-26)
+# until that build is bounded on its own (loom#1924). DEADLINE_MARKER_FILE,
+# written when the deadline is armed and removed when the pass ends, lets the
+# next pass say the last one overran.
+PASS_DEADLINE = 3600
+DEADLINE_MARKER_FILE = "pass-deadline.json"
 STEP_ROTATION_FILE = "step-rotation.json"
 # A pass step that takes this long is logged with its time and requests, so a
 # long pass names its cause: on 2026-10-24 passes ran 25 to 98 minutes and
@@ -770,6 +814,7 @@ class Settings:
                  report_digest: Sequence[Tuple[int, int]] = (),
                  health_urls: str = "",
                  health_every: int = health.EVERY,
+                 health_diagnose: Optional[Dict[str, str]] = None,
                  friction_mode: str = "",
                  evidence_cmds: Optional[Dict[str, str]] = None,
                  evidence_window_hours: float = EVIDENCE_WINDOW_HOURS,
@@ -786,8 +831,28 @@ class Settings:
                  disk_free_min_gb: float = DISK_FREE_MIN_GB,
                  settle_claimed: str = "off",
                  settle_claimed_max: int = claimed.PER_RUN,
-                 claim_idle_hours: int = 0) -> None:
+                 claim_idle_hours: int = 0,
+                 agy_workdir: str = "",
+                 thin_snapshots: bool = False,
+                 urgency_config: Optional[urgency.Config] = None,
+                 pass_deadline: int = 0) -> None:
         self.home = home
+        # LOOM_PASS_DEADLINE: seconds a whole pass may run before it dumps its
+        # stack and exits (PASS_DEADLINE). 0, the default for a Settings
+        # built in code, arms nothing.
+        self.pass_deadline = pass_deadline
+        # LOOM_URGENCY_*: score each ask before it is routed (bus/urgency.py,
+        # loom#1787). Off for a Settings built in code; from_env defaults to
+        # shadow, which records scores and still routes by the label rules.
+        self.urgency = urgency_config or urgency.Config(mode=urgency.OFF)
+        # LOOM_THIN_SNAPSHOTS: below twice the free-space floor, ask macOS to
+        # thin its local Time Machine snapshots before claims pause. On, from
+        # from_env, unless "0"; off for a Settings built in code.
+        self.thin_snapshots = thin_snapshots
+        # The agy lane's tree folder (lanes/run_lane.sh WORKDIR for LANE=agy),
+        # pruned beside home/worktrees; empty, the default for a Settings
+        # built in code, prunes home/worktrees only.
+        self.agy_workdir = agy_workdir
         # LOOM_CLAIM_IDLE_HOURS: another operator's claim its claimer has left
         # alone this long comes back to this Loom (bus/stale_claims.py); 0, the
         # default for a Settings built in code, is off; from_env defaults to 24.
@@ -821,6 +886,9 @@ class Settings:
         # endpoint (bus/health.py, docs/HEALTH.md), read every health_every s.
         self.health_urls = health_urls
         self.health_every = health_every
+        # "owner/name#goal" -> the goal home's read-only diagnosis command,
+        # whose output every health brief quotes (docs/HEALTH.md, loom#1243).
+        self.health_diagnose = health_diagnose or {}
         # LOOM_FRICTION_INTAKE: "on" files a ticket for a slowdown the tick
         # journals keep naming, "dry" logs what it would file, "" is off
         # (bus/friction_intake.py).
@@ -957,6 +1025,7 @@ class Settings:
                        env.get("LOOM_LIVE_EVIDENCE_PASS_ENV", ""), env),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
+                   health_diagnose=_health_diagnose(env),
                    friction_mode=friction_intake.mode(env.get("LOOM_FRICTION_INTAKE", "")),
                    roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")),
                    pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"),
@@ -970,7 +1039,19 @@ class Settings:
                                                 or env.get("LOOM_DISK_FREE_MIN_GB", "")),
                    settle_claimed=claimed.mode(env.get("LOOM_SETTLE_CLAIMED", "")),
                    settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")),
-                   claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")))
+                   claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")),
+                   agy_workdir=_agy_workdir(env),
+                   thin_snapshots=env.get("LOOM_THIN_SNAPSHOTS", "1").strip() != "0",
+                   urgency_config=urgency.Config.from_env(env),
+                   pass_deadline=_pass_deadline(env.get("LOOM_PASS_DEADLINE", "")))
+
+
+def _agy_workdir(env: Dict[str, str]) -> str:
+    """The agy lane's tree folder, with lanes/run_lane.sh's defaults."""
+    if env.get("LOOM_AGY_WORKDIR"):
+        return env["LOOM_AGY_WORKDIR"]
+    home = env.get("LOOM_AGY_HOME") or "/Users/%s" % (env.get("LOOM_AGY_USER") or "loom")
+    return os.path.join(home, "lanes")
 
 
 def _keep_days(raw: str) -> int:
@@ -1003,6 +1084,17 @@ def _free_floor(raw: str) -> float:
 
 def _gb(n: float) -> str:
     return "%.1f GB" % (n / GB)
+
+
+def _thin_snapshots(path: str, want: int) -> bool:
+    """Ask macOS to thin the local snapshots on path's volume until about
+    want bytes are free (tmutil, urgency 4, no root needed)."""
+    try:
+        done = subprocess.run(["tmutil", "thinlocalsnapshots", path, str(want), "4"],
+                              capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
 
 
 def _tree_stat(path: str) -> Tuple[float, int]:
@@ -1144,6 +1236,13 @@ def _workflow_run_steps(path: str, workflow: str) -> List[Tuple[str, str]]:
     return found
 
 
+def _health_diagnose(env: Dict[str, str]) -> Dict[str, str]:
+    commands, problem = health.diagnose_commands(env.get("LOOM_HEALTH_DIAGNOSE_CMDS", ""))
+    if problem:
+        _say("ignoring LOOM_HEALTH_DIAGNOSE_CMDS: %s" % problem)
+    return commands
+
+
 def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
     try:
         commands = json.loads(env.get("LOOM_EVIDENCE_CMDS", "{}") or "{}")
@@ -1170,6 +1269,90 @@ def _seconds(raw: str, default: int) -> int:
     """A whole number of seconds of at least 60, else default."""
     raw = raw.strip()
     return int(raw) if raw.isdigit() and int(raw) >= 60 else default
+
+
+def _pass_deadline(raw: str) -> int:
+    """LOOM_PASS_DEADLINE: 0 turns the deadline off; a whole number of
+    seconds of at least 60 is used; anything else is PASS_DEADLINE."""
+    raw = raw.strip()
+    if raw == "0":
+        return 0
+    if raw:
+        value = _seconds(raw, 0)
+        if value:
+            return value
+        _say("ignoring LOOM_PASS_DEADLINE %r: not a whole number of seconds, at least 60"
+             % raw)
+    return PASS_DEADLINE
+
+
+def _deadline_stream() -> Any:
+    """The stream faulthandler writes to: the station log (stderr, as launchd
+    runs the station), or the process's own stderr when sys.stderr has no
+    file descriptor (a test capturing it)."""
+    try:
+        sys.stderr.fileno()
+        return sys.stderr
+    except (AttributeError, OSError, ValueError):
+        return sys.__stderr__
+
+
+def _arm_pass_deadline(state: str, seconds: int, now: float) -> Optional[str]:
+    """Say whether the last pass overran, then arm this pass's deadline and
+    write its marker. Returns the marker's path, or None when off."""
+    path = os.path.join(state, "station", DEADLINE_MARKER_FILE)
+    last = _read_json(path, None, strict=False)
+    if isinstance(last, dict):
+        started = last.get("started")
+        limit = last.get("deadline")
+        if isinstance(started, (int, float)) and isinstance(limit, int):
+            ran = int(now - started)
+            if ran >= limit:
+                _say("the last pass (pid %s, started %s) overran its %ds deadline: its stack is "
+                     "in this log above" % (last.get("pid"), time.strftime(
+                         "%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)), limit))
+            else:
+                _say("the last pass (pid %s) ended %ds into its %ds deadline without a clean "
+                     "finish (killed or crashed)" % (last.get("pid"), ran, limit))
+    if seconds <= 0:
+        _discard(path)
+        return None
+    _write_json(path, {"pid": os.getpid(), "started": now, "deadline": seconds})
+    faulthandler.dump_traceback_later(seconds, exit=True, file=_deadline_stream())
+    return path
+
+
+def _discard(path: str) -> None:
+    """Remove a file that may already be gone."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _try_arm_pass_deadline(state: str, seconds: int, now: float) -> Optional[str]:
+    """_arm_pass_deadline, but a failure to arm is logged and the pass runs
+    unarmed rather than dying before it starts: the deadline is a backstop,
+    and losing it must not stop the station."""
+    try:
+        return _arm_pass_deadline(state, seconds, now)
+    except Exception as err:  # noqa: BLE001 - any arm failure must not stop the pass
+        _say("could not arm the pass deadline (%s: %s); this pass runs without one"
+             % (type(err).__name__, err))
+        try:
+            faulthandler.cancel_dump_traceback_later()
+            _discard(os.path.join(state, "station", DEADLINE_MARKER_FILE))
+        except OSError as cleanup:
+            _say("could not clear the pass deadline marker: %s" % cleanup)
+        return None
+
+
+def _disarm_pass_deadline(path: Optional[str]) -> None:
+    """Cancel this pass's deadline and remove its marker."""
+    if path is None:
+        return
+    faulthandler.cancel_dump_traceback_later()
+    _discard(path)
 
 
 def _origin_repo() -> str:
@@ -1655,8 +1838,13 @@ class Station:
                  upload: Optional[Uploader] = None,
                  ancestor: Optional[Callable[[str, str], bool]] = None,
                  head: Optional[Callable[[], str]] = None,
-                 fetch: Optional[Fetcher] = None) -> None:
+                 fetch: Optional[Fetcher] = None,
+                 urgency_client: Optional[urgency.Client] = None) -> None:
         self.gh = gh
+        # The urgency model's client; None reads the key from SSM when a score
+        # is first wanted (Station._urgency_client).
+        self._urgency_injected = urgency_client
+        self._digest_ranked = False  # act mode: the digest keeps the score order
         # Status comments by the station's trusted writers read as events.
         writers = getattr(gh, "status_authors", None)
         if isinstance(writers, set):
@@ -1739,6 +1927,8 @@ class Station:
         self._issue_stamps: Dict[Tuple[str, int], str] = {}
         saved_reads = _read_json(os.path.join(self.state, "ticket_reads.json"), {}, strict=False)
         self._ticket_reads: Dict[str, Any] = saved_reads if isinstance(saved_reads, dict) else {}
+        if hasattr(self.gh, "target") and self.gh.target is None:
+            self.gh.target = PASS_REQUEST_TARGET
 
     # -- paths ---------------------------------------------------------
     def inbox(self, lane: str) -> str:
@@ -1780,8 +1970,11 @@ class Station:
         if isinstance(kept, dict) and kept.get("stamp") == stamp and isinstance(kept.get("data"), list):
             kept["seen"] = self.now
             return kept["data"]
+        carried_before = dict(getattr(self.gh, "carried_over", {}))
         items = self.gh.paginate(path)
-        self._ticket_reads[key] = {"stamp": stamp, "data": items, "seen": self.now}
+        carried_after = getattr(self.gh, "carried_over", {})
+        if carried_before == carried_after:
+            self._ticket_reads[key] = {"stamp": stamp, "data": items, "seen": self.now}
         return items
 
     def _issue(self, repo: str, number: int) -> Dict[str, Any]:
@@ -1817,6 +2010,8 @@ class Station:
     def _check_trust(self, repo: str, issue: Dict[str, Any]) -> Tuple[bool, str]:
         number = int(issue["number"])
         events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
+        if self._target_reached():
+            return False, "target reached"
         editor = self._editor(repo, number)
         return tickets.trusted(issue, events, editor, self.s.authors, self.s.owners,
                                self.s.briefers)
@@ -2182,10 +2377,11 @@ class Station:
             if not isinstance(c, dict):
                 continue
             body = str(c.get("body") or "")
-            if CLAIM_RE.fullmatch(body.strip()):
+            trusted = tickets._login(c.get("user")) in allowed
+            # A stranger's claim marker must not hide a trusted fix.
+            if trusted and CLAIM_RE.fullmatch(body.strip()):
                 last_claim = i
-            if (tickets._login(c.get("user")) in allowed
-                    and body.startswith(tickets.FIX_MARKER)):
+            if trusted and body.startswith(tickets.FIX_MARKER):
                 newest_fix = (i, c, body)
         if newest_fix is None or newest_fix[0] < last_claim:
             return None
@@ -2216,9 +2412,9 @@ class Station:
         or when its newest claim's brief is still waiting or running in a
         lane inbox (left for the next pass)."""
         number = int(issue["number"])
-        if self._verify_before_build(repo, issue):
+        comments = self._claim_comments(repo, issue, number)
+        if comments is None:
             return False
-        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         try:
             fix_source = self._fix_for(repo, comments)
         except ValueError as err:
@@ -2263,6 +2459,14 @@ class Station:
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
+
+    def _claim_comments(self, repo: str, issue: Dict[str, Any],
+                        number: int) -> Optional[List[Any]]:
+        """Read claim comments after verification, stopping at the pass target."""
+        if self._verify_before_build(repo, issue):
+            return None
+        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        return None if self._target_reached() else comments
 
     def _linked_pulls(self, repo: str, number: int) -> List[str]:
         """The pull requests in any repo that reference the ticket, from the
@@ -2623,10 +2827,11 @@ class Station:
             return None
         latest = None
         pattern = re.compile(r"^<!-- loom:remote-heartbeat v1 ([a-z0-9-]+) ([0-9.]+) -->$")
-        for comment in self._paginate("/repos/%s/issues/%d/comments" %
-                                        (repo, int(issues[0]["number"]))):
-            match = pattern.fullmatch(str(comment.get("body") or "").strip()) \
-                if isinstance(comment, dict) else None
+        # A trusted heartbeat only: a stranger's copy must not mark a lane alive.
+        for comment in brain.trusted_comments(self._paginate(
+                "/repos/%s/issues/%d/comments" % (repo, int(issues[0]["number"]))),
+                self.s.authors):
+            match = pattern.fullmatch(str(comment.get("body") or "").strip())
             if match and match.group(1) == lane:
                 try:
                     at = float(match.group(2))
@@ -3019,6 +3224,10 @@ class Station:
                     return
             except RateLimited:
                 raise
+            except TargetReached as err:
+                # Claims made earlier this pass stay made; the rest wait.
+                _say("%s#%s waits for the next pass: %s" % (repo, issue["number"], err))
+                return
             except (GitHubError, OSError) as err:
                 _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
 
@@ -3059,6 +3268,8 @@ class Station:
             self._try_ticket(repo, lane, issue, free)
         except RateLimited:
             raise
+        except TargetReached as err:
+            _say("%s#%s waits for the next pass: %s" % (repo, issue["number"], err))
         except (GitHubError, OSError) as err:
             _say("could not queue %s#%s: %s" % (repo, issue["number"], err))
 
@@ -3772,6 +3983,8 @@ class Station:
             _say("%s#%s is held until %s" % (repo, issue["number"], headers["Not before"]))
             return False
         ok, reason = self._check_trust(repo, issue)
+        if self._target_reached():
+            return False
         if not ok:
             self._refuse(repo, issue, reason)
             return False
@@ -3806,6 +4019,18 @@ class Station:
             if lane is None:
                 return False
         if self._model_waits(repo, issue, lane, headers):
+            return False
+        if needs_public_repo(lane, model) and not self._public(repo):
+            # A lane that became public-only after the ticket was labeled for
+            # it (a slot moved to cluster runners): the dispatch would park
+            # the brief and only then retry it (loom#1917). Back to the queue,
+            # where the factory gives it a lane that takes private repos.
+            names = [n for n in _label_names(fresh) if not n.startswith("lane:")
+                     and n not in (BRIEFED, "loom:queued")] + ["loom:queued"]
+            self.gh.rest("PUT", "/repos/%s/issues/%s/labels" % (repo, fresh["number"]),
+                         {"labels": names})
+            _say("%s#%s: lane %s takes public repos only; back to the queue"
+                 % (repo, fresh["number"], lane))
             return False
         return self._claim(repo, lane, fresh)
 
@@ -4062,14 +4287,10 @@ class Station:
 
     @staticmethod
     def _unbuilt_criteria(ticket: dict, merged: Sequence[dict]) -> List[str]:
-        """The ticket's criteria that no merged pull request for it ticks or
-        marks "not built: <reason>" (the factory's own reading of a body)."""
-        body = str(ticket.get("body") or "")
-        left = factory.missing_criteria(body, str(merged[0].get("body") or ""))
-        for other in merged[1:]:
-            answered = set(left) - set(factory.missing_criteria(body, str(other.get("body") or "")))
-            left = [text for text in left if text not in answered]
-        return left
+        """The ticket's code criteria that no merged pull request for it ticks
+        built: a box marked "not built: <reason>" is still unbuilt (loom#2026)."""
+        return factory.unbuilt_criteria(str(ticket.get("body") or ""),
+                                        [str(pr.get("body") or "") for pr in merged])
 
     def _reconcile_adoptions(self, repo: str, open_tickets: List[Dict[str, Any]]) -> None:
         """Move each open adoption ticket to loom:merged once the pull
@@ -4321,6 +4542,7 @@ class Station:
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.close_done_tickets, self.settle_orphan_sources,
                      self.settle_claimed_tickets, self.release_stale_claims,
+                     self.clean_labels,
                      self.queue_stateless_tickets,
                      self.restate_shipped_live,
                      self.health_intake, self.intake_friction,
@@ -4340,6 +4562,7 @@ class Station:
         stopped_at = None
         for offset in range(len(steps)):
             if self._deferred():
+                stopped_at = (start + offset) % len(steps)
                 break
             # Past the budget the rest of the loop waits for the next pass,
             # which starts here: claims, fix rounds and deploys come round
@@ -4353,7 +4576,10 @@ class Station:
                 break
             step = steps[(start + offset) % len(steps)]
             try:
-                self._timed(step)
+                if not self._timed(step):
+                    # The carried-over step starts the next pass's loop.
+                    stopped_at = (start + offset) % len(steps)
+                    break
             except RateLimited:
                 raise
             except (GitHubError, OSError, ValueError) as err:
@@ -4363,17 +4589,23 @@ class Station:
         except OSError as err:
             _say("could not record the step rotation: %s" % err)
 
-    def _timed(self, step: Any) -> None:
+    def _timed(self, step: Any) -> bool:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
-        more, with the requests it made (as the step loop does)."""
+        more, with the requests it made (as the step loop does). False when
+        a read the step needed was carried over at the pass request target:
+        the line names the step, and the rest of it waits for the next pass."""
         started, asked = time.monotonic(), self.gh.requests
         try:
             step()
+        except TargetReached as err:
+            _say("step %s carried over to the next pass: %s" % (step.__name__, err))
+            return False
         finally:
             took = time.monotonic() - started
             if took >= SLOW_STEP_SECONDS:
                 _say("step %s took %ds and %d requests"
                      % (step.__name__, took, self.gh.requests - asked))
+        return True
 
     def reconcile_pull_requests(self) -> None:
         """Repair ticket state from the PR's authoritative terminal state.
@@ -5469,16 +5701,49 @@ class Station:
                 if not (name == self.s.review_check and factory.degraded_review(tail, tail))]
         degraded = len(kept) != len(failed)
         failed = kept
+        # An infra timeout (bus/flake.py) is no lane's to fix: it is re-run
+        # once before any round, whatever else fails, and never reads as a
+        # stuck failure after (loom#1962).
+        flaky = [name for name, tail in failed if name not in (
+            self.s.review_check, self.s.plan_check) and flake.infra_flake(tail)]
+        if flaky and self._rerun_flaky(repo, number, pr_number, sha, flaky):
+            self._remove_ready_if_present(repo, number, names)
+            return
         self._note_first_push(repo, pr_number, comments, failed)
         threads = self._bot_threads(repo, pr_number)
-        if not failed and not threads and not degraded:
+        # A conflicting pull request is not ready, however green its checks
+        # (loom#1963): status read READY for pull requests GitHub reported as
+        # DIRTY after hand merges moved main. Its conflict brief is the
+        # factory's (Factory._send_back), so no round is sent from here.
+        conflict = detail.get("mergeable") is False
+        if not failed and not threads and not degraded and not conflict:
             self._mark_ready(repo, number, sha, names, ready)
             return
         self._remove_ready_if_present(repo, number, names)
         if self._no_round(failed, threads):
             return
         self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
-                                   comments, names, failed, threads, rounds)
+                                   comments, names, failed, threads, rounds, flaky)
+
+    def _rerun_flaky(self, repo: str, number: int, pr_number: int, sha: str,
+                     flaky: List[str]) -> bool:
+        """Re-run the workflow runs of the infra-failed checks on this head
+        once (flake.rerun_once). False when each was already re-run, or when
+        GitHub refused the read or the re-run: the fix round then goes as it
+        did before this re-run existed."""
+        try:
+            runs = brain.newest_check_runs((self.gh.rest(
+                "GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data
+                or {}).get("check_runs") or [])
+            if not flake.rerun_once(self.gh, repo, runs, flaky):
+                return False
+        except GitHubError as err:
+            _say("%s#%d: could not re-run %s on %s#%d (%s); the fix round goes as usual"
+                 % (repo, number, ", ".join(sorted(flaky)), repo, pr_number, err))
+            return False
+        _say("%s#%d: re-ran %s on %s#%d once before a fix round: an infra failure"
+             % (repo, number, ", ".join(sorted(flaky)), repo, pr_number))
+        return True
 
     def _no_round(self, failed: List[Tuple[str, str]], threads: List[Any]) -> bool:
         """Nothing a lane round could fix: no failure at all, or the plan check
@@ -5525,7 +5790,7 @@ class Station:
                        and run.get("conclusion") in brain.FAILED_CONCLUSIONS
                        and str(run.get("name") or "") in names]
             gaps = ci_gap.find_gaps(self.gh, repo, pr_number, sha, fields, failing,
-                                    lambda: self._pull_paths(repo, pr_number) or [])
+                                    lambda: self._pull_paths(repo, pr_number) or [], _say)
             filed = ci_gap.file_gaps(self.gh, self.state, gaps, self.now, _say)
         except RateLimited:
             raise
@@ -5582,7 +5847,8 @@ class Station:
             status.get("state") == "pending" for status in statuses)
 
     def _bot_threads(self, repo: str, pr_number: int) -> List[Dict[str, Any]]:
-        threads = brain._open_threads(self.gh, repo, pr_number)
+        threads = brain._open_threads(self.gh, repo, pr_number, bot=self.s.review_bot,
+                                      authors=self.s.authors)
         return [thread for thread in threads if self._thread_starts_with_bot(thread)]
 
     def _thread_starts_with_bot(self, thread: Dict[str, Any]) -> bool:
@@ -5633,19 +5899,21 @@ class Station:
     def _post_fix_or_escalate(self, repo: str, number: int, pr_number: int, lane: str,
                               detail: Dict[str, Any], sha: str, comments: List[Any],
                               names: List[str], failed: List[Any], threads: List[Any],
-                              rounds: int) -> None:
+                              rounds: int, flaky: Sequence[str] = ()) -> None:
         """Send the next fix round, unless the last one moved nothing. Each
         round went to the same lane until the cap, with no look at whether
         the last one fixed anything (2026-10-26: four rounds on a local model
         left the same checks failing and the same finding open). A round whose
         failures persist by signature (bus/converge.py) climbs the model
         ladder at once; with no rung left, or with the round cap reached on
-        its rung, the rounds stop (_stop_fix_rounds)."""
+        its rung, the rounds stop (_stop_fix_rounds). A check in `flaky`
+        failed on the infrastructure (bus/flake.py) and is never read as a
+        failure the last round left."""
         authors = {author.lower() for author in self.s.authors}
         failing = [name for name, _ in failed]
         persisted = converge.persistent(
             converge.last_fix_body(comments, authors, (repo, pr_number)),
-            failing, threads, ignore=(self.s.review_check, self.s.plan_check))
+            failing, threads, ignore=(self.s.review_check, self.s.plan_check) + tuple(flaky))
         if persisted:
             lane = self._climb_stuck(repo, number, pr_number, detail, comments, persisted)
             if lane is None:
@@ -5769,6 +6037,7 @@ class Station:
             return True
         if self._field(text, "Deliverable") == "verify":
             return self._report_verify(lane, kind, repo, number, name)
+        self._revert_decision_ticks(repo, number, lane, text)
         if kind == "done":
             if self._field(text, "Deliverable") == "answer":
                 _say("reported %s#%d answer posted by lane %s" % (repo, number, lane))
@@ -5776,7 +6045,7 @@ class Station:
             if not self._field(text, "Fix-PR") and self._answered(lane, name):
                 prs = {int(n) for n in NAMED_PR_RE.findall(text)}
                 self._post_thread_answers(repo, prs, lane, name, text, None)
-                self._settle_no_change(repo, number, lane, name)
+                self._settle_no_change(repo, number, lane, name, text)
                 _say("reported %s#%d answered by lane %s: nothing to change" % (repo, number, lane))
                 return True
             branch = self._field(text, "Branch")
@@ -5863,6 +6132,14 @@ class Station:
         if fix_pr.isdigit() and bare.startswith(NO_COMMIT):
             self._post_answers(repo, int(fix_pr), lane, name, text)
             self._nothing_to_fix(repo, number, int(fix_pr), lane, name)
+            return True
+        if (klass == "factory" and lane in runners.runner_slots()
+                and CHECK_CANNOT_RUN_RE.search(bare)):
+            # Held behind the incident, the ticket went back to the same
+            # runner, which can never clear it: another lane runs the check.
+            note = self._retry(repo, number, lane, "transient", reason)
+            if note:
+                self._requeue_transient(repo, number, lane, reason, note)
             return True
         if klass == "factory":
             # The validation environment the factory broke, not the ticket's
@@ -6284,7 +6561,36 @@ class Station:
             return plain[:-1] + "; its reason did not pass the text checks and is in the lane log."
         return said
 
-    def _settle_no_change(self, repo: str, number: int, lane: str, name: str) -> None:
+    def _revert_decision_ticks(self, repo: str, number: int, lane: str, brief: str) -> None:
+        """Untick each decision box (bus/criteria_gate.py) that was unticked
+        in the brief and is ticked on the ticket now that the lane reported,
+        unless an operator made the last body edit: only an operator decides.
+        One incident note on the ticket names the boxes. On 2026-10-21 a
+        lane's no-change report ticked a box asking for an operator decision,
+        and every later step read it as decided (loom#2029)."""
+        issue = self._issue(repo, number)
+        body = str(issue.get("body") or "")
+        ticked = criteria_gate.decision_ticks(brief, body)
+        if not ticked:
+            return
+        editor = (self._editor(repo, number) or "").lower()
+        ops = answer.operators(trusted=list(self.s.authors) + list(self.s.briefers))
+        if editor and not editor.endswith("[bot]") and editor in ops:
+            return
+        fixed = criteria_gate.untick(body, ticked)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": fixed})
+        issue["body"] = fixed
+        notify.post(self.gh, repo, number, "%s\nIncident: a decision box was ticked while lane "
+                    "%s ran on this ticket, and only an operator ticks one. Loom unticked it: "
+                    "%s. Tick it yourself once you have decided."
+                    % (DECISION_REVERT_MARKER, lane,
+                       "; ".join(" ".join(t.split())[:criteria_gate.ASK_WIDTH] for t in ticked)),
+                    notify.FAILURE)
+        _say("%s#%d: unticked %d decision box(es) ticked during lane %s's run"
+             % (repo, number, len(ticked), lane))
+
+    def _settle_no_change(self, repo: str, number: int, lane: str, name: str,
+                          brief: str = "") -> None:
         """Record a build run's no-change answer and settle its ticket from it.
 
         The answer is an event in the ticket's status comment, quoting the
@@ -6305,6 +6611,19 @@ class Station:
         undoes = bool(set(names) & {REGRESSION, factory.REVERT_LABEL})
         merged = self._merged_linked(repo, issue) if (
             issue.get("state") == "open" and RUNNING in names and not undoes) else []
+        decide = criteria_gate.open_decisions(str(issue.get("body") or ""))
+        if merged and decide:
+            # The merged work does not settle a decision only an operator
+            # makes: the ticket waits on a person, not on ship and verify.
+            self._relabel(repo, number, "loom:answered")
+            self._routine(repo, number, "%s\n\nPull request #%d already carries this "
+                          "ticket's work, but the ticket has a decision box only an "
+                          "operator ticks, so it waits on a person, not loom:merged."
+                          % (said, int(merged[0]["number"])))
+            if HUMAN not in _label_names(self._issue(repo, number)):
+                brain.human(self.gh, repo, number, DECISION_ASK % "; ".join(
+                    " ".join(t.split())[:criteria_gate.ASK_WIDTH] for t in decide))
+            return
         if merged:
             pr = merged[0]
             states = {"loom:" + s for s in brain.STATES}
@@ -6916,7 +7235,10 @@ class Station:
         newest first, so they are not buried behind old ones."""
         prev = covered_before if isinstance(covered_before, dict) else {}
         covered = {k: self._ask_rev(i) for k, _, i in asks}
-        new = [a for a in reversed(asks) if prev.get(a[0]) != covered[a[0]]]
+        # Asks ranked by their urgency score (act mode) keep that order.
+        ranked = self._digest_ranked
+        new = [a for a in (asks if ranked else reversed(asks))
+               if prev.get(a[0]) != covered[a[0]]]
         seen = [a for a in asks if prev.get(a[0]) == covered[a[0]]]
         plan: Dict[str, Any] = {
             "day": today, "covered": covered, "new": len(new),
@@ -7108,8 +7430,9 @@ class Station:
         if keyed is None:
             return
         self._prune_urgent(ledger, {k for k, _, _ in keyed})
+        routes = self._route_asks(keyed)
         urgent_keys = {k for k, _, i in keyed
-                       if URGENT in _label_names(i) and k not in ledger[2]}
+                       if routes[k].route == urgency.URGENT and k not in ledger[2]}
         url = None
         # Urgent asks go out on their own: nothing the digest needs (a trust
         # check of an old ask, a page post) can hold them.
@@ -7121,7 +7444,61 @@ class Station:
                 return
             self._send_urgent(url, todo, ledger)
         if digest_due:
+            if self.s.urgency.mode == urgency.ACT:
+                # Act: only urgent and digest routes go in, highest score first.
+                keyed = [a for a in keyed
+                         if routes[a[0]].route in (urgency.URGENT, urgency.DIGEST)]
+                keyed.sort(key=lambda a: -(routes[a[0]].score or 0.0))
+                self._digest_ranked = True
             self._send_digest(url, keyed, ledger, today)
+
+    def _urgency_client(self) -> Optional[urgency.Client]:
+        if self._urgency_injected is not None:
+            return self._urgency_injected
+        if not self.s.urgency.key_ssm:
+            return None
+        key = self.read_secret(self.s.urgency.key_ssm, self.s.region)
+        return urgency.http_client(key, self.s.urgency.model) if key else None
+
+    def _label_urgent(self, key: str, repo: str, issue: Dict[str, Any]) -> None:
+        """Add loom:urgent beside the ask's labels (act mode); a failed write
+        is said and the ask is still forwarded this pass."""
+        try:
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+                         {"labels": [URGENT]})
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not label %s %s: %s" % (key, URGENT, err))
+
+    def _route_asks(self, keyed: List[Tuple[str, str, Dict[str, Any]]]
+                    ) -> Dict[str, urgency.Decision]:
+        """key -> where each ask goes this pass (bus/urgency.py). Off, or
+        shadow, routes by the label rules; act may add loom:urgent."""
+        cfg = self.s.urgency
+        scorer = urgency.Scorer(cfg, os.path.join(self.state, "urgency.json"),
+                                os.path.join(self.state, "urgency.jsonl"),
+                                client=self._urgency_client, now=self.now, say=_say)
+        titles = {k: " ".join(str(i.get("title") or "").split()) for k, _, i in keyed}
+        out: Dict[str, urgency.Decision] = {}
+        for key, repo, issue in keyed:
+            labels = _label_names(issue)
+            if cfg.mode == urgency.OFF:
+                out[key] = urgency.Decision(urgency.today_route(labels), None, None, False)
+                continue
+            state = urgency.ask_state(repo, issue, labels, self.now,
+                                      [t for k, t in titles.items() if k != key])
+            decision = scorer.decide(key, state, labels)
+            if decision.route == urgency.URGENT and URGENT not in labels:
+                self._label_urgent(key, repo, issue)
+            out[key] = decision
+        if cfg.mode != urgency.OFF:
+            scorer.prune(set(out))
+            try:
+                scorer.save()
+            except OSError as err:
+                _say("could not save the urgency ledger (%s)" % type(err).__name__)
+        return out
 
     # -- goal reports -----------------------------------------------------
     def _goal_issues(self, repo: str) -> List[Dict[str, Any]]:
@@ -8390,7 +8767,7 @@ class Station:
             return 0
         said = brain.settle_source(self.gh, repo, ticket, issue.get("body"),
                                    "completed" if completed else "not_planned",
-                                   unproven=completed)
+                                   unproven=completed, authors=self.s.authors)
         if said is None or not completed:
             pairs[key] = 0  # nothing more to do for this source
         if said is None:
@@ -8503,6 +8880,82 @@ class Station:
         finally:
             state["_at"] = self.now
             _write_json(path, state)
+
+    def clean_labels(self) -> None:
+        """One label pass (bus/label_pass.py, loom#2024): remove labels that
+        contradict each other or describe a step that is over, on at most
+        label_pass.PER_RUN issues a run, at most once every label_pass.EVERY
+        seconds. A body Part of #N that disagrees with the sub-issue parent is
+        one health note in the state file, said once. In shadow each removal
+        is a ledger line and is not sent."""
+        path = os.path.join(self.state, label_pass.STATE_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        last = state.get("_at")
+        if isinstance(last, (int, float)) and 0 <= self.now - last < label_pass.EVERY:
+            return
+        notes = state.get("notes") if isinstance(state.get("notes"), dict) else {}
+        left = label_pass.PER_RUN
+        try:
+            for repo in self._verify_repos():
+                if left <= 0 or self._deferred():
+                    break
+                try:
+                    left -= self._clean_labels_repo(repo, left, notes)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("could not clean the labels of %s: %s" % (repo, err))
+        finally:
+            state["_at"] = self.now
+            state["notes"] = notes
+            _write_json(path, state)
+
+    def _clean_labels_repo(self, repo: str, left: int, notes: Dict[str, Any]) -> int:
+        """Clean up to `left` issues of the repo: its open issues, and its
+        closed ones still at loom:triage; how many were changed."""
+        issues = self._paginate("/repos/%s/issues?state=open&per_page=100" % repo)
+        closed = self.gh.rest("GET", "/repos/%s/issues?labels=%s&state=closed&per_page=100"
+                              % (repo, quote(label_pass.TRIAGE, safe=":"))).data
+        issues = list(issues or []) + list(closed if isinstance(closed, list) else [])
+        station_logins = list(self.s.authors) + sorted(self._own_apps())
+        seen = set()
+        changed = 0
+        for issue in issues:
+            if not isinstance(issue, dict) or "pull_request" in issue:
+                continue
+            number = int(issue["number"])
+            if (number in seen
+                    or tickets.owned_elsewhere(issue, self.s.authors, self.s.briefers)):
+                continue
+            seen.add(number)
+            events = (self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
+                      if label_pass.needs_events(issue) else None)
+            found = label_pass.plan(issue, events, station_logins)
+            key = "%s#%d" % (repo, number)
+            if found.note and notes.get(key) != found.note:
+                _say("health note %s: %s" % (key, found.note))
+            if found.note:
+                notes[key] = found.note
+            else:
+                notes.pop(key, None)
+            if not found.remove or changed >= left:
+                continue
+            for removal in found.remove:
+                self._unlabel(repo, number, removal)
+            changed += 1
+        return changed
+
+    def _unlabel(self, repo: str, number: int, removal: "label_pass.Removal") -> None:
+        """Remove one label, or in shadow record that it would be removed."""
+        why = "remove %s: %s" % (removal.label, removal.why)
+        if shadow.active(repo):
+            shadow.record_held(shadow.UNLABEL, repo, number, "issue", reason=why,
+                               label=removal.label, source="station clean_labels")
+            return
+        self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                     % (repo, number, quote(removal.label, safe="")), ok=(404,))
+        _say("%s#%d: %s" % (repo, number, why))
 
     def _foreign_claimed(self, repo: str) -> Dict[int, Dict[str, Any]]:
         """The repo's open issues another operator claims by label, or that
@@ -8986,7 +9439,7 @@ class Station:
         last = state.get("last")
         if isinstance(last, (int, float)) and 0 <= self.now - last < self.s.health_every:
             return
-        sources, problems = health.parse_sources(self.s.health_urls)
+        sources, problems = health.parse_sources(self.s.health_urls, self.s.health_diagnose)
         for problem in problems:
             _say("ignoring a LOOM_HEALTH_URLS entry: %s" % problem)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now))
@@ -9100,9 +9553,53 @@ class Station:
             issues = state.get("issues")
             if not isinstance(issues, dict):
                 issues = state["issues"] = {}
+            subjects = state.get("subjects")
+            if not isinstance(subjects, dict):
+                subjects = state["subjects"] = {}
             invariants.Filer(self.gh, goal[0], goal[1], issues, self.now, _say,
-                             write=not self._deferred()).run(breaches)
+                             write=not self._deferred(), authors=self.s.authors,
+                             subjects=subjects,
+                             settled=lambda inv, subject: self._invariant_settled(
+                                 facts, inv, subject)).run(breaches)
         invariants.save(path, state)
+
+    def _invariant_settled(self, facts: invariants.Facts, invariant: str,
+                           subject: str) -> Optional[str]:
+        """Why a gone breach's subject is settled for good, in words a public
+        issue may carry, or None (loom#2022): a lane pull request merged or
+        closed unmerged, an epic back at its ticket cap."""
+        ref = re.fullmatch(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)", subject)
+        if ref is None:
+            return None
+        if invariant == "lane-pr-stalled":
+            return self._lane_pull_settled(ref.group(1), int(ref.group(2)))
+        if invariant == "epic-over-cap":
+            return self._epic_settled(facts, subject)
+        return None
+
+    def _lane_pull_settled(self, repo: str, number: int) -> Optional[str]:
+        """How a lane pull request left the open set, or None while it is open."""
+        if any(isinstance(p, dict) and p.get("number") == number
+               for p in self._pulls.get(repo, [])):
+            return None
+        pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+        if not isinstance(pr, dict) or pr.get("state") != "closed":
+            return None
+        label = self._invariant_ref(repo, number, "pull request").label
+        if pr.get("merged_at"):
+            return "lane %s merged at %s" % (label, pr["merged_at"])
+        return "lane %s was closed unmerged at %s" % (
+            label, pr.get("closed_at") or "an unknown time")
+
+    @staticmethod
+    def _epic_settled(facts: invariants.Facts, subject: str) -> Optional[str]:
+        """An epic this pass read at or under its ticket cap, or None."""
+        for shape in facts.shapes or []:
+            for epic in shape.epics:
+                if epic.epic.key == subject and epic.tickets <= invariants.EPIC_TICKETS:
+                    return "epic %s holds %d tickets, within the cap of %d" % (
+                        epic.epic.label, epic.tickets, invariants.EPIC_TICKETS)
+        return None
 
     def _invariant_goal(self) -> Optional[Tuple[str, int]]:
         """(repo, number) of the goal home breaches are filed on: the
@@ -9171,13 +9668,24 @@ class Station:
         ref = lambda issue: self._invariant_ref(repo, int(issue["number"]))  # noqa: E731
         outside = tuple(ref(i) for i in loose if i.get("state") == "open"
                         and "loom:ticket" in _label_names(i))
-        epics = tuple(invariants.EpicShape(
-            ref(epic), epic.get("state", "open") == "open", len(found),
-            tuple(ref(t) for t in found if t.get("state") != "closed"),
-            brain.standing_epic(epic))
-            for epic, found in tree)
+        # An open epic's tickets are its sub-issues and every issue whose Part
+        # of line names it, closed ones too, each once (loom#2023). The
+        # standing repairs epic has no ticket cap, so it costs no search.
+        linked = brain.part_of_linked(self.gh, repo, [
+            int(epic["number"]) for epic, _ in tree
+            if epic.get("state", "open") == "open" and not brain.standing_epic(epic)])
+        epics = []
+        for epic, found in tree:
+            union = {int(t.get("number") or 0): t for t in found}
+            for t in linked.get(int(epic["number"]), []):
+                union.setdefault(int(t.get("number") or 0), t)
+            union.pop(0, None)
+            epics.append(invariants.EpicShape(
+                ref(epic), epic.get("state", "open") == "open", len(union),
+                tuple(ref(t) for t in union.values() if t.get("state") != "closed"),
+                brain.standing_epic(epic), brain.sub_issue_count(self.gh, repo, epic, found)))
         return invariants.GoalShape(self._invariant_ref(repo, number),
-                                    brain.goal_epic_cap(goal), epics, outside)
+                                    brain.goal_epic_cap(goal), tuple(epics), outside)
 
     def _roll_goals(self, homes: List[Tuple[str, Dict[str, Any]]]) -> List[invariants.Ref]:
         """The goal homes whose body names a roll that no LOOM_ROLL_SHIP_DOCS
@@ -10404,6 +10912,37 @@ class Station:
             _say("could not send the needs-brain hold counts (%s); next run"
                  % type(err).__name__)
 
+    def post_chain(self) -> None:
+        """Send the dashboard (POST CHAIN_PATH) each watched repo's shadow
+        mode and the last CHAIN_ROWS held and acted entries, at most every
+        CHAIN_EVERY seconds. Read from bus.shadow and local files alone: no
+        GitHub request. The send is stamped however it ends, and a failed
+        one waits for the next run."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return
+        path = os.path.join(self.state, CHAIN_FILE)
+        stamp = _read_json(path, {}, strict=False)
+        last = stamp.get("at") if isinstance(stamp, dict) else None
+        if isinstance(last, (int, float)) and 0 <= self.now - last < CHAIN_EVERY:
+            return
+        _write_json(path, {"at": self.now})
+        token = self._transcript_token()
+        if token is None:
+            return
+        held = [{"action": e.get("action"), "repo": e.get("repo"), "number": e.get("number"),
+                 "at": e.get("time"), "source": e.get("source")}
+                for e in shadow.read(shadow.ledger_path())[-CHAIN_ROWS:]]
+        acted = [{key: e.get(key) for key in ("action", "repo", "number", "at", "source")}
+                 for e in shadow.read_acted(CHAIN_ROWS)]
+        body = {"at": self.now, "shadow_on": shadow.scope()[0],
+                "repos": [{"repo": repo, "shadow": shadow.active(repo)} for repo in self.s.repos],
+                "held": held, "acted": acted}
+        try:
+            self.upload(brain_memory.dashboard_url(self.s.transcript_url, CHAIN_PATH), token, body)
+        # Deliberately broad, as in _post_brain_holds: only the type is logged.
+        except Exception as err:  # noqa: BLE001
+            _say("could not send the command chain snapshot (%s); next run" % type(err).__name__)
+
     def _silent_lanes(self) -> Dict[str, float]:
         """Local lane -> seconds since its last heartbeat, for each lane
         without a live one (_heartbeat_ok false) that has ever reported and
@@ -10984,7 +11523,6 @@ class Station:
         reconcile read it) goes at once with its check copy and the runner's
         files beside it, unless a brief of that ticket is still in an inbox
         (loom#1808); so does an idle lane's run scratch from that ticket."""
-        root = os.path.join(self.s.home, "worktrees")
         live = set()
         for lane in LANES:
             try:
@@ -10998,37 +11536,58 @@ class Station:
                 return
         busy = {t for t in (self._tree_ticket(n) for n in live) if t is not None}
         self._prune_run_scratch(busy)
+        self._prune_tree_root(os.path.join(self.s.home, "worktrees"), live, busy)
+        if self.s.agy_workdir:
+            self._prune_tree_root(self.s.agy_workdir, live, busy, tickets_only=True)
+
+    def _prune_tree_root(self, root: str, live: Set[str], busy: Set[Tuple[str, int]],
+                         tickets_only: bool = False) -> None:
+        """Remove the finished trees in one lane tree folder. The folder is
+        opened once, never through a symlink, and every entry is listed and
+        removed relative to that open folder, so nothing resolves the path
+        again. tickets_only (the agy folder, in another user's home) also
+        refuses a path with a symlink in any part and removes only entries
+        named for a watched repo's ticket."""
+        if tickets_only and os.path.realpath(root) != os.path.abspath(root):
+            _say("lane tree folder %s passes through a symlink, so nothing in it is removed"
+                 % root)
+            return
         try:
-            names = os.listdir(root)
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except FileNotFoundError:
             return
         except OSError as err:
-            _say("cannot list %s to remove finished lane trees: %s" % (root, err))
+            _say("cannot open %s to remove finished lane trees (a symlink is never "
+                 "followed): %s" % (root, err))
             return
         removed = done = 0
-        for name in names:
-            path = os.path.join(root, name)
-            try:
-                st = os.lstat(path)
-            except FileNotFoundError:
-                continue
-            except OSError as err:
-                _say("cannot stat lane tree %s: %s" % (name, err))
-                continue
-            if name in live:
-                continue
-            finished = self._tree_done(name, busy)
-            if not finished and self.now - st.st_mtime < TREE_KEEP:
-                continue
-            if stat.S_ISDIR(st.st_mode):
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                os.unlink(path)
-            removed += 1
-            done += finished
+        try:
+            for name in os.listdir(fd):
+                if name in live or (tickets_only and self._tree_ticket(name) is None):
+                    continue
+                try:
+                    st = os.lstat(name, dir_fd=fd)
+                except FileNotFoundError:
+                    continue
+                except OSError as err:
+                    _say("cannot stat lane tree %s: %s" % (name, err))
+                    continue
+                finished = self._tree_done(name, busy)
+                if not finished and self.now - st.st_mtime < TREE_KEEP:
+                    continue
+                if stat.S_ISDIR(st.st_mode):
+                    shutil.rmtree(name, ignore_errors=True, dir_fd=fd)
+                else:
+                    os.unlink(name, dir_fd=fd)
+                removed += 1
+                done += finished
+        except OSError as err:
+            _say("cannot list %s to remove finished lane trees: %s" % (root, err))
+        finally:
+            os.close(fd)
         if removed:
-            _say("removed %d finished lane tree(s)%s" % (
-                removed, " (%d of tickets done)" % done if done else ""))
+            _say("removed %d finished lane tree(s) from %s%s" % (
+                removed, root, " (%d of tickets done)" % done if done else ""))
 
     def _tree_ticket(self, name: str) -> Optional[Tuple[str, int]]:
         """(repo, number) of a lane tree or brief name (tickets.ticket_name,
@@ -11158,7 +11717,8 @@ class Station:
 
     def _disk_free(self) -> Optional[int]:
         """Free bytes on the loom home's disk, read once a pass; None when it
-        cannot be read."""
+        cannot be read. Below twice the floor, local snapshots are thinned
+        first (thin_snapshots) and the free space is read again."""
         if not self._free_read:
             self._free_read = True
             try:
@@ -11166,7 +11726,30 @@ class Station:
             except OSError as err:
                 _say("cannot read the free space on the loom home's disk: %s" % err)
                 self._free = None
+            want = int(2 * self.s.disk_free_min_gb * GB)
+            if self._free is not None and self._free < want and self._thin_due():
+                ok = _thin_snapshots(self.s.home, want - self._free)
+                try:
+                    after = shutil.disk_usage(self.s.home).free
+                except OSError:
+                    after = self._free
+                _say("asked macOS to thin local snapshots (%s): %s free before, %s after"
+                     % ("done" if ok else "refused", _gb(self._free), _gb(after)))
+                self._free = after
         return self._free
+
+    def _thin_due(self) -> bool:
+        """Thinning is on and was last asked for THIN_EVERY or more ago; the
+        time is recorded now."""
+        if not self.s.thin_snapshots:
+            return False
+        path = os.path.join(self.state, THIN_FILE)
+        saved = _read_json(path, {}, strict=False)
+        last = saved.get("at") if isinstance(saved, dict) else None
+        if self._num(last) and self.now - float(last) < THIN_EVERY:
+            return False
+        _write_json(path, {"at": self.now})
+        return True
 
     def disk_low(self) -> bool:
         """True while the loom home's disk has less than disk_free_min_gb
@@ -11371,9 +11954,20 @@ class Station:
                if v[0] < BUDGET_FLOOR * v[1]]
         return min(low)[1:] if low else None
 
+    def _target_reached(self) -> bool:
+        target = getattr(self.gh, "target", None)
+        if not isinstance(target, int) or isinstance(target, bool):
+            return False
+        counted = getattr(self.gh, "counted", None)
+        if counted is None:
+            counted = getattr(self.gh, "requests", 0) - getattr(self.gh, "not_modified", 0)
+        return counted >= target
+
     def _deferred(self) -> bool:
-        """True when the budget is low: the step waits for the reset. Said
-        once per rate limit window."""
+        """True when the budget is low or the pass request target has been
+        reached: deferrable steps wait for the reset or next pass."""
+        if self._target_reached():
+            return True
         low = self.budget_low()
         if low is None:
             return False
@@ -11408,8 +12002,14 @@ class Station:
         line = "requests: %d, %d counted (%s), %d answered 304 (not counted)" % (
             gh.requests, gh.requests - gh.not_modified, kinds or "none", gh.not_modified)
         counted = gh.requests - gh.not_modified
+        target = getattr(gh, "target", None) or PASS_REQUEST_TARGET
         line += "; target %d counted (%s)" % (
-            PASS_REQUEST_TARGET, "over" if counted > PASS_REQUEST_TARGET else "met")
+            target, "over" if counted > target else "met")
+        carried = ", ".join("%s %d" % (k, n) for k, n in
+                            sorted(getattr(gh, "carried_over", {}).items(),
+                                   key=lambda kv: (-kv[1], kv[0])))
+        if carried:
+            line += "; carried over %s" % carried
         rates = self._rates()
         if "core" in rates:
             remaining, limit, reset = rates["core"]
@@ -11547,44 +12147,94 @@ class Station:
             return
         if not self.check_repo_access():
             return
-        self.sync_labels()
-        self.finish_claims()
-        self._safe_run(self.tend_runners, GitHubError, OSError, runners.ReportError,
-                       msg="tend_runners failed")
-        self.report_outcomes()
-        self._safe_run_deferred(self.reconcile_pull_requests, GitHubError, OSError,
-                                msg="pull request reconciliation failed")
-        self._safe_run_deferred(self.hand_back, GitHubError, OSError,
-                                msg="hand_back failed")
-        # A disk under the floor takes no new work (loom#1808); a pass
-        # still finishes half-done claims, reconciles and prunes.
-        self._safe_run_conditional(not self.disk_low(), self.claim_new, OSError,
-                                   msg="claim_new failed")
-        self._safe_run_deferred(self.assign_queued, GitHubError, OSError,
-                                msg="assign_queued failed")
-        self._safe_run(self.record_scans, OSError,
-                       msg="could not record the repo scans")
-        self._safe_run(self._scan_grug_idle, GitHubError, OSError,
-                       msg="grug:idle scan failed")
-        self._run_steps()
-        # The day's metrics line goes out even below the budget floor: one post
-        # a day, and on 2026-10-18 the floor deferred it every pass, so the
-        # operator got no numbers for the day. Only a spent budget stops it.
-        self._safe_run(self.post_metrics, GitHubError, OSError, ValueError,
-                       msg="post_metrics failed")
-        self._safe_run(self.watch_logs, GitHubError, OSError,
-                       msg="watch_logs failed")
-        # Local housekeeping: finished lane trees, old lane logs, the disk.
-        for local in (self.prune_trees, self.tend_disk):
-            self._safe_run(local, OSError, msg="%s failed" % local.__name__)
-        self._safe_run(lambda: self._collect_and_write_usage(), OSError,
-                       msg="could not write usage limits")
+        # The local end of the pass runs however the GitHub part ends: a pass
+        # that stops at its request target (TargetReached) or a rate limit
+        # still prunes lane trees, tends the disk and sends its snapshots.
+        # From loom#1915 until this change every such pass skipped them, and
+        # no lane tree was pruned for hours on 2026-10-26.
+        try:
+            self.sync_labels()
+            self.finish_claims()
+            try:
+                self._timed(self.tend_runners)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, runners.ReportError) as err:
+                _say("tend_runners failed: %s" % err)
+            self.report_outcomes()
+            if not self._deferred():
+                try:
+                    self._timed(self.reconcile_pull_requests)
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError) as err:
+                    _say("pull request reconciliation failed: %s" % err)
+            if not self._deferred():
+                try:
+                    self._timed(self.hand_back)
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError) as err:
+                    _say("hand_back failed: %s" % err)
+            # A disk under the floor takes no new work (loom#1808); a pass
+            # still finishes half-done claims, reconciles and prunes.
+            if not self.disk_low():
+                self._timed(self.claim_new)
+            if not self._deferred():
+                try:
+                    self._timed(self.assign_queued)
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError) as err:
+                    _say("assign_queued failed: %s" % err)
+            try:
+                self.record_scans()
+            except OSError as err:
+                _say("could not record the repo scans: %s" % err)
+            try:
+                self._scan_grug_idle()
+            except RateLimited:
+                raise
+            except (GitHubError, OSError) as err:
+                _say("grug:idle scan failed: %s" % err)
+            self._run_steps()
+            # The day's metrics line goes out even below the budget floor: one post
+            # a day, and on 2026-10-18 the floor deferred it every pass, so the
+            # operator got no numbers for the day. Only a spent budget stops it.
+            try:
+                self.post_metrics()
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("post_metrics failed: %s" % err)
+            try:
+                self.watch_logs()
+            except RateLimited:
+                raise
+            except (GitHubError, OSError) as err:
+                _say("watch_logs failed: %s" % err)
+        finally:
+            self._end_pass_locally()
 
-    def _collect_and_write_usage(self) -> None:
-        """Collect and write usage limits, then upload them."""
-        records = usage.collect(self.s.home, now=self.now)
-        usage.write(self.s.home, records)
-        self.upload_usage_limits(records)
+    def _end_pass_locally(self) -> None:
+        """Local housekeeping that needs no GitHub request: finished lane
+        trees, old lane logs, the disk, the usage snapshot and the command
+        chain snapshot."""
+        for local in (self.prune_trees, self.tend_disk):
+            try:
+                local()
+            except OSError as err:
+                _say("%s failed: %s" % (local.__name__, err))
+        try:
+            records = usage.collect(self.s.home, now=self.now)
+            usage.write(self.s.home, records)
+            self.upload_usage_limits(records)
+        except OSError as err:
+            _say("could not write usage limits: %s" % err)
+        try:
+            self.post_chain()
+        except OSError as err:
+            _say("could not send the command chain snapshot: %s" % err)
 
     def tend_runners(self) -> None:
         """The slots in LOOM_RUNNER_SLOTS: dispatch their briefs to cluster
@@ -11668,29 +12318,39 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         os.ftruncate(fd, 0)
         os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
-        if gh is None:
-            from .github import auth_from_env
-            gh = GitHub(auth_from_env())
-            gh.status_in_body = True
-        _trust_app_login(settings, gh)
-        if gh.cache_dir is None:
-            # Every GET is conditional: a list re-read each pass costs a 304.
-            gh.cache_dir = os.path.join(state, "station", "etags")
-        app = getattr(gh, "app", None)
-        if app is not None and getattr(app, "state_file", None) is None:
-            # GitHub's ETags differ per token: keep the App token across
-            # passes (0600) so last pass's ETags still answer 304 (loom#1306).
-            app.state_file = os.path.join(state, "station", "app-token.json")
-        st = Station(gh, settings, **hooks)
+        deadline = _try_arm_pass_deadline(state, settings.pass_deadline, time.time())
         try:
-            st.run_pass()
-        except RateLimited as err:
-            _say("%s; the pass stopped there" % err)
-        except StateError as err:
-            _say("stopping: %s" % err)
-            return 1
+            return _locked_pass(settings, state, gh, hooks)
         finally:
-            st.end_pass()
-        return 0
+            _disarm_pass_deadline(deadline)
     finally:
         os.close(fd)
+
+
+def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
+                 hooks: Dict[str, Any]) -> int:
+    """The pass run() starts once it holds the lock."""
+    if gh is None:
+        from .github import auth_from_env
+        gh = GitHub(auth_from_env())
+        gh.status_in_body = True
+    _trust_app_login(settings, gh)
+    if gh.cache_dir is None:
+        # Every GET is conditional: a list re-read each pass costs a 304.
+        gh.cache_dir = os.path.join(state, "station", "etags")
+    app = getattr(gh, "app", None)
+    if app is not None and getattr(app, "state_file", None) is None:
+        # GitHub's ETags differ per token: keep the App token across
+        # passes (0600) so last pass's ETags still answer 304 (loom#1306).
+        app.state_file = os.path.join(state, "station", "app-token.json")
+    st = Station(gh, settings, **hooks)
+    try:
+        st.run_pass()
+    except (RateLimited, TargetReached) as err:
+        _say("%s; the pass stopped there" % err)
+    except StateError as err:
+        _say("stopping: %s" % err)
+        return 1
+    finally:
+        st.end_pass()
+    return 0

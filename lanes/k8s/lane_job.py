@@ -267,6 +267,9 @@ def lane_env() -> Dict[str, str]:
         "LOOM_SSM_DIR": os.path.join(d, "ssm"),
         "LOOM_SANDBOX": "bwrap",
         "LOOM_DROP_TREES": "1",
+        # A red base check here files no incident: the station sends the
+        # ticket to another lane, which files it if the base is red there.
+        "LOOM_CLUSTER_RUNNER": "1",
         # Scratch on the job's volume, not the runner's small /tmp.
         "TMPDIR": os.path.join(d, "tmp"),
     })
