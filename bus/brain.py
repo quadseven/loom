@@ -5452,10 +5452,29 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
                         ", ".join(history.tried), "; ".join(history.reasons)), notify.RUNAWAY)
         return "needs-brain"
     free = _available_lanes(gh, lanes_repo)
+    load_counter = factory.Factory(gh, [lanes_repo], time.time(),
+                                  trusted=trusted_authors())
+    load_counter.count_load({lanes_repo: load_counter._tickets(lanes_repo)})
     choice = None
+    skipped_load = None
+    lane_sets = {n: tuple(x for x in rung_lanes(n) if x in free) for n in left}
+    first = next((n for n in left if lane_sets[n]), None)
+    if first is not None:
+        first_lane = factory.pick_lane(lane_sets[first], load_counter.load)
+        first_load = load_counter.load.get(first_lane, 0)
+        if len(lane_sets[first]) == 1 and first_load > factory.ONE_LANE_MAX:
+            for n in left:
+                if n == first or not lane_sets[n]:
+                    continue
+                lane = factory.pick_lane(lane_sets[n], load_counter.load)
+                lane_load = load_counter.load.get(lane, 0)
+                if lane_load <= first_load - 3:
+                    skipped_load = (first + 1, first_lane, first_load)
+                    first = n
+                    break
     for n in left:
-        lane = next((x for x in rung_lanes(n) if x in free), None)
-        if lane:
+        if n == first:
+            lane = factory.pick_lane(lane_sets[n], load_counter.load)
             choice = (n - 1, lane)
             break
     if choice is None:
@@ -5463,10 +5482,15 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     rung, lane = choice
     model = factory.CLIMB[rung][1]
     reason = "; ".join(history.reasons)
-    comment = "\n".join([ESCALATE_MARKER,
+    comment_lines = [ESCALATE_MARKER,
                          "Escalated to rung %d of %d: %s on lane %s." % (rung + 1, len(factory.CLIMB), model, lane),
                          "Reason: %s (attempts %d, tried %s)." % (reason, history.attempts, ", ".join(history.tried) or "none"),
-                         "Rung: %d %s %s" % (rung + 1, model, lane)])
+                         "Rung: %d %s %s" % (rung + 1, model, lane)]
+    if skipped_load:
+        skipped_rung, skipped_lane, load = skipped_load
+        comment_lines.insert(2, "Skipped rung %d: lane %s holds %d tickets." %
+                             (skipped_rung, skipped_lane, load))
+    comment = "\n".join(comment_lines)
     _check_written_text(comment)
     pr = open_pr if "loom:pr" in names else None
     if pr is not None:

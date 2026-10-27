@@ -2785,6 +2785,22 @@ class EscalateTests(unittest.TestCase):
         gh = GitHub("t", transport=fake)
         return fake, brain.escalate(gh, REPO, 9)
 
+    def escalated_with_lane_load(self, first, second):
+        routes = ticket_routes(stuck_ticket("failed"), TWICE, [], free=("claude", "codex"))
+        rows = []
+        for n in range(first):
+            rows.append(dict(ticket("briefed"), number=100 + n,
+                             labels=[{"name": "loom:ticket"}, {"name": "loom:briefed"},
+                                     {"name": "lane:claude"}], user={"login": "example-brain"}))
+        for n in range(second):
+            rows.append(dict(ticket("briefed"), number=200 + n,
+                             labels=[{"name": "loom:ticket"}, {"name": "loom:briefed"},
+                                     {"name": "lane:codex"}], user={"login": "example-brain"}))
+        routes[("GET", "/repos/quadseven/loom/issues")] = reply(200, rows + [
+            {"number": 99, "labels": [{"name": "loom:lanes"}]}])
+        with unittest.mock.patch.dict(os.environ, TRUSTED):
+            return self.run_escalate(routes)
+
     def test_runaway_tickets_have_a_dedicated_status_section(self):
         rows = [dict(ticket("briefed"), number=12, title="Ordinary"),
                 dict(ticket("briefed"), number=13, title="Ticket")]
@@ -2881,6 +2897,17 @@ class EscalateTests(unittest.TestCase):
         self.assertIn("rung 2 of 3", note)
         self.assertIn("failed 2 times", note)
         self.assertIn("Rung: 2 gpt-6-luna codex", note)
+
+    def test_escalate_skips_overloaded_single_lane_rung(self):
+        fake, outcome = self.escalated_with_lane_load(5, 1)
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
+        self.assertEqual(fake.sent("PUT", "/issues/9/labels"),
+                         [{"labels": ["loom:ticket", "loom:briefed", "lane:codex"]}])
+        self.assertIn("holds 5 tickets", fake.sent("POST", "/issues/9/comments")[-1]["body"])
+
+    def test_escalate_keeps_lowest_rung_at_one_lane_max(self):
+        _, outcome = self.escalated_with_lane_load(3, 1)
+        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
 
     def test_escalate_edits_the_status_comment_and_posts_no_comment(self):
         status_comment = {"id": 77, "user": {"login": "example-brain"}, "created_at": OLD,
