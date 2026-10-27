@@ -229,7 +229,12 @@ def _render_generated(brief: str, lane: str, model: str, ticket: str,
     """Render the generated sections the way lanes/run_lane.sh::pr_body does."""
     _check_footer_fields(ticket, lane, model)
     why = _brief_section(brief, "Why")
-    summary = _brief_section(brief, "What")
+    # Briefs write the change under "## What" or "## Summary"; a Why left
+    # empty falls back to that change, else the title, so the body keeps a
+    # non-empty ## Why for the plan check (loom#1468).
+    summary = _brief_section(brief, "What") or _brief_section(brief, "Summary")
+    if not why.strip():
+        why = summary if summary.strip() else (_brief_title(brief) or "")
     if acceptance is None:
         acceptance = _brief_criteria(brief)
     size = _brief_size(brief)
