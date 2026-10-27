@@ -121,6 +121,23 @@ class PassDeadline(unittest.TestCase):
         self.assertEqual(cancel.call_count, 1)
         self.assertFalse(os.path.exists(self.marker))
 
+    def test_a_deadline_that_cannot_be_armed_is_logged_and_the_pass_still_runs(self):
+        ran = {}
+
+        def look(st):
+            ran["pass"] = True
+
+        with mock.patch.object(station.faulthandler, "dump_traceback_later",
+                               side_effect=OSError("no stream")), \
+                mock.patch.object(station.faulthandler, "cancel_dump_traceback_later"):
+            code, said = self.quiet_pass(
+                station.Settings(self.home, [REPO], [], [], pass_deadline=600), look)
+        self.assertEqual(code, 0)
+        self.assertTrue(ran.get("pass"), "the pass runs unarmed")
+        self.assertIn("could not arm the pass deadline", said)
+        self.assertIn("no stream", said)
+        self.assertFalse(os.path.exists(self.marker), "no marker is left for an unarmed pass")
+
     def test_a_killed_pass_is_not_called_an_overrun(self):
         os.makedirs(os.path.dirname(self.marker))
         with open(self.marker, "w") as fh:

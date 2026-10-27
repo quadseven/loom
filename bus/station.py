@@ -1328,6 +1328,23 @@ def _discard(path: str) -> None:
         pass
 
 
+def _try_arm_pass_deadline(state: str, seconds: int, now: float) -> Optional[str]:
+    """_arm_pass_deadline, but a failure to arm is logged and the pass runs
+    unarmed rather than dying before it starts: the deadline is a backstop,
+    and losing it must not stop the station."""
+    try:
+        return _arm_pass_deadline(state, seconds, now)
+    except Exception as err:  # noqa: BLE001 - any arm failure must not stop the pass
+        _say("could not arm the pass deadline (%s: %s); this pass runs without one"
+             % (type(err).__name__, err))
+        try:
+            faulthandler.cancel_dump_traceback_later()
+            _discard(os.path.join(state, "station", DEADLINE_MARKER_FILE))
+        except OSError as cleanup:
+            _say("could not clear the pass deadline marker: %s" % cleanup)
+        return None
+
+
 def _disarm_pass_deadline(path: Optional[str]) -> None:
     """Cancel this pass's deadline and remove its marker."""
     if path is None:
@@ -12154,7 +12171,7 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         os.ftruncate(fd, 0)
         os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
-        deadline = _arm_pass_deadline(state, settings.pass_deadline, time.time())
+        deadline = _try_arm_pass_deadline(state, settings.pass_deadline, time.time())
         try:
             return _locked_pass(settings, state, gh, hooks)
         finally:
