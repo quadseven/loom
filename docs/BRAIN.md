@@ -76,6 +76,17 @@ station and the runner need to say "taken" and "gave up" without the brain
 present. `loom:ready` is a PR readiness label, and `needs-brain` asks for a
 full review after automatic fix rounds; neither replaces the ticket state.
 
+The station's `clean_labels` step (bus/label_pass.py, loom#2024) keeps that
+true. At most once an hour, on at most 20 issues a run, it removes from each
+open issue (and each closed one still at `loom:triage`) that no other
+operator owns: every state label but the newest the station set; `needs-brain`
+when `loom:human` or a `needs:<login>` label says a person holds the issue;
+`loom:triage` once the issue is a `loom:ticket` or closed; and the `lane:*`
+label of a ticket at `loom:answered`, whose lane answered with no change. A
+body `Part of #N` naming another issue than the sub-issue parent is changed
+by nobody: it is one health note in the step's state file, logged once. In
+shadow mode each removal is an `unlabel` line of the ledger and is not sent.
+
 ### Shipping Loom itself
 
 The station deploys this repo (lanes/mac/station.sh) and records each

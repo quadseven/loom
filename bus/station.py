@@ -46,6 +46,7 @@ from . import scope_fit
 from . import shadow
 from . import urgency
 from . import stale_claims
+from . import label_pass
 from . import factory
 from . import friction_intake
 from . import evidence
@@ -4366,6 +4367,7 @@ class Station:
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.close_done_tickets, self.settle_orphan_sources,
                      self.settle_claimed_tickets, self.release_stale_claims,
+                     self.clean_labels,
                      self.queue_stateless_tickets,
                      self.restate_shipped_live,
                      self.health_intake, self.intake_friction,
@@ -8667,6 +8669,82 @@ class Station:
             state["_at"] = self.now
             _write_json(path, state)
 
+    def clean_labels(self) -> None:
+        """One label pass (bus/label_pass.py, loom#2024): remove labels that
+        contradict each other or describe a step that is over, on at most
+        label_pass.PER_RUN issues a run, at most once every label_pass.EVERY
+        seconds. A body Part of #N that disagrees with the sub-issue parent is
+        one health note in the state file, said once. In shadow each removal
+        is a ledger line and is not sent."""
+        path = os.path.join(self.state, label_pass.STATE_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        last = state.get("_at")
+        if isinstance(last, (int, float)) and 0 <= self.now - last < label_pass.EVERY:
+            return
+        notes = state.get("notes") if isinstance(state.get("notes"), dict) else {}
+        left = label_pass.PER_RUN
+        try:
+            for repo in self._verify_repos():
+                if left <= 0 or self._deferred():
+                    break
+                try:
+                    left -= self._clean_labels_repo(repo, left, notes)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("could not clean the labels of %s: %s" % (repo, err))
+        finally:
+            state["_at"] = self.now
+            state["notes"] = notes
+            _write_json(path, state)
+
+    def _clean_labels_repo(self, repo: str, left: int, notes: Dict[str, Any]) -> int:
+        """Clean up to `left` issues of the repo: its open issues, and its
+        closed ones still at loom:triage; how many were changed."""
+        issues = self._paginate("/repos/%s/issues?state=open&per_page=100" % repo)
+        closed = self.gh.rest("GET", "/repos/%s/issues?labels=%s&state=closed&per_page=100"
+                              % (repo, quote(label_pass.TRIAGE, safe=":"))).data
+        issues = list(issues or []) + list(closed if isinstance(closed, list) else [])
+        station_logins = list(self.s.authors) + sorted(self._own_apps())
+        seen = set()
+        changed = 0
+        for issue in issues:
+            if not isinstance(issue, dict) or "pull_request" in issue:
+                continue
+            number = int(issue["number"])
+            if (number in seen
+                    or tickets.owned_elsewhere(issue, self.s.authors, self.s.briefers)):
+                continue
+            seen.add(number)
+            events = (self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
+                      if label_pass.needs_events(issue) else None)
+            found = label_pass.plan(issue, events, station_logins)
+            key = "%s#%d" % (repo, number)
+            if found.note and notes.get(key) != found.note:
+                _say("health note %s: %s" % (key, found.note))
+            if found.note:
+                notes[key] = found.note
+            else:
+                notes.pop(key, None)
+            if not found.remove or changed >= left:
+                continue
+            for removal in found.remove:
+                self._unlabel(repo, number, removal)
+            changed += 1
+        return changed
+
+    def _unlabel(self, repo: str, number: int, removal: "label_pass.Removal") -> None:
+        """Remove one label, or in shadow record that it would be removed."""
+        why = "remove %s: %s" % (removal.label, removal.why)
+        if shadow.active(repo):
+            shadow.record_held(shadow.UNLABEL, repo, number, "issue", reason=why,
+                               label=removal.label, source="station clean_labels")
+            return
+        self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                     % (repo, number, quote(removal.label, safe="")), ok=(404,))
+        _say("%s#%d: %s" % (repo, number, why))
+
     def _foreign_claimed(self, repo: str) -> Dict[int, Dict[str, Any]]:
         """The repo's open issues another operator claims by label, or that
         are assigned to a trusted briefer (another operator's login)."""
@@ -9263,9 +9341,53 @@ class Station:
             issues = state.get("issues")
             if not isinstance(issues, dict):
                 issues = state["issues"] = {}
+            subjects = state.get("subjects")
+            if not isinstance(subjects, dict):
+                subjects = state["subjects"] = {}
             invariants.Filer(self.gh, goal[0], goal[1], issues, self.now, _say,
-                             write=not self._deferred(), authors=self.s.authors).run(breaches)
+                             write=not self._deferred(), authors=self.s.authors,
+                             subjects=subjects,
+                             settled=lambda inv, subject: self._invariant_settled(
+                                 facts, inv, subject)).run(breaches)
         invariants.save(path, state)
+
+    def _invariant_settled(self, facts: invariants.Facts, invariant: str,
+                           subject: str) -> Optional[str]:
+        """Why a gone breach's subject is settled for good, in words a public
+        issue may carry, or None (loom#2022): a lane pull request merged or
+        closed unmerged, an epic back at its ticket cap."""
+        ref = re.fullmatch(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)", subject)
+        if ref is None:
+            return None
+        if invariant == "lane-pr-stalled":
+            return self._lane_pull_settled(ref.group(1), int(ref.group(2)))
+        if invariant == "epic-over-cap":
+            return self._epic_settled(facts, subject)
+        return None
+
+    def _lane_pull_settled(self, repo: str, number: int) -> Optional[str]:
+        """How a lane pull request left the open set, or None while it is open."""
+        if any(isinstance(p, dict) and p.get("number") == number
+               for p in self._pulls.get(repo, [])):
+            return None
+        pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+        if not isinstance(pr, dict) or pr.get("state") != "closed":
+            return None
+        label = self._invariant_ref(repo, number, "pull request").label
+        if pr.get("merged_at"):
+            return "lane %s merged at %s" % (label, pr["merged_at"])
+        return "lane %s was closed unmerged at %s" % (
+            label, pr.get("closed_at") or "an unknown time")
+
+    @staticmethod
+    def _epic_settled(facts: invariants.Facts, subject: str) -> Optional[str]:
+        """An epic this pass read at or under its ticket cap, or None."""
+        for shape in facts.shapes or []:
+            for epic in shape.epics:
+                if epic.epic.key == subject and epic.tickets <= invariants.EPIC_TICKETS:
+                    return "epic %s holds %d tickets, within the cap of %d" % (
+                        epic.epic.label, epic.tickets, invariants.EPIC_TICKETS)
+        return None
 
     def _invariant_goal(self) -> Optional[Tuple[str, int]]:
         """(repo, number) of the goal home breaches are filed on: the

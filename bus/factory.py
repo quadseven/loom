@@ -144,6 +144,10 @@ Neither needs a model:
   closed with a comment naming the pull request that superseded it. A pull
   request a person opened, or one not on a loom/ branch, is never closed this
   way.
+- A lane pull request whose open ticket was rewritten as a newer ticket, or is
+  loom:failed past the last rung of the model ladder (hand-off pool or not),
+  is closed with one comment naming the ticket and where the work went
+  (loom#2027). A ticket in a fix round, or failed with a rung left, keeps it.
 
 Each climb is recorded on the ticket as a RUNG_MARKER comment, so the ladder
 survives restarts and any brain can read where a ticket stands.
@@ -192,6 +196,8 @@ NO_LANE_RE = re.compile(r"(no free lane takes model |no free lane in tier "
                         r"|on lane \S+, .*: no free lane in its )")
 # The hand-off pool the second operator's session works (docs/BRAIN.md).
 HANDOFF_LABEL = labels.HANDOFF
+# What bus.brain writes on an issue it rewrote as a new ticket (_filed_rewrite).
+REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 # The states in which a lane has taken the ticket: its no-lane wait is over.
 LANED_STATES = ("running", "pr", "answered", "merged", "shipped", "verified")
 
@@ -489,6 +495,11 @@ CLASSES = change_class.CLASSES
 # station process reads the files once per commit.
 CLASS_RANK = {name: rank for rank, name in enumerate(reversed(CLASSES))}
 _CLASSED: Dict[Tuple[str, int, str], str] = {}
+# When the keep-current step last brought each held pull request up to date
+# (2026-10-27: the first behind pull request in landing order took the repo's
+# one slot every pass and the rest fell up to 71 commits behind).
+KEEP_CURRENT_COOLDOWN = 30 * 60
+_KEPT_AT: Dict[Tuple[str, int], float] = {}
 DEFER_LABEL = "loom:triage"
 DEFER_TITLE = "Settle the review findings left from PR #%d"
 # The title before the naming standard (docs/NAMING.md): an open follow-up
@@ -2236,9 +2247,74 @@ class Factory:
                             ticket, old.get("merged_at"), events):
                         return
                 self._close_all_but(repo, prs, merged, closed)
+            return
+        ended = self._ended_note(repo, ticket, ticket_map) if ticket else None
+        if ended is not None:
+            for pr in prs:
+                if self.actions >= MAX_ACTIONS:
+                    return
+                self._close_ended_pr(repo, pr, ended)
+                closed.add(int(pr["number"]))
         elif len(prs) > 1:
             newest = max(prs, key=lambda p: (_ts(p.get("created_at")), int(p["number"])))
             self._close_all_but(repo, prs, int(newest["number"]), closed)
+
+    def _superseding_ticket(self, ticket: Dict[str, Any],
+                            ticket_map: Dict[int, Dict[str, Any]],
+                            comments: Callable[[], List[Dict[str, Any]]]) -> Optional[int]:
+        """The newest open ticket that supersedes this one, or None: an open
+        loom:ticket whose body says "Rewritten from issue N." (what
+        bus.brain brief --refs writes), or, for a ticket labelled
+        loom:rewritten, the ticket a trusted "Rewritten as ticket #M," comment
+        names. `comments` reads the ticket's trusted comments, called only
+        for such a label."""
+        number = int(ticket["number"])
+        found = [n for n, t in ticket_map.items()
+                 if n != number and tickets.rewritten_source(t.get("body")) == number]
+        if "loom:rewritten" in _labels(ticket):
+            found += [int(m.group(1)) for c in comments()
+                      for m in REWRITTEN_AS_RE.finditer(str(c.get("body") or ""))
+                      if int(m.group(1)) != number]
+        return max(found) if found else None
+
+    def _ended_note(self, repo: str, ticket: Dict[str, Any],
+                    ticket_map: Dict[int, Dict[str, Any]]) -> Optional[str]:
+        """Why nothing will ever build an open ticket's lane pull request, as
+        the close comment, or None while something may (loom#2027): the ticket
+        was rewritten as a newer ticket, or it is loom:failed past the last
+        rung of the model ladder. A ticket in a fix round, or failed with a
+        rung left to climb, keeps its pull request. A closed ticket is not
+        handled here."""
+        if ticket.get("state") != "open":
+            return None
+        number = int(ticket["number"])
+        read: List[List[Dict[str, Any]]] = []
+
+        def comments() -> List[Dict[str, Any]]:
+            # One read a ticket, shared by both checks below.
+            if not read:
+                read.append(self._comments(repo, number))
+            return read[0]
+
+        newer = self._superseding_ticket(ticket, ticket_map, comments)
+        if newer is not None:
+            return ("Closed by the station as superseded: its ticket #%d was rewritten as "
+                    "ticket #%d, which a lane builds on its own branch." % (number, newer))
+        if _state(ticket) != "failed" or not self._gave_up_since_claim(comments()):
+            return None
+        where = ("in the hand-off pool (%s), where the second operator's session takes it"
+                 % HANDOFF_LABEL) if HANDOFF_LABEL in _labels(ticket) else "for the brain"
+        return ("Closed by the station: its ticket #%d is past the last rung of the model "
+                "ladder and is left loom:failed %s; the work is re-briefed as a new "
+                "loom:ticket." % (number, where))
+
+    def _close_ended_pr(self, repo: str, pr: Dict[str, Any], comment: str) -> None:
+        """Close an open lane pull request whose ticket ended, with the one
+        comment _ended_note wrote."""
+        number = int(pr["number"])
+        self.close(self.gh, repo, number, comment)
+        self.actions += 1
+        _say("closed %s#%d: %s" % (repo, number, comment))
 
     def _close_superseded_prs(self, repo: str, open_prs: Sequence[Dict[str, Any]],
                               tickets: Dict[int, Dict[str, Any]]) -> set:
@@ -2699,12 +2775,20 @@ class Factory:
         pinned to the head it judged, at most one a repo a pass; it never
         merges. A refused update (422) is left for the next pass: a held
         pull request is not sent back to a lane."""
-        if repo in self.kept_current or not self._behind(repo, full):
+        if repo in self.kept_current:
+            return
+        # Each held pull request waits KEEP_CURRENT_COOLDOWN after its update
+        # (its checks rerun meanwhile) and lets the next one in landing order
+        # have the slot, so one that keeps falling behind cannot starve the rest.
+        if self.now - _KEPT_AT.get((repo, number), float("-inf")) < KEEP_CURRENT_COOLDOWN:
+            return
+        if not self._behind(repo, full):
             return
         sha = str((full.get("head") or {}).get("sha") or "")
         done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
                             {"expected_head_sha": sha}, ok=(422,))
         self.kept_current.add(repo)
+        _KEPT_AT[(repo, number)] = self.now
         if done.status == 422:
             _say("%s#%d is held and could not be brought up to date with its base"
                  % (repo, number))
