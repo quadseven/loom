@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -19,10 +20,26 @@ class EvidenceTextSafetyTest(unittest.TestCase):
     def test_capture_file_source_filters_by_match_and_since(self):
         from lanes.evidence.serve import _log_lines
         with tempfile.TemporaryDirectory() as directory:
-            capture = Path(directory) / "capture.log"
-            capture.write_text("2026-10-25T00:00:00Z old event\n2026-10-27T00:00:00Z new event\n")
-            self.assertEqual(_log_lines({"file": str(capture)}, 24, "event"),
-                             ["2026-10-27T00:00:00Z new event"])
+            capture = Path(directory) / "logs" / "capture" / "game.log"
+            capture.parent.mkdir(parents=True)
+            old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 40 * 3600))
+            new = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
+            capture.write_text("%s old event\n%s new event\n" % (old, new))
+            with mock.patch.dict("os.environ", {"LOOM_HOME": directory}):
+                self.assertEqual(_log_lines({"file": str(capture)}, 24, "event"),
+                                 ["%s new event" % new])
+                self.assertEqual(len(_log_lines({"file": str(capture)}, 48, "event")), 2)
+
+    def test_capture_file_source_outside_the_capture_directory_is_refused(self):
+        from lanes.evidence.serve import _log_lines
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "logs" / "capture").mkdir(parents=True)
+            secret = Path(directory) / "secret.log"
+            secret.write_text("2026-10-27T00:00:00Z event\n")
+            escape = str(Path(directory) / "logs" / "capture" / ".." / ".." / "secret.log")
+            with mock.patch.dict("os.environ", {"LOOM_HOME": directory}):
+                with self.assertRaises(ValueError):
+                    _log_lines({"file": escape}, 24, "event")
 
     def test_private_host_and_credential_lines_are_dropped_and_counted(self):
         safe, dropped = _safe_items([

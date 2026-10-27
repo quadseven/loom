@@ -18,7 +18,8 @@ standalone argument, replaced with the validated `since` value. The caller's
 only commands that read logs.
 
 A log entry may instead set `file` to a station capture path. The service
-reads timestamped lines from that file, applies the requested `since` window,
+refuses a `file` that resolves outside `$LOOM_HOME/logs/capture`, reads
+timestamped lines from that file, applies the requested `since` window,
 then filters by the fixed `match` substring. Configure `LOOM_LOG_CAPTURE`
 on the station as a JSON list of objects with `source`, `namespace`, and
 `selector` strings; the station writes captures under `$LOOM_HOME/logs/capture`.

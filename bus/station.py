@@ -4444,37 +4444,51 @@ class Station:
             except OSError as err:
                 _say("could not read capture for %s: %s" % (name, err))
                 continue
-            previous = [evidence.line_time(line) for line in existing.splitlines()]
-            previous = [stamp for stamp in previous if stamp is not None]
+            previous = [stamp for stamp in map(evidence.line_time, existing.splitlines())
+                        if stamp is not None]
             since = max(previous) if previous else self.now - 48 * 3600
-            try:
-                result = subprocess.run(
-                    ["kubectl", "-n", spec["namespace"], "logs", "-l", spec["selector"],
-                     "--all-containers=true", "--timestamps=true",
-                     "--since-time=" + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))],
-                    check=True, capture_output=True, text=True, timeout=120)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
-                _say("could not capture log for %s: %s" % (name, type(err).__name__))
+            fetched = self._fetch_pod_log(spec, since)
+            if fetched is None:
                 continue
-            recent = existing.splitlines()[-MAX_CAPTURE_LINES:]
-            seen = set(recent)
-            added = [line for line in result.stdout.splitlines() if line not in seen]
-            lines = recent + added
-            first_new = next((evidence.line_time(line) for line in added
-                              if evidence.line_time(line) is not None), None)
-            if previous and first_new is not None and first_new - since > 3600:
-                marker = "LOOM_LOG_GAP from=%s to=%s" % (
-                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since)),
-                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(first_new)))
-                lines.append(marker)
-            cutoff = self.now - self.s.log_capture_retention_hours * 3600
-            kept = [line for line in lines if evidence.line_time(line) is None or
-                    evidence.line_time(line) >= cutoff]
+            kept = self._merged_capture(existing, fetched, since if previous else None)
             temp = path + ".tmp"
             Path(temp).write_text("".join(line + "\n" for line in kept), encoding="utf-8")
             os.replace(temp, path)
             if kept:
                 _say("log capture: %s holds %s" % (name, kept[0].split(" ", 1)[0]))
+
+    def _fetch_pod_log(self, spec: Dict[str, str], since: float) -> Optional[str]:
+        """The pod log lines with timestamps from since on, or None (said) when
+        kubectl failed or timed out."""
+        try:
+            result = subprocess.run(
+                ["kubectl", "-n", spec["namespace"], "logs", "-l", spec["selector"],
+                 "--all-containers=true", "--timestamps=true",
+                 "--since-time=" + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))],
+                check=True, capture_output=True, text=True, timeout=120)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
+            _say("could not capture log for %s: %s" % (spec["source"], type(err).__name__))
+            return None
+        return result.stdout
+
+    def _merged_capture(self, existing: str, fetched: str, since: Optional[float]) -> List[str]:
+        """The capture's lines after this read: the new lines appended, a gap
+        marker when the first new line starts over an hour after the last
+        captured one (since, None for a new capture), and lines older than
+        the retention trimmed."""
+        recent = existing.splitlines()[-MAX_CAPTURE_LINES:]
+        seen = set(recent)
+        added = [line for line in fetched.splitlines() if line not in seen]
+        lines = recent + added
+        first_new = next((stamp for stamp in map(evidence.line_time, added)
+                          if stamp is not None), None)
+        if since is not None and first_new is not None and first_new - since > 3600:
+            lines.append("LOOM_LOG_GAP from=%s to=%s" % (
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since)),
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(first_new))))
+        cutoff = self.now - self.s.log_capture_retention_hours * 3600
+        return [line for line in lines if evidence.line_time(line) is None or
+                evidence.line_time(line) >= cutoff]
 
     def _timed(self, step: Any) -> bool:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or

@@ -71,9 +71,20 @@ def _audit_parameters(params: dict[str, str]) -> dict[str, str]:
             else "<redacted>" for key, value in params.items()}
 
 
+def _capture_path(path: str) -> str:
+    """The resolved capture file, refused unless it sits under the station's
+    $LOOM_HOME/logs/capture directory."""
+    home = os.environ.get("LOOM_HOME") or os.path.join(os.path.expanduser("~"), "loom")
+    root = os.path.realpath(os.path.join(home, "logs", "capture"))
+    resolved = os.path.realpath(path)
+    if os.path.commonpath([root, resolved]) != root or resolved == root:
+        raise ValueError("log capture file is outside the capture directory")
+    return resolved
+
+
 def _capture_lines(path: str, cutoff: float, match: str) -> list[str]:
     result = []
-    with open(path, "r", encoding="utf-8") as source:
+    with open(_capture_path(path), "r", encoding="utf-8") as source:
         for line in source:
             stamp = re.match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)Z?", line)
             recent = not stamp or calendar.timegm(time.strptime(
