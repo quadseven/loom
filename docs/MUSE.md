@@ -18,7 +18,10 @@ you). The lock lives in `quadseven/loom`.
 
 Shadow mode (docs/BRAIN.md, Shadow mode): set `LOOM_SHADOW=1` and
 `LOOM_SHADOW_REPOS` to the same values as the station. Unset, the brain is in
-shadow for every repo. In shadow, `bus.brain merge` and `bus.brain close` run
+shadow for every repo. Shadow is per repo: a repo not in a non-empty
+`LOOM_SHADOW_REPOS` is out of shadow, and there `bus.brain merge` and
+`bus.brain close` act once their gates pass (`python3 -m bus.shadow status`
+says which). In shadow, `bus.brain merge` and `bus.brain close` run
 every gate and then stop with "shadow mode: would ..."; that is the expected
 result, not a failure to retry or work around. Name each such pull request or
 ticket in the journal as "would merge" or "would close". Never merge or close
