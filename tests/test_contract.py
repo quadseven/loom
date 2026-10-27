@@ -63,6 +63,11 @@ class ContractFormTests(unittest.TestCase):
         self.assertEqual(contract.normalize(text),
                          "interpreter: uv\ncheck: uv run ruff check .\n")
 
+    def test_quoted_command_parses_unchanged(self):
+        text = '[test]\ncommand = "uv run pytest -q"\n'
+        self.assertEqual(contract.normalize(text),
+                         "interpreter: uv\ncheck: uv run pytest -q\n")
+
     def test_unquoted_four_tables_join_in_kind_order(self):
         text = ('[lint]\ncommand = uv run ruff check .\nworkflow = a.yml\nstep = lint\n\n'
                 '[format]\ncommand = uv run ruff format --check .\nworkflow = a.yml\nstep = format\n\n'
