@@ -17,6 +17,13 @@ standalone argument, replaced with the validated `since` value. The caller's
 `match` value filters the command's output as a fixed substring. Configure
 only commands that read logs.
 
+A log entry may instead set `file` to a station capture path. The service
+reads timestamped lines from that file, applies the requested `since` window,
+then filters by the fixed `match` substring. Configure `LOOM_LOG_CAPTURE`
+on the station as a JSON list of objects with `source`, `namespace`, and
+`selector` strings; the station writes captures under `$LOOM_HOME/logs/capture`.
+`LOOM_LOG_CAPTURE_RETENTION_HOURS` controls retention and defaults to 48.
+
 A query entry has `database`, `sql`, and `params` fields. `sql` must be one
 SELECT statement using named SQLite parameters. Each declared parameter type
 is `str`, `int`, `float`, or `bool`; all declared values must be present in a

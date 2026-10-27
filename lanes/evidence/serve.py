@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import calendar
 import json
 import logging
 import os
@@ -71,6 +72,16 @@ def _audit_parameters(params: dict[str, str]) -> dict[str, str]:
 
 
 def _log_lines(spec: dict[str, Any], hours: int, match: str) -> list[str]:
+    if isinstance(spec.get("file"), str):
+        cutoff = time.time() - hours * 3600
+        result = []
+        with open(spec["file"], "r", encoding="utf-8") as source:
+            for line in source:
+                stamp = re.match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)Z?", line)
+                if match in line and (not stamp or calendar.timegm(time.strptime(
+                        stamp.group(1), "%Y-%m-%dT%H:%M:%S")) >= cutoff):
+                    result.append(line.rstrip("\n"))
+        return result
     argv = spec.get("command")
     if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
         raise ValueError("log source command must be a non-empty argument list")

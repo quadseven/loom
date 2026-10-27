@@ -219,6 +219,8 @@ def lines_since(command: str, literal: str, since: float, now: float,
                     {"LOOM_EVIDENCE_SINCE": "%d" % int(since)})
     if lines is None:
         return None
+    if any("LOOM_LOG_GAP" in line for line in lines):
+        return None
     read_from = now - (min(windows) if windows else window_hours) * 3600
     out = []
     for line in lines:

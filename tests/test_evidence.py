@@ -16,6 +16,14 @@ from tests.local_http import LocalHTTPServer
 
 
 class EvidenceTextSafetyTest(unittest.TestCase):
+    def test_capture_file_source_filters_by_match_and_since(self):
+        from lanes.evidence.serve import _log_lines
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / "capture.log"
+            capture.write_text("2026-10-25T00:00:00Z old event\n2026-10-27T00:00:00Z new event\n")
+            self.assertEqual(_log_lines({"file": str(capture)}, 24, "event"),
+                             ["2026-10-27T00:00:00Z new event"])
+
     def test_private_host_and_credential_lines_are_dropped_and_counted(self):
         safe, dropped = _safe_items([
             "ordinary evidence", "service.internal failed", "Bearer abcdefghijklmnop"])

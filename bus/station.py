@@ -798,6 +798,8 @@ class Settings:
                  friction_mode: str = "",
                  evidence_cmds: Optional[Dict[str, str]] = None,
                  evidence_window_hours: float = EVIDENCE_WINDOW_HOURS,
+                 log_capture: Optional[List[Dict[str, str]]] = None,
+                 log_capture_retention_hours: int = 48,
                  live_evidence_repos: Sequence[str] = (),
                  live_evidence_env: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
@@ -873,6 +875,8 @@ class Settings:
         # searches, which bounds the absence a verify can prove (a command that
         # prints loom-evidence-window-hours: N overrides it per run).
         self.evidence_window_hours = evidence_window_hours
+        self.log_capture = list(log_capture or [])
+        self.log_capture_retention_hours = log_capture_retention_hours
         # LOOM_LIVE_EVIDENCE_REPOS: repos whose .loom/live-evidence.json
         # adapter the live proof may run (bus/live_adapter.py, loom#1770);
         # LOOM_LIVE_EVIDENCE_PASS_ENV names the station variables (a
@@ -994,6 +998,9 @@ class Settings:
                    evidence_cmds=_evidence_commands(env),
                    evidence_window_hours=_hours(env.get("LOOM_EVIDENCE_WINDOW_HOURS", ""),
                                                 EVIDENCE_WINDOW_HOURS),
+                   log_capture=_log_capture_specs(env.get("LOOM_LOG_CAPTURE", "")),
+                   log_capture_retention_hours=_hours(
+                       env.get("LOOM_LOG_CAPTURE_RETENTION_HOURS", ""), 48),
                    live_evidence_repos=live_adapter.opted_in(
                        env.get("LOOM_LIVE_EVIDENCE_REPOS", "")),
                    live_evidence_env=live_adapter.passed_env(
@@ -1228,6 +1235,22 @@ def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
         _say("ignoring LOOM_EVIDENCE_CMDS: %s" % err)
         return {}
     return commands
+
+
+def _log_capture_specs(raw: str) -> List[Dict[str, str]]:
+    if not raw.strip():
+        return []
+    try:
+        values = json.loads(raw)
+    except ValueError as err:
+        _say("ignoring LOOM_LOG_CAPTURE: %s" % err)
+        return []
+    if not isinstance(values, list):
+        _say("ignoring LOOM_LOG_CAPTURE: expected a JSON list")
+        return []
+    return [item for item in values if isinstance(item, dict) and
+            all(isinstance(item.get(key), str) and item[key].strip()
+                for key in ("source", "namespace", "selector"))]
 
 
 def _hours(raw: str, default: float) -> float:
@@ -4354,7 +4377,7 @@ class Station:
         loop step a pass and a full turn of the loop took hours."""
         loop_started = time.monotonic()
         # Below the budget floor these wait for the reset; trees are local.
-        steps = (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_merged,
+        steps = (self.capture_pod_logs, self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_merged,
                      self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
@@ -4405,6 +4428,41 @@ class Station:
             _write_json(rotation_path, {"next": stopped_at if stopped_at is not None else 0})
         except OSError as err:
             _say("could not record the step rotation: %s" % err)
+
+    def capture_pod_logs(self) -> None:
+        """Append configured Kubernetes pod logs and trim the capture window."""
+        for spec in self.s.log_capture:
+            name = spec["source"]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+                _say("ignoring log capture with invalid source name")
+                continue
+            path = os.path.join(self.s.home, "logs", "capture", name + ".log")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            existing = Path(path).read_text(encoding="utf-8") if os.path.exists(path) else ""
+            previous = [evidence.line_time(line) for line in existing.splitlines()]
+            previous = [stamp for stamp in previous if stamp is not None]
+            since = max(previous) if previous else self.now - 48 * 3600
+            result = subprocess.run(
+                    ["kubectl", "-n", spec["namespace"], "logs", "-l", spec["selector"],
+                     "--all-containers=true", "--timestamps=true",
+                     "--since-time=" + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))],
+                    check=True, capture_output=True, text=True, timeout=120)
+            seen = set(existing.splitlines())
+            added = [line for line in result.stdout.splitlines() if line not in seen]
+            lines = existing.splitlines() + added
+            first_new = next((evidence.line_time(line) for line in added
+                              if evidence.line_time(line) is not None), None)
+            if previous and first_new is not None and first_new - since > 3600:
+                marker = "LOOM_LOG_GAP from=%s to=%s" % (
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since)),
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(first_new)))
+                lines.append(marker)
+            cutoff = self.now - self.s.log_capture_retention_hours * 3600
+            kept = [line for line in lines if evidence.line_time(line) is None or
+                    evidence.line_time(line) >= cutoff]
+            Path(path).write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+            if kept:
+                _say("log capture: %s holds %s" % (name, kept[0].split(" ", 1)[0]))
 
     def _timed(self, step: Any) -> bool:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
