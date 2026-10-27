@@ -2361,15 +2361,13 @@ class Station:
             return False
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
-        fixture_source = tickets.rewritten_source(issue.get("body"))
         has_contract, checks = self._validation_checks(repo)
         text = tickets.render_brief(repo, issue, lane, attempt, fix, checks, has_contract,
                                     None if fix else self._timedout_branch(comments),
                                     notes=tickets.operator_notes(
                                         comments, list(self.s.authors) + list(self.s.briefers)
                                         + list(self.s.owners)),
-                                    linked=self._linked_pulls(repo, number),
-                                    fixture_source=fixture_source)
+                                    linked=self._linked_pulls(repo, number))
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an

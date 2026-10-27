@@ -4245,26 +4245,30 @@ class ClaimTest(Base):
         self.assertFalse([n for n in self.fake.names(12) if n.startswith("wait:")])
         self.assertEqual(self.fake.paths("PUT"), ["/repos/%s/issues/12/labels" % REPO])
 
-    def test_a_claimed_tickets_brief_includes_fixture_source_line(self):
-        # loom#1860: a build brief for a ticket that reads stored rows
-        # contains the fixture-source line.
-        # The ticket was rewritten from issue 123 (which is open, so the ticket
-        # is not rejected by the source_shipped check).
-        body = ("Difficulty: medium\n\n## Why\nTest\n\n## What\nDo it\n\n"
-                "Rewritten from issue 123.\n")
-        # Add the source issue as open so the stale-ticket check passes
-        self.fake.issues[123] = {
-            "number": 123, "title": "Source", "body": "", "state": "open",
-            "user": {"login": "alice-example"}, "labels": [{"name": "loom:ticket"}]}
-        self.fake.comments[123] = []
+    def claimed_brief(self, body):
         self.fake.add(12, body=body)
         self.run_pass()
         name = "example-owner.example-repo-12"
         self.assertEqual(self.listing(), [name + ".md"])
         with open(self.inbox("codex", name + ".md")) as fh:
-            text = fh.read()
-        self.assertIn("Fixture-Source: #123", text)
-        self.assertIn("Rewritten from issue 123.", text)
+            return fh.read()
+
+    def test_a_brief_for_a_ticket_that_reads_stored_rows_names_the_fixture_source(self):
+        # loom#1860: a lane built its fixture rows by hand with an ended reason
+        # the live writer never writes; a ticket whose criteria read stored
+        # rows tells the lane where fixture rows come from.
+        text = self.claimed_brief(
+            "Difficulty: medium\n\n## Why\nTest\n\n## What\nDo it\n\n"
+            "## Acceptance criteria\n- [ ] A test: the report reads each run row "
+            "from the runs table.\n")
+        self.assertIn(tickets.FIXTURE_NOTE, text)
+        self.assertNotIn("Fixture-Source", text)
+
+    def test_a_brief_for_a_ticket_that_reads_no_rows_has_no_fixture_line(self):
+        text = self.claimed_brief(
+            "Difficulty: medium\n\n## Why\nTest\n\n## What\nDo it\n\n"
+            "## Acceptance criteria\n- [ ] A test: the status line names the base.\n")
+        self.assertNotIn(tickets.FIXTURE_NOTE, text)
 
     def test_a_limit_on_another_model_or_one_that_lifted_does_not_hold_the_claim(self):
         self.heartbeat("codex", limited_models={"model-y": int(time.time()) + 3600,
