@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import sys
 import tempfile
+import time
 import unittest
-from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -17,219 +19,204 @@ AUTHORS = ["alice-example"]
 PR_NUMBER = 1
 TICKET_NUMBER = 2
 HEAD_SHA = "abc123"
-FOUR_HOURS_AGO = 4 * 3600
-PR_STALLED = 6 * 3600
+NEEDS_BRAIN_AGE = 4 * 3600
+NOW = time.time()
+
+
+def stamp(hours_ago: float) -> str:
+    """An ISO-8601 timestamp `hours_ago` before NOW."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - hours_ago * 3600))
+
+
+class Response:
+    """A minimal stand-in for bus.github.GitHub's rest response."""
+
+    def __init__(self, data):
+        self.data = data
+        self.status = 200
 
 
 class FakeGitHub:
-    """A tiny stateful issues API for testing escalations."""
+    """A tiny stateful GitHub for testing escalations."""
 
     def __init__(self):
         self.issues = {}
         self.pulls = []
         self.comments = {}
-        self.calls = []
-        self.posts = []
-        self.writes = []
         self.head_commits = {}
-        self.lane_prs = []
-        self.add_issue(
-            repo=REPO, number=TICKET_NUMBER, state="open",
-            labels=["loom:ticket", "loom:pr", "needs-brain"],
-            body=f"Refs {REPO}#{TICKET_NUMBER}"
-        )
-        self.add_pull(
-            repo=REPO, number=PR_NUMBER, state="open",
-            head_ref="loom/1", head_sha=HEAD_SHA, user="alice-example"
-        )
-        self.pr_ticket_map = {f"{REPO}#{PR_NUMBER}": TICKET_NUMBER}
-        self.head_commits[HEAD_SHA] = {"ref": "loom/1", "pr_number": PR_NUMBER}
+        self.api = "https://api.github.com"
 
-    def add_issue(self, repo, number, state="open", labels=(), body=""):
+    @staticmethod
+    def _resp(data):
+        return Response(data)
+
+    def add_issue(self, repo, number, state="open", labels=(), body="", created_at=None):
+        if created_at is None:
+            created_at = stamp(0)
         self.issues[f"{repo}#{number}"] = {
-            "number": number, "state": state, "labels": labels,
-            "body": body, "created_at": "2026-01-01T00:00:00Z"
+            "number": number, "state": state, "labels": list(labels),
+            "body": body, "created_at": created_at,
         }
-        self.open_issues = [
-            (repo, int(i["number"]))
-            for repo, issues in self.issues.items()
-            for i in issues if i.get("state") == "open"
-        ]
 
-    def add_pull(self, repo, number, state="open", head_ref="loom/1", head_sha=None, user="alice-example"):
+    def add_pull(self, repo, number, state="open", head_ref="loom/1", head_sha=None,
+                 user="alice-example", created_at=None):
         if head_sha is None:
-            head_sha = "abc123"
+            head_sha = HEAD_SHA
+        if created_at is None:
+            created_at = stamp(0)
         self.pulls.append({
-            "number": number, "state": state, "created_at": "2026-01-01T00:00:00Z",
-            "head": {"ref": head_ref, "sha": head_sha}, "user": {"login": user}
+            "number": number, "state": state, "created_at": created_at,
+            "head": {"ref": head_ref, "sha": head_sha}, "user": {"login": user},
         })
-        self.lane_prs.append((repo, number, head_sha))
+        self.head_commits[head_sha] = {"ref": head_ref, "pr_number": number}
 
     def get_issue(self, repo, number):
         return self.issues.get(f"{repo}#{number}")
 
     def get_pull(self, repo, number):
         for pr in self.pulls:
-            if pr["repo"] == repo and pr["number"] == number:
+            if pr["number"] == number:
                 return pr
         return None
 
     def paginate(self, path):
-        self.calls.append(("GET", path))
+        ticket_q = "/repos/%s/issues?labels=loom:ticket&state=open" % REPO
+        pulls_q = "/repos/%s/pulls?state=open" % REPO
+        if path.startswith(ticket_q):
+            return [i for i in self.issues.values()
+                    if i.get("state") == "open" and "loom:ticket" in i.get("labels", [])]
+        if path.startswith(pulls_q):
+            return [pr for pr in self.pulls if pr.get("state") == "open"]
         m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/comments\?", path)
         if m:
             return list(self.comments.get((m.group(1), int(m.group(2))), []))
-        m = re.match(r"/repos/([^/]+/[^/]+)/issues\?labels=loom:ticket&state=open", path)
-        if m:
-            issues = []
-            for repo, issues_dict in self.issues.items():
-                for issue in issues_dict:
-                    if issue.get("state") == "open" and "loom:ticket" in issue.get("labels", []):
-                        issues.append(issue)
-            return issues
-        m = re.match(r"/repos/([^/]+/[^/]+)/issues\?labels=loom:pr&state=open", path)
-        if m:
-            issues = []
-            for repo, issues_dict in self.issues.items():
-                for issue in issues_dict:
-                    if issue.get("state") == "open" and "loom:pr" in issue.get("labels", []):
-                        issues.append(issue)
-            return issues
         return []
 
     def rest(self, method, path, body=None):
-        self.calls.append((method, path))
-        if method == "GET":
-            m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)", path)
-            if m:
-                repo, number = m.group(1), int(m.group(2))
-                return self.get_issue(repo, number)
-            m = re.match(r"/repos/([^/]+/[^/]+)/pulls/(\d+)", path)
-            if m:
-                repo, number = m.group(1), int(m.group(2))
-                return self.get_pull(repo, number)
-            m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/comments", path)
-            if m:
-                repo, number = m.group(1), int(m.group(2))
-                return self.comments.get((repo, number), [])
-            m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/labels", path)
-            if m:
-                repo, number = m.group(1), int(m.group(2))
-                issue = self.get_issue(repo, number)
-                if issue:
-                    return issue.get("labels", [])
-        if method == "POST":
-            if path.endswith("/comments"):
-                comment_id = len(self.comments) + 1
-                self.comments.append({
-                    (path.rsplit("/", 1)[0], comment_id): body
-                })
-                return {"id": comment_id, "body": body}
-            if path.endswith("/labels"):
-                m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/labels", path)
-                if m:
-                    repo, number = m.group(1), int(m.group(2))
-                    self.add_label(repo, number, body.get("name"))
-            if path.endswith("/commits"):
-                m = re.match(r"/repos/([^/+]+)/([^/]+)/commits/(.+)", path)
-                if m:
-                    repo, _owner, sha = m.group(1), m.group(2), m.group(3)
-                    self.head_commits[sha] = self.head_commits.get(sha, {})
-                    return {"sha": sha, "commit": self.head_commits[sha]}
-            if path.endswith("/merge"):
-                return {"merged": True, "merge_commit_sha": "def456"}
-
-        return {"data": None}
-
-    def add_label(self, repo, number, label):
-        if f"{repo}#{number}" not in self.issues:
-            return
-        issue = self.issues[f"{repo}#{number}"]
-        if isinstance(issue.get("labels"), list):
-            issue["labels"].append(label)
-        else:
-            issue["labels"] = [label]
+        m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)$", path)
+        if method == "GET" and m:
+            return self._resp(self.get_issue(m.group(1), int(m.group(2))))
+        m = re.match(r"/repos/([^/]+/[^/]+)/pulls/(\d+)$", path)
+        if method == "GET" and m:
+            return self._resp(self.get_pull(m.group(1), int(m.group(2))))
+        m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/comments$", path)
+        if method == "GET" and m:
+            return self._resp(list(self.comments.get((m.group(1), int(m.group(2))), [])))
+        if method == "POST" and m:
+            repo, number = m.group(1), int(m.group(2))
+            self.comments.setdefault((repo, number), []).append({"body": body.get("body")})
+            return self._resp({"id": len(self.comments), "body": body.get("body")})
+        m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/labels$", path)
+        if method == "GET" and m:
+            issue = self.get_issue(m.group(1), int(m.group(2)))
+            return self._resp(list(issue.get("labels", [])) if issue else [])
+        if method == "PUT" and m:
+            repo, number = m.group(1), int(m.group(2))
+            issue = self.get_issue(repo, number)
+            if issue:
+                issue["labels"] = list(body.get("labels", []))
+            return self._resp({"labels": issue.get("labels", [])} if issue else {})
+        m = re.match(r"/repos/([^/]+/[^/]+)/pulls\?state=open", path)
+        if method == "GET" and m:
+            return self._resp([pr for pr in self.pulls if pr.get("state") == "open"])
+        return self._resp({"data": None})
 
     def add_comment(self, repo, number, comment):
-        if (repo, number) not in self.comments:
-            self.comments[(repo, number)] = []
-        self.comments[(repo, number)].append(comment)
+        self.comments.setdefault((repo, number), []).append(comment)
+
+    def comment_bodies(self, repo, number):
+        return [str(c.get("body", "")) for c in self.comments.get((repo, number), [])]
 
     def has_comment_marker(self, repo, number, marker):
-        if (repo, number) not in self.comments:
-            return False
-        for comment in self.comments[(repo, number)]:
-            if marker in str(comment.get("body", "")):
-                return True
-        return False
+        return any(marker in body for body in self.comment_bodies(repo, number))
+
+    def human_comment_count(self, repo, number):
+        return sum(1 for body in self.comment_bodies(repo, number)
+                   if "<!-- loom:human v1 -->" in body)
 
 
 class TestNeedsBrainEscalation(unittest.TestCase):
-    """Test that the station escalates tickets that wait on brain for 4+ hours."""
+    """Test that the station escalates needs-brain tickets that wait 4+ hours."""
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
         self.gh = FakeGitHub()
+        self.gh.add_issue(
+            repo=REPO, number=TICKET_NUMBER, state="open",
+            labels=["loom:ticket", "loom:pr", "needs-brain"],
+            body="Refs %s#%d" % (REPO, TICKET_NUMBER), created_at=stamp(5))
+        self.gh.add_pull(
+            repo=REPO, number=PR_NUMBER, state="open",
+            head_ref="loom/%d" % TICKET_NUMBER, head_sha=HEAD_SHA)
         self.station = station.Station(
             settings=station.Settings(
-                home=self.temp_dir,
-                repos=[REPO],
-                authors=AUTHORS,
-                plan_check="Grug - Chief",
-                factory_on=False
-            ),
+                home=self.temp_dir, repos=[REPO], authors=AUTHORS,
+                owners=(), plan_check="Grug - Chief", factory_on=False),
             gh=self.gh,
-            now=time.time() - FOUR_HOURS_AGO
-        )
+            now=NOW)
         os.makedirs(os.path.join(self.temp_dir, "state"), exist_ok=True)
 
     def tearDown(self):
         if hasattr(self, 'temp_dir'):
             shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    def test_ticket_4_plus_hours_escalates_once(self):
+        """A ticket with an open lane PR that waited 4+ hours gets loom:human
+        and exactly one escalation comment naming the PR and the ask."""
+        self.station.escalate_needs_brain_tickets()
+        issue = self.gh.get_issue(REPO, TICKET_NUMBER)
+        self.assertIn("loom:human", issue["labels"])
+        self.assertEqual(self.gh.human_comment_count(REPO, TICKET_NUMBER), 1)
+        self.assertTrue(self.gh.has_comment_marker(
+            REPO, TICKET_NUMBER, "<!-- loom:human v1 -->"))
+        body = "\n".join(self.gh.comment_bodies(REPO, TICKET_NUMBER))
+        self.assertIn("%s#%d" % (REPO, PR_NUMBER), body)
+        self.assertIn("python3 -m bus.brain merge %s#%d" % (REPO, PR_NUMBER), body)
+        self.assertIn("python3 -m bus.brain fix", body)
+
     def test_ticket_under_4_hours_no_change(self):
-        """A ticket under 4 hours with needs-brain is left alone."""
-        # Ticket is open for only 3 hours, so it should not be escalated
-        self.station.now = time.time() - (3 * 3600)
+        """A ticket under 4 hours is left alone."""
+        self.gh.add_issue(
+            repo=REPO, number=TICKET_NUMBER, state="open",
+            labels=["loom:ticket", "loom:pr", "needs-brain"],
+            body="Refs %s#%d" % (REPO, TICKET_NUMBER), created_at=stamp(3))
         self.station.escalate_needs_brain_tickets()
         issue = self.gh.get_issue(REPO, TICKET_NUMBER)
         self.assertEqual(issue["labels"], ["loom:ticket", "loom:pr", "needs-brain"])
-        self.assertFalse(self.gh.has_comment_marker(REPO, TICKET_NUMBER, "<!-- loom:human v1 -->"))
+        self.assertFalse(self.gh.has_comment_marker(
+            REPO, TICKET_NUMBER, "<!-- loom:human v1 -->"))
 
     def test_no_open_lane_pr_no_change(self):
         """A ticket with no open lane PR is left alone."""
-        # Remove the lane PR
         for pr in self.gh.pulls:
             if pr["number"] == PR_NUMBER:
                 pr["state"] = "closed"
-        self.gh.escalated_prs = set()
         self.station.escalate_needs_brain_tickets()
         issue = self.gh.get_issue(REPO, TICKET_NUMBER)
         self.assertEqual(issue["labels"], ["loom:ticket", "loom:pr", "needs-brain"])
-        self.assertFalse(self.gh.has_comment_marker(REPO, TICKET_NUMBER, "<!-- loom:human v1 -->"))
+        self.assertFalse(self.gh.has_comment_marker(
+            REPO, TICKET_NUMBER, "<!-- loom:human v1 -->"))
 
     def test_pr_already_escalated_no_duplicate(self):
         """A second pass on the same PR head posts no comment and changes no label."""
-        # First pass should escalate
         self.station.escalate_needs_brain_tickets()
         issue = self.gh.get_issue(REPO, TICKET_NUMBER)
         self.assertIn("loom:human", issue["labels"])
-        self.assertTrue(self.gh.has_comment_marker(REPO, TICKET_NUMBER, "<!-- loom:human v1 -->"))
+        self.assertEqual(self.gh.human_comment_count(REPO, TICKET_NUMBER), 1)
 
-        # Second pass should not escalate again
         self.station.escalate_needs_brain_tickets()
         issue = self.gh.get_issue(REPO, TICKET_NUMBER)
         self.assertIn("loom:human", issue["labels"])
-        self.assertTrue(self.gh.has_comment_marker(REPO, TICKET_NUMBER, "<!-- loom:human v1 -->"))
+        self.assertEqual(self.gh.human_comment_count(REPO, TICKET_NUMBER), 1)
 
     def test_different_pr_head_escalates(self):
-        """A new head commit may escalate again."""
-        # First PR head is already escalated
+        """A new head commit may escalate once more."""
         self.station.escalate_needs_brain_tickets()
         issue = self.gh.get_issue(REPO, TICKET_NUMBER)
         self.assertIn("loom:human", issue["labels"])
+        first = self.gh.human_comment_count(REPO, TICKET_NUMBER)
+        self.assertEqual(first, 1)
 
-        # New PR head should be escalated
         new_sha = "def456"
         for pr in self.gh.pulls:
             if pr["number"] == PR_NUMBER:
@@ -237,29 +224,26 @@ class TestNeedsBrainEscalation(unittest.TestCase):
         self.station.escalate_needs_brain_tickets()
         issue = self.gh.get_issue(REPO, TICKET_NUMBER)
         self.assertIn("loom:human", issue["labels"])
-        self.assertTrue(self.gh.has_comment_marker(REPO, TICKET_NUMBER, "<!-- loom:human v1 -->"))
+        self.assertEqual(self.gh.human_comment_count(REPO, TICKET_NUMBER), 2)
 
-    def test_multiple_tickets_one_escalates(self):
-        """Multiple tickets with needs-brain, only one is open for 4+ hours."""
-        # Add a second ticket that is also 4+ hours old
-        TICKET_NUMBER_2 = 3
+    def test_multiple_tickets_only_the_due_one_escalates(self):
+        """Of several needs-brain tickets, only the one that waited 4+ hours
+        is escalated."""
         self.gh.add_issue(
-            repo=REPO, number=TICKET_NUMBER_2, state="open",
+            repo=REPO, number=3, state="open",
             labels=["loom:ticket", "loom:pr", "needs-brain"],
-            body=f"Refs {REPO}#{TICKET_NUMBER_2}"
-        )
+            body="Refs %s#3" % REPO, created_at=stamp(1))
         self.gh.add_pull(
-            repo=REPO, number=PR_NUMBER + 1, state="open",
-            head_ref="loom/2", head_sha="ghi789", user="alice-example"
-        )
+            repo=REPO, number=2, state="open",
+            head_ref="loom/3", head_sha="ghi789")
 
         self.station.escalate_needs_brain_tickets()
         issue1 = self.gh.get_issue(REPO, TICKET_NUMBER)
-        issue2 = self.gh.get_issue(REPO, TICKET_NUMBER_2)
+        issue2 = self.gh.get_issue(REPO, 3)
         self.assertIn("loom:human", issue1["labels"])
-        self.assertIn("loom:human", issue2["labels"])
-        self.assertTrue(self.gh.has_comment_marker(REPO, TICKET_NUMBER, "<!-- loom:human v1 -->"))
-        self.assertTrue(self.gh.has_comment_marker(REPO, TICKET_NUMBER_2, "<!-- loom:human v1 -->"))
+        self.assertNotIn("loom:human", issue2["labels"])
+        self.assertEqual(self.gh.human_comment_count(REPO, TICKET_NUMBER), 1)
+        self.assertEqual(self.gh.human_comment_count(REPO, 3), 0)
 
 
 if __name__ == "__main__":
