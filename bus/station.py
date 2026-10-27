@@ -5542,7 +5542,7 @@ class Station:
                        and run.get("conclusion") in brain.FAILED_CONCLUSIONS
                        and str(run.get("name") or "") in names]
             gaps = ci_gap.find_gaps(self.gh, repo, pr_number, sha, fields, failing,
-                                    lambda: self._pull_paths(repo, pr_number) or [])
+                                    lambda: self._pull_paths(repo, pr_number) or [], _say)
             filed = ci_gap.file_gaps(self.gh, self.state, gaps, self.now, _say)
         except RateLimited:
             raise

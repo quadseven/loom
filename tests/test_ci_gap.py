@@ -1,5 +1,6 @@
 """The validation-gap reader (bus/ci_gap.py) and the failure facts of a red
 CI log (bus/ci_facts.py), loom#1773."""
+import base64
 import os
 import sys
 import tempfile
@@ -90,6 +91,109 @@ class CoverageTest(unittest.TestCase):
         self.assertEqual(ci_gap.suggestion("make t", [], {"check": "make lint"}),
                          "check: make lint && make t")
         self.assertEqual(ci_gap.suggestion("make t", [], {"check": "true"}), "check: make t")
+
+
+SETUP_WORKFLOW = """name: adapter
+on:
+  pull_request:
+jobs:
+  adapter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install packages
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq || echo "::warning::update failed"
+          for attempt in 1 2 3; do
+            if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \\
+              cmake clang; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "stalled" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          clang++ --version | head -1
+      - name: Tests
+        timeout-minutes: 10
+        run: python -m unittest discover -s tests
+"""
+
+
+class _Data:
+    def __init__(self, data):
+        self.data = data
+
+
+class SetupGh:
+    """What find_gaps reads: the Actions job and run, and the workflow."""
+
+    def __init__(self, steps, job=None):
+        self.job = dict(job or {}, run_id=77, name="adapter", steps=steps)
+
+    def rest(self, method, path, data=None, ok=()):
+        if path == "/repos/o/r/actions/jobs/501":
+            return _Data(self.job)
+        if path == "/repos/o/r/actions/runs/77":
+            return _Data({"path": ".github/workflows/adapter.yml"})
+        if path.startswith("/repos/o/r/contents/.github/workflows/adapter.yml"):
+            return _Data({"content": base64.b64encode(SETUP_WORKFLOW.encode()).decode()})
+        raise AssertionError(path)
+
+
+def _step(name, conclusion="failure", minutes=1):
+    return {"name": name, "conclusion": conclusion, "started_at": "2026-10-26T22:00:00Z",
+            "completed_at": "2026-10-26T22:%02d:00Z" % minutes}
+
+
+class RunnerSetupTest(unittest.TestCase):
+    """loom#1942: a failing runner setup step (installing system packages, a
+    cancelled or timed-out step) was filed as a validation gap asking every
+    lane validation to run sudo apt-get install."""
+
+    RUN = {"id": 501, "name": "adapter", "conclusion": "failure", "app": {"slug": "github-actions"}}
+
+    def gaps(self, steps, run=None, job=None):
+        said = []
+        found = ci_gap.find_gaps(SetupGh(steps, job), "o/r", 7, "a" * 40, {"check": "true"},
+                                 [dict(self.RUN, **(run or {}))], lambda: [], said.append)
+        return found, said
+
+    def test_a_step_that_only_installs_system_packages_is_logged_not_filed(self):
+        gaps, said = self.gaps([_step("Install packages")])
+        self.assertEqual(gaps, [])
+        self.assertEqual(said, ["validation gap: o/r#7 CI job adapter step Install packages only "
+                                "installs system packages; not a gap"])
+
+    def test_a_failing_step_that_runs_the_repos_tests_is_still_a_gap(self):
+        gaps, said = self.gaps([_step("Install packages", "success"), _step("Tests")])
+        self.assertEqual([g.step for g in gaps], ["Tests"])
+        self.assertEqual(gaps[0].command, "python -m unittest discover -s tests")
+        self.assertEqual(said, [])
+
+    def test_a_step_that_ran_into_its_timeout_is_not_a_gap(self):
+        gaps, _ = self.gaps([_step("Install packages", "success"), _step("Tests", minutes=10)])
+        self.assertEqual(gaps, [])
+
+    def test_a_cancelled_step_or_run_or_a_timed_out_job_is_not_a_gap(self):
+        self.assertEqual(self.gaps([_step("Tests", "cancelled")])[0], [])
+        self.assertEqual(self.gaps([_step("Tests")], run={"conclusion": "cancelled"})[0], [])
+        self.assertEqual(self.gaps([_step("Tests")], run={"conclusion": "timed_out"})[0], [])
+        self.assertEqual(self.gaps([_step("Tests")], job={
+            "started_at": "2026-10-26T22:00:00Z", "completed_at": "2026-10-26T22:20:05Z"})[0], [])
+
+    def test_what_counts_as_installing_system_packages(self):
+        for command in ("command -v timeout || brew install coreutils", "apk add --no-cache bash",
+                        "sudo dnf install -y gcc", "sudo -E env X=1 apt-get -qq update"):
+            self.assertTrue(ci_gap.setup_only(command), command)
+        for command in ("pip install -r requirements.txt", "sudo apt-get install -y x && make test",
+                        "python -m pytest", "set -e", "echo hi"):
+            self.assertFalse(ci_gap.setup_only(command), command)
 
 
 class FirstPushStatusTest(unittest.TestCase):
