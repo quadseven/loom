@@ -124,36 +124,44 @@ class LoomSizedResume:
         with self.lock:
             self.calls[(method, path)] += 1
         if path == "/graphql":
-            query = json.loads(body)["query"]
-            with self.lock:
-                self.queries.append(query)
-            if query.lstrip().startswith("mutation"):
-                raise AssertionError("resume wrote through GraphQL")
-            return self._reply({"data": {"repository": self._states(query)}})
+            return self._graphql(json.loads(body)["query"])
         if method != "GET":
             raise AssertionError("resume wrote: %s %s" % (method, path))
         bare = path.split("?", 1)[0]
-        if ISSUE.match(bare):
-            number = int(ISSUE.match(bare).group(1))
-            found = self.by_number.get(number) or (
-                _issue(number, ["loom:ticket"], state="closed") if number < 900 else None)
-            return self._reply(found) if found else (404, {}, b'{"message": "Not Found"}')
-        if COMMENTS.match(bare):
-            number = int(COMMENTS.match(bare).group(1))
-            return self._reply(_home_comments(number) if number in GOALS else [])
-        if EVENTS.match(bare):
-            return self._reply(_events(int(EVENTS.match(bare).group(1))))
-        if SUBS.match(bare):
-            return self._reply(self._sub_list(int(SUBS.match(bare).group(1))))
         if bare == "/repos/%s/issues" % REPO:
-            if "labels=epic" in path:
-                return self._reply([e for g in GOALS for e in EPICS[g]])
-            if "labels=loom:ticket" in path:
-                return self._reply(SHIPPED_TICKETS)
-            if "labels=" in path:
-                return self._reply([])
-            return self._reply(OPEN_ISSUES)
+            return self._reply(self._listing(path))
+        for pattern, answer in ((ISSUE, self._single), (COMMENTS, self._comments),
+                                (EVENTS, _events), (SUBS, self._sub_list)):
+            found = pattern.match(bare)
+            if found:
+                value = answer(int(found.group(1)))
+                return self._reply(value) if value is not None else (
+                    404, {}, b'{"message": "Not Found"}')
         return self._reply([])
+
+    def _graphql(self, query):
+        with self.lock:
+            self.queries.append(query)
+        if query.lstrip().startswith("mutation"):
+            raise AssertionError("resume wrote through GraphQL")
+        return self._reply({"data": {"repository": self._states(query)}})
+
+    def _single(self, number):
+        """An open issue as listed; a closed ticket below 900; gone above."""
+        return self.by_number.get(number) or (
+            _issue(number, ["loom:ticket"], state="closed") if number < 900 else None)
+
+    @staticmethod
+    def _comments(number):
+        return _home_comments(number) if number in GOALS else []
+
+    @staticmethod
+    def _listing(path):
+        if "labels=epic" in path:
+            return [e for g in GOALS for e in EPICS[g]]
+        if "labels=loom:ticket" in path:
+            return SHIPPED_TICKETS
+        return [] if "labels=" in path else OPEN_ISSUES
 
     def _sub_list(self, number):
         return self.sub_pages.get(number) or _subs(number)
