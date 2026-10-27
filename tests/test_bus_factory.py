@@ -2955,6 +2955,17 @@ class Tickets(Base):
         self.assertEqual(factory.lanes_of("medium", True)[4:7],
                          ("free-ollama", "free-gemma", "openrouter"))
 
+    def test_a_slot_on_cluster_runners_never_takes_a_private_repos_ticket(self):
+        # A runner's inputs and logs live in the public repo's Actions, so the
+        # dispatch refuses a private repo; the factory gave free-gemma private
+        # tickets anyway, each costing a claim and a park (2026-10-27).
+        with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
+            self.assertNotIn("free-gemma", factory.lanes_of("medium", True))
+            self.assertIn("free-gemma", factory.lanes_of("medium", False))
+            self.assertTrue(factory.public_only("free-gemma"))
+        self.assertIn("free-gemma", factory.lanes_of("medium", True))
+        self.assertFalse(factory.public_only("free-gemma"))
+
     def test_the_free_lanes_take_medium_work_before_the_paid_codex_lanes(self):
         # Operator 2026-10-19: "I always want my free tier used up".
         medium = factory.TIERS["medium"]
