@@ -99,6 +99,10 @@ AFTER_RELEASE_RE = re.compile(r"^<!-- loom:after-release ([0-9]+) -->")
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
 # The runner's reason when a lane run ends with nothing committed.
 NO_COMMIT = "agent made no commit"
+# Elder review check output parsing: individual markings like "removed-guarded-path"
+# are listed in the summary. Each marking line looks like:
+# "- `removed-guarded-path`: Paths: `path/to/file.md`"
+_ELDER_MARKING_RE = re.compile(r"^\s*-\s+`([a-z0-9-]+)`:\s.*?Paths:\s*(.*)$", re.M)
 # A pull request a brief names in words, as a settle-findings ticket names the
 # one its findings were left on.
 NAMED_PR_RE = re.compile(r"\b(?:PR|pull request) #([0-9]+)\b")
@@ -5448,6 +5452,20 @@ class Station:
             self._pulls[repo] = data if isinstance(data, list) else []
         return self._pulls[repo]
 
+    def _elder_markings(self, summary: str) -> List[Tuple[str, List[str]]]:
+        """Parse Elder review markings from a review check summary.
+        Returns list of (marking_kind, paths) tuples."""
+        text = str(summary or "")
+        return [(m.group(1), [p.strip("` ") for p in re.findall(r"`([^`]+)`", m.group(2))])
+                for m in _ELDER_MARKING_RE.finditer(text)]
+
+    def _is_removed_guarded_path_named(self, marking: Tuple[str, List[str]], ticket_body: str) -> bool:
+        """True when a removed-guarded-path marking only names paths the ticket names."""
+        kind, paths = marking
+        if kind != "removed-guarded-path":
+            return False
+        return all(operator_hold._named(path, ticket_body) for path in paths)
+
     def _hand_back_ticket(self, repo: str, issue: Dict[str, Any], prs: List[Dict[str, Any]],
                           rounds: int) -> None:
         number = int(issue["number"])
@@ -5482,6 +5500,28 @@ class Station:
                 if not (name == self.s.review_check and factory.degraded_review(tail, tail))]
         degraded = len(kept) != len(failed)
         failed = kept
+        # Check for the special case: only the review check failed, and all
+        # its blocking Elder markings are "removed-guarded-path" on paths the
+        # ticket names for removal. In this case, ask the maintainer for
+        # /grug accept-removal approval instead of a fix round.
+        if (len(failed) == 1 and failed[0][0] == self.s.review_check):
+            review_summary = failed[0][1]
+            markings = self._elder_markings(review_summary)
+            ticket_body = str(issue.get("body") or "")
+            blocking_markings = [m for m in markings if m[0] != "reviewability"]
+            if (blocking_markings and
+                    all(self._is_removed_guarded_path_named(m, ticket_body) for m in blocking_markings)):
+                # Only removed-guarded-path on named paths: no fix round, no runaway,
+                # ask maintainer for /grug accept-removal
+                paths = ", ".join(p for m in blocking_markings for p in m[1])
+                ask = operator_hold.ask(number, [
+                    f"it deletes or mostly replaces {paths}, which its ticket names for removal"
+                ])
+                ask += "\n\n/grug accept-removal"
+                brain.human(self.gh, repo, number, ask)
+                _say("%s#%d: only removed-guarded-path on named paths; moved to loom:human for accept-removal"
+                     % (repo, number))
+                return
         self._note_first_push(repo, pr_number, comments, failed)
         threads = self._bot_threads(repo, pr_number)
         if not failed and not threads and not degraded:

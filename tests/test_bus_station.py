@@ -2842,6 +2842,8 @@ class ReviewFake:
                 return response
         if method == "PUT" and path == "/repos/%s/issues/12/labels" % REPO:
             return self._put_labels(data)
+        if method == "POST" and path == "/repos/%s/issues/12/labels" % REPO:
+            return self._put_labels(data)
         if method == "POST" and path == "/repos/%s/issues/12/comments" % REPO:
             return self._post_comment(data)
         if method == "PATCH" and path.startswith("/repos/%s/issues/comments/" % REPO):
@@ -2964,6 +2966,50 @@ class HandBackTest(unittest.TestCase):
         self.assertNotIn("Degraded review", body)
         self.assertNotIn(factory.DEFAULT_REVIEW_CHECK, body)
         self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_only_removed_guarded_path_on_named_path_moves_to_human_for_accept_removal(self):
+        # Ticket names README.md for removal
+        self.gh.issue["body"] = "## Why\nx\n\n## Acceptance criteria\n- [ ] Remove README.md\n"
+        # Review check fails only on removed-guarded-path for README.md
+        review_output = (
+            "Elder markings - 1 blocking, 1 total\n\n"
+            "- `removed-guarded-path`: Paths: `README.md`"
+        )
+        self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK, review_output)])
+        names = [x["name"] for x in self.gh.issue["labels"]]
+        self.assertIn("loom:human", names)
+        self.assertNotIn("loom:briefed", names)
+        # Check the note contains the accept-removal ask
+        note_comment = next(c for c in self.gh.comments if "Kind: decision" in c["body"])
+        self.assertIn("/grug accept-removal", note_comment["body"])
+        self.assertIn("README.md", note_comment["body"])
+
+    def test_removed_guarded_path_on_unnamed_path_still_gets_fix_round(self):
+        # Ticket does NOT name the path
+        self.gh.issue["body"] = "## Why\nx\n\n## Acceptance criteria\n- [ ] Do something else\n"
+        # Review check fails on removed-guarded-path for unnamed path
+        review_output = (
+            "Elder markings - 1 blocking, 1 total\n\n"
+            "- `removed-guarded-path`: Paths: `docs/old.md`"
+        )
+        self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK, review_output)])
+        names = [x["name"] for x in self.gh.issue["labels"]]
+        self.assertIn("loom:briefed", names)
+        self.assertNotIn("loom:human", names)
+
+    def test_removed_guarded_path_mixed_with_other_marking_gets_fix_round(self):
+        # Ticket names README.md for removal
+        self.gh.issue["body"] = "## Why\nx\n\n## Acceptance criteria\n- [ ] Remove README.md\n"
+        # Review check fails on removed-guarded-path AND another marking
+        review_output = (
+            "Elder markings - 2 blocking, 2 total\n\n"
+            "- `removed-guarded-path`: Paths: `README.md`\n"
+            "- `unmet-criterion`: Paths: `a.py`"
+        )
+        self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK, review_output)])
+        names = [x["name"] for x in self.gh.issue["labels"]]
+        self.assertIn("loom:briefed", names)
+        self.assertNotIn("loom:human", names)
 
     def test_unresolved_review_bot_thread_is_sent_back(self):
         thread = {"id": "PRRT_fake", "path": "a.py", "line": 4,
