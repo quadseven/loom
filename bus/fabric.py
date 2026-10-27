@@ -94,8 +94,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     note. With no key configured it prints nothing and exits 0.
     """
     args = _argument_parser().parse_args(argv)
-    if args.command != "ask":
-        return 1
     key_ssm = os.environ.get("LOOM_FABRIC_KEY_SSM", "").strip()
     region = os.environ.get("LOOM_AWS_REGION", "").strip() or "us-east-1"
     print(ask(BRAIN_QUESTION, key_ssm, region))
