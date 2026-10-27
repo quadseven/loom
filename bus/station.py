@@ -479,6 +479,9 @@ DECISION_REVERT_MARKER = "<!-- loom:decision-revert v1 -->"
 DECISION_ASK = ("Kind: decision\nA merged pull request already carries this ticket's work, "
                 "but these boxes ask for an operator decision: %s. Decide, tick each box, "
                 "and move the ticket on, or say what to change.")
+# A no-change answer that leaves a code acceptance box unproven (loom#2032).
+NO_CHANGE_UNPROVEN_NOTE = ("The answer does not prove every acceptance box, so the ticket is "
+                           "back at loom:queued instead of settling. Not proven: %s")
 # A base check that failed before the agent ran: it could not start (exit
 # 125 to 127) or it was red on the unmodified repo or default branch. On a
 # cluster runner that is often the runner image (a tool the repo's check
@@ -6910,6 +6913,8 @@ class Station:
         said = self._no_change_said(lane, name)
         issue = self._issue(repo, number)
         names = _label_names(issue)
+        if self._unproven_no_change(repo, number, issue, said):
+            return
         undoes = bool(set(names) & {REGRESSION, factory.REVERT_LABEL})
         merged = self._merged_linked(repo, issue) if (
             issue.get("state") == "open" and RUNNING in names and not undoes) else []
@@ -6942,6 +6947,25 @@ class Station:
                     "again." % ("This is a regression or revert ticket" if undoes else
                                 "No merged pull request references this ticket"))
         self._routine(repo, number, "%s\n\n%s" % (said, note))
+
+    def _unproven_no_change(self, repo: str, number: int, issue: Dict[str, Any],
+                            said: str) -> bool:
+        """Send a running ticket back to loom:queued, naming each box, when a
+        no-change answer leaves a code acceptance box unproven (neither the
+        ticket nor the answer's checklist ticks it). On 2026-10-17 a lane's
+        no-op answer settled a ticket whose third box still failed, and it
+        went on to loom:merged (loom#2032). True when it requeued."""
+        if issue.get("state") != "open" or RUNNING not in _label_names(issue):
+            return False
+        left = factory.unproven_criteria(str(issue.get("body") or ""), said)
+        if not left:
+            return False
+        self._relabel(repo, number, "loom:queued")
+        self._routine(repo, number, "%s\n\n%s" % (said, NO_CHANGE_UNPROVEN_NOTE % "; ".join(
+            " ".join(text.split())[:criteria_gate.ASK_WIDTH] for text in left)))
+        _say("%s#%d: a no-change answer left %d box(es) unproven, requeued"
+             % (repo, number, len(left)))
+        return True
 
     def _merged_cited(self, repo: str, issue: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Merged pull requests the Fabric workspace cites as already doing
@@ -12377,17 +12401,25 @@ class Station:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def sync_labels(self) -> None:
-        """Sync every registered repo when the desired label set changes."""
+        """Sync every registered repo when the desired label set changes, and
+        a repo enrolled since the last sync on its first pass: one enrolled
+        later lacked loom:answered, and a lane could not set it (loom#2032).
+        The ledger records the digest and the repos synced at it."""
         path = os.path.join(self.state, "labels.json")
         digest = self.label_digest()
         saved = _read_json(path, {}, strict=False)
+        synced: List[str] = []
         if isinstance(saved, dict) and saved.get("digest") == digest:
+            synced = [r for r in saved.get("repos") or [] if isinstance(r, str)]
+        todo = [repo for repo in self.s.repos if repo not in synced]
+        if not todo:
             return
-        for repo in self.s.repos:
+        for repo in todo:
             changed = labels.ensure_labels(self.gh, repo)
             if changed:
                 _say("labels changed in %s: %s" % (repo, ", ".join(changed)))
-        _write_json(path, {"digest": digest})
+            synced.append(repo)
+            _write_json(path, {"digest": digest, "repos": synced})
 
     def run_pass(self) -> None:
         if self._budget_exhausted():
