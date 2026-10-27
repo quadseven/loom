@@ -3041,14 +3041,15 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
 # do with the repo, the GitHub API, logs or a diagnosis is not one of these,
 # and neither is work the unproven-work gate only delays: 174 loom:human
 # issues on 2026-10-18 were mostly such work, parked as "waiting on you".
-HUMAN_KINDS = ("money", "hardware", "account", "credential", "physical", "decision")
-HUMAN_KIND_RE = re.compile(r"\AKind:\s*(\S+)\s*\n?", re.I)
+from bus.kinds import HUMAN_KINDS, HUMAN_KIND_RE
+import re
+_HUMAN_KIND_RE = re.compile(HUMAN_KIND_RE)
 
 
 def human_kind(ask: str) -> Tuple[str, str]:
     """(kind, ask) from an ask whose first line is "Kind: K", K one of
     HUMAN_KINDS; ValueError otherwise."""
-    match = HUMAN_KIND_RE.match(ask.strip())
+    match = _HUMAN_KIND_RE.match(ask.strip())
     kind = match.group(1).lower() if match else ""
     if kind not in HUMAN_KINDS:
         raise ValueError("the ask must start with a line \"Kind: K\", K one of %s: "
