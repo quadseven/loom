@@ -13,8 +13,9 @@ on one. It returns "" when the answer holds on the head, else why not:
 - Any other answer must cite something the head can show: a file path (with
   an optional :line or :start-end), a line of the thread's file ("line 12",
   "lines 3-5"), or a backticked symbol. Every file must exist on the head,
-  every line must be inside its file, and every symbol must appear in a cited
-  file or the thread's file. An answer that cites nothing checkable fails.
+  every line must be inside its file, and at least one cited symbol must
+  appear in a cited file or the thread's file (a library name such as
+  `socket.timeout` need not). An answer that cites nothing checkable fails.
 - "`f` is called by `g`" (or "it is called from <file:line>"): the head must
   show that call, inside g's body or on that line. The subject of "it" is the
   finding's first backticked symbol.
@@ -35,7 +36,7 @@ from urllib.parse import quote
 Read = Callable[[str], Optional[str]]
 Ancestor = Callable[[str], bool]
 
-FIXED_RE = re.compile(r"^\s*Fixed in `?([0-9a-fA-F]{7,40})`?")
+FIXED_RE = re.compile(r"^\s*Fixed in `?([0-9a-fA-F]{7,40})`?", re.I)
 # A repo file path: a known source or text extension (so `mod.NAME` reads as
 # a symbol, not a file), optional :line or :start-end.
 _EXTS = ("py|pyi|go|sh|bash|js|mjs|cjs|ts|jsx|tsx|rs|rb|java|kt|c|h|cc|cpp|hpp|cs|swift|"
@@ -146,11 +147,18 @@ def _files_refusal(cited: List[Tuple[str, int, int]], head: _Head) -> str:
 
 
 def _symbols_refusal(symbols: List[str], head: _Head, where: List[str]) -> str:
-    for symbol in symbols:
+    """Refuse only when none of the cited symbols is on the head: an answer
+    may name a library symbol (`socket.timeout`) its cited files never spell,
+    and one symbol found there is enough to anchor it. Caller claims and
+    dead-code findings are checked strictly elsewhere."""
+    def found(symbol: str) -> bool:
         word = re.compile(r"(?<![\w])%s(?![\w])" % re.escape(symbol))
-        if not any(word.search(head.text(p) or "") for p in where):
-            return "`%s` is not in %s on the head" % (symbol, ", ".join(where) or "any cited file")
-    return ""
+        return any(word.search(head.text(p) or "") for p in where)
+
+    if not symbols or any(found(s) for s in symbols):
+        return ""
+    return "none of %s is in %s on the head" % (
+        ", ".join("`%s`" % s for s in symbols), ", ".join(where) or "any cited file")
 
 
 def _claims_refusal(answer: str, subject: str, head: _Head, where: List[str]) -> str:

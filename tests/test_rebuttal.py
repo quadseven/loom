@@ -72,7 +72,16 @@ class Refusal(unittest.TestCase):
     def test_a_cited_symbol_missing_from_the_head_does_not_hold(self):
         why = check("The test checks `tickets.OTHER_MARKER`.",
                     {"t/test_s.py": TEST_FILE}, COVERAGE, "t/test_s.py")
-        self.assertIn("`tickets.OTHER_MARKER` is not in t/test_s.py", why)
+        self.assertIn("none of `tickets.OTHER_MARKER` is in t/test_s.py", why)
+
+    def test_a_well_cited_answer_naming_a_library_symbol_holds(self):
+        # The #2009 shape: the cited file has the handler, not the stdlib
+        # name the answer also mentions; one symbol on the head is enough.
+        github = "def _send(self):\n    try:\n        return go()\n    except OSError:\n        raise\n"
+        answer = ("`_send` in bus/github.py:4 already catches OSError, and `socket.timeout` "
+                  "is a subclass of it, so the timeout is handled.")
+        self.assertEqual(check(answer, {"bus/github.py": github, "bus/station.py": "x = 1\n"},
+                               COVERAGE, "bus/station.py"), "")
 
     def test_a_cited_file_or_line_missing_from_the_head_does_not_hold(self):
         files = {"t/test_s.py": TEST_FILE}
@@ -81,6 +90,9 @@ class Refusal(unittest.TestCase):
 
     def test_fixed_in_a_commit_on_the_head_history_holds(self):
         self.assertEqual(check("Fixed in abc1234", {}, ancestors={"abc1234"}), "")
+
+    def test_a_lowercase_fixed_in_a_commit_on_the_head_history_holds(self):
+        self.assertEqual(check("fixed in abc1234", {}, ancestors={"abc1234"}), "")
 
     def test_fixed_in_a_foreign_commit_does_not_hold(self):
         why = check("Fixed in 0ddba11", {}, ancestors={"abc1234"})

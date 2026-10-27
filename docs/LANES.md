@@ -474,8 +474,9 @@ answer as the reply on its thread, redacted and text-checked. The station
 resolves the thread only when the round ran on a ladder model, the thread
 is the review bot's own medium or low finding, and the answer holds on the
 pull request head (bus/rebuttal.py, loom#2081): "Fixed in <sha>" names the
-head or one of its ancestors, or the answer cites a file, line or backticked
-symbol the head has, every "`f` is called by `g`" claim is a real call there,
+head or one of its ancestors (any case), or the answer cites files and lines
+the head has and, when it names backticked symbols, at least one of them is
+there, every "`f` is called by `g`" claim is a real call there,
 and a dead-code finding's symbol has a call. An answer that cites nothing
 checkable stays open. Any other answered thread stays open, and the factory
 reads it as a finding that survived. The brain's merge re-checks every bot
