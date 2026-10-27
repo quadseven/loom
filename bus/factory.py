@@ -2002,30 +2002,10 @@ class Factory:
         # request past the ladder, however old the pull request is
         # (loom#1963): a ready pull request that hand merges left
         # conflicting got no brief at all once its age read as stuck.
-        if not conflict_only and stuck(comments, open_threads, checks_failing, age, self.now,
-                                       no_test, unticked, threads):
-            footer = self._footer(repo, pr)
-            if self._climb(repo, issue, comments, why, footer=footer) is None:
-                if RUNAWAY in _labels(issue):
-                    return
-                if self._rungs_left(repo, issue, comments, footer):
-                    # Not past the ladder: no lane of an untried rung is up.
-                    # It waits, with no comment, and climbs on a later pass.
-                    # An answered thread is judged by the review bot instead:
-                    # it re-reviews the head with the reply in view.
-                    asked = self._ask_reviewer(repo, pr)
-                    note = ("; the review bot was asked to judge the answer on #%d"
-                            % int(pr["number"])) if asked else ""
-                    self._waiting(repo, number, "no lane is up for its next rung")
-                    _say("%s#%d waits: no lane is up for its next rung%s"
-                         % (repo, number, note))
-                    return
-                tried, _ = self._tried(issue, comments, footer=footer)
-                self._close_past_ladder_pr(repo, pr)
-                self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
-                                                 if 1 <= n <= len(CLIMB)])
-                self._hand_off_failed(repo, issue)
-                return
+        if (not conflict_only and stuck(comments, open_threads, checks_failing, age, self.now,
+                                        no_test, unticked, threads)
+                and not self._climb_or_stop(repo, pr, issue, comments, why)):
+            return
         lane = None
         # A ticket with no lane label (a silent-lane requeue drops it, and the
         # run's pull request opens after; loom#1095, 2026-10-21) failed every
@@ -2062,6 +2042,37 @@ class Factory:
             return
         self.actions += 1
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
+
+    def _climb_or_stop(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
+                       comments: List[Dict[str, Any]], why: str) -> bool:
+        """Climb a stuck pull request's ticket one rung. True when it climbed,
+        so the send-back goes on to the new lane; False when it waits for a
+        lane of its next rung, is a runaway, or is past the ladder (its pull
+        request closed and the ticket given up), so nothing is sent."""
+        number = int(issue["number"])
+        footer = self._footer(repo, pr)
+        if self._climb(repo, issue, comments, why, footer=footer) is not None:
+            return True
+        if RUNAWAY in _labels(issue):
+            return False
+        if self._rungs_left(repo, issue, comments, footer):
+            # Not past the ladder: no lane of an untried rung is up.
+            # It waits, with no comment, and climbs on a later pass.
+            # An answered thread is judged by the review bot instead:
+            # it re-reviews the head with the reply in view.
+            asked = self._ask_reviewer(repo, pr)
+            note = ("; the review bot was asked to judge the answer on #%d"
+                    % int(pr["number"])) if asked else ""
+            self._waiting(repo, number, "no lane is up for its next rung")
+            _say("%s#%d waits: no lane is up for its next rung%s"
+                 % (repo, number, note))
+            return False
+        tried, _ = self._tried(issue, comments, footer=footer)
+        self._close_past_ladder_pr(repo, pr)
+        self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
+                                         if 1 <= n <= len(CLIMB)])
+        self._hand_off_failed(repo, issue)
+        return False
 
     def _past_no_change(self, repo: str, issue: Dict[str, Any],
                         comments: Sequence[Dict[str, Any]]) -> bool:
