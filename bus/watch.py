@@ -531,6 +531,19 @@ def _checked(line: str) -> str:
     return line
 
 
+def quiet_reason(issue: Dict[str, Any]) -> Optional[str]:
+    """The state_reason a quiet signature's open issue closes with: completed
+    once it became a ticket that shipped, not_planned for a bare signature,
+    None for a ticket not yet shipped, which its own state machine closes
+    (loom#1934)."""
+    labels = set(naming.label_names(issue))
+    if labels.intersection(SHIPPED_LABELS):
+        return "completed"
+    if TICKET_LABEL in labels:
+        return None
+    return "not_planned"
+
+
 class Watcher:
     def __init__(self, gh: Any, repo: str, logs: List[Tuple[str, str]], path: str,
                  now: float, say: Say, write: bool = True, private: Iterable[str] = ()) -> None:
@@ -1072,21 +1085,16 @@ class Watcher:
             try:
                 issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (self.repo, int(number))).data
                 if isinstance(issue, dict) and issue.get("state") == "open":
-                    labels = set(naming.label_names(issue))
-                    shipped = bool(labels.intersection(SHIPPED_LABELS))
-                    if not shipped and TICKET_LABEL in labels:
-                        # A ticket not yet shipped: its own state machine
-                        # closes it, not a quiet signature (loom#1934). The
-                        # link is kept so a return is counted there.
-                        continue
-                    reason = "completed" if shipped else "not_planned"
+                    reason = quiet_reason(issue)
+                    if reason is None:
+                        continue   # the link is kept, so a return is counted there
                     # Before the note, so a close shadow mode holds (the
                     # signature became a ticket) says nothing (loom#1551).
                     if shadow.guard("PATCH", "/repos/%s/issues/%d" % (self.repo, int(number)),
                                     {"state": "closed", "state_reason": reason}, issue,
                                     source="watch quiet close") is not None:
                         continue
-                    body = self._quiet_body(rec, shipped)
+                    body = self._quiet_body(rec, reason == "completed")
                     _text.check(body)
                     notify.post(self.gh, self.repo, number, body, notify.CLOSED)
                     self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
