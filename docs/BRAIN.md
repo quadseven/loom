@@ -774,9 +774,12 @@ labelled `claim:<login>`) still follows its pull request: an open pull
 request by that owner, on a branch of the repo, whose `Refs` line names a
 ticket a trusted login filed, moves it from `loom:queued` to `loom:pr`, and
 from there the closed pull request pass moves it to `loom:merged` on merge
-and shipping follows. A merge that leaves ticket criteria neither ticked nor
-marked `; not built: <reason>` in any merged pull request for it moves the
-ticket to `loom:queued` instead, with a status event naming them. It is never
+and shipping follows. A merge that leaves a code criterion unticked in every
+merged pull request for it, and unticked on the ticket, moves the ticket to
+`loom:queued` instead, with a status event naming only those boxes. A box
+marked `; not built: <reason>` is unbuilt, and boxes match after whitespace
+and markdown markup are normalised (loom#2026). The brain's own merge applies
+the same rule after the diff check. It is never
 briefed or claimed this way, and a pull
 request by anyone who does not own the ticket moves nothing. So is a ticket assigned to a login outside
 `LOOM_BRIEF_AUTHORS` or labelled `claim:<login>` for one, or one under a goal home whose `Operator:` line names
@@ -2076,6 +2079,19 @@ in the output and on stderr, and finishes the other repos. `resume` lists
 such repos under "Skipped repos (fix LOOM_REPOS)". Any other GitHub error
 (5xx, a rate limit, a dropped connection) still ends the command, so a
 fault never reads as an empty repo.
+
+`status` and `resume` print as they go (loom#2049): the heading first, then
+each repo's section as soon as that repo's reads finish (in the order the
+repos finish), then the sections that span every repo (Runaway tickets,
+Priorities, Waiting on you and the rest for `status`; Sensitive pull
+requests, Finished epics, Verify due and Lane proof audit for `resume`).
+Each repo's reads have a budget, `--repo-budget SECONDS` or
+`LOOM_REPO_BUDGET`, 120 seconds by default; a repo past it prints
+`skipped <repo>: timed out after ...` and is left out of the cross-repo
+sections, and the run goes on with the other repos. Within a repo, the
+reads per pull request, per stuck ticket and per epic run side by side, so
+one repo's status takes about a third of the time it did when they ran one
+after another.
 
 `resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`
 tickets across the repos, oldest ship first, each with how long ago it
