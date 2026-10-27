@@ -410,6 +410,11 @@ PIN_SHIP_LOOKBACK = 7 * 24 * 3600
 # the repo's open loom:merged tickets whose merge commit that commit carries
 # move to loom:shipped.
 ROLL_SIGNAL_FILE = ".loom/ship-roll"
+# Each repo's ROLL_SIGNAL_FILE is read at most every ROLL_SIGNAL_EVERY seconds
+# (ROLL_SIGNALS_FILE keeps the text, or None for a repo without one), so a
+# repo that declares no roll costs one request an hour, not two a pass.
+ROLL_SIGNALS_FILE = "roll_signals.json"
+ROLL_SIGNAL_EVERY = 3600
 ROLL_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,99}")
 PIN_SHIP_SETTLE = 3600
 PIN_SHIPS_FILE = "pin_ships.json"
@@ -4847,15 +4852,20 @@ class Station:
         # (a ticket shipped through its own revert, 2026-10-21).
         found = {n: pr for n, pr in found.items() if not revert.looks_like_revert(pr)}
         missing = wanted - set(found)
-        if beyond is not None:
-            missing &= beyond
+        self._add_beyond_window(repo, missing if beyond is None else missing & beyond,
+                                found, seen)
+        return found
+
+    def _add_beyond_window(self, repo: str, missing: set, found: Dict[int, Dict[str, Any]],
+                           seen: Optional[List[Dict[str, Any]]]) -> None:
+        """Add the merged pull request of up to SHIP_PER_PASS missing tickets
+        found past the closed pull window (_ticket_pull_beyond_window)."""
         for number in sorted(missing)[:SHIP_PER_PASS]:
             pr = self._ticket_pull_beyond_window(repo, number)
             if pr is not None and not revert.looks_like_revert(pr):
                 found[number] = pr
                 if seen is not None:
                     seen.append(pr)
-        return found
 
     def ship_deployed(self) -> None:
         """Move each open merged ticket of the repo this checkout deploys
@@ -5322,18 +5332,37 @@ class Station:
         roll record (ROLL_SIGNAL_FILE) to loom:shipped once the source commit
         the record names carries their pull request's merge commit, unless a
         later revert the commit also carries undid it (loom#2025)."""
-        for repo in [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]:
-            try:
-                merged = self._merged_tickets(repo)
-                text = self._contents_text(repo, ROLL_SIGNAL_FILE) if merged else None
-                if text is None:
-                    continue
-                for deploy, path, key in parse_roll_signals(text):
-                    self._ship_roll(repo, merged, deploy, path, key)
-            except RateLimited:
-                raise
-            except (GitHubError, ValueError) as err:
-                _say("could not ship %s by its roll record: %s" % (repo, err))
+        path = os.path.join(self.state, ROLL_SIGNALS_FILE)
+        saved = _read_json(path, {}, strict=False)
+        known = saved if isinstance(saved, dict) else {}
+        kept: Dict[str, Any] = {}
+        try:
+            for repo in [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]:
+                try:
+                    text = self._roll_signal(repo, known.get(repo), kept)
+                    merged = self._merged_tickets(repo) if text else set()
+                    if not merged:
+                        continue
+                    for deploy, where, key in parse_roll_signals(text or ""):
+                        self._ship_roll(repo, merged, deploy, where, key)
+                except RateLimited:
+                    raise
+                except (GitHubError, ValueError) as err:
+                    _say("could not ship %s by its roll record: %s" % (repo, err))
+        finally:
+            _write_json(path, kept)
+
+    def _roll_signal(self, repo: str, cached: Any, kept: Dict[str, Any]) -> Optional[str]:
+        """The repo's ROLL_SIGNAL_FILE text, None when it has none: read
+        again only ROLL_SIGNAL_EVERY after the last read."""
+        if (isinstance(cached, dict) and self._num(cached.get("at"))
+                and 0 <= self.now - cached["at"] < ROLL_SIGNAL_EVERY
+                and isinstance(cached.get("text"), (str, type(None)))):
+            kept[repo] = cached
+            return cached["text"]
+        text = self._contents_text(repo, ROLL_SIGNAL_FILE)
+        kept[repo] = {"text": text, "at": self.now}
+        return text
 
     def _ship_roll(self, repo: str, merged: set, deploy: str, path: str, key: str) -> None:
         record = self._contents_text(deploy, path)
@@ -9522,6 +9551,7 @@ class Station:
                            ("runs", self._invariant_runs),
                            ("silent_runs", self._invariant_silent),
                            ("waits", self._invariant_waits),
+                           ("unshipped", self._invariant_unshipped),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):
             try:
@@ -9557,12 +9587,6 @@ class Station:
                 raise
             except (GitHubError, OSError) as err:
                 _say("invariants: could not read the queued tickets: %s" % err)
-        try:
-            facts.unshipped = self._invariant_unshipped()
-        except RateLimited:
-            raise
-        except (GitHubError, OSError) as err:
-            _say("invariants: could not read the merged tickets found deployed: %s" % err)
         try:
             facts.checks = self._invariant_checks()
         except RateLimited:

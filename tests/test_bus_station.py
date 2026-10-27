@@ -4034,8 +4034,9 @@ class CorruptStateTest(Base):
         # reconciliation's read of the open tickets (loom#784) and the
         # done-ticket close step's, the hourly read of rewritten sources, and
         # the changed label-set sync, and the hourly read of open tickets for
-        # ones with no state label (loom#1653).
-        self.assertEqual(self.run_pass().requests, 13)
+        # ones with no state label (loom#1653), and the hourly read of the
+        # repo's roll record declaration (loom#2025).
+        self.assertEqual(self.run_pass().requests, 14)
 
 
 class TicketsTest(unittest.TestCase):
