@@ -2852,8 +2852,10 @@ class ReviewFake:
         self.statuses = []
         self.comments = []
         self.writes = []
+        self.workflows = []
+        self.workflow_texts = {}
 
-    def rest(self, method, path, data=None):
+    def rest(self, method, path, data=None, etag=None, ok=()):
         # Writes are only accepted at the exact ticket paths; any other PUT or POST
         # falls through to the AssertionError below, so a wrong path fails the test.
         if method == "GET":
@@ -2886,12 +2888,23 @@ class ReviewFake:
         return mock.Mock(data={})
 
     def _get(self, path):
+        if path == "/repos/%s" % REPO:
+            return mock.Mock(data={"default_branch": "main"})
         if path.startswith("/repos/%s/issues?labels=loom:pr" % REPO):
             return mock.Mock(data=[dict(self.issue)])
         if path.startswith("/repos/%s/pulls?" % REPO):
             return mock.Mock(data=[self.pr])
         if path == "/repos/%s/pulls/7" % REPO:
             return mock.Mock(data=self.pr)
+        if path == "/repos/%s/contents/.github/workflows" % REPO:
+            return mock.Mock(data=self.workflows)
+        m = re.match(r"/repos/%s/contents/.github/workflows/(.+)$" % REPO, path)
+        if m:
+            name = m.group(1)
+            text = self.workflow_texts.get(name)
+            if text is None:
+                return mock.Mock(data=None)
+            return mock.Mock(data={"content": base64.b64encode(text.encode()).decode()})
         if path.endswith("/check-runs?per_page=100"):
             return mock.Mock(data={"check_runs": self.check_runs})
         if path.endswith("/status"):
@@ -3196,6 +3209,48 @@ class HandBackTest(unittest.TestCase):
         self.gh.check_runs = [{"status": "in_progress"}]
         self.run_hand_back()
         self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+    def status_says(self, phrase):
+        return any(status.is_status(c.get("body")) and phrase in str(c.get("body") or "")
+                   for c in self.gh.comments)
+
+    def test_a_pr_with_only_review_bot_checks_is_not_ready_when_repo_ci_did_not_run(self):
+        # loom#1860: a lane pull request whose head carries only the review
+        # bot's checks, in a repo with a pull-request workflow, is not ready;
+        # the status says the repo CI did not run.
+        self.gh.check_runs = [{"name": factory.DEFAULT_REVIEW_CHECK,
+                               "status": "completed", "conclusion": "success"}]
+        self.gh.workflows = [{"path": ".github/workflows/test.yml"}]
+        self.gh.workflow_texts = {"test.yml": ("on:\n  pull_request:\n  push:\n"
+                                               "    branches: [main]\njobs:\n  test:\n"
+                                               "    runs-on: ubuntu-latest\n"
+                                               "    run: python3 -m unittest\n")}
+        self.run_hand_back()
+        self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual(self.ready_events(), [])
+        self.assertTrue(self.status_says("repo CI did not run"))
+
+    def test_a_pr_whose_base_is_not_the_trunk_is_not_ready_and_names_the_base(self):
+        # loom#1860: a lane pull request whose base is not the trunk is not
+        # ready, and the status names the base.
+        self.gh.pr["base"] = {"ref": "side-branch"}
+        self.gh.check_runs = [{"name": "test", "status": "completed", "conclusion": "success"}]
+        self.gh.workflows = [{"path": ".github/workflows/test.yml"}]
+        self.gh.workflow_texts = {"test.yml": "on:\n  pull_request:\n"}
+        self.run_hand_back()
+        self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual(self.ready_events(), [])
+        self.assertTrue(self.status_says("side-branch"))
+
+    def test_a_pr_with_repo_ci_green_on_its_head_is_ready(self):
+        # loom#1860: a lane pull request with the repo's CI green on its head
+        # is ready, as before.
+        self.gh.check_runs = [{"name": "test", "status": "completed", "conclusion": "success"}]
+        self.gh.workflows = [{"path": ".github/workflows/test.yml"}]
+        self.gh.workflow_texts = {"test.yml": "on:\n  pull_request:\n"}
+        self.run_hand_back()
+        self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual(self.ready_events(), [READY % ("a" * 40)])
 
     def test_a_conflicting_green_pr_is_not_ready_and_loses_a_stale_ready(self):
         # loom#1963: hand merges moved main under a ready pull request and it
@@ -4244,6 +4299,31 @@ class ClaimTest(Base):
         self.assertIn("loom:running", self.fake.names(12))
         self.assertFalse([n for n in self.fake.names(12) if n.startswith("wait:")])
         self.assertEqual(self.fake.paths("PUT"), ["/repos/%s/issues/12/labels" % REPO])
+
+    def claimed_brief(self, body):
+        self.fake.add(12, body=body)
+        self.run_pass()
+        name = "example-owner.example-repo-12"
+        self.assertEqual(self.listing(), [name + ".md"])
+        with open(self.inbox("codex", name + ".md")) as fh:
+            return fh.read()
+
+    def test_a_brief_for_a_ticket_that_reads_stored_rows_names_the_fixture_source(self):
+        # loom#1860: a lane built its fixture rows by hand with an ended reason
+        # the live writer never writes; a ticket whose criteria read stored
+        # rows tells the lane where fixture rows come from.
+        text = self.claimed_brief(
+            "Difficulty: medium\n\n## Why\nTest\n\n## What\nDo it\n\n"
+            "## Acceptance criteria\n- [ ] A test: the report reads each run row "
+            "from the runs table.\n")
+        self.assertIn(tickets.FIXTURE_NOTE, text)
+        self.assertNotIn("Fixture-Source", text)
+
+    def test_a_brief_for_a_ticket_that_reads_no_rows_has_no_fixture_line(self):
+        text = self.claimed_brief(
+            "Difficulty: medium\n\n## Why\nTest\n\n## What\nDo it\n\n"
+            "## Acceptance criteria\n- [ ] A test: the status line names the base.\n")
+        self.assertNotIn(tickets.FIXTURE_NOTE, text)
 
     def test_a_limit_on_another_model_or_one_that_lifted_does_not_hold_the_claim(self):
         self.heartbeat("codex", limited_models={"model-y": int(time.time()) + 3600,
