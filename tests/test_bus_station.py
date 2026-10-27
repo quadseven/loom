@@ -787,10 +787,25 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("Third works.", note)
         self.assertNotIn("First works", note)
 
-    def test_a_criterion_marked_not_built_with_a_reason_counts_as_answered(self):
+    def test_a_criterion_marked_not_built_is_left_unbuilt(self):
+        # loom#2026: "not built: <reason>" answers the lane's gate, but the
+        # box is still unbuilt, so the merge sends the ticket back for it.
         self.merged_with("- [x] First works; test.\n- [ ] Second works.; not built: needs a key\n"
                          "- [x] Third works.\n")
-        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        note = [c["body"] for c in status.expand(self.fake.comments[12], AUTHORS)][0]
+        self.assertIn("Second works.", note)
+        self.assertNotIn("Third works", note)
+
+    def test_a_merge_that_builds_one_box_names_the_rest_and_not_the_built_one(self):
+        self.merged_with("- [ ] First works; test.; not built: needs a key\n"
+                         "- [x] `Second`   works\n- [ ] Third works.; not built: needs a key\n")
+        self.assertIn("loom:queued", self.fake.names(12))
+        note = [c["body"] for c in status.expand(self.fake.comments[12], AUTHORS)][0]
+        self.assertIn("First works; test.", note)
+        self.assertIn("Third works.", note)
+        self.assertNotIn("Second works", note)
 
     def test_a_pr_merged_before_the_requeue_does_not_requeue_the_ticket_again(self):
         self.merged_with("- [x] First works; test.\n")
@@ -3853,8 +3868,10 @@ class CorruptStateTest(Base):
         # reconciliation's read of the open tickets (loom#784) and the
         # done-ticket close step's, the hourly read of rewritten sources, and
         # the changed label-set sync, and the hourly read of open tickets for
-        # ones with no state label (loom#1653).
-        self.assertEqual(self.run_pass().requests, 13)
+        # ones with no state label (loom#1653), and the hourly label pass's
+        # reads of open issues and of closed ones still at loom:triage
+        # (loom#2024).
+        self.assertEqual(self.run_pass().requests, 15)
 
 
 class TicketsTest(unittest.TestCase):

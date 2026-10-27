@@ -9,6 +9,14 @@ edited the file by hand (loom#1773). The station puts these facts at the top
 of each failing check in a loom:fix comment (bus/brain.py _fix_body), and a
 regenerate command first of all.
 
+A review app's check-run output is a reviewer's prose, not a log. On loom#665
+the station read the start of an Elder "Suggested fix:" paragraph as a
+regenerate command and told the lane to run it every round (loom#1898). In
+review text (ReviewText) only what the reviewer marks as a command is one: a
+line in a shell-tagged fenced block, or a "Run:" or "Regenerate:" line.
+"Suggested fix:" lines are kept as suggestions, quoted as the finding to
+address, never as a command.
+
 Pure text: no GitHub reads, no imports from the rest of bus/.
 """
 from __future__ import annotations
@@ -44,12 +52,25 @@ _RENDER = re.compile(r"((?:[\w./-]+=\S+\s+)*[\w./-]+(?:\s+[^\s>|;&`'\"]+)*\s+--?
                      r"(?:\s+[^\s>|;&`'\"]+)*\s*>\s*[\w./-]+)")
 _LEADING_VERB = re.compile(r"^(?:(?:please|try|run|rerun|re-run|with|using|via)\s+)+", re.I)
 _PROGRAM = re.compile(r"^(?:[\w./-]+=\S+\s+)*[\w./-]+$")
+# Review text: a fence line and its language tag, the tags that mark a shell
+# command, a line that marks a command, and a "Suggested fix:" line.
+_FENCE = re.compile(r"^\s*(?:`{3,}|~{3,})\s*([\w+-]*)")
+_SHELL_TAGS = ("sh", "bash", "shell", "console", "zsh")
+_MARKED = re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*)?(?:Run|Regenerate)(?:\*\*)?:(?:\*\*)?\s+(.+)$")
+_SUGGESTED = re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*)?Suggested fix\b", re.I)
+SUGGESTIONS_MAX = 4
+
+
+class ReviewText(str):
+    """A failing check's text that a reviewer wrote (a review app's check-run
+    output), not a CI log: only what it marks as a command is one."""
 
 
 class Facts(NamedTuple):
     tests: List[str]
     assertions: List[str]
     regenerate: List[str]
+    suggestions: List[str]
 
 
 def _clean(line: str) -> str:
@@ -110,6 +131,42 @@ def names_a_regenerate_command(line: str) -> bool:
     return bool(regenerate_commands(line))
 
 
+def review_commands(text: str) -> List[str]:
+    """The commands a reviewer marks in review text: each line of a fenced
+    block tagged sh, bash, shell, console or zsh (a leading "$ " dropped),
+    and the rest of a "Run:" or "Regenerate:" line outside a fence. Prose,
+    an untagged fence and a "suggestion" fence give none (loom#1898)."""
+    found: List[str] = []
+    fence = None
+    for raw in (text or "").replace("\r", "").split("\n"):
+        opened = _FENCE.match(raw)
+        if opened:
+            fence = None if fence is not None else opened.group(1).lower()
+            continue
+        line = _clean(raw)
+        if fence is not None:
+            if fence in _SHELL_TAGS:
+                cmd = _trimmed(line[2:] if line.startswith("$ ") else line)
+                if _command_ok(cmd):
+                    found.append(cmd)
+            continue
+        marked = _MARKED.match(line)
+        if marked:
+            cmd = _trimmed(marked.group(1))
+            if len(cmd) > 1 and cmd[0] == cmd[-1] == "`":
+                cmd = cmd[1:-1].strip()
+            if _command_ok(cmd):
+                found.append(cmd)
+    return found
+
+
+def suggestions(text: str) -> List[str]:
+    """The "Suggested fix:" lines in review text: guidance the brief quotes
+    as the finding to address, never a command to run (loom#1898)."""
+    return [_clean(line) for line in (text or "").replace("\r", "").split("\n")
+            if _SUGGESTED.match(line)]
+
+
 def _unique(items: Sequence[str], limit: int) -> List[str]:
     seen: List[str] = []
     for item in items:
@@ -118,12 +175,17 @@ def _unique(items: Sequence[str], limit: int) -> List[str]:
     return seen[:limit]
 
 
-def facts(text: str) -> Facts:
+def facts(text: str, review: bool = False) -> Facts:
     """The failing tests, assertion lines and regenerate commands in a
-    failing check's log text, each list deduplicated and bounded."""
+    failing check's log text, each list deduplicated and bounded. For review
+    text the commands are only those the reviewer marks (review_commands),
+    and its "Suggested fix:" lines are kept as suggestions."""
     lines = (text or "").replace("\r", "").split("\n")
     tests = [_test_name(line) for line in lines]
     assertions = [_clean(line) for line in lines if _ASSERTION.search(line)]
-    commands = [cmd for line in lines for cmd in regenerate_commands(line)]
+    if review:
+        commands, suggested = review_commands(text), suggestions(text)
+    else:
+        commands, suggested = [cmd for line in lines for cmd in regenerate_commands(line)], []
     return Facts(_unique(tests, TESTS_MAX), _unique(assertions, ASSERTIONS_MAX),
-                 _unique(commands, COMMANDS_MAX))
+                 _unique(commands, COMMANDS_MAX), _unique(suggested, SUGGESTIONS_MAX))
