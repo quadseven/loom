@@ -17,7 +17,7 @@ from urllib.parse import quote
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
-from . import answer, ci_facts, ci_gap, fixrounds, merge_tier, naming, operator_hold, shadow
+from . import answer, ci_facts, ci_gap, fixrounds, issue_reads, merge_tier, naming, operator_hold, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import HANDOFF, LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -980,7 +980,9 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     """The repo's status section; with into, its open tickets are kept
     there under the repo's name for the cross-repo Priorities section. With
     waiting, so are the repo's open loom:human count and, per goal, the share
-    under that goal (waiting_lines)."""
+    under that goal (waiting_lines). Each issue is read once per repo
+    (loom#2057): every helper below shares the first answer."""
+    gh = issue_reads.once(gh)
     issues = _issues(gh, repo)
     shares: Dict[int, int] = {}
     if waiting is not None:
