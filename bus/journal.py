@@ -343,20 +343,32 @@ _HUMAN_COUNT = re.compile(r"loom:human", re.I)
 _NOTHING = re.compile(r"(?:nothing|none|no one|n/a)\b", re.I)
 
 
-def waiting_line(by_repo: Dict[str, int], share: int = 0) -> str:
+def waiting_line(by_repo: Dict[str, int], share: int = 0,
+                 public: Optional[Dict[str, bool]] = None) -> str:
     """The report's "Waiting on you:" line: the open loom:human issues by
     repo, how many of them sit under this goal, and where they are listed
     (the daily digest). "Waiting on you: nothing" when there are none. It is
     its own line, apart from "Needs you:", so that "nothing" never sits next
-    to a non-zero count and a moving count never reads as a new ask (loom#1775)."""
+    to a non-zero count and a moving count never reads as a new ask (loom#1775).
+
+    `public` maps each repo to whether it may be named by name. For a public
+    goal home, repos that are not public are folded into one "N in private
+    repos" part and only public repos are named; a private home keeps every
+    repo named. The total and the "under this goal" count stay the same. A
+    repo whose visibility cannot be read counts as private. With no `public`
+    map every repo is named, as today."""
     counts = [(repo, int(n)) for repo, n in by_repo.items() if int(n) > 0]
     total = sum(n for _, n in counts)
     if total == 0:
         return "Waiting on you: nothing"
     counts.sort(key=lambda item: (-item[1], item[0]))
+    nameable = [(repo, n) for repo, n in counts if not public or public.get(repo)]
+    folded = sum(n for repo, n in counts if public and not public.get(repo))
+    parts = ["%d in %s" % (n, repo) for repo, n in nameable]
+    if folded:
+        parts.append("%d in private repos" % folded)
     return ("Waiting on you: %d open loom:human (%s; %d of them under this goal), listed in "
-            "the daily digest" % (total, ", ".join("%d in %s" % (n, repo) for repo, n in counts),
-                                  int(share)))
+            "the daily digest" % (total, ", ".join(parts), int(share)))
 
 
 def check_report(text: str) -> None:

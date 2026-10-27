@@ -1152,18 +1152,25 @@ def goal_human_share(children: Sequence[Dict[str, Any]], issues: Sequence[Dict[s
     return len({int(c.get("number") or 0) for c in children if isinstance(c, dict)} & waiting)
 
 
-def waiting_lines(waiting: Dict[str, Dict[str, Any]], repos: Sequence[str]) -> List[str]:
+def waiting_lines(waiting: Dict[str, Dict[str, Any]], repos: Sequence[str],
+                  public: Optional[Dict[str, bool]] = None) -> List[str]:
     """The "## Waiting on you" section: for each goal, the exact line that goes
     right under "Needs you:" in its report (journal.waiting_line), so the
     report's count comes from data. The repo counts span every repo status
-    read; the share is the goal's own."""
+    read; the share is the goal's own. `public` maps each repo to whether it
+    may be named by name; for a private goal home every repo is named."""
     by_repo = {repo: int(waiting[repo]["count"]) for repo in repos if repo in waiting}
     lines = ["## Waiting on you (paste the line under \"Needs you:\" in each goal's report; "
              "\"Needs you:\" never carries a count)"]
     goals = [(repo, number, share) for repo in repos if repo in waiting
              for number, share in sorted(waiting[repo]["goals"].items())]
     for repo, number, share in goals:
-        lines.append("- %s#%d: %s" % (repo, number, journal.waiting_line(by_repo, share)))
+        if public is None:
+            line_public = None
+        else:
+            home_public = bool(public.get(repo, False))
+            line_public = public if home_public else {r: True for r in by_repo}
+        lines.append("- %s#%d: %s" % (repo, number, journal.waiting_line(by_repo, share, line_public)))
     return lines if goals else lines + ["- no goals"]
 
 
