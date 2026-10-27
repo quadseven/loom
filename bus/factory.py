@@ -482,7 +482,7 @@ DEFER_AFTER = 2
 # rule.
 CLASSES = change_class.CLASSES
 # A fix round can add a file of a higher class than the one the lane opened
-# the pull request with (infra#5938 opened as docs and gained a gateway code
+# the pull request with (2026-10-27: one opened as docs gained a gateway code
 # change, which skipped the test rule). The factory reclassifies each new head
 # from its files and only ever raises the label: a missing sensitive-paths read
 # must never lower a sensitive pull request. Keyed by head commit, so one

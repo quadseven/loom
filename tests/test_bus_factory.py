@@ -2254,7 +2254,7 @@ class ChangeClasses(Base):
         self.assertEqual(len(self.fixed), 1)
 
     def test_a_docs_pull_request_that_gained_a_sensitive_file_is_left_for_the_brain(self):
-        # infra#5938: opened as class:docs, a fix round added code; the label stayed docs.
+        # 2026-10-27: opened as class:docs, a fix round added code; the label stayed docs.
         self.gh.contents[".loom/sensitive-paths"] = "bus/brain.py\n"
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, labels=("class:docs",), files=("docs/a.md", "bus/brain.py"))
