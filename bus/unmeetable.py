@@ -171,11 +171,6 @@ def terms(live: str) -> List[Term]:
     return out
 
 
-def literal_strings(live: str) -> List[str]:
-    """The fixed part of each string the Live box waits for (`terms`)."""
-    return [t.literal for t in terms(live)]
-
-
 def holds(found: Term, texts: Iterable[str]) -> bool:
     """Whether a line of any of these source texts can print the term."""
     return any(found.pattern.search(line)
