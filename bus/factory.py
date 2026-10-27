@@ -2732,7 +2732,8 @@ class Factory:
                           issue: Dict[str, Any], comments: List[Dict[str, Any]],
                           sensitive: bool = False) -> None:
         """Land a clean, reviewed pull request, or send it back when it
-        changes code without a test. A clean sensitive one waits for the brain."""
+        changes code without a test. A clean sensitive one waits for the
+        brain, kept current with its base."""
         missing = missing_criteria(str(issue.get("body") or ""), str(full.get("body") or ""))
         ticked = criteria_gate.lane_ticks(str(issue.get("body") or ""), str(full.get("body") or ""))
         if ticked:
@@ -2751,7 +2752,10 @@ class Factory:
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
         elif sensitive:
-            return
+            # The brain merges it, and its merge gate refuses a pull request
+            # behind its base, so keep it current while it waits (2026-10-27:
+            # green sensitive pull requests sat 4 to 66 commits behind).
+            self._keep_current(repo, number, full)
         elif (self._operator_holds(repo, number, full, issue, comments)
               or self._risk_holds(repo, number, full, issue, comments)):
             self._keep_current(repo, number, full)
@@ -2760,8 +2764,8 @@ class Factory:
             self._land(repo, number, full, issue, comments)
 
     def _keep_current(self, repo: str, number: int, full: Dict[str, Any]) -> None:
-        """Bring a ready pull request held for the operator up to date with
-        its base when it is behind, so it does not drift into a conflict
+        """Bring a ready pull request held for the operator or the brain up
+        to date with its base when it is behind, so it does not drift into a conflict
         while it waits (loom#1963). The same update-branch call as _land,
         pinned to the head it judged, at most one a repo a pass; it never
         merges. A refused update (422) is left for the next pass: a held

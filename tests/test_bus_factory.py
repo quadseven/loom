@@ -973,6 +973,18 @@ class PullRequests(Base):
         self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
                        {"expected_head_sha": "sha50"}), self.gh.writes)
 
+    def test_a_clean_sensitive_pull_request_behind_its_base_is_kept_current_never_merged(self):
+        # 2026-10-27: the brain's merge gate refuses a pull request behind its
+        # base, and nothing brought a sensitive one up to date, so green
+        # sensitive pull requests waited behind by 4 to 66 commits.
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:sensitive", "needs-brain"))
+        self.gh.behind[50] = 4
+        self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+        self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
+                       {"expected_head_sha": "sha50"}), self.gh.writes)
+
     def test_a_held_pull_request_up_to_date_with_its_base_is_left_alone(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)
