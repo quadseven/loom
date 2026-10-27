@@ -11,7 +11,7 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import change_class, hunt_plan, notify, pr_repair, tickets
+from . import brain, change_class, hunt_plan, notify, pr_repair, tickets
 from .github import GitHub, GitHubError, auth_from_env
 from .labels import REMOTE_LANES
 
@@ -30,8 +30,9 @@ def _names(issue: Dict[str, Any]) -> List[str]:
 
 
 def _comments(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
-    return [c for c in gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-            if isinstance(c, dict)]
+    """The comments a LOOM_BRIEF_AUTHORS login wrote: a stranger's claim or
+    heartbeat marker neither holds a ticket nor is edited as the lane's."""
+    return brain.trusted_comments(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)))
 
 
 def _claims(comments: Sequence[Dict[str, Any]], lane: str) -> List[Tuple[int, float, float]]:
