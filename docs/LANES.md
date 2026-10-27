@@ -1016,6 +1016,23 @@ The loom home is kept bounded by the station and the runner (loom#643).
   (`loom home holds ...`), kept in `state/station/disk.json`. A compressed
   store goes with its run's other logs after `LOOM_LOG_KEEP_DAYS`.
 
+## Pass deadline
+
+A whole station pass is bounded by `LOOM_PASS_DEADLINE` seconds (default
+3600, at least 60, `0` off; loom#1921). Each request already has a read
+timeout, but nothing else bounded a pass: on 2026-10-26 one sat for 27
+minutes and the log never said where. When the pass takes its lock it arms
+`faulthandler.dump_traceback_later` with the station log as its file and
+writes `state/station/pass-deadline.json` (pid, start, deadline); the pass's
+end cancels both, whether it returned or raised. A pass that runs past the
+deadline writes every thread's Python stack to `station.log` and exits, so
+launchd starts a fresh one. The next pass finds the marker and logs one line:
+`the last pass (pid ..., started ...) overran its ...s deadline`, or, when the
+marker is younger than its deadline (the pass was killed), `ended ...s into
+its ...s deadline without a clean finish`. The default sits above a daily
+metrics build (about 30 minutes on 2026-10-26) until that build is bounded on
+its own (loom#1924).
+
 ## Log watch
 
 Each station pass reads the lines each component added to its log since the
