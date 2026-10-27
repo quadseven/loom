@@ -481,6 +481,14 @@ DEFER_AFTER = 2
 # so sensitive is checked first; a pull request with no class keeps today's
 # rule.
 CLASSES = change_class.CLASSES
+# A fix round can add a file of a higher class than the one the lane opened
+# the pull request with (2026-10-27: one opened as docs gained a gateway code
+# change, which skipped the test rule). The factory reclassifies each new head
+# from its files and only ever raises the label: a missing sensitive-paths read
+# must never lower a sensitive pull request. Keyed by head commit, so one
+# station process reads the files once per commit.
+CLASS_RANK = {name: rank for rank, name in enumerate(reversed(CLASSES))}
+_CLASSED: Dict[Tuple[str, int, str], str] = {}
 DEFER_LABEL = "loom:triage"
 DEFER_TITLE = "Settle the review findings left from PR #%d"
 # The title before the naming standard (docs/NAMING.md): an open follow-up
@@ -1764,6 +1772,36 @@ class Factory:
             _say("resolved %d thread(s) on %s#%d that the review bot marked fixed"
                  % (len(picked), repo, number))
 
+    def _reclass(self, repo: str, number: int, sha: str, full: Dict[str, Any]) -> None:
+        """Raise the pull request's class label to what its head's files say,
+        never lower it. A pull request with no class label is left as it is."""
+        have = class_of(full)
+        if not have or (repo, number, sha) in _CLASSED:
+            return
+        base = str((full.get("base") or {}).get("ref") or "main")
+        found = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s"
+                             % (repo, quote(change_class.SENSITIVE_FILE, safe="/"), quote(base)),
+                             ok=(404,)).data
+        patterns: List[str] = []
+        if isinstance(found, dict) and found.get("content"):
+            import base64
+            patterns = change_class.parse_patterns(
+                base64.b64decode(found["content"]).decode("utf-8", "replace"))
+        kind = change_class.classify(self._files(repo, number), patterns)
+        _CLASSED[(repo, number, sha)] = kind
+        if CLASS_RANK[kind] <= CLASS_RANK[have]:
+            return
+        self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                     % (repo, number, quote("class:" + have, safe="")), ok=(404,))
+        self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": ["class:" + kind]})
+        full["labels"] = [x for x in full.get("labels") or []
+                          if (x.get("name") if isinstance(x, dict) else x)
+                          not in ("class:" + have, "class:" + kind)] + [{"name": "class:" + kind}]
+        self.actions += 1
+        _say("%s#%d changes %s files on its head %s; its class:%s label is now class:%s"
+             % (repo, number, kind, sha[:12], have, kind))
+
     def _mark_sensitive(self, repo: str, number: int, full: Dict[str, Any]) -> None:
         """A sensitive-class pull request is never merged by the factory: mark
         it needs-brain so the brain reviews and merges it (docs/MUSE.md,
@@ -2251,6 +2289,7 @@ class Factory:
         sha = str((full.get("head") or {}).get("sha") or "")
         if not sha or full.get("mergeable") is None:
             return
+        self._reclass(repo, number, sha, full)
         sensitive = class_of(full) == "sensitive"
         if sensitive:
             # A change to the code that merges, closes or deploys never lands
