@@ -73,6 +73,8 @@ EVENT_WINDOW = 2 * REPEATED_FAILURE
 FAILURE_KINDS = ("rewrite_failed", "rewrite_skipped", "model_wait", "not_claiming")
 # Decision 0003: an epic holds at most EPIC_TICKETS tickets.
 EPIC_TICKETS = 15
+# GitHub refuses a sub-issue past this many under one issue.
+SUB_ISSUE_LIMIT = brain.SUB_ISSUE_LIMIT
 PLAN_FAILED_AGE = 30 * 60
 # More than LABELER_REFUSALS_MAX refusals of briefed tickets for one untrusted
 # labeler within LABELER_WINDOW seconds is a trust gap (loom#660).
@@ -238,6 +240,9 @@ class EpicShape(NamedTuple):
     # The goal's standing "Factory repairs" epic: no ticket cap, and not
     # counted against the goal's open epic cap.
     standing: bool = False
+    # How many sub-issues GitHub holds under it: at SUB_ISSUE_LIMIT it takes
+    # no more links, standing or not (loom#2023).
+    sub_issues: int = 0
 
 
 class GoalShape(NamedTuple):
@@ -610,18 +615,35 @@ def ticket_outside_epic(f: Facts) -> List[Breach]:
 
 
 def epic_over_cap(f: Facts) -> List[Breach]:
-    """An epic holding more than EPIC_TICKETS tickets."""
+    """An epic holding more than EPIC_TICKETS tickets (its sub-issues and
+    the issues whose Part of line names it, each once), or any epic, the
+    standing repairs epic too, holding GitHub's limit of sub-issues: GitHub
+    refuses its next link (loom#2023)."""
     if f.shapes is None:
         return []
-    return [Breach("epic-over-cap", epic.epic.key,
-                   "Epic %s holds %d tickets (cap %d)" % (epic.epic.label, epic.tickets,
-                                                          EPIC_TICKETS),
-                   ("Epic %s of goal home %s holds %d tickets; an epic holds at most %d, "
-                    "and more work goes into a next epic" % (
-                        epic.epic.label, shape.goal.label, epic.tickets, EPIC_TICKETS),),
-                   f.now)
-            for shape in f.shapes for epic in shape.epics
-            if epic.tickets > EPIC_TICKETS and not epic.standing]
+    out = []
+    for shape in f.shapes:
+        for epic in shape.epics:
+            if epic.open and epic.sub_issues >= SUB_ISSUE_LIMIT:
+                out.append(Breach(
+                    "epic-over-cap", epic.epic.key,
+                    "Epic %s holds %d sub-issues (GitHub's limit %d)"
+                    % (epic.epic.label, epic.sub_issues, SUB_ISSUE_LIMIT),
+                    ("Epic %s of goal home %s holds %d sub-issues; GitHub refuses a sub-issue "
+                     "past %d, so new work goes into a next epic" % (
+                         epic.epic.label, shape.goal.label, epic.sub_issues,
+                         SUB_ISSUE_LIMIT),),
+                    f.now))
+            elif epic.tickets > EPIC_TICKETS and not epic.standing:
+                out.append(Breach(
+                    "epic-over-cap", epic.epic.key,
+                    "Epic %s holds %d tickets (cap %d)" % (epic.epic.label, epic.tickets,
+                                                           EPIC_TICKETS),
+                    ("Epic %s of goal home %s holds %d tickets; an epic holds at most %d, "
+                     "and more work goes into a next epic" % (
+                         epic.epic.label, shape.goal.label, epic.tickets, EPIC_TICKETS),),
+                    f.now))
+    return out
 
 
 def goal_epics_over_cap(f: Facts) -> List[Breach]:
@@ -1133,12 +1155,47 @@ class Filer:
         try:
             self.gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (self.repo, self._home()),
                          {"sub_issue_id": made["id"]})
-        except (GitHubError, KeyError) as err:
-            # A refused link (a goal at GitHub's sub-issue limit): the Part
-            # of line still names where it belongs.
+        except GitHubError as err:
+            if err.status == 422:
+                self._roll_over(number, made, body, err)
+            else:
+                self.say("invariants: %s#%d is linked to #%d by its Part of line only: %s"
+                         % (self.repo, number, self._home(), err))
+        except KeyError as err:
             self.say("invariants: %s#%d is linked to #%d by its Part of line only: %s"
                      % (self.repo, number, self._home(), err))
         self.say("invariants: filed %s#%d: %s" % (self.repo, number, title))
+
+    def _roll_over(self, number: int, made: Dict[str, Any], body: str, err: GitHubError) -> None:
+        """GitHub refused the issue as a sub-issue of the repairs epic (HTTP
+        422: the epic holds GitHub's limit of sub-issues). The issue moves to
+        the next factory repairs batch epic with room, its Part of line names
+        that epic, and later filings this pass go there too (loom#2023)."""
+        home = self._home()
+        self.say("invariants: #%d refused %s#%d as a sub-issue (HTTP 422: %s); rolling over "
+                 "to a factory repairs batch epic" % (home, self.repo, number, err))
+        try:
+            batch = brain.repairs_epic(self.gh, self.repo, self.goal, full=(home,))
+        except (GitHubError, ValueError, KeyError) as exc:
+            self.say("invariants: %s#%d is linked to #%d by its Part of line only, no batch "
+                     "epic to roll over to: %s" % (self.repo, number, home, exc))
+            return
+        if batch == home:
+            return
+        self._repairs = batch
+        moved = re.sub(r"^Part of #%d[ \t]*$" % home, "Part of #%d" % batch, body, flags=re.M)
+        if moved != body:
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number), {"body": moved})
+            self.writes += 1
+        try:
+            self.gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (self.repo, batch),
+                         {"sub_issue_id": made["id"]})
+        except GitHubError as exc:
+            self.say("invariants: %s#%d is linked to batch epic #%d by its Part of line only: %s"
+                     % (self.repo, number, batch, exc))
+            return
+        self.say("invariants: %s#%d filed under factory repairs batch epic #%d"
+                 % (self.repo, number, batch))
 
     @staticmethod
     def _broken_note(comment: Dict[str, Any]) -> Optional[float]:

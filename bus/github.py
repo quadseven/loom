@@ -569,7 +569,12 @@ class GitHub:
         return self.api + path
 
     def rest(self, method: str, path: str, body: Any = None,
-             etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
+             etag: Optional[str] = None, ok: Tuple[int, ...] = (),
+             issue: Optional[Callable[[str], Response]] = None) -> Response:
+        """One request. `issue`, when given, answers the single-issue read a
+        ticket's first comments page makes for its body's status section
+        (_with_body_events), so a caller that already holds that issue
+        (bus/issue_reads.py) does not read it again (loom#2078)."""
         body = self._without_mentions(method, body)
         body = self._keep_status_section(method, path, body)
         resp = self._rest(method, path, body, etag, ok)
@@ -580,7 +585,7 @@ class GitHub:
             # every reader of those events sees them as before (loom#866).
             writers = self._status_logins()
             expanded = status.expand(resp.data, writers)
-            expanded = self._with_body_events(path, expanded)
+            expanded = self._with_body_events(path, expanded, issue)
             # A pull request's one fix comment reads as one comment per
             # round, so round counting and the lane's brief see every round
             # (loom#1640).
@@ -614,7 +619,8 @@ class GitHub:
                         found["variables"] = dict(holder, body=clean)
         return found
 
-    def _with_body_events(self, path: str, items: Any) -> Any:
+    def _with_body_events(self, path: str, items: Any,
+                          read: Optional[Callable[[str], Response]] = None) -> Any:
         """The first page of a ticket's comments with the events of its issue
         body's status section added, one pseudo-comment each (loom#1341). They
         carry the issue author's login, trusted only when it is one of ours,
@@ -626,7 +632,9 @@ class GitHub:
         if not allowed or _page_of(path) != 1 or not isinstance(items, list):
             return items
         try:
-            issue = self._rest("GET", "/repos/%s/issues/%s" % found.groups()).data
+            issue_path = "/repos/%s/issues/%s" % found.groups()
+            issue = (read(issue_path) if read is not None
+                     else self._rest("GET", issue_path)).data
         except GitHubError as err:
             if err.status == 404:
                 return items  # the issue is gone or moved: no section to read
