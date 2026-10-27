@@ -5902,6 +5902,26 @@ class FactoryIncidentTest(Base):
         held = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
         self.assertNotIn("%s#12" % REPO, held)
 
+    def test_a_cluster_runner_whose_base_check_fails_with_any_exit_moves_the_ticket(self):
+        # A missing tool inside a script exits 1, not 127 (mod-overseer's
+        # check without g++ on the runner image, 2026-10-27): the runner
+        # still cannot tell its image from a red base, so another lane runs
+        # the base check and files the incident if the base is red there too.
+        for reason in ("[factory] setup failed: base check exited 1 on the unmodified repo; "
+                       "factory incident %s#99" % REPO,
+                       "[factory] setup failed: base check exited 2 on the default branch; "
+                       "factory incident %s#99" % REPO):
+            with self.subTest(reason=reason):
+                self.setUp()
+                self.heartbeat("anthropic")
+                with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
+                    self.heartbeat("free-gemma")
+                    self.failed(lane="free-gemma", reason=reason)
+                    self.run_pass()
+                names = self.fake.names(12)
+                self.assertNotIn("wait:incident", names)
+                self.assertIn("lane:anthropic", names)
+
     def test_incident_filing_failure_is_named_in_ticket_status(self):
         self.heartbeat("muse")
         self.failed(reason="[factory] setup failed: incident filing failed")
