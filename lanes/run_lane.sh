@@ -2083,6 +2083,21 @@ note_factory_incident() {  # kind, detail, reason_var_name
   printf -v "$3" '%s; %s' "${!3}" "$ref"
 }
 
+# A red base check, before the agent. On a cluster runner (LOOM_CLUSTER_RUNNER,
+# set by lanes/k8s/lane_job.py) it is often the runner image, and the station
+# retries the ticket on another lane, which files the incident if the base is
+# red there too: filed from the runner, it held nothing and waited for a
+# person to close it.
+note_base_check_failure() {  # kind, detail, reason_var_name
+  if [ "${LOOM_CLUSTER_RUNNER:-}" = 1 ]; then
+    PARK_CLASS=factory
+    printf -v "$3" '%s; %s' "${!3}" "no incident filed on a cluster runner: another lane runs the base check"
+    echo "base check failed on a cluster runner; no incident filed" >> "$LOG"
+    return 0
+  fi
+  note_factory_incident "$@"
+}
+
 # Run one contract command in the tree the way an API-lane agent runs: an
 # emptied environment with a scratch HOME, under the sandbox profile (its
 # second argument is the interpreter, whose directory stays readable). The
@@ -2271,7 +2286,7 @@ prepare_validation() {
     fi
     if [ "$BASELINE_EXIT" -ne 0 ]; then
       SETUP_REASON="base check exited $BASELINE_EXIT on the default branch"
-      note_factory_incident base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
       return 1
     fi
     return 0
@@ -2306,7 +2321,7 @@ prepare_validation() {
   case "$BASELINE_EXIT" in
     125|126|127)
       SETUP_REASON="validation environment unavailable: the check exited $BASELINE_EXIT on the unmodified base"
-      note_factory_incident environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+      note_base_check_failure environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
       return 1 ;;
   esac
   # One red run does not make the base red: Loom's own check timed out
@@ -2353,7 +2368,7 @@ prepare_validation() {
       BASELINE_EXIT="$DEFAULT_EXIT"
     fi
     SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
-    note_factory_incident base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+    note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
     return 1
   fi
   [ -z "$changed" ] || { SETUP_REASON="setup or check changed tracked files on the base: $changed"; return 1; }
