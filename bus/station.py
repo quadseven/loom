@@ -4331,6 +4331,7 @@ class Station:
                      self.queue_stateless_tickets,
                      self.restate_shipped_live,
                      self.health_intake, self.intake_friction,
+                     self.log_capture,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
@@ -11707,6 +11708,158 @@ class Station:
             actor = None
         runners.Runners(self.gh, self.s.home, repo, slots, dict(os.environ), self._public, _say,
                         actor=actor, now=self.now).tend()
+
+    def log_capture(self) -> None:
+        """Append new lines from pod logs to capture files and trim old lines."""
+        if not self.s.evidence_cmds:
+            return
+
+        config = _read_json(os.path.join(self.s.home, "config.json"), {})
+        log_capture_config = config.get("log_capture") or config.get("LOG_CAPTURE") or {}
+        log_root = log_capture_config.get("log_root") or os.path.join(self.s.home, "logs")
+
+        for repo, command in self.s.evidence_cmds.items():
+            if not command or not isinstance(command, str):
+                continue
+
+            source = self._parse_capture_source(log_capture_config, repo)
+            if not source:
+                continue
+
+            self._update_capture_file(repo, command, source, log_root, log_capture_config)
+
+    def _parse_capture_source(self, log_capture_config: Dict[str, Any], repo: str) -> Optional[Dict[str, Any]]:
+        """Parse capture source configuration for a given repo."""
+        sources = log_capture_config.get("sources") or {}
+        namespace = log_capture_config.get("namespace") or ""
+        pod_selector = log_capture_config.get("pod_selector") or ""
+        source_name = None
+
+        for name, source_config in sources.items():
+            if source_config.get("repo") == repo:
+                source_name = name
+                break
+
+        if not source_name:
+            return None
+
+        return {
+            "name": source_name,
+            "namespace": namespace,
+            "pod_selector": pod_selector,
+            "log_root": log_capture_config.get("log_root", ""),
+        }
+
+    def _update_capture_file(self, repo: str, command: str, source: Dict[str, Any], log_root: str, log_capture_config: Dict[str, Any]) -> None:
+        """Update capture file with new pod log lines."""
+        capture_dir = os.path.join(log_root, "captures")
+        os.makedirs(capture_dir, exist_ok=True)
+
+        capture_file = os.path.join(capture_dir, source["name"] + ".log")
+
+        self._ensure_capture_file_exists(capture_file)
+
+        retention_hours = log_capture_config.get("retention_hours", 48)
+
+        self._append_new_lines(capture_file, repo, command, source, retention_hours)
+
+        self._trim_old_lines(capture_file, retention_hours)
+
+    def _ensure_capture_file_exists(self, capture_file: str) -> None:
+        """Ensure the capture file exists with header if it doesn't exist."""
+        if not os.path.exists(capture_file):
+            with open(capture_file, "w", encoding="utf-8") as f:
+                f.write("[capture file v1]\n")
+
+    def _append_new_lines(self, capture_file: str, repo: str, command: str, source: Dict[str, Any], retention_hours: float) -> None:
+        """Append new lines from pod logs to capture file."""
+        try:
+            process = subprocess.Popen(
+                ["/bin/sh", "-c", command],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            stdout, _ = process.communicate(timeout=60)
+
+            lines = stdout.splitlines()
+            if not lines:
+                return
+
+            existing_lines = []
+            if os.path.exists(capture_file):
+                with open(capture_file, "r", encoding="utf-8") as f:
+                    existing_lines = f.readlines()
+
+            existing_lines.extend(lines)
+
+            self._write_capture_file(capture_file, existing_lines, source, repo, retention_hours)
+
+        except (subprocess.TimeoutExpired, OSError) as err:
+            _say("failed to read pod logs for %s: %s" % (repo, err))
+
+    def _write_capture_file(self, capture_file: str, lines: List[str], source: Dict[str, Any], repo: str, retention_hours: float) -> None:
+        """Write capture file with timestamps and gap markers."""
+        output_lines = []
+        for line in lines:
+            if not line:
+                continue
+
+            output_lines.append(line)
+
+        self._ensure_last_line_is_gap_marker(output_lines, source)
+
+        self._trim_lines_by_time(output_lines, retention_hours)
+
+        with open(capture_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(output_lines) + "\n")
+
+    def _ensure_last_line_is_gap_marker(self, lines: List[str], source: Dict[str, Any]) -> None:
+        """Ensure the last line is a gap marker."""
+        if len(lines) < 2:
+            return
+
+        last_line = lines[-1]
+        if not last_line.startswith("[gap:"):
+            return
+
+        gap_match = re.match(r"\[gap: (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) -> (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\]", last_line)
+        if gap_match:
+            return
+
+        lines.append("[gap: %s -> %s]" % (last_line, last_line))
+
+    def _trim_lines_by_time(self, lines: List[str], retention_hours: float) -> None:
+        """Trim lines older than retention hours."""
+        if retention_hours <= 0:
+            return
+
+        cutoff_time = time.time() - retention_hours * 3600
+
+        filtered_lines = []
+        for line in lines:
+            if not line or line.startswith("[gap:") or line.startswith("[capture file"):
+                filtered_lines.append(line)
+                continue
+
+            timestamp = self._extract_timestamp(line)
+            if timestamp and timestamp >= cutoff_time:
+                filtered_lines.append(line)
+
+        lines[:] = filtered_lines
+
+    def _extract_timestamp(self, line: str) -> Optional[float]:
+        """Extract timestamp from a log line."""
+        match = re.match(r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\]", line)
+        if not match:
+            return None
+
+        timestamp_str = match.group(1)
+        try:
+            return time.mktime(time.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%SZ"))
+        except ValueError:
+            return None
 
     def upload_usage_limits(self, records: List[Dict[str, Any]]) -> None:
         """Send the current limits snapshot using the transcript upload token."""

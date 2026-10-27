@@ -304,5 +304,44 @@ def hours_text(value: float) -> str:
     return "%g" % value
 
 
-def section(commands: Dict[str, str], repo: str, live: str) -> str:
-    return gather(commands, repo, live)[0]
+def capture_source_exists(commands: Dict[str, str], repo: str) -> bool:
+    """Check if a repo has a capture-file source type command."""
+    return repo in commands and isinstance(commands.get(repo), str)
+
+
+def gather_capture_file(commands: Dict[str, str], repo: str, match: str, since_hours: float) -> Optional[List[str]]:
+    """Read lines from capture file for a given source and time window."""
+    command = commands.get(repo)
+    if not command or not isinstance(command, str):
+        return None
+
+    if not match or not isinstance(match, str):
+        return None
+
+    if not isinstance(since_hours, (int, float)) or since_hours < 0:
+        return None
+
+    capture_dir = os.path.join(os.path.dirname(command), "captures")
+    capture_file = os.path.join(capture_dir, os.path.basename(command))
+
+    if not os.path.exists(capture_file):
+        return None
+
+    try:
+        cutoff_time = time.time() - since_hours * 3600
+
+        lines = []
+        with open(capture_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line or line.startswith("[gap:") or line.startswith("[capture file"):
+                    continue
+
+                timestamp = line_time(line)
+                if timestamp and timestamp >= cutoff_time:
+                    lines.append(line)
+
+        return lines if lines else None
+
+    except (OSError, ValueError):
+        return None

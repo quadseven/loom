@@ -29,8 +29,17 @@ SQL_FORBIDDEN_RE = re.compile(r";|--|/\*|\*/", re.IGNORECASE)
 VALUE_FORBIDDEN_RE = re.compile(r"[;\\\"'`$|&<>()[\]{}*?!\r\n]")
 
 
-def _valid_name(value: str) -> bool:
-    return bool(NAME_RE.fullmatch(value))
+def _valid_command(command: str) -> bool:
+    if not isinstance(command, str):
+        return False
+
+    if not os.path.isabs(command):
+        return False
+
+    if ".." in command:
+        return False
+
+    return True
 
 
 def _read_config(path: str) -> dict[str, Any]:
@@ -161,14 +170,6 @@ def _capped_payload(key: str, items: list[Any], dropped: int) -> dict[str, Any]:
         dropped += 1
 
 
-class _Refused(Exception):
-    """A request that names something the allowlist does not hold."""
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.message = message
-
-
 def _logs_payload(config: dict[str, Any], query: dict[str, list[str]],
                   params: dict[str, str]) -> tuple[str, dict[str, Any]]:
     name = _single(query, "source")
@@ -196,8 +197,89 @@ def _query_payload(config: dict[str, Any], query: dict[str, list[str]],
     return name, _capped_payload("rows", safe, dropped)
 
 
+class _Refused(Exception):
+    """A request that names something the allowlist does not hold."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def _read_capture_file(file_path: str, since_hours: int, match: str) -> list[str]:
+    """Read lines from a capture file that match the criteria."""
+    if not os.path.exists(file_path):
+        return []
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = []
+            for line in f:
+                line = line.rstrip("\n")
+
+                if not line or line.startswith("[gap:") or line.startswith("[capture file"):
+                    continue
+
+                if since_hours > 0:
+                    try:
+                        timestamp_match = re.match(
+                            r"^\s*\[(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})Z\]", line
+                        )
+                        if timestamp_match:
+                            day, time_str = timestamp_match.groups()
+                            try:
+                                timestamp = time.mktime(time.strptime(f"{day} {time_str}", "%Y-%m-%d %H:%M:%S"))
+                                cutoff = time.time() - since_hours * 3600
+                                if timestamp < cutoff:
+                                    continue
+                            except ValueError:
+                                continue
+                    except Exception:
+                        continue
+
+                if match and match not in line:
+                    continue
+
+                lines.append(line)
+
+        return lines
+
+    except (OSError, ValueError):
+        return []
+
+
+def _capture_payload(config: dict[str, Any], query: dict[str, list[str]],
+                      params: dict[str, str]) -> tuple[str, dict[str, Any]]:
+    """Handle requests to /evidence/capture?command=FILE&match=TEXT&since=HOURS."""
+    command = _single(query, "command")
+    match = _single(query, "match")
+    raw_hours = _single(query, "since")
+    params.update({"command": command, "match": match, "since": raw_hours})
+
+    if not _valid_command(command) or not os.path.isabs(command):
+        raise _Refused("unknown capture source")
+
+    if not _safe_parameter(match) or not raw_hours.isdigit():
+        raise ValueError("invalid capture parameters")
+
+    hours = int(raw_hours)
+    if not 0 <= hours <= MAX_SINCE_HOURS:
+        raise ValueError("since is outside the allowed range")
+
+    capture_file = os.path.join(os.path.dirname(command), os.path.basename(command))
+
+    if not os.path.exists(capture_file):
+        raise _Refused("capture source not found")
+
+    lines = _read_capture_file(capture_file, hours, match)
+
+    safe, dropped = _safe_items(lines)
+
+    return command, _capped_payload("lines", safe, dropped)
+
+
 _ROUTES = {"/evidence/logs": ("logs", _logs_payload),
-           "/evidence/query": ("query", _query_payload)}
+           "/evidence/query": ("query", _query_payload),
+           "/evidence/capture": ("capture", _capture_payload)}
 
 
 def make_handler(config: dict[str, Any], token: str, logger: logging.Logger,
@@ -219,7 +301,7 @@ def make_handler(config: dict[str, Any], token: str, logger: logging.Logger,
             return len(data)
 
         def _answer(self, parts: Any, kind: str, name: str,
-                    params: dict[str, str]) -> tuple[str, str, int, int]:
+                     params: dict[str, str]) -> tuple[str, str, int, int]:
             """Return kind, name, status and size after sending the reply."""
             if self.headers.get("Authorization", "") != "Bearer " + token:
                 return kind, name, 401, self._reply(401, {"error": "unauthorized"})

@@ -113,6 +113,28 @@ class EvidenceEndpointTest(unittest.TestCase):
                 self.get_json(path, token)
             self.assertEqual(caught.exception.code, code, path)
 
+    def test_capture_file_source_answering_match_and_since(self):
+        self.log.write_text("""[2025-01-01T10:00:00Z] event1
+[2025-01-02T12:00:00Z] event2
+[2025-01-03T14:00:00Z] event3
+""", encoding="utf-8")
+
+        _, result = self.get_json("/evidence/capture?command=%s&match=event2&since=24" % self.log)
+
+        self.assertEqual(result["lines"], ["[2025-01-02T12:00:00Z] event2"])
+        self.assertEqual(result["dropped"], 0)
+
+    def test_capture_file_source_with_gap_marker(self):
+        self.log.write_text("""[2025-01-01T10:00:00Z] event1
+[gap: 2025-01-02T12:00:00Z -> 2025-01-03T14:00:00Z]
+[2025-01-03T14:00:00Z] event3
+""", encoding="utf-8")
+
+        _, result = self.get_json("/evidence/capture?command=%s&match=event&since=48" % self.log)
+
+        self.assertEqual(result["lines"], ["[2025-01-03T14:00:00Z] event3"])
+        self.assertEqual(result["dropped"], 0)
+
     def test_bearer_is_required_and_each_call_is_logged(self):
         calls = []
         handler = make_handler(self.config, "test-bearer", logging.getLogger("evidence-audit"),
