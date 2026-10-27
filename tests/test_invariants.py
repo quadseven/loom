@@ -557,6 +557,22 @@ class StationTest(StationBase):
         self.assertIn("#506", filed["body"])
         self.assertNotIn("#658", filed["title"] + filed["body"])
 
+    def test_a_lane_pull_closed_past_the_ladder_clears_its_finding_on_the_next_pass(self):
+        # loom#2027: the factory closes such a pull request; the stalled
+        # finding is gone on the next pass and its issue closes once quiet.
+        self.lane_ticket(506, labels=("loom:ticket", "loom:failed", "handoff:claude"))
+        self.lane_pull(657, 506, T0 - 7 * 3600)
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertEqual(filed["state"], "open")
+        self.gh.pulls[REPO] = []  # closed by the factory: no longer listed open
+        st = self.run_at(T0 + invariants.CHECK_EVERY)
+        facts = st._invariant_facts({})
+        self.assertEqual(invariants.lane_pr_stalled(facts), [])
+        self.assertEqual(len(self.breaches()), 1)
+        self.run_at(T0 + invariants.CLEAR_AFTER + 3 * invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+
     def test_a_lane_pull_with_open_review_threads_and_no_fix_round_files_a_breach(self):
         self.lane_ticket(602)
         self.lane_pull(660, 602, T0 - 7 * 3600)

@@ -76,6 +76,17 @@ station and the runner need to say "taken" and "gave up" without the brain
 present. `loom:ready` is a PR readiness label, and `needs-brain` asks for a
 full review after automatic fix rounds; neither replaces the ticket state.
 
+The station's `clean_labels` step (bus/label_pass.py, loom#2024) keeps that
+true. At most once an hour, on at most 20 issues a run, it removes from each
+open issue (and each closed one still at `loom:triage`) that no other
+operator owns: every state label but the newest the station set; `needs-brain`
+when `loom:human` or a `needs:<login>` label says a person holds the issue;
+`loom:triage` once the issue is a `loom:ticket` or closed; and the `lane:*`
+label of a ticket at `loom:answered`, whose lane answered with no change. A
+body `Part of #N` naming another issue than the sub-issue parent is changed
+by nobody: it is one health note in the step's state file, logged once. In
+shadow mode each removal is an `unlabel` line of the ledger and is not sent.
+
 ### Shipping Loom itself
 
 The station deploys this repo (lanes/mac/station.sh) and records each
@@ -1764,7 +1775,14 @@ criterion is one of three kinds:
   station check, or, for a `Live:` line with log strings, the station's own
   log search that dispatched the verify run.
 - operator: something only a person does (signs off, approves, acts by
-  hand, checks a handset). Loom never closes it.
+  hand, checks a handset). Loom never closes it. A decision box is one: its
+  text starts with "Operator decides" or "Decision:", or carries
+  `<!-- loom:decision -->`. Only an operator ticks it. When a lane's run
+  ends, the station unticks a decision box that was open in the brief and is
+  ticked now, unless an operator made the last body edit, and posts one
+  incident note naming it. A no-change report on a ticket with an open
+  decision box does not move it to `loom:merged`, whatever merged: it goes to
+  `loom:human` with a `Kind: decision` ask (loom#2029).
 
 A tick is nobody's evidence: not the ticket's, not the lane's pull request
 body's. The station's done close leaves a shipped ticket open while a live

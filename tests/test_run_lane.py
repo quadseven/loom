@@ -189,6 +189,8 @@ fi
 # exits non-zero ($FAKE_AGENT=fail), or prints $FAKE_OUT and exits
 # $FAKE_EXIT, editing a file first when $FAKE_EDIT is set and writing a hook
 # config the brief never names when $FAKE_HOOK is set ($FAKE_AGENT=say).
+# With $FAKE_LAST_MESSAGE set, say also writes it to the file the runner
+# names with --output-last-message, as codex does.
 # $FAKE_AGENT=stray also commits files no brief here names (a hook config,
 # a scratch file under .loom/, a top-level test script).
 # $FAKE_AGENT=manifest commits $FAKE_MANIFEST as deploy.yaml.
@@ -202,6 +204,12 @@ printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = say ]; then
+  if [ -n "${FAKE_LAST_MESSAGE:-}" ]; then
+    while [ $# -gt 0 ]; do
+      [ "$1" = --output-last-message ] && printf '%s\\n' "$FAKE_LAST_MESSAGE" > "$2"
+      shift
+    done
+  fi
   [ -z "${FAKE_EDIT:-}" ] || echo partial > fix.txt
   if [ -n "${FAKE_HOOK:-}" ]; then mkdir -p .agents && echo '{}' > .agents/hooks.json; fi
   printf '%s\\n' "$FAKE_OUT"
@@ -1265,6 +1273,46 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         line = self.failure_line()
         self.assertIn("it said: I am blocked: open <path> operation not permitted.", line)
         self.assertNotIn("Users", line)
+
+    def test_the_final_message_file_wins_over_a_printed_git_config(self):
+        # loom#1799: on 2026-10-25 a park quoted a repository's .git/config,
+        # the last thing the agent printed, instead of what it said.
+        self.drop_brief()
+        dump = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false"
+        said = "I stopped: the brief asks for a change the module no longer has."
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT=dump,
+                               FAKE_LAST_MESSAGE=said)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertIn("it said: " + said, line)
+        self.assertNotIn("repositoryformatversion", line)
+        self.assertTrue(any(c.startswith("codex exec") and "--output-last-message" in c
+                            for c in self.calls()), self.calls())
+
+    def test_a_colored_final_message_carries_no_escape_sequences(self):
+        self.drop_brief()
+        out = ("\x1b[1m\x1b[33mPermission needed:\x1b[0m allow the agent to run "
+               "\x1b[36mmake test\x1b[0m? \x1b[2m(y/n)\x1b[0m")
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT=out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertIn("it said: Permission needed: allow the agent to run make test? (y/n)", line)
+        self.assertNotIn("[0m", line)
+        self.assertNotIn("\x1b", line)
+
+    def test_only_tool_output_reads_as_ended_without_explaining_why(self):
+        self.drop_brief()
+        out = ("[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n"
+               "self.assertEqual(result.returncode, 0, result.stderr)")
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT=out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertIn("the agent ended without explaining why", line)
+        # Still the no-reason class the factory counts (bus/factory.py NO_REASON).
+        self.assertIn("agent made no commit and wrote no reason", line)
+        self.assertNotIn("it said", line)
+        self.assertNotIn("repositoryformatversion", line)
+        self.assertNotIn("assertEqual", line)
 
     def test_a_final_message_that_fails_the_text_checks_keeps_the_no_reason_class(self):
         self.drop_brief()
