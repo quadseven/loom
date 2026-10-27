@@ -2762,21 +2762,8 @@ class Factory:
         failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
         if not failed or any(r.get("name") == self.review_check for r in failed):
             return False
-        if not self._behind(repo, full):
+        if not self._behind(repo, full) or not self._green_on_base(repo, full, failed):
             return False
-        base = str((full.get("base") or {}).get("ref") or "")
-        if not base:
-            return False
-        base_sha = str((self.gh.rest("GET", "/repos/%s/commits/%s"
-                                     % (repo, quote(base, safe=""))).data or {}).get("sha") or "")
-        if not base_sha:
-            return False
-        on_base = {str(r.get("name") or ""): r for r in self._check_runs(repo, base_sha)}
-        for run in failed:
-            found = on_base.get(str(run.get("name") or ""))
-            if (found is None or found.get("status") != "completed"
-                    or found.get("conclusion") != "success"):
-                return False
         done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
                             {"expected_head_sha": sha}, ok=(422,))
         if done.status == 422:
@@ -2785,6 +2772,23 @@ class Factory:
         _say("brought %s#%d up to date with its base: %s passed on the base head, so "
              "no fix round" % (repo, number, ", ".join(sorted(str(r.get("name")) for r in failed))))
         return True
+
+    def _green_on_base(self, repo: str, full: Dict[str, Any],
+                       failed: Sequence[Dict[str, Any]]) -> bool:
+        """Did every one of these checks pass on the base branch's current
+        head? False when the base head cannot be read, or when a check is
+        missing there, still running, or not a success."""
+        base = str((full.get("base") or {}).get("ref") or "")
+        if not base:
+            return False
+        base_sha = str((self.gh.rest("GET", "/repos/%s/commits/%s"
+                                     % (repo, quote(base, safe=""))).data or {}).get("sha") or "")
+        if not base_sha:
+            return False
+        on_base = {str(r.get("name") or ""): r for r in self._check_runs(repo, base_sha)}
+        found = [on_base.get(str(r.get("name") or "")) or {} for r in failed]
+        return all(f.get("status") == "completed" and f.get("conclusion") == "success"
+                   for f in found)
 
     def _run_again(self, repo: str, number: int, sha: str) -> bool:
         """Re-run the failed Actions jobs on this commit once. False when a
