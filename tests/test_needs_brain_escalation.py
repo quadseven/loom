@@ -44,6 +44,7 @@ class FakeGitHub:
         self.pulls = []
         self.comments = {}
         self.head_commits = {}
+        self.events = {}
         self.api = "https://api.github.com"
 
     @staticmethod
@@ -57,6 +58,10 @@ class FakeGitHub:
             "number": number, "state": state, "labels": list(labels),
             "body": body, "created_at": created_at,
         }
+        self.events[(repo, number)] = [{
+            "event": "labeled", "label": {"name": "needs-brain"},
+            "created_at": created_at,
+        }]
 
     def add_pull(self, repo, number, state="open", head_ref="loom/1", head_sha=None,
                  user="alice-example", created_at=None):
@@ -90,6 +95,9 @@ class FakeGitHub:
         m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/comments\?", path)
         if m:
             return list(self.comments.get((m.group(1), int(m.group(2))), []))
+        m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/events", path)
+        if m:
+            return list(self.events.get((m.group(1), int(m.group(2))), []))
         return []
 
     def rest(self, method, path, body=None):
@@ -144,7 +152,7 @@ class TestNeedsBrainEscalation(unittest.TestCase):
         self.gh.add_issue(
             repo=REPO, number=TICKET_NUMBER, state="open",
             labels=["loom:ticket", "loom:pr", "needs-brain"],
-            body="Refs %s#%d" % (REPO, TICKET_NUMBER), created_at=stamp(5))
+            body="Refs %s#%d" % (REPO, TICKET_NUMBER), created_at=stamp(4))
         self.gh.add_pull(
             repo=REPO, number=PR_NUMBER, state="open",
             head_ref="loom/%d" % TICKET_NUMBER, head_sha=HEAD_SHA)
@@ -171,8 +179,30 @@ class TestNeedsBrainEscalation(unittest.TestCase):
             REPO, TICKET_NUMBER, "<!-- loom:human v1 -->"))
         body = "\n".join(self.gh.comment_bodies(REPO, TICKET_NUMBER))
         self.assertIn("%s#%d" % (REPO, PR_NUMBER), body)
-        self.assertIn("python3 -m bus.brain merge %s#%d" % (REPO, PR_NUMBER), body)
-        self.assertIn("python3 -m bus.brain fix", body)
+        self.assertIn("python3 -m bus.brain merge %s#%d" % (REPO, PR_NUMBER), body)  # leak-guard-allow: command format under test
+        self.assertIn("python3 -m bus.brain fix %s#%d" % (REPO, PR_NUMBER), body)  # leak-guard-allow: command format under test
+
+    def test_age_uses_needs_brain_label_event(self):
+        """An old ticket with a recent needs-brain label has not waited four hours."""
+        self.gh.events[(REPO, TICKET_NUMBER)] = [{
+            "event": "labeled", "label": {"name": "needs-brain"},
+            "created_at": stamp(2),
+        }]
+        self.station.escalate_needs_brain_tickets()
+        issue = self.gh.get_issue(REPO, TICKET_NUMBER)
+        self.assertNotIn("loom:human", issue["labels"])
+        self.assertEqual(self.gh.human_comment_count(REPO, TICKET_NUMBER), 0)
+
+    def test_removed_needs_brain_label_is_not_escalated(self):
+        """A later label removal ends the needs-brain wait period."""
+        self.gh.events[(REPO, TICKET_NUMBER)].append({
+            "event": "unlabeled", "label": {"name": "needs-brain"},
+            "created_at": stamp(1),
+        })
+        self.station.escalate_needs_brain_tickets()
+        issue = self.gh.get_issue(REPO, TICKET_NUMBER)
+        self.assertNotIn("loom:human", issue["labels"])
+        self.assertEqual(self.gh.human_comment_count(REPO, TICKET_NUMBER), 0)
 
     def test_ticket_under_4_hours_no_change(self):
         """A ticket under 4 hours is left alone."""
@@ -202,6 +232,11 @@ class TestNeedsBrainEscalation(unittest.TestCase):
         self.station.escalate_needs_brain_tickets()
         issue = self.gh.get_issue(REPO, TICKET_NUMBER)
         self.assertIn("loom:human", issue["labels"])
+        self.assertEqual(self.gh.human_comment_count(REPO, TICKET_NUMBER), 1)
+
+        self.station.escalate_needs_brain_tickets()
+        issue = self.gh.get_issue(REPO, TICKET_NUMBER)
+        self.assertEqual(issue["labels"].count("loom:human"), 1)
         self.assertEqual(self.gh.human_comment_count(REPO, TICKET_NUMBER), 1)
 
         self.station.escalate_needs_brain_tickets()

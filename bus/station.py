@@ -5874,17 +5874,32 @@ class Station:
             ticket = self._ticket_for_pr(repo, pr, tickets)
             if ticket is None:
                 continue
-            created = self._epoch(ticket.get("created_at") or "")
-            if created is None or self.now - created < NEEDS_BRAIN_AGE:
+            since = self._needs_brain_since(repo, int(ticket["number"]))
+            if since is None or self.now - since < NEEDS_BRAIN_AGE:
                 continue
             sha = str((pr.get("head") or {}).get("sha") or "")
-            if not sha or sha in already:
+            key = "%s#%s" % (repo, sha)
+            if not sha or key in already:
                 continue
             self._escalate_to_human(repo, ticket, pr, sha)
-            already.add(sha)
-            ledger.setdefault(repo, []).append(sha)
+            already.add(key)
+            ledger.setdefault(repo, []).append(key)
             escalated_any = True
         return escalated_any
+
+    def _needs_brain_since(self, repo: str, number: int) -> Optional[float]:
+        """Return when needs-brain was most recently applied and remains active."""
+        events = self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
+        matching = [(index, event) for index, event in enumerate(events)
+                    if isinstance(event, dict) and event.get("event") in ("labeled", "unlabeled")
+                    and str((event.get("label") or {}).get("name") or "") == "needs-brain"]
+        if not matching:
+            return None
+        _, latest = max(matching, key=lambda pair: (
+            str(pair[1].get("created_at") or ""), pair[0]))
+        if latest.get("event") != "labeled":
+            return None
+        return self._epoch(str(latest.get("created_at") or ""))
 
     def _needs_brain_tickets(self, repo: str) -> List[Dict[str, Any]]:
         """Open loom:ticket issues that carry needs-brain and a lane PR."""
@@ -5908,7 +5923,7 @@ class Station:
         number = int(ticket["number"])
         self._add_label(repo, number, HUMAN)
         body = self._human_escalation_body(repo, number, pr)
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
+        notify.post(self.gh, repo, number, body, notify.ASK)
 
     def _human_escalation_body(self, repo: str, number: int,
                                pr: Dict[str, Any]) -> str:
@@ -11851,6 +11866,12 @@ class Station:
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
             self.report_outcomes()
+            try:
+                self._timed(self.escalate_needs_brain_tickets)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError) as err:
+                _say("needs-brain escalation failed: %s" % err)
             if not self._deferred():
                 try:
                     self._timed(self.reconcile_pull_requests)
