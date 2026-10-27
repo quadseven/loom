@@ -173,7 +173,9 @@ class FakeGitHub:
         raise AssertionError("unexpected GET %s" % path)
 
     def transport(self, method, url, headers, body):
-        return 200, {}, self.logs[url.rsplit("/", 1)[1]].encode("utf-8")
+        # A job with no log given answers as an expired log does.
+        log = self.logs.get(url.rsplit("/", 1)[1])
+        return (404, {}, b"") if log is None else (200, {}, log.encode("utf-8"))
 
     def _write(self, method, path, body):
         self.writes.append((method, path, body))
