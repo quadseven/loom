@@ -117,10 +117,10 @@ class Tiers(unittest.TestCase):
     def test_a_ticket_naming_default_branch_does_not_classify_cross_repo(self):
         # Test case for T1926: when repo has default branch "owner/name", a ticket
         # naming that branch as "Base: owner/name" should NOT be treated as cross-repo.
-        # Example: mod-dungeon-clear has default branch quadseven/prod, but quadseven/prod
-        # is not a separate repo, it's just the default branch name.
+        # Example: a repository default branch may itself be named owner/name.
         ticket = "## What\nAlso change this\n\nBase: quadseven/prod\n"
-        got, why = merge_tier.classify("quadseven/mod-dungeon-clear", entries(APP_CHANGE), ticket)
+        got, why = merge_tier.classify("quadseven/mod-dungeon-clear", entries(APP_CHANGE), ticket,
+                                       default_branch="quadseven/prod")
         self.assertEqual(got, merge_tier.APP_CODE)
         self.assertNotIn("another repo", why)
 
