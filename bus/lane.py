@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from . import brain, change_class, hunt_plan, notify, pr_repair, tickets
-from .github import GitHub, GitHubError, auth_from_env
+from .github import GitHub, GitHubError, RateLimited, auth_from_env
 from .labels import REMOTE_LANES
 
 # One claim comment per ticket claim: the first time is the claim, and each
@@ -29,10 +29,34 @@ def _names(issue: Dict[str, Any]) -> List[str]:
             for x in issue.get("labels") or []]
 
 
+def _own_login(gh: GitHub) -> Optional[str]:
+    """The App login this lane writes as, or None on a personal token or when
+    GET /app cannot be read. Only this App can author as it, so trusting it
+    lets no stranger in (loom#2008)."""
+    login_of = getattr(gh, "app_login", None)
+    if login_of is None:
+        return None
+    try:
+        login = login_of()
+    except RateLimited:
+        raise
+    except GitHubError:
+        return None
+    return login if isinstance(login, str) and login else None
+
+
 def _comments(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
-    """The comments a LOOM_BRIEF_AUTHORS login wrote: a stranger's claim or
-    heartbeat marker neither holds a ticket nor is edited as the lane's."""
-    return brain.trusted_comments(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)))
+    """The comments a LOOM_BRIEF_AUTHORS login or the lane's own App wrote: a
+    stranger's claim or heartbeat marker neither holds a ticket nor is edited
+    as the lane's. The lane's own login counts even when LOOM_BRIEF_AUTHORS
+    omits it, or every beat would miss its last marker and post a new comment
+    (loom#2008)."""
+    authors = brain.trusted_authors()
+    own = _own_login(gh)
+    if own and own.lower() not in {a.lower() for a in authors}:
+        authors = authors + [own]
+    return brain.trusted_comments(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)),
+                                  authors)
 
 
 def _claims(comments: Sequence[Dict[str, Any]], lane: str) -> List[Tuple[int, float, float]]:
