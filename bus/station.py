@@ -9459,7 +9459,7 @@ class Station:
         epics = tuple(invariants.EpicShape(
             ref(epic), epic.get("state", "open") == "open", len(found),
             tuple(ref(t) for t in found if t.get("state") != "closed"),
-            brain.standing_epic(epic))
+            brain.standing_epic(epic), str(epic.get("title") or ""))
             for epic, found in tree)
         return invariants.GoalShape(self._invariant_ref(repo, number),
                                     brain.goal_epic_cap(goal), epics, outside)

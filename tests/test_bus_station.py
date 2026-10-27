@@ -1110,11 +1110,11 @@ class AdoptUntrackedPullRequestTest(Base):
                         "## Definition of done"):
             self.assertIn(section, body)
         # Filed under the goal's intake epic, which the station opened.
-        intake = [c for c in self.fake.created if c["title"] == brain.INTAKE_TITLE]
+        intake = [c for c in self.fake.created if brain.is_intake_epic(c)]
         self.assertEqual(len(intake), 1)
         self.assertRegex(intake[0]["body"], r"(?m)^Part of #30$")
         epic_number = next(n for n, i in self.fake.issues.items()
-                           if i.get("title") == brain.INTAKE_TITLE)
+                           if brain.is_intake_epic(i))
         self.assertRegex(body, r"(?m)^Part of #%d$" % epic_number)
         self.assertNotRegex(body, r"(?m)^Part of #30$")
         self.assertNotRegex(body, r"(?m)^Refs ")

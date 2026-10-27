@@ -3780,6 +3780,9 @@ class FakeRepo:
         if path.startswith("/issues?labels=epic&state=all"):
             return reply(200, [i for i in self.issues
                                if any(l["name"] == "epic" for l in i["labels"])])
+        if path.startswith("/issues?labels=epic&state=open"):
+            return reply(200, [i for i in self.issues if i["state"] == "open"
+                               and any(l["name"] == "epic" for l in i["labels"])])
         if path.startswith("/issues?"):
             self.assertIn_("labels=loom%3Agoal", path)
             return reply(200, [i for i in self.issues
@@ -3866,7 +3869,7 @@ class OnboardTests(unittest.TestCase):
         self.assertIn("backlog goal home: #100, created", lines)
         # Onboarding opens the backlog goal's intake epic (decision 0003).
         intake = posted[1][2]
-        self.assertEqual((intake["title"], intake["labels"]), (brain.INTAKE_TITLE, ["epic"]))
+        self.assertEqual((intake["title"], intake["labels"]), (brain.INTAKE_BATCH_TITLE % 1, ["epic"]))
         self.assertTrue(intake["body"].endswith("\n\nPart of #100\n"))
         self.assertIn("intake epic: #101", lines)
         self.assertEqual(fake.subs, {100: [101]})
@@ -4041,6 +4044,11 @@ class GoalRepo:
 
     def __call__(self, method, url, headers, body):
         payload = json.loads(body) if body else None
+        if method == "GET" and "labels=epic&state=open" in url:
+            # The repo's open epics, which name a new intake epic's batch.
+            self.calls.append((method, "?epics", None))
+            return reply(200, [i for i in self.issues.values() if i.get("state") == "open"
+                               and "epic" in [x["name"] for x in i.get("labels", [])]])
         path = url.split("api.github.com")[1].split("?")[0][len("/repos/%s/issues" % REPO):]
         self.calls.append((method, path, payload))
         parts = path.strip("/").split("/")
@@ -4790,7 +4798,7 @@ class EpicFilingTests(unittest.TestCase):
         fake = GoalRepo()
         gh = GitHub("t", transport=fake)
         first = brain.intake_epic(gh, REPO, 1)
-        self.assertEqual(fake.issues[first]["title"], brain.INTAKE_TITLE)
+        self.assertEqual(fake.issues[first]["title"], brain.INTAKE_BATCH_TITLE % 1)
         self.assertEqual(brain.intake_epic(gh, REPO, 1), first)  # found, not opened again
         url = brain.brief_intake(gh, REPO, 1, "Ticket", BODY, "codex")
         self.assertIn(int(url.rsplit("/", 1)[1]), fake.subs[first])
@@ -4799,7 +4807,7 @@ class EpicFilingTests(unittest.TestCase):
             fake.subs[first].append(n)
         nxt = brain.intake_epic(gh, REPO, 1)
         self.assertNotEqual(nxt, first)
-        self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_TITLE)
+        self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_BATCH_TITLE % 2)
 
     def test_an_intake_epic_with_closed_tickets_still_has_room(self):
         # 2026-10-24: room counted every ticket an intake epic ever held, so
@@ -4853,9 +4861,41 @@ class EpicFilingTests(unittest.TestCase):
         gh = GitHub("t", transport=fake)
         nxt = brain.intake_epic(gh, REPO, 1)
         self.assertNotIn(nxt, (60, 61))
-        self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_TITLE)
+        self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_BATCH_TITLE % 1)
         self.assertEqual([len(fake.subs[n]) for n in (60, 61)],
                          [brain.EPIC_TICKET_CAP, brain.EPIC_TICKET_CAP + 4])
+
+    def test_a_new_intake_epic_takes_a_batch_number_no_open_epic_uses(self):
+        # loom#2030: five open intake epics shared one title, so rewrites and
+        # people picking by title split tickets across all five.
+        fake = GoalRepo()
+        self.intake_epics(fake, [brain.EPIC_TICKET_CAP])  # #60, the unnumbered title
+        # Intake epics of other goals in the repo, one of them closed.
+        fake.issues[70] = dict(item(70, body="Part of #9\n", labels=["epic"]),
+                               title=brain.INTAKE_BATCH_TITLE % 4)
+        fake.issues[71] = dict(item(71, body="Part of #9\n", labels=["epic"], state="closed"),
+                               title=brain.INTAKE_BATCH_TITLE % 9)
+        gh = GitHub("t", transport=fake)
+        nxt = brain.intake_epic(gh, REPO, 1)
+        self.assertNotIn(nxt, (60, 70, 71))
+        title = fake.issues[nxt]["title"]
+        self.assertEqual(title, brain.INTAKE_BATCH_TITLE % 5)
+        others = [i["title"] for n, i in fake.issues.items()
+                  if n != nxt and i.get("state") == "open" and "title" in i]
+        self.assertNotIn(title, others)
+        self.assertEqual(brain.intake_batch(title), 5)
+        # Found by its numbered title, not opened again.
+        self.assertEqual(brain.intake_epic(gh, REPO, 1), nxt)
+
+    def test_intake_takes_the_newest_intake_epic_with_room_by_number_not_by_title(self):
+        # An older unnumbered intake epic and a newer numbered one, both with
+        # room: the newer one by its number, not the first exact title match.
+        fake = GoalRepo()
+        self.intake_epics(fake, [3, 2])
+        fake.issues[61]["title"] = brain.INTAKE_BATCH_TITLE % 2
+        gh = GitHub("t", transport=fake)
+        self.assertEqual(brain.intake_epic(gh, REPO, 1), 61)
+        self.assertEqual(fake.created(), [])
 
 
 class PlacementTests(unittest.TestCase):
@@ -4896,7 +4936,7 @@ class PlacementTests(unittest.TestCase):
         fake = self.fake_with_epics([brain.EPIC_TICKET_CAP])
         made = self.place(fake, 60)
         self.assertNotEqual(made, 60)
-        self.assertEqual(fake.issues[made]["title"], brain.INTAKE_TITLE)
+        self.assertTrue(brain.is_intake_epic(fake.issues[made]))
         self.assertIn("Part of #1", fake.issues[made]["body"])
 
     def test_the_parts_of_a_split_need_room_for_all_of_them(self):
@@ -5088,7 +5128,7 @@ class MoveOutsideEpicTests(unittest.TestCase):
         # A new intake epic took the other two, oldest first.
         opened = [n for n in fake.subs[1] if n != 60]
         self.assertEqual(len(opened), 1)
-        self.assertEqual(fake.issues[opened[0]]["title"], brain.INTAKE_TITLE)
+        self.assertTrue(brain.is_intake_epic(fake.issues[opened[0]]))
         self.assertIn("Part of #1", fake.issues[opened[0]]["body"])
         self.assertEqual(fake.subs[opened[0]], [11, 12])
         # Every move replaced the goal as the parent, oldest ticket first.

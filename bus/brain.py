@@ -1579,6 +1579,11 @@ _SIZE_RE = re.compile(r"^(?:#+[ \t]*)?Size\b", re.M | re.I)
 EPIC_TITLE_PREFIX = naming.EPIC_WORD
 EPIC_TITLE_MAX = naming.TITLE_MAX
 INTAKE_TITLE = "Epic: work that triage, rewrites and health intake find"
+# Each new intake epic carries a batch number no open epic of its repo uses,
+# so no two open intake epics share a title (loom#2030): five once did, and
+# rewrites and people picking by title split tickets across all five.
+INTAKE_BATCH_TITLE = INTAKE_TITLE + ", batch %d"
+_INTAKE_BATCH_RE = re.compile(r"^%s, batch (\d+)$" % re.escape(INTAKE_TITLE))
 INTAKE_BODY = (
     "Done when: this intake epic holds %d tickets, or every ticket in it is closed; "
     "the next intake opens a new epic.\n\n"
@@ -1595,6 +1600,32 @@ REPAIRS_BODY = (
     "15-ticket cap, is not counted against the goal's open epic cap, and is never "
     "flagged as finished.\n\n"
     "Size: no cap (a standing epic).\n")
+
+
+def intake_batch(title: Any) -> Optional[int]:
+    """The batch number of an intake epic's title: 0 for the unnumbered title
+    intake epics carried before loom#2030, None for any other title."""
+    title = " ".join(str(title or "").split())
+    if title == INTAKE_TITLE:
+        return 0
+    match = _INTAKE_BATCH_RE.match(title)
+    return int(match.group(1)) if match else None
+
+
+def is_intake_epic(epic: Dict[str, Any]) -> bool:
+    """An intake epic by its title, numbered or not."""
+    return intake_batch(epic.get("title")) is not None
+
+
+def next_intake_title(gh: GitHub, repo: str) -> str:
+    """The title of a new intake epic: a batch number one past the highest
+    any open epic of the repo carries, so it is used by none of them
+    (loom#2030)."""
+    used = [intake_batch(i.get("title"))
+            for i in gh.paginate("/repos/%s/issues?labels=epic&state=open&per_page=100" % repo)
+            if isinstance(i, dict) and "pull_request" not in i
+            and i.get("state", "open") == "open" and _epic_label(i)]
+    return INTAKE_BATCH_TITLE % (max([n for n in used if n is not None] + [0]) + 1)
 
 
 def standing_epic(epic: Dict[str, Any]) -> bool:
@@ -1659,7 +1690,7 @@ def open_epic(gh: GitHub, repo: str, epic: int
                          % (epic, goal)) from None
     if standing_epic(issue):
         held = 0
-    elif str(issue.get("title") or "") == INTAKE_TITLE:
+    elif is_intake_epic(issue):
         held = _open_count(_epic_tickets(gh, repo, epic))
     else:
         held = len(_epic_tickets(gh, repo, epic))
@@ -1780,11 +1811,12 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1) -> int:
     _, tree = goal_tree(gh, repo, goal)
     roomy = [int(found["number"]) for found, held in tree
              if found.get("state", "open") == "open"
-             and str(found.get("title") or "") == INTAKE_TITLE
+             and is_intake_epic(found)
              and _open_count(held) + room <= EPIC_TICKET_CAP]  # goal_tree already read its tickets
     if roomy:
         return max(roomy)
-    made = file_epic(gh, repo, goal, INTAKE_TITLE, INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP))
+    made = file_epic(gh, repo, goal, next_intake_title(gh, repo),
+                     INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP))
     if not made.get("number"):
         raise ValueError("GitHub named no number for the new intake epic of goal #%d" % goal)
     return int(made["number"])
@@ -1899,7 +1931,7 @@ def _intake_with_room(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
     holds; (None, 0) when no intake epic has room."""
     roomy = [(int(epic["number"]), _open_count(held)) for epic, held in tree
              if epic.get("state", "open") == "open"
-             and str(epic.get("title") or "") == INTAKE_TITLE
+             and is_intake_epic(epic)
              and _open_count(held) < EPIC_TICKET_CAP]
     return max(roomy) if roomy else (None, 0)
 
