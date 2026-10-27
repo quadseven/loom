@@ -1185,10 +1185,17 @@ ticket gets one separate invariant issue that refs the ticket (loom#1223
 flipped 18 times in a day before this). Issues and pull requests in a private repo are named in words, and
 failure reasons have repos, paths and credentials replaced. One pass files
 or reopens at most 5, and below the GitHub budget floor files nothing.
+A `lane-pr-stalled` or `epic-over-cap` issue whose subject settled for good
+(its pull request merged or was closed unmerged, its epic is back at the
+cap) closes on the first pass the breach is gone, whatever labels it carries
+(not a `loom:ticket`), with one note naming how; these closes come before
+the other clears and read no comments (loom#2022). Other cleared issues
+close once the breach has been gone 6 hours.
 `python3 -m bus.brain status` lists the open ones under "Invariants broken"
 for the brain's report, and the station's own standup on that goal home
 names them under "Not going well". `state/station/invariants.json` keeps
-the issue numbers, when each lane was first seen held, and the newest
+the issue numbers, the subject of each open settling breach, when each lane
+was first seen held, and the newest
 journal seen. Adding an invariant is one function in `INVARIANTS` plus a
 test.
 
