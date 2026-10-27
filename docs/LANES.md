@@ -174,6 +174,13 @@ redirect, such as `tool --render-rbac > rbac.yaml`), the comment's first line
 after its header says to run that command and commit what it writes
 (`bus/ci_facts.py`).
 
+A review app's failing check (any check run not from GitHub Actions) is a
+reviewer's prose, not a log, and those rules do not apply to it. Only what the
+reviewer marks as a command becomes a "run" line: a line in a fenced block
+tagged `sh`, `bash`, `shell`, `console` or `zsh`, or a `Run:` or
+`Regenerate:` line. Its "Suggested fix:" lines are quoted as the finding to
+address, never as a command (loom#1898).
+
 ### Live-cluster check
 
 Before a lane opens a pull request, or pushes to one in a fix round, whose
