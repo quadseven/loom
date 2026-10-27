@@ -39,9 +39,11 @@ from . import brain_hold
 from . import claimed
 from . import fabric
 from . import fixrounds
+from . import flake
 from . import runners
 from . import scope_fit
 from . import shadow
+from . import urgency
 from . import stale_claims
 from . import factory
 from . import friction_intake
@@ -806,8 +808,13 @@ class Settings:
                  settle_claimed_max: int = claimed.PER_RUN,
                  claim_idle_hours: int = 0,
                  agy_workdir: str = "",
-                 thin_snapshots: bool = False) -> None:
+                 thin_snapshots: bool = False,
+                 urgency_config: Optional[urgency.Config] = None) -> None:
         self.home = home
+        # LOOM_URGENCY_*: score each ask before it is routed (bus/urgency.py,
+        # loom#1787). Off for a Settings built in code; from_env defaults to
+        # shadow, which records scores and still routes by the label rules.
+        self.urgency = urgency_config or urgency.Config(mode=urgency.OFF)
         # LOOM_THIN_SNAPSHOTS: below twice the free-space floor, ask macOS to
         # thin its local Time Machine snapshots before claims pause. On, from
         # from_env, unless "0"; off for a Settings built in code.
@@ -1004,7 +1011,8 @@ class Settings:
                    settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")),
                    claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")),
                    agy_workdir=_agy_workdir(env),
-                   thin_snapshots=env.get("LOOM_THIN_SNAPSHOTS", "1").strip() != "0")
+                   thin_snapshots=env.get("LOOM_THIN_SNAPSHOTS", "1").strip() != "0",
+                   urgency_config=urgency.Config.from_env(env))
 
 
 def _agy_workdir(env: Dict[str, str]) -> str:
@@ -1715,8 +1723,13 @@ class Station:
                  upload: Optional[Uploader] = None,
                  ancestor: Optional[Callable[[str, str], bool]] = None,
                  head: Optional[Callable[[], str]] = None,
-                 fetch: Optional[Fetcher] = None) -> None:
+                 fetch: Optional[Fetcher] = None,
+                 urgency_client: Optional[urgency.Client] = None) -> None:
         self.gh = gh
+        # The urgency model's client; None reads the key from SSM when a score
+        # is first wanted (Station._urgency_client).
+        self._urgency_injected = urgency_client
+        self._digest_ranked = False  # act mode: the digest keeps the score order
         # Status comments by the station's trusted writers read as events.
         writers = getattr(gh, "status_authors", None)
         if isinstance(writers, set):
@@ -5500,16 +5513,49 @@ class Station:
                 if not (name == self.s.review_check and factory.degraded_review(tail, tail))]
         degraded = len(kept) != len(failed)
         failed = kept
+        # An infra timeout (bus/flake.py) is no lane's to fix: it is re-run
+        # once before any round, whatever else fails, and never reads as a
+        # stuck failure after (loom#1962).
+        flaky = [name for name, tail in failed if name not in (
+            self.s.review_check, self.s.plan_check) and flake.infra_flake(tail)]
+        if flaky and self._rerun_flaky(repo, number, pr_number, sha, flaky):
+            self._remove_ready_if_present(repo, number, names)
+            return
         self._note_first_push(repo, pr_number, comments, failed)
         threads = self._bot_threads(repo, pr_number)
-        if not failed and not threads and not degraded:
+        # A conflicting pull request is not ready, however green its checks
+        # (loom#1963): status read READY for pull requests GitHub reported as
+        # DIRTY after hand merges moved main. Its conflict brief is the
+        # factory's (Factory._send_back), so no round is sent from here.
+        conflict = detail.get("mergeable") is False
+        if not failed and not threads and not degraded and not conflict:
             self._mark_ready(repo, number, sha, names, ready)
             return
         self._remove_ready_if_present(repo, number, names)
         if self._no_round(failed, threads):
             return
         self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
-                                   comments, names, failed, threads, rounds)
+                                   comments, names, failed, threads, rounds, flaky)
+
+    def _rerun_flaky(self, repo: str, number: int, pr_number: int, sha: str,
+                     flaky: List[str]) -> bool:
+        """Re-run the workflow runs of the infra-failed checks on this head
+        once (flake.rerun_once). False when each was already re-run, or when
+        GitHub refused the read or the re-run: the fix round then goes as it
+        did before this re-run existed."""
+        try:
+            runs = brain.newest_check_runs((self.gh.rest(
+                "GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data
+                or {}).get("check_runs") or [])
+            if not flake.rerun_once(self.gh, repo, runs, flaky):
+                return False
+        except GitHubError as err:
+            _say("%s#%d: could not re-run %s on %s#%d (%s); the fix round goes as usual"
+                 % (repo, number, ", ".join(sorted(flaky)), repo, pr_number, err))
+            return False
+        _say("%s#%d: re-ran %s on %s#%d once before a fix round: an infra failure"
+             % (repo, number, ", ".join(sorted(flaky)), repo, pr_number))
+        return True
 
     def _no_round(self, failed: List[Tuple[str, str]], threads: List[Any]) -> bool:
         """Nothing a lane round could fix: no failure at all, or the plan check
@@ -5665,19 +5711,21 @@ class Station:
     def _post_fix_or_escalate(self, repo: str, number: int, pr_number: int, lane: str,
                               detail: Dict[str, Any], sha: str, comments: List[Any],
                               names: List[str], failed: List[Any], threads: List[Any],
-                              rounds: int) -> None:
+                              rounds: int, flaky: Sequence[str] = ()) -> None:
         """Send the next fix round, unless the last one moved nothing. Each
         round went to the same lane until the cap, with no look at whether
         the last one fixed anything (2026-10-26: four rounds on a local model
         left the same checks failing and the same finding open). A round whose
         failures persist by signature (bus/converge.py) climbs the model
         ladder at once; with no rung left, or with the round cap reached on
-        its rung, the rounds stop (_stop_fix_rounds)."""
+        its rung, the rounds stop (_stop_fix_rounds). A check in `flaky`
+        failed on the infrastructure (bus/flake.py) and is never read as a
+        failure the last round left."""
         authors = {author.lower() for author in self.s.authors}
         failing = [name for name, _ in failed]
         persisted = converge.persistent(
             converge.last_fix_body(comments, authors, (repo, pr_number)),
-            failing, threads, ignore=(self.s.review_check, self.s.plan_check))
+            failing, threads, ignore=(self.s.review_check, self.s.plan_check) + tuple(flaky))
         if persisted:
             lane = self._climb_stuck(repo, number, pr_number, detail, comments, persisted)
             if lane is None:
@@ -6924,7 +6972,10 @@ class Station:
         newest first, so they are not buried behind old ones."""
         prev = covered_before if isinstance(covered_before, dict) else {}
         covered = {k: self._ask_rev(i) for k, _, i in asks}
-        new = [a for a in reversed(asks) if prev.get(a[0]) != covered[a[0]]]
+        # Asks ranked by their urgency score (act mode) keep that order.
+        ranked = self._digest_ranked
+        new = [a for a in (asks if ranked else reversed(asks))
+               if prev.get(a[0]) != covered[a[0]]]
         seen = [a for a in asks if prev.get(a[0]) == covered[a[0]]]
         plan: Dict[str, Any] = {
             "day": today, "covered": covered, "new": len(new),
@@ -7111,8 +7162,9 @@ class Station:
         if keyed is None:
             return
         self._prune_urgent(ledger, {k for k, _, _ in keyed})
+        routes = self._route_asks(keyed)
         urgent_keys = {k for k, _, i in keyed
-                       if URGENT in _label_names(i) and k not in ledger[2]}
+                       if routes[k].route == urgency.URGENT and k not in ledger[2]}
         url = None
         # Urgent asks go out on their own: nothing the digest needs (a trust
         # check of an old ask, a page post) can hold them.
@@ -7124,7 +7176,61 @@ class Station:
                 return
             self._send_urgent(url, todo, ledger)
         if digest_due:
+            if self.s.urgency.mode == urgency.ACT:
+                # Act: only urgent and digest routes go in, highest score first.
+                keyed = [a for a in keyed
+                         if routes[a[0]].route in (urgency.URGENT, urgency.DIGEST)]
+                keyed.sort(key=lambda a: -(routes[a[0]].score or 0.0))
+                self._digest_ranked = True
             self._send_digest(url, keyed, ledger, today)
+
+    def _urgency_client(self) -> Optional[urgency.Client]:
+        if self._urgency_injected is not None:
+            return self._urgency_injected
+        if not self.s.urgency.key_ssm:
+            return None
+        key = self.read_secret(self.s.urgency.key_ssm, self.s.region)
+        return urgency.http_client(key, self.s.urgency.model) if key else None
+
+    def _label_urgent(self, key: str, repo: str, issue: Dict[str, Any]) -> None:
+        """Add loom:urgent beside the ask's labels (act mode); a failed write
+        is said and the ask is still forwarded this pass."""
+        try:
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+                         {"labels": [URGENT]})
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not label %s %s: %s" % (key, URGENT, err))
+
+    def _route_asks(self, keyed: List[Tuple[str, str, Dict[str, Any]]]
+                    ) -> Dict[str, urgency.Decision]:
+        """key -> where each ask goes this pass (bus/urgency.py). Off, or
+        shadow, routes by the label rules; act may add loom:urgent."""
+        cfg = self.s.urgency
+        scorer = urgency.Scorer(cfg, os.path.join(self.state, "urgency.json"),
+                                os.path.join(self.state, "urgency.jsonl"),
+                                client=self._urgency_client, now=self.now, say=_say)
+        titles = {k: " ".join(str(i.get("title") or "").split()) for k, _, i in keyed}
+        out: Dict[str, urgency.Decision] = {}
+        for key, repo, issue in keyed:
+            labels = _label_names(issue)
+            if cfg.mode == urgency.OFF:
+                out[key] = urgency.Decision(urgency.today_route(labels), None, None, False)
+                continue
+            state = urgency.ask_state(repo, issue, labels, self.now,
+                                      [t for k, t in titles.items() if k != key])
+            decision = scorer.decide(key, state, labels)
+            if decision.route == urgency.URGENT and URGENT not in labels:
+                self._label_urgent(key, repo, issue)
+            out[key] = decision
+        if cfg.mode != urgency.OFF:
+            scorer.prune(set(out))
+            try:
+                scorer.save()
+            except OSError as err:
+                _say("could not save the urgency ledger (%s)" % type(err).__name__)
+        return out
 
     # -- goal reports -----------------------------------------------------
     def _goal_issues(self, repo: str) -> List[Dict[str, Any]]:

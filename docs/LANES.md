@@ -434,7 +434,11 @@ conflict goes back to a lane as a fix brief. It stays on its lane while the
 rounds make progress, and climbs the model ladder only when stuck: a review
 thread survived a fix round, checks it was asked to fix still fail, or the
 pull request is over 6 hours old and has not climbed in 6 hours (a review that finds new things, or a
-conflict alone, never climbs). Failed tickets and briefed tickets no lane
+conflict alone, never climbs, by age either: a conflict-only pull request is
+sent back on its lane however old it is, and the station never marks a
+conflicting pull request `loom:ready`). A ready pull request held for the
+operator is brought up to date with its base while it waits, and still never
+merges on the factory's say-so. Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
 starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
@@ -563,6 +567,28 @@ a retry sends the same one; once sent, `covered` holds each ask's revision
 (a hash of its title and body) and `pages` the links. Posts mention nobody
 except the numeric user id in `LOOM_DISCORD_MENTION`; a failed post is retried
 on the next pass.
+
+Urgency score (`bus/urgency.py`, loom#1787): before routing, the station can
+score each ask with one request to a System One model (TypeSafe Jev): an
+`urgency` Score on five levels (0 weekly look to 4 now) and three yes
+probabilities, `needs_person`, `duplicate` and `public_exposure`, over the
+ask's repo, title, body excerpt, labels, age, filer and the other open asks.
+`LOOM_URGENCY_MODE` is `off`, `shadow` (the default: score and record, route by
+the labels as above) or `act`. In act, `public_exposure` >= 0.7, or `urgency` >=
+3.2 with `needs_person` >= 0.6, adds `loom:urgent` and forwards it now;
+`duplicate` >= 0.8 leaves it out of the digest as a repeat; `urgency` >= 1.5
+puts it in the digest, highest score first; lower stays out of the digest.
+The thresholds are `LOOM_URGENCY_EXPOSURE`, `LOOM_URGENCY_URGENT`,
+`LOOM_URGENCY_URGENT_PERSON`, `LOOM_URGENCY_DIGEST` and
+`LOOM_URGENCY_DUPLICATE`. The key comes from the SSM parameter named by
+`LOOM_URGENCY_KEY_SSM` (empty: no request); `LOOM_URGENCY_MODEL` defaults to
+`jev-latest`. Each ask is scored once per revision; the scores sit in
+`state/station/urgency.json` and every score is appended to
+`state/station/urgency.jsonl` beside the route the labels gave.
+`LOOM_URGENCY_DAILY_TOKENS` (default 200000 input tokens a UTC day) caps the
+spend: past it no request is sent, and past it or on any API error the ask
+routes by the labels and `fallbacks` in `urgency.json` goes up. A failed ask is
+tried again after an hour.
 
 Metrics: set `LOOM_METRICS_GOAL=owner/name#N` to name a goal home in
 `LOOM_REPOS`. Once a day after `LOOM_DIGEST_HOUR`, the station measures the

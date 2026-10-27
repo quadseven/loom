@@ -292,6 +292,20 @@ if [ -n "${LOOM_TRANSCRIPT_URL:-}" ] && [ -n "${LOOM_TRANSCRIPT_TOKEN_SSM:-}" ];
     { say "could not read the handoff packet; the tick runs without it"; PACKET=""; }
 fi
 
+# The Shadow mode sentence comes from bus/shadow.py, the same scope() the
+# merge and close gates read, so a repo the operator took out of shadow
+# (LOOM_SHADOW_REPOS) is one the prompt lets the brain merge in (loom#1960).
+# If it cannot be read, the prompt fails closed: shadow for every repo.
+SHADOW_LINE="$(cd "$REPO_ROOT" && python3 -m bus.shadow prompt 2>> "$LOG")" || SHADOW_LINE=""
+case "$SHADOW_LINE" in
+  "Shadow mode (MUSE.md) "*) ;;
+  *) say "could not read the shadow scope; the prompt says shadow for every repo"
+     SHADOW_LINE="Shadow mode (MUSE.md) is on for every repo: never merge, \
+close an issue, approve a pull request, or add ready-to-land or loom:shipped \
+by any route (gh, curl, the API); bus.brain merge and bus.brain close run \
+their gates and record what they would do." ;;
+esac
+
 PROMPT="You are the Loom brain for one tick. Follow $WORK/loom/docs/MUSE.md, \
 with these differences: the checkout is already up to date, and the tick lock \
 is already held for you as holder $HOLDER by the wrapper, so skip the lock and unlock steps \
@@ -307,10 +321,7 @@ $HOLDER, which edits your journal of the day there instead of emailing the \
 issue's watchers with a new comment; evidence whose blocker kind has no issue \
 of exactly that kind goes to the goal home's journal, never the closest \
 issue. This replaces the 15-minute limit in MUSE.md: stop within \
-$((MINUTES - 5)) minutes; you are cut off at $MINUTES. Shadow mode (MUSE.md): \
-unless LOOM_SHADOW is 0, never merge, close an issue, approve a pull request, \
-or add ready-to-land or loom:shipped by any route (gh, curl, the API); \
-bus.brain merge and bus.brain close run their gates and record what they would do."
+$((MINUTES - 5)) minutes; you are cut off at $MINUTES. $SHADOW_LINE"
 if [ "$SCOPE" = live ]; then
   PROMPT="$PROMPT Muse does the GitHub steps, ships and rolls, and reads \
 live data through REST APIs, but has no cluster or database access. Do what \
