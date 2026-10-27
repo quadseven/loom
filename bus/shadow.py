@@ -90,6 +90,11 @@ ACTIONS = (MERGE, CLOSE, REOPEN, LABEL, DELETE_BRANCH, APPROVE)
 # ledger pairs what Loom would have done with the operator's verdict. Its
 # label is the verdict ("merge" or "hold"); it is never counted as an action.
 VERDICT = "operator-verdict"
+# Not a request the choke point holds: a label removal is reversible, so
+# GitHub._rest sends it. The station's label pass (bus/label_pass.py,
+# loom#2024) records its own removals as this action in shadow and sends
+# none, so the operator reads what the pass would clean before it does.
+UNLABEL = "unlabel"
 
 # Labels whose addition grants a merge or ships a ticket, each with the labels
 # that mean the ticket is already past it (a verified ticket moved back to
@@ -656,9 +661,10 @@ def parse_since(text: str, now: float) -> float:
 
 def _counts(entries: Sequence[Mapping[str, Any]]) -> str:
     words = {MERGE: "merge", CLOSE: "close", REOPEN: "reopen", LABEL: "ship or merge label",
-             DELETE_BRANCH: "branch deletion", APPROVE: "approving review"}
+             DELETE_BRANCH: "branch deletion", APPROVE: "approving review",
+             UNLABEL: "label removal"}
     parts = []
-    for action in ACTIONS:
+    for action in ACTIONS + (UNLABEL,):
         n = sum(1 for e in entries if e.get("action") == action)
         if n:
             parts.append("%d %s%s" % (n, words[action], "" if n == 1 else "s"))

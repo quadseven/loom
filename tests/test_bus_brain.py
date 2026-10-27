@@ -1665,9 +1665,11 @@ class SensitiveResumeTests(unittest.TestCase):
                                   "ticket": (REPO, 9), "head_sha": "checked"})
         self.assertTrue(fake.calls[-2][1].endswith("/repos/%s/issues/9" % REPO))
 
-    def _merge_with_files(self, files, labels=("loom:ticket", "loom:pr"), search_items=None):
-        pr, query = self._merge_replies()
-        issue = {"state": "open", "labels": [{"name": x} for x in labels]}
+    def _merge_with_files(self, files, labels=("loom:ticket", "loom:pr"), search_items=None,
+                          ticket_body="", pull_body=None):
+        pr, query = self._merge_replies(
+            None if pull_body is None else {"pr": {"body": "Refs %s#9\n\n%s" % (REPO, pull_body)}})
+        issue = {"state": "open", "labels": [{"name": x} for x in labels], "body": ticket_body}
         replies = [pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204)]
         if "documentation" not in labels:
             replies.append(reply(200, files))
@@ -1701,6 +1703,33 @@ class SensitiveResumeTests(unittest.TestCase):
         patch = "+def decide(x):\n+    return x"
         labels, _ = self._merge_with_files(
             [{"filename": "bus/a.py", "patch": patch}], search_items=["bus/b.py"])
+        self.assertEqual(labels, ["loom:ticket", "loom:merged"])
+
+    FOUR_BOXES = ("## Acceptance criteria\n- [ ] First works; test.\n- [ ] Second works.\n"
+                  "- [ ] Third works.\n- [ ] Fourth works.\n")
+    CALLED = [{"filename": "bus/a.py", "patch": "+def decide(x):\n+    return x\n+y = decide(1)"}]
+
+    def test_merge_of_a_pull_request_that_builds_one_of_four_boxes_requeues_its_ticket(self):
+        # loom#2026: the brain merged a pull request that built 1 of 4 boxes
+        # and marked the rest not built, and moved its ticket to loom:merged.
+        pull = ("## Acceptance criteria\n- [x] First works; test.\n"
+                "- [ ] Second works.; not built: needs a key\n"
+                "- [ ] Third works.; not built: needs a key\n"
+                "- [ ] Fourth works.; not built: needs a key\n")
+        labels, fake = self._merge_with_files(self.CALLED, ticket_body=self.FOUR_BOXES,
+                                              pull_body=pull)
+        self.assertEqual(labels, ["loom:ticket", "loom:queued"])
+        note = [c[2]["body"] for c in fake.calls if c[1].endswith("/issues/9/comments")][0]
+        self.assertIn("Pull request #8 merged and left ticket criteria unbuilt", note)
+        for text in ("Second works.", "Third works.", "Fourth works."):
+            self.assertIn(text, note)
+        self.assertNotIn("First works", note)
+
+    def test_merge_of_a_pull_request_that_builds_every_box_marks_merged(self):
+        pull = ("## Acceptance criteria\n- [x] First works; test.\n- [x] Second works.\n"
+                "- [x] `Third` works\n- [x] Fourth  works.\n")
+        labels, _ = self._merge_with_files(self.CALLED, ticket_body=self.FOUR_BOXES,
+                                           pull_body=pull)
         self.assertEqual(labels, ["loom:ticket", "loom:merged"])
 
     def test_merge_of_a_docs_pull_request_for_a_docs_ticket_marks_merged(self):
@@ -5273,6 +5302,72 @@ class RepairsEpicTests(unittest.TestCase):
         brain.brief(gh, REPO, epic, "Repair", BODY, "codex")
         tree = brain.goal_tree(gh, REPO, 1)[1]
         self.assertNotIn(epic, [e["number"] for e in brain.finished_epics(tree)])
+
+    def full_repairs(self):
+        """Goal #1 at its open epic cap, its standing repairs epic #50 at
+        GitHub's limit of 100 sub-issues."""
+        fake = GoalRepo()
+        for n in range(60, 65):
+            fake.issues[n] = dict(item(n, body="Part of #1\n", labels=["epic"]),
+                                  title="Epic: number %d" % n)
+            fake.subs[1].append(n)
+        fake.issues[50] = dict(item(50, body="Part of #1\n", labels=["epic"]),
+                               title=brain.REPAIRS_TITLE)
+        fake.subs[1].append(50)
+        fake.subs[50] = []
+        for n in range(1000, 1100):
+            fake.issues[n] = item(n, labels=["loom:ticket"], state="closed")
+            fake.subs[50].append(n)
+        return fake
+
+    def batch(self, fake, number, held):
+        fake.issues[number] = dict(item(number, body="Part of #1\n", labels=["epic"]),
+                                   title="Epic: factory repairs the brain finds by hand, "
+                                         "batch %d" % number)
+        fake.subs[1].append(number)
+        fake.subs[number] = []
+        for n in range(held):
+            fake.issues[number * 100 + n] = item(number * 100 + n, labels=["loom:ticket"])
+            fake.subs[number].append(number * 100 + n)
+
+    def test_a_repairs_epic_at_the_sub_issue_limit_rolls_over_to_the_newest_batch_with_room(self):
+        """loom#2023: the standing epic held 100 sub-issues and repairs still
+        named it; they go to the newest batch epic with room instead."""
+        fake = self.full_repairs()
+        self.batch(fake, 70, 3)   # older, with room
+        self.batch(fake, 72, 15)  # newest, full at the cap
+        self.batch(fake, 71, 4)   # newest with room
+        gh = GitHub("t", transport=fake)
+        self.assertEqual(brain.repairs_epic(gh, REPO, 1), 71)
+        # A ticket placed beside the full standing epic lands there too.
+        self.assertEqual(brain.placement_epic(gh, REPO, 50), 71)
+        self.assertEqual(fake.created(), [])
+
+    def test_a_full_repairs_epic_with_no_batch_room_opens_the_next_batch_outside_the_cap(self):
+        fake = self.full_repairs()
+        self.batch(fake, 70, 15)
+        gh = GitHub("t", transport=fake)
+        number = brain.repairs_epic(gh, REPO, 1)
+        self.assertEqual(fake.issues[number]["title"], brain.REPAIRS_BATCH_TITLE)
+        self.assertTrue(brain.repairs_batch(fake.issues[number]))
+        self.assertFalse(brain.standing_epic(fake.issues[number]))
+        self.assertIn("Part of #1", fake.issues[number]["body"])
+        self.assertIn(number, fake.subs[1])
+        # The next repair finds that batch: none is opened twice.
+        self.assertEqual(brain.repairs_epic(gh, REPO, 1), number)
+        self.assertEqual(len(fake.created()), 1)
+
+    def test_a_refused_link_names_the_repairs_epic_full_below_the_limit(self):
+        """GitHub's 422 is the truth when the count read disagrees: an epic
+        named in full rolls over though its listing holds fewer than 100."""
+        fake = GoalRepo()
+        fake.issues[50] = dict(item(50, body="Part of #1\n", labels=["epic"]),
+                               title=brain.REPAIRS_TITLE)
+        fake.subs[1].append(50)
+        self.batch(fake, 70, 2)
+        gh = GitHub("t", transport=fake)
+        self.assertEqual(brain.repairs_epic(gh, REPO, 1), 50)
+        self.assertEqual(brain.repairs_epic(gh, REPO, 1, full=(50,)), 70)
 
 
 class ClaimDropMoveTests(unittest.TestCase):
