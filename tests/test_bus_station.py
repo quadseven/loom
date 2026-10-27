@@ -93,6 +93,10 @@ class FakeGitHub:
         self.pull_files = {}
         self.carried = set()
         self.check_runs_status = 200
+        # Strings a code search of the repo finds nothing for (bus/unmeetable.py);
+        # every other search finds one file.
+        self.code_absent = set()
+        self.code_searches = []
 
     def add_foreign(self, repo, number, labels=("loom:pr",), state="open", reason=None):
         """An issue in another repo, as an After: line that names one reads it."""
@@ -205,6 +209,13 @@ class FakeGitHub:
                                    if any(l.get("name") == "loom:factory"
                                           for l in i.get("labels", []))])
             return reply(200, self.factory_incidents)
+        if method == "GET" and parts.path == "/search/code":
+            term = unquote(parts.query[len("q="):]).rsplit(" repo:", 1)[0].rsplit("+repo:", 1)[0]
+            term = term.strip('"')
+            self.code_searches.append(term)
+            hits = 0 if term in self.code_absent else 1
+            return reply(200, {"total_count": hits, "incomplete_results": False,
+                               "items": [{"path": "src/app.py"}] * hits})
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if method == "GET" and rest == "labels":
             return reply(200, [{"name": name, "color": value["color"],
@@ -10513,6 +10524,68 @@ class VerifyDispatchTest(Base):
         self.assertTrue(any("-6-verify-" in n for n in self.briefs()), self.briefs())
         self.assertNotIn("wait:live-event", self.fake.names(6))
         self.assertIn("loom:shipped", self.fake.names(6))
+
+    def unmeetable_pass(self):
+        """A pass with the verify cooldown cleared, so only the Live box decides."""
+        self.write(os.path.join(self.home, "state", "station", station.VERIFY_FILE), "{}")
+        self.run_pass()
+
+    def test_a_live_box_whose_log_string_no_code_prints_gets_one_restate_ask(self):
+        # loom#2028: a Live box waiting on a string nothing emits went back
+        # through lanes and came back unmet each time.
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        ask = self.fake.comments[2][0]["body"]
+        self.assertIn("<!-- loom:unmeetable-live v1 ", ask)
+        self.assertIn("`daily status ready`", ask)
+        self.assertIn("Restate the Live box", ask)
+        self.assertIn("loom:shipped", self.fake.names(2))
+        # Later passes neither ask again nor queue it, nor search again.
+        searched = len(self.fake.code_searches)
+        self.unmeetable_pass()
+        self.unmeetable_pass()
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.code_searches), searched)
+        # A restated box is checked afresh and verified.
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "`daily status ready`", "`daily status line ready`")
+        self.unmeetable_pass()
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+
+    def test_a_live_box_whose_log_string_the_code_prints_is_verified(self):
+        self.fake.issues.pop(1)
+        self.run_pass()
+        self.assertIn("daily status ready", self.fake.code_searches)
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_live_box_waiting_on_a_closed_issue_gets_one_restate_ask(self):
+        self.fake.issues.pop(1)
+        self.fake.add_foreign("example-owner/muster", 163, state="closed", reason="completed")
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "after deploy, muster#163 is verified and the log prints `daily status ready`")
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertIn("example-owner/muster#163", self.fake.comments[2][0]["body"])
+        self.unmeetable_pass()
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+
+    def test_a_lost_state_file_does_not_ask_twice_for_the_same_box(self):
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.run_pass()
+        os.remove(os.path.join(self.home, "state", "station", station.UNMEETABLE_FILE))
+        self.unmeetable_pass()
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
 
     def test_verify_pool_never_hands_ticket_with_unsearchable_live_line(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(

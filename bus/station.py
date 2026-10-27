@@ -68,6 +68,7 @@ from . import verify_data
 from . import text as _text
 from . import tickets
 from . import transcripts
+from . import unmeetable
 from . import brief_check
 from . import criteria_gate
 from . import live_adapter, live_proof
@@ -547,6 +548,14 @@ EVIDENCE_WINDOW_HOURS = 24.0
 # loom:awaiting-evidence label: a reason, not a word.
 MISSING_MIN = 20
 VERIFY_FILE = "verify-runs.json"
+# Live boxes that can never be met as written (bus/unmeetable.py): ticket ->
+# {"key": box text key, "reasons": [...], "at": checked}. A flagged box gets
+# one restate ask and no verify lane until its text changes; a clean result
+# is checked again after UNMEETABLE_RECHECK. Code searches have their own
+# small GitHub budget, so at most UNMEETABLE_SEARCHES run a pass.
+UNMEETABLE_FILE = "unmeetable-live.json"
+UNMEETABLE_RECHECK = 24 * 3600
+UNMEETABLE_SEARCHES = 4
 LIVE_EVENT_MARKER = "<!-- loom:wait-live-event v1 -->"
 # A shipped ticket whose proof was refused this many times leaves the verify
 # queue and goes to the brain with the refusals listed (loom#1307): the
@@ -3157,13 +3166,96 @@ class Station:
         # The cheap filters first: the events and comments of a ticket are
         # read only when its cooldown is over.
         found = []
+        searches = [UNMEETABLE_SEARCHES]
         for repo, issue in verify_due(shipped, attempts, self.now, refused):
+            if self._unmeetable_live(repo, issue, searches):
+                continue
             issue["shipped_at"] = self._shipped_stamp(repo, issue)
             issue["has_proof"] = self._proven(repo, int(issue["number"]))
             issue["health_proof"] = health.proof_of(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))), self.s.authors)
             found.append((repo, issue))
         return verify_due(found, attempts, self.now, refused), held
+
+    def _unmeetable_live(self, repo: str, issue: Dict[str, Any], searches: List[int]) -> bool:
+        """True when the ticket's Live box can never be met as written
+        (bus/unmeetable.py): it waits on a closed issue or an unmerged closed
+        pull request, or on a log string no file of the repo contains. The
+        first time a box text is flagged one restate ask is posted; until the
+        text changes the ticket is not handed to a verify lane again (loom#2028:
+        two such tickets went through lane after lane and came back unmet).
+        `searches` holds the code searches left this pass."""
+        live = brain.live_criterion(issue.get("body"), limit=None)
+        if live == "(no Live criterion on the ticket)":
+            return False
+        number = int(issue["number"])
+        ticket = "%s#%d" % (repo, number)
+        box = unmeetable.key(live)
+        path = os.path.join(self.state, UNMEETABLE_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        seen = state.get(ticket)
+        if isinstance(seen, dict) and seen.get("key") == box:
+            if seen.get("reasons"):
+                return True
+            at = seen.get("at")
+            if isinstance(at, (int, float)) and 0 <= self.now - at < UNMEETABLE_RECHECK:
+                return False
+        unknown = [False]
+
+        def state_of(where: str, ref: int) -> Optional[Tuple[str, bool]]:
+            try:
+                data = self.gh.rest("GET", "/repos/%s/issues/%d" % (where, ref)).data
+            except RateLimited:
+                raise
+            except GitHubError:
+                return None
+            if not isinstance(data, dict):
+                return None
+            pull = data.get("pull_request")
+            merged = bool(isinstance(pull, dict) and pull.get("merged_at"))
+            return str(data.get("state") or ""), merged
+
+        def present(text: str) -> Optional[bool]:
+            if searches[0] <= 0:
+                unknown[0] = True
+                return None
+            searches[0] -= 1
+            try:
+                data = self.gh.rest("GET", "/search/code?q=%s+repo:%s" % (
+                    quote('"%s"' % text, safe=""), repo)).data
+            except GitHubError:
+                # The search budget is apart from the core one: a refused
+                # search proves nothing and ends this pass's searches.
+                searches[0] = 0
+                unknown[0] = True
+                return None
+            if not isinstance(data, dict) or data.get("incomplete_results") \
+                    or not isinstance(data.get("total_count"), int):
+                return None
+            return data["total_count"] > 0
+
+        found = unmeetable.reasons(live, repo, number, state_of, present)
+        if not found:
+            if not unknown[0]:
+                state[ticket] = {"key": box, "reasons": [], "at": self.now}
+                _write_json(path, state)
+            return False
+        try:
+            comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+            if not unmeetable.asked(list(comments), live):
+                notify.post(self.gh, repo, number, unmeetable.ask(
+                    live, [self._note_text(r) for r in found]), notify.HELD)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not ask to restate the Live box of %s: %s" % (ticket, err))
+            return True
+        state[ticket] = {"key": box, "reasons": found, "at": self.now}
+        _write_json(path, state)
+        _say("not verifying %s: its Live box cannot be met as written (%s)"
+             % (ticket, "; ".join(found)))
+        return True
 
     def _audit_holds(self) -> Dict[str, float]:
         """The lanes a failed audit of their proof holds from verify runs,
