@@ -18,10 +18,17 @@ LANES = Path(__file__).resolve().parent.parent / "lanes"
 SCRIPT = LANES / "mac" / "brain.sh"
 
 # Fake python3: `-m bus lock` exits $FAKE_LOCK (default 0), `-m bus unlock`
-# exits 0, and `-m bus.brain_memory handoff` prints $FAKE_PACKET and exits
-# $FAKE_PACKET_EXIT (default 0). Every call is appended to $FAKE_LOG.
+# exits 0, `-m bus.brain_memory handoff` prints $FAKE_PACKET and exits
+# $FAKE_PACKET_EXIT (default 0), and `-m bus.shadow prompt` runs the real one
+# under $FAKE_REAL_PYTHON or fails. Every call is appended to $FAKE_LOG.
 FAKE_PYTHON = """#!/usr/bin/env bash
 printf 'python3 %s\\n' "$*" >> "$FAKE_LOG"
+if [ "$2 $3" = "bus.shadow prompt" ]; then
+  # FAKE_REAL_PYTHON: run the real bus.shadow from the checkout; unset, the
+  # command fails and the tick falls back to shadow for every repo.
+  [ -n "${FAKE_REAL_PYTHON:-}" ] && exec "$FAKE_REAL_PYTHON" -B "$@"
+  exit 1
+fi
 if [ "$2" = bus.brain_memory ]; then
   printf '%s\\n' "${FAKE_PACKET:-}"
   exit "${FAKE_PACKET_EXIT:-0}"
@@ -546,6 +553,45 @@ class BrainTickTest(unittest.TestCase):
         self.log.unlink()
         _, calls = self.spark_tick()
         self.assertIn("gh-path-opencode %s/run/brain-home/bin/gh" % self.home, calls)
+
+    def with_real_shadow(self):
+        shutil.copytree(LANES.parent / "bus", self.root / "bus",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        git("add", ".", cwd=self.root)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "bus", cwd=self.root)
+        git("push", "-q", "origin", "main", cwd=self.root)
+        return {"FAKE_REAL_PYTHON": sys.executable}
+
+    def test_the_prompt_names_only_the_repos_still_in_shadow(self):
+        # loom#1960: the prompt said "unless LOOM_SHADOW is 0, never merge",
+        # so with LOOM_SHADOW_REPOS narrowed the brain refused merges the
+        # gates allowed, in repos the operator had taken out of shadow.
+        _, calls = self.tick(LOOM_SHADOW="1", LOOM_SHADOW_REPOS="example-owner/held",
+                             **self.with_real_shadow())
+        self.assertIn("python3 -m bus.shadow prompt", calls)
+        claude = self.agent_calls(calls, "claude")[0]
+        self.assertIn("is on only for example-owner/held", claude)
+        self.assertIn("Every other repo is out of shadow", claude)
+        self.assertNotIn("unless LOOM_SHADOW is 0", claude)
+        self.assertNotIn("is on for every repo", claude)
+
+    def test_the_prompt_says_every_repo_when_the_list_is_empty(self):
+        _, calls = self.tick(LOOM_SHADOW="1", **self.with_real_shadow())
+        claude = self.agent_calls(calls, "claude")[0]
+        self.assertIn("Shadow mode (MUSE.md) is on for every repo: never merge", claude)
+        self.assertNotIn("out of shadow", claude)
+
+    def test_a_shadow_scope_that_cannot_be_read_is_every_repo(self):
+        # The fake prompt command fails: the tick still runs, in shadow for all.
+        run, calls = self.tick(LOOM_SHADOW="0", LOOM_SHADOW_REPOS="example-owner/held")
+        self.assertEqual(0, run.returncode, run.stderr)
+        claude = self.agent_calls(calls, "claude")[0]
+        self.assertIn("Shadow mode (MUSE.md) is on for every repo: never merge, "
+                      "close an issue, approve a pull request", claude)
+        self.assertNotIn("out of shadow", claude)
+        self.assertIn("could not read the shadow scope",
+                      (self.home / "logs" / "brain.log").read_text())
 
     def test_the_guard_refuses_a_merge_in_shadow_and_runs_gh_otherwise(self):
         # The rung's checkout carries the real bus package, as origin does.

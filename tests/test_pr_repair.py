@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import pr_repair, text  # noqa: E402
+from bus import hunt_plan, pr_repair, text  # noqa: E402
 
 
 BRIEF = """# Brief: example-owner.example-repo-42
@@ -83,6 +83,32 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("## Out of scope\n- Other things", body)
         self.assertIn("---\nLoom ticket T42, lane codex, model gpt-test.", body)
         self.assertIn("\nRefs example-owner/example-repo#42", body)
+
+    def test_rendered_body_reads_a_summary_heading_when_what_is_absent(self):
+        # Ticket briefs often write the change under "## Summary"; the body's
+        # ## Summary came out empty for them (loom#1468).
+        brief = BRIEF.replace("## What\nMake the thing work.",
+                              "## Summary\nMake the thing work for every user.")
+        body = pr_repair._render_generated(brief, "codex", "gpt-test", "T42")
+        self.assertIn("## Why\nThe thing is broken for every user.", body)
+        self.assertIn("## Summary\nMake the thing work for every user.", body)
+
+    def test_rendered_body_uses_summary_when_why_is_empty_and_what_absent(self):
+        brief = BRIEF.replace("## Why\nThe thing is broken for every user.", "## Why\n")
+        brief = brief.replace("## What\nMake the thing work.",
+                              "## Summary\nMake the thing work for every user.")
+        body = pr_repair._render_generated(brief, "codex", "gpt-test", "T42")
+        self.assertIn("## Why\nMake the thing work for every user.", body)
+        self.assertIn("## Summary\nMake the thing work for every user.", body)
+        self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_rendered_body_uses_the_title_when_why_and_summary_are_empty(self):
+        brief = BRIEF.replace("## Why\nThe thing is broken for every user.", "## Why\n")
+        brief = brief.replace("## What\nMake the thing work.", "## What\n")
+        body = pr_repair._render_generated(brief, "codex", "gpt-test", "T42")
+        why = body.split("## Why\n", 1)[1].split("\n\n## Summary", 1)[0]
+        self.assertTrue(why.strip(), body)
+        self.assertEqual(why, pr_repair._brief_title(brief))
 
     def test_criteria_under_an_acceptance_heading_render_as_the_runner_renders_them(self):
         # lanes/run_lane.sh::criteria_section reads the same headings: a
