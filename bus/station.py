@@ -9553,13 +9553,24 @@ class Station:
         ref = lambda issue: self._invariant_ref(repo, int(issue["number"]))  # noqa: E731
         outside = tuple(ref(i) for i in loose if i.get("state") == "open"
                         and "loom:ticket" in _label_names(i))
-        epics = tuple(invariants.EpicShape(
-            ref(epic), epic.get("state", "open") == "open", len(found),
-            tuple(ref(t) for t in found if t.get("state") != "closed"),
-            brain.standing_epic(epic))
-            for epic, found in tree)
+        # An open epic's tickets are its sub-issues and every issue whose Part
+        # of line names it, closed ones too, each once (loom#2023). The
+        # standing repairs epic has no ticket cap, so it costs no search.
+        linked = brain.part_of_linked(self.gh, repo, [
+            int(epic["number"]) for epic, _ in tree
+            if epic.get("state", "open") == "open" and not brain.standing_epic(epic)])
+        epics = []
+        for epic, found in tree:
+            union = {int(t.get("number") or 0): t for t in found}
+            for t in linked.get(int(epic["number"]), []):
+                union.setdefault(int(t.get("number") or 0), t)
+            union.pop(0, None)
+            epics.append(invariants.EpicShape(
+                ref(epic), epic.get("state", "open") == "open", len(union),
+                tuple(ref(t) for t in union.values() if t.get("state") != "closed"),
+                brain.standing_epic(epic), brain.sub_issue_count(self.gh, repo, epic, found)))
         return invariants.GoalShape(self._invariant_ref(repo, number),
-                                    brain.goal_epic_cap(goal), epics, outside)
+                                    brain.goal_epic_cap(goal), tuple(epics), outside)
 
     def _roll_goals(self, homes: List[Tuple[str, Dict[str, Any]]]) -> List[invariants.Ref]:
         """The goal homes whose body names a roll that no LOOM_ROLL_SHIP_DOCS
