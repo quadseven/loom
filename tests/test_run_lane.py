@@ -197,7 +197,8 @@ fi
 # rewrites the validation contract.
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
-[ -z "${FAKE_AGENT_ENV:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" "${LOOM_GITHUB_APP_ID:-none}" "${GIT_CONFIG_COUNT:-none}" >> "$FAKE_AGENT_ENV"
+[ -z "${FAKE_AGENT_ENV:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" "${LOOM_GITHUB_APP_ID:-none}" "${GIT_CONFIG_COUNT:-none}" "${GH_CONFIG_DIR:-none}" "$(cat "${GH_CONFIG_DIR:-/nonexistent}/hosts.yml" 2>/dev/null | tr '\\n' ' ')" >> "$FAKE_AGENT_ENV"
+[ -z "${FAKE_AGENT_SAYS:-}" ] || printf '%s\\n' "$FAKE_AGENT_SAYS"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = say ]; then
@@ -1120,6 +1121,28 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("## Out of scope\n- Other things", body)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def test_pr_body_reads_a_summary_heading_when_what_is_absent(self):
+        # loom#1468: a brief that writes "## Summary" left the body's empty.
+        self.drop_brief(text=BRIEF.replace(
+            "## What\nMake the thing work.", "## Summary\nMake the thing work for every user."))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("## Why\nThe thing is broken for every user.", body)
+        self.assertIn("## Summary\nMake the thing work for every user.", body)
+
+    def test_pr_body_uses_summary_when_why_is_empty_and_what_absent(self):
+        self.drop_brief(text=BRIEF.replace(
+            "## Why\nThe thing is broken for every user.", "## Why\n").replace(
+                "## What\nMake the thing work.",
+                "## Summary\nMake the thing work for every user."))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("## Why\nMake the thing work for every user.", body)
+        self.assertIn("## Summary\nMake the thing work for every user.", body)
+        self.assertEqual(hunt_plan.problems(body), [])
+
     def test_answer_deliverable_posts_comment_and_does_not_push_or_open_pr(self):
         self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer"))
         result = self.run_lane(FAKE_AGENT="answer-file")
@@ -1372,6 +1395,10 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
     def test_agent_owned_commit_is_validated_and_pushed_without_touching_main(self):
+        if not sandbox_caps.SEATBELT:
+            # The commit flow under test is the same off macOS; only the
+            # seatbelt around the check is missing, so a pass-through stands in.
+            self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         self.contract_repo()
         self.drop_brief()
         result = self.run_contract_lane(FAKE_AGENT="detached")
@@ -2815,6 +2842,9 @@ exec /usr/bin/git "$@"
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     def test_opencode_go_model_mismatch_is_transient(self):
+        # The brief is parked before any agent runs; a host without
+        # sandbox-exec would report the lane unavailable and claim nothing.
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         inbox = self.loom / "briefs" / "opencode-go"
         inbox.mkdir(parents=True)
         (inbox / "T042-fix-the-thing.md").write_text(
@@ -3651,6 +3681,7 @@ exec /usr/bin/git "$@"
         self.assertEqual(sorted(p.name for p in copy.iterdir()), ["impeccable", "tdd"])
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    @unittest.skipUnless(sandbox_caps.SEATBELT, sandbox_caps.NO_SEATBELT)
     def test_agy_lane_is_unavailable_when_its_keychain_will_not_unlock(self):
         inbox, _, result, agy = self.agy_lane(FAKE_KC_PW="some-other-password")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -3660,6 +3691,7 @@ exec /usr/bin/git "$@"
         self.assertFalse(beat["available"])
         self.assertIn("unlock", beat["reason"])
 
+    @unittest.skipUnless(sandbox_caps.SEATBELT, sandbox_caps.NO_SEATBELT)
     def test_agy_lane_refuses_a_keychain_password_security_would_split(self):
         pw = "two words"
         inbox, _, result, agy = self.agy_lane(FAKE_KC_PW=pw, FAKE_SECRET__k_kc=pw)
@@ -5023,6 +5055,9 @@ exit %d
         seen_gh = Path(self._tmp.name) / "gh-tokens"
         seen_agent = Path(self._tmp.name) / "agent-tokens"
         self.drop_brief()
+        stale = self.loom / "run" / "codex-gh.KILLED"
+        stale.mkdir(parents=True)
+        (stale / "hosts.yml").write_text("oauth_token: ghs_old\n")
         self.run_lane(LOOM_GITHUB_APP_ID="124",
                       # Installation tokens carry dots and dashes (2026-10-20: 383
                       # characters, ghs_ then a JWT-like body).
@@ -5031,8 +5066,53 @@ exit %d
                       FAKE_AGENT_ENV=str(seen_agent))
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.calls())
         self.assertEqual(set(seen_gh.read_text().split()), {"ghs_lanes.tok-en"})
-        # Nor the App's settings to mint one, nor git's helper to borrow one.
-        self.assertEqual(seen_agent.read_text().split(), ["none", "none", "none"])
+        # No token in its environment, nor the App's settings to mint one, nor
+        # git's helper to borrow one.
+        agent_env = seen_agent.read_text().splitlines()
+        self.assertEqual(agent_env[:3], ["none", "none", "none"])
+        # loom#665: its gh reads the minted App token, never the operator's,
+        # from a per-run config directory the runner removes after the agent.
+        store = Path(agent_env[3])
+        self.assertEqual(store.parent, self.loom / "run")
+        self.assertTrue(store.name.startswith("codex-gh."), store)
+        self.assertIn("oauth_token: ghs_lanes.tok-en ", agent_env[4])
+        self.assertNotIn("ghp_personal", agent_env[4])
+        self.assertFalse(store.exists())
+        self.assertFalse(stale.exists())
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertNotIn("ghs_lanes.tok-en", log)
+
+    def test_a_lane_without_app_settings_leaves_the_agent_gh_config_alone(self):
+        seen_agent = Path(self._tmp.name) / "agent-tokens"
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT_ENV=str(seen_agent))
+        self.assertEqual(seen_agent.read_text().splitlines()[3], "none")
+        self.assertEqual(list((self.loom / "run").glob("codex-gh.*")), [])
+
+    def test_the_brief_says_not_to_poll_and_the_run_reports_its_gh_calls(self):
+        # loom#665: agents polled their own pull requests hundreds of times.
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT_SAYS="$ gh pr checks 7\nrunning gh api rate_limit\nno ghost here")
+        self.assertIn("Do not poll pull request checks or reviews", self.log.read_text())
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertRegex(log, r"T042-fix-the-thing agent gh calls: 2\n")
+
+    def test_a_failed_run_reports_its_gh_calls_too(self):
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="gh pr view 7", FAKE_EXIT="3")
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("agent gh calls: 1", log)
+
+    def test_agent_launch_chain_stops_when_the_tree_cannot_be_entered(self):
+        # The agent must never start outside its tree with the runner's token.
+        source = RUNNER.read_text()
+        self.assertRegex(
+            source,
+            r'cd "\$TREE" && unset GH_TOKEN GITHUB_TOKEN "\$\{!LOOM_GITHUB_APP_@\}" '
+            r'"\$\{!GIT_CONFIG_@\}" &&\s*\{ \[ -z "\$AGENT_GH_CONFIG" \] '
+            r'\|\| export GH_CONFIG_DIR="\$AGENT_GH_CONFIG"; \} &&\s*'
+            r'run_agent "\$RUN_BRIEF"',
+        )
 
     def test_a_lane_whose_app_token_cannot_be_minted_posts_nothing_as_anyone(self):
         self.drop_brief()
@@ -6162,6 +6242,9 @@ exec /usr/bin/git "$@"
     def test_a_default_branch_checkout_that_still_fails_is_a_factory_incident_not_work(self):
         # A [work] failure here spent a ladder attempt, and counted toward
         # the runaway hold, for a fault in the runner's own clone (2026-10-20).
+        # A pass-through sandbox-exec: on a host without one the lane stops at
+        # sandbox_ready, before the default branch checkout this test fails.
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         real_git = shutil.which("git")
         self.write_tool(self.bin / "git", "#!/bin/sh\ncase \" $* \" in *\" checkout -q --detach \"*) "
                         "echo 'fatal: unable to read tree' >&2; exit 128;; esac\n"
@@ -6212,6 +6295,24 @@ exec /usr/bin/git "$@"
         ancestor = subprocess.run(["git", "--git-dir", str(self.remote), "merge-base",
                                    "--is-ancestor", main, self.FIX_BRANCH])
         self.assertEqual(ancestor.returncode, 0)
+
+    def test_a_cluster_runner_files_no_incident_for_a_red_base_check(self):
+        # On a cluster runner a red base check is often the runner image (a
+        # missing tool), and the station sends the ticket to another lane,
+        # which files the incident if the base is red there too. Filed from
+        # the runner, the incident held nothing and waited for a person to
+        # close it (three on 2026-10-27).
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        name, _ = self.fix_brief()
+        self.advance_main("fix.txt", "broken\n")
+        result = self.run_contract_lane(LOOM_CLUSTER_RUNNER="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        log = self.run_log(name + ".log")
+        self.assertIn("base check exited 1 on the", log)
+        self.assertIn("[factory]", log)
+        self.assertFalse(any(c.startswith("gh issue create") for c in self.calls()))
 
     def test_a_red_default_branch_on_a_fix_round_files_a_base_check_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
@@ -6356,6 +6457,46 @@ exec /usr/bin/git "$@"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
         self.assertFalse(self.records()[-1]["ok"] is False, self.lane_log())
+
+    def final_retry_lane(self, exits):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        counter = Path(self._tmp.name) / "check-count"
+        check = Path(self._tmp.name) / "flaky-check"
+        cases = " ".join(f"{index}) exit {code} ;;" for index, code in enumerate(exits, 1))
+        self.write_tool(check, "#!/bin/sh\n"
+                        f"n=0; [ ! -f '{counter}' ] || n=$(cat '{counter}'); n=$((n+1)); "
+                        f"echo $n > '{counter}'; case $n in {cases} esac; exit 0\n")
+        self.contract_repo(contract=f"interpreter: loom-test-python\ncheck: {check}\n")
+        self.drop_brief()
+        return self.run_contract_lane()
+
+    def test_final_check_retries_plain_failure_and_mentions_second_run_in_pr(self):
+        result = self.final_retry_lane([0, 1, 0])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        finals = [record for record in self.records() if record["phase"] == "final"]
+        self.assertEqual([record["exit"] for record in finals], [1, 0])
+        self.assertEqual(finals[1]["detail"], "second run after exit 1")
+        self.assertIn("final check passed on a second run", self.body.read_text())
+
+    def test_final_check_fails_after_two_plain_failures(self):
+        result = self.final_retry_lane([0, 1, 1])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        finals = [record for record in self.records() if record["phase"] == "final"]
+        self.assertEqual([record["exit"] for record in finals], [1, 1])
+        self.assertEqual(finals[1]["detail"], "second run after exit 1")
+        self.assertIn("validation failed: the check exited 1", self.lane_log())
+
+    def test_final_check_does_not_retry_timeout_environment_or_sigterm_exits(self):
+        for code in (124, 125, 126, 127, 143):
+            with self.subTest(exit=code):
+                self.tearDown()
+                self.setUp()
+                result = self.final_retry_lane([0, code, 0])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                finals = [record for record in self.records() if record["phase"] == "final"]
+                self.assertEqual([record["exit"] for record in finals], [code])
 
     def test_final_validation_classifies_denied_python_interpreter_as_factory(self):
         text = RUNNER.read_text()

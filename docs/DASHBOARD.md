@@ -43,7 +43,12 @@ homes may also be specific goal issues as `OWNER/NAME#N`. Set
 the last two weeks of issue and review comments in `LOOM_REPOS`. With
 `LOOM_BRIEF_AUTHORS` set, only those logins' comments count as station
 outcomes, and `LOOM_REVIEW_BOT` names the review bot whose findings are
-counted (default `grug-tribe`). `.env.example` lists the dashboard variables with placeholder
+counted (default `grug-tribe`). `/chain` shows the command chain from the operator down to the review bot.
+Its station and audit layers come from the station, which posts each
+watched repo's shadow mode (`bus.shadow`) and the last held and acted
+actions to `POST /api/chain` with the upload token every ten minutes: the
+held side from the shadow ledger, the acted side from `acted.jsonl` beside
+it, a line for each merge or close GitHub accepted from Loom. `.env.example` lists the dashboard variables with placeholder
 values. Set `LOOM_UPLOAD_TOKEN` to the same private value for the dashboard
 and station so completed runs can upload to `POST /api/transcripts`.
 Keep the dashboard ingress tailnet-only; the bearer token authenticates
