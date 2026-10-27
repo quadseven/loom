@@ -55,6 +55,8 @@ class FakeGH:
                                     "labels": [{"name": "loom:goal"}],
                                     "sub_issues_summary": {"total": 40}}]}
         self.pulls = {}
+        # (repo, number) -> a pull request as GET .../pulls/N answers it.
+        self.pull_state = {}
         self.check_runs = {}
         self.private = {OTHER}
         self.calls = []
@@ -137,6 +139,12 @@ class FakeGH:
                     {"id": self.next_comment, "body": body["body"], "created_at": stamp(T0 + 10),
                      "user": {"login": AUTHOR}})
             return Response(201, {"id": getattr(self, "next_comment", 1)})
+        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls/(\d+)", path)
+        if m and method == "GET":
+            pull = self.pull_state.get((m.group(1), int(m.group(2))))
+            if pull is None:
+                raise GitHubError("Not Found", 404)
+            return Response(200, dict(pull, number=int(m.group(2))))
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls\?state=open&per_page=100", path)
         if m:
             return Response(200, self.pulls.get(m.group(1), []))
@@ -549,6 +557,22 @@ class StationTest(StationBase):
         self.assertIn("#506", filed["body"])
         self.assertNotIn("#658", filed["title"] + filed["body"])
 
+    def test_a_lane_pull_closed_past_the_ladder_clears_its_finding_on_the_next_pass(self):
+        # loom#2027: the factory closes such a pull request; the stalled
+        # finding is gone on the next pass and its issue closes once quiet.
+        self.lane_ticket(506, labels=("loom:ticket", "loom:failed", "handoff:claude"))
+        self.lane_pull(657, 506, T0 - 7 * 3600)
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertEqual(filed["state"], "open")
+        self.gh.pulls[REPO] = []  # closed by the factory: no longer listed open
+        st = self.run_at(T0 + invariants.CHECK_EVERY)
+        facts = st._invariant_facts({})
+        self.assertEqual(invariants.lane_pr_stalled(facts), [])
+        self.assertEqual(len(self.breaches()), 1)
+        self.run_at(T0 + invariants.CLEAR_AFTER + 3 * invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+
     def test_a_lane_pull_with_open_review_threads_and_no_fix_round_files_a_breach(self):
         self.lane_ticket(602)
         self.lane_pull(660, 602, T0 - 7 * 3600)
@@ -656,6 +680,82 @@ class StationTest(StationBase):
         self.assertIn("Invariants broken: #%d 1 open tickets sit under no epic across 1 goal homes."
                       % number, body)
         self.assertNotIn("Invariants broken", st._overdue_standup_body([], None))
+
+
+class SettledSubjectTest(StationBase):
+    """loom#2022: an invariant issue whose subject settled for good (its lane
+    pull request merged or closed, its epic back at the cap) closes on the
+    next pass with one note naming how, not after the clear wait."""
+
+    def stalled(self):
+        self.lane_ticket(602)
+        self.lane_pull(660, 602, T0 - 7 * 3600)
+        self.bot_threads(2)
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertEqual(filed["state"], "open")
+        return filed
+
+    def leave_open_set(self, **pull):
+        self.gh.pulls[REPO] = []
+        self.gh.pull_state[(REPO, 660)] = dict({"state": "closed"}, **pull)
+
+    def notes(self, filed):
+        return [c["body"] for c in self.gh.comments.get((REPO, filed["number"]), [])]
+
+    def test_a_merged_lane_pull_closes_its_issue_with_one_note_naming_the_merge(self):
+        filed = self.stalled()
+        self.leave_open_set(merged_at=stamp(T0 + 100), closed_at=stamp(T0 + 100))
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+        self.assertEqual(filed["state_reason"], "not_planned")
+        (note,) = self.notes(filed)
+        self.assertIn("pull request #660 merged at %s" % stamp(T0 + 100), note)
+        self.assertIn(invariants.CLEARED_TEXT, note)
+        # A later pass writes nothing more.
+        self.run_at(T0 + 2 * invariants.CHECK_EVERY)
+        self.assertEqual(len(self.notes(filed)), 1)
+
+    def test_a_lane_pull_closed_unmerged_closes_its_issue_too(self):
+        filed = self.stalled()
+        self.leave_open_set(merged_at=None, closed_at=stamp(T0 + 100))
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+        (note,) = self.notes(filed)
+        self.assertIn("pull request #660 was closed unmerged at %s" % stamp(T0 + 100), note)
+
+    def test_it_closes_whatever_labels_the_issue_carries(self):
+        filed = self.stalled()
+        filed["labels"] = [invariants.LABEL, "needs-info"]
+        self.leave_open_set(merged_at=stamp(T0 + 100), closed_at=stamp(T0 + 100))
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+
+    def test_an_issue_whose_finding_is_still_live_stays_open(self):
+        filed = self.stalled()
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "open")
+        self.assertEqual(self.notes(filed), [])
+
+    def test_a_gone_breach_whose_pull_request_is_still_open_waits(self):
+        filed = self.stalled()
+        # A fix round is queued: the breach is gone, the pull request is not.
+        self.gh.comment(602, T0 + 60, "<!-- loom:fix v1 -->\n<!-- loom:fix-head %x -->" % 660)
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "open", self.said)
+        self.assertNotIn(("GET", "/repos/%s/pulls/660" % REPO), self.gh.calls)
+
+    def test_an_epic_back_at_its_cap_closes_its_issue(self):
+        self.gh.subs[(REPO, GOAL)] = [epic(40)]
+        self.gh.subs[(REPO, 40)] = [ticket(n, state="closed") for n in range(50, 66)]
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertIn("holds 16 tickets (cap 15)", filed["title"])
+        self.gh.subs[(REPO, 40)] = self.gh.subs[(REPO, 40)][:15]
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+        (note,) = self.notes(filed)
+        self.assertIn("epic #40 holds 15 tickets, within the cap of 15", note)
 
 
 class FilerTest(unittest.TestCase):

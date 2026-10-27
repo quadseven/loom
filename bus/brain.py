@@ -4527,6 +4527,10 @@ def _failing_checks(gh: GitHub, repo: str, sha: str) -> List[Tuple[str, str]]:
         if tail is None:
             out = run.get("output") or {}
             tail = "\n".join(x for x in (out.get("title"), out.get("summary"), out.get("text")) if x)
+            if (run.get("app") or {}).get("slug") != "github-actions":
+                # A review app's output is a reviewer's prose, not a log
+                # (loom#1898): only what it marks as a command is one.
+                tail = ci_facts.ReviewText(tail)
         found.append((str(run.get("name") or "unnamed check"),
                       tail or "no log was available (conclusion %s)" % run.get("conclusion")))
     try:
@@ -4686,13 +4690,22 @@ def _fix_body(repo: str, number: int, branch: str, notes: str,
     neither shows (the operator got a whole review board three times by
     email, 2026-10-20). The factory reads the ### headings in it."""
     out = _fix_header(repo, number, branch, key)
-    found = [(name, ci_facts.facts(tail)) for name, tail in checks]
+    found = [(name, ci_facts.facts(tail, isinstance(tail, ci_facts.ReviewText)))
+             for name, tail in checks]
     # A regenerate command the failure text names is the first step: the fix
-    # rounds on a stale generated file edited it by hand (loom#1773).
-    first = [(name, cmd) for name, facts in found for cmd in facts.regenerate]
-    for name, cmd in first[:ci_facts.COMMANDS_MAX]:
-        out.append("First step: run %s and commit what it writes; the failure text of check "
-                   "%s names it as the way to regenerate a file." % (_shown(cmd), _shown(name)))
+    # rounds on a stale generated file edited it by hand (loom#1773). In a
+    # review app's output only a command the reviewer marks counts, never a
+    # "Suggested fix:" paragraph (loom#1898).
+    first = [(name, cmd, isinstance(tail, ci_facts.ReviewText))
+             for (name, tail), (_, facts) in zip(checks, found, strict=True)
+             for cmd in facts.regenerate]
+    for name, cmd, review in first[:ci_facts.COMMANDS_MAX]:
+        if review:
+            out.append("First step: run %s; the review in check %s marks it as a command to run."
+                       % (_shown(cmd), _shown(name)))
+        else:
+            out.append("First step: run %s and commit what it writes; the failure text of check "
+                       "%s names it as the way to regenerate a file." % (_shown(cmd), _shown(name)))
     if first:
         out.append("")
     if notes.strip():
@@ -4710,6 +4723,9 @@ def _fix_body(repo: str, number: int, branch: str, notes: str,
             hidden += ["Failing tests:"] + ["- %s" % _shown(t) for t in facts.tests] + [""]
         if facts.assertions:
             hidden += ["Assertion lines:", ""] + _quoted("\n".join(facts.assertions)) + [""]
+        if facts.suggestions:
+            hidden += ["Suggested fixes (the reviewer's guidance on the finding to address, "
+                       "not a command to run):", ""] + _quoted("\n".join(facts.suggestions)) + [""]
         hidden += _quoted(tail) + [""]
     for thread in threads:
         comments = (thread.get("comments") or {}).get("nodes") or []

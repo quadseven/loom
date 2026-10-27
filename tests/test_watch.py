@@ -424,6 +424,53 @@ class FilingTest(WatchBase):
         self.run_at(T0 + 600)
         self.assertEqual(len(self.gh.comments), 1)
 
+    def quiet_labelled_issue(self, labels):
+        """As quiet_issue(25), with the issue relabelled before the quiet pass,
+        as GitHub returns labels (objects with a name)."""
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0 - 25 * 3600)
+        self.gh.issues[1]["labels"] = [{"name": name} for name in labels]
+        self.run_at(T0)
+
+    def test_a_quiet_signature_that_shipped_closes_as_completed(self):
+        # loom#1934: a signature that became a ticket and shipped is done
+        # work, not dropped work. Shadow mode off, as Loom runs since it left
+        # shadow; in shadow the hold keeps the issue open.
+        self.enterContext(mock.patch.dict(os.environ, {"LOOM_SHADOW": "0"}))
+        for shipped in ("loom:shipped", "loom:verified"):
+            with self.subTest(label=shipped):
+                self.setUp()
+                self.quiet_labelled_issue(["loom:ticket", shipped])
+                issue = self.gh.issues[1]
+                self.assertEqual(issue["state"], "closed")
+                self.assertEqual(issue["state_reason"], "completed")
+                (note,) = self.gh.comments
+                self.assertIn("shipped", note[1])
+                self.assertNotIn("not planned", note[1])
+
+    def test_a_quiet_signature_that_is_an_unshipped_ticket_stays_open(self):
+        # Shadow off: the ticket stays open by the watcher's own rule, not by
+        # the shadow hold.
+        self.enterContext(mock.patch.dict(os.environ, {"LOOM_SHADOW": "0"}))
+        self.quiet_labelled_issue(["loom:ticket", "loom:running"])
+        self.assertEqual(self.gh.issues[1]["state"], "open")
+        self.assertEqual(self.gh.comments, [])
+        self.assertFalse(any("closed quiet" in line for line in self.said))
+        # The ticket closes on its own; the next pass writes nothing to it.
+        self.gh.issues[1]["state"] = "closed"
+        self.run_at(T0 + 600)
+        self.assertEqual(self.gh.comments, [])
+        self.assertNotIn("state_reason", self.gh.issues[1])
+
+    def test_a_bare_quiet_signature_still_closes_as_not_planned(self):
+        self.enterContext(mock.patch.dict(os.environ, {"LOOM_SHADOW": "0"}))
+        self.quiet_labelled_issue(["loom:triage"])
+        issue = self.gh.issues[1]
+        self.assertEqual(issue["state"], "closed")
+        self.assertEqual(issue["state_reason"], "not_planned")
+        (note,) = self.gh.comments
+        self.assertIn("not planned", note[1])
+
     def test_an_issue_whose_signature_was_last_seen_23_hours_ago_stays_open(self):
         self.quiet_issue(23)
         self.assertEqual(self.gh.issues[1]["state"], "open")
