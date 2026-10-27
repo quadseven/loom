@@ -495,6 +495,11 @@ CLASSES = change_class.CLASSES
 # station process reads the files once per commit.
 CLASS_RANK = {name: rank for rank, name in enumerate(reversed(CLASSES))}
 _CLASSED: Dict[Tuple[str, int, str], str] = {}
+# When the keep-current step last brought each held pull request up to date
+# (2026-10-27: the first behind pull request in landing order took the repo's
+# one slot every pass and the rest fell up to 71 commits behind).
+KEEP_CURRENT_COOLDOWN = 30 * 60
+_KEPT_AT: Dict[Tuple[str, int], float] = {}
 DEFER_LABEL = "loom:triage"
 DEFER_TITLE = "Settle the review findings left from PR #%d"
 # The title before the naming standard (docs/NAMING.md): an open follow-up
@@ -2801,12 +2806,20 @@ class Factory:
         pinned to the head it judged, at most one a repo a pass; it never
         merges. A refused update (422) is left for the next pass: a held
         pull request is not sent back to a lane."""
-        if repo in self.kept_current or not self._behind(repo, full):
+        if repo in self.kept_current:
+            return
+        # Each held pull request waits KEEP_CURRENT_COOLDOWN after its update
+        # (its checks rerun meanwhile) and lets the next one in landing order
+        # have the slot, so one that keeps falling behind cannot starve the rest.
+        if self.now - _KEPT_AT.get((repo, number), float("-inf")) < KEEP_CURRENT_COOLDOWN:
+            return
+        if not self._behind(repo, full):
             return
         sha = str((full.get("head") or {}).get("sha") or "")
         done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
                             {"expected_head_sha": sha}, ok=(422,))
         self.kept_current.add(repo)
+        _KEPT_AT[(repo, number)] = self.now
         if done.status == 422:
             _say("%s#%d is held and could not be brought up to date with its base"
                  % (repo, number))
