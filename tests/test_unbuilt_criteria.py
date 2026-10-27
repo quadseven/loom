@@ -20,20 +20,20 @@ from bus import factory  # noqa: E402
 # A ticket whose third box the pull request built, with the box's backticks
 # dropped, and whose first two boxes it marked not built.
 SAMPLER_TICKET = """## Acceptance criteria
-- [ ] Audit endpoint or job reports all six fields for every online guild and roster member.
-- [ ] Per-character `wow.dev.*` metrics emitted; digest-tier watches fire on stalled >15 min, >6 deaths/hour, or item level 10+ below level.
-- [ ] `overseer_sample` includes rows for the Horde family (Zug, Oz, Uzza, Zork, Zrog) in addition to existing families.
-- [ ] Live: first `wow.dev.audit` run on wow-dev lists stalled members and empty-slot characters found manually, with nothing extra.
+- [ ] Audit endpoint or job reports all six fields for every online team and roster member.
+- [ ] Per-member `app.dev.*` metrics emitted; digest-tier watches fire on stalled >15 min, >6 errors/hour, or a score 10+ below target.
+- [ ] `digest_sample` includes rows for the second roster (A, B, C, D, E) in addition to existing rosters.
+- [ ] Live: first `app.dev.audit` run on the dev site lists stalled members and empty-slot members found manually, with nothing extra.
 
 ## Size
 M
 """
 
 SAMPLER_PULL = """## Acceptance criteria
-- [ ] Audit endpoint or job reports all six fields for every online guild and roster member; not built: unavailable in this checkout.
-- [ ] Per-character wow.dev.* metrics emitted and digest-tier watches fire at the requested thresholds; not built: unavailable in this checkout.
-- [x] overseer_sample includes rows for the Horde family (Zug, Oz, Uzza, Zork, Zrog) in addition to existing families.
-- [ ] Live: first wow.dev.audit run lists manually confirmed stalled members and empty-slot characters with nothing extra; not built: no audit job was implemented or run live.
+- [ ] Audit endpoint or job reports all six fields for every online team and roster member; not built: unavailable in this checkout.
+- [ ] Per-member app.dev.* metrics emitted and digest-tier watches fire at the requested thresholds; not built: unavailable in this checkout.
+- [x] digest_sample includes rows for the second roster (A, B, C, D, E) in addition to existing rosters.
+- [ ] Live: first app.dev.audit run lists manually confirmed stalled members and empty-slot members with nothing extra; not built: no audit job was implemented or run live.
 
 Size: M
 """
@@ -41,19 +41,19 @@ Size: M
 # A ticket whose first two boxes were ticked before its pull request merged;
 # the pull request listed its work as plain bullets.
 ENCOUNTER_TICKET = """## Acceptance criteria
-- [x] Encounter table with all Molten Core bosses listing required tanks, dispels, crowd control, interrupts, and resistance
-- [x] Composition calculator that reports what raid lacks for each boss based on encounter requirements
-- [ ] Updated raid lineup module replacing fixed group template with encounter-driven composition
-- [ ] Validation that composition satisfies actual boss needs from this server's spell data
+- [x] Stage table with all ten stages listing required workers, retries, rate limits, timeouts, and quotas
+- [x] Capacity calculator that reports what the pool lacks for each stage based on stage requirements
+- [ ] Updated pool layout module replacing fixed group template with stage-driven capacity
+- [ ] Validation that capacity satisfies actual stage needs from this server's job data
 
 ## Size
 M
 """
 
 ENCOUNTER_PULL = """## Acceptance criteria
-- Encounter table with all ten Molten Core bosses listing tanks, dispels, crowd control, interrupts, fear protection and fire resistance, each citing the pinned boss script spell (`tests/test_mcencounters.py` TheTableCoversEveryBoss)
-- Composer reports what the raid lacks for each boss, from seats for tanks and classes for the rest (TheComposerReportsWhatIsMissing)
-- Approved lineups carry the report without moving a seat; automatic lineups carry it too (TheLineupCarriesTheReport)
+- Stage table with all ten stages listing workers, retries, rate limits, timeouts, backoff and quotas, each citing the pinned stage config (`tests/test_stages.py` TheTableCoversEveryStage)
+- Calculator reports what the pool lacks for each stage, from slots for workers and kinds for the rest (TheCalculatorReportsWhatIsMissing)
+- Approved layouts carry the report without moving a slot; automatic layouts carry it too (TheLayoutCarriesTheReport)
 - Full suite as CI runs it, OK
 
 Size: S
