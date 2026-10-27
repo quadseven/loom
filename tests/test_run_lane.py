@@ -778,7 +778,7 @@ print('leak guard: clean (shape patterns only)')
         # No infra-public checkout and no remote to clone it from: the scanner
         # cannot be had, so a public-repo push is a factory incident (one issue
         # filed, the ticket held) instead of a transient failure that the
-        # station re-briefs endlessly (quadseven/loom#1143).
+        # station re-briefs endlessly.
         self.drop_brief()
         result = self.run_lane(LOOM_LEAK_SCANNER="")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -813,6 +813,32 @@ print('leak guard: clean (shape patterns only)')
         self.assertTrue((self.loom / "infra-public" / ".github" / "scripts" / "check_private_leaks.py").exists())
         self.assertTrue((self.inbox / "done" / "T043-next.md").exists())
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+
+        checkout = self.loom / "infra-public"
+        first_head = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                    capture_output=True, text=True, check=True).stdout.strip()
+        (scripts / "scanner-version").write_text("updated\n")
+        git("add", ".github/scripts/scanner-version", cwd=remote)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "update", cwd=remote)
+        self.log.write_text("")
+        self.drop_brief("T044-hourly.md", BRIEF.replace("T042-fix-the-thing", "T044-hourly"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                        capture_output=True, text=True, check=True).stdout.strip(),
+                         first_head)
+
+        stamp = self.loom / "run" / "infra-public.updated"
+        old = time.time() - 2 * 3600
+        stamp.write_text(str(int(old)) + "\n")
+        self.log.write_text("")
+        self.drop_brief("T045-hourly-refresh.md", BRIEF.replace("T042-fix-the-thing", "T045-hourly-refresh"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                           capture_output=True, text=True, check=True).stdout.strip(),
+                            first_head)
 
     # A workload that selects a node label, for the live-cluster check
     # (bus/live_cluster.py, loom#1832).

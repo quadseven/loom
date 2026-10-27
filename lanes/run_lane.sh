@@ -127,7 +127,7 @@ keep_scanner_current() {
   if [ -d "$INFRA_PUBLIC/.git" ]; then
     if [ $((now - stamp)) -ge 3600 ]; then
       (cd "$INFRA_PUBLIC" && timeout "$NET_TIMEOUT" git fetch -q origin \
-          && timeout "$NET_TIMEOUT" git merge -q --ff-only @{u}) >> "$LOG" 2>&1 || true
+          && timeout "$NET_TIMEOUT" git merge -q --ff-only FETCH_HEAD) >> "$LOG" 2>&1 || true
       date +%s > "$INFRA_PUBLIC_STAMP"
     fi
     return 0
@@ -3729,11 +3729,7 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
   fi
   if [ "$REPO_PRIVATE" = false ]; then
-    if [ ! -f "$LEAK_SCANNER" ]; then
-      # The station keeps infra-public cloned and current; try it once before
-      # the lane gives up on the scanner.
-      keep_scanner_current || true
-    fi
+    keep_scanner_current || true
     if [ ! -f "$LEAK_SCANNER" ]; then
       # A scanner that still cannot be had is the machine's fault, not the
       # ticket's: a factory incident holds the ticket and files one issue,
