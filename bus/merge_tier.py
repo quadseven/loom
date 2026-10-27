@@ -188,7 +188,7 @@ def entry_tier(entry: Mapping[str, Any]) -> str:
     return max((file_tier(p) for p in paths), key=_rank)
 
 
-def other_repos(repo: str, ticket_body: str, default_branch: Optional[str] = None) -> List[str]:
+def other_repos(repo: str, ticket_body: str) -> List[str]:
     """Other repos of the same owner the ticket's own words name (citation
     lines, HTML comments and Loom's status section aside)."""
     owner, _, name = repo.partition("/")
@@ -198,10 +198,6 @@ def other_repos(repo: str, ticket_body: str, default_branch: Optional[str] = Non
     for who, what in _OWNER_REPO_RE.findall(text):
         what = what.rstrip(".")
         if who.lower() == owner.lower() and what.lower() != name.lower():
-            if default_branch is not None:
-                default_owner, _, default_repo = default_branch.partition("/")
-                if who.lower() == default_owner.lower() and what.lower() == default_repo.lower():
-                    continue
             found.append("%s/%s" % (who, what))
     return list(dict.fromkeys(found))
 
@@ -216,7 +212,7 @@ def _shown(paths: Sequence[str]) -> str:
 
 
 def classify(repo: str, entries: Sequence[Mapping[str, Any]], ticket_body: str = "",
-              sensitive: bool = False, default_branch: Optional[str] = None) -> Tuple[str, str]:
+             sensitive: bool = False) -> Tuple[str, str]:
     """(tier, why) for a pull request with these changed-file entries (REST
     files: filename and, when read, patch). `sensitive` is the pull request's
     class:sensitive label."""
@@ -234,7 +230,7 @@ def classify(repo: str, entries: Sequence[Mapping[str, Any]], ticket_body: str =
         best = SECURITY
     if sensitive and _rank(SECURITY) > _rank(best):
         return SECURITY, "it carries class:sensitive"
-    repos = other_repos(repo, ticket_body, default_branch)
+    repos = other_repos(repo, ticket_body)
     if repos and _rank(CROSS_REPO) > _rank(best):
         return CROSS_REPO, "its ticket names another repo (%s)" % _shown(repos)
     if not entries:

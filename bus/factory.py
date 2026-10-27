@@ -2716,10 +2716,8 @@ class Factory:
             if not refused:
                 return False
             _say("%s#%d is not exempt as a revert: %s" % (repo, number, refused))
-        default_branch = full.get("base", {}).get("ref")
         tier, why = merge_tier.classify(repo, entries, str(issue.get("body") or ""),
-                                        change_class.class_of(full) == "sensitive",
-                                        default_branch=default_branch)
+                                        change_class.class_of(full) == "sensitive")
         if tier in merge_tier.auto_tiers():
             return False
         settled = self._operator_verdict(repo, number, full, issue, comments)
