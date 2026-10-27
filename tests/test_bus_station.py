@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
+from bus import answer, audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
 from bus import urgency  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
@@ -502,6 +502,45 @@ class StationLabelSyncTest(Base):
         self.assertEqual([call.args[1] for call in ensure.call_args_list], repos)
         with open(ledger, encoding="utf-8") as fh:
             self.assertEqual(json.load(fh)["digest"], runner.label_digest())
+
+
+class DecisionDefaultTest(Base):
+    def test_overdue_reversible_decision_is_answered_once_and_wait_labels_are_removed(self):
+        now = time.time()
+        created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 4 * 86400))
+        issue = {"number": 71, "state": "open", "labels": [{"name": "loom:human"},
+                 {"name": "needs-operator"}, {"name": "needs:alice-example"}]}
+        self.fake.humans = [issue]
+        self.fake.issues[71] = issue
+        self.fake.comments[71] = [{"body": brain.HUMAN_MARKER +
+            "\nKeep this ticket open or close it?\nDefault: Keep\nReversible: yes\nKind: decision",
+            "user": {"login": self.fake.bot}, "created_at": created}]
+        gh = GitHub("token", transport=self.fake)
+        runner = station.Station(gh, self.settings, now=now)
+        runner.apply_decision_defaults(force=True)
+        answers = [c for c in self.fake.comments[71] if answer.ANSWER_MARKER in c["body"]]
+        self.assertEqual(len(answers), 1)
+        self.assertIn("Keep.", answers[0]["body"])
+        self.assertIn("Reverse it by posting a new answer", answers[0]["body"])
+        self.assertNotIn("loom:human", self.fake.names(71))
+        self.assertNotIn("needs-operator", self.fake.names(71))
+        self.assertNotIn("needs:alice-example", self.fake.names(71))
+        self.assertIn(answer.ANSWERED_LABEL, self.fake.names(71))
+        runner.apply_decision_defaults(force=True)
+        self.assertEqual(len([c for c in self.fake.comments[71] if answer.ANSWER_MARKER in c["body"]]), 1)
+
+    def test_answer_inside_window_is_not_overridden(self):
+        now = time.time()
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 60))
+        issue = {"number": 72, "state": "open", "labels": [{"name": "loom:human"}]}
+        self.fake.humans = [issue]
+        self.fake.issues[72] = issue
+        self.fake.comments[72] = [{"body": brain.HUMAN_MARKER +
+            "\nKeep this ticket open or close it?\nDefault: Keep\nReversible: yes\nKind: decision",
+            "user": {"login": self.fake.bot}, "created_at": recent}]
+        station.Station(GitHub("token", transport=self.fake), self.settings, now=now).apply_decision_defaults(
+            force=True)
+        self.assertFalse([c for c in self.fake.comments[72] if answer.ANSWER_MARKER in c["body"]])
 
     def test_unchanged_label_digest_makes_no_label_calls(self):
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)

@@ -412,9 +412,11 @@ class TicketStore:
             humans = self.gh.paginate("/repos/%s/issues?labels=loom%%3Ahuman&state=open" % quote(repo, safe="/"))
         except (GitHubError, OSError, ValueError) as exc:
             return repo, [], 0, "%s operator items: %s" % (repo, self._error_reason(exc))
-        humans = [row for row in humans if isinstance(row, dict) and "pull_request" not in row]
+        humans = [row for row in humans if isinstance(row, dict) and "pull_request" not in row
+                  and not any(name.startswith("blocked:") for name in _label_names(row))]
         found = [_operator_item(repo, issue, "needs_operator")
-                 for issue in asks if isinstance(issue, dict) and "pull_request" not in issue]
+                 for issue in asks if isinstance(issue, dict) and "pull_request" not in issue
+                 and not any(name.startswith("blocked:") for name in _label_names(issue))]
         # A loom:human issue waits on the operator too (loom#1777): its ask is
         # the loom:human comment, read with the needs-operator asks.
         listed = {item["number"] for item in found}

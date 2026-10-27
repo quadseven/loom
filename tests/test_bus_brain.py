@@ -3625,6 +3625,9 @@ class HumanAndRefsTests(unittest.TestCase):
 
     def test_human_refusals_write_nothing(self):
         cases = [(item(6, labels=["loom:human"]), "Kind: money\nBuy it."),
+                 (item(6), "Kind: money\nBuy it.\nDefault: Buy\nReversible: yes"),
+                 (item(6), "Kind: decision\nKeep this ticket open or close it?\nDefault: Maybe\nReversible: yes"),
+                 (item(6, labels=["blocked:progression"]), "Kind: decision\nReply yes or no."),
                  (item(6, state="closed"), "Kind: money\nBuy it."),
                  (item(6, pull_request={}), "Kind: money\nBuy it."), (item(6), "Kind: money\n  "),
                  # 2026-10-18: asks like these filled the digest with factory work.
@@ -3636,6 +3639,9 @@ class HumanAndRefsTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     brain.human(GitHub("t", transport=fake), REPO, 6, ask)
                 self.assertTrue(all(c[0] == "GET" for c in fake.calls))
+
+    def test_blocked_human_issues_are_not_in_the_waiting_count(self):
+        self.assertEqual(brain.open_human([item(6, labels=["loom:human", "blocked:progression"])]), [])
 
     def test_brief_refs_rewrites_without_closing_the_original(self):
         fake = Fake(reply(200, item(6, labels=["loom:triage"])), reply(200, goal()), reply(200, []),

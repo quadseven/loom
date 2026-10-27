@@ -147,6 +147,15 @@ from the page's script), under the same rules: never below the budget floor,
 and at most 30 such reads in each 15 minute Operators interval; beyond them
 the card says the next refresh reads it.
 
+A reversible `Kind: decision` ask may include `Default: <offered option>` and
+`Reversible: yes`. Such cards are listed for every configured operator. After
+three days without an answer (configurable with `LOOM_DECISION_WINDOW_DAYS`),
+the station posts the default through the same answer path, explains how to
+reverse it, and clears the wait labels. An answer within the window is kept.
+Defaults on irreversible kinds are refused when written. Issues with a
+`blocked:<reason>` label are omitted from waiting counts and are not given a
+new `loom:human` ask while blocked.
+
 Each card takes an answer in one tap (loom#1777). Its buttons come from the
 ask's own words (`bus.answer.options`, no model): "reply with one number" is
 a number field; a lane pull request held for the operator, or "merge ... or

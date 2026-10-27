@@ -1353,8 +1353,7 @@ good observation and the first failing one ("last good read 04:28Z, first
 failing read 09:02Z"). The last good read is not the start. Every text a
 `bus` command posts is checked for this (`bus/text.py`).
 
-Open `loom:human` issues are not asks: the station never posts one on its
-own. They are listed once a day under "Waiting on you" at the end of the
+Open, unblocked `loom:human` issues are listed once a day under "Waiting on you" at the end of the
 same digest (the 15 newest, grouped by repo, each with the first line of
 its `loom:human` comment), so hundreds of them still make one message.
 
@@ -1669,6 +1668,16 @@ operator's newest comment: the stale-brief check (`bus/brief_check.py`)
 reads it as the operator's own words, and the brief's Operator notes carry
 it ("Answer: ..."). Each factory pass reads the open `loom:answer-pending`
 issues of a repo (at most 10) and takes the label off.
+
+A reversible decision ask may also include `Default: <offered option>` and
+`Reversible: yes`. The station waits three days by default, configurable with
+`LOOM_DECISION_WINDOW_DAYS`, then posts the default in the same answer format
+with a note explaining how to reverse it. An answer given during the window
+is never overridden. Defaults are refused on every other kind, including
+money, account, credential, hardware and physical asks. An issue with a
+`blocked:<reason>` label is excluded from person-wait counts and receives no
+new `loom:human` ask until that label is gone. Reversible decision cards are
+available to every configured operator on Needs you.
 
 On a lane pull request held for the operator, the hold ask offers Merge or
 Hold. Merge lifts that hold only, in the factory and in `bus.brain merge`:

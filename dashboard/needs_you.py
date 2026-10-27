@@ -118,7 +118,9 @@ def _merge(entry: Dict[str, Any], item: Dict[str, Any], waiting: bool, names: Di
 
 
 def _listable(item: Dict[str, Any], who: List[str]) -> bool:
-    return item.get("number") is not None and bool(_repo_name(item.get("repo"))) and bool(who)
+    labels = [str(label).lower() for label in item.get("labels") or []]
+    return (item.get("number") is not None and bool(_repo_name(item.get("repo"))) and bool(who)
+            and not any(label.startswith("blocked:") for label in labels))
 
 
 def _add(found: Dict[str, Dict[str, Any]], item: Dict[str, Any], is_needs: bool, who: List[str],
@@ -138,13 +140,24 @@ def entries(operator_asks: Iterable[Any], needs: Iterable[Any], repos: Iterable[
     waiting = [item for item in needs or [] if isinstance(item, dict)]
     names = full_names(list(repos or []) + [item.get("repo") for item in asks + waiting])
     found: Dict[str, Dict[str, Any]] = {}
-    sources = [(item, False, [OPERATOR]) for item in asks] + [
+    sources = [(item, False, _operator_holders(item)) for item in asks] + [
         (item, True, list(item.get("waiting_on") or [])) for item in waiting]
     for item, is_needs, who in sources:
         if _listable(item, who):
             _add(found, item, is_needs, who, names)
     return sorted(found.values(), key=lambda entry: (
         -entry["unblocks"], str(entry.get("waiting_since") or entry.get("updated_at") or "9999")))
+
+
+def _operator_holders(item: Dict[str, Any]) -> List[str]:
+    """A reversible decision can be answered by every configured operator."""
+    labels = [str(label).lower() for label in item.get("labels") or []]
+    if "loom:human" not in labels:
+        return [OPERATOR]
+    ask = str(item.get("comment_full") or item.get("comment_ask") or item.get("body_ask") or "")
+    if not answers_lib.reversible_decision(ask):
+        return [OPERATOR]
+    return answers_lib.operators() or [OPERATOR]
 
 
 def who_param(value: Any) -> str:

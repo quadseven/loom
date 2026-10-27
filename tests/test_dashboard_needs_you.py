@@ -121,6 +121,16 @@ class NeedsYouPageTest(unittest.TestCase):
         self.assertIn("From the backlog (1)", body)
         self.assertNotIn(">app#40<", body)
 
+    def test_reversible_human_decision_is_for_every_operator_and_blocked_waits_are_excluded(self):
+        ask = "Kind: decision\nKeep this ticket open or close it?\nDefault: Keep\nReversible: yes"
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "loom-app[bot] first-op second-op"}):
+            found = needs_you.entries([{"repo": REPO, "number": 70, "title": "Decision",
+                "labels": ["loom:human"], "comment_full": ask}], [], [REPO])
+            blocked = needs_you.entries([{"repo": REPO, "number": 71, "title": "Blocked",
+                "labels": ["loom:human", "blocked:progression"]}], [], [REPO])
+        self.assertEqual(found[0]["who"], ["first-op", "second-op"])
+        self.assertEqual(blocked, [])
+
     def test_filter_chips_count_each_login_and_the_operator_and_filter_by_query(self):
         from dashboard import needs_you
         body = self.page()

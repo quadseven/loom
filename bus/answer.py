@@ -60,6 +60,32 @@ _REPLY_LETTERS_RE = re.compile(r"\breply (?:with )?\(?([a-d])\)?((?:\s*,\s*\(?[a
 _LETTER_OPTION_RE = re.compile(r"(?:^|[\s(])\(([a-d])\)\s", re.I | re.M)
 _DONE_RE = re.compile(r"\breply (?:with )?done\b", re.I)
 _KIND_RE = re.compile(r"^\s*Kind:\s*(\S+)\s*$", re.I | re.M)
+_DEFAULT_RE = re.compile(r"^\s*Default:\s*(.*?)\s*$", re.I | re.M)
+_REVERSIBLE_RE = re.compile(r"^\s*Reversible:\s*(\S+)\s*$", re.I | re.M)
+
+
+def decision_default(text: str) -> str:
+    """Return a validated default for a reversible decision ask, else empty."""
+    source = str(text or "")
+    found = _DEFAULT_RE.findall(source)
+    if not found:
+        return ""
+    if len(found) != 1 or ask_kind(source) != "decision":
+        raise ValueError("a Default line is only allowed once on a decision ask")
+    if not reversible_decision(source):
+        raise ValueError("a decision default requires Reversible: yes")
+    cleaned = _DEFAULT_RE.sub("", _REVERSIBLE_RE.sub("", source))
+    offered = options(cleaned)
+    if offered.kind != CHOICE:
+        raise ValueError("a decision default requires explicit choices in the ask")
+    choice, _ = accept(offered, found[0])
+    return choice
+
+
+def reversible_decision(text: str) -> bool:
+    """Whether an ask explicitly names itself as a reversible decision."""
+    source = str(text or "")
+    return ask_kind(source) == "decision" and _REVERSIBLE_RE.findall(source) == ["yes"]
 
 
 def ask_kind(text: str) -> str:
@@ -98,7 +124,8 @@ def options(ask: str, kind: str = "") -> Options:
     - "reply done", or Kind account, physical or hardware: Done or Not now;
     - anything else: free text.
     """
-    text = " ".join(str(ask or "").replace("**", "").split())
+    text = " ".join(_DEFAULT_RE.sub("", _REVERSIBLE_RE.sub("", str(ask or "")))
+                    .replace("**", "").split())
     kind = (kind or ask_kind(str(ask or ""))).lower()
     if _NUMBER_RE.search(text):
         return Options(NUMBER)

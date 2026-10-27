@@ -70,6 +70,18 @@ class Options(unittest.TestCase):
         with self.assertRaises(ValueError):
             answer.accept(answer.Options(answer.TEXT), "   ")
 
+    def test_decision_default_is_an_offered_option_and_only_reversible_decisions_may_have_one(self):
+        ask = "Kind: decision\nKeep this ticket open or close it?\nDefault: Keep\nReversible: yes"
+        self.assertEqual(answer.decision_default(ask), "Keep")
+        with self.assertRaises(ValueError):
+            answer.decision_default(ask.replace("Default: Keep", "Default: Maybe"))
+        with self.assertRaises(ValueError):
+            answer.decision_default(ask.replace("Reversible: yes", "Reversible: no"))
+        with self.assertRaises(ValueError):
+            answer.decision_default("Kind: money\nDefault: Keep\nReversible: yes")
+        with self.assertRaises(ValueError):
+            answer.decision_default("Kind: decision\nPick the approach.\nDefault: Keep\nReversible: yes")
+
 
 class Comment(unittest.TestCase):
     def test_the_comment_has_the_marker_the_login_the_choice_and_the_note(self):
