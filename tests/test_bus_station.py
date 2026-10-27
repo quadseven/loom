@@ -93,6 +93,7 @@ class FakeGitHub:
         self.pull_files = {}
         self.carried = set()
         self.check_runs_status = 200
+        self.head_files = {}
 
     def add_foreign(self, repo, number, labels=("loom:pr",), state="open", reason=None):
         """An issue in another repo, as an After: line that names one reads it."""
@@ -192,6 +193,12 @@ class FakeGitHub:
         if method == "GET" and parts.path.startswith("/repos/%s/contents/" % REPO):
             if parts.path.endswith("/.github/workflows"):
                 return reply(200, [])
+            # Files on a pull request head, for a lane answer's citations
+            # (bus/rebuttal.py): path -> text, read at any ref.
+            text = self.head_files.get(parts.path[len("/repos/%s/contents/" % REPO):])
+            if text is not None:
+                return reply(200, {"type": "file", "encoding": "base64",
+                                   "content": base64.b64encode(text.encode()).decode()})
             return reply(404, {"message": "Not Found"})
         other = re.match(r"/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/issues/(\d+)$", parts.path)
         if other and other.group(1) != REPO:
@@ -6859,12 +6866,19 @@ THREAD_FIX = FIX_BODY + "\n### Thread PRRT_abcd1 (comment 5) at a.py:3\n\n    me
 class AnswerTest(Base):
     """A fix brief's answers to findings (lanes/run_lane.sh keep_answers)."""
 
-    def thread(self, tid="PRRT_abcd1", pr=99, severity="medium", author=BOT):
+    def setUp(self):
+        super().setUp()
+        # The head the answers cite: a.py with its guard on line 2.
+        self.fake.head_files["a.py"] = "def f(x):\n    if x is None: return\n    return x.y\n"
+
+    def thread(self, tid="PRRT_abcd1", pr=99, severity="medium", author=BOT,
+               kind="null-deref", path="a.py"):
         self.fake.threads[tid] = {
-            "isResolved": False,
-            "pullRequest": {"number": pr, "repository": {"nameWithOwner": REPO}},
+            "isResolved": False, "path": path,
+            "pullRequest": {"number": pr, "headRefOid": "f" * 40,
+                            "repository": {"nameWithOwner": REPO}},
             "comments": {"nodes": [{"author": author,
-                                    "body": "%s | _correctness_ | `null-deref`\n\nx" % severity}]}}
+                                    "body": "%s | _correctness_ | `%s`\n\nx" % (severity, kind)}]}}
 
     def finish(self, answers, model="claude-opus-5-5", kind="done", fix_body=THREAD_FIX):
         body = BODY.replace("Model: model-x", "Model: " + model)
@@ -6904,6 +6918,45 @@ class AnswerTest(Base):
         self.finish({"PRRT_abcd1": "Already guarded at a.py:2."}, kind="failed")
         self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
         self.assertIn("loom:pr", self.fake.names(12))
+
+    def test_an_answer_that_cites_nothing_is_posted_but_stays_open(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "Not valid, this is already handled."})
+        self.assertEqual((len(self.fake.replies), self.fake.resolved), (1, []))
+
+    def dead_code(self):
+        self.fake.head_files["bus/s.py"] = (
+            "def _markings(s):\n    return []\n\n\n"
+            "def _markings_with_accept(s):\n    return []\n\n\n"
+            "def _hand_back(s):\n    return _markings_with_accept(s)\n")
+        self.thread(kind="dead-code", path="bus/s.py")
+        self.fake.threads["PRRT_abcd1"]["comments"]["nodes"][0]["body"] = (
+            "medium | _maintainability_ | `dead-code`\n\nNew function `_markings` has no caller.")
+
+    def test_a_false_caller_claim_on_a_dead_code_finding_stays_open(self):
+        # loom#1948: the lane said the dead function had a caller; the head
+        # calls only its sibling, so the thread must not be resolved.
+        self.dead_code()
+        self.finish({"PRRT_abcd1": "`_markings` is called by `_hand_back`, so it is not dead code."})
+        self.assertEqual((len(self.fake.replies), self.fake.resolved), (1, []))
+
+    def test_a_true_caller_claim_on_a_dead_code_finding_is_resolved(self):
+        self.dead_code()
+        self.fake.head_files["bus/s.py"] = self.fake.head_files["bus/s.py"].replace(
+            "return _markings_with_accept(s)", "return _markings(s) + _markings_with_accept(s)")
+        self.finish({"PRRT_abcd1": "`_markings` is called by `_hand_back`, so it is not dead code."})
+        self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
+
+    def test_a_fixed_in_answer_resolves_only_for_a_commit_on_the_head(self):
+        self.thread()
+        self.fake.carried.add("abc1234")
+        self.finish({"PRRT_abcd1": "Fixed in abc1234"})
+        self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
+
+    def test_a_fixed_in_answer_naming_a_foreign_commit_stays_open(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "Fixed in 0ddba11"})
+        self.assertEqual((len(self.fake.replies), self.fake.resolved), (1, []))
 
     def test_a_model_off_the_ladder_answers_but_does_not_resolve(self):
         self.thread()

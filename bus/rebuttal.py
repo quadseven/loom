@@ -1,0 +1,253 @@
+"""Does a lane's answer to a review finding hold on the pull request head? (loom#2081)
+
+A lane may answer a review finding instead of changing the code. The station
+used to resolve such a thread on the answer's word alone, and the brain's
+merge gate then read it as settled. On loom#1948 the answer said a dead
+function had a caller; on the head it had none, and the dead code merged.
+
+`refusal` is the one check both sides use: the station before it resolves a
+thread on an answer, and the brain's merge gate for a thread already resolved
+on one. It returns "" when the answer holds on the head, else why not:
+
+- "Fixed in <sha>": the sha must be the head or an ancestor of it.
+- Any other answer must cite something the head can show: a file path (with
+  an optional :line or :start-end), a line of the thread's file ("line 12",
+  "lines 3-5"), or a backticked symbol. Every file must exist on the head,
+  every line must be inside its file, and every symbol must appear in a cited
+  file or the thread's file. An answer that cites nothing checkable fails.
+- "`f` is called by `g`" (or "it is called from <file:line>"): the head must
+  show that call, inside g's body or on that line. The subject of "it" is the
+  finding's first backticked symbol.
+- A dead-code finding is answered only by a call of its symbol on the head.
+
+The reads go through two callables, so the rules are tested without GitHub:
+`read(path)` returns a file's text on the head or None, and
+`ancestor(sha)` says whether sha is the head or one of its ancestors.
+"""
+
+from __future__ import annotations
+
+import base64
+import re
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote
+
+Read = Callable[[str], Optional[str]]
+Ancestor = Callable[[str], bool]
+
+FIXED_RE = re.compile(r"^\s*Fixed in `?([0-9a-fA-F]{7,40})`?")
+# A repo file path: a known source or text extension (so `mod.NAME` reads as
+# a symbol, not a file), optional :line or :start-end.
+_EXTS = ("py|pyi|go|sh|bash|js|mjs|cjs|ts|jsx|tsx|rs|rb|java|kt|c|h|cc|cpp|hpp|cs|swift|"
+         "md|txt|rst|yml|yaml|json|toml|ini|cfg|conf|sql|html|css|j2|tf|lua|php")
+_PATH_RE = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)*[\w-]+(?:\.[\w-]+)*\.(?:%s))"
+                      r"(?::(\d+)(?:-(\d+))?)?(?![\w/])" % _EXTS)
+_LINE_RE = re.compile(r"\blines?\s+(\d+)(?:\s*(?:-|to|through)\s*(\d+))?", re.I)
+_TICKED = re.compile(r"`([^`\n]+)`")
+_SYMBOL = re.compile(r"[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)*")
+# "`f` is called by `g`" or "it is called from path:line": the caller must be
+# backticked or a path, so "it is used in the tests" claims nothing to check.
+_CALLED = re.compile(
+    r"(?:`([A-Za-z_][\w.]*)(?:\(\))?`|\b(it|this|that)\b)\s+is\s+(?:called|used|invoked)"
+    r"\s+(?:by|from|in)\s+(?:`([A-Za-z_][\w.]*)(?:\(\))?`|`?((?:[\w.-]+/)*[\w.-]+\.(?:%s)"
+    r"(?::\d+)?)`?)" % _EXTS, re.I)
+_DEF_RE = r"^(\s*)(?:async\s+)?(?:def|func|function)\s+%s\b"
+
+
+def fixed_sha(answer: str) -> str:
+    """The sha of a "Fixed in <sha>" answer, else ""."""
+    m = FIXED_RE.match(answer or "")
+    return m.group(1).lower() if m else ""
+
+
+def _symbols(text: str) -> List[str]:
+    """The backticked symbols in text that are not file paths."""
+    out = []
+    for raw in _TICKED.findall(text or ""):
+        word = raw.strip().removesuffix("()")
+        if _SYMBOL.fullmatch(word) and not _PATH_RE.fullmatch(word):
+            out.append(word)
+    return out
+
+
+def finding_symbol(finding: str) -> str:
+    """The finding's first backticked symbol (its subject), else ""."""
+    found = _symbols(finding)
+    return found[0] if found else ""
+
+
+def _kind(finding: str) -> str:
+    first = (finding or "").split("\n", 1)[0]
+    m = re.search(r"`([a-z]+(?:-[a-z]+)+)`", first)
+    return m.group(1) if m else ""
+
+
+def _calls(text: str, name: str) -> bool:
+    return bool(re.search(r"(?<![\w])%s\s*\(" % re.escape(name.split(".")[-1]), text))
+
+
+def _body(text: str, name: str) -> Optional[str]:
+    """The body of the function `name` in text (indent-delimited), else None."""
+    lines = text.splitlines()
+    pattern = re.compile(_DEF_RE % re.escape(name.split(".")[-1]))
+    for i, line in enumerate(lines):
+        m = pattern.match(line)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        out = []
+        for later in lines[i + 1:]:
+            if later.strip() and len(later) - len(later.lstrip()) <= indent:
+                break
+            out.append(later)
+        return "\n".join(out)
+    return None
+
+
+def _called_outside_def(text: str, name: str) -> bool:
+    short = re.escape(name.split(".")[-1])
+    defs = re.compile(_DEF_RE % short)
+    return any(_calls(line, name) for line in text.splitlines() if not defs.match(line))
+
+
+def refusal(answer: str, read: Read, ancestor: Ancestor, thread_path: str = "",
+            finding: str = "") -> str:
+    """"" when the answer holds on the head, else the reason it does not."""
+    answer = (answer or "").strip()
+    sha = fixed_sha(answer)
+    if sha:
+        return "" if ancestor(sha) else "Fixed in %s names a commit that is not on the head" % sha
+    files: Dict[str, Optional[str]] = {}
+
+    def text_of(path: str) -> Optional[str]:
+        if path not in files:
+            files[path] = read(path)
+        return files[path]
+
+    cited: List[Tuple[str, int, int]] = []
+    for m in _PATH_RE.finditer(answer):
+        start = int(m.group(2) or 0)
+        cited.append((m.group(1), start, int(m.group(3) or start)))
+    last = cited[-1][0] if cited else thread_path
+    for m in _LINE_RE.finditer(answer):
+        if last:
+            start = int(m.group(1))
+            cited.append((last, start, int(m.group(2) or start)))
+    symbols = _symbols(answer)
+    if not cited and not symbols:
+        return "the answer cites no file, line or symbol to check on the head"
+    for path, start, end in cited:
+        text = text_of(path)
+        if text is None:
+            return "%s does not exist on the head" % path
+        if max(start, end) > len(text.splitlines()):
+            return "%s has no line %d on the head" % (path, max(start, end))
+    where: List[str] = []
+    for path in [p for p, _, _ in cited] + ([thread_path] if thread_path else []):
+        if path not in where and text_of(path) is not None:
+            where.append(path)
+    for symbol in symbols:
+        if not any(re.search(r"(?<![\w])%s(?![\w])" % re.escape(symbol), text_of(p) or "")
+                   for p in where):
+            return "`%s` is not in %s on the head" % (symbol, ", ".join(where) or "any cited file")
+    subject_default = finding_symbol(finding)
+    for m in _CALLED.finditer(answer):
+        subject = m.group(1) or subject_default
+        target = m.group(3) or m.group(4)
+        if not subject:
+            return "the answer names a caller but not what it calls"
+        reason = _call_refusal(subject, target, text_of, where)
+        if reason:
+            return reason
+    if _kind(finding) == "dead-code" and subject_default:
+        if not any(_called_outside_def(text_of(p) or "", subject_default) for p in where):
+            return "no call of `%s` in %s on the head" % (subject_default, ", ".join(where))
+    return ""
+
+
+def _call_refusal(subject: str, target: str, text_of: Callable[[str], Optional[str]],
+                  where: List[str]) -> str:
+    path, _, line = target.partition(":")
+    if _PATH_RE.fullmatch(path):
+        text = text_of(path)
+        if text is None:
+            return "%s does not exist on the head" % path
+        if line:
+            lines = text.splitlines()
+            n = int(line)
+            if not 1 <= n <= len(lines) or not _calls(lines[n - 1], subject):
+                return "%s:%s does not call `%s` on the head" % (path, line, subject)
+            return ""
+        if not _called_outside_def(text, subject):
+            return "%s does not call `%s` on the head" % (path, subject)
+        return ""
+    for p in where:
+        body = _body(text_of(p) or "", target)
+        if body is not None:
+            if _calls(body, subject):
+                return ""
+            return "`%s` does not call `%s` on the head" % (target, subject)
+    return "`%s` is not defined in %s on the head" % (target, ", ".join(where) or "any cited file")
+
+
+def quoted(reply: str) -> str:
+    """The lane's own words from the station's reply: the quoted lines after
+    its first line, with the quote marks taken off."""
+    lines = (reply or "").split("\n")[1:]
+    return "\n".join(x[1:].lstrip() if x.startswith(">") else x for x in lines).strip()
+
+
+def head_reader(gh: Any, repo: str, head: str) -> Tuple[Read, Ancestor]:
+    """read and ancestor over the GitHub API at the head commit. A failed
+    read is a file the head cannot show, so a check that cannot read keeps
+    the thread open (the safe side). A rate limit is raised, not read as a
+    missing file: the brain would reopen a sound thread on it."""
+    from .github import GitHubError, RateLimited
+
+    def read(path: str) -> Optional[str]:
+        try:
+            data = gh.rest("GET", "/repos/%s/contents/%s?ref=%s"
+                           % (repo, quote(path, safe="/"), head), ok=(404,)).data
+        except RateLimited:
+            raise
+        except GitHubError:
+            return None
+        if not isinstance(data, dict) or data.get("type", "file") != "file":
+            return None
+        raw = data.get("content")
+        if not raw and data.get("sha"):
+            # Files over 1 MB come back without content; the blob has it.
+            try:
+                blob = gh.rest("GET", "/repos/%s/git/blobs/%s" % (repo, data["sha"])).data
+            except RateLimited:
+                raise
+            except GitHubError:
+                return None
+            raw = (blob or {}).get("content") if isinstance(blob, dict) else None
+        if not raw:
+            return None
+        try:
+            return base64.b64decode(raw).decode("utf-8", errors="replace")
+        except ValueError:
+            return None
+
+    def ancestor(sha: str) -> bool:
+        try:
+            data = gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, sha, head), ok=(404,)).data
+        except RateLimited:
+            raise
+        except GitHubError:
+            return False
+        return isinstance(data, dict) and data.get("status") in ("ahead", "identical")
+
+    return read, ancestor
+
+
+def check_on_head(gh: Any, repo: str, head: str, answer: str, thread_path: str = "",
+                  finding: str = "") -> str:
+    """refusal() with reads from GitHub at the head commit; no head, no pass."""
+    if not head:
+        return "the pull request head is unknown"
+    read, ancestor = head_reader(gh, repo, head)
+    return refusal(answer, read, ancestor, thread_path, finding)
+
