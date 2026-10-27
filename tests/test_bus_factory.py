@@ -216,6 +216,10 @@ class FakeGitHub:
                     have = [x["name"] for x in self.pulls[number].get("labels", [])]
                     self.pulls[number]["labels"] = [
                         {"name": x} for x in dict.fromkeys(have + list(body["labels"]))]
+                    # As GitHub does: each label put on leaves a labeled event.
+                    self.events.setdefault(number, []).extend(
+                        {"event": "labeled", "label": {"name": x}, "created_at": iso(0)}
+                        for x in body["labels"] if x not in have)
             elif m.group(2) == "/comments":
                 self.next_comment = getattr(self, "next_comment", 1000) + 1
                 self.comments.setdefault(number, []).append(
@@ -1053,17 +1057,21 @@ class PullRequests(Base):
     def test_an_updated_pull_request_lands_on_a_later_pass_once_green(self):
         # First pass: the pull request is behind, so it is updated, not
         # merged. Second pass: its new head is up to date and green, so it
-        # merges with no further update call.
+        # merges with no further update call. The update takes the landing
+        # lock (loom#2066) and the merge gives it back.
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)
         self.gh.behind[50] = 3
         self.go()
         self.assertEqual((self.merged, self.fixed), ([], []))
-        self.assertEqual(len(self.gh.writes), 1)
+        self.assertEqual([w[:2] for w in self.gh.writes],
+                         [("PUT", "/repos/%s/pulls/50/update-branch" % REPO),
+                          ("POST", "/repos/%s/issues/50/labels" % REPO)])
         self.gh.behind[50] = 0
         self.go()
         self.assertEqual(self.merged, [(50, (REPO, 5))])
-        self.assertEqual(len(self.gh.writes), 1)
+        self.assertEqual(self.gh.writes[2:], [
+            ("DELETE", "/repos/%s/issues/50/labels/loom%%3Alanding" % REPO, None)])
 
     def test_each_repo_lands_one_pull_request_a_pass_oldest_first(self):
         self.gh.ticket(5, "pr")
@@ -1521,6 +1529,164 @@ LEAK_BODY = ("Implements the ticket.\n\nThe shape follows example-org/other-repo
 CLEAN = "leak guard: clean (9 shape patterns, deny-list not configured, %d lines scanned)"
 HIT = "  %s:%d  [%s] %s - why"
 TEXT = "/home/runner/work/_temp/text.md"
+
+
+OTHER = "example-org/other-repo"
+LANDING = "loom:landing"
+
+
+def landing_event(seconds_ago):
+    return {"event": "labeled", "label": {"name": LANDING}, "created_at": iso(seconds_ago)}
+
+
+class TwoRepos:
+    """Two fake repos behind one client: OTHER's calls go to the second
+    fake with its name read as REPO, so each fake keeps its own state."""
+
+    def __init__(self, one, two):
+        self.one, self.two = one, two
+        self.requests = 0
+
+    def _route(self, path):
+        return (self.two, path.replace(OTHER, REPO)) if OTHER in path else (self.one, path)
+
+    def paginate(self, path):
+        gh, path = self._route(path)
+        return gh.paginate(path)
+
+    def rest(self, method, path, body=None, etag=None, ok=()):
+        gh, path = self._route(path)
+        return gh.rest(method, path, body, etag, ok)
+
+    def graphql(self, query, variables=None):
+        name = OTHER.split("/")[1]
+        gh = (self.two if '"%s"' % name in query or name in (variables or {}).values()
+              else self.one)
+        return gh.graphql(query, variables)
+
+    def transport(self, method, url, headers, body):
+        return self.one.transport(method, url, headers, body)
+
+
+class LandingLock(Base):
+    """loom#2066: one green lane pull request at a time is brought up to
+    date and landed in a repo, so main does not move under it."""
+
+    def updates(self, gh=None):
+        return [w[1].split("/")[-2] for w in (gh or self.gh).writes
+                if w[1].endswith("/update-branch")]
+
+    def carries(self, number, gh=None):
+        return LANDING in [x["name"] for x in (gh or self.gh).pulls[number]["labels"]]
+
+    def held_by_50(self, seconds_ago=600, gh=None):
+        """PR 50 holds the lock, marked seconds_ago, its checks still running."""
+        gh = gh or self.gh
+        gh.ticket(5, "pr")
+        gh.pull(50, 5, labels=(LANDING,), runs=(("unittest", "in_progress"),))
+        gh.events[50] = [landing_event(seconds_ago)]
+
+    def test_of_two_green_behind_pull_requests_only_the_oldest_is_updated_and_marked(self):
+        for ticket, number, created in ((5, 50, 7200), (6, 60, 3600)):
+            self.gh.ticket(ticket, "pr")
+            self.gh.pull(number, ticket, created=created)
+            self.gh.behind[number] = 3
+        self.go()
+        self.assertEqual(self.updates(), ["50"])
+        self.assertTrue(self.carries(50))
+        self.assertFalse(self.carries(60))
+        self.assertEqual(self.merged, [])
+
+    def test_while_a_fresh_lock_is_held_no_other_pull_request_is_updated_or_landed(self):
+        self.held_by_50()
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6)
+        self.gh.behind[60] = 2
+        self.gh.ticket(7, "pr")
+        self.gh.pull(70, 7)
+        self.go()
+        self.assertEqual((self.updates(), self.merged), ([], []))
+        self.assertTrue(self.carries(50))
+
+    def test_the_brain_merge_step_refuses_another_pull_request_while_the_lock_is_held(self):
+        self.held_by_50()
+        self.gh.ticket(7, "pr")
+        self.gh.pull(70, 7)
+        args = brain.parser().parse_args(["merge", "%s#70" % REPO])
+        with mock.patch.object(brain, "merge") as merge, \
+                mock.patch("time.time", return_value=NOW):
+            with self.assertRaisesRegex(ValueError, "#50 holds the repo's landing lock"):
+                brain._cmd_merge(self.gh, args)
+            merge.assert_not_called()
+            # The holder itself merges, and its lock comes off.
+            brain._cmd_merge(self.gh, brain.parser().parse_args(["merge", "%s#50" % REPO]))
+        self.assertEqual(merge.call_args.args[1:3], (REPO, 50))
+        self.assertFalse(self.carries(50))
+
+    def test_a_lock_40_minutes_old_is_released_and_the_next_one_taken(self):
+        self.held_by_50(seconds_ago=40 * 60)
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6)
+        self.gh.behind[60] = 2
+        self.go()
+        self.assertFalse(self.carries(50))
+        self.assertEqual(self.updates(), ["60"])
+        self.assertTrue(self.carries(60))
+
+    def test_the_landing_pull_request_lands_when_current_and_its_lock_comes_off(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=(LANDING,), created=60)
+        self.gh.events[50] = [landing_event(600)]
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6, created=7200)
+        self.gh.behind[60] = 2
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertFalse(self.carries(50))
+        self.assertEqual(self.updates(), [])
+
+    def test_the_landing_pull_request_behind_again_is_updated_and_keeps_the_lock(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=(LANDING,), created=60)
+        self.gh.events[50] = [landing_event(600)]
+        self.gh.behind[50] = 1
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6, created=7200)
+        self.go()
+        self.assertEqual((self.updates(), self.merged), (["50"], []))
+        self.assertTrue(self.carries(50))
+        self.assertEqual(self.gh.events[50], [landing_event(600)])
+
+    def test_a_landing_pull_request_merged_elsewhere_holds_nothing(self):
+        self.gh.ticket(5, "merged")
+        self.gh.pull(50, 5, labels=(LANDING,), state="closed", merged_at=iso(60))
+        self.gh.events[50] = [landing_event(600)]
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6)
+        self.gh.behind[60] = 2
+        self.go()
+        self.assertEqual(self.updates(), ["60"])
+        self.assertTrue(self.carries(60))
+
+    def test_a_lock_in_one_repo_does_not_block_another_repo(self):
+        other = FakeGitHub()
+        self.held_by_50()
+        self.gh.ticket(7, "pr")
+        self.gh.pull(70, 7)
+        other.ticket(6, "pr")
+        other.pull(60, 6, body="Refs %s#6\n" % OTHER, branch="loom/6-some-title")
+        both = TwoRepos(self.gh, other)
+        merged = []
+        f = factory.Factory(both, [REPO, OTHER], NOW, trusted=["Alice-Example"],
+                            merge=lambda gh, repo, number, ticket: merged.append((repo, number)),
+                            fix=mock.Mock(), move=mock.Mock(), close=mock.Mock(),
+                            human=mock.Mock(), place=mock.Mock())
+        f.run()
+        self.assertEqual(merged, [(OTHER, 60)])
+        with mock.patch.object(brain, "merge") as merge, \
+                mock.patch("time.time", return_value=NOW):
+            brain._cmd_merge(both, brain.parser().parse_args(["merge", "%s#60" % OTHER]))
+        self.assertEqual(merge.call_args.args[1:3], (OTHER, 60))
 
 
 def leak_log(diff_hits=(), text_hits=()):
