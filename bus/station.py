@@ -3816,6 +3816,18 @@ class Station:
                 return False
         if self._model_waits(repo, issue, lane, headers):
             return False
+        if needs_public_repo(lane, model) and not self._public(repo):
+            # A lane that became public-only after the ticket was labeled for
+            # it (a slot moved to cluster runners): the dispatch would park
+            # the brief and only then retry it (loom#1917). Back to the queue,
+            # where the factory gives it a lane that takes private repos.
+            names = [n for n in _label_names(fresh) if not n.startswith("lane:")
+                     and n not in (BRIEFED, "loom:queued")] + ["loom:queued"]
+            self.gh.rest("PUT", "/repos/%s/issues/%s/labels" % (repo, fresh["number"]),
+                         {"labels": names})
+            _say("%s#%s: lane %s takes public repos only; back to the queue"
+                 % (repo, fresh["number"], lane))
+            return False
         return self._claim(repo, lane, fresh)
 
     def _status_texts(self, repo: str, number: int) -> List[str]:
@@ -5544,7 +5556,7 @@ class Station:
                        and run.get("conclusion") in brain.FAILED_CONCLUSIONS
                        and str(run.get("name") or "") in names]
             gaps = ci_gap.find_gaps(self.gh, repo, pr_number, sha, fields, failing,
-                                    lambda: self._pull_paths(repo, pr_number) or [])
+                                    lambda: self._pull_paths(repo, pr_number) or [], _say)
             filed = ci_gap.file_gaps(self.gh, self.state, gaps, self.now, _say)
         except RateLimited:
             raise

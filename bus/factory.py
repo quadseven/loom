@@ -165,6 +165,7 @@ from urllib.parse import quote
 from . import answer, bench, brain, brain_hold, brief_check, change_class, converge, criteria_gate, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
+from . import runners
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
 
 FACTORY_CHECK = 300
@@ -1434,10 +1435,17 @@ def difficulty_of(issue: Dict[str, Any]) -> str:
     return str(tickets.parse(issue.get("body"))[0]["Difficulty"]).strip().lower()
 
 
+def public_only(lane: str) -> bool:
+    """Whether the lane takes public repos only: PUBLIC_ONLY, or a slot sent to
+    cluster runners (LOOM_RUNNER_SLOTS), whose inputs and logs live in this
+    public repository's Actions, so the dispatch refuses a private repo."""
+    return lane in PUBLIC_ONLY or lane in runners.runner_slots()
+
+
 def lanes_of(difficulty: str, private: bool) -> Tuple[str, ...]:
     """The lanes of a difficulty tier a repo may run on, best first."""
     return tuple(x for x in TIERS.get(difficulty, ())
-                 if not (private and x in PUBLIC_ONLY))
+                 if not (private and public_only(x)))
 
 
 def tier_lanes(issue: Dict[str, Any], private: bool) -> Tuple[str, ...]:
@@ -1874,7 +1882,7 @@ class Factory:
         that takes public repos only never takes a private repo's."""
         lanes = CLIMB[rung - 1][0]
         if self._is_private(repo):
-            lanes = tuple(lane for lane in lanes if lane not in PUBLIC_ONLY)
+            lanes = tuple(lane for lane in lanes if not public_only(lane))
         return lanes
 
     def _up_lanes(self, repo: str) -> Dict[int, Tuple[str, ...]]:

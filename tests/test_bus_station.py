@@ -11923,3 +11923,39 @@ class RemoteClaimCountTest(unittest.TestCase):
             runner = self.runner()
             body = runner._lanes_body(runner._lane_rows())
         self.assertIn("Remote claims: muse 1/4", body)
+
+
+class RunnerSlotClaimTest(Base):
+    """A slot on cluster runners takes public repos only: a private ticket
+    labeled for one is sent back to the queue, never briefed there
+    (loom#1917)."""
+
+    MEDIUM = "Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n"
+
+    def claim(self):
+        with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
+            self.heartbeat("free-gemma")
+            self.fake.add(12, lane="free-gemma", body=self.MEDIUM)
+            self.run_pass()
+
+    def test_a_private_ticket_labeled_for_a_runner_slot_is_not_briefed_there(self):
+        self.fake.private = True
+        self.claim()
+        self.assertEqual(self.listing("free-gemma"), [])
+        names = self.fake.names(12)
+        self.assertNotIn("lane:free-gemma", names)
+        self.assertNotIn("loom:running", names)
+        self.assertIn("loom:queued", names)
+
+    def test_a_public_ticket_labeled_for_a_runner_slot_is_claimed_there(self):
+        self.fake.private = False
+        self.claim()
+        self.assertEqual(len(self.listing("free-gemma")), 1)
+        self.assertIn("lane:free-gemma", self.fake.names(12))
+
+    def test_a_private_ticket_for_free_gemma_is_claimed_when_it_runs_locally(self):
+        self.fake.private = True
+        self.heartbeat("free-gemma")
+        self.fake.add(12, lane="free-gemma", body=self.MEDIUM)
+        self.run_pass()
+        self.assertEqual(len(self.listing("free-gemma")), 1)

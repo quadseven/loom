@@ -5122,6 +5122,84 @@ class MoveOutsideEpicTests(unittest.TestCase):
         self.move(fake)
         self.assertEqual(fake.issues[10]["body"], "## Why\nwhy\n\nPart of #60\n")
 
+    def epic_under_goal(self, fake, number, state="open", tickets=()):
+        """A (non-intake) epic of goal #1 holding the given tickets as its
+        sub-issues."""
+        fake.issues[number] = dict(item(number, body="Part of #1\n", labels=("epic",),
+                                        state=state), title="Epic: the work %d" % number)
+        fake.subs[1].append(number)
+        fake.subs[number] = []
+        for ticket in tickets:
+            fake.issues[ticket["number"]] = ticket
+            fake.subs[number].append(ticket["number"])
+
+    def under(self, number, epic, **extra):
+        """An open ticket that names the epic by its Part of line."""
+        out = item(number, body="## Why\nwhy\n\nPart of #%d\n" % epic, labels=("loom:ticket",),
+                   created_at="2030-01-01T00:00:00Z")
+        out.update(extra)
+        return out
+
+    def test_open_tickets_under_a_closed_epic_move_to_an_open_intake_epic(self):
+        # loom#1925: epic #20 was closed by a person's tool; ticket #21 is its
+        # sub-issue and #22 names it only by its Part of line.
+        url = "https://api.github.com/repos/%s/issues/20" % REPO
+        sub = self.under(21, 20, parent_issue_url=url, created_at="2030-01-02T00:00:00Z")
+        named = self.under(22, 20, created_at="2030-01-01T00:00:00Z")
+        fake = self.repo(epics=[(60, 1)])
+        self.epic_under_goal(fake, 20, state="closed", tickets=[sub])
+        fake.issues[22] = named
+        fake.open_tickets = [sub, named]
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (2, 0))
+        # Oldest first, into the intake epic with room.
+        self.assertEqual(fake.subs[60][-2:], [22, 21])
+        self.assertNotIn(21, fake.subs[20])
+        # The sub-issue link replaced the closed epic as the parent.
+        links = [c[2] for c in fake.writes() if c[1].endswith("/sub_issues")]
+        self.assertEqual(links, [{"sub_issue_id": 1022},
+                                 {"sub_issue_id": 1021, "replace_parent": True}])
+        # Each Part of line now names the intake epic, not the closed one.
+        self.assertEqual(fake.issues[21]["body"], "## Why\nwhy\n\nPart of #60\n")
+        self.assertEqual(fake.issues[22]["body"], "## Why\nwhy\n\nPart of #60\n")
+        # The closed epic stays closed.
+        self.assertEqual(fake.issues[20]["state"], "closed")
+        self.assertFalse([c for c in fake.writes() if c[1].endswith("/issues/20")])
+
+    def test_a_closed_epic_ticket_waits_when_no_intake_epic_may_open(self):
+        url = "https://api.github.com/repos/%s/issues/20" % REPO
+        fake = self.repo(epics=[(60 + n, brain.EPIC_TICKET_CAP) for n in range(6)])
+        self.epic_under_goal(fake, 20, state="closed",
+                             tickets=[self.under(21, 20, parent_issue_url=url)])
+        self.assertEqual(self.move(fake), (0, 1))
+        self.assertEqual(fake.writes(), [])
+
+    def test_open_epic_tickets_an_epic_an_ask_and_a_closed_ticket_never_move(self):
+        closed_url = "https://api.github.com/repos/%s/issues/20" % REPO
+        open_url = "https://api.github.com/repos/%s/issues/30" % REPO
+        fake = self.repo(epics=[(60, 1)])
+        # Under an open epic: by sub-issue link, and by Part of line only.
+        in_open = self.under(31, 30, parent_issue_url=open_url)
+        named_open = self.under(32, 30)
+        self.epic_under_goal(fake, 30, tickets=[in_open])
+        fake.issues[32] = named_open
+        # Under the closed epic: an epic, an ask and a closed ticket; and a
+        # ticket that names the closed epic but is an open epic's sub-issue.
+        inner_epic = dict(item(23, body="Part of #20\n", labels=("epic",),
+                               parent_issue_url=closed_url), title="Epic: inner")
+        ask = self.under(24, 20, labels=[{"name": "loom:ticket"}, {"name": "needs-operator"}],
+                         parent_issue_url=closed_url)
+        done = self.under(25, 20, state="closed", parent_issue_url=closed_url)
+        elsewhere = self.under(26, 20, parent_issue_url=open_url)
+        self.epic_under_goal(fake, 20, state="closed", tickets=[inner_epic, ask, done])
+        fake.issues[26] = elsewhere
+        fake.subs[30].append(26)
+        fake.open_tickets = [in_open, named_open, ask, elsewhere]
+        self.assertEqual(self.move(fake), (0, 0))
+        self.assertEqual(fake.writes(), [])
+        self.assertEqual(fake.subs[30], [31, 26])
+        self.assertEqual(fake.subs[20], [23, 24, 25])
+
 
 class CloseEpicTests(unittest.TestCase):
     """loom#638: the brain closes a finished epic with a one-line note."""
