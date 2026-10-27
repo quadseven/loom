@@ -104,6 +104,12 @@ AFTER_RELEASE_RE = re.compile(r"^<!-- loom:after-release ([0-9]+) -->")
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
 # The runner's reason when a lane run ends with nothing committed.
 NO_COMMIT = "agent made no commit"
+# Elder review check output parsing: individual markings like "removed-guarded-path"
+# are listed in the summary. Each marking line looks like:
+# "- `removed-guarded-path`: This PR deletes \`path/to/file.md\`, which removes KIND. /grug accept-removal path/to/file.md SHA"
+# The accept-removal line may be on the same line or the next line.
+_ELDER_MARKING_RE = re.compile(r"^\s*-\s+`([a-z0-9-]+)`:\s*(.*)$", re.M)
+_ACCEPT_REMOVAL_RE = re.compile(r"/grug accept-removal\s+(\S+)\s+(\S+)")
 # A pull request a brief names in words, as a settle-findings ticket names the
 # one its findings were left on.
 NAMED_PR_RE = re.compile(r"\b(?:PR|pull request) #([0-9]+)\b")
@@ -1193,6 +1199,15 @@ _PULL_REQUEST_TRIGGER = re.compile(
 def _has_pull_request_trigger(workflow: str) -> bool:
     """Whether a workflow's text runs on pull_request."""
     return bool(_PULL_REQUEST_TRIGGER.search(workflow))
+
+
+def _is_code_scanning_check(name: str, run: Dict[str, Any]) -> bool:
+    """Whether a check run is code scanning, not the repo's own lane CI."""
+    low = str(name).lower()
+    if "code scanning" in low or "codeql" in low:
+        return True
+    app = run.get("app") or {}
+    return str(app.get("slug") or "").lower() in ("codeql", "code-scanning")
 
 
 def _block_scalar(lines: List[str], index: int, indent: int) -> Tuple[str, int]:
@@ -5589,6 +5604,45 @@ class Station:
             self._pulls[repo] = data if isinstance(data, list) else []
         return self._pulls[repo]
 
+    def _elder_markings(self, summary: str) -> List[Tuple[str, List[str]]]:
+        """Parse Elder review markings from a review check summary.
+        Returns list of (marking_kind, paths) tuples."""
+        text = str(summary or "")
+        return [(m.group(1), [p.strip("` ") for p in re.findall(r"`([^`]+)`", m.group(2))])
+                for m in _ELDER_MARKING_RE.finditer(text)]
+
+    def _elder_markings_with_accept(self, summary: str, sha: str) -> List[Tuple[str, List[str], List[str]]]:
+        """Parse Elder review markings and their accept-removal lines.
+        Returns list of (marking_kind, paths, accept_removal_lines) tuples.
+        Each accept_removal_line is the exact '/grug accept-removal PATH SHA' line.
+        If not found in the summary, builds it from the path and the given SHA."""
+        text = str(summary or "")
+        markings = []
+        for m in _ELDER_MARKING_RE.finditer(text):
+            kind = m.group(1)
+            rest = m.group(2)
+            paths = [p.strip("` ") for p in re.findall(r"`([^`]+)`", rest)]
+            # Find accept-removal lines for these paths in the full text
+            accept_lines = []
+            for path in paths:
+                found = False
+                for am in _ACCEPT_REMOVAL_RE.finditer(text):
+                    if am.group(1) == path:
+                        accept_lines.append(f"/grug accept-removal {am.group(1)} {am.group(2)}")
+                        found = True
+                        break
+                if not found:
+                    accept_lines.append(f"/grug accept-removal {path} {sha}")
+            markings.append((kind, paths, accept_lines))
+        return markings
+
+    def _is_removed_guarded_path_named(self, marking: Tuple[str, List[str]], ticket_body: str) -> bool:
+        """True when a removed-guarded-path marking only names paths the ticket names."""
+        kind, paths = marking
+        if kind != "removed-guarded-path":
+            return False
+        return all(operator_hold._named(path, ticket_body) for path in paths)
+
     def _hand_back_ticket(self, repo: str, issue: Dict[str, Any], prs: List[Dict[str, Any]],
                           rounds: int) -> None:
         number = int(issue["number"])
@@ -5623,6 +5677,32 @@ class Station:
                 if not (name == self.s.review_check and factory.degraded_review(tail, tail))]
         degraded = len(kept) != len(failed)
         failed = kept
+        # Check for the special case: only the review check failed, and all
+        # its blocking Elder markings are "removed-guarded-path" on paths the
+        # ticket names for removal. In this case, ask the maintainer for
+        # /grug accept-removal approval instead of a fix round.
+        if (len(failed) == 1 and failed[0][0] == self.s.review_check):
+            review_summary = failed[0][1]
+            markings = self._elder_markings_with_accept(review_summary, sha)
+            ticket_body = str(issue.get("body") or "")
+            blocking_markings = [m for m in markings if m[0] != "reviewability"]
+            if (blocking_markings and
+                    all(self._is_removed_guarded_path_named((m[0], m[1]), ticket_body) for m in blocking_markings)):
+                # Only removed-guarded-path on named paths: no fix round, no runaway,
+                # ask maintainer for /grug accept-removal with exact lines
+                accept_lines = []
+                for m in blocking_markings:
+                    accept_lines.extend(m[2])
+                accept_block = "\n".join(accept_lines)
+                paths = ", ".join(p for m in blocking_markings for p in m[1])
+                ask = operator_hold.ask(number, [
+                    f"it deletes or mostly replaces {paths}, which its ticket names for removal"
+                ])
+                ask += f"\n\n{accept_block}"
+                brain.human(self.gh, repo, number, ask)
+                _say("%s#%d: only removed-guarded-path on named paths; moved to loom:human for accept-removal"
+                     % (repo, number))
+                return
         # An infra timeout (bus/flake.py) is no lane's to fix: it is re-run
         # once before any round, whatever else fails, and never reads as a
         # stuck failure after (loom#1962).
@@ -5639,6 +5719,24 @@ class Station:
         # factory's (Factory._send_back), so no round is sent from here.
         conflict = detail.get("mergeable") is False
         if not failed and not threads and not degraded and not conflict:
+            # A lane pull request is ready only on its goal home's trunk (or
+            # the repo's default branch when the goal home names no trunk).
+            base_ref = str((detail.get("base") or {}).get("ref") or "")
+            if base_ref:
+                trunk = self._trunk_for(repo, issue)
+                if trunk and base_ref != trunk:
+                    self._remove_ready_if_present(repo, number, names)
+                    self._routine(repo, number, "base %s is not the trunk %s"
+                                  % (base_ref, trunk))
+                    return
+            # The repo's own CI must have run green on the head, but only in a
+            # repo that has a pull-request-triggered workflow. When none ran,
+            # the status says so and the pull request stays not ready.
+            if self._has_pull_request_workflow(repo) \
+                    and not self._repo_ci_green_on_head(repo, sha):
+                self._remove_ready_if_present(repo, number, names)
+                self._routine(repo, number, "repo CI did not run on head %s" % sha)
+                return
             self._mark_ready(repo, number, sha, names, ready)
             return
         self._remove_ready_if_present(repo, number, names)
@@ -5767,6 +5865,71 @@ class Station:
         statuses = (self.gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data or {}).get("statuses") or []
         return not any(run.get("status") != "completed" for run in runs) and not any(
             status.get("state") == "pending" for status in statuses)
+
+    def _trunk_for(self, repo: str, issue: Dict[str, Any]) -> str:
+        """The goal home's Trunk branch, else the repo's default branch, else
+        "". An unreadable goal home or repo reads as no trunk, so a pull
+        request whose base cannot be compared is not blocked here."""
+        trunk = ""
+        try:
+            goal = brain._goal_home_for_ticket(self.gh, repo, issue)
+            if isinstance(goal, dict):
+                trunk = str(brain.goal_trunk(goal) or "")
+        except (GitHubError, ValueError, TypeError):
+            trunk = ""
+        if not trunk:
+            try:
+                trunk = self._default_branch(repo)
+            except (GitHubError, ValueError, TypeError):
+                trunk = ""
+        return trunk
+
+    def _has_pull_request_workflow(self, repo: str) -> bool:
+        """Whether the repo has a workflow that runs on pull_request: only then
+        does the repo's own CI need to have run on a lane pull request's head
+        for it to be ready. An unreadable workflow list reads as none."""
+        try:
+            listing = self.gh.rest("GET", "/repos/%s/contents/.github/workflows" % repo).data
+        except (GitHubError, ValueError, TypeError, AssertionError):
+            return False
+        if not isinstance(listing, list):
+            return False
+        for item in listing:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "")
+            if not path.endswith((".yml", ".yaml")):
+                continue
+            try:
+                workflow = self._contents_text(repo, path)
+            except (GitHubError, ValueError, TypeError, AssertionError):
+                continue
+            if workflow is not None and _has_pull_request_trigger(workflow):
+                return True
+        return False
+
+    def _repo_ci_green_on_head(self, repo: str, sha: str) -> bool:
+        """Whether at least one check from the repo's own workflows - not the
+        review bot and not code scanning - concluded success on the head
+        commit."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
+                                % (repo, sha)).data or {}
+        except (GitHubError, ValueError, TypeError, AssertionError):
+            return False
+        runs = data.get("check_runs") or []
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            if str(run.get("conclusion") or "") != "success":
+                continue
+            name = str(run.get("name") or "")
+            if not name or name == self.s.review_check:
+                continue
+            if _is_code_scanning_check(name, run):
+                continue
+            return True
+        return False
 
     def _bot_threads(self, repo: str, pr_number: int) -> List[Dict[str, Any]]:
         threads = brain._open_threads(self.gh, repo, pr_number, bot=self.s.review_bot,

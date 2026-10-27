@@ -640,6 +640,24 @@ def _context_text(notes: Sequence[Tuple[str, str, str]], linked: Sequence[str]) 
     return text
 
 
+# A ticket whose What or criteria read stored rows (loom#1860): a lane that
+# invented its fixture rows passed tests against rows the live writer never
+# produces, so the fix could never fire live.
+_STORED_ROWS_RE = re.compile(
+    r"\b(rows?|tables?|quer(y|ies)|database|sqlite|select\s+\S+\s+from)\b", re.I)
+_WHAT_OR_CRITERIA_RE = re.compile(
+    r"^## (What|Acceptance criteria)\s*\n(.*?)(?=^## |\Z)", re.M | re.S)
+FIXTURE_NOTE = (
+    "This ticket reads stored rows: take each test's fixture rows from the code that "
+    "writes them or from a read-only live read, and cite which in the pull request.")
+
+
+def reads_stored_rows(body: str) -> bool:
+    """Whether a ticket's What or Acceptance criteria name stored rows."""
+    return any(_STORED_ROWS_RE.search(m.group(2))
+               for m in _WHAT_OR_CRITERIA_RE.finditer(body or ""))
+
+
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   fix: Optional[Fix] = None,
                   ci_checks: Optional[List[Tuple[str, str]]] = None,
@@ -680,6 +698,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += "\n"
     if body:
         text += body + "\n"
+    if reads_stored_rows(body):
+        text += "\n" + FIXTURE_NOTE + "\n"
     text += _context_text(notes, linked)
     if resume:
         text += ("\n## Earlier attempt\n\nAn earlier attempt ended (a timeout or a limit) after "
