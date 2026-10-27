@@ -1269,6 +1269,39 @@ def acceptance_criteria(body: str) -> List[str]:
     return found
 
 
+_MD_LINK_RE = re.compile(r"\[([^\]\n]*)\]\([^)\n]*\)")
+_MD_MARK_RE = re.compile(r"[`*_~]")
+
+
+def criterion_key(text: str) -> str:
+    """A box's text for matching a pull request box to a ticket box: without
+    a "not built: <reason>" suffix, markdown links, emphasis and code marks,
+    runs of whitespace or trailing punctuation, and case (loom#2026)."""
+    text = _MD_MARK_RE.sub("", _MD_LINK_RE.sub(r"\1", NOT_BUILT_RE.sub("", text)))
+    return " ".join(text.split()).rstrip(".;:,").strip().casefold()
+
+
+def unbuilt_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
+    """The ticket's code boxes that a merge left unbuilt: neither ticked on the
+    ticket nor ticked (without "not built") in any of these merged pull request
+    bodies. A box marked "not built: <reason>" answers a lane's gate but is
+    still unbuilt, so a partial merge sends its ticket back (loom#2026). Live
+    and operator boxes are the verify path's, never named here."""
+    built = set()
+    for criterion in [c for body in pull_bodies for c in acceptance_criteria(body)]:
+        checked, _, text = criterion.partition(" ")
+        if checked == "x" and not NOT_BUILT_RE.search(text):
+            built.add(criterion_key(text))
+    left = []
+    for criterion in acceptance_criteria(ticket_body):
+        checked, _, text = criterion.partition(" ")
+        if checked == "x" or criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE:
+            continue
+        if criterion_key(text) not in built:
+            left.append(text)
+    return left
+
+
 def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
     """Ticket criteria that a lane PR leaves unticked, excluding live checks
     and operator actions (bus/criteria_gate.py): only the station's verifier
@@ -1278,15 +1311,13 @@ def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
     states = {}
     for criterion in pull:
         checked, _, text = criterion.partition(" ")
-        clean = NOT_BUILT_RE.sub("", text).strip().casefold()
-        states[clean] = (checked == "x", bool(NOT_BUILT_RE.search(text)))
+        states[criterion_key(text)] = (checked == "x", bool(NOT_BUILT_RE.search(text)))
     missing = []
     for criterion in ticket:
         _, _, text = criterion.partition(" ")
         if criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE:
             continue
-        clean = NOT_BUILT_RE.sub("", text).strip().casefold()
-        checked, not_built = states.get(clean, (False, False))
+        checked, not_built = states.get(criterion_key(text), (False, False))
         if not checked and not not_built:
             missing.append(text)
     return missing
