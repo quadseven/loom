@@ -73,14 +73,14 @@ class HandoffRuleTests(unittest.TestCase):
         # comment's createdAt day. A muse journal from 2026-10-19 with
         # "Tick 20:30Z, muse" should not appear fresh at 2026-10-26T13:51Z.
         now = datetime(2026, 10, 26, 13, 51, tzinfo=timezone.utc)
-        # Comment created at 20:30Z on 2026-10-19 (matching the tick time)
+        # GitHub's comment timestamps date the time-only Tick line.
         created_at = "2026-10-19T20:30:00Z"
         updated_at = "2026-10-19T20:30:00Z"
         body = "\n".join([handoff.JOURNAL_MARKER, "Tick 20:30Z, muse",
                           "- Waiting: merge deferred for budget"])
         comment = {"body": body, "at": created_at, "login": "allowed-bot",
-                   "created_at": created_at, "updated_at": updated_at}
-        expanded = handoff.expand_journals([comment])
+                   "createdAt": created_at, "updatedAt": updated_at}
+        expanded = handoff.journals([comment], AUTHORS)
         self.assertEqual(len(expanded), 1)
         # The tick time should be parsed as 2026-10-19T20:30:00Z
         self.assertEqual(expanded[0]["at"], "2026-10-19T20:30:00Z")
