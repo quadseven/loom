@@ -5765,6 +5765,27 @@ class FactoryIncidentTest(Base):
         self.assertIn("keeps its rung", hold[0])
         self.assertIn("factory incident %s#99" % REPO, hold[0])
 
+    def test_a_cluster_runner_whose_check_cannot_run_moves_the_ticket_to_another_lane(self):
+        # The runner image lacks a tool the repo's check calls (make, ruff):
+        # exit 127 on the unmodified base. Held behind the incident, the
+        # ticket went back to the same runner, which can never clear it
+        # (three tickets held so on 2026-10-27).
+        self.heartbeat("anthropic")
+        with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
+            self.heartbeat("free-gemma")
+            self.failed(lane="free-gemma")
+            self.run_pass()
+        names = self.fake.names(12)
+        self.assertNotIn("wait:incident", names)
+        self.assertNotIn("lane:free-gemma", names)
+        self.assertIn("lane:anthropic", names)
+        retry = [b for b in self.bodies() if b.startswith("Automatic retry")]
+        self.assertEqual(len(retry), 1, self.bodies())
+        self.assertIn("(transient): moved from lane free-gemma to lane anthropic", retry[0])
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        held = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
+        self.assertNotIn("%s#12" % REPO, held)
+
     def test_incident_filing_failure_is_named_in_ticket_status(self):
         self.heartbeat("muse")
         self.failed(reason="[factory] setup failed: incident filing failed")
