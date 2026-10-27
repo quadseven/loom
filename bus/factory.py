@@ -162,7 +162,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, bench, brain, brain_hold, brief_check, change_class, converge, criteria_gate, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brain_hold, brief_check, change_class, converge, criteria_gate, flake, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from . import runners
@@ -2266,6 +2266,11 @@ class Factory:
                                       True)):
             details = brain._pr_graphql(self.gh, repo, number)
             faults = pr_faults(details, full, runs)
+        # An infra timeout is re-run whatever else fails on the head: the
+        # review check failing beside it kept _run_again from ever re-running
+        # it, and the fix round then read it as a stuck failure (loom#1962).
+        if "failing checks" in faults and self._rerun_infra_flakes(repo, number, sha):
+            return
         if faults == ["failing checks"] and (
                 self._split_pr(repo, number, full, issue, comments, sha)
                 or self._repair_body_leak(repo, number, full, issue, comments, sha)
@@ -2778,6 +2783,27 @@ class Factory:
             self.gh.rest("POST", "/repos/%s/actions/runs/%s/rerun-failed-jobs" % (repo, run_id))
         self.actions += 1
         _say("re-ran failed jobs on %s#%d once before sending it back" % (repo, number))
+        return True
+
+    def _rerun_infra_flakes(self, repo: str, number: int, sha: str) -> bool:
+        """Re-run, once, the failed Actions jobs on this head that failed on
+        the infrastructure (bus/flake.py), even when the review check failed
+        too: its findings still go back to the lane on a later pass, with the
+        flake gone. False when no such job is on its first attempt, or when
+        GitHub refused a read or the re-run: the pull request then goes the
+        usual paths, as it did before this re-run existed."""
+        runs = self._runs.get(sha, [])
+        try:
+            names = flake.flaky_names(self.gh, repo, runs, (self.review_check, self.plan_check))
+            if not names or not flake.rerun_once(self.gh, repo, runs, names):
+                return False
+        except GitHubError as err:
+            _say("could not re-run infra-failed jobs on %s#%d (%s); judged as usual"
+                 % (repo, number, err))
+            return False
+        self.actions += 1
+        _say("re-ran %s on %s#%d once: an infra failure, not the change"
+             % (", ".join(sorted(names)), repo, number))
         return True
 
     def _review_again(self, repo: str, number: int, full: Dict[str, Any],
