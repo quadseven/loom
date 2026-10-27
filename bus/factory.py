@@ -30,7 +30,10 @@ Neither needs a model:
   request that is behind its base is brought up to date first (GitHub's
   update-branch), and lands only once its checks and review pass again on
   the new head. Each repo lands at most one pull request a pass, so the
-  next one is checked against the base that includes it. A ready pull
+  next one is checked against the base that includes it. The one brought up
+  to date holds the repo's landing lock (bus/landing.py, loom:landing) for
+  up to 40 minutes, and no other pull request there is updated or landed
+  meanwhile, so main does not move under it (loom#2066). A ready pull
   request held for the operator is brought up to date the same way while it
   waits, so it does not drift into a conflict; it still never lands here. Pull requests of
   loom:urgent and loom:regression tickets land first, then by priority,
@@ -169,7 +172,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, bench, brain, brain_hold, brief_check, change_class, converge, criteria_gate, flake, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brain_hold, brief_check, change_class, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from . import runners
@@ -1628,6 +1631,9 @@ class Factory:
         self.load: Dict[str, int] = {}
         self.landed: set = set()
         self.updated: set = set()
+        # Repo -> the pull request holding its landing lock, or None; read
+        # once a pass (bus/landing.py).
+        self.locks: Dict[str, Optional[int]] = {}
         # Repos where a held pull request was brought up to date this pass
         # (_keep_current), apart from `updated` so it never delays a landing.
         self.kept_current: set = set()
@@ -3096,9 +3102,13 @@ class Factory:
         """Merge a ready pull request that is up to date with its base, one a
         repo a pass; bring one that is behind up to date instead. A pull
         request that cannot be brought up to date cleanly goes back for a
-        fix round, as a conflict does."""
+        fix round, as a conflict does. The one brought up to date takes the
+        repo's landing lock; while another holds it, this does neither."""
         if repo in self.landed:
             return
+        held = self._lock(repo)
+        if held is not None and held != number:
+            return  # another pull request holds the repo's landing lock
         if self._behind(repo, full):
             if repo in self.updated:
                 return
@@ -3109,10 +3119,15 @@ class Factory:
             if done.status == 422:
                 self._send_back(repo, full, issue, comments,
                                 "could not be brought up to date with its base")
+                if held == number:
+                    self._unlock(repo, number)
                 # keep repo in updated to retry on next pass
                 return
             # reset updated for future merges
             self.updated.remove(repo)
+            if held is None:
+                landing.mark(self.gh, repo, number)
+                self.locks[repo] = number
             self.actions += 1
             _say("brought %s#%d up to date with its base; it lands once its checks "
                  "and review pass on the new head" % (repo, number))
@@ -3121,6 +3136,19 @@ class Factory:
             return
         if self._merge(repo, number, issue, str((full.get("head") or {}).get("sha") or "")):
             self.landed.add(repo)
+            if held == number:
+                self._unlock(repo, number)
+
+    def _lock(self, repo: str, pulls: Optional[List[Dict[str, Any]]] = None) -> Optional[int]:
+        """The pull request holding the repo's landing lock, read once a pass
+        (bus/landing.py releases an expired one as it reads)."""
+        if repo not in self.locks:
+            self.locks[repo] = landing.holder(self.gh, repo, self.now, pulls)
+        return self.locks[repo]
+
+    def _unlock(self, repo: str, number: int) -> None:
+        landing.release(self.gh, repo, number)
+        self.locks[repo] = None
 
     def _scope_holds(self, repo: str, number: int, full: Dict[str, Any],
                      issue: Dict[str, Any]) -> bool:
@@ -4208,6 +4236,9 @@ class Factory:
         closed_numbers = self._close_superseded_prs(repo, all_prs, tickets)
         prs = [p for p in all_prs if self._trusted(p) and int(p.get("number") or 0) not in closed_numbers]
         linked = {a[1]: pr for pr in prs for a in [self._association(repo, pr)] if a}
+        # Read first, so an expired lock comes off even when nothing lands.
+        self._guarded(lambda r, _: self._lock(r, [p for p in all_prs if int(
+            p.get("number") or 0) not in closed_numbers]), repo, {})
         for pr in landing_order(prs, tickets, linked):
             if self.actions >= MAX_ACTIONS:
                 return
