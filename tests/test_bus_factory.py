@@ -146,8 +146,12 @@ class FakeGitHub:
             # A one-line change, unless the test gave the file its own patch.
             return Response(200, [{"filename": n, "patch": self.patches.get(
                 n, "@@ -1 +1 @@\n-old\n+new")} for n in names])
+        if path == "/repos/%s/commits/main" % REPO:
+            return Response(200, {"sha": "shamain"})
         m = re.search(r"/commits/(\w+)/check-runs", path)
         if m:
+            if m.group(1) == "shamain":
+                return Response(200, {"check_runs": self.runs.get("shamain", [])})
             return Response(200, {"check_runs": self.runs[m.group(1)]})
         m = re.search(r"/compare/main\.\.\.sha(\d+)$", path)
         if m:
@@ -173,7 +177,9 @@ class FakeGitHub:
         raise AssertionError("unexpected GET %s" % path)
 
     def transport(self, method, url, headers, body):
-        return 200, {}, self.logs[url.rsplit("/", 1)[1]].encode("utf-8")
+        # A job with no log given answers as an expired log does.
+        log = self.logs.get(url.rsplit("/", 1)[1])
+        return (404, {}, b"") if log is None else (200, {}, log.encode("utf-8"))
 
     def _write(self, method, path, body):
         self.writes.append((method, path, body))
@@ -267,7 +273,7 @@ class Base(unittest.TestCase):
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
                 raise GitHubError("PUT /repos/%s/pulls/%d/merge -> 405" % (repo, number), 405)
             self.merged.append((number, ticket))
-        def fix(gh, repo, number, ticket, notes, lane=None, model=None):
+        def fix(gh, repo, number, ticket, notes, lane=None, model=None, authors=None):
             f.notes = notes
             if lane:
                 gh.issues[ticket[1]]["labels"] = [
@@ -692,10 +698,12 @@ class PullRequests(Base):
         self.assertEqual(self.model(6), "claude-sonnet-5-5")
 
     def test_age_climbs_once_per_window_not_every_round(self):
+        # An open thread, not a conflict: a conflict alone never climbs, by
+        # age either (loom#1963).
         self.gh.ticket(5, "pr")
         self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME,
                                  "created_at": iso(3600)}, CLAIM]
-        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 2)
+        self.gh.pull(50, 5, resolved=False, created=factory.STUCK_AGE * 2)
         self.go()
         self.assertEqual(self.model(5), None, "climbed an hour after the last climb")
         self.assertEqual(len(self.fixed), 1)
@@ -706,10 +714,37 @@ class PullRequests(Base):
 
     def test_an_old_pull_request_climbs_on_its_first_send_back(self):
         self.gh.ticket(5, "pr")
-        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE + 60)
+        self.gh.pull(50, 5, resolved=False, created=factory.STUCK_AGE + 60)
         self.go()
         self.assertEqual(self.model(5), "claude-sonnet-5-5")
         self.assertEqual(len(self.fixed), 1)
+
+    def test_an_old_conflicting_pull_request_gets_a_brief_on_its_lane_without_climbing(self):
+        # loom#1963: a ready pull request that hand merges left conflicting
+        # read as stuck by age, and waited for a rung instead of a brief.
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.issues[5]["labels"].append({"name": "loom:ready"})
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM]
+        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 3)
+        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.model(5), None)
+        self.assertEqual((self.moved, self.closed), ([], []))
+
+    def test_a_conflict_past_the_last_rung_gets_a_brief_not_a_give_up(self):
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.comments[5] += ALL_RUNGS
+        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 3)
+        self.go()
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual((self.moved, self.closed), ([], []))
+
+    def test_a_conflict_on_a_ticket_a_person_holds_gets_no_brief(self):
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5]["labels"].append({"name": "loom:human"})
+        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 3)
+        self.go()
+        self.assertEqual((self.fixed, self.moved, self.closed, self.merged), ([], [], [], []))
 
     def test_the_rungs_go_sonnet_then_sol_then_opus(self):
         self.gh.ticket(5, "pr")
@@ -924,6 +959,53 @@ class PullRequests(Base):
             "brought %s#50 up to date with its base; it lands once its checks "
             "and review pass on the new head" % REPO)
 
+    def test_a_held_ready_pull_request_behind_its_base_is_kept_current_never_merged(self):
+        # loom#1963: a pull request held for the operator never reached
+        # _land, the only update-branch call, so it drifted into a conflict.
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 4
+        with mock.patch.object(factory.Factory, "_operator_holds", return_value=True):
+            self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+        self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
+                       {"expected_head_sha": "sha50"}), self.gh.writes)
+
+    def test_a_held_pull_request_up_to_date_with_its_base_is_left_alone(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        with mock.patch.object(factory.Factory, "_risk_holds", return_value=True):
+            self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+        self.assertEqual([w for w in self.gh.writes if w[1].endswith("/update-branch")], [])
+
+    def test_a_held_pull_request_whose_update_is_refused_is_not_sent_back(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 1
+        self.gh.update_status = 422
+        with mock.patch.object(factory.Factory, "_operator_holds", return_value=True):
+            self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_a_held_update_does_not_stop_another_pull_request_landing(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=7200)
+        self.gh.behind[50] = 2
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6, created=3600)
+        self.gh.behind[60] = 2
+        real = factory.Factory._operator_holds
+        with mock.patch.object(factory.Factory, "_operator_holds", autospec=True,
+                               side_effect=lambda f, repo, number, *a, **k:
+                               number == 50 or real(f, repo, number, *a, **k)):
+            self.go()
+        self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
+                       {"expected_head_sha": "sha50"}), self.gh.writes)
+        self.assertIn(("PUT", "/repos/%s/pulls/60/update-branch" % REPO,
+                       {"expected_head_sha": "sha60"}), self.gh.writes)
+        self.assertEqual(self.merged, [])
+
     def test_a_refused_update_goes_back_for_a_fix_round_like_a_conflict(self):
         # 2026-10-20: an update that cannot be applied cleanly goes back for
         # a fix round, as a conflict does, instead of silently waiting.
@@ -1011,12 +1093,125 @@ class PullRequests(Base):
         self.go()
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
 
+    def _red_from_base(self, base_conclusion="success", behind=2, failing="unittest"):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": failing, "status": "completed", "conclusion": "failure",
+             "details_url": "https://github.com/%s/actions/runs/77/job/1" % REPO},
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "success"}]
+        self.gh.behind[50] = behind
+        self.gh.runs["shamain"] = [
+            {"name": "unittest", "status": "completed", "conclusion": base_conclusion}]
+
+    UPDATE = ("PUT", "/repos/%s/pulls/50/update-branch" % REPO, {"expected_head_sha": "sha50"})
+
+    def test_a_check_red_from_the_base_and_green_on_main_is_updated_not_sent_back(self):
+        # loom#1961: four pull requests failed tests their main had fixed;
+        # a re-run reuses the old merge commit, and a fix round waits on a lane.
+        self._red_from_base()
+        f = self.go()
+        self.assertIn(self.UPDATE, self.gh.writes)
+        self.assertEqual((self.fixed, self.merged), ([], []))
+        self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
+        self.assertEqual(f.actions, 1)
+
+    def test_a_check_also_red_on_main_is_run_again_not_updated(self):
+        self._red_from_base(base_conclusion="failure")
+        self.go()
+        self.assertNotIn(self.UPDATE, self.gh.writes)
+        self.assertIn(("POST", "/repos/%s/actions/runs/77/rerun-failed-jobs" % REPO, None),
+                      self.gh.writes)
+
+    def test_a_check_that_never_ran_on_main_is_not_updated(self):
+        self._red_from_base(failing="e2e")
+        self.go()
+        self.assertNotIn(self.UPDATE, self.gh.writes)
+        self.assertIn(("POST", "/repos/%s/actions/runs/77/rerun-failed-jobs" % REPO, None),
+                      self.gh.writes)
+
+    def test_a_red_pull_request_up_to_date_with_main_is_not_updated(self):
+        self._red_from_base(behind=0)
+        self.gh.attempts["77"] = 2
+        self.go()
+        self.assertNotIn(self.UPDATE, self.gh.writes)
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_failed_review_never_takes_the_update_path(self):
+        self._red_from_base()
+        self.gh.runs["sha50"][1]["conclusion"] = "failure"
+        self.gh.runs["shamain"].append(
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "success"})
+        self.go()
+        self.assertNotIn(self.UPDATE, self.gh.writes)
+        self.assertEqual(len(self.fixed), 1)
+
+    def test_a_refused_update_of_a_base_red_check_falls_back_to_the_old_path(self):
+        self._red_from_base()
+        self.gh.update_status = 422
+        self.gh.attempts["77"] = 2
+        self.go()
+        self.assertIn(self.UPDATE, self.gh.writes)
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+
     def test_a_failed_review_is_never_run_again(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, green=False)
         self.gh.runs["sha50"] = [
             {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
              "details_url": "https://github.com/%s/actions/runs/78/job/1" % REPO}]
+        self.go()
+        self.assertEqual(len(self.fixed), 1)
+        self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
+
+    INSTALL_TIMEOUT = ("Setting up build-essential ...\n"
+                       "##[error]The action 'Install what the core's own Dockerfile installs' "
+                       "has timed out after 10 minutes.")
+
+    def flaky_head(self, log):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"id": 501, "name": "adapter", "status": "completed", "conclusion": "failure",
+             "details_url": "https://github.com/%s/actions/runs/88/job/501" % REPO},
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
+             "output": {"title": "FAIL Elder found 1 problem", "summary": "Fix the null check."},
+             "details_url": "https://grug.example"}]
+        self.gh.logs["501"] = log
+
+    def test_an_infra_timeout_is_run_again_even_when_the_review_also_failed(self):
+        # loom#1962: the adapter job timed out installing packages beside a
+        # failing review; _run_again refused on the review and the job was
+        # never re-run, so the fix round read it as a stuck failure.
+        self.flaky_head(self.INSTALL_TIMEOUT)
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertIn(("POST", "/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO, None),
+                      self.gh.writes)
+        self.assertEqual(self.merged, [])
+
+    def test_an_infra_timeout_on_its_second_attempt_goes_back_as_before(self):
+        self.flaky_head(self.INSTALL_TIMEOUT)
+        self.gh.attempts["88"] = 2
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
+
+    def test_a_refused_rerun_of_an_infra_timeout_is_judged_as_usual(self):
+        self.flaky_head(self.INSTALL_TIMEOUT)
+        write = self.gh._write
+
+        def refuse(method, path, body):
+            if path.endswith("/rerun-failed-jobs"):
+                raise GitHubError("POST %s -> 500" % path, 500)
+            return write(method, path, body)
+        self.gh._write = refuse
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_real_test_failure_beside_a_failed_review_is_not_run_again(self):
+        self.flaky_head("FAILED tests/test_a.py::test_x - assert 1 == 2\n##[error]Process completed "
+                        "with exit code 1.")
         self.go()
         self.assertEqual(len(self.fixed), 1)
         self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
@@ -2110,7 +2305,7 @@ class SendBackNeedsAFinding(Base):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, green=False)
         refused = []
-        def fix(gh, repo, number, ticket, notes, lane=None, model=None):
+        def fix(gh, repo, number, ticket, notes, lane=None, model=None, authors=None):
             refused.append(number)
             return False
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"], fix=fix,
@@ -2954,6 +3149,17 @@ class Tickets(Base):
         self.assertEqual(factory.TIERS["medium"][6:11], factory.FREE_POOL)
         self.assertEqual(factory.lanes_of("medium", True)[4:7],
                          ("free-ollama", "free-gemma", "openrouter"))
+
+    def test_a_slot_on_cluster_runners_never_takes_a_private_repos_ticket(self):
+        # A runner's inputs and logs live in the public repo's Actions, so the
+        # dispatch refuses a private repo; the factory gave free-gemma private
+        # tickets anyway, each costing a claim and a park (2026-10-27).
+        with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
+            self.assertNotIn("free-gemma", factory.lanes_of("medium", True))
+            self.assertIn("free-gemma", factory.lanes_of("medium", False))
+            self.assertTrue(factory.public_only("free-gemma"))
+        self.assertIn("free-gemma", factory.lanes_of("medium", True))
+        self.assertFalse(factory.public_only("free-gemma"))
 
     def test_the_free_lanes_take_medium_work_before_the_paid_codex_lanes(self):
         # Operator 2026-10-19: "I always want my free tier used up".

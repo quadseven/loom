@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -662,6 +663,11 @@ class FilerTest(unittest.TestCase):
         self.gh = FakeGH()
         self.said = []
         self.state = {}
+        # The Filer reads only trusted comments (loom#1956); the fake writes
+        # every comment as AUTHOR.
+        patcher = mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": AUTHOR})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def file(self, breach, now=T0, write=True):
         invariants.Filer(self.gh, REPO, GOAL, self.state, now, self.said.append, write).run([breach])
@@ -866,7 +872,7 @@ class FilerTest(unittest.TestCase):
         self.assertEqual(self.gh.issues[number]["state"], "open")
         self.gh.comments[(REPO, number)].append(
             {"id": 900, "body": "The invariant cleared by x; its last breach was observed earlier.",
-             "created_at": stamp(T0 - 3 * 3600)})
+             "created_at": stamp(T0 - 3 * 3600), "user": {"login": AUTHOR}})
         self.gh.issues[number].update(state="closed", closed_at=stamp(T0 - 3 * 3600))
         self.file(self.breach(at=T0), now=T0)
         self.assertEqual(self.gh.issues[number]["state"], "open")
@@ -906,8 +912,10 @@ class FilerTest(unittest.TestCase):
         issue = self.gh.issues[number]
         issue.update(created_at=stamp(T0 - 7 * 3600), labels=[{"name": x} for x in invariants.LABELS])
         self.gh.comments[(REPO, number)] = [
-            {"body": "Broken again after this was closed: evidence", "created_at": stamp(T0 - 2 * 86400)},
-            {"body": "Broken again after this was closed: evidence", "created_at": stamp(T0 - 86400)},
+            {"body": "Broken again after this was closed: evidence", "created_at": stamp(T0 - 2 * 86400),
+             "user": {"login": AUTHOR}},
+            {"body": "Broken again after this was closed: evidence", "created_at": stamp(T0 - 86400),
+             "user": {"login": AUTHOR}},
         ]
         invariants.Filer(self.gh, REPO, GOAL, self.state, T0, self.said.append).run([])
         self.assertEqual(issue["state"], "open")

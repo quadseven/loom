@@ -931,10 +931,13 @@ def _checked(line: str) -> str:
 
 class Filer:
     def __init__(self, gh: Any, repo: str, goal: int, state: Dict[str, Any], now: float,
-                 say: Say, write: bool = True) -> None:
+                 say: Say, write: bool = True,
+                 authors: Optional[Sequence[str]] = None) -> None:
         """gh files in repo under goal home #goal. state maps a breach key to
         its issue number and is changed in place (the caller keeps it);
-        write False (the GitHub budget is low) files nothing this pass."""
+        write False (the GitHub budget is low) files nothing this pass.
+        `authors` (default brain.trusted_authors()) are the logins whose
+        comments it reads: a stranger's marker is data."""
         self.gh = gh
         self.repo = repo
         self.goal = goal
@@ -942,6 +945,7 @@ class Filer:
         self.now = now
         self.say = say
         self.write = write
+        self.authors = list(brain.trusted_authors() if authors is None else authors)
         self.writes = 0
         self._listed: Optional[Dict[str, int]] = None
         # Issue numbers the listing found closed: clearing skips them unread.
@@ -1170,8 +1174,8 @@ class Filer:
         return True
 
     def _comments(self, number: int) -> List[Dict[str, Any]]:
-        return [c for c in self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100"
-                                            % (self.repo, number)) if isinstance(c, dict)]
+        return brain.trusted_comments(self.gh.paginate(
+            "/repos/%s/issues/%d/comments?per_page=100" % (self.repo, number)), self.authors)
 
     def _rolled_into(self, key: str, current: Dict[str, Breach]) -> Optional[int]:
         """The open rolling issue an older issue of the same invariant now
