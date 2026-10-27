@@ -575,11 +575,11 @@ PASS_STEP_BUDGET = 300
 # log and exits, so launchd starts a fresh pass (loom#1921): on 2026-10-26 a
 # pass sat for 27 minutes with nothing in the log to say where. The default
 # sits above a legitimate daily metrics build (about 30 minutes on 2026-10-26)
-# until that build is bounded on its own (loom#1924). PASS_DEADLINE_FILE,
+# until that build is bounded on its own (loom#1924). DEADLINE_MARKER_FILE,
 # written when the deadline is armed and removed when the pass ends, lets the
 # next pass say the last one overran.
 PASS_DEADLINE = 3600
-PASS_DEADLINE_FILE = "pass-deadline.json"
+DEADLINE_MARKER_FILE = "pass-deadline.json"
 STEP_ROTATION_FILE = "step-rotation.json"
 # A pass step that takes this long is logged with its time and requests, so a
 # long pass names its cause: on 2026-10-24 passes ran 25 to 98 minutes and
@@ -1291,7 +1291,7 @@ def _deadline_stream() -> Any:
 def _arm_pass_deadline(state: str, seconds: int, now: float) -> Optional[str]:
     """Say whether the last pass overran, then arm this pass's deadline and
     write its marker. Returns the marker's path, or None when off."""
-    path = os.path.join(state, "station", PASS_DEADLINE_FILE)
+    path = os.path.join(state, "station", DEADLINE_MARKER_FILE)
     last = _read_json(path, None, strict=False)
     if isinstance(last, dict):
         started = last.get("started")

@@ -46,7 +46,7 @@ class PassDeadline(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.home = os.path.join(self._tmp.name, "loom")
-        self.marker = os.path.join(self.home, "state", "station", station.PASS_DEADLINE_FILE)
+        self.marker = os.path.join(self.home, "state", "station", station.DEADLINE_MARKER_FILE)
 
     def quiet_pass(self, settings, run_pass=lambda self: None):
         err = io.StringIO()
