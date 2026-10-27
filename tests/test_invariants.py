@@ -66,6 +66,8 @@ class FakeGH:
         self.subs = {}
         # repo -> its open loom:ticket issues.
         self.tickets = {}
+        # Issues GitHub refuses a further sub-issue under (HTTP 422).
+        self.refuse_subs = set()
 
     def paginate(self, path):
         self.calls.append(("GET", path))
@@ -102,6 +104,8 @@ class FakeGH:
         if method == "GET" and path.startswith("/search/issues?"):
             return Response(200, {"items": self.search_items})
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/sub_issues", path)
+        if method == "POST" and m and int(m.group(2)) in self.refuse_subs:
+            raise GitHubError("Validation Failed: sub-issue limit reached", 422)
         if method == "POST" and m:
             child = next((i for i in self.issues.values() if i.get("id") == body["sub_issue_id"]),
                          None)
@@ -625,6 +629,32 @@ class StationTest(StationBase):
                 self.run_at(T0 + invariants.CLEAR_AFTER + 3 * invariants.CHECK_EVERY)
                 self.assertEqual(filed[0]["state"], "closed", self.said)
 
+    def test_epic_over_cap_counts_sub_issues_and_part_of_links_once(self):
+        """loom#2023: 13 sub-issues plus 4 issues linked only by a Part of
+        line (one of them closed) are 17 tickets, not 16."""
+        part_of = lambda n, state="open": dict(ticket(n, state), body="Why.\n\nPart of #40\n")  # noqa: E731
+        subs = [ticket(n) for n in range(50, 63)]
+        self.gh.subs[(REPO, GOAL)] = [epic(40)]
+        self.gh.subs[(REPO, 40)] = subs
+        self.gh.tickets[REPO] = subs + [part_of(70), part_of(71), part_of(72)]
+        # The search finds every Part of #40 issue, the closed one too, and a
+        # sub-issue that also says so is still counted once.
+        self.gh.search_items = [part_of(70), part_of(71), part_of(72),
+                                part_of(73, "closed"), part_of(50)]
+        self.run_at(T0)
+        (filed,) = self.gh.filed()
+        self.assertIn("Epic #40 holds 17 tickets (cap 15)", filed["title"])
+
+    def test_epic_over_cap_flags_the_standing_repairs_epic_at_the_sub_issue_limit(self):
+        repairs = dict(epic(50), title=brain.REPAIRS_TITLE,
+                       sub_issues_summary={"total": 100, "completed": 98})
+        self.gh.subs[(REPO, GOAL)] = [repairs]
+        self.gh.subs[(REPO, 50)] = [ticket(n, state="closed") for n in range(200, 300)]
+        self.run_at(T0)
+        (filed,) = self.gh.filed()
+        self.assertIn("Epic #50 holds 100 sub-issues (GitHub's limit 100)", filed["title"])
+        self.assertIn("`epic-over-cap`", filed["body"])
+
     def test_a_goal_home_exception_raises_its_epic_cap(self):
         self.gh.goal_issues[REPO][0]["body"] = "Epic cap: 8 until 2999-12-31\n"
         self.gh.subs[(REPO, GOAL)] = [epic(n) for n in range(40, 47)]
@@ -691,6 +721,29 @@ class FilerTest(unittest.TestCase):
         self.file(invariants.Breach("goal-full", "x/y#2", "Another", ("line",), T0))
         self.assertEqual(len([i for i in self.gh.issues.values()
                               if i.get("title") == brain.REPAIRS_TITLE]), 1)
+
+    def test_a_refused_sub_issue_link_rolls_over_to_a_batch_epic_and_is_logged(self):
+        """loom#2023: GitHub answered 422 for the repairs epic at its
+        sub-issue limit, and the issue kept only a Part of line naming it."""
+        self.gh.issues[GOAL] = {"number": GOAL, "id": 9000 + GOAL, "state": "open",
+                                "title": "Goal", "labels": [{"name": "loom:goal"}], "body": ""}
+        repairs = dict(epic(50), title=brain.REPAIRS_TITLE)
+        batch = dict(epic(60), title="Epic: factory repairs the brain finds by hand, batch 2")
+        self.gh.subs[(REPO, GOAL)] = [repairs, batch]
+        self.gh.subs[(REPO, 50)] = [ticket(n, state="closed") for n in range(200, 299)]
+        self.gh.subs[(REPO, 60)] = [ticket(7)]
+        self.gh.refuse_subs.add(50)
+        self.file(self.breach())
+        (filed,) = [i for i in self.gh.issues.values() if "loom:invariant" in i.get("labels", [])]
+        self.assertTrue(filed["body"].rstrip().endswith("Part of #60"), filed["body"])
+        self.assertNotIn("Part of #50", filed["body"])
+        self.assertIn(filed["number"], [c["number"] for c in self.gh.subs[(REPO, 60)]])
+        self.assertTrue(any("HTTP 422" in line and "#50" in line for line in self.said),
+                        self.said)
+        # The next filing this pass goes straight to the batch.
+        self.file(invariants.Breach("goal-full", "x/y#2", "Another", ("line",), T0))
+        later = [i for i in self.gh.issues.values() if i.get("title") == "Another"][0]
+        self.assertTrue(later["body"].rstrip().endswith("Part of #60"), later["body"])
 
     def rolling(self, title, evidence, at=T0):
         return invariants.Breach("ticket-outside-epic", invariants.OUTSIDE_EPIC_SUBJECT,
@@ -1502,6 +1555,16 @@ class StandingEpicTest(unittest.TestCase):
         f = Facts(T0, shapes=[invariants.GoalShape(goal, 6, epics + (repairs,), ())])
         self.assertEqual(invariants.epic_over_cap(f), [])
         self.assertEqual(invariants.goal_epics_over_cap(f), [])
+
+    def test_any_open_epic_at_the_sub_issue_limit_is_flagged_standing_or_not(self):
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        repairs = invariants.EpicShape(Ref("%s#50" % REPO, "#50"), True, 100, (), True, 100)
+        batch = invariants.EpicShape(Ref("%s#51" % REPO, "#51"), True, 100, (), False, 100)
+        done = invariants.EpicShape(Ref("%s#52" % REPO, "#52"), False, 15, (), True, 100)
+        f = Facts(T0, shapes=[invariants.GoalShape(goal, 6, (repairs, batch, done), ())])
+        found = invariants.epic_over_cap(f)
+        self.assertEqual([b.subject for b in found], ["%s#50" % REPO, "%s#51" % REPO])
+        self.assertIn("100 sub-issues", found[0].title)
 
 
 class RollPinOffTest(StationBase):

@@ -422,6 +422,17 @@ It holds any number of tickets, does not count against the 6 open epics, and
 is never flagged as finished. The asks digest groups an ask that names an
 epic under that epic's goal.
 
+GitHub holds at most 100 sub-issues under one issue. Once the standing epic
+holds that many, or GitHub answers 422 to a link under it, repairs roll over
+to the newest open factory repairs batch epic (an epic whose title starts
+"Epic: factory repairs", the goal's own or another in the repo) holding fewer
+than 15 tickets; when none has room, "Epic: factory repairs for this goal,
+next batch" opens even when the goal is at its open epic cap. The filer
+logs each rollover, and the filed issue's `Part of` line names the batch
+epic. `epic-over-cap` counts an epic's tickets as its sub-issues and every
+loom:ticket issue, open or closed, whose `Part of` line names it, each once,
+and flags any open epic, the standing one too, that holds 100 sub-issues.
+
 Triage, the rewriter, health intake, validation contracts and pull request
 adoption file under the goal's intake epic ("Epic: work that triage,
 rewrites and health intake find"): the newest open one holding fewer than 15

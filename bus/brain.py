@@ -1442,6 +1442,39 @@ def _sub_issue_of(issue: Dict[str, Any], repo: str, goal: int) -> bool:
     return str(issue.get("parent_issue_url") or "").endswith("/repos/%s/issues/%d" % (repo, goal))
 
 
+# GitHub search allows five operators: four ORs join five Part of phrases.
+PART_OF_BATCH = 5
+
+
+def part_of_linked(gh: GitHub, repo: str, epics: Sequence[int]
+                   ) -> Dict[int, List[Dict[str, Any]]]:
+    """For each epic, the loom:ticket issues, open or closed, whose body has
+    a Part of line naming it: one search per PART_OF_BATCH epics. goal_tree
+    reads only open ones, so a closed ticket linked by its Part of line alone
+    went uncounted (loom#2023: 13 sub-issues and 4 such links read as 16)."""
+    out: Dict[int, List[Dict[str, Any]]] = {int(n): [] for n in epics}
+    numbers = sorted(out)
+    for start in range(0, len(numbers), PART_OF_BATCH):
+        chunk = numbers[start:start + PART_OF_BATCH]
+        phrases = " OR ".join('"%s"' % part_of_line(n) for n in chunk)
+        q = quote("repo:%s is:issue label:loom:ticket in:body %s" % (repo, phrases))
+        url: Optional[str] = "/search/issues?q=%s&per_page=100" % q
+        for _ in range(SEARCH_PAGES):
+            if not url:
+                break
+            resp = gh.rest("GET", url)
+            data = resp.data if isinstance(resp.data, dict) else {}
+            for item in data.get("items") or []:
+                if (not isinstance(item, dict) or "pull_request" in item
+                        or "loom:ticket" not in _labels(item)):
+                    continue
+                for n in chunk:
+                    if _names_goal(item.get("body"), n):
+                        out[n].append(item)
+            url = _next_link(resp.headers.get("link", ""))
+    return out
+
+
 def unassociated_tickets(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
     """loom:ticket issues that say Part of #goal but are neither its sub-issues
     nor carry the line on a line of its own, nor sit under one of its epics, so
@@ -1595,6 +1628,16 @@ REPAIRS_BODY = (
     "15-ticket cap, is not counted against the goal's open epic cap, and is never "
     "flagged as finished.\n\n"
     "Size: no cap (a standing epic).\n")
+# Every factory repairs epic's title starts so: the standing one, and the
+# batch epics repairs roll over to once it holds GitHub's sub-issue limit.
+REPAIRS_PREFIX = "Epic: factory repairs"
+REPAIRS_BATCH_TITLE = "Epic: factory repairs for this goal, next batch"
+REPAIRS_BATCH_BODY = (
+    "Done when: every ticket under this epic is closed. It holds at most %d tickets; "
+    "the next factory repair past that opens a new batch.\n\n"
+    "Size: at most %d tickets.\n\n"
+    "The goal's standing factory repairs epic holds GitHub's limit of 100 sub-issues, "
+    "so the station files new factory repairs in batch epics like this one.\n")
 
 
 def standing_epic(epic: Dict[str, Any]) -> bool:
@@ -1964,13 +2007,18 @@ def placement_epic(gh: GitHub, repo: str, named: int, room: int = 1) -> int:
         if not isinstance(issue, dict) or "pull_request" in issue:
             break
         if _epic_label(issue):
+            standing = standing_epic(issue)
             if issue.get("state", "open") == "open" and (
-                    standing_epic(issue)
-                    or len(_epic_tickets(gh, repo, number)) + room <= EPIC_TICKET_CAP):
+                    (standing and sub_issue_count(gh, repo, issue) < SUB_ISSUE_LIMIT)
+                    or (not standing
+                        and len(_epic_tickets(gh, repo, number)) + room <= EPIC_TICKET_CAP)):
                 return number
             parent = _issue_goal(issue)
             if parent is None or parent == number:
                 break
+            if standing or repairs_batch(issue):
+                # A full repairs epic: the repair goes to a batch with room.
+                return repairs_epic(gh, repo, parent, room, full=(number,))
             return intake_epic(gh, repo, parent, room)
         if "loom:goal" in _labels(issue):
             return intake_epic(gh, repo, number, room)
@@ -1992,17 +2040,83 @@ def repo_goal(gh: GitHub, repo: str) -> Optional[int]:
     return homes[0][1] if homes else None
 
 
-def repairs_epic(gh: GitHub, repo: str, goal: int) -> int:
+def repairs_epic(gh: GitHub, repo: str, goal: int, room: int = 1,
+                 full: Sequence[int] = ()) -> int:
     """The goal's standing "Factory repairs" epic, opened when it has none
     (outside the epic cap): where breach invariants, revert, fix-forward and
-    red-check tickets are filed."""
+    red-check tickets are filed. Once it holds GitHub's limit of
+    SUB_ISSUE_LIMIT sub-issues, or is named in `full` (GitHub just refused a
+    link to it), repairs roll over to the newest open factory repairs batch
+    epic with room for `room` more tickets, and a next batch epic opens when
+    none has room (loom#2023: the standing epic sat at 100 sub-issues and new
+    repairs got only a Part of line naming it)."""
     _, tree = goal_tree(gh, repo, goal)
-    for found, _ in tree:
+    for found, held in tree:
         if found.get("state", "open") == "open" and standing_epic(found):
-            return int(found["number"])
+            number = int(found["number"])
+            if number not in full and sub_issue_count(gh, repo, found, held) < SUB_ISSUE_LIMIT:
+                return number
+            return repairs_batch_epic(gh, repo, goal, tree, room, full)
     made = file_epic(gh, repo, goal, REPAIRS_TITLE, REPAIRS_BODY, standing=True)
     if not made.get("number"):
         raise ValueError("GitHub named no number for the repairs epic of goal #%d" % goal)
+    return int(made["number"])
+
+
+def sub_issue_count(gh: GitHub, repo: str, epic: Dict[str, Any],
+                    held: Optional[List[Dict[str, Any]]] = None) -> int:
+    """How many sub-issues GitHub holds under the epic: its
+    sub_issues_summary total, else its listed tickets (`held`, read when not
+    given)."""
+    summary = epic.get("sub_issues_summary")
+    total = summary.get("total") if isinstance(summary, dict) else None
+    if isinstance(total, int) and not isinstance(total, bool):
+        return total
+    if held is None:
+        held = [c for c in gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
+                                       % (repo, int(epic["number"]))) if isinstance(c, dict)]
+    return len(held)
+
+
+def repairs_batch(epic: Dict[str, Any]) -> bool:
+    """A factory repairs batch epic: an epic titled for factory repairs that
+    is not the standing one. It holds at most EPIC_TICKET_CAP tickets."""
+    title = str(epic.get("title") or "").strip()
+    return title.startswith(REPAIRS_PREFIX) and not standing_epic(epic)
+
+
+def repairs_batch_epic(gh: GitHub, repo: str, goal: int,
+                       tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
+                       room: int = 1, full: Sequence[int] = ()) -> int:
+    """The newest open factory repairs batch epic with room for `room` more
+    tickets, the goal's own or any other in the repo, opened outside the
+    epic cap (as the standing epic is) when none has room. A batch in `full`
+    is skipped."""
+    held_by = {int(e.get("number") or 0): held for e, held in tree}
+    batches: Dict[int, Dict[str, Any]] = {}
+    for epic, _ in tree:
+        if epic.get("state", "open") == "open" and repairs_batch(epic):
+            batches[int(epic.get("number") or 0)] = epic
+    for epic in gh.paginate("/repos/%s/issues?labels=epic&state=open&per_page=100" % repo):
+        if (isinstance(epic, dict) and "pull_request" not in epic
+                and epic.get("state", "open") == "open" and repairs_batch(epic)):
+            batches.setdefault(int(epic.get("number") or 0), epic)
+    for number in sorted(batches, reverse=True):
+        if not number or number in full:
+            continue
+        held = held_by.get(number)
+        if held is None:
+            held = _epic_tickets(gh, repo, number)
+        if (len(held) + room <= EPIC_TICKET_CAP
+                and sub_issue_count(gh, repo, batches[number], held) < SUB_ISSUE_LIMIT):
+            return number
+    print("goal #%d: the factory repairs epic and every batch epic are full; opening the "
+          "next batch" % goal, file=sys.stderr)
+    made = file_epic(gh, repo, goal, REPAIRS_BATCH_TITLE,
+                     REPAIRS_BATCH_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP), standing=True)
+    if not made.get("number"):
+        raise ValueError("GitHub named no number for the next repairs batch epic of goal #%d"
+                         % goal)
     return int(made["number"])
 
 
