@@ -346,9 +346,11 @@ utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
 # shellcheck source=lanes/agent_cli.sh
 . "$LOOM_ROOT/lanes/agent_cli.sh"
 
-# Body of one "## <name>" section of the brief, blank lines dropped.
+# The "## $1" section of $2, blank lines dropped. It runs to the next
+# heading of level one or two, so text under a "### " subheading belongs to
+# it (loom#2031). bus/pr_repair.py::_brief_section reads it the same way.
 section() {
-  awk -v h="## $1" '$0 == h {on=1; next} /^#+ / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
+  awk -v h="## $1" '$0 == h {on=1; next} /^##? / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
 }
 
 # The acceptance criteria of $1, blank lines dropped: its "## Acceptance

@@ -1243,10 +1243,10 @@ def _check_brief_args(title: str, body: str, lane: Optional[str],
     if len(title) > naming.TICKET_TITLE_MAX:
         raise ValueError("a ticket title is one outcome sentence of at most %d characters "
                          "(docs/NAMING.md)" % naming.TICKET_TITLE_MAX)
-    if any(section not in body for section in SECTIONS if section != "## Size") \
-            or hunt_plan.stated_size(body) is None:
-        raise ValueError("body must contain all required sections (Size as %s)"
-                         % hunt_plan.SIZE_FORMS)
+    absent = missing_headings(body)
+    if absent or hunt_plan.stated_size(body) is None:
+        raise ValueError("body must contain all required sections (Size as %s)%s"
+                         % (hunt_plan.SIZE_FORMS, "".join("; " + a for a in absent)))
     found = plan_problems(body)
     if found:
         raise ValueError("the pull request this brief makes would fail the review "
@@ -1267,6 +1267,31 @@ def _check_live_criterion(body: str) -> None:
         raise ValueError("the Live criterion names no exact string the station can look "
                          "for: put the log line, field or endpoint it means in backticks, "
                          "for example `overseer: summoned` or `/api/v2/health`")
+
+
+def missing_headings(body: str) -> List[str]:
+    """Each required section (Size aside) the body lacks as its own "## <name>"
+    line, the line the runner reads it from, as "no ## Why heading". When the
+    name stands under another heading level, the note says where: "no ## Why
+    heading (found ### Why)". A Why kept under a demoted heading was refused
+    as "## Why has 0 words", and readers went looking for a paragraph that
+    was there (loom#2031)."""
+    lines = str(body or "").replace("\r\n", "\n").split("\n")
+    out: List[str] = []
+    for section in SECTIONS:
+        if section == "## Size":
+            continue
+        # As the runner reads it: the exact line, the criteria in any case.
+        if any(line == section or (section == "## Acceptance criteria"
+                                   and line.rstrip().lower() == section.lower())
+               for line in lines):
+            continue
+        name = section[3:].lower()
+        found = next((line for line in lines
+                      if re.fullmatch(r"#+[ \t]+" + re.escape(name) + r"[ \t#:]*",
+                                      line, re.IGNORECASE)), None)
+        out.append("no %s heading%s" % (section, " (found %s)" % found if found else ""))
+    return out
 
 
 def plan_problems(body: str) -> List[str]:
