@@ -30,6 +30,7 @@ from pathlib import Path
 from urllib.parse import quote
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from . import answer
 from . import audit
 from . import bench
 from . import ci_gap
@@ -442,6 +443,11 @@ RETRY_MAX = 2
 # FACTORY_REPO), and the marker and ticket line their bodies carry.
 FACTORY_REPO = "quadseven/loom"
 INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
+# The note that says the station unticked a decision box a lane ticked.
+DECISION_REVERT_MARKER = "<!-- loom:decision-revert v1 -->"
+DECISION_ASK = ("Kind: decision\nA merged pull request already carries this ticket's work, "
+                "but these boxes ask for an operator decision: %s. Decide, tick each box, "
+                "and move the ticket on, or say what to change.")
 # A base check that failed before the agent ran: it could not start (exit
 # 125 to 127) or it was red on the unmodified repo or default branch. On a
 # cluster runner that is often the runner image (a tool the repo's check
@@ -5856,6 +5862,7 @@ class Station:
             return True
         if self._field(text, "Deliverable") == "verify":
             return self._report_verify(lane, kind, repo, number, name)
+        self._revert_decision_ticks(repo, number, lane, text)
         if kind == "done":
             if self._field(text, "Deliverable") == "answer":
                 _say("reported %s#%d answer posted by lane %s" % (repo, number, lane))
@@ -5863,7 +5870,7 @@ class Station:
             if not self._field(text, "Fix-PR") and self._answered(lane, name):
                 prs = {int(n) for n in NAMED_PR_RE.findall(text)}
                 self._post_thread_answers(repo, prs, lane, name, text, None)
-                self._settle_no_change(repo, number, lane, name)
+                self._settle_no_change(repo, number, lane, name, text)
                 _say("reported %s#%d answered by lane %s: nothing to change" % (repo, number, lane))
                 return True
             branch = self._field(text, "Branch")
@@ -6379,7 +6386,36 @@ class Station:
             return plain[:-1] + "; its reason did not pass the text checks and is in the lane log."
         return said
 
-    def _settle_no_change(self, repo: str, number: int, lane: str, name: str) -> None:
+    def _revert_decision_ticks(self, repo: str, number: int, lane: str, brief: str) -> None:
+        """Untick each decision box (bus/criteria_gate.py) that was unticked
+        in the brief and is ticked on the ticket now that the lane reported,
+        unless an operator made the last body edit: only an operator decides.
+        One incident note on the ticket names the boxes. On 2026-10-21 a
+        lane's no-change report ticked a box asking for an operator decision,
+        and every later step read it as decided (loom#2029)."""
+        issue = self._issue(repo, number)
+        body = str(issue.get("body") or "")
+        ticked = criteria_gate.decision_ticks(brief, body)
+        if not ticked:
+            return
+        editor = (self._editor(repo, number) or "").lower()
+        ops = answer.operators(trusted=list(self.s.authors) + list(self.s.briefers))
+        if editor and not editor.endswith("[bot]") and editor in ops:
+            return
+        fixed = criteria_gate.untick(body, ticked)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": fixed})
+        issue["body"] = fixed
+        notify.post(self.gh, repo, number, "%s\nIncident: a decision box was ticked while lane "
+                    "%s ran on this ticket, and only an operator ticks one. Loom unticked it: "
+                    "%s. Tick it yourself once you have decided."
+                    % (DECISION_REVERT_MARKER, lane,
+                       "; ".join(" ".join(t.split())[:criteria_gate.ASK_WIDTH] for t in ticked)),
+                    notify.FAILURE)
+        _say("%s#%d: unticked %d decision box(es) ticked during lane %s's run"
+             % (repo, number, len(ticked), lane))
+
+    def _settle_no_change(self, repo: str, number: int, lane: str, name: str,
+                          brief: str = "") -> None:
         """Record a build run's no-change answer and settle its ticket from it.
 
         The answer is an event in the ticket's status comment, quoting the
@@ -6400,6 +6436,19 @@ class Station:
         undoes = bool(set(names) & {REGRESSION, factory.REVERT_LABEL})
         merged = self._merged_linked(repo, issue) if (
             issue.get("state") == "open" and RUNNING in names and not undoes) else []
+        decide = criteria_gate.open_decisions(str(issue.get("body") or ""))
+        if merged and decide:
+            # The merged work does not settle a decision only an operator
+            # makes: the ticket waits on a person, not on ship and verify.
+            self._relabel(repo, number, "loom:answered")
+            self._routine(repo, number, "%s\n\nPull request #%d already carries this "
+                          "ticket's work, but the ticket has a decision box only an "
+                          "operator ticks, so it waits on a person, not loom:merged."
+                          % (said, int(merged[0]["number"])))
+            if HUMAN not in _label_names(self._issue(repo, number)):
+                brain.human(self.gh, repo, number, DECISION_ASK % "; ".join(
+                    " ".join(t.split())[:criteria_gate.ASK_WIDTH] for t in decide))
+            return
         if merged:
             pr = merged[0]
             states = {"loom:" + s for s in brain.STATES}
