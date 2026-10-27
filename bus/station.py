@@ -42,6 +42,7 @@ from . import fixrounds
 from . import runners
 from . import scope_fit
 from . import shadow
+from . import urgency
 from . import stale_claims
 from . import factory
 from . import friction_intake
@@ -806,8 +807,13 @@ class Settings:
                  settle_claimed_max: int = claimed.PER_RUN,
                  claim_idle_hours: int = 0,
                  agy_workdir: str = "",
-                 thin_snapshots: bool = False) -> None:
+                 thin_snapshots: bool = False,
+                 urgency_config: Optional[urgency.Config] = None) -> None:
         self.home = home
+        # LOOM_URGENCY_*: score each ask before it is routed (bus/urgency.py,
+        # loom#1787). Off for a Settings built in code; from_env defaults to
+        # shadow, which records scores and still routes by the label rules.
+        self.urgency = urgency_config or urgency.Config(mode=urgency.OFF)
         # LOOM_THIN_SNAPSHOTS: below twice the free-space floor, ask macOS to
         # thin its local Time Machine snapshots before claims pause. On, from
         # from_env, unless "0"; off for a Settings built in code.
@@ -1004,7 +1010,8 @@ class Settings:
                    settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")),
                    claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")),
                    agy_workdir=_agy_workdir(env),
-                   thin_snapshots=env.get("LOOM_THIN_SNAPSHOTS", "1").strip() != "0")
+                   thin_snapshots=env.get("LOOM_THIN_SNAPSHOTS", "1").strip() != "0",
+                   urgency_config=urgency.Config.from_env(env))
 
 
 def _agy_workdir(env: Dict[str, str]) -> str:
@@ -1715,8 +1722,13 @@ class Station:
                  upload: Optional[Uploader] = None,
                  ancestor: Optional[Callable[[str, str], bool]] = None,
                  head: Optional[Callable[[], str]] = None,
-                 fetch: Optional[Fetcher] = None) -> None:
+                 fetch: Optional[Fetcher] = None,
+                 urgency_client: Optional[urgency.Client] = None) -> None:
         self.gh = gh
+        # The urgency model's client; None reads the key from SSM when a score
+        # is first wanted (Station._urgency_client).
+        self._urgency_injected = urgency_client
+        self._digest_ranked = False  # act mode: the digest keeps the score order
         # Status comments by the station's trusted writers read as events.
         writers = getattr(gh, "status_authors", None)
         if isinstance(writers, set):
@@ -6909,7 +6921,10 @@ class Station:
         newest first, so they are not buried behind old ones."""
         prev = covered_before if isinstance(covered_before, dict) else {}
         covered = {k: self._ask_rev(i) for k, _, i in asks}
-        new = [a for a in reversed(asks) if prev.get(a[0]) != covered[a[0]]]
+        # Asks ranked by their urgency score (act mode) keep that order.
+        ranked = self._digest_ranked
+        new = [a for a in (asks if ranked else reversed(asks))
+               if prev.get(a[0]) != covered[a[0]]]
         seen = [a for a in asks if prev.get(a[0]) == covered[a[0]]]
         plan: Dict[str, Any] = {
             "day": today, "covered": covered, "new": len(new),
@@ -7096,8 +7111,9 @@ class Station:
         if keyed is None:
             return
         self._prune_urgent(ledger, {k for k, _, _ in keyed})
+        routes = self._route_asks(keyed)
         urgent_keys = {k for k, _, i in keyed
-                       if URGENT in _label_names(i) and k not in ledger[2]}
+                       if routes[k].route == urgency.URGENT and k not in ledger[2]}
         url = None
         # Urgent asks go out on their own: nothing the digest needs (a trust
         # check of an old ask, a page post) can hold them.
@@ -7109,7 +7125,57 @@ class Station:
                 return
             self._send_urgent(url, todo, ledger)
         if digest_due:
+            if self.s.urgency.mode == urgency.ACT:
+                # Act: only urgent and digest routes go in, highest score first.
+                keyed = [a for a in keyed
+                         if routes[a[0]].route in (urgency.URGENT, urgency.DIGEST)]
+                keyed.sort(key=lambda a: -(routes[a[0]].score or 0.0))
+                self._digest_ranked = True
             self._send_digest(url, keyed, ledger, today)
+
+    def _urgency_client(self) -> Optional[urgency.Client]:
+        if self._urgency_injected is not None:
+            return self._urgency_injected
+        if not self.s.urgency.key_ssm:
+            return None
+        key = self.read_secret(self.s.urgency.key_ssm, self.s.region)
+        return urgency.http_client(key, self.s.urgency.model) if key else None
+
+    def _route_asks(self, keyed: List[Tuple[str, str, Dict[str, Any]]]
+                    ) -> Dict[str, urgency.Decision]:
+        """key -> where each ask goes this pass (bus/urgency.py). Off, or
+        shadow, routes by the label rules; act may add loom:urgent."""
+        cfg = self.s.urgency
+        scorer = urgency.Scorer(cfg, os.path.join(self.state, "urgency.json"),
+                                os.path.join(self.state, "urgency.jsonl"),
+                                client=self._urgency_client, now=self.now, say=_say)
+        titles = {k: " ".join(str(i.get("title") or "").split()) for k, _, i in keyed}
+        out: Dict[str, urgency.Decision] = {}
+        for key, repo, issue in keyed:
+            labels = _label_names(issue)
+            if cfg.mode == urgency.OFF:
+                out[key] = urgency.Decision(urgency.today_route(labels), None, None, False)
+                continue
+            state = urgency.ask_state(repo, issue, labels, self.now,
+                                      [t for k, t in titles.items() if k != key])
+            decision = scorer.decide(key, state, labels)
+            if decision.route == urgency.URGENT and URGENT not in labels:
+                try:
+                    # POST adds the label beside the ones the ask carries.
+                    self.gh.rest("POST", "/repos/%s/issues/%d/labels"
+                                 % (repo, int(issue["number"])), {"labels": [URGENT]})
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("could not label %s %s: %s" % (key, URGENT, err))
+            out[key] = decision
+        if cfg.mode != urgency.OFF:
+            scorer.prune(set(out))
+            try:
+                scorer.save()
+            except OSError as err:
+                _say("could not save the urgency ledger (%s)" % type(err).__name__)
+        return out
 
     # -- goal reports -----------------------------------------------------
     def _goal_issues(self, repo: str) -> List[Dict[str, Any]]:

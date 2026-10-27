@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
+from bus import urgency  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
@@ -7511,7 +7512,7 @@ class AsksTest(Base):
         self.fail_post = False
         self.read = []
 
-    def go(self, now=NOON):
+    def go(self, now=NOON, urgency_client=None):
         def post(url, payload):
             if self.fail_post:
                 raise OSError("down")
@@ -7521,7 +7522,72 @@ class AsksTest(Base):
             self.read.append((name, region))
             return URL
         gh = GitHub("token", transport=self.fake)
-        station.Station(gh, self.settings, now=now, read_secret=secret, post=post).run_pass()
+        station.Station(gh, self.settings, now=now, read_secret=secret, post=post,
+                        urgency_client=urgency_client).run_pass()
+
+    def scored(self, by_title):
+        """A stub urgency client answering by the ask's title; it records
+        every request."""
+        asked = []
+
+        def client(request):
+            asked.append(request)
+            score, person = by_title[request["state"]["title"]]
+            return {"usage": {"input_tokens": 100}, "answers": {
+                "urgency": {"type": "score", "score": score},
+                "needs_person": {"type": "noul", "noul": person},
+                "duplicate": {"type": "noul", "noul": 0.0},
+                "public_exposure": {"type": "noul", "noul": 0.0}}}
+        return client, asked
+
+    def test_shadow_scores_each_ask_and_routes_by_the_labels(self):
+        self.settings.urgency = urgency.Config(mode=urgency.SHADOW)
+        self.fake.add_ask(5, title="Site down", created="2030-01-01T00:00:00Z")
+        self.fake.add_ask(6, title="Pick a name", created="2030-01-02T00:00:00Z")
+        client, asked = self.scored({"Site down": (4.0, 0.9), "Pick a name": (0.3, 0.1)})
+        self.go(urgency_client=client)
+        self.assertEqual(len(asked), 2)
+        # No label written, no urgent send, and the digest holds both asks
+        # in today's order (newest first).
+        self.assertFalse(any(p.endswith("/labels") for p in self.fake.paths()))
+        self.assertEqual(len(self.sent), 1)
+        lines = self.sent[0][1]["content"].splitlines()[1:]
+        self.assertEqual([ln.rsplit("/", 1)[1] for ln in lines], ["6", "5"])
+        with open(os.path.join(self.home, "state", "station", "urgency.json")) as fh:
+            scores = json.load(fh)["scores"]
+        self.assertEqual(scores["%s#5" % REPO]["route"], urgency.URGENT)
+        self.assertEqual(scores["%s#5" % REPO]["today_route"], urgency.DIGEST)
+        self.assertEqual(scores["%s#6" % REPO]["route"], urgency.STATUS)
+        # The next pass asks nothing again for the same revisions.
+        self.go(NOON + 60, urgency_client=client)
+        self.assertEqual(len(asked), 2)
+
+    def test_act_forwards_by_the_score_and_ranks_the_digest(self):
+        self.settings.urgency = urgency.Config(mode=urgency.ACT)
+        self.fake.add_ask(5, title="Site down", created="2030-01-01T00:00:00Z")
+        self.fake.add_ask(6, title="Pick a name", created="2030-01-02T00:00:00Z")
+        self.fake.add_ask(7, title="Rename a file", created="2030-01-03T00:00:00Z")
+        self.fake.asks[0]["state"] = "open"
+        self.fake.issues[5] = self.fake.asks[0]
+        client, _ = self.scored({"Site down": (4.0, 0.9), "Pick a name": (2.0, 0.9),
+                                 "Rename a file": (0.5, 0.0)})
+        self.go(urgency_client=client)
+        self.assertEqual([p for p in self.fake.paths("POST") if p.endswith("/labels")],
+                         ["/repos/%s/issues/5/labels" % REPO])
+        self.assertIn("loom:urgent", self.fake.names(5))
+        contents = [p["content"] for _, p in self.sent]
+        self.assertEqual(contents[0],
+                         "Urgent ask: Site down https://github.com/%s/issues/5" % REPO)
+        lines = contents[1].splitlines()[1:]
+        # Status-only asks stay out; the rest highest score first.
+        self.assertEqual([ln.rsplit("/", 1)[1] for ln in lines], ["5", "6"])
+
+    def test_off_sends_no_urgency_request(self):
+        self.settings.urgency = urgency.Config(mode=urgency.OFF)
+        self.fake.add_ask(5, title="Site down")
+        client, asked = self.scored({"Site down": (4.0, 0.9)})
+        self.go(urgency_client=client)
+        self.assertEqual(asked, [])
 
     def test_untrusted_asks_are_ignored(self):
         self.fake.add_ask(5, author="stranger", urgent=True)
