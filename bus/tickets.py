@@ -645,7 +645,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   ci_checks: Optional[List[Tuple[str, str]]] = None,
                   has_contract: bool = True, resume: Optional[str] = None,
                   notes: Sequence[Tuple[str, str, str]] = (),
-                  linked: Sequence[str] = ()) -> str:
+                  linked: Sequence[str] = (),
+                  fixture_source: Optional[int] = None) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -657,6 +658,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         "Lane: %s" % lane,
         "Issue: %s#%d" % (repo, number),
     ]
+    if fixture_source is not None:
+        out.append("Fixture-Source: #%d" % fixture_source)
     if fix:
         out.append("Fix-PR: %d" % fix.pr)
         for f in fix.findings_list:

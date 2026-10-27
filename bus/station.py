@@ -1171,6 +1171,15 @@ def _has_pull_request_trigger(workflow: str) -> bool:
     return bool(_PULL_REQUEST_TRIGGER.search(workflow))
 
 
+def _is_code_scanning_check(name: str, run: Dict[str, Any]) -> bool:
+    """Whether a check run is code scanning, not the repo's own lane CI."""
+    low = str(name).lower()
+    if "code scanning" in low or "codeql" in low:
+        return True
+    app = run.get("app") or {}
+    return str(app.get("slug") or "").lower() in ("codeql", "code-scanning")
+
+
 def _block_scalar(lines: List[str], index: int, indent: int) -> Tuple[str, int]:
     """Join a run: | block's lines deeper than indent; return it and the next index."""
     block = []
@@ -2244,13 +2253,15 @@ class Station:
             return False
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
+        fixture_source = tickets.rewritten_source(issue.get("body"))
         has_contract, checks = self._validation_checks(repo)
         text = tickets.render_brief(repo, issue, lane, attempt, fix, checks, has_contract,
                                     None if fix else self._timedout_branch(comments),
                                     notes=tickets.operator_notes(
                                         comments, list(self.s.authors) + list(self.s.briefers)
                                         + list(self.s.owners)),
-                                    linked=self._linked_pulls(repo, number))
+                                    linked=self._linked_pulls(repo, number),
+                                    fixture_source=fixture_source)
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
@@ -5534,6 +5545,24 @@ class Station:
         # factory's (Factory._send_back), so no round is sent from here.
         conflict = detail.get("mergeable") is False
         if not failed and not threads and not degraded and not conflict:
+            # A lane pull request is ready only on its goal home's trunk (or
+            # the repo's default branch when the goal home names no trunk).
+            base_ref = str((detail.get("base") or {}).get("ref") or "")
+            if base_ref:
+                trunk = self._trunk_for(repo, issue)
+                if trunk and base_ref != trunk:
+                    self._remove_ready_if_present(repo, number, names)
+                    self._routine(repo, number, "base %s is not the trunk %s"
+                                  % (base_ref, trunk))
+                    return
+            # The repo's own CI must have run green on the head, but only in a
+            # repo that has a pull-request-triggered workflow. When none ran,
+            # the status says so and the pull request stays not ready.
+            if self._has_pull_request_workflow(repo) \
+                    and not self._repo_ci_green_on_head(repo, sha):
+                self._remove_ready_if_present(repo, number, names)
+                self._routine(repo, number, "repo CI did not run on head %s" % sha)
+                return
             self._mark_ready(repo, number, sha, names, ready)
             return
         self._remove_ready_if_present(repo, number, names)
@@ -5662,6 +5691,71 @@ class Station:
         statuses = (self.gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data or {}).get("statuses") or []
         return not any(run.get("status") != "completed" for run in runs) and not any(
             status.get("state") == "pending" for status in statuses)
+
+    def _trunk_for(self, repo: str, issue: Dict[str, Any]) -> str:
+        """The goal home's Trunk branch, else the repo's default branch, else
+        "". An unreadable goal home or repo reads as no trunk, so a pull
+        request whose base cannot be compared is not blocked here."""
+        trunk = ""
+        try:
+            goal = brain._goal_home_for_ticket(self.gh, repo, issue)
+            if isinstance(goal, dict):
+                trunk = str(brain.goal_trunk(goal) or "")
+        except (GitHubError, ValueError, TypeError):
+            trunk = ""
+        if not trunk:
+            try:
+                trunk = self._default_branch(repo)
+            except (GitHubError, ValueError, TypeError):
+                trunk = ""
+        return trunk
+
+    def _has_pull_request_workflow(self, repo: str) -> bool:
+        """Whether the repo has a workflow that runs on pull_request: only then
+        does the repo's own CI need to have run on a lane pull request's head
+        for it to be ready. An unreadable workflow list reads as none."""
+        try:
+            listing = self.gh.rest("GET", "/repos/%s/contents/.github/workflows" % repo).data
+        except (GitHubError, ValueError, TypeError, AssertionError):
+            return False
+        if not isinstance(listing, list):
+            return False
+        for item in listing:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "")
+            if not path.endswith((".yml", ".yaml")):
+                continue
+            try:
+                workflow = self._contents_text(repo, path)
+            except (GitHubError, ValueError, TypeError, AssertionError):
+                continue
+            if workflow is not None and _has_pull_request_trigger(workflow):
+                return True
+        return False
+
+    def _repo_ci_green_on_head(self, repo: str, sha: str) -> bool:
+        """Whether at least one check from the repo's own workflows - not the
+        review bot and not code scanning - concluded success on the head
+        commit."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
+                                % (repo, sha)).data or {}
+        except (GitHubError, ValueError, TypeError, AssertionError):
+            return False
+        runs = data.get("check_runs") or []
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            if str(run.get("conclusion") or "") != "success":
+                continue
+            name = str(run.get("name") or "")
+            if not name or name == self.s.review_check:
+                continue
+            if _is_code_scanning_check(name, run):
+                continue
+            return True
+        return False
 
     def _bot_threads(self, repo: str, pr_number: int) -> List[Dict[str, Any]]:
         threads = brain._open_threads(self.gh, repo, pr_number, bot=self.s.review_bot,
