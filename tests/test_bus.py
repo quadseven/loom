@@ -611,6 +611,30 @@ class CliTests(unittest.TestCase):
         self.assertRegex(posted[1], r"^Tick \S+Z, lane-machine$")
         self.assertEqual(posted[2], "Moved: nothing.")
 
+    def test_journal_command_holder_writes_full_iso_tick_time(self):
+        # bus journal --holder writes a Tick line whose time parses with
+        # %Y-%m-%dT%H:%M:%SZ (acceptance criterion 3).
+        from bus import handoff
+        t = Scripted(reply(200, {"login": "me"}), reply(200, []), reply(201, {}))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "j.md")
+            with open(path, "w") as fh:
+                fh.write(journal.JOURNAL_MARKER + "\nMoved: nothing.\n")
+            code, _ = self.run_cli(["journal", REPO + "#5", "--file", path,
+                                    "--holder", "lane-machine"], t)
+        self.assertEqual(code, 0)
+        posted = json.loads(t.calls[2][3])["body"].splitlines()
+        tick_line = posted[1]
+        self.assertTrue(tick_line.startswith("Tick "))
+        self.assertTrue(tick_line.endswith(", lane-machine"))
+        # Extract the time part between "Tick " and ", lane-machine"
+        tick_time = tick_line[len("Tick "):-len(", lane-machine")]
+        # The time should parse as full ISO format with date
+        parsed = handoff._parse(tick_time)
+        self.assertIsNotNone(parsed, "Tick time %r should parse as full ISO format" % tick_time)
+        # Should have a valid date component (year >= 2020)
+        self.assertGreaterEqual(parsed.year, 2020)
+
     def test_journal_command_says_not_posted_for_a_report_held_by_the_gap(self):
         just = (datetime.now(timezone.utc) - timedelta(minutes=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
         t = Scripted(reply(200, [{"user": {"login": "example-loom[bot]", "type": "Bot"},
