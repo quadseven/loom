@@ -42,7 +42,7 @@ from . import notify
 from . import shadow
 from . import text as _text
 from . import watch
-from .github import GitHubError
+from .github import GitHubError, RateLimited
 from .labels import REMOTE_LANES
 
 DAY = 24 * 3600
@@ -156,8 +156,19 @@ HOLD_LOG_MAX = 20
 HELD_LINE_RE = re.compile(r"^- ([A-Za-z0-9._-]+): held by a limit since (\S+?);", re.M)
 LOG_LINE_RE = re.compile(r"^- [A-Za-z0-9._-]+: held since \S+, cleared \S+$")
 WITHHELD = "(withheld: the line fails the written-text check)"
+# Invariants whose subject can be gone for good: a lane pull request merged or
+# closed, an epic back at its cap. The filer keeps each breach's subject in
+# its local state and, once the breach is gone, asks the caller's settled()
+# whether the subject itself settled; one that did closes its issue on that
+# pass, before any other clear, whatever labels it carries (loom#2022: five
+# lane-pr-stalled issues stayed open up to a day after their pull requests
+# merged or closed, and an operator closed them by hand).
+SETTLES = ("lane-pr-stalled", "epic-over-cap")
 
 Say = Callable[[str], None]
+# (invariant, subject) -> why the subject is settled, in words a public issue
+# may carry, or None while it is not (or cannot be read).
+Settled = Callable[[str, str], Optional[str]]
 
 
 class Ref(NamedTuple):
@@ -962,12 +973,17 @@ def _checked(line: str) -> str:
 class Filer:
     def __init__(self, gh: Any, repo: str, goal: int, state: Dict[str, Any], now: float,
                  say: Say, write: bool = True,
-                 authors: Optional[Sequence[str]] = None) -> None:
+                 authors: Optional[Sequence[str]] = None,
+                 subjects: Optional[Dict[str, Any]] = None,
+                 settled: Optional[Settled] = None) -> None:
         """gh files in repo under goal home #goal. state maps a breach key to
         its issue number and is changed in place (the caller keeps it);
         write False (the GitHub budget is low) files nothing this pass.
         `authors` (default brain.trusted_authors()) are the logins whose
-        comments it reads: a stranger's marker is data."""
+        comments it reads: a stranger's marker is data. `subjects` maps the
+        key of each SETTLES breach to its subject (kept by the caller, never
+        written to GitHub), and `settled` says whether a gone breach's
+        subject is settled for good."""
         self.gh = gh
         self.repo = repo
         self.goal = goal
@@ -976,6 +992,8 @@ class Filer:
         self.say = say
         self.write = write
         self.authors = list(brain.trusted_authors() if authors is None else authors)
+        self.subjects = subjects if subjects is not None else {}
+        self.settled = settled
         self.writes = 0
         self._listed: Optional[Dict[str, int]] = None
         # Issue numbers the listing found closed: clearing skips them unread.
@@ -1236,7 +1254,67 @@ class Filer:
         self.writes += 1
         self.say("invariants: folded %s#%d into #%d" % (self.repo, number, into))
 
+    def _settle(self, current: Dict[str, Breach]) -> None:
+        """Close the open issue of each gone SETTLES breach whose subject
+        settled for good, with one note naming how. Runs before the other
+        clears, so a pass short of writes still spends them here first, and
+        reads no comments (a deferred comment read stopped the whole clear)."""
+        listing = self._listing()
+        for key, subject in list(self.subjects.items()):
+            if self.writes + 2 > WRITES_MAX:
+                return
+            invariant = key.split("/", 1)[0]
+            if key in current or invariant not in SETTLES or not isinstance(subject, str):
+                continue
+            number = listing.get(key)
+            if number is None or number in self._listed_closed:
+                self.subjects.pop(key, None)
+                continue
+            issue = self._issue(number)
+            if issue is None or issue.get("state") != "open":
+                self.subjects.pop(key, None)
+                continue
+            if TICKET_LABEL in self._label_names(issue):
+                # Rewritten into work: the ticket path closes it.
+                self.subjects.pop(key, None)
+                continue
+            why = self._settled_why(invariant, subject, number)
+            if why and self._close_settled(number, issue, why):
+                self.subjects.pop(key, None)
+
+    def _settled_why(self, invariant: str, subject: str, number: int) -> Optional[str]:
+        """The caller's word on whether the subject settled; None when it has
+        none or cannot read it this pass (a rate limit still stops the pass)."""
+        if self.settled is None:
+            return None
+        try:
+            return self.settled(invariant, subject)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            self.say("invariants: could not tell whether %s#%d settled: %s"
+                     % (self.repo, number, err))
+            return None
+
+    def _close_settled(self, number: int, issue: Dict[str, Any], why: str) -> bool:
+        """Close an issue whose subject settled, with one note saying how.
+        False when shadow mode holds it (recorded in the ledger)."""
+        if self._held(number, {"state": "closed", "state_reason": "not_planned"}, issue,
+                      "settled: " + why):
+            return False
+        body = "%s%s: %s." % (CLEARED_TEXT, utc(self.now), why.rstrip("."))
+        _text.check(body)
+        notify.post(self.gh, self.repo, number, body, notify.CLOSED)
+        self.writes += 1
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                     {"state": "closed", "state_reason": "not_planned"})
+        self.writes += 1
+        self._listed_closed.add(number)
+        self.say("invariants: closed settled %s#%d: %s" % (self.repo, number, why))
+        return True
+
     def _clear_stale(self, current: Dict[str, Breach]) -> None:
+        self._settle(current)
         for key, number in self._listing().items():
             if self.writes >= WRITES_MAX:
                 return
@@ -1384,6 +1462,9 @@ class Filer:
 
     def run(self, breaches: Iterable[Breach]) -> None:
         current = {b.key: b for b in breaches}
+        for b in current.values():
+            if b.invariant in SETTLES:
+                self.subjects[b.key] = b.subject
         for b in current.values():
             if not self.write or self.writes >= WRITES_MAX:
                 return

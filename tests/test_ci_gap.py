@@ -77,6 +77,22 @@ class CoverageTest(unittest.TestCase):
         self.assertTrue(ci_gap.covered("python -m pytest -q \\\n  tests",
                                        "cd deploy/rbac && python -m pytest -q tests", "deploy/rbac"))
 
+    def test_output_plumbing_and_the_python3_name_do_not_make_a_gap(self):
+        # The suite CI tees to a log under pipefail is the suite the contract
+        # runs; python and python3 are the same interpreter on a lane
+        # (loom#1977: the lane contract already ran this command).
+        contract = "python3 -B .github/unittest_parallel.py --allow-skips"
+        self.assertTrue(ci_gap.covered(
+            "set -o pipefail\npython -B .github/unittest_parallel.py --allow-skips 2>&1 | tee unittest.out",
+            contract))
+        self.assertTrue(ci_gap.covered("python3 -m pytest -q > out.log 2>&1", "python -m pytest -q"))
+        # A pipe into another check is not plumbing, and a flag the contract
+        # leaves out is still a gap.
+        self.assertFalse(ci_gap.covered("make t | grep -q ok", "make t"))
+        self.assertFalse(ci_gap.covered(
+            "python -B .github/unittest_parallel.py --strict 2>&1 | tee unittest.out",
+            "python3 -B .github/unittest_parallel.py --allow-skips"))
+
     def test_a_command_or_directory_the_contract_does_not_run_is_a_gap(self):
         self.assertFalse(ci_gap.covered("ruff check . && mypy .", "ruff check ."))
         # The same command from the root runs another suite.
@@ -246,6 +262,85 @@ class FailureFactsTest(unittest.TestCase):
         facts = ci_facts.facts(log)
         self.assertEqual(len(facts.tests), ci_facts.TESTS_MAX)
         self.assertEqual(len(facts.assertions), ci_facts.ASSERTIONS_MAX)
+
+
+# The Elder output that loom#665's round 1 brief read as a command (loom#1898).
+ELDER_665 = (
+    "Elder markings - 1 blocking, 1 total\n"
+    "<details>\n<summary>Prompt for AI agents (all findings)</summary>\n\n"
+    "```\n"
+    "Verify each finding against the current code. Fix only if still valid.\n"
+    "- lanes/run_lane.sh:3226 [high | robustness | missing-error-handling] the gh call counter "
+    "treats a missing log as zero calls.\n"
+    "  Suggested fix: AGENT_GH_CALLS=$(tail -c +$((LOG_START + 1)) $LOG 2>/dev/null | "
+    "grep -cE '(^|[[:space:]])gh [^[:space:]]+' || true); [ -s $LOG ] || AGENT_GH_CALLS=unknown\n"
+    "```\n</details>\n\n"
+    "**Required fixes**\n\n"
+    "1. `lanes/run_lane.sh:3226` `missing-error-handling` - AGENT_GH_CALLS=$(tail -c "
+    "+$((LOG_START + 1)) $LOG 2>/dev/null | grep -cE 'gh ' || true)\n")
+
+
+class _Gh:
+    """Just enough of GitHub for _failing_checks: one check-runs page."""
+
+    def __init__(self, runs):
+        self.runs = runs
+
+    def rest(self, method, path):
+        data = {"check_runs": self.runs} if "check-runs" in path else {"statuses": []}
+        return type("Resp", (), {"data": data})()
+
+
+class ReviewFactsTest(unittest.TestCase):
+    """A review app's output: only what the reviewer marks is a command
+    (loom#1898)."""
+
+    def test_a_suggested_fix_is_quoted_as_guidance_not_a_command(self):
+        tail = ci_facts.ReviewText(ELDER_665)
+        facts = ci_facts.facts(tail, review=True)
+        self.assertEqual(facts.regenerate, [])
+        self.assertEqual(len(facts.suggestions), 1)
+        self.assertTrue(facts.suggestions[0].startswith("Suggested fix: AGENT_GH_CALLS="))
+        body = brain._fix_body("o/r", 8, "loom/665-x", "", [("Grug - Elder", tail)], [])
+        self.assertNotIn("First step", body)
+        self.assertNotIn("run `", body)
+        self.assertIn("Suggested fixes (the reviewer's guidance on the finding to address, "
+                      "not a command to run):\n\n    Suggested fix: AGENT_GH_CALLS=", body)
+
+    def test_the_same_text_as_a_log_still_reads_a_command(self):
+        # Without the fix this is what the station did with Elder's output.
+        self.assertTrue(ci_facts.facts(ELDER_665).regenerate)
+
+    def test_a_fenced_shell_block_is_the_only_command(self):
+        text = ci_facts.ReviewText(
+            "The generated file is stale.\nSuggested fix: edit it by hand > out.yaml\n"
+            "```bash\n$ python3 render.py --render-rbac > rbac.yaml\n```\n"
+            "```suggestion\nrm -rf build --force\n```\n"
+            "```\nmake all --jobs 4\n```\n")
+        self.assertEqual(ci_facts.facts(text, review=True).regenerate,
+                         ["python3 render.py --render-rbac > rbac.yaml"])
+        body = brain._fix_body("o/r", 8, "loom/9-x", "", [("Grug - Elder", text)], [])
+        self.assertEqual([l for l in body.splitlines() if l.startswith("First step")],
+                         ["First step: run `python3 render.py --render-rbac > rbac.yaml`; the review "
+                          "in check `Grug - Elder` marks it as a command to run."])
+
+    def test_a_run_or_regenerate_line_is_a_command(self):
+        self.assertEqual(ci_facts.review_commands(
+            "Run: `make render --all`\n- Regenerate: python3 r.py --out x.yaml\nrun: yaml key"),
+            ["make render --all", "python3 r.py --out x.yaml"])
+
+    def test_a_finding_with_no_command_gives_no_run_instruction(self):
+        text = ci_facts.ReviewText("The counter treats a missing log as zero; it is stale and "
+                                   "should be regenerated with care > later.\n")
+        self.assertEqual(ci_facts.facts(text, review=True).regenerate, [])
+        body = brain._fix_body("o/r", 8, "loom/9-x", "", [("Grug - Elder", text)], [])
+        self.assertNotIn("First step", body)
+
+    def test_a_review_apps_output_is_review_text_and_an_actions_log_is_not(self):
+        runs = [{"id": 1, "name": "Grug - Elder", "conclusion": "failure",
+                 "app": {"slug": "grug-tribe"}, "output": {"summary": ELDER_665}}]
+        checks = brain._failing_checks(_Gh(runs), "o/r", "abc")
+        self.assertIsInstance(checks[0][1], ci_facts.ReviewText)
 
 
 if __name__ == "__main__":
