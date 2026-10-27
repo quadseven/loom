@@ -9,7 +9,11 @@ brain's and none is the operator's (loom#1142); `LOOM_GITHUB_TOKEN` is only
 for a Muse without them. Set `LOOM_REPOS` (space separated `OWNER/NAME`
 values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
 post proofs, the same value the station uses). Without it `prioritize`,
-`close`, verified moves and merges refuse every ticket as untrusted. With a
+`close`, verified moves and merges refuse every ticket as untrusted. Set `LOOM_GOAL_CAP`
+to the station's value too: unset, a Muse tick uses the default cap of 16
+while the station and the lane machine's brain use theirs, and a brief the
+lane machine would file (a factory ticket included) is refused as over the
+cap (2026-10-27: 26 in flight, refused at 16). With a
 personal `LOOM_GITHUB_TOKEN`, every issue a `bus` or `bus.brain` command opens
 or comments on is unsubscribed for that person afterwards, so later bot
 comments there send them no email; an @mention still does. Use `muse` as your lock
@@ -738,7 +742,9 @@ To set a model by hand on a first attempt or any other move, use
 Every lane pull request carries one change class (`class:<name>`, set by the
 runner from its changed files; docs/LANES.md). The merge rule follows it, so
 a cheap change lands fast and a dangerous one never lands on the factory's
-say-so alone:
+say-so alone. The runner sets the class when it opens the pull request; a fix
+round can add files of a higher class, so the factory reclassifies each new
+head commit from its files and raises the label to match, never lowering it:
 
 - `docs` and `tests`: the factory lands them on green checks and a review
   pass on the head commit alone.
@@ -750,7 +756,9 @@ say-so alone:
   finding still sends the pull request back.
 - `sensitive`: the factory never merges it. It marks the pull request
   `needs-brain`, lists it in `bus.brain status` under "Sensitive pull
-  requests", and leaves the merge to the brain. Its conflicts, failing
+  requests", and leaves the merge to the brain. While a clean one waits, the
+  factory brings it up to date with its base when it falls behind (one a
+  repo a pass), so the brain's merge gate does not refuse it as behind. Its conflicts, failing
   checks, high findings and missing tests still go back to its lane, and its
   medium and low findings are deferred, as for any class. A brain merges it with
   `python3 -m bus.brain merge`, which for this class also requires that the
@@ -758,6 +766,12 @@ say-so alone:
   commit.
 - A pull request with no class label keeps the `logic` rule.
 - A medium or low finding from a bad-work rule is never deferred (below).
+
+One lane pull request lands at a time in a repo: the factory marks the one it
+is landing `loom:landing`, and for up to 40 minutes from the mark no other
+pull request there is updated or merged, by the factory or by `bus.brain
+merge`, which refuses it (docs/BRAIN.md, Landing lock). Merge the marked one,
+or wait for it; do not merge around it.
 
 ## Merge by risk tier
 
