@@ -9,7 +9,11 @@ brain's and none is the operator's (loom#1142); `LOOM_GITHUB_TOKEN` is only
 for a Muse without them. Set `LOOM_REPOS` (space separated `OWNER/NAME`
 values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
 post proofs, the same value the station uses). Without it `prioritize`,
-`close`, verified moves and merges refuse every ticket as untrusted. With a
+`close`, verified moves and merges refuse every ticket as untrusted. Set `LOOM_GOAL_CAP`
+to the station's value too: unset, a Muse tick uses the default cap of 16
+while the station and the lane machine's brain use theirs, and a brief the
+lane machine would file (a factory ticket included) is refused as over the
+cap (2026-10-27: 26 in flight, refused at 16). With a
 personal `LOOM_GITHUB_TOKEN`, every issue a `bus` or `bus.brain` command opens
 or comments on is unsubscribed for that person afterwards, so later bot
 comments there send them no email; an @mention still does. Use `muse` as your lock
