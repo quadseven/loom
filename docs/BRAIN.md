@@ -378,7 +378,11 @@ and anything with a `loom:` label. A ready issue (Why, What,
 Acceptance criteria with checkboxes, Size and Out of scope, and a body the
 runner accepts) gets `loom:ticket` and `loom:queued` and becomes a sub-issue
 of goal N's intake epic, while the goal is under `LOOM_GOAL_CAP`; past the cap it is left
-for a later run. Any other issue gets `loom:triage`, and the station's log
+for a later run. In a repo with `area:` labels, ready tickets go under the
+open epic carrying their area label. When no area label matches the issue,
+triage selects the area whose label name or description shares the most words
+with the title and body, adds that label, and uses that area's epic. Any other
+issue gets `loom:triage`, and the station's log
 line names what is missing. Triage writes labels and sub-issue links
 only, and posts no comment: it never closes or retitles an issue, and edits nothing but the one
 line below, because an automated pass over old issues over-calls work as
@@ -447,9 +451,12 @@ and flags any open epic, the standing one too, that holds 100 sub-issues.
 
 Triage, the rewriter, health intake, validation contracts and pull request
 adoption file under the goal's intake epic ("Epic: work that triage,
-rewrites and health intake find"): the newest open one holding fewer than 15
-tickets. One is opened by `bus.brain onboard`, and again whenever no open
-intake epic has room.
+rewrites and health intake find") in repos without `area:` labels: the newest
+open one holding fewer than 15 tickets. One is opened by `bus.brain onboard`,
+and again whenever no open intake epic has room. In a repo with `area:` labels,
+triage and the outside-epic move use the ticket's area epic instead. A new area
+epic is titled `Epic: <area>` and carries the matching `area:<area>` label
+when no open epic in that area has room.
 
 Every other path that files a ticket under a goal does the same
 (`brain.placement_epic`): the parts of a split pull request and the follow-up
@@ -464,7 +471,9 @@ tickets that were placed before this, or by hand.
 The station moves the tickets that break this rule itself, at most every hour
 (`Station.move_outside_tickets`, `brain.move_outside_tickets`): for each goal
 home, the tickets that are the goal's own sub-issues and sit under no epic
-move, oldest first, into an open intake epic of that goal with room. The
+move, oldest first, into an open intake epic of that goal with room. In a repo
+with `area:` labels, each moves into an epic for its area; a missing area is
+inferred from label names and descriptions. The
 epic's sub-issue link replaces the goal as the parent and the ticket's `Part
 of` line names the epic. When no intake epic has room and the goal is under
 its open epic cap, a new intake epic opens the way triage opens one; otherwise
