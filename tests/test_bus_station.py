@@ -10617,7 +10617,7 @@ class VerifyDispatchTest(Base):
 
     def test_a_quoted_log_line_with_filled_in_values_matches_its_template(self):
         # loom#2050: a box quoting the line as printed ("claimed
-        # example-owner/loom#528 for lane") is matched against the source
+        # #528 for lane") is matched against the source
         # template ("claimed %s for lane"), not searched literally.
         self.fake.issues.pop(1)
         quoted = "claimed example-owner/loom#528 for lane at 1a2b3c4d"  # leak-guard-allow: fictional example repos

@@ -16,7 +16,7 @@ unmet. Two shapes are read here:
   code prints it). A string the box needs to be absent, and a template too
   general to search (bus/evidence.py), are never flagged. A quoted line
   often carries filled-in values the source holds as a placeholder
-  (`claimed example-owner/repo#528 for lane` against "claimed %s for
+  (`claimed #528 for lane` against "claimed %s for
   lane"): issue references, hex SHAs and numbers are read as wildcards
   (`Term`), so the source line is matched, not the literal values.
 
