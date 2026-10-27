@@ -212,5 +212,17 @@ class ResumeReadsListedItemsOnce(unittest.TestCase):
         self.assertEqual(fake.issue_reads(), {9999: 2})
 
 
+class CommentsOfAGoneIssue(unittest.TestCase):
+    def test_a_404_on_the_body_read_still_answers_the_comments(self):
+        # The body-events read goes through the pass's issue reads; a gone
+        # issue's 404 is caught as before and the comments come back as read.
+        from bus import issue_reads
+        fake = LoomSizedFake()
+        gh = issue_reads.once(_client(fake))
+        comments = gh.paginate("/repos/%s/issues/9999/comments" % REPO)
+        self.assertEqual([c["id"] for c in comments], [9000 + 9999 * 10, 9000 + 9999 * 10 + 1])
+        self.assertEqual(fake.issue_reads(), {9999: 1})
+
+
 if __name__ == "__main__":
     unittest.main()
