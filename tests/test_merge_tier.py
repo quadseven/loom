@@ -116,7 +116,7 @@ class Tiers(unittest.TestCase):
 
     def test_a_repo_named_only_in_the_loom_status_section_is_not_cross_repo(self):
         # loom#1959: the status section is Loom's log, not the ticket's words.
-        log = ("%s\n---\n\n- 2026-10-26T13:33:57Z Factory incident example-owner/loom#7 "
+        log = ("%s\n---\n\n- 2026-10-26T13:33:57Z Factory incident example-owner/loom#7 "  # leak-guard-allow
                "is closed: the ticket is back in the queue.\n%s\n" % (
                    status.BODY_BEGIN, status.BODY_END))
         ticket = "## What\nCount timed-out runs as progress.\n\n" + log
