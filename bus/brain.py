@@ -17,7 +17,7 @@ from urllib.parse import quote
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
-from . import answer, ci_facts, ci_gap, fixrounds, merge_tier, naming, operator_hold, per_repo, shadow
+from . import answer, ci_facts, ci_gap, fixrounds, landing, merge_tier, naming, operator_hold, per_repo, shadow
 from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
 from .labels import HANDOFF, LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -6069,7 +6069,16 @@ def _cmd_close(gh: GitHub, args: argparse.Namespace) -> None:
 def _cmd_merge(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.pull_request, "pull request")
     ticket = _ref(args.ticket, "ticket") if args.ticket else None
+    # The landing lock (bus/landing.py): while another pull request in the
+    # repo is being landed, merging this one would move main under it.
+    held = landing.holder(gh, repo, time.time())
+    if held is not None and held != number:
+        raise ValueError("%s#%d holds the repo's landing lock (%s, up to %d minutes); "
+                         "merge #%d after it lands" % (repo, held, landing.LABEL,
+                                                       landing.HOLD // 60, number))
     merge(gh, repo, number, ticket, args.adopt)
+    if held == number:
+        landing.release(gh, repo, number)
 
 
 def _cmd_reply(gh: GitHub, args: argparse.Namespace) -> None:
