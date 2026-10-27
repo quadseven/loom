@@ -174,6 +174,13 @@ redirect, such as `tool --render-rbac > rbac.yaml`), the comment's first line
 after its header says to run that command and commit what it writes
 (`bus/ci_facts.py`).
 
+A review app's failing check (any check run not from GitHub Actions) is a
+reviewer's prose, not a log, and those rules do not apply to it. Only what the
+reviewer marks as a command becomes a "run" line: a line in a fenced block
+tagged `sh`, `bash`, `shell`, `console` or `zsh`, or a `Run:` or
+`Regenerate:` line. Its "Suggested fix:" lines are quoted as the finding to
+address, never as a command (loom#1898).
+
 ### Live-cluster check
 
 Before a lane opens a pull request, or pushes to one in a fix round, whose
@@ -506,7 +513,10 @@ a live pid, as running. The stamp says nothing of availability. When the
 factory does find a lane silent with a running ticket, the station log names
 what it saw of the runner (its lock and the stamp's age).
 A failed or stalled
-ticket climbs, and past the last rung it is left `loom:failed` for the brain. Landing
+ticket climbs, and past the last rung it is left `loom:failed` for the brain. Its
+open lane pull request is closed then, or on any later pass, as is one whose
+open ticket was rewritten as a newer ticket, each with one comment naming the
+ticket (loom#2027); a ticket still in a fix round keeps its pull request. Landing
 keeps the default branch green: a ready pull request that is behind its base
 is brought up to date first (GitHub's update-branch) and lands only after its
 checks and review pass again on the new head; each repo lands at most one a
@@ -1006,6 +1016,23 @@ The loom home is kept bounded by the station and the runner (loom#643).
   (`loom home holds ...`), kept in `state/station/disk.json`. A compressed
   store goes with its run's other logs after `LOOM_LOG_KEEP_DAYS`.
 
+## Pass deadline
+
+A whole station pass is bounded by `LOOM_PASS_DEADLINE` seconds (default
+3600, at least 60, `0` off; loom#1921). Each request already has a read
+timeout, but nothing else bounded a pass: on 2026-10-26 one sat for 27
+minutes and the log never said where. When the pass takes its lock it arms
+`faulthandler.dump_traceback_later` with the station log as its file and
+writes `state/station/pass-deadline.json` (pid, start, deadline); the pass's
+end cancels both, whether it returned or raised. A pass that runs past the
+deadline writes every thread's Python stack to `station.log` and exits, so
+launchd starts a fresh one. The next pass finds the marker and logs one line:
+`the last pass (pid ..., started ...) overran its ...s deadline`, or, when the
+marker is younger than its deadline (the pass was killed), `ended ...s into
+its ...s deadline without a clean finish`. The default sits above a daily
+metrics build (about 30 minutes on 2026-10-26) until that build is bounded on
+its own (loom#1924).
+
 ## Log watch
 
 Each station pass reads the lines each component added to its log since the
@@ -1185,10 +1212,17 @@ ticket gets one separate invariant issue that refs the ticket (loom#1223
 flipped 18 times in a day before this). Issues and pull requests in a private repo are named in words, and
 failure reasons have repos, paths and credentials replaced. One pass files
 or reopens at most 5, and below the GitHub budget floor files nothing.
+A `lane-pr-stalled` or `epic-over-cap` issue whose subject settled for good
+(its pull request merged or was closed unmerged, its epic is back at the
+cap) closes on the first pass the breach is gone, whatever labels it carries
+(not a `loom:ticket`), with one note naming how; these closes come before
+the other clears and read no comments (loom#2022). Other cleared issues
+close once the breach has been gone 6 hours.
 `python3 -m bus.brain status` lists the open ones under "Invariants broken"
 for the brain's report, and the station's own standup on that goal home
 names them under "Not going well". `state/station/invariants.json` keeps
-the issue numbers, when each lane was first seen held, and the newest
+the issue numbers, the subject of each open settling breach, when each lane
+was first seen held, and the newest
 journal seen. Adding an invariant is one function in `INVARIANTS` plus a
 test.
 

@@ -30,7 +30,10 @@ Neither needs a model:
   request that is behind its base is brought up to date first (GitHub's
   update-branch), and lands only once its checks and review pass again on
   the new head. Each repo lands at most one pull request a pass, so the
-  next one is checked against the base that includes it. A ready pull
+  next one is checked against the base that includes it. The one brought up
+  to date holds the repo's landing lock (bus/landing.py, loom:landing) for
+  up to 40 minutes, and no other pull request there is updated or landed
+  meanwhile, so main does not move under it (loom#2066). A ready pull
   request held for the operator is brought up to date the same way while it
   waits, so it does not drift into a conflict; it still never lands here. Pull requests of
   loom:urgent and loom:regression tickets land first, then by priority,
@@ -144,6 +147,10 @@ Neither needs a model:
   closed with a comment naming the pull request that superseded it. A pull
   request a person opened, or one not on a loom/ branch, is never closed this
   way.
+- A lane pull request whose open ticket was rewritten as a newer ticket, or is
+  loom:failed past the last rung of the model ladder (hand-off pool or not),
+  is closed with one comment naming the ticket and where the work went
+  (loom#2027). A ticket in a fix round, or failed with a rung left, keeps it.
 
 Each climb is recorded on the ticket as a RUNG_MARKER comment, so the ladder
 survives restarts and any brain can read where a ticket stands.
@@ -165,7 +172,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, bench, brain, brain_hold, brief_check, change_class, converge, criteria_gate, flake, hunt_plan, labels, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brain_hold, brief_check, change_class, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from . import runners
@@ -192,6 +199,8 @@ NO_LANE_RE = re.compile(r"(no free lane takes model |no free lane in tier "
                         r"|on lane \S+, .*: no free lane in its )")
 # The hand-off pool the second operator's session works (docs/BRAIN.md).
 HANDOFF_LABEL = labels.HANDOFF
+# What bus.brain writes on an issue it rewrote as a new ticket (_filed_rewrite).
+REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 # The states in which a lane has taken the ticket: its no-lane wait is over.
 LANED_STATES = ("running", "pr", "answered", "merged", "shipped", "verified")
 
@@ -481,6 +490,19 @@ DEFER_AFTER = 2
 # so sensitive is checked first; a pull request with no class keeps today's
 # rule.
 CLASSES = change_class.CLASSES
+# A fix round can add a file of a higher class than the one the lane opened
+# the pull request with (2026-10-27: one opened as docs gained a gateway code
+# change, which skipped the test rule). The factory reclassifies each new head
+# from its files and only ever raises the label: a missing sensitive-paths read
+# must never lower a sensitive pull request. Keyed by head commit, so one
+# station process reads the files once per commit.
+CLASS_RANK = {name: rank for rank, name in enumerate(reversed(CLASSES))}
+_CLASSED: Dict[Tuple[str, int, str], str] = {}
+# When the keep-current step last brought each held pull request up to date
+# (2026-10-27: the first behind pull request in landing order took the repo's
+# one slot every pass and the rest fell up to 71 commits behind).
+KEEP_CURRENT_COOLDOWN = 30 * 60
+_KEPT_AT: Dict[Tuple[str, int], float] = {}
 DEFER_LABEL = "loom:triage"
 DEFER_TITLE = "Settle the review findings left from PR #%d"
 # The title before the naming standard (docs/NAMING.md): an open follow-up
@@ -1261,6 +1283,39 @@ def acceptance_criteria(body: str) -> List[str]:
     return found
 
 
+_MD_LINK_RE = re.compile(r"\[([^\]\n]*)\]\([^)\n]*\)")
+_MD_MARK_RE = re.compile(r"[`*_~]")
+
+
+def criterion_key(text: str) -> str:
+    """A box's text for matching a pull request box to a ticket box: without
+    a "not built: <reason>" suffix, markdown links, emphasis and code marks,
+    runs of whitespace or trailing punctuation, and case (loom#2026)."""
+    text = _MD_MARK_RE.sub("", _MD_LINK_RE.sub(r"\1", NOT_BUILT_RE.sub("", text)))
+    return " ".join(text.split()).rstrip(".;:,").strip().casefold()
+
+
+def unbuilt_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
+    """The ticket's code boxes that a merge left unbuilt: neither ticked on the
+    ticket nor ticked (without "not built") in any of these merged pull request
+    bodies. A box marked "not built: <reason>" answers a lane's gate but is
+    still unbuilt, so a partial merge sends its ticket back (loom#2026). Live
+    and operator boxes are the verify path's, never named here."""
+    built = set()
+    for criterion in [c for body in pull_bodies for c in acceptance_criteria(body)]:
+        checked, _, text = criterion.partition(" ")
+        if checked == "x" and not NOT_BUILT_RE.search(text):
+            built.add(criterion_key(text))
+    left = []
+    for criterion in acceptance_criteria(ticket_body):
+        checked, _, text = criterion.partition(" ")
+        if checked == "x" or criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE:
+            continue
+        if criterion_key(text) not in built:
+            left.append(text)
+    return left
+
+
 def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
     """Ticket criteria that a lane PR leaves unticked, excluding live checks
     and operator actions (bus/criteria_gate.py): only the station's verifier
@@ -1270,15 +1325,13 @@ def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
     states = {}
     for criterion in pull:
         checked, _, text = criterion.partition(" ")
-        clean = NOT_BUILT_RE.sub("", text).strip().casefold()
-        states[clean] = (checked == "x", bool(NOT_BUILT_RE.search(text)))
+        states[criterion_key(text)] = (checked == "x", bool(NOT_BUILT_RE.search(text)))
     missing = []
     for criterion in ticket:
         _, _, text = criterion.partition(" ")
         if criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE:
             continue
-        clean = NOT_BUILT_RE.sub("", text).strip().casefold()
-        checked, not_built = states.get(clean, (False, False))
+        checked, not_built = states.get(criterion_key(text), (False, False))
         if not checked and not not_built:
             missing.append(text)
     return missing
@@ -1578,6 +1631,9 @@ class Factory:
         self.load: Dict[str, int] = {}
         self.landed: set = set()
         self.updated: set = set()
+        # Repo -> the pull request holding its landing lock, or None; read
+        # once a pass (bus/landing.py).
+        self.locks: Dict[str, Optional[int]] = {}
         # Repos where a held pull request was brought up to date this pass
         # (_keep_current), apart from `updated` so it never delays a landing.
         self.kept_current: set = set()
@@ -1763,6 +1819,36 @@ class Factory:
         if picked:
             _say("resolved %d thread(s) on %s#%d that the review bot marked fixed"
                  % (len(picked), repo, number))
+
+    def _reclass(self, repo: str, number: int, sha: str, full: Dict[str, Any]) -> None:
+        """Raise the pull request's class label to what its head's files say,
+        never lower it. A pull request with no class label is left as it is."""
+        have = class_of(full)
+        if not have or (repo, number, sha) in _CLASSED:
+            return
+        base = str((full.get("base") or {}).get("ref") or "main")
+        found = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s"
+                             % (repo, quote(change_class.SENSITIVE_FILE, safe="/"), quote(base)),
+                             ok=(404,)).data
+        patterns: List[str] = []
+        if isinstance(found, dict) and found.get("content"):
+            import base64
+            patterns = change_class.parse_patterns(
+                base64.b64decode(found["content"]).decode("utf-8", "replace"))
+        kind = change_class.classify(self._files(repo, number), patterns)
+        _CLASSED[(repo, number, sha)] = kind
+        if CLASS_RANK[kind] <= CLASS_RANK[have]:
+            return
+        self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                     % (repo, number, quote("class:" + have, safe="")), ok=(404,))
+        self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": ["class:" + kind]})
+        full["labels"] = [x for x in full.get("labels") or []
+                          if (x.get("name") if isinstance(x, dict) else x)
+                          not in ("class:" + have, "class:" + kind)] + [{"name": "class:" + kind}]
+        self.actions += 1
+        _say("%s#%d changes %s files on its head %s; its class:%s label is now class:%s"
+             % (repo, number, kind, sha[:12], have, kind))
 
     def _mark_sensitive(self, repo: str, number: int, full: Dict[str, Any]) -> None:
         """A sensitive-class pull request is never merged by the factory: mark
@@ -2198,9 +2284,74 @@ class Factory:
                             ticket, old.get("merged_at"), events):
                         return
                 self._close_all_but(repo, prs, merged, closed)
+            return
+        ended = self._ended_note(repo, ticket, ticket_map) if ticket else None
+        if ended is not None:
+            for pr in prs:
+                if self.actions >= MAX_ACTIONS:
+                    return
+                self._close_ended_pr(repo, pr, ended)
+                closed.add(int(pr["number"]))
         elif len(prs) > 1:
             newest = max(prs, key=lambda p: (_ts(p.get("created_at")), int(p["number"])))
             self._close_all_but(repo, prs, int(newest["number"]), closed)
+
+    def _superseding_ticket(self, ticket: Dict[str, Any],
+                            ticket_map: Dict[int, Dict[str, Any]],
+                            comments: Callable[[], List[Dict[str, Any]]]) -> Optional[int]:
+        """The newest open ticket that supersedes this one, or None: an open
+        loom:ticket whose body says "Rewritten from issue N." (what
+        bus.brain brief --refs writes), or, for a ticket labelled
+        loom:rewritten, the ticket a trusted "Rewritten as ticket #M," comment
+        names. `comments` reads the ticket's trusted comments, called only
+        for such a label."""
+        number = int(ticket["number"])
+        found = [n for n, t in ticket_map.items()
+                 if n != number and tickets.rewritten_source(t.get("body")) == number]
+        if "loom:rewritten" in _labels(ticket):
+            found += [int(m.group(1)) for c in comments()
+                      for m in REWRITTEN_AS_RE.finditer(str(c.get("body") or ""))
+                      if int(m.group(1)) != number]
+        return max(found) if found else None
+
+    def _ended_note(self, repo: str, ticket: Dict[str, Any],
+                    ticket_map: Dict[int, Dict[str, Any]]) -> Optional[str]:
+        """Why nothing will ever build an open ticket's lane pull request, as
+        the close comment, or None while something may (loom#2027): the ticket
+        was rewritten as a newer ticket, or it is loom:failed past the last
+        rung of the model ladder. A ticket in a fix round, or failed with a
+        rung left to climb, keeps its pull request. A closed ticket is not
+        handled here."""
+        if ticket.get("state") != "open":
+            return None
+        number = int(ticket["number"])
+        read: List[List[Dict[str, Any]]] = []
+
+        def comments() -> List[Dict[str, Any]]:
+            # One read a ticket, shared by both checks below.
+            if not read:
+                read.append(self._comments(repo, number))
+            return read[0]
+
+        newer = self._superseding_ticket(ticket, ticket_map, comments)
+        if newer is not None:
+            return ("Closed by the station as superseded: its ticket #%d was rewritten as "
+                    "ticket #%d, which a lane builds on its own branch." % (number, newer))
+        if _state(ticket) != "failed" or not self._gave_up_since_claim(comments()):
+            return None
+        where = ("in the hand-off pool (%s), where the second operator's session takes it"
+                 % HANDOFF_LABEL) if HANDOFF_LABEL in _labels(ticket) else "for the brain"
+        return ("Closed by the station: its ticket #%d is past the last rung of the model "
+                "ladder and is left loom:failed %s; the work is re-briefed as a new "
+                "loom:ticket." % (number, where))
+
+    def _close_ended_pr(self, repo: str, pr: Dict[str, Any], comment: str) -> None:
+        """Close an open lane pull request whose ticket ended, with the one
+        comment _ended_note wrote."""
+        number = int(pr["number"])
+        self.close(self.gh, repo, number, comment)
+        self.actions += 1
+        _say("closed %s#%d: %s" % (repo, number, comment))
 
     def _close_superseded_prs(self, repo: str, open_prs: Sequence[Dict[str, Any]],
                               tickets: Dict[int, Dict[str, Any]]) -> set:
@@ -2251,6 +2402,7 @@ class Factory:
         sha = str((full.get("head") or {}).get("sha") or "")
         if not sha or full.get("mergeable") is None:
             return
+        self._reclass(repo, number, sha, full)
         sensitive = class_of(full) == "sensitive"
         if sensitive:
             # A change to the code that merges, closes or deploys never lands
@@ -2622,7 +2774,8 @@ class Factory:
                           issue: Dict[str, Any], comments: List[Dict[str, Any]],
                           sensitive: bool = False) -> None:
         """Land a clean, reviewed pull request, or send it back when it
-        changes code without a test. A clean sensitive one waits for the brain."""
+        changes code without a test. A clean sensitive one waits for the
+        brain, kept current with its base."""
         missing = missing_criteria(str(issue.get("body") or ""), str(full.get("body") or ""))
         ticked = criteria_gate.lane_ticks(str(issue.get("body") or ""), str(full.get("body") or ""))
         if ticked:
@@ -2641,7 +2794,10 @@ class Factory:
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
         elif sensitive:
-            return
+            # The brain merges it, and its merge gate refuses a pull request
+            # behind its base, so keep it current while it waits (2026-10-27:
+            # green sensitive pull requests sat 4 to 66 commits behind).
+            self._keep_current(repo, number, full)
         elif (self._operator_holds(repo, number, full, issue, comments)
               or self._risk_holds(repo, number, full, issue, comments)):
             self._keep_current(repo, number, full)
@@ -2650,18 +2806,26 @@ class Factory:
             self._land(repo, number, full, issue, comments)
 
     def _keep_current(self, repo: str, number: int, full: Dict[str, Any]) -> None:
-        """Bring a ready pull request held for the operator up to date with
-        its base when it is behind, so it does not drift into a conflict
+        """Bring a ready pull request held for the operator or the brain up
+        to date with its base when it is behind, so it does not drift into a conflict
         while it waits (loom#1963). The same update-branch call as _land,
         pinned to the head it judged, at most one a repo a pass; it never
         merges. A refused update (422) is left for the next pass: a held
         pull request is not sent back to a lane."""
-        if repo in self.kept_current or not self._behind(repo, full):
+        if repo in self.kept_current:
+            return
+        # Each held pull request waits KEEP_CURRENT_COOLDOWN after its update
+        # (its checks rerun meanwhile) and lets the next one in landing order
+        # have the slot, so one that keeps falling behind cannot starve the rest.
+        if self.now - _KEPT_AT.get((repo, number), float("-inf")) < KEEP_CURRENT_COOLDOWN:
+            return
+        if not self._behind(repo, full):
             return
         sha = str((full.get("head") or {}).get("sha") or "")
         done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
                             {"expected_head_sha": sha}, ok=(422,))
         self.kept_current.add(repo)
+        _KEPT_AT[(repo, number)] = self.now
         if done.status == 422:
             _say("%s#%d is held and could not be brought up to date with its base"
                  % (repo, number))
@@ -2938,31 +3102,59 @@ class Factory:
         """Merge a ready pull request that is up to date with its base, one a
         repo a pass; bring one that is behind up to date instead. A pull
         request that cannot be brought up to date cleanly goes back for a
-        fix round, as a conflict does."""
+        fix round, as a conflict does. The one brought up to date takes the
+        repo's landing lock; while another holds it, this does neither."""
         if repo in self.landed:
             return
+        held = self._lock(repo)
+        if held is not None and held != number:
+            return  # another pull request holds the repo's landing lock
         if self._behind(repo, full):
-            if repo in self.updated:
-                return
-            self.updated.add(repo)
-            sha = str((full.get("head") or {}).get("sha") or "")
-            done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
-                                {"expected_head_sha": sha}, ok=(422,))
-            if done.status == 422:
-                self._send_back(repo, full, issue, comments,
-                                "could not be brought up to date with its base")
-                # keep repo in updated to retry on next pass
-                return
-            # reset updated for future merges
-            self.updated.remove(repo)
-            self.actions += 1
-            _say("brought %s#%d up to date with its base; it lands once its checks "
-                 "and review pass on the new head" % (repo, number))
+            if repo not in self.updated:
+                self._update_to_land(repo, number, full, issue, comments, held)
             return
         if self._scope_holds(repo, number, full, issue):
             return
         if self._merge(repo, number, issue, str((full.get("head") or {}).get("sha") or "")):
             self.landed.add(repo)
+            if held == number:
+                self._unlock(repo, number)
+
+    def _update_to_land(self, repo: str, number: int, full: Dict[str, Any],
+                        issue: Dict[str, Any], comments: List[Dict[str, Any]],
+                        held: Optional[int]) -> None:
+        """_land's update: bring the pull request up to date and take the
+        repo's landing lock, or send it back when GitHub refuses."""
+        self.updated.add(repo)
+        sha = str((full.get("head") or {}).get("sha") or "")
+        done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
+                            {"expected_head_sha": sha}, ok=(422,))
+        if done.status == 422:
+            self._send_back(repo, full, issue, comments,
+                            "could not be brought up to date with its base")
+            if held == number:
+                self._unlock(repo, number)
+            # keep repo in updated to retry on next pass
+            return
+        # reset updated for future merges
+        self.updated.remove(repo)
+        if held is None:
+            landing.mark(self.gh, repo, number)
+            self.locks[repo] = number
+        self.actions += 1
+        _say("brought %s#%d up to date with its base; it lands once its checks "
+             "and review pass on the new head" % (repo, number))
+
+    def _lock(self, repo: str, pulls: Optional[List[Dict[str, Any]]] = None) -> Optional[int]:
+        """The pull request holding the repo's landing lock, read once a pass
+        (bus/landing.py releases an expired one as it reads)."""
+        if repo not in self.locks:
+            self.locks[repo] = landing.holder(self.gh, repo, self.now, pulls)
+        return self.locks[repo]
+
+    def _unlock(self, repo: str, number: int) -> None:
+        landing.release(self.gh, repo, number)
+        self.locks[repo] = None
 
     def _scope_holds(self, repo: str, number: int, full: Dict[str, Any],
                      issue: Dict[str, Any]) -> bool:
@@ -4050,6 +4242,8 @@ class Factory:
         closed_numbers = self._close_superseded_prs(repo, all_prs, tickets)
         prs = [p for p in all_prs if self._trusted(p) and int(p.get("number") or 0) not in closed_numbers]
         linked = {a[1]: pr for pr in prs for a in [self._association(repo, pr)] if a}
+        # Read first, so an expired lock comes off even when nothing lands.
+        self._guarded(lambda r, _: self._lock(r, prs), repo, {})
         for pr in landing_order(prs, tickets, linked):
             if self.actions >= MAX_ACTIONS:
                 return
