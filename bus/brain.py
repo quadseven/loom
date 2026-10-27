@@ -18,7 +18,8 @@ from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, a
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
 from . import answer, ci_facts, ci_gap, fixrounds, merge_tier, naming, operator_hold, shadow
-from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
+from .status import (add as add_status_event, is_status as is_status_comment,
+                     parse as parse_status_events, strip_body as strip_status_body)
 from .labels import HANDOFF, LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
@@ -2344,7 +2345,7 @@ def _rewrite_in_place(gh: GitHub, repo: str, source: Dict[str, Any], epic: int,
     names = _ticket_labels(gh, repo, new, lane)
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"title": title, "body": new})
     gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": names})
-    if not _link_to_goal(gh, repo, epic, source, under=goal):
+    if _sub_issue_parent(source) != epic and not _link_to_goal(gh, repo, epic, source, under=goal):
         print("#%d is linked to epic #%d by its Part of line" % (number, epic), file=sys.stderr)
     for name in ("loom:triage", "needs-brain"):
         if name in _labels(source):
@@ -2547,8 +2548,12 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         raise ValueError(refusal)
     _check_written_text(title + "\n" + body)
     _check_no_foreign_refs(gh, repo, title + "\n" + body)
+    if epic is None and intake_of is not None and source is not None:
+        # A rewrite stays under the epic its source already sits in, not the
+        # goal's intake epic (loom#2033).
+        epic = _source_epic(gh, repo, source, elsewhere is None)
     if epic is not None:
-        _, goal, goal_issue = open_epic(gh, repo, epic)
+        _, goal, goal_issue = _open_epic_for(gh, repo, epic, source, elsewhere is None)
     elif intake_of is not None:
         goal, goal_issue = intake_of, _goal_issue(gh, repo, intake_of)
     else:
@@ -2570,12 +2575,68 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     done = _brief_done_due(gh, repo, goal, holder, env, resolves)
     if epic is None:
         epic = intake_epic(gh, repo, goal)
+    if source is not None:
+        # A rewrite's draft may carry its own Part of line naming another
+        # issue (loom#2033); the ticket names the epic it is filed under.
+        full_body = _without_other_part_of(full_body, epic)
     issue = _brief_issue(gh, repo, epic, title, _with_part_of(full_body, epic), lane,
                          source, elsewhere, goal)
     url = str(issue.get("html_url", ""))
     if done:
         _journal_brief_done(gh, repo, goal, str(holder), done, url)
     return url
+
+
+def _source_parent(source: Dict[str, Any]) -> Optional[int]:
+    """The issue a rewrite's source sits under: its sub-issue parent, else
+    the Part of line of its own text. The sub-issue parent wins when the two
+    disagree: GitHub keeps one parent, and a body line is only words."""
+    parent = _sub_issue_parent(source)
+    if parent is not None:
+        return parent
+    match = _PART_OF_ANY.search(strip_status_body(source.get("body")))
+    return int(match.group(1)) if match else None
+
+
+def _open_epic_for(gh: GitHub, repo: str, epic: int, source: Optional[Dict[str, Any]],
+                   in_place: bool) -> Tuple[Dict[str, Any], int, Dict[str, Any]]:
+    """open_epic, except that a source rewritten in place that is already
+    the epic's sub-issue adds no ticket to it, so the cap does not refuse it."""
+    if source is not None and in_place and _sub_issue_parent(source) == epic:
+        try:
+            return open_epic(gh, repo, epic)
+        except ValueError as err:
+            if "already holds" not in str(err):
+                raise
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, epic)).data or {}
+        goal = int(_issue_goal(issue) or 0)
+        return issue, goal, _goal_issue(gh, repo, goal)
+    return open_epic(gh, repo, epic)
+
+
+def _source_epic(gh: GitHub, repo: str, source: Dict[str, Any],
+                 in_place: bool) -> Optional[int]:
+    """The open epic a rewrite's source already sits under (_source_parent),
+    when a ticket may be filed there; None sends the rewrite to the goal's
+    intake epic. A rewrite once ignored it: an issue under its epic was
+    rewritten into a brief that said Part of the intake epic, while GitHub
+    kept the old parent (loom#2033)."""
+    parent = _source_parent(source)
+    if parent is None:
+        return None
+    try:
+        _open_epic_for(gh, repo, parent, source, in_place)
+    except ValueError:
+        return None
+    return parent
+
+
+_PART_OF_LINE = re.compile(r"^Part of #(\d+)[ \t]*\n?", re.M)
+
+
+def _without_other_part_of(body: str, epic: int) -> str:
+    """The body without Part of lines that name an issue other than epic."""
+    return _PART_OF_LINE.sub(lambda m: m.group(0) if int(m.group(1)) == epic else "", body)
 
 
 def _rewrite_source(gh: GitHub, repo: str, refs: Optional[int],
