@@ -86,7 +86,12 @@ carries to `loom:shipped`, with a note naming the revision and the deploy
 time, and one log line per move. The pull request is the merged one whose
 `Refs` line or `loom/<number>` branch names the ticket. At most 20 move a
 pass, oldest merge first. A deploy that did not happen records nothing, so it
-ships nothing. Tickets of every other repo are never moved here; their goal
+ships nothing. An open issue still at `loom:triage` or `loom:queued` whose
+linked pull request merged and deployed ships the same way, with one comment,
+and loses `loom:triage`: only `loom:pr` tickets are reconciled from their
+pull request, so such issues sat behind after the deploy (loom#2025). A
+`loom:regression` issue, another operator's issue, or a ticket sent back to
+`loom:queued` after that merge (criteria left unbuilt) stays. Tickets of every other repo are never moved here; their goal
 home's ship rules decide, unless they ship on merge, on a deploy workflow or
 through a pin pull request (below).
 
@@ -127,6 +132,25 @@ files and the manual step (for a chart, the helm upgrade); the brain or an
 operator moves it to `loom:shipped` after. A `!` pattern
 excludes, as GitHub does; a workflow without a `paths` filter is not a deploy
 workflow here. Reverts and the 20 moves per pass limit apply as above.
+
+### Shipping through a downstream roll
+
+A repo that deploys only when another repo rolls it (a game module a server
+roll builds in, say) declares the roll record in `.loom/ship-roll` on its
+default branch: one line per record, `<OWNER/NAME> <path> <key>`, `#`
+comments. The record is the file at `<path>` on that repo's default branch,
+and its `<key>=<sha>` (or `<key>: <sha>`) line names the full source commit
+the last roll deployed. Each pass, for each watched repo with open
+`loom:merged` tickets and that file, the station moves each ticket whose pull
+request's merge commit that commit carries (the compare API) to
+`loom:shipped`, unless a later revert the commit also carries undid it. The
+note names the record's repo, or "a private repo" when the ticket's repo is
+public and the record's is not. A record that names no commit, or two, ships
+nothing. A malformed line ships nothing for that repo and is logged.
+
+A ticket a ship rule found deployed whose move to `loom:shipped` failed is
+kept with when it was first found; one still at `loom:merged` 24 hours later
+is listed in the `merged-not-shipped` invariant (docs/LANES.md, Invariants).
 
 ### Shipping through a pin pull request
 

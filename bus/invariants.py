@@ -129,6 +129,11 @@ TICKETS_SUBJECT = "every ticket"
 # The one subject of the rolling roll-pin-off breach: each goal home that
 # ships by roll with no roll ship document is a line in one issue.
 ROLL_SUBJECT = "every roll goal"
+# The one subject of the rolling merged-not-shipped breach: each ticket still
+# at loom:merged MERGED_UNSHIPPED_AFTER after a ship rule found its commit
+# deployed is a line in one issue (loom#2025).
+UNSHIPPED_SUBJECT = "every deployed merged ticket"
+MERGED_UNSHIPPED_AFTER = 24 * 3600
 # How long a ticket may wait for one reason the factory repeats every pass
 # before it is raised: six fix rounds waited nine hours on a lane at a limit
 # above the last rung of the ladder, logged every pass and raised by nothing
@@ -311,6 +316,9 @@ class Facts:
     # entry names, and how many entries there are.
     roll_goals: Optional[List[Ref]] = None
     roll_docs: int = 0
+    # Each open loom:merged ticket a ship rule found deployed but could not
+    # move, with when it was first found deployed (loom#2025).
+    unshipped: Optional[List[Tuple[Ref, float]]] = None
 
 
 @dataclass(frozen=True)
@@ -831,6 +839,28 @@ def roll_pin_off(f: Facts) -> List[Breach]:
                    f.now, rolling=True)]
 
 
+def merged_not_shipped(f: Facts) -> List[Breach]:
+    """Tickets still at loom:merged MERGED_UNSHIPPED_AFTER after a ship rule
+    found their merge commit deployed: the move to loom:shipped failed, and
+    nothing else would say so (loom#2025). One rolling breach, a line per
+    ticket; it clears once each has moved."""
+    if not f.unshipped:
+        return []
+    late = sorted((at, ref) for ref, at in f.unshipped
+                  if f.now - at >= MERGED_UNSHIPPED_AFTER)
+    if not late:
+        return []
+    return [Breach("merged-not-shipped", UNSHIPPED_SUBJECT,
+                   ("1 ticket stays" if len(late) == 1 else "%d tickets stay" % len(late))
+                   + " at loom:merged over %d hours after deploy" % (MERGED_UNSHIPPED_AFTER // 3600),
+                   ("A ship rule found each one's merge commit deployed, but its move to "
+                    "loom:shipped failed (the station log names why):",)
+                   + tuple("%s: deployed since %s" % (ref.label, utc(at)) for at, ref in late)
+                   + ("Once the cause is fixed, move each with python3 -m bus.brain move "
+                      "OWNER/NAME#N --to shipped",),
+                   max(at for at, _ in late), rolling=True)]
+
+
 def _decision(kind: str) -> str:
     """The decision an event kind reports on: rewrite_failed, rewrite_skipped
     and rewrite_succeeded all report on rewrite."""
@@ -898,7 +928,7 @@ INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
     plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
     repeated_failure, ticket_waiting,
-    untrusted_labeler, roll_pin_off)
+    untrusted_labeler, roll_pin_off, merged_not_shipped)
 
 
 def check(facts: Facts, say: Say,
