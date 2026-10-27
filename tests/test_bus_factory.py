@@ -261,6 +261,8 @@ class Base(unittest.TestCase):
         tiers.start()
         self.addCleanup(tiers.stop)
         self.gh = FakeGitHub()
+        # Each test's pull request reuses head shas; the reclass memo is per station process.
+        factory._CLASSED.clear()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
         self.humans = []
         self.placed = []
@@ -967,6 +969,18 @@ class PullRequests(Base):
         self.gh.behind[50] = 4
         with mock.patch.object(factory.Factory, "_operator_holds", return_value=True):
             self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+        self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
+                       {"expected_head_sha": "sha50"}), self.gh.writes)
+
+    def test_a_clean_sensitive_pull_request_behind_its_base_is_kept_current_never_merged(self):
+        # 2026-10-27: the brain's merge gate refuses a pull request behind its
+        # base, and nothing brought a sensitive one up to date, so green
+        # sensitive pull requests waited behind by 4 to 66 commits.
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:sensitive", "needs-brain"))
+        self.gh.behind[50] = 4
+        self.go()
         self.assertEqual((self.merged, self.fixed), ([], []))
         self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
                        {"expected_head_sha": "sha50"}), self.gh.writes)
@@ -2250,6 +2264,34 @@ class ChangeClasses(Base):
         self.go()
         self.assertEqual(self.merged, [])
         self.assertEqual(len(self.fixed), 1)
+
+    def test_a_docs_pull_request_that_gained_a_sensitive_file_is_left_for_the_brain(self):
+        # 2026-10-27: opened as class:docs, a fix round added code; the label stayed docs.
+        self.gh.contents[".loom/sensitive-paths"] = "bus/brain.py\n"
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:docs",), files=("docs/a.md", "bus/brain.py"))
+        self.go()
+        self.assertEqual(self.merged, [])
+        names = [x["name"] for x in self.gh.pulls[50]["labels"]]
+        self.assertEqual([n for n in names if n.startswith("class:")], ["class:sensitive"])
+        self.assertIn("needs-brain", names)
+
+    def test_a_docs_pull_request_that_gained_code_is_relabeled_logic(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:docs",), files=("docs/a.md", "bus/a.py", "tests/test_a.py"))
+        self.go()
+        names = [x["name"] for x in self.gh.pulls[50]["labels"]]
+        self.assertEqual([n for n in names if n.startswith("class:")], ["class:logic"])
+
+    def test_a_class_is_never_lowered_from_the_files(self):
+        # No sensitive-paths file read means no sensitive class from the files;
+        # the label the lane set stands.
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:sensitive", "needs-brain"))
+        self.go()
+        names = [x["name"] for x in self.gh.pulls[50]["labels"]]
+        self.assertIn("class:sensitive", names)
+        self.assertNotIn("class:logic", names)
 
     def test_a_sensitive_pull_request_already_marked_is_left_alone(self):
         self.gh.ticket(5, "pr")
