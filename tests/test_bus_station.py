@@ -93,6 +93,14 @@ class FakeGitHub:
         self.pull_files = {}
         self.carried = set()
         self.check_runs_status = 200
+        # Strings a code search of the repo finds nothing for (bus/unmeetable.py);
+        # every other search finds one file.
+        self.code_absent = set()
+        self.code_searches = []
+        # The default branch's files the code search index skips (over
+        # 384 KB): path -> text, read through the git trees and blobs API.
+        self.big_files = {}
+        self.tree_status = 200
 
     def add_foreign(self, repo, number, labels=("loom:pr",), state="open", reason=None):
         """An issue in another repo, as an After: line that names one reads it."""
@@ -209,6 +217,8 @@ class FakeGitHub:
                                    if any(l.get("name") == "loom:factory"
                                           for l in i.get("labels", []))])
             return reply(200, self.factory_incidents)
+        if method == "GET" and parts.path == "/search/code":
+            return self._code_search(parts.query)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if method == "GET" and rest == "labels":
             return reply(200, [{"name": name, "color": value["color"],
@@ -254,7 +264,29 @@ class FakeGitHub:
             return reply(200, self.pull_files.get(int(files.group(1)), []))
         if method == "GET" and rest == "git/ref/heads/loom-lock/brain":
             return reply(404, {"message": "Not Found"})
+        if method == "GET" and rest == "git/trees/HEAD" and parts.query == "recursive=1":
+            if self.tree_status != 200:
+                return reply(self.tree_status, {"message": "refused"})
+            tree = [{"path": "src/app.py", "type": "blob", "sha": "a" * 40, "size": 2000}]
+            tree += [{"path": name, "type": "blob", "sha": hashlib.sha1(name.encode()).hexdigest(),
+                      "size": 640000} for name in self.big_files]
+            return reply(200, {"tree": tree, "truncated": False})
+        blob = re.match(r"git/blobs/([0-9a-f]{40})$", rest)
+        if method == "GET" and blob:
+            for name, text in self.big_files.items():
+                if hashlib.sha1(name.encode()).hexdigest() == blob.group(1):
+                    return reply(200, {"encoding": "base64", "content": base64.b64encode(
+                        text.encode()).decode()})
+            return reply(404, {"message": "Not Found"})
         raise AssertionError("unexpected call %s %s" % (method, path))
+
+    def _code_search(self, query):
+        """A code search: one hit unless the term is in code_absent."""
+        term = unquote(query[len("q="):]).rsplit("+repo:", 1)[0].strip('"')
+        self.code_searches.append(term)
+        hits = 0 if term in self.code_absent else 1
+        return reply(200, {"total_count": hits, "incomplete_results": False,
+                           "items": [{"path": "src/app.py"}] * hits})
 
     def _post_page(self, data):
         if self.page_error:
@@ -506,10 +538,28 @@ class StationLabelSyncTest(Base):
     def test_unchanged_label_digest_makes_no_label_calls(self):
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
         ledger = os.path.join(runner.state, "labels.json")
-        self.write(ledger, json.dumps({"digest": runner.label_digest()}))
+        self.write(ledger, json.dumps({"digest": runner.label_digest(),
+                                       "repos": list(self.settings.repos)}))
         with mock.patch.object(labels_module, "ensure_labels") as ensure:
             runner.sync_labels()
         ensure.assert_not_called()
+
+    def test_a_repo_enrolled_after_the_last_sync_gets_the_full_label_set_on_its_first_pass(self):
+        # loom#2032: the sync ran only when the label set changed, so a repo
+        # enrolled later lacked loom:answered and a lane could not set it.
+        repos = ["example-owner/first", "example-owner/second"]
+        settings = station.Settings(self.home, repos, list(AUTHORS), list(OWNERS))
+        runner = station.Station(GitHub("token", transport=self.fake), settings)
+        ledger = os.path.join(runner.state, "labels.json")
+        self.write(ledger, json.dumps({"digest": runner.label_digest(), "repos": repos[:1]}))
+        with mock.patch.object(labels_module, "ensure_labels", return_value=[]) as ensure:
+            runner.sync_labels()
+            self.assertEqual([call.args[1] for call in ensure.call_args_list], repos[1:])
+            ensure.reset_mock()
+            runner.sync_labels()
+            ensure.assert_not_called()
+        with open(ledger, encoding="utf-8") as fh:
+            self.assertEqual(sorted(json.load(fh)["repos"]), repos)
 
 
 class StationKeepsAppTokenTest(Base):
@@ -1129,11 +1179,11 @@ class AdoptUntrackedPullRequestTest(Base):
                         "## Definition of done"):
             self.assertIn(section, body)
         # Filed under the goal's intake epic, which the station opened.
-        intake = [c for c in self.fake.created if c["title"] == brain.INTAKE_TITLE]
+        intake = [c for c in self.fake.created if brain.is_intake_epic(c)]
         self.assertEqual(len(intake), 1)
         self.assertRegex(intake[0]["body"], r"(?m)^Part of #30$")
         epic_number = next(n for n, i in self.fake.issues.items()
-                           if i.get("title") == brain.INTAKE_TITLE)
+                           if brain.is_intake_epic(i))
         self.assertRegex(body, r"(?m)^Part of #%d$" % epic_number)
         self.assertNotRegex(body, r"(?m)^Part of #30$")
         self.assertNotRegex(body, r"(?m)^Refs ")
@@ -3639,6 +3689,25 @@ class FlakyLadderFake(LadderReviewFake):
 INSTALL_TIMEOUT = ("##[error]The action 'Install what the core's own Dockerfile installs' "
                    "has timed out after 10 minutes.")
 
+PYTEST_READTIMEOUT = (
+    "ERROR at setup of test_postgres [conftest.py:7]\n"
+    "E   ReadTimeout: read timeout=60\n"
+    "ERROR at setup of test_other [conftest.py:7]\n"
+    "E   ReadTimeout: read timeout=60\n"
+    "4528 passed, 5 errors")
+
+PYSETUP = [
+    {"id": 501, "name": "pytest", "status": "completed", "conclusion": "failure",
+     "details_url": "https://github.com/%s/actions/runs/88/job/501" % REPO},
+    {"id": 502, "name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+     "conclusion": "success", "details_url": "https://grug.example"}]
+
+CANCELLED = [
+    {"id": 501, "name": "adapter", "status": "completed", "conclusion": "cancelled",
+     "details_url": "https://github.com/%s/actions/runs/88/job/501" % REPO},
+    {"id": 502, "name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+     "conclusion": "failure", "details_url": "https://grug.example"}]
+
 
 class InfraFlakeHandBackTest(unittest.TestCase):
     """An infra timeout is re-run before a fix round, whatever else fails,
@@ -3694,6 +3763,51 @@ class InfraFlakeHandBackTest(unittest.TestCase):
                                                "with exit code 1.")])
         self.assertEqual(self.reruns(), [])
         self.assertIn("lane:claude", self.names())
+
+    def test_a_pull_request_with_only_readtimeout_errors_is_rerun_once_and_not_judged(self):
+        """A job whose only failing lines are 5 Docker ReadTimeout errors (no
+        test failures) gets one re-run of its failed jobs and no fix round
+        (fails on main)."""
+        self.gh.check_runs = PYSETUP
+        self.last_round("### Check: pytest\n\n    5 errors")
+        self.run_hand_back(checks=[("pytest", PYTEST_READTIMEOUT),
+                                   (factory.DEFAULT_REVIEW_CHECK, "failure")])
+        self.assertEqual(self.reruns(),
+                         ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertIn("lane:spark", self.names())
+
+    def test_a_cancelled_job_is_rerun_once_then_a_fix_round(self):
+        """A cancelled job gets one re-run before the station counts it; the
+        same red after the re-run sends a fix round as today."""
+        self.gh.check_runs = CANCELLED
+        self.last_round("### Check: adapter\n\n    cancelled")
+        self.run_hand_back(checks=[("adapter", "no log was available (conclusion cancelled)"),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(self.reruns(),
+                         ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertIn("lane:spark", self.names())
+        # The same red head: already re-ran once, so a fix round is sent and
+        # no further re-run happens.
+        self.run_hand_back(checks=[("adapter", "no log was available (conclusion cancelled)"),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(self.reruns(),
+                         ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 2)
+        self.assertIn("lane:spark", self.names())
+
+    def test_a_real_test_failure_is_sent_straight_back_with_no_rerun(self):
+        """A real test failure (an assertion) sends a fix round at once, with
+        no re-run."""
+        self.gh.check_runs = PYSETUP
+        self.run_hand_back(checks=[("pytest",
+                                    "FAILED tests/test_a.py::test_x - assert 1 == 2\n"
+                                    "##[error]Process completed with exit code 1.")])
+        self.assertEqual(self.reruns(), [])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertIn("lane:spark", self.names())
+        self.assertNotIn("lane:claude", self.names())
 
 
 class StampedReviewFake(ReviewFake):
@@ -7200,8 +7314,9 @@ class NoChangeAnswerTest(Base):
     no longer applies. The runner hands its reason to the station in the
     .answered marker; the station records it and settles the ticket."""
 
-    def no_change(self, said=NO_CHANGE_SAID, pulls=(), labels=()):
-        self.fake.add(12, state="running")
+    def no_change(self, said=NO_CHANGE_SAID, pulls=(), labels=(), fresh=True):
+        if fresh:
+            self.fake.add(12, state="running")
         self.fake.issues[12]["labels"] += [{"name": label} for label in labels]
         self.fake.pulls = list(pulls)
         name = tickets.ticket_name(REPO, 12, 1)
@@ -7259,6 +7374,40 @@ class NoChangeAnswerTest(Base):
         events = self.events()
         self.assertNotIn("Fixes #12", events[0])
         self.assertIn("its reason did not pass the text checks", events[0])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:answered"])
+
+    def test_a_box_the_answer_does_not_prove_requeues_the_ticket_and_names_the_box(self):
+        # loom#2032: a no-op answer moved a ticket to loom:merged while its
+        # third box still failed. Every code box must be ticked on the ticket
+        # or in the answer's own checklist before the answer is accepted.
+        self.fake.add(12, state="running", body=BODY + (
+            "\n## Acceptance criteria\n- [x] The walk is suppressed\n"
+            "- [ ] The list names only public repos\n"))
+        sha = "%040x" % 77
+        self.no_change(pulls=[{"number": 77, "state": "closed", "merged_at": "2030-01-01T00:00:00Z",
+                               "merge_commit_sha": sha, "body": "Refs %s#12" % REPO,
+                               "head": {"ref": "a-fix"}}], fresh=False)
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
+        events = self.events()
+        self.assertIn("The list names only public repos", events[0])
+        self.assertNotIn("Pull request #77", events[0])
+
+    def test_a_box_the_answer_marks_not_built_is_not_proven(self):
+        self.fake.add(12, state="running", body=BODY + (
+            "\n## Acceptance criteria\n- [ ] The walk is suppressed\n"))
+        self.no_change(said=NO_CHANGE_SAID.replace(
+            "- [x] The walk is suppressed", "- [ ] The walk is suppressed; not built: no key"),
+            fresh=False)
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertIn("The walk is suppressed", self.events()[0])
+
+    def test_every_box_proven_by_the_answer_or_the_ticket_accepts_it(self):
+        self.fake.add(12, state="running", body=BODY + (
+            "\n## Acceptance criteria\n- [ ] The walk is suppressed\n"
+            "- [x] The old flag is gone\n- [ ] Live: the station log shows `walk off`\n"))
+        self.no_change(fresh=False)
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:answered"])
 
     def test_an_empty_marker_still_settles_the_ticket(self):
@@ -10866,6 +11015,114 @@ class VerifyDispatchTest(Base):
         self.assertTrue(any("-6-verify-" in n for n in self.briefs()), self.briefs())
         self.assertNotIn("wait:live-event", self.fake.names(6))
         self.assertIn("loom:shipped", self.fake.names(6))
+
+    def unmeetable_pass(self):
+        """A pass with the verify cooldown cleared, so only the Live box decides."""
+        self.write(os.path.join(self.home, "state", "station", station.VERIFY_FILE), "{}")
+        self.run_pass()
+
+    def test_a_live_box_whose_log_string_no_code_prints_gets_one_restate_ask(self):
+        # loom#2028: a Live box waiting on a string nothing emits went back
+        # through lanes and came back unmet each time.
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        ask = self.fake.comments[2][0]["body"]
+        self.assertIn("<!-- loom:unmeetable-live v1 ", ask)
+        self.assertIn("`daily status ready`", ask)
+        self.assertIn("Restate the Live box", ask)
+        self.assertIn("loom:shipped", self.fake.names(2))
+        # Later passes neither ask again nor queue it, nor search again.
+        searched = len(self.fake.code_searches)
+        self.unmeetable_pass()
+        self.unmeetable_pass()
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.code_searches), searched)
+        # A restated box is checked afresh and verified.
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "`daily status ready`", "`daily status line ready`")
+        self.unmeetable_pass()
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+
+    def test_a_live_box_whose_log_string_the_code_prints_is_verified(self):
+        self.fake.issues.pop(1)
+        self.run_pass()
+        self.assertIn("daily status ready", self.fake.code_searches)
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_live_box_waiting_on_a_closed_issue_gets_one_restate_ask(self):
+        self.fake.issues.pop(1)
+        self.fake.add_foreign("example-owner/muster", 163, state="closed", reason="completed")
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "after deploy, muster#163 is verified and the log prints `daily status ready`")
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertIn("example-owner/muster#163", self.fake.comments[2][0]["body"])  # leak-guard-allow: fictional example repos
+        self.unmeetable_pass()
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+
+    def test_a_log_string_only_a_file_too_big_for_code_search_prints_is_verified(self):
+        # loom#2050: GitHub's code search skips files over 384 KB, so a
+        # string printed only from such a file (the station's own
+        # "trusting briefing logins") searched as absent and was flagged.
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"trusting briefing logins"}
+        self.fake.big_files = {"bus/big.py": 'x = 1\n_say("trusting briefing logins: %s" % who)\n'}
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "`daily status ready`", "`trusting briefing logins`")
+        self.run_pass()
+        self.assertIn("trusting briefing logins", self.fake.code_searches)
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_quoted_log_line_with_filled_in_values_matches_its_template(self):
+        # loom#2050: a box quoting the line as printed ("claimed
+        # #528 for lane") is matched against the source
+        # template ("claimed %s for lane"), not searched literally.
+        self.fake.issues.pop(1)
+        quoted = "claimed example-owner/loom#528 for lane at 1a2b3c4d"  # leak-guard-allow: fictional example repos
+        self.fake.code_absent = {quoted, "for lane at"}
+        self.fake.big_files = {"bus/big.py": '_say("claimed %s for lane at %s" % (ref, sha))\n'}
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "`daily status ready`", "`%s`" % quoted)
+        self.run_pass()
+        self.assertNotIn(quoted, self.fake.code_searches)
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_log_string_neither_the_search_nor_the_big_files_hold_is_flagged(self):
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.fake.big_files = {"bus/big.py": '_say("daily status is ready")\n'}
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertIn("`daily status ready`", self.fake.comments[2][0]["body"])
+
+    def test_a_search_zero_with_an_unreadable_tree_flags_nothing(self):
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.fake.tree_status = 502
+        self.run_pass()
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_lost_state_file_does_not_ask_twice_for_the_same_box(self):
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.run_pass()
+        os.remove(os.path.join(self.home, "state", "station", station.UNMEETABLE_FILE))
+        self.unmeetable_pass()
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
 
     def test_verify_pool_never_hands_ticket_with_unsearchable_live_line(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(

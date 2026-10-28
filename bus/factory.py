@@ -199,6 +199,8 @@ NO_LANE_RE = re.compile(r"(no free lane takes model |no free lane in tier "
                         r"|on lane \S+, .*: no free lane in its )")
 # The hand-off pool the second operator's session works (docs/BRAIN.md).
 HANDOFF_LABEL = labels.HANDOFF
+WAIT_SUPERSEDED = "wait:superseded"
+WAIT_BLOCKED = "wait:blocked"
 # What bus.brain writes on an issue it rewrote as a new ticket (_filed_rewrite).
 REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 # The states in which a lane has taken the ticket: its no-lane wait is over.
@@ -1333,6 +1335,29 @@ def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
             continue
         checked, not_built = states.get(criterion_key(text), (False, False))
         if not checked and not not_built:
+            missing.append(text)
+    return missing
+
+
+def unproven_criteria(ticket_body: str, answer: str) -> List[str]:
+    """Ticket code criteria a lane's no-change answer leaves unproven: not
+    ticked on the ticket and not ticked in the answer's own Acceptance
+    criteria checklist (the answer quotes the lane's summary, so its lines
+    start with "> "). A "not built: <reason>" mark proves nothing here: the
+    answer says the work is already done. Live and operator criteria are left
+    to the verifier and the operator, as for a pull request (loom#2032)."""
+    unquoted = "\n".join(re.sub(r"^>[ \t]?", "", line) for line in (answer or "").splitlines())
+    ticked = set()
+    for criterion in acceptance_criteria(unquoted):
+        checked, _, text = criterion.partition(" ")
+        if checked == "x" and not NOT_BUILT_RE.search(text):
+            ticked.add(text.strip().casefold())
+    missing = []
+    for criterion in acceptance_criteria(ticket_body):
+        checked, _, text = criterion.partition(" ")
+        if checked == "x" or criteria_gate.kind(text) != criteria_gate.CODE:
+            continue
+        if text.strip().casefold() not in ticked:
             missing.append(text)
     return missing
 
@@ -3830,7 +3855,7 @@ class Factory:
         """Why a queued ticket gets no lane this pass, or ""."""
         if self.now < held_until(issue) or self._host_only(repo, issue):
             return "is held"
-        held = self._brief_wait(repo, issue)
+        held = self._brief_wait(repo, issue) or self._superseded_or_blocked(repo, issue)
         if held:
             return "waits: " + held
         # A ticket held by After: is never briefed: the station refuses the
@@ -3854,6 +3879,34 @@ class Factory:
             reason = "health ticket names no cause"
         else:
             return ""
+        self._waiting(repo, issue["number"], reason)
+        return reason
+
+    def _superseded_or_blocked(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why a queued ticket whose brief says another issue supersedes it,
+        or whose Blocked on section names an issue still open, gets no lane,
+        or "" (bus/brief_check.py superseded_by, blocked_on). It is labelled
+        wait:superseded or wait:blocked, once; a claim clears the label. An
+        issue that cannot be read keeps the hold. 2026-10-25: a rewrite whose
+        own brief said it was superseded by a blocked issue was queued and
+        laned twice (loom#2033)."""
+        body = issue.get("body")
+        newer = brief_check.superseded_by(body)
+        if newer is not None:
+            reason, label = "superseded by #%d" % newer, WAIT_SUPERSEDED
+        else:
+            still = [n for n in brief_check.blocked_on(body) if n != int(issue["number"])
+                     and (self._dependency(repo, n) or {}).get("state") != "closed"]
+            if not still:
+                return ""
+            reason = "blocked on %s" % ", ".join("#%d" % n for n in still)
+            label = WAIT_BLOCKED
+        if label not in _labels(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+                         {"labels": [label]})
+            issue["labels"] = list(issue.get("labels") or []) + [{"name": label}]
+            self.actions += 1
+            _say("held queued %s#%s: its brief says %s" % (repo, issue["number"], reason))
         self._waiting(repo, issue["number"], reason)
         return reason
 
