@@ -6310,6 +6310,36 @@ def _rung_by_load(left: Sequence[int], lanes_of: Callable[[int], Tuple[str, ...]
     return (n, lane), None
 
 
+# Lane load per station repo list, counted on the first escalate in this
+# process and kept current as escalate moves tickets, so a sweep reads each
+# repo once and its later tickets see the earlier ones.
+_LANE_LOAD: Dict[Tuple[str, ...], Dict[str, int]] = {}
+
+
+def _lane_load(gh: GitHub, repo: str) -> Dict[str, int]:
+    """Open briefed and running tickets per lane over every LOOM_REPOS repo
+    and `repo`, as the factory counts them (Factory.count_load): lanes are
+    shared by every repo the station watches."""
+    repos = tuple(dict.fromkeys(
+        os.environ.get("LOOM_REPOS", "").replace(",", " ").split() + [repo]))
+    if repos not in _LANE_LOAD:
+        from . import factory  # factory imports this module
+        counter = factory.Factory(gh, repos, time.time(), trusted=trusted_authors())
+        counter.count_load()
+        _LANE_LOAD[repos] = counter.load
+    return _LANE_LOAD[repos]
+
+
+def _count_move(load: Dict[str, int], issue: Dict[str, Any], lane: str) -> None:
+    """Count an escalated ticket on its new lane, off the lane it was counted
+    on when it was already briefed or running there."""
+    from . import factory  # factory imports this module
+    old = factory._lane(issue)
+    if factory._state(issue) in ("briefed", "running") and old:
+        load[old] = load.get(old, 0) - 1
+    load[lane] = load.get(lane, 0) + 1
+
+
 def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
              lanes_repo: str = "quadseven/loom") -> str:
     """Move a repeatedly stuck ticket to the lowest untried rung of the model
@@ -6377,10 +6407,9 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
                         ", ".join(history.tried), "; ".join(history.reasons)), notify.RUNAWAY)
         return "needs-brain"
     free = _available_lanes(gh, lanes_repo)
-    load_counter = factory.Factory(gh, [repo], time.time(), trusted=trusted_authors())
-    load_counter.count_load()
+    load = _lane_load(gh, repo)
     choice, skipped_load = _rung_by_load(
-        left, lambda n: tuple(x for x in rung_lanes(n) if x in free), load_counter.load)
+        left, lambda n: tuple(x for x in rung_lanes(n) if x in free), load)
     if choice is None:
         raise ValueError("no untried rung has an available lane")
     rung, lane = choice[0] - 1, choice[1]
@@ -6402,6 +6431,7 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
         fix(gh, repo, pr, (repo, number), notes or comment.split("\n")[1], lane, model)
     else:
         move(gh, repo, number, "briefed", lane, None, None, model)
+    _count_move(load, issue, lane)
     # A routine event: the status comment's event list, not a new comment (loom#866).
     add_status_event(gh, repo, number, comment, time.time(), trusted_authors())
     return "rung %d %s on %s" % (rung + 1, model, lane)
