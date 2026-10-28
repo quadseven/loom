@@ -1742,9 +1742,12 @@ class RolledKindTest(unittest.TestCase):
         return self.gh.issues[number]
 
     def test_an_old_issue_folds_only_into_its_own_repos_tracking_issue(self):
-        private = self.legacy(61)
+        # Each old issue's marker key hashes its own repo's subject, as the
+        # station filed it; the hash cannot be read back, so with no kept
+        # subject the title is all migration has to tell the repo by.
+        private = self.legacy(61, subject="%s#2440" % OTHER)
         private["title"] = "Lane pull request 2440 of a private repo open 32.9 hours: x"
-        public = self.legacy(62)
+        public = self.legacy(62, subject="%s#1527" % self.PUBLIC)
         public["title"] = "Lane pull request 1527 of %s open 13.3 hours: x" % self.PUBLIC
         # Only the factory repo has a stalled pull request this pass.
         self.file(self.stalled([self.pull(201)]))
