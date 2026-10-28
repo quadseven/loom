@@ -35,6 +35,7 @@ SETUP_STEP_RE = re.compile(
 # A step name may hold an apostrophe ("Install what the core's own
 # Dockerfile installs"), so the name runs to the last quote on the line.
 STEP_TIMEOUT_RE = re.compile(r"The action '(.*)' has timed out after \d+ minutes")
+STEP_FAILED_RE = re.compile(r"The action '(.*)' failed(?: with exit code \d+)?")
 # Runner and mirror failures, whatever step they hit.
 INFRA_LINE_RE = re.compile(
     r"The runner has received a shutdown signal"
@@ -42,14 +43,56 @@ INFRA_LINE_RE = re.compile(
     r"|The hosted runner encountered an error"
     r"|^\s*E: (?:Failed to fetch|Unable to fetch some archives)"
     r"|Temporary failure resolving '", re.M)
+# A job GitHub's conclusion marks as cancelled: CI infrastructure, not the
+# change.
+CANCELLED_RE = re.compile(r"\bconclusion\s+cancelled\b|\bthe job was cancelled\b", re.I)
+# A pytest error detail line (pytest prefixes the error with "E ").
+PYTEST_ERROR_DETAIL_RE = re.compile(r"^\s*E\b", re.M)
+# A pytest test failure line (an assertion), which names the change, not the
+# infrastructure.
+PYTEST_FAILED_RE = re.compile(r"\bFAILED\b", re.I)
+# A timeout or connection error named in a pytest error detail line.
+PYTEST_INFRA_RE = re.compile(
+    r"\b(?:ReadTimeout|ConnectTimeout|ConnectionError|timeout|connection refused|"
+    r"unreachable|could not connect|network is unreachable)\b", re.I)
+
+
+def _pytest_only_infra_errors(text: str) -> bool:
+    """True when pytest reports only errors (no test failures) and every error
+    detail line names a timeout or a connection error: the change's tests did
+    not fail, the infrastructure did."""
+    lines = text.splitlines()
+    if any(PYTEST_FAILED_RE.search(line) for line in lines):
+        return False
+    details = [line for line in lines if PYTEST_ERROR_DETAIL_RE.match(line)]
+    if not details:
+        return False
+    return all(PYTEST_INFRA_RE.search(line) for line in details)
+
+
+def _setup_step_failed(text: str) -> bool:
+    """True when a setup or install step (not a test or build step) failed,
+    so the job never ran any repo code."""
+    for match in STEP_FAILED_RE.finditer(text):
+        if SETUP_STEP_RE.search(match.group(1)):
+            return True
+    return False
 
 
 def infra_flake(text: Optional[str]) -> bool:
     """Does this job log excerpt or check output show an infrastructure
-    failure: a setup or install step's own timeout, a lost or stopped runner,
-    or a package mirror that could not be reached?"""
+    failure: a cancelled job, a setup or install step's own timeout or failure,
+    a lost or stopped runner, a package mirror that could not be reached, a
+    job that failed before any repo code ran, or pytest reporting only errors
+    that each name a timeout or a connection error (no test failures)?"""
     if not text:
         return False
+    if CANCELLED_RE.search(text):
+        return True
+    if _setup_step_failed(text):
+        return True
+    if _pytest_only_infra_errors(text):
+        return True
     for match in STEP_TIMEOUT_RE.finditer(text):
         if SETUP_STEP_RE.search(match.group(1)):
             return True

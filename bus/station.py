@@ -479,6 +479,9 @@ DECISION_REVERT_MARKER = "<!-- loom:decision-revert v1 -->"
 DECISION_ASK = ("Kind: decision\nA merged pull request already carries this ticket's work, "
                 "but these boxes ask for an operator decision: %s. Decide, tick each box, "
                 "and move the ticket on, or say what to change.")
+# A no-change answer that leaves a code acceptance box unproven (loom#2032).
+NO_CHANGE_UNPROVEN_NOTE = ("The answer does not prove every acceptance box, so the ticket is "
+                           "back at loom:queued instead of settling. Not proven: %s")
 # A base check that failed before the agent ran: it could not start (exit
 # 125 to 127) or it was red on the unmodified repo or default branch. On a
 # cluster runner that is often the runner image (a tool the repo's check
@@ -5922,10 +5925,15 @@ class Station:
                 return
         # An infra timeout (bus/flake.py) is no lane's to fix: it is re-run
         # once before any round, whatever else fails, and never reads as a
-        # stuck failure after (loom#1962).
+        # stuck failure after (loom#1962). A cancelled job, a job that failed
+        # before any repo code ran, and pytest reporting only timeout or
+        # connection errors (no test failures) are the same shape. The station
+        # re-runs each head commit's failed jobs once, records it on the
+        # ticket's status comment and waits: a second red on the same head
+        # counts as a fix round as usual.
         flaky = [name for name, tail in failed if name not in (
             self.s.review_check, self.s.plan_check) and flake.infra_flake(tail)]
-        if flaky and self._rerun_flaky(repo, number, pr_number, sha, flaky):
+        if flaky and self._rerun_flaky(repo, number, pr_number, sha, flaky, comments):
             self._remove_ready_if_present(repo, number, names)
             return
         self._note_first_push(repo, pr_number, comments, failed)
@@ -5963,24 +5971,65 @@ class Station:
                                    comments, names, failed, threads, rounds, flaky)
 
     def _rerun_flaky(self, repo: str, number: int, pr_number: int, sha: str,
-                     flaky: List[str]) -> bool:
+                     flaky: List[str], comments: List[Any]) -> bool:
         """Re-run the workflow runs of the infra-failed checks on this head
-        once (flake.rerun_once). False when each was already re-run, or when
-        GitHub refused the read or the re-run: the fix round then goes as it
-        did before this re-run existed."""
+        once (flake.rerun_once), record it on the ticket's status comment and
+        wait. Returns True when a re-run was started and the ticket should
+        wait for it; False when it was already re-run on this head, no re-run
+        is due, or GitHub refused the re-run: the fix round then goes as it
+        did before this re-run existed (a second red on this head counts as
+        usual)."""
+        if self._already_re_ran(repo, sha):
+            return False
         try:
             runs = brain.newest_check_runs((self.gh.rest(
                 "GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data
                 or {}).get("check_runs") or [])
-            if not flake.rerun_once(self.gh, repo, runs, flaky):
+            done = flake.rerun_once(self.gh, repo, runs, flaky)
+            if not done:
                 return False
         except GitHubError as err:
-            _say("%s#%d: could not re-run %s on %s#%d (%s); the fix round goes as usual"
-                 % (repo, number, ", ".join(sorted(flaky)), repo, pr_number, err))
+            self._cannot_re_run(repo, err)
             return False
+        self._record_re_run(repo, number, sha, flaky, comments)
         _say("%s#%d: re-ran %s on %s#%d once before a fix round: an infra failure"
              % (repo, number, ", ".join(sorted(flaky)), repo, pr_number))
         return True
+
+    def _already_re_ran(self, repo: str, sha: str) -> bool:
+        """Whether this Loom already re-ran the failed jobs of `sha` on this
+        repo once (state/ci_reruns.json), so a second red on the same head
+        counts as a fix round instead of another re-run."""
+        record = _read_json(os.path.join(self.state, "ci_reruns.json"), {}, strict=False)
+        return "%s#%s" % (repo, sha) in record
+
+    def _record_re_run(self, repo: str, number: int, sha: str, flaky: List[str],
+                       comments: List[Any]) -> None:
+        """Remember the re-run (state/ci_reruns.json) and note it on the
+        ticket's status comment so the next pass reads it back and waits."""
+        record = _read_json(os.path.join(self.state, "ci_reruns.json"), {}, strict=False)
+        record["%s#%s" % (repo, sha)] = self.now
+        _write_json(os.path.join(self.state, "ci_reruns.json"), record)
+        status.add(self.gh, repo, number,
+                   "Re-ran %s once before a fix round (infra failure, head %s): "
+                   "waiting on the re-run." % (", ".join(sorted(flaky)), sha[:12]),
+                   self.now, self.s.authors)
+
+    def _cannot_re_run(self, repo: str, err: GitHubError) -> None:
+        """Say once per repo that the Loom App cannot re-run jobs because it
+        lacks the actions: write permission, so the operator knows to install
+        it (docs/LANES.md). Other refusals keep the earlier behaviour."""
+        said = _read_json(os.path.join(self.state, "ci_rerun_refused.json"), {}, strict=False)
+        if repo in said:
+            return
+        said[repo] = self.now
+        _write_json(os.path.join(self.state, "ci_rerun_refused.json"), said)
+        if getattr(err, "status", 0) in (401, 403):
+            _say("%s: cannot re-run infra-failed jobs: the Loom App has no actions: "
+                 "write permission (%s); a fix round goes as usual" % (repo, err))
+        else:
+            _say("%s: could not re-run infra-failed jobs (%s); a fix round goes as usual"
+                 % (repo, err))
 
     def _no_round(self, failed: List[Tuple[str, str]], threads: List[Any]) -> bool:
         """Nothing a lane round could fix: no failure at all, or the plan check
@@ -6910,6 +6959,8 @@ class Station:
         said = self._no_change_said(lane, name)
         issue = self._issue(repo, number)
         names = _label_names(issue)
+        if self._unproven_no_change(repo, number, issue, said):
+            return
         undoes = bool(set(names) & {REGRESSION, factory.REVERT_LABEL})
         merged = self._merged_linked(repo, issue) if (
             issue.get("state") == "open" and RUNNING in names and not undoes) else []
@@ -6942,6 +6993,25 @@ class Station:
                     "again." % ("This is a regression or revert ticket" if undoes else
                                 "No merged pull request references this ticket"))
         self._routine(repo, number, "%s\n\n%s" % (said, note))
+
+    def _unproven_no_change(self, repo: str, number: int, issue: Dict[str, Any],
+                            said: str) -> bool:
+        """Send a running ticket back to loom:queued, naming each box, when a
+        no-change answer leaves a code acceptance box unproven (neither the
+        ticket nor the answer's checklist ticks it). On 2026-10-17 a lane's
+        no-op answer settled a ticket whose third box still failed, and it
+        went on to loom:merged (loom#2032). True when it requeued."""
+        if issue.get("state") != "open" or RUNNING not in _label_names(issue):
+            return False
+        left = factory.unproven_criteria(str(issue.get("body") or ""), said)
+        if not left:
+            return False
+        self._relabel(repo, number, "loom:queued")
+        self._routine(repo, number, "%s\n\n%s" % (said, NO_CHANGE_UNPROVEN_NOTE % "; ".join(
+            " ".join(text.split())[:criteria_gate.ASK_WIDTH] for text in left)))
+        _say("%s#%d: a no-change answer left %d box(es) unproven, requeued"
+             % (repo, number, len(left)))
+        return True
 
     def _merged_cited(self, repo: str, issue: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Merged pull requests the Fabric workspace cites as already doing
@@ -12377,17 +12447,25 @@ class Station:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def sync_labels(self) -> None:
-        """Sync every registered repo when the desired label set changes."""
+        """Sync every registered repo when the desired label set changes, and
+        a repo enrolled since the last sync on its first pass: one enrolled
+        later lacked loom:answered, and a lane could not set it (loom#2032).
+        The ledger records the digest and the repos synced at it."""
         path = os.path.join(self.state, "labels.json")
         digest = self.label_digest()
         saved = _read_json(path, {}, strict=False)
+        synced: List[str] = []
         if isinstance(saved, dict) and saved.get("digest") == digest:
+            synced = [r for r in saved.get("repos") or [] if isinstance(r, str)]
+        todo = [repo for repo in self.s.repos if repo not in synced]
+        if not todo:
             return
-        for repo in self.s.repos:
+        for repo in todo:
             changed = labels.ensure_labels(self.gh, repo)
             if changed:
                 _say("labels changed in %s: %s" % (repo, ", ".join(changed)))
-        _write_json(path, {"digest": digest})
+            synced.append(repo)
+            _write_json(path, {"digest": digest, "repos": synced})
 
     def run_pass(self) -> None:
         if self._budget_exhausted():
