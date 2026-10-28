@@ -93,7 +93,7 @@ DEFAULT_PLAN_CHECK = "Grug - Chief"
 # The step names of a brain tick (docs/MUSE.md). A journal line such as
 # "- Step status: failed (GitHub answered 502)" reports one that broke.
 STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage",
-         "journal", "unlock")
+         "sweep", "journal", "unlock")
 STEP_RE = re.compile(r"(?im)^[ \t]*[-*]?[ \t]*(?:step[ \t]+)?(%s)(?:[ \t]+step)?[ \t]*:[ \t]*"
                      r"(failed|degraded)\b[ \t:,.-]*(.*?)[ \t]*$" % "|".join(STEPS))
 LABEL = "loom:invariant"

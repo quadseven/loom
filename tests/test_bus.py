@@ -599,7 +599,9 @@ class CliTests(unittest.TestCase):
         self.assertIn("requests: 1", err)
 
     def test_journal_command_holder_adds_the_tick_line(self):
-        t = Scripted(reply(200, {"login": "me"}), reply(200, []), reply(201, {}))
+        # The tick record read first (loom#2104): no lock, no step times.
+        t = Scripted(reply(404, {"message": "Not Found"}), reply(200, {"login": "me"}),
+                     reply(200, []), reply(201, {}))
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "j.md")
             with open(path, "w") as fh:
@@ -607,7 +609,7 @@ class CliTests(unittest.TestCase):
             code, _ = self.run_cli(["journal", REPO + "#5", "--file", path,
                                     "--holder", "lane-machine"], t)
         self.assertEqual(code, 0)
-        posted = json.loads(t.calls[2][3])["body"].splitlines()
+        posted = json.loads(t.calls[3][3])["body"].splitlines()
         self.assertRegex(posted[1], r"^Tick \S+Z, lane-machine$")
         self.assertEqual(posted[2], "Moved: nothing.")
 
@@ -615,7 +617,9 @@ class CliTests(unittest.TestCase):
         # bus journal --holder writes a Tick line whose time parses with
         # %Y-%m-%dT%H:%M:%SZ (acceptance criterion 3).
         from bus import handoff
-        t = Scripted(reply(200, {"login": "me"}), reply(200, []), reply(201, {}))
+        # The tick record read first (loom#2104): no lock, no step times.
+        t = Scripted(reply(404, {"message": "Not Found"}), reply(200, {"login": "me"}),
+                     reply(200, []), reply(201, {}))
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "j.md")
             with open(path, "w") as fh:
@@ -623,7 +627,7 @@ class CliTests(unittest.TestCase):
             code, _ = self.run_cli(["journal", REPO + "#5", "--file", path,
                                     "--holder", "lane-machine"], t)
         self.assertEqual(code, 0)
-        posted = json.loads(t.calls[2][3])["body"].splitlines()
+        posted = json.loads(t.calls[3][3])["body"].splitlines()
         tick_line = posted[1]
         self.assertTrue(tick_line.startswith("Tick "))
         self.assertTrue(tick_line.endswith(", lane-machine"))
