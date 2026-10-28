@@ -3655,12 +3655,34 @@ class HumanAndRefsTests(unittest.TestCase):
         self.assertEqual(fake.calls[7][2], {"labels": ["loom:rewritten"]})
         self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
 
-    def test_brief_refs_refuses_a_ticket_or_closed_original(self):
-        for issue in (item(6, labels=["loom:ticket"]), item(6, state="closed")):
+    def test_brief_refs_refuses_a_rewritten_or_closed_original(self):
+        for issue in (item(6, labels=["loom:rewritten"]), item(6, state="closed")):
             fake = Fake(reply(200, issue))
             with self.assertRaises(ValueError):
                 brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, refs=6)
             self.assertTrue(all(c[0] == "GET" for c in fake.calls))
+
+    def test_brief_refs_rewrites_a_ticket_issue_as_a_new_ticket_and_clears_its_labels(self):
+        # loom#1861: a shipped ticket issue rewritten into a new ticket kept
+        # loom:ticket and its state labels, so every later step treated the
+        # source as a live ticket of its own. The rewrite is filed as a new
+        # ticket (the source keeps its history), and the source keeps only
+        # loom:rewritten of its Loom labels.
+        made = {"id": 202, "number": 20, "html_url": "https://example.com/t"}
+        fake, url = self.brief_in_place(
+            self.source(labels=["loom:ticket", "loom:shipped"]),
+            reply(201, made), reply(201, {}), reply(201, {}),
+            reply(200, []), reply(200, []), reply(200, []), reply(200, []))
+        self.assertEqual(url, "https://example.com/t")
+        self.assertTrue(fake.calls[3][2]["body"].endswith(
+            "\n\nRewritten from issue 6.\n\nPart of #2\n"))
+        self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
+        deletes = [c[1].split(REPO)[-1] for c in fake.calls if c[0] == "DELETE"]
+        self.assertEqual(deletes, ["/issues/6/labels/loom%3Atriage",
+                                   "/issues/6/labels/loom%3Aticket",
+                                   "/issues/6/labels/loom%3Ashipped"])
+        self.assertEqual(fake.calls[-1][2], {"labels": ["loom:rewritten"]})
+        self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
 
     # loom#1229: a rewrite filed a second issue and commented on the first,
     # two more notification emails and a duplicate open issue per rewrite.
