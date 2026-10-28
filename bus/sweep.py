@@ -229,22 +229,9 @@ def _batches(items: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:
         yield items[at:at + size]
 
 
-def run(gh: Any, plan: Sequence[Dict[str, Any]], record: Dict[str, Any],
-        steps: Sequence[str], rewrite: Rewrite,
-        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-        repos: Sequence[str] = SWEEP_REPOS) -> Result:
-    """Run the brain's planned sweep actions under the guard and the caps.
-
-    Claims at most MAX_CLAIMS issues at a time, acts on each, and releases
-    the batch in a finally before the next: an action that raises still
-    leaves no claim:muse behind, and the error goes on to the caller. An
-    action a gate refuses (ValueError, a GitHub refusal) is counted skipped.
-    """
-    result = Result()
-    why = sweep_allowed(record, steps, clock())
-    if why:
-        result.stopped = why
-        return result
+def _parse_plan(plan: Sequence[Dict[str, Any]], repos: Sequence[str],
+                result: Result) -> List[Action]:
+    """The plan's actions the rules allow; the rest are counted skipped."""
     actions: List[Action] = []
     for item in plan:
         try:
@@ -259,8 +246,85 @@ def run(gh: Any, plan: Sequence[Dict[str, Any]], record: Dict[str, Any],
                                 % (act.repo, act.number, " and ".join(repos)))
             continue
         actions.append(act)
-    open_prs: Dict[str, List[Dict[str, Any]]] = {}
-    labelled: set = set()
+    return actions
+
+
+class _Claims:
+    """Reads, skips and claims one batch, remembering each repo's open pull
+    requests and whether its claim label was made, across batches."""
+
+    def __init__(self, gh: Any) -> None:
+        self.gh = gh
+        self.open_prs: Dict[str, List[Dict[str, Any]]] = {}
+        self.labelled: set = set()
+
+    def prs(self, repo: str) -> List[Dict[str, Any]]:
+        if repo not in self.open_prs:
+            self.open_prs[repo] = self.gh.paginate("/repos/%s/pulls?state=open" % repo)
+        return self.open_prs[repo]
+
+    def take(self, act: Action, result: Result) -> Optional[Dict[str, Any]]:
+        """Claim `act`'s issue and return it as read, or None when skipped."""
+        issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (act.repo, act.number)).data
+        reason = skip_reason(issue, self.prs(act.repo))
+        if reason:
+            result.skipped += 1
+            result.lines.append("skipped %s#%d: %s" % (act.repo, act.number, reason))
+            return None
+        if act.repo not in self.labelled:
+            ensure_label(self.gh, act.repo)
+            self.labelled.add(act.repo)
+        claim(self.gh, act.repo, act.number)
+        return issue
+
+
+def _act(gh: Any, act: Action, issue: Dict[str, Any], rewrite: Rewrite, result: Result) -> None:
+    """One action. A refusal (ValueError, a GitHub refusal) is counted
+    skipped; anything else is raised."""
+    try:
+        if act.action == "rewrite":
+            line = rewrite(act.repo, act.number, act.epic or 0, act.title, act.body)
+            result.rewritten += 1
+            result.lines.append("rewrote %s#%d: %s" % (act.repo, act.number, line))
+        else:
+            _close(gh, act, issue)
+            result.closed += 1
+            result.lines.append("closed %s#%d as %s" % (act.repo, act.number, act.action))
+    except (ValueError, GitHubError) as err:
+        result.skipped += 1
+        result.lines.append("skipped %s#%d: refused, %s" % (act.repo, act.number, err))
+
+
+def release_all(gh: Any, held: Sequence[Tuple[str, int]]) -> None:
+    """Release every claim in `held`, trying each even when one fails; the
+    first failure is raised once all were tried."""
+    failed: Optional[BaseException] = None
+    for repo, number in held:
+        try:
+            release(gh, repo, number)
+        except Exception as err:  # noqa: BLE001 - raised after the loop
+            failed = failed or err
+    if failed is not None:
+        raise failed
+
+
+def run(gh: Any, plan: Sequence[Dict[str, Any]], record: Dict[str, Any],
+        steps: Sequence[str], rewrite: Rewrite,
+        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        repos: Sequence[str] = SWEEP_REPOS) -> Result:
+    """Run the brain's planned sweep actions under the guard and the caps.
+
+    Claims at most MAX_CLAIMS issues at a time, acts on each, and releases
+    the batch in a finally before the next: an action that raises still
+    leaves no claim:muse behind, and the error goes on to the caller. An
+    action a gate refuses (ValueError, a GitHub refusal) is counted skipped.
+    """
+    result = Result()
+    result.stopped = sweep_allowed(record, steps, clock())
+    if result.stopped:
+        return result
+    actions = _parse_plan(plan, repos, result)
+    claims = _Claims(gh)
     acted = 0
     for batch in _batches(actions, MAX_CLAIMS):
         held: List[Tuple[str, int]] = []
@@ -270,49 +334,19 @@ def run(gh: Any, plan: Sequence[Dict[str, Any]], record: Dict[str, Any],
                 if acted + len(todo) >= MAX_ACTIONS:
                     result.stopped = "stopped at the cap of %d actions" % MAX_ACTIONS
                     break
-                if act.repo not in open_prs:
-                    open_prs[act.repo] = gh.paginate("/repos/%s/pulls?state=open" % act.repo)
-                issue = gh.rest("GET", "/repos/%s/issues/%d" % (act.repo, act.number)).data
-                reason = skip_reason(issue, open_prs[act.repo])
-                if reason:
-                    result.skipped += 1
-                    result.lines.append("skipped %s#%d: %s" % (act.repo, act.number, reason))
-                    continue
-                if act.repo not in labelled:
-                    ensure_label(gh, act.repo)
-                    labelled.add(act.repo)
-                claim(gh, act.repo, act.number)
-                held.append((act.repo, act.number))
-                todo.append((act, issue))
-            for act, read in todo:
+                issue = claims.take(act, result)
+                if issue is not None:
+                    held.append((act.repo, act.number))
+                    todo.append((act, issue))
+            for act, issue in todo:
                 late = time_left(record, clock())
                 if late:
                     result.stopped = late.replace("skipped", "stopped", 1)
                     break
                 acted += 1
-                try:
-                    if act.action == "rewrite":
-                        line = rewrite(act.repo, act.number, act.epic or 0, act.title, act.body)
-                        result.rewritten += 1
-                        result.lines.append("rewrote %s#%d: %s" % (act.repo, act.number, line))
-                    else:
-                        _close(gh, act, read)
-                        result.closed += 1
-                        result.lines.append("closed %s#%d as %s" % (act.repo, act.number, act.action))
-                except (ValueError, GitHubError) as err:
-                    result.skipped += 1
-                    result.lines.append("skipped %s#%d: refused, %s" % (act.repo, act.number, err))
+                _act(gh, act, issue, rewrite, result)
         finally:
-            # Every claim is tried even when one release fails; the first
-            # failure is raised once all were tried.
-            failed: Optional[BaseException] = None
-            for repo, number in held:
-                try:
-                    release(gh, repo, number)
-                except Exception as err:  # noqa: BLE001 - raised after the loop
-                    failed = failed or err
-            if failed is not None:
-                raise failed
+            release_all(gh, held)
         if result.stopped:
             break
     return result

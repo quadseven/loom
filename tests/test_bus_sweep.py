@@ -63,45 +63,59 @@ class FakeGH:
         return out
 
     def _rest(self, method: str, path: str, body: Any):
-        r = lambda data, status=200: SimpleNamespace(status=status, data=data)  # noqa: E731
-        if "/git/ref/heads/" in path and method == "GET":
-            return r({"object": {"sha": self.head}})
-        if "/git/commits/" in path and method == "GET":
-            sha = path.rsplit("/", 1)[1]
-            return r(self.commits[sha]) if sha in self.commits else r({}, 404)
-        if path.endswith("/git/commits") and method == "POST":
-            sha = "c%d" % len(self.commits)
-            self.commits[sha] = {"message": body["message"], "tree": {"sha": body["tree"]}}
-            return r({"sha": sha})
-        if "/git/refs/heads/" in path and method == "PATCH":
-            self.head = body["sha"]
-            return r({})
-        if "/labels/" in path and "/issues/" not in path:
-            name = path.rsplit("/", 1)[1].replace("%3A", ":")
-            return r({}) if name in self.repo_labels else r({}, 404)
-        if path.endswith("/labels") and "/issues/" not in path and method == "POST":
-            self.repo_labels.add(body["name"])
-            return r({})
+        if "/git/" in path:
+            return self._git(method, path, body)
+        if "/issues/" not in path:
+            return self._repo_label(method, path, body)
         number = int(path.split("/issues/")[1].split("/")[0])
-        issue = self.issues[number]
-        names = [x["name"] for x in issue["labels"]]
-        if path.endswith("/labels") and method == "POST":
-            issue["labels"] += [{"name": n} for n in body["labels"] if n not in names]
-            return r({})
-        if "/labels/" in path and method == "DELETE":
-            name = path.rsplit("/", 1)[1].replace("%3A", ":")
-            if name not in names:
-                return r({}, 404)
-            issue["labels"] = [x for x in issue["labels"] if x["name"] != name]
-            return r({})
-        if path.endswith("/comments") and method == "POST":
-            return r({})
+        if "/labels" in path:
+            return self._issue_label(method, path, body, self.issues[number])
+        if path.endswith("/comments"):
+            return reply({})
         if method == "PATCH":
             if number in self.fail_close:
                 raise self.fail_close[number]
-            issue.update(body)
-            return r({})
-        return r(dict(issue))
+            self.issues[number].update(body)
+            return reply({})
+        return reply(dict(self.issues[number]))
+
+    def _git(self, method: str, path: str, body: Any):
+        if method == "GET" and "/git/ref/heads/" in path:
+            return reply({"object": {"sha": self.head}})
+        if method == "GET":
+            sha = path.rsplit("/", 1)[1]
+            return reply(self.commits[sha]) if sha in self.commits else reply({}, 404)
+        if method == "POST":
+            sha = "c%d" % len(self.commits)
+            self.commits[sha] = {"message": body["message"], "tree": {"sha": body["tree"]}}
+            return reply({"sha": sha})
+        self.head = body["sha"]
+        return reply({})
+
+    def _repo_label(self, method: str, path: str, body: Any):
+        if method == "POST":
+            self.repo_labels.add(body["name"])
+            return reply({})
+        return reply({}) if label_of(path) in self.repo_labels else reply({}, 404)
+
+    @staticmethod
+    def _issue_label(method: str, path: str, body: Any, issue: Dict[str, Any]):
+        names = [x["name"] for x in issue["labels"]]
+        if method == "POST":
+            issue["labels"] += [{"name": n} for n in body["labels"] if n not in names]
+            return reply({})
+        if label_of(path) not in names:
+            return reply({}, 404)
+        issue["labels"] = [x for x in issue["labels"] if x["name"] != label_of(path)]
+        return reply({})
+
+
+def reply(data: Any, status: int = 200) -> SimpleNamespace:
+    return SimpleNamespace(status=status, data=data)
+
+
+def label_of(path: str) -> str:
+    return path.rsplit("/", 1)[1].replace("%3A", ":")
 
 
 def issue(number: int, *labels: str) -> Dict[str, Any]:

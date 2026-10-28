@@ -5116,6 +5116,19 @@ def _step_record(message: str) -> Dict[str, Any]:
     return record
 
 
+def _sweep_step_note(record: Dict[str, Any], note: Optional[str], now: datetime) -> Optional[str]:
+    """The sweep step's guard, asked before the record moves: it reads the
+    step the tick was at. A sweep before triage is refused, not recorded;
+    one past the time budget is recorded with the skip as its note."""
+    why = sweep.sweep_allowed(record, TICK_STEPS, now)
+    if why and why.startswith("skipped, the sweep runs only after"):
+        raise ValueError(why)
+    record["sweep"] = why or "ok"
+    if why and not note:
+        return "skipped: " + why[len("skipped, "):]
+    return note
+
+
 def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
               note: Optional[str] = None, holder: Optional[str] = None,
               now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -5140,14 +5153,7 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
         raise ValueError("%s does not hold the lock in %s; only the lock holder acts"
                          % (holder, lock_repo))
     if step == "sweep":
-        # Asked before the record moves: the guard reads the step the tick
-        # was at, and a sweep before triage is refused, not recorded.
-        why = sweep.sweep_allowed(record, TICK_STEPS, now)
-        if why and why.startswith("skipped, the sweep runs only after"):
-            raise ValueError(why)
-        if why and not note:
-            note = "skipped: " + why[len("skipped, "):]
-        record["sweep"] = why or "ok"
+        note = _sweep_step_note(record, note, now)
     at = _iso(now)
     if step == "lock" or not record["started_at"]:
         record["started_at"] = at
@@ -5195,7 +5201,7 @@ def _cmd_sweep(gh: GitHub, args: argparse.Namespace) -> None:
     try:
         plan = json.loads(_read(args.file))
     except ValueError as err:
-        raise ValueError("the sweep plan is a JSON list of actions: %s" % err)
+        raise ValueError("the sweep plan is a JSON list of actions: %s" % err) from err
     if not isinstance(plan, list):
         raise ValueError("the sweep plan is a JSON list of actions")
     line, lines = run_sweep(gh, _repo(args.lock_repo), args.holder, plan)
