@@ -93,6 +93,15 @@ class FakeGitHub:
         self.pull_files = {}
         self.carried = set()
         self.check_runs_status = 200
+        self.head_files = {}
+        # Strings a code search of the repo finds nothing for (bus/unmeetable.py);
+        # every other search finds one file.
+        self.code_absent = set()
+        self.code_searches = []
+        # The default branch's files the code search index skips (over
+        # 384 KB): path -> text, read through the git trees and blobs API.
+        self.big_files = {}
+        self.tree_status = 200
 
     def add_foreign(self, repo, number, labels=("loom:pr",), state="open", reason=None):
         """An issue in another repo, as an After: line that names one reads it."""
@@ -192,7 +201,7 @@ class FakeGitHub:
         if method == "GET" and parts.path.startswith("/repos/%s/contents/" % REPO):
             if parts.path.endswith("/.github/workflows"):
                 return reply(200, [])
-            return reply(404, {"message": "Not Found"})
+            return self._head_file(parts.path[len("/repos/%s/contents/" % REPO):])
         other = re.match(r"/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/issues/(\d+)$", parts.path)
         if other and other.group(1) != REPO:
             found = self.foreign.get((other.group(1), int(other.group(2))))
@@ -209,6 +218,8 @@ class FakeGitHub:
                                    if any(l.get("name") == "loom:factory"
                                           for l in i.get("labels", []))])
             return reply(200, self.factory_incidents)
+        if method == "GET" and parts.path == "/search/code":
+            return self._code_search(parts.query)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if method == "GET" and rest == "labels":
             return reply(200, [{"name": name, "color": value["color"],
@@ -254,7 +265,38 @@ class FakeGitHub:
             return reply(200, self.pull_files.get(int(files.group(1)), []))
         if method == "GET" and rest == "git/ref/heads/loom-lock/brain":
             return reply(404, {"message": "Not Found"})
+        if method == "GET" and rest == "git/trees/HEAD" and parts.query == "recursive=1":
+            if self.tree_status != 200:
+                return reply(self.tree_status, {"message": "refused"})
+            tree = [{"path": "src/app.py", "type": "blob", "sha": "a" * 40, "size": 2000}]
+            tree += [{"path": name, "type": "blob", "sha": hashlib.sha1(name.encode()).hexdigest(),
+                      "size": 640000} for name in self.big_files]
+            return reply(200, {"tree": tree, "truncated": False})
+        blob = re.match(r"git/blobs/([0-9a-f]{40})$", rest)
+        if method == "GET" and blob:
+            for name, text in self.big_files.items():
+                if hashlib.sha1(name.encode()).hexdigest() == blob.group(1):
+                    return reply(200, {"encoding": "base64", "content": base64.b64encode(
+                        text.encode()).decode()})
+            return reply(404, {"message": "Not Found"})
         raise AssertionError("unexpected call %s %s" % (method, path))
+
+    def _head_file(self, path):
+        """A file on a pull request head, for a lane answer's citations
+        (bus/rebuttal.py): head_files maps path to text, read at any ref."""
+        text = self.head_files.get(path)
+        if text is None:
+            return reply(404, {"message": "Not Found"})
+        return reply(200, {"type": "file", "encoding": "base64",
+                           "content": base64.b64encode(text.encode()).decode()})
+
+    def _code_search(self, query):
+        """A code search: one hit unless the term is in code_absent."""
+        term = unquote(query[len("q="):]).rsplit("+repo:", 1)[0].strip('"')
+        self.code_searches.append(term)
+        hits = 0 if term in self.code_absent else 1
+        return reply(200, {"total_count": hits, "incomplete_results": False,
+                           "items": [{"path": "src/app.py"}] * hits})
 
     def _post_page(self, data):
         if self.page_error:
@@ -1147,11 +1189,11 @@ class AdoptUntrackedPullRequestTest(Base):
                         "## Definition of done"):
             self.assertIn(section, body)
         # Filed under the goal's intake epic, which the station opened.
-        intake = [c for c in self.fake.created if c["title"] == brain.INTAKE_TITLE]
+        intake = [c for c in self.fake.created if brain.is_intake_epic(c)]
         self.assertEqual(len(intake), 1)
         self.assertRegex(intake[0]["body"], r"(?m)^Part of #30$")
         epic_number = next(n for n, i in self.fake.issues.items()
-                           if i.get("title") == brain.INTAKE_TITLE)
+                           if brain.is_intake_epic(i))
         self.assertRegex(body, r"(?m)^Part of #%d$" % epic_number)
         self.assertNotRegex(body, r"(?m)^Part of #30$")
         self.assertNotRegex(body, r"(?m)^Refs ")
@@ -3657,6 +3699,25 @@ class FlakyLadderFake(LadderReviewFake):
 INSTALL_TIMEOUT = ("##[error]The action 'Install what the core's own Dockerfile installs' "
                    "has timed out after 10 minutes.")
 
+PYTEST_READTIMEOUT = (
+    "ERROR at setup of test_postgres [conftest.py:7]\n"
+    "E   ReadTimeout: read timeout=60\n"
+    "ERROR at setup of test_other [conftest.py:7]\n"
+    "E   ReadTimeout: read timeout=60\n"
+    "4528 passed, 5 errors")
+
+PYSETUP = [
+    {"id": 501, "name": "pytest", "status": "completed", "conclusion": "failure",
+     "details_url": "https://github.com/%s/actions/runs/88/job/501" % REPO},
+    {"id": 502, "name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+     "conclusion": "success", "details_url": "https://grug.example"}]
+
+CANCELLED = [
+    {"id": 501, "name": "adapter", "status": "completed", "conclusion": "cancelled",
+     "details_url": "https://github.com/%s/actions/runs/88/job/501" % REPO},
+    {"id": 502, "name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+     "conclusion": "failure", "details_url": "https://grug.example"}]
+
 
 class InfraFlakeHandBackTest(unittest.TestCase):
     """An infra timeout is re-run before a fix round, whatever else fails,
@@ -3712,6 +3773,51 @@ class InfraFlakeHandBackTest(unittest.TestCase):
                                                "with exit code 1.")])
         self.assertEqual(self.reruns(), [])
         self.assertIn("lane:claude", self.names())
+
+    def test_a_pull_request_with_only_readtimeout_errors_is_rerun_once_and_not_judged(self):
+        """A job whose only failing lines are 5 Docker ReadTimeout errors (no
+        test failures) gets one re-run of its failed jobs and no fix round
+        (fails on main)."""
+        self.gh.check_runs = PYSETUP
+        self.last_round("### Check: pytest\n\n    5 errors")
+        self.run_hand_back(checks=[("pytest", PYTEST_READTIMEOUT),
+                                   (factory.DEFAULT_REVIEW_CHECK, "failure")])
+        self.assertEqual(self.reruns(),
+                         ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertIn("lane:spark", self.names())
+
+    def test_a_cancelled_job_is_rerun_once_then_a_fix_round(self):
+        """A cancelled job gets one re-run before the station counts it; the
+        same red after the re-run sends a fix round as today."""
+        self.gh.check_runs = CANCELLED
+        self.last_round("### Check: adapter\n\n    cancelled")
+        self.run_hand_back(checks=[("adapter", "no log was available (conclusion cancelled)"),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(self.reruns(),
+                         ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertIn("lane:spark", self.names())
+        # The same red head: already re-ran once, so a fix round is sent and
+        # no further re-run happens.
+        self.run_hand_back(checks=[("adapter", "no log was available (conclusion cancelled)"),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(self.reruns(),
+                         ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 2)
+        self.assertIn("lane:spark", self.names())
+
+    def test_a_real_test_failure_is_sent_straight_back_with_no_rerun(self):
+        """A real test failure (an assertion) sends a fix round at once, with
+        no re-run."""
+        self.gh.check_runs = PYSETUP
+        self.run_hand_back(checks=[("pytest",
+                                    "FAILED tests/test_a.py::test_x - assert 1 == 2\n"
+                                    "##[error]Process completed with exit code 1.")])
+        self.assertEqual(self.reruns(), [])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertIn("lane:spark", self.names())
+        self.assertNotIn("lane:claude", self.names())
 
 
 class StampedReviewFake(ReviewFake):
@@ -7058,12 +7164,19 @@ THREAD_FIX = FIX_BODY + "\n### Thread PRRT_abcd1 (comment 5) at a.py:3\n\n    me
 class AnswerTest(Base):
     """A fix brief's answers to findings (lanes/run_lane.sh keep_answers)."""
 
-    def thread(self, tid="PRRT_abcd1", pr=99, severity="medium", author=BOT):
+    def setUp(self):
+        super().setUp()
+        # The head the answers cite: a.py with its guard on line 2.
+        self.fake.head_files["a.py"] = "def f(x):\n    if x is None: return\n    return x.y\n"
+
+    def thread(self, tid="PRRT_abcd1", pr=99, severity="medium", author=BOT,
+               kind="null-deref", path="a.py"):
         self.fake.threads[tid] = {
-            "isResolved": False,
-            "pullRequest": {"number": pr, "repository": {"nameWithOwner": REPO}},
+            "isResolved": False, "path": path,
+            "pullRequest": {"number": pr, "headRefOid": "f" * 40,
+                            "repository": {"nameWithOwner": REPO}},
             "comments": {"nodes": [{"author": author,
-                                    "body": "%s | _correctness_ | `null-deref`\n\nx" % severity}]}}
+                                    "body": "%s | _correctness_ | `%s`\n\nx" % (severity, kind)}]}}
 
     def finish(self, answers, model="claude-opus-5-5", kind="done", fix_body=THREAD_FIX):
         body = BODY.replace("Model: model-x", "Model: " + model)
@@ -7103,6 +7216,45 @@ class AnswerTest(Base):
         self.finish({"PRRT_abcd1": "Already guarded at a.py:2."}, kind="failed")
         self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
         self.assertIn("loom:pr", self.fake.names(12))
+
+    def test_an_answer_that_cites_nothing_is_posted_but_stays_open(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "Not valid, this is already handled."})
+        self.assertEqual((len(self.fake.replies), self.fake.resolved), (1, []))
+
+    def dead_code(self):
+        self.fake.head_files["bus/s.py"] = (
+            "def _markings(s):\n    return []\n\n\n"
+            "def _markings_with_accept(s):\n    return []\n\n\n"
+            "def _hand_back(s):\n    return _markings_with_accept(s)\n")
+        self.thread(kind="dead-code", path="bus/s.py")
+        self.fake.threads["PRRT_abcd1"]["comments"]["nodes"][0]["body"] = (
+            "medium | _maintainability_ | `dead-code`\n\nNew function `_markings` has no caller.")
+
+    def test_a_false_caller_claim_on_a_dead_code_finding_stays_open(self):
+        # loom#1948: the lane said the dead function had a caller; the head
+        # calls only its sibling, so the thread must not be resolved.
+        self.dead_code()
+        self.finish({"PRRT_abcd1": "`_markings` is called by `_hand_back`, so it is not dead code."})
+        self.assertEqual((len(self.fake.replies), self.fake.resolved), (1, []))
+
+    def test_a_true_caller_claim_on_a_dead_code_finding_is_resolved(self):
+        self.dead_code()
+        self.fake.head_files["bus/s.py"] = self.fake.head_files["bus/s.py"].replace(
+            "return _markings_with_accept(s)", "return _markings(s) + _markings_with_accept(s)")
+        self.finish({"PRRT_abcd1": "`_markings` is called by `_hand_back`, so it is not dead code."})
+        self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
+
+    def test_a_fixed_in_answer_resolves_only_for_a_commit_on_the_head(self):
+        self.thread()
+        self.fake.carried.add("abc1234")
+        self.finish({"PRRT_abcd1": "Fixed in abc1234"})
+        self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
+
+    def test_a_fixed_in_answer_naming_a_foreign_commit_stays_open(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "Fixed in 0ddba11"})
+        self.assertEqual((len(self.fake.replies), self.fake.resolved), (1, []))
 
     def test_a_model_off_the_ladder_answers_but_does_not_resolve(self):
         self.thread()
@@ -10919,6 +11071,114 @@ class VerifyDispatchTest(Base):
         self.assertTrue(any("-6-verify-" in n for n in self.briefs()), self.briefs())
         self.assertNotIn("wait:live-event", self.fake.names(6))
         self.assertIn("loom:shipped", self.fake.names(6))
+
+    def unmeetable_pass(self):
+        """A pass with the verify cooldown cleared, so only the Live box decides."""
+        self.write(os.path.join(self.home, "state", "station", station.VERIFY_FILE), "{}")
+        self.run_pass()
+
+    def test_a_live_box_whose_log_string_no_code_prints_gets_one_restate_ask(self):
+        # loom#2028: a Live box waiting on a string nothing emits went back
+        # through lanes and came back unmet each time.
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        ask = self.fake.comments[2][0]["body"]
+        self.assertIn("<!-- loom:unmeetable-live v1 ", ask)
+        self.assertIn("`daily status ready`", ask)
+        self.assertIn("Restate the Live box", ask)
+        self.assertIn("loom:shipped", self.fake.names(2))
+        # Later passes neither ask again nor queue it, nor search again.
+        searched = len(self.fake.code_searches)
+        self.unmeetable_pass()
+        self.unmeetable_pass()
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.code_searches), searched)
+        # A restated box is checked afresh and verified.
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "`daily status ready`", "`daily status line ready`")
+        self.unmeetable_pass()
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+
+    def test_a_live_box_whose_log_string_the_code_prints_is_verified(self):
+        self.fake.issues.pop(1)
+        self.run_pass()
+        self.assertIn("daily status ready", self.fake.code_searches)
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_live_box_waiting_on_a_closed_issue_gets_one_restate_ask(self):
+        self.fake.issues.pop(1)
+        self.fake.add_foreign("example-owner/muster", 163, state="closed", reason="completed")
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "after deploy, muster#163 is verified and the log prints `daily status ready`")
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertIn("example-owner/muster#163", self.fake.comments[2][0]["body"])  # leak-guard-allow: fictional example repos
+        self.unmeetable_pass()
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+
+    def test_a_log_string_only_a_file_too_big_for_code_search_prints_is_verified(self):
+        # loom#2050: GitHub's code search skips files over 384 KB, so a
+        # string printed only from such a file (the station's own
+        # "trusting briefing logins") searched as absent and was flagged.
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"trusting briefing logins"}
+        self.fake.big_files = {"bus/big.py": 'x = 1\n_say("trusting briefing logins: %s" % who)\n'}
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "`daily status ready`", "`trusting briefing logins`")
+        self.run_pass()
+        self.assertIn("trusting briefing logins", self.fake.code_searches)
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_quoted_log_line_with_filled_in_values_matches_its_template(self):
+        # loom#2050: a box quoting the line as printed ("claimed
+        # #528 for lane") is matched against the source
+        # template ("claimed %s for lane"), not searched literally.
+        self.fake.issues.pop(1)
+        quoted = "claimed example-owner/loom#528 for lane at 1a2b3c4d"  # leak-guard-allow: fictional example repos
+        self.fake.code_absent = {quoted, "for lane at"}
+        self.fake.big_files = {"bus/big.py": '_say("claimed %s for lane at %s" % (ref, sha))\n'}
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "`daily status ready`", "`%s`" % quoted)
+        self.run_pass()
+        self.assertNotIn(quoted, self.fake.code_searches)
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_log_string_neither_the_search_nor_the_big_files_hold_is_flagged(self):
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.fake.big_files = {"bus/big.py": '_say("daily status is ready")\n'}
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertIn("`daily status ready`", self.fake.comments[2][0]["body"])
+
+    def test_a_search_zero_with_an_unreadable_tree_flags_nothing(self):
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.fake.tree_status = 502
+        self.run_pass()
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_lost_state_file_does_not_ask_twice_for_the_same_box(self):
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.run_pass()
+        os.remove(os.path.join(self.home, "state", "station", station.UNMEETABLE_FILE))
+        self.unmeetable_pass()
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
 
     def test_verify_pool_never_hands_ticket_with_unsearchable_live_line(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(

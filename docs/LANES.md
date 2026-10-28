@@ -361,7 +361,7 @@ App writes need no hand-listed login; its startup log line `trusting briefing
 logins` names every login trusted. More than three briefed tickets refused in
 an hour for one untrusted labeller file the `untrusted-labeler` invariant,
 naming the login. The App needs contents,
-issues and pull requests read and write, and checks and actions read, on the
+issues and pull requests read and write, and checks and actions write, on the
 scanned repos. To set one up, `python3 -m bus app manifest --owner OWNER`
 (add `--org` for an organisation) prints the create page and a manifest with
 exactly those permissions and no webhook; `--form` prints an HTML page whose
@@ -402,7 +402,7 @@ login by itself, so the brain's and the lanes' logins (`<slug>[bot]`) go in
 `LOOM_BRIEF_AUTHORS`, and a repo whose workflows admit only collaborators must
 admit the lanes' login for lane pull requests to run.
 A new App is easiest made from
-`https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=read`.
+`https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=write`.
 
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
@@ -471,9 +471,17 @@ A fix brief may answer a finding instead of fixing it: the agent writes the
 reason to `.loom-answers/<thread id>.md`, the runner moves that folder out of
 the tree (never committed; links dropped unread), and the station posts each
 answer as the reply on its thread, redacted and text-checked. The station
-resolves the thread only when the round ran on a ladder model and the thread
-is the review bot's own medium or low finding; any other answered thread
-stays open, and the factory reads it as a finding that survived.
+resolves the thread only when the round ran on a ladder model, the thread
+is the review bot's own medium or low finding, and the answer holds on the
+pull request head (bus/rebuttal.py, loom#2081): "Fixed in <sha>" names the
+head or one of its ancestors (any case), or the answer cites files and lines
+the head has and, when it names backticked symbols, at least one of them is
+there, every "`f` is called by `g`" claim is a real call there,
+and a dead-code finding's symbol has a call. An answer that cites nothing
+checkable stays open. Any other answered thread stays open, and the factory
+reads it as a finding that survived. The brain's merge re-checks every bot
+thread resolved on a lane answer the same way, and reopens it and refuses
+the merge when the answer does not hold.
 An answered thread that survives and leaves its ticket with no lane up for
 its next rung does not wait with nothing to move it: the factory asks the
 review bot to judge the answer instead, commenting `/grug improve` on the
