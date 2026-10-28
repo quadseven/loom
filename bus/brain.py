@@ -16,12 +16,13 @@ from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
-from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
+from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
 from .labels import HANDOFF, LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
+from . import tick_clock
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
 # In a loom:fix comment: the head commit and a hash of what was asked, so a
@@ -93,7 +94,11 @@ REPORT_GRACE = 30 * 60
 # Two hours and a quarter gives an hourly tick two chances to write it first.
 # A report written in this window counts for the reading time it precedes.
 REPORT_OWED_EARLY = 2 * 3600 + 15 * 60
-TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage", "journal", "unlock")
+# sweep (docs/MUSE.md, Muse sweep, bus/sweep.py) runs after triage and only
+# under the tick's time budget, so it never comes before or shortens merge,
+# verify or failed.
+TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage", "sweep",
+              "journal", "unlock")
 RUNAWAY = "loom:runaway"
 STEP_MARKER = "loom:tick="
 LANES_MARKER = "<!-- loom:lanes v1 -->"
@@ -5358,21 +5363,78 @@ def _lock_holder(gh: GitHub, lock_repo: str, holder: str, now: datetime) -> None
                          % (holder, lock_repo))
 
 
+class BudgetRefused(ValueError):
+    """A step note deferred on budget before tick_clock.BUDGET_MINUTES: the
+    step is recorded with the refusal as its note, then this is raised with
+    the record it wrote (None for a refused defer, which writes nothing)."""
+
+    def __init__(self, message: str, record: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.record = record
+
+
+def _time_step(record: Dict[str, Any], step: str, at: str) -> None:
+    """Close the running step and open `step` in the record's times. The
+    same step again (a second note) keeps its entry; unlock ends at once."""
+    times = record["times"]
+    running = times[-1] if times and isinstance(times[-1], dict) else None
+    if running is not None and running.get("step") == step and not running.get("ended_at"):
+        return
+    if running is not None and not running.get("ended_at"):
+        running["ended_at"] = at
+    times.append({"step": step, "started_at": at,
+                  "ended_at": at if step == "unlock" else None})
+
+
+def _budget_note(record: Dict[str, Any], note: Optional[str], now: datetime
+                 ) -> Tuple[Optional[str], Optional[str]]:
+    """(the note to record, why it was refused or None). The budget is the
+    clock's, not the model's guess (loom#2104): a note that defers on budget
+    before 20 minutes is recorded as refused, and one past it carries the
+    real elapsed minutes."""
+    if note and ("\n" in note or "\r" in note):
+        raise ValueError("note must be one line")
+    refused = tick_clock.budget_refusal(record, note, now)
+    if refused:
+        return "%s: %s" % (refused.split(";")[0], note), refused
+    if note and tick_clock.claims_budget(note):
+        return tick_clock.with_elapsed(note, record, now), None
+    return note, None
+
+
 def _step_record(message: str) -> Dict[str, Any]:
     """Read the recorded step fields from one lock commit message."""
     current_holder = re.search(r"holder=(\S+)", message)
     record = {"holder": current_holder.group(1) if current_holder else None,
               "started_at": None,
-              "step": None, "step_index": None, "steps": list(TICK_STEPS), "notes": []}
+              "step": None, "step_index": None, "steps": list(TICK_STEPS), "notes": [],
+              "times": []}
     encoded = next((line[len(STEP_MARKER):] for line in message.splitlines()
                     if line.startswith(STEP_MARKER)), "")
     if encoded:
         try:
             saved = json.loads(encoded)
             record.update({k: saved[k] for k in ("started_at", "step", "step_index", "notes")})
-        except (ValueError, TypeError, KeyError):
+            # Per-step start and end times (loom#2104); a record written
+            # before them has none.
+            times = saved.get("times")
+            record["times"] = times if isinstance(times, list) else []
+        except (ValueError, TypeError, KeyError, AttributeError):
             pass
     return record
+
+
+def _sweep_step_note(record: Dict[str, Any], note: Optional[str], now: datetime) -> Optional[str]:
+    """The sweep step's guard, asked before the record moves: it reads the
+    step the tick was at. A sweep before triage is refused, not recorded;
+    one past the time budget is recorded with the skip as its note."""
+    why = sweep.sweep_allowed(record, TICK_STEPS, now)
+    if why and why.startswith("skipped, the sweep runs only after"):
+        raise ValueError(why)
+    record["sweep"] = why or "ok"
+    if why and not note:
+        return "skipped: " + why[len("skipped, "):]
+    return note
 
 
 def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
@@ -5398,35 +5460,100 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
     if lock_info is None or lock_info[0] != holder or lock_info[1] is None or lock_info[1] <= now:
         raise ValueError("%s does not hold the lock in %s; only the lock holder acts"
                          % (holder, lock_repo))
+    if step == "sweep":
+        note = _sweep_step_note(record, note, now)
     at = _iso(now)
     if step == "lock" or not record["started_at"]:
         record["started_at"] = at
         record["notes"] = []
+        record["times"] = []
     record["step"] = step
     record["step_index"] = TICK_STEPS.index(step) + 1
+    _time_step(record, step, at)
+    note, refused = _budget_note(record, note, now)
     if note:
-        if "\n" in note or "\r" in note:
-            raise ValueError("note must be one line")
         record["notes"].append({"ts": at, "step": step, "text": note})
     record["holder"] = holder
     clean = "\n".join(line for line in message.splitlines() if not line.startswith(STEP_MARKER))
     new_message = clean + "\n" + STEP_MARKER + json.dumps(
-        {k: record[k] for k in ("started_at", "step", "step_index", "notes")}, separators=(",", ":"))
+        {k: record[k] for k in ("started_at", "step", "step_index", "notes", "times")},
+        separators=(",", ":"))
     created = gh.rest("POST", "/repos/%s/git/commits" % lock_repo, {
         "message": new_message, "tree": commit.data["tree"]["sha"], "parents": [sha]})
     # GitHub reads a ref at git/ref/<ref> but updates it at git/refs/<ref>;
     # the read path answers 404 to a PATCH, so no step was ever recorded.
     gh.rest("PATCH", "/repos/%s/git/refs/heads/%s" % (lock_repo, lock.LOCK_BRANCH),
             {"sha": created.data["sha"], "force": True})
+    if refused:
+        raise BudgetRefused(refused, record)
     return record
 
 
-def _cmd_step(gh: GitHub, args: argparse.Namespace) -> None:
+def run_sweep(gh: GitHub, lock_repo: str, holder: str, plan: Sequence[Dict[str, Any]],
+              clock: Optional[Callable[[], datetime]] = None) -> Tuple[str, List[str]]:
+    """Run the brain's sweep plan (bus/sweep.py) for the lock holder: the
+    tick record gives the guard its step and start time, a rewrite is a
+    brief in place under the named epic (brief --refs), and the report line
+    is appended to the tick record as the sweep step's note."""
+    clock = clock or (lambda: datetime.now(timezone.utc))
+    _lock_holder(gh, lock_repo, holder, clock())
+    record = tick_step(gh, lock_repo)
+
+    def rewrite(repo: str, number: int, epic: int, title: str, body: str) -> str:
+        return brief(gh, repo, epic, title, body, refs=number, holder=holder)
+
+    result = sweep.run(gh, plan, record, TICK_STEPS, rewrite, clock=clock)
+    line = sweep.report_line(result)
+    if record.get("step") in ("triage", "sweep"):
+        tick_step(gh, lock_repo, "sweep", line, holder, clock())
+    return line, result.lines
+
+
+def _cmd_sweep(gh: GitHub, args: argparse.Namespace) -> None:
     try:
-        print(json.dumps(tick_step(gh, _repo(args.lock_repo), args.name,
-                                   args.note, args.holder), sort_keys=True))
+        plan = json.loads(_read(args.file))
+    except ValueError as err:
+        raise ValueError("the sweep plan is a JSON list of actions: %s" % err) from err
+    if not isinstance(plan, list):
+        raise ValueError("the sweep plan is a JSON list of actions")
+    line, lines = run_sweep(gh, _repo(args.lock_repo), args.holder, plan)
+    for each in lines:
+        print(each)
+    print(line)
+
+
+def _cmd_step(gh: GitHub, args: argparse.Namespace) -> None:
+    now = datetime.now(timezone.utc)
+    try:
+        record = tick_step(gh, _repo(args.lock_repo), args.name, args.note, args.holder, now)
+    except BudgetRefused as exc:
+        # Recorded, and loud: the brain reads the clock and this before it
+        # moves on.
+        if exc.record is not None:
+            print(tick_clock.elapsed_line(exc.record, now))
+        print("BUDGET DEFERRAL REFUSED: %s" % exc)
+        raise
     except GitHubError as exc:
         print("brain step write failed: %s" % exc, file=sys.stderr)
+        return
+    # The clock first, so the model reads the time instead of guessing it.
+    print(tick_clock.elapsed_line(record, now))
+    print(json.dumps(record, sort_keys=True))
+
+
+def _cmd_step_budget(gh: GitHub, args: argparse.Namespace) -> None:
+    print(tick_clock.budget_status(tick_step(gh, _repo(args.lock_repo)),
+                                   datetime.now(timezone.utc)))
+
+
+def _print_clock(gh: GitHub, lock_repo: str) -> None:
+    """The tick's elapsed line at the top of status and resume. A failed
+    read says so and the command goes on."""
+    try:
+        _flushed("Tick clock: " + tick_clock.elapsed_line(tick_step(gh, lock_repo),
+                                                          datetime.now(timezone.utc)))
+    except GitHubError as exc:
+        _flushed("Tick clock: unread (%s); run python3 -m bus.brain step-budget" % exc)
 
 
 GoalJournals = Tuple[str, Dict[str, Any], List[Dict[str, Any]], List[str]]
@@ -6254,10 +6381,12 @@ def parser() -> argparse.ArgumentParser:
     au = sub.add_parser("audit"); au.add_argument("ticket"); au.add_argument("--result", choices=audit.RESULTS, required=True); au.add_argument("--note", required=True)
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
-    df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note")
+    df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note"); df.add_argument("--lock-repo", default="quadseven/loom")
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True); dn.add_argument("--resolves", help="brief defer key this done finishes")
+    sb = sub.add_parser("step-budget", help="the tick's elapsed minutes and whether a step may be deferred on budget"); sb.add_argument("--lock-repo", default="quadseven/loom")
     rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom"); rs.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET)
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
+    sw = sub.add_parser("sweep"); sw.add_argument("--file", required=True, help="JSON list of sweep actions (docs/MUSE.md, step 9)"); sw.add_argument("--holder", required=True); sw.add_argument("--lock-repo", default="quadseven/loom")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check"); ob.add_argument("--operator")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
@@ -6286,6 +6415,7 @@ def _flushed(part: str) -> None:
 
 
 def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
+    _print_clock(gh, _repo(args.lanes_repo))
     status(gh, [_repo(x) for x in args.repos], _repo(args.lanes_repo),
            emit=_flushed, budget=args.repo_budget)
 
@@ -6390,7 +6520,29 @@ def _cmd_escalate(gh: GitHub, args: argparse.Namespace) -> None:
     print(escalate(gh, repo, number, _read(args.file) if args.file else "", _repo(args.lanes_repo)))
 
 
+def _check_defer_budget(gh: GitHub, lock_repo: str, holder: str, note: Optional[str],
+                        now: Optional[datetime] = None) -> None:
+    """Refuse a defer whose note claims the time budget while the holder's
+    tick has used under 20 minutes (loom#2104). Outside the holder's tick
+    there is no clock to check, so nothing is refused."""
+    if not tick_clock.claims_budget(note):
+        return
+    try:
+        record = tick_step(gh, lock_repo)
+    except GitHubError as exc:
+        # No clock to check is no refusal: the defer goes out, and says so.
+        print("tick record unread, defer not checked against the clock: %s" % exc,
+              file=sys.stderr)
+        return
+    if record.get("holder") != holder or not record.get("started_at"):
+        return
+    refused = tick_clock.budget_refusal(record, note, now or datetime.now(timezone.utc))
+    if refused:
+        raise BudgetRefused(refused)
+
+
 def _cmd_defer(gh: GitHub, args: argparse.Namespace) -> None:
+    _check_defer_budget(gh, _repo(args.lock_repo), args.holder, args.note)
     print(defer(gh, args.stage, _ref(args.item, "item"), args.holder, args.note))
 
 
@@ -6400,6 +6552,7 @@ def _cmd_done(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
+    _print_clock(gh, _repo(args.lock_repo))
     resume(gh, [_repo(x) for x in args.repos], args.holder, _repo(args.lock_repo),
            emit=_flushed, budget=args.repo_budget)
 
@@ -6410,8 +6563,9 @@ COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate, "epic": _cmd_epic,
-            "close-epic": _cmd_close_epic}
+            "close-epic": _cmd_close_epic, "step-budget": _cmd_step_budget}
 COMMANDS["step"] = _cmd_step
+COMMANDS["sweep"] = _cmd_sweep
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

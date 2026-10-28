@@ -649,7 +649,7 @@ class HandoffPacketTests(unittest.TestCase):
                   "steps": list(brain.TICK_STEPS),
                   "notes": [{"ts": at(2), "step": "merge", "text": "two ready"}]}
         text = packet([goal(journal(40, "muse"))], record)
-        self.assertIn("- %s muse, no journal yet: at step merge (3/10). Last note: two ready."
+        self.assertIn("- %s muse, no journal yet: at step merge (3/11). Last note: two ready."
                       % at(3), text)
 
     def test_a_private_goal_home_is_neither_named_nor_quoted(self):
