@@ -5207,6 +5207,22 @@ def _time_step(record: Dict[str, Any], step: str, at: str) -> None:
                   "ended_at": at if step == "unlock" else None})
 
 
+def _budget_note(record: Dict[str, Any], note: Optional[str], now: datetime
+                 ) -> Tuple[Optional[str], Optional[str]]:
+    """(the note to record, why it was refused or None). The budget is the
+    clock's, not the model's guess (loom#2104): a note that defers on budget
+    before 20 minutes is recorded as refused, and one past it carries the
+    real elapsed minutes."""
+    if note and ("\n" in note or "\r" in note):
+        raise ValueError("note must be one line")
+    refused = tick_clock.budget_refusal(record, note, now)
+    if refused:
+        return "%s: %s" % (refused.split(";")[0], note), refused
+    if note and tick_clock.claims_budget(note):
+        return tick_clock.with_elapsed(note, record, now), None
+    return note, None
+
+
 def _step_record(message: str) -> Dict[str, Any]:
     """Read the recorded step fields from one lock commit message."""
     current_holder = re.search(r"holder=(\S+)", message)
@@ -5259,17 +5275,8 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
         record["times"] = []
     record["step"] = step
     record["step_index"] = TICK_STEPS.index(step) + 1
-    if note and ("\n" in note or "\r" in note):
-        raise ValueError("note must be one line")
     _time_step(record, step, at)
-    # The budget is the clock's, not the model's guess (loom#2104): a note
-    # that defers on budget before 20 minutes is recorded as refused, and
-    # one past it carries the real elapsed minutes.
-    refused = tick_clock.budget_refusal(record, note, now)
-    if refused:
-        note = "%s: %s" % (refused.split(";")[0], note)
-    elif note and tick_clock.claims_budget(note):
-        note = tick_clock.with_elapsed(note, record, now)
+    note, refused = _budget_note(record, note, now)
     if note:
         record["notes"].append({"ts": at, "step": step, "text": note})
     record["holder"] = holder

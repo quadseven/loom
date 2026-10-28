@@ -177,9 +177,12 @@ def with_tick(text: str, holder: Optional[str], now: Optional[datetime] = None) 
 _STEPS_LINE = re.compile(r"^[ \t]*-[ \t]+Steps:.*(?:\r?\n|$)", re.M)
 
 
-def with_steps(text: str, line: str) -> str:
+def with_steps(text: str, line: Optional[str]) -> str:
     """The journal tick `text` with the station's per-step durations as its
-    last line (loom#2104), in place of any "- Steps:" line already there."""
+    last line (loom#2104), in place of any "- Steps:" line already there.
+    With no line the text is unchanged."""
+    if not line:
+        return text
     return "%s\n%s" % (_STEPS_LINE.sub("", text).rstrip("\n"), line)
 
 
@@ -308,9 +311,7 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
     a journal tick and never in a report or reply."""
     text = as_journal(text, holder)
     if text.startswith(JOURNAL_MARKER):
-        text = with_tick(text, holder)
-        if steps:
-            text = with_steps(text, steps)
+        text = with_steps(with_tick(text, holder), steps)
         _text.check(text)
         mine = todays_journal(gh, repo, issue_number, text)
         if mine is not None:
