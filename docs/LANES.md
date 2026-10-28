@@ -1231,12 +1231,18 @@ checks, the goal shapes) leaves its tracking issue as it is, and so does a
 pass that could not read one repo's open pull requests for that repo's
 lane-pr-stalled issue: the other repos' issues still update. Closing it rather than leaving it
 open keeps an empty list from holding a goal out of quiet (docs/BRAIN.md).
-The per-violation issues these kinds filed before this stay open while
-their kind is broken anywhere this pass (their breach is a line of a tracking
-issue now, so their own key going quiet says nothing) and close by the usual
-clear rule once it is not; folding them into the tracking issue of their own
-repo is a later change. Every other kind, `lane-no-success` with its per-lane
-keys for the dead-lane release included, files as below.
+The per-violation issues these kinds filed before this fold into the
+tracking issue of their kind and their own subject repo (from the subject the
+station kept, else the repo the old title names) as the station meets them:
+closed as not planned with one "Folded into #N" comment. One whose repo
+cannot be told (a private repo the title names in words) folds into no
+tracking issue: it closes with a note that names none. At most `FOLD_MAX`
+(2) old issues close a pass, within the pass's 5 writes, so the migration
+cannot spend the GitHub budget.
+One rewritten into a `loom:ticket` is work the factory carries and is never
+folded, nor is one asking an operator (`needs:<login>`); every other kind,
+`lane-no-success` with its per-lane keys for the dead-lane release included,
+files as below.
 
 Each other breach files one issue labelled `loom:triage` and `loom:invariant` under
 the standing repairs epic (docs/BRAIN.md, Filing under an epic; the goal home

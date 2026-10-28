@@ -784,6 +784,18 @@ class SettledSubjectTest(StationBase):
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "closed", self.said)
 
+    def test_an_old_issue_whose_finding_is_still_live_folds_into_the_tracking_issue(self):
+        filed = self.legacy("lane-pr-stalled", "%s#660" % REPO)
+        self.lane_ticket(602)
+        self.lane_pull(660, 602, T0 - 7 * 3600)
+        self.bot_threads(2)
+        self.run_at(T0)
+        (rolled,) = [i for i in self.breaches() if invariants.ROLL_MARKER in i["body"]]
+        self.assertIn("#660: 2 review threads, no fix round", rolled["body"])
+        self.assertEqual(filed["state"], "closed", self.said)
+        (note,) = self.notes(filed)
+        self.assertIn("Folded into #%d" % rolled["number"], note)
+
     def test_an_issue_whose_finding_is_still_live_stays_open(self):
         """A live subject is never closed as settled: its line stays on the
         open tracking issue, and no settle note is written anywhere."""
@@ -1720,21 +1732,71 @@ class RolledKindTest(unittest.TestCase):
         self.file(shape(17, T0 + 5000), now=T0 + 5000)
         self.assertIn("17 tickets (cap 15) (since %s)" % stamp(T0 + 5000), issue["body"])
 
-    def test_old_per_violation_issues_are_left_as_they_are(self):
-        """While its kind is broken, an older per-violation issue of a ROLLED
-        kind is never closed as cleared: its breach now lives on the tracking
-        issue, so its own key going quiet says nothing."""
-        key = invariants.Breach("lane-pr-stalled", "%s#51" % REPO, "t", (), T0).key
-        old = self.gh.issues[51] = {
-            "number": 51, "id": 9051, "state": "open", "closed_at": None,
-            "title": "Lane pull request #51 open 7.0 hours",
+    def legacy(self, number, invariant="lane-pr-stalled", labels=None, subject=None):
+        key = invariants.Breach(invariant, subject or "%s#%d" % (REPO, number), "t", (), T0).key
+        self.gh.issues[number] = {
+            "number": number, "id": 9000 + number, "state": "open", "closed_at": None,
+            "title": "Lane pull request #%d open 7.0 hours" % number,
             "body": "%s\nOld.\n\nPart of #%d" % (invariants.MARKER % key, GOAL),
-            "labels": [{"name": n} for n in invariants.LABELS]}
+            "labels": [{"name": n} for n in (labels or invariants.LABELS)]}
+        return self.gh.issues[number]
+
+    def test_an_old_issue_folds_only_into_its_own_repos_tracking_issue(self):
+        # Each old issue's marker key hashes its own repo's subject, as the
+        # station filed it; the hash cannot be read back, so with no kept
+        # subject the title is all migration has to tell the repo by.
+        private = self.legacy(61, subject="%s#2440" % OTHER)
+        private["title"] = "Lane pull request 2440 of a private repo open 32.9 hours: x"
+        public = self.legacy(62, subject="%s#1527" % self.PUBLIC)
+        public["title"] = "Lane pull request 1527 of %s open 13.3 hours: x" % self.PUBLIC
+        # Only the factory repo has a stalled pull request this pass.
         self.file(self.stalled([self.pull(201)]))
-        self.file(self.stalled([self.pull(201)], now=T0 + 2 * invariants.CLEAR_AFTER),
-                  now=T0 + 2 * invariants.CLEAR_AFTER)
-        self.assertEqual(old["state"], "open", self.said)
-        self.assertNotIn((REPO, 51), self.gh.comments)
+        (rolled,) = self.rolled()
+        # The private one's repo cannot be told: closed with a note naming
+        # no tracking issue, and not folded into the factory repo's.
+        self.assertEqual(private["state"], "closed")
+        (note,) = self.gh.comments[(REPO, 61)]
+        self.assertIn(invariants.RETIRED_TEXT, note["body"])
+        self.assertNotIn("#%d" % rolled, note["body"])
+        self.assertNotIn("Folded", note["body"])
+        # The public repo has no tracking issue open: left to the clear rule.
+        self.assertEqual(public["state"], "open")
+        self.assertNotIn((REPO, 62), self.gh.comments)
+        # Its repo breaks too: it folds into that repo's issue, not the other.
+        later = T0 + 300
+        self.file(self.stalled([self.pull(201),
+                                self.pull(301, self.PUBLIC)], now=later), now=later)
+        mine = [n for n, i in self.rolled().items() if i["title"].endswith(self.PUBLIC)]
+        self.assertEqual(len(mine), 1)
+        self.assertEqual(public["state"], "closed")
+        (note,) = self.gh.comments[(REPO, 62)]
+        self.assertIn("Folded into #%d" % mine[0], note["body"])
+        self.assertNotIn("lists this subject", note["body"])
+
+    def test_migration_folds_old_per_violation_issues_a_few_a_pass_with_a_pointer(self):
+        old = [self.legacy(n) for n in (51, 52, 53)]
+        ticketed = self.legacy(54, labels=(invariants.LABEL, "loom:ticket", "loom:briefed"))
+        other = self.legacy(55, invariant="lane-no-success", subject="zen")
+        # The issues already filed this way are what the station's own
+        # marker and label identify; the live list names other pulls.
+        self.file(self.stalled([self.pull(201)]))
+        (rolled,) = self.rolled()
+        closed = [i for i in old if i["state"] == "closed"]
+        self.assertEqual(len(closed), invariants.FOLD_MAX, self.said)
+        for issue in closed:
+            self.assertEqual(issue["state_reason"], "not_planned")
+            (note,) = self.gh.comments[(REPO, issue["number"])]
+            self.assertIn("Folded into #%d" % rolled, note["body"])
+        self.file(self.stalled([self.pull(201)], now=T0 + 300), now=T0 + 300)
+        self.assertEqual([i["state"] for i in old], ["closed"] * 3)
+        for issue in old:
+            self.assertEqual(len(self.gh.comments[(REPO, issue["number"])]), 1)
+        # A ticket rewritten from one keeps its factory link; another kind
+        # keeps its own clear rule.
+        self.assertEqual(ticketed["state"], "open")
+        self.assertNotIn((REPO, 54), self.gh.comments)
+        self.assertEqual(other["state"], "open")
+        self.assertEqual(len(self.gh.issues), 6)
 
 
 class RollingLaneTest(unittest.TestCase):
