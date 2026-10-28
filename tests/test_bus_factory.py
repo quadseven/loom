@@ -4460,10 +4460,6 @@ class NoLane(Base):
         self.assertTrue(brain._in_flight(ticket("pr", factory.HANDOFF_LABEL)))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LunaReview(Base):
     """The Codex Luna review fallback (loom#2142): when the review check is
     degraded (its model route is exhausted) and the review bot's re-ask has
@@ -4581,3 +4577,6 @@ class LunaReview(Base):
         self.go(review_brief=write)
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.merged, [])
+
+if __name__ == "__main__":
+    unittest.main()
