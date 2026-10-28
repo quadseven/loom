@@ -506,6 +506,20 @@ _CLASSED: Dict[Tuple[str, int, str], str] = {}
 # one slot every pass and the rest fell up to 71 commits behind).
 KEEP_CURRENT_COOLDOWN = 30 * 60
 _KEPT_AT: Dict[Tuple[str, int], float] = {}
+# How many pull requests the branch-hygiene pass (loom#2135) may bring up to
+# date in one repo a pass. Each update restarts the pull request's checks
+# and review, so the bound keeps hygiene from starving the landing lock's
+# one landing a pass while a rotten backlog catches up in small steps.
+HYGIENE_UPDATES_PER_REPO = 2
+# The fix note branch hygiene sends a conflicting pull request back with.
+# It names only the conflict: the pull request's merge still waits for its
+# usual gates, and resolving a conflict is the lane's work, never a merge.
+HYGIENE_CONFLICT_NOTES = """Branch hygiene: this pull request conflicts with the default \
+branch, and no fix round for the conflict is open.
+
+- Merge the default branch into this branch and resolve each conflict, \
+keeping the change its ticket asks for.
+- Keep the whole suite green, and change nothing the ticket does not ask for."""
 DEFER_LABEL = "loom:triage"
 DEFER_TITLE = "Settle the review findings left from PR #%d"
 # The title before the naming standard (docs/NAMING.md): an open follow-up
@@ -1664,6 +1678,16 @@ class Factory:
         # Repos where a held pull request was brought up to date this pass
         # (_keep_current), apart from `updated` so it never delays a landing.
         self.kept_current: set = set()
+        # (repo, pull request) sent back for a fix round this pass, by the
+        # judge or by branch hygiene: hygiene leaves those to the round
+        # already opened.
+        self.sent_back: set = set()
+        # Repo -> how many pull requests branch hygiene brought up to date
+        # this pass (HYGIENE_UPDATES_PER_REPO bounds it), and the (repo,
+        # reason) skips it has already logged this pass, so a locked or
+        # spent repo is named once, not once per waiting pull request.
+        self.hygiene_updates: Dict[str, int] = {}
+        self._hygiene_noted: set = set()
         self._runs: Dict[str, List[Dict[str, Any]]] = {}
         # The tickets named by After: lines, and closed tickets whose lane
         # pull requests are still open, read once a pass.
@@ -2127,14 +2151,6 @@ class Factory:
                                         no_test, unticked, threads)
                 and not self._climb_or_stop(repo, pr, issue, comments, why)):
             return
-        lane = None
-        # A ticket with no lane label (a silent-lane requeue drops it, and the
-        # run's pull request opens after; loom#1095, 2026-10-21) failed every
-        # fix brief on "exactly one lane label": it moves like a remote one.
-        if not _lane(issue) or _lane(issue) in REMOTE_LANES:
-            lane, _ = self._tier_move(repo, issue, allow_remote=False)
-            if lane is None:
-                lane = LADDER[0][0][0]
         notes = TEST_NOTES if no_test else FIX_NOTES
         if unticked:
             try:
@@ -2152,19 +2168,35 @@ class Factory:
             except ValueError as err:
                 _say("%s#%d: ticked criteria not quoted in the fix note (%s)"
                      % (repo, number, err))
-        if lane is not None:
-            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane,
-                            authors=sorted(self.trusted))
-        else:
-            sent = self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes,
-                            authors=sorted(self.trusted))
+        sent = self._open_round(repo, int(pr["number"]), issue, notes)
         if sent is False:
             # brain.fix found nothing new to say and wrote nothing.
             _say("%s#%d not sent back for #%d (%s): the brief would add nothing"
                  % (repo, pr["number"], number, why))
             return
         self.actions += 1
+        self.sent_back.add((repo, int(pr["number"])))
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
+
+    def _open_round(self, repo: str, pr_number: int, issue: Dict[str, Any],
+                    notes: str) -> Any:
+        """Open a fix round on a pull request's ticket, with the lane the
+        send-back picks: a ticket with no lane label (a silent-lane requeue
+        drops it, and the run's pull request opens after; loom#1095,
+        2026-10-21) failed every fix brief on "exactly one lane label", so
+        it moves like a remote-lane ticket and takes a tier lane; any other
+        keeps its own lane. Returns what brain.fix returns: False when the
+        brief would add nothing and nothing was written."""
+        lane = None
+        if not _lane(issue) or _lane(issue) in REMOTE_LANES:
+            lane, _ = self._tier_move(repo, issue, allow_remote=False)
+            if lane is None:
+                lane = LADDER[0][0][0]
+        if lane is not None:
+            return self.fix(self.gh, repo, pr_number, (repo, int(issue["number"])),
+                            notes, lane=lane, authors=sorted(self.trusted))
+        return self.fix(self.gh, repo, pr_number, (repo, int(issue["number"])),
+                        notes, authors=sorted(self.trusted))
 
     def _climb_or_stop(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
                        comments: List[Dict[str, Any]], why: str) -> bool:
@@ -2897,6 +2929,167 @@ class Factory:
         _say("brought held %s#%d up to date with its base; it still waits for the operator"
              % (repo, number))
 
+    # -- branch hygiene (loom#2135) ---------------------------------------
+    def _hygiene(self, repo: str, prs: List[Dict[str, Any]],
+                 tickets: Dict[int, Dict[str, Any]]) -> None:
+        """Branch hygiene: every open lane pull request in the repo, oldest
+        first. The judge above reaches only a pull request whose ticket sits
+        at loom:pr with its review settled, and its keep-current step leaves
+        a refused update where it lies, so a pull request outside that path
+        (one waiting on its checks, one held for the operator) drifted
+        behind or into a conflict nobody was assigned (loom#2135: an
+        operator-held pull request was found 37 behind and conflicting only
+        when the operator came to merge it). This pass keeps each one
+        current, or hands its conflict to its lane, over its whole life.
+        It never merges anything, and a class:sensitive pull request is
+        maintained exactly like a lane one up to that step."""
+        for pr in sorted(prs, key=lambda p: _ts(p.get("created_at"))):
+            if self.actions >= MAX_ACTIONS:
+                return
+            self._guarded(self._hygiene_one, repo, pr, tickets)
+
+    def _hygiene_one(self, repo: str, pr: Dict[str, Any],
+                     tickets: Dict[int, Dict[str, Any]]) -> None:
+        if not self._is_lane_pr(pr):
+            return
+        number = int(pr["number"])
+        if (repo, number) in self.sent_back:
+            return  # the judge sent it back this pass; that round is open
+        association = self._association(repo, pr)
+        if association is None:
+            return  # no ticket in this repo: not a lane pull request to maintain
+        issue = tickets.get(association[1]) or self._ticket(repo, association[1])
+        if (issue is None or issue.get("state") != "open"
+                or "loom:ticket" not in _labels(issue)):
+            return
+        full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+        sha = str((full.get("head") or {}).get("sha") or "")
+        if not sha or full.get("state") != "open" or full.get("mergeable") is None:
+            return  # GitHub has not judged this head yet; a later pass reads it
+        if full.get("mergeable") is False:
+            self._hygiene_conflict(repo, number, issue, sha)
+        elif self._behind(repo, full):
+            self._hygiene_update(repo, number, issue, sha)
+
+    def _hygiene_conflict(self, repo: str, number: int, issue: Dict[str, Any],
+                          sha: str) -> None:
+        """Hand a conflicting pull request's lane exactly one fix round for
+        the conflict. The judged send-back refuses a ticket a person or the
+        brain holds (SEND_BACK_HOLDS), which is what left an operator-held
+        pull request's conflict unassigned: the loom:human hold guards its
+        merge, not its branch, so hygiene opens the round anyway, and the
+        hold stays on the ticket through the move. A needs-brain ticket is
+        the brain's own work and is left to it, as is one in the hand-off
+        pool, and a ticket a lane or the ladder already holds keeps the
+        round it has."""
+        labels = _labels(issue)
+        if HANDOFF_LABEL in labels:
+            _say("hygiene: %s#%d conflicts with its base, but its ticket is in the "
+                 "hand-off pool; left to that session" % (repo, number))
+            return
+        if "needs-brain" in labels:
+            _say("hygiene: %s#%d conflicts with its base, but its ticket is held "
+                 "for the brain; left to it" % (repo, number))
+            return
+        if _state(issue) != "pr":
+            return  # a lane or the ladder already holds the ticket
+        comments = self._comments(repo, int(issue["number"]))
+        if self._conflict_round_open(comments, repo, number, sha):
+            _say("hygiene: %s#%d already has a conflict fix round open; left alone"
+                 % (repo, number))
+            return
+        sent = self._open_round(repo, number, issue, HYGIENE_CONFLICT_NOTES)
+        if sent is False:
+            # brain.fix found nothing new to say and wrote nothing.
+            _say("hygiene: %s#%d conflicts with its base, but the fix brief would "
+                 "add nothing" % (repo, number))
+            return
+        self.actions += 1
+        self.sent_back.add((repo, number))
+        _say("hygiene: opened a conflict fix round for %s#%d (ticket #%d)"
+             % (repo, number, int(issue["number"])))
+
+    def _conflict_round_open(self, comments: Sequence[Dict[str, Any]], repo: str,
+                             number: int, sha: str) -> bool:
+        """Whether a trusted loom:fix comment on the ticket already sends
+        this pull request back for its conflict on its current head: the
+        header names the pull request, the body carries the conflict line,
+        and the comment's loom:fix-key holds the head it was opened for, so
+        the round reads as open until the lane pushes a new head or the
+        conflict clears. A comment with no key (written before heads were
+        keyed) counts as open for any head."""
+        header = "Pull request: %s#%d" % (repo, number)
+        for comment in comments:
+            body = str(comment.get("body") or "")
+            if not body.startswith(FIX_MARKER) or header not in body:
+                continue
+            if "- The branch conflicts with the default branch" not in body:
+                continue
+            found = brain.FIX_KEY_RE.search(body)
+            if found is None or found.group(1).split(":", 1)[0] == sha.lower():
+                return True
+        return False
+
+    def _hygiene_update(self, repo: str, number: int, issue: Dict[str, Any],
+                        sha: str) -> None:
+        """Bring a behind, conflict-free pull request up to date with its
+        base, early and in small steps, with the same update-branch call
+        the landing path uses, pinned to the head read this pass. Never
+        while another pull request in the repo holds the landing lock (its
+        checks are the ones that must finish) or in a pass where the repo
+        already landed one, never on a ticket a lane or the ladder is
+        actively working, never on a head with a failed check (the judge's
+        re-runs and fix rounds are the cheaper answer there, and an update
+        would discard them), and at most HYGIENE_UPDATES_PER_REPO a repo a
+        pass. The keep-current cooldown is shared, so a pull request the
+        held path just brought up to date is not updated again here."""
+        if _state(issue) not in ("pr", "answered"):
+            return
+        held = self._lock(repo)
+        if held == number:
+            return  # the landing path is landing this one; it keeps it current
+        if held is not None:
+            self._hygiene_skip(repo, "lock",
+                                "hygiene: %s pull requests wait: #%d holds the "
+                                "landing lock" % (repo, held))
+            return
+        if repo in self.landed:
+            self._hygiene_skip(repo, "landed",
+                                "hygiene: %s landed a pull request this pass; "
+                                "its updates wait for the next one" % repo)
+            return
+        runs = self._runs.get(sha)
+        if runs is None:
+            runs = self._runs[sha] = self._check_runs(repo, sha)
+        if any(r.get("conclusion") in brain.FAILED_CONCLUSIONS for r in runs):
+            return  # a red head is the judge's work: a re-run or a fix round
+        if self.hygiene_updates.get(repo, 0) >= HYGIENE_UPDATES_PER_REPO:
+            self._hygiene_skip(repo, "bound",
+                                "hygiene: %s already had its %d hygiene updates "
+                                "this pass; the rest wait"
+                                % (repo, HYGIENE_UPDATES_PER_REPO))
+            return
+        if self.now - _KEPT_AT.get((repo, number), float("-inf")) < KEEP_CURRENT_COOLDOWN:
+            return  # brought up to date less than the cooldown ago
+        done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
+                            {"expected_head_sha": sha}, ok=(422,))
+        if done.status == 422:
+            _say("hygiene: %s#%d could not be brought up to date with its base; "
+                 "it reads as a conflict on a later pass" % (repo, number))
+            return
+        _KEPT_AT[(repo, number)] = self.now
+        self.hygiene_updates[repo] = self.hygiene_updates.get(repo, 0) + 1
+        self.actions += 1
+        _say("hygiene: brought %s#%d up to date with its base" % (repo, number))
+
+    def _hygiene_skip(self, repo: str, reason: str, line: str) -> None:
+        """Say a hygiene skip once a repo a pass, however many pull
+        requests it covers."""
+        if (repo, reason) in self._hygiene_noted:
+            return
+        self._hygiene_noted.add((repo, reason))
+        _say(line)
+
     def _operator_holds(self, repo: str, number: int, full: Dict[str, Any],
                         issue: Dict[str, Any], comments: Sequence[Dict[str, Any]] = ()) -> bool:
         """Whether the pull request waits for the operator instead of landing
@@ -3058,6 +3251,7 @@ class Factory:
                             {"expected_head_sha": sha}, ok=(422,))
         if done.status == 422:
             return False
+        _KEPT_AT[(repo, number)] = self.now
         self.actions += 1
         _say("brought %s#%d up to date with its base: %s passed on the base head, so "
              "no fix round" % (repo, number, ", ".join(sorted(str(r.get("name")) for r in failed))))
@@ -4339,6 +4533,7 @@ class Factory:
             if self.actions >= MAX_ACTIONS:
                 return
             self._guarded(self.pull_request, repo, pr, tickets)
+        self._guarded(lambda r, _: self._hygiene(r, prs, tickets), repo, {})
         self._guarded(lambda r, _: self._close_unmerged_follow_ups(r), repo, {})
         steps = {"failed": lambda r, i: self.failed(r, i, linked), "briefed": self.briefed,
                  "running": self.running, "merged": self.settle_deferred,
