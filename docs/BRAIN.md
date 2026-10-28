@@ -476,9 +476,13 @@ and flags any open epic, the standing one too, that holds 100 sub-issues.
 
 Triage, the rewriter, health intake, validation contracts and pull request
 adoption file under the goal's intake epic ("Epic: work that triage,
-rewrites and health intake find"): the newest open one holding fewer than 15
-tickets. One is opened by `bus.brain onboard`, and again whenever no open
-intake epic has room.
+rewrites and health intake find, batch N"): the newest open one, by issue
+number, holding fewer than 15 open tickets. One is opened by `bus.brain
+onboard`, and again whenever no open intake epic has room. Each new one takes
+a batch number one past the highest any open epic of the repo carries, so no
+two open intake epics share a title (intake epics opened before this carry the
+title without a batch and are still found). The `epic-title-shared` invariant
+reports two or more open epics of one repo with the same title.
 
 Every other path that files a ticket under a goal does the same
 (`brain.placement_epic`): the parts of a split pull request and the follow-up
@@ -818,20 +822,12 @@ labelled `claim:<login>`) still follows its pull request: an open pull
 request by that owner, on a branch of the repo, whose `Refs` line names a
 ticket a trusted login filed, moves it from `loom:queued` to `loom:pr`, and
 from there the closed pull request pass moves it to `loom:merged` on merge
-and shipping follows. A merge that leaves a code criterion unticked in every
-merged pull request for it, and unticked on the ticket, moves the ticket to
-`loom:queued` instead, with a status event naming only those boxes. A box
-marked `; not built: <reason>` is unbuilt, and boxes match after whitespace
-and markdown markup are normalised (loom#2026). The brain's own merge applies
-the same rule after the diff check. It is never
-briefed or claimed this way, and a pull
-request by anyone who does not own the ticket moves nothing. So is a ticket assigned to a login outside
-`LOOM_BRIEF_AUTHORS` or labelled `claim:<login>` for one, or one under a goal home whose `Operator:` line names
-another login: another operator's Loom owns it (docs/LANES.md, "Two Looms on
-shared repos"). A trusted briefer owns nothing here: an issue assigned to or
-claim-labelled for one is skipped too, unless it is a `loom:ticket` that
-briefer authored, which is a hand-off. A claim assigns the ticket to this
-Loom's operator login and labels it `claim:<that login>`.
+and shipping follows. A ticket assigned to or claim-labelled for a second
+contributor, on an open pull request by that contributor, also moves from
+`loom:pr` to `loom:merged` when that pull request is merged (the merge itself
+is the trust for a contributor). This ensures that work done by a second
+contributor through their own pull request still progresses through the Loom
+states to `loom:shipped.
 
 The brain applies the same rule to what it reads: issue bodies, comments and
 reviews from logins outside `LOOM_BRIEF_AUTHORS` and the review bots are
