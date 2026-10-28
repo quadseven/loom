@@ -513,8 +513,43 @@ this tick"; a step with no note shows nothing there.
    `loom:human` issue turns out to be work the brain can do after all,
    remove the label and brief it the same way (`brief --refs M`). Never
    close an issue or mark one done from triage: an old issue that looks finished stays
-   open for a person to close.
-9. First run `python3 -m bus.brain step journal --holder muse`. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md --holder muse`,
+   open for a person to close (the sweep, step 9, is the one place the brain
+   closes an issue that is not its ticket).
+9. First run `python3 -m bus.brain step sweep --holder muse`. The Muse sweep:
+   close or rewrite issues in quadseven/loom and quadseven/grug in the time
+   left after the brain steps, which always come first. The step runs only
+   after triage and only while the tick has used under 20 of its 25
+   minutes; past that, `step sweep` records "skipped: the tick used N of
+   its 25 minutes" and the journal says so. You decide what to sweep; write
+   it as a JSON list to SWEEP.json and run
+   `python3 -m bus.brain sweep --file SWEEP.json --holder muse`. Each entry
+   is one action: `{"repo": "quadseven/loom", "number": N, "action": A,
+   "evidence": "<one line>"}` where A is `done`, `duplicate`, `stale` or
+   `overtaken` (an issue already finished, duplicated, gone stale or
+   overtaken, closed with one line of evidence: a commit, pull request or
+   log line you read this tick) or `wontdo` (too vague to build and not
+   worth building, closed as won't do with the reason as the evidence); or
+   `{"repo": ..., "number": N, "action": "rewrite", "epic": E, "title":
+   "...", "body": "<brief>"}` for an issue too vague to build, rewritten in
+   place into one exact ask under epic E (the same rewrite as `brief
+   --refs`). The command enforces the rest: at most 10 actions a tick;
+   issues with any `claim:*` label, any `wait:*` label, a lane state
+   (loom:queued, loom:briefed, loom:running, loom:pr), the epic or
+   loom:goal label, or an open pull request naming them are skipped;
+   `claim:muse` (created when missing) goes on before an issue is touched,
+   at most 5 are held at once, and each is released before the command
+   ends, whether or not the action worked or raised. It stops when the tick
+   reaches 20 minutes. The sweep never opens a pull request: building stays
+   with the lanes. Cite only what you read this tick. Never write that an
+   operator decided something unless a person's comment or label on the
+   issue records it (loom#2089); when you act on your own judgment, say so
+   in the evidence. The command's last line is the tick's count, `swept N
+   (closed N, rewritten N, skipped N)`, and it is also the sweep step's
+   note; post it under the day's "[brain] ticks YYYY-MM-DD" thread and put
+   the same line in the loom#30 journal as `- Sweep: swept N (closed N,
+   rewritten N, skipped N)`, with the reason after a colon when it was
+   skipped.
+10. First run `python3 -m bus.brain step journal --holder muse`. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md --holder muse`,
    before unlocking. The day's first tick posts the journal; every later
    tick that day edits that comment in place, newest tick first, so the
    operator gets no email per tick. `--holder` adds the `Tick <UTC time>, muse` line after
@@ -528,7 +563,7 @@ this tick"; a step with no note shows nothing there.
    A step of this tick that failed or ran degraded gets its own line,
    `- Step <name>: failed <why>` or `- Step <name>: degraded <why>`, with
    the step's name from the list above (lock, status, merge, verify, failed,
-   asks, brief, triage, journal, unlock): the station files a ticket when one
+   asks, brief, triage, sweep, journal, unlock): the station files a ticket when one
    brain's two ticks in a row carry such a line (docs/LANES.md, Invariants).
    Twice a day per goal (when status lists the goal under "Reports owed
    before unlock" as due, overdue or heartbeat; a quiet goal and a backlog
@@ -581,9 +616,9 @@ this tick"; a step with no note shows nothing there.
    carries a `loom:human` count, or whose "Waiting on you:" line says
    "nothing" beside a number, is refused: `journal` posts nothing, prints
    `not posted:` and the reason, and exits 2, a failed step to rewrite.
-10. First run `python3 -m bus.brain step unlock --holder muse`. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
+11. First run `python3 -m bus.brain step unlock --holder muse`. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
     failure as well.
-11. End the tick's chat reply in the same standup shape as the reports
+12. End the tick's chat reply in the same standup shape as the reports
     (one sentence on how things are going, then going well, not going
     well, still stuck, next, needs you), across all goals. When the tick
     posted reports, the reply uses the same words, so the Muse app and

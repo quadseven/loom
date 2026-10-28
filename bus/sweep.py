@@ -1,0 +1,318 @@
+"""The Muse sweep: the brain's step after triage (docs/MUSE.md, step 9).
+
+The brain agent decides what to close or rewrite; this module only runs
+what it decided, inside the goal's rules:
+
+- only after the triage step, and only while the tick has used under
+  BUDGET_MINUTES of its TICK_MINUTES (sweep_allowed);
+- at most MAX_ACTIONS actions a tick, in SWEEP_REPOS only;
+- an issue with a claim:* label, a wait:* label, an active Loom state or an
+  open pull request naming it is skipped (skip_reason);
+- CLAIM_LABEL goes on before an issue is touched, at most MAX_CLAIMS are
+  held at once, and every claim is released in a finally, so a raising
+  action never leaves one behind (run);
+- the tick's count is one line (report_line).
+
+The sweep never opens a pull request: building stays with the lanes.
+"""
+from __future__ import annotations
+
+import re
+import urllib.parse
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+
+from . import notify, shadow, text
+from .github import GitHubError
+
+SWEEP_REPOS = ("quadseven/loom", "quadseven/grug")
+TICK_MINUTES = 25
+BUDGET_MINUTES = 20
+MAX_ACTIONS = 10
+MAX_CLAIMS = 5
+CLAIM_LABEL = "claim:muse"
+CLAIM_COLOR = "5319E7"
+CLAIM_DESCRIPTION = "Claimed by the Muse sweep for this tick; released before the tick ends"
+# Labels that say a lane or a factory is working the issue (the tickets'
+# own states), and the issues the sweep never closes or rewrites.
+BUSY_LABELS = ("loom:queued", "loom:briefed", "loom:running", "loom:pr")
+NEVER_LABELS = ("epic", "loom:goal")
+# What each close action records as GitHub's state_reason.
+CLOSE_REASONS = {"done": "completed", "duplicate": "duplicate", "stale": "not_planned",
+                 "overtaken": "not_planned", "wontdo": "not_planned"}
+ACTIONS = tuple(CLOSE_REASONS) + ("rewrite",)
+# The step after which the sweep may run (bus.brain TICK_STEPS).
+AFTER_STEP = "triage"
+
+Rewrite = Callable[[str, int, int, str, str], str]
+
+
+@dataclass
+class Result:
+    closed: int = 0
+    rewritten: int = 0
+    skipped: int = 0
+    lines: List[str] = field(default_factory=list)
+    stopped: Optional[str] = None
+
+    @property
+    def swept(self) -> int:
+        return self.closed + self.rewritten + self.skipped
+
+
+def report_line(result: Optional[Result] = None, skipped_because: Optional[str] = None) -> str:
+    """The tick report's sweep line, the same in the tick thread and the
+    loom#30 journal: "swept N (closed N, rewritten N, skipped N)". A sweep
+    the guard refused says why after a colon."""
+    r = result or Result()
+    line = "swept %d (closed %d, rewritten %d, skipped %d)" % (
+        r.swept, r.closed, r.rewritten, r.skipped)
+    why = skipped_because or r.stopped
+    return line + (": " + why if why else "")
+
+
+def _stamp(value: Any) -> Optional[datetime]:
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def minutes_used(record: Dict[str, Any], now: datetime) -> Optional[float]:
+    started = _stamp(record.get("started_at"))
+    if started is None:
+        return None
+    return (now - started).total_seconds() / 60.0
+
+
+def time_left(record: Dict[str, Any], now: datetime) -> Optional[str]:
+    """None while the tick has used under BUDGET_MINUTES, else why not."""
+    used = minutes_used(record, now)
+    if used is None:
+        return "skipped, no tick start recorded (run bus.brain step lock first)"
+    if used >= BUDGET_MINUTES:
+        return "skipped, the tick used %d of its %d minutes (the sweep needs under %d)" % (
+            int(used), TICK_MINUTES, BUDGET_MINUTES)
+    return None
+
+
+def sweep_allowed(record: Dict[str, Any], steps: Sequence[str], now: datetime) -> Optional[str]:
+    """None when the sweep may run now, else the reason it is skipped. It
+    runs only once the tick record has reached the triage step, so it can
+    never come before or shorten the merge, verify or failed steps."""
+    step = record.get("step")
+    if step not in steps or steps.index(step) < steps.index(AFTER_STEP):
+        return "skipped, the sweep runs only after the triage step (tick is at %s)" % (
+            step or "no step")
+    return time_left(record, now)
+
+
+def _labels(issue: Dict[str, Any]) -> List[str]:
+    return [str(x.get("name", "")) for x in issue.get("labels", [])]
+
+
+def names_issue(pr: Dict[str, Any], number: int) -> bool:
+    """Whether an open pull request names issue `number`: "#N" in its title
+    or body, or a branch named for it. Generous on purpose: a false match
+    only skips an issue."""
+    words = "%s\n%s" % (pr.get("title") or "", pr.get("body") or "")
+    if re.search(r"#%d(?!\d)" % number, words):
+        return True
+    branch = str((pr.get("head") or {}).get("ref") or "")
+    return bool(re.search(r"(?:^|/)%d(?:-|$)" % number, branch))
+
+
+def skip_reason(issue: Dict[str, Any], open_prs: Sequence[Dict[str, Any]],
+                holder_label: str = CLAIM_LABEL) -> Optional[str]:
+    """None when the sweep may touch `issue`, else why it is left alone."""
+    if "pull_request" in issue:
+        return "a pull request"
+    if issue.get("state") != "open":
+        return "not open"
+    names = _labels(issue)
+    for name in names:
+        if name.startswith("claim:") and name != holder_label:
+            return "claimed (%s)" % name
+        if name == holder_label:
+            return "already claimed by the sweep"
+        if name.startswith("wait:"):
+            return "waiting (%s)" % name
+        if name in BUSY_LABELS:
+            return "in a lane (%s)" % name
+        if name in NEVER_LABELS:
+            return "an %s" % name if name == "epic" else "a %s" % name
+    number = int(issue["number"])
+    for pr in open_prs:
+        if names_issue(pr, number):
+            return "open pull request #%s" % pr.get("number")
+    return None
+
+
+def _label_path(repo: str, number: int, label: str) -> str:
+    return "/repos/%s/issues/%d/labels/%s" % (repo, number, urllib.parse.quote(label, safe=""))
+
+
+def ensure_label(gh: Any, repo: str, label: str = CLAIM_LABEL) -> None:
+    """Create the claim label in `repo` when it is missing."""
+    found = gh.rest("GET", "/repos/%s/labels/%s" % (repo, urllib.parse.quote(label, safe="")),
+                    ok=(404,))
+    if found.status == 404:
+        gh.rest("POST", "/repos/%s/labels" % repo,
+                {"name": label, "color": CLAIM_COLOR, "description": CLAIM_DESCRIPTION},
+                ok=(422,))
+
+
+def claim(gh: Any, repo: str, number: int, label: str = CLAIM_LABEL) -> None:
+    gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [label]})
+
+
+def release(gh: Any, repo: str, number: int, label: str = CLAIM_LABEL) -> None:
+    gh.rest("DELETE", _label_path(repo, number, label), ok=(404,))
+
+
+def _one_line(value: Any, what: str) -> str:
+    line = " ".join(str(value or "").split())
+    if not line or "\n" in str(value or "").strip():
+        raise ValueError("%s must be one non-empty line" % what)
+    text.check(line)
+    return line
+
+
+@dataclass
+class Action:
+    repo: str
+    number: int
+    action: str
+    evidence: str = ""
+    epic: Optional[int] = None
+    title: str = ""
+    body: str = ""
+
+    @classmethod
+    def parse(cls, item: Dict[str, Any]) -> "Action":
+        """One planned action from the brain's plan file. Raises ValueError
+        for an action the rules do not allow, so it is skipped unrun."""
+        repo = str(item.get("repo") or "")
+        number = int(item.get("number") or 0)
+        kind = str(item.get("action") or "")
+        if kind not in ACTIONS:
+            raise ValueError("action must be one of %s" % ", ".join(ACTIONS))
+        if kind == "rewrite":
+            if not item.get("epic") or not item.get("title") or not item.get("body"):
+                raise ValueError("a rewrite names its epic, title and body")
+            return cls(repo, number, kind, epic=int(item["epic"]),
+                       title=_one_line(item["title"], "title"), body=str(item["body"]))
+        return cls(repo, number, kind, evidence=_one_line(item.get("evidence"), "evidence"))
+
+
+def close_comment(action: Action) -> str:
+    if action.action == "wontdo":
+        return "Closed by the Muse sweep as won't do. Reason: %s" % action.evidence
+    return "Closed by the Muse sweep as %s. Evidence read this tick: %s" % (
+        action.action, action.evidence)
+
+
+def _close(gh: Any, action: Action, issue: Dict[str, Any]) -> None:
+    reason = CLOSE_REASONS[action.action]
+    path = "/repos/%s/issues/%d" % (action.repo, action.number)
+    # Before the note, so a close shadow mode holds says nothing.
+    if shadow.guard("PATCH", path, {"state": "closed", "state_reason": reason}, issue,
+                    source="muse sweep close") is not None:
+        raise ValueError("shadow mode held the close; recorded in the shadow ledger")
+    notify.post(gh, action.repo, action.number, close_comment(action), notify.CLOSED)
+    gh.rest("PATCH", path, {"state": "closed", "state_reason": reason})
+
+
+def _batches(items: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:
+    for at in range(0, len(items), size):
+        yield items[at:at + size]
+
+
+def run(gh: Any, plan: Sequence[Dict[str, Any]], record: Dict[str, Any],
+        steps: Sequence[str], rewrite: Rewrite,
+        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        repos: Sequence[str] = SWEEP_REPOS) -> Result:
+    """Run the brain's planned sweep actions under the guard and the caps.
+
+    Claims at most MAX_CLAIMS issues at a time, acts on each, and releases
+    the batch in a finally before the next: an action that raises still
+    leaves no claim:muse behind, and the error goes on to the caller. An
+    action a gate refuses (ValueError, a GitHub refusal) is counted skipped.
+    """
+    result = Result()
+    why = sweep_allowed(record, steps, clock())
+    if why:
+        result.stopped = why
+        return result
+    actions: List[Action] = []
+    for item in plan:
+        try:
+            act = Action.parse(item)
+        except (TypeError, ValueError) as err:
+            result.skipped += 1
+            result.lines.append("skipped %s#%s: %s" % (item.get("repo"), item.get("number"), err))
+            continue
+        if act.repo not in repos:
+            result.skipped += 1
+            result.lines.append("skipped %s#%d: the sweep works only in %s"
+                                % (act.repo, act.number, " and ".join(repos)))
+            continue
+        actions.append(act)
+    open_prs: Dict[str, List[Dict[str, Any]]] = {}
+    labelled: set = set()
+    acted = 0
+    for batch in _batches(actions, MAX_CLAIMS):
+        held: List[Tuple[str, int]] = []
+        try:
+            todo: List[Tuple[Action, Dict[str, Any]]] = []
+            for act in batch:
+                if acted + len(todo) >= MAX_ACTIONS:
+                    result.stopped = "stopped at the cap of %d actions" % MAX_ACTIONS
+                    break
+                if act.repo not in open_prs:
+                    open_prs[act.repo] = gh.paginate("/repos/%s/pulls?state=open" % act.repo)
+                issue = gh.rest("GET", "/repos/%s/issues/%d" % (act.repo, act.number)).data
+                reason = skip_reason(issue, open_prs[act.repo])
+                if reason:
+                    result.skipped += 1
+                    result.lines.append("skipped %s#%d: %s" % (act.repo, act.number, reason))
+                    continue
+                if act.repo not in labelled:
+                    ensure_label(gh, act.repo)
+                    labelled.add(act.repo)
+                claim(gh, act.repo, act.number)
+                held.append((act.repo, act.number))
+                todo.append((act, issue))
+            for act, read in todo:
+                late = time_left(record, clock())
+                if late:
+                    result.stopped = late.replace("skipped", "stopped", 1)
+                    break
+                acted += 1
+                try:
+                    if act.action == "rewrite":
+                        line = rewrite(act.repo, act.number, act.epic or 0, act.title, act.body)
+                        result.rewritten += 1
+                        result.lines.append("rewrote %s#%d: %s" % (act.repo, act.number, line))
+                    else:
+                        _close(gh, act, read)
+                        result.closed += 1
+                        result.lines.append("closed %s#%d as %s" % (act.repo, act.number, act.action))
+                except (ValueError, GitHubError) as err:
+                    result.skipped += 1
+                    result.lines.append("skipped %s#%d: refused, %s" % (act.repo, act.number, err))
+        finally:
+            # Every claim is tried even when one release fails; the first
+            # failure is raised once all were tried.
+            failed: Optional[BaseException] = None
+            for repo, number in held:
+                try:
+                    release(gh, repo, number)
+                except Exception as err:  # noqa: BLE001 - raised after the loop
+                    failed = failed or err
+            if failed is not None:
+                raise failed
+        if result.stopped:
+            break
+    return result
