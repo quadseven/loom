@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, proof, tickets
+from . import answer, proof, status, tickets
 from .github import GitHubError
 
 STALE = "stale"
@@ -182,6 +182,56 @@ def health_hold(issue: Mapping[str, Any]) -> bool:
     """Whether the factory gives the queued ticket no lane: a health ticket
     whose cause is missing or names only the measurement. Reads nothing."""
     return health_verdict(str(issue.get("body") or "")) is not None
+
+
+# A brief that says another issue does its work (loom#2033): "Superseded by
+# #21", "superseded by issue #21", "issue #21 supersedes this work".
+SUPERSEDED_RE = re.compile(
+    r"(?<!not )(?<!never )\bsuperseded by (?:issue |ticket |pull request )?#(\d+)\b"
+    r"|#(\d+) (?:now )?supersedes (?:this|it)\b", re.I)
+# A "Blocked on" or "Blocked by" section: a heading, a bold line or a
+# "Blocked on:" line, with the lines under it up to the next heading.
+BLOCKED_HEAD_RE = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]*|\*\*)?Blocked (?:on|by)\b(.*)$", re.I)
+NEXT_HEAD_RE = re.compile(r"^[ \t]*(?:#{1,6}[ \t]|\*\*[^*\n]+\*\*[ \t]*$)")
+SAME_REPO_REF_RE = re.compile(r"(?<![\w/#.-])#(\d+)\b")
+DETAILS_RE = re.compile(r"<details>.*?</details>", re.S | re.I)
+
+
+def brief_text(body: Any) -> str:
+    """The brief a person or the rewriter wrote: without the status section,
+    the original issue an in-place rewrite kept, collapsed sections and
+    quoted lines, which are the source's words, not the ticket's."""
+    text = tickets.without_original(status.strip_body(body))
+    text = DETAILS_RE.sub("", text)
+    return "\n".join(line for line in text.split("\n") if not line.lstrip().startswith(">"))
+
+
+def superseded_by(body: Any) -> Optional[int]:
+    """The issue the brief says supersedes it, or None. Reads nothing."""
+    found = SUPERSEDED_RE.search(brief_text(body))
+    if not found:
+        return None
+    return int(found.group(1) or found.group(2))
+
+
+def blocked_on(body: Any) -> List[int]:
+    """The same-repo issues the brief's Blocked on section names, in order,
+    once each. Reads nothing: whether one is still open is the caller's."""
+    found: List[int] = []
+    inside = False
+    for line in brief_text(body).split("\n"):
+        head = BLOCKED_HEAD_RE.match(line)
+        if head:
+            inside = True
+            line = head.group(1)
+        elif inside and NEXT_HEAD_RE.match(line):
+            inside = False
+        if inside:
+            for ref in SAME_REPO_REF_RE.findall(line):
+                if int(ref) not in found:
+                    found.append(int(ref))
+    return found
 
 
 def _patch_complete(entry: Mapping[str, Any]) -> bool:

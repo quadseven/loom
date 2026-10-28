@@ -93,6 +93,14 @@ class FakeGitHub:
         self.pull_files = {}
         self.carried = set()
         self.check_runs_status = 200
+        # Strings a code search of the repo finds nothing for (bus/unmeetable.py);
+        # every other search finds one file.
+        self.code_absent = set()
+        self.code_searches = []
+        # The default branch's files the code search index skips (over
+        # 384 KB): path -> text, read through the git trees and blobs API.
+        self.big_files = {}
+        self.tree_status = 200
 
     def add_foreign(self, repo, number, labels=("loom:pr",), state="open", reason=None):
         """An issue in another repo, as an After: line that names one reads it."""
@@ -209,6 +217,8 @@ class FakeGitHub:
                                    if any(l.get("name") == "loom:factory"
                                           for l in i.get("labels", []))])
             return reply(200, self.factory_incidents)
+        if method == "GET" and parts.path == "/search/code":
+            return self._code_search(parts.query)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if method == "GET" and rest == "labels":
             return reply(200, [{"name": name, "color": value["color"],
@@ -254,7 +264,29 @@ class FakeGitHub:
             return reply(200, self.pull_files.get(int(files.group(1)), []))
         if method == "GET" and rest == "git/ref/heads/loom-lock/brain":
             return reply(404, {"message": "Not Found"})
+        if method == "GET" and rest == "git/trees/HEAD" and parts.query == "recursive=1":
+            if self.tree_status != 200:
+                return reply(self.tree_status, {"message": "refused"})
+            tree = [{"path": "src/app.py", "type": "blob", "sha": "a" * 40, "size": 2000}]
+            tree += [{"path": name, "type": "blob", "sha": hashlib.sha1(name.encode()).hexdigest(),
+                      "size": 640000} for name in self.big_files]
+            return reply(200, {"tree": tree, "truncated": False})
+        blob = re.match(r"git/blobs/([0-9a-f]{40})$", rest)
+        if method == "GET" and blob:
+            for name, text in self.big_files.items():
+                if hashlib.sha1(name.encode()).hexdigest() == blob.group(1):
+                    return reply(200, {"encoding": "base64", "content": base64.b64encode(
+                        text.encode()).decode()})
+            return reply(404, {"message": "Not Found"})
         raise AssertionError("unexpected call %s %s" % (method, path))
+
+    def _code_search(self, query):
+        """A code search: one hit unless the term is in code_absent."""
+        term = unquote(query[len("q="):]).rsplit("+repo:", 1)[0].strip('"')
+        self.code_searches.append(term)
+        hits = 0 if term in self.code_absent else 1
+        return reply(200, {"total_count": hits, "incomplete_results": False,
+                           "items": [{"path": "src/app.py"}] * hits})
 
     def _post_page(self, data):
         if self.page_error:
@@ -1147,11 +1179,11 @@ class AdoptUntrackedPullRequestTest(Base):
                         "## Definition of done"):
             self.assertIn(section, body)
         # Filed under the goal's intake epic, which the station opened.
-        intake = [c for c in self.fake.created if c["title"] == brain.INTAKE_TITLE]
+        intake = [c for c in self.fake.created if brain.is_intake_epic(c)]
         self.assertEqual(len(intake), 1)
         self.assertRegex(intake[0]["body"], r"(?m)^Part of #30$")
         epic_number = next(n for n, i in self.fake.issues.items()
-                           if i.get("title") == brain.INTAKE_TITLE)
+                           if brain.is_intake_epic(i))
         self.assertRegex(body, r"(?m)^Part of #%d$" % epic_number)
         self.assertNotRegex(body, r"(?m)^Part of #30$")
         self.assertNotRegex(body, r"(?m)^Refs ")
@@ -10983,6 +11015,114 @@ class VerifyDispatchTest(Base):
         self.assertTrue(any("-6-verify-" in n for n in self.briefs()), self.briefs())
         self.assertNotIn("wait:live-event", self.fake.names(6))
         self.assertIn("loom:shipped", self.fake.names(6))
+
+    def unmeetable_pass(self):
+        """A pass with the verify cooldown cleared, so only the Live box decides."""
+        self.write(os.path.join(self.home, "state", "station", station.VERIFY_FILE), "{}")
+        self.run_pass()
+
+    def test_a_live_box_whose_log_string_no_code_prints_gets_one_restate_ask(self):
+        # loom#2028: a Live box waiting on a string nothing emits went back
+        # through lanes and came back unmet each time.
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        ask = self.fake.comments[2][0]["body"]
+        self.assertIn("<!-- loom:unmeetable-live v1 ", ask)
+        self.assertIn("`daily status ready`", ask)
+        self.assertIn("Restate the Live box", ask)
+        self.assertIn("loom:shipped", self.fake.names(2))
+        # Later passes neither ask again nor queue it, nor search again.
+        searched = len(self.fake.code_searches)
+        self.unmeetable_pass()
+        self.unmeetable_pass()
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.code_searches), searched)
+        # A restated box is checked afresh and verified.
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "`daily status ready`", "`daily status line ready`")
+        self.unmeetable_pass()
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+
+    def test_a_live_box_whose_log_string_the_code_prints_is_verified(self):
+        self.fake.issues.pop(1)
+        self.run_pass()
+        self.assertIn("daily status ready", self.fake.code_searches)
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_live_box_waiting_on_a_closed_issue_gets_one_restate_ask(self):
+        self.fake.issues.pop(1)
+        self.fake.add_foreign("example-owner/muster", 163, state="closed", reason="completed")
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "after deploy, muster#163 is verified and the log prints `daily status ready`")
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertIn("example-owner/muster#163", self.fake.comments[2][0]["body"])  # leak-guard-allow: fictional example repos
+        self.unmeetable_pass()
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+
+    def test_a_log_string_only_a_file_too_big_for_code_search_prints_is_verified(self):
+        # loom#2050: GitHub's code search skips files over 384 KB, so a
+        # string printed only from such a file (the station's own
+        # "trusting briefing logins") searched as absent and was flagged.
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"trusting briefing logins"}
+        self.fake.big_files = {"bus/big.py": 'x = 1\n_say("trusting briefing logins: %s" % who)\n'}
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "`daily status ready`", "`trusting briefing logins`")
+        self.run_pass()
+        self.assertIn("trusting briefing logins", self.fake.code_searches)
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_quoted_log_line_with_filled_in_values_matches_its_template(self):
+        # loom#2050: a box quoting the line as printed ("claimed
+        # #528 for lane") is matched against the source
+        # template ("claimed %s for lane"), not searched literally.
+        self.fake.issues.pop(1)
+        quoted = "claimed example-owner/loom#528 for lane at 1a2b3c4d"  # leak-guard-allow: fictional example repos
+        self.fake.code_absent = {quoted, "for lane at"}
+        self.fake.big_files = {"bus/big.py": '_say("claimed %s for lane at %s" % (ref, sha))\n'}
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "`daily status ready`", "`%s`" % quoted)
+        self.run_pass()
+        self.assertNotIn(quoted, self.fake.code_searches)
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_log_string_neither_the_search_nor_the_big_files_hold_is_flagged(self):
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.fake.big_files = {"bus/big.py": '_say("daily status is ready")\n'}
+        self.run_pass()
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertIn("`daily status ready`", self.fake.comments[2][0]["body"])
+
+    def test_a_search_zero_with_an_unreadable_tree_flags_nothing(self):
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.fake.tree_status = 502
+        self.run_pass()
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertEqual(self.fake.comments[2], [])
+
+    def test_a_lost_state_file_does_not_ask_twice_for_the_same_box(self):
+        self.fake.issues.pop(1)
+        self.fake.code_absent = {"daily status ready"}
+        self.run_pass()
+        os.remove(os.path.join(self.home, "state", "station", station.UNMEETABLE_FILE))
+        self.unmeetable_pass()
+        self.assertEqual(len(self.fake.comments[2]), 1)
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
 
     def test_verify_pool_never_hands_ticket_with_unsearchable_live_line(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
