@@ -17,12 +17,12 @@ from urllib.parse import quote
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
-from . import tick_clock
 from . import answer, ci_facts, ci_gap, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
 from .labels import HANDOFF, LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
+from . import tick_clock
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
 # In a loom:fix comment: the head commit and a hash of what was asked, so a
@@ -5189,6 +5189,24 @@ def _lock_holder(gh: GitHub, lock_repo: str, holder: str, now: datetime) -> None
                          % (holder, lock_repo))
 
 
+class BudgetRefused(ValueError):
+    """A step note deferred on budget before tick_clock.BUDGET_MINUTES: the
+    step is recorded with the refusal as its note, then this is raised."""
+
+
+def _time_step(record: Dict[str, Any], step: str, at: str) -> None:
+    """Close the running step and open `step` in the record's times. The
+    same step again (a second note) keeps its entry; unlock ends at once."""
+    times = record["times"]
+    running = times[-1] if times and isinstance(times[-1], dict) else None
+    if running is not None and running.get("step") == step and not running.get("ended_at"):
+        return
+    if running is not None and not running.get("ended_at"):
+        running["ended_at"] = at
+    times.append({"step": step, "started_at": at,
+                  "ended_at": at if step == "unlock" else None})
+
+
 def _step_record(message: str) -> Dict[str, Any]:
     """Read the recorded step fields from one lock commit message."""
     current_holder = re.search(r"holder=(\S+)", message)
@@ -5209,24 +5227,6 @@ def _step_record(message: str) -> Dict[str, Any]:
         except (ValueError, TypeError, KeyError, AttributeError):
             pass
     return record
-
-
-class BudgetRefused(ValueError):
-    """A step note deferred on budget before tick_clock.BUDGET_MINUTES: the
-    step is recorded with the refusal as its note, then this is raised."""
-
-
-def _time_step(record: Dict[str, Any], step: str, at: str) -> None:
-    """Close the running step and open `step` in the record's times. The
-    same step again (a second note) keeps its entry; unlock ends at once."""
-    times = record["times"]
-    running = times[-1] if times and isinstance(times[-1], dict) else None
-    if running is not None and running.get("step") == step and not running.get("ended_at"):
-        return
-    if running is not None and not running.get("ended_at"):
-        running["ended_at"] = at
-    times.append({"step": step, "started_at": at,
-                  "ended_at": at if step == "unlock" else None})
 
 
 def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
@@ -6128,9 +6128,9 @@ def parser() -> argparse.ArgumentParser:
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
     df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note"); df.add_argument("--lock-repo", default="quadseven/loom")
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True); dn.add_argument("--resolves", help="brief defer key this done finishes")
+    sb = sub.add_parser("step-budget", help="the tick's elapsed minutes and whether a step may be deferred on budget"); sb.add_argument("--lock-repo", default="quadseven/loom")
     rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom"); rs.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET)
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
-    sb = sub.add_parser("step-budget", help="the tick's elapsed minutes and whether a step may be deferred on budget"); sb.add_argument("--lock-repo", default="quadseven/loom")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check"); ob.add_argument("--operator")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
@@ -6301,9 +6301,8 @@ COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate, "epic": _cmd_epic,
-            "close-epic": _cmd_close_epic}
+            "close-epic": _cmd_close_epic, "step-budget": _cmd_step_budget}
 COMMANDS["step"] = _cmd_step
-COMMANDS["step-budget"] = _cmd_step_budget
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
