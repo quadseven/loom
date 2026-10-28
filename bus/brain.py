@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
-from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
+from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
@@ -94,7 +94,11 @@ REPORT_GRACE = 30 * 60
 # Two hours and a quarter gives an hourly tick two chances to write it first.
 # A report written in this window counts for the reading time it precedes.
 REPORT_OWED_EARLY = 2 * 3600 + 15 * 60
-TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage", "journal", "unlock")
+# sweep (docs/MUSE.md, Muse sweep, bus/sweep.py) runs after triage and only
+# under the tick's time budget, so it never comes before or shortens merge,
+# verify or failed.
+TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage", "sweep",
+              "journal", "unlock")
 RUNAWAY = "loom:runaway"
 STEP_MARKER = "loom:tick="
 LANES_MARKER = "<!-- loom:lanes v1 -->"
@@ -5362,6 +5366,19 @@ def _step_record(message: str) -> Dict[str, Any]:
     return record
 
 
+def _sweep_step_note(record: Dict[str, Any], note: Optional[str], now: datetime) -> Optional[str]:
+    """The sweep step's guard, asked before the record moves: it reads the
+    step the tick was at. A sweep before triage is refused, not recorded;
+    one past the time budget is recorded with the skip as its note."""
+    why = sweep.sweep_allowed(record, TICK_STEPS, now)
+    if why and why.startswith("skipped, the sweep runs only after"):
+        raise ValueError(why)
+    record["sweep"] = why or "ok"
+    if why and not note:
+        return "skipped: " + why[len("skipped, "):]
+    return note
+
+
 def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
               note: Optional[str] = None, holder: Optional[str] = None,
               now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -5385,6 +5402,8 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
     if lock_info is None or lock_info[0] != holder or lock_info[1] is None or lock_info[1] <= now:
         raise ValueError("%s does not hold the lock in %s; only the lock holder acts"
                          % (holder, lock_repo))
+    if step == "sweep":
+        note = _sweep_step_note(record, note, now)
     at = _iso(now)
     if step == "lock" or not record["started_at"]:
         record["started_at"] = at
@@ -5410,6 +5429,39 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
     if refused:
         raise BudgetRefused(refused, record)
     return record
+
+
+def run_sweep(gh: GitHub, lock_repo: str, holder: str, plan: Sequence[Dict[str, Any]],
+              clock: Optional[Callable[[], datetime]] = None) -> Tuple[str, List[str]]:
+    """Run the brain's sweep plan (bus/sweep.py) for the lock holder: the
+    tick record gives the guard its step and start time, a rewrite is a
+    brief in place under the named epic (brief --refs), and the report line
+    is appended to the tick record as the sweep step's note."""
+    clock = clock or (lambda: datetime.now(timezone.utc))
+    _lock_holder(gh, lock_repo, holder, clock())
+    record = tick_step(gh, lock_repo)
+
+    def rewrite(repo: str, number: int, epic: int, title: str, body: str) -> str:
+        return brief(gh, repo, epic, title, body, refs=number, holder=holder)
+
+    result = sweep.run(gh, plan, record, TICK_STEPS, rewrite, clock=clock)
+    line = sweep.report_line(result)
+    if record.get("step") in ("triage", "sweep"):
+        tick_step(gh, lock_repo, "sweep", line, holder, clock())
+    return line, result.lines
+
+
+def _cmd_sweep(gh: GitHub, args: argparse.Namespace) -> None:
+    try:
+        plan = json.loads(_read(args.file))
+    except ValueError as err:
+        raise ValueError("the sweep plan is a JSON list of actions: %s" % err) from err
+    if not isinstance(plan, list):
+        raise ValueError("the sweep plan is a JSON list of actions")
+    line, lines = run_sweep(gh, _repo(args.lock_repo), args.holder, plan)
+    for each in lines:
+        print(each)
+    print(line)
 
 
 def _cmd_step(gh: GitHub, args: argparse.Namespace) -> None:
@@ -6259,6 +6311,7 @@ def parser() -> argparse.ArgumentParser:
     sb = sub.add_parser("step-budget", help="the tick's elapsed minutes and whether a step may be deferred on budget"); sb.add_argument("--lock-repo", default="quadseven/loom")
     rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom"); rs.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET)
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
+    sw = sub.add_parser("sweep"); sw.add_argument("--file", required=True, help="JSON list of sweep actions (docs/MUSE.md, step 9)"); sw.add_argument("--holder", required=True); sw.add_argument("--lock-repo", default="quadseven/loom")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check"); ob.add_argument("--operator")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
@@ -6437,6 +6490,7 @@ COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate, "epic": _cmd_epic,
             "close-epic": _cmd_close_epic, "step-budget": _cmd_step_budget}
 COMMANDS["step"] = _cmd_step
+COMMANDS["sweep"] = _cmd_sweep
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
