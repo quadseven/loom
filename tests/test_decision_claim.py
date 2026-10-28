@@ -133,6 +133,15 @@ class CloseCitingADecision(unittest.TestCase):
         close(fake, CLAIM)
         self.assertIn(("PATCH", "/repos/%s/issues/9" % REPO), fake.wrote())
 
+    def test_a_dashboard_answer_naming_a_login_that_is_not_an_operator_does_not_count(self):
+        # The operators come from env (LOOM_BRIEF_AUTHORS' person logins):
+        # an App-posted answer naming anyone else is not an operator's.
+        posted = comment(APP, answer.comment_body("example-stranger", "Close"))
+        fake = Fake(comments={(REPO, 9): [ASK, posted]})
+        with self.assertRaises(decision_claim.DecisionNotRecorded):
+            close(fake, CLAIM)
+        self.assertEqual(fake.wrote(), [])
+
     def test_a_decision_on_the_ticket_the_text_names_counts(self):
         named = "per the operator decision recorded on %s#4" % OTHER
         fake = Fake(comments={(REPO, 9): [], (OTHER, 4): [ASK, comment(PERSON, "Close it.")]})
