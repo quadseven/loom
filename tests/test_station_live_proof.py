@@ -181,6 +181,15 @@ class EvidenceDropsVerifyNotesTest(unittest.TestCase):
         self.assertIn(self.PASS_LINE, text)
         self.assertNotIn("verify of", text)
 
+    def test_a_verify_note_with_no_time_prefix_is_dropped_too(self):
+        bare = self.NOTE.split("] ", 1)[1]
+        self.assertTrue(bare.startswith("station: verify of "))
+        text, seen, _ = evidence.gather_window(
+            {"r": self.command(self.PASS_LINE, bare)}, "r", "Live: `%s`" % self.NEEDLE)
+        self.assertTrue(seen)
+        self.assertIn(self.PASS_LINE, text)
+        self.assertNotIn("verify of", text)
+
     def test_a_line_that_only_mentions_verify_in_the_middle_is_kept(self):
         timing = "[2030-01-02T03:04:06Z] station: step verify took 12s (budget 0 of 5000 left)"
         lines = evidence.lines_since(self.command(timing), self.NEEDLE, 0, 1_900_000_000, 24)
