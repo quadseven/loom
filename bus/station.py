@@ -4614,6 +4614,35 @@ class Station:
                 self._reconcile_pr_ticket(repo, pr, pool, landed)
                 if merged:
                     self._deliver_unlinked(repo, pr, unlinked)
+        # Also check contributor-linked tickets for merging
+        for pr in closed if isinstance(closed, list) else []:
+            if isinstance(pr, dict) and pr.get("state") == "closed":
+                merged = self._terminal_label(pr) == "loom:merged"
+                if not merged:
+                    continue
+                # Find tickets linked by this contributor PR
+                author = tickets._login(pr.get("user"))
+                if author in trusted_authors:
+                    continue
+                # Look for tickets this contributor owns and linked by this PR
+                number = self._pr_ticket_number(repo, pr)
+                if number is not None:
+                    ticket = tickets_by_number.get(number)
+                    if ticket is not None and self._contributor_ticket(repo, pr, author) is ticket:
+                        # This is a contributor-linked ticket
+                        pool = tickets_by_number if merged else waiting
+                        self._reconcile_pr_ticket(repo, pr, pool, landed)
+                        # Check if it moved to merged
+                        if "loom:merged" in _label_names(ticket):
+                            _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
+                    ticket = tickets_by_number.get(number)
+                    if ticket is not None and self._contributor_ticket(repo, pr, author) is ticket:
+                        # This is a contributor-linked ticket
+                        pool = tickets_by_number if merged else waiting
+                        self._reconcile_pr_ticket(repo, pr, pool, landed)
+                        # Check if it moved to merged
+                        if "loom:merged" in _label_names(ticket):
+                            _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
 
     def _unlinked_tickets(self, repo: str, linked: Dict[int, Dict[str, Any]],
                           found: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
