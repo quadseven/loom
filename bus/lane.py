@@ -29,6 +29,16 @@ def _names(issue: Dict[str, Any]) -> List[str]:
             for x in issue.get("labels") or []]
 
 
+def _missing_hold_label(issue: Dict[str, Any], lane: str) -> Optional[str]:
+    """The first label a ticket held by this lane must carry that it lacks:
+    loom:running, then the lane's own label. None when it carries both."""
+    names = _names(issue)
+    for label in ("loom:running", "lane:" + lane):
+        if label not in names:
+            return label
+    return None
+
+
 def _own_login(gh: GitHub) -> Optional[str]:
     """The App login this lane writes as, or None on a personal token or when
     GET /app cannot be read. Only this App can author as it, so trusting it
@@ -281,7 +291,7 @@ def heartbeat(gh: GitHub, repo: str, number: int, lane: str = "muse",
         raise ValueError("unknown remote lane: %s" % lane)
     now = time.time() if now is None else now
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
-    if "loom:running" not in _names(issue) or "lane:" + lane not in _names(issue):
+    if _missing_hold_label(issue, lane) is not None:
         raise ValueError("ticket is not held by this remote lane")
     comments = _comments(gh, repo, number)
     held = [c for c in _claims(comments, lane) if comments[c[0]].get("id")]
@@ -291,6 +301,52 @@ def heartbeat(gh: GitHub, repo: str, number: int, lane: str = "muse",
                 {"body": _claim_body(lane, number, now, first)})
         return
     notify.post(gh, repo, number, _claim_body(lane, number, now), notify.RECORD)
+
+
+def confirm_claim(gh: GitHub, repo: str, number: int, lane: str = "muse",
+                  now: Optional[float] = None) -> Dict[str, Any]:
+    """Confirm a ticket reference is real and held by this lane before a run
+    implements from it. A run takes its ticket from claim's own return; any
+    other reference (a hand-off, a note, a message) is confirmed here first,
+    so a reference to a ticket that does not exist stops the run before it
+    spends work (loom#2136). Returns the ticket's repo, number, title and
+    brief headers. Raises ValueError with the reason when the ticket is not
+    this lane's to work. (Confirm, not verify: the glossary reserves Verify
+    for proof on the live system after a change ships.)"""
+    if lane not in REMOTE_LANES:
+        raise ValueError("unknown remote lane: %s" % lane)
+    now = time.time() if now is None else now
+    try:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    except GitHubError as err:
+        if err.status == 404:
+            raise ValueError("ticket %s#%d does not exist" % (repo, number)) from err
+        raise
+    if "pull_request" in issue:
+        raise ValueError("ticket %s#%d is a pull request, not a ticket" % (repo, number))
+    if issue.get("state") != "open":
+        raise ValueError("ticket %s#%d is not open" % (repo, number))
+    missing = _missing_hold_label(issue, lane)
+    if missing == "loom:running":
+        raise ValueError("ticket %s#%d is not loom:running" % (repo, number))
+    if missing is not None:
+        raise ValueError("ticket %s#%d is not held by lane %s" % (repo, number, lane))
+    live = False
+    for _, beat, _ in _claims(_comments(gh, repo, number), lane):
+        live = now - beat <= CLAIM_AGE
+    if not live:
+        raise ValueError("ticket %s#%d has no live claim comment from lane %s"
+                         % (repo, number, lane))
+    try:
+        headers = tickets.parse(issue.get("body"))[0]
+    except ValueError as err:
+        raise ValueError("ticket %s#%d has an unreadable brief: %s"
+                         % (repo, number, err)) from err
+    if not headers:
+        raise ValueError("ticket %s#%d has no brief headers" % (repo, number))
+    return {"repo": repo, "number": number,
+            "title": str(issue.get("title") or ""),
+            "headers": headers}
 
 
 def lane_heartbeat(gh: GitHub, repo: str, lane: str = "muse",
@@ -503,6 +559,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--title")
     p = sub.add_parser("push")
     p.add_argument("ticket", help="OWNER/NAME#N")
+    p = sub.add_parser("confirm-claim")
+    p.add_argument("ticket", help="OWNER/NAME#N")
+    p.add_argument("--lane", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "claim":
@@ -528,6 +587,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gh = GitHub(auth_from_env())
         if args.command == "heartbeat":
             heartbeat(gh, repo, number, args.lane)
+        elif args.command == "confirm-claim":
+            found = confirm_claim(gh, repo, number, args.lane)
+            print("%s#%d: %s" % (found["repo"], found["number"], found["title"]))
+            for key, value in found["headers"].items():
+                print("%s: %s" % (key, value))
         elif args.command == "push":
             sha = push_branch(gh, repo, number)
             print(sha)
