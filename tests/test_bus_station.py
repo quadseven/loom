@@ -3667,6 +3667,25 @@ class FlakyLadderFake(LadderReviewFake):
 INSTALL_TIMEOUT = ("##[error]The action 'Install what the core's own Dockerfile installs' "
                    "has timed out after 10 minutes.")
 
+PYTEST_READTIMEOUT = (
+    "ERROR at setup of test_postgres [conftest.py:7]\n"
+    "E   ReadTimeout: read timeout=60\n"
+    "ERROR at setup of test_other [conftest.py:7]\n"
+    "E   ReadTimeout: read timeout=60\n"
+    "4528 passed, 5 errors")
+
+PYSETUP = [
+    {"id": 501, "name": "pytest", "status": "completed", "conclusion": "failure",
+     "details_url": "https://github.com/%s/actions/runs/88/job/501" % REPO},
+    {"id": 502, "name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+     "conclusion": "success", "details_url": "https://grug.example"}]
+
+CANCELLED = [
+    {"id": 501, "name": "adapter", "status": "completed", "conclusion": "cancelled",
+     "details_url": "https://github.com/%s/actions/runs/88/job/501" % REPO},
+    {"id": 502, "name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+     "conclusion": "failure", "details_url": "https://grug.example"}]
+
 
 class InfraFlakeHandBackTest(unittest.TestCase):
     """An infra timeout is re-run before a fix round, whatever else fails,
@@ -3722,6 +3741,51 @@ class InfraFlakeHandBackTest(unittest.TestCase):
                                                "with exit code 1.")])
         self.assertEqual(self.reruns(), [])
         self.assertIn("lane:claude", self.names())
+
+    def test_a_pull_request_with_only_readtimeout_errors_is_rerun_once_and_not_judged(self):
+        """A job whose only failing lines are 5 Docker ReadTimeout errors (no
+        test failures) gets one re-run of its failed jobs and no fix round
+        (fails on main)."""
+        self.gh.check_runs = PYSETUP
+        self.last_round("### Check: pytest\n\n    5 errors")
+        self.run_hand_back(checks=[("pytest", PYTEST_READTIMEOUT),
+                                   (factory.DEFAULT_REVIEW_CHECK, "failure")])
+        self.assertEqual(self.reruns(),
+                         ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertIn("lane:spark", self.names())
+
+    def test_a_cancelled_job_is_rerun_once_then_a_fix_round(self):
+        """A cancelled job gets one re-run before the station counts it; the
+        same red after the re-run sends a fix round as today."""
+        self.gh.check_runs = CANCELLED
+        self.last_round("### Check: adapter\n\n    cancelled")
+        self.run_hand_back(checks=[("adapter", "no log was available (conclusion cancelled)"),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(self.reruns(),
+                         ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertIn("lane:spark", self.names())
+        # The same red head: already re-ran once, so a fix round is sent and
+        # no further re-run happens.
+        self.run_hand_back(checks=[("adapter", "no log was available (conclusion cancelled)"),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(self.reruns(),
+                         ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 2)
+        self.assertIn("lane:spark", self.names())
+
+    def test_a_real_test_failure_is_sent_straight_back_with_no_rerun(self):
+        """A real test failure (an assertion) sends a fix round at once, with
+        no re-run."""
+        self.gh.check_runs = PYSETUP
+        self.run_hand_back(checks=[("pytest",
+                                    "FAILED tests/test_a.py::test_x - assert 1 == 2\n"
+                                    "##[error]Process completed with exit code 1.")])
+        self.assertEqual(self.reruns(), [])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertIn("lane:spark", self.names())
+        self.assertNotIn("lane:claude", self.names())
 
 
 class StampedReviewFake(ReviewFake):
