@@ -9870,7 +9870,8 @@ class Station:
         """Check the factory's own invariants on what the station reads
         (bus/invariants.py), at most every invariants.CHECK_EVERY seconds,
         and file one loom:invariant issue per breach on the invariant goal
-        home. Below the budget floor nothing is filed."""
+        home, the kinds in invariants.ROLLED as one tracking issue per kind
+        and repo (loom#2099). Below the budget floor nothing is filed."""
         path = os.path.join(self.state, "invariants.json")
         state = invariants.load(path, _say)
         checked = state.get("checked")
@@ -9891,9 +9892,13 @@ class Station:
             subjects = state.get("subjects")
             if not isinstance(subjects, dict):
                 subjects = state["subjects"] = {}
+            seen = state.get("seen")
+            if not isinstance(seen, dict):
+                seen = state["seen"] = {}
             invariants.Filer(self.gh, goal[0], goal[1], issues, self.now, _say,
                              write=not self._deferred(), authors=self.s.authors,
-                             subjects=subjects,
+                             subjects=subjects, seen=seen,
+                             read=invariants.read_kinds(facts),
                              settled=lambda inv, subject: self._invariant_settled(
                                  facts, inv, subject)).run(breaches)
         invariants.save(path, state)

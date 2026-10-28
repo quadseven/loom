@@ -1197,7 +1197,39 @@ hold that comes and goes never closes and reopens an issue (each reopen mailed
 the people watching it). The lanes it listed move into a "Hold log" in the body
 (a line per hold, newest first, the last 20).
 
-Each breach files one issue labelled `loom:triage` and `loom:invariant` under
+Five kinds file no issue per violation at all (loom#2099): `lane-pr-stalled`,
+`plan-check-failed`, `epic-over-cap`, `goal-epics-over-cap` and
+`closed-epic-open-tickets` (`invariants.ROLLED`). Each restates state the pull
+request, the epic or `python3 -m bus.brain status` already shows, and filing
+one ticket per violation opened 185 of them in 7 days (109 stalled lane pull
+requests, 36 over-cap epics, 15 closed epics with open tickets, 13 failed plan
+checks), every one closing itself later. Instead each kind has one tracking
+issue per subject repo, titled `Invariant: <kind> in <repo>` (a private repo
+named in words with a short hash), labelled `loom:invariant` only (not
+`loom:triage`, so the rewriter never turns the list into a ticket and freezes
+it). Its body lists every current violation, a line each with its link and
+when it started (`since <time>`: a lane pull request's open time, a plan
+check's completion, else when the station first saw it, kept in
+`invariants.json` under `seen`), and a "Last checked" line. The station
+rewrites the body only when the list changes: an unchanged list, or only a
+newer check time, writes nothing. When a kind's list empties, the next pass
+rewrites it to "Current violations: none."; if it is still empty a pass later
+the issue closes as not planned with one line; a violation that returns
+reopens that same issue (the one "Broken again" note, edited in place), so
+the kind keeps one stable issue number. A pass that could not read a kind's
+facts (the lane pull requests, the plan checks, the goal shapes) leaves its
+tracking issue as it is. Closing it rather than leaving it
+open keeps an empty list from holding a goal out of quiet (docs/BRAIN.md).
+The per-violation issues these kinds filed before this fold into the
+tracking issue of their kind as the station meets them: closed as not
+planned with one "Folded into #N" comment, at most `FOLD_MAX` (2) a pass and
+within the pass's 5 writes, so the migration cannot spend the GitHub budget.
+One rewritten into a `loom:ticket` is work the factory carries and is never
+folded, nor is one asking an operator (`needs:<login>`); every other kind,
+`lane-no-success` with its per-lane keys for the dead-lane release included,
+files as below.
+
+Each other breach files one issue labelled `loom:triage` and `loom:invariant` under
 the standing repairs epic (docs/BRAIN.md, Filing under an epic; the goal home
 itself when that epic cannot be read) of the invariant goal home
 (`LOOM_INVARIANT_GOAL`; empty means
@@ -1216,7 +1248,8 @@ ticket gets one separate invariant issue that refs the ticket (loom#1223
 flipped 18 times in a day before this). Issues and pull requests in a private repo are named in words, and
 failure reasons have repos, paths and credentials replaced. One pass files
 or reopens at most 5, and below the GitHub budget floor files nothing.
-A `lane-pr-stalled` or `epic-over-cap` issue whose subject settled for good
+A per-violation `lane-pr-stalled` or `epic-over-cap` issue filed before
+loom#2099 whose subject settled for good
 (its pull request merged or was closed unmerged, its epic is back at the
 cap) closes on the first pass the breach is gone, whatever labels it carries
 (not a `loom:ticket`), with one note naming how; these closes come before
