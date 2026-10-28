@@ -34,16 +34,20 @@ MAX_CLAIMS = 5
 CLAIM_LABEL = "claim:muse"
 CLAIM_COLOR = "5319E7"
 CLAIM_DESCRIPTION = "Claimed by the Muse sweep for this tick; released before the tick ends"
-# Labels that say a lane or a factory is working the issue (the tickets'
-# own states), and the issues the sweep never closes or rewrites.
-BUSY_LABELS = ("loom:queued", "loom:briefed", "loom:running", "loom:pr")
-NEVER_LABELS = ("epic", "loom:goal")
+# Issues the sweep never closes or rewrites, beside every hold label.
+NEVER_LABELS = ("loom:goal",)
 # What each close action records as GitHub's state_reason.
 CLOSE_REASONS = {"done": "completed", "duplicate": "duplicate", "stale": "not_planned",
                  "overtaken": "not_planned", "wontdo": "not_planned"}
 ACTIONS = tuple(CLOSE_REASONS) + ("rewrite",)
-# The step after which the sweep may run (bus.brain TICK_STEPS).
-AFTER_STEP = "triage"
+# The tick steps the sweep may start from (bus.brain TICK_STEPS): right
+# after triage, or a second sweep run in the same step; never after journal.
+SWEEP_FROM = ("triage", "sweep")
+# Beyond the station's hold labels (bus/station.py _holds_ticket): a person
+# ask or a handoff in any form, a backlog goal home, and work merged and
+# waiting to be seen live.
+EXTRA_SKIP_PREFIXES = ("needs:", "handoff:")
+EXTRA_SKIP_LABELS = ("loom:backlog", "awaiting-live-check")
 
 Rewrite = Callable[[str, int, int, str, str], str]
 
@@ -102,9 +106,9 @@ def sweep_allowed(record: Dict[str, Any], steps: Sequence[str], now: datetime) -
     runs only once the tick record has reached the triage step, so it can
     never come before or shorten the merge, verify or failed steps."""
     step = record.get("step")
-    if step not in steps or steps.index(step) < steps.index(AFTER_STEP):
-        return "skipped, the sweep runs only after the triage step (tick is at %s)" % (
-            step or "no step")
+    if step not in SWEEP_FROM or step not in steps:
+        return ("skipped, the sweep runs only after the triage step and before the journal "
+                "(tick is at %s)" % (step or "no step"))
     return time_left(record, now)
 
 
@@ -130,18 +134,17 @@ def skip_reason(issue: Dict[str, Any], open_prs: Sequence[Dict[str, Any]],
         return "a pull request"
     if issue.get("state") != "open":
         return "not open"
-    names = _labels(issue)
-    for name in names:
-        if name.startswith("claim:") and name != holder_label:
-            return "claimed (%s)" % name
+    # Imported here: bus.brain imports this module, and bus.station imports
+    # bus.brain. Both are loaded by the time a sweep runs.
+    from . import brain, station
+    for name in _labels(issue):
         if name == holder_label:
             return "already claimed by the sweep"
-        if name.startswith("wait:"):
-            return "waiting (%s)" % name
-        if name in BUSY_LABELS:
-            return "in a lane (%s)" % name
-        if name in NEVER_LABELS:
-            return "an %s" % name if name == "epic" else "a %s" % name
+        if station._holds_ticket(name) or name in EXTRA_SKIP_LABELS \
+                or name.startswith(EXTRA_SKIP_PREFIXES) or name in NEVER_LABELS:
+            return "held (%s)" % name
+    if brain._is_epic(issue):
+        return "an epic"
     number = int(issue["number"])
     for pr in open_prs:
         if names_issue(pr, number):
@@ -263,8 +266,11 @@ class _Claims:
             self.open_prs[repo] = self.gh.paginate("/repos/%s/pulls?state=open" % repo)
         return self.open_prs[repo]
 
-    def take(self, act: Action, result: Result) -> Optional[Dict[str, Any]]:
-        """Claim `act`'s issue and return it as read, or None when skipped."""
+    def take(self, act: Action, result: Result,
+             held: List[Tuple[str, int]]) -> Optional[Dict[str, Any]]:
+        """Claim `act`'s issue and return it as read, or None when skipped.
+        The issue goes on `held` before the claim is sent, so a claim that
+        applied but answered with an error is still released."""
         issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (act.repo, act.number)).data
         reason = skip_reason(issue, self.prs(act.repo))
         if reason:
@@ -274,6 +280,7 @@ class _Claims:
         if act.repo not in self.labelled:
             ensure_label(self.gh, act.repo)
             self.labelled.add(act.repo)
+        held.append((act.repo, act.number))
         claim(self.gh, act.repo, act.number)
         return issue
 
@@ -308,6 +315,18 @@ def release_all(gh: Any, held: Sequence[Tuple[str, int]]) -> None:
         raise failed
 
 
+def release_leftovers(gh: Any, repos: Sequence[str], result: Result) -> None:
+    """Release every open claim:muse in `repos`. Only the lock holder
+    sweeps, so a claim found at the start is a dead tick's, never a live
+    one's: without this a crashed tick's claims would hold issues forever."""
+    found = []
+    for repo in repos:
+        path = "/repos/%s/issues?state=open&labels=%s" % (repo, urllib.parse.quote(CLAIM_LABEL, safe=""))
+        found += [(repo, int(i["number"])) for i in gh.paginate(path) if "pull_request" not in i]
+    release_all(gh, found)
+    result.lines += ["released %s#%d: a claim left by an earlier tick" % x for x in found]
+
+
 def run(gh: Any, plan: Sequence[Dict[str, Any]], record: Dict[str, Any],
         steps: Sequence[str], rewrite: Rewrite,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
@@ -320,6 +339,7 @@ def run(gh: Any, plan: Sequence[Dict[str, Any]], record: Dict[str, Any],
     action a gate refuses (ValueError, a GitHub refusal) is counted skipped.
     """
     result = Result()
+    release_leftovers(gh, repos, result)
     result.stopped = sweep_allowed(record, steps, clock())
     if result.stopped:
         return result
@@ -334,9 +354,8 @@ def run(gh: Any, plan: Sequence[Dict[str, Any]], record: Dict[str, Any],
                 if acted + len(todo) >= MAX_ACTIONS:
                     result.stopped = "stopped at the cap of %d actions" % MAX_ACTIONS
                     break
-                issue = claims.take(act, result)
+                issue = claims.take(act, result, held)
                 if issue is not None:
-                    held.append((act.repo, act.number))
                     todo.append((act, issue))
             for act, issue in todo:
                 late = time_left(record, clock())

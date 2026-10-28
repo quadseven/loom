@@ -42,6 +42,7 @@ class FakeGH:
         self.calls: List[tuple] = []
         self.max_claims = 0
         self.fail_close: Dict[int, BaseException] = {}
+        self.fail_claim: Dict[int, BaseException] = {}
         message = "holder=%s expires=%s" % (holder, stamp(START + timedelta(hours=1)))
         if tick is not None:
             message += "\n" + brain.STEP_MARKER + json.dumps(tick)
@@ -54,7 +55,17 @@ class FakeGH:
 
     def paginate(self, path: str) -> List[Any]:
         self.calls.append(("PAGINATE", path))
+        if "/issues?" in path:
+            # Only quadseven/loom's issues live in this fake.
+            if not path.startswith("/repos/%s/" % REPO):
+                return []
+            return [dict(i) for i in self.issues.values()
+                    if i["state"] == "open" and sweep.CLAIM_LABEL in [x["name"] for x in i["labels"]]]
         return list(self.prs)
+
+    def writes(self) -> List[tuple]:
+        """Every call but a read."""
+        return [c for c in self.calls if c[0] not in ("GET", "PAGINATE")]
 
     def rest(self, method: str, path: str, body: Any = None, ok: tuple = (), **_: Any):
         self.calls.append((method, path, body))
@@ -69,7 +80,7 @@ class FakeGH:
             return self._repo_label(method, path, body)
         number = int(path.split("/issues/")[1].split("/")[0])
         if "/labels" in path:
-            return self._issue_label(method, path, body, self.issues[number])
+            return self._issue_label(method, path, body, self.issues[number], self.fail_claim)
         if path.endswith("/comments"):
             return reply({})
         if method == "PATCH":
@@ -99,10 +110,14 @@ class FakeGH:
         return reply({}) if label_of(path) in self.repo_labels else reply({}, 404)
 
     @staticmethod
-    def _issue_label(method: str, path: str, body: Any, issue: Dict[str, Any]):
+    def _issue_label(method: str, path: str, body: Any, issue: Dict[str, Any],
+                     fail_claim: Dict[int, BaseException]):
         names = [x["name"] for x in issue["labels"]]
         if method == "POST":
             issue["labels"] += [{"name": n} for n in body["labels"] if n not in names]
+            if issue["number"] in fail_claim:
+                # The label applied, but the answer was an error.
+                raise fail_claim[issue["number"]]
             return reply({})
         if label_of(path) not in names:
             return reply({}, 404)
@@ -165,6 +180,19 @@ class TickStepsTest(unittest.TestCase):
                                 now=START + timedelta(minutes=22))
         self.assertEqual(later["step"], "journal")
 
+    def test_sweep_after_the_journal_is_refused(self):
+        for step in ("journal", "unlock"):
+            gh = FakeGH({1: issue(1)})
+            result = sweep.run(gh, [close(1)], {"step": step, "started_at": stamp(START)},
+                               brain.TICK_STEPS, no_rewrite,
+                               clock=lambda: START + timedelta(minutes=2))
+            self.assertIn("before the journal", result.stopped, step)
+            self.assertEqual(gh.writes(), [], step)
+        tick = {"started_at": stamp(START), "step": "journal", "step_index": 10, "notes": []}
+        with self.assertRaisesRegex(ValueError, "only after the triage step"):
+            brain.tick_step(FakeGH({}, tick=tick), LOCK_REPO, "sweep", holder="muse",
+                            now=START + timedelta(minutes=2))
+
     def test_step_sweep_before_triage_is_refused(self):
         tick = {"started_at": stamp(START), "step": "merge", "step_index": 3, "notes": []}
         gh = FakeGH({}, tick=tick)
@@ -184,14 +212,14 @@ class GuardTest(unittest.TestCase):
             result = sweep.run(gh, [close(1)], record, brain.TICK_STEPS, no_rewrite,
                                clock=lambda: START + timedelta(minutes=1))
             self.assertIn("only after the triage step", result.stopped, step)
-            self.assertEqual(gh.calls, [], step)
+            self.assertEqual(gh.writes(), [], step)
 
     def test_skipped_at_twenty_minutes_and_says_so(self):
         record, _ = at_triage()
         gh = FakeGH({1: issue(1)})
         result = sweep.run(gh, [close(1)], record, brain.TICK_STEPS, no_rewrite,
                            clock=lambda: START + timedelta(minutes=20))
-        self.assertEqual(gh.calls, [])
+        self.assertEqual(gh.writes(), [])
         self.assertEqual(sweep.report_line(result),
                          "swept 0 (closed 0, rewritten 0, skipped 0): skipped, the tick used "
                          "20 of its 25 minutes (the sweep needs under 20)")
@@ -280,8 +308,8 @@ class SkipTest(unittest.TestCase):
             self.assertFalse(any(c[0] == "POST" and c[1].endswith("/issues/%d/labels" % n)
                                  for c in gh.calls), "never claimed #%d" % n)
         text = "\n".join(result.lines)
-        for why in ("claimed (claim:ccqw)", "waiting (wait:ci)", "open pull request #40",
-                    "open pull request #41", "in a lane (loom:running)", "an epic"):
+        for why in ("held (claim:ccqw)", "held (wait:ci)", "open pull request #40",
+                    "open pull request #41", "held (loom:running)", "an epic"):
             self.assertIn(why, text)
 
     def test_a_close_shadow_mode_holds_is_skipped_and_released(self):
@@ -294,13 +322,55 @@ class SkipTest(unittest.TestCase):
         self.assertFalse(any(c[1].endswith("/comments") for c in gh.calls), "no note on a held close")
         self.assertEqual(gh.claims(), 0)
 
+    def test_skips_person_asks_holds_and_parents_and_never_claims_them(self):
+        record, clock = at_triage()
+        groups = ["loom:human", "needs:quadseven", "loom:shipped", "loom:backlog",
+                  "awaiting-live-check", "handoff:claude", "needs-operator", "loom:triage"]
+        issues = {n: issue(n, label) for n, label in enumerate(groups, 1)}
+        parent = issue(len(groups) + 1)
+        parent["sub_issues_summary"] = {"total": 1, "completed": 0}
+        issues[parent["number"]] = parent
+        gh = FakeGH(issues)
+        result = sweep.run(gh, [close(n) for n in issues], record, brain.TICK_STEPS,
+                           no_rewrite, clock=clock)
+        self.assertEqual((result.closed, result.skipped), (0, len(issues)))
+        self.assertEqual(gh.writes(), [], "nothing claimed, closed or commented")
+        text = "\n".join(result.lines)
+        for label in groups:
+            self.assertIn("held (%s)" % label, text)
+        self.assertIn("#%d: an epic" % parent["number"], text)
+
+    def test_a_dead_ticks_claim_is_released_at_the_start(self):
+        record, clock = at_triage()
+        gh = FakeGH({1: issue(1, "claim:muse"), 2: issue(2)})
+        result = sweep.run(gh, [close(2)], record, brain.TICK_STEPS, no_rewrite, clock=clock)
+        self.assertEqual(gh.claims(), 0)
+        self.assertEqual(gh.issues[1]["state"], "open", "released, not acted on")
+        self.assertIn("released quadseven/loom#1: a claim left by an earlier tick", result.lines)
+        self.assertEqual(result.closed, 1)
+
+    def test_a_dead_ticks_claim_is_released_even_when_the_sweep_is_refused(self):
+        gh = FakeGH({1: issue(1, "claim:muse")})
+        sweep.run(gh, [], {"step": "journal", "started_at": stamp(START)}, brain.TICK_STEPS,
+                  no_rewrite, clock=lambda: START + timedelta(minutes=1))
+        self.assertEqual(gh.claims(), 0)
+
+    def test_a_claim_whose_post_raised_is_still_released(self):
+        record, clock = at_triage()
+        gh = FakeGH({1: issue(1), 2: issue(2)})
+        gh.fail_claim[2] = GitHubError("POST answered 502")
+        with self.assertRaises(GitHubError):
+            sweep.run(gh, [close(1), close(2)], record, brain.TICK_STEPS, no_rewrite, clock=clock)
+        self.assertEqual(gh.claims(), 0)
+        self.assertEqual(gh.issues[1]["state"], "open", "nothing acted before the claims held")
+
     def test_only_loom_and_grug(self):
         record, clock = at_triage()
         gh = FakeGH({1: issue(1)})
         result = sweep.run(gh, [close(1, repo="quadseven/infra")], record, brain.TICK_STEPS,
                            no_rewrite, clock=clock)
         self.assertEqual((result.closed, result.skipped), (0, 1))
-        self.assertEqual(gh.calls, [])
+        self.assertEqual(gh.writes(), [])
 
     def test_a_close_needs_one_line_of_evidence(self):
         record, clock = at_triage()

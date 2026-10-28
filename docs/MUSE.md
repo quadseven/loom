@@ -532,14 +532,20 @@ this tick"; a step with no note shows nothing there.
    `{"repo": ..., "number": N, "action": "rewrite", "epic": E, "title":
    "...", "body": "<brief>"}` for an issue too vague to build, rewritten in
    place into one exact ask under epic E (the same rewrite as `brief
-   --refs`). The command enforces the rest: at most 10 actions a tick;
-   issues with any `claim:*` label, any `wait:*` label, a lane state
-   (loom:queued, loom:briefed, loom:running, loom:pr), the epic or
-   loom:goal label, or an open pull request naming them are skipped;
+   --refs`). The command enforces the rest: it runs only from the triage
+   or sweep step, never after the journal; at most 10 actions a tick; it
+   skips an issue with any hold label the station honours (every `loom:`
+   state, loom:triage, loom:human, loom:held, loom:ready,
+   loom:awaiting-evidence, loom:closed-unmerged, needs-operator,
+   needs-brain, any `claim:*` or `wait:*`), any `needs:*` or `handoff:*`
+   label, loom:backlog, awaiting-live-check or loom:goal, an epic (the
+   label or any sub-issue), or an open pull request naming it;
    `claim:muse` (created when missing) goes on before an issue is touched,
    at most 5 are held at once, and each is released before the command
-   ends, whether or not the action worked or raised. It stops when the tick
-   reaches 20 minutes. The sweep never opens a pull request: building stays
+   ends, whether or not the action worked or raised. Any `claim:muse`
+   still open in loom or grug when the command starts is a dead tick's
+   (only the lock holder sweeps) and is released first. It stops when the
+   tick reaches 20 minutes. The sweep never opens a pull request: building stays
    with the lanes. Cite only what you read this tick. Never write that an
    operator decided something unless a person's comment or label on the
    issue records it (loom#2089); when you act on your own judgment, say so
