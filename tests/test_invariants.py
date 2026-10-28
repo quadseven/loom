@@ -787,6 +787,19 @@ class SettledSubjectTest(StationBase):
         (note,) = self.notes(filed)
         self.assertIn("Folded into #%d" % rolled["number"], note)
 
+    def test_an_issue_whose_finding_is_still_live_stays_open(self):
+        """A live subject is never closed as settled: its line stays on the
+        open tracking issue, and no settle note is written anywhere."""
+        self.lane_ticket(602)
+        self.lane_pull(660, 602, T0 - 7 * 3600)
+        self.bot_threads(2)
+        self.run_at(T0)
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        (rolled,) = self.breaches()
+        self.assertEqual(rolled["state"], "open")
+        self.assertIn("#660", rolled["body"])
+        self.assertEqual(self.notes(rolled), [])
+
     def test_a_gone_breach_whose_pull_request_is_still_open_waits(self):
         filed = self.legacy("lane-pr-stalled", "%s#660" % REPO)
         self.lane_ticket(602)
