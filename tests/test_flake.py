@@ -46,6 +46,32 @@ class InfraFlake(unittest.TestCase):
             "FAILED tests/test_a.py::test_x - assert 1 == 2\n"
             "##[error]Process completed with exit code 1."))
 
+    def test_pytest_only_timeout_errors_are_infra_errors(self):
+        self.assertTrue(flake.infra_flake(
+            "ERROR at setup of test_postgres [conftest.py:7]\n"
+            "E   ReadTimeout: read timeout=60\n"
+            "ERROR at setup of test_other [conftest.py:7]\n"
+            "E   ReadTimeout: read timeout=60\n"
+            "4528 passed, 5 errors"))
+
+    def test_pytest_with_a_test_failure_is_not_infra(self):
+        self.assertFalse(flake.infra_flake(
+            "FAILED tests/test_a.py::test_x - assert 1 == 2\n"
+            "ERROR at setup of test_postgres [conftest.py:7]\n"
+            "E   ReadTimeout: read timeout=60"))
+
+    def test_a_cancelled_job_is_infra(self):
+        self.assertTrue(flake.infra_flake("no log was available (conclusion cancelled)"))
+        self.assertTrue(flake.infra_flake("The job was cancelled."))
+
+    def test_a_setup_step_failure_is_infra(self):
+        self.assertTrue(flake.infra_flake(
+            "##[error]The action 'Checkout' failed with exit code 128"))
+
+    def test_a_build_step_timeout_is_not_infra(self):
+        self.assertFalse(flake.infra_flake(
+            "##[error]The action 'Build the module' has timed out after 30 minutes."))
+
 
 class FlakyNamesAndRerun(unittest.TestCase):
     def setUp(self):
