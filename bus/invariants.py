@@ -1077,6 +1077,16 @@ def roll_title_where(repo: str, where: str, filer_repo: str) -> str:
     return where
 
 
+def _first_seen(seen: Dict[str, Any], key: str, now: float, keep: set) -> float:
+    """When the filer first saw a violation with no start of its own,
+    recorded now when it is new."""
+    first = seen.get(key)
+    since = first if isinstance(first, (int, float)) and not isinstance(first, bool) else now
+    seen[key] = since
+    keep.add(key)
+    return float(since)
+
+
 def roll_up(breaches: Iterable[Breach], filer_repo: str, now: float,
             seen: Optional[Dict[str, Any]] = None,
             read: Sequence[str] = ROLLED) -> List[Breach]:
@@ -1098,13 +1108,7 @@ def roll_up(breaches: Iterable[Breach], filer_repo: str, now: float,
     for (kind, repo), members in sorted(groups.items()):
         rows = []
         for b in members:
-            since = b.since
-            if since is None:
-                first = seen.get(b.key)
-                since = first if isinstance(first, (int, float)) and not isinstance(
-                    first, bool) else now
-                seen[b.key] = since
-                keep.add(b.key)
+            since = b.since if b.since is not None else _first_seen(seen, b.key, now, keep)
             rows.append((since, "%s (since %s)" % (b.line or b.title, utc(since))))
         where = roll_title_where(repo, members[0].where, filer_repo)
         out.append(Breach(kind, "%s in %s" % (kind, repo), ROLL_TITLE % (kind, where),
@@ -1206,19 +1210,25 @@ class Filer:
                 if not m:
                     continue
                 number = int(issue["number"])
-                if ROLL_MARKER in str(issue.get("body") or ""):
-                    self._rolls.setdefault(m.group(1), number)
-                ticket = TICKET_LABEL in self._label_names(issue)
-                if ticket:
-                    self._ticketed.add(number)
-                if issue.get("state") == "closed":
-                    self._listed_closed.add(number)
+                ticket = self._note_listed(issue, m.group(1), number)
                 held = self._listed.get(m.group(1))
                 # The first issue of a key wins, but a plain invariant issue
                 # replaces a ticket: the ticket is not where a breach lives.
                 if held is None or (held in self._ticketed and not ticket):
                     self._listed[m.group(1)] = number
         return self._listed
+
+    def _note_listed(self, issue: Dict[str, Any], key: str, number: int) -> bool:
+        """Record what the listing shows of one issue: a tracking issue, a
+        ticket, a closed one. True when it carries loom:ticket."""
+        if ROLL_MARKER in str(issue.get("body") or ""):
+            self._rolls.setdefault(key, number)
+        ticket = TICKET_LABEL in self._label_names(issue)
+        if ticket:
+            self._ticketed.add(number)
+        if issue.get("state") == "closed":
+            self._listed_closed.add(number)
+        return ticket
 
     @staticmethod
     def _label_names(issue: Dict[str, Any]) -> List[str]:
@@ -1621,45 +1631,54 @@ class Filer:
                 return
             if key in current or number in self._listed_closed:
                 continue
-            if self._roll_pending(key, current):
-                continue
-            issue = self._issue(number)
-            if issue is None or issue.get("state") != "open":
-                continue
-            labels = [str(x.get("name", "")) for x in issue.get("labels", [])
-                      if isinstance(x, dict)]
-            if self._rolls.get(key) == number and TICKET_LABEL not in labels:
-                if key.split("/", 1)[0] not in self.read:
-                    # Its facts were not read this pass: an empty list
-                    # would be a guess.
-                    continue
-                if not self._roll_clear(key, number, issue):
-                    return
-                continue
-            if "loom:triage" not in labels and "loom:rewritten" not in labels:
-                continue
-            into = self._rolled_into(key, current)
-            if into is not None and into != number:
-                if any(n.startswith("needs:") for n in labels) or TICKET_LABEL in labels:
-                    # An ask for an operator (needs:<login>) stays open on
-                    # its own issue: folding would close it unanswered. A
-                    # ticket is work the factory carries: it is not folded.
-                    continue
-                if key.split("/", 1)[0] in ROLLED and self.folds >= FOLD_MAX:
-                    # The migration of older per-violation issues is
-                    # bounded, so one pass cannot spend the budget on it.
-                    continue
-                # Still broken, so no clear wait: its subject is a line of #into.
-                if self.writes + 2 > WRITES_MAX:
-                    return
-                self._fold(number, into, self._comments(number), issue)
-                self.folds += 1
-            elif key in _standing_keys():
-                if self.writes >= WRITES_MAX:
-                    return
-                self._mark_clear(key, number, issue)
-            elif not self._close_quiet(number, issue, labels, self._comments(number)):
+            if not self._roll_pending(key, current) and not self._clear_one(key, number,
+                                                                             current):
                 return
+
+    def _clear_one(self, key: str, number: int, current: Dict[str, Breach]) -> bool:
+        """Settle one open issue whose breach is gone this pass: a tracking
+        issue lists none or closes, an older issue folds into its rolling
+        one, a standing one says clear, any other closes once quiet. False
+        when the pass has no writes left."""
+        issue = self._issue(number)
+        if issue is None or issue.get("state") != "open":
+            return True
+        labels = [str(x.get("name", "")) for x in issue.get("labels", [])
+                  if isinstance(x, dict)]
+        if self._rolls.get(key) == number and TICKET_LABEL not in labels:
+            # Its facts not read this pass: an empty list would be a guess.
+            return key.split("/", 1)[0] not in self.read or self._roll_clear(key, number, issue)
+        if "loom:triage" not in labels and "loom:rewritten" not in labels:
+            return True
+        into = self._rolled_into(key, current)
+        if into is not None and into != number:
+            return self._fold_old(key, number, into, issue, labels)
+        if key in _standing_keys():
+            if self.writes >= WRITES_MAX:
+                return False
+            self._mark_clear(key, number, issue)
+            return True
+        return self._close_quiet(number, issue, labels, self._comments(number))
+
+    def _fold_old(self, key: str, number: int, into: int, issue: Dict[str, Any],
+                  labels: List[str]) -> bool:
+        """Fold an older issue whose subject is a line of rolling issue
+        #into. False when the pass has no writes left."""
+        if any(n.startswith("needs:") for n in labels) or TICKET_LABEL in labels:
+            # An ask for an operator (needs:<login>) stays open on its own
+            # issue: folding would close it unanswered. A ticket is work the
+            # factory carries: it is not folded.
+            return True
+        if key.split("/", 1)[0] in ROLLED and self.folds >= FOLD_MAX:
+            # The migration of older per-violation issues is bounded, so
+            # one pass cannot spend the budget on it.
+            return True
+        # Still broken, so no clear wait.
+        if self.writes + 2 > WRITES_MAX:
+            return False
+        self._fold(number, into, self._comments(number), issue)
+        self.folds += 1
+        return True
 
     def _mark_clear(self, key: str, number: int, issue: Dict[str, Any]) -> None:
         """A standing issue whose breach is gone says so in place and stays
