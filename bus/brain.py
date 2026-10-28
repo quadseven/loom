@@ -1128,6 +1128,9 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     bot = env.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     now = now or datetime.now(timezone.utc)
     seconds = per_repo.budget(env, budget)
+    # One pass reads each issue, issue listing, comments and events once,
+    # across every repo and the lane status (loom#2078).
+    gh = issue_reads.once(gh)
     # Explicit `authors` are the caller's choice; read from the environment,
     # an empty list is refused, as it would trust no journal (loom#783).
     if authors is None:
@@ -5474,6 +5477,9 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     authors = require_trusted_authors(env, "resume")
     seconds = per_repo.budget(env, budget)
     _lock_holder(gh, lock_repo, holder, now)
+    # Resume is read-only past the lock check: one pass reads each issue,
+    # issue listing, comments and events once (loom#2078).
+    gh = issue_reads.once(gh)
     out: List[str] = []
     goals, unread, timed = _resume_journals(gh, repos, authors, seconds)
     # A moved or forbidden repo is named once and left out of every later
