@@ -370,7 +370,12 @@ says READY for a pull request merge would refuse on these rules.
 repo for Loom in one step, and a second run changes nothing:
 
 - creates the labels above that are missing (the same as `python3 -m bus
-  labels`);
+  labels`). The station does the same on each repo's first pass after it is
+  enrolled in `LOOM_REPOS`, and for every repo when the label set changes,
+  so an onboard that was skipped still leaves the repo with every label
+  (loom#2032). A runner whose `gh issue edit` is refused for a missing label
+  creates it from the canonical set (`python3 -m bus.labels spec NAME`) and
+  retries once;
 - opens the repo's backlog goal home when none is open: `loom:goal` and
   `loom:backlog`, titled "Goal: Loom or a person works every open
   <owner/name> issue" (docs/NAMING.md), with the destination, the metric (open issues not
@@ -1036,6 +1041,13 @@ When the runner finishes, the station finds the brief in `done/` or
   repo's ticket, 2026-10-21). The reason passes the text checks again first; one
   that does not is replaced by a sentence saying it is in the lane log. Then
   the station settles the ticket from the answer:
+  - First, every code acceptance box must be proven: ticked on the ticket
+    or ticked in the answer's own Acceptance criteria checklist (a "not
+    built" mark proves nothing, since the answer says the work is done).
+    Live and operator boxes are left to the verifier and the operator. When
+    a box is unproven, the ticket goes back to `loom:queued` and the event
+    names each such box; it neither settles nor moves to `loom:merged`
+    (loom#2032).
   - When a pull request linked to the ticket (a `Refs` line or a
     `loom/<number>` branch) has merged into the default branch, that pull
     request carries the work the lane found done. The ticket moves to

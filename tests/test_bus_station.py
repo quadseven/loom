@@ -506,10 +506,28 @@ class StationLabelSyncTest(Base):
     def test_unchanged_label_digest_makes_no_label_calls(self):
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
         ledger = os.path.join(runner.state, "labels.json")
-        self.write(ledger, json.dumps({"digest": runner.label_digest()}))
+        self.write(ledger, json.dumps({"digest": runner.label_digest(),
+                                       "repos": list(self.settings.repos)}))
         with mock.patch.object(labels_module, "ensure_labels") as ensure:
             runner.sync_labels()
         ensure.assert_not_called()
+
+    def test_a_repo_enrolled_after_the_last_sync_gets_the_full_label_set_on_its_first_pass(self):
+        # loom#2032: the sync ran only when the label set changed, so a repo
+        # enrolled later lacked loom:answered and a lane could not set it.
+        repos = ["example-owner/first", "example-owner/second"]
+        settings = station.Settings(self.home, repos, list(AUTHORS), list(OWNERS))
+        runner = station.Station(GitHub("token", transport=self.fake), settings)
+        ledger = os.path.join(runner.state, "labels.json")
+        self.write(ledger, json.dumps({"digest": runner.label_digest(), "repos": repos[:1]}))
+        with mock.patch.object(labels_module, "ensure_labels", return_value=[]) as ensure:
+            runner.sync_labels()
+            self.assertEqual([call.args[1] for call in ensure.call_args_list], repos[1:])
+            ensure.reset_mock()
+            runner.sync_labels()
+            ensure.assert_not_called()
+        with open(ledger, encoding="utf-8") as fh:
+            self.assertEqual(sorted(json.load(fh)["repos"]), repos)
 
 
 class StationKeepsAppTokenTest(Base):
@@ -7200,8 +7218,9 @@ class NoChangeAnswerTest(Base):
     no longer applies. The runner hands its reason to the station in the
     .answered marker; the station records it and settles the ticket."""
 
-    def no_change(self, said=NO_CHANGE_SAID, pulls=(), labels=()):
-        self.fake.add(12, state="running")
+    def no_change(self, said=NO_CHANGE_SAID, pulls=(), labels=(), fresh=True):
+        if fresh:
+            self.fake.add(12, state="running")
         self.fake.issues[12]["labels"] += [{"name": label} for label in labels]
         self.fake.pulls = list(pulls)
         name = tickets.ticket_name(REPO, 12, 1)
@@ -7259,6 +7278,40 @@ class NoChangeAnswerTest(Base):
         events = self.events()
         self.assertNotIn("Fixes #12", events[0])
         self.assertIn("its reason did not pass the text checks", events[0])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:answered"])
+
+    def test_a_box_the_answer_does_not_prove_requeues_the_ticket_and_names_the_box(self):
+        # loom#2032: a no-op answer moved a ticket to loom:merged while its
+        # third box still failed. Every code box must be ticked on the ticket
+        # or in the answer's own checklist before the answer is accepted.
+        self.fake.add(12, state="running", body=BODY + (
+            "\n## Acceptance criteria\n- [x] The walk is suppressed\n"
+            "- [ ] The list names only public repos\n"))
+        sha = "%040x" % 77
+        self.no_change(pulls=[{"number": 77, "state": "closed", "merged_at": "2030-01-01T00:00:00Z",
+                               "merge_commit_sha": sha, "body": "Refs %s#12" % REPO,
+                               "head": {"ref": "a-fix"}}], fresh=False)
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
+        events = self.events()
+        self.assertIn("The list names only public repos", events[0])
+        self.assertNotIn("Pull request #77", events[0])
+
+    def test_a_box_the_answer_marks_not_built_is_not_proven(self):
+        self.fake.add(12, state="running", body=BODY + (
+            "\n## Acceptance criteria\n- [ ] The walk is suppressed\n"))
+        self.no_change(said=NO_CHANGE_SAID.replace(
+            "- [x] The walk is suppressed", "- [ ] The walk is suppressed; not built: no key"),
+            fresh=False)
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertIn("The walk is suppressed", self.events()[0])
+
+    def test_every_box_proven_by_the_answer_or_the_ticket_accepts_it(self):
+        self.fake.add(12, state="running", body=BODY + (
+            "\n## Acceptance criteria\n- [ ] The walk is suppressed\n"
+            "- [x] The old flag is gone\n- [ ] Live: the station log shows `walk off`\n"))
+        self.no_change(fresh=False)
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:answered"])
 
     def test_an_empty_marker_still_settles_the_ticket(self):
