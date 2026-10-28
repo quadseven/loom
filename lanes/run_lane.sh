@@ -77,7 +77,15 @@ LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_ROOT/../infra-public/.github/scripts/check_private_leaks.py}"
+# The leak scanner a public-repo push reads lives in infra-public, kept at
+# $LOOM_HOME/infra-public and fast-forwarded at most hourly
+# (keep_scanner_current). The default reads it from there.
+LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_HOME/infra-public/.github/scripts/check_private_leaks.py}"
+# The remote infra-public is cloned from, LOOM_CLONE_BASE-prefixed like the
+# ticket repos the lane clones. Override it on a machine without network.
+INFRA_PUBLIC="$LOOM_HOME/infra-public"
+INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE}quadseven/infra-public"
+INFRA_PUBLIC_STAMP="$LOOM_HOME/run/infra-public.updated"
 # The SSM parameter of the shared deny-list: names and products with no
 # generic shape, which only this list catches. Every scan passes it.
 LEAK_DENY_SSM="${LOOM_LEAK_DENY_SSM:-/infra/leak-scan/deny-list}"
@@ -106,6 +114,30 @@ leak_scan() {
   fi
   env ${LOOM_AWS_REGION:+AWS_REGION="$LOOM_AWS_REGION"} timeout "$NET_TIMEOUT" \
     python3 -B "$LEAK_SCANNER" "$@" --deny-list-ssm "$LEAK_DENY_SSM"
+}
+# Keep $INFRA_PUBLIC cloned and fast-forward it at most once an hour, so the
+# leak scanner a public-repo push needs is present before any lane scans.
+# The first lane that needs it clones it; a later run fetches at most hourly,
+# gated by the stamp file. Returns 0 when the checkout is usable, 1 when it
+# cannot be had (the scanner stays missing and the run becomes an incident).
+keep_scanner_current() {
+  local now stamp=0
+  now="$(date +%s)"
+  [ -f "$INFRA_PUBLIC_STAMP" ] && stamp="$(tr -cd '0-9' < "$INFRA_PUBLIC_STAMP")"
+  if [ -d "$INFRA_PUBLIC/.git" ]; then
+    if [ $((now - stamp)) -ge 3600 ]; then
+      (cd "$INFRA_PUBLIC" && timeout "$NET_TIMEOUT" git fetch -q origin \
+          && timeout "$NET_TIMEOUT" git merge -q --ff-only FETCH_HEAD) >> "$LOG" 2>&1 && date +%s > "$INFRA_PUBLIC_STAMP"
+    fi
+    return 0
+  fi
+  mkdir -p "$LOOM_HOME"
+  if timeout "$NET_TIMEOUT" git clone -q "$INFRA_PUBLIC_REMOTE" "$INFRA_PUBLIC" >> "$LOG" 2>&1; then
+    date +%s > "$INFRA_PUBLIC_STAMP"
+    return 0
+  fi
+  echo "could not clone the leak scanner's repo $INFRA_PUBLIC_REMOTE" >&2
+  return 1
 }
 INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
@@ -3729,9 +3761,14 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
   fi
   if [ "$REPO_PRIVATE" = false ]; then
+    keep_scanner_current || true
     if [ ! -f "$LEAK_SCANNER" ]; then
-      park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed" transient
-      continue
+      # A scanner that still cannot be had is the machine's fault, not the
+      # ticket's: a factory incident holds the ticket and files one issue,
+      # instead of a transient failure the station re-briefs endlessly.
+      SCANNER_REASON=""
+      note_factory_incident scanner "leak scanner not found at $LEAK_SCANNER" SCANNER_REASON
+      park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed$SCANNER_REASON" "$PARK_CLASS"; continue
     fi
     # A fix round that merged the default branch scans what the pull request
     # adds to it: BASE..HEAD would hold all the default branch gained since,
