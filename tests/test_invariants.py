@@ -635,6 +635,11 @@ class StationTest(StationBase):
             "closed-epic-open-tickets": (lambda: self.gh.subs.update({
                 (REPO, GOAL): [epic(40, state="closed")], (REPO, 40): [ticket(7)]}),
                 "Closed epic #40: 1 open tickets: #7"),
+            # loom#2030: two open epics in one repo with one title.
+            "epic-title-shared": (lambda: self.gh.subs.update({
+                (REPO, GOAL): [dict(epic(40), title="Epic: one name"),
+                               dict(epic(41), title="Epic: one  name"), epic(42)]}),
+                "2 open epics share the title of epic #40"),
         }
         for name, (shape, title) in cases.items():
             with self.subTest(name):
@@ -1862,6 +1867,36 @@ class StandingLaneHeldTest(unittest.TestCase):
         self.gh.issues[number].update(labels=[{"name": x} for x in invariants.LABELS])
         self.file([], now=T0 + 7 * 3600)
         self.assertEqual(self.gh.issues[number]["state"], "closed")
+
+
+class EpicTitleSharedTest(unittest.TestCase):
+    """loom#2030: open epics of one repo that share a title are a breach;
+    closed ones, other repos and distinct titles are not."""
+
+    def shape(self, goal, *epics):
+        return invariants.GoalShape(goal, 6, tuple(epics), ())
+
+    def test_two_open_epics_of_one_repo_with_one_title_are_reported(self):
+        goal, other = Ref("%s#%d" % (REPO, GOAL), "#30"), Ref("%s#9" % REPO, "#9")
+        same = "Epic: work that triage, rewrites and health intake find"
+        e = lambda n, title, open_=True, repo=REPO: invariants.EpicShape(  # noqa: E731
+            Ref("%s#%d" % (repo, n), "#%d" % n), open_, 1, (), False, title=title)
+        f = Facts(T0, shapes=[
+            self.shape(goal, e(45, same), e(41, "Epic: other work"), e(39, same, False)),
+            self.shape(other, e(43, same), e(44, same, repo="example-owner/elsewhere"))])
+        (b,) = invariants.epic_title_shared(f)
+        self.assertEqual(b.subject, "%s#43" % REPO)
+        self.assertIn("2 open epics share the title of epic #43", b.title)
+        self.assertIn("#43, #45", b.evidence[0])
+        self.assertNotIn(same, " ".join((b.title,) + b.evidence))  # labels only
+        self.assertIn(invariants.epic_title_shared, invariants.INVARIANTS)
+
+    def test_distinct_titles_and_unread_shapes_are_healthy(self):
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        epics = [invariants.EpicShape(Ref("%s#%d" % (REPO, n), "#%d" % n), True, 1, (), False,
+                                      title="Epic: work, batch %d" % n) for n in (40, 41)]
+        self.assertEqual(invariants.epic_title_shared(Facts(T0, shapes=[self.shape(goal, *epics)])), [])
+        self.assertEqual(invariants.epic_title_shared(Facts(T0)), [])
 
 
 class StandingEpicTest(unittest.TestCase):

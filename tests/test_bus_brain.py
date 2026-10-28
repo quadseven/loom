@@ -12,6 +12,7 @@ import unittest
 import unittest.mock
 from contextlib import redirect_stderr
 from datetime import datetime, timezone
+from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -3811,6 +3812,9 @@ class FakeRepo:
         if path.startswith("/issues?labels=epic&state=all"):
             return reply(200, [i for i in self.issues
                                if any(l["name"] == "epic" for l in i["labels"])])
+        if path.startswith("/issues?labels=epic&state=open"):
+            return reply(200, [i for i in self.issues if i.get("state", "open") == "open"
+                               and any(l["name"] == "epic" for l in i["labels"])])
         if path.startswith("/issues?"):
             self.assertIn_("labels=loom%3Agoal", path)
             return reply(200, [i for i in self.issues
@@ -3897,7 +3901,7 @@ class OnboardTests(unittest.TestCase):
         self.assertIn("backlog goal home: #100, created", lines)
         # Onboarding opens the backlog goal's intake epic (decision 0003).
         intake = posted[1][2]
-        self.assertEqual((intake["title"], intake["labels"]), (brain.INTAKE_TITLE, ["epic"]))
+        self.assertEqual((intake["title"], intake["labels"]), (brain.INTAKE_BATCH_TITLE % 1, ["epic"]))
         self.assertTrue(intake["body"].endswith("\n\nPart of #100\n"))
         self.assertIn("intake epic: #101", lines)
         self.assertEqual(fake.subs, {100: [101]})
@@ -4072,6 +4076,11 @@ class GoalRepo:
 
     def __call__(self, method, url, headers, body):
         payload = json.loads(body) if body else None
+        if method == "GET" and "labels=epic&state=open" in url:
+            # The repo's open epics, which name a new intake epic's batch.
+            self.calls.append((method, "?epics", None))
+            return reply(200, [i for i in self.issues.values() if i.get("state") == "open"
+                               and "epic" in [x["name"] for x in i.get("labels", [])]])
         path = url.split("api.github.com")[1].split("?")[0][len("/repos/%s/issues" % REPO):]
         self.calls.append((method, path, payload))
         parts = path.strip("/").split("/")
@@ -4821,7 +4830,7 @@ class EpicFilingTests(unittest.TestCase):
         fake = GoalRepo()
         gh = GitHub("t", transport=fake)
         first = brain.intake_epic(gh, REPO, 1)
-        self.assertEqual(fake.issues[first]["title"], brain.INTAKE_TITLE)
+        self.assertEqual(fake.issues[first]["title"], brain.INTAKE_BATCH_TITLE % 1)
         self.assertEqual(brain.intake_epic(gh, REPO, 1), first)  # found, not opened again
         url = brain.brief_intake(gh, REPO, 1, "Ticket", BODY, "codex")
         self.assertIn(int(url.rsplit("/", 1)[1]), fake.subs[first])
@@ -4830,7 +4839,7 @@ class EpicFilingTests(unittest.TestCase):
             fake.subs[first].append(n)
         nxt = brain.intake_epic(gh, REPO, 1)
         self.assertNotEqual(nxt, first)
-        self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_TITLE)
+        self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_BATCH_TITLE % 2)
 
     def test_an_intake_epic_with_closed_tickets_still_has_room(self):
         # 2026-10-24: room counted every ticket an intake epic ever held, so
@@ -4884,9 +4893,41 @@ class EpicFilingTests(unittest.TestCase):
         gh = GitHub("t", transport=fake)
         nxt = brain.intake_epic(gh, REPO, 1)
         self.assertNotIn(nxt, (60, 61))
-        self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_TITLE)
+        self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_BATCH_TITLE % 1)
         self.assertEqual([len(fake.subs[n]) for n in (60, 61)],
                          [brain.EPIC_TICKET_CAP, brain.EPIC_TICKET_CAP + 4])
+
+    def test_a_new_intake_epic_takes_a_batch_number_no_open_epic_uses(self):
+        # loom#2030: five open intake epics shared one title, so rewrites and
+        # people picking by title split tickets across all five.
+        fake = GoalRepo()
+        self.intake_epics(fake, [brain.EPIC_TICKET_CAP])  # #60, the unnumbered title
+        # Intake epics of other goals in the repo, one of them closed.
+        fake.issues[70] = dict(item(70, body="Part of #9\n", labels=["epic"]),
+                               title=brain.INTAKE_BATCH_TITLE % 4)
+        fake.issues[71] = dict(item(71, body="Part of #9\n", labels=["epic"], state="closed"),
+                               title=brain.INTAKE_BATCH_TITLE % 9)
+        gh = GitHub("t", transport=fake)
+        nxt = brain.intake_epic(gh, REPO, 1)
+        self.assertNotIn(nxt, (60, 70, 71))
+        title = fake.issues[nxt]["title"]
+        self.assertEqual(title, brain.INTAKE_BATCH_TITLE % 5)
+        others = [i["title"] for n, i in fake.issues.items()
+                  if n != nxt and i.get("state") == "open" and "title" in i]
+        self.assertNotIn(title, others)
+        self.assertEqual(brain.intake_batch(title), 5)
+        # Found by its numbered title, not opened again.
+        self.assertEqual(brain.intake_epic(gh, REPO, 1), nxt)
+
+    def test_intake_takes_the_newest_intake_epic_with_room_by_number_not_by_title(self):
+        # An older unnumbered intake epic and a newer numbered one, both with
+        # room: the newer one by its number, not the first exact title match.
+        fake = GoalRepo()
+        self.intake_epics(fake, [3, 2])
+        fake.issues[61]["title"] = brain.INTAKE_BATCH_TITLE % 2
+        gh = GitHub("t", transport=fake)
+        self.assertEqual(brain.intake_epic(gh, REPO, 1), 61)
+        self.assertEqual(fake.created(), [])
 
 
 class PlacementTests(unittest.TestCase):
@@ -4927,7 +4968,7 @@ class PlacementTests(unittest.TestCase):
         fake = self.fake_with_epics([brain.EPIC_TICKET_CAP])
         made = self.place(fake, 60)
         self.assertNotEqual(made, 60)
-        self.assertEqual(fake.issues[made]["title"], brain.INTAKE_TITLE)
+        self.assertTrue(brain.is_intake_epic(fake.issues[made]))
         self.assertIn("Part of #1", fake.issues[made]["body"])
 
     def test_the_parts_of_a_split_need_room_for_all_of_them(self):
@@ -5013,6 +5054,83 @@ class MoveFromGoalTests(unittest.TestCase):
                          [{"sub_issue_id": 1006, "replace_parent": True}])
 
 
+class RewriteRepo(GoalRepo):
+    """GoalRepo that also removes a label, as a rewrite in place does."""
+
+    def __call__(self, method, url, headers, body):
+        if method == "DELETE":
+            path = url.split("api.github.com")[1]
+            self.calls.append((method, path, None))
+            number, name = re.search(r"/issues/(\d+)/labels/(.+)$", path).groups()
+            issue = self.issues[int(number)]
+            issue["labels"] = [x for x in issue["labels"] if x["name"] != unquote(name)]
+            return reply(200, [])
+        return super().__call__(method, url, headers, body)
+
+
+class RewriteKeepsSourceEpicTests(unittest.TestCase):
+    """loom#2033: a rewrite of an issue that sat under its epic filed it
+    under the goal's intake epic: the brief said Part of the intake epic
+    while GitHub kept the old parent, so the two disagreed."""
+
+    EPIC_URL = "https://api.github.com/repos/%s/issues/%d" % (REPO, EPIC)
+
+    def repo(self, source_body="## Problem\nSlow.\n", parent=EPIC_URL):
+        fake = RewriteRepo()
+        # Epic #5 is another open epic of goal #1.
+        fake.issues[5] = epic_issue(number=5, id=105)
+        fake.subs[1].append(5)
+        fake.subs[5] = []
+        extra = {"parent_issue_url": parent} if parent else {}
+        fake.issues[6] = item(6, body=source_body, labels=["loom:triage"], title="Slow page",
+                              user={"login": "example-brain"},
+                              html_url="https://example.com/6", **extra)
+        if parent:
+            fake.subs[int(parent.rsplit("/", 1)[1])].append(6)
+        return fake
+
+    def rewrite(self, fake, body=BODY + "\n\nPart of #30\n"):
+        with redirect_stderr(io.StringIO()):
+            return brain.brief_intake(GitHub("t", transport=fake), REPO, 1, "Ticket", body,
+                                      refs=6, env=TRUSTED)
+
+    def ticket_part(self, fake):
+        return tickets.without_original(fake.issues[6]["body"])
+
+    def test_a_rewrite_names_the_source_s_sub_issue_parent(self):
+        fake = self.repo()
+        self.assertEqual(self.rewrite(fake), "https://example.com/6")
+        part = self.ticket_part(fake)
+        self.assertTrue(part.rstrip().endswith("Part of #%d" % EPIC), part)
+        self.assertNotIn("Part of #30", part)
+        # No intake epic opened, no new issue, no second parent asked for.
+        self.assertEqual(fake.created(), [])
+        self.assertFalse([c for c in fake.calls if c[0] == "POST" and c[1].endswith("/sub_issues")])
+        self.assertEqual(fake.subs[EPIC], [6])
+
+    def test_the_sub_issue_parent_wins_when_the_body_disagrees(self):
+        fake = self.repo(source_body="## Problem\nSlow.\n\nPart of #5\n")
+        self.rewrite(fake, body=BODY + "\n\nPart of #5\n")
+        part = self.ticket_part(fake)
+        self.assertTrue(part.rstrip().endswith("Part of #%d" % EPIC), part)
+        self.assertNotIn("Part of #5", part)
+
+    def test_a_source_with_only_a_part_of_line_stays_under_that_epic(self):
+        fake = self.repo(source_body="## Problem\nSlow.\n\nPart of #5\n", parent=None)
+        self.rewrite(fake)
+        self.assertTrue(self.ticket_part(fake).rstrip().endswith("Part of #5"))
+        self.assertEqual(fake.created(), [])
+        self.assertIn(6, fake.subs[5])
+
+    def test_a_source_under_a_closed_epic_goes_to_the_intake_epic(self):
+        fake = self.repo()
+        fake.issues[EPIC]["state"] = "closed"
+        with unittest.mock.patch.object(brain, "intake_epic", return_value=5):
+            self.rewrite(fake)
+        self.assertTrue(self.ticket_part(fake).rstrip().endswith("Part of #5"))
+        self.assertNotIn("Part of #30", self.ticket_part(fake))
+
+
 class OutsideEpicRepo:
     """Goal #1 with the tickets of its own, its open intake epics and the
     tickets they hold. A sub-issue link that replaces the parent moves the
@@ -5040,6 +5158,8 @@ class OutsideEpicRepo:
             return reply(200, self.open_tickets)
         if path.startswith("/repos/%s/issues?labels=epic&state=all" % REPO):
             return reply(200, self.epics)
+        if path.startswith("/repos/%s/issues?labels=epic&state=open" % REPO):
+            return reply(200, [e for e in self.epics if e.get("state", "open") == "open"])
         if path == "/repos/%s/issues/1" % REPO:
             return reply(200, self.issues[1])
         raise AssertionError("unexpected read %s" % path)
@@ -5119,7 +5239,7 @@ class MoveOutsideEpicTests(unittest.TestCase):
         # A new intake epic took the other two, oldest first.
         opened = [n for n in fake.subs[1] if n != 60]
         self.assertEqual(len(opened), 1)
-        self.assertEqual(fake.issues[opened[0]]["title"], brain.INTAKE_TITLE)
+        self.assertTrue(brain.is_intake_epic(fake.issues[opened[0]]))
         self.assertIn("Part of #1", fake.issues[opened[0]]["body"])
         self.assertEqual(fake.subs[opened[0]], [11, 12])
         # Every move replaced the goal as the parent, oldest ticket first.
