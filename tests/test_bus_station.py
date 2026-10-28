@@ -82,6 +82,7 @@ class FakeGitHub:
         self.threads = {}
         self.reply_fails = set()
         self.replies = []
+        self.next_comment_id = 100
         self.resolved = []
         self.open_issues = []
         self.bot = AUTHORS[0]
@@ -478,8 +479,13 @@ class FakeGitHub:
             if result is not None:
                 return result
         if method == "POST" and sub == "comments":
-            self.comments[n].append({"body": data["body"], "user": {"login": self.bot}})
-            return reply(201, {})
+            self.next_comment_id += 1
+            comment = {"id": self.next_comment_id, "body": data["body"],
+                       "user": {"login": self.bot},
+                       "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                       "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            self.comments[n].append(comment)
+            return reply(201, {"id": self.next_comment_id})
         if method == "PATCH" and sub is None:
             return self._patch_issue(n, data)
         if method == "POST" and sub == "sub_issues":

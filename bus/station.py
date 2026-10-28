@@ -3611,7 +3611,8 @@ class Station:
         """Add missing-evidence notes to shipped tickets >24h old that were not
         handed to a verify lane in this pass (loom#2092). The reserved lane
         verifies one ticket per pass; the rest get a note. Tickets flagged as
-        unmeetable (restate ask posted) are skipped."""
+        unmeetable (restate ask posted) are skipped. Notes are edited in place:
+        a second pass adds no duplicate note."""
         path = os.path.join(self.state, VERIFY_FILE)
         attempts = _read_json(path, {}, strict=False)
         attempts = attempts if isinstance(attempts, dict) else {}
@@ -3643,9 +3644,20 @@ class Station:
                 if key in handed_this_pass or key in unmeetable_keys:
                     continue
                 try:
-                    status.add(self.gh, repo, int(issue["number"]),
-                              "Missing evidence: ticket not yet reached by verify lane after 24h",
-                              self.now)
+                    number = int(issue["number"])
+                    # Check if a missing-evidence note already exists
+                    found = status.find(self.gh, repo, number, self.s.authors)
+                    has_missing_note = False
+                    if found:
+                        _, events = found
+                        for _, text in events:
+                            if "missing evidence" in text.lower():
+                                has_missing_note = True
+                                break
+                    if not has_missing_note:
+                        status.add(self.gh, repo, number,
+                                  "Missing evidence: ticket not yet reached by verify lane after 24h",
+                                  self.now)
                 except Exception as err:
                     _say("could not add missing-evidence note to %s: %s" % (key, err))
 
