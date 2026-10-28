@@ -707,9 +707,19 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     return line
 
 
-def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
+def _pending_brain_fix(comments: List[Any], authors: Sequence[str],
+                        gh: Optional[GitHub] = None,
+                        repo: Optional[str] = None,
+                        number: Optional[int] = None) -> bool:
+    """Check if there is a pending brain fix that blocks merge.
+    
+    A fix is pending if there is a newer fix comment than the last claim.
+    Additionally, if all threads named in the fix are resolved, the fix is
+    cancelled and does not block merge.
+    """
     allowed = {a.lower() for a in authors}
     last_claim = newest = -1
+    newest_fix_comment = None
     # Newest stamps seen, for the timestamped comparison below. A claim line
     # inside the ticket's status comment carries its own time: the station
     # edits that one comment in place, so the line's stamp - not the
@@ -738,10 +748,27 @@ def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
             created = str(comment.get("created_at") or "")
             if created > fix_stamp:
                 fix_stamp = created
+                newest_fix_comment = comment
     if claim_stamp and fix_stamp:
         # A brain-fix ask newer than the last real claim still blocks the
         # merge; only the detection of the claim changed (loom#1203).
         return fix_stamp > claim_stamp
+    if newest > last_claim and newest_fix_comment:
+        # Check if all threads in the fix are resolved (only in merge context)
+        if gh and repo and number:
+            try:
+                from . import tickets
+                pr_number = tickets.pull_of(newest_fix_comment.get("body"))
+                if pr_number:
+                    resolved, message = _fix_threads_resolved(
+                        gh, repo, pr_number[1], newest_fix_comment.get("id"))
+                    if resolved:
+                        # Cancel the pending fix
+                        _cancel_pending_fix(gh, repo, number, pr_number[1], message)
+                        return False  # Fix is cancelled, does not block merge
+            except Exception as err:
+                _say("_pending_brain_fix: error checking threads (%s); treating as unresolved" % err)
+                return True
     return newest > last_claim
 
 
@@ -876,11 +903,11 @@ def _docs_criterion_override(gh: GitHub, repo: str,
 
 
 def _pending_fix_blocker(gh: GitHub, ticket: Optional[Tuple[str, int]],
-                         authors: Sequence[str], line: str) -> str:
+                          authors: Sequence[str], line: str) -> str:
     """Add a blocker while a brain fix still awaits its author."""
     if ticket is not None and authors:
         comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
-        if _pending_brain_fix(comments, authors):
+        if _pending_brain_fix(comments, authors, gh, ticket[0], ticket[1]):
             return _add_blocker(line, "pending brain fix")
     return line
 
@@ -4171,8 +4198,81 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     return tier
 
 
+def _fix_threads_resolved(gh: GitHub, repo: str, pr_number: int, fix_comment_id: int) -> Tuple[bool, Optional[str]]:
+    """Check if all threads named in a fix comment are resolved.
+    
+    Returns a tuple (all_resolved, cancellation_message) where all_resolved is True
+    when all threads are resolved, and cancellation_message is the text to post
+    when the fix is cancelled.
+    """
+    from . import tickets  # Import here to avoid circular dependency
+    
+    try:
+        # Get the PR details to check the threads
+        pr_details = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data
+    except GitHubError:
+        return False, None
+    
+    threads = (pr_details.get("reviewThreads") or {}).get("nodes") or []
+    
+    # Parse the fix comment to find which threads it names
+    comment = gh.rest("GET", "/repos/%s/issues/%d/comments/%d" % (repo, pr_number, fix_comment_id))
+    if not isinstance(comment.data, dict):
+        return False, None
+    
+    try:
+        fix = tickets.parse_fix(repo, str(comment.data.get("body") or ""))
+    except ValueError:
+        return False, None
+    
+    # Check each thread mentioned in the fix
+    found_threads = set()
+    for finding in fix.findings_list:
+        if finding.location:
+            comment_id = finding.location[2]
+            found_threads.add(comment_id)
+    
+    if not found_threads:
+        # No threads mentioned in the fix
+        return True, None
+    
+    # Check if all mentioned threads are resolved
+    all_resolved = True
+    unresolved = []
+    for thread in threads:
+        thread_id = thread.get("id")
+        if thread_id in found_threads and not thread.get("isResolved"):
+            all_resolved = False
+            unresolved.append(thread_id)
+    
+    if all_resolved:
+        return True, f"cancelled: all threads named in the pending fix are resolved"
+    else:
+        return False, f"cancelled: unresolved threads {unresolved}"
+
+
+def _cancel_pending_fix(gh: GitHub, repo: str, number: int, pr_number: int,
+                        cancellation_message: str) -> None:
+    """Cancel a pending fix that is no longer needed.
+    
+    Posts a comment explaining why the fix was cancelled and moves the ticket
+    back to a state where it can be merged.
+    """
+    comment = f"{tickets.FIX_MARKER}\n\nThe station cancelled the pending fix: {cancellation_message}\n\n" \
+              "This fix is no longer needed because all threads it names have been resolved."
+    
+    try:
+        brain._check_written_text(comment)
+    except ValueError as err:
+        _say("%s#%d: cancellation comment's text check failed (%s); posting anyway" %
+             (repo, number, err))
+    
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
+    _say("%s#%d: pending fix cancelled: %s" % (repo, number, cancellation_message))
+
+
 def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
-                        env: Optional[Dict[str, str]]) -> None:
+                         env: Optional[Dict[str, str]]) -> None:
     """Refuse a merge while the ticket's brain fix has not run: status marks
     such a pull request "blocked: pending brain fix", and merging it then would
     land the head the fix was sent to change (2026-10-15)."""
@@ -4180,7 +4280,7 @@ def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
     if ticket is None or not authors:
         return
     comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
-    if _pending_brain_fix(list(comments), authors):
+    if _pending_brain_fix(list(comments), authors, gh, ticket[0], ticket[1]):
         raise ValueError("a brain fix is pending on the ticket; merge after it runs")
 
 
