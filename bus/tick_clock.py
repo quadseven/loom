@@ -26,11 +26,23 @@ from typing import Any, Dict, List, Optional, Tuple
 TICK_MINUTES = 25
 BUDGET_MINUTES = 20
 
-# A note that skips or defers work because of the time budget. "budget"
-# alone is not enough: "lane budget 3 of 5" is a count, not a deferral.
-_BUDGET = re.compile(r"\b(budget|out of time|no time left|ran out of time)\b", re.I)
-_DEFERS = re.compile(r"\b(defer\w*|skip\w*|spent|ran out|out of|next tick|postpon\w*|"
+# A note that defers work because the tick's time ran out. "budget" counts
+# only in its tick-time sense ("on budget", "on the 20-minute budget",
+# "tick budget", "time budget"): the API, App installation, per-repo read,
+# lane and request budgets are counts, not the tick's clock, and a note
+# naming one is never refused.
+_TIME_BUDGET = re.compile(
+    r"\b(?:on|over|past|tick(?:'s)?|time|minutes?|\d+[- ]?minutes?)[ \t]+(?:the[ \t]+)?"
+    r"(?:(?:\d+[- ]?minutes?|tick(?:'s)?|time)[ \t]+)?budget\b", re.I)
+_OUT_OF_TIME = re.compile(
+    r"\b(?:out of time|no time left|ran out of time|time is up|time'?s up|"
+    r"(?:over|past|at) the \d+[- ]?minute (?:limit|mark|line))\b", re.I)
+_DEFERS = re.compile(r"\b(defer\w*|skip\w*|spent|ran out|next tick|postpon\w*|"
                      r"left for|not reached|no time)\b", re.I)
+# A negated claim is no claim: "not budget", "no deferral", "without
+# skipping". Taken out before the patterns above are read.
+_NEGATED = re.compile(r"\b(?:not|no|never|without)[ \t]+(?:\w+[ \t]+){0,2}?"
+                      r"(?:budget|defer\w*|skip\w*|postpon\w*)\b", re.I)
 
 
 def stamp(value: Any) -> Optional[datetime]:
@@ -82,8 +94,14 @@ def budget_status(record: Dict[str, Any], now: datetime) -> str:
 
 
 def claims_budget(note: Optional[str]) -> bool:
-    """Whether `note` defers or skips work on the time budget."""
-    return bool(note and _BUDGET.search(note) and _DEFERS.search(note))
+    """Whether `note` defers or skips work because the tick's time ran out.
+    Another budget (API, App, per-repo read, lane) and a negation ("not
+    budget", "no deferral") are no claim."""
+    if not note:
+        return False
+    plain = _NEGATED.sub(" ", note)
+    return bool((_TIME_BUDGET.search(plain) or _OUT_OF_TIME.search(plain))
+                and _DEFERS.search(plain))
 
 
 def budget_refusal(record: Dict[str, Any], note: Optional[str], now: datetime) -> Optional[str]:

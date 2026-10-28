@@ -88,11 +88,13 @@ def _backlog_home(gh: GitHub, repo: str, number: int) -> bool:
     return isinstance(issue, dict) and naming.is_backlog_home(issue)
 
 
-def _steps_footer(gh: GitHub, lock_repo: str, holder: Optional[str]) -> Optional[str]:
+def _steps_footer(gh: GitHub, lock_repo: str, holder: Optional[str],
+                  text: str = "") -> Optional[str]:
     """The holder's tick step durations for its journal (loom#2104), or None
     outside that holder's tick. A failed read is said on stderr and the
     journal goes out without them."""
-    if not holder:
+    if not holder or text.startswith(journal.REPORT_MARKER) or journal.REPLY_RE.match(text):
+        # A report or reply carries no Steps line, so nothing is read for it.
         return None
     try:
         record = brain.tick_step(gh, lock_repo)
@@ -127,7 +129,7 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
         journal.post(gh, repo, int(num), text, args.holder, authors,
                      quiet=lambda: brain.goal_quiet(gh, repo, int(num), authors),
                      backlog=lambda: _backlog_home(gh, repo, int(num)),
-                     steps=_steps_footer(gh, args.lock_repo, args.holder))
+                     steps=_steps_footer(gh, args.lock_repo, args.holder, text))
     except (journal.ReportTooSoon, journal.ReportQuiet, journal.ReportBacklog) as held:
         # The goal is already reported, or quiet since its last report
         # (loom#1534): not a failed step, so exit 0.

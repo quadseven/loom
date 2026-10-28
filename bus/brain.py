@@ -5191,7 +5191,12 @@ def _lock_holder(gh: GitHub, lock_repo: str, holder: str, now: datetime) -> None
 
 class BudgetRefused(ValueError):
     """A step note deferred on budget before tick_clock.BUDGET_MINUTES: the
-    step is recorded with the refusal as its note, then this is raised."""
+    step is recorded with the refusal as its note, then this is raised with
+    the record it wrote (None for a refused defer, which writes nothing)."""
+
+    def __init__(self, message: str, record: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.record = record
 
 
 def _time_step(record: Dict[str, Any], step: str, at: str) -> None:
@@ -5291,7 +5296,7 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
     gh.rest("PATCH", "/repos/%s/git/refs/heads/%s" % (lock_repo, lock.LOCK_BRANCH),
             {"sha": created.data["sha"], "force": True})
     if refused:
-        raise BudgetRefused(refused)
+        raise BudgetRefused(refused, record)
     return record
 
 
@@ -5300,7 +5305,10 @@ def _cmd_step(gh: GitHub, args: argparse.Namespace) -> None:
     try:
         record = tick_step(gh, _repo(args.lock_repo), args.name, args.note, args.holder, now)
     except BudgetRefused as exc:
-        # Recorded, and loud: the brain reads this before it moves on.
+        # Recorded, and loud: the brain reads the clock and this before it
+        # moves on.
+        if exc.record is not None:
+            print(tick_clock.elapsed_line(exc.record, now))
         print("BUDGET DEFERRAL REFUSED: %s" % exc)
         raise
     except GitHubError as exc:
@@ -6278,7 +6286,13 @@ def _check_defer_budget(gh: GitHub, lock_repo: str, holder: str, note: Optional[
     there is no clock to check, so nothing is refused."""
     if not tick_clock.claims_budget(note):
         return
-    record = tick_step(gh, lock_repo)
+    try:
+        record = tick_step(gh, lock_repo)
+    except GitHubError as exc:
+        # No clock to check is no refusal: the defer goes out, and says so.
+        print("tick record unread, defer not checked against the clock: %s" % exc,
+              file=sys.stderr)
+        return
     if record.get("holder") != holder or not record.get("started_at"):
         return
     refused = tick_clock.budget_refusal(record, note, now or datetime.now(timezone.utc))

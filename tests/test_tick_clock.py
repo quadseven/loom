@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import brain, journal, tick_clock  # noqa: E402
-from bus.github import GitHub  # noqa: E402
+from bus.github import GitHub, GitHubError  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 from test_bus import REPO, FakeGit, Scripted, reply  # noqa: E402
 
@@ -154,6 +154,75 @@ class BudgetGuardTests(unittest.TestCase):
         self.assertFalse(tick_clock.claims_budget("lane budget 3 of 5 slots filled"))
         self.assertTrue(tick_clock.claims_budget("verify deferred: out of time"))
 
+    # Real journal phrasings that name another budget, or negate one: never
+    # a deferral on the tick's time, so never refused.
+    OTHER_BUDGETS = (
+        "skipped quadseven/loom after the 120s per-repo budget (LOOM_REPO_BUDGET)",
+        "The App installation budget ran out (0 of 5000), deferred brief",
+        "GitHub API budget low, deferring sweep",
+        "deferred on cap, not budget",
+        "budget: 4 of 20 minutes used, no deferral",
+    )
+    TIME_DEFERRALS = (
+        "deferred verify on the 20-minute budget",
+        "skipped triage on budget",
+        "deferred brief on budget",
+        "verify deferred: out of time",
+        "asks deferred, tick budget spent",
+        "over the 20-minute limit, deferred",
+        "time is up, triage left for next tick",
+    )
+
+    def test_other_budgets_and_negations_are_not_a_claim(self):
+        for note in self.OTHER_BUDGETS:
+            with self.subTest(note=note):
+                self.assertFalse(tick_clock.claims_budget(note))
+
+    def test_tick_time_deferrals_are_a_claim(self):
+        for note in self.TIME_DEFERRALS:
+            with self.subTest(note=note):
+                self.assertTrue(tick_clock.claims_budget(note))
+
+    def test_other_budget_notes_at_8_minutes_are_recorded_not_refused(self):
+        _, gh = held_lock()
+        run_step(gh, at(0), "lock")
+        for minute, note in enumerate(self.OTHER_BUDGETS, start=4):
+            with self.subTest(note=note):
+                out = run_step(gh, at(minute), "status", note).splitlines()
+                self.assertTrue(out[0].startswith("elapsed %d of 25 minutes" % minute))
+                self.assertEqual(brain.tick_step(gh, REPO)["notes"][-1]["text"], note)
+
+    def test_tick_time_deferrals_at_8_minutes_are_still_refused(self):
+        _, gh = held_lock()
+        run_step(gh, at(0), "lock")
+        for note in self.TIME_DEFERRALS:
+            with self.subTest(note=note), self.assertRaises(brain.BudgetRefused):
+                run_step(gh, at(8), "verify", note)
+
+    def test_a_refused_step_prints_the_elapsed_line_too(self):
+        _, gh = held_lock()
+        run_step(gh, at(0), "lock")
+        out = io.StringIO()
+        args = argparse.Namespace(lock_repo=REPO, name="verify", note="deferred on budget",
+                                  holder="muse", show=False)
+        with mock.patch.object(brain, "datetime", clock(at(8))), \
+                contextlib.redirect_stdout(out), self.assertRaises(brain.BudgetRefused):
+            brain._cmd_step(gh, args)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(lines[0], "elapsed 8 of 25 minutes (1020 seconds left)")
+        self.assertTrue(lines[1].startswith("BUDGET DEFERRAL REFUSED"))
+
+    def test_an_unread_tick_record_lets_the_defer_go_out(self):
+        class Broken:
+            requests = 0
+
+            def rest(self, *args, **kwargs):
+                raise GitHubError("offline")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            brain._check_defer_budget(Broken(), REPO, "muse", "deferred on budget", at(8))
+        self.assertIn("defer not checked against the clock", err.getvalue())
+
     def test_defer_on_budget_is_refused_under_20_minutes_in_the_holders_tick(self):
         _, gh = held_lock()
         brain.tick_step(gh, REPO, "lock", holder="muse", now=at(0))
@@ -192,6 +261,15 @@ class JournalFooterTests(unittest.TestCase):
         body = json.loads(posting.calls[2][3])["body"].splitlines()
         self.assertEqual(body[-1], line)
         self.assertNotIn("- Steps: stale", body)
+
+    def test_a_report_or_reply_reads_no_tick_record(self):
+        class NoReads:
+            def rest(self, *args, **kwargs):
+                raise AssertionError("a report reads no tick record")
+        self.assertIsNone(cli._steps_footer(NoReads(), REPO, "muse",
+                                            journal.REPORT_MARKER + "\nReport x, muse\n"))
+        self.assertIsNone(cli._steps_footer(NoReads(), REPO, "muse",
+                                            "<!-- loom:reply v1 discord=12 -->\nok\n"))
 
 
 if __name__ == "__main__":
