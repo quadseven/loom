@@ -6246,11 +6246,15 @@ class Station:
                  % (repo, err))
 
     def _no_round(self, failed: List[Tuple[str, str]], threads: List[Any]) -> bool:
-        """Nothing a lane round could fix: no failure at all, or the plan check
-        alone, which fails on the pull request's body; the factory rebuilds
-        that from the ticket (factory._judge, loom#1837), so it is also no
-        round to judge stuck."""
-        return not threads and all(name == self.s.plan_check for name, _ in failed)
+        """Whether failed checks need no lane round because they read PR text."""
+        if threads:
+            return False
+        if all(name == self.s.plan_check for name, _ in failed):
+            return True
+        return bool(failed) and all(
+            factory.LEAK_CHECK_RE.search(name)
+            and factory.body_leak_hits(tail.splitlines()) is not None
+            for name, tail in failed)
 
     def _note_first_push(self, repo: str, pr_number: int, comments: List[Any],
                          failed: List[Tuple[str, str]]) -> None:

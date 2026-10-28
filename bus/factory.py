@@ -77,7 +77,8 @@ Neither needs a model:
   Each flagged body line is rewritten, a cross-repo issue reference as
   "issue N of another repo" in words, or dropped when it cannot be; editing
   the body reruns the scan. Once per head commit, with a comment on the
-  ticket saying which lines changed.
+  ticket saying which lines changed; if the scan still finds text, the ticket
+  gets one needs-brain note naming its location.
 - A pull request whose only failing check is the plan check, failing on its
   body (bus/hunt_plan.py), has the failing parts rebuilt from its ticket
   (bus/pr_repair.py plan_repair) instead of a lane round whose agent edits
@@ -541,6 +542,7 @@ NOT_BUILT_RE = re.compile(r"\s*;\s*not built:\s*\S.+$", re.I)
 SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
                          r"([a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9])#(\d+)\b", re.I)
 BODY_LEAK_MARKER = "<!-- loom:body-leak-repaired %s -->"
+BODY_LEAK_HOLD_MARKER = "<!-- loom:body-leak-hold %s -->"
 # On the ticket: the station put it under an epic for this head commit.
 EPIC_REPAIR_MARKER = "<!-- loom:epic-repaired %s -->"
 # On the ticket's status comment: the factory rebuilt the pull request body
@@ -2597,10 +2599,10 @@ class Factory:
                           sha: str) -> bool:
         """Rewrite the flagged lines of the pull request's text when every
         failing check is a leak scan that failed on that text alone; once per
-        head commit. False leaves the pull request to the usual paths."""
+        head commit. A repeat failure is held for the brain, not sent to a lane."""
         marker = BODY_LEAK_MARKER % sha
         if any(marker in str(c.get("body") or "") for c in comments):
-            return False
+            return self._hold_repeated_body_leak(repo, number, issue, comments, sha)
         failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
         if not failed or not all(LEAK_CHECK_RE.search(str(r.get("name") or ""))
                                  and (r.get("app") or {}).get("slug") == "github-actions"
@@ -2630,8 +2632,44 @@ class Factory:
                     % (marker, number, "\n".join("- " + c for c in changed)),
                     notify.REPAIR)
         self.actions += 1
-        _say("rewrote %d flagged line(s) of %s#%d's text after a body-only leak scan"
+        _say("rewrote %d flagged line(s) of %s#%d's text after the leak scan failed on its text"
              % (len(changed), repo, number))
+        return True
+
+    def _hold_repeated_body_leak(self, repo: str, number: int,
+                                 issue: Dict[str, Any],
+                                 comments: List[Dict[str, Any]], sha: str) -> bool:
+        """Hold a text repair that still fails, once, with its scan location."""
+        failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
+        if not failed or not all(LEAK_CHECK_RE.search(str(r.get("name") or ""))
+                                 and (r.get("app") or {}).get("slug") == "github-actions"
+                                 for r in failed):
+            return False
+        locations: List[str] = []
+        for run in failed:
+            try:
+                log = brain._job_log(self.gh, repo, int(run["id"]))
+            except (GitHubError, KeyError, TypeError, ValueError):
+                return False
+            hits = body_leak_hits(log or [])
+            if hits is None:
+                return False
+            locations.extend("line %d (%s)" % (line, rule)
+                             for line, rule in sorted(hits.items()))
+        hold_marker = BODY_LEAK_HOLD_MARKER % sha
+        if any(hold_marker in str(c.get("body") or "") for c in comments):
+            return True
+        if "needs-brain" not in _labels(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+                         {"labels": ["needs-brain"]})
+            issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
+        notify.post(self.gh, repo, int(issue["number"]),
+                    "%s\nThe leak scan still failed on the rebuilt pull request text at %s. "
+                    "The ticket needs a brain review; no fix round was sent."
+                    % (hold_marker, ", ".join(locations)), notify.HELD)
+        self.actions += 1
+        _say("held %s#%d for the brain: the leak scan still failed on its text at %s"
+             % (repo, number, ", ".join(locations)))
         return True
 
     def _repair_ticket_epic(self, repo: str, number: int, issue: Dict[str, Any],
