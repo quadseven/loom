@@ -558,7 +558,7 @@ class ReviewBriefTest(unittest.TestCase):
         for header in ("Repo: example-owner/example-repo",
                        "Branch: loom/7-retry-logs",
                        "Lane: codex-2",
-                       "Issue: example-owner/example-repo#7",
+                       "Issue: example-owner/example-repo#7",  # leak-guard-allow: fictional example repos
                        "Review-PR: 42",
                        "Head-Sha: 0123456789abcdef0123456789abcdef01234567",
                        "Base: main",
