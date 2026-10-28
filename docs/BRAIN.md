@@ -98,7 +98,12 @@ carries to `loom:shipped`, with a note naming the revision and the deploy
 time, and one log line per move. The pull request is the merged one whose
 `Refs` line or `loom/<number>` branch names the ticket. At most 20 move a
 pass, oldest merge first. A deploy that did not happen records nothing, so it
-ships nothing. Tickets of every other repo are never moved here; their goal
+ships nothing. An open issue still at `loom:triage` or `loom:queued` whose
+linked pull request merged and deployed ships the same way, with one comment,
+and loses `loom:triage`: only `loom:pr` tickets are reconciled from their
+pull request, so such issues sat behind after the deploy (loom#2025). A
+`loom:regression` issue, another operator's issue, or a ticket sent back to
+`loom:queued` after that merge (criteria left unbuilt) stays. Tickets of every other repo are never moved here; their goal
 home's ship rules decide, unless they ship on merge, on a deploy workflow or
 through a pin pull request (below).
 
@@ -139,6 +144,25 @@ files and the manual step (for a chart, the helm upgrade); the brain or an
 operator moves it to `loom:shipped` after. A `!` pattern
 excludes, as GitHub does; a workflow without a `paths` filter is not a deploy
 workflow here. Reverts and the 20 moves per pass limit apply as above.
+
+### Shipping through a downstream roll
+
+A repo that deploys only when another repo rolls it (a game module a server
+roll builds in, say) declares the roll record in `.loom/ship-roll` on its
+default branch: one line per record, `<OWNER/NAME> <path> <key>`, `#`
+comments. The record is the file at `<path>` on that repo's default branch,
+and its `<key>=<sha>` (or `<key>: <sha>`) line names the full source commit
+the last roll deployed. Each pass, for each watched repo with open
+`loom:merged` tickets and that file, the station moves each ticket whose pull
+request's merge commit that commit carries (the compare API) to
+`loom:shipped`, unless a later revert the commit also carries undid it. The
+note names the record's repo, or "a private repo" when the ticket's repo is
+public and the record's is not. A record that names no commit, or two, ships
+nothing. A malformed line ships nothing for that repo and is logged.
+
+A ticket a ship rule found deployed whose move to `loom:shipped` failed is
+kept with when it was first found; one still at `loom:merged` 24 hours later
+is listed in the `merged-not-shipped` invariant (docs/LANES.md, Invariants).
 
 ### Shipping through a pin pull request
 
@@ -346,7 +370,12 @@ says READY for a pull request merge would refuse on these rules.
 repo for Loom in one step, and a second run changes nothing:
 
 - creates the labels above that are missing (the same as `python3 -m bus
-  labels`);
+  labels`). The station does the same on each repo's first pass after it is
+  enrolled in `LOOM_REPOS`, and for every repo when the label set changes,
+  so an onboard that was skipped still leaves the repo with every label
+  (loom#2032). A runner whose `gh issue edit` is refused for a missing label
+  creates it from the canonical set (`python3 -m bus.labels spec NAME`) and
+  retries once;
 - opens the repo's backlog goal home when none is open: `loom:goal` and
   `loom:backlog`, titled "Goal: Loom or a person works every open
   <owner/name> issue" (docs/NAMING.md), with the destination, the metric (open issues not
@@ -1016,6 +1045,13 @@ When the runner finishes, the station finds the brief in `done/` or
   repo's ticket, 2026-10-21). The reason passes the text checks again first; one
   that does not is replaced by a sentence saying it is in the lane log. Then
   the station settles the ticket from the answer:
+  - First, every code acceptance box must be proven: ticked on the ticket
+    or ticked in the answer's own Acceptance criteria checklist (a "not
+    built" mark proves nothing, since the answer says the work is done).
+    Live and operator boxes are left to the verifier and the operator. When
+    a box is unproven, the ticket goes back to `loom:queued` and the event
+    names each such box; it neither settles nor moves to `loom:merged`
+    (loom#2032).
   - When a pull request linked to the ticket (a `Refs` line or a
     `loom/<number>` branch) has merged into the default branch, that pull
     request carries the work the lane found done. The ticket moves to

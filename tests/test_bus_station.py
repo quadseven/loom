@@ -506,10 +506,28 @@ class StationLabelSyncTest(Base):
     def test_unchanged_label_digest_makes_no_label_calls(self):
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
         ledger = os.path.join(runner.state, "labels.json")
-        self.write(ledger, json.dumps({"digest": runner.label_digest()}))
+        self.write(ledger, json.dumps({"digest": runner.label_digest(),
+                                       "repos": list(self.settings.repos)}))
         with mock.patch.object(labels_module, "ensure_labels") as ensure:
             runner.sync_labels()
         ensure.assert_not_called()
+
+    def test_a_repo_enrolled_after_the_last_sync_gets_the_full_label_set_on_its_first_pass(self):
+        # loom#2032: the sync ran only when the label set changed, so a repo
+        # enrolled later lacked loom:answered and a lane could not set it.
+        repos = ["example-owner/first", "example-owner/second"]
+        settings = station.Settings(self.home, repos, list(AUTHORS), list(OWNERS))
+        runner = station.Station(GitHub("token", transport=self.fake), settings)
+        ledger = os.path.join(runner.state, "labels.json")
+        self.write(ledger, json.dumps({"digest": runner.label_digest(), "repos": repos[:1]}))
+        with mock.patch.object(labels_module, "ensure_labels", return_value=[]) as ensure:
+            runner.sync_labels()
+            self.assertEqual([call.args[1] for call in ensure.call_args_list], repos[1:])
+            ensure.reset_mock()
+            runner.sync_labels()
+            ensure.assert_not_called()
+        with open(ledger, encoding="utf-8") as fh:
+            self.assertEqual(sorted(json.load(fh)["repos"]), repos)
 
 
 class StationKeepsAppTokenTest(Base):
@@ -1480,6 +1498,102 @@ class ShipDeployedTest(Base):
         self.assertEqual(station.run(self.settings, gh, ancestor=self.ancestor), 0)
         self.assertIn("loom:shipped", self.fake.names(12))
 
+    def early(self, number, pr, label, events=(), merged_at="2030-01-02T00:00:00Z"):
+        """An open issue at an early state (loom:triage, loom:queued) whose
+        Refs-linked pull request merged and is carried by the deploy."""
+        self.merged(number, pr, merged_at=merged_at)
+        extra = [] if label == "loom:triage" else [{"name": "loom:ticket"}]
+        self.fake.issues[number]["labels"] = extra + [{"name": label}]
+        self.fake.events[number] = list(events)
+
+    def early_transport(self):
+        """The fake, answering the early-state issue listings it leaves to
+        its briefed listing."""
+        real = self.fake
+
+        def transport(method, url, headers, body):
+            query = urlsplit(url).query
+            for label in station.EARLY_SHIP_STATES:
+                if method == "GET" and "labels=%s&" % label in query:
+                    return reply(200, [i for i in real.issues.values() if i["state"] == "open"
+                                       and label in real.names(i["number"])])
+            return real(method, url, headers, body)
+        return transport
+
+    def test_a_triage_or_queued_issue_whose_pull_request_deployed_ships_with_one_comment(self):
+        # Six issues sat at loom:triage after their pull requests merged and
+        # the station deployed them (loom#2025).
+        self.early(12, 99, "loom:triage")
+        self.early(13, 100, "loom:queued")
+        self.record_deploy()
+        self.ship(self.early_transport())
+        for number, pr in ((12, 99), (13, 100)):
+            names = self.fake.names(number)
+            self.assertIn("loom:shipped", names)
+            self.assertNotIn("loom:triage", names)
+            self.assertNotIn("loom:queued", names)
+            self.assertEqual(len(self.fake.comments[number]), 1)
+            self.assertIn("#%d" % pr, self.fake.comments[number][0]["body"])
+            self.assertIn(DEPLOYED[:12], self.fake.comments[number][0]["body"])
+
+    def test_an_early_issue_whose_commit_is_not_deployed_stays(self):
+        self.early(12, 99, "loom:triage")
+        self.carried.discard("%040x" % 99)
+        self.record_deploy()
+        self.ship(self.early_transport())
+        self.assertEqual(self.fake.names(12), ["loom:triage"])
+        self.assertEqual(self.fake.comments[12], [])
+
+    def test_a_ticket_requeued_after_its_merge_stays_queued(self):
+        # A merge that left criteria unbuilt sends the ticket back to
+        # loom:queued for the rest: that merge does not ship it.
+        requeue = {"event": "labeled", "label": {"name": "loom:queued"},
+                   "actor": {"login": "alice-example"}, "created_at": "2030-01-02T01:00:00Z"}
+        self.early(13, 100, "loom:queued", events=[requeue])
+        self.record_deploy()
+        self.ship(self.early_transport())
+        self.assertIn("loom:queued", self.fake.names(13))
+        self.assertNotIn("loom:shipped", self.fake.names(13))
+        self.assertEqual(self.fake.comments[13], [])
+
+    def test_a_regression_ticket_at_queued_does_not_ship_on_an_old_merge(self):
+        self.early(13, 100, "loom:queued")
+        self.fake.issues[13]["labels"].append({"name": "loom:regression"})
+        self.record_deploy()
+        self.ship(self.early_transport())
+        self.assertNotIn("loom:shipped", self.fake.names(13))
+
+    def test_a_failed_move_is_kept_for_the_merged_not_shipped_invariant(self):
+        self.merged(12, 99)
+        self.record_deploy()
+        real = self.fake
+
+        def refusing(method, url, headers, body):
+            if method == "PUT" and urlsplit(url).path.endswith("/issues/12/labels"):
+                return reply(422, {"message": "refused"})
+            return real(method, url, headers, body)
+        with mock.patch("bus.station.time.time", return_value=DEPLOYED_AT + 60):
+            gh = GitHub("token", transport=refusing)
+            st = station.Station(gh, self.settings, ancestor=self.ancestor)
+            st.ship_deployed()
+        self.assertIn("loom:merged", self.fake.names(12))
+        gh = GitHub("token", transport=self.fake)
+        st = station.Station(gh, self.settings, ancestor=self.ancestor)
+        st._invariant_repo = REPO
+        (found,) = st._invariant_unshipped()
+        ref, at = found
+        self.assertEqual(ref.key, "%s#12" % REPO)
+        facts = invariants.Facts(now=at + 25 * 3600, unshipped=[found])
+        (breach,) = invariants.merged_not_shipped(facts)
+        self.assertTrue(breach.rolling)
+        self.assertIn("#12", "\n".join(breach.evidence))
+        self.assertEqual(invariants.merged_not_shipped(
+            invariants.Facts(now=at + 23 * 3600, unshipped=[found])), [])
+        # Once it ships, the ledger forgets it.
+        st.ship_deployed()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertEqual(st._invariant_unshipped(), [])
+
     def test_self_repo_defaults_to_the_lanes_repo(self):
         env = {"LOOM_HOME": self.home, "LOOM_REPOS": REPO,
                "LOOM_STATUS_REPO": "example-owner/lanes"}
@@ -1496,6 +1610,91 @@ class ShipDeployedTest(Base):
         sha = head.stdout.strip()
         self.assertTrue(station._is_ancestor(sha, sha))
         self.assertFalse(station._is_ancestor("0" * 40, sha))
+
+
+class ShipRollTest(Base):
+    """A repo that deploys only when another repo rolls it declares the roll
+    record in .loom/ship-roll; its merged tickets ship once the record's
+    source commit carries their merge commit (loom#2025)."""
+
+    DEPLOY = "example-owner/deploy"
+    PATH = "pins/UPSTREAM-PINS.env"
+
+    def setUp(self):
+        super().setUp()
+        self.signal = "%s %s EXAMPLE_REPO_SHA\n" % (self.DEPLOY, self.PATH)
+        self.record = ""
+        self.compares = []
+
+    def merged(self, number, pr, merged_at="2030-01-02T00:00:00Z"):
+        self.fake.add(number, state="merged")
+        sha = "%040x" % pr
+        self.fake.pulls.append({"number": pr, "state": "closed", "merged_at": merged_at,
+                                "merge_commit_sha": sha, "title": "Fix the thing",
+                                "body": "Refs %s#%d" % (REPO, number),
+                                "head": {"ref": "loom/%d-fix" % number}})
+        return sha
+
+    def transport(self, method, url, headers, body):
+        path = urlsplit(url).path
+        if method == "GET" and path == "/repos/%s/contents/%s" % (REPO, station.ROLL_SIGNAL_FILE):
+            return reply(200, {"content": base64.b64encode(self.signal.encode()).decode()})
+        if method == "GET" and path == "/repos/%s/contents/%s" % (self.DEPLOY, self.PATH):
+            if not self.record:
+                return reply(404, {"message": "Not Found"})
+            return reply(200, {"content": base64.b64encode(self.record.encode()).decode()})
+        if method == "GET" and path == "/repos/%s" % self.DEPLOY:
+            return reply(200, {"full_name": self.DEPLOY, "private": True})
+        compare = re.match(r"/repos/%s/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)$" % REPO, path)
+        if compare:
+            self.compares.append(compare.groups())
+            return reply(200, {"status": "ahead" if compare.groups() in self.carried
+                               else "diverged"})
+        return self.fake(method, url, headers, body)
+
+    def ship(self):
+        station.Station(GitHub("token", transport=self.transport), self.settings).ship_rolls()
+
+    def test_a_merged_ticket_ships_when_the_roll_record_carries_its_merge_commit(self):
+        rolled = "e" * 40
+        sha = self.merged(12, 99)
+        self.merged(13, 100)
+        self.carried = {(sha, rolled)}
+        self.record = "OTHER_SHA=%s\nEXAMPLE_REPO_SHA=%s  # roll 70\n" % ("f" * 40, rolled)
+        self.fake.private = False
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        note = self.fake.comments[12][-1]["body"]
+        self.assertIn(rolled[:12], note)
+        self.assertIn("#99", note)
+        # A private deployment repo is never named on the ticket.
+        self.assertNotIn(self.DEPLOY, note)
+        self.assertIn("loom:merged", self.fake.names(13))
+        self.assertEqual(self.fake.comments[13], [])
+
+    def test_a_record_that_names_no_commit_ships_nothing(self):
+        self.merged(12, 99)
+        self.carried = set()
+        for record in ("", "EXAMPLE_REPO_SHA=abc\n",
+                       "EXAMPLE_REPO_SHA=%s\nEXAMPLE_REPO_SHA=%s\n" % ("e" * 40, "f" * 40)):
+            self.record = record
+            self.ship()
+            self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.compares, [])
+
+    def test_a_repo_with_no_roll_signal_reads_no_record(self):
+        self.merged(12, 99)
+        self.signal = ""
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_a_malformed_roll_signal_is_refused(self):
+        with self.assertRaises(ValueError):
+            station.parse_roll_signals("example-owner/deploy pins.env\n")
+        with self.assertRaises(ValueError):
+            station.parse_roll_signals("example-owner/deploy ../pins.env KEY\n")
+        self.assertEqual(station.parse_roll_signals("# a comment\n%s" % self.signal),
+                         [(self.DEPLOY, self.PATH, "EXAMPLE_REPO_SHA")])
 
 
 class ShipRuleTest(Base):
@@ -3458,6 +3657,25 @@ class FlakyLadderFake(LadderReviewFake):
 INSTALL_TIMEOUT = ("##[error]The action 'Install what the core's own Dockerfile installs' "
                    "has timed out after 10 minutes.")
 
+PYTEST_READTIMEOUT = (
+    "ERROR at setup of test_postgres [conftest.py:7]\n"
+    "E   ReadTimeout: read timeout=60\n"
+    "ERROR at setup of test_other [conftest.py:7]\n"
+    "E   ReadTimeout: read timeout=60\n"
+    "4528 passed, 5 errors")
+
+PYSETUP = [
+    {"id": 501, "name": "pytest", "status": "completed", "conclusion": "failure",
+     "details_url": "https://github.com/%s/actions/runs/88/job/501" % REPO},
+    {"id": 502, "name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+     "conclusion": "success", "details_url": "https://grug.example"}]
+
+CANCELLED = [
+    {"id": 501, "name": "adapter", "status": "completed", "conclusion": "cancelled",
+     "details_url": "https://github.com/%s/actions/runs/88/job/501" % REPO},
+    {"id": 502, "name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+     "conclusion": "failure", "details_url": "https://grug.example"}]
+
 
 class InfraFlakeHandBackTest(unittest.TestCase):
     """An infra timeout is re-run before a fix round, whatever else fails,
@@ -3513,6 +3731,51 @@ class InfraFlakeHandBackTest(unittest.TestCase):
                                                "with exit code 1.")])
         self.assertEqual(self.reruns(), [])
         self.assertIn("lane:claude", self.names())
+
+    def test_a_pull_request_with_only_readtimeout_errors_is_rerun_once_and_not_judged(self):
+        """A job whose only failing lines are 5 Docker ReadTimeout errors (no
+        test failures) gets one re-run of its failed jobs and no fix round
+        (fails on main)."""
+        self.gh.check_runs = PYSETUP
+        self.last_round("### Check: pytest\n\n    5 errors")
+        self.run_hand_back(checks=[("pytest", PYTEST_READTIMEOUT),
+                                   (factory.DEFAULT_REVIEW_CHECK, "failure")])
+        self.assertEqual(self.reruns(),
+                         ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertIn("lane:spark", self.names())
+
+    def test_a_cancelled_job_is_rerun_once_then_a_fix_round(self):
+        """A cancelled job gets one re-run before the station counts it; the
+        same red after the re-run sends a fix round as today."""
+        self.gh.check_runs = CANCELLED
+        self.last_round("### Check: adapter\n\n    cancelled")
+        self.run_hand_back(checks=[("adapter", "no log was available (conclusion cancelled)"),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(self.reruns(),
+                         ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertIn("lane:spark", self.names())
+        # The same red head: already re-ran once, so a fix round is sent and
+        # no further re-run happens.
+        self.run_hand_back(checks=[("adapter", "no log was available (conclusion cancelled)"),
+                                   (factory.DEFAULT_REVIEW_CHECK, "FAIL Elder found 1 problem")])
+        self.assertEqual(self.reruns(),
+                         ["/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO])
+        self.assertEqual(len(self.rounds()), 2)
+        self.assertIn("lane:spark", self.names())
+
+    def test_a_real_test_failure_is_sent_straight_back_with_no_rerun(self):
+        """A real test failure (an assertion) sends a fix round at once, with
+        no re-run."""
+        self.gh.check_runs = PYSETUP
+        self.run_hand_back(checks=[("pytest",
+                                    "FAILED tests/test_a.py::test_x - assert 1 == 2\n"
+                                    "##[error]Process completed with exit code 1.")])
+        self.assertEqual(self.reruns(), [])
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertIn("lane:spark", self.names())
+        self.assertNotIn("lane:claude", self.names())
 
 
 class StampedReviewFake(ReviewFake):
@@ -3982,10 +4245,10 @@ class CorruptStateTest(Base):
         # reconciliation's read of the open tickets (loom#784) and the
         # done-ticket close step's, the hourly read of rewritten sources, and
         # the changed label-set sync, and the hourly read of open tickets for
-        # ones with no state label (loom#1653), and the hourly label pass's
-        # reads of open issues and of closed ones still at loom:triage
-        # (loom#2024).
-        self.assertEqual(self.run_pass().requests, 15)
+        # ones with no state label (loom#1653), the hourly label pass's reads
+        # of open issues and of closed ones still at loom:triage (loom#2024),
+        # and the hourly read of the repo's roll record declaration (loom#2025).
+        self.assertEqual(self.run_pass().requests, 16)
 
 
 class TicketsTest(unittest.TestCase):
@@ -7019,8 +7282,9 @@ class NoChangeAnswerTest(Base):
     no longer applies. The runner hands its reason to the station in the
     .answered marker; the station records it and settles the ticket."""
 
-    def no_change(self, said=NO_CHANGE_SAID, pulls=(), labels=()):
-        self.fake.add(12, state="running")
+    def no_change(self, said=NO_CHANGE_SAID, pulls=(), labels=(), fresh=True):
+        if fresh:
+            self.fake.add(12, state="running")
         self.fake.issues[12]["labels"] += [{"name": label} for label in labels]
         self.fake.pulls = list(pulls)
         name = tickets.ticket_name(REPO, 12, 1)
@@ -7078,6 +7342,40 @@ class NoChangeAnswerTest(Base):
         events = self.events()
         self.assertNotIn("Fixes #12", events[0])
         self.assertIn("its reason did not pass the text checks", events[0])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:answered"])
+
+    def test_a_box_the_answer_does_not_prove_requeues_the_ticket_and_names_the_box(self):
+        # loom#2032: a no-op answer moved a ticket to loom:merged while its
+        # third box still failed. Every code box must be ticked on the ticket
+        # or in the answer's own checklist before the answer is accepted.
+        self.fake.add(12, state="running", body=BODY + (
+            "\n## Acceptance criteria\n- [x] The walk is suppressed\n"
+            "- [ ] The list names only public repos\n"))
+        sha = "%040x" % 77
+        self.no_change(pulls=[{"number": 77, "state": "closed", "merged_at": "2030-01-01T00:00:00Z",
+                               "merge_commit_sha": sha, "body": "Refs %s#12" % REPO,
+                               "head": {"ref": "a-fix"}}], fresh=False)
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
+        events = self.events()
+        self.assertIn("The list names only public repos", events[0])
+        self.assertNotIn("Pull request #77", events[0])
+
+    def test_a_box_the_answer_marks_not_built_is_not_proven(self):
+        self.fake.add(12, state="running", body=BODY + (
+            "\n## Acceptance criteria\n- [ ] The walk is suppressed\n"))
+        self.no_change(said=NO_CHANGE_SAID.replace(
+            "- [x] The walk is suppressed", "- [ ] The walk is suppressed; not built: no key"),
+            fresh=False)
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertIn("The walk is suppressed", self.events()[0])
+
+    def test_every_box_proven_by_the_answer_or_the_ticket_accepts_it(self):
+        self.fake.add(12, state="running", body=BODY + (
+            "\n## Acceptance criteria\n- [ ] The walk is suppressed\n"
+            "- [x] The old flag is gone\n- [ ] Live: the station log shows `walk off`\n"))
+        self.no_change(fresh=False)
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:answered"])
 
     def test_an_empty_marker_still_settles_the_ticket(self):

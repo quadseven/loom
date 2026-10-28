@@ -361,7 +361,7 @@ App writes need no hand-listed login; its startup log line `trusting briefing
 logins` names every login trusted. More than three briefed tickets refused in
 an hour for one untrusted labeller file the `untrusted-labeler` invariant,
 naming the login. The App needs contents,
-issues and pull requests read and write, and checks and actions read, on the
+issues and pull requests read and write, and checks and actions write, on the
 scanned repos. To set one up, `python3 -m bus app manifest --owner OWNER`
 (add `--org` for an organisation) prints the create page and a manifest with
 exactly those permissions and no webhook; `--form` prints an HTML page whose
@@ -402,7 +402,7 @@ login by itself, so the brain's and the lanes' logins (`<slug>[bot]`) go in
 `LOOM_BRIEF_AUTHORS`, and a repo whose workflows admit only collaborators must
 admit the lanes' login for lane pull requests to run.
 A new App is easiest made from
-`https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=read`.
+`https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=write`.
 
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
@@ -1178,6 +1178,10 @@ Each invariant is one function returning breaches with evidence:
   every such goal): the station opens no source-pin pull request when their
   module changes merge (README.md, Roll source pins). The issue says when
   the setting is empty, which turns the pass off.
+- Tickets still at `loom:merged` 24 hours after a ship rule found their merge
+  commit deployed, because the move to `loom:shipped` failed
+  (`merged-not-shipped`, one rolling issue, a line per ticket; docs/BRAIN.md,
+  Shipping through a downstream roll).
 
 The failing-streak, lane-held and silent-lane invariants are one rolling
 issue each, a line per lane, rewritten in place while the list changes, as
