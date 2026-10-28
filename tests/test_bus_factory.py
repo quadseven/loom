@@ -1494,6 +1494,16 @@ class PullRequests(Base):
         self.assertEqual(self.closed, [(50, "Superseded by #51.")])
         self.assertEqual(self.gh.pulls[50]["state"], "closed")
 
+    def test_pull_request_2011_closed_when_superseded_by_newer_pr(self):
+        self.gh.ticket(11, "pr")
+        self.gh.pull(2011, 11, created=7200, updated=7200, branch="loom/11-some-title")
+        self.gh.pull(2012, 11, created=3600, updated=3600, branch="loom/11-some-title-r2")
+        self.go()
+        self.assertEqual(self.closed, [(2011, "Superseded by #2012.")])
+        self.assertEqual(self.gh.pulls[2011]["state"], "closed")
+        self.assertTrue(self.gh.pulls[2011]["body"].endswith("Superseded by #2012."))
+        self.assertEqual(self.merged, [(2012, (REPO, 11))])
+
     def test_non_loom_branch_pull_request_is_left_open(self):
         self.gh.ticket(5, "merged")
         self.gh.pull(51, 5, created=7200, updated=7200, branch="loom/5-some-title-r2",
