@@ -17,7 +17,7 @@ from urllib.parse import quote
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
-from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
+from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow, tick_clock
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
 from .labels import HANDOFF, LANES, REMOTE_LANES
@@ -5305,13 +5305,15 @@ def _step_record(message: str) -> Dict[str, Any]:
     current_holder = re.search(r"holder=(\S+)", message)
     record = {"holder": current_holder.group(1) if current_holder else None,
               "started_at": None,
-              "step": None, "step_index": None, "steps": list(TICK_STEPS), "notes": []}
+              "step": None, "step_index": None, "steps": list(TICK_STEPS), "notes": [],
+              "times": []}
     encoded = next((line[len(STEP_MARKER):] for line in message.splitlines()
                     if line.startswith(STEP_MARKER)), "")
     if encoded:
         try:
             saved = json.loads(encoded)
-            record.update({k: saved[k] for k in ("started_at", "step", "step_index", "notes")})
+            record.update({k: saved[k] for k in ("started_at", "step", "step_index", "notes",
+                                                 "times") if k in saved})
         except (ValueError, TypeError, KeyError):
             pass
     return record
@@ -5346,14 +5348,24 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
         record["notes"] = []
     record["step"] = step
     record["step_index"] = TICK_STEPS.index(step) + 1
+    record["times"] = tick_clock.record_step_time(record, step, now)
     if note:
         if "\n" in note or "\r" in note:
             raise ValueError("note must be one line")
+        # The tick's clock, not a guess, judges a budget deferral
+        # (bus/tick_clock.py): refused and recorded as refused under 20
+        # minutes, kept with its real elapsed at 20 or more.
+        if tick_clock.is_budget_deferral(note):
+            if tick_clock.budget_deferral_allowed(record, now):
+                note = tick_clock.allowed_note(note, record, now)
+            else:
+                note = tick_clock.refused_note(note, record, now)
+                record["budget_refused"] = True
         record["notes"].append({"ts": at, "step": step, "text": note})
     record["holder"] = holder
     clean = "\n".join(line for line in message.splitlines() if not line.startswith(STEP_MARKER))
     new_message = clean + "\n" + STEP_MARKER + json.dumps(
-        {k: record[k] for k in ("started_at", "step", "step_index", "notes")}, separators=(",", ":"))
+        {k: record[k] for k in ("started_at", "step", "step_index", "notes", "times")}, separators=(",", ":"))
     created = gh.rest("POST", "/repos/%s/git/commits" % lock_repo, {
         "message": new_message, "tree": commit.data["tree"]["sha"], "parents": [sha]})
     # GitHub reads a ref at git/ref/<ref> but updates it at git/refs/<ref>;
@@ -5365,10 +5377,37 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
 
 def _cmd_step(gh: GitHub, args: argparse.Namespace) -> None:
     try:
-        print(json.dumps(tick_step(gh, _repo(args.lock_repo), args.name,
-                                   args.note, args.holder), sort_keys=True))
+        record = tick_step(gh, _repo(args.lock_repo), args.name,
+                           args.note, args.holder)
     except GitHubError as exc:
         print("brain step write failed: %s" % exc, file=sys.stderr)
+        return
+    # The real clock first (bus/tick_clock.py), before the record and
+    # before any refusal, so the brain reads it instead of guessing.
+    print(tick_clock.elapsed_line(record, datetime.now(timezone.utc)))
+    print(json.dumps(record, sort_keys=True))
+    if record.get("budget_refused"):
+        print("BUDGET DEFERRAL REFUSED")
+        raise SystemExit(1)
+
+
+def _print_tick_clock(gh: GitHub, lock_repo: str) -> None:
+    """The Tick clock line status and resume print first, when a tick is
+    running; a tick record that cannot be read prints nothing."""
+    try:
+        record = tick_step(gh, _repo(lock_repo))
+    except Exception:
+        return
+    if record.get("started_at"):
+        print(tick_clock.clock_line(record, datetime.now(timezone.utc)), flush=True)
+
+
+def _cmd_step_budget(gh: GitHub, args: argparse.Namespace) -> None:
+    record = tick_step(gh, _repo(args.lock_repo))
+    now = datetime.now(timezone.utc)
+    print(tick_clock.elapsed_line(record, now))
+    print("budget deferral allowed" if tick_clock.budget_deferral_allowed(record, now)
+          else "budget deferral not allowed")
 
 
 GoalJournals = Tuple[str, Dict[str, Any], List[Dict[str, Any]], List[str]]
@@ -6179,10 +6218,11 @@ def parser() -> argparse.ArgumentParser:
     au = sub.add_parser("audit"); au.add_argument("ticket"); au.add_argument("--result", choices=audit.RESULTS, required=True); au.add_argument("--note", required=True)
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
-    df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note")
+    df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note"); df.add_argument("--lock-repo", default="quadseven/loom")
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True); dn.add_argument("--resolves", help="brief defer key this done finishes")
     rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom"); rs.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET)
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
+    sb = sub.add_parser("step-budget"); sb.add_argument("--lock-repo", default="quadseven/loom")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check"); ob.add_argument("--operator")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
@@ -6211,6 +6251,7 @@ def _flushed(part: str) -> None:
 
 
 def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
+    _print_tick_clock(gh, args.lanes_repo)
     status(gh, [_repo(x) for x in args.repos], _repo(args.lanes_repo),
            emit=_flushed, budget=args.repo_budget)
 
@@ -6316,7 +6357,25 @@ def _cmd_escalate(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 def _cmd_defer(gh: GitHub, args: argparse.Namespace) -> None:
-    print(defer(gh, args.stage, _ref(args.item, "item"), args.holder, args.note))
+    note = args.note
+    if note and tick_clock.is_budget_deferral(note):
+        # The same clock guard as a step note: refused under 20 minutes of
+        # real elapsed, kept with its real elapsed at 20 or more. A tick
+        # record that cannot be read lets the defer go out, with a warning.
+        record = None
+        try:
+            record = tick_step(gh, _repo(args.lock_repo))
+        except Exception as exc:
+            print("warning: tick record unread, defer sent without its clock: %s" % exc,
+                  file=sys.stderr)
+        if record is not None and record.get("started_at"):
+            now = datetime.now(timezone.utc)
+            print(tick_clock.elapsed_line(record, now))
+            if not tick_clock.budget_deferral_allowed(record, now):
+                print("BUDGET DEFERRAL REFUSED")
+                raise SystemExit(1)
+            note = tick_clock.allowed_note(note, record, now)
+    print(defer(gh, args.stage, _ref(args.item, "item"), args.holder, note))
 
 
 def _cmd_done(gh: GitHub, args: argparse.Namespace) -> None:
@@ -6325,6 +6384,7 @@ def _cmd_done(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
+    _print_tick_clock(gh, args.lock_repo)
     resume(gh, [_repo(x) for x in args.repos], args.holder, _repo(args.lock_repo),
            emit=_flushed, budget=args.repo_budget)
 
@@ -6337,6 +6397,7 @@ COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate, "epic": _cmd_epic,
             "close-epic": _cmd_close_epic}
 COMMANDS["step"] = _cmd_step
+COMMANDS["step-budget"] = _cmd_step_budget
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

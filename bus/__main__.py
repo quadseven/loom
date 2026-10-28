@@ -6,7 +6,7 @@ import re
 import sys
 from typing import Callable, List, Optional
 
-from . import app, brain, decision_claim, journal, labels, lock, naming, station
+from . import app, brain, decision_claim, journal, labels, lock, naming, station, tick_clock
 from .github import GitHub, GitHubError, Transport, auth_from_env, openssl_sign
 
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
@@ -56,6 +56,8 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("target", type=_issue, metavar="OWNER/NAME#N")
     s.add_argument("--file", required=True)
     s.add_argument("--holder", help="the brain posting a journal; adds its Tick line when missing")
+    s.add_argument("--lock-repo", type=_repo, default="quadseven/loom",
+                   help="repo holding the tick lock record, for the journal's Steps line")
     sub.add_parser("station", help="one station pass: claim briefed tickets, report outcomes")
     s = sub.add_parser("app", help="set up the Loom's own GitHub App")
     app_sub = s.add_subparsers(dest="app_command", required=True)
@@ -102,6 +104,20 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
     repo, _, num = args.target.partition("#")
     with open(args.file, encoding="utf-8") as fh:
         text = fh.read()
+    if (args.holder and not text.lstrip().startswith(journal.REPORT_MARKER)
+            and not journal.REPLY_RE.search(text)):
+        # A journal tick ends with its Steps line, read from the holder's
+        # tick record (bus/tick_clock.py). Reports and replies get no Steps
+        # line and read no tick record; a failed read posts the journal
+        # without it and says so on stderr.
+        try:
+            line = tick_clock.step_times_line(brain.tick_step(gh, args.lock_repo))
+        except Exception as exc:
+            print("warning: tick record unread, journal posted without its Steps line: %s"
+                  % exc, file=sys.stderr)
+            line = None
+        if line:
+            text = text.rstrip("\n") + "\n" + line + "\n"
     authors = brain.trusted_authors()
     try:
         journal.post(gh, repo, int(num), text, args.holder, authors,

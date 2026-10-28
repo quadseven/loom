@@ -863,6 +863,14 @@ pages, and a list that cannot be read in full refuses the merge. The adopt path
   write the last good read as the start ("down since 04:28Z"): `bus`
   commands refuse that text.
 - Never retry a failed step in the same tick. Stop at 25 minutes.
+- Read the tick clock instead of guessing how long the tick has run: every
+  `bus.brain step` call prints `elapsed N of 25 minutes (S seconds left)`
+  first, `bus.brain status` and `resume` print it as a `Tick clock:` line
+  first, and `python3 -m bus.brain step-budget` prints it on its own. A
+  step may be deferred on budget only when the printed elapsed is 20
+  minutes or more; under 20 minutes a step or defer note that defers on
+  budget is refused. Until the clock is in (a `step` call with no elapsed
+  line) and the tick is short, run triage before verify.
 - Every note or piece of evidence a tick leaves on an issue, outside the
   comments a `bus` or `bus.brain` command writes itself, goes through
   `python3 -m bus journal OWNER/NAME#N --file FILE --holder NAME`: it edits
