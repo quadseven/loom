@@ -556,6 +556,31 @@ def _review_blocker(node: Dict[str, Any], bot: str) -> Optional[str]:
     return None
 
 
+# A person's review that sets or clears their verdict, as GitHub's
+# reviewDecision reads it: a later COMMENTED review leaves a change request
+# standing, and a dismissal turns that review itself into DISMISSED.
+_VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+
+
+def _person_blockers(node: Dict[str, Any]) -> List[str]:
+    """One blocker per person (any author that is not a Bot) whose newest
+    verdict review on the pull request is CHANGES_REQUESTED. Bots keep their
+    own rule (_review_blocker); the review bot dismisses or re-reviews its own."""
+    newest: Dict[str, Dict[str, Any]] = {}
+    for r in (node.get("reviews") or {}).get("nodes") or []:
+        author = r.get("author") or {}
+        login = str(author.get("login") or "")
+        stamp = str(r.get("submittedAt") or "")
+        if (author.get("__typename") == "Bot" or not login or not stamp
+                or r.get("state") not in _VERDICT_STATES):
+            continue
+        seen = newest.get(login.lower())
+        if seen is None or stamp > str(seen.get("submittedAt") or ""):
+            newest[login.lower()] = r
+    return ["changes requested by a person (%s)" % (r.get("author") or {}).get("login")
+            for _, r in sorted(newest.items()) if r.get("state") == "CHANGES_REQUESTED"]
+
+
 def _threads_blocker(threads: List[Dict[str, Any]]) -> Optional[str]:
     unresolved = sum(1 for t in threads if not t.get("isResolved"))
     return "%d unresolved threads" % unresolved if unresolved else None
@@ -582,7 +607,7 @@ def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
     head = _head_commit(node)
     threads = (node.get("reviewThreads") or {}).get("nodes") or []
     blockers = [b for b in (_checks_blocker(head), _review_blocker(node, bot),
-                            _threads_blocker(threads),
+                            *_person_blockers(node), _threads_blocker(threads),
                             _unfixed_blocker(threads, head, bot)) if b]
     return "blocked: " + ", ".join(blockers) if blockers else "READY"
 
@@ -3740,6 +3765,7 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     owner, name = repo.split("/", 1)
     query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
              ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
+             ' reviews(last:100) { nodes { author { __typename login } state submittedAt } } '
              ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
              ' reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes {'
              ' databaseId author { __typename login } body createdAt } } } }'
@@ -3747,6 +3773,15 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
              ' } } }') % (_gql(owner), _gql(name), number)
     data = gh.graphql(query) or {}
     return ((data.get("repository") or {}).get("pullRequest") or {})
+
+
+def _refuse_person_change_request(details: Dict[str, Any]) -> None:
+    """Refuse before the merge call, in the words status shows, when a
+    person's change request stands: GitHub would answer the PUT with a bare
+    405, and the brain would retry it every tick."""
+    blockers = _person_blockers(details)
+    if blockers:
+        raise ValueError("blocked: " + ", ".join(blockers))
 
 
 def merge(gh: GitHub, repo: str, number: int,
@@ -3762,10 +3797,12 @@ def merge(gh: GitHub, repo: str, number: int,
             raise ValueError("pull request is linked to a ticket; merge it without --adopt")
         _check_written_text(ADOPT_COMMENT)
         _validate_adopt_pr(gh, repo, pr, details, env)
+        _refuse_person_change_request(details)
         association: Optional[Tuple[str, int]] = None
     else:
         pr, details = _await_settled(gh, repo, number, pr, details, env)
         _validate_merge_pr(repo, pr, details, env)
+        _refuse_person_change_request(details)
         if change_class.class_of(pr) == "sensitive":
             from . import factory
             bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
