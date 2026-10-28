@@ -26,16 +26,25 @@ from typing import Any, Dict, List, Optional, Tuple
 TICK_MINUTES = 25
 BUDGET_MINUTES = 20
 
-# A note that defers work because the tick's time ran out. "budget" counts
-# only in its tick-time sense ("on budget", "on the 20-minute budget",
-# "tick budget", "time budget"): the API, App installation, per-repo read,
-# lane and request budgets are counts, not the tick's clock, and a note
-# naming one is never refused.
-_TIME_BUDGET = re.compile(
-    r"\b(?:on|over|past|tick(?:'s)?|time|minutes?|\d+[- ]?minutes?)[ \t]+(?:the[ \t]+)?"
-    r"(?:(?:\d+[- ]?minutes?|tick(?:'s)?|time)[ \t]+)?budget\b", re.I)
+# A note that defers work because the tick's time ran out. Any "budget"
+# next to a defer word counts ("deferred: budget", "budget spent, skipping
+# brief", "on the 20-minute budget"), unless another budget noun qualifies
+# it: the API, App installation, per-repo read, lane, token, review and
+# per-minute budgets are counts, not the tick's clock, and a note naming one
+# is never refused (loom#2109). _OTHER_BUDGET is taken out first, either
+# side of the word: "API budget", "per-minute budget", "budget of the API",
+# "budget on API calls".
+_QUALIFIER = (r"(?:repo|api|app|installation|lane|token|review|request|rate|call|read)"
+              r"s?(?:'s)?")
+_OTHER_BUDGET = re.compile(
+    r"(?:\b(?:" + _QUALIFIER + r"|per[- ]\w+)[ \t-]+budget\b"
+    r"|\bbudget[ \t]+(?:of|for|on)[ \t]+(?:the[ \t]+)?(?:\w+[ \t]+)?"
+    + _QUALIFIER + r"\b)", re.I)
+_TIME_BUDGET = re.compile(r"\bbudget\b", re.I)
 _OUT_OF_TIME = re.compile(
-    r"\b(?:out of time|no time left|ran out of time|time is up|time'?s up|"
+    r"\b(?:out of time|no time left|not enough time|ran out of time|"
+    r"time(?: is|'?s)? up|for time|ran long|running long|"
+    r"\d+(?: of \d+)?[- ]?minutes? elapsed|"
     r"(?:over|past|at) the \d+[- ]?minute (?:limit|mark|line))\b", re.I)
 _DEFERS = re.compile(r"\b(defer\w*|skip\w*|spent|ran out|next tick|postpon\w*|"
                      r"left for|not reached|no time)\b", re.I)
@@ -95,11 +104,12 @@ def budget_status(record: Dict[str, Any], now: datetime) -> str:
 
 def claims_budget(note: Optional[str]) -> bool:
     """Whether `note` defers or skips work because the tick's time ran out.
-    Another budget (API, App, per-repo read, lane) and a negation ("not
-    budget", "no deferral") are no claim."""
+    A bare "budget" next to a defer word is a claim; another budget (API,
+    App installation, per-repo read, lane, token, review, per-minute) and a
+    negation ("not budget", "no deferral") are no claim."""
     if not note:
         return False
-    plain = _NEGATED.sub(" ", note)
+    plain = _OTHER_BUDGET.sub(" ", _NEGATED.sub(" ", note))
     return bool((_TIME_BUDGET.search(plain) or _OUT_OF_TIME.search(plain))
                 and _DEFERS.search(plain))
 
