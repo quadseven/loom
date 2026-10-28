@@ -422,17 +422,21 @@ class MetricsTest(unittest.TestCase):
 
 
 class VisibilityCadenceTest(unittest.TestCase):
-    def test_the_visibility_target_follows_the_report_cadence(self):
-        # 2026-10-18: the operator moved reports to every 6 hours; a 2-hour
-        # target would fail every goal from then on.
-        def number(hours):
+    def test_the_visibility_target_follows_the_reading_times(self):
+        # 2026-10-25: reports are due at the operator's reading times, 10:00
+        # and 21:00 New York, so a report's age alone no longer says whether
+        # it is late: 13 hours overnight is on time, a missed reading time is
+        # not.
+        def number(hours, late):
             total = metrics.Totals()
             total.goals = 1
-            total.report_ages = {"example-owner/example-repo#1": hours * 3600}
+            total.report_ages = {"goal-one": hours * 3600}
+            total.overdue_goals = ["goal-one"] if late else []
             return metrics.visibility_number(total)
-        self.assertTrue(number(5).passed)
-        self.assertFalse(number(7).passed)
-        self.assertIn("<=6h", number(5).target)
+        self.assertTrue(number(13, False).passed)
+        self.assertFalse(number(7, True).passed)
+        self.assertIn("late", number(7, True).value)
+        self.assertEqual(number(5, False).target, "each goal reported by 10:00 and 21:00")
 
 
 if __name__ == "__main__":

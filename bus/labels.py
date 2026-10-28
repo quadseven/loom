@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 import re
+import sys
 from typing import Dict, List
 from urllib.parse import quote
 
 from .github import GitHub
+
+# The hand-off pool: a ticket no lane of this Loom takes (bus/factory.py
+# NO_LANE_HANDOFF) carries it, leaves its goal's in-flight count, and waits
+# for the second operator's session to claim it (docs/BRAIN.md).
+HANDOFF = "handoff:claude"
 
 LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
          "zai", "workersai", "agy", "spark"]
@@ -51,7 +57,9 @@ def base_lane(slot: str) -> str:
 # beat_max: seconds a remote worker's last heartbeat counts as up. Muse runs
 # on its own schedule (about every 30 minutes), not every minute like a
 # local runner, so its window is longer than HEARTBEAT_MAX_AGE.
-REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 1,
+# slots: tickets the lane may hold at once; Muse runs four scheduled lane
+# tasks (operator, 2026-10-25).
+REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 4,
                          "beat_max": 2 * 3600}}
 LANES += list(REMOTE_LANES)
 
@@ -69,6 +77,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:answered": {"color": "5319e7", "description": "The runner posted an answer for brain review"},
     "loom:answer-pending": {"color": "c5def5", "description": "An operator answered on the dashboard; the station has not read it yet"},
     "loom:ready": {"color": "0e8a16", "description": "Checks passed and review-bot threads are resolved"},
+    "loom:landing": {"color": "0e8a16", "description": "Being landed: no other pull request in the repo is updated or merged meanwhile"},
     "loom:failed": {"color": "d93f0b", "description": "The runner gave up; see the ticket"},
     "loom:merged": {"color": "8fd19e", "description": "Merged, not deployed yet"},
     "loom:closed-unmerged": {"color": "d93f0b", "description": "Linked pull request closed without merging"},
@@ -87,7 +96,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:factory": {"color": "b60205", "description": "A factory validation incident"},
     "loom:validation-gap": {"color": "fbca04", "description": "A CI job the repo's .loom/validation.conf does not run"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
-    "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},
+    "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
     "loom:regression": {"color": "b60205", "description": "Fixes a measured regression of a shipped ticket"},
     "loom:revert": {"color": "b60205", "description": "Reverts the merge that turned the default branch red"},
@@ -102,8 +111,13 @@ LABELS: Dict[str, Dict[str, str]] = {
     "wait:lane": {"color": "fef2c0", "description": "Waiting: no free lane takes its model"},
     "wait:incident": {"color": "fef2c0", "description": "Waiting: held for an open factory incident"},
     "wait:after": {"color": "fef2c0", "description": "Waiting: another ticket must merge first (After:)"},
+    "wait:blocked": {"color": "fef2c0", "description": "Waiting: its Blocked on section names an issue still open"},
+    "wait:superseded": {"color": "fef2c0", "description": "Waiting: its brief says another issue supersedes it; the brain closes or re-briefs it"},
     "wait:window": {"color": "fef2c0", "description": "Waiting: a deploy or roll window"},
     "wait:live-event": {"color": "fef2c0", "description": "Waiting: its Live box needs a rare event the log has not shown; held apart from open work"},
+    # The hand-off pool (docs/BRAIN.md): tickets this Loom's lanes do not
+    # take, for the second operator's session to claim.
+    HANDOFF: {"color": "d876e3", "description": "In the hand-off pool for the second operator's session; out of the goal's in-flight count"},
 }
 for _lane in LANES:
     LABELS["lane:" + _lane] = {"color": "bfdadc",
@@ -140,3 +154,30 @@ def ensure_labels(gh: GitHub, repo: str) -> List[str]:
                     {"color": want["color"], "description": want["description"]})
             changed.append(name)
     return changed
+
+
+def spec(name: str) -> str:
+    """One canonical label as "<color>\\t<description>", for a runner that
+    must create a label its repo lacks before it sets it (lanes/run_lane.sh,
+    loom#2032). ValueError when the name is not a Loom label."""
+    want = LABELS.get(name)
+    if want is None:
+        raise ValueError("not a Loom label: %s" % name)
+    return "%s\t%s" % (want["color"], want["description"])
+
+
+def main(argv: List[str]) -> int:
+    """`python3 -m bus.labels spec NAME` prints NAME's color and description."""
+    if len(argv) != 2 or argv[0] != "spec":
+        print("usage: python3 -m bus.labels spec NAME", file=sys.stderr)
+        return 2
+    try:
+        print(spec(argv[1]))
+    except ValueError as err:
+        print(err, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

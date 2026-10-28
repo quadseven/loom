@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
-from bus import answer, brain, handoff, labels, status, tickets
+from bus import answer, brain, fixrounds, handoff, labels, status, tickets
 from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
@@ -284,6 +284,7 @@ class TicketStore:
             # only an App, the timeline still shows each push and failure.
             gh.status_authors |= {a.lower() for a in brain.trusted_authors()}
             gh.status_in_body = True  # events in the issue body too (loom#1341)
+            gh.fix_ledger = fixrounds.ledger_from_env()  # fix rounds (loom#1640)
         self.gh = gh
         self.budget_floor = (int(os.environ.get("LOOM_DASHBOARD_BUDGET_FLOOR", "500"))
                              if budget_floor is None else budget_floor)

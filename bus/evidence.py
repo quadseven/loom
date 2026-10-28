@@ -11,10 +11,11 @@ from typing import Optional, Tuple, Dict, Iterable, List
 
 from . import text
 
-# An exact string in the Live criterion, backticked or in double quotes: about
-# one in seven shipped tickets wrote it as "text" and got no log data. A
-# backticked span is matched first, so a quote inside one is not a needle.
-NEEDLE_RE = re.compile(r'`([^`]+)`|"([^"\n]+)"')
+# An exact string in the Live criterion, backticked, in double quotes, or with
+# template placeholders like <name> or ...: about one in seven shipped tickets
+# wrote it as "text" and got no log data. A backticked span is matched first,
+# so a quote inside one is not a needle.
+NEEDLE_RE = re.compile(r'`([^`]+)`|"([^"\n]+)"|<[^>]+>|\\.{3}')
 IP_RE = re.compile(r"\b[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?::[0-9]+)?\b")
 # Live strings are often written as templates: `sync: ... (waiting)`,
 # "left N file(s)", `export <report>: ...`, "account 'X' charges 'Y'". No log
@@ -35,6 +36,8 @@ _BEFORE_ABSENT_RE = re.compile(r"\b(?:no|never|zero|without|not)\b|n't\b", re.I)
 _AFTER_ABSENT_RE = re.compile(
     r"\bnever\b|\babsent\b|n't\b|\b(?:does|do|did|is|are|was|were|must|should|will|would)"
     r"\s+not\b", re.I)
+_AFTER_PRESENT_RE = re.compile(
+    r"\b(?:appears?|shows?|returns?|answers?|contains?|becomes?|remains?)\b", re.I)
 _CONNECTOR_RE = re.compile(r"^[\s,]*(?:(?:and|or|nor)\b)?[\s,]*$", re.I)
 _SPAN_RE = re.compile(
     r"(\d+(?:\.\d+)?)[- ]?(hours?|hrs?|h|days?|d|weeks?|w)\b|\b(?:a|an|one)\s+(hour|day|week)\b",
@@ -71,13 +74,16 @@ def absent_needles(live: str) -> List[str]:
     log: "no `X` line appears", "never logs `X`", "`X` does not appear". A
     string is read with the words before it (back to the clause start) and
     after it (up to the next string); a string joined to an absent one by
-    "and"/"or" alone shares its wording."""
+    "and"/"or" alone shares its wording unless a positive predicate starts
+    the next clause."""
     found = list(NEEDLE_RE.finditer(live))
     absent: List[str] = []
     previous = False
     end = 0
     for index, match in enumerate(found):
         value = match.group(1) or match.group(2)
+        if value is None:
+            continue
         before = live[end:match.start()]
         following = found[index + 1].start() if index + 1 < len(found) else len(live)
         after = live[match.end():following]
@@ -85,7 +91,11 @@ def absent_needles(live: str) -> List[str]:
         joined = bool(_CONNECTOR_RE.match(before)) and index > 0
         flag = (previous if joined
                 else bool(_BEFORE_ABSENT_RE.search(clause)))
-        flag = flag or bool(_AFTER_ABSENT_RE.search(after[:60]))
+        after_clause = after[:60]
+        flag = flag or bool(_AFTER_ABSENT_RE.search(after_clause))
+        if joined and _AFTER_PRESENT_RE.search(after_clause) \
+                and not _AFTER_ABSENT_RE.search(after_clause):
+            flag = False
         if flag and _eligible(value) and not template(value) and value not in absent:
             absent.append(value)
         previous = flag

@@ -43,7 +43,12 @@ homes may also be specific goal issues as `OWNER/NAME#N`. Set
 the last two weeks of issue and review comments in `LOOM_REPOS`. With
 `LOOM_BRIEF_AUTHORS` set, only those logins' comments count as station
 outcomes, and `LOOM_REVIEW_BOT` names the review bot whose findings are
-counted (default `grug-tribe`). `.env.example` lists the dashboard variables with placeholder
+counted (default `grug-tribe`). `/chain` shows the command chain from the operator down to the review bot.
+Its station and audit layers come from the station, which posts each
+watched repo's shadow mode (`bus.shadow`) and the last held and acted
+actions to `POST /api/chain` with the upload token every ten minutes: the
+held side from the shadow ledger, the acted side from `acted.jsonl` beside
+it, a line for each merge or close GitHub accepted from Loom. `.env.example` lists the dashboard variables with placeholder
 values. Set `LOOM_UPLOAD_TOKEN` to the same private value for the dashboard
 and station so completed runs can upload to `POST /api/transcripts`.
 Keep the dashboard ingress tailnet-only; the bearer token authenticates
@@ -183,6 +188,14 @@ All, one per login with its count, and Operator (`?who=<login>`,
 by `OWNER/NAME` (`example-owner/app#7`) is one item when only one
 configured repo has that name. The Floor's "Needs you" count is the same
 deduplicated list.
+
+Above the cards, "Goals stuck at their cap" lists each goal the station found
+at its in-flight cap for over 6 hours: how long, its count against the cap,
+and how many of its in-flight tickets wait with no lane that takes them
+(docs/BRAIN.md, Tickets no lane takes). The station sends the list with the
+upload token (`POST /api/goal-caps`, `{goals: [{goal, since, in_flight, cap,
+no_lane}], at}`) when it changes and at most every 10 minutes; the dashboard
+keeps it in memory and shows nothing once the newest report is an hour old.
 
 `/free` lists, per repo, the open issues free for the operator named by
 `?operator=<login>` (anyone, with none), from `bus.free`, the function
