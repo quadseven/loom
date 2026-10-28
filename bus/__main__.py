@@ -7,7 +7,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
-from . import app, brain, journal, labels, lock, naming, station, tick_clock
+from . import app, brain, decision_claim, journal, labels, lock, naming, station, tick_clock
 from .github import GitHub, GitHubError, Transport, auth_from_env, openssl_sign
 
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
@@ -135,6 +135,11 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
         # (loom#1534): not a failed step, so exit 0.
         print("not posted: %s" % held)
         return 0
+    except decision_claim.DecisionNotRecorded as bad:
+        # A journal citing a decision no person recorded (loom#2089) is the
+        # brain's to rewrite: nothing is posted and the exit is non-zero.
+        print("not posted: %s" % bad)
+        return 2
     except journal.ReportInvalid as bad:
         # A report that contradicts itself is the brain's to rewrite, so this
         # is a failed step: nothing is posted and the exit is non-zero.

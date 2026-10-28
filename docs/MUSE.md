@@ -461,6 +461,21 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    remove the label. Keep an ask only when only the operator can do it, with
    one exact ask in its body. The station forwards every open ask to the
    operator, so an ask left open is a message to the operator's phone.
+   An unanswered ask is not a decision. When you act on an ask nobody has
+   answered (close a pull request as superseded, close or re-brief its
+   ticket), say it was the brain's own judgment, in the note and in the
+   journal line ("on the brain's own judgment: ..."), with the evidence.
+   Never cite an operator decision unless a person's comment or label
+   records it, after the latest ask, on the issue or on a ticket you name
+   (a person taking `loom:human` or `needs:*` off, or a body heading
+   `## Decision (LOGIN, YYYY-MM-DD)` by an operator dated on or after the
+   ask, also counts); then link it. `close`, `close-epic`, `move`, `reply`,
+   `audit`, `prioritize`, `defer`, `fix`, `escalate` and `bus journal`
+   refuse text that claims a person decided ("per the operator decision",
+   "the operator decided", "per LOGIN's decision", "LOGIN decided", LOGIN an
+   operator or trusted login) when no such record exists
+   (bus/decision_claim.py, loom#2089). A ruling cited from a repo doc
+   ("per the operator ruling in docs/MUSE.md") is not refused.
 7. First run `python3 -m bus.brain step brief --holder muse`. Fill every free lane slot with the highest-ranked work (The brain's job),
    skipping any ticket whose `Not before:` line names a later UTC time (the
    operator asked for it later; the station will not claim it before then,

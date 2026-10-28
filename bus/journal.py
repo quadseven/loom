@@ -6,6 +6,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
+from . import answer as _answer
+from . import decision_claim as _decision_claim
 from . import handoff
 from . import notify as _notify
 from . import quiet as _quiet
@@ -310,6 +312,10 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
     `steps` is the tick's "- Steps:" line (tick_clock.footer), put last in
     a journal tick and never in a report or reply."""
     text = as_journal(text, holder)
+    # A journal that says a person decided needs that person's record
+    # (bus/decision_claim.py, loom#2089).
+    _decision_claim.check(gh, repo, issue_number, text, list(trusted),
+                          _answer.operators(None, list(trusted) or None))
     if text.startswith(JOURNAL_MARKER):
         text = with_steps(with_tick(text, holder), steps)
         _text.check(text)
