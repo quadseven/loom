@@ -186,7 +186,16 @@ below; where the steps leave room, this is how to spend it.
     does not reach, with the merge stage), and the rest acting on the
     Priorities list. When the
     budget runs out, defer what is left with markers; never skip a stage
-    silently "on budget".
+    silently "on budget". The budget is the clock's, never a guess: every
+    `bus.brain step NAME` prints `elapsed N of 25 minutes (S seconds left)`
+    as its first line, `bus.brain status` and `resume` print it as their
+    `Tick clock:` line, and `python3 -m bus.brain step-budget` prints it on
+    its own. Read that line instead of judging the time. A step may be
+    deferred on budget only when the printed elapsed is 20 minutes or more;
+    under 20, a `step` or `defer` note that defers on budget is refused
+    (recorded as refused, exit 1), so do the step instead (loom#2104). Until
+    the clock is in (a `step` that prints no elapsed line) and the tick is
+    short, run triage before verify.
 12. The journal ends with what moved, counted: merged N, briefed N (with
     numbers), closed or verified N, escalated N, factory tickets filed N,
     deferred N with their stages. A tick that moved nothing says so as its
@@ -295,7 +304,9 @@ own files and, on this VM, says it is not the lane machine instead.
 
 Each `bus.brain step NAME` below may carry `--note "<one line>"`: what that
 step found or decided. The notes are the dashboard Brain view's "Thinking,
-this tick"; a step with no note shows nothing there.
+this tick"; a step with no note shows nothing there. Each step call records
+when that step started and when the previous one ended, and prints the
+tick's elapsed line first (Rules, 11): read it before deciding what fits.
 
 1. Run `python3 -m bus lock quadseven/loom --holder muse --minutes 30`.
    Stop if the lock is held. The lock outlives the 25-minute tick, so no
@@ -575,7 +586,10 @@ this tick"; a step with no note shows nothing there.
    tick that day edits that comment in place, newest tick first, so the
    operator gets no email per tick. `--holder` adds the `Tick <UTC time>, muse` line after
    the marker; without that line a peer reads the journal as another brain's
-   and stays to its resume items, and `journal` refuses it. It states the goal's metrics against the last journal,
+   and stays to its resume items, and `journal` refuses it. With `--holder`,
+   `journal` also puts the station's `- Steps:` line last: each step's
+   minutes from the tick record and the elapsed line; write no such line
+   yourself. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
    goal's measure, then the defer and done lines (Handing off stage work).
    A `- Decided: <one line>` line and a `- Model: <model>` line give the
@@ -903,7 +917,8 @@ pages, and a list that cannot be read in full refuses the merge. The adopt path
   failing one ("last good read 04:28Z, first failing read 09:02Z"). Never
   write the last good read as the start ("down since 04:28Z"): `bus`
   commands refuse that text.
-- Never retry a failed step in the same tick. Stop at 25 minutes.
+- Never retry a failed step in the same tick. Stop at 25 minutes, as the
+  printed elapsed line says, never by a guess.
 - Every note or piece of evidence a tick leaves on an issue, outside the
   comments a `bus` or `bus.brain` command writes itself, goes through
   `python3 -m bus journal OWNER/NAME#N --file FILE --holder NAME`: it edits
