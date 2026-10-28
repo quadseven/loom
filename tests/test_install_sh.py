@@ -221,6 +221,12 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_LOG_KEEP_DAYS</key><string>14</string>", plist)
         self.assertIn("<key>LOOM_MIN_FREE_GB</key><string>20</string>", plist)
 
+    def test_pass_deadline_is_written_to_station_plist(self):
+        result = self.run_install(LOOM_PASS_DEADLINE="2400")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_PASS_DEADLINE</key><string>2400</string>", plist)
+
     def test_claimed_settle_settings_are_written_to_station_plist(self):
         result = self.run_install(LOOM_SETTLE_CLAIMED="on", LOOM_SETTLE_CLAIMED_MAX="5")
         self.assertEqual(result.returncode, 0, result.stderr)

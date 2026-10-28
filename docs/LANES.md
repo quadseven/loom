@@ -174,6 +174,13 @@ redirect, such as `tool --render-rbac > rbac.yaml`), the comment's first line
 after its header says to run that command and commit what it writes
 (`bus/ci_facts.py`).
 
+A review app's failing check (any check run not from GitHub Actions) is a
+reviewer's prose, not a log, and those rules do not apply to it. Only what the
+reviewer marks as a command becomes a "run" line: a line in a fenced block
+tagged `sh`, `bash`, `shell`, `console` or `zsh`, or a `Run:` or
+`Regenerate:` line. Its "Suggested fix:" lines are quoted as the finding to
+address, never as a command (loom#1898).
+
 ### Live-cluster check
 
 Before a lane opens a pull request, or pushes to one in a fix round, whose
@@ -354,7 +361,7 @@ App writes need no hand-listed login; its startup log line `trusting briefing
 logins` names every login trusted. More than three briefed tickets refused in
 an hour for one untrusted labeller file the `untrusted-labeler` invariant,
 naming the login. The App needs contents,
-issues and pull requests read and write, and checks and actions read, on the
+issues and pull requests read and write, and checks and actions write, on the
 scanned repos. To set one up, `python3 -m bus app manifest --owner OWNER`
 (add `--org` for an organisation) prints the create page and a manifest with
 exactly those permissions and no webhook; `--form` prints an HTML page whose
@@ -395,7 +402,7 @@ login by itself, so the brain's and the lanes' logins (`<slug>[bot]`) go in
 `LOOM_BRIEF_AUTHORS`, and a repo whose workflows admit only collaborators must
 admit the lanes' login for lane pull requests to run.
 A new App is easiest made from
-`https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=read`.
+`https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=write`.
 
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
@@ -464,9 +471,17 @@ A fix brief may answer a finding instead of fixing it: the agent writes the
 reason to `.loom-answers/<thread id>.md`, the runner moves that folder out of
 the tree (never committed; links dropped unread), and the station posts each
 answer as the reply on its thread, redacted and text-checked. The station
-resolves the thread only when the round ran on a ladder model and the thread
-is the review bot's own medium or low finding; any other answered thread
-stays open, and the factory reads it as a finding that survived.
+resolves the thread only when the round ran on a ladder model, the thread
+is the review bot's own medium or low finding, and the answer holds on the
+pull request head (bus/rebuttal.py, loom#2081): "Fixed in <sha>" names the
+head or one of its ancestors (any case), or the answer cites files and lines
+the head has and, when it names backticked symbols, at least one of them is
+there, every "`f` is called by `g`" claim is a real call there,
+and a dead-code finding's symbol has a call. An answer that cites nothing
+checkable stays open. Any other answered thread stays open, and the factory
+reads it as a finding that survived. The brain's merge re-checks every bot
+thread resolved on a lane answer the same way, and reopens it and refuses
+the merge when the answer does not hold.
 An answered thread that survives and leaves its ticket with no lane up for
 its next rung does not wait with nothing to move it: the factory asks the
 review bot to judge the answer instead, commenting `/grug improve` on the
@@ -1009,6 +1024,23 @@ The loom home is kept bounded by the station and the runner (loom#643).
   (`loom home holds ...`), kept in `state/station/disk.json`. A compressed
   store goes with its run's other logs after `LOOM_LOG_KEEP_DAYS`.
 
+## Pass deadline
+
+A whole station pass is bounded by `LOOM_PASS_DEADLINE` seconds (default
+3600, at least 60, `0` off; loom#1921). Each request already has a read
+timeout, but nothing else bounded a pass: on 2026-10-26 one sat for 27
+minutes and the log never said where. When the pass takes its lock it arms
+`faulthandler.dump_traceback_later` with the station log as its file and
+writes `state/station/pass-deadline.json` (pid, start, deadline); the pass's
+end cancels both, whether it returned or raised. A pass that runs past the
+deadline writes every thread's Python stack to `station.log` and exits, so
+launchd starts a fresh one. The next pass finds the marker and logs one line:
+`the last pass (pid ..., started ...) overran its ...s deadline`, or, when the
+marker is younger than its deadline (the pass was killed), `ended ...s into
+its ...s deadline without a clean finish`. The default sits above a daily
+metrics build (about 30 minutes on 2026-10-26) until that build is bounded on
+its own (loom#1924).
+
 ## Log watch
 
 Each station pass reads the lines each component added to its log since the
@@ -1154,6 +1186,10 @@ Each invariant is one function returning breaches with evidence:
   every such goal): the station opens no source-pin pull request when their
   module changes merge (README.md, Roll source pins). The issue says when
   the setting is empty, which turns the pass off.
+- Tickets still at `loom:merged` 24 hours after a ship rule found their merge
+  commit deployed, because the move to `loom:shipped` failed
+  (`merged-not-shipped`, one rolling issue, a line per ticket; docs/BRAIN.md,
+  Shipping through a downstream roll).
 
 The failing-streak, lane-held and silent-lane invariants are one rolling
 issue each, a line per lane, rewritten in place while the list changes, as
