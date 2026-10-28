@@ -544,30 +544,35 @@ def _checks_blocker(head: Dict[str, Any]) -> Optional[str]:
     return None if checks == "SUCCESS" else "checks %s" % checks.lower()
 
 
+def _newest_reviews(node: Dict[str, Any], bot: str) -> List[Dict[str, Any]]:
+    """Each reviewer's newest submitted review. A reviewer is the review bot
+    or one login, compared without letter case; a person can take the bot's
+    login without being the bot, so the two are kept apart."""
+    newest: Dict[Tuple[bool, str], Dict[str, Any]] = {}
+    for r in (node.get("reviews") or {}).get("nodes") or []:
+        stamp = str(r.get("submittedAt") or "")
+        if not stamp:
+            continue
+        key = (by_bot(r, bot), str((r.get("author") or {}).get("login") or "").lower())
+        if key not in newest or stamp > str(newest[key].get("submittedAt")):
+            newest[key] = r
+    return list(newest.values())
+
+
 def _review_blocker(node: Dict[str, Any], bot: str) -> List[str]:
     # One blocker per reviewer whose newest submitted review still asks for
     # changes: the review bot's newest review (its rule is unchanged), and each
     # person's newest review. A later APPROVED or DISMISSED review from the same
     # person clears it; an older CHANGES_REQUESTED that a later review
-    # superseded no longer blocks. A person can take the bot's login without
-    # being the bot, so the author type must be Bot as well.
-    reviews = [r for r in (node.get("reviews") or {}).get("nodes") or []
-               if r.get("submittedAt")]
-    newest: Dict[str, Dict[str, Any]] = {}
-    for r in reviews:
-        author = r.get("author") or {}
-        login = str(author.get("login") or "")
-        stamp = str(r.get("submittedAt") or "")
-        cur = newest.get(login)
-        if cur is None or stamp > str(cur.get("submittedAt") or ""):
-            newest[login] = r
+    # superseded no longer blocks.
     blockers: List[str] = []
-    for login, r in newest.items():
-        state = str(r.get("state") or "")
+    for r in _newest_reviews(node, bot):
+        if str(r.get("state") or "") != "CHANGES_REQUESTED":
+            continue
         if by_bot(r, bot):
-            if state == "CHANGES_REQUESTED":
-                blockers.append("grug changes_requested")
-        elif state == "CHANGES_REQUESTED":
+            blockers.append("grug changes_requested")
+        else:
+            login = str((r.get("author") or {}).get("login") or "")
             blockers.append("changes requested by a person (%s)" % login)
     return blockers
 

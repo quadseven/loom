@@ -1586,8 +1586,9 @@ A lane pull request is merge-ready if and only if all four hold:
   followed by newer `COMMENTED` reviews no longer blocks;
 - the newest submitted review from each person who is not the review bot is
   not `CHANGES_REQUESTED`. A `CHANGES_REQUESTED` followed by a newer
-  `APPROVED` or `DISMISSED` review from the same login no longer blocks, and
-  the blocker reads `changes requested by a person (LOGIN)`;
+  `APPROVED` or `DISMISSED` review from the same login (compared without
+  letter case, and kept apart from the bot) no longer blocks, and the
+  blocker reads `changes requested by a person (LOGIN)`;
 - it has no unresolved review thread;
 - every thread the review bot opened (a finding) is older than the head
   commit, so a fix-up commit came after each finding.

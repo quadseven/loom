@@ -913,6 +913,22 @@ class SensitiveResumeTests(unittest.TestCase):
             "grug-tribe"),
             "blocked: changes requested by a person (reviewer-one), changes requested by a person (reviewer-two)")
 
+    def test_merge_ready_keeps_the_bot_apart_from_a_person_with_its_login(self):
+        bot = {"__typename": "Bot", "login": "grug-tribe"}
+        namesake = {"__typename": "User", "login": "grug-tribe"}
+        # A person's later review under the bot's login does not hide the
+        # bot's newest change request.
+        node = ready_node(reviews=[
+            {"author": bot, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"},
+            {"author": namesake, "state": "COMMENTED", "submittedAt": "2030-01-01T09:00:00Z"}])
+        self.assertEqual(brain.merge_ready(node, "grug-tribe"), "blocked: grug changes_requested")
+        # A newer bot review under another letter case still supersedes the old one.
+        node = ready_node(reviews=[
+            {"author": bot, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"},
+            {"author": {"__typename": "Bot", "login": "GRUG-TRIBE"}, "state": "COMMENTED",
+             "submittedAt": "2030-01-01T09:00:00Z"}])
+        self.assertEqual(brain.merge_ready(node, "grug-tribe"), "READY")
+
     def test_status_shows_a_person_changes_requested_blocker(self):
         person = {"__typename": "User", "login": "reviewer-one"}
         node = ready_node(reviews=[{"author": person, "state": "CHANGES_REQUESTED",
