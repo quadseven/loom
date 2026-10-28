@@ -42,6 +42,7 @@ from . import claimed
 from . import fabric
 from . import fixrounds
 from . import flake
+from . import rebuttal
 from . import runners
 from . import scope_fit
 from . import shadow
@@ -157,8 +158,8 @@ GB = 1024 ** 3
 ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
 ANSWER_MAX = 3000
 STRONG_MODELS = frozenset(model for _, model in factory.CLIMB)
-THREAD_QUERY = ('query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread { isResolved'
-                ' pullRequest { number repository { nameWithOwner } }'
+THREAD_QUERY = ('query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread { isResolved path'
+                ' pullRequest { number headRefOid repository { nameWithOwner } }'
                 ' comments(first:1) { nodes { body author { __typename login } } } } } }')
 REPLY_MUTATION = ('mutation($id:ID!,$body:String!) { addPullRequestReviewThreadReply('
                   'input:{pullRequestReviewThreadId:$id,body:$body}) { comment { id } } }')
@@ -6044,13 +6045,6 @@ class Station:
             self._pulls[repo] = data if isinstance(data, list) else []
         return self._pulls[repo]
 
-    def _elder_markings(self, summary: str) -> List[Tuple[str, List[str]]]:
-        """Parse Elder review markings from a review check summary.
-        Returns list of (marking_kind, paths) tuples."""
-        text = str(summary or "")
-        return [(m.group(1), [p.strip("` ") for p in re.findall(r"`([^`]+)`", m.group(2))])
-                for m in _ELDER_MARKING_RE.finditer(text)]
-
     def _elder_markings_with_accept(self, summary: str, sha: str) -> List[Tuple[str, List[str], List[str]]]:
         """Parse Elder review markings and their accept-removal lines.
         Returns list of (marking_kind, paths, accept_removal_lines) tuples.
@@ -7309,9 +7303,10 @@ class Station:
                              brief: str, asked: Optional[Set[str]]) -> None:
         """Post each answer the lane wrote as the reply on its thread: an open
         thread on one of prs and, unless asked is None, one the brief asked
-        about. It is resolved when the round ran on a ladder model and the
-        thread is the review bot's own medium or low finding; otherwise it
-        stays open, and the factory reads it as a finding that survived."""
+        about. It is resolved when the round ran on a ladder model, the
+        thread is the review bot's own medium or low finding, and the answer
+        holds on the head (bus/rebuttal.py); otherwise it stays open, and the
+        factory reads it as a finding that survived."""
         folder = os.path.join(self.inbox(lane), "answers", name)
         try:
             entries = sorted(os.listdir(folder))
@@ -7351,7 +7346,8 @@ class Station:
             return
         self.gh.graphql(REPLY_MUTATION, {"id": thread_id, "body": body})
         root = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
-        settled = strong and _bot_minor(root, self.s.review_bot)
+        settled = (strong and _bot_minor(root, self.s.review_bot)
+                   and self._answer_holds(repo, pr, lane, thread_id, node, said))
         if settled:
             try:
                 self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
@@ -7364,6 +7360,20 @@ class Station:
                 _say("could not resolve %s on %s#%d: %s" % (thread_id, repo, pr, err))
         _say("posted lane %s's answer on %s#%d thread %s%s" % (
             lane, repo, pr, thread_id, " and resolved it" if settled else ""))
+
+    def _answer_holds(self, repo: str, pr: int, lane: str, thread_id: str,
+                      node: Dict[str, Any], said: str) -> bool:
+        """The answer settles its thread only when what it cites holds on
+        the head (bus/rebuttal.py, loom#2081): a false "it has a caller"
+        answer once merged dead code."""
+        root = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
+        head = str((node.get("pullRequest") or {}).get("headRefOid") or "")
+        why = rebuttal.check_on_head(self.gh, repo, head, said,
+                                     str(node.get("path") or ""), str(root.get("body") or ""))
+        if why:
+            _say("left %s on %s#%d open: lane %s's answer does not hold on the head: %s"
+                 % (thread_id, repo, pr, lane, why))
+        return not why
 
     def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str) -> None:
         """A fix brief that ended with nothing committed. Most often the lane
