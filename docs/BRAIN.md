@@ -59,7 +59,7 @@ that talks to GitHub about tickets.
 | `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
 | `loom:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
 | `loom:answer-pending` | An operator answered the item's ask on the dashboard's Needs you page (`<!-- loom:answer v1 -->` comment, `bus/answer.py`); the station has not read it yet. The factory reads it on its next pass and takes the label off (see Operator answers). |
-| `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:window`, `wait:live-event` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, a deploy or roll window, or (`wait:live-event`, on a shipped ticket) its Live box needs a rare event the log has not shown in 7 days since it shipped. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
+| `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:blocked`, `wait:superseded`, `wait:window`, `wait:live-event` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, its brief's Blocked on section names an issue still open, its brief says another issue supersedes it (the factory gives neither a lane), a deploy or roll window, or (`wait:live-event`, on a shipped ticket) its Live box needs a rare event the log has not shown in 7 days since it shipped. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
 | `handoff:claude` | The hand-off pool, machine-readable. Two routes lead into it: a ticket no lane of this Loom took for a day, with no other lane or model rung its tier allows free (see Tickets no lane takes), which is `loom:queued` with no lane and holds no slot of its goal's in-flight cap (one at `loom:pr` still counts); and a ticket whose fix rounds stopped on the same failures, with no rung of the model ladder left or the round cap reached on its rung (see the station's hand-back below), which is `loom:failed` with one note naming what still fails. The factory moves neither any more. The second operator's session works this pool (its goal issue, #1036) and may claim such a ticket at any state; taking the label off returns the ticket to this Loom. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
@@ -487,7 +487,10 @@ their ticket names while it is open with room for them, else under the goal's
 next intake epic, and are linked as its sub-issues. A rewritten or triaged
 issue that is a direct child of its goal moves to the epic (the sub-issue link
 replaces the goal as parent), so it does not stay under the goal and in no
-epic. The `ticket-outside-epic` and `epic-over-cap` invariants fire only for
+epic. A rewrite whose issue already sits under an open epic stays there: its
+sub-issue parent (else its own Part of line; the sub-issue parent wins when
+they disagree) names the epic, and the ticket's Part of line names that epic,
+whatever the draft wrote (loom#2033). The `ticket-outside-epic` and `epic-over-cap` invariants fire only for
 tickets that were placed before this, or by hand.
 
 The station moves the tickets that break this rule itself, at most every hour
