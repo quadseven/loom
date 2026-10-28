@@ -847,6 +847,24 @@ class SettledSubjectTest(StationBase):
         self.assertIn(invariants.ROLL_NONE, own["body"])
         self.assertEqual(own["state"], "closed", self.said)
 
+    def test_an_epic_back_at_its_cap_closes_its_issue(self):
+        """Since loom#2099 the epic is a line of its repo's tracking issue:
+        back at the cap, the line goes, and the empty list closes once it
+        has been clear for CLEAR_AFTER."""
+        self.gh.subs[(REPO, GOAL)] = [epic(40)]
+        self.gh.subs[(REPO, 40)] = [ticket(n, state="closed") for n in range(50, 66)]
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertIn("Epic #40 of goal home #30: 16 tickets (cap 15)", filed["body"])
+        self.gh.subs[(REPO, 40)] = self.gh.subs[(REPO, 40)][:15]
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertIn(invariants.ROLL_NONE, filed["body"])
+        self.assertEqual(filed["state"], "open")
+        self.run_at(T0 + invariants.CHECK_EVERY + invariants.CLEAR_AFTER)
+        self.assertEqual(filed["state"], "closed", self.said)
+        (note,) = self.notes(filed)
+        self.assertIn(invariants.CLEARED_TEXT, note)
+
     def test_an_epic_back_at_its_cap_closes_its_old_issue(self):
         filed = self.legacy("epic-over-cap", "%s#40" % REPO)
         self.gh.subs[(REPO, GOAL)] = [epic(40)]

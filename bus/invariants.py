@@ -1748,26 +1748,38 @@ class Filer:
         labels = [str(x.get("name", "")) for x in issue.get("labels", [])
                   if isinstance(x, dict)]
         if self._rolls.get(key) == number and TICKET_LABEL not in labels:
-            # Its facts not read this pass: an empty list would be a guess.
-            if key.split("/", 1)[0] not in self.read or key in self._unread_keys:
-                return True
-            return self._roll_clear(key, number, issue)
+            return self._clear_roll(key, number, issue)
         if "loom:triage" not in labels and "loom:rewritten" not in labels:
             return True
-        into = self._rolled_into(key, current)
-        if into is not None and into != number:
-            return self._fold_old(key, number, into, issue, labels)
-        if key.split("/", 1)[0] in ROLLED and self._old_repo(
-                key, str(issue.get("title") or "")) is None:
-            # An old issue whose repo cannot be told: no tracking issue is
-            # its own, so it closes with a note that names none.
-            return self._fold_old(key, number, None, issue, labels)
+        into = self._fold_target(key, number, issue, current)
+        if into is not None:
+            return self._fold_old(key, number, into or None, issue, labels)
         if key in _standing_keys():
             if self.writes >= WRITES_MAX:
                 return False
             self._mark_clear(key, number, issue)
             return True
         return self._close_quiet(number, issue, labels, self._comments(number))
+
+    def _clear_roll(self, key: str, number: int, issue: Dict[str, Any]) -> bool:
+        """A tracking issue with no violation this pass; left as it is when
+        its facts were not read (an empty list would be a guess)."""
+        if key.split("/", 1)[0] not in self.read or key in self._unread_keys:
+            return True
+        return self._roll_clear(key, number, issue)
+
+    def _fold_target(self, key: str, number: int, issue: Dict[str, Any],
+                     current: Dict[str, Breach]) -> Optional[int]:
+        """Where an older issue folds: its rolling issue's number, 0 for a
+        ROLLED kind's old issue whose repo cannot be told (it closes with a
+        note naming none), or None when it does not fold."""
+        into = self._rolled_into(key, current)
+        if into is not None and into != number:
+            return into
+        if key.split("/", 1)[0] in ROLLED and self._old_repo(
+                key, str(issue.get("title") or "")) is None:
+            return 0
+        return None
 
     def _fold_old(self, key: str, number: int, into: Optional[int], issue: Dict[str, Any],
                   labels: List[str]) -> bool:
@@ -1886,26 +1898,7 @@ class Filer:
             return
         self.state[b.key] = number
         if TICKET_LABEL in self._label_names(issue):
-            # A ticket (an invariant issue rewritten into work) is no longer
-            # the breach's own issue: it is never reopened or rewritten back to
-            # the invariant text (loom#1223 flipped 18 times).
-            if issue.get("state") == "open":
-                if b.rolling:
-                    self._rolling_open[b.key] = number
-                return
-            closed = _epoch(issue.get("closed_at"))
-            if closed is not None and b.at <= closed:
-                return
-            plain = self._listing().get(b.key)
-            if plain is not None and plain != number and plain not in self._ticketed:
-                # The breach already has its own invariant issue beside the ticket.
-                self.state[b.key] = plain
-                self._one(b)
-                return
-            self.state.pop(b.key, None)
-            self._file(b, ticket=number)
-            if b.rolling:
-                self._rolling_open[b.key] = self.state[b.key]
+            self._one_ticketed(b, number, issue)
             return
         if issue.get("state") == "open":
             if b.rolling:
@@ -1913,6 +1906,33 @@ class Filer:
                 if b.key not in self._unread_keys:
                     self._refresh(b, number, issue)
             return
+        self._one_closed(b, number, issue)
+
+    def _one_ticketed(self, b: Breach, number: int, issue: Dict[str, Any]) -> None:
+        """A ticket (an invariant issue rewritten into work) is no longer the
+        breach's own issue: it is never reopened or rewritten back to the
+        invariant text (loom#1223 flipped 18 times)."""
+        if issue.get("state") == "open":
+            if b.rolling:
+                self._rolling_open[b.key] = number
+            return
+        closed = _epoch(issue.get("closed_at"))
+        if closed is not None and b.at <= closed:
+            return
+        plain = self._listing().get(b.key)
+        if plain is not None and plain != number and plain not in self._ticketed:
+            # The breach already has its own invariant issue beside the ticket.
+            self.state[b.key] = plain
+            self._one(b)
+            return
+        self.state.pop(b.key, None)
+        self._file(b, ticket=number)
+        if b.rolling:
+            self._rolling_open[b.key] = self.state[b.key]
+
+    def _one_closed(self, b: Breach, number: int, issue: Dict[str, Any]) -> None:
+        """The breach's own issue is closed: reopen it for evidence newer than
+        the close, once while the breach stands."""
         closed = _epoch(issue.get("closed_at"))
         if closed is None or b.at > closed:
             comments = self._comments(number)
