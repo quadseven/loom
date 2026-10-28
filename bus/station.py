@@ -3607,6 +3607,48 @@ class Station:
                 handed += 1
                 break
 
+    def _add_missing_evidence_notes(self) -> None:
+        """Add missing-evidence notes to shipped tickets >24h old that were not
+        handed to a verify lane in this pass (loom#2092). The reserved lane
+        verifies one ticket per pass; the rest get a note. Tickets flagged as
+        unmeetable (restate ask posted) are skipped."""
+        path = os.path.join(self.state, VERIFY_FILE)
+        attempts = _read_json(path, {}, strict=False)
+        attempts = attempts if isinstance(attempts, dict) else {}
+
+        unmeetable_path = os.path.join(self.state, UNMEETABLE_FILE)
+        unmeetable_state = _read_json(unmeetable_path, {}, strict=False)
+        unmeetable_state = unmeetable_state if isinstance(unmeetable_state, dict) else {}
+        unmeetable_keys = {k for k, v in unmeetable_state.items()
+                           if isinstance(v, dict) and v.get("reasons")}
+
+        handed_this_pass = {key for key, ts in attempts.items()
+                            if isinstance(ts, (int, float)) and abs(float(ts) - self.now) < 10}
+
+        day_ago = self.now - 86400
+        for repo in self._verify_repos():
+            issues = self._tickets_open(repo)
+            for issue in issues:
+                labels = _label_names(issue)
+                if "loom:ticket" not in labels or "loom:shipped" not in labels:
+                    continue
+                if "loom:verified" in labels:
+                    continue
+                shipped_at = float(issue.get("shipped_at", 0) or 0)
+                if shipped_at == 0:
+                    shipped_at = self._shipped_stamp(repo, issue)
+                if shipped_at == 0 or shipped_at > day_ago:
+                    continue
+                key = "%s#%s" % (repo, issue.get("number"))
+                if key in handed_this_pass or key in unmeetable_keys:
+                    continue
+                try:
+                    status.add(self.gh, repo, int(issue["number"]),
+                              "Missing evidence: ticket not yet reached by verify lane after 24h",
+                              self.now)
+                except Exception as err:
+                    _say("could not add missing-evidence note to %s: %s" % (key, err))
+
     def _write_verify_brief(self, repo: str, lane: str, issue: Dict[str, Any]) -> None:
         number = int(issue["number"])
         self._clear_awaiting(repo, number)
@@ -12736,6 +12778,8 @@ class Station:
             # still finishes half-done claims, reconciles and prunes.
             if not self.disk_low():
                 self._timed(self.claim_new)
+            # Cheap pass for missing-evidence notes on stale shipped tickets (loom#2092)
+            self._timed(self._add_missing_evidence_notes)
             if not self._deferred():
                 try:
                     self._timed(self.assign_queued)
