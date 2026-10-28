@@ -1655,6 +1655,64 @@ def goal_tree(gh: GitHub, repo: str, goal: int
     return loose, tree
 
 
+def _finishable_tree(gh: GitHub, repo: str, goal: int
+                     ) -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
+    """goal_tree's epics as finished_epics reads them: only an open epic
+    that is not the standing one can be finished, so only those epics'
+    tickets are read, and their sub-issues' states come in one GraphQL read
+    (EPIC_STATES) instead of one REST read per epic. Every other epic keeps
+    an empty ticket list, which finished_epics never looks at. On
+    2026-10-27 resume read 25 sub-issue lists for quadseven/loom, 12 of them
+    for closed epics (loom#2078)."""
+    direct = _direct_children(gh, repo, goal)
+    epics = _goal_epics(gh, repo, goal, direct)
+    wanted = [int(e.get("number") or 0) for e in epics
+              if e.get("state", "open") == "open" and not standing_epic(e)]
+    if not wanted:
+        return [(epic, []) for epic in epics]
+    open_tickets = [i for i in gh.paginate(
+        "/repos/%s/issues?labels=loom:ticket&state=open&per_page=100" % repo)
+        if isinstance(i, dict) and "pull_request" not in i]
+    subs = _sub_issue_states(gh, repo, wanted)
+    return [(epic, _tree_tickets(int(epic.get("number") or 0), subs[n], open_tickets)
+             if n in subs else [])
+            for epic, n in ((e, int(e.get("number") or 0)) for e in epics)]
+
+
+# Epics one sub-issue state query asks for; each brings up to 100 sub-issues.
+EPIC_STATES = 25
+
+
+def _sub_issue_states(gh: GitHub, repo: str, numbers: Sequence[int]
+                      ) -> Dict[int, List[Dict[str, Any]]]:
+    """Each issue's sub-issues as {"number", "state"} in GitHub's REST
+    spelling ("open", "closed"), in sub-issue order, read EPIC_STATES issues
+    to a GraphQL query. An issue with more sub-issues than one page holds is
+    read through REST, as goal_tree reads it."""
+    owner, name = repo.split("/", 1)
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    chunks = [list(numbers[i:i + EPIC_STATES]) for i in range(0, len(numbers), EPIC_STATES)]
+
+    def read(chunk: List[int]) -> Dict[str, Any]:
+        fields = " ".join("e%d: issue(number:%d) { subIssues(first:100) { totalCount "
+                          "nodes { number state } } }" % (n, n) for n in chunk)
+        data = gh.graphql("query { repository(owner:%s,name:%s) { %s } }"
+                          % (_gql(owner), _gql(name), fields)) or {}
+        return data.get("repository") or {}
+
+    for chunk, found in zip(chunks, _read_each(read, chunks), strict=True):
+        for n in chunk:
+            subs = (found.get("e%d" % n) or {}).get("subIssues") or {}
+            nodes = [x for x in subs.get("nodes") or [] if isinstance(x, dict)]
+            if int(subs.get("totalCount") or 0) > len(nodes):
+                out[n] = list(gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
+                                          % (repo, n)))
+            else:
+                out[n] = [{"number": x.get("number"), "state": str(x.get("state") or "").lower()}
+                          for x in nodes]
+    return out
+
+
 def _tree_tickets(number: int, sub: Sequence[Any], open_tickets: Sequence[Dict[str, Any]]
                   ) -> List[Dict[str, Any]]:
     """The epic's sub-issues, then the open tickets whose Part of line names
@@ -5843,14 +5901,30 @@ def _resume_repo(gh: GitHub, repo: str, goals: Sequence[GoalJournals],
     """One repo's resume reads: its goals' resume lines, printed as the repo
     finishes, and its share of each cross-repo section."""
     mine = [g for g in goals if g[0] == repo]
-    lines: List[str] = []
-    for r, issue, found, skipped in mine:
-        lines += _goal_resume_lines(gh, r, issue, found, latest, skipped, gone)
-    return {"lines": lines,
-            "sensitive": _ready_sensitive_in(gh, repo, now, check),
-            "epics": _finished_epic_lines(gh, [(r, i) for r, i, _, _ in mine]),
-            "verify": _verify_due_in(gh, repo, now),
-            "audit": audit.due(gh, [repo], trusted, now.timestamp())}
+
+    def goal_lines() -> List[str]:
+        # The open issue listing first: each open handoff item's own read is
+        # then answered from it (issue_reads), and the verify part shares it.
+        if mine:
+            _issues(gh, repo)
+        lines: List[str] = []
+        for r, issue, found, skipped in mine:
+            lines += _goal_resume_lines(gh, r, issue, found, latest, skipped, gone)
+        return lines
+
+    # The five parts read different things, so they run side by side: one
+    # after another they took the whole per-repo budget on the remote brain
+    # for quadseven/loom (loom#2078). Each answer is put back in its place,
+    # and the first exception in this order is raised, as a loop would.
+    parts: List[Tuple[str, Callable[[], Any]]] = [
+        ("lines", goal_lines),
+        ("sensitive", lambda: _ready_sensitive_in(gh, repo, now, check)),
+        ("epics", lambda: _finished_epic_lines(gh, [(r, i) for r, i, _, _ in mine])),
+        ("verify", lambda: _verify_due_in(gh, repo, now)),
+        ("audit", lambda: audit.due(gh, [repo], trusted, now.timestamp()))]
+    with ThreadPoolExecutor(max_workers=len(parts)) as pool:
+        futures = [(key, pool.submit(part)) for key, part in parts]
+        return {key: future.result() for key, future in futures}
 
 
 def _resume_tail(gh: GitHub, repos: Sequence[str], read: Dict[str, Dict[str, Any]],
@@ -5879,8 +5953,9 @@ def _finished_epic_lines(gh: GitHub, goals: Sequence[Tuple[str, Dict[str, Any]]]
                          ) -> List[str]:
     """One resume close-epic line per finished epic of `goals`."""
     out: List[str] = []
-    for repo, goal in goals:
-        _, tree = goal_tree(gh, repo, int(goal["number"]))
+    # Each goal's tree is read side by side; the lines keep the goals' order.
+    trees = _read_each(lambda g: _finishable_tree(gh, g[0], int(g[1]["number"])), goals)
+    for (repo, _), tree in zip(goals, trees, strict=True):
         for epic in finished_epics(tree):
             out.append("- resume close-epic %s#%s %s: check its done-when, then run "
                        "python3 -m bus.brain close-epic %s#%s --note TEXT, or file the "
