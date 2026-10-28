@@ -202,7 +202,7 @@ drop_run_scratch() {
   [ -z "${AGENT_HOME:-}" ] || rm -rf "$AGENT_HOME"
   [[ "${TICKET:-}" =~ ^[A-Za-z0-9._-]+$ ]] && [ -n "${WORKDIR:-}" ] || return 0
   local f
-  for f in "" -default-check .answers .described-step .final-message .no-change.md .opencode-events .run.md .summary.md; do
+  for f in "" -default-check .answers .described-step .final-message .last-message .no-change.md .opencode-events .run.md .summary.md; do
     rm -rf "${WORKDIR:?}/$TICKET$f"
   done
 }
@@ -242,19 +242,24 @@ drop_build_output() {
 # a stamp left by a runner killed hard goes stale after the station's window.
 # The stamp is no heartbeat: it says nothing of availability, so a busy lane
 # is not offered more work and no limit or hold is hidden.
+# The loop sleeps through `wait` so a TERM ends it at once, and the runner
+# waits for it to exit before removing the stamp: a loop still mid-write
+# after the remove left the stamp behind.
 ALIVE="$LOOM_HOME/state/usage/$SLOT.alive"
 KEEPALIVE_PID=""
 keepalive_loop() {
-  local parent="$1" every="${LOOM_KEEPALIVE_SECONDS:-60}" tmp="$ALIVE.$1"
+  local parent="$1" every="${LOOM_KEEPALIVE_SECONDS:-60}" tmp="$ALIVE.$1" sleeper=""
   [[ "$every" =~ ^[1-9][0-9]*$ ]] || every=60
+  trap '[ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null; rm -f "$tmp"; exit 0' TERM
   while kill -0 "$parent" 2>/dev/null; do
     date +%s > "$tmp" 2>/dev/null && mv -f "$tmp" "$ALIVE" 2>/dev/null
-    sleep "$every"
+    sleep "$every" & sleeper=$!
+    wait "$sleeper"
   done
   rm -f "$tmp"
 }
 stop_keepalive() {
-  [ -z "$KEEPALIVE_PID" ] || { pkill -P "$KEEPALIVE_PID" 2>/dev/null; kill "$KEEPALIVE_PID" 2>/dev/null; }
+  [ -z "$KEEPALIVE_PID" ] || { kill "$KEEPALIVE_PID" 2>/dev/null; wait "$KEEPALIVE_PID" 2>/dev/null; }
   rm -f "$ALIVE"
 }
 mkdir -p "$LOOM_HOME/state/usage"
@@ -899,23 +904,30 @@ NO_REASON="agent made no commit and wrote no reason"
 FINAL_SAID_MAX=600
 
 # What the agent said last, for a run that committed nothing and wrote no
-# summary (loom#1362): the end of the run's output, without the provider's
-# work events (RUN_OUTPUT), as one ASCII line cut to FINAL_SAID_MAX, through
+# summary (loom#1362), as one ASCII line cut to FINAL_SAID_MAX, through
 # checked_text. Sets FINAL_SAID, empty when the agent said nothing or its words
-# were refused. The agent CLI's own log lines and the runner's timestamped
+# were refused, and FINAL_SAID_DUMP=1 when the run's output ended on a tool's
+# output alone. bus/final_said.py picks the words: the codex final-message
+# file, then the last text event of an opencode run, then the end of the
+# run's output (RUN_OUTPUT) with escape sequences removed and only the prose
+# after the last line that reads like a file or a command's output. On
+# 2026-10-25 five parks quoted a source comment, a git config, a test
+# assertion and a colored permission prompt as the agent's reason
+# (loom#1799). The agent CLI's own log lines and the runner's timestamped
 # lines are left out: retried stream errors once filled the whole quote.
 # Local paths read <path>: an agent naming the file its sandbox refused
 # failed the text checks, and ten agy runs on 2026-10-24 read "wrote no
 # reason" (loom#1736).
 FINAL_SAID_SKIP_RE='^timestamp=[^ ]+ level=[A-Z]+ |^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z\] '
 final_said() {
-  local file="$WORKDIR/$TICKET.final-message" line
-  FINAL_SAID=""
-  line="$(printf '%s\n' "$RUN_OUTPUT" | { grep -vE "$FINAL_SAID_SKIP_RE" || true; } | tail -n 20 | LC_ALL=C tr -cd '\11\12\40-\176' |
-          tr -s ' \t\n' ' ' | sed 's/^ //; s/ $//')"
-  [ -n "$line" ] || return 0
-  line="$(printf '%s' "$line" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
-    'import sys; from bus.text import LOCAL_PATH_RE; sys.stdout.write(LOCAL_PATH_RE.sub("<path>", sys.stdin.read()))')" || return 0
+  local file="$WORKDIR/$TICKET.final-message" line status
+  FINAL_SAID="" FINAL_SAID_DUMP=""
+  line="$(printf '%s\n' "$RUN_OUTPUT" | { grep -vE "$FINAL_SAID_SKIP_RE" || true; } | tail -n 20 |
+          PYTHONPATH="$REPO_ROOT" python3 -B -m bus.final_said \
+            --message "$WORKDIR/$TICKET.last-message" --events "$WORKDIR/$TICKET.opencode-events" 2>> "$LOG")"
+  status=$?
+  [ "$status" -ne 3 ] || { FINAL_SAID_DUMP=1; return 0; }
+  [ "$status" -eq 0 ] && [ -n "$line" ] || return 0
   [ "${#line}" -le "$FINAL_SAID_MAX" ] || line="${line:0:FINAL_SAID_MAX}..."
   printf '%s\n' "$line" > "$file"
   FINAL_SAID="$(checked_text "$file" 2>> "$LOG")" || FINAL_SAID=""
@@ -952,6 +964,25 @@ no_change_reason() {
   [ -z "$NO_CHANGE_WHY" ]
 }
 
+# Label the ticket loom:answered. gh refuses a label its repo lacks ("'X'
+# not found"), and a repo enrolled after the station's last label sync lacked
+# loom:answered, so an answer was posted and its ticket left with no state
+# (loom#2032). On a failure, create each Loom label the edit names from the
+# canonical set (bus/labels.py; one that exists already is left as it is)
+# and retry once.
+mark_answered() {
+  local names=(loom:answered loom:running loom:briefed loom:queued) name spec
+  timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered \
+    --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1 && return 0
+  for name in "${names[@]}"; do
+    spec="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.labels spec "$name" 2>> "$LOG")" || return 1
+    timeout "$NET_TIMEOUT" gh label create "$name" -R "$REPO" --color "${spec%%$'\t'*}" \
+      --description "${spec#*$'\t'}" >> "$LOG" 2>&1 || true
+  done
+  timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered \
+    --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1
+}
+
 # Hand an answered run's reason and its thread answers to whoever reports
 # it. The reason goes into the .answered marker. A station brief (an `Issue:
 # OWNER/NAME#N` line) is reported by the station, which records the reason as
@@ -968,7 +999,7 @@ post_no_change() {
     if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$NO_CHANGE_TEXT" >> "$LOG" 2>&1; then
       echo "answer comment failed"; return 1
     fi
-    if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
+    if ! mark_answered; then
       echo "answer posted but ticket label update failed"; return 1
     fi
   fi
@@ -3010,6 +3041,8 @@ run_agent() {
 Do not search the whole filesystem (for example, find /). Search within the checkout and read the repository's build files to learn how it builds and tests."
   fi
   AGENT_EXTRA_ENV=""
+  AGENT_LAST_MESSAGE=""
+  [ "$LANE" = codex ] && AGENT_LAST_MESSAGE="$WORKDIR/$TICKET.last-message"
   agent_uv_cache
   is_api_lane && fresh_agent_home
   case "$LANE" in
@@ -3432,7 +3465,7 @@ for BRIEF in "$INBOX"/*.md; do
 
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
-  rm -f "$WORKDIR/$TICKET.described-step" "$WORKDIR/$TICKET.opencode-events"
+  rm -f "$WORKDIR/$TICKET.described-step" "$WORKDIR/$TICKET.opencode-events" "$WORKDIR/$TICKET.last-message"
   rm -f "$LOGDIR/$TICKET.answered" "$LOGDIR/$TICKET.answered.tmp" "$LOGDIR/$TICKET.pushed"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
@@ -3624,7 +3657,7 @@ for BRIEF in "$INBOX"/*.md; do
     if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$ANSWER_TEXT" >> "$LOG" 2>&1; then
       park "$BRIEF" "answer comment failed" transient; continue
     fi
-    if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
+    if ! mark_answered; then
       park "$BRIEF" "answer posted but ticket label update failed" transient; continue
     fi
     echo "[$(date -u +%FT%TZ)] $TICKET done, answer posted" >> "$LOG"
@@ -3857,6 +3890,9 @@ for BRIEF in "$INBOX"/*.md; do
       final_said
       if [ -n "$FINAL_SAID" ]; then
         park "$BRIEF" "agent made no commit; it said: $FINAL_SAID (on $BRANCH)"; continue
+      fi
+      if [ -n "$FINAL_SAID_DUMP" ]; then
+        park "$BRIEF" "$NO_REASON: the agent ended without explaining why, on a tool's output; see the run log (on $BRANCH)"; continue
       fi
       park "$BRIEF" "$NO_REASON on $BRANCH"; continue
     fi
