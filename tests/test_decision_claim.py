@@ -6,13 +6,18 @@ loom:human ask. These tests hold the guard in the brain's write path.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
+import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from bus import __main__ as cli  # noqa: E402
 from bus import answer, brain, decision_claim, journal  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
@@ -133,6 +138,45 @@ class CloseCitingADecision(unittest.TestCase):
         close(fake, CLAIM)
         self.assertIn(("PATCH", "/repos/%s/issues/9" % REPO), fake.wrote())
 
+    def test_a_decision_heading_in_the_issue_body_counts(self):
+        cases = (("## Decision (example-op, 2030-01-01)\nClose it.", False),
+                 ("## Decision (example-op, 2030-01-02)\nClose it.", False),
+                 ("## Decision (example-op, 2029-12-31)\nClose it.", True),
+                 ("## Decision (example-stranger, 2030-01-01)\nClose it.", True),
+                 ("## Decision (example-brain[bot], 2030-01-01)\nClose it.", True))
+        for body, refused in cases:
+            with self.subTest(body=body):
+                issue = {"state": "open", "body": body, "labels": [{"name": "loom:ticket"}]}
+                fake = Fake(comments={(REPO, 9): [ASK]}, issue=issue)
+                if refused:
+                    with self.assertRaises(decision_claim.DecisionNotRecorded):
+                        close(fake, CLAIM)
+                    self.assertEqual(fake.wrote(), [])
+                else:
+                    close(fake, CLAIM)
+                    self.assertIn(("PATCH", "/repos/%s/issues/9" % REPO), fake.wrote())
+
+    def test_a_person_taking_the_ask_label_off_after_the_ask_is_an_answer(self):
+        off = {"event": "unlabeled", "actor": PERSON, "label": {"name": "loom:human"},
+               "created_at": "2030-01-01T20:00:00Z"}
+        cases = ((off, False), (dict(off, label={"name": "needs:example-op"}), False),
+                 (dict(off, actor=APP), True), (dict(off, event="labeled"), True),
+                 (dict(off, created_at="2030-01-01T09:00:00Z"), True))
+        for event, refused in cases:
+            with self.subTest(event=event):
+                fake = Fake(comments={(REPO, 9): [ASK]}, events={(REPO, 9): [event]})
+                if refused:
+                    with self.assertRaises(decision_claim.DecisionNotRecorded):
+                        close(fake, CLAIM)
+                else:
+                    close(fake, CLAIM)
+
+    def test_a_named_login_claim_with_no_record_is_refused(self):
+        fake = Fake(comments={(REPO, 9): [ASK]})
+        with self.assertRaises(decision_claim.DecisionNotRecorded):
+            close(fake, "Dropped: example-op decided to drop it.")
+        close(Fake(comments={(REPO, 9): [ASK]}), "Dropped: upstream decided to drop it.")
+
     def test_a_dashboard_answer_naming_a_login_that_is_not_an_operator_does_not_count(self):
         # The operators come from env (LOOM_BRIEF_AUTHORS' person logins):
         # an App-posted answer naming anyone else is not an operator's.
@@ -160,10 +204,26 @@ class OtherWritePaths(unittest.TestCase):
                          ["example-brain[bot]"])
         self.assertEqual(fake.wrote(), [])
 
+    def test_the_journal_command_says_not_posted_for_an_unrecorded_decision(self):
+        fake = Fake(comments={(REPO, 9): [ASK]})
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "j.md")
+            with open(path, "w") as fh:
+                fh.write("Closed it per the operator decision.\n")
+            with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-op"}), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                code = cli.main(["journal", REPO + "#9", "--file", path, "--holder", "muse"],
+                                gh=GitHub("t", transport=fake))
+        self.assertEqual(code, 2)
+        self.assertTrue(out.getvalue().startswith("not posted: the text claims"), out.getvalue())
+        self.assertEqual(fake.wrote(), [])
+
     def test_a_move_note_and_an_epic_close_note_are_guarded(self):
         fake = Fake(comments={(REPO, 9): [ASK]})
         with self.assertRaises(decision_claim.DecisionNotRecorded):
-            brain.move(GitHub("t", transport=fake), REPO, 9, "briefed", note="example-op decided to restart it")
+            brain.move(GitHub("t", transport=fake), REPO, 9, "briefed",
+                       note="Restarted per the operator decision.")
         with self.assertRaises(decision_claim.DecisionNotRecorded):
             brain.close_epic(GitHub("t", transport=fake), REPO, 9, "Done per the owner's decision.")
         self.assertEqual(fake.wrote(), [])
@@ -172,11 +232,11 @@ class OtherWritePaths(unittest.TestCase):
 class Claims(unittest.TestCase):
     def test_phrasings_that_claim_a_person_decided(self):
         for said in ("Done by the brain per the operator decision: closed.",
-                     "per example-op's decision", "Alex decided to drop it.",
+                     "per example-op's decision", "example-op decided to drop it.",
                      "The operator decided.", "operator decision recorded on #5",
-                     "the owner has approved it", "following the maintainer's ruling"):
+                     "the owner has approved it", "following the owner's ruling"):
             with self.subTest(said=said):
-                self.assertTrue(decision_claim.claim(said))
+                self.assertTrue(decision_claim.claim(said, ["example-op"]))
 
     def test_text_that_claims_no_person_decided(self):
         for said in (OWN, "Waiting on an operator decision on #3.",
@@ -185,7 +245,25 @@ class Claims(unittest.TestCase):
                      "Awaiting a decision by the operator.", "codex decided to rename it",
                      "needs a decision from the operator"):
             with self.subTest(said=said):
+                self.assertEqual(decision_claim.claim(said, ["example-op"]), "")
+
+    def test_a_named_subject_is_a_claim_only_when_it_is_an_operator_or_trusted_login(self):
+        for said in ("Upstream decided to drop the flag.", "Pulumi decided to replace it.",
+                     "The PR author decided to split it.", "Dependabot decided to bump it.",
+                     "The user confirmed the fix works.", "per upstream's decision",
+                     "Alex decided to drop it."):
+            with self.subTest(said=said):
+                self.assertEqual(decision_claim.claim(said, ["example-op"]), "")
+        self.assertTrue(decision_claim.claim("example-op decided to drop it.", ["example-op"]))
+
+    def test_a_ruling_cited_from_a_repo_doc_is_not_a_ticket_claim(self):
+        for said in ("Closed per the operator ruling in docs/MUSE.md step 6.",
+                     "Per the operator's ruling of 2026-10-20 in docs, the brain closes it.",
+                     "Held per the owner's decision in BRAIN.md."):
+            with self.subTest(said=said):
                 self.assertEqual(decision_claim.claim(said), "")
+        # A doc named in a later sentence does not excuse the claim.
+        self.assertTrue(decision_claim.claim("Closed per the operator decision. See docs/MUSE.md."))
 
     def test_the_guarded_phrase_list_lives_in_one_place(self):
         self.assertTrue(decision_claim.CLAIM_PATTERNS)

@@ -2845,6 +2845,10 @@ def _journal_brief_done(gh: GitHub, repo: str, goal: int, holder: str, line: str
         # Into the holder's journal of the day, edited in place (bus/journal.py).
         from . import journal
         journal.post(gh, repo, goal, body, holder)
+    except decision_claim.DecisionNotRecorded as exc:
+        raise decision_claim.DecisionNotRecorded(
+            "filed %s, but its brief done marker was not posted (%s); put this line, "
+            "worded as the brain's own judgment, in your journal: %s" % (url, exc, line)) from exc
     except GitHubError as exc:
         raise GitHubError("filed %s, but its brief done marker was not posted (%s); put this "
                           "line in your journal: %s" % (url, exc, line), exc.status, exc.body) from exc
