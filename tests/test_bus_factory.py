@@ -1728,7 +1728,8 @@ class LeakScanText(Base):
     def test_a_body_only_failure_edits_the_body_and_sends_nothing_to_the_lane(self):
         self.leaky(BODY_ONLY)
         self.gh.attempts["77"] = 1
-        self.go()
+        with mock.patch("bus.factory._say") as say:
+            self.go()
         self.assertEqual(self.fixed, [])
         self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
         self.assertEqual(len(self.pr_edits()), 1)
@@ -1743,6 +1744,8 @@ class LeakScanText(Base):
         # The comment names lines, never the flagged text.
         self.assertNotIn("other-repo", note)
         self.assertNotIn("build-box", note)
+        say.assert_any_call("rewrote 2 flagged line(s) of %s#50's text after the leak scan failed on its text"
+                            % REPO)
 
     def test_a_diff_failure_still_goes_back_to_the_lane(self):
         self.leaky(leak_log(diff_hits=[(10, "private-issue-ref")],
@@ -1751,14 +1754,19 @@ class LeakScanText(Base):
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
         self.assertEqual(self.pr_edits(), [])
 
-    def test_a_second_failure_on_the_same_head_is_not_edited_again(self):
+    def test_a_repeated_text_failure_is_held_for_the_brain_with_its_location(self):
         self.leaky(BODY_ONLY)
         self.go()
         self.assertEqual(len(self.pr_edits()), 1)
         self.gh.pulls[50]["body"] = LEAK_BODY
         self.go()
         self.assertEqual(len(self.pr_edits()), 1)
-        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.fixed, [])
+        self.assertIn("needs-brain", factory._labels(self.gh.issues[5]))
+        notes = [c["body"] for c in self.gh.comments[5]
+                 if factory.BODY_LEAK_HOLD_MARKER % "sha50" in c["body"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("line 4 (private-issue-ref)", notes[0])
 
     def test_another_failing_check_goes_back_to_the_lane(self):
         self.leaky(BODY_ONLY)

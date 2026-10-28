@@ -3649,6 +3649,24 @@ class StuckFixRoundTest(unittest.TestCase):
         self.assertEqual(self.names(), ["loom:ticket", "loom:pr", "lane:spark"])
         self.assertEqual(len(self.rounds()), 1)
 
+    def test_a_text_only_leak_scan_failure_is_left_for_the_factorys_body_repair(self):
+        log = ["--- PR diff ---", "leak guard: clean (9 shape patterns, deny-list not configured, 4 lines scanned)",
+               "--- title and body ---", "BLOCKED: private infrastructure identifiers found",
+               "  text.md:3  [private-hostname] 'x' - why"]
+        self.run_hand_back(checks=[("leak-scan / Scan diff and PR text", "\n".join(log))])
+        self.assertEqual(self.rounds(), [])
+        self.assertFalse(any(path.endswith("/pulls/7") for _, path, _ in self.gh.writes))
+        self.assertEqual([x["name"] for x in self.gh.issue["labels"]],
+                         ["loom:ticket", "loom:pr", "lane:spark"])
+
+    def test_a_diff_leak_scan_failure_still_opens_a_fix_round(self):
+        log = ["--- PR diff ---", "BLOCKED: private infrastructure identifiers found",
+               "  web/staged.js:3  [private-hostname] 'x' - why",
+               "--- title and body ---",
+               "leak guard: clean (9 shape patterns, deny-list not configured, 4 lines scanned)"]
+        self.run_hand_back(checks=[("leak-scan / Scan diff and PR text", "\n".join(log))])
+        self.assertEqual(len(self.rounds()), 1)
+
     def test_a_plan_check_failing_again_beside_a_new_failure_is_not_stuck(self):
         self.last_round("### Check: %s\n\n    0 non-empty bullets" % factory.DEFAULT_PLAN_CHECK)
         self.run_hand_back(checks=[(factory.DEFAULT_PLAN_CHECK, "0 non-empty bullets"),
