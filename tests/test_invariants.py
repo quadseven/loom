@@ -70,6 +70,8 @@ class FakeGH:
         self.tickets = {}
         # Issues GitHub refuses a further sub-issue under (HTTP 422).
         self.refuse_subs = set()
+        # Repos whose open pull request listing answers an error.
+        self.pull_errors = set()
 
     def paginate(self, path):
         self.calls.append(("GET", path))
@@ -150,6 +152,8 @@ class FakeGH:
                 raise GitHubError("Not Found", 404)
             return Response(200, dict(pull, number=int(m.group(2))))
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls\?state=open&per_page=100", path)
+        if m and m.group(1) in self.pull_errors:
+            raise GitHubError("Bad Gateway", 502)
         if m:
             return Response(200, self.pulls.get(m.group(1), []))
         m = re.match(r"/repos/[^/]+/[^/]+/commits/([0-9a-f]+)/check-runs\?", path)
@@ -813,6 +817,35 @@ class SettledSubjectTest(StationBase):
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "open", self.said)
         self.assertNotIn(("GET", "/repos/%s/pulls/660" % REPO), self.gh.calls)
+
+    def test_a_repo_whose_pull_requests_cannot_be_read_keeps_its_tracking_issue(self):
+        """One repo's open pull requests answer an error: its tracking issue
+        is not emptied or closed, and the other repo's still updates."""
+        self.lane_ticket(602)
+        self.lane_pull(660, 602, T0 - 7 * 3600)
+        self.lane_ticket(603)
+        self.gh.pulls[OTHER] = [{"number": 770, "created_at": stamp(T0 - 7 * 3600),
+                                 "head": {"ref": "loom/603-thing", "sha": "abc770"},
+                                 "labels": [], "user": {"login": AUTHOR}}]
+        self.bot_threads(2)
+        self.run_at(T0)
+        rolled = {i["title"]: i for i in self.breaches()}
+        self.assertEqual(len(rolled), 2, sorted(rolled))
+        (own,) = [i for t, i in rolled.items() if t.endswith(REPO)]
+        (hidden,) = [i for t, i in rolled.items() if "private repo" in t]
+        body = hidden["body"]
+        self.assertIn("pull request 770 of a private repo", body)
+        # The private repo's listing fails from now on; #660 merges.
+        self.gh.pull_errors.add(OTHER)
+        self.gh.pulls[REPO] = []
+        self.gh.pull_state[(REPO, 660)] = {"state": "closed", "merged_at": stamp(T0 + 60)}
+        for n in range(1, 5):
+            self.run_at(T0 + n * invariants.CLEAR_AFTER)
+        self.assertEqual(hidden["body"], body)
+        self.assertEqual(hidden["state"], "open")
+        self.assertNotIn((REPO, hidden["number"]), self.gh.comments)
+        self.assertIn(invariants.ROLL_NONE, own["body"])
+        self.assertEqual(own["state"], "closed", self.said)
 
     def test_an_epic_back_at_its_cap_closes_its_old_issue(self):
         filed = self.legacy("epic-over-cap", "%s#40" % REPO)
@@ -1570,32 +1603,63 @@ class RolledKindTest(unittest.TestCase):
         self.assertEqual(self.gh.comments, {})
         self.assertEqual(self.gh.issues[number]["state"], "open")
 
-    def test_a_cleared_kind_says_none_then_closes_once_and_reopens_the_same_issue(self):
+    def test_a_cleared_kind_says_none_then_closes_after_the_clear_wait_and_reopens(self):
+        self.clear_and_return()
+
+    def clear_and_return(self):
+        """Clear, wait, close, return: the tracking issue's number and when."""
         self.file(self.stalled([self.pull(201)]))
         (number,) = self.gh.issues
         issue = self.gh.issues[number]
         self.file([], now=T0 + 300)
         self.assertIn(invariants.ROLL_NONE, issue["body"])
+        self.assertIn("Clear since %s." % stamp(T0 + 300), issue["body"])
         self.assertNotIn("#201", issue["body"])
-        self.assertEqual(issue["state"], "open")
         self.assertEqual(self.gh.comments, {})
-        # Clear for a full pass: it closes with one line.
-        self.file([], now=T0 + 600)
+        # Empty for passes, but short of CLEAR_AFTER: open, nothing written.
+        writes = len(self.gh.writes)
+        for at in (T0 + 600, T0 + 300 + invariants.CLEAR_AFTER - 60):
+            self.file([], now=at)
+        self.assertEqual(issue["state"], "open")
+        self.assertEqual(len(self.gh.writes), writes)
+        # Clear for CLEAR_AFTER: it closes with one line.
+        closed_at = T0 + 300 + invariants.CLEAR_AFTER
+        self.file([], now=closed_at)
         self.assertEqual(issue["state"], "closed")
         self.assertEqual(issue["state_reason"], "not_planned")
         (note,) = self.gh.comments[(REPO, number)]
-        self.assertIn(invariants.CLEARED_TEXT, note["body"])
+        self.assertIn(invariants.CLEARED_TEXT + stamp(closed_at), note["body"])
         # Still clear: nothing more is written.
         writes = len(self.gh.writes)
-        self.file([], now=T0 + 900)
+        self.file([], now=closed_at + 300)
         self.assertEqual(len(self.gh.writes), writes)
         # A violation returns: the same issue reopens with the new list.
-        issue["closed_at"] = stamp(T0 + 600)
-        self.file(self.stalled([self.pull(205)], now=T0 + 1200), now=T0 + 1200)
+        issue["closed_at"] = stamp(closed_at)
+        back = closed_at + 600
+        self.file(self.stalled([self.pull(205)], now=back), now=back)
         self.assertEqual(list(self.gh.issues), [number])
         self.assertEqual(issue["state"], "open")
         self.assertIn("#205", issue["body"])
         self.assertNotIn(invariants.ROLL_NONE, issue["body"])
+        return number, back
+
+    def test_a_second_clear_edits_the_one_cleared_note_and_it_reopens_again(self):
+        number, back = self.clear_and_return()
+        issue = self.gh.issues[number]
+        self.file([], now=back + 300)
+        again = back + 300 + invariants.CLEAR_AFTER
+        self.file([], now=again)
+        self.assertEqual(issue["state"], "closed")
+        notes = [c["body"] for c in self.gh.comments[(REPO, number)]
+                 if invariants.CLEARED_TEXT in c["body"]]
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn(invariants.CLEARED_TEXT + stamp(again), notes[0])
+        # The edited note is newer than the reopen note: a third return
+        # reopens the issue again.
+        issue["closed_at"] = stamp(again)
+        self.file(self.stalled([self.pull(206)], now=again + 600), now=again + 600)
+        self.assertEqual(issue["state"], "open", self.said)
+        self.assertIn("#206", issue["body"])
 
     def test_a_pass_that_could_not_read_the_facts_leaves_the_list_alone(self):
         self.file(self.stalled([self.pull(201)]))
@@ -1658,6 +1722,35 @@ class RolledKindTest(unittest.TestCase):
             "body": "%s\nOld.\n\nPart of #%d" % (invariants.MARKER % key, GOAL),
             "labels": [{"name": n} for n in (labels or invariants.LABELS)]}
         return self.gh.issues[number]
+
+    def test_an_old_issue_folds_only_into_its_own_repos_tracking_issue(self):
+        private = self.legacy(61)
+        private["title"] = "Lane pull request 2440 of a private repo open 32.9 hours: x"
+        public = self.legacy(62)
+        public["title"] = "Lane pull request 1527 of %s open 13.3 hours: x" % self.PUBLIC
+        # Only the factory repo has a stalled pull request this pass.
+        self.file(self.stalled([self.pull(201)]))
+        (rolled,) = self.rolled()
+        # The private one's repo cannot be told: closed with a note naming
+        # no tracking issue, and not folded into the factory repo's.
+        self.assertEqual(private["state"], "closed")
+        (note,) = self.gh.comments[(REPO, 61)]
+        self.assertIn(invariants.RETIRED_TEXT, note["body"])
+        self.assertNotIn("#%d" % rolled, note["body"])
+        self.assertNotIn("Folded", note["body"])
+        # The public repo has no tracking issue open: left to the clear rule.
+        self.assertEqual(public["state"], "open")
+        self.assertNotIn((REPO, 62), self.gh.comments)
+        # Its repo breaks too: it folds into that repo's issue, not the other.
+        later = T0 + 300
+        self.file(self.stalled([self.pull(201),
+                                self.pull(301, self.PUBLIC)], now=later), now=later)
+        mine = [n for n, i in self.rolled().items() if i["title"].endswith(self.PUBLIC)]
+        self.assertEqual(len(mine), 1)
+        self.assertEqual(public["state"], "closed")
+        (note,) = self.gh.comments[(REPO, 62)]
+        self.assertIn("Folded into #%d" % mine[0], note["body"])
+        self.assertNotIn("lists this subject", note["body"])
 
     def test_migration_folds_old_per_violation_issues_a_few_a_pass_with_a_pointer(self):
         old = [self.legacy(n) for n in (51, 52, 53)]

@@ -1213,17 +1213,24 @@ check's completion, else when the station first saw it, kept in
 `invariants.json` under `seen`), and a "Last checked" line. The station
 rewrites the body only when the list changes: an unchanged list, or only a
 newer check time, writes nothing. When a kind's list empties, the next pass
-rewrites it to "Current violations: none."; if it is still empty a pass later
-the issue closes as not planned with one line; a violation that returns
-reopens that same issue (the one "Broken again" note, edited in place), so
-the kind keeps one stable issue number. A pass that could not read a kind's
-facts (the lane pull requests, the plan checks, the goal shapes) leaves its
-tracking issue as it is. Closing it rather than leaving it
+rewrites it to "Current violations: none." with a "Clear since" time; once it
+has said none for 6 hours (`CLEAR_AFTER`) the issue closes as not planned
+with one cleared note, which a later clear edits in place rather than posting
+again; a violation that returns reopens that same issue (the one "Broken
+again" note, edited in place), so the kind keeps one stable issue number. A
+pass that could not read a kind's facts (the lane pull requests, the plan
+checks, the goal shapes) leaves its tracking issue as it is, and so does a
+pass that could not read one repo's open pull requests for that repo's
+lane-pr-stalled issue: the other repos' issues still update. Closing it rather than leaving it
 open keeps an empty list from holding a goal out of quiet (docs/BRAIN.md).
 The per-violation issues these kinds filed before this fold into the
-tracking issue of their kind as the station meets them: closed as not
-planned with one "Folded into #N" comment, at most `FOLD_MAX` (2) a pass and
-within the pass's 5 writes, so the migration cannot spend the GitHub budget.
+tracking issue of their kind and their own subject repo (from the subject the
+station kept, else the repo the old title names) as the station meets them:
+closed as not planned with one "Folded into #N" comment. One whose repo
+cannot be told (a private repo the title names in words) folds into no
+tracking issue: it closes with a note that names none. At most `FOLD_MAX`
+(2) old issues close a pass, within the pass's 5 writes, so the migration
+cannot spend the GitHub budget.
 One rewritten into a `loom:ticket` is work the factory carries and is never
 folded, nor is one asking an operator (`needs:<login>`); every other kind,
 `lane-no-success` with its per-lane keys for the dead-lane release included,

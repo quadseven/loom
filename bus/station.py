@@ -9898,7 +9898,7 @@ class Station:
             invariants.Filer(self.gh, goal[0], goal[1], issues, self.now, _say,
                              write=not self._deferred(), authors=self.s.authors,
                              subjects=subjects, seen=seen,
-                             read=invariants.read_kinds(facts),
+                             read=invariants.read_kinds(facts), unread=facts.unread,
                              settled=lambda inv, subject: self._invariant_settled(
                                  facts, inv, subject)).run(breaches)
         invariants.save(path, state)
@@ -10113,6 +10113,7 @@ class Station:
             _say("invariants: could not read the plan checks: %s" % err)
         try:
             facts.lane_pulls = self._invariant_lane_pulls()
+            facts.unread = {"lane-pr-stalled": tuple(self._lane_pulls_unread)}
         except RateLimited:
             raise
         except (GitHubError, OSError) as err:
@@ -10236,9 +10237,12 @@ class Station:
         """The open lane pull requests the stalled invariant reads: trusted, on
         a loom/ branch and opened over invariants.PR_STALLED ago (loom#715).
         A pull request that cannot be read is logged and skipped, so one
-        unreadable repo or ticket costs that pull request and no other."""
+        unreadable repo or ticket costs that pull request and no other; each
+        such repo is kept in self._lane_pulls_unread, and its tracking issue
+        is left as it is this pass (loom#2099)."""
         authors = {a.lower() for a in self.s.authors}
         out: List[invariants.LanePull] = []
+        self._lane_pulls_unread: List[str] = []
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
                 continue
@@ -10248,6 +10252,7 @@ class Station:
                 raise
             except GitHubError as err:
                 _say("invariants: could not read the open pull requests of %s: %s" % (repo, err))
+                self._lane_pulls_unread.append(repo)
                 continue
             for pr in pulls:
                 at = self._stalled_since(pr, authors)
@@ -10260,6 +10265,8 @@ class Station:
                 except GitHubError as err:
                     _say("invariants: left out pull request %s#%s, unreadable: %s"
                          % (repo, pr.get("number"), err))
+                    if repo not in self._lane_pulls_unread:
+                        self._lane_pulls_unread.append(repo)
         return out
 
     def _stalled_since(self, pr: Dict[str, Any], authors: set) -> Optional[float]:
