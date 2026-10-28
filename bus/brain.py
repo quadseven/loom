@@ -18,7 +18,8 @@ from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, a
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
 from . import answer, ci_facts, ci_gap, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
-from .status import add as add_status_event, is_status as is_status_comment, parse as parse_status_events
+from .status import (add as add_status_event, is_status as is_status_comment,
+                     parse as parse_status_events, strip_body as strip_status_body)
 from .labels import HANDOFF, LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
@@ -1666,6 +1667,11 @@ _SIZE_RE = re.compile(r"^(?:#+[ \t]*)?Size\b", re.M | re.I)
 EPIC_TITLE_PREFIX = naming.EPIC_WORD
 EPIC_TITLE_MAX = naming.TITLE_MAX
 INTAKE_TITLE = "Epic: work that triage, rewrites and health intake find"
+# Each new intake epic carries a batch number no open epic of its repo uses,
+# so no two open intake epics share a title (loom#2030): five once did, and
+# rewrites and people picking by title split tickets across all five.
+INTAKE_BATCH_TITLE = INTAKE_TITLE + ", batch %d"
+_INTAKE_BATCH_RE = re.compile(r"^%s, batch (\d+)$" % re.escape(INTAKE_TITLE))
 INTAKE_BODY = (
     "Done when: this intake epic holds %d tickets, or every ticket in it is closed; "
     "the next intake opens a new epic.\n\n"
@@ -1692,6 +1698,32 @@ REPAIRS_BATCH_BODY = (
     "Size: at most %d tickets.\n\n"
     "The goal's standing factory repairs epic holds GitHub's limit of 100 sub-issues, "
     "so the station files new factory repairs in batch epics like this one.\n")
+
+
+def intake_batch(title: Any) -> Optional[int]:
+    """The batch number of an intake epic's title: 0 for the unnumbered title
+    intake epics carried before loom#2030, None for any other title."""
+    title = " ".join(str(title or "").split())
+    if title == INTAKE_TITLE:
+        return 0
+    match = _INTAKE_BATCH_RE.match(title)
+    return int(match.group(1)) if match else None
+
+
+def is_intake_epic(epic: Dict[str, Any]) -> bool:
+    """An intake epic by its title, numbered or not."""
+    return intake_batch(epic.get("title")) is not None
+
+
+def next_intake_title(gh: GitHub, repo: str) -> str:
+    """The title of a new intake epic: a batch number one past the highest
+    any open epic of the repo carries, so it is used by none of them
+    (loom#2030)."""
+    used = [intake_batch(i.get("title"))
+            for i in gh.paginate("/repos/%s/issues?labels=epic&state=open&per_page=100" % repo)
+            if isinstance(i, dict) and "pull_request" not in i
+            and i.get("state", "open") == "open" and _epic_label(i)]
+    return INTAKE_BATCH_TITLE % (max([n for n in used if n is not None] + [0]) + 1)
 
 
 def standing_epic(epic: Dict[str, Any]) -> bool:
@@ -1756,7 +1788,7 @@ def open_epic(gh: GitHub, repo: str, epic: int
                          % (epic, goal)) from None
     if standing_epic(issue):
         held = 0
-    elif str(issue.get("title") or "") == INTAKE_TITLE:
+    elif is_intake_epic(issue):
         held = _open_count(_epic_tickets(gh, repo, epic))
     else:
         held = len(_epic_tickets(gh, repo, epic))
@@ -1877,11 +1909,12 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1) -> int:
     _, tree = goal_tree(gh, repo, goal)
     roomy = [int(found["number"]) for found, held in tree
              if found.get("state", "open") == "open"
-             and str(found.get("title") or "") == INTAKE_TITLE
+             and is_intake_epic(found)
              and _open_count(held) + room <= EPIC_TICKET_CAP]  # goal_tree already read its tickets
     if roomy:
         return max(roomy)
-    made = file_epic(gh, repo, goal, INTAKE_TITLE, INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP))
+    made = file_epic(gh, repo, goal, next_intake_title(gh, repo),
+                     INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP))
     if not made.get("number"):
         raise ValueError("GitHub named no number for the new intake epic of goal #%d" % goal)
     return int(made["number"])
@@ -1996,7 +2029,7 @@ def _intake_with_room(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
     holds; (None, 0) when no intake epic has room."""
     roomy = [(int(epic["number"]), _open_count(held)) for epic, held in tree
              if epic.get("state", "open") == "open"
-             and str(epic.get("title") or "") == INTAKE_TITLE
+             and is_intake_epic(epic)
              and _open_count(held) < EPIC_TICKET_CAP]
     return max(roomy) if roomy else (None, 0)
 
@@ -2526,7 +2559,7 @@ def _rewrite_in_place(gh: GitHub, repo: str, source: Dict[str, Any], epic: int,
     names = _ticket_labels(gh, repo, new, lane)
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"title": title, "body": new})
     gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": names})
-    if not _link_to_goal(gh, repo, epic, source, under=goal):
+    if _sub_issue_parent(source) != epic and not _link_to_goal(gh, repo, epic, source, under=goal):
         print("#%d is linked to epic #%d by its Part of line" % (number, epic), file=sys.stderr)
     for name in ("loom:triage", "needs-brain"):
         if name in _labels(source):
@@ -2729,8 +2762,12 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         raise ValueError(refusal)
     _check_written_text(title + "\n" + body)
     _check_no_foreign_refs(gh, repo, title + "\n" + body)
+    if epic is None and intake_of is not None and source is not None:
+        # A rewrite stays under the epic its source already sits in, not the
+        # goal's intake epic (loom#2033).
+        epic = _source_epic(gh, repo, source, elsewhere is None)
     if epic is not None:
-        _, goal, goal_issue = open_epic(gh, repo, epic)
+        _, goal, goal_issue = _open_epic_for(gh, repo, epic, source, elsewhere is None)
     elif intake_of is not None:
         goal, goal_issue = intake_of, _goal_issue(gh, repo, intake_of)
     else:
@@ -2752,12 +2789,68 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     done = _brief_done_due(gh, repo, goal, holder, env, resolves)
     if epic is None:
         epic = intake_epic(gh, repo, goal)
+    if source is not None:
+        # A rewrite's draft may carry its own Part of line naming another
+        # issue (loom#2033); the ticket names the epic it is filed under.
+        full_body = _without_other_part_of(full_body, epic)
     issue = _brief_issue(gh, repo, epic, title, _with_part_of(full_body, epic), lane,
                          source, elsewhere, goal)
     url = str(issue.get("html_url", ""))
     if done:
         _journal_brief_done(gh, repo, goal, str(holder), done, url)
     return url
+
+
+def _source_parent(source: Dict[str, Any]) -> Optional[int]:
+    """The issue a rewrite's source sits under: its sub-issue parent, else
+    the Part of line of its own text. The sub-issue parent wins when the two
+    disagree: GitHub keeps one parent, and a body line is only words."""
+    parent = _sub_issue_parent(source)
+    if parent is not None:
+        return parent
+    match = _PART_OF_ANY.search(strip_status_body(source.get("body")))
+    return int(match.group(1)) if match else None
+
+
+def _open_epic_for(gh: GitHub, repo: str, epic: int, source: Optional[Dict[str, Any]],
+                   in_place: bool) -> Tuple[Dict[str, Any], int, Dict[str, Any]]:
+    """open_epic, except that a source rewritten in place that is already
+    the epic's sub-issue adds no ticket to it, so the cap does not refuse it."""
+    if source is not None and in_place and _sub_issue_parent(source) == epic:
+        try:
+            return open_epic(gh, repo, epic)
+        except ValueError as err:
+            if "already holds" not in str(err):
+                raise
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, epic)).data or {}
+        goal = int(_issue_goal(issue) or 0)
+        return issue, goal, _goal_issue(gh, repo, goal)
+    return open_epic(gh, repo, epic)
+
+
+def _source_epic(gh: GitHub, repo: str, source: Dict[str, Any],
+                 in_place: bool) -> Optional[int]:
+    """The open epic a rewrite's source already sits under (_source_parent),
+    when a ticket may be filed there; None sends the rewrite to the goal's
+    intake epic. A rewrite once ignored it: an issue under its epic was
+    rewritten into a brief that said Part of the intake epic, while GitHub
+    kept the old parent (loom#2033)."""
+    parent = _source_parent(source)
+    if parent is None:
+        return None
+    try:
+        _open_epic_for(gh, repo, parent, source, in_place)
+    except ValueError:
+        return None
+    return parent
+
+
+_PART_OF_LINE = re.compile(r"^Part of #(\d+)[ \t]*\n?", re.M)
+
+
+def _without_other_part_of(body: str, epic: int) -> str:
+    """The body without Part of lines that name an issue other than epic."""
+    return _PART_OF_LINE.sub(lambda m: m.group(0) if int(m.group(1)) == epic else "", body)
 
 
 def _rewrite_source(gh: GitHub, repo: str, refs: Optional[int],

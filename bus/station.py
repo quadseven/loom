@@ -72,6 +72,7 @@ from . import verify_data
 from . import text as _text
 from . import tickets
 from . import transcripts
+from . import unmeetable
 from . import brief_check
 from . import criteria_gate
 from . import live_adapter, live_proof
@@ -589,6 +590,25 @@ EVIDENCE_WINDOW_HOURS = 24.0
 # loom:awaiting-evidence label: a reason, not a word.
 MISSING_MIN = 20
 VERIFY_FILE = "verify-runs.json"
+# Live boxes that can never be met as written (bus/unmeetable.py): ticket ->
+# {"key": box text key, "reasons": [...], "at": checked}. A flagged box gets
+# one restate ask and no verify lane until its text changes; a clean result
+# is checked again after UNMEETABLE_RECHECK. Code searches have their own
+# small GitHub budget, so at most UNMEETABLE_SEARCHES run a pass.
+UNMEETABLE_FILE = "unmeetable-live.json"
+UNMEETABLE_RECHECK = 24 * 3600
+UNMEETABLE_SEARCHES = 4
+# GitHub's code search index skips files of 384 KB and over, so a search
+# that finds nothing says nothing about them: the station reads each such
+# file itself (at most UNMEETABLE_BIG_READS a repo, else the answer is
+# unknown) before it calls a string absent. The margin covers KB vs KiB.
+UNINDEXED_BYTES = 350 * 1000
+UNMEETABLE_BIG_READS = 8
+# Files no log line is printed from; never read.
+UNREAD_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".pdf", ".zip",
+                   ".gz", ".tgz", ".bz2", ".xz", ".jar", ".whl", ".woff", ".woff2",
+                   ".ttf", ".otf", ".mp3", ".mp4", ".webm", ".mov", ".so", ".dylib",
+                   ".a", ".o", ".bin", ".exe", ".dll", ".wasm", ".sqlite", ".db", ".pyc")
 LIVE_EVENT_MARKER = "<!-- loom:wait-live-event v1 -->"
 # A shipped ticket whose proof was refused this many times leaves the verify
 # queue and goes to the brain with the refusals listed (loom#1307): the
@@ -1869,6 +1889,14 @@ READY_RE = re.compile(r"Ready: checks and review passed on head ([0-9a-f]{40})\b
 # its own; it is still read.
 OLD_READY_RE = re.compile(r"<!-- loom:ready-head ([0-9a-f]+) -->")
 
+
+def _unindexed_entries(tree: List[Any]) -> List[Dict[str, Any]]:
+    """The blobs of a git tree listing the code search index skips
+    (UNINDEXED_BYTES and over), leaving out files no log line is printed from."""
+    return [entry for entry in tree if isinstance(entry, dict)
+            and entry.get("type") == "blob" and isinstance(entry.get("size"), int)
+            and entry["size"] >= UNINDEXED_BYTES
+            and not str(entry.get("path") or "").lower().endswith(UNREAD_SUFFIXES)]
 
 
 def parse_roll_signals(text: str) -> List[Tuple[str, str, str]]:
@@ -3339,13 +3367,176 @@ class Station:
         # The cheap filters first: the events and comments of a ticket are
         # read only when its cooldown is over.
         found = []
+        reads: Dict[str, Any] = {"searches": UNMEETABLE_SEARCHES, "big": {}}
         for repo, issue in verify_due(shipped, attempts, self.now, refused):
+            if self._unmeetable_live(repo, issue, reads):
+                continue
             issue["shipped_at"] = self._shipped_stamp(repo, issue)
             issue["has_proof"] = self._proven(repo, int(issue["number"]))
             issue["health_proof"] = health.proof_of(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))), self.s.authors)
             found.append((repo, issue))
         return verify_due(found, attempts, self.now, refused), held
+
+    def _unmeetable_live(self, repo: str, issue: Dict[str, Any], reads: Dict[str, Any]) -> bool:
+        """True when the ticket's Live box can never be met as written
+        (bus/unmeetable.py): it waits on a closed issue or an unmerged closed
+        pull request, or on a log string no file of the repo contains. The
+        first time a box text is flagged one restate ask is posted; until the
+        text changes the ticket is not handed to a verify lane again (loom#2028:
+        two such tickets went through lane after lane and came back unmet).
+        `reads` holds this pass's source lookups (_source_has)."""
+        live = brain.live_criterion(issue.get("body"), limit=None)
+        if live == "(no Live criterion on the ticket)":
+            return False
+        number = int(issue["number"])
+        ticket = "%s#%d" % (repo, number)
+        box = unmeetable.key(live)
+        path = os.path.join(self.state, UNMEETABLE_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        known = self._unmeetable_known(state.get(ticket), box)
+        if known is not None:
+            return known
+        unknown: List[bool] = []
+        found = unmeetable.reasons(live, repo, number, self._issue_state,
+                                   lambda term: self._source_has(repo, term, reads, unknown))
+        if not found:
+            if not unknown:
+                state[ticket] = {"key": box, "reasons": [], "at": self.now}
+                _write_json(path, state)
+            return False
+        if self._ask_restate(repo, number, live, found):
+            state[ticket] = {"key": box, "reasons": found, "at": self.now}
+            _write_json(path, state)
+            _say("not verifying %s: its Live box cannot be met as written (%s)"
+                 % (ticket, "; ".join(found)))
+        return True
+
+    def _unmeetable_known(self, seen: Any, box: str) -> Optional[bool]:
+        """The recorded answer for this box text: True when it was flagged,
+        False when it was clean within UNMEETABLE_RECHECK, else None."""
+        if not isinstance(seen, dict) or seen.get("key") != box:
+            return None
+        if seen.get("reasons"):
+            return True
+        at = seen.get("at")
+        if isinstance(at, (int, float)) and 0 <= self.now - at < UNMEETABLE_RECHECK:
+            return False
+        return None
+
+    def _issue_state(self, repo: str, number: int) -> Optional[Tuple[str, bool]]:
+        """(state, merged) of an issue or pull request, None when unreadable."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+        except RateLimited:
+            raise
+        except GitHubError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        pull = data.get("pull_request")
+        return str(data.get("state") or ""), bool(isinstance(pull, dict) and pull.get("merged_at"))
+
+    def _source_has(self, repo: str, term: unmeetable.Term, reads: Dict[str, Any],
+                    unknown: List[bool]) -> Optional[bool]:
+        """Whether the repo's source holds `term`; None when unknown
+        (`unknown` is marked). A code search that finds the term's fixed part
+        is enough to say yes. One that finds nothing is not proof (loom#2050):
+        the index skips files over 384 KB, so those are read directly and
+        searched line by line with the term's wildcards; only when that read
+        covers them all is the answer no."""
+        found = self._code_search_hits(repo, term.literal, reads)
+        if found is None:
+            unknown.append(True)
+            return None
+        if found:
+            return True
+        big = self._unindexed_sources(repo, reads)
+        if big is None:
+            unknown.append(True)
+            return None
+        return unmeetable.holds(term, big)
+
+    def _code_search_hits(self, repo: str, text: str, reads: Dict[str, Any]) -> Optional[int]:
+        """How many files a code search of the repo finds `text` in; None
+        when the search was not run, failed or was incomplete."""
+        if reads["searches"] <= 0:
+            return None
+        reads["searches"] -= 1
+        try:
+            data = self.gh.rest("GET", "/search/code?q=%s+repo:%s" % (
+                quote('"%s"' % text, safe=""), repo)).data
+        except GitHubError:
+            # The search budget is apart from the core one: a refused search
+            # proves nothing and ends this pass's searches.
+            reads["searches"] = 0
+            return None
+        if not isinstance(data, dict) or data.get("incomplete_results") \
+                or not isinstance(data.get("total_count"), int):
+            return None
+        return data["total_count"]
+
+    def _unindexed_sources(self, repo: str, reads: Dict[str, Any]) -> Optional[List[str]]:
+        """The text of every file on the repo's default branch the code
+        search index skips (UNINDEXED_BYTES and over), read once a pass;
+        None when the tree or a file cannot be read, the tree listing is
+        truncated, or there are more such files than UNMEETABLE_BIG_READS."""
+        cache = reads["big"]
+        if repo in cache:
+            return cache[repo]
+        cache[repo] = None
+        try:
+            data = self.gh.rest("GET", "/repos/%s/git/trees/HEAD?recursive=1" % repo).data
+        except RateLimited:
+            raise
+        except GitHubError:
+            return None
+        if not isinstance(data, dict) or data.get("truncated") \
+                or not isinstance(data.get("tree"), list):
+            return None
+        big = _unindexed_entries(data["tree"])
+        if len(big) > UNMEETABLE_BIG_READS:
+            return None
+        texts = []
+        for entry in big:
+            text = self._blob_text(repo, str(entry.get("sha") or ""))
+            if text is None:
+                return None
+            texts.append(text)
+        cache[repo] = texts
+        return texts
+
+    def _blob_text(self, repo: str, sha: str) -> Optional[str]:
+        """A file's text read by its blob SHA; None when it cannot be read."""
+        try:
+            blob = self.gh.rest("GET", "/repos/%s/git/blobs/%s" % (repo, sha)).data
+        except RateLimited:
+            raise
+        except GitHubError:
+            return None
+        if not isinstance(blob, dict) or blob.get("encoding") != "base64" \
+                or not isinstance(blob.get("content"), str):
+            return None
+        try:
+            return base64.b64decode(blob["content"]).decode("utf-8", errors="replace")
+        except ValueError:
+            return None
+
+    def _ask_restate(self, repo: str, number: int, live: str, found: List[str]) -> bool:
+        """Post the one restate ask for this box text unless a comment
+        already carries it; False when GitHub refused (tried next pass)."""
+        try:
+            comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+            if not unmeetable.asked(list(comments), live):
+                notify.post(self.gh, repo, number, unmeetable.ask(
+                    live, [self._note_text(r) for r in found]), notify.HELD)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not ask to restate the Live box of %s#%d: %s" % (repo, number, err))
+            return False
+        return True
 
     def _audit_holds(self) -> Dict[str, float]:
         """The lanes a failed audit of their proof holds from verify runs,
@@ -4424,6 +4615,35 @@ class Station:
                 self._reconcile_pr_ticket(repo, pr, pool, landed)
                 if merged:
                     self._deliver_unlinked(repo, pr, unlinked)
+        # Also check contributor-linked tickets for merging
+        for pr in closed if isinstance(closed, list) else []:
+            if isinstance(pr, dict) and pr.get("state") == "closed":
+                merged = self._terminal_label(pr) == "loom:merged"
+                if not merged:
+                    continue
+                # Find tickets linked by this contributor PR
+                author = tickets._login(pr.get("user"))
+                if author in trusted_authors:
+                    continue
+                # Look for tickets this contributor owns and linked by this PR
+                number = self._pr_ticket_number(repo, pr)
+                if number is not None:
+                    ticket = tickets_by_number.get(number)
+                    if ticket is not None and self._contributor_ticket(repo, pr, author) is ticket:
+                        # This is a contributor-linked ticket
+                        pool = tickets_by_number if merged else waiting
+                        self._reconcile_pr_ticket(repo, pr, pool, landed)
+                        # Check if it moved to merged
+                        if "loom:merged" in _label_names(ticket):
+                            _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
+                    ticket = tickets_by_number.get(number)
+                    if ticket is not None and self._contributor_ticket(repo, pr, author) is ticket:
+                        # This is a contributor-linked ticket
+                        pool = tickets_by_number if merged else waiting
+                        self._reconcile_pr_ticket(repo, pr, pool, landed)
+                        # Check if it moved to merged
+                        if "loom:merged" in _label_names(ticket):
+                            _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
 
     def _unlinked_tickets(self, repo: str, linked: Dict[int, Dict[str, Any]],
                           found: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
@@ -10028,7 +10248,8 @@ class Station:
             epics.append(invariants.EpicShape(
                 ref(epic), epic.get("state", "open") == "open", len(union),
                 tuple(ref(t) for t in union.values() if t.get("state") != "closed"),
-                brain.standing_epic(epic), brain.sub_issue_count(self.gh, repo, epic, found)))
+                brain.standing_epic(epic), brain.sub_issue_count(self.gh, repo, epic, found),
+                title=str(epic.get("title") or "")))
         return invariants.GoalShape(self._invariant_ref(repo, number),
                                     brain.goal_epic_cap(goal), tuple(epics), outside)
 
