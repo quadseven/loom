@@ -243,6 +243,9 @@ class EpicShape(NamedTuple):
     # How many sub-issues GitHub holds under it: at SUB_ISSUE_LIMIT it takes
     # no more links, standing or not (loom#2023).
     sub_issues: int = 0
+    # Its title: two open epics of one repo must not share one (loom#2030).
+    # Never written into a breach, which names epics by their labels only.
+    title: str = ""
 
 
 class GoalShape(NamedTuple):
@@ -679,6 +682,40 @@ def closed_epic_open_tickets(f: Facts) -> List[Breach]:
             if not epic.open and epic.open_tickets]
 
 
+def epic_title_shared(f: Facts) -> List[Breach]:
+    """Two or more open epics of one repo with the same title: rewrites and
+    people pick an epic by its title, and five intake epics with one title
+    split their tickets across all five (loom#2030). The breach names the
+    epics by their labels, never by the title, which a private repo keeps."""
+    if f.shapes is None:
+        return []
+    groups: Dict[Tuple[str, str], Dict[str, Ref]] = {}
+    for shape in f.shapes:
+        for epic in shape.epics:
+            title = " ".join(epic.title.split()).lower()
+            if not epic.open or not title:
+                continue
+            repo = epic.epic.key.rsplit("#", 1)[0]
+            groups.setdefault((repo, title), {})[epic.epic.key] = epic.epic
+    out: List[Breach] = []
+    for found in groups.values():
+        if len(found) < 2:
+            continue
+        refs = sorted(found.values(), key=lambda r: _ref_number(r.key))
+        out.append(Breach("epic-title-shared", refs[0].key,
+                          "%d open epics share the title of epic %s" % (len(refs), refs[0].label),
+                          ("Open epics with one title: %s" % _refs(refs),
+                           "Give each a distinct title (a new intake epic carries a batch "
+                           "number), and move the tickets of the older ones under one"),
+                          f.now))
+    return out
+
+
+def _ref_number(key: str) -> int:
+    tail = key.rsplit("#", 1)[-1]
+    return int(tail) if tail.isdigit() else 0
+
+
 def plan_check_failed(f: Facts) -> List[Breach]:
     """An open lane pull request whose plan check failed over PLAN_FAILED_AGE ago."""
     if f.checks is None:
@@ -959,7 +996,7 @@ INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     brain_failing, brain_silent, marker_cadence, lane_no_success, lane_failing_streak,
     lane_held,
     ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
-    plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
+    epic_title_shared, plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
     repeated_failure, ticket_waiting,
     untrusted_labeler, roll_pin_off, merged_not_shipped)
 
