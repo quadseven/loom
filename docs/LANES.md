@@ -39,12 +39,14 @@ Before pushing a branch or opening a pull request on a public repository, the
 lane runner uses infra-public's `check_private_leaks.py` on the diff and
 generated pull request body, with the shared deny-list of names and products
 (`--deny-list-ssm`, the SSM parameter `LOOM_LEAK_DENY_SSM`, default
-`/infra/leak-scan/deny-list`). Every scan goes through `leak_scan`. Set
-`LOOM_LEAK_SCANNER` to that script's path when it is not at
-`../infra-public/.github/scripts/check_private_leaks.py` relative to the Loom
-checkout. A missing scanner, a deny-list the scanner cannot read (it exits 2)
-or a hit blocks the push; a scan that could not run parks the brief
-`[transient]`. A lane pod or cluster runner (`LOOM_SSM_DIR`) holds no AWS
+`/infra/leak-scan/deny-list`). Every scan goes through `leak_scan`. The lane
+machine keeps `$LOOM_HOME/infra-public` cloned, cloning it when first needed
+and fast-forwarding it at most hourly. Set `LOOM_LEAK_SCANNER` to that
+script's path when using another checkout. A scanner that is still missing
+files a factory incident and holds the brief; a deny-list the scanner cannot
+read (it exits 2) or a hit blocks the push. A scan that could not run for
+another reason parks the brief `[transient]`. A lane pod or cluster runner
+(`LOOM_SSM_DIR`) holds no AWS
 key: the scanner reads the deny-list's copy under `LOOM_SSM_DIR` through
 `lanes/k8s/ssm-dir-bin/aws`, a stand-in for the AWS CLI put first on the
 scanner's PATH only. Without that copy it pushes nothing to a public repo.
