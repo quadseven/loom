@@ -174,6 +174,15 @@ def with_tick(text: str, holder: Optional[str], now: Optional[datetime] = None) 
     return "%s\n%s\n%s" % (JOURNAL_MARKER, tick, rest)
 
 
+_STEPS_LINE = re.compile(r"^[ \t]*-[ \t]+Steps:.*(?:\r?\n|$)", re.M)
+
+
+def with_steps(text: str, line: str) -> str:
+    """The journal tick `text` with the station's per-step durations as its
+    last line (loom#2104), in place of any "- Steps:" line already there."""
+    return "%s\n%s" % (_STEPS_LINE.sub("", text).rstrip("\n"), line)
+
+
 # A first line that reads as a tick header but is not the canonical one:
 # "Tick" and a time with a space in it, or no holder. Group 1 is the holder
 # it names. Prose that only starts with the word ("Tick evidence: ...") is
@@ -281,7 +290,8 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
          holder: Optional[str] = None, trusted: Sequence[str] = (),
          now: Optional[datetime] = None,
          quiet: Optional[Callable[[], Optional["_quiet.Quiet"]]] = None,
-         backlog: Optional[Callable[[], bool]] = None):
+         backlog: Optional[Callable[[], bool]] = None,
+         steps: Optional[str] = None):
     """Post a journal, report or reply. A journal edits this holder's journal
     of the same UTC day in place, newest tick first, and is posted new only
     for the day's first tick: each new comment emails the operator
@@ -293,10 +303,14 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
     ReportQuiet, and once its last report is quiet.HEARTBEAT_EVERY old the
     report is that week's heartbeat, edited into this client's newest
     report instead of posted (loom#1534). `backlog` says whether the goal
-    home is a backlog goal, whose report is refused with ReportBacklog."""
+    home is a backlog goal, whose report is refused with ReportBacklog.
+    `steps` is the tick's "- Steps:" line (tick_clock.footer), put last in
+    a journal tick and never in a report or reply."""
     text = as_journal(text, holder)
     if text.startswith(JOURNAL_MARKER):
         text = with_tick(text, holder)
+        if steps:
+            text = with_steps(text, steps)
         _text.check(text)
         mine = todays_journal(gh, repo, issue_number, text)
         if mine is not None:
