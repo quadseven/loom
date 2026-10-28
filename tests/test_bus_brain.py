@@ -12,6 +12,7 @@ import unittest
 import unittest.mock
 from contextlib import redirect_stderr
 from datetime import datetime, timezone
+from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -5011,6 +5012,83 @@ class MoveFromGoalTests(unittest.TestCase):
         fake.assert_all_used()
         self.assertEqual([c[2] for c in self.sub_issue_posts(fake.calls)],
                          [{"sub_issue_id": 1006, "replace_parent": True}])
+
+
+class RewriteRepo(GoalRepo):
+    """GoalRepo that also removes a label, as a rewrite in place does."""
+
+    def __call__(self, method, url, headers, body):
+        if method == "DELETE":
+            path = url.split("api.github.com")[1]
+            self.calls.append((method, path, None))
+            number, name = re.search(r"/issues/(\d+)/labels/(.+)$", path).groups()
+            issue = self.issues[int(number)]
+            issue["labels"] = [x for x in issue["labels"] if x["name"] != unquote(name)]
+            return reply(200, [])
+        return super().__call__(method, url, headers, body)
+
+
+class RewriteKeepsSourceEpicTests(unittest.TestCase):
+    """loom#2033: a rewrite of an issue that sat under its epic filed it
+    under the goal's intake epic: the brief said Part of the intake epic
+    while GitHub kept the old parent, so the two disagreed."""
+
+    EPIC_URL = "https://api.github.com/repos/%s/issues/%d" % (REPO, EPIC)
+
+    def repo(self, source_body="## Problem\nSlow.\n", parent=EPIC_URL):
+        fake = RewriteRepo()
+        # Epic #5 is another open epic of goal #1.
+        fake.issues[5] = epic_issue(number=5, id=105)
+        fake.subs[1].append(5)
+        fake.subs[5] = []
+        extra = {"parent_issue_url": parent} if parent else {}
+        fake.issues[6] = item(6, body=source_body, labels=["loom:triage"], title="Slow page",
+                              user={"login": "example-brain"},
+                              html_url="https://example.com/6", **extra)
+        if parent:
+            fake.subs[int(parent.rsplit("/", 1)[1])].append(6)
+        return fake
+
+    def rewrite(self, fake, body=BODY + "\n\nPart of #30\n"):
+        with redirect_stderr(io.StringIO()):
+            return brain.brief_intake(GitHub("t", transport=fake), REPO, 1, "Ticket", body,
+                                      refs=6, env=TRUSTED)
+
+    def ticket_part(self, fake):
+        return tickets.without_original(fake.issues[6]["body"])
+
+    def test_a_rewrite_names_the_source_s_sub_issue_parent(self):
+        fake = self.repo()
+        self.assertEqual(self.rewrite(fake), "https://example.com/6")
+        part = self.ticket_part(fake)
+        self.assertTrue(part.rstrip().endswith("Part of #%d" % EPIC), part)
+        self.assertNotIn("Part of #30", part)
+        # No intake epic opened, no new issue, no second parent asked for.
+        self.assertEqual(fake.created(), [])
+        self.assertFalse([c for c in fake.calls if c[0] == "POST" and c[1].endswith("/sub_issues")])
+        self.assertEqual(fake.subs[EPIC], [6])
+
+    def test_the_sub_issue_parent_wins_when_the_body_disagrees(self):
+        fake = self.repo(source_body="## Problem\nSlow.\n\nPart of #5\n")
+        self.rewrite(fake, body=BODY + "\n\nPart of #5\n")
+        part = self.ticket_part(fake)
+        self.assertTrue(part.rstrip().endswith("Part of #%d" % EPIC), part)
+        self.assertNotIn("Part of #5", part)
+
+    def test_a_source_with_only_a_part_of_line_stays_under_that_epic(self):
+        fake = self.repo(source_body="## Problem\nSlow.\n\nPart of #5\n", parent=None)
+        self.rewrite(fake)
+        self.assertTrue(self.ticket_part(fake).rstrip().endswith("Part of #5"))
+        self.assertEqual(fake.created(), [])
+        self.assertIn(6, fake.subs[5])
+
+    def test_a_source_under_a_closed_epic_goes_to_the_intake_epic(self):
+        fake = self.repo()
+        fake.issues[EPIC]["state"] = "closed"
+        with unittest.mock.patch.object(brain, "intake_epic", return_value=5):
+            self.rewrite(fake)
+        self.assertTrue(self.ticket_part(fake).rstrip().endswith("Part of #5"))
+        self.assertNotIn("Part of #30", self.ticket_part(fake))
 
 
 class OutsideEpicRepo:
