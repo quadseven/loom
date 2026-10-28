@@ -111,6 +111,8 @@ LABELS: Dict[str, Dict[str, str]] = {
     "wait:lane": {"color": "fef2c0", "description": "Waiting: no free lane takes its model"},
     "wait:incident": {"color": "fef2c0", "description": "Waiting: held for an open factory incident"},
     "wait:after": {"color": "fef2c0", "description": "Waiting: another ticket must merge first (After:)"},
+    "wait:blocked": {"color": "fef2c0", "description": "Waiting: its Blocked on section names an issue still open"},
+    "wait:superseded": {"color": "fef2c0", "description": "Waiting: its brief says another issue supersedes it; the brain closes or re-briefs it"},
     "wait:window": {"color": "fef2c0", "description": "Waiting: a deploy or roll window"},
     "wait:live-event": {"color": "fef2c0", "description": "Waiting: its Live box needs a rare event the log has not shown; held apart from open work"},
     # The hand-off pool (docs/BRAIN.md): tickets this Loom's lanes do not
