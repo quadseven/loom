@@ -10018,7 +10018,8 @@ class Station:
             epics.append(invariants.EpicShape(
                 ref(epic), epic.get("state", "open") == "open", len(union),
                 tuple(ref(t) for t in union.values() if t.get("state") != "closed"),
-                brain.standing_epic(epic), brain.sub_issue_count(self.gh, repo, epic, found)))
+                brain.standing_epic(epic), brain.sub_issue_count(self.gh, repo, epic, found),
+                title=str(epic.get("title") or "")))
         return invariants.GoalShape(self._invariant_ref(repo, number),
                                     brain.goal_epic_cap(goal), tuple(epics), outside)
 

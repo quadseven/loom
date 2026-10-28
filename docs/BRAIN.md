@@ -476,9 +476,13 @@ and flags any open epic, the standing one too, that holds 100 sub-issues.
 
 Triage, the rewriter, health intake, validation contracts and pull request
 adoption file under the goal's intake epic ("Epic: work that triage,
-rewrites and health intake find"): the newest open one holding fewer than 15
-tickets. One is opened by `bus.brain onboard`, and again whenever no open
-intake epic has room.
+rewrites and health intake find, batch N"): the newest open one, by issue
+number, holding fewer than 15 open tickets. One is opened by `bus.brain
+onboard`, and again whenever no open intake epic has room. Each new one takes
+a batch number one past the highest any open epic of the repo carries, so no
+two open intake epics share a title (intake epics opened before this carry the
+title without a batch and are still found). The `epic-title-shared` invariant
+reports two or more open epics of one repo with the same title.
 
 Every other path that files a ticket under a goal does the same
 (`brain.placement_epic`): the parts of a split pull request and the follow-up
