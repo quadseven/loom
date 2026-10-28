@@ -1576,14 +1576,22 @@ branch after the merge instead (bus/revert.py, every pass, off with
 
 ## Merge-ready
 
-A lane pull request is merge-ready if and only if all four hold:
+A lane pull request is merge-ready if and only if all five hold:
 
 - its head commit's check rollup is `SUCCESS`;
 - the newest submitted review from the review bot (`LOOM_REVIEW_BOT`, else
   `grug-tribe`, and an app, not a person with that login) is not
   `CHANGES_REQUESTED`. Only the newest counts: a `CHANGES_REQUESTED`
-  followed by newer `COMMENTED` reviews no longer blocks, and reviews and
-  replies from anyone else never change the verdict;
+  followed by newer `COMMENTED` reviews no longer blocks, and other apps'
+  reviews never change the verdict;
+- no person (any review author that is not an app) has a standing change
+  request. As GitHub's `reviewDecision` reads it, each person's newest
+  `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED` review counts (login
+  compared without letter case) and a later `COMMENTED` review does not
+  clear a request. The blocker reads `changes requested by a person
+  (LOGIN)`, and `bus.brain merge` refuses with the same words before the
+  merge call (loom#1987), so a tick no longer spends a merge attempt on a
+  GitHub 405 every time;
 - it has no unresolved review thread;
 - every thread the review bot opened (a finding) is older than the head
   commit, so a fix-up commit came after each finding.
