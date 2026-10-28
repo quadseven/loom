@@ -580,6 +580,11 @@ IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
 CACHE_KEEP = 24 * 3600
 VERIFY_INTERVAL = 6 * 3600
+# A Luna review verdict's findings (loom#2142): at most this many per list,
+# each finding's text collapsed and capped, so a lane's review.json can
+# never turn the verdict comment into a wall.
+REVIEW_FINDINGS_MAX = 50
+REVIEW_FINDING_CHARS = 500
 # A shipped ticket whose Live box has seen no matching log line this many days
 # after it shipped waits on a rare event, not on a verifier: it gets
 # wait:live-event and is held apart from open work (loom#1220).
@@ -3629,6 +3634,34 @@ class Station:
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
 
+    def _write_review_brief(self, repo: str, pr_number: int, sha: str,
+                            issue: Dict[str, Any]) -> bool:
+        """The factory's Luna review writer (loom#2142): render the review
+        brief for the pull request's current head and hand it to the Luna
+        review slot. False when the pull request cannot be read or its head
+        has moved since the factory asked: no verdict may ever be posted
+        for a commit nobody asked about."""
+        try:
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data or {}
+        except GitHubError as err:
+            _say("could not read %s#%d for its Luna review brief: %s" % (repo, pr_number, err))
+            return False
+        head = pr.get("head") or {}
+        base = pr.get("base") or {}
+        if (str(head.get("sha") or "") != sha or not head.get("ref") or not base.get("ref")):
+            return False
+        stamp = int(self.now)
+        text = tickets.render_review_brief(
+            repo, issue, factory.LUNA_REVIEW_LANE, stamp, pr_number,
+            str(head["ref"]), str(base["ref"]), sha)
+        claiming = self._write_brief(
+            factory.LUNA_REVIEW_LANE,
+            tickets.review_name(repo, int(issue["number"]), stamp), text)
+        os.replace(claiming, claiming[:-len(".claiming")] + ".md")
+        _say("handed %s#%d head %s to lane %s to review"
+             % (repo, pr_number, sha[:12], factory.LUNA_REVIEW_LANE))
+        return True
+
     def _verify_github_data(self, repo: str, issue: Dict[str, Any]) -> str:
         """The verify brief's GitHub section: the lane has no network, so the
         station reads the ticket's merged pull requests, linked the way
@@ -3818,19 +3851,38 @@ class Station:
         except GitHubError as err:
             _say("could not clear the awaiting label on %s#%d: %s" % (repo, number, err))
 
-    def _read_verify(self, lane: str, name: str) -> Tuple[Optional[Dict[str, Any]], str]:
-        """(the lane's verify.json, "") or (None, why it cannot be used)."""
-        path = os.path.join(self.s.home, "logs", lane, name + ".verify.json")
+    def _read_result(self, lane: str, name: str, filename: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """(the lane's result file, "") or (None, why it cannot be used): the
+        shared reader behind _read_verify and _read_review."""
+        path = os.path.join(self.s.home, "logs", lane, name + "." + filename)
         try:
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
         except FileNotFoundError:
-            return None, "The run wrote no verify.json."
+            return None, "The run wrote no %s." % filename
         except ValueError:
-            return None, "Its verify.json is not valid JSON."
+            return None, "Its %s is not valid JSON." % filename
         if not isinstance(data, dict):
-            return None, "Its verify.json is not a JSON object."
+            return None, "Its %s is not a JSON object." % filename
         return data, ""
+
+    def _read_verify(self, lane: str, name: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """(the lane's verify.json, "") or (None, why it cannot be used)."""
+        return self._read_result(lane, name, "verify.json")
+
+    def _review_model(self, lane: str, name: str) -> str:
+        """The model the review run used, as the runner recorded it next to
+        review.json; "" when it recorded none."""
+        path = os.path.join(self.s.home, "logs", lane, name + ".review.model")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except FileNotFoundError:
+            return ""
+
+    def _read_review(self, lane: str, name: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """(the lane's review.json, "") or (None, why it cannot be used)."""
+        return self._read_result(lane, name, "review.json")
 
     def _report_verify(self, lane: str, kind: str, repo: str, number: int, name: str) -> bool:
         """Apply a finished verify run. A failed run changes nothing: the
@@ -3870,6 +3922,111 @@ class Station:
             self._refute_merged(lane, repo, number, result["unmet"])
         else:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
+        return True
+
+    @staticmethod
+    def _review_findings(value: Any) -> Optional[List[Dict[str, Any]]]:
+        """A review.json finding list, cleaned, or None when its shape is
+        not a list of findings: each entry keeps its finding text (whitespace
+        collapsed, capped), an optional file and an optional line."""
+        if not isinstance(value, list):
+            return None
+        out: List[Dict[str, Any]] = []
+        for entry in value[:REVIEW_FINDINGS_MAX]:
+            if not isinstance(entry, dict) or not isinstance(entry.get("finding"), str):
+                return None
+            finding = " ".join(entry["finding"].split())[:REVIEW_FINDING_CHARS]
+            if not finding:
+                return None
+            item: Dict[str, Any] = {"finding": finding}
+            if isinstance(entry.get("file"), str) and entry["file"]:
+                item["file"] = entry["file"]
+            if isinstance(entry.get("line"), int) and entry["line"] > 0:
+                item["line"] = entry["line"]
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _finding_line(finding: Dict[str, Any]) -> str:
+        where = ""
+        if "file" in finding:
+            where = "`%s`%s: " % (finding["file"],
+                                  " (line %d)" % finding["line"] if "line" in finding else "")
+        return where + finding["finding"]
+
+    def _report_review(self, lane: str, kind: str, repo: str, number: int,
+                       name: str, text: str) -> bool:
+        """Apply a finished Luna review run (loom#2142): post the lane's
+        review.json on the pull request as a verdict in the Elder's markings
+        shape, with its blocking findings as review threads when they name a
+        file and a line, so the factory's gate and fix rounds read them
+        exactly like the review bot's own. A failed run, an unreadable
+        result or a result in the wrong shape posts nothing: the factory
+        dispatches again after its retry window. A result also posts
+        nothing when it did not come from the review slot's own Luna run:
+        the gate trusts the posted verdict, so no other lane or model may
+        speak it."""
+        if kind == "failed":
+            _say("Luna review run %s on lane %s failed; %s#%d keeps waiting for "
+                 "a verdict" % (name, lane, repo, number))
+            return True
+        if lane != factory.LUNA_REVIEW_LANE:
+            _say("Luna review run %s reported on lane %s, not the review slot "
+                 "%s; its verdict is not posted" % (name, lane, factory.LUNA_REVIEW_LANE))
+            return True
+        model = self._review_model(lane, name)
+        if model != factory.LUNA_MODEL:
+            _say("Luna review run %s recorded model %s, not %s; its verdict is "
+                 "not posted" % (name, model or "none", factory.LUNA_MODEL))
+            return True
+        result, why = self._read_review(lane, name)
+        if result is None:
+            _say("Luna review run %s left no usable verdict: %s" % (name, why))
+            return True
+        blocking = self._review_findings(result.get("blocking"))
+        notes = self._review_findings(result.get("notes"))
+        summary = result.get("summary")
+        pr_field = self._field(text, "Review-PR")
+        sha = self._field(text, "Head-Sha")
+        if (blocking is None or notes is None or not isinstance(summary, str)
+                or not pr_field.isdigit() or not sha):
+            _say("Luna review run %s wrote a verdict in the wrong shape; "
+                 "nothing posted" % name)
+            return True
+        pr_number = int(pr_field)
+        # Each anchored blocking finding becomes a review thread of its own
+        # (one pulls/comments post per finding), so the factory's fix rounds
+        # and rebuttal reads meet them exactly like the review bot's threads.
+        for finding in [f for f in blocking if "file" in f and "line" in f]:
+            try:
+                self.gh.rest("POST", "/repos/%s/pulls/%d/comments" % (repo, pr_number), {
+                    "commit_id": sha, "path": finding["file"],
+                    "line": finding["line"], "side": "RIGHT",
+                    "body": finding["finding"]})
+            except GitHubError as err:
+                _say("could not post a Luna review thread on %s#%d (%s); the "
+                     "finding still lands in the verdict comment" % (repo, pr_number, err))
+        lines = [factory.LUNA_REVIEW_MARKER % sha,
+                 "Elder markings - %d blocking, %d total"
+                 % (len(blocking), len(blocking) + len(notes)),
+                 "", " ".join(summary.split())[:1000] or "The lane gave no summary.",
+                 "",
+                 "This verdict comes from a Codex Luna review (lane %s, gpt-6-luna "
+                 "through `codex exec`) while the Elder review route is degraded. "
+                 "The merge gate reads it for this head in the degraded check's "
+                 "place." % lane]
+        if blocking:
+            lines += ["", "Blocking findings:"] + \
+                     ["- " + self._finding_line(f) for f in blocking]
+        if notes:
+            lines += ["", "Notes:"] + ["- " + self._finding_line(f) for f in notes]
+        try:
+            notify.post(self.gh, repo, pr_number, "\n".join(lines), notify.RECORD)
+        except GitHubError as err:
+            _say("could not post the Luna verdict on %s#%d (%s)" % (repo, pr_number, err))
+            return True
+        _say("posted the Luna verdict on %s#%d: %d blocking, %d total"
+             % (repo, pr_number, len(blocking), len(blocking) + len(notes)))
         return True
 
     def _refute_merged(self, lane: str, repo: str, number: int, why: Any) -> None:
@@ -6606,6 +6763,8 @@ class Station:
             return True
         if self._field(text, "Deliverable") == "verify":
             return self._report_verify(lane, kind, repo, number, name)
+        if self._field(text, "Deliverable") == "review":
+            return self._report_review(lane, kind, repo, number, name, text)
         self._revert_decision_ticks(repo, number, lane, text)
         if kind == "done":
             if self._field(text, "Deliverable") == "answer":
@@ -11752,7 +11911,8 @@ class Station:
                                benched=pairs,
                                limit_until=self.limit_until(),
                                known_waits=self._saved_waits(),
-                               no_lane_since=self._no_lane_since(), **extra)
+                               no_lane_since=self._no_lane_since(),
+                               review_brief=self._write_review_brief, **extra)
 
     def _no_lane_since(self) -> Dict[str, float]:
         """Each ticket's first no-lane wait as _record_waits kept it."""
