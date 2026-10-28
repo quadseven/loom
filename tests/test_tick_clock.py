@@ -173,6 +173,26 @@ class BudgetGuardTests(unittest.TestCase):
         "time is up, triage left for next tick",
     )
 
+    # loom#2109: real deferrals the first cut let through. A bare "budget"
+    # next to a defer word is the likeliest wording around the guard.
+    MISSED_DEFERRALS = (
+        "deferred: budget",
+        "deferred, budget",
+        "budget spent, skipping brief",
+        "budget exhausted, deferred",
+        "skipped for time",
+        "ran long, deferring",
+        "deferred, not enough time",
+        "skipped - tick time up",
+        "deferred: 21 minutes elapsed",
+    )
+    # loom#2109: a per-minute API budget is a count, not the tick's clock.
+    PER_MINUTE_BUDGETS = (
+        "skipped because the minute budget of the API ran out",
+        "over budget on API calls, skipped",
+        "deferred, per-minute budget used",
+    )
+
     def test_other_budgets_and_negations_are_not_a_claim(self):
         for note in self.OTHER_BUDGETS:
             with self.subTest(note=note):
@@ -182,6 +202,32 @@ class BudgetGuardTests(unittest.TestCase):
         for note in self.TIME_DEFERRALS:
             with self.subTest(note=note):
                 self.assertTrue(tick_clock.claims_budget(note))
+
+    def test_bare_budget_and_plain_time_deferrals_are_a_claim(self):
+        for note in self.MISSED_DEFERRALS:
+            with self.subTest(note=note):
+                self.assertTrue(tick_clock.claims_budget(note))
+
+    def test_bare_budget_deferrals_before_20_minutes_are_refused(self):
+        _, gh = held_lock()
+        run_step(gh, at(0), "lock")
+        for note in self.MISSED_DEFERRALS:
+            with self.subTest(note=note), self.assertRaises(brain.BudgetRefused):
+                run_step(gh, at(8), "verify", note)
+
+    def test_per_minute_api_budgets_are_not_a_claim(self):
+        for note in self.PER_MINUTE_BUDGETS + self.OTHER_BUDGETS:
+            with self.subTest(note=note):
+                self.assertFalse(tick_clock.claims_budget(note))
+
+    def test_a_bare_budget_qualified_by_another_noun_is_not_a_claim(self):
+        for noun in ("repo", "API", "App installation", "lane", "token", "review"):
+            for note in ("deferred, %s budget spent" % noun,
+                         "skipped: the budget for the %s ran out" % noun):
+                with self.subTest(note=note):
+                    self.assertFalse(tick_clock.claims_budget(note))
+        self.assertTrue(tick_clock.claims_budget("deferred review on budget"))
+        self.assertTrue(tick_clock.claims_budget("deferred: budget, review next tick"))
 
     def test_other_budget_notes_at_8_minutes_are_recorded_not_refused(self):
         _, gh = held_lock()
