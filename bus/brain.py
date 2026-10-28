@@ -17,7 +17,7 @@ from urllib.parse import quote
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
-from . import answer, ci_facts, ci_gap, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, shadow
+from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
 from .labels import HANDOFF, LANES, REMOTE_LANES
@@ -114,6 +114,16 @@ TRIAGE_LIMIT = 25
 # repository's default branch. The line lives in the goal body's header area.
 _TRUNK_RE = re.compile(r"^Trunk:[ \t]*([A-Za-z0-9._][A-Za-z0-9._/-]*)[ \t]*$", re.M)
 _check_written_text = text.check
+
+
+def _check_decision_claim(gh: GitHub, repo: str, number: int, written: Any,
+                          env: Optional[Dict[str, str]] = None) -> None:
+    """Refuse text bound for repo#number that cites a person's decision no
+    person recorded (bus/decision_claim.py, loom#2089): an unanswered
+    loom:human ask is not a decision, so the brain says it acted on its own
+    judgment instead."""
+    trusted = trusted_authors(env)
+    decision_claim.check(gh, repo, number, written, trusted, answer.operators(env, trusted))
 
 
 def goal_trunk(issue: Dict[str, Any]) -> Optional[str]:
@@ -1862,6 +1872,7 @@ def close_epic(gh: GitHub, repo: str, number: int, note: str) -> None:
     if not note:
         raise ValueError("a closed epic gets a one-line note saying how its done-when holds")
     _check_written_text(note)
+    _check_decision_claim(gh, repo, number, note)
     try:
         issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
         if issue.get("state") != "open" or not _epic_label(issue):
@@ -2956,6 +2967,10 @@ def _journal_brief_done(gh: GitHub, repo: str, goal: int, holder: str, line: str
         # Into the holder's journal of the day, edited in place (bus/journal.py).
         from . import journal
         journal.post(gh, repo, goal, body, holder)
+    except decision_claim.DecisionNotRecorded as exc:
+        raise decision_claim.DecisionNotRecorded(
+            "filed %s, but its brief done marker was not posted (%s); put this line, "
+            "worded as the brain's own judgment, in your journal: %s" % (url, exc, line)) from exc
     except GitHubError as exc:
         raise GitHubError("filed %s, but its brief done marker was not posted (%s); put this "
                           "line in your journal: %s" % (url, exc, line), exc.status, exc.body) from exc
@@ -3508,6 +3523,7 @@ def prioritize(gh: GitHub, repo: str, number: int, priority: Optional[str],
         _check_written_text(note)
         if "\n" in note or "\r" in note:
             raise ValueError("priority note must be one line")
+        _check_decision_claim(gh, repo, number, note, env)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     body = str(issue.get("body") or "")
     updated = _prioritize_body(issue, priority, env, difficulty)
@@ -3654,6 +3670,8 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     line first. A verified ticket that was rewritten from an issue closes
     that issue (settle_source); the line saying so is returned."""
     _check_move_args(state, lane, note, model)
+    if note is not None:
+        _check_decision_claim(gh, repo, number, note)
     if (state == "verified") != (record is not None):
         raise ValueError("verified needs a proof record, and no other state takes one")
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
@@ -3713,8 +3731,9 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
              ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
              ' reviews(last:100) { nodes { author { __typename login } state submittedAt } } '
              ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
-             ' reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes {'
-             ' databaseId author { __typename login } body createdAt } } } }'
+             ' reviewThreads(first:100) { nodes { id isResolved path comments(first:1) { nodes {'
+             ' databaseId author { __typename login } body createdAt } }'
+             ' latest: comments(last:1) { nodes { author { __typename login } body } } } }'
              ' files(first:100) { totalCount nodes { path deletions changeType } }'
              ' } } }') % (_gql(owner), _gql(name), number)
     data = gh.graphql(query) or {}
@@ -3749,6 +3768,7 @@ def merge(gh: GitHub, repo: str, number: int,
         pr, details = _await_settled(gh, repo, number, pr, details, env)
         _validate_merge_pr(repo, pr, details, env)
         _refuse_person_change_request(details)
+        _refuse_unheld_answers(gh, repo, details, env)
         if change_class.class_of(pr) == "sensitive":
             from . import factory
             bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
@@ -4189,6 +4209,56 @@ def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
             raise ValueError(reason)
 
 
+UNRESOLVE_MUTATION = ('mutation($id:ID!) { unresolveReviewThread(input:{threadId:$id})'
+                      ' { thread { isResolved } } }')
+
+
+def _first(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
+    nodes = (thread.get(field) or {}).get("nodes") or [{}]
+    return nodes[index] or {}
+
+
+def _unheld_answer(gh: GitHub, repo: str, head: str, thread: Dict[str, Any],
+                   bot: str, trusted: set) -> str:
+    """Why a resolved bot thread whose newest comment is a lane's answer was
+    resolved on an answer that does not hold on the head, else ""."""
+    from . import factory  # factory imports this module
+    root, latest = _first(thread, "comments", 0), _first(thread, "latest", -1)
+    if not (thread.get("isResolved") and by_bot(root, bot)
+            and factory.lane_answered(latest, trusted)):
+        return ""
+    return rebuttal.check_on_head(gh, repo, head, rebuttal.quoted(str(latest.get("body") or "")),
+                                  str(thread.get("path") or ""), str(root.get("body") or ""))
+
+
+def _reopen(gh: GitHub, thread_id: str) -> None:
+    try:
+        gh.graphql(UNRESOLVE_MUTATION, {"id": thread_id})
+    except RateLimited:
+        raise
+    except GitHubError as err:
+        # The merge is refused anyway; the next tick tries again.
+        print("could not reopen review thread %s: %s" % (thread_id, err), file=sys.stderr)
+
+
+def _refuse_unheld_answers(gh: GitHub, repo: str, details: Dict[str, Any],
+                           env: Optional[Dict[str, str]] = None) -> None:
+    """Refuse the merge when a review bot thread was resolved on a lane's
+    answer that does not hold on the head (bus/rebuttal.py, loom#2081). The
+    thread is reopened, so the factory reads it as a finding that survived
+    and moves it on, and the next merge sees it unresolved."""
+    from . import factory  # factory imports this module
+    bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
+    trusted = {a.lower() for a in trusted_authors(env)}
+    head = str(details.get("headRefOid") or "")
+    for thread in (details.get("reviewThreads") or {}).get("nodes") or []:
+        why = _unheld_answer(gh, repo, head, thread, bot, trusted)
+        if why:
+            _reopen(gh, str(thread.get("id") or ""))
+            raise ValueError("review thread %s was resolved on a lane answer that does not "
+                             "hold on the head: %s" % (thread.get("id"), why))
+
+
 # A sensitive change (bus/change_class.py) is never merged by the factory; the
 # brain merges it only when the review check passed and no high or critical
 # finding is open on the head commit (docs/MUSE.md, Merge by change class).
@@ -4316,6 +4386,7 @@ def _validate_adopt_pr(gh: GitHub, repo: str, pr: Dict[str, Any],
 def reply_to_review(gh: GitHub, repo: str, number: int, comment_id: int,
                     body: str, resolve: bool = False) -> None:
     _check_written_text(body)
+    _check_decision_claim(gh, repo, number, body)
     gh.rest("POST", "/repos/%s/pulls/%d/comments/%d/replies" % (repo, number, comment_id), {"body": body})
     if resolve:
         details = _pr_graphql(gh, repo, number)
@@ -4487,6 +4558,7 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
         raise ValueError("reason is completed or not_planned")
     if note is not None:
         _check_written_text(note)
+        _check_decision_claim(gh, repo, number, note, env)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
     names = _labels(issue)
     if issue.get("state") != "open" or "loom:ticket" not in names:
@@ -4700,6 +4772,7 @@ def audit_proof(gh: GitHub, repo: str, number: int, result: str, note: str,
         raise ValueError("an audit result is pass or fail")
     if not str(note or "").strip():
         raise ValueError("an audit needs a note naming the evidence read or what failed")
+    _check_decision_claim(gh, repo, number, note, env)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     if "loom:ticket" not in _labels(issue) or "loom:verified" not in _labels(issue):
         raise ValueError("only a verified ticket is audited")
@@ -5137,6 +5210,7 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
         raise ValueError("remote lane %s only works with --to queued" % lane)
     _check_model(model)
     _check_written_text(notes)
+    _check_decision_claim(gh, ticket[0], ticket[1], notes)
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
     _check_fix(repo, pr, ticket, issue, lane)
@@ -5212,6 +5286,7 @@ def defer(gh: GitHub, stage: str, item: Tuple[str, int], holder: str,
         if "\n" in note or "\r" in note:
             raise ValueError("note must be one line")
         _check_written_text(note)
+        _check_decision_claim(gh, item[0], item[1], note)
     handoff.defer_marker(stage, item, "x", holder, note=note)
     _check_stage_item(gh, stage, *item)
     rev = item_revision(gh, *item)
@@ -6054,6 +6129,7 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     whose open pull request has nothing to fix is refused: fix rounds that
     already landed a green, reviewed head are not a stuck ticket."""
     _check_written_text(notes)
+    _check_decision_claim(gh, repo, number, notes)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     names = _labels(issue)
     if RUNAWAY in names:
