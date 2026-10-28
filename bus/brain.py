@@ -17,7 +17,7 @@ from urllib.parse import quote
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, text, tickets
-from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, shadow
+from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
 from .labels import HANDOFF, LANES, REMOTE_LANES
@@ -3727,8 +3727,9 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
              ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
              ' reviews(last:100) { nodes { author { __typename login } state submittedAt } } '
              ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
-             ' reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes {'
-             ' databaseId author { __typename login } body createdAt } } } }'
+             ' reviewThreads(first:100) { nodes { id isResolved path comments(first:1) { nodes {'
+             ' databaseId author { __typename login } body createdAt } }'
+             ' latest: comments(last:1) { nodes { author { __typename login } body } } } }'
              ' files(first:100) { totalCount nodes { path deletions changeType } }'
              ' } } }') % (_gql(owner), _gql(name), number)
     data = gh.graphql(query) or {}
@@ -3763,6 +3764,7 @@ def merge(gh: GitHub, repo: str, number: int,
         pr, details = _await_settled(gh, repo, number, pr, details, env)
         _validate_merge_pr(repo, pr, details, env)
         _refuse_person_change_request(details)
+        _refuse_unheld_answers(gh, repo, details, env)
         if change_class.class_of(pr) == "sensitive":
             from . import factory
             bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
@@ -4201,6 +4203,56 @@ def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
     for ok, reason in rules:
         if not ok:
             raise ValueError(reason)
+
+
+UNRESOLVE_MUTATION = ('mutation($id:ID!) { unresolveReviewThread(input:{threadId:$id})'
+                      ' { thread { isResolved } } }')
+
+
+def _first(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
+    nodes = (thread.get(field) or {}).get("nodes") or [{}]
+    return nodes[index] or {}
+
+
+def _unheld_answer(gh: GitHub, repo: str, head: str, thread: Dict[str, Any],
+                   bot: str, trusted: set) -> str:
+    """Why a resolved bot thread whose newest comment is a lane's answer was
+    resolved on an answer that does not hold on the head, else ""."""
+    from . import factory  # factory imports this module
+    root, latest = _first(thread, "comments", 0), _first(thread, "latest", -1)
+    if not (thread.get("isResolved") and by_bot(root, bot)
+            and factory.lane_answered(latest, trusted)):
+        return ""
+    return rebuttal.check_on_head(gh, repo, head, rebuttal.quoted(str(latest.get("body") or "")),
+                                  str(thread.get("path") or ""), str(root.get("body") or ""))
+
+
+def _reopen(gh: GitHub, thread_id: str) -> None:
+    try:
+        gh.graphql(UNRESOLVE_MUTATION, {"id": thread_id})
+    except RateLimited:
+        raise
+    except GitHubError as err:
+        # The merge is refused anyway; the next tick tries again.
+        print("could not reopen review thread %s: %s" % (thread_id, err), file=sys.stderr)
+
+
+def _refuse_unheld_answers(gh: GitHub, repo: str, details: Dict[str, Any],
+                           env: Optional[Dict[str, str]] = None) -> None:
+    """Refuse the merge when a review bot thread was resolved on a lane's
+    answer that does not hold on the head (bus/rebuttal.py, loom#2081). The
+    thread is reopened, so the factory reads it as a finding that survived
+    and moves it on, and the next merge sees it unresolved."""
+    from . import factory  # factory imports this module
+    bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
+    trusted = {a.lower() for a in trusted_authors(env)}
+    head = str(details.get("headRefOid") or "")
+    for thread in (details.get("reviewThreads") or {}).get("nodes") or []:
+        why = _unheld_answer(gh, repo, head, thread, bot, trusted)
+        if why:
+            _reopen(gh, str(thread.get("id") or ""))
+            raise ValueError("review thread %s was resolved on a lane answer that does not "
+                             "hold on the head: %s" % (thread.get("id"), why))
 
 
 # A sensitive change (bus/change_class.py) is never merged by the factory; the
