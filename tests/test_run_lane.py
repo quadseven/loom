@@ -860,6 +860,16 @@ print('leak guard: clean (shape patterns only)')
                                            capture_output=True, text=True, check=True).stdout.strip(),
                             first_head)
 
+        # A refresh whose fetch fails leaves the stamp stale, so the next run
+        # tries again instead of trusting a checkout it could not update.
+        stamp.write_text(str(int(old)) + "\n")
+        remote.rename(remotes / "quadseven" / "infra-public-gone")
+        self.log.write_text("")
+        self.drop_brief("T046-fetch-fails.md", BRIEF.replace("T042-fix-the-thing", "T046-fetch-fails"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stamp.read_text().strip(), str(int(old)))
+
     # A workload that selects a node label, for the live-cluster check
     # (bus/live_cluster.py, loom#1832).
     MANIFEST = ("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
