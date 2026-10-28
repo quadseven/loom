@@ -231,10 +231,45 @@ model_env() {
   done
 }
 
+# A slot in LOOM_RUNNER_SLOTS runs on cluster runners: the station
+# dispatches its briefs (bus/runners.py), so it gets no runner here, and one
+# installed before is removed (docs/LANES.md, "Lanes on cluster runners").
+RUNNER_SLOTS=" $(printf '%s' "${LOOM_RUNNER_SLOTS:-}" | tr ',\t\n' '   ') "
+# The station's settings for its runner slots, as plist entries.
+runner_env() {
+  local k v
+  [ -n "${LOOM_RUNNER_SLOTS:-}" ] || return 0
+  PYTHONPATH="$REPO_ROOT" python3 -B -m bus.runners station-env | while IFS='=' read -r k v; do
+    printf '    <key>%s</key><string>%s</string>\n' "$k" "$(xml "$v")"
+  done
+}
+
+# LOOM_STATION_PASS_ENV: the non-LOOM variables, comma or space separated,
+# the station plist keeps from the installing environment when set (for
+# example KUBECONFIG, which LOOM_LIVE_EVIDENCE_PASS_ENV hands the live
+# evidence adapter). PATH, HOME and LOOM_* names are written elsewhere and
+# skipped. Each entry starts its own line, so an empty list adds no byte.
+station_pass_env() {
+  local n
+  for n in $(printf '%s' "${LOOM_STATION_PASS_ENV:-}" | tr ',\t\n' '   '); do
+    case "$n" in PATH|HOME|LOOM_*) continue ;; esac
+    [[ "$n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [ -n "${!n+x}" ] || continue
+    printf '\n    <key>%s</key><string>%s</string>' "$n" "$(xml "${!n}")"
+  done
+}
+
 for L in "${LANES[@]}"; do
   LABEL="com.loom.$L"
   if runner_busy "$LOOM_HOME/run/$L.lock"; then
     echo "skipped $LABEL: runner busy, re-run the installer later"
+    continue
+  fi
+  if [[ "$RUNNER_SLOTS" == *" $L "* ]]; then
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    wait_job_gone "gui/$(id -u)/$LABEL"
+    rm -f "$AGENTS/$LABEL.plist"
+    echo "no $LABEL: $L runs on cluster runners (LOOM_RUNNER_SLOTS)"
     continue
   fi
   PLIST="$AGENTS/$LABEL.plist"
@@ -311,9 +346,13 @@ done
 # docs/BRAIN.md), and
 # LOOM_EVIDENCE_CMDS (private JSON map of repo to read-only log command for
 # verify briefs, docs/LANES.md Verify runs), and
-# LOOM_LOG_KEEP_DAYS and LOOM_DISK_FREE_MIN_GB (days a lane's logs are kept,
-# default 7, 0 forever; and the free disk under which every pass warns,
-# default 10 GB, docs/LANES.md Disk), and
+# LOOM_LOG_KEEP_DAYS and LOOM_MIN_FREE_GB (days a lane's logs are kept,
+# default 7, 0 forever; and the free disk under which the station claims no
+# new work, default 15 GB, the older name LOOM_DISK_FREE_MIN_GB still read,
+# docs/LANES.md Disk), and
+# LOOM_PASS_DEADLINE (seconds a station pass may run before it writes its
+# stack to the station log and exits, default 3600, 0 off, docs/LANES.md
+# Pass deadline), and
 # LOOM_INVARIANT_GOAL and LOOM_PLAN_CHECK (the goal home invariant breaches
 # are filed on, and the review bot's plan check, docs/LANES.md Invariants), and
 # LOOM_NO_TOPUP (provider lanes whose credit is never topped up: their slots
@@ -329,7 +368,8 @@ done
 # LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and LOOM_GITHUB_APP_KEY_SSM
 # or LOOM_GITHUB_APP_KEY_FILE (a GitHub App installation token instead of the
 # personal one, minted from the key in that SSM parameter or that mode-600
-# file, docs/LANES.md; all or none, checked above). Runs from
+# file, docs/LANES.md; all or none, checked above), and the variables
+# LOOM_STATION_PASS_ENV names (station_pass_env above). Runs from
 # this checkout, like the lanes, through
 # lanes/mac/station.sh, which first fast-forwards the checkout to its default
 # branch once that head passed CI (LOOM_DEPLOY=0 turns it off).
@@ -362,6 +402,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_BRIEF_AUTHORS</key><string>$(xml "${LOOM_BRIEF_AUTHORS:-}")</string>
     <key>LOOM_TRUSTED_BRIEFERS</key><string>$(xml "${LOOM_TRUSTED_BRIEFERS:-}")</string>
     <key>LOOM_GOAL_CAP</key><string>$(xml "${LOOM_GOAL_CAP:-}")</string>
+    <key>LOOM_NO_LANE_REROUTE</key><string>$(xml "${LOOM_NO_LANE_REROUTE:-}")</string>
     <key>LOOM_UNVERIFIED_LIMIT</key><string>$(xml "${LOOM_UNVERIFIED_LIMIT:-}")</string>
     <key>LOOM_REPO_OWNERS</key><string>$(xml "$LOOM_REPO_OWNERS")</string>
     <key>LOOM_STATUS_REPO</key><string>$(xml "${LOOM_STATUS_REPO:-}")</string>
@@ -373,7 +414,8 @@ cat > "$PLIST" <<EOF
     <key>LOOM_SHIP_WORKFLOWS</key><string>$(xml "${LOOM_SHIP_WORKFLOWS:-}")</string>
     <key>LOOM_SHIP_PATH_WORKFLOWS</key><string>$(xml "${LOOM_SHIP_PATH_WORKFLOWS:-}")</string>
     <key>LOOM_LOG_KEEP_DAYS</key><string>$(xml "${LOOM_LOG_KEEP_DAYS:-}")</string>
-    <key>LOOM_DISK_FREE_MIN_GB</key><string>$(xml "${LOOM_DISK_FREE_MIN_GB:-}")</string>
+    <key>LOOM_PASS_DEADLINE</key><string>$(xml "${LOOM_PASS_DEADLINE:-}")</string>
+    <key>LOOM_MIN_FREE_GB</key><string>$(xml "${LOOM_MIN_FREE_GB:-${LOOM_DISK_FREE_MIN_GB:-}}")</string>
     <key>LOOM_SETTLE_CLAIMED</key><string>$(xml "${LOOM_SETTLE_CLAIMED:-}")</string>
     <key>LOOM_SETTLE_CLAIMED_MAX</key><string>$(xml "${LOOM_SETTLE_CLAIMED_MAX:-}")</string>
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
@@ -411,6 +453,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_GITHUB_APP_KEY_SSM</key><string>$(xml "${LOOM_GITHUB_APP_KEY_SSM:-}")</string>
     <key>LOOM_GITHUB_APP_KEY_FILE</key><string>$(xml "${LOOM_GITHUB_APP_KEY_FILE:-}")</string>
 $(model_env)
+$(runner_env)$(station_pass_env)
   </dict>
 </dict>
 </plist>

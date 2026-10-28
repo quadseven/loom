@@ -11,8 +11,8 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import change_class, hunt_plan, notify, pr_repair, tickets
-from .github import GitHub, GitHubError, auth_from_env
+from . import brain, change_class, hunt_plan, notify, pr_repair, tickets
+from .github import GitHub, GitHubError, RateLimited, auth_from_env
 from .labels import REMOTE_LANES
 
 # One claim comment per ticket claim: the first time is the claim, and each
@@ -29,9 +29,34 @@ def _names(issue: Dict[str, Any]) -> List[str]:
             for x in issue.get("labels") or []]
 
 
+def _own_login(gh: GitHub) -> Optional[str]:
+    """The App login this lane writes as, or None on a personal token or when
+    GET /app cannot be read. Only this App can author as it, so trusting it
+    lets no stranger in (loom#2008)."""
+    login_of = getattr(gh, "app_login", None)
+    if login_of is None:
+        return None
+    try:
+        login = login_of()
+    except RateLimited:
+        raise
+    except GitHubError:
+        return None
+    return login if isinstance(login, str) and login else None
+
+
 def _comments(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
-    return [c for c in gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-            if isinstance(c, dict)]
+    """The comments a LOOM_BRIEF_AUTHORS login or the lane's own App wrote: a
+    stranger's claim or heartbeat marker neither holds a ticket nor is edited
+    as the lane's. The lane's own login counts even when LOOM_BRIEF_AUTHORS
+    omits it, or every beat would miss its last marker and post a new comment
+    (loom#2008)."""
+    authors = brain.trusted_authors()
+    own = _own_login(gh)
+    if own and own.lower() not in {a.lower() for a in authors}:
+        authors = authors + [own]
+    return brain.trusted_comments(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)),
+                                  authors)
 
 
 def _claims(comments: Sequence[Dict[str, Any]], lane: str) -> List[Tuple[int, float, float]]:
@@ -181,10 +206,16 @@ def _takes(item: Any, lane: str) -> bool:
     if "loom:queued" not in names or "lane:" + lane not in names:
         return False
     try:
-        difficulty = tickets.parse(item.get("body"))[0].get("Difficulty", "")
+        headers = tickets.parse(item.get("body"))[0]
     except ValueError:
         return False
-    return difficulty in REMOTE_LANES[lane]["tiers"]
+    if not headers:
+        return False  # no brief header at all: not a ticket a lane can run
+    # The factory's reading (its default tier for a ticket with no
+    # Difficulty: line), so a ticket it reserved for this lane is one the
+    # lane takes (a reserved ticket sat unclaimed under four Muse lanes).
+    from .factory import difficulty_of
+    return difficulty_of(item) in REMOTE_LANES[lane]["tiers"]
 
 
 def _take(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
@@ -225,7 +256,10 @@ def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
                 continue
             recent = [at for _, at, _ in _claims(_comments(gh, repo, int(issue["number"])), lane)
                       if now - at < CLAIM_AGE]
-            if len(recent) >= REMOTE_LANES[lane]["slots"]:
+            # One claim per ticket, whatever the lane's slot count: with
+            # several slots, a ticket a hand-back left queued while its claim
+            # is fresh would otherwise be claimed again by another run.
+            if recent:
                 skipped.append("#%s skipped: claim active" % issue["number"])
                 continue
             claimed_result = _take(gh, repo, issue, lane, now)

@@ -47,14 +47,25 @@ _SIZE_LINE = re.compile(r"^[ \t]*(?:\*\*|__)?size(?:\*\*|__)?[ \t]*:[ \t]*(?:\*\
 SIZE_FORMS = "a ## Size section or a Size: XS|S|M|L line (or Small, Medium, Large)"
 
 
+# Markdown a ticket wraps its size in ("**Size:** S", "`M`"), a list or quote
+# mark before it ("- S"), and the label a line may repeat ("Size: S",
+# "Size - M"). size_letter drops all three before it reads the size.
+_SIZE_MARKUP = re.compile(r"[*_`]")
+_SIZE_LEAD = re.compile(r"^[\s>#-]+")
+_SIZE_LABEL = re.compile(r"^size\b[\s:=-]*", re.IGNORECASE)
+
+
 def size_letter(text: str) -> str:
-    """The gate's letter for a size written as a letter or a word ("Medium",
-    "m", "Size: Small"). ValueError for XL (too big for one pull request)
-    and for anything else."""
-    value = str(text or "").strip()
-    value = re.sub(r"^size\b[:\s\*_]*", "", value, flags=re.IGNORECASE)
-    value = value.strip().strip("*_").strip().rstrip(":.,;").strip().lower()
-    for candidate in (value, value.split(" (")[0].strip(),
+    """The gate's letter for a size written as a letter or a word, with or
+    without markdown or a label: "Medium", "m", "Size: Small", "**Size:** S",
+    "**S**", "S (small)", "M - medium". The one size normalizer: every
+    reader (stated_size, brief_size, with_size_letter, the runner, PR repair)
+    goes through it. ValueError for XL (too big for one pull request) and
+    for anything else."""
+    value = _SIZE_MARKUP.sub("", str(text or "")).strip()
+    value = _SIZE_LABEL.sub("", _SIZE_LEAD.sub("", value)).strip().lower()
+    value = value.rstrip(":.,;").strip()
+    for candidate in (value, value.split(" (")[0].strip(), value.split(" - ")[0].strip(),
                       " ".join(value.split()[:2]), (value.split() or [""])[0]):
         candidate = candidate.rstrip(":.,;")
         if candidate in _TOO_BIG:
@@ -99,7 +110,8 @@ def brief_size(brief: str) -> str:
     try:
         return size_letter(stated)
     except ValueError:
-        return stated.split()[0].rstrip(":") if stated else ""
+        words = _SIZE_LABEL.sub("", _SIZE_MARKUP.sub("", stated).strip()).split()
+        return words[0].rstrip(":") if words else ""
 
 
 def _heading_matches(heading: str, name: str) -> bool:
