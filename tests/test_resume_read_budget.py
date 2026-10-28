@@ -268,6 +268,42 @@ class ResumePartsReadSideBySide(unittest.TestCase):
                 brain._resume_repo(None, REPO, [], {}, {}, NOW, "Grug - Elder", ())
 
 
+class InOrder(LoomSizedResume):
+    """The fake, keeping the order of its requests."""
+
+    def __init__(self):
+        super().__init__()
+        self.order = []
+
+    def __call__(self, method, url, headers, body):
+        with self.lock:
+            self.order.append((method, url.split("api.github.com")[-1]))
+        return super().__call__(method, url, headers, body)
+
+
+class TheListingIsWarmBeforeThePartsStart(unittest.TestCase):
+    """The goal part and the verify part both read the open issue listing,
+    side by side. They do not race for it: the goal journals read it first,
+    before any part starts, through the same once-per-pass client, so both
+    parts are answered from that read and each open handoff item from the
+    listing (loom#2088 review)."""
+
+    def test_the_open_listing_is_read_once_before_any_part_reads(self):
+        fake = InOrder()
+        report = _resume(fake)
+        self.assertIn("- resume failed %s#501 (deferred by muse" % REPO, report)
+        listing = [k for k, (m, p) in enumerate(fake.order)
+                   if p.split("?", 1)[0] == "/repos/%s/issues" % REPO and "labels=" not in p]
+        self.assertEqual(len(listing), 1)
+        parts = [k for k, (m, p) in enumerate(fake.order)
+                 if SUBS.match(p.split("?", 1)[0]) or p == "/graphql" or "labels=" in p]
+        self.assertTrue(parts)
+        self.assertLess(listing[0], min(parts))
+        single = [p for (m, p) in fake.order if ISSUE.match(p)
+                  and int(ISSUE.match(p).group(1)) in fake.by_number]
+        self.assertEqual(single, [])
+
+
 class SubIssueStates(unittest.TestCase):
     def test_an_epic_past_one_page_of_sub_issues_is_read_through_rest(self):
         many = [_issue(10000 + k, ["loom:ticket"], state="closed") for k in range(150)]
