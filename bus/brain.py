@@ -6013,20 +6013,14 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     # The sensitive pull requests are read first, as resume lists them
     # first: a repo GitHub will not show there is named once and left out
     # of every later read, so its goals are never read at all. Any other
-    # fault ends the run, as a fault in the goal reads does.
-    ready: Dict[str, List[Dict[str, Any]]] = {}
-    unread: Dict[str, str] = {}
-    for repo in dict.fromkeys(repos):
-        try:
-            ready[repo] = _ready_sensitive_in(gh, repo, now, check)
-        except GitHubError as err:
-            reason = unreadable(err)
-            if reason is None:
-                raise
-            unread[repo] = reason
-    goals, skipped, timed = _resume_journals(
-        gh, [r for r in dict.fromkeys(repos) if r not in unread], authors, seconds)
+    # fault ends the run, as a fault in the goal reads does. These reads
+    # run under the per-repo budget too: a repo past it is timed out.
+    ready, unread, timed = _resume_ready_sensitive(gh, repos, now, check, seconds)
+    goals, skipped, late = _resume_journals(
+        gh, [r for r in dict.fromkeys(repos) if r not in unread and r not in timed],
+        authors, seconds)
     unread.update(skipped)
+    timed += late
     # A moved or forbidden repo is named once and left out of every later
     # section, so one stale LOOM_REPOS entry does not end the run (loom#800).
     # A timed-out repo is left out the same way.
@@ -6073,6 +6067,34 @@ def _resume_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str], s
     return [g for repo in dict.fromkeys(repos) for g in by_repo.get(repo, [])], unread, timed
 
 
+def _resume_ready_sensitive(gh: GitHub, repos: Sequence[str], now: datetime, check: str,
+                            seconds: float
+                            ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, str], List[str]]:
+    """Each repo's ready sensitive pull requests, read repo by repo under the
+    budget: (ready by repo, unreadable repos with the reason, timed-out
+    repos). A fault that is not unreadable (github.unreadable) is raised."""
+    def sensitive(repo: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        try:
+            return _ready_sensitive_in(gh, repo, now, check), None
+        except GitHubError as err:
+            reason = unreadable(err)
+            if reason is None:
+                raise
+            return [], reason
+
+    ready: Dict[str, List[Dict[str, Any]]] = {}
+    unread: Dict[str, str] = {}
+    timed: List[str] = []
+    for repo, done, value in per_repo.each(repos, sensitive, seconds, READ_WORKERS):
+        if not done:
+            timed.append(repo)
+        elif value[1] is None:
+            ready[repo] = value[0]
+        else:
+            unread[repo] = value[1]
+    return ready, unread, timed
+
+
 def _latest_marks(goals: Sequence[GoalJournals]
                   ) -> Dict[Tuple[str, Tuple[str, int], str], handoff.Mark]:
     """The newest mark of each handoff across every goal's journals."""
@@ -6099,6 +6121,8 @@ def _resume_head(holder: str, authors: Sequence[str], goals: Sequence[GoalJourna
         head += ["", "## Timed-out repos (read again next tick)"]
         head += [_skip_line(repo, per_repo.timed_out(seconds)) for repo in timed]
     return head
+
+
 def _resume_repo(gh: GitHub, repo: str, goals: Sequence[GoalJournals],
                  latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark],
                  gone: Dict[str, str], now: datetime, check: str,
