@@ -4552,14 +4552,17 @@ class ClaimTest(Base):
         model_wait_events = [e for e in events if e.kind == "model_wait"
                              and e.item == hashlib.sha256(("%s#12" % REPO).encode()).hexdigest()]
         self.assertEqual(len(model_wait_events), 1)
-        # A subsequent pass reaching the same wait decision records another
-        # event, even while the wait label is already present.
+        # A subsequent pass reaching the same wait decision does not repeat
+        # the event while the wait label is already present.
         issue = self.fake.issues[12]
+        st.now += invariants.REPEATED_FAILURE
         st._route_model_claim(REPO, issue, "opencode-go-3", "claude-sonnet-5-5", [])
         events = st._read_events()
         model_wait_events = [e for e in events if e.kind == "model_wait"
                              and e.item == hashlib.sha256(("%s#12" % REPO).encode()).hexdigest()]
-        self.assertEqual(len(model_wait_events), 2)
+        self.assertEqual(len(model_wait_events), 1)
+        self.assertEqual(invariants.repeated_failure(
+            invariants.Facts(st.now, events=events)), [])
 
     def test_the_brief_carries_the_operators_notes_and_pull_requests_in_other_repos(self):
         # 2026-10-22: the operator's comment and two merges in

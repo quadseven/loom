@@ -4513,8 +4513,9 @@ class Station:
             # A log line, not a comment: each comment emails the operator
             # (2026-10-18), and the ticket's labels already say it waits.
             _say("%s#%d waits: no free lane takes model %s" % (repo, number, model))
-            self._event("model_wait", "no free lane takes model %s" % model,
-                        "%s#%d" % (repo, number), lane, model)
+            if not already_waiting:
+                self._event("model_wait", "no free lane takes model %s" % model,
+                            "%s#%d" % (repo, number), lane, model)
             return None
         names.append("lane:" + target)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
