@@ -105,6 +105,8 @@ _OWNER_REPO_RE = re.compile(r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9.
 _CITATION_RE = re.compile(r"^\s*(?:Refs?|Part of|Rewritten from|Follows|See|Source)\b.*$",
                           re.I | re.M)
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+# A "Base: owner/name" line names the branch a lane PR targets, never a repo.
+_BASE_RE = re.compile(r"^\s*Base\s*:.*$", re.I | re.M)
 # The status section Loom keeps on a ticket is Loom's own log, not the
 # ticket's words: a line such as "Factory incident owner/loom#N is closed"
 # names a repo without asking for a change there (loom#1959).
@@ -189,10 +191,10 @@ def entry_tier(entry: Mapping[str, Any]) -> str:
 
 def other_repos(repo: str, ticket_body: str) -> List[str]:
     """Other repos of the same owner the ticket's own words name (citation
-    lines, HTML comments and Loom's status section aside)."""
+    lines, Base: lines, HTML comments and Loom's status section aside)."""
     owner, _, name = repo.partition("/")
     text = _STATUS_RE.sub("", ticket_body or "")
-    text = _CITATION_RE.sub("", _COMMENT_RE.sub("", text))
+    text = _BASE_RE.sub("", _CITATION_RE.sub("", _COMMENT_RE.sub("", text)))
     found = []
     for who, what in _OWNER_REPO_RE.findall(text):
         what = what.rstrip(".")

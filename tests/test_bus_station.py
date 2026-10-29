@@ -1088,6 +1088,25 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("loom:closed-unmerged", self.fake.names(12))
         self.assertIn("loom:runaway", self.fake.names(12))
 
+    def test_a_merged_pull_request_clears_runaway_when_criteria_stay_unbuilt(self):
+        # A runaway ticket whose pull request merges but leaves criteria
+        # unbuilt is requeued to build the rest, and the runaway hold is
+        # cleared so the ticket can be claimed again (loom#1405).
+        self.fake.add(12, state="pr", body=BODY + "\n" + self.CRITERIA)
+        self.fake.issues[12]["labels"].append({"name": "loom:runaway"})
+        self.fake.pulls = [{"number": 99, "state": "closed",
+                            "merged_at": "2030-01-02T00:00:00Z",
+                            "body": ("Refs %s#12\n\n## Acceptance criteria\n\n"
+                                     "- [x] First works; test.\n- [ ] Second works.\n")
+                            % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+        self.assertTrue(any("Pull request #99 merged, so this ticket's loom:runaway hold is cleared"
+                            in c["body"] for c in self.fake.comments[12]))
+
     def adoption(self, number, pr, state="queued", lane="codex"):
         self.fake.add(number, state=state, lane=lane, body=station.adoption_body(pr))
         self.fake.issues[number]["title"] = "Land or supersede #%d: A fix" % pr
@@ -4552,14 +4571,17 @@ class ClaimTest(Base):
         model_wait_events = [e for e in events if e.kind == "model_wait"
                              and e.item == hashlib.sha256(("%s#12" % REPO).encode()).hexdigest()]
         self.assertEqual(len(model_wait_events), 1)
-        # A subsequent pass reaching the same wait decision records another
-        # event, even while the wait label is already present.
+        # A subsequent pass reaching the same wait decision does not repeat
+        # the event while the wait label is already present.
         issue = self.fake.issues[12]
+        st.now += invariants.REPEATED_FAILURE
         st._route_model_claim(REPO, issue, "opencode-go-3", "claude-sonnet-5-5", [])
         events = st._read_events()
         model_wait_events = [e for e in events if e.kind == "model_wait"
                              and e.item == hashlib.sha256(("%s#12" % REPO).encode()).hexdigest()]
-        self.assertEqual(len(model_wait_events), 2)
+        self.assertEqual(len(model_wait_events), 1)
+        self.assertEqual(invariants.repeated_failure(
+            invariants.Facts(st.now, events=events)), [])
 
     def test_the_brief_carries_the_operators_notes_and_pull_requests_in_other_repos(self):
         # 2026-10-22: the operator's comment and two merges in

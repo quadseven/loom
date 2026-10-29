@@ -621,7 +621,8 @@ def epic_over_cap(f: Facts) -> List[Breach]:
     """An epic holding more than EPIC_TICKETS tickets (its sub-issues and
     the issues whose Part of line names it, each once), or any epic, the
     standing repairs epic too, holding GitHub's limit of sub-issues: GitHub
-    refuses its next link (loom#2023)."""
+    refuses its next link (loom#2023). A closed epic is finished work whose
+    closed tickets can never leave it, so it is never over a cap (loom#2140)."""
     if f.shapes is None:
         return []
     out = []
@@ -637,7 +638,7 @@ def epic_over_cap(f: Facts) -> List[Breach]:
                          epic.epic.label, shape.goal.label, epic.sub_issues,
                          SUB_ISSUE_LIMIT),),
                     f.now))
-            elif epic.tickets > EPIC_TICKETS and not epic.standing:
+            elif epic.open and epic.tickets > EPIC_TICKETS and not epic.standing:
                 out.append(Breach(
                     "epic-over-cap", epic.epic.key,
                     "Epic %s holds %d tickets (cap %d)" % (epic.epic.label, epic.tickets,
