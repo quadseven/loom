@@ -1494,6 +1494,26 @@ lookup leaves the brief for the next pass. The rule covers:
 - Best for: scoped implementation, CI failure repair, `codex review` passes.
 - Models per ticket: Astra (hardest), Sol (default building), Luna (volume).
 
+## Elder fallback reviews: the codex-2 slot on Luna
+
+When the review bot's model route is exhausted, its check on a lane pull
+request concludes as a degraded review - not a verdict - and the re-ask
+degrades the same way (loom#2142). The factory then dispatches one review
+brief to the `codex-2` slot instead of another fix round: a
+`Deliverable: review` brief in the verify brief's shape, whose tree is the
+pull request's own branch, pinned `Model: gpt-6-luna` (the only model the
+codex lanes run), through `codex exec` on the operator's Codex login, on
+the same lane machine as the other codex slots. The lane changes no code;
+it writes `review.json` (blocking findings, notes, a summary). The station
+posts the verdict on the pull request in the Elder's markings shape
+(`Elder markings - N blocking, M total`, under a
+`<!-- loom:luna-review v1 sha=... -->` marker), with blocking findings
+also posted as review threads, and the factory's merge gate reads the
+verdict for that head in the degraded check's place: a clean verdict lets
+the pull request land, a blocking one sends it back through the ordinary
+fix rounds. A dispatched review that produces no verdict is dispatched
+again after an hour.
+
 ## opencode/ - volume
 
 - Tool: headless opencode runs. Providers configured in `config.json`:

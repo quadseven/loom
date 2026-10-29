@@ -274,7 +274,7 @@ class Base(unittest.TestCase):
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
            down=(), limit_until=None, scope=None, known_waits=None, demoted=None,
-           no_lane_since=None):
+           no_lane_since=None, review_brief=None):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
@@ -307,7 +307,7 @@ class Base(unittest.TestCase):
                             available=available, model_limits=model_limits, held=held,
                             silent=silent, down=down, limit_until=limit_until, scope=scope,
                             known_waits=known_waits, demoted=demoted,
-                            no_lane_since=no_lane_since)
+                            no_lane_since=no_lane_since, review_brief=review_brief)
         f.run()
         return f
 
@@ -4102,6 +4102,12 @@ class Helpers(unittest.TestCase):
         self.assertIsNone(scope({"LOOM_SCOPE_CHECK_URL": "http://gw.invalid/v1"}))
         self.assertTrue(callable(scope({"LOOM_SCOPE_CHECK_URL": "https://gw.invalid/free-public/gemini/v1"})))
 
+    def test_the_station_wires_the_luna_review_writer_into_the_factory(self):
+        with tempfile.TemporaryDirectory() as home:
+            settings = station.Settings(home, [REPO], ["alice-example"], [], factory_on=True)
+            st = station.Station(FakeGitHub(), settings, now=NOW)
+            self.assertEqual(st._factory().review_brief, st._write_review_brief)
+
 
     def test_the_station_tells_the_factory_which_tickets_it_holds(self):
         with tempfile.TemporaryDirectory() as home:
@@ -4128,7 +4134,7 @@ class Helpers(unittest.TestCase):
                          no_test_repos=(), available=None, briefers=(), held=(),
                          model_limits=None, silent=None, down=(), limit_until=None,
                          benched=(), known_waits=None, plan_check=None, demoted=None,
-                         no_lane_since=None):
+                         no_lane_since=None, review_brief=None):
                 self.silent_running, self.silent, self.waits = {}, silent, {}
                 self.settled = set()
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
@@ -4453,6 +4459,124 @@ class NoLane(Base):
         self.assertTrue(brain._in_flight(ticket("pr")))
         self.assertTrue(brain._in_flight(ticket("pr", factory.HANDOFF_LABEL)))
 
+
+class LunaReview(Base):
+    """The Codex Luna review fallback (loom#2142): when the review check is
+    degraded (its model route is exhausted) and the review bot's re-ask has
+    already failed on the same head, the factory dispatches one review brief
+    to the Luna lane slot instead of a fix round no lane can close, and the
+    gate reads the lane's verdict for that head like the review bot's own."""
+
+    DEGRADED = {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+                "conclusion": "failure",
+                "output": {"title": "WARN Grug eyes clouded",
+                           "summary": "Degraded review (all_failed): not a verdict. "
+                                      "Comment /grug improve to re-run once the backend recovers."},
+                "details_url": "https://github.com/%s/actions/runs/80/job/1" % REPO}
+
+    def degraded_pr(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [dict(self.DEGRADED)]
+
+    def writer(self):
+        calls = []
+
+        def write(repo, pr_number, sha, issue):
+            calls.append((repo, pr_number, sha, int(issue["number"])))
+            return True
+        return calls, write
+
+    def seed(self, body, ago=0, user=None):
+        self.gh.comments.setdefault(50, []).append(
+            {"body": body, "user": user or ME, "created_at": iso(ago)})
+
+    def test_parse_luna_verdict_reads_the_markings_line(self):
+        body = (factory.LUNA_REVIEW_MARKER % "sha50" +
+                "\nElder markings - 2 blocking, 5 total\n\nFindings follow.")
+        self.assertEqual(factory.parse_luna_verdict(body, "sha50"), (2, 5))
+        self.assertIsNone(factory.parse_luna_verdict(body, "sha99"))
+        self.assertIsNone(factory.parse_luna_verdict(
+            "Elder markings - 0 blocking, 0 total", "sha50"))
+        self.assertIsNone(factory.parse_luna_verdict(
+            factory.LUNA_REVIEW_MARKER % "sha50" + "\nno markings here", "sha50"))
+
+    def test_a_degraded_review_still_degraded_after_the_reask_dispatches_a_luna_review(self):
+        self.degraded_pr()
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        self.assertEqual(calls, [])  # the first pass only re-asks the review bot
+        self.go(review_brief=write)
+        self.assertEqual(calls, [(REPO, 50, "sha50", 5)])
+        bodies = [str(c.get("body") or "") for c in self.gh.comments[50]]
+        self.assertTrue(any(factory.LUNA_REQUEST_MARKER % "sha50" in body for body in bodies))
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.merged, [])
+
+    def test_without_a_review_writer_a_second_degraded_review_is_sent_back_as_before(self):
+        self.degraded_pr()
+        self.go()
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_luna_request_already_in_flight_is_not_dispatched_again(self):
+        self.degraded_pr()
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        self.go(review_brief=write)
+        self.go(review_brief=write)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.fixed, [])
+
+    def test_a_luna_request_older_than_the_retry_window_is_dispatched_again(self):
+        self.degraded_pr()
+        self.seed(factory.REVIEW_AGAIN_MARKER % "sha50" + "\n/grug improve")
+        self.seed(factory.LUNA_REQUEST_MARKER % "sha50", ago=2 * factory.LUNA_RETRY_AFTER)
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_clean_luna_verdict_lets_the_pull_request_land(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.runs["sha50"] = [dict(self.DEGRADED)]
+        self.seed(factory.LUNA_REVIEW_MARKER % "sha50" +
+                  "\nElder markings - 0 blocking, 2 total\n\nThe change is sound.")
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertEqual(self.fixed, [])
+
+    def test_a_blocking_luna_verdict_does_not_excuse_the_check(self):
+        self.degraded_pr()
+        self.seed(factory.REVIEW_AGAIN_MARKER % "sha50" + "\n/grug improve")
+        self.seed(factory.LUNA_REVIEW_MARKER % "sha50" +
+                  "\nElder markings - 2 blocking, 3 total\n\nTwo findings block.")
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        self.assertEqual(calls, [])  # a verdict exists: nothing new to dispatch
+        self.assertEqual(self.merged, [])
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_an_untrusted_luna_verdict_is_ignored(self):
+        self.degraded_pr()
+        self.seed(factory.REVIEW_AGAIN_MARKER % "sha50" + "\n/grug improve")
+        self.seed(factory.LUNA_REVIEW_MARKER % "sha50" +
+                  "\nElder markings - 0 blocking, 0 total",
+                  user={"login": "mallory-example"})
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        self.assertEqual(len(calls), 1)  # no trusted verdict: the lane is asked
+        self.assertEqual(self.merged, [])
+
+    def test_a_luna_verdict_for_another_head_is_ignored(self):
+        self.degraded_pr()
+        self.seed(factory.REVIEW_AGAIN_MARKER % "sha50" + "\n/grug improve")
+        self.seed(factory.LUNA_REVIEW_MARKER % "shaOTHER" +
+                  "\nElder markings - 0 blocking, 1 total")
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.merged, [])
 
 if __name__ == "__main__":
     unittest.main()
