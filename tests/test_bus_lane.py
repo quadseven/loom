@@ -226,6 +226,12 @@ class PushBranchTest(unittest.TestCase):
         gh = FakeGitHub(self.dir, refs)
         return gh, lane.push_branch(gh, REPO, NUMBER)
 
+    def assert_only_the_singular_ref_was_read(self, gh):
+        reads = [path for method, path, _ in gh.calls
+                 if method == "GET" and "/git/ref" in path]
+        self.assertEqual(reads, ["/repos/%s/git/ref/heads/%s"
+                                 % (REPO, quote(BRANCH, safe=""))])
+
     def test_a_prefix_sibling_does_not_crash_an_up_to_date_push(self):
         gh, sha = self.push({EXACT: self.head, SIBLING_R3: self.base,
                              SIBLING_R4: self.base})
@@ -245,6 +251,7 @@ class PushBranchTest(unittest.TestCase):
                    if call[0] == "POST" and call[1].endswith("/git/refs")]
         self.assertEqual(len(creates), 1)
         self.assertEqual(creates[0][2]["ref"], EXACT)
+        self.assert_only_the_singular_ref_was_read(gh)
 
     def test_prefix_siblings_with_a_behind_target_update_only_the_target(self):
         gh, sha = self.push({EXACT: self.base, SIBLING_R3: self.base,
@@ -261,6 +268,7 @@ class PushBranchTest(unittest.TestCase):
         creates = [call for call in gh.writes()
                    if call[0] == "POST" and call[1].endswith("/git/refs")]
         self.assertEqual(creates, [])
+        self.assert_only_the_singular_ref_was_read(gh)
 
     def test_a_missing_target_with_no_siblings_is_created(self):
         gh, sha = self.push({})
@@ -287,6 +295,8 @@ class PushBranchTest(unittest.TestCase):
             {},                                              # no object at all
             {"object": {}},                                  # an object, no commit
             {"object": "not-a-ref-object"},                  # a non-object object
+            {"ref": SIBLING_R3,                              # a sibling's ref
+             "object": {"sha": self.base, "type": "commit"}},
         ]
         for payload in payloads:
             with self.subTest(payload=payload):

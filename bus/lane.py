@@ -469,13 +469,15 @@ def push_branch(gh: GitHub, repo: str, number: int) -> str:
     obj = ref.get("object") if isinstance(ref, dict) else None
     if ref is _NO_REF:
         remote_head = ""
-    elif isinstance(obj, dict) and obj.get("sha"):
+    elif (isinstance(obj, dict) and obj.get("sha")
+            and ref.get("ref") in (None, "refs/heads/" + branch)):
         remote_head = str(obj["sha"])
     else:
         # A 200 that is not the one ref object (a list, an empty body, a
-        # payload with no commit) must stop the push loudly: guessing a
-        # remote head here could update the wrong ref or silently strand
-        # the lane's commits behind a success report.
+        # payload with no commit, or one naming a different ref) must stop
+        # the push loudly: guessing a remote head here could update the
+        # wrong ref or silently strand the lane's commits behind a success
+        # report.
         raise GitHubError("the ref read for branch %s answered an unexpected "
                           "payload (%s); refusing to push"
                           % (branch, type(ref).__name__))
