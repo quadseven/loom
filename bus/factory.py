@@ -302,6 +302,12 @@ LUNA_REVIEW_MARKER = "<!-- loom:luna-review v1 sha=%s -->"
 # A dispatched review that produced no verdict is dispatched again after
 # this long: its lane run may have failed, or never picked the brief up.
 LUNA_RETRY_AFTER = 3600
+# One request comment per head records every dispatch (loom#2207): each adds a
+# line and a hidden stamp to it, and after LUNA_MAX_DISPATCHES without a
+# verdict the head is not dispatched again and a factory ticket is filed.
+LUNA_MAX_DISPATCHES = 3
+_LUNA_DISPATCH_RE = re.compile(r"<!-- loom:luna-dispatch at=(\d+) -->")
+LUNA_STUCK_TITLE = "Luna review of %s#%d head %s got no verdict after %d dispatches"
 _LUNA_MARKINGS_RE = re.compile(r"Elder markings - (\d+) blocking, (\d+) total")
 
 
@@ -3454,7 +3460,8 @@ class Factory:
         if self.review_brief is None or not self._review_degraded(sha):
             return False
         asked = False
-        newest = 0.0
+        request: Optional[Dict[str, Any]] = None
+        stamps: List[int] = []
         for comment in self._trusted_comments(repo, number):
             body = str(comment.get("body") or "")
             if parse_luna_verdict(body, sha) is not None:
@@ -3462,9 +3469,14 @@ class Factory:
             if REVIEW_AGAIN_MARKER % sha in body:
                 asked = True
             if LUNA_REQUEST_MARKER % sha in body:
-                newest = max(newest, _ts(comment.get("created_at")))
+                request = request or comment
+                # A request written before the stamps counts as one dispatch
+                # at its creation time.
+                stamps += [int(x) for x in _LUNA_DISPATCH_RE.findall(body)] or [
+                    int(_ts(comment.get("created_at")))]
         if not asked:
             return False  # the review bot has not had its re-ask yet
+        newest = max(stamps, default=0)
         if newest and self.now - newest <= LUNA_RETRY_AFTER:
             # A review for this head is already in flight: the pull request
             # waits for the lane's verdict instead of bouncing through a fix
@@ -3472,20 +3484,52 @@ class Factory:
             _say("%s#%d waits for the Luna review of head %s dispatched %ds ago"
                  % (repo, number, sha[:12], int(self.now - newest)))
             return True
+        if len(stamps) >= LUNA_MAX_DISPATCHES:
+            self._luna_stuck(repo, number, sha, len(stamps))
+            return True  # the filed ticket carries it from here
         if not self.review_brief(repo, number, sha, issue):
             return False
-        notify.post(self.gh, repo, number,
-                    "%s\nThe review check is degraded on this head and its re-run "
-                    "was degraded too, so a Codex Luna review was dispatched on "
-                    "lane %s (gpt-6-luna, through `codex exec`). Its verdict will "
-                    "be posted here for this head, and the merge gate reads it "
-                    "while the review route is down."
-                    % (LUNA_REQUEST_MARKER % sha, LUNA_REVIEW_LANE),
-                    notify.NOTE)
+        stamp = int(self.now)
+        line = ("Dispatch %d at %s UTC.\n<!-- loom:luna-dispatch at=%d -->"
+                % (len(stamps) + 1, datetime.fromtimestamp(stamp, timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M"), stamp))
+        if request is None:
+            notify.post(self.gh, repo, number,
+                        "%s\nThe review check is degraded on this head and its re-run "
+                        "was degraded too, so a Codex Luna review was dispatched on "
+                        "lane %s (gpt-6-luna, through `codex exec`). Its verdict will "
+                        "be posted here for this head, and the merge gate reads it "
+                        "while the review route is down. A dispatch with no verdict "
+                        "is retried on this comment, up to %d times.\n\n%s"
+                        % (LUNA_REQUEST_MARKER % sha, LUNA_REVIEW_LANE,
+                           LUNA_MAX_DISPATCHES, line), notify.NOTE)
+        else:
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(request["id"])),
+                         {"body": str(request.get("body") or "").rstrip() + "\n" + line})
         self.actions += 1
         _say("dispatched a Luna review of %s#%d head %s on lane %s"
              % (repo, number, sha[:12], LUNA_REVIEW_LANE))
         return True
+
+    def _luna_stuck(self, repo: str, number: int, sha: str, sent: int) -> None:
+        """File one factory ticket for a head whose Luna review got no verdict
+        after `sent` dispatches, unless an open one already names it."""
+        title = LUNA_STUCK_TITLE % (repo, number, sha[:12], sent)
+        for found in self.gh.paginate("/repos/%s/issues?labels=loom:factory&state=open" % repo):
+            if isinstance(found, dict) and found.get("title") == title and self._trusted(found):
+                return
+        body = ("The review check is degraded on pull request #%d head %s and its re-run "
+                "was too, so its review was dispatched to lane %s %d times with no "
+                "verdict. No further dispatch is made for this head: the pull request "
+                "waits until the lane answers or a new head is pushed.\n\n"
+                "## Why\nThe lane cannot answer, or its run never records a verdict.\n"
+                % (number, sha[:12], LUNA_REVIEW_LANE, sent))
+        brain._check_written_text(title + "\n" + body)
+        self.gh.rest("POST", "/repos/%s/issues" % repo,
+                     {"title": title, "body": body, "labels": ["loom:factory"]})
+        self.actions += 1
+        _say("filed a factory ticket: Luna review of %s#%d head %s stuck"
+             % (repo, number, sha[:12]))
 
     def _behind(self, repo: str, full: Dict[str, Any]) -> int:
         base = str((full.get("base") or {}).get("ref") or "")

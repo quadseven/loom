@@ -107,7 +107,8 @@ class FakeGitHub:
             return [p for p in self.pulls.values() if p.get("state") == "closed"]
         if path.endswith("/pulls?state=all") or re.search(r"/pulls\?.*state=all", path) or path.endswith("/pulls"):
             return list(self.pulls.values())
-        if path.endswith("/issues?labels=loom:triage&state=open"):
+        if path.endswith("/issues?labels=loom:triage&state=open") or path.endswith(
+                "/issues?labels=loom:factory&state=open"):
             return list(self.filed)
         if "/issues?labels=loom%3Aanswer-pending&state=open" in path:
             return [i for i in self.issues.values() if i.get("state") == "open"
@@ -274,7 +275,7 @@ class Base(unittest.TestCase):
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
            down=(), limit_until=None, scope=None, known_waits=None, demoted=None,
-           no_lane_since=None, review_brief=None):
+           no_lane_since=None, review_brief=None, now=NOW):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
@@ -301,7 +302,7 @@ class Base(unittest.TestCase):
             self.humans.append((number, ask))
             gh.comments[number].append({"body": brain.HUMAN_MARKER + "\n" + ask, "user": ME})
             gh.issues[number]["labels"].append({"name": "loom:human"})
-        f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
+        f = factory.Factory(self.gh, [REPO], now, trusted=["Alice-Example"],
                             merge=merge, fix=fix, move=move, close=close, human=human, place=place,
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
@@ -4697,6 +4698,41 @@ class LunaReview(Base):
         self.go(review_brief=write)
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.merged, [])
+
+    def requests(self):
+        return [c for c in self.gh.comments.get(50, [])
+                if factory.LUNA_REQUEST_MARKER % "sha50" in str(c.get("body") or "")]
+
+    def dispatches(self, count):
+        """Run the factory once to re-ask, then `count` passes a retry window
+        apart; returns the writer's calls."""
+        self.degraded_pr()
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        for n in range(count):
+            self.go(review_brief=write, now=NOW + n * (factory.LUNA_RETRY_AFTER + 1))
+        return calls
+
+    def test_two_dispatches_for_one_head_leave_one_comment_edited(self):
+        calls = self.dispatches(2)
+        self.assertEqual(len(calls), 2)
+        found = self.requests()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["body"].count("Dispatch "), 2)
+
+    def test_three_dispatches_without_a_verdict_file_one_factory_ticket_and_stop(self):
+        calls = self.dispatches(3)
+        self.assertEqual(len(calls), 3)
+        later = self.writer()
+        for n in (4, 6):
+            self.go(review_brief=later[1], now=NOW + n * (factory.LUNA_RETRY_AFTER + 1))
+        self.assertEqual(later[0], [])
+        self.assertEqual(len(self.requests()), 1)
+        self.assertEqual(len(self.gh.filed), 1)
+        self.assertIn("loom:factory", self.gh.filed[0]["labels"])
+        self.assertIn("sha50", self.gh.filed[0]["title"])
+        self.assertEqual(self.fixed, [])
+
 
 if __name__ == "__main__":
     unittest.main()
