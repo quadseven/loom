@@ -475,9 +475,11 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
     health = health_verdict(body)
     if health is not None:
         return health
+    # The stale reads come before the criteria hold: a ticket whose work an
+    # operator answered, a source shipped, or a twin already built surfaces
+    # that verdict and its ask, and the criteria park still waits for every
+    # ticket the stale reads pass over.
     criteria = criteria_verdict(body)
-    if criteria is not None:
-        return criteria
     done = asked(comments, trusted)
     operator = tickets.operator_login(trusted) or ""
     # An answer an operator gave on the dashboard (bus/answer.py) reads as
@@ -495,7 +497,7 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
                 return found
     except (GitHubError, ValueError, KeyError, TypeError) as err:
         raise Unread(str(err)) from err
-    return None
+    return criteria
 
 
 def ask(verdict: Verdict) -> str:
