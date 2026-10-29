@@ -746,12 +746,20 @@ class PullRequests(Base):
         self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
         self.assertEqual((self.moved, self.closed), ([], []))
 
-    def test_a_conflict_on_a_ticket_a_person_holds_gets_no_brief(self):
+    def test_a_conflict_on_a_ticket_a_person_holds_gets_a_hygiene_round_only(self):
+        # Changed by loom#2135: the judged send-back still refuses a ticket
+        # a person holds, which left an operator-held pull request's
+        # conflict unassigned until the operator came to merge it. Branch
+        # hygiene opens the conflict round anyway (the loom:human hold
+        # guards the merge, not the branch, and stays on the ticket);
+        # nothing else about the ticket moves.
         self.gh.ticket(5, "pr")
         self.gh.issues[5]["labels"].append({"name": "loom:human"})
         self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 3)
         self.go()
-        self.assertEqual((self.fixed, self.moved, self.closed, self.merged), ([], [], [], []))
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual((self.moved, self.closed, self.merged), ([], [], []))
+        self.assertIn("loom:human", [x["name"] for x in self.gh.issues[5]["labels"]])
 
     def test_the_rungs_go_sonnet_then_sol_then_opus(self):
         self.gh.ticket(5, "pr")
@@ -4458,6 +4466,118 @@ class NoLane(Base):
         self.assertFalse(brain._in_flight(ticket("briefed", factory.HANDOFF_LABEL)))
         self.assertTrue(brain._in_flight(ticket("pr")))
         self.assertTrue(brain._in_flight(ticket("pr", factory.HANDOFF_LABEL)))
+
+
+def conflict_round_comment(number, ticket):
+    """A loom:fix comment sending a pull request back for its conflict, in
+    the shape brain.fix writes (the header names the pull request, and the
+    body carries the conflict line)."""
+    return {"body": FIX_MARKER + "\nPull request: %s#%d, branch loom/%d-some-title\n" % (REPO, number, ticket)
+            + brain.BRAIN_FIX_MARKER + "\n\n" + factory.FIX_NOTES
+            + "\n\n- The branch conflicts with the default branch\n",
+            "user": ME}
+
+
+class BranchHygiene(Base):
+    """The standing branch-hygiene pass (loom#2135): every open lane pull
+    request is kept current or sent back for its conflict over its lifetime,
+    not only at merge time. The setups keep the judge path out of the way
+    (its checks still running, so it waits) unless the test says otherwise,
+    so what moves is the hygiene pass."""
+
+    WAITING = (("unittest", "in_progress"), (factory.DEFAULT_REVIEW_CHECK, "in_progress"))
+
+    def updates(self):
+        return [w[1] for w in self.gh.writes if w[1].endswith("/update-branch")]
+
+    def test_a_behind_pull_request_is_brought_up_to_date_and_a_current_one_left_alone(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=7200, runs=self.WAITING)
+        self.gh.behind[50] = 3
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6, created=3600, runs=self.WAITING)
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_a_dirty_pull_request_gets_a_fix_round_naming_it(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+        f = self.go()
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertIn("conflict", f.notes)
+        self.assertEqual(self.merged, [])
+
+    def test_a_dirty_pull_request_with_a_round_open_gets_no_second_round(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+        self.gh.comments[5].append(conflict_round_comment(50, 5))
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.merged, [])
+
+    def test_no_update_while_another_pull_request_holds_the_landing_lock(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=3600, labels=("loom:landing",), runs=self.WAITING)
+        self.gh.events[50] = [landing_event(600)]
+        self.gh.behind[50] = 2
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6, created=7200, runs=self.WAITING)
+        self.gh.behind[60] = 2
+        self.go()
+        self.assertEqual(self.updates(), [])
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_updates_are_bounded_per_repo_per_pass_oldest_first(self):
+        for ticket, number, created in ((5, 50, 10800), (6, 60, 7200), (7, 70, 3600)):
+            self.gh.ticket(ticket, "pr")
+            self.gh.pull(number, ticket, created=created, runs=self.WAITING)
+            self.gh.behind[number] = 1
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO,
+                                          "/repos/%s/pulls/60/update-branch" % REPO])
+
+    def test_a_sensitive_pull_request_is_kept_current_and_never_merged(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:sensitive",), runs=self.WAITING)
+        self.gh.behind[50] = 4
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_a_dirty_sensitive_pull_request_gets_a_fix_round_and_is_never_merged(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, mergeable=False, labels=("class:sensitive",), runs=self.WAITING)
+        self.go()
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.merged, [])
+
+    def test_a_conflict_on_an_operator_held_ticket_still_gets_its_round(self):
+        # loom#1599's stall: the ticket sits at loom:human (its merge waits
+        # for the operator), and the held send-back path never assigns the
+        # conflict. Hygiene maintains the branch anyway: a fix round is not
+        # a merge, and the hold stays on the ticket.
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5]["labels"].append({"name": "loom:human"})
+        self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+        self.go()
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.merged, [])
+
+    def test_a_conflict_on_a_needs_brain_ticket_waits_for_the_brain(self):
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5]["labels"].append({"name": "needs-brain"})
+        self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.merged, [])
+
+    def test_a_dirty_pull_request_whose_ticket_a_lane_already_holds_is_left_alone(self):
+        self.gh.ticket(5, "queued")
+        self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.merged, [])
 
 
 class LunaReview(Base):
