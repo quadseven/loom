@@ -500,6 +500,12 @@ class TicketStore:
         configured = set(self.repos) | {repo for repo, _ in homes}
         titles, parents = self._goal_info(rows, configured)
         epics = self._assign_epics(rows)
+        # A goal home whose issue does not exist is no goal: a ticket
+        # naming it (or naming an epic under it) names nothing (loom#2166).
+        cache = self.__dict__.get("_goal_info_cache") or {}
+        for row in rows:
+            if row.get("goal") and (cache.get(row["goal"]) or {}).get("is_missing"):
+                row["goal"] = None
         # Reports on the goal homes read in full above count too: a goal home
         # in LOOM_IMPROVEMENT_HOMES keeps its report even if its repo's
         # comment feed failed this pass.
@@ -761,7 +767,9 @@ class TicketStore:
         name and every parent above them. A goal home is read again after
         GOAL_INFO_TTL (a parent line can be added at any time; a conditional
         read of an unchanged issue costs no request budget); an unreadable
-        one stays None and is read again next pass.
+        one stays None and is read again next pass. A home whose issue
+        does not exist (a 404 read) is no goal at all: it is in neither
+        map, and tickets naming it name nothing (loom#2166).
 
         A parent counts only in a repo the dashboard is configured for
         (`configured`: LOOM_REPOS and the goal-home repos), and only when it is
@@ -782,8 +790,16 @@ class TicketStore:
                 if goal not in seen and goal not in level and len(seen) + len(level) < GOAL_INFO_MAX:
                     level.append(goal)
             seen.update(level)
-            stale = [goal for goal in level if not (cache.get(goal) or {}).get("title")
-                     or now - cache[goal].get("read_at", 0) >= GOAL_INFO_TTL]
+            stale = []
+            for goal in level:
+                cached = cache.get(goal) or {}
+                # A home read as missing (its issue is a 404) stays missing
+                # until the TTL, like any other read (loom#2166); a home
+                # with no title otherwise is read again every pass.
+                if not cached.get("title") and not cached.get("is_missing"):
+                    stale.append(goal)
+                elif now - cached.get("read_at", 0) >= GOAL_INFO_TTL:
+                    stale.append(goal)
             with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
                 read = list(pool.map(lambda goal: self._read_goal_home(goal, cache.get(goal), now, configured),
                                      stale))
@@ -799,12 +815,14 @@ class TicketStore:
         def accepted(parent):
             if not parent or parent.partition("#")[0] not in configured:
                 return None
+            if (cache.get(parent) or {}).get("is_missing"):
+                return None
             return parent if parent in named or (cache.get(parent) or {}).get("is_goal") else None
 
-        titles = {goal: entry.get("title") for goal, entry in cache.items()}
+        titles = {goal: entry.get("title") for goal, entry in cache.items() if not entry.get("is_missing")}
         # An epic is not a smaller goal: it never rolls up as one.
         parents = {goal: None if entry.get("is_epic") else accepted(entry.get("parent"))
-                   for goal, entry in cache.items()}
+                   for goal, entry in cache.items() if not entry.get("is_missing")}
         return titles, parents
 
     def _assign_epics(self, rows) -> Dict[str, Dict[str, Any]]:
@@ -819,16 +837,28 @@ class TicketStore:
             entry = cache.get(named) if named else None
             if not entry or not entry.get("is_epic"):
                 continue
-            row["epic"], row["goal"] = named, entry.get("epic_goal")
+            epic_goal = entry.get("epic_goal")
+            if epic_goal and (cache.get(epic_goal) or {}).get("is_missing"):
+                epic_goal = None  # the epic's goal home does not exist (loom#2166)
+            row["epic"], row["goal"] = named, epic_goal
             epics[named] = {"title": entry.get("title"), "open": entry.get("open", True),
-                            "goal": entry.get("epic_goal")}
+                            "goal": epic_goal}
         return epics
 
     def _read_goal_home(self, goal, entry, now, configured):
         repo, _, number = goal.partition("#")
         try:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), int(number))).data
-        except (GitHubError, OSError, ValueError):
+        except GitHubError as exc:
+            if exc.status == 404:
+                # The issue does not exist, so there is no goal home here,
+                # whatever an earlier read cached: a definitive answer,
+                # not a transient failure (loom#2166).
+                return {"title": None, "parent": None, "is_goal": False, "is_epic": False,
+                        "epic_goal": None, "open": False, "is_missing": True, "read_at": now}
+            # Keep what an earlier read found; try again next pass.
+            return dict(entry or {}, read_at=0)
+        except (OSError, ValueError):
             # Keep what an earlier read found; try again next pass.
             return dict(entry or {}, read_at=0)
         if not isinstance(issue, dict):
