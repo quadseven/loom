@@ -112,8 +112,11 @@ class ResumeSkipTests(unittest.TestCase):
         self.assertNotIn("resume merge %s#7" % REPO, out)
 
     def test_a_fault_still_ends_the_run(self):
-        with self.assertRaises(GitHubError):
-            self.resume(self.routes(moved_status=500, moved_body={"message": "boom"}))
+        for status, body in ((500, {"message": "boom"}),
+                             (403, {"message": "API rate limit exceeded"})):
+            with self.subTest(status=status):
+                with self.assertRaises(GitHubError):
+                    self.resume(self.routes(moved_status=status, moved_body=body))
 
 
 class StatusSkipTests(unittest.TestCase):

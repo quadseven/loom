@@ -316,3 +316,97 @@ class BrainHoldsTest(NeedsYouPageTest):
                      {"repos": [dict(self.ROW, old="3")]},
                      {"repos": [dict(self.ROW, person=True)]}):
             self.assertEqual(self.post(body)[0], 400, body)
+
+
+class AcceptanceCriteriaTest(unittest.TestCase):
+    """Acceptance criteria for loom#1859: three gaps in the Needs-you page."""
+
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, dict(ENV, LOOM_BRIEF_AUTHORS=LOOM))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _make_store(self, gh):
+        store = TicketStore([REPO], gh=gh, budget_floor=500)
+        store._waits_refreshed_at = float("inf")
+        store.refresh()
+        return store
+
+    def page(self, document=None, who=""):
+        return server._needs_you(document or {}, self.store, who=who)
+
+    def cards(self, body):
+        return [part.split("</article>")[0] for part in body.split('<article class="card ask-card"')[1:]]
+
+    def card(self, body, number):
+        return next(card for card in self.cards(body) if "%s#%d<" % (REPO, number) in card
+                    or "%s#%d -" % (REPO, number) in card)
+
+    def test_claim_comment_is_skipped_when_picking_ask(self):
+        """Issue with only a claim comment after the wait label shows no claim text as ask."""
+        # An issue labelled needs:owner with a claim comment (bot handoff) and no other ask comment
+        claim_issue = _issue(50, "Claim test", ["needs:" + OWNER], hours=10)
+        claim_issue["comments"] = 2
+        pages = {
+            "/repos/%s/labels" % REPO: [{"name": "needs:" + OWNER}],
+            "/repos/%s/issues?labels=needs%%3A%s&" % (REPO, OWNER): [claim_issue],
+        }
+        url = "https://github.com/%s/issues/%d#issuecomment-%d"
+        rest = {
+            "/repos/%s/issues/50/comments?per_page=100&page=1" % REPO: [
+                {"body": "Opened for the work.", "html_url": url % (REPO, 50, 1)},
+                {"body": "<!-- ccqw:handoff v1 -->\nLabelled needs:%s.\n\nDetail." % OWNER,
+                 "html_url": url % (REPO, 50, 2)}],
+        }
+        gh = FakeGitHub(pages, rest)
+        store = self._make_store(gh)
+        body = server._needs_you({}, store)
+        card = self.card(body, 50)
+        # The claim comment should not be picked as the ask
+        self.assertNotIn("Labelled needs", card)
+        self.assertNotIn("ccqw:handoff", card)
+        # Should show "No exact ask" since there's no real ask comment
+        self.assertIn("No exact ask is written", card)
+
+    def test_ask_from_comment_is_copied_to_body_ask_section(self):
+        """Ask only in a comment gets copied to body's ## Ask section once."""
+        # This tests the station's behavior of copying the ask from a comment to the body.
+        # The station edits the issue body to add "## Ask" section. The dashboard then
+        # reads body_ask from the body, which takes precedence over comment_ask.
+        issue = _issue(51, "Copy ask test", ["needs:" + OWNER], hours=10)
+        issue["comments"] = 1
+        # Simulate station copying ask to body: body now has ## Ask section
+        issue["body"] = "## Ask\n\nThis ask was copied from a comment\n"
+        pages = {
+            "/repos/%s/labels" % REPO: [{"name": "needs:" + OWNER}],
+            "/repos/%s/issues?labels=needs%%3A%s&" % (REPO, OWNER): [issue],
+        }
+        gh = FakeGitHub(pages, {})
+        store = self._make_store(gh)
+        body = server._needs_you({}, store)
+        card = self.card(body, 51)
+        # Body ask should be shown (blockquote), not the comment source
+        self.assertIn("<blockquote>This ask was copied from a comment</blockquote>", card)
+        # The "from a comment" SOURCE link should NOT appear when body_ask is present
+        self.assertNotIn('class="machine-fact ask-source">', card)
+
+    def test_unknown_kind_is_flagged_and_counted(self):
+        """Kind: command shows as unknown kind and counted in standup line."""
+        from dashboard import needs_you
+        # Create an entry with an unknown kind in its ask
+        entry = {
+            "repo": REPO, "number": 52, "title": "Unknown kind test",
+            "who": [OWNER], "unblocks": 0,
+            "body_ask": "Kind: command\n\nDo something.",
+            "comment_ask": None, "comment_url": "",
+        }
+        # The action_kind should return "unknown" for unknown kinds
+        kind = needs_you.action_kind(entry)
+        self.assertEqual(kind, "unknown")
+        # The summary should count unknown kinds
+        summary_html = needs_you.summary([entry])
+        self.assertIn("unknown kind", summary_html.lower())
+        # The groups should have an "unknown" group
+        groups_html = needs_you.groups([entry])
+        self.assertIn('data-kind="unknown"', groups_html)
+        self.assertIn("Unknown", groups_html)

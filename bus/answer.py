@@ -34,9 +34,7 @@ NOTE_MAX = 1000
 CHOICE, NUMBER, TEXT = "choice", "number", "text"
 MERGE, HOLD = "Merge", "Hold"
 NOT_NOW = "Not now"
-# Kinds of loom:human ask (bus.brain.HUMAN_KINDS) a person settles by doing
-# the thing and saying so.
-DONE_KINDS = ("account", "physical", "hardware")
+from .kinds import DONE_KINDS
 
 
 class Options(NamedTuple):

@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import time
 import unittest
@@ -210,6 +211,9 @@ class Routes:
             self.posted.append((path, json.loads(body) if body else None))
         if method == "GET" and path.startswith("/repos/") and path.endswith("/pulls"):
             return 200, {}, b"[]"
+        if method == "POST" and path == "/graphql" and "subIssues" in json.loads(body)["query"]:
+            return 200, {}, json.dumps({"data": {"repository": self.sub_issue_states(
+                json.loads(body)["query"])}}).encode()
         if (method == "GET" and path.endswith("/sub_issues")
                 and (method, path) not in self.routes):
             return 200, {}, b"[]"  # a goal with no epics or tickets linked
@@ -217,6 +221,18 @@ class Routes:
             raise AssertionError("unexpected call %s %s" % (method, path))
         status, data = self.routes[(method, path)]
         return status, {}, json.dumps(data).encode()
+
+    def sub_issue_states(self, query):
+        """Resume's batched sub-issue states (brain._sub_issue_states), from
+        the same sub_issues routes a REST read answers."""
+        repo = "%s/%s" % re.search(r'owner:"([^"]+)",name:"([^"]+)"', query).groups()
+        out = {}
+        for number in re.findall(r"issue\(number:(\d+)\)", query):
+            _, subs = self.routes.get(
+                ("GET", "/repos/%s/issues/%s/sub_issues" % (repo, number)), (200, []))
+            out["e" + number] = {"subIssues": {"totalCount": len(subs), "nodes": [
+                {"number": s["number"], "state": s["state"].upper()} for s in subs]}}
+        return out
 
 
 def lock_routes(holder="lane-machine", expires="2030-01-01T12:30:00Z"):
@@ -637,7 +653,7 @@ class HandoffPacketTests(unittest.TestCase):
                   "steps": list(brain.TICK_STEPS),
                   "notes": [{"ts": at(2), "step": "merge", "text": "two ready"}]}
         text = packet([goal(journal(40, "muse"))], record)
-        self.assertIn("- %s muse, no journal yet: at step merge (3/10). Last note: two ready."
+        self.assertIn("- %s muse, no journal yet: at step merge (3/11). Last note: two ready."
                       % at(3), text)
 
     def test_a_private_goal_home_is_neither_named_nor_quoted(self):

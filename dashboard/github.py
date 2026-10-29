@@ -591,7 +591,21 @@ class TicketStore:
         items = operators.collect(claimed, rows, data.get("pull_requests") or [])
         checks = self._read_claim_checks(items, errors)
         needs = operators.collect_needs(waiting)
-        self._read_asks(needs, previous.get("needs") or [], errors)
+        # Split needs into operator needs (waited-on login is in LOOM_BRIEF_AUTHORS)
+        # and human needs (waited-on login is not an operator).
+        # Operator needs use non-strict mode (fallback to latest comment for operators page).
+        # Human needs use strict mode (only comments that name the ask for needs_you page).
+        trusted = {a.lower() for a in brain.trusted_authors()}
+        operator_needs = []
+        human_needs = []
+        for item in needs:
+            waited_on = {login.lower() for login in (item.get("waiting_on") or [])}
+            if waited_on & trusted:
+                operator_needs.append(item)
+            else:
+                human_needs.append(item)
+        self._read_asks(operator_needs, previous.get("needs") or [], errors, strict=False)
+        self._read_asks(human_needs, previous.get("needs") or [], errors, strict=True)
         # Items answered on the dashboard that the station has not read yet
         # (loom:answer-pending): their comments hold the answer.
         self._read_asks(answered, previous.get("answered") or [], errors, always=True)
@@ -626,7 +640,7 @@ class TicketStore:
         issues = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100" % (path, quote(name, safe="")))
         return [issue for issue in issues if isinstance(issue, dict)]
 
-    def _read_asks(self, items, previous, errors, field: str = "ask", always: bool = False) -> None:
+    def _read_asks(self, items, previous, errors, field: str = "ask", always: bool = False, strict: bool = False) -> None:
         """Set each item's ask (item[field]) and the comment it came from
         (item[field + "_url"]): its body's "## Ask" section when it has one,
         else operators.pick_ask over its comments. A comment read also sets
@@ -637,7 +651,8 @@ class TicketStore:
         none; at most OPERATOR_ASK_READS comment reads a pass (the last page
         of operators.ASK_COMMENTS each), the rest keep their last ask or say
         it is not read yet (None). With `always`, the comments are read even
-        when the body has the ask (an answered item: its answer is in them)."""
+        when the body has the ask (an answered item: its answer is in them).
+        With `strict`, claim comments are never picked as the ask."""
         url = field + "_url"
         kept = {"%s#%s" % (item.get("repo"), item.get("number")): item for item in previous}
         to_read = []
@@ -655,13 +670,13 @@ class TicketStore:
                 to_read.append((item, old))
         # The comment reads overlap (loom#433); errors keep the items' order.
         with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
-            results = list(pool.map(lambda pair: self._read_ask(pair[0], pair[1], field), to_read))
+            results = list(pool.map(lambda pair: self._read_ask(pair[0], pair[1], field, strict), to_read))
         for (item, _), (found, error) in zip(to_read, results, strict=True):
             item.update(found)
             if error:
                 errors.append(error)
 
-    def _read_ask(self, item, old, field: str = "ask") -> Tuple[Dict[str, Any], str]:
+    def _read_ask(self, item, old, field: str = "ask", strict: bool = False) -> Tuple[Dict[str, Any], str]:
         """(the ask fields to set, error): the old item's with the error when
         the comments cannot be read."""
         page = (int(item["comments"]) - 1) // operators.ASK_COMMENTS + 1
@@ -673,7 +688,7 @@ class TicketStore:
             _keep_ask(fallback, old, field)
             return fallback, "%s#%s ask: %s" % (item["repo"], item["number"], self._error_reason(exc))
         found = [c for c in (resp.data if isinstance(resp.data, list) else []) if isinstance(c, dict)]
-        return ask_fields(item, found, field), ""
+        return ask_fields(item, found, field, strict=strict), ""
 
     def read_ask_now(self, repo: str, number: int) -> Dict[str, Any]:
         """Read one waiting item's ask now, for a card that has none yet
@@ -1231,12 +1246,12 @@ def _keep_ask(item: Dict[str, Any], old: Dict[str, Any], field: str) -> None:
         item["answer"] = old["answer"]
 
 
-def ask_fields(item: Dict[str, Any], comments: List[Dict[str, Any]], field: str = "ask") -> Dict[str, Any]:
+def ask_fields(item: Dict[str, Any], comments: List[Dict[str, Any]], field: str = "ask", *, strict: bool = False) -> Dict[str, Any]:
     """The ask fields one comment page gives an item: the ask line and its
     comment (the body's "## Ask" section wins when it has one), the ask's
     whole text and time, and the newest answer posted from the dashboard."""
     out: Dict[str, Any] = {}
-    chosen = operators.ask_comment(comments, operators.ask_names(item.get("labels") or []))
+    chosen = operators.ask_comment(comments, operators.ask_names(item.get("labels") or []), strict=strict)
     if item.get("body_ask"):
         out[field], out[field + "_url"] = operators.ask_line(item["body_ask"]), ""
         out[field + "_full"] = str(item["body_ask"])

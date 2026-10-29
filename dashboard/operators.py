@@ -130,6 +130,8 @@ NEEDS_PREFIX = "needs:"
 ASK_CHARS = 200
 _MARKER_RE = re.compile(r"<!--.*?-->", re.S)
 _LEAD_RE = re.compile(r"^(?:[#>]+\s*|[-*+]\s+)+")
+# Claim/handoff comments (e.g. <!-- ccqw:handoff v1 -->) are not asks.
+_CLAIM_COMMENT_RE = re.compile(r"<!--\s*ccqw:handoff\b", re.I)
 
 
 def needs_labels(names: Iterable[str]) -> List[str]:
@@ -180,7 +182,7 @@ def ask_line(body: Any) -> str:
 # its latest comment. A comment read is one page of ASK_COMMENTS, the last.
 ASK_COMMENTS = 100
 ASK_SECTION_RE = re.compile(r"^##\s*Ask\s*\n(.*?)(?=^##\s|\Z)", re.M | re.S)
-_ASK_START_RE = re.compile(r"^[*_]*(?:exact\s+)?ask\b", re.I)
+_ASK_START_RE = re.compile(r"^[*_]*(?:exact\s+)?ask\b", re.I | re.M)
 
 
 def body_ask(body: Any) -> str:
@@ -223,27 +225,50 @@ def comment_ask(body: Any) -> str:
     return ask_line(starts or text)
 
 
-def ask_comment(comments: Iterable[Any], names: Iterable[str]) -> Optional[Dict[str, Any]]:
+def _is_claim_comment(body: str) -> bool:
+    """True if the comment is only a claim/handoff with no ask content."""
+    text = str(body or "")
+    if not _CLAIM_COMMENT_RE.search(text):
+        return False
+    # Remove the claim marker and check if anything meaningful remains
+    without_marker = _CLAIM_COMMENT_RE.sub("", text)
+    # If it only says "Labelled needs:X" or similar, it's a pure claim comment
+    without_marker = _MARKER_RE.sub("", without_marker).strip()
+    # Check if it has any ask-like content (## Ask section, "Exact ask:", "Ask:" etc.)
+    # If it does, it's NOT a pure claim comment - it's a handoff WITH an ask
+    if ASK_SECTION_RE.search(without_marker) or _ASK_START_RE.search(without_marker):
+        return False
+    return not _names_the_ask(without_marker, [])
+
+
+def ask_comment(comments: Iterable[Any], names: Iterable[str], *, strict: bool = False) -> Optional[Dict[str, Any]]:
     """The comment that holds an item's ask, from its comments oldest first:
     on a loom:human item the newest loom:human ask comment; else the newest
-    comment that names the ask, else the latest comment; None with none. An
-    answer comment (bus/answer.py) is never the ask."""
+    comment that names the ask; else the latest non-claim comment (unless strict);
+    None with none. An answer comment (bus/answer.py) and a pure claim/handoff
+    comment are never the ask."""
     found = [comment for comment in comments if isinstance(comment, dict)
-             and not str(comment.get("body") or "").lstrip().startswith(answer.ANSWER_MARKER)]
+             and not str(comment.get("body") or "").lstrip().startswith(answer.ANSWER_MARKER)
+             and not _is_claim_comment(str(comment.get("body") or ""))]
     names = list(names)
     if HUMAN_LABEL in names:
         human = next((comment for comment in reversed(found)
                       if str(comment.get("body") or "").startswith(HUMAN_MARKER)), None)
         if human is not None:
             return human
-    return next((comment for comment in reversed(found)
-                 if _names_the_ask(str(comment.get("body") or ""), names)), found[-1] if found else None)
+    named = next((comment for comment in reversed(found)
+                  if _names_the_ask(str(comment.get("body") or ""), names)), None)
+    if named:
+        return named
+    if strict:
+        return None
+    return found[-1] if found else None
 
 
-def pick_ask(comments: Iterable[Any], names: Iterable[str]) -> Tuple[str, str]:
+def pick_ask(comments: Iterable[Any], names: Iterable[str], *, strict: bool = False) -> Tuple[str, str]:
     """(ask, comment url) from an item's comments, oldest first: the newest
-    comment that names the ask, else the latest comment; ("", "") with none."""
-    chosen = ask_comment(comments, names)
+    comment that names the ask, else the latest comment (unless strict); ("", "") with none."""
+    chosen = ask_comment(comments, names, strict=strict)
     if chosen is None:
         return "", ""
     return comment_ask(chosen.get("body")), str(chosen.get("html_url") or "")
