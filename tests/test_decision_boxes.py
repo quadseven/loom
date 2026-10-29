@@ -26,6 +26,9 @@ CODE = "A test shows the export is off by default."
 BODY_OPEN = (tbs.BODY + "\n## Acceptance criteria\n\n- [ ] %s\n- [ ] %s\n\nSize: S\n"
              % (CODE, DECIDE))
 BODY_TICKED = BODY_OPEN.replace("- [ ] " + DECIDE, "- [x] " + DECIDE)
+# A no-change answer that proves the code box (loom#2032: an answer settles
+# only when every code box is ticked on the ticket or in its checklist).
+SAID = tbs.NO_CHANGE_SAID + "> - [x] %s\n" % CODE
 
 
 class DecisionParser(unittest.TestCase):
@@ -62,8 +65,7 @@ class DecisionTicks(tbs.Base):
         self.write(self.inbox("codex", "done", name + ".md"),
                    tickets.render_brief(REPO, self.fake.issues[12], "codex"))
         self.fake.issues[12]["body"] = body_now
-        self.write(os.path.join(self.home, "logs", "codex", name + ".answered"),
-                   tbs.NO_CHANGE_SAID)
+        self.write(os.path.join(self.home, "logs", "codex", name + ".answered"), SAID)
         self.run_pass()
         self.run_pass()
 

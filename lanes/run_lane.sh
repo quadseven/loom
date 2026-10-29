@@ -32,6 +32,11 @@
 # folder with the run's model beside it (<ticket>.verify.model), and the
 # station checks it and moves the ticket, naming lane and model as the proof's
 # maker. No pull request.
+# A review brief (Deliverable: review, from the station, loom#2142) also
+# changes no code: its tree is the reviewed pull request's own branch (a
+# Review-PR: <number> line names it, cloned like a fix brief's), the agent
+# leaves review.json in its tree, and the runner copies it to the lane's log
+# folder the same way; the station posts the verdict on the pull request.
 # Lanes never merge. codex runs sandboxed: no network, no .git writes.
 #
 # Env: LOOM_REPO_OWNERS (required: space-separated GitHub owners whose repos
@@ -77,7 +82,15 @@ LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_ROOT/../infra-public/.github/scripts/check_private_leaks.py}"
+# The leak scanner a public-repo push reads lives in infra-public, kept at
+# $LOOM_HOME/infra-public and fast-forwarded at most hourly
+# (keep_scanner_current). The default reads it from there.
+LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_HOME/infra-public/.github/scripts/check_private_leaks.py}"
+# The remote infra-public is cloned from, LOOM_CLONE_BASE-prefixed like the
+# ticket repos the lane clones. Override it on a machine without network.
+INFRA_PUBLIC="$LOOM_HOME/infra-public"
+INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE}quadseven/infra-public"
+INFRA_PUBLIC_STAMP="$LOOM_HOME/run/infra-public.updated"
 # The SSM parameter of the shared deny-list: names and products with no
 # generic shape, which only this list catches. Every scan passes it.
 LEAK_DENY_SSM="${LOOM_LEAK_DENY_SSM:-/infra/leak-scan/deny-list}"
@@ -106,6 +119,30 @@ leak_scan() {
   fi
   env ${LOOM_AWS_REGION:+AWS_REGION="$LOOM_AWS_REGION"} timeout "$NET_TIMEOUT" \
     python3 -B "$LEAK_SCANNER" "$@" --deny-list-ssm "$LEAK_DENY_SSM"
+}
+# Keep $INFRA_PUBLIC cloned and fast-forward it at most once an hour, so the
+# leak scanner a public-repo push needs is present before any lane scans.
+# The first lane that needs it clones it; a later run fetches at most hourly,
+# gated by the stamp file. Returns 0 when the checkout is usable, 1 when it
+# cannot be had (the scanner stays missing and the run becomes an incident).
+keep_scanner_current() {
+  local now stamp=0
+  now="$(date +%s)"
+  [ -f "$INFRA_PUBLIC_STAMP" ] && stamp="$(tr -cd '0-9' < "$INFRA_PUBLIC_STAMP")"
+  if [ -d "$INFRA_PUBLIC/.git" ]; then
+    if [ $((now - stamp)) -ge 3600 ]; then
+      (cd "$INFRA_PUBLIC" && timeout "$NET_TIMEOUT" git fetch -q origin \
+          && timeout "$NET_TIMEOUT" git merge -q --ff-only FETCH_HEAD) >> "$LOG" 2>&1 && date +%s > "$INFRA_PUBLIC_STAMP"
+    fi
+    return 0
+  fi
+  mkdir -p "$LOOM_HOME"
+  if timeout "$NET_TIMEOUT" git clone -q "$INFRA_PUBLIC_REMOTE" "$INFRA_PUBLIC" >> "$LOG" 2>&1; then
+    date +%s > "$INFRA_PUBLIC_STAMP"
+    return 0
+  fi
+  echo "could not clone the leak scanner's repo $INFRA_PUBLIC_REMOTE" >&2
+  return 1
 }
 INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
@@ -210,19 +247,24 @@ drop_build_output() {
 # a stamp left by a runner killed hard goes stale after the station's window.
 # The stamp is no heartbeat: it says nothing of availability, so a busy lane
 # is not offered more work and no limit or hold is hidden.
+# The loop sleeps through `wait` so a TERM ends it at once, and the runner
+# waits for it to exit before removing the stamp: a loop still mid-write
+# after the remove left the stamp behind.
 ALIVE="$LOOM_HOME/state/usage/$SLOT.alive"
 KEEPALIVE_PID=""
 keepalive_loop() {
-  local parent="$1" every="${LOOM_KEEPALIVE_SECONDS:-60}" tmp="$ALIVE.$1"
+  local parent="$1" every="${LOOM_KEEPALIVE_SECONDS:-60}" tmp="$ALIVE.$1" sleeper=""
   [[ "$every" =~ ^[1-9][0-9]*$ ]] || every=60
+  trap '[ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null; rm -f "$tmp"; exit 0' TERM
   while kill -0 "$parent" 2>/dev/null; do
     date +%s > "$tmp" 2>/dev/null && mv -f "$tmp" "$ALIVE" 2>/dev/null
-    sleep "$every"
+    sleep "$every" & sleeper=$!
+    wait "$sleeper"
   done
   rm -f "$tmp"
 }
 stop_keepalive() {
-  [ -z "$KEEPALIVE_PID" ] || { pkill -P "$KEEPALIVE_PID" 2>/dev/null; kill "$KEEPALIVE_PID" 2>/dev/null; }
+  [ -z "$KEEPALIVE_PID" ] || { kill "$KEEPALIVE_PID" 2>/dev/null; wait "$KEEPALIVE_PID" 2>/dev/null; }
   rm -f "$ALIVE"
 }
 mkdir -p "$LOOM_HOME/state/usage"
@@ -625,12 +667,12 @@ note_plan_hold() {
 # FIX_REASON set when it is not, and with FIX_REASON empty when gh could not
 # say (the brief then waits for the next pass).
 fix_pr_open() {
-  local state
+  local state pr="${1:-$FIX_PR}"
   FIX_REASON=""
-  state="$(timeout "$NET_TIMEOUT" gh pr view "$FIX_PR" -R "$REPO" --json state,headRefName \
+  state="$(timeout "$NET_TIMEOUT" gh pr view "$pr" -R "$REPO" --json state,headRefName \
     --jq '.state + " " + .headRefName')" || return 1
   [ "$state" = "OPEN $BRANCH" ] && return 0
-  FIX_REASON="pull request #$FIX_PR is no longer open on $BRANCH (${state:-no answer})"
+  FIX_REASON="pull request #$pr is no longer open on $BRANCH (${state:-no answer})"
   return 1
 }
 
@@ -929,6 +971,25 @@ no_change_reason() {
   [ -z "$NO_CHANGE_WHY" ]
 }
 
+# Label the ticket loom:answered. gh refuses a label its repo lacks ("'X'
+# not found"), and a repo enrolled after the station's last label sync lacked
+# loom:answered, so an answer was posted and its ticket left with no state
+# (loom#2032). On a failure, create each Loom label the edit names from the
+# canonical set (bus/labels.py; one that exists already is left as it is)
+# and retry once.
+mark_answered() {
+  local names=(loom:answered loom:running loom:briefed loom:queued) name spec
+  timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered \
+    --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1 && return 0
+  for name in "${names[@]}"; do
+    spec="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.labels spec "$name" 2>> "$LOG")" || return 1
+    timeout "$NET_TIMEOUT" gh label create "$name" -R "$REPO" --color "${spec%%$'\t'*}" \
+      --description "${spec#*$'\t'}" >> "$LOG" 2>&1 || true
+  done
+  timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered \
+    --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1
+}
+
 # Hand an answered run's reason and its thread answers to whoever reports
 # it. The reason goes into the .answered marker. A station brief (an `Issue:
 # OWNER/NAME#N` line) is reported by the station, which records the reason as
@@ -945,7 +1006,7 @@ post_no_change() {
     if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$NO_CHANGE_TEXT" >> "$LOG" 2>&1; then
       echo "answer comment failed"; return 1
     fi
-    if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
+    if ! mark_answered; then
       echo "answer posted but ticket label update failed"; return 1
     fi
   fi
@@ -3247,11 +3308,15 @@ for BRIEF in "$INBOX"/*.md; do
   if [ -n "$BASE_BRANCH" ] && ! [[ "$BASE_BRANCH" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
     park "$BRIEF" "brief Base: is not a branch name"; continue
   fi
-  if [ -n "$DELIVERABLE" ] && [ "$DELIVERABLE" != answer ] && [ "$DELIVERABLE" != verify ]; then
-    park "$BRIEF" "brief Deliverable: must be answer or verify"; continue
+  if [ -n "$DELIVERABLE" ] && [ "$DELIVERABLE" != answer ] && [ "$DELIVERABLE" != verify ] \
+     && [ "$DELIVERABLE" != review ]; then
+    park "$BRIEF" "brief Deliverable: must be answer, verify or review"; continue
   fi
   if [ "$DELIVERABLE" = answer ] && ! [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
     park "$BRIEF" "answer brief needs Issue: owner/name#number"; continue
+  fi
+  if [ "$DELIVERABLE" = review ] && ! [[ "$(field Review-PR "$BRIEF" || true)" =~ ^[0-9]+$ ]]; then
+    park "$BRIEF" "review brief needs Review-PR: <number>"; continue
   fi
   # A brief that opens a pull request needs criteria for its body: without
   # them the body's ## Acceptance criteria is empty, the review bot's plan
@@ -3378,11 +3443,14 @@ for BRIEF in "$INBOX"/*.md; do
   fi
 
   FIX_PR="$(field Fix-PR "$BRIEF" || true)"
-  if [ -n "$FIX_PR" ]; then
-    if ! [[ "$FIX_PR" =~ ^[0-9]+$ ]]; then
+  REVIEW_PR="$(field Review-PR "$BRIEF" || true)"
+  # A review brief (Deliverable: review) takes its pull request's branch the
+  # same way a fix brief does: the tree under review is the PR's own head.
+  if [ -n "$FIX_PR" ] || [ -n "$REVIEW_PR" ]; then
+    if [ -n "$FIX_PR" ] && ! [[ "$FIX_PR" =~ ^[0-9]+$ ]]; then
       park "$BRIEF" "brief Fix-PR: is not a pull request number"; continue
     fi
-    if ! fix_pr_open; then
+    if ! fix_pr_open "${FIX_PR:-$REVIEW_PR}"; then
       [ -n "$FIX_REASON" ] && { park "$BRIEF" "$FIX_REASON"; continue; }
       echo "$TICKET: gh pr view failed; will retry next pass" >&2; continue
     fi
@@ -3415,7 +3483,7 @@ for BRIEF in "$INBOX"/*.md; do
   rm -f "$LOGDIR/$TICKET.answered" "$LOGDIR/$TICKET.answered.tmp" "$LOGDIR/$TICKET.pushed"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
-         { [ -n "$FIX_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
+         { [ -n "$FIX_PR" ] || [ -n "$REVIEW_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
     park "$BRIEF" "clone or branch failed" transient; continue
   fi
   if ! BASE="$(git -C "$TREE" rev-parse HEAD)" || [ -z "$BASE" ]; then
@@ -3440,8 +3508,8 @@ for BRIEF in "$INBOX"/*.md; do
       } > "$RUN_BRIEF"
     fi
   fi
-  # A verify run changes no code, so there is nothing to validate.
-  if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
+  # A verify or review run changes no code, so there is nothing to validate.
+  if [ "$DELIVERABLE" != verify ] && [ "$DELIVERABLE" != review ] && ! prepare_validation >> "$LOG" 2>&1; then
     park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
   fi
   resume_earlier_attempt
@@ -3589,6 +3657,21 @@ for BRIEF in "$INBOX"/*.md; do
     mv "$BRIEF" "$INBOX/done/"
     continue
   fi
+  if [ "$DELIVERABLE" = review ]; then
+    # The station reads the result from the log folder and posts the verdict;
+    # the runner moves no label and opens no pull request.
+    RESULT="$TREE/review.json"
+    # Only a file the agent made counts: one the repo tracks was there before.
+    if [ ! -f "$RESULT" ] || [ -L "$RESULT" ] || [ "$(wc -c < "$RESULT")" -gt 65536 ] ||
+       [ -n "$(safe_git ls-files ':(icase)review.json')" ]; then
+      park "$BRIEF" "no review.json written"; continue
+    fi
+    cp "$RESULT" "$LOGDIR/$TICKET.review.json"
+    printf '%s\n' "$MODEL" > "$LOGDIR/$TICKET.review.model"
+    echo "[$(date -u +%FT%TZ)] $TICKET done, review result recorded" >> "$LOG"
+    mv "$BRIEF" "$INBOX/done/"
+    continue
+  fi
   if [ "$DELIVERABLE" = answer ]; then
     ANSWER="$TREE/.loom/answer.md"
     if [ ! -d "$TREE/.loom" ] || [ -L "$TREE/.loom" ] || [ ! -f "$ANSWER" ] || [ -L "$ANSWER" ]; then
@@ -3603,7 +3686,7 @@ for BRIEF in "$INBOX"/*.md; do
     if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$ANSWER_TEXT" >> "$LOG" 2>&1; then
       park "$BRIEF" "answer comment failed" transient; continue
     fi
-    if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
+    if ! mark_answered; then
       park "$BRIEF" "answer posted but ticket label update failed" transient; continue
     fi
     echo "[$(date -u +%FT%TZ)] $TICKET done, answer posted" >> "$LOG"
@@ -3707,9 +3790,14 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
   fi
   if [ "$REPO_PRIVATE" = false ]; then
+    keep_scanner_current || true
     if [ ! -f "$LEAK_SCANNER" ]; then
-      park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed" transient
-      continue
+      # A scanner that still cannot be had is the machine's fault, not the
+      # ticket's: a factory incident holds the ticket and files one issue,
+      # instead of a transient failure the station re-briefs endlessly.
+      SCANNER_REASON=""
+      note_factory_incident scanner "leak scanner not found at $LEAK_SCANNER" SCANNER_REASON
+      park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed$SCANNER_REASON" "$PARK_CLASS"; continue
     fi
     # A fix round that merged the default branch scans what the pull request
     # adds to it: BASE..HEAD would hold all the default branch gained since,
