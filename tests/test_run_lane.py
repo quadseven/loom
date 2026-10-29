@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from bus import hunt_plan, pr_repair, text, tickets  # noqa: E402
+from bus import hunt_plan, labels, pr_repair, text, tickets  # noqa: E402
 from tests import sandbox_caps  # noqa: E402
 from tests.local_http import LocalHTTPServer  # noqa: E402
 
@@ -157,6 +157,18 @@ if [ "$1 $2" = "pr comment" ] && [ -n "${FAKE_COMMENT:-}" ]; then
   while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_COMMENT"; shift; done
   exit 0
 fi
+# A repo that lacks the label $FAKE_GH_MISSING_LABEL: `issue edit` refuses it,
+# as real gh does, until `label create` makes it ($FAKE_LOG.labels lists
+# each label made); $FAKE_GH_LABEL_CREATE_FAIL makes every create fail.
+if [ "$1 $2" = "label create" ]; then
+  [ -z "${FAKE_GH_LABEL_CREATE_FAIL:-}" ] || { echo "HTTP 403" >&2; exit 1; }
+  printf '%s\n' "$3" >> "$FAKE_LOG.labels"
+  exit 0
+fi
+if [ "$1 $2" = "issue edit" ] && [ -n "${FAKE_GH_MISSING_LABEL:-}" ] &&
+   ! grep -qxF "$FAKE_GH_MISSING_LABEL" "$FAKE_LOG.labels" 2>/dev/null; then
+  echo "could not add label: '$FAKE_GH_MISSING_LABEL' not found" >&2; exit 1
+fi
 if [ "$1 $2" = "pr create" ]; then
   [ -z "${FAKE_GH_CREATE_FAIL:-}" ] || { echo "pr create blew up" >&2; exit 1; }
   case " $* " in *" --label "*) [ -z "${FAKE_GH_NO_LABELS:-}" ] || { echo "could not add label: 'class:logic' not found" >&2; exit 1; } ;; esac
@@ -189,6 +201,8 @@ fi
 # exits non-zero ($FAKE_AGENT=fail), or prints $FAKE_OUT and exits
 # $FAKE_EXIT, editing a file first when $FAKE_EDIT is set and writing a hook
 # config the brief never names when $FAKE_HOOK is set ($FAKE_AGENT=say).
+# With $FAKE_LAST_MESSAGE set, say also writes it to the file the runner
+# names with --output-last-message, as codex does.
 # $FAKE_AGENT=stray also commits files no brief here names (a hook config,
 # a scratch file under .loom/, a top-level test script).
 # $FAKE_AGENT=manifest commits $FAKE_MANIFEST as deploy.yaml.
@@ -202,6 +216,12 @@ printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = say ]; then
+  if [ -n "${FAKE_LAST_MESSAGE:-}" ]; then
+    while [ $# -gt 0 ]; do
+      [ "$1" = --output-last-message ] && printf '%s\\n' "$FAKE_LAST_MESSAGE" > "$2"
+      shift
+    done
+  fi
   [ -z "${FAKE_EDIT:-}" ] || echo partial > fix.txt
   if [ -n "${FAKE_HOOK:-}" ]; then mkdir -p .agents && echo '{}' > .agents/hooks.json; fi
   printf '%s\\n' "$FAKE_OUT"
@@ -239,6 +259,10 @@ if [ "${FAKE_AGENT:-commit}" = private-ref ]; then
 fi
 if [ "${FAKE_AGENT:-commit}" = verify-file ]; then
   printf '{"missing": "the station log"}' > verify.json
+  exit 0
+fi
+if [ "${FAKE_AGENT:-commit}" = review-file ]; then
+  printf '{"blocking": [], "notes": [], "summary": "sound"}' > review.json
   exit 0
 fi
 if [ "${FAKE_AGENT:-commit}" = limit ]; then
@@ -774,6 +798,82 @@ print('leak guard: clean (shape patterns only)')
         self.assertTrue(line.startswith("[transient] public repo leak scan could not run"), line)
         self.assertIn("could not read deny-list", line)
 
+    def test_a_missing_leak_scanner_is_a_factory_incident(self):
+        # No infra-public checkout and no remote to clone it from: the scanner
+        # cannot be had, so a public-repo push is a factory incident (one issue
+        # filed, the ticket held) instead of a transient failure that the
+        # station re-briefs endlessly.
+        self.drop_brief()
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        line = self.failure_line()
+        self.assertTrue(line.startswith("[factory] "), line)
+        self.assertIn("scanner not found", line)
+        self.assertEqual(len([c for c in self.calls() if c.startswith("gh issue create")]), 1)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+        # With an infra-public remote holding the scanner but no local
+        # checkout, the lane clones it before the scan and the push opens.
+        root = Path(self._tmp.name)
+        remotes = root / "remotes"
+        remote = remotes / "quadseven" / "infra-public"
+        remote.parent.mkdir(parents=True)
+        git("init", "-q", "-b", "main", str(remote))
+        scripts = remote / ".github" / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "check_private_leaks.py").write_text(self.scanner.read_text())
+        git("add", ".github/scripts/check_private_leaks.py", cwd=remote)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "scanner", cwd=remote)
+        self.log.write_text("")
+        self.drop_brief("T043-next.md", BRIEF.replace("T042-fix-the-thing", "T043-next"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.loom / "infra-public").exists())
+        self.assertTrue((self.loom / "infra-public" / ".github" / "scripts" / "check_private_leaks.py").exists())
+        self.assertTrue((self.inbox / "done" / "T043-next.md").exists())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+
+        checkout = self.loom / "infra-public"
+        first_head = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                    capture_output=True, text=True, check=True).stdout.strip()
+        (scripts / "scanner-version").write_text("updated\n")
+        git("add", ".github/scripts/scanner-version", cwd=remote)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "update", cwd=remote)
+        self.log.write_text("")
+        self.drop_brief("T044-hourly.md", BRIEF.replace("T042-fix-the-thing", "T044-hourly"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                        capture_output=True, text=True, check=True).stdout.strip(),
+                         first_head)
+
+        stamp = self.loom / "run" / "infra-public.updated"
+        old = time.time() - 2 * 3600
+        stamp.write_text(str(int(old)) + "\n")
+        self.log.write_text("")
+        self.drop_brief("T045-hourly-refresh.md", BRIEF.replace("T042-fix-the-thing", "T045-hourly-refresh"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                           capture_output=True, text=True, check=True).stdout.strip(),
+                            first_head)
+
+        # A refresh whose fetch fails leaves the stamp stale, so the next run
+        # tries again instead of trusting a checkout it could not update.
+        stamp.write_text(str(int(old)) + "\n")
+        remote.rename(remotes / "quadseven" / "infra-public-gone")
+        self.log.write_text("")
+        self.drop_brief("T046-fetch-fails.md", BRIEF.replace("T042-fix-the-thing", "T046-fetch-fails"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stamp.read_text().strip(), str(int(old)))
+
     # A workload that selects a node label, for the live-cluster check
     # (bus/live_cluster.py, loom#1832).
     MANIFEST = ("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
@@ -1159,6 +1259,31 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual(pushed, "")
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def test_a_missing_answered_label_is_created_from_the_canonical_set_and_retried_once(self):
+        # loom#2032: a repo enrolled after the last label sync lacked
+        # loom:answered; the answer was posted and the ticket left stateless.
+        self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer"))
+        result = self.run_lane(FAKE_AGENT="answer-file", FAKE_GH_MISSING_LABEL="loom:answered")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        edits = [c for c in calls if c.startswith("gh issue edit 42")]
+        self.assertEqual(len(edits), 2, calls)
+        made = [c for c in calls if c.startswith("gh label create loom:answered")]
+        self.assertEqual(len(made), 1, calls)
+        self.assertIn("--color %s" % labels.LABELS["loom:answered"]["color"], made[0])
+        self.assertIn(labels.LABELS["loom:answered"]["description"], made[0])
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_label_that_still_cannot_be_set_is_retried_only_once(self):
+        self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer"))
+        result = self.run_lane(FAKE_AGENT="answer-file", FAKE_GH_MISSING_LABEL="loom:answered",
+                               FAKE_GH_LABEL_CREATE_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        edits = [c for c in self.calls() if c.startswith("gh issue edit 42")]
+        self.assertEqual(len(edits), 2)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("answer posted but ticket label update failed", log)
+
     def test_answer_deliverable_refuses_local_paths_and_closing_keywords(self):
         for answer, reason in (("See /Users/person/private/file", "absolute path"),
                                ("This fixes #42", "closing keyword")):
@@ -1183,6 +1308,57 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual((logs / "T042-fix-the-thing.verify.model").read_text(), "gpt-test-default\n")
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def review_brief(self):
+        """A Luna review brief for PR 7 (loom#2142), whose branch is already
+        on the remote with the lane's first commit, as the station's
+        dispatch leaves it."""
+        work = Path(self._tmp.name) / "pr-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
+        (work / "first.txt").write_text("first try\n")
+        git("add", "first.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "First try", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        issue = {"number": 42, "title": "Fix the thing",
+                 "body": "Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n"}
+        head = self.remote_head(self.FIX_BRANCH)
+        name = tickets.review_name("example/repo", 42, 2)
+        self.drop_brief(name + ".md", tickets.render_review_brief(
+            "example/repo", issue, "codex", 2, 7, self.FIX_BRANCH, "main", head))
+        return name, head
+
+    def test_a_review_brief_records_its_verdict_and_pushes_nothing(self):
+        name, before = self.review_brief()
+        result = self.run_lane(FAKE_AGENT="review-file")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        logs = self.loom / "logs" / "codex"
+        self.assertEqual((logs / (name + ".review.json")).read_text(),
+                         '{"blocking": [], "notes": [], "summary": "sound"}')
+        # The brief's Model: line pins the run to Luna, not the lane default.
+        self.assertEqual((logs / (name + ".review.model")).read_text(), "gpt-6-luna\n")
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("codex ") for c in calls))
+        self.assertFalse(any(c.startswith("gh pr create") for c in calls))
+
+    def test_a_review_brief_without_a_review_pr_is_parked(self):
+        brief = BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: review")
+        self.drop_brief(text=brief)
+        result = self.run_lane(FAKE_AGENT="review-file")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("review brief needs Review-PR", log)
+        self.assertFalse((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_review_run_without_a_verdict_is_parked(self):
+        name, _ = self.review_brief()
+        result = self.run_lane(FAKE_AGENT="noop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("no review.json written", log)
 
     def test_answer_deliverable_without_file_fails_as_no_answer_written(self):
         brief = BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer")
@@ -1265,6 +1441,46 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         line = self.failure_line()
         self.assertIn("it said: I am blocked: open <path> operation not permitted.", line)
         self.assertNotIn("Users", line)
+
+    def test_the_final_message_file_wins_over_a_printed_git_config(self):
+        # loom#1799: on 2026-10-25 a park quoted a repository's .git/config,
+        # the last thing the agent printed, instead of what it said.
+        self.drop_brief()
+        dump = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false"
+        said = "I stopped: the brief asks for a change the module no longer has."
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT=dump,
+                               FAKE_LAST_MESSAGE=said)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertIn("it said: " + said, line)
+        self.assertNotIn("repositoryformatversion", line)
+        self.assertTrue(any(c.startswith("codex exec") and "--output-last-message" in c
+                            for c in self.calls()), self.calls())
+
+    def test_a_colored_final_message_carries_no_escape_sequences(self):
+        self.drop_brief()
+        out = ("\x1b[1m\x1b[33mPermission needed:\x1b[0m allow the agent to run "
+               "\x1b[36mmake test\x1b[0m? \x1b[2m(y/n)\x1b[0m")
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT=out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertIn("it said: Permission needed: allow the agent to run make test? (y/n)", line)
+        self.assertNotIn("[0m", line)
+        self.assertNotIn("\x1b", line)
+
+    def test_only_tool_output_reads_as_ended_without_explaining_why(self):
+        self.drop_brief()
+        out = ("[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n"
+               "self.assertEqual(result.returncode, 0, result.stderr)")
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EXIT="0", FAKE_OUT=out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self.failure_line()
+        self.assertIn("the agent ended without explaining why", line)
+        # Still the no-reason class the factory counts (bus/factory.py NO_REASON).
+        self.assertIn("agent made no commit and wrote no reason", line)
+        self.assertNotIn("it said", line)
+        self.assertNotIn("repositoryformatversion", line)
+        self.assertNotIn("assertEqual", line)
 
     def test_a_final_message_that_fails_the_text_checks_keeps_the_no_reason_class(self):
         self.drop_brief()

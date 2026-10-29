@@ -128,6 +128,17 @@ class Tiers(unittest.TestCase):
                          (merge_tier.CROSS_REPO,
                           "its ticket names another repo (example-owner/other-repo)"))
 
+    def test_a_base_line_naming_a_branch_is_not_cross_repo(self):
+        # A Base: line names a branch; owner/name there is never a repo.
+        body = "## What\nCount timed-out runs as progress.\n\nBase: quadseven/prod\n"
+        self.assertEqual(merge_tier.classify("quadseven/example", entries(APP_CHANGE), body)[0],
+                         merge_tier.APP_CODE)
+
+    def test_a_repo_named_outside_a_base_line_is_still_cross_repo(self):
+        body = "Base: quadseven/prod\n\n## What\nAlso change quadseven/other to match.\n"
+        self.assertEqual(merge_tier.classify("quadseven/example", entries(APP_CHANGE), body),
+                         (merge_tier.CROSS_REPO, "its ticket names another repo (quadseven/other)"))
+
     def test_a_test_or_doc_named_deploy_file_is_never_low_risk(self):
         # Security review: docs and tests were matched before deploy rules.
         for path in ("tests/manifests/app/deployment.yaml", "tests/main.tf",

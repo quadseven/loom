@@ -25,14 +25,20 @@ parked.
 writes `.loom/answer.md`; the runner validates and posts it as one ticket
 comment, then labels the ticket `loom:answered` for the brain to review. It
 does not push a branch or open a pull request. Without this header, a run
-still needs to produce a commit. Any value other than `answer` parks the brief,
-and an answer brief with no issue number (from `Issue:` or the ticket name) is
-parked too.
+still needs to produce a commit. An answer brief with no issue number (from
+`Issue:` or the ticket name) is parked too.
 
 `Deliverable: verify` is written only by the station (a ticket cannot ask for
 it) and hands a lane one shipped ticket to verify. The agent changes no code
 and writes `verify.json`; the runner copies it to the lane's log folder, moves
 the brief to `done/`, and opens no pull request (docs/LANES.md, "Verify runs").
+
+`Deliverable: review` is written only by the station (a ticket cannot ask for
+it) and hands a lane one pull request to review when the normal review route
+is degraded. The agent changes no code and writes `review.json`; the runner
+copies it to the lane's log folder, moves the brief to `done/`, and opens no
+pull request (docs/LANES.md, "Elder fallback reviews"). Any `Deliverable:`
+value other than `answer`, `verify` or `review` parks the brief.
 
 The ticket's `Not before:`, `After:` and `Priority:` lines decide when and in
 what order the station claims it (docs/BRAIN.md); they stay on the ticket and
@@ -59,7 +65,7 @@ Repo: <owner/name>
 Branch: loom/T0001-<slug>
 Base: <target branch, optional>
 Model: <model id, optional>
-Deliverable: answer (optional; the station also writes verify; any other value parks the brief)
+Deliverable: answer (optional; the station also writes verify and review; any other value parks the brief)
 
 # T0001: <short title>
 
