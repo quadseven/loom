@@ -4326,8 +4326,10 @@ class CorruptStateTest(Base):
         # the changed label-set sync, and the hourly read of open tickets for
         # ones with no state label (loom#1653), the hourly label pass's reads
         # of open issues and of closed ones still at loom:triage (loom#2024),
-        # and the hourly read of the repo's roll record declaration (loom#2025).
-        self.assertEqual(self.run_pass().requests, 16)
+        # and the hourly read of the repo's roll record declaration (loom#2025),
+        # and the verify-note pass's own build of the verify pool (its
+        # audit-hold read and pool listing, loom#2092).
+        self.assertEqual(self.run_pass().requests, 18)
 
 
 class TicketsTest(unittest.TestCase):
