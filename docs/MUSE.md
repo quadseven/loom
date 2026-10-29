@@ -565,8 +565,13 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    left after the brain steps, which always come first. The step runs only
    after triage and only while the tick has used under 20 of its 25
    minutes; past that, `step sweep` records "skipped: the tick used N of
-   its 25 minutes" and the journal says so. You decide what to sweep; write
-   it as a JSON list to SWEEP.json and run
+   its 25 minutes" and the journal says so. The step prints a candidate list
+   after the tick record: up to 30 of the oldest open issues with evidence
+   the station already holds (`merged` with the merge sha, `duplicate` with
+   the other issue's number, `quiet` for a week without an update), or `no
+   candidates`. Read only those issues; close or rewrite each with the
+   evidence line you read, or skip it with a reason. You decide what to
+   sweep; write it as a JSON list to SWEEP.json and run
    `python3 -m bus.brain sweep --file SWEEP.json --holder muse`. Each entry
    is one action: `{"repo": "quadseven/loom", "number": N, "action": A,
    "evidence": "<one line>"}` where A is `done`, `duplicate`, `stale` or
