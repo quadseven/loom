@@ -13,27 +13,30 @@ LOOM_WORKHORSE_JOURNAL). Its row reads that body's Updated line and its
 latest counted line.
 
 Lateness is cadence-relative, never a fixed wall clock: OK up to 1.5x the
-cadence, LATE past that, DOWN past 2.5x. Ages are computed here, at build
-time, from the journal timestamps themselves, so the page cannot present
-an old snapshot's silence as the present (the shell stamps the snapshot's
-own freshness separately).
+cadence, LATE past that, DOWN past 2.5x. Ages are computed when the page
+is built for its request, from the journal timestamps themselves, so the
+page cannot present an old snapshot's silence as the present (the shell
+stamps the snapshot's own freshness separately).
 """
 from __future__ import annotations
 
 import html
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from . import brain_view
 
-# Each scheduled actor's expected tick cadence, in seconds. The primary
-# brain runs every 30 minutes (its cron), the backup brain hourly (its
-# launchd job), and the workhorse overwrites its journal at most 2 hours
-# apart (its journal's own words). A holder with no entry still appears;
-# it is shown without a lateness verdict.
-BRAIN_CADENCE = {"muse": 30 * 60, "lane-machine": 60 * 60}
-WORKHORSE_CADENCE = 2 * 3600
+# Each scheduled actor's expected tick cadence, in seconds, as this
+# deployment schedules it: the primary brain every 30 minutes (its cron),
+# the backup brain hourly (its launchd job), and the workhorse at most
+# 2 hours between journal overwrites (its journal's own words). A
+# deployment whose schedules differ names its own in LOOM_ROSTER_CADENCES
+# ("holder=seconds" pairs, comma separated; the workhorse's key is
+# "workhorse"). A holder with no entry still appears; it is shown without
+# a lateness verdict.
+DEFAULT_CADENCES = {"muse": 30 * 60, "lane-machine": 60 * 60, "workhorse": 2 * 3600}
 ROLES = {"muse": "primary brain", "lane-machine": "backup brain",
          "operator-session": "operator session"}
 LATE_FACTOR = 1.5
@@ -47,20 +50,27 @@ COUNT_ORDER = ("merged", "briefed", "closed", "verified", "deferred", "escalated
 UPDATED_RE = re.compile(r"^Updated: (\d{4}-\d\d-\d\d) (\d\d):(\d\d)Z", re.M)
 COUNTED_RE = re.compile(r"counted (\d+)(?: \(closed (\d+), merged (\d+), rewritten (\d+)\))?")
 PACE_RE = re.compile(r"pace (\d+) per hour")
-STATUS_RANK = {"down": 0, "late": 1, "ok": 2, "untracked": 3}
+VERDICT_RANK = {"down": 0, "late": 1, "ok": 2, "untracked": 3}
+
+
+def _cadences() -> Dict[str, int]:
+    merged = dict(DEFAULT_CADENCES)
+    for pair in re.split(r"[,\s]+", os.environ.get("LOOM_ROSTER_CADENCES", "")):
+        name, sep, seconds = pair.partition("=")
+        if sep and name.strip() and seconds.strip().isdigit():
+            merged[name.strip().lower()] = int(seconds.strip())
+    return merged
 
 
 def _parse_time(value) -> Optional[datetime]:
     text = str(value or "").strip()
-    match = re.match(r"(\d{4}-\d\d-\d\d)[T ](\d\d):(\d\d)(?::(\d\d))?", text)
-    if not match:
+    if not text:
         return None
-    year, month, day = (int(part) for part in text[:10].split("-"))
-    hour, minute, second = int(match.group(2)), int(match.group(3)), int(match.group(4) or 0)
     try:
-        return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
 def _iso(moment: datetime) -> str:
@@ -74,7 +84,7 @@ def _counts(section: str) -> Dict[str, int]:
     return {name: int(count) for name, count in COUNT_RE.findall(moved.group(1))}
 
 
-def _line(section: str) -> str:
+def _summary_line(section: str) -> str:
     for raw in section.splitlines():
         line = raw.strip()
         if not line or line.startswith("<!--"):
@@ -101,7 +111,7 @@ def _brain_ticks(journals) -> Dict[str, List[Dict[str, Any]]]:
                 continue
             section = body[match.end():end]
             ticks.append({"holder": match.group(2), "moment": moment,
-                          "counts": _counts(section), "line": _line(section)})
+                          "counts": _counts(section), "line": _summary_line(section)})
         if not ticks:
             # A journal without Tick sections (the older one-tick shapes):
             # brain_view's own reader names its holder and summary line.
@@ -120,7 +130,7 @@ def _brain_ticks(journals) -> Dict[str, List[Dict[str, Any]]]:
             for holder, found in by_holder.items()}
 
 
-def _status(age: Optional[float], cadence: Optional[int]) -> str:
+def _verdict(age: Optional[float], cadence: Optional[int]) -> str:
     if age is None or cadence is None:
         return "untracked"
     if age > DOWN_FACTOR * cadence:
@@ -136,7 +146,7 @@ def _actor(name, role, cadence, ticks, now):
     return {"name": name, "role": role, "cadence": cadence,
             "last_at": _iso(last) if last else None,
             "age_seconds": int(age) if age is not None else None,
-            "status": _status(age, cadence),
+            "verdict": _verdict(age, cadence),
             "ticks": [{"at": _iso(tick["moment"]), "counts": tick["counts"],
                        "line": tick["line"],
                        **({"counted": tick["counted"], "pace": tick["pace"]}
@@ -144,7 +154,7 @@ def _actor(name, role, cadence, ticks, now):
                       for tick in ticks[:RECENT_TICKS]]}
 
 
-def _workhorse_actor(workhorse, now):
+def _workhorse_actor(workhorse, now, cadence):
     body = str((workhorse or {}).get("body") or "")
     updated = UPDATED_RE.search(body)
     moment = None
@@ -154,8 +164,8 @@ def _workhorse_actor(workhorse, now):
     if moment is None:
         # The journal is configured but nothing in it could be read: the
         # row still stands, with no tick and no lateness verdict.
-        return {"name": "workhorse", "role": "workhorse", "cadence": WORKHORSE_CADENCE,
-                "last_at": None, "age_seconds": None, "status": "untracked", "ticks": []}
+        return {"name": "workhorse", "role": "workhorse", "cadence": cadence,
+                "last_at": None, "age_seconds": None, "verdict": "untracked", "ticks": []}
     counts, counted, pace = {}, None, None
     for text in body.splitlines():
         match = COUNTED_RE.search(text)
@@ -176,20 +186,21 @@ def _workhorse_actor(workhorse, now):
     tick = {"moment": moment, "counts": counts, "line": line}
     if counted is not None:
         tick["counted"], tick["pace"] = counted, pace
-    return _actor("workhorse", "workhorse", WORKHORSE_CADENCE, [tick], now)
+    return _actor("workhorse", "workhorse", cadence, [tick], now)
 
 
-def build_roster(journals, workhorse, now) -> Dict[str, Any]:
+def build_roster(journals, workhorse, now, cadences=None) -> Dict[str, Any]:
     """Every brain in the journals plus the workhorse, worst state first."""
+    table = _cadences() if cadences is None else cadences
     actors = []
     for holder, ticks in _brain_ticks(journals).items():
         key = holder.lower()
         actors.append(_actor(holder, ROLES.get(key, "brain"),
-                             BRAIN_CADENCE.get(key), ticks, now))
+                             table.get(key), ticks, now))
     if workhorse:
-        actors.append(_workhorse_actor(workhorse, now))
-    actors.sort(key=lambda a: (STATUS_RANK[a["status"]], 1 if a["role"] == "workhorse" else 0,
-                               a["name"]))
+        actors.append(_workhorse_actor(workhorse, now, table.get("workhorse")))
+    actors.sort(key=lambda a: (VERDICT_RANK[a["verdict"]],
+                               1 if a["role"] == "workhorse" else 0, a["name"]))
     reason = "" if actors else (
         "no brain journals were read and no workhorse journal is configured")
     return {"actors": actors, "reason": reason, "now": now}
@@ -214,9 +225,9 @@ def _cadence_text(actor) -> str:
         return "no set cadence"
     if actor["role"] == "workhorse":
         return "updates at most every %d hours" % (cadence // 3600)
-    if cadence >= 3600:
-        return "ticks every %d minutes" % (cadence // 60) if cadence % 3600 else \
-            "ticks every hour"
+    if cadence >= 3600 and cadence % 3600 == 0:
+        hours = cadence // 3600
+        return "ticks every hour" if hours == 1 else "ticks every %d hours" % hours
     return "ticks every %d minutes" % (cadence // 60)
 
 
@@ -231,14 +242,17 @@ def _counts_text(tick) -> str:
     return ", ".join(parts)
 
 
+def _tick_item(tick) -> str:
+    counts = _counts_text(tick)
+    return ('<li><span class="at machine-fact">%s</span><div><p>%s</p>%s</div></li>' % (
+        html.escape(tick["at"][11:16]), html.escape(tick["line"]),
+        '<p class="machine-fact">%s</p>' % html.escape(counts) if counts else ""))
+
+
 def _render_actor(actor) -> str:
     esc = html.escape
-    status = actor["status"]
-    ticks = "".join(
-        '<li><span class="at machine-fact">%s</span><div><p>%s</p>%s</div></li>' % (
-            esc(tick["at"][11:16]), esc(tick["line"]),
-            '<p class="machine-fact">%s</p>' % esc(_counts_text(tick)) if _counts_text(tick) else "")
-        for tick in actor["ticks"])
+    verdict = actor["verdict"]
+    ticks = "".join(_tick_item(tick) for tick in actor["ticks"])
     if actor["last_at"]:
         last = "%s %sZ (%s)" % (actor["last_at"][:10], actor["last_at"][11:16],
                                 _age_text(actor["age_seconds"]))
@@ -252,9 +266,9 @@ def _render_actor(actor) -> str:
             '<p class="machine-fact"><span class="actor-status outcome-%s">%s</span> %s / %s</p>'
             '<p>last tick %s</p>'
             '%s</article>') % (
-        " actor-down" if status == "down" else "", esc(actor["name"]),
-        {"ok": "ok", "late": "degraded", "down": "failed"}.get(status, "none"),
-        esc(status.upper() if status != "untracked" else "NO SET CADENCE"),
+        " actor-down" if verdict == "down" else "", esc(actor["name"]),
+        {"ok": "ok", "late": "degraded", "down": "failed"}.get(verdict, "none"),
+        esc(verdict.upper() if verdict != "untracked" else "NO SET CADENCE"),
         esc(actor["role"]), esc(_cadence_text(actor)),
         esc(last), listing)
 

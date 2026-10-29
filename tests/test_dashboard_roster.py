@@ -90,8 +90,8 @@ class BrainRosterTest(unittest.TestCase):
         data = roster.build_roster([MUSE_DAY, LANE_MACHINE_DAY], None, NOW)
         actors = by_name(data)
         # 29h13m since the last lane-machine tick, on a 60-minute cadence.
-        self.assertEqual(actors["lane-machine"]["status"], "down")
-        self.assertEqual(actors["muse"]["status"], "ok")
+        self.assertEqual(actors["lane-machine"]["verdict"], "down")
+        self.assertEqual(actors["muse"]["verdict"], "ok")
 
     def test_ticks_are_newest_first_with_the_counts_the_journal_states(self):
         data = roster.build_roster([MUSE_DAY], None, NOW)
@@ -109,23 +109,35 @@ class BrainRosterTest(unittest.TestCase):
     def test_a_holder_without_a_cadence_gets_no_lateness_verdict(self):
         data = roster.build_roster([OPERATOR_DAY], None, NOW)
         actor = by_name(data)["operator-session"]
-        self.assertEqual(actor["status"], "untracked")
+        self.assertEqual(actor["verdict"], "untracked")
         self.assertIsNone(actor["cadence"])
 
-    def test_status_boundaries_follow_the_cadence(self):
-        def status_at(tick_iso):
+    def test_verdict_boundaries_follow_the_cadence(self):
+        def verdict_at(tick_iso):
             day = journal("\n".join([
                 "<!-- loom:journal v1 -->",
                 "Tick %s, muse" % tick_iso,
                 "- Moved: merged 0, briefed 0, closed 0, verified 0, deferred 0.",
             ]))
-            return by_name(roster.build_roster([day], None, NOW))["muse"]["status"]
+            return by_name(roster.build_roster([day], None, NOW))["muse"]["verdict"]
 
         # The primary brain ticks every 30 minutes: LATE past 45, DOWN past 75.
-        self.assertEqual(status_at("2030-01-08T11:45:00Z"), "ok")    # exactly 45m
-        self.assertEqual(status_at("2030-01-08T11:44:00Z"), "late")  # 46m
-        self.assertEqual(status_at("2030-01-08T11:15:00Z"), "late")  # exactly 75m
-        self.assertEqual(status_at("2030-01-08T11:14:00Z"), "down")  # 76m
+        self.assertEqual(verdict_at("2030-01-08T11:45:00Z"), "ok")    # exactly 45m
+        self.assertEqual(verdict_at("2030-01-08T11:44:00Z"), "late")  # 46m
+        self.assertEqual(verdict_at("2030-01-08T11:15:00Z"), "late")  # exactly 75m
+        self.assertEqual(verdict_at("2030-01-08T11:14:00Z"), "down")  # 76m
+
+
+    def test_a_cadence_override_changes_the_verdict(self):
+        data = roster.build_roster([LANE_MACHINE_DAY], None, NOW,
+                                   cadences={"lane-machine": 10 ** 9})
+        self.assertEqual(by_name(data)["lane-machine"]["verdict"], "ok")
+
+    def test_cadences_come_from_the_environment_when_set(self):
+        with mock.patch.dict(os.environ,
+                             {"LOOM_ROSTER_CADENCES": "lane-machine=999999999"}):
+            data = roster.build_roster([LANE_MACHINE_DAY], None, NOW)
+        self.assertEqual(by_name(data)["lane-machine"]["verdict"], "ok")
 
 
 class WorkhorseRosterTest(unittest.TestCase):
@@ -134,7 +146,7 @@ class WorkhorseRosterTest(unittest.TestCase):
         actor = by_name(data)["workhorse"]
         self.assertEqual(actor["role"], "workhorse")
         self.assertEqual(actor["last_at"], "2030-01-08T12:01:00Z")
-        self.assertEqual(actor["status"], "ok")
+        self.assertEqual(actor["verdict"], "ok")
         tick = actor["ticks"][0]
         self.assertEqual(tick["counts"], {"closed": 35, "merged": 28, "rewritten": 18})
         self.assertEqual(tick["counted"], 81)
@@ -144,7 +156,7 @@ class WorkhorseRosterTest(unittest.TestCase):
         stale = dict(WORKHORSE, body=WORKHORSE_BODY.replace("12:01Z", "06:01Z"),
                      updated_at="2030-01-08T06:01:30Z")
         data = roster.build_roster([], stale, NOW)
-        self.assertEqual(by_name(data)["workhorse"]["status"], "down")
+        self.assertEqual(by_name(data)["workhorse"]["verdict"], "down")
 
     def test_no_workhorse_configured_no_workhorse_row(self):
         data = roster.build_roster([MUSE_DAY], None, NOW)
@@ -162,7 +174,7 @@ class WorkhorseRosterTest(unittest.TestCase):
         broken = {"ref": "example-owner/overseer#99", "body": "", "updated_at": None}
         data = roster.build_roster([], broken, NOW)
         actor = by_name(data)["workhorse"]
-        self.assertEqual(actor["status"], "untracked")
+        self.assertEqual(actor["verdict"], "untracked")
         self.assertIsNone(actor["last_at"])
 
 
