@@ -2971,7 +2971,7 @@ class Factory:
             self._hygiene_update(repo, number, issue, sha)
 
     def _hygiene_issue(self, repo: str, association: Tuple[str, int],
-                       tickets: Dict[int, Dict[str, Any]]) -> Any:
+                       tickets: Dict[int, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """The open loom ticket a lane pull request belongs to, from this
         pass's tickets when it is among them and fetched when it is not;
         None when there is nothing to maintain (no such ticket, a closed
