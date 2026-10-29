@@ -1088,6 +1088,25 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("loom:closed-unmerged", self.fake.names(12))
         self.assertIn("loom:runaway", self.fake.names(12))
 
+    def test_a_merged_pull_request_clears_runaway_when_criteria_stay_unbuilt(self):
+        # A runaway ticket whose pull request merges but leaves criteria
+        # unbuilt is requeued to build the rest, and the runaway hold is
+        # cleared so the ticket can be claimed again (loom#1405).
+        self.fake.add(12, state="pr", body=BODY + "\n" + self.CRITERIA)
+        self.fake.issues[12]["labels"].append({"name": "loom:runaway"})
+        self.fake.pulls = [{"number": 99, "state": "closed",
+                            "merged_at": "2030-01-02T00:00:00Z",
+                            "body": ("Refs %s#12\n\n## Acceptance criteria\n\n"
+                                     "- [x] First works; test.\n- [ ] Second works.\n")
+                            % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+        self.assertTrue(any("Pull request #99 merged, so this ticket's loom:runaway hold is cleared"
+                            in c["body"] for c in self.fake.comments[12]))
+
     def adoption(self, number, pr, state="queued", lane="codex"):
         self.fake.add(number, state=state, lane=lane, body=station.adoption_body(pr))
         self.fake.issues[number]["title"] = "Land or supersede #%d: A fix" % pr
@@ -3649,6 +3668,24 @@ class StuckFixRoundTest(unittest.TestCase):
         self.assertEqual(self.names(), ["loom:ticket", "loom:pr", "lane:spark"])
         self.assertEqual(len(self.rounds()), 1)
 
+    def test_a_text_only_leak_scan_failure_is_left_for_the_factorys_body_repair(self):
+        log = ["--- PR diff ---", "leak guard: clean (9 shape patterns, deny-list not configured, 4 lines scanned)",
+               "--- title and body ---", "BLOCKED: private infrastructure identifiers found",
+               "  text.md:3  [private-hostname] 'x' - why"]
+        self.run_hand_back(checks=[("leak-scan / Scan diff and PR text", "\n".join(log))])
+        self.assertEqual(self.rounds(), [])
+        self.assertFalse(any(path.endswith("/pulls/7") for _, path, _ in self.gh.writes))
+        self.assertEqual([x["name"] for x in self.gh.issue["labels"]],
+                         ["loom:ticket", "loom:pr", "lane:spark"])
+
+    def test_a_diff_leak_scan_failure_still_opens_a_fix_round(self):
+        log = ["--- PR diff ---", "BLOCKED: private infrastructure identifiers found",
+               "  web/staged.js:3  [private-hostname] 'x' - why",
+               "--- title and body ---",
+               "leak guard: clean (9 shape patterns, deny-list not configured, 4 lines scanned)"]
+        self.run_hand_back(checks=[("leak-scan / Scan diff and PR text", "\n".join(log))])
+        self.assertEqual(len(self.rounds()), 1)
+
     def test_a_plan_check_failing_again_beside_a_new_failure_is_not_stuck(self):
         self.last_round("### Check: %s\n\n    0 non-empty bullets" % factory.DEFAULT_PLAN_CHECK)
         self.run_hand_back(checks=[(factory.DEFAULT_PLAN_CHECK, "0 non-empty bullets"),
@@ -4534,14 +4571,17 @@ class ClaimTest(Base):
         model_wait_events = [e for e in events if e.kind == "model_wait"
                              and e.item == hashlib.sha256(("%s#12" % REPO).encode()).hexdigest()]
         self.assertEqual(len(model_wait_events), 1)
-        # A subsequent pass reaching the same wait decision records another
-        # event, even while the wait label is already present.
+        # A subsequent pass reaching the same wait decision does not repeat
+        # the event while the wait label is already present.
         issue = self.fake.issues[12]
+        st.now += invariants.REPEATED_FAILURE
         st._route_model_claim(REPO, issue, "opencode-go-3", "claude-sonnet-5-5", [])
         events = st._read_events()
         model_wait_events = [e for e in events if e.kind == "model_wait"
                              and e.item == hashlib.sha256(("%s#12" % REPO).encode()).hexdigest()]
-        self.assertEqual(len(model_wait_events), 2)
+        self.assertEqual(len(model_wait_events), 1)
+        self.assertEqual(invariants.repeated_failure(
+            invariants.Facts(st.now, events=events)), [])
 
     def test_the_brief_carries_the_operators_notes_and_pull_requests_in_other_repos(self):
         # 2026-10-22: the operator's comment and two merges in
@@ -12814,3 +12854,185 @@ class RunnerSlotClaimTest(Base):
         self.fake.add(12, lane="free-gemma", body=self.MEDIUM)
         self.run_pass()
         self.assertEqual(len(self.listing("free-gemma")), 1)
+
+
+class LunaReviewFake(FakeGitHub):
+    """FakeGitHub plus the pulls/<n>/comments POSTs a Luna verdict's
+    anchored findings use."""
+
+    def __init__(self):
+        super().__init__()
+        self.reviews_posted = []
+
+    def __call__(self, method, url, headers, body):
+        parts = urlsplit(url)
+        found = re.match(r"/repos/%s/pulls/(\d+)/comments$" % REPO, parts.path)
+        if method == "POST" and found:
+            self.reviews_posted.append(
+                (int(found.group(1)), json.loads(body) if body else None))
+            return reply(201, {"id": 9})
+        return super().__call__(method, url, headers, body)
+
+
+class LunaReviewWriterTest(Base):
+    """The factory's Luna review writer (loom#2142): the station renders the
+    review brief for the pull request's current head and hands it to the
+    Luna review slot; a head that moved on is refused, so no verdict can
+    ever be posted for a commit the factory did not ask about."""
+
+    SHA = "a" * 40
+
+    def station(self):
+        return station.Station(GitHub("token", transport=self.fake), self.settings,
+                               now=time.time())
+
+    def pull(self, sha):
+        self.fake.pulls = [{"number": 42,
+                            "head": {"ref": "loom/5-fix-the-thing", "sha": sha},
+                            "base": {"ref": "main"}}]
+
+    def briefs(self):
+        folder = self.inbox(factory.LUNA_REVIEW_LANE)
+        return [n for n in os.listdir(folder) if n.endswith(".md")] \
+            if os.path.isdir(folder) else []
+
+    def test_the_writer_hands_a_review_brief_to_the_luna_slot(self):
+        self.fake.add(5, lane="codex", state="pr")
+        self.pull(self.SHA)
+        st = self.station()
+        self.assertTrue(st._write_review_brief(REPO, 42, self.SHA, self.fake.issues[5]))
+        names = self.briefs()
+        self.assertEqual(len(names), 1)
+        self.assertIn("-review-", names[0])
+        with open(os.path.join(self.inbox(factory.LUNA_REVIEW_LANE), names[0])) as fh:
+            text = fh.read()
+        self.assertIn("Repo: %s\n" % REPO, text)
+        self.assertIn("Branch: loom/5-fix-the-thing\n", text)
+        self.assertIn("Review-PR: 42\n", text)
+        self.assertIn("Head-Sha: %s\n" % self.SHA, text)
+        self.assertIn("Model: gpt-6-luna\n", text)
+        self.assertIn("Deliverable: review\n", text)
+
+    def test_the_writer_refuses_a_head_that_moved(self):
+        self.fake.add(5, lane="codex", state="pr")
+        self.pull("b" * 40)
+        st = self.station()
+        self.assertFalse(st._write_review_brief(REPO, 42, self.SHA, self.fake.issues[5]))
+        self.assertEqual(self.briefs(), [])
+
+    def test_the_writer_refuses_an_unreadable_pull_request(self):
+        self.fake.add(5, lane="codex", state="pr")
+        st = self.station()
+        self.assertFalse(st._write_review_brief(REPO, 42, self.SHA, self.fake.issues[5]))
+        self.assertEqual(self.briefs(), [])
+
+
+class LunaReviewResultTest(Base):
+    """A finished Luna review run (loom#2142): the station posts the lane's
+    review.json on the pull request as a verdict in the Elder's markings
+    shape, with any blocking findings as review threads, so the factory's
+    gate and fix rounds read them exactly like the review bot's own."""
+
+    SHA = "a" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.fake = LunaReviewFake()
+        self.fake.add(5, lane="codex", body=BODY, state="pr")
+        self.fake.comments[42] = []
+        self.name = tickets.review_name(REPO, 5, 7)
+        issue = {"number": 5, "title": "Fix the thing", "body": BODY}
+        brief = tickets.render_review_brief(REPO, issue, factory.LUNA_REVIEW_LANE, 7, 42,
+                                            "loom/5-fix-the-thing", "main", self.SHA)
+        self.brief_path = os.path.join(self.inbox(factory.LUNA_REVIEW_LANE, "done"),
+                                       self.name + ".md")
+        self.write(self.brief_path, brief)
+
+    def result(self, data, lane=None, model="gpt-6-luna"):
+        text = data if isinstance(data, str) else json.dumps(data)
+        lane = lane or factory.LUNA_REVIEW_LANE
+        self.write(os.path.join(self.home, "logs", lane,
+                                self.name + ".review.json"), text)
+        if model is not None:
+            self.write(os.path.join(self.home, "logs", lane,
+                                    self.name + ".review.model"), model + "\n")
+
+    def report(self, kind="done", lane=None):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        return st._report(lane or factory.LUNA_REVIEW_LANE, kind, self.brief_path, self.name)
+
+    def verdicts(self):
+        return [str(c.get("body") or "") for c in self.fake.comments[42]]
+
+    def test_a_clean_verdict_is_posted_in_the_elders_shape(self):
+        self.result({"blocking": [],
+                     "notes": [{"file": "src/app.py", "line": 3,
+                                "finding": "Name the flag for the next reader."}],
+                     "summary": "The change is sound."})
+        self.assertTrue(self.report())
+        bodies = self.verdicts()
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual(factory.parse_luna_verdict(bodies[0], self.SHA), (0, 1))
+        self.assertIn("The change is sound.", bodies[0])
+        self.assertIn("Name the flag for the next reader.", bodies[0])
+        self.assertEqual(self.fake.reviews_posted, [])
+
+    def test_a_blocking_verdict_posts_its_findings_as_review_threads(self):
+        self.result({"blocking": [
+                         {"file": "src/app.py", "line": 9,
+                          "finding": "The null check is missing."},
+                         {"file": None, "line": None,
+                          "finding": "No test covers the fallback."}],
+                     "notes": [], "summary": "Two problems."})
+        self.assertTrue(self.report())
+        bodies = self.verdicts()
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual(factory.parse_luna_verdict(bodies[0], self.SHA), (2, 2))
+        self.assertIn("The null check is missing.", bodies[0])
+        self.assertIn("No test covers the fallback.", bodies[0])
+        # Only the anchored finding becomes a review thread; both findings
+        # are in the verdict comment above.
+        self.assertEqual(len(self.fake.reviews_posted), 1)
+        number, thread = self.fake.reviews_posted[0]
+        self.assertEqual(number, 42)
+        self.assertEqual(thread, {"commit_id": self.SHA, "path": "src/app.py",
+                                  "line": 9, "side": "RIGHT",
+                                  "body": "The null check is missing."})
+
+    def test_a_missing_review_json_posts_nothing(self):
+        self.assertTrue(self.report())
+        self.assertEqual(self.verdicts(), [])
+        self.assertEqual(self.fake.reviews_posted, [])
+
+    def test_a_malformed_review_json_posts_nothing(self):
+        self.result({"blocking": "none", "notes": [], "summary": "x"})
+        self.assertTrue(self.report())
+        self.assertEqual(self.verdicts(), [])
+        self.assertEqual(self.fake.reviews_posted, [])
+
+    def test_a_failed_run_posts_nothing(self):
+        self.result({"blocking": [], "notes": [], "summary": "Sound."})
+        self.assertTrue(self.report(kind="failed"))
+        self.assertEqual(self.verdicts(), [])
+        self.assertEqual(self.fake.reviews_posted, [])
+
+    def test_a_verdict_from_another_lane_posts_nothing(self):
+        # The gate trusts the posted verdict, so it counts only from the
+        # slot the factory dispatched the brief to.
+        self.result({"blocking": [], "notes": [], "summary": "Sound."}, lane="codex")
+        self.assertTrue(self.report(lane="codex"))
+        self.assertEqual(self.verdicts(), [])
+        self.assertEqual(self.fake.reviews_posted, [])
+
+    def test_a_verdict_from_a_non_luna_model_posts_nothing(self):
+        self.result({"blocking": [], "notes": [], "summary": "Sound."}, model="gpt-6-sol")
+        self.assertTrue(self.report())
+        self.assertEqual(self.verdicts(), [])
+        self.assertEqual(self.fake.reviews_posted, [])
+
+    def test_a_verdict_with_no_recorded_model_posts_nothing(self):
+        self.result({"blocking": [], "notes": [], "summary": "Sound."}, model=None)
+        self.assertTrue(self.report())
+        self.assertEqual(self.verdicts(), [])
+        self.assertEqual(self.fake.reviews_posted, [])

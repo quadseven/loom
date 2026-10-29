@@ -39,12 +39,14 @@ Before pushing a branch or opening a pull request on a public repository, the
 lane runner uses infra-public's `check_private_leaks.py` on the diff and
 generated pull request body, with the shared deny-list of names and products
 (`--deny-list-ssm`, the SSM parameter `LOOM_LEAK_DENY_SSM`, default
-`/infra/leak-scan/deny-list`). Every scan goes through `leak_scan`. Set
-`LOOM_LEAK_SCANNER` to that script's path when it is not at
-`../infra-public/.github/scripts/check_private_leaks.py` relative to the Loom
-checkout. A missing scanner, a deny-list the scanner cannot read (it exits 2)
-or a hit blocks the push; a scan that could not run parks the brief
-`[transient]`. A lane pod or cluster runner (`LOOM_SSM_DIR`) holds no AWS
+`/infra/leak-scan/deny-list`). Every scan goes through `leak_scan`. The lane
+machine keeps `$LOOM_HOME/infra-public` cloned, cloning it when first needed
+and fast-forwarding it at most hourly. Set `LOOM_LEAK_SCANNER` to that
+script's path when using another checkout. A scanner that is still missing
+files a factory incident and holds the brief; a deny-list the scanner cannot
+read (it exits 2) or a hit blocks the push. A scan that could not run for
+another reason parks the brief `[transient]`. A lane pod or cluster runner
+(`LOOM_SSM_DIR`) holds no AWS
 key: the scanner reads the deny-list's copy under `LOOM_SSM_DIR` through
 `lanes/k8s/ssm-dir-bin/aws`, a stand-in for the AWS CLI put first on the
 scanner's PATH only. Without that copy it pushes nothing to a public repo.
@@ -1324,6 +1326,10 @@ cannot query the viewer or any other local service.
   `--allow-all-tools`; the run output, including any CLI usage details, is
   retained in the lane log. Monthly usage-limit messages hold the lane until
   the next UTC month begins.
+- Model choice on the priced Anthropic routes follows
+  docs/USAGE_ROUTING.md ("October 2026 price changes"): high-volume
+  subtasks pin `claude-haiku-5-5`; cache-heavy work stays on
+  `claude-sonnet-5-5`.
 - Any step that fails moves the brief to `failed/` with the reason in
   `logs/<lane>/<ticket>.log`. Failed briefs are never retried; the
   orchestrator re-briefs.
@@ -1526,6 +1532,26 @@ lookup leaves the brief for the next pass. The rule covers:
 - Best for: scoped implementation, CI failure repair, `codex review` passes.
 - Models per ticket: Astra (hardest), Sol (default building), Luna (volume).
 
+## Elder fallback reviews: the codex-2 slot on Luna
+
+When the review bot's model route is exhausted, its check on a lane pull
+request concludes as a degraded review - not a verdict - and the re-ask
+degrades the same way (loom#2142). The factory then dispatches one review
+brief to the `codex-2` slot instead of another fix round: a
+`Deliverable: review` brief in the verify brief's shape, whose tree is the
+pull request's own branch, pinned `Model: gpt-6-luna` (the only model the
+codex lanes run), through `codex exec` on the operator's Codex login, on
+the same lane machine as the other codex slots. The lane changes no code;
+it writes `review.json` (blocking findings, notes, a summary). The station
+posts the verdict on the pull request in the Elder's markings shape
+(`Elder markings - N blocking, M total`, under a
+`<!-- loom:luna-review v1 sha=... -->` marker), with blocking findings
+also posted as review threads, and the factory's merge gate reads the
+verdict for that head in the degraded check's place: a clean verdict lets
+the pull request land, a blocking one sends it back through the ordinary
+fix rounds. A dispatched review that produces no verdict is dispatched
+again after an hour.
+
 ## opencode/ - volume
 
 - Tool: headless opencode runs. Providers configured in `config.json`:
@@ -1604,6 +1630,32 @@ unchanged for a run that did not end on a described step.
   limited lane to the next rung of the model ladder at once. Any other
   failure to answer (a timeout, a name that does not resolve) only makes the
   lane unavailable; its briefs wait.
+
+### Mellum 2.1 evaluation (spark slots)
+
+The spark slots serve their local model over vLLM (above). JetBrains
+released Mellum 2.1 on 2026-10-08: a 12B mixture-of-experts model with
+2.5B active parameters, a 131k context, Apache 2.0, served with vLLM or
+SGLang - the same serving shape as the incumbent, so it can be evaluated
+on one box without new machinery. It is built for coding agents and fast
+sub-agents on your own hardware, which is the spark slots' shape of work
+(easy-tier tickets, triage and review workers). The vendor's benchmark
+figures are self-reported from its own pipeline, so they are a reason to
+evaluate, not evidence: nothing here claims the model performs at any
+level on this repo's tickets.
+
+Plan:
+
+- Serve Mellum 2.1 on one spark box beside the incumbent model; the
+  thermal guard and the one-stream rule apply unchanged.
+- Run the same sample of easy tickets through both models and compare
+  the outcomes the scorecard already records per (lane, model)
+  (bus/scorecard.py): review outcome (clean, findings, bad work),
+  send-backs, merged, reverted and failed deploys - plus wall-clock per
+  ticket under load.
+- Adopt only if Mellum 2.1 matches or beats the incumbent on those
+  measures, and record the result in this section either way. Until
+  then no tier, ladder or default names it.
 
 ## agy: the Google plan, as a separate macOS user
 

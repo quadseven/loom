@@ -580,6 +580,11 @@ IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
 CACHE_KEEP = 24 * 3600
 VERIFY_INTERVAL = 6 * 3600
+# A Luna review verdict's findings (loom#2142): at most this many per list,
+# each finding's text collapsed and capped, so a lane's review.json can
+# never turn the verdict comment into a wall.
+REVIEW_FINDINGS_MAX = 50
+REVIEW_FINDING_CHARS = 500
 # A shipped ticket whose Live box has seen no matching log line this many days
 # after it shipped waits on a rare event, not on a verifier: it gets
 # wait:live-event and is held apart from open work (loom#1220).
@@ -2018,6 +2023,7 @@ class Station:
         self._claimed_rereviews: Dict[str, Any] = {}
         self._claimed_writes = 0
         self._branch_cache: Dict[str, str] = {}
+        self._stale_asks_withdrawn = 0
         # Per pass: each path-scoped repo's workflow filters, and its deploy runs.
         self._path_filters: Dict[str, Dict[str, List[str]]] = {}
         self._manual_listed: Dict[str, List[str]] = {}
@@ -3629,6 +3635,34 @@ class Station:
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
 
+    def _write_review_brief(self, repo: str, pr_number: int, sha: str,
+                            issue: Dict[str, Any]) -> bool:
+        """The factory's Luna review writer (loom#2142): render the review
+        brief for the pull request's current head and hand it to the Luna
+        review slot. False when the pull request cannot be read or its head
+        has moved since the factory asked: no verdict may ever be posted
+        for a commit nobody asked about."""
+        try:
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data or {}
+        except GitHubError as err:
+            _say("could not read %s#%d for its Luna review brief: %s" % (repo, pr_number, err))
+            return False
+        head = pr.get("head") or {}
+        base = pr.get("base") or {}
+        if (str(head.get("sha") or "") != sha or not head.get("ref") or not base.get("ref")):
+            return False
+        stamp = int(self.now)
+        text = tickets.render_review_brief(
+            repo, issue, factory.LUNA_REVIEW_LANE, stamp, pr_number,
+            str(head["ref"]), str(base["ref"]), sha)
+        claiming = self._write_brief(
+            factory.LUNA_REVIEW_LANE,
+            tickets.review_name(repo, int(issue["number"]), stamp), text)
+        os.replace(claiming, claiming[:-len(".claiming")] + ".md")
+        _say("handed %s#%d head %s to lane %s to review"
+             % (repo, pr_number, sha[:12], factory.LUNA_REVIEW_LANE))
+        return True
+
     def _verify_github_data(self, repo: str, issue: Dict[str, Any]) -> str:
         """The verify brief's GitHub section: the lane has no network, so the
         station reads the ticket's merged pull requests, linked the way
@@ -3818,19 +3852,38 @@ class Station:
         except GitHubError as err:
             _say("could not clear the awaiting label on %s#%d: %s" % (repo, number, err))
 
-    def _read_verify(self, lane: str, name: str) -> Tuple[Optional[Dict[str, Any]], str]:
-        """(the lane's verify.json, "") or (None, why it cannot be used)."""
-        path = os.path.join(self.s.home, "logs", lane, name + ".verify.json")
+    def _read_result(self, lane: str, name: str, filename: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """(the lane's result file, "") or (None, why it cannot be used): the
+        shared reader behind _read_verify and _read_review."""
+        path = os.path.join(self.s.home, "logs", lane, name + "." + filename)
         try:
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
         except FileNotFoundError:
-            return None, "The run wrote no verify.json."
+            return None, "The run wrote no %s." % filename
         except ValueError:
-            return None, "Its verify.json is not valid JSON."
+            return None, "Its %s is not valid JSON." % filename
         if not isinstance(data, dict):
-            return None, "Its verify.json is not a JSON object."
+            return None, "Its %s is not a JSON object." % filename
         return data, ""
+
+    def _read_verify(self, lane: str, name: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """(the lane's verify.json, "") or (None, why it cannot be used)."""
+        return self._read_result(lane, name, "verify.json")
+
+    def _review_model(self, lane: str, name: str) -> str:
+        """The model the review run used, as the runner recorded it next to
+        review.json; "" when it recorded none."""
+        path = os.path.join(self.s.home, "logs", lane, name + ".review.model")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except FileNotFoundError:
+            return ""
+
+    def _read_review(self, lane: str, name: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """(the lane's review.json, "") or (None, why it cannot be used)."""
+        return self._read_result(lane, name, "review.json")
 
     def _report_verify(self, lane: str, kind: str, repo: str, number: int, name: str) -> bool:
         """Apply a finished verify run. A failed run changes nothing: the
@@ -3870,6 +3923,111 @@ class Station:
             self._refute_merged(lane, repo, number, result["unmet"])
         else:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
+        return True
+
+    @staticmethod
+    def _review_findings(value: Any) -> Optional[List[Dict[str, Any]]]:
+        """A review.json finding list, cleaned, or None when its shape is
+        not a list of findings: each entry keeps its finding text (whitespace
+        collapsed, capped), an optional file and an optional line."""
+        if not isinstance(value, list):
+            return None
+        out: List[Dict[str, Any]] = []
+        for entry in value[:REVIEW_FINDINGS_MAX]:
+            if not isinstance(entry, dict) or not isinstance(entry.get("finding"), str):
+                return None
+            finding = " ".join(entry["finding"].split())[:REVIEW_FINDING_CHARS]
+            if not finding:
+                return None
+            item: Dict[str, Any] = {"finding": finding}
+            if isinstance(entry.get("file"), str) and entry["file"]:
+                item["file"] = entry["file"]
+            if isinstance(entry.get("line"), int) and entry["line"] > 0:
+                item["line"] = entry["line"]
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _finding_line(finding: Dict[str, Any]) -> str:
+        where = ""
+        if "file" in finding:
+            where = "`%s`%s: " % (finding["file"],
+                                  " (line %d)" % finding["line"] if "line" in finding else "")
+        return where + finding["finding"]
+
+    def _report_review(self, lane: str, kind: str, repo: str, number: int,
+                       name: str, text: str) -> bool:
+        """Apply a finished Luna review run (loom#2142): post the lane's
+        review.json on the pull request as a verdict in the Elder's markings
+        shape, with its blocking findings as review threads when they name a
+        file and a line, so the factory's gate and fix rounds read them
+        exactly like the review bot's own. A failed run, an unreadable
+        result or a result in the wrong shape posts nothing: the factory
+        dispatches again after its retry window. A result also posts
+        nothing when it did not come from the review slot's own Luna run:
+        the gate trusts the posted verdict, so no other lane or model may
+        speak it."""
+        if kind == "failed":
+            _say("Luna review run %s on lane %s failed; %s#%d keeps waiting for "
+                 "a verdict" % (name, lane, repo, number))
+            return True
+        if lane != factory.LUNA_REVIEW_LANE:
+            _say("Luna review run %s reported on lane %s, not the review slot "
+                 "%s; its verdict is not posted" % (name, lane, factory.LUNA_REVIEW_LANE))
+            return True
+        model = self._review_model(lane, name)
+        if model != factory.LUNA_MODEL:
+            _say("Luna review run %s recorded model %s, not %s; its verdict is "
+                 "not posted" % (name, model or "none", factory.LUNA_MODEL))
+            return True
+        result, why = self._read_review(lane, name)
+        if result is None:
+            _say("Luna review run %s left no usable verdict: %s" % (name, why))
+            return True
+        blocking = self._review_findings(result.get("blocking"))
+        notes = self._review_findings(result.get("notes"))
+        summary = result.get("summary")
+        pr_field = self._field(text, "Review-PR")
+        sha = self._field(text, "Head-Sha")
+        if (blocking is None or notes is None or not isinstance(summary, str)
+                or not pr_field.isdigit() or not sha):
+            _say("Luna review run %s wrote a verdict in the wrong shape; "
+                 "nothing posted" % name)
+            return True
+        pr_number = int(pr_field)
+        # Each anchored blocking finding becomes a review thread of its own
+        # (one pulls/comments post per finding), so the factory's fix rounds
+        # and rebuttal reads meet them exactly like the review bot's threads.
+        for finding in [f for f in blocking if "file" in f and "line" in f]:
+            try:
+                self.gh.rest("POST", "/repos/%s/pulls/%d/comments" % (repo, pr_number), {
+                    "commit_id": sha, "path": finding["file"],
+                    "line": finding["line"], "side": "RIGHT",
+                    "body": finding["finding"]})
+            except GitHubError as err:
+                _say("could not post a Luna review thread on %s#%d (%s); the "
+                     "finding still lands in the verdict comment" % (repo, pr_number, err))
+        lines = [factory.LUNA_REVIEW_MARKER % sha,
+                 "Elder markings - %d blocking, %d total"
+                 % (len(blocking), len(blocking) + len(notes)),
+                 "", " ".join(summary.split())[:1000] or "The lane gave no summary.",
+                 "",
+                 "This verdict comes from a Codex Luna review (lane %s, gpt-6-luna "
+                 "through `codex exec`) while the Elder review route is degraded. "
+                 "The merge gate reads it for this head in the degraded check's "
+                 "place." % lane]
+        if blocking:
+            lines += ["", "Blocking findings:"] + \
+                     ["- " + self._finding_line(f) for f in blocking]
+        if notes:
+            lines += ["", "Notes:"] + ["- " + self._finding_line(f) for f in notes]
+        try:
+            notify.post(self.gh, repo, pr_number, "\n".join(lines), notify.RECORD)
+        except GitHubError as err:
+            _say("could not post the Luna verdict on %s#%d (%s)" % (repo, pr_number, err))
+            return True
+        _say("posted the Luna verdict on %s#%d: %d blocking, %d total"
+             % (repo, pr_number, len(blocking), len(blocking) + len(notes)))
         return True
 
     def _refute_merged(self, lane: str, repo: str, number: int, why: Any) -> None:
@@ -4355,8 +4513,9 @@ class Station:
             # A log line, not a comment: each comment emails the operator
             # (2026-10-18), and the ticket's labels already say it waits.
             _say("%s#%d waits: no free lane takes model %s" % (repo, number, model))
-            self._event("model_wait", "no free lane takes model %s" % model,
-                        "%s#%d" % (repo, number), lane, model)
+            if not already_waiting:
+                self._event("model_wait", "no free lane takes model %s" % model,
+                            "%s#%d" % (repo, number), lane, model)
             return None
         names.append("lane:" + target)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
@@ -4439,7 +4598,8 @@ class Station:
             if tickets.merged_before_regression_requeue(ticket, pr.get("merged_at"), events):
                 return
         left: List[str] = []
-        if target == "loom:merged":
+        merged = target == "loom:merged"
+        if merged:
             left = self._unbuilt_criteria(ticket, [pr, *landed])
             if left:
                 events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
@@ -4453,7 +4613,11 @@ class Station:
                        "merged", "shipped", "verified", "closed-unmerged")
         states = {"loom:" + state for state in state_names}
         kept = self._drop_claim(name for name in labels if name not in states)
-        cleared = target == "loom:merged" and RUNAWAY in kept
+        # A merged pull request lands the lane's run, so a runaway hold the run
+        # caused is cleared even when the ticket is requeued to build criteria
+        # the pull request left unbuilt; otherwise a runaway ticket can never
+        # be claimed again (bus/station.py, test_a_runaway_ticket_is_not_claimed).
+        cleared = merged and RUNAWAY in kept
         if cleared:
             kept = [name for name in kept if name != RUNAWAY]
         kept.append(target)
@@ -6246,11 +6410,15 @@ class Station:
                  % (repo, err))
 
     def _no_round(self, failed: List[Tuple[str, str]], threads: List[Any]) -> bool:
-        """Nothing a lane round could fix: no failure at all, or the plan check
-        alone, which fails on the pull request's body; the factory rebuilds
-        that from the ticket (factory._judge, loom#1837), so it is also no
-        round to judge stuck."""
-        return not threads and all(name == self.s.plan_check for name, _ in failed)
+        """Whether failed checks need no lane round because they read PR text."""
+        if threads:
+            return False
+        if all(name == self.s.plan_check for name, _ in failed):
+            return True
+        return bool(failed) and all(
+            factory.LEAK_CHECK_RE.search(name)
+            and factory.body_leak_hits(tail.splitlines()) is not None
+            for name, tail in failed)
 
     def _note_first_push(self, repo: str, pr_number: int, comments: List[Any],
                          failed: List[Tuple[str, str]]) -> None:
@@ -6602,6 +6770,8 @@ class Station:
             return True
         if self._field(text, "Deliverable") == "verify":
             return self._report_verify(lane, kind, repo, number, name)
+        if self._field(text, "Deliverable") == "review":
+            return self._report_review(lane, kind, repo, number, name, text)
         self._revert_decision_ticks(repo, number, lane, text)
         if kind == "done":
             if self._field(text, "Deliverable") == "answer":
@@ -10990,14 +11160,20 @@ class Station:
             "Needs you: Open asks: %s." % rows(groups["asks"]), "",
             STANDUP_FOOTER])
 
-    @staticmethod
-    def _standup_summary(groups: Dict[str, List[Dict[str, Any]]]) -> str:
+    def _standup_summary(self, groups: Dict[str, List[Dict[str, Any]]], station: Optional["Station"] = None) -> str:
         """"3 merged, 2 in flight": the counts of a standup's groups, or ""."""
         counts = [(len(groups[k]), word) for k, word in (
             ("merged", "merged"), ("verified", "verified"), ("sent_back", "shipped"),
             ("failed", "failed"), ("regressed", "regressed"), ("aged_pr", "stuck"),
-            ("in_flight", "in flight"), ("queued", "queued"), ("asks", "waiting on you"))]
-        return ", ".join("%d %s" % (n, word) for n, word in counts if n)
+            ("in_flight", "in flight"), ("queued", "queued"), ("asks", "waiting on you"))
+            if k in groups]
+        st = station or self
+        stale = getattr(st, "_stale_asks_withdrawn", 0)
+        summary = ", ".join("%d %s" % (n, word) for n, word in counts if n)
+        if stale > 0:
+            word = "stale ask withdrawn" if stale == 1 else "stale asks withdrawn"
+            summary = (summary + ", " if summary else "") + ("%d %s" % (stale, word))
+        return summary
 
     def _standup_ticket_groups(self, children: List[Any], since: Optional[float] = None
                                ) -> Dict[str, List[Dict[str, Any]]]:
@@ -11012,9 +11188,14 @@ class Station:
                     groups[group].append(issue)
         return groups
 
+    @staticmethod
+    def _issue_label_names(issue: Dict[str, Any]) -> List[str]:
+        return [str(l.get("name", "")) if isinstance(l, dict) else str(l)
+                for l in issue.get("labels", [])]
+
     def _standup_groups_of(self, issue: Dict[str, Any], since: Optional[float]) -> List[str]:
         """The standup headings one ticket belongs under."""
-        labels = {label.get("name") for label in issue.get("labels", [])}
+        labels = set(self._issue_label_names(issue))
         updated = self._epoch(str(issue.get("updated_at") or ""))
         recent = since is None or (updated is not None and updated >= since)
         found = [group for label, group in (("loom:merged", "merged"),
@@ -11023,22 +11204,33 @@ class Station:
                  if label in labels and recent]
         if issue.get("state") != "open" or "loom:ticket" not in labels:
             return found
+        found.extend(self._open_standup_groups(issue, labels))
+        return found
+
+    def _open_standup_groups(self, issue: Dict[str, Any], labels: Set[str]) -> List[str]:
         created = self._epoch(str(issue.get("created_at") or ""))
         aged = created is not None and self.now - created > factory.STUCK_AGE
-        # Queued is not in flight: no lane holds it yet (2026-10-21, a goal
-        # report named a queued ticket "in flight" twice while nothing ran).
+        is_waiting, is_queued = self._standup_ask_status(issue, labels)
+        found = []
         for group, hit in (("failed", "loom:failed" in labels),
                            ("regressed", "loom:regression" in labels),
                            ("aged_pr", "loom:pr" in labels and aged),
                            ("in_flight", bool(labels & {"loom:briefed", "loom:running",
                                                         "loom:pr"})),
-                           ("queued", "loom:queued" in labels),
+                           ("queued", is_queued),
                            ("needs_difficulty", "loom:queued" in labels and
                             not factory.has_difficulty(issue)),
-                           ("asks", bool(labels & {NEEDS_OPERATOR, HUMAN}))):
+                           ("asks", is_waiting)):
             if hit:
                 found.append(group)
         return found
+
+    def _standup_ask_status(self, issue: Dict[str, Any], labels: Set[str]) -> Tuple[bool, bool]:
+        has_needs = any(self.NEEDS_LABEL_PATTERN.match(l) for l in labels)
+        has_ask = self._has_ask_comment(issue) if has_needs else False
+        is_waiting = bool(labels & {NEEDS_OPERATOR, HUMAN}) or (has_needs and has_ask)
+        is_queued = ("loom:queued" in labels) or (has_needs and not has_ask)
+        return is_waiting, is_queued
 
     @staticmethod
     def _standup_rows(items: List[Dict[str, Any]]) -> str:
@@ -11047,6 +11239,171 @@ class Station:
             for issue in items[:STANDUP_ROWS_MAX]) or "none"
         more = len(items) - STANDUP_ROWS_MAX
         return shown + (" and %d more" % more if more > 0 else "")
+
+    # -- stale ask detection -----------------------------------------------
+    STALE_ASK_PATTERN = re.compile(r"stale-when:\s*commit\s+([0-9a-f]{7,40})\s+live", re.I)
+    ISSUE_EXISTS_PATTERN = re.compile(r"stale-when:\s*issue\s+exists", re.I)
+    NEEDS_LABEL_PATTERN = re.compile(r"^needs:([a-z0-9_.-]+)$", re.I)
+    _ASK_HEADING_PATTERN = re.compile(r"^##\s*Ask\b", re.M | re.I)
+    _ASK_WORD_PATTERN = re.compile(r"[*_]*(?:exact\s+)?ask\b", re.I)
+
+    def _parse_stale_when(self, comment_body: str) -> Optional[str]:
+        """Parse an ask comment for a stale-when line: 'stale-when: commit <sha> live' or
+        'stale-when: issue exists'."""
+        stale_when = self.STALE_ASK_PATTERN.search(comment_body)
+        if stale_when:
+            return stale_when.group(1).lower()
+        if self.ISSUE_EXISTS_PATTERN.search(comment_body):
+            return "issue exists"
+        return None
+
+    def _check_commit_live(self, repo: str, commit_sha: str) -> bool:
+        """Check if a commit SHA exists in the repo's default branch git history."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/commits/%s" % (repo, commit_sha)).data or {}
+            return bool(isinstance(data, dict) and data.get("sha"))
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not check commit %s in %s: %s" % (commit_sha, repo, err))
+            return False
+
+    def _check_issue_exists(self, repo: str, issue_number: int) -> bool:
+        """Check if an issue number exists in a repo."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, issue_number)).data or {}
+            return bool(isinstance(data, dict) and data.get("number"))
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not check issue %d in %s: %s" % (issue_number, repo, err))
+            return False
+
+    def _get_issue_comments(self, repo: str, issue_number: int) -> List[Dict[str, Any]]:
+        """Fetch comments for an issue, returning empty list on error."""
+        try:
+            items = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, issue_number))
+            return [c for c in items if isinstance(c, dict)]
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not fetch comments for %s#%d: %s" % (repo, issue_number, err))
+            return []
+
+    def _is_ask_text(self, body: str) -> bool:
+        """Check whether a comment or issue body contains ask indicators."""
+        if not body:
+            return False
+        if body.startswith(HUMAN_MARKER):
+            return True
+        patterns = (self.STALE_ASK_PATTERN, self.ISSUE_EXISTS_PATTERN,
+                    self._ASK_HEADING_PATTERN, self._ASK_WORD_PATTERN)
+        if any(p.search(body) for p in patterns):
+            return True
+        return any(self.NEEDS_LABEL_PATTERN.search(w) for w in body.split())
+
+    def _has_ask_comment(self, issue: Dict[str, Any]) -> bool:
+        """Check if an issue has an ask comment."""
+        repo = issue.get("repository", {}).get("full_name") or (self.s.repos[0] if self.s.repos else "")
+        number = int(issue.get("number") or 0)
+        comments = self._get_issue_comments(repo, number)
+        if any(self._is_ask_text(str(c.get("body") or "")) for c in comments):
+            return True
+        return self._is_ask_text(str(issue.get("body") or ""))
+
+    def _target_labels_after_withdrawal(self, labels: List[str], reason: str) -> List[str]:
+        remaining = [name for name in labels if not self.NEEDS_LABEL_PATTERN.match(name)]
+        if not any(k in remaining for k in ("awaiting-live-check", "loom:queued")):
+            target = "awaiting-live-check" if reason.startswith(("commit", "roll")) else "loom:queued"
+            remaining.append(target)
+        return remaining
+
+    def _withdraw_stale_ask(self, repo: str, issue: Dict[str, Any], reason: str) -> bool:
+        """Withdraw a stale ask: post a note and move issue back to working state,
+        removing needs:<login> label. Returns True if withdrawn, False otherwise."""
+        labels = self._issue_label_names(issue)
+        if not any(self.NEEDS_LABEL_PATTERN.match(lbl) for lbl in labels):
+            return False
+
+        number = int(issue.get("number") or 0)
+        body = "Stale ask withdrawn: %s" % reason
+
+        try:
+            notify.post(self.gh, repo, number, body, notify.NOTE)
+            remaining = self._target_labels_after_withdrawal(labels, reason)
+            new_label_objs = [{"name": name} for name in remaining]
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                         {"labels": new_label_objs})
+            issue["labels"] = new_label_objs
+            return True
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("failed to withdraw stale ask on %s#%d: %s" % (repo, number, err))
+            return False
+
+    def _issue_and_comment_texts(self, repo: str, issue: Dict[str, Any]) -> List[str]:
+        number = int(issue.get("number") or 0)
+        comments = self._get_issue_comments(repo, number)
+        texts = [str(c.get("body") or "") for c in comments if isinstance(c, dict)]
+        body = str(issue.get("body") or "")
+        if body:
+            texts.append(body)
+        return texts
+
+    def _is_commit_deployed(self, repo: str, sha: str, deployed_commits: Set[str]) -> bool:
+        return (sha in deployed_commits
+                or any(d.startswith(sha) or sha.startswith(d) for d in deployed_commits)
+                or self._check_commit_live(repo, sha))
+
+    def _withdraw_if_commit_live(self, repo: str, issue: Dict[str, Any],
+                                 texts: List[str], deployed_commits: Set[str]) -> bool:
+        for text in texts:
+            m = self.STALE_ASK_PATTERN.search(text)
+            if not m:
+                continue
+            sha = m.group(1).lower()
+            if self._is_commit_deployed(repo, sha, deployed_commits):
+                return self._withdraw_stale_ask(repo, issue, "commit %s is live" % sha[:12])
+        return False
+
+    def _withdraw_if_issue_exists(self, repo: str, issue: Dict[str, Any],
+                                  texts: List[str], deployed_issues: Set[Tuple[str, int]]) -> bool:
+        if not any(self.ISSUE_EXISTS_PATTERN.search(text) for text in texts):
+            return False
+        for dep_repo, dep_num in deployed_issues:
+            if self._check_issue_exists(dep_repo, dep_num):
+                return self._withdraw_stale_ask(repo, issue, "issue %s exists" % dep_num)
+        return False
+
+    def _process_stale_ask_issue(self, issue: Dict[str, Any],
+                                 deployed_commits: Set[str],
+                                 deployed_issues: Set[Tuple[str, int]]) -> bool:
+        if issue.get("state") != "open":
+            return False
+        labels = self._issue_label_names(issue)
+        if not any(self.NEEDS_LABEL_PATTERN.match(lbl) for lbl in labels):
+            return False
+
+        repo = issue.get("repository", {}).get("full_name") or (self.s.repos[0] if self.s.repos else "")
+        if not self._has_ask_comment(issue):
+            return self._withdraw_stale_ask(repo, issue, "no ask comment")
+
+        texts = self._issue_and_comment_texts(repo, issue)
+        return (self._withdraw_if_commit_live(repo, issue, texts, deployed_commits)
+                or self._withdraw_if_issue_exists(repo, issue, texts, deployed_issues))
+
+    def _check_and_withdraw_stale_asks(self, issues: List[Dict[str, Any]],
+                                       deployed_commits: Set[str],
+                                       deployed_issues: Set[Tuple[str, int]],
+                                       last_check: float) -> int:
+        """Check all issues with needs:<login> labels and withdraw stale ones.
+        Returns the number of asks withdrawn as stale."""
+        withdrawn = 0
+        for issue in issues:
+            if self._process_stale_ask_issue(issue, deployed_commits, deployed_issues):
+                withdrawn += 1
+        return withdrawn
 
     # -- the brain -------------------------------------------------------
     def _brain(self) -> Optional[Tuple[Dict[str, Any], Optional[float]]]:
@@ -11760,7 +12117,8 @@ class Station:
                                benched=pairs,
                                limit_until=self.limit_until(),
                                known_waits=self._saved_waits(),
-                               no_lane_since=self._no_lane_since(), **extra)
+                               no_lane_since=self._no_lane_since(),
+                               review_brief=self._write_review_brief, **extra)
 
     def _no_lane_since(self) -> Dict[str, float]:
         """Each ticket's first no-lane wait as _record_waits kept it."""
@@ -11795,6 +12153,7 @@ class Station:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
         deploy_watch.Watch(self.gh, repos, self.now, trusted=self.s.authors,
                            state_dir=self.state, page=self._page_operator).run()
+        self._check_stale_asks(0, force=True)
 
     def _page_operator(self, message: str) -> Optional[bool]:
         """Send one message to the operator, with the mention: True when it
@@ -12674,6 +13033,59 @@ class Station:
             raise GitHubError("no operator access ask was created in %s" % home)
         state[key] = int(made["number"])
 
+    def _get_deployed_items(self) -> Tuple[Set[str], Set[Tuple[str, int]]]:
+        """Get the set of deployed commits and issue numbers from roll and bridge ship events."""
+        deployed_commits: Set[str] = set()
+        deployed_issues: Set[Tuple[str, int]] = set()
+
+        try:
+            from . import deploy_watch
+
+            ledger_path = os.path.join(self.state, deploy_watch.LEDGER)
+            ledger = _read_json(ledger_path, {}, strict=False)
+
+            if isinstance(ledger, dict):
+                for entry in ledger.get("merges", {}).values():
+                    if isinstance(entry, dict):
+                        sha = str(entry.get("sha") or "")
+                        if sha:
+                            deployed_commits.add(sha.lower())
+                            if len(sha) >= 7:
+                                deployed_commits.add(sha[:7].lower())
+                            if len(sha) >= 12:
+                                deployed_commits.add(sha[:12].lower())
+
+                        ticket = entry.get("ticket")
+                        repo = str(entry.get("repo") or "")
+                        if ticket and repo:
+                            try:
+                                deployed_issues.add((repo, int(ticket)))
+                            except (ValueError, TypeError) as err:
+                                _say("invalid ticket in deploy ledger: %s" % err)
+        except Exception as err:
+            _say("could not read deploy items: %s" % err)
+
+        return deployed_commits, deployed_issues
+
+    def _open_needs_issues(self) -> List[Dict[str, Any]]:
+        """Find open issues carrying needs:<login> labels across configured repos."""
+        found: List[Dict[str, Any]] = []
+        for repo in self.s.repos:
+            try:
+                items = self._paginate("/repos/%s/issues?state=open&per_page=100" % repo)
+                for item in items:
+                    if isinstance(item, dict) and "pull_request" not in item:
+                        labels = self._issue_label_names(item)
+                        if any(self.NEEDS_LABEL_PATTERN.match(lbl) for lbl in labels):
+                            if "repository" not in item:
+                                item["repository"] = {"full_name": repo}
+                            found.append(item)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not read issues in %s: %s" % (repo, err))
+        return found
+
     def roll_source_pins(self) -> None:
         if self.s.roll_ship_docs:
             try:
@@ -12683,6 +13095,34 @@ class Station:
                 raise GitHubError("invalid roll ship document or pin: %s" % err) from err
             except health.NotLooked as err:
                 raise GitHubError("roll family gate could not be read: %s" % err) from err
+            self._check_stale_asks(0, force=True)
+
+    def _check_stale_asks(self, last_check: Optional[float] = None, force: bool = False) -> int:
+        """Check and withdraw stale needs:login asks after each deploy event and daily.
+        Returns the number of asks withdrawn as stale."""
+        try:
+            check_time = float(last_check) if isinstance(last_check, (int, float)) else 0.0
+            if not force and check_time > 0 and self.now - check_time < 86400:
+                return 0
+            deployed_commits, deployed_issues = self._get_deployed_items()
+            issues = self._open_needs_issues()
+            withdrawn = self._check_and_withdraw_stale_asks(issues, deployed_commits, deployed_issues, check_time)
+            self._stale_asks_withdrawn += withdrawn
+            if withdrawn:
+                _say("stale ask detection: withdrew %d asks" % withdrawn)
+            stale_asks_path = os.path.join(self.state, "stale_asks_check.json")
+            saved = _read_json(stale_asks_path, {}, strict=False)
+            if not isinstance(saved, dict):
+                saved = {}
+            saved["at"] = self.now
+            saved["withdrawn_today"] = saved.get("withdrawn_today", 0) + withdrawn
+            _write_json(stale_asks_path, saved)
+            return withdrawn
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("stale ask detection failed: %s" % err)
+            return 0
 
     @staticmethod
     def label_digest() -> str:
