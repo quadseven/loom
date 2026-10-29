@@ -1694,7 +1694,13 @@ Plan:
   are readable only by agy's own binary (a profile rule on the process
   path). A command agy launches cannot read, link, move or delete either
   file, or move its folder; in a validation run's profile no process may
-  read them. The same profile keeps the keychain server and
+  read them. The named path is the launched binary itself, never an
+  interpreter's or helper's path: if the file at that path were a
+  script, or the token's reader a helper image, widening the exception
+  to that image would hand the token to any launched command running
+  under the same runtime, so that case needs a distinguishing rule of
+  its own (the outside-helper design in #1623), not a broader
+  exception. The same profile keeps the keychain server and
   `Library/Keychains` denied.
 - Before each run, the runner clears agy's memory of earlier runs
   (`agy_forget`), deleting everything in its state directory except sign-in

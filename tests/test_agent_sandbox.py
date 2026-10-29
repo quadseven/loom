@@ -5,6 +5,7 @@ keychain and /usr/bin/security denied), and the validation run keeps its own
 rules."""
 
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -41,18 +42,19 @@ if /usr/bin/security --help > /dev/null 2>&1; then echo security=ran; else echo 
 # CLI's own binary): try to read each oauth token file (TOKEN_A in the file
 # store, TOKEN_B in the CLI state directory) directly, through a hard link,
 # through a symlink, after moving the file, and after moving its folder,
-# and a file in the keychain folder. $1 is the tree; links land beside it.
+# and a file in the keychain folder. In t, $1 is the printed label (a or
+# b), $2 where the links and moves land, $3 the token file.
 TOKEN_PROBE = r"""
 r() { if /usr/bin/head -c 1 "$2" > /dev/null 2>&1; then echo "$1=read"; else echo "$1=denied"; fi; }
 t() {
-  r "$1-direct" "$2"
-  ln "$2" "$1-hard" 2> /dev/null; r "$1-hardlink" "$1-hard"
-  ln -s "$2" "$1-soft" 2> /dev/null; r "$1-symlink" "$1-soft"
-  mv "$2" "$1-moved" 2> /dev/null; r "$1-moved" "$1-moved"
-  mv "$(dirname "$2")" "$1-dir" 2> /dev/null; r "$1-folder" "$1-dir/$(basename "$2")"
+  r "$1-direct" "$3"
+  ln "$3" "$2-hard" 2> /dev/null; r "$1-hardlink" "$2-hard"
+  ln -s "$3" "$2-soft" 2> /dev/null; r "$1-symlink" "$2-soft"
+  mv "$3" "$2-moved" 2> /dev/null; r "$1-moved" "$2-moved"
+  mv "$(dirname "$3")" "$2-dir" 2> /dev/null; r "$1-folder" "$2-dir/$(basename "$3")"
 }
-t "$TREE/a" "$TOKEN_A"
-t "$TREE/b" "$TOKEN_B"
+t a "$TREE/a" "$TOKEN_A"
+t b "$TREE/b" "$TOKEN_B"
 r keychain "$KEYCHAIN_FILE"
 """
 
@@ -81,6 +83,21 @@ class AgentSandboxTest(unittest.TestCase):
         result = self.bash('sandbox_profile "$1" bash "$2"', mode, lane=lane, **env)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
+
+    def fake_agy(self, contents=None):
+        # A stand-in binary at the path the lane itself launches for agy
+        # (AGY_BIN in lanes/run_lane.sh: .local/bin/agy under the lane
+        # user's home, here the scratch home the tests use for it). With
+        # no contents it is a copy of cat, a dedicated binary; pass
+        # contents to place a script there instead.
+        path = self.scratch / ".local" / "bin" / "agy"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if contents is None:
+            shutil.copy(shutil.which("cat"), path)
+        else:
+            path.write_text(contents)
+        path.chmod(0o755)
+        return path
 
     def test_an_api_agent_may_write_only_its_tree_and_scratch_home(self):
         lines = self.profile("api").splitlines()
@@ -191,6 +208,47 @@ class AgentSandboxTest(unittest.TestCase):
             with self.subTest(mode=mode, lane=lane):
                 self.assertNotIn("antigravity-oauth-token", self.profile(mode, lane=lane))
 
+    def test_the_agy_token_exception_names_the_binary_at_agys_own_path(self):
+        # The runner launches exactly one binary for this lane (AGY_BIN in
+        # lanes/run_lane.sh) and builds the profile for that launch, so the
+        # token exception names that binary's resolved path: the reader
+        # the rule trusts is the launched binary itself, recorded here at
+        # its real install path rather than a stand-in found on PATH, and
+        # no other process is named anywhere in the profile.
+        agy = self.fake_agy()
+        result = self.bash('sandbox_profile "$1" "$2" ""', str(agy), lane="agy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        profile = result.stdout
+        expected = str(agy.resolve())
+        named = re.findall(r'\(process-path "([^"]+)"\)', profile)
+        self.assertEqual(sorted(set(named)), [expected])
+        self.assertEqual(len(named), 4)
+        for folder in (f"{self.scratch}/Library/Application Support/antigravity",
+                       f"{self.scratch}/.gemini/antigravity-cli"):
+            self.assertIn(
+                f'(deny file-read* file-write-unlink file-link '
+                f'(require-all (literal "{folder}/antigravity-oauth-token") '
+                f'(require-not (process-path "{expected}"))))',
+                profile)
+
+    def test_a_script_at_agys_path_names_no_interpreter_in_the_token_exception(self):
+        # The danger in a script at the launched path is not the script:
+        # its own contents are fixed, and an agent command invoking the
+        # interpreter directly is a different image, still denied. The
+        # danger is the repair such a script invites, widening the token
+        # exception to the interpreter's path so the refresh works again:
+        # every launched command under that runtime could then read the
+        # token (#1623). So the built profile names the launched path
+        # alone, never its interpreter; a reader that is not the launched
+        # binary itself needs a distinguishing rule, not a broader
+        # exception.
+        agy = self.fake_agy("#!/usr/bin/env bash\nexit 0\n")
+        result = self.bash('sandbox_profile "$1" "$2" ""', str(agy), lane="agy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        named = re.findall(r'\(process-path "([^"]+)"\)', result.stdout)
+        self.assertEqual(sorted(set(named)), [str(agy.resolve())])
+        self.assertNotIn(str(Path(shutil.which("bash")).resolve()), named)
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_inside_the_agy_profile_a_command_cannot_read_the_oauth_token(self):
         # #1623's probe: the profiled CLI is /bin/cat, standing in for agy's
@@ -215,6 +273,50 @@ class AgentSandboxTest(unittest.TestCase):
                           "b-direct=denied", "b-hardlink=denied", "b-symlink=denied",
                           "b-moved=denied", "b-folder=denied",
                           "keychain=denied", "agy=read"])
+        self.assertEqual(store.read_text(), "not-a-real-secret\n")
+        self.assertEqual(state.read_text(), "not-a-real-secret\n")
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_inside_the_agy_profile_the_binary_at_agys_own_path_reads_the_token(self):
+        # The /bin/cat probe above, with the exception naming a binary
+        # installed where the lane's own agy sits (.local/bin/agy under
+        # the lane home): that binary reads a disposable token, which is
+        # the refresh path, while a command agy launched is denied
+        # however it reaches for either file. Commands agy runs are its
+        # children, launched through the helper it writes into its state
+        # directory (bin/agentapi): the probe's bash and its tools stand
+        # in for their images, and the helper line runs a reader placed
+        # at that helper's own path. Every image but the launched
+        # binary's is denied alike. What this suite cannot pair is the
+        # real process tree (there is no agy here to launch commands) or
+        # a reader that is itself a shared interpreter: the exception
+        # naming no interpreter is pinned by the test above, and which
+        # image actually reads the token is recorded by the ticket's
+        # live check.
+        agy = self.fake_agy()
+        store = self.scratch / "Library" / "Application Support" / "antigravity" / "antigravity-oauth-token"
+        state = self.scratch / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        keychain = self.scratch / "Library" / "Keychains" / "fixture.keychain-db"
+        for f in (store, state, keychain):
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("not-a-real-secret\n")
+        helper = state.parent / "bin" / "agentapi"
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(shutil.which("cat"), helper)
+        helper.chmod(0o755)
+        script = ('export TOKEN_A="$2" TOKEN_B="$3" KEYCHAIN_FILE="$4" TREE="$1"\n'
+                  'p="$(sandbox_profile "$1" "$6" "")" || exit 9\n'
+                  'sandbox-exec -p "$p" /bin/bash -c "$5"\n'
+                  'sandbox-exec -p "$p" "$7" "$2" > /dev/null && echo helper=read || echo helper=denied\n'
+                  'sandbox-exec -p "$p" "$6" "$2" > /dev/null && echo agy=read || echo agy=denied')
+        result = self.bash(script, str(store), str(state), str(keychain), TOKEN_PROBE, str(agy), str(helper), lane="agy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(),
+                         ["a-direct=denied", "a-hardlink=denied", "a-symlink=denied",
+                          "a-moved=denied", "a-folder=denied",
+                          "b-direct=denied", "b-hardlink=denied", "b-symlink=denied",
+                          "b-moved=denied", "b-folder=denied",
+                          "keychain=denied", "helper=denied", "agy=read"])
         self.assertEqual(store.read_text(), "not-a-real-secret\n")
         self.assertEqual(state.read_text(), "not-a-real-secret\n")
 
