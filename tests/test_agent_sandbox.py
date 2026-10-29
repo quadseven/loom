@@ -214,7 +214,7 @@ class AgentSandboxTest(unittest.TestCase):
         # token exception names that binary's resolved path: the reader
         # the rule trusts is the launched binary itself, recorded here at
         # its real install path rather than a stand-in found on PATH, and
-        # no other process is named anywhere in the profile.
+        # no other process is named anywhere in the profile (#1623).
         agy = self.fake_agy()
         result = self.bash('sandbox_profile "$1" "$2" ""', str(agy), lane="agy")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -291,8 +291,8 @@ class AgentSandboxTest(unittest.TestCase):
         # real process tree (there is no agy here to launch commands) or
         # a reader that is itself a shared interpreter: the exception
         # naming no interpreter is pinned by the test above, and which
-        # image actually reads the token is recorded by the ticket's
-        # live check.
+        # image actually reads the token is recorded by #1623's live
+        # check.
         agy = self.fake_agy()
         store = self.scratch / "Library" / "Application Support" / "antigravity" / "antigravity-oauth-token"
         state = self.scratch / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
