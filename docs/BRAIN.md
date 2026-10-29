@@ -1672,9 +1672,9 @@ landing lock, the per-repo bound, a landing earlier in the pass, a ticket
 with the brain or in the hand-off pool, a round already open, an update
 refused); the lock, bound and landed skips are said once a repo a pass,
 however many pull requests they cover. Pull requests outside the pass's
-remit — not a lane pull request, no ticket in the repo, not yet judged by
+remit (not a lane pull request, no ticket in the repo, not yet judged by
 GitHub, a red head the judge is already handling, one brought up to date
-within the cooldown — pass without a line.
+within the cooldown) pass without a line.
 
 ## Merge by change class
 

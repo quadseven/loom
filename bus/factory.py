@@ -2958,9 +2958,8 @@ class Factory:
         association = self._association(repo, pr)
         if association is None:
             return  # no ticket in this repo: not a lane pull request to maintain
-        issue = tickets.get(association[1]) or self._ticket(repo, association[1])
-        if (issue is None or issue.get("state") != "open"
-                or "loom:ticket" not in _labels(issue)):
+        issue = self._hygiene_issue(repo, association, tickets)
+        if issue is None:
             return
         full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
         sha = str((full.get("head") or {}).get("sha") or "")
@@ -2970,6 +2969,18 @@ class Factory:
             self._hygiene_conflict(repo, number, issue, sha)
         elif self._behind(repo, full):
             self._hygiene_update(repo, number, issue, sha)
+
+    def _hygiene_issue(self, repo: str, association: Tuple[str, int],
+                       tickets: Dict[int, Dict[str, Any]]) -> Any:
+        """The open loom ticket a lane pull request belongs to, from this
+        pass's tickets when it is among them and fetched when it is not;
+        None when there is nothing to maintain (no such ticket, a closed
+        one, or not a loom ticket at all)."""
+        issue = tickets.get(association[1]) or self._ticket(repo, association[1])
+        if (issue is None or issue.get("state") != "open"
+                or "loom:ticket" not in _labels(issue)):
+            return None
+        return issue
 
     def _hygiene_conflict(self, repo: str, number: int, issue: Dict[str, Any],
                           sha: str) -> None:
