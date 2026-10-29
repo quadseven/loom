@@ -32,6 +32,11 @@
 # folder with the run's model beside it (<ticket>.verify.model), and the
 # station checks it and moves the ticket, naming lane and model as the proof's
 # maker. No pull request.
+# A review brief (Deliverable: review, from the station, loom#2142) also
+# changes no code: its tree is the reviewed pull request's own branch (a
+# Review-PR: <number> line names it, cloned like a fix brief's), the agent
+# leaves review.json in its tree, and the runner copies it to the lane's log
+# folder the same way; the station posts the verdict on the pull request.
 # Lanes never merge. codex runs sandboxed: no network, no .git writes.
 #
 # Env: LOOM_REPO_OWNERS (required: space-separated GitHub owners whose repos
@@ -660,12 +665,12 @@ note_plan_hold() {
 # FIX_REASON set when it is not, and with FIX_REASON empty when gh could not
 # say (the brief then waits for the next pass).
 fix_pr_open() {
-  local state
+  local state pr="${1:-$FIX_PR}"
   FIX_REASON=""
-  state="$(timeout "$NET_TIMEOUT" gh pr view "$FIX_PR" -R "$REPO" --json state,headRefName \
+  state="$(timeout "$NET_TIMEOUT" gh pr view "$pr" -R "$REPO" --json state,headRefName \
     --jq '.state + " " + .headRefName')" || return 1
   [ "$state" = "OPEN $BRANCH" ] && return 0
-  FIX_REASON="pull request #$FIX_PR is no longer open on $BRANCH (${state:-no answer})"
+  FIX_REASON="pull request #$pr is no longer open on $BRANCH (${state:-no answer})"
   return 1
 }
 
@@ -3301,11 +3306,15 @@ for BRIEF in "$INBOX"/*.md; do
   if [ -n "$BASE_BRANCH" ] && ! [[ "$BASE_BRANCH" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
     park "$BRIEF" "brief Base: is not a branch name"; continue
   fi
-  if [ -n "$DELIVERABLE" ] && [ "$DELIVERABLE" != answer ] && [ "$DELIVERABLE" != verify ]; then
-    park "$BRIEF" "brief Deliverable: must be answer or verify"; continue
+  if [ -n "$DELIVERABLE" ] && [ "$DELIVERABLE" != answer ] && [ "$DELIVERABLE" != verify ] \
+     && [ "$DELIVERABLE" != review ]; then
+    park "$BRIEF" "brief Deliverable: must be answer, verify or review"; continue
   fi
   if [ "$DELIVERABLE" = answer ] && ! [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
     park "$BRIEF" "answer brief needs Issue: owner/name#number"; continue
+  fi
+  if [ "$DELIVERABLE" = review ] && ! [[ "$(field Review-PR "$BRIEF" || true)" =~ ^[0-9]+$ ]]; then
+    park "$BRIEF" "review brief needs Review-PR: <number>"; continue
   fi
   # A brief that opens a pull request needs criteria for its body: without
   # them the body's ## Acceptance criteria is empty, the review bot's plan
@@ -3432,11 +3441,14 @@ for BRIEF in "$INBOX"/*.md; do
   fi
 
   FIX_PR="$(field Fix-PR "$BRIEF" || true)"
-  if [ -n "$FIX_PR" ]; then
-    if ! [[ "$FIX_PR" =~ ^[0-9]+$ ]]; then
+  REVIEW_PR="$(field Review-PR "$BRIEF" || true)"
+  # A review brief (Deliverable: review) takes its pull request's branch the
+  # same way a fix brief does: the tree under review is the PR's own head.
+  if [ -n "$FIX_PR" ] || [ -n "$REVIEW_PR" ]; then
+    if [ -n "$FIX_PR" ] && ! [[ "$FIX_PR" =~ ^[0-9]+$ ]]; then
       park "$BRIEF" "brief Fix-PR: is not a pull request number"; continue
     fi
-    if ! fix_pr_open; then
+    if ! fix_pr_open "${FIX_PR:-$REVIEW_PR}"; then
       [ -n "$FIX_REASON" ] && { park "$BRIEF" "$FIX_REASON"; continue; }
       echo "$TICKET: gh pr view failed; will retry next pass" >&2; continue
     fi
@@ -3469,7 +3481,7 @@ for BRIEF in "$INBOX"/*.md; do
   rm -f "$LOGDIR/$TICKET.answered" "$LOGDIR/$TICKET.answered.tmp" "$LOGDIR/$TICKET.pushed"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
-         { [ -n "$FIX_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
+         { [ -n "$FIX_PR" ] || [ -n "$REVIEW_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
     park "$BRIEF" "clone or branch failed" transient; continue
   fi
   if ! BASE="$(git -C "$TREE" rev-parse HEAD)" || [ -z "$BASE" ]; then
@@ -3494,8 +3506,8 @@ for BRIEF in "$INBOX"/*.md; do
       } > "$RUN_BRIEF"
     fi
   fi
-  # A verify run changes no code, so there is nothing to validate.
-  if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
+  # A verify or review run changes no code, so there is nothing to validate.
+  if [ "$DELIVERABLE" != verify ] && [ "$DELIVERABLE" != review ] && ! prepare_validation >> "$LOG" 2>&1; then
     park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
   fi
   resume_earlier_attempt
@@ -3640,6 +3652,21 @@ for BRIEF in "$INBOX"/*.md; do
     cp "$RESULT" "$LOGDIR/$TICKET.verify.json"
     printf '%s\n' "$MODEL" > "$LOGDIR/$TICKET.verify.model"
     echo "[$(date -u +%FT%TZ)] $TICKET done, verify result recorded" >> "$LOG"
+    mv "$BRIEF" "$INBOX/done/"
+    continue
+  fi
+  if [ "$DELIVERABLE" = review ]; then
+    # The station reads the result from the log folder and posts the verdict;
+    # the runner moves no label and opens no pull request.
+    RESULT="$TREE/review.json"
+    # Only a file the agent made counts: one the repo tracks was there before.
+    if [ ! -f "$RESULT" ] || [ -L "$RESULT" ] || [ "$(wc -c < "$RESULT")" -gt 65536 ] ||
+       [ -n "$(safe_git ls-files ':(icase)review.json')" ]; then
+      park "$BRIEF" "no review.json written"; continue
+    fi
+    cp "$RESULT" "$LOGDIR/$TICKET.review.json"
+    printf '%s\n' "$MODEL" > "$LOGDIR/$TICKET.review.model"
+    echo "[$(date -u +%FT%TZ)] $TICKET done, review result recorded" >> "$LOG"
     mv "$BRIEF" "$INBOX/done/"
     continue
   fi

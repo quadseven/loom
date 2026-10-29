@@ -281,6 +281,40 @@ def degraded_review(title: str, summary: str) -> bool:
 # partial review, so a second partial result on the same head goes back.
 REVIEW_AGAIN_MARKER = "<!-- loom:review-again v1 sha=%s -->"
 
+# The Codex Luna review fallback (loom#2142). When the review bot's model
+# route is exhausted, its check on a blocking repo concludes failure with a
+# degraded output - not a verdict - and the re-ask (`/grug improve`) degrades
+# the same way, so the pull request can only bounce through fix rounds no
+# lane can close. Instead, one codex lane slot reviews the head: every codex
+# slot runs gpt-6-luna only, through `codex exec` on the operator's Codex
+# login, and LUNA_REVIEW_LANE names the slot the review briefs go to. The
+# station posts the lane's verdict as a pull request comment carrying
+# LUNA_REVIEW_MARKER and the Elder's own markings line; the gate below reads
+# it for that head commit only, from trusted authors only, exactly like a
+# verdict from the review bot itself.
+LUNA_REVIEW_LANE = "codex-2"
+# The model the review brief pins and the station checks the run recorded:
+# the codex lanes' only model (bus/tickets.py writes the same pin into the
+# brief itself).
+LUNA_MODEL = "gpt-6-luna"
+LUNA_REQUEST_MARKER = "<!-- loom:luna-request v1 sha=%s -->"
+LUNA_REVIEW_MARKER = "<!-- loom:luna-review v1 sha=%s -->"
+# A dispatched review that produced no verdict is dispatched again after
+# this long: its lane run may have failed, or never picked the brief up.
+LUNA_RETRY_AFTER = 3600
+_LUNA_MARKINGS_RE = re.compile(r"Elder markings - (\d+) blocking, (\d+) total")
+
+
+def parse_luna_verdict(body: Any, sha: str) -> Optional[Tuple[int, int]]:
+    """(blocking, total) from a Luna verdict comment for this head commit,
+    else None: the comment must carry the verdict marker for the head and
+    the Elder's markings line."""
+    text = str(body or "")
+    if LUNA_REVIEW_MARKER % sha not in text:
+        return None
+    found = _LUNA_MARKINGS_RE.search(text)
+    return (int(found.group(1)), int(found.group(2))) if found else None
+
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
 # The slots that draw on one API credit: an empty credit holds all of them.
 # run_lane.sh reads this set (`python3 -m bus.factory credit-slots`).
@@ -290,6 +324,14 @@ SHARED_CREDIT = ANTHROPIC
 # spent the weekly codex limit in a day), so the codex rung is luna. Each
 # rung lists the lanes that serve it, best first. No rung, hard-tier pin or
 # equivalent may name a tickets.FORBIDDEN_MODELS model.
+# October 2026 price changes (recorded 2026-10-28): the first rung stays
+# claude-sonnet-5-5. On 2026-10-07 the vendor halved Sonnet 5.5's cache-read
+# price ($0.20 to $0.10 per million tokens, cache writes unchanged), and a
+# stuck ticket's climb is cache-heavy work: every rung re-reads the same
+# brief, diff and review threads. The same day's cheaper small model
+# (Haiku 5.5) is the pin for high-volume subtasks on priced routes instead
+# (docs/USAGE_ROUTING.md, "October 2026 price changes"); it is not a rung,
+# because a climb is the work that most needs the strong model.
 LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
     (("claude",), "claude-sonnet-5-5"),
     (("codex", "codex-2"), "gpt-6-luna"),
@@ -1593,6 +1635,7 @@ class Factory:
                  place: Callable[..., Any] = brain.place_under_epic,
                  plan_check: str = DEFAULT_PLAN_CHECK,
                  scope: Optional[scope_fit.Ask] = None,
+                 review_brief: Optional[Callable[..., Any]] = None,
                  demoted: Optional[Dict[str, str]] = None,
                  operators: Optional[Sequence[str]] = None,
                  no_lane_since: Optional[Dict[str, float]] = None,
@@ -1668,6 +1711,9 @@ class Factory:
         # Sends the scope check's prompt to a cheap model (bus/scope_fit.py);
         # None skips the check.
         self.scope = scope
+        # Writes one Luna review brief (loom#2142): the station's writer,
+        # passed only when the fallback is on, so the default stays off.
+        self.review_brief = review_brief
         self.actions = 0
         self.load: Dict[str, int] = {}
         self.landed: set = set()
@@ -1747,6 +1793,14 @@ class Factory:
         logins only."""
         data = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         return [c for c in data if isinstance(c, dict) and self._trusted(c)]
+
+    def _trusted_comments(self, repo: str, number: int) -> List[Dict[str, Any]]:
+        """A pull request's comments by trusted logins, in order: anyone can
+        comment on a public repo, so a marker counts only from these. By
+        author alone (brain.trusted_comments), unlike _comments: a marker is
+        read the same whoever the pull request is assigned to."""
+        return brain.trusted_comments(self.gh.paginate(
+            "/repos/%s/issues/%d/comments" % (repo, number)), sorted(self.trusted))
 
     def _is_private(self, repo: str) -> bool:
         """Whether the repo is private; unreadable counts as private."""
@@ -2504,6 +2558,17 @@ class Factory:
         # it, and the fix round then read it as a stuck failure (loom#1962).
         if "failing checks" in faults and self._rerun_infra_flakes(repo, number, sha):
             return
+        if faults == ["failing checks"] and self._review_degraded(sha):
+            # A degraded review is not a verdict (loom#2142): a clean Luna
+            # verdict for this head stands in for the review check, so the
+            # pull request is judged on everything else. A blocking verdict
+            # leaves the faults as they are: the pull request goes back with
+            # the lane's findings as review threads, as the bot's would.
+            verdict = self._luna_verdict(repo, number, sha)
+            if verdict is not None and verdict[0] == 0:
+                faults = []
+                _say("%s#%d: the Luna review of head %s is clean and stands in "
+                     "for the degraded review check" % (repo, number, sha[:12]))
         if faults == ["failing checks"] and (
                 self._split_pr(repo, number, full, issue, comments, sha)
                 or self._repair_body_leak(repo, number, full, issue, comments, sha)
@@ -2511,7 +2576,8 @@ class Factory:
                 or self._repair_plan_body(repo, number, full, issue, comments, sha)
                 or self._update_base_fixed(repo, number, full, sha)
                 or self._run_again(repo, number, sha)
-                or self._review_again(repo, number, full, sha)):
+                or self._review_again(repo, number, full, sha)
+                or self._luna_review(repo, number, full, issue, sha)):
             return
         if faults:
             self._send_back(repo, full, issue, comments,
@@ -3347,8 +3413,7 @@ class Factory:
             return False
         marker = REVIEW_AGAIN_MARKER % sha
         # A trusted marker only: a stranger's copy must not stop the ask.
-        for comment in brain.trusted_comments(self.gh.paginate(
-                "/repos/%s/issues/%d/comments" % (repo, number)), sorted(self.trusted)):
+        for comment in self._trusted_comments(repo, number):
             if marker in str(comment.get("body") or ""):
                 return False
         notify.post(self.gh, repo, number, "%s\n%s" % (marker, REVIEW_AGAIN),
@@ -3356,6 +3421,70 @@ class Factory:
         self.actions += 1
         _say("asked the review bot to review %s#%d again after a partial review"
              % (repo, number))
+        return True
+
+    def _review_degraded(self, sha: str) -> bool:
+        """True when the only non-green run on this head is the review check
+        and its output is a degraded review, not a verdict."""
+        failed = [r for r in self._runs.get(sha, [])
+                  if r.get("conclusion") not in GREEN]
+        if len(failed) != 1 or failed[0].get("name") != self.review_check:
+            return False
+        output = failed[0].get("output") or {}
+        return degraded_review(str(output.get("title") or ""),
+                               str(output.get("summary") or ""))
+
+    def _luna_verdict(self, repo: str, number: int, sha: str) -> Optional[Tuple[int, int]]:
+        """The Luna lane's (blocking, total) verdict for this head, from the
+        trusted verdict comment on the pull request, else None."""
+        for comment in self._trusted_comments(repo, number):
+            verdict = parse_luna_verdict(comment.get("body"), sha)
+            if verdict is not None:
+                return verdict
+        return None
+
+    def _luna_review(self, repo: str, number: int, full: Dict[str, Any],
+                     issue: Dict[str, Any], sha: str) -> bool:
+        """Dispatch one Codex Luna review brief for this head (loom#2142),
+        when the only failing check is a degraded review and the review bot's
+        re-ask already failed on this head. The brief writer is the station's
+        (the factory's review_brief); without one this does nothing, as it
+        does when a verdict for this head already stands or a request younger
+        than LUNA_RETRY_AFTER is in flight. True when it dispatched."""
+        if self.review_brief is None or not self._review_degraded(sha):
+            return False
+        asked = False
+        newest = 0.0
+        for comment in self._trusted_comments(repo, number):
+            body = str(comment.get("body") or "")
+            if parse_luna_verdict(body, sha) is not None:
+                return False  # the lane already answered for this head
+            if REVIEW_AGAIN_MARKER % sha in body:
+                asked = True
+            if LUNA_REQUEST_MARKER % sha in body:
+                newest = max(newest, _ts(comment.get("created_at")))
+        if not asked:
+            return False  # the review bot has not had its re-ask yet
+        if newest and self.now - newest <= LUNA_RETRY_AFTER:
+            # A review for this head is already in flight: the pull request
+            # waits for the lane's verdict instead of bouncing through a fix
+            # round that cannot answer a degraded review.
+            _say("%s#%d waits for the Luna review of head %s dispatched %ds ago"
+                 % (repo, number, sha[:12], int(self.now - newest)))
+            return True
+        if not self.review_brief(repo, number, sha, issue):
+            return False
+        notify.post(self.gh, repo, number,
+                    "%s\nThe review check is degraded on this head and its re-run "
+                    "was degraded too, so a Codex Luna review was dispatched on "
+                    "lane %s (gpt-6-luna, through `codex exec`). Its verdict will "
+                    "be posted here for this head, and the merge gate reads it "
+                    "while the review route is down."
+                    % (LUNA_REQUEST_MARKER % sha, LUNA_REVIEW_LANE),
+                    notify.NOTE)
+        self.actions += 1
+        _say("dispatched a Luna review of %s#%d head %s on lane %s"
+             % (repo, number, sha[:12], LUNA_REVIEW_LANE))
         return True
 
     def _behind(self, repo: str, full: Dict[str, Any]) -> int:
