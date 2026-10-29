@@ -44,6 +44,12 @@ The ticket's `Not before:`, `After:` and `Priority:` lines decide when and in
 what order the station claims it (docs/BRAIN.md); they stay on the ticket and
 are not written into the brief.
 
+Right after the ticket body, a build brief carries a `## Proof checks`
+section: each acceptance criterion restated as the check that proves it
+(the lane's pull request ticking it, the station's verify run observing it
+live, or the operator's own hand, by the criterion's kind). The pull
+request body answers criterion by criterion.
+
 After the ticket body, a station brief carries two sections when they have
 anything to say. `## Operator notes` quotes the ticket's newest five comments
 by the operator's own logins and trusted briefers (never a `[bot]` login, a
@@ -101,9 +107,12 @@ The runner uses the `Why`, `What`, `Acceptance criteria`, `Size`, `Out of
 scope` and `Operator steps before merge` sections when it builds the pull
 request body. Keep these headings exactly as written; the one exception is
 the criteria, which the runner also reads under `## Acceptance` and in any
-case. A brief with no criteria under either heading is parked as a work
-failure before the agent runs, since its pull request body could not pass
-the review bot's plan check. A brief whose change
+case. A build ticket with no criteria under either heading is not
+dispatchable: the station holds it for the brain before any brief is
+written, since no criterion could be restated as the check that proves it
+(bus/brief_check.py); the runner still parks such a brief as a work
+failure before the agent runs, as the backstop for briefs it is handed
+any other way. A brief whose change
 needs a person first (a data migration, a cutover, a VM resize) names those
 steps in `Operator steps before merge`: the pull request is then held for
 the operator instead of merging (docs/BRAIN.md, Operator holds).

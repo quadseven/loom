@@ -15,8 +15,8 @@ from unittest import mock
 
 from bus import brain, rewrite, station, tickets
 from bus.github import GitHub
-from tests.test_bus_station import (AUTHORS, OWNERS, READY_BODY, REPO, Base, FakeGitHub,
-                                    labeled)
+from tests.test_bus_station import (AUTHORS, BODY_WITH_CRITERIA, OWNERS, READY_BODY, REPO,
+                                    Base, FakeGitHub, labeled)
 
 BRIEFER = "dana-example"
 ENV = {"LOOM_BRIEF_AUTHORS": " ".join(AUTHORS), "LOOM_TRUSTED_BRIEFERS": BRIEFER}
@@ -31,6 +31,8 @@ def by_briefer(fake, number, state="briefed", lane="codex"):
 class Pass(Base):
     def setUp(self):
         super().setUp()
+        # The passes here claim and brief the tickets they add (loom#2162).
+        self.fake.default_body = BODY_WITH_CRITERIA
         self.settings.briefers = [BRIEFER]
         patcher = mock.patch.dict(os.environ, ENV)
         patcher.start()
