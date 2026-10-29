@@ -32,7 +32,7 @@ KINDS = ("lint", "format", "type", "test")
 AFFECTED = "affected"
 LEGACY = re.compile(r"^(interpreter|submodules|setup|check|affected)\s*:")
 TABLE = re.compile(r"^(?:\[([a-z]+)(?:\.[A-Za-z0-9_-]+)*\]|\[\[([a-z]+)(?:\.[A-Za-z0-9_-]+)*\]\])$")
-COMMAND = re.compile(r'^command\s*=\s*"((?:[^"\\]|\\.)*)"$')
+COMMAND = re.compile(r'^command\s*=\s*(?:"((?:[^"\\]|\\.)*)"|(.*\S))$')
 
 
 def _lines(text: str) -> List[str]:
@@ -78,7 +78,10 @@ def _from_tables(lines: List[str]) -> List[Tuple[str, str]]:
             continue
         cmd = COMMAND.match(line)
         if cmd and kind:
-            found.append((kind, cmd.group(1).replace('\\"', '"').replace("\\\\", "\\")))
+            if cmd.group(1) is not None:
+                found.append((kind, cmd.group(1).replace('\\"', '"').replace("\\\\", "\\")))
+            else:
+                found.append((kind, cmd.group(2)))
         elif not re.match(r"^(workflow|step)\s*=", line):
             raise ValueError("has an unknown line '%s'" % line)
     return found

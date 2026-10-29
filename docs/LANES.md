@@ -39,12 +39,14 @@ Before pushing a branch or opening a pull request on a public repository, the
 lane runner uses infra-public's `check_private_leaks.py` on the diff and
 generated pull request body, with the shared deny-list of names and products
 (`--deny-list-ssm`, the SSM parameter `LOOM_LEAK_DENY_SSM`, default
-`/infra/leak-scan/deny-list`). Every scan goes through `leak_scan`. Set
-`LOOM_LEAK_SCANNER` to that script's path when it is not at
-`../infra-public/.github/scripts/check_private_leaks.py` relative to the Loom
-checkout. A missing scanner, a deny-list the scanner cannot read (it exits 2)
-or a hit blocks the push; a scan that could not run parks the brief
-`[transient]`. A lane pod or cluster runner (`LOOM_SSM_DIR`) holds no AWS
+`/infra/leak-scan/deny-list`). Every scan goes through `leak_scan`. The lane
+machine keeps `$LOOM_HOME/infra-public` cloned, cloning it when first needed
+and fast-forwarding it at most hourly. Set `LOOM_LEAK_SCANNER` to that
+script's path when using another checkout. A scanner that is still missing
+files a factory incident and holds the brief; a deny-list the scanner cannot
+read (it exits 2) or a hit blocks the push. A scan that could not run for
+another reason parks the brief `[transient]`. A lane pod or cluster runner
+(`LOOM_SSM_DIR`) holds no AWS
 key: the scanner reads the deny-list's copy under `LOOM_SSM_DIR` through
 `lanes/k8s/ssm-dir-bin/aws`, a stand-in for the AWS CLI put first on the
 scanner's PATH only. Without that copy it pushes nothing to a public repo.
@@ -111,9 +113,12 @@ unset variables.
   exits non-zero or changes tracked files, or a missing interpreter parks the
   brief as `commit refused: ...; nothing pushed`. The records are the
   `contract-setup` and `contract-check` phases.
-- After the agent: the runner commits, then runs `check` on that commit. It
-  passes only with exit 0 and no tracked file changed (a formatter that has
-  to rewrite the agent's files is a failure). Only then is the branch pushed
+- After the agent: the runner commits, then runs `check` on that commit. A
+  plain non-zero exit gets one retry on the same commit; only a pass on that
+  retry validates, and the pull request says the check passed on a second
+  run. Timeouts, environment errors and SIGTERM are not retried. The check
+  must pass with exit 0 and no tracked file changed (a formatter that has to
+  rewrite the agent's files is a failure). Only then is the branch pushed
   and the pull request opened, with a `Validation:` line naming the commit.
 - A failed check parks the brief as `validation failed: ...` (exit 125 to
   127 as `validation environment unavailable: ...`), opens no pull request
@@ -170,6 +175,13 @@ or must be regenerated, or a command that renders into a file with a
 redirect, such as `tool --render-rbac > rbac.yaml`), the comment's first line
 after its header says to run that command and commit what it writes
 (`bus/ci_facts.py`).
+
+A review app's failing check (any check run not from GitHub Actions) is a
+reviewer's prose, not a log, and those rules do not apply to it. Only what the
+reviewer marks as a command becomes a "run" line: a line in a fenced block
+tagged `sh`, `bash`, `shell`, `console` or `zsh`, or a `Run:` or
+`Regenerate:` line. Its "Suggested fix:" lines are quoted as the finding to
+address, never as a command (loom#1898).
 
 ### Live-cluster check
 
@@ -351,7 +363,7 @@ App writes need no hand-listed login; its startup log line `trusting briefing
 logins` names every login trusted. More than three briefed tickets refused in
 an hour for one untrusted labeller file the `untrusted-labeler` invariant,
 naming the login. The App needs contents,
-issues and pull requests read and write, and checks and actions read, on the
+issues and pull requests read and write, and checks and actions write, on the
 scanned repos. To set one up, `python3 -m bus app manifest --owner OWNER`
 (add `--org` for an organisation) prints the create page and a manifest with
 exactly those permissions and no webhook; `--form` prints an HTML page whose
@@ -392,7 +404,7 @@ login by itself, so the brain's and the lanes' logins (`<slug>[bot]`) go in
 `LOOM_BRIEF_AUTHORS`, and a repo whose workflows admit only collaborators must
 admit the lanes' login for lane pull requests to run.
 A new App is easiest made from
-`https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=read`.
+`https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=write`.
 
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
@@ -434,7 +446,11 @@ conflict goes back to a lane as a fix brief. It stays on its lane while the
 rounds make progress, and climbs the model ladder only when stuck: a review
 thread survived a fix round, checks it was asked to fix still fail, or the
 pull request is over 6 hours old and has not climbed in 6 hours (a review that finds new things, or a
-conflict alone, never climbs). Failed tickets and briefed tickets no lane
+conflict alone, never climbs, by age either: a conflict-only pull request is
+sent back on its lane however old it is, and the station never marks a
+conflicting pull request `loom:ready`). A ready pull request held for the
+operator is brought up to date with its base while it waits, and still never
+merges on the factory's say-so. Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
 starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
@@ -457,9 +473,17 @@ A fix brief may answer a finding instead of fixing it: the agent writes the
 reason to `.loom-answers/<thread id>.md`, the runner moves that folder out of
 the tree (never committed; links dropped unread), and the station posts each
 answer as the reply on its thread, redacted and text-checked. The station
-resolves the thread only when the round ran on a ladder model and the thread
-is the review bot's own medium or low finding; any other answered thread
-stays open, and the factory reads it as a finding that survived.
+resolves the thread only when the round ran on a ladder model, the thread
+is the review bot's own medium or low finding, and the answer holds on the
+pull request head (bus/rebuttal.py, loom#2081): "Fixed in <sha>" names the
+head or one of its ancestors (any case), or the answer cites files and lines
+the head has and, when it names backticked symbols, at least one of them is
+there, every "`f` is called by `g`" claim is a real call there,
+and a dead-code finding's symbol has a call. An answer that cites nothing
+checkable stays open. Any other answered thread stays open, and the factory
+reads it as a finding that survived. The brain's merge re-checks every bot
+thread resolved on a lane answer the same way, and reopens it and refuses
+the merge when the answer does not hold.
 An answered thread that survives and leaves its ticket with no lane up for
 its next rung does not wait with nothing to move it: the factory asks the
 review bot to judge the answer instead, commenting `/grug improve` on the
@@ -499,7 +523,10 @@ a live pid, as running. The stamp says nothing of availability. When the
 factory does find a lane silent with a running ticket, the station log names
 what it saw of the runner (its lock and the stamp's age).
 A failed or stalled
-ticket climbs, and past the last rung it is left `loom:failed` for the brain. Landing
+ticket climbs, and past the last rung it is left `loom:failed` for the brain. Its
+open lane pull request is closed then, or on any later pass, as is one whose
+open ticket was rewritten as a newer ticket, each with one comment naming the
+ticket (loom#2027); a ticket still in a fix round keeps its pull request. Landing
 keeps the default branch green: a ready pull request that is behind its base
 is brought up to date first (GitHub's update-branch) and lands only after its
 checks and review pass again on the new head; each repo lands at most one a
@@ -563,6 +590,28 @@ a retry sends the same one; once sent, `covered` holds each ask's revision
 (a hash of its title and body) and `pages` the links. Posts mention nobody
 except the numeric user id in `LOOM_DISCORD_MENTION`; a failed post is retried
 on the next pass.
+
+Urgency score (`bus/urgency.py`, loom#1787): before routing, the station can
+score each ask with one request to a System One model (TypeSafe Jev): an
+`urgency` Score on five levels (0 weekly look to 4 now) and three yes
+probabilities, `needs_person`, `duplicate` and `public_exposure`, over the
+ask's repo, title, body excerpt, labels, age, filer and the other open asks.
+`LOOM_URGENCY_MODE` is `off`, `shadow` (the default: score and record, route by
+the labels as above) or `act`. In act, `public_exposure` >= 0.7, or `urgency` >=
+3.2 with `needs_person` >= 0.6, adds `loom:urgent` and forwards it now;
+`duplicate` >= 0.8 leaves it out of the digest as a repeat; `urgency` >= 1.5
+puts it in the digest, highest score first; lower stays out of the digest.
+The thresholds are `LOOM_URGENCY_EXPOSURE`, `LOOM_URGENCY_URGENT`,
+`LOOM_URGENCY_URGENT_PERSON`, `LOOM_URGENCY_DIGEST` and
+`LOOM_URGENCY_DUPLICATE`. The key comes from the SSM parameter named by
+`LOOM_URGENCY_KEY_SSM` (empty: no request); `LOOM_URGENCY_MODEL` defaults to
+`jev-latest`. Each ask is scored once per revision; the scores sit in
+`state/station/urgency.json` and every score is appended to
+`state/station/urgency.jsonl` beside the route the labels gave.
+`LOOM_URGENCY_DAILY_TOKENS` (default 200000 input tokens a UTC day) caps the
+spend: past it no request is sent, and past it or on any API error the ask
+routes by the labels and `fallbacks` in `urgency.json` goes up. A failed ask is
+tried again after an hour.
 
 Metrics: set `LOOM_METRICS_GOAL=owner/name#N` to name a goal home in
 `LOOM_REPOS`. Once a day after `LOOM_DIGEST_HOUR`, the station measures the
@@ -977,6 +1026,23 @@ The loom home is kept bounded by the station and the runner (loom#643).
   (`loom home holds ...`), kept in `state/station/disk.json`. A compressed
   store goes with its run's other logs after `LOOM_LOG_KEEP_DAYS`.
 
+## Pass deadline
+
+A whole station pass is bounded by `LOOM_PASS_DEADLINE` seconds (default
+3600, at least 60, `0` off; loom#1921). Each request already has a read
+timeout, but nothing else bounded a pass: on 2026-10-26 one sat for 27
+minutes and the log never said where. When the pass takes its lock it arms
+`faulthandler.dump_traceback_later` with the station log as its file and
+writes `state/station/pass-deadline.json` (pid, start, deadline); the pass's
+end cancels both, whether it returned or raised. A pass that runs past the
+deadline writes every thread's Python stack to `station.log` and exits, so
+launchd starts a fresh one. The next pass finds the marker and logs one line:
+`the last pass (pid ..., started ...) overran its ...s deadline`, or, when the
+marker is younger than its deadline (the pass was killed), `ended ...s into
+its ...s deadline without a clean finish`. The default sits above a daily
+metrics build (about 30 minutes on 2026-10-26) until that build is bounded on
+its own (loom#1924).
+
 ## Log watch
 
 Each station pass reads the lines each component added to its log since the
@@ -1122,6 +1188,10 @@ Each invariant is one function returning breaches with evidence:
   every such goal): the station opens no source-pin pull request when their
   module changes merge (README.md, Roll source pins). The issue says when
   the setting is empty, which turns the pass off.
+- Tickets still at `loom:merged` 24 hours after a ship rule found their merge
+  commit deployed, because the move to `loom:shipped` failed
+  (`merged-not-shipped`, one rolling issue, a line per ticket; docs/BRAIN.md,
+  Shipping through a downstream roll).
 
 The failing-streak, lane-held and silent-lane invariants are one rolling
 issue each, a line per lane, rewritten in place while the list changes, as
@@ -1156,10 +1226,17 @@ ticket gets one separate invariant issue that refs the ticket (loom#1223
 flipped 18 times in a day before this). Issues and pull requests in a private repo are named in words, and
 failure reasons have repos, paths and credentials replaced. One pass files
 or reopens at most 5, and below the GitHub budget floor files nothing.
+A `lane-pr-stalled` or `epic-over-cap` issue whose subject settled for good
+(its pull request merged or was closed unmerged, its epic is back at the
+cap) closes on the first pass the breach is gone, whatever labels it carries
+(not a `loom:ticket`), with one note naming how; these closes come before
+the other clears and read no comments (loom#2022). Other cleared issues
+close once the breach has been gone 6 hours.
 `python3 -m bus.brain status` lists the open ones under "Invariants broken"
 for the brain's report, and the station's own standup on that goal home
 names them under "Not going well". `state/station/invariants.json` keeps
-the issue numbers, when each lane was first seen held, and the newest
+the issue numbers, the subject of each open settling breach, when each lane
+was first seen held, and the newest
 journal seen. Adding an invariant is one function in `INVARIANTS` plus a
 test.
 
@@ -1215,6 +1292,10 @@ cannot query the viewer or any other local service.
   `--allow-all-tools`; the run output, including any CLI usage details, is
   retained in the lane log. Monthly usage-limit messages hold the lane until
   the next UTC month begins.
+- Model choice on the priced Anthropic routes follows
+  docs/USAGE_ROUTING.md ("October 2026 price changes"): high-volume
+  subtasks pin `claude-haiku-5-5`; cache-heavy work stays on
+  `claude-sonnet-5-5`.
 - Any step that fails moves the brief to `failed/` with the reason in
   `logs/<lane>/<ticket>.log`. Failed briefs are never retried; the
   orchestrator re-briefs.
@@ -1417,6 +1498,26 @@ lookup leaves the brief for the next pass. The rule covers:
 - Best for: scoped implementation, CI failure repair, `codex review` passes.
 - Models per ticket: Astra (hardest), Sol (default building), Luna (volume).
 
+## Elder fallback reviews: the codex-2 slot on Luna
+
+When the review bot's model route is exhausted, its check on a lane pull
+request concludes as a degraded review - not a verdict - and the re-ask
+degrades the same way (loom#2142). The factory then dispatches one review
+brief to the `codex-2` slot instead of another fix round: a
+`Deliverable: review` brief in the verify brief's shape, whose tree is the
+pull request's own branch, pinned `Model: gpt-6-luna` (the only model the
+codex lanes run), through `codex exec` on the operator's Codex login, on
+the same lane machine as the other codex slots. The lane changes no code;
+it writes `review.json` (blocking findings, notes, a summary). The station
+posts the verdict on the pull request in the Elder's markings shape
+(`Elder markings - N blocking, M total`, under a
+`<!-- loom:luna-review v1 sha=... -->` marker), with blocking findings
+also posted as review threads, and the factory's merge gate reads the
+verdict for that head in the degraded check's place: a clean verdict lets
+the pull request land, a blocking one sends it back through the ordinary
+fix rounds. A dispatched review that produces no verdict is dispatched
+again after an hour.
+
 ## opencode/ - volume
 
 - Tool: headless opencode runs. Providers configured in `config.json`:
@@ -1495,6 +1596,32 @@ unchanged for a run that did not end on a described step.
   limited lane to the next rung of the model ladder at once. Any other
   failure to answer (a timeout, a name that does not resolve) only makes the
   lane unavailable; its briefs wait.
+
+### Mellum 2.1 evaluation (spark slots)
+
+The spark slots serve their local model over vLLM (above). JetBrains
+released Mellum 2.1 on 2026-10-08: a 12B mixture-of-experts model with
+2.5B active parameters, a 131k context, Apache 2.0, served with vLLM or
+SGLang - the same serving shape as the incumbent, so it can be evaluated
+on one box without new machinery. It is built for coding agents and fast
+sub-agents on your own hardware, which is the spark slots' shape of work
+(easy-tier tickets, triage and review workers). The vendor's benchmark
+figures are self-reported from its own pipeline, so they are a reason to
+evaluate, not evidence: nothing here claims the model performs at any
+level on this repo's tickets.
+
+Plan:
+
+- Serve Mellum 2.1 on one spark box beside the incumbent model; the
+  thermal guard and the one-stream rule apply unchanged.
+- Run the same sample of easy tickets through both models and compare
+  the outcomes the scorecard already records per (lane, model)
+  (bus/scorecard.py): review outcome (clean, findings, bad work),
+  send-backs, merged, reverted and failed deploys - plus wall-clock per
+  ticket under load.
+- Adopt only if Mellum 2.1 matches or beats the incumbent on those
+  measures, and record the result in this section either way. Until
+  then no tier, ladder or default names it.
 
 ## agy: the Google plan, as a separate macOS user
 
@@ -1638,6 +1765,14 @@ brief on an ephemeral self-hosted runner, with `LOOM_SANDBOX=bwrap` and
 tree, cache or session database stays anywhere. API lanes only: opencode-go,
 zen, openrouter, zai, workersai, the free provider slots and spark (both
 through the gateway). codex, claude, agy and anthropic stay local.
+
+The runner image carries the lane runner's tools, not every tool a repo's
+check calls. A base check that fails there before the agent runs (exit 125
+to 127, or any red exit on the unmodified repo or default branch: a script
+that calls a missing `g++` exits 1) is not held behind its factory incident,
+which that runner could never clear: the station retries the ticket on
+another lane as a transient ending, and that lane holds it if the base is
+red there too. The runner files no incident for it (`LOOM_CLUSTER_RUNNER`).
 
 The job, step by step (`lanes/k8s/lane_job.py`):
 

@@ -62,7 +62,7 @@ class BrainViewTest(unittest.TestCase):
                       '<span class="tick-name">merge</span><span class="visually-hidden">current</span></li>', body)
         self.assertIn('<span class="tick-name">lock</span><span class="visually-hidden">done</span>', body)
         self.assertIn('<span class="tick-name">verify</span><span class="visually-hidden">ahead</span>', body)
-        self.assertEqual(body.count('class="tick-step '), 10)
+        self.assertEqual(body.count('class="tick-step '), 11)
         self.assertIn("brain-a holds the lock / started 11:30", body)
         self.assertIn("&lt;!-- loom:defer v1 stage=merge item=example-owner/sample#40 "
                       "rev=abc123 holder=brain-a --&gt;", body)

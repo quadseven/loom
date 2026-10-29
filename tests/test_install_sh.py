@@ -221,6 +221,12 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_LOG_KEEP_DAYS</key><string>14</string>", plist)
         self.assertIn("<key>LOOM_MIN_FREE_GB</key><string>20</string>", plist)
 
+    def test_pass_deadline_is_written_to_station_plist(self):
+        result = self.run_install(LOOM_PASS_DEADLINE="2400")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_PASS_DEADLINE</key><string>2400</string>", plist)
+
     def test_claimed_settle_settings_are_written_to_station_plist(self):
         result = self.run_install(LOOM_SETTLE_CLAIMED="on", LOOM_SETTLE_CLAIMED_MAX="5")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -257,6 +263,39 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_CLAUDE_MODEL</key><string>claude-test</string>", plist)
         self.assertIn("<key>LOOM_CODEX_MODEL</key><string>codex-test</string>", plist)
+
+    def station_plist_with(self, **env):
+        # KUBECONFIG and the allow-list come only from the test, never from
+        # the operator's own environment.
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("KUBECONFIG", "LOOM_STATION_PASS_ENV")}
+        with unittest.mock.patch.dict(os.environ, clean, clear=True):
+            result = self.run_install(**env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+
+    def test_station_pass_env_writes_kubeconfig_to_station_plist(self):
+        # Live evidence (LOOM_LIVE_EVIDENCE_PASS_ENV=KUBECONFIG) needs the
+        # station to have KUBECONFIG; a reinstall must keep it.
+        plist = self.station_plist_with(KUBECONFIG="/example/kube/config",
+                                        LOOM_STATION_PASS_ENV="KUBECONFIG")
+        self.assertIn("<key>KUBECONFIG</key><string>/example/kube/config</string>", plist)
+        self.assertEqual(plist.count("<key>KUBECONFIG</key>"), 1)
+
+    def test_without_station_pass_env_the_station_plist_is_unchanged(self):
+        before = self.station_plist_with()
+        after = self.station_plist_with(KUBECONFIG="/example/kube/config")
+        self.assertEqual(after, before)
+        self.assertNotIn("KUBECONFIG", after)
+
+    def test_station_pass_env_skips_unset_loom_and_written_names(self):
+        plist = self.station_plist_with(LOOM_STATION_PASS_ENV="KUBECONFIG, PATH HOME LOOM_X bad-name",
+                                        LOOM_X="x")
+        self.assertNotIn("KUBECONFIG", plist)
+        self.assertNotIn("LOOM_X", plist)
+        self.assertNotIn("bad-name", plist)
+        self.assertEqual(plist.count("<key>PATH</key>"), 1)
+        self.assertEqual(plist.count("<key>HOME</key>"), 1)
 
     def test_a_bad_station_interval_installs_nothing(self):
         for bad in ("soon", "30"):
