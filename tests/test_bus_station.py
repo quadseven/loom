@@ -11720,6 +11720,17 @@ class VerifyNoteTest(Base):
         self.assertIn("/repos/%s/issues/comments/4242" % REPO,
                       [p for _, p in self.fake.calls])
 
+    def test_a_deferred_run_stamps_no_cadence_and_the_next_run_retries(self):
+        st = self.station()
+        with mock.patch.object(st, "_deferred", return_value=True):
+            st.note_stale_shipped()
+        self.assertEqual(self.notes(1), [])
+        path = os.path.join(self.home, "state", "station", station.VERIFY_NOTE_FILE)
+        with open(path) as fh:
+            self.assertNotIn("_at", json.load(fh))
+        st.note_stale_shipped()
+        self.assertEqual(len(self.notes(1)), 1)
+
     def age_ledger(self, at, noted):
         path = os.path.join(self.home, "state", "station", station.VERIFY_NOTE_FILE)
         with open(path) as fh:

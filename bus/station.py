@@ -3625,9 +3625,11 @@ class Station:
         except GitHubError as err:
             _say("could not list shipped tickets for verify notes: %s" % err)
             return
+        deferred = False
         try:
             for repo, issue in pool:
                 if self._deferred():
+                    deferred = True
                     break
                 number = int(issue["number"])
                 if "%s#%d" % (repo, number) in attempts:
@@ -3637,7 +3639,12 @@ class Station:
                     continue
                 self._note_one_shipped(repo, issue, ledger)
         finally:
-            ledger["_at"] = self.now
+            # A run the step budget cut short is not stamped: the cadence
+            # stamp would suppress the retry for a whole VERIFY_NOTE_EVERY
+            # while the tail of the pool is still unnoted. The notes already
+            # written keep their per-ticket stamps either way.
+            if not deferred:
+                ledger["_at"] = self.now
             _write_json(path, ledger)
 
     def _note_one_shipped(self, repo: str, issue: Dict[str, Any],
