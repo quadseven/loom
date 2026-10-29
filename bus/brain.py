@@ -5540,6 +5540,19 @@ def _cmd_step(gh: GitHub, args: argparse.Namespace) -> None:
     # The clock first, so the model reads the time instead of guessing it.
     print(tick_clock.elapsed_line(record, now))
     print(json.dumps(record, sort_keys=True))
+    if args.name == "sweep" and record.get("sweep") == "ok":
+        _print_sweep_candidates(gh, now)
+
+
+def _print_sweep_candidates(gh: GitHub, now: datetime) -> None:
+    """The sweep step's candidate list (docs/MUSE.md, step 9): the model reads
+    only these issues. A failed read says so instead of passing for empty."""
+    try:
+        lines = sweep.candidate_lines(sweep.candidates(gh, now=now))
+    except GitHubError as exc:
+        lines = ["candidate list unavailable: %s" % exc]
+    for each in lines:
+        print(each)
 
 
 def _cmd_step_budget(gh: GitHub, args: argparse.Namespace) -> None:
