@@ -208,9 +208,10 @@ class GoalCapsTest(NeedsYouPageTest):
             self.assertEqual(self.post({"goals": [self.GOAL]}, auth="")[0], 401)
             self.assertEqual(self.post({"goals": [self.GOAL]}), (201, {"goals": 1}))
             body = self.page()
-        self.assertIn("Goals stuck at their cap (1)", body)
-        self.assertIn("%s#5</strong> stuck at its cap for 10 hours: 32 of 28 in "
-                      "flight, 20 blocked on no lane." % REPO, body)
+        self.assertIn("Stuck in Loom, not waiting on you (1)", body)
+        self.assertIn("%s#5</strong> has been full for 10 hours: 32 of 28 tickets in "
+                      "progress (the limit), 20 with no lane able to take them. "
+                      "Waits on: Loom." % REPO, body)
 
     def test_an_old_or_empty_report_shows_nothing(self):
         self.assertEqual(needs_you.goal_caps_section({"goals": [self.GOAL], "received_at": 0.0},

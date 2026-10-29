@@ -567,15 +567,16 @@ def goal_caps_section(stored: Any, now: float) -> str:
         return ""
     esc = html.escape
     rows = "".join(
-        '<li class="card"><strong>%s</strong> stuck at its cap for %.0f hours: %d of %d in flight, '
-        '%d blocked on no lane.</li>' % (
+        '<li class="card"><strong>%s</strong> has been full for %.0f hours: %d of %d tickets in '
+        'progress (the limit), %d with no lane able to take them. Waits on: Loom.</li>' % (
             esc(goal["goal"]), max(0.0, now - goal["since"]) / 3600, goal["in_flight"], goal["cap"],
             goal["no_lane"])
         for goal in stored["goals"])
-    return ('<section class="needs-group needs-goal-caps" data-kind="goal-caps"><h2>Goals stuck at '
-            'their cap (%d)</h2><p class="muted">the station skips their triage rewrites; tickets no '
-            'lane takes are rerouted after hours and go to the hand-off pool within a day</p>'
-            '<ul>%s</ul></section>') % (len(stored["goals"]), rows)
+    return ('<section class="needs-group needs-goal-caps" data-kind="goal-caps"><h2>Stuck in Loom, '
+            'not waiting on you (%d)</h2><p class="muted">Loom is working these itself: it skips '
+            'their triage rewrites, reroutes tickets no lane takes after a few hours, and hands '
+            'them to the hand-off pool within a day. Nothing to do unless one is still stuck '
+            'after a day.</p><ul>%s</ul></section>') % (len(stored["goals"]), rows)
 
 
 
