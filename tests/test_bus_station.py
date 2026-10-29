@@ -4842,7 +4842,7 @@ class ClaimTest(Base):
 
     def test_a_dependency_of_another_repo_is_read_from_there(self):
         self.fake.add_foreign("other-owner/other-repo", 5, labels=("loom:merged",))
-        self.fake.add(12, body="After: other-owner/other-repo#5\n" + BODY_WITH_CRITERIA)
+        self.fake.add(12, body="After: other-owner/other-repo#5\n" + BODY_WITH_CRITERIA)  # leak-guard-allow
         self.run_pass()
         self.assertIn("/repos/other-owner/other-repo/issues/5", self.fake.paths())
         self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
