@@ -798,6 +798,17 @@ print('leak guard: clean (shape patterns only)')
         self.assertTrue(line.startswith("[transient] public repo leak scan could not run"), line)
         self.assertIn("could not read deny-list", line)
 
+    def test_a_lane_started_without_a_clone_base_does_not_crash_on_an_unbound_variable(self):
+        """launchd starts the local lanes without LOOM_CLONE_BASE; the scanner
+        remote must default like the ticket clone does (git@github.com:), or
+        every run dies at once under set -u and no lane works."""
+        env = self.lane_env()
+        del env["LOOM_CLONE_BASE"]
+        self.drop_brief()
+        result = subprocess.run(["bash", str(RUNNER), "codex"], env=env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertNotIn("unbound variable", result.stderr)
+
     def test_a_missing_leak_scanner_is_a_factory_incident(self):
         # No infra-public checkout and no remote to clone it from: the scanner
         # cannot be had, so a public-repo push is a factory incident (one issue
