@@ -89,7 +89,7 @@ LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_HOME/infra-public/.github/scripts/check
 # The remote infra-public is cloned from, LOOM_CLONE_BASE-prefixed like the
 # ticket repos the lane clones. Override it on a machine without network.
 INFRA_PUBLIC="$LOOM_HOME/infra-public"
-INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE}quadseven/infra-public"
+INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE:-git@github.com:}quadseven/infra-public"
 INFRA_PUBLIC_STAMP="$LOOM_HOME/run/infra-public.updated"
 # The SSM parameter of the shared deny-list: names and products with no
 # generic shape, which only this list catches. Every scan passes it.
