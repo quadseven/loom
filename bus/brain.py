@@ -5329,6 +5329,7 @@ def _check_stage_item(gh: GitHub, stage: str, repo: str, number: int) -> None:
         "ask": ("needs-operator" in names, "an ask item is a needs-operator issue"),
         "regression": ("pull_request" not in issue, "a regression item is an issue"),
         "brief": ("loom:goal" in names, "a brief item is a loom:goal issue"),
+        "brief-needs-brain": ("loom:goal" in names and "needs-brain" in names and "loom:briefed" in names, "a brief-needs-brain item is a loom:goal issue that is loom:briefed and needs-brain"),
     }
     if stage not in rules:
         raise ValueError("unknown stage %s; stages are %s" % (stage, ", ".join(handoff.STAGES)))
