@@ -3489,27 +3489,33 @@ class Factory:
             return True  # the filed ticket carries it from here
         if not self.review_brief(repo, number, sha, issue):
             return False
-        stamp = int(self.now)
-        line = ("Dispatch %d at %s UTC.\n<!-- loom:luna-dispatch at=%d -->"
-                % (len(stamps) + 1, datetime.fromtimestamp(stamp, timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M"), stamp))
-        if request is None:
-            notify.post(self.gh, repo, number,
-                        "%s\nThe review check is degraded on this head and its re-run "
-                        "was degraded too, so a Codex Luna review was dispatched on "
-                        "lane %s (gpt-6-luna, through `codex exec`). Its verdict will "
-                        "be posted here for this head, and the merge gate reads it "
-                        "while the review route is down. A dispatch with no verdict "
-                        "is retried on this comment, up to %d times.\n\n%s"
-                        % (LUNA_REQUEST_MARKER % sha, LUNA_REVIEW_LANE,
-                           LUNA_MAX_DISPATCHES, line), notify.NOTE)
-        else:
-            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(request["id"])),
-                         {"body": str(request.get("body") or "").rstrip() + "\n" + line})
+        self._luna_note(repo, number, sha, request, len(stamps) + 1)
         self.actions += 1
         _say("dispatched a Luna review of %s#%d head %s on lane %s"
              % (repo, number, sha[:12], LUNA_REVIEW_LANE))
         return True
+
+    def _luna_note(self, repo: str, number: int, sha: str,
+                   request: Optional[Dict[str, Any]], sent: int) -> None:
+        """Record dispatch number `sent` on the head's request comment: post
+        it the first time, then edit it in place."""
+        stamp = int(self.now)
+        line = ("Dispatch %d at %s UTC.\n<!-- loom:luna-dispatch at=%d -->"
+                % (sent, datetime.fromtimestamp(stamp, timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M"), stamp))
+        if request is not None:
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(request["id"])),
+                         {"body": str(request.get("body") or "").rstrip() + "\n" + line})
+            return
+        notify.post(self.gh, repo, number,
+                    "%s\nThe review check is degraded on this head and its re-run "
+                    "was degraded too, so a Codex Luna review was dispatched on "
+                    "lane %s (gpt-6-luna, through `codex exec`). Its verdict will "
+                    "be posted here for this head, and the merge gate reads it "
+                    "while the review route is down. A dispatch with no verdict "
+                    "is retried on this comment, up to %d times.\n\n%s"
+                    % (LUNA_REQUEST_MARKER % sha, LUNA_REVIEW_LANE,
+                       LUNA_MAX_DISPATCHES, line), notify.NOTE)
 
     def _luna_stuck(self, repo: str, number: int, sha: str, sent: int) -> None:
         """File one factory ticket for a head whose Luna review got no verdict
