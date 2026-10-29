@@ -107,8 +107,7 @@ class FakeGitHub:
             return [p for p in self.pulls.values() if p.get("state") == "closed"]
         if path.endswith("/pulls?state=all") or re.search(r"/pulls\?.*state=all", path) or path.endswith("/pulls"):
             return list(self.pulls.values())
-        if path.endswith("/issues?labels=loom:triage&state=open") or path.endswith(
-                "/issues?labels=loom:factory&state=open"):
+        if re.search(r"/issues\?labels=loom:(triage|factory)&state=open$", path):
             return list(self.filed)
         if "/issues?labels=loom%3Aanswer-pending&state=open" in path:
             return [i for i in self.issues.values() if i.get("state") == "open"

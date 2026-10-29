@@ -3459,21 +3459,9 @@ class Factory:
         than LUNA_RETRY_AFTER is in flight. True when it dispatched."""
         if self.review_brief is None or not self._review_degraded(sha):
             return False
-        asked = False
-        request: Optional[Dict[str, Any]] = None
-        stamps: List[int] = []
-        for comment in self._trusted_comments(repo, number):
-            body = str(comment.get("body") or "")
-            if parse_luna_verdict(body, sha) is not None:
-                return False  # the lane already answered for this head
-            if REVIEW_AGAIN_MARKER % sha in body:
-                asked = True
-            if LUNA_REQUEST_MARKER % sha in body:
-                request = request or comment
-                # A request written before the stamps counts as one dispatch
-                # at its creation time.
-                stamps += [int(x) for x in _LUNA_DISPATCH_RE.findall(body)] or [
-                    int(_ts(comment.get("created_at")))]
+        request, stamps, asked = self._luna_requests(repo, number, sha)
+        if asked is None:
+            return False  # the lane already answered for this head
         if not asked:
             return False  # the review bot has not had its re-ask yet
         newest = max(stamps, default=0)
@@ -3494,6 +3482,27 @@ class Factory:
         _say("dispatched a Luna review of %s#%d head %s on lane %s"
              % (repo, number, sha[:12], LUNA_REVIEW_LANE))
         return True
+
+    def _luna_requests(self, repo: str, number: int, sha: str
+                       ) -> Tuple[Optional[Dict[str, Any]], List[int], Optional[bool]]:
+        """(the head's first request comment, each dispatch's epoch seconds,
+        whether the review bot was re-asked); asked is None once a verdict
+        for this head stands."""
+        asked = False
+        request: Optional[Dict[str, Any]] = None
+        stamps: List[int] = []
+        for comment in self._trusted_comments(repo, number):
+            body = str(comment.get("body") or "")
+            if parse_luna_verdict(body, sha) is not None:
+                return None, [], None
+            asked = asked or REVIEW_AGAIN_MARKER % sha in body
+            if LUNA_REQUEST_MARKER % sha in body:
+                request = request or comment
+                # A request written before the stamps counts as one dispatch
+                # at its creation time.
+                stamps += [int(x) for x in _LUNA_DISPATCH_RE.findall(body)] or [
+                    int(_ts(comment.get("created_at")))]
+        return request, stamps, asked
 
     def _luna_note(self, repo: str, number: int, sha: str,
                    request: Optional[Dict[str, Any]], sent: int) -> None:
