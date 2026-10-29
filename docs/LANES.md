@@ -1292,6 +1292,10 @@ cannot query the viewer or any other local service.
   `--allow-all-tools`; the run output, including any CLI usage details, is
   retained in the lane log. Monthly usage-limit messages hold the lane until
   the next UTC month begins.
+- Model choice on the priced Anthropic routes follows
+  docs/USAGE_ROUTING.md ("October 2026 price changes"): high-volume
+  subtasks pin `claude-haiku-5-5`; cache-heavy work stays on
+  `claude-sonnet-5-5`.
 - Any step that fails moves the brief to `failed/` with the reason in
   `logs/<lane>/<ticket>.log`. Failed briefs are never retried; the
   orchestrator re-briefs.
@@ -1572,6 +1576,32 @@ unchanged for a run that did not end on a described step.
   limited lane to the next rung of the model ladder at once. Any other
   failure to answer (a timeout, a name that does not resolve) only makes the
   lane unavailable; its briefs wait.
+
+### Mellum 2.1 evaluation (spark slots)
+
+The spark slots serve their local model over vLLM (above). JetBrains
+released Mellum 2.1 on 2026-10-08: a 12B mixture-of-experts model with
+2.5B active parameters, a 131k context, Apache 2.0, served with vLLM or
+SGLang - the same serving shape as the incumbent, so it can be evaluated
+on one box without new machinery. It is built for coding agents and fast
+sub-agents on your own hardware, which is the spark slots' shape of work
+(easy-tier tickets, triage and review workers). The vendor's benchmark
+figures are self-reported from its own pipeline, so they are a reason to
+evaluate, not evidence: nothing here claims the model performs at any
+level on this repo's tickets.
+
+Plan:
+
+- Serve Mellum 2.1 on one spark box beside the incumbent model; the
+  thermal guard and the one-stream rule apply unchanged.
+- Run the same sample of easy tickets through both models and compare
+  the outcomes the scorecard already records per (lane, model)
+  (bus/scorecard.py): review outcome (clean, findings, bad work),
+  send-backs, merged, reverted and failed deploys - plus wall-clock per
+  ticket under load.
+- Adopt only if Mellum 2.1 matches or beats the incumbent on those
+  measures, and record the result in this section either way. Until
+  then no tier, ladder or default names it.
 
 ## agy: the Google plan, as a separate macOS user
 

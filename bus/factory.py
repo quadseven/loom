@@ -290,6 +290,14 @@ SHARED_CREDIT = ANTHROPIC
 # spent the weekly codex limit in a day), so the codex rung is luna. Each
 # rung lists the lanes that serve it, best first. No rung, hard-tier pin or
 # equivalent may name a tickets.FORBIDDEN_MODELS model.
+# October 2026 price changes (recorded 2026-10-28): the first rung stays
+# claude-sonnet-5-5. On 2026-10-07 the vendor halved Sonnet 5.5's cache-read
+# price ($0.20 to $0.10 per million tokens, cache writes unchanged), and a
+# stuck ticket's climb is cache-heavy work: every rung re-reads the same
+# brief, diff and review threads. The same day's cheaper small model
+# (Haiku 5.5) is the pin for high-volume subtasks on priced routes instead
+# (docs/USAGE_ROUTING.md, "October 2026 price changes"); it is not a rung,
+# because a climb is the work that most needs the strong model.
 LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
     (("claude",), "claude-sonnet-5-5"),
     (("codex", "codex-2"), "gpt-6-luna"),
