@@ -1659,6 +1659,13 @@ unchanged for a run that did not end on a described step.
   stays read-only as well, including shell startup files, `~/.gemini`
   config (with the skills copied to `~/.gemini/config/skills`, see Skills
   on every lane), and MCP servers.
+- agy's sign-in files, `antigravity-oauth-token` in its file store
+  (`Library/Application Support/antigravity`) and in its state directory,
+  are readable only by agy's own binary (a profile rule on the process
+  path). A command agy launches cannot read, link, move or delete either
+  file, or move its folder; in a validation run's profile no process may
+  read them. The same profile keeps the keychain server and
+  `Library/Keychains` denied.
 - Before each run, the runner clears agy's memory of earlier runs
   (`agy_forget`), deleting everything in its state directory except sign-in
   and install state. Kept entries in the state directory are `settings.json`,

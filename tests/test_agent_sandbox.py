@@ -37,6 +37,25 @@ if /usr/bin/nc -z -w 1 192.0.2.1 80 > /dev/null 2>&1; then echo net=reachable; e
 if /usr/bin/security --help > /dev/null 2>&1; then echo security=ran; else echo security=denied; fi
 """
 
+# Run inside the agy profile as a command agy launched (not the profiled
+# CLI's own binary): try to read each oauth token file (TOKEN_A in the file
+# store, TOKEN_B in the CLI state directory) directly, through a hard link,
+# through a symlink, after moving the file, and after moving its folder,
+# and a file in the keychain folder. $1 is the tree; links land beside it.
+TOKEN_PROBE = r"""
+r() { if /usr/bin/head -c 1 "$2" > /dev/null 2>&1; then echo "$1=read"; else echo "$1=denied"; fi; }
+t() {
+  r "$1-direct" "$2"
+  ln "$2" "$1-hard" 2> /dev/null; r "$1-hardlink" "$1-hard"
+  ln -s "$2" "$1-soft" 2> /dev/null; r "$1-symlink" "$1-soft"
+  mv "$2" "$1-moved" 2> /dev/null; r "$1-moved" "$1-moved"
+  mv "$(dirname "$2")" "$1-dir" 2> /dev/null; r "$1-folder" "$1-dir/$(basename "$2")"
+}
+t "$TREE/a" "$TOKEN_A"
+t "$TREE/b" "$TOKEN_B"
+r keychain "$KEYCHAIN_FILE"
+"""
+
 
 class AgentSandboxTest(unittest.TestCase):
     def setUp(self):
@@ -134,6 +153,70 @@ class AgentSandboxTest(unittest.TestCase):
                 self.assertIn('(literal "/usr/bin/security")', profile)
                 if lane == "agy":
                     self.assertIn(folder, profile)
+
+    def test_the_agy_profile_denies_its_oauth_token_to_every_other_process(self):
+        # #1623: agy keeps its sign-in in two files named antigravity-oauth-token,
+        # its file store (Library/Application Support/antigravity, #1620) and its
+        # CLI state directory (.gemini/antigravity-cli). A command agy launches
+        # runs in the same sandbox and could read either and send it out, so the
+        # profile denies each file, and linking or moving it or its folder, to
+        # every process but agy's own binary (here bash, the profiled CLI).
+        cli = str(Path(shutil.which("bash")).resolve())
+        profile = self.profile("", lane="agy")
+        for folder in (f"{self.scratch}/Library/Application Support/antigravity",
+                       f"{self.scratch}/.gemini/antigravity-cli"):
+            token = f"{folder}/antigravity-oauth-token"
+            self.assertIn(
+                f'(deny file-read* file-write-unlink file-link '
+                f'(require-all (literal "{token}") (require-not (process-path "{cli}"))))',
+                profile)
+            self.assertIn(
+                f'(deny file-write-unlink file-link '
+                f'(require-all (literal "{folder}") (require-not (process-path "{cli}"))))',
+                profile)
+
+    def test_the_agy_check_profile_denies_its_oauth_token_to_every_process(self):
+        # A validation run never runs agy, so its profile names no process
+        # that may read the token: agent-written test code is denied too.
+        profile = self.profile("check", lane="agy")
+        for folder in (f"{self.scratch}/Library/Application Support/antigravity",
+                       f"{self.scratch}/.gemini/antigravity-cli"):
+            self.assertIn(
+                f'(deny file-read* file-write-unlink file-link '
+                f'(literal "{folder}/antigravity-oauth-token"))', profile)
+        self.assertNotIn("process-path", profile)
+
+    def test_only_the_agy_lane_profile_names_the_oauth_token(self):
+        for mode, lane in (("", "codex"), ("api", "opencode-go"), ("check", "codex")):
+            with self.subTest(mode=mode, lane=lane):
+                self.assertNotIn("antigravity-oauth-token", self.profile(mode, lane=lane))
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_inside_the_agy_profile_a_command_cannot_read_the_oauth_token(self):
+        # #1623's probe: the profiled CLI is /bin/cat, standing in for agy's
+        # binary; it alone may read the token. /bin/bash and the tools it
+        # runs stand in for a command agy launched: they cannot read either
+        # token file however they reach for it, nor the keychain folder.
+        store = self.scratch / "Library" / "Application Support" / "antigravity" / "antigravity-oauth-token"
+        state = self.scratch / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        keychain = self.scratch / "Library" / "Keychains" / "fixture.keychain-db"
+        for f in (store, state, keychain):
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("not-a-real-secret\n")
+        script = ('export TOKEN_A="$2" TOKEN_B="$3" KEYCHAIN_FILE="$4" TREE="$1"\n'
+                  'p="$(sandbox_profile "$1" cat "")" || exit 9\n'
+                  'sandbox-exec -p "$p" /bin/bash -c "$5"\n'
+                  'sandbox-exec -p "$p" /bin/cat "$2" > /dev/null && echo agy=read || echo agy=denied')
+        result = self.bash(script, str(store), str(state), str(keychain), TOKEN_PROBE, lane="agy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(),
+                         ["a-direct=denied", "a-hardlink=denied", "a-symlink=denied",
+                          "a-moved=denied", "a-folder=denied",
+                          "b-direct=denied", "b-hardlink=denied", "b-symlink=denied",
+                          "b-moved=denied", "b-folder=denied",
+                          "keychain=denied", "agy=read"])
+        self.assertEqual(store.read_text(), "not-a-real-secret\n")
+        self.assertEqual(state.read_text(), "not-a-real-secret\n")
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_inside_the_agy_profile_connections_and_security_stay_confined(self):

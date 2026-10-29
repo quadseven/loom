@@ -1141,7 +1141,8 @@ park() {
 # startup files, ~/.gemini config, MCP servers). Other lanes get no rules here.
 # antigravity-oauth-token is agy's sign-in when it cannot reach the keychain
 # (the sandbox denies /usr/bin/security): wiped, every run asked for a browser
-# login (2026-10-22 to 10-24, #1620).
+# login (2026-10-22 to 10-24, #1620). The sandbox profile lets only agy's own
+# binary read it (agy_token_rules in lanes/agent_sandbox.sh, #1623).
 AGY_STATE_KEEP=(settings.json bin builtin installation_id jetski_state.pbtxt updater last_check.timestamp log cli.log crashes cache antigravity-oauth-token)
 AGY_CACHE_KEEP=(onboarding.json default_project_id.txt)
 # agy keeps its sign-in in its file store, Library/Application Support/
