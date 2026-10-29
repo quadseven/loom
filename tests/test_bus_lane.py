@@ -79,31 +79,44 @@ class FakeGitHub:
     def rest(self, method, path, body=None):
         self.calls.append((method, path, body))
         rest = path[len("/repos/" + REPO):]
-        if method == "GET" and rest == "/issues/%d" % NUMBER:
-            return _Response({"number": NUMBER, "title": TITLE})
-        if method == "GET" and rest == "":
-            return _Response({"default_branch": "main"})
-        if method == "GET" and rest.startswith("/git/refs/heads/"):
-            return self._read_refs(unquote(rest[len("/git/refs/heads/"):]))
-        if method == "GET" and rest.startswith("/git/ref/heads/"):
-            return self._read_ref(unquote(rest[len("/git/ref/heads/"):]))
-        if method == "POST" and rest == "/git/blobs":
-            sha = self._git("hash-object", "-w", "--stdin",
-                            data=base64.b64decode(body["content"]).decode())
-            return _Response({"sha": sha})
-        if method == "POST" and rest == "/git/trees":
-            return _Response({"sha": self._make_tree(body)})
-        if method == "POST" and rest == "/git/commits":
-            return _Response({"sha": self._make_commit(body)})
-        if method == "POST" and rest == "/git/refs":
-            if body["ref"] in self.refs:
-                raise GitHubError("reference already exists", 422)
-            self.refs[body["ref"]] = body["sha"]
-            return _Response({"ref": body["ref"],
-                              "object": {"sha": body["sha"], "type": "commit"}})
+        if method == "GET":
+            return self._get(rest)
+        if method == "POST":
+            return self._post(rest, body)
         if method == "PATCH" and rest.startswith("/git/refs/heads/"):
             return self._update_ref(unquote(rest[len("/git/refs/heads/"):]), body)
         raise AssertionError("unexpected call: %s %s" % (method, path))
+
+    def _get(self, rest):
+        if rest == "/issues/%d" % NUMBER:
+            return _Response({"number": NUMBER, "title": TITLE})
+        if rest == "":
+            return _Response({"default_branch": "main"})
+        if rest.startswith("/git/refs/heads/"):
+            return self._read_refs(unquote(rest[len("/git/refs/heads/"):]))
+        if rest.startswith("/git/ref/heads/"):
+            return self._read_ref(unquote(rest[len("/git/ref/heads/"):]))
+        raise AssertionError("unexpected call: GET /repos/%s%s" % (REPO, rest))
+
+    def _post(self, rest, body):
+        if rest == "/git/blobs":
+            sha = self._git("hash-object", "-w", "--stdin",
+                            data=base64.b64decode(body["content"]).decode())
+            return _Response({"sha": sha})
+        if rest == "/git/trees":
+            return _Response({"sha": self._make_tree(body)})
+        if rest == "/git/commits":
+            return _Response({"sha": self._make_commit(body)})
+        if rest == "/git/refs":
+            return self._create_ref(body)
+        raise AssertionError("unexpected call: POST /repos/%s%s" % (REPO, rest))
+
+    def _create_ref(self, body):
+        if body["ref"] in self.refs:
+            raise GitHubError("reference already exists", 422)
+        self.refs[body["ref"]] = body["sha"]
+        return _Response({"ref": body["ref"],
+                          "object": {"sha": body["sha"], "type": "commit"}})
 
     def _ref_object(self, name):
         return {"ref": name, "object": {"sha": self.refs[name], "type": "commit"}}
