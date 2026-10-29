@@ -6319,15 +6319,25 @@ _LANE_LOAD: Dict[Tuple[str, ...], Dict[str, int]] = {}
 def _lane_load(gh: GitHub, repo: str) -> Dict[str, int]:
     """Open briefed and running tickets per lane over every LOOM_REPOS repo
     and `repo`, as the factory counts them (Factory.count_load): lanes are
-    shared by every repo the station watches."""
+    shared by every repo the station watches. A repo that cannot be read
+    counts as empty and is said on stderr; a count missing a repo is not
+    kept, so the next ticket reads again."""
     repos = tuple(dict.fromkeys(
         os.environ.get("LOOM_REPOS", "").replace(",", " ").split() + [repo]))
-    if repos not in _LANE_LOAD:
-        from . import factory  # factory imports this module
-        counter = factory.Factory(gh, repos, time.time(), trusted=trusted_authors())
-        counter.count_load()
+    if repos in _LANE_LOAD:
+        return _LANE_LOAD[repos]
+    from . import factory  # factory imports this module
+    counter = factory.Factory(gh, repos, time.time(), trusted=trusted_authors())
+    found: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    for each in repos:
+        try:
+            found[each] = counter._tickets(each)
+        except GitHubError as err:
+            print("lane load: cannot read %s (%s); counted as empty" % (each, err), file=sys.stderr)
+    counter.count_load({each: found.get(each, {}) for each in repos})
+    if len(found) == len(repos):
         _LANE_LOAD[repos] = counter.load
-    return _LANE_LOAD[repos]
+    return counter.load
 
 
 def _count_move(load: Dict[str, int], issue: Dict[str, Any], lane: str) -> None:
