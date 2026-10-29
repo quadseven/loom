@@ -15,8 +15,22 @@ lane-failing-streak, silent-lane, roll-pin-off) is one issue for its whole
 cause, a line per goal home or lane, and its open issue is rewritten in place whenever what it
 lists changes; an older open issue of the same invariant is folded into it.
 lane-no-success stays one issue per lane: the station reads its per-lane keys
-to release runaways a dead lane held. Adding an invariant is one function in
-INVARIANTS plus a test.
+to release runaways a dead lane held.
+
+The kinds in ROLLED (lane-pr-stalled, plan-check-failed, epic-over-cap,
+goal-epics-over-cap, closed-epic-open-tickets) restate state the pull request,
+the epic or the dashboard already shows, so they file no issue per violation
+(loom#2099: 185 such tickets in 7 days). The filer folds each kind's breaches
+into one tracking issue per (kind, subject repo), titled "Invariant: <kind> in
+<repo>", whose body lists every current violation, a line each with when it
+started. The list is rewritten in place only when it changes. A list that
+empties says "none"; after CLEAR_AFTER of none the issue closes with one
+cleared note (edited, not reposted, on a later clear), and a violation that
+returns reopens the same issue. A repo whose facts could not be read keeps
+its issue as it is. An older per-violation issue of those kinds stays open
+while its kind is broken anywhere this pass (the settle path still closes
+one whose subject settled).
+Adding an invariant is one function in INVARIANTS plus a test.
 
 Everything here is written to a public repo. A subject in another repo comes
 in as a Ref whose label is already public (a private repo is named in words),
@@ -166,6 +180,47 @@ WITHHELD = "(withheld: the line fails the written-text check)"
 # lane-pr-stalled issues stayed open up to a day after their pull requests
 # merged or closed, and an operator closed them by hand).
 SETTLES = ("lane-pr-stalled", "epic-over-cap")
+# Invariants that restate state the pull request, the epic or the dashboard
+# already shows: one tracking issue per (kind, subject repo), its list edited
+# in place, instead of one issue per violation (loom#2099). The settle path
+# above now only closes per-violation issues filed before this.
+ROLLED = ("lane-pr-stalled", "plan-check-failed", "epic-over-cap", "goal-epics-over-cap",
+          "closed-epic-open-tickets")
+ROLL_MARKER = "<!-- loom:invariant roll v1 -->"
+ROLL_TITLE = "Invariant: %s in %s"
+ROLL_TITLE_RE = re.compile(r"^Invariant: [a-z-]+ in (.+)$")
+ROLL_NONE = "Current violations: none."
+# One note per tracking issue says when it last cleared; it is edited in
+# place on each later clear, never posted again.
+ROLL_CLEARED_MARKER = "<!-- loom:invariant roll-cleared -->"
+CLEARED_AT_RE = re.compile(re.escape("The invariant cleared by ") + r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)")
+CLEAR_SINCE_RE = re.compile(r"^Clear since ([0-9T:Z-]+)\.$", re.M)
+ROLL_CHECKED = "Last checked: %s (checked every station pass; this issue is edited only " \
+               "when the list changes)."
+# A tracking issue is a list, not work: it carries loom:invariant only, so the
+# rewriter never turns it into a ticket and freezes the list.
+ROLL_LABELS = [LABEL]
+ROLL_HINTS = {
+    "lane-pr-stalled": "\n".join([
+        "Each pull request here is open past %d hours with nothing driving it. Unstick it "
+        "by its reason:" % (PR_STALLED // 3600),
+        "- no open loom:ticket carries it: make its ticket an open loom:ticket and move it "
+        "with `python3 -m bus.brain move OWNER/NAME#N --to pr`, or close the pull request "
+        "as superseded",
+        "- ticket past the model ladder: brief the work again with `python3 -m bus.brain "
+        "brief`, or close the pull request as superseded",
+        "- ticket waits on the brain: review it in a brain tick (`python3 -m bus.brain "
+        "merge` or `fix`)",
+        "- review threads, no fix round: `python3 -m bus.brain fix OWNER/NAME#N --ticket "
+        "OWNER/NAME#N --file FIX.md`"]),
+    "plan-check-failed": "Each pull request here is held by its plan check; fix the rows its "
+                         "check-run summary marks failing.",
+    "epic-over-cap": "Each epic here holds more than its cap; new work goes into a next epic.",
+    "goal-epics-over-cap": "Each goal home here has more open epics than its cap; finish an "
+                           "epic before opening another, or record a one-time exception.",
+    "closed-epic-open-tickets": "Each closed epic here still holds open tickets; reopen the "
+                                "epic, or move the tickets under an open one.",
+}
 
 Say = Callable[[str], None]
 # (invariant, subject) -> why the subject is settled, in words a public issue
@@ -338,6 +393,10 @@ class Facts:
     # Each open loom:merged ticket a ship rule found deployed but could not
     # move, with when it was first found deployed (loom#2025).
     unshipped: Optional[List[Tuple[Ref, float]]] = None
+    # ROLLED kind -> the repos whose facts for it could not be read this
+    # pass (one repo's open pull requests answered an error): their tracking
+    # issues are left as they are.
+    unread: Optional[Dict[str, Tuple[str, ...]]] = None
 
 
 @dataclass(frozen=True)
@@ -351,6 +410,14 @@ class Breach:
     # One issue for the whole cause, its title and body rewritten in place
     # while it is open and what it lists changes.
     rolling: bool = False
+    # A ROLLED kind's breach as one line of its tracking issue: the line,
+    # when the violation started (None: when the filer first saw it), and
+    # the subject's repo as a public issue may name it ("" for the repo the
+    # filer files in). Stable while nothing changes, so an unchanged list
+    # writes nothing.
+    line: str = ""
+    since: Optional[float] = None
+    where: str = ""
 
     @property
     def key(self) -> str:
@@ -589,6 +656,12 @@ def lane_held(f: Facts) -> List[Breach]:
                    f.now, rolling=True)]
 
 
+def _where(ref: Ref) -> str:
+    """The repo a Ref's label names ("" for the repo issues are filed in)."""
+    m = re.search(r" of (.+)$", ref.label)
+    return m.group(1) if m else ""
+
+
 def _refs(found: Sequence[Ref]) -> str:
     shown = ", ".join(r.label for r in list(found)[:SHOWN])
     return shown + (" and %d more" % (len(found) - SHOWN) if len(found) > SHOWN else "")
@@ -636,7 +709,10 @@ def epic_over_cap(f: Facts) -> List[Breach]:
                      "past %d, so new work goes into a next epic" % (
                          epic.epic.label, shape.goal.label, epic.sub_issues,
                          SUB_ISSUE_LIMIT),),
-                    f.now))
+                    f.now,
+                    line="Epic %s of goal home %s: %d sub-issues (GitHub's limit %d)" % (
+                        epic.epic.label, shape.goal.label, epic.sub_issues, SUB_ISSUE_LIMIT),
+                    where=_where(epic.epic)))
             elif epic.tickets > EPIC_TICKETS and not epic.standing:
                 out.append(Breach(
                     "epic-over-cap", epic.epic.key,
@@ -645,7 +721,10 @@ def epic_over_cap(f: Facts) -> List[Breach]:
                     ("Epic %s of goal home %s holds %d tickets; an epic holds at most %d, "
                      "and more work goes into a next epic" % (
                          epic.epic.label, shape.goal.label, epic.tickets, EPIC_TICKETS),),
-                    f.now))
+                    f.now,
+                    line="Epic %s of goal home %s: %d tickets (cap %d)" % (
+                        epic.epic.label, shape.goal.label, epic.tickets, EPIC_TICKETS),
+                    where=_where(epic.epic)))
     return out
 
 
@@ -664,7 +743,10 @@ def goal_epics_over_cap(f: Facts) -> List[Breach]:
                               ("Open epics: %s" % _refs(opened),
                                "Finish an epic before opening another, or record a one-time "
                                "exception on the goal home"),
-                              f.now))
+                              f.now,
+                              line="Goal home %s: %d open epics (cap %d): %s" % (
+                                  shape.goal.label, len(opened), shape.cap, _refs(opened)),
+                              where=_where(shape.goal)))
     return out
 
 
@@ -677,7 +759,10 @@ def closed_epic_open_tickets(f: Facts) -> List[Breach]:
                                                             len(epic.open_tickets)),
                    ("Open tickets under it: %s" % _refs(epic.open_tickets),
                     "Reopen the epic, or move the tickets under an open one"),
-                   f.now)
+                   f.now,
+                   line="Closed epic %s: %d open tickets: %s" % (
+                       epic.epic.label, len(epic.open_tickets), _refs(epic.open_tickets)),
+                   where=_where(epic.epic))
             for shape in f.shapes for epic in shape.epics
             if not epic.open and epic.open_tickets]
 
@@ -725,7 +810,11 @@ def plan_check_failed(f: Facts) -> List[Breach]:
                    % (c.pr.label, c.name, _minutes(f.now - c.at)),
                    tuple(["%s: %s at %s" % (c.name, c.conclusion, utc(c.at))]
                          + (["It says: %s" % public(c.title)] if c.title.strip() else [])),
-                   c.at)
+                   c.at,
+                   line="Lane %s: %s %s%s" % (
+                       c.pr.label, c.name, c.conclusion,
+                       "; it says: %s" % public(c.title) if c.title.strip() else ""),
+                   since=c.at, where=_where(c.pr))
             for c in f.checks
             if c.conclusion in PLAN_FAILED and f.now - c.at > PLAN_FAILED_AGE]
 
@@ -796,7 +885,11 @@ def lane_pr_stalled(f: Facts) -> List[Breach]:
                            "Stalled because %s" % why,
                            _ticket_line(p),
                            "Unstick it: %s" % fix),
-                          f.now))
+                          f.now,
+                          line="Lane %s: %s; %s" % (p.pr.label, short,
+                                                     _ticket_line(p)[0].lower()
+                                                     + _ticket_line(p)[1:]),
+                          since=p.at, where=_where(p.pr)))
     return out
 
 
@@ -1013,6 +1106,82 @@ def check(facts: Facts, say: Say,
     return out
 
 
+# -- one tracking issue per ROLLED kind and repo (loom#2099) ------------
+def _subject_repo(subject: str) -> str:
+    """The repo of a subject key "owner/name#N"; the whole subject otherwise."""
+    return subject.split("#", 1)[0]
+
+
+def roll_title_where(repo: str, where: str, filer_repo: str) -> str:
+    """How a tracking issue's title names the subject repo: the repo issues
+    are filed in or another public one by name, a private repo in words with
+    a short hash so two private repos keep two titles."""
+    if not where:
+        return filer_repo
+    if where == "a private repo":
+        return "a private repo (%s)" % hashlib.sha256(repo.encode()).hexdigest()[:6]
+    return where
+
+
+def _first_seen(seen: Dict[str, Any], key: str, now: float, keep: set) -> float:
+    """When the filer first saw a violation with no start of its own,
+    recorded now when it is new."""
+    first = seen.get(key)
+    since = first if isinstance(first, (int, float)) and not isinstance(first, bool) else now
+    seen[key] = since
+    keep.add(key)
+    return float(since)
+
+
+def roll_up(breaches: Iterable[Breach], filer_repo: str, now: float,
+            seen: Optional[Dict[str, Any]] = None,
+            read: Sequence[str] = ROLLED) -> List[Breach]:
+    """The breaches with each ROLLED kind's folded into one rolling Breach
+    per (kind, subject repo): a line per violation with when it started,
+    sorted, so the same violations give the same list. `seen` (changed in
+    place) keeps when the filer first saw each violation that carries no
+    start of its own; a violation gone this pass is dropped from it, unless
+    its kind's facts were not `read` this pass."""
+    seen = seen if seen is not None else {}
+    out: List[Breach] = []
+    groups: Dict[Tuple[str, str], List[Breach]] = {}
+    for b in breaches:
+        if b.invariant in ROLLED and not b.rolling:
+            groups.setdefault((b.invariant, _subject_repo(b.subject)), []).append(b)
+        else:
+            out.append(b)
+    keep = set()
+    for (kind, repo), members in sorted(groups.items()):
+        rows = []
+        for b in members:
+            since = b.since if b.since is not None else _first_seen(seen, b.key, now, keep)
+            rows.append((since, "%s (since %s)" % (b.line or b.title, utc(since))))
+        where = roll_title_where(repo, members[0].where, filer_repo)
+        out.append(Breach(kind, "%s in %s" % (kind, repo), ROLL_TITLE % (kind, where),
+                          tuple(line for _, line in sorted(rows)), now, rolling=True,
+                          where=where))
+    for key in list(seen):
+        if key not in keep and key.split("/", 1)[0] in read:
+            del seen[key]
+    return out
+
+
+# The Facts field each ROLLED kind reads: a pass that could not read it says
+# nothing about that kind, so its tracking issue is left as it is.
+ROLLED_FACTS = {"lane-pr-stalled": "lane_pulls", "plan-check-failed": "checks",
+                "epic-over-cap": "shapes", "goal-epics-over-cap": "shapes",
+                "closed-epic-open-tickets": "shapes"}
+
+
+def read_kinds(facts: Facts) -> Tuple[str, ...]:
+    """The ROLLED kinds whose facts this pass read."""
+    return tuple(kind for kind in ROLLED if getattr(facts, ROLLED_FACTS[kind]) is not None)
+
+
+def is_rolled(b: Breach) -> bool:
+    return b.rolling and b.invariant in ROLLED
+
+
 # -- filing --------------------------------------------------------------
 def _epoch(stamp: Any) -> Optional[float]:
     try:
@@ -1034,7 +1203,10 @@ class Filer:
                  say: Say, write: bool = True,
                  authors: Optional[Sequence[str]] = None,
                  subjects: Optional[Dict[str, Any]] = None,
-                 settled: Optional[Settled] = None) -> None:
+                 settled: Optional[Settled] = None,
+                 seen: Optional[Dict[str, Any]] = None,
+                 read: Optional[Sequence[str]] = None,
+                 unread: Optional[Dict[str, Sequence[str]]] = None) -> None:
         """gh files in repo under goal home #goal. state maps a breach key to
         its issue number and is changed in place (the caller keeps it);
         write False (the GitHub budget is low) files nothing this pass.
@@ -1042,7 +1214,11 @@ class Filer:
         comments it reads: a stranger's marker is data. `subjects` maps the
         key of each SETTLES breach to its subject (kept by the caller, never
         written to GitHub), and `settled` says whether a gone breach's
-        subject is settled for good."""
+        subject is settled for good. `seen` (kept by the caller) holds when
+        each ROLLED violation was first seen, for its tracking issue line;
+        `read` names the ROLLED kinds whose facts this pass read (None: all),
+        and a tracking issue of any other kind is left as it is, as is the
+        tracking issue of each (kind, repo) in `unread`."""
         self.gh = gh
         self.repo = repo
         self.goal = goal
@@ -1053,7 +1229,14 @@ class Filer:
         self.authors = list(brain.trusted_authors() if authors is None else authors)
         self.subjects = subjects if subjects is not None else {}
         self.settled = settled
+        self.seen = seen if seen is not None else {}
+        self.read = tuple(ROLLED if read is None else read)
+        # Tracking issue keys whose repo could not be read this pass.
+        self._unread_keys = {Breach(kind, "%s in %s" % (kind, repo), "", (), 0.0).key
+                             for kind, repos in (unread or {}).items() for repo in repos}
         self.writes = 0
+        # Breach key -> issue number of each tracking issue (ROLL_MARKER).
+        self._rolls: Dict[str, int] = {}
         self._listed: Optional[Dict[str, int]] = None
         # Issue numbers the listing found closed: clearing skips them unread.
         self._listed_closed: set = set()
@@ -1076,7 +1259,7 @@ class Filer:
                 if not m:
                     continue
                 number = int(issue["number"])
-                ticket = self._note_listed(issue, number)
+                ticket = self._note_listed(issue, m.group(1), number)
                 held = self._listed.get(m.group(1))
                 # The first issue of a key wins, but a plain invariant issue
                 # replaces a ticket: the ticket is not where a breach lives.
@@ -1084,9 +1267,11 @@ class Filer:
                     self._listed[m.group(1)] = number
         return self._listed
 
-    def _note_listed(self, issue: Dict[str, Any], number: int) -> bool:
-        """Record what the listing shows of one issue: a ticket, a closed
-        one. True when it carries loom:ticket."""
+    def _note_listed(self, issue: Dict[str, Any], key: str, number: int) -> bool:
+        """Record what the listing shows of one issue: a tracking issue, a
+        ticket, a closed one. True when it carries loom:ticket."""
+        if ROLL_MARKER in str(issue.get("body") or ""):
+            self._rolls.setdefault(key, number)
         ticket = TICKET_LABEL in self._label_names(issue)
         if ticket:
             self._ticketed.add(number)
@@ -1123,7 +1308,28 @@ class Filer:
                 self._repairs = self.goal
         return self._repairs
 
+    def _roll_body(self, key: str, invariant: str, where: str, lines: Sequence[str],
+                   at: float) -> str:
+        """A tracking issue's body: every current violation of one ROLLED
+        kind in one repo, a line each, or "none"."""
+        listed = (["Current violations (%d):" % len(lines)] + ["- " + _checked(line)
+                                                              for line in lines]
+                  if lines else [ROLL_NONE, CLEAR_SINCE % utc(at)])
+        return "\n".join(
+            [MARKER % key, ROLL_MARKER,
+             "One tracking issue for the `%s` invariant in %s: the station rewrites the list "
+             "below in place when it changes and files no issue per violation." % (
+                 invariant, where), ""] + listed +
+            ["", ROLL_CHECKED % utc(at), "", ROLL_HINTS.get(invariant, ""),
+             "", "Invariant: `%s` (bus/invariants.py). The pull requests, epics and "
+                 "`python3 -m bus.brain status` already show these subjects. This issue "
+                 "closes once the list has been empty for %s and reopens when a violation "
+                 "returns." % (invariant, _hours(CLEAR_AFTER)),
+             "", "Part of #%d" % self._home()])
+
     def _body(self, b: Breach, log: Sequence[str] = ()) -> str:
+        if is_rolled(b):
+            return self._roll_body(b.key, b.invariant, b.where, b.evidence, b.at)
         rolling = (["", "One rolling issue for this cause: the station rewrites this list "
                         "in place while it changes.", LAST_SEEN % utc(b.at)]
                    if b.rolling else [])
@@ -1171,7 +1377,8 @@ class Filer:
 
         def steady(text: Any) -> str:
             return "\n".join(line for line in str(text or "").replace("\r\n", "\n").split("\n")
-                             if not line.startswith(LAST_SEEN.split("%")[0]))
+                             if not line.startswith(LAST_SEEN.split("%")[0])
+                             and not line.startswith(ROLL_CHECKED.split("%")[0]))
         if issue.get("title") == title and steady(issue.get("body")) == steady(body):
             return
         _text.check(title + "\n" + body)
@@ -1191,7 +1398,8 @@ class Filer:
                                 "it that is closed; Refs #%d.\n\nPart of #" % (ticket, ticket))
         _text.check(title + "\n" + body)
         made = self.gh.rest("POST", "/repos/%s/issues" % self.repo,
-                            {"title": title, "body": body, "labels": LABELS}).data
+                            {"title": title, "body": body,
+                             "labels": ROLL_LABELS if is_rolled(b) else LABELS}).data
         self.writes += 1
         number = int(made["number"])
         self.state[b.key] = number
@@ -1271,9 +1479,19 @@ class Filer:
         noted = [t for t in (self._broken_note(c) for c in comments) if t is not None]
         if not noted:
             return False
-        cleared = [t for t in (_epoch(c.get("created_at")) for c in comments
+        cleared = [t for t in (self._cleared_at(c) for c in comments
                                if CLEARED_TEXT in str(c.get("body", ""))) if t is not None]
         return not cleared or max(noted) >= max(cleared)
+
+    @staticmethod
+    def _cleared_at(comment: Dict[str, Any]) -> Optional[float]:
+        """When a cleared note last said the invariant cleared: the time in
+        its text (a tracking issue's one note is edited on each clear), else
+        its creation."""
+        m = CLEARED_AT_RE.search(str(comment.get("body", "")))
+        at = _epoch(m.group(1)) if m else None
+        times = [t for t in (at, _epoch(comment.get("created_at"))) if t is not None]
+        return max(times) if times else None
 
     def _held(self, number: int, body: Dict[str, Any], issue: Any, why: str) -> bool:
         """True, after recording it, when shadow mode holds this close or
@@ -1335,6 +1553,63 @@ class Filer:
             if b.rolling and b.invariant == invariant and b.key != key and number is not None:
                 return number
         return None
+
+    def _roll_live(self, key: str, current: Dict[str, Breach]) -> bool:
+        """True when an older per-violation issue of a ROLLED kind must stay
+        as it is: its kind is broken this pass, so its key going quiet says
+        nothing (the breach is a line of a tracking issue now) and closing it
+        as cleared could say something false. Folding these is left to a
+        later change."""
+        invariant = key.split("/", 1)[0]
+        return invariant in ROLLED and any(
+            is_rolled(b) and b.invariant == invariant for b in current.values())
+
+    def _roll_clear(self, key: str, number: int, issue: Dict[str, Any]) -> bool:
+        """A tracking issue whose kind has no violation in its repo this
+        pass: the first such pass rewrites its list to "none" with the time
+        it went clear; once it has said none for CLEAR_AFTER it closes, with
+        its one cleared note written or edited in place. False when the pass
+        has no writes left for it."""
+        invariant = key.split("/", 1)[0]
+        body = str(issue.get("body") or "")
+        m = ROLL_TITLE_RE.match(str(issue.get("title") or ""))
+        where = m.group(1) if m else self.repo
+        if ROLL_NONE not in body:
+            if self.writes >= WRITES_MAX:
+                return False
+            text = self._roll_body(key, invariant, where, (), self.now)
+            _text.check(text)
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number), {"body": text})
+            self.writes += 1
+            self.say("invariants: %s#%d lists no violation now" % (self.repo, number))
+            return True
+        m = CLEAR_SINCE_RE.search(body)
+        since = _epoch(m.group(1)) if m else None
+        if since is not None and self.now - since < CLEAR_AFTER:
+            return True
+        if self.writes + 2 > WRITES_MAX:
+            return False
+        if self._held(number, {"state": "closed", "state_reason": "not_planned"}, issue,
+                      "cleared: no %s violation for %s" % (invariant, _hours(CLEAR_AFTER))):
+            return True
+        note = "\n".join([ROLL_CLEARED_MARKER, (
+            "%s%s: no `%s` violation in %s for %s. The station reopens this issue when one "
+            "returns, and edits this note on each later clear." % (
+                CLEARED_TEXT, utc(self.now), invariant, where, _hours(CLEAR_AFTER)))])
+        _text.check(note)
+        mine = [c for c in self._comments(number) if ROLL_CLEARED_MARKER in str(c.get("body", ""))]
+        if mine and mine[-1].get("id") is not None:
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%s" % (self.repo, mine[-1]["id"]),
+                         {"body": note})
+        else:
+            notify.post(self.gh, self.repo, number, note, notify.CLOSED)
+        self.writes += 1
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                     {"state": "closed", "state_reason": "not_planned"})
+        self.writes += 1
+        self._listed_closed.add(number)
+        self.say("invariants: closed cleared tracking issue %s#%d" % (self.repo, number))
+        return True
 
     def _fold(self, number: int, into: int, comments: List[Dict[str, Any]],
               issue: Any = None) -> None:
@@ -1424,15 +1699,20 @@ class Filer:
                 return
 
     def _clear_one(self, key: str, number: int, current: Dict[str, Breach]) -> bool:
-        """Settle one open issue whose breach is gone this pass: an older
-        issue folds into its rolling one, a standing one says clear, any other
-        closes once quiet. False when the pass has no writes left."""
+        """Settle one open issue whose breach is gone this pass: a tracking
+        issue lists none or closes, an older issue folds into its rolling
+        one, a standing one says clear, any other closes once quiet. False
+        when the pass has no writes left."""
         issue = self._issue(number)
         if issue is None or issue.get("state") != "open":
             return True
         labels = [str(x.get("name", "")) for x in issue.get("labels", [])
                   if isinstance(x, dict)]
+        if self._rolls.get(key) == number and TICKET_LABEL not in labels:
+            return self._clear_roll(key, number, issue)
         if "loom:triage" not in labels and "loom:rewritten" not in labels:
+            return True
+        if self._roll_live(key, current):
             return True
         comments = self._comments(number)
         into = self._rolled_into(key, current)
@@ -1444,6 +1724,13 @@ class Filer:
             self._mark_clear(key, number, issue)
             return True
         return self._close_quiet(number, issue, labels, comments)
+
+    def _clear_roll(self, key: str, number: int, issue: Dict[str, Any]) -> bool:
+        """A tracking issue with no violation this pass; left as it is when
+        its facts were not read (an empty list would be a guess)."""
+        if key.split("/", 1)[0] not in self.read or key in self._unread_keys:
+            return True
+        return self._roll_clear(key, number, issue)
 
     def _fold_old(self, number: int, into: int, issue: Dict[str, Any], labels: List[str],
                   comments: List[Dict[str, Any]]) -> bool:
@@ -1537,7 +1824,8 @@ class Filer:
         if issue.get("state") == "open":
             if b.rolling:
                 self._rolling_open[b.key] = number
-                self._refresh(b, number, issue)
+                if b.key not in self._unread_keys:
+                    self._refresh(b, number, issue)
             return
         self._one_closed(b, number, issue)
 
@@ -1583,9 +1871,10 @@ class Filer:
                     self._refresh(b, number, issue)
 
     def run(self, breaches: Iterable[Breach]) -> None:
-        current = {b.key: b for b in breaches}
+        current = {b.key: b for b in roll_up(breaches, self.repo, self.now, self.seen,
+                                             self.read)}
         for b in current.values():
-            if b.invariant in SETTLES:
+            if b.invariant in SETTLES and not b.rolling:
                 self.subjects[b.key] = b.subject
         for b in current.values():
             if not self.write or self.writes >= WRITES_MAX:
