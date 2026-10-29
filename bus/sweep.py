@@ -445,11 +445,12 @@ def _evidence(issue: Dict[str, Any], merged: Dict[int, str], titles: Dict[str, L
 def candidates(gh: Any, repos: Sequence[str] = SWEEP_REPOS, limit: int = MAX_CANDIDATES,
                now: Optional[datetime] = None) -> List[Dict[str, Any]]:
     """The oldest `limit` open issues the sweep may touch that already carry
-    evidence: kind "merged" (a merged pull request closes it; evidence is its
-    merge sha), "duplicate" (another open issue has the same title; evidence
-    is the older issue's number; a hint to read, never proof) or "quiet" (no update for QUIET_DAYS days). Held issues
-    are left out by skip_reason. Each entry: repo, number, title, kind,
-    evidence."""
+    evidence: kind "merged" (a pull request merged into the default branch
+    closes it by keyword; evidence is its merge sha), "duplicate-hint" (an
+    older open issue by a trusted or the same author has the same title;
+    evidence is its number) or "quiet" (no update for QUIET_DAYS days).
+    The first two are hints to read, never proof. Held issues are left out
+    by skip_reason. Each entry: repo, number, title, kind, evidence."""
     now = now or datetime.now(timezone.utc)
     trusted = _trusted_logins()
     out: List[Dict[str, Any]] = []
