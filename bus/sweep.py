@@ -426,6 +426,22 @@ def _older_twins(issue: Dict[str, Any], same_title: Sequence[Dict[str, Any]],
             and (_login(o) == me or _login(o) in trusted)]
 
 
+def _evidence(issue: Dict[str, Any], merged: Dict[int, str], titles: Dict[str, List[Dict[str, Any]]],
+              trusted: Sequence[str], now: datetime) -> Optional[Tuple[str, str]]:
+    """(kind, evidence) for the first signal an issue carries, else None."""
+    number = int(issue["number"])
+    key = _title_key(issue.get("title"))
+    twins = _older_twins(issue, titles[key], trusted) if key else []
+    seen = _stamp(issue.get("updated_at"))
+    if number in merged:
+        return "merged", "merged " + merged[number]
+    if twins:
+        return "duplicate-hint", "same title as older open #%d; read both before closing" % min(twins)
+    if seen is not None and (now - seen).days >= QUIET_DAYS:
+        return "quiet", "no update since %s" % str(issue["updated_at"])[:10]
+    return None
+
+
 def candidates(gh: Any, repos: Sequence[str] = SWEEP_REPOS, limit: int = MAX_CANDIDATES,
                now: Optional[datetime] = None) -> List[Dict[str, Any]]:
     """The oldest `limit` open issues the sweep may touch that already carry
@@ -449,22 +465,13 @@ def candidates(gh: Any, repos: Sequence[str] = SWEEP_REPOS, limit: int = MAX_CAN
         for i in issues:
             titles.setdefault(_title_key(i.get("title")), []).append(i)
         for i in issues:
-            number = int(i["number"])
             if skip_reason(i, open_prs):
                 continue
-            twins = _older_twins(i, titles[_title_key(i.get("title"))], trusted)
-            seen = _stamp(i.get("updated_at"))
-            if number in merged:
-                kind, evidence = "merged", "merged " + merged[number]
-            elif twins and _title_key(i.get("title")):
-                kind = "duplicate-hint"
-                evidence = "same title as older open #%d; read both before closing" % min(twins)
-            elif seen is not None and (now - seen).days >= QUIET_DAYS:
-                kind, evidence = "quiet", "no update since %s" % i["updated_at"][:10]
-            else:
-                continue
-            out.append({"repo": repo, "number": number, "title": " ".join(str(i.get("title")).split()),
-                        "kind": kind, "evidence": evidence, "created": str(i.get("created_at") or "")})
+            why = _evidence(i, merged, titles, trusted, now)
+            if why is not None:
+                out.append({"repo": repo, "number": int(i["number"]),
+                            "title": " ".join(str(i.get("title")).split()), "kind": why[0],
+                            "evidence": why[1], "created": str(i.get("created_at") or "")})
     out.sort(key=lambda c: (c["created"], c["repo"], c["number"]))
     for c in out:
         del c["created"]
