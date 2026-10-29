@@ -32,6 +32,12 @@ Before the station hands a ticket to a lane (`check`), it reads:
   brain's work: the ticket goes back to the queue with `needs-brain`, and
   the factory gives it no lane until the cause is named
   (`health_hold`).
+- criteria: a build ticket whose body names no acceptance criteria gets
+  no lane (`criteria_verdict`): its brief could restate no criterion as
+  the check that proves it, and the runner would park the brief as a work
+  failure. Writing criteria is the brain's rewrite work, so the ticket
+  goes back the same way a health ticket does. An answer ticket opens no
+  pull request and is exempt, as at the runner.
 
 A read that fails holds the ticket for the next pass: a gate that cannot
 read never lets the ticket through.
@@ -52,6 +58,7 @@ from .github import GitHubError
 
 STALE = "stale"
 HEALTH = "health"
+CRITERIA = "criteria"
 
 ASK_MARKER = "<!-- loom:stale-brief %s -->"
 ASK_MARKER_RE = re.compile(r"<!-- loom:stale-brief (\S+) -->")
@@ -102,8 +109,8 @@ SHOWN = 160
 
 
 class Verdict(NamedTuple):
-    """Why a ticket gets no lane: kind (STALE or HEALTH), a key naming the
-    evidence, and the reason in words."""
+    """Why a ticket gets no lane: kind (STALE, HEALTH or CRITERIA), a key
+    naming the evidence, and the reason in words."""
     kind: str
     key: str
     reason: str
@@ -182,6 +189,37 @@ def health_hold(issue: Mapping[str, Any]) -> bool:
     """Whether the factory gives the queued ticket no lane: a health ticket
     whose cause is missing or names only the measurement. Reads nothing."""
     return health_verdict(str(issue.get("body") or "")) is not None
+
+
+# -- criteria -------------------------------------------------------------------
+def _criteria_named(body: str) -> bool:
+    """Whether the body names at least one acceptance criterion, read the
+    way bus/tickets.py restates them as proof checks: the two readings
+    agree, so a dispatchable ticket's brief always carries the section."""
+    return bool(tickets.proof_checks(body))
+
+
+def criteria_verdict(body: str) -> Optional[Verdict]:
+    """Why a build ticket with no acceptance criteria gets no lane, or
+    None: a brief is not dispatchable until each criterion is restated as
+    the check that proves it (bus/tickets.py's proof checks, loom#2162),
+    and a body with no criteria can carry none. The runner already parks
+    such a brief as a work failure; held here, the ticket costs no claim
+    and no lane run. An answer ticket opens no pull request and needs no
+    criteria, as at the runner. Reads nothing."""
+    body = body or ""
+    try:
+        headers, _ = tickets.parse(body)
+    except ValueError:
+        headers = {}
+    if headers.get("Deliverable"):
+        return None
+    if _criteria_named(body):
+        return None
+    stamp = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
+    return Verdict(CRITERIA, "criteria-" + stamp,
+                   "its body names no acceptance criteria, so no criterion can be "
+                   "restated as the check that proves it")
 
 
 # A brief that says another issue does its work (loom#2033): "Superseded by
@@ -437,6 +475,9 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
     health = health_verdict(body)
     if health is not None:
         return health
+    criteria = criteria_verdict(body)
+    if criteria is not None:
+        return criteria
     done = asked(comments, trusted)
     operator = tickets.operator_login(trusted) or ""
     # An answer an operator gave on the dashboard (bus/answer.py) reads as

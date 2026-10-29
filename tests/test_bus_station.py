@@ -40,7 +40,8 @@ REPORT_OVERDUE_AGE = 24 * 3600
 AUTHORS = ["alice-example", "bob-example"]
 OWNERS = ["example-owner"]
 CLOSED_PULLS = "/repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=100"
-BODY = "Difficulty: hard\nModel: model-x\n\n## Why\nBecause.\n\n## What\nDo it.\n"
+BODY = ("Difficulty: hard\nModel: model-x\n\n## Why\nBecause.\n\n## What\nDo it.\n\n"
+        "## Acceptance criteria\n- [ ] A test shows the thing is fixed.\n")
 
 
 def reply(status=200, body=None, headers=None):
@@ -3589,6 +3590,82 @@ class HandBackTest(unittest.TestCase):
 
 
 
+class WeakenedFake(ReviewFake):
+    """ReviewFake that also serves the pull request's file entries."""
+
+    def __init__(self, files):
+        super().__init__()
+        self.files = files
+
+    def _get(self, path):
+        if path == "/repos/%s/pulls/7/files?per_page=100" % REPO:
+            return mock.Mock(data=self.files)
+        if path == "/repos/%s/pulls/7/files?per_page=100&page=2" % REPO:
+            return mock.Mock(data=getattr(self, "files_page2", []))
+        return super()._get(path)
+
+
+class WeakenedHandBackTest(unittest.TestCase):
+    """A lane pull request whose diff weakens its own tests is bounced to
+    its lane before the review round (loom#2162): the station names the
+    weakened lines in a fix round and never marks the head ready, though
+    every check passed and no review thread is open."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+
+    def run_with_files(self, files):
+        self.gh = WeakenedFake(files)
+        self.station = station.Station(
+            self.gh, station.Settings(self.temp.name, [REPO], AUTHORS, OWNERS))
+        with mock.patch("bus.brain._failing_checks", return_value=[]), \
+                mock.patch("bus.brain._open_threads", return_value=[]):
+            self.station.hand_back()
+
+    def ready_events(self):
+        return [text for c in self.gh.comments if status.is_status(c["body"])
+                for _, text in status.parse(c["body"]) if text.startswith("Ready:")]
+
+    def test_a_weakened_diff_is_bounced_naming_the_lines(self):
+        patch = ("@@ -10,4 +10,3 @@ def test_total(self):\n"
+                 "         kept = 1\n"
+                 "-        self.assertEqual(total([1, 2]), 3)\n"
+                 "         self.assertTrue(done)\n")
+        self.run_with_files([{"filename": "tests/test_cart.py", "patch": patch}])
+        self.assertEqual([], self.ready_events())
+        bodies = [c["body"] for c in self.gh.comments]
+        self.assertTrue(any("tests/test_cart.py:11" in b and "assertion deleted" in b
+                            for b in bodies), bodies)
+        self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_a_clean_diff_still_becomes_ready(self):
+        patch = ("@@ -2,2 +2,3 @@\n"
+                 "+        self.assertEqual(total([1, 2]), 3)\n"
+                 "         pass\n")
+        self.run_with_files([{"filename": "tests/test_cart.py", "patch": patch}])
+        self.assertEqual([READY % ("a" * 40)], self.ready_events())
+
+    def test_a_weakening_on_the_second_page_of_files_is_bounced(self):
+        # A pull request with more files than one page holds: the scan
+        # reads on while a page comes back full, so a weakened test file
+        # listed on page two is still caught.
+        clean = [{"filename": "src/module_%03d.py" % i,
+                  "patch": "@@ -1,1 +1,1 @@\n-x = 1\n+x = 2\n"} for i in range(100)]
+        patch = ("@@ -10,4 +10,3 @@ def test_total(self):\n"
+                 "         kept = 1\n"
+                 "-        self.assertEqual(total([1, 2]), 3)\n"
+                 "         self.assertTrue(done)\n")
+        self.gh = WeakenedFake(clean)
+        self.gh.files_page2 = [{"filename": "tests/test_cart.py", "patch": patch}]
+        self.station = station.Station(
+            self.gh, station.Settings(self.temp.name, [REPO], AUTHORS, OWNERS))
+        with mock.patch("bus.brain._failing_checks", return_value=[]), \
+                mock.patch("bus.brain._open_threads", return_value=[]):
+            self.station.hand_back()
+        self.assertEqual([], self.ready_events())
+
+
 class StuckFixRoundTest(unittest.TestCase):
     """A fix round that leaves the same failures is stuck: the next round
     climbs the model ladder, or the rounds stop with no rung left
@@ -4623,6 +4700,20 @@ class ClaimTest(Base):
         self.assertTrue(status.is_status(self.fake.comments[12][0]["body"]))
         self.assertEqual([c["body"] for c in status.expand(self.fake.comments[12], AUTHORS)],
                          ["Claimed for lane codex (body sha256 %s)" % sha])
+
+    def test_a_ticket_with_no_acceptance_criteria_is_held_for_the_brain(self):
+        # loom#2162: a brief is not dispatchable until each criterion is
+        # restated as the check that proves it; a body with none is held
+        # for the brain's rewrite instead of being claimed, briefed and
+        # parked by the runner as a work failure.
+        self.fake.add(12, body="Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n")
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("needs-brain", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
+        said = [text for c in self.fake.comments[12] if status.is_status(c["body"])
+                for _, text in status.parse(c["body"])]
+        self.assertTrue(any("names no acceptance criteria" in text for text in said), said)
 
     def test_a_ticket_pinned_to_a_model_limited_on_its_lane_is_not_claimed(self):
         # The lane is up (its ladder has another model), but not for this
@@ -6163,7 +6254,8 @@ class DeadLaneRunawayTest(Base):
     invariant. The station releases the hold and briefs the ticket to a free
     lane of its tier, naming the lane fault; this is not a failure, so the
     ladder does not move."""
-    MEDIUM = "Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n"
+    MEDIUM = ("Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n\n"
+              "## Acceptance criteria\n- [ ] A test shows the thing is fixed.\n")
 
     def bodies(self, number=12):
         return [c["body"] for c in status.expand(self.fake.comments[number], AUTHORS)]
@@ -12825,7 +12917,8 @@ class RunnerSlotClaimTest(Base):
     labeled for one is sent back to the queue, never briefed there
     (loom#1917)."""
 
-    MEDIUM = "Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n"
+    MEDIUM = ("Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n\n"
+              "## Acceptance criteria\n- [ ] A test shows the thing is fixed.\n")
 
     def claim(self):
         with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
