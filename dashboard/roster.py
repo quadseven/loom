@@ -34,16 +34,16 @@ from . import brain_view
 # it is shown without a lateness verdict.
 BRAIN_CADENCE = {"muse": 30 * 60, "lane-machine": 60 * 60}
 WORKHORSE_CADENCE = 2 * 3600
-ROLES = {"muse": "primary brain", "lane-machine": "backup brain"}
-OPERATOR_HOLDERS = {"operator-session", "operator", "mastermind"}
+ROLES = {"muse": "primary brain", "lane-machine": "backup brain",
+         "operator-session": "operator session"}
 LATE_FACTOR = 1.5
 DOWN_FACTOR = 2.5
 RECENT_TICKS = 8
 
 TICK_RE = brain_view.TICK_RE
 MOVED_RE = re.compile(r"^- Moved: (.+)$", re.M)
-COUNT_RE = re.compile(r"\b(merged|briefed|closed|verified|deferred|escalated|swept) (\d+)")
-COUNT_ORDER = ("merged", "briefed", "closed", "verified", "deferred", "escalated", "swept")
+COUNT_RE = re.compile(r"\b(merged|briefed|closed|verified|deferred|escalated) (\d+)")
+COUNT_ORDER = ("merged", "briefed", "closed", "verified", "deferred", "escalated")
 UPDATED_RE = re.compile(r"^Updated: (\d{4}-\d\d-\d\d) (\d\d):(\d\d)Z", re.M)
 COUNTED_RE = re.compile(r"counted (\d+)(?: \(closed (\d+), merged (\d+), rewritten (\d+)\))?")
 PACE_RE = re.compile(r"pace (\d+) per hour")
@@ -152,18 +152,28 @@ def _workhorse_actor(workhorse, now):
         moment = _parse_time("%s %s:%s" % (updated.group(1), updated.group(2), updated.group(3)))
     moment = moment or _parse_time((workhorse or {}).get("updated_at"))
     if moment is None:
-        return None
-    counts = {}
-    counted = pace = None
-    for match in COUNTED_RE.finditer(body):
+        # The journal is configured but nothing in it could be read: the
+        # row still stands, with no tick and no lateness verdict.
+        return {"name": "workhorse", "role": "workhorse", "cadence": WORKHORSE_CADENCE,
+                "last_at": None, "age_seconds": None, "status": "untracked", "ticks": []}
+    counts, counted, pace = {}, None, None
+    for text in body.splitlines():
+        match = COUNTED_RE.search(text)
+        if not match:
+            continue
+        # The latest counted line wins, read as a unit: its counts and its
+        # pace come from that line alone, never mixed across lines.
         counted = int(match.group(1))
         counts = {name: int(value) for name, value in
                   zip(("closed", "merged", "rewritten"), match.groups()[1:]) if value is not None}
-    for match in PACE_RE.finditer(body):
-        pace = int(match.group(1))
-    tick = {"moment": moment, "counts": counts,
-            "line": "counted %d, pace %d per hour" % (counted, pace) if counted is not None
-                    else "journal updated"}
+        found = PACE_RE.search(text)
+        pace = int(found.group(1)) if found else None
+    line = "journal updated"
+    if counted is not None:
+        line = "counted %d" % counted
+        if pace is not None:
+            line += ", pace %d per hour" % pace
+    tick = {"moment": moment, "counts": counts, "line": line}
     if counted is not None:
         tick["counted"], tick["pace"] = counted, pace
     return _actor("workhorse", "workhorse", WORKHORSE_CADENCE, [tick], now)
@@ -174,13 +184,10 @@ def build_roster(journals, workhorse, now) -> Dict[str, Any]:
     actors = []
     for holder, ticks in _brain_ticks(journals).items():
         key = holder.lower()
-        name = "operator session" if key in OPERATOR_HOLDERS else holder
-        role = "operator session" if key in OPERATOR_HOLDERS else ROLES.get(key, "brain")
-        actors.append(_actor(name, role, BRAIN_CADENCE.get(key), ticks, now))
+        actors.append(_actor(holder, ROLES.get(key, "brain"),
+                             BRAIN_CADENCE.get(key), ticks, now))
     if workhorse:
-        actor = _workhorse_actor(workhorse, now)
-        if actor:
-            actors.append(actor)
+        actors.append(_workhorse_actor(workhorse, now))
     actors.sort(key=lambda a: (STATUS_RANK[a["status"]], 1 if a["role"] == "workhorse" else 0,
                                a["name"]))
     reason = "" if actors else (
@@ -232,15 +239,24 @@ def _render_actor(actor) -> str:
             esc(tick["at"][11:16]), esc(tick["line"]),
             '<p class="machine-fact">%s</p>' % esc(_counts_text(tick)) if _counts_text(tick) else "")
         for tick in actor["ticks"])
+    if actor["last_at"]:
+        last = "%s %sZ (%s)" % (actor["last_at"][:10], actor["last_at"][11:16],
+                                _age_text(actor["age_seconds"]))
+    else:
+        last = _age_text(actor["age_seconds"])
+    if actor["ticks"]:
+        listing = '<ol class="recent-ticks">%s</ol>' % ticks
+    else:
+        listing = '<p class="empty-state">No tick could be read from its journal.</p>'
     return ('<article class="card%s"><h2>%s</h2>'
             '<p class="machine-fact"><span class="actor-status outcome-%s">%s</span> %s / %s</p>'
             '<p>last tick %s</p>'
-            '<ol class="recent-ticks">%s</ol></article>') % (
+            '%s</article>') % (
         " actor-down" if status == "down" else "", esc(actor["name"]),
         {"ok": "ok", "late": "degraded", "down": "failed"}.get(status, "none"),
         esc(status.upper() if status != "untracked" else "NO SET CADENCE"),
         esc(actor["role"]), esc(_cadence_text(actor)),
-        esc(_age_text(actor["age_seconds"])), ticks)
+        esc(last), listing)
 
 
 def render_roster(data) -> str:

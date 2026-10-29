@@ -856,9 +856,9 @@ class TicketStore:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), number)).data
         except (GitHubError, OSError, ValueError) as exc:
             errors.append("%s workhorse journal: %s" % (repo, self._error_reason(exc)))
-            return None
+            return {"ref": "%s#%d" % (repo, number), "body": "", "updated_at": None}
         if not isinstance(issue, dict):
-            return None
+            return {"ref": "%s#%d" % (repo, number), "body": "", "updated_at": None}
         return {"ref": "%s#%d" % (repo, number), "body": str(issue.get("body") or ""),
                 "updated_at": issue.get("updated_at")}
 

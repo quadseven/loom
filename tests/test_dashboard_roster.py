@@ -81,7 +81,7 @@ class BrainRosterTest(unittest.TestCase):
         data = roster.build_roster([MUSE_DAY, LANE_MACHINE_DAY, OPERATOR_DAY,
                                     THIRD_BRAIN_DAY], None, NOW)
         actors = by_name(data)
-        self.assertEqual(set(actors), {"muse", "lane-machine", "operator session", "brain-c"})
+        self.assertEqual(set(actors), {"muse", "lane-machine", "operator-session", "brain-c"})
         self.assertEqual(actors["muse"]["role"], "primary brain")
         self.assertEqual(actors["lane-machine"]["role"], "backup brain")
         self.assertEqual(actors["brain-c"]["role"], "brain")
@@ -108,7 +108,7 @@ class BrainRosterTest(unittest.TestCase):
 
     def test_a_holder_without_a_cadence_gets_no_lateness_verdict(self):
         data = roster.build_roster([OPERATOR_DAY], None, NOW)
-        actor = by_name(data)["operator session"]
+        actor = by_name(data)["operator-session"]
         self.assertEqual(actor["status"], "untracked")
         self.assertIsNone(actor["cadence"])
 
@@ -150,6 +150,21 @@ class WorkhorseRosterTest(unittest.TestCase):
         data = roster.build_roster([MUSE_DAY], None, NOW)
         self.assertNotIn("workhorse", by_name(data))
 
+    def test_a_counted_line_without_a_pace_still_renders(self):
+        body = WORKHORSE_BODY.replace(", pace 13 per hour", "")
+        data = roster.build_roster([], dict(WORKHORSE, body=body), NOW)
+        tick = by_name(data)["workhorse"]["ticks"][0]
+        self.assertEqual(tick["counted"], 81)
+        self.assertIsNone(tick["pace"])
+        self.assertIn("counted 81", roster.render_roster(data))
+
+    def test_a_configured_but_unreadable_workhorse_still_gets_a_row(self):
+        broken = {"ref": "example-owner/overseer#99", "body": "", "updated_at": None}
+        data = roster.build_roster([], broken, NOW)
+        actor = by_name(data)["workhorse"]
+        self.assertEqual(actor["status"], "untracked")
+        self.assertIsNone(actor["last_at"])
+
 
 class EmptyRosterTest(unittest.TestCase):
     def test_no_journals_and_no_workhorse_is_an_empty_roster_with_a_reason(self):
@@ -172,6 +187,10 @@ class RenderRosterTest(unittest.TestCase):
     def test_ages_come_from_the_journal_timestamps(self):
         html = roster.render_roster(roster.build_roster([LANE_MACHINE_DAY], None, NOW))
         self.assertIn("1 day ago", html)
+
+    def test_the_last_tick_date_is_shown_not_just_its_age(self):
+        html = roster.render_roster(roster.build_roster([LANE_MACHINE_DAY], None, NOW))
+        self.assertIn("2030-01-07 07:17Z", html)
 
 
 class WorkhorseReadTest(unittest.TestCase):
