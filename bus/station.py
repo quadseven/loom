@@ -3669,8 +3669,7 @@ class Station:
             note = next((c for c in comments if isinstance(c, dict)
                          and VERIFY_NOTE_MARKER in str(c.get("body") or "")), None)
             if note is None:
-                self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                             {"body": text})
+                notify.post(self.gh, repo, number, text, notify.RECORD)
                 _say("noted %s: shipped over 24h with no verify attempt" % key)
             elif isinstance(note.get("id"), int):
                 self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, note["id"]),
