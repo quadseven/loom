@@ -4598,7 +4598,8 @@ class Station:
             if tickets.merged_before_regression_requeue(ticket, pr.get("merged_at"), events):
                 return
         left: List[str] = []
-        if target == "loom:merged":
+        merged = target == "loom:merged"
+        if merged:
             left = self._unbuilt_criteria(ticket, [pr, *landed])
             if left:
                 events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
@@ -4612,7 +4613,11 @@ class Station:
                        "merged", "shipped", "verified", "closed-unmerged")
         states = {"loom:" + state for state in state_names}
         kept = self._drop_claim(name for name in labels if name not in states)
-        cleared = target == "loom:merged" and RUNAWAY in kept
+        # A merged pull request lands the lane's run, so a runaway hold the run
+        # caused is cleared even when the ticket is requeued to build criteria
+        # the pull request left unbuilt; otherwise a runaway ticket can never
+        # be claimed again (bus/station.py, test_a_runaway_ticket_is_not_claimed).
+        cleared = merged and RUNAWAY in kept
         if cleared:
             kept = [name for name in kept if name != RUNAWAY]
         kept.append(target)
