@@ -251,7 +251,7 @@ def _int_or(value: Any, default: int = 0) -> int:
 # fills. A pass below the budget floor reads none of them and carries every
 # source an earlier pass read; source_read_at says when each was read.
 VIEW_SOURCES = {
-    "improving": ("improving", "floor_context"),
+    "improving": ("improving", "floor_context", "workhorse"),
     "lanes": ("lanes",),
     "pull_requests": ("pull_requests", "footer_models", "footer_runs"),
     "brain_step": ("brain_step", "brain_step_error"),
@@ -555,6 +555,7 @@ class TicketStore:
         data["footer_runs"] = views.footer_runs(prs)
         data["dashboard_errors"] = errors
         data["brain_step"], data["brain_step_error"] = self._read_brain_step(status_home)
+        data["workhorse"] = self._read_workhorse(errors)
         self._read_hot_spot_comments(data)
         self._read_goal_context(data, homes, reports, metric_comments)
         now = int(time.time())
@@ -840,6 +841,26 @@ class TicketStore:
                 "is_goal": "loom:goal" in names, "is_epic": is_epic,
                 "epic_goal": goals.epic_goal_of(repo, issue, configured) if is_epic else None,
                 "open": issue.get("state", "open") != "closed", "read_at": now}
+
+    def _read_workhorse(self, errors):
+        """The workhorse journal (LOOM_WORKHORSE_JOURNAL, owner/repo#N): one
+        issue whose body the workhorse overwrites in place instead of
+        commenting, read the way a goal home is read. Unset, the dashboard
+        has no workhorse source and the roster shows brains only."""
+        raw = os.environ.get("LOOM_WORKHORSE_JOURNAL", "").strip()
+        match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)", raw)
+        if not match:
+            return None
+        repo, number = match.group(1), int(match.group(2))
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), number)).data
+        except (GitHubError, OSError, ValueError) as exc:
+            errors.append("%s workhorse journal: %s" % (repo, self._error_reason(exc)))
+            return None
+        if not isinstance(issue, dict):
+            return None
+        return {"ref": "%s#%d" % (repo, number), "body": str(issue.get("body") or ""),
+                "updated_at": issue.get("updated_at")}
 
     def _read_brain_step(self, status_home):
         """The brain's tick record from the lock branch (bus.brain step --show)."""
