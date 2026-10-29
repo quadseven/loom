@@ -261,6 +261,10 @@ if [ "${FAKE_AGENT:-commit}" = verify-file ]; then
   printf '{"missing": "the station log"}' > verify.json
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = review-file ]; then
+  printf '{"blocking": [], "notes": [], "summary": "sound"}' > review.json
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = limit ]; then
   echo "ERROR: You've hit your usage limit. Try again at 12:21 PM."
   exit 1
@@ -1304,6 +1308,57 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual((logs / "T042-fix-the-thing.verify.model").read_text(), "gpt-test-default\n")
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def review_brief(self):
+        """A Luna review brief for PR 7 (loom#2142), whose branch is already
+        on the remote with the lane's first commit, as the station's
+        dispatch leaves it."""
+        work = Path(self._tmp.name) / "pr-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
+        (work / "first.txt").write_text("first try\n")
+        git("add", "first.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "First try", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        issue = {"number": 42, "title": "Fix the thing",
+                 "body": "Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n"}
+        head = self.remote_head(self.FIX_BRANCH)
+        name = tickets.review_name("example/repo", 42, 2)
+        self.drop_brief(name + ".md", tickets.render_review_brief(
+            "example/repo", issue, "codex", 2, 7, self.FIX_BRANCH, "main", head))
+        return name, head
+
+    def test_a_review_brief_records_its_verdict_and_pushes_nothing(self):
+        name, before = self.review_brief()
+        result = self.run_lane(FAKE_AGENT="review-file")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        logs = self.loom / "logs" / "codex"
+        self.assertEqual((logs / (name + ".review.json")).read_text(),
+                         '{"blocking": [], "notes": [], "summary": "sound"}')
+        # The brief's Model: line pins the run to Luna, not the lane default.
+        self.assertEqual((logs / (name + ".review.model")).read_text(), "gpt-6-luna\n")
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("codex ") for c in calls))
+        self.assertFalse(any(c.startswith("gh pr create") for c in calls))
+
+    def test_a_review_brief_without_a_review_pr_is_parked(self):
+        brief = BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: review")
+        self.drop_brief(text=brief)
+        result = self.run_lane(FAKE_AGENT="review-file")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("review brief needs Review-PR", log)
+        self.assertFalse((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_review_run_without_a_verdict_is_parked(self):
+        name, _ = self.review_brief()
+        result = self.run_lane(FAKE_AGENT="noop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("no review.json written", log)
 
     def test_answer_deliverable_without_file_fails_as_no_answer_written(self):
         brief = BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer")
