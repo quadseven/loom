@@ -822,20 +822,12 @@ labelled `claim:<login>`) still follows its pull request: an open pull
 request by that owner, on a branch of the repo, whose `Refs` line names a
 ticket a trusted login filed, moves it from `loom:queued` to `loom:pr`, and
 from there the closed pull request pass moves it to `loom:merged` on merge
-and shipping follows. A merge that leaves a code criterion unticked in every
-merged pull request for it, and unticked on the ticket, moves the ticket to
-`loom:queued` instead, with a status event naming only those boxes. A box
-marked `; not built: <reason>` is unbuilt, and boxes match after whitespace
-and markdown markup are normalised (loom#2026). The brain's own merge applies
-the same rule after the diff check. It is never
-briefed or claimed this way, and a pull
-request by anyone who does not own the ticket moves nothing. So is a ticket assigned to a login outside
-`LOOM_BRIEF_AUTHORS` or labelled `claim:<login>` for one, or one under a goal home whose `Operator:` line names
-another login: another operator's Loom owns it (docs/LANES.md, "Two Looms on
-shared repos"). A trusted briefer owns nothing here: an issue assigned to or
-claim-labelled for one is skipped too, unless it is a `loom:ticket` that
-briefer authored, which is a hand-off. A claim assigns the ticket to this
-Loom's operator login and labels it `claim:<that login>`.
+and shipping follows. A ticket assigned to or claim-labelled for a second
+contributor, on an open pull request by that contributor, also moves from
+`loom:pr` to `loom:merged` when that pull request is merged (the merge itself
+is the trust for a contributor). This ensures that work done by a second
+contributor through their own pull request still progresses through the Loom
+states to `loom:shipped.
 
 The brain applies the same rule to what it reads: issue bodies, comments and
 reviews from logins outside `LOOM_BRIEF_AUTHORS` and the review bots are
@@ -1584,14 +1576,22 @@ branch after the merge instead (bus/revert.py, every pass, off with
 
 ## Merge-ready
 
-A lane pull request is merge-ready if and only if all four hold:
+A lane pull request is merge-ready if and only if all five hold:
 
 - its head commit's check rollup is `SUCCESS`;
 - the newest submitted review from the review bot (`LOOM_REVIEW_BOT`, else
   `grug-tribe`, and an app, not a person with that login) is not
   `CHANGES_REQUESTED`. Only the newest counts: a `CHANGES_REQUESTED`
-  followed by newer `COMMENTED` reviews no longer blocks, and reviews and
-  replies from anyone else never change the verdict;
+  followed by newer `COMMENTED` reviews no longer blocks, and other apps'
+  reviews never change the verdict;
+- no person (any review author that is not an app) has a standing change
+  request. As GitHub's `reviewDecision` reads it, each person's newest
+  `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED` review counts (login
+  compared without letter case) and a later `COMMENTED` review does not
+  clear a request. The blocker reads `changes requested by a person
+  (LOGIN)`, and `bus.brain merge` refuses with the same words before the
+  merge call (loom#1987), so a tick no longer spends a merge attempt on a
+  GitHub 405 every time;
 - it has no unresolved review thread;
 - every thread the review bot opened (a finding) is older than the head
   commit, so a fix-up commit came after each finding.

@@ -118,11 +118,11 @@ class SdlcDoc(unittest.TestCase):
     def test_each_muse_tick_step_records_its_name_first(self):
         text = MUSE.read_text(encoding="utf-8")
         for step in ("lock", "status", "merge", "verify", "failed", "asks",
-                     "brief", "triage", "journal", "unlock"):
+                     "brief", "triage", "sweep", "journal", "unlock"):
             with self.subTest(step=step):
-                number = 10 if step == "unlock" else {"lock": 1, "status": 2,
-                    "merge": 3, "verify": 4, "failed": 5, "asks": 6,
-                    "brief": 7, "triage": 8, "journal": 9}[step]
+                number = {"lock": 1, "status": 2, "merge": 3, "verify": 4,
+                          "failed": 5, "asks": 6, "brief": 7, "triage": 8,
+                          "sweep": 9, "journal": 10, "unlock": 11}[step]
                 end = r"(?=\n%d\.|\Z)" % (number + 1)
                 self.assertRegex(text, r"(?ms)^%d\..*?python3 -m bus\.brain step %s.*?%s"
                                  % (number, step, end))

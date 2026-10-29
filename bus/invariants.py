@@ -93,7 +93,7 @@ DEFAULT_PLAN_CHECK = "Grug - Chief"
 # The step names of a brain tick (docs/MUSE.md). A journal line such as
 # "- Step status: failed (GitHub answered 502)" reports one that broke.
 STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage",
-         "journal", "unlock")
+         "sweep", "journal", "unlock")
 STEP_RE = re.compile(r"(?im)^[ \t]*[-*]?[ \t]*(?:step[ \t]+)?(%s)(?:[ \t]+step)?[ \t]*:[ \t]*"
                      r"(failed|degraded)\b[ \t:,.-]*(.*?)[ \t]*$" % "|".join(STEPS))
 LABEL = "loom:invariant"
@@ -1076,17 +1076,23 @@ class Filer:
                 if not m:
                     continue
                 number = int(issue["number"])
-                ticket = TICKET_LABEL in self._label_names(issue)
-                if ticket:
-                    self._ticketed.add(number)
-                if issue.get("state") == "closed":
-                    self._listed_closed.add(number)
+                ticket = self._note_listed(issue, number)
                 held = self._listed.get(m.group(1))
                 # The first issue of a key wins, but a plain invariant issue
                 # replaces a ticket: the ticket is not where a breach lives.
                 if held is None or (held in self._ticketed and not ticket):
                     self._listed[m.group(1)] = number
         return self._listed
+
+    def _note_listed(self, issue: Dict[str, Any], number: int) -> bool:
+        """Record what the listing shows of one issue: a ticket, a closed
+        one. True when it carries loom:ticket."""
+        ticket = TICKET_LABEL in self._label_names(issue)
+        if ticket:
+            self._ticketed.add(number)
+        if issue.get("state") == "closed":
+            self._listed_closed.add(number)
+        return ticket
 
     @staticmethod
     def _label_names(issue: Dict[str, Any]) -> List[str]:
@@ -1414,30 +1420,44 @@ class Filer:
                 return
             if key in current or number in self._listed_closed:
                 continue
-            issue = self._issue(number)
-            if issue is None or issue.get("state") != "open":
-                continue
-            labels = [str(x.get("name", "")) for x in issue.get("labels", [])
-                      if isinstance(x, dict)]
-            if "loom:triage" not in labels and "loom:rewritten" not in labels:
-                continue
-            comments = self._comments(number)
-            into = self._rolled_into(key, current)
-            if into is not None and into != number:
-                if any(n.startswith("needs:") for n in labels):
-                    # An ask for an operator (needs:<login>) stays open on
-                    # its own issue: folding would close it unanswered.
-                    continue
-                # Still broken, so no clear wait: its subject is a line of #into.
-                if self.writes + 2 > WRITES_MAX:
-                    return
-                self._fold(number, into, comments, issue)
-            elif key in _standing_keys():
-                if self.writes >= WRITES_MAX:
-                    return
-                self._mark_clear(key, number, issue)
-            elif not self._close_quiet(number, issue, labels, comments):
+            if not self._clear_one(key, number, current):
                 return
+
+    def _clear_one(self, key: str, number: int, current: Dict[str, Breach]) -> bool:
+        """Settle one open issue whose breach is gone this pass: an older
+        issue folds into its rolling one, a standing one says clear, any other
+        closes once quiet. False when the pass has no writes left."""
+        issue = self._issue(number)
+        if issue is None or issue.get("state") != "open":
+            return True
+        labels = [str(x.get("name", "")) for x in issue.get("labels", [])
+                  if isinstance(x, dict)]
+        if "loom:triage" not in labels and "loom:rewritten" not in labels:
+            return True
+        comments = self._comments(number)
+        into = self._rolled_into(key, current)
+        if into is not None and into != number:
+            return self._fold_old(number, into, issue, labels, comments)
+        if key in _standing_keys():
+            if self.writes >= WRITES_MAX:
+                return False
+            self._mark_clear(key, number, issue)
+            return True
+        return self._close_quiet(number, issue, labels, comments)
+
+    def _fold_old(self, number: int, into: int, issue: Dict[str, Any], labels: List[str],
+                  comments: List[Dict[str, Any]]) -> bool:
+        """Fold an older issue into rolling issue #into. False when the pass
+        has no writes left."""
+        if any(n.startswith("needs:") for n in labels):
+            # An ask for an operator (needs:<login>) stays open on its own
+            # issue: folding would close it unanswered.
+            return True
+        # Still broken, so no clear wait: its subject is a line of #into.
+        if self.writes + 2 > WRITES_MAX:
+            return False
+        self._fold(number, into, comments, issue)
+        return True
 
     def _mark_clear(self, key: str, number: int, issue: Dict[str, Any]) -> None:
         """A standing issue whose breach is gone says so in place and stays
@@ -1512,32 +1532,40 @@ class Filer:
             return
         self.state[b.key] = number
         if TICKET_LABEL in self._label_names(issue):
-            # A ticket (an invariant issue rewritten into work) is no longer
-            # the breach's own issue: it is never reopened or rewritten back to
-            # the invariant text (loom#1223 flipped 18 times).
-            if issue.get("state") == "open":
-                if b.rolling:
-                    self._rolling_open[b.key] = number
-                return
-            closed = _epoch(issue.get("closed_at"))
-            if closed is not None and b.at <= closed:
-                return
-            plain = self._listing().get(b.key)
-            if plain is not None and plain != number and plain not in self._ticketed:
-                # The breach already has its own invariant issue beside the ticket.
-                self.state[b.key] = plain
-                self._one(b)
-                return
-            self.state.pop(b.key, None)
-            self._file(b, ticket=number)
-            if b.rolling:
-                self._rolling_open[b.key] = self.state[b.key]
+            self._one_ticketed(b, number, issue)
             return
         if issue.get("state") == "open":
             if b.rolling:
                 self._rolling_open[b.key] = number
                 self._refresh(b, number, issue)
             return
+        self._one_closed(b, number, issue)
+
+    def _one_ticketed(self, b: Breach, number: int, issue: Dict[str, Any]) -> None:
+        """A ticket (an invariant issue rewritten into work) is no longer the
+        breach's own issue: it is never reopened or rewritten back to the
+        invariant text (loom#1223 flipped 18 times)."""
+        if issue.get("state") == "open":
+            if b.rolling:
+                self._rolling_open[b.key] = number
+            return
+        closed = _epoch(issue.get("closed_at"))
+        if closed is not None and b.at <= closed:
+            return
+        plain = self._listing().get(b.key)
+        if plain is not None and plain != number and plain not in self._ticketed:
+            # The breach already has its own invariant issue beside the ticket.
+            self.state[b.key] = plain
+            self._one(b)
+            return
+        self.state.pop(b.key, None)
+        self._file(b, ticket=number)
+        if b.rolling:
+            self._rolling_open[b.key] = self.state[b.key]
+
+    def _one_closed(self, b: Breach, number: int, issue: Dict[str, Any]) -> None:
+        """The breach's own issue is closed: reopen it for evidence newer than
+        the close, once while the breach stands."""
         closed = _epoch(issue.get("closed_at"))
         if closed is None or b.at > closed:
             comments = self._comments(number)
