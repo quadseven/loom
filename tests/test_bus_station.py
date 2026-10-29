@@ -11649,6 +11649,98 @@ class VerifyDispatchTest(Base):
         self.assertEqual(self.briefs("zen"), [])
 
 
+class VerifyNoteTest(Base):
+    """loom#2092: a shipped ticket older than 24h that no verify attempt has
+    reached gets one missing-evidence note, edited in place, so no shipped
+    ticket waits unrecorded behind the reserved verify lane's one hand-out
+    per VERIFY_RESERVE_EVERY."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake.private = False
+        # Three stale shipped tickets, none ever attempted: more than the
+        # reserved lane could reach, so the notes are what covers them.
+        for n, age in ((1, 30), (2, 49), (3, 26)):
+            self.fake.add(n, lane="codex", body=SHIPPED_BODY, state="shipped",
+                          events=shipped_at(age))
+        # One stale ticket a verify attempt already reached: no note owed.
+        # Ticket 4's attempt is inside the verify cooldown; ticket 6's is
+        # outside it, so 6 is back in the verify pool -- the attempts ledger,
+        # not the cooldown, is what spares it a note.
+        self.fake.add(4, lane="codex", body=SHIPPED_BODY, state="shipped",
+                      events=shipped_at(30))
+        self.fake.add(6, lane="codex", body=SHIPPED_BODY, state="shipped",
+                      events=shipped_at(30))
+        self.write(os.path.join(self.home, "state", "station", station.VERIFY_FILE),
+                   json.dumps({"%s#4" % REPO: time.time() - 3600,
+                               "%s#6" % REPO: time.time() - 7 * 3600}))
+        # One shipped ticket still inside its first day: no note owed yet.
+        self.fake.add(5, lane="codex", body=SHIPPED_BODY, state="shipped",
+                      events=shipped_at(10))
+
+    def station(self):
+        return station.Station(GitHub("token", transport=self.fake), self.settings)
+
+    def notes(self, number):
+        return [c["body"] for c in self.fake.comments[number]
+                if station.VERIFY_NOTE_MARKER in str(c.get("body") or "")]
+
+    def test_every_stale_shipped_ticket_gets_a_note_or_has_an_attempt(self):
+        self.station().note_stale_shipped()
+        for n in (1, 2, 3):
+            self.assertEqual(len(self.notes(n)), 1, "ticket %d" % n)
+        self.assertIn("30 hours", self.notes(1)[0])
+        for n in (4, 5, 6):
+            self.assertEqual(self.notes(n), [], "ticket %d" % n)
+            self.assertEqual(self.fake.comments[n], [], "ticket %d" % n)
+
+    def test_the_note_is_one_comment_edited_in_place(self):
+        st = self.station()
+        st.note_stale_shipped()
+        self.assertEqual(len(self.fake.comments[1]), 1)
+        # A second run inside the cadence changes nothing at all.
+        st.note_stale_shipped()
+        self.assertEqual(len(self.fake.comments[1]), 1)
+        self.assertEqual(self.fake.edits, [])
+        # Past the cadence but inside the refresh window: still no new
+        # comment and no edit.
+        self.age_ledger(at=st.now - station.VERIFY_NOTE_EVERY - 1,
+                        noted=st.now - 60)
+        st.note_stale_shipped()
+        self.assertEqual(len(self.fake.comments[1]), 1)
+        self.assertEqual(self.fake.edits, [])
+        # Past the refresh window the same comment is edited, never reposted.
+        self.fake.comments[1][0]["id"] = 4242
+        self.age_ledger(at=st.now - station.VERIFY_NOTE_EVERY - 1,
+                        noted=st.now - station.VERIFY_NOTE_REFRESH - 1)
+        st.note_stale_shipped()
+        self.assertEqual(len(self.fake.comments[1]), 1)
+        self.assertEqual(len(self.fake.edits), 1)
+        self.assertIn(station.VERIFY_NOTE_MARKER, self.fake.edits[0])
+        self.assertIn("/repos/%s/issues/comments/4242" % REPO,
+                      [p for _, p in self.fake.calls])
+
+    def age_ledger(self, at, noted):
+        path = os.path.join(self.home, "state", "station", station.VERIFY_NOTE_FILE)
+        with open(path) as fh:
+            ledger = json.load(fh)
+        ledger["_at"] = at
+        for key in list(ledger):
+            if key != "_at":
+                ledger[key] = {"at": noted}
+        self.write(path, json.dumps(ledger))
+
+    def test_the_close_guard_still_refuses_an_unchecked_shipped_ticket(self):
+        # The #539 gate at GitHub.rest(): the note pass must not weaken it --
+        # a completed close of a shipped ticket whose boxes are unchecked is
+        # refused before it is sent, and the ticket stays open.
+        gh = GitHub("token", transport=self.fake)
+        with self.assertRaisesRegex(ValueError, "unchecked acceptance criterion"):
+            gh.rest("PATCH", "/repos/%s/issues/1" % REPO, {"state": "closed"})
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assertEqual(self.fake.paths("PATCH"), [])
+
+
 class VerifyResultTest(Base):
     def setUp(self):
         super().setUp()
