@@ -10328,9 +10328,12 @@ class Station:
 
     @staticmethod
     def _epic_settled(facts: invariants.Facts, subject: str) -> Optional[str]:
-        """An epic this pass read at or under its ticket cap, or None."""
+        """An epic this pass read closed, or at or under its ticket cap, or
+        None (loom#2140: a closed epic keeps its closed tickets)."""
         for shape in facts.shapes or []:
             for epic in shape.epics:
+                if epic.epic.key == subject and not epic.open:
+                    return "epic %s is closed" % epic.epic.label
                 if epic.epic.key == subject and epic.tickets <= invariants.EPIC_TICKETS:
                     return "epic %s holds %d tickets, within the cap of %d" % (
                         epic.epic.label, epic.tickets, invariants.EPIC_TICKETS)
