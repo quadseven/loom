@@ -61,9 +61,35 @@ class ProblemsTest(unittest.TestCase):
     def test_a_good_body_passes(self):
         self.assertEqual(hunt_plan.problems(GOOD), [])
 
-    def test_chief_acceptance_criteria_check_accepts_what_good_look_like(self):
+    def test_what_good_look_like_is_not_an_acceptance_heading(self):
+        # "What good look like" is the label of the review bot's acceptance
+        # check in its report, not a heading that check reads (see the
+        # drift test below): a body whose criteria sit under it has no
+        # criteria section the gate accepts.
         body = GOOD.replace("## Acceptance criteria", "## What good look like")
-        self.assertEqual(hunt_plan.problems(body), [])
+        self.assertTrue(any("missing ## Acceptance criteria" in p
+                            for p in hunt_plan.problems(body)),
+                        hunt_plan.problems(body))
+
+    def test_accepted_acceptance_headings_equal_the_review_bots(self):
+        # The drift catcher: Loom's plan check mirrors the review bot's
+        # check_acceptance in services/_shared/personas/tpm/dor_checks.py
+        # (the grug repo), which reads sections under these two headings
+        # (a trailing qualifier on the heading is tolerated there, as
+        # here, by the same heading match). Deriving
+        # Loom's accepted set through problems(), over the bot's headings
+        # plus the near-misses this check has actually produced (the bot's
+        # report label for it; the brief-side "Acceptance" alias), and
+        # comparing it with the bot's set restated here from that source,
+        # fails loudly if an alias creeps back into the plan check.
+        chief_headings = {"Acceptance criteria", "Test plan"}
+        candidates = chief_headings | {"What good look like", "Acceptance"}
+        accepted_headings = set()
+        for heading in candidates:
+            body = GOOD.replace("## Acceptance criteria", "## " + heading)
+            if hunt_plan.problems(body) == []:
+                accepted_headings.add(heading)
+        self.assertEqual(accepted_headings, chief_headings)
 
     def test_each_blocking_check_is_named(self):
         cases = {

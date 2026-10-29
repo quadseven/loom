@@ -139,7 +139,7 @@ def problems(body: str) -> List[str]:
         out.append("missing ## Why (or ## Summary) section")
     elif len(why.split()) < 5:
         out.append("## Why has %d words; need >=5" % len(why.split()))
-    criteria = _section_text(body, "Acceptance criteria", "What good look like")
+    criteria = _section_text(body, "Acceptance criteria")
     name = "Acceptance criteria"
     if criteria is None:
         criteria, name = _section_text(body, "Test plan"), "Test plan"
