@@ -22,6 +22,9 @@ from .labels import REMOTE_LANES
 CLAIM_RE = re.compile(r"^<!-- loom:remote-claim v1 ([^ ]+) ([0-9]+) ([0-9.]+)(?: ([0-9.]+))? -->$")
 CLAIM_AGE = 2 * 3600
 PR_AGE = 3 * 3600
+# push_branch's ref read: the sentinel a 404 leaves behind, so an empty or
+# malformed 200 payload is never mistaken for "the branch is not there".
+_NO_REF = object()
 
 
 def _names(issue: Dict[str, Any]) -> List[str]:
@@ -449,14 +452,33 @@ def push_branch(gh: GitHub, repo: str, number: int) -> str:
         raise ValueError("current branch %r does not match the ticket branch %r"
                          % (current, branch))
     local_head = _git("rev-parse", "HEAD")
+    # Read the branch through the singular ref endpoint. The plural
+    # /git/refs/heads/{branch} path prefix-matches, so when earlier attempt
+    # branches (the -r3/-r4 shape) share the branch name as a prefix it
+    # answers a list, and the read crashed on .get (loom#2160). The singular
+    # endpoint answers the one exact ref, or 404 when the branch is not
+    # there; the PATCH below still updates at the plural path, which is the
+    # endpoint GitHub defines for updates.
     try:
-        ref = gh.rest("GET", "/repos/%s/git/refs/heads/%s"
-                      % (repo, quote(branch, safe=""))).data or {}
-        remote_head = str(((ref.get("object") or {}).get("sha")) or "")
+        ref = gh.rest("GET", "/repos/%s/git/ref/heads/%s"
+                      % (repo, quote(branch, safe=""))).data
     except GitHubError as err:
         if err.status != 404:
             raise
+        ref = _NO_REF
+    obj = ref.get("object") if isinstance(ref, dict) else None
+    if ref is _NO_REF:
         remote_head = ""
+    elif isinstance(obj, dict) and obj.get("sha"):
+        remote_head = str(obj["sha"])
+    else:
+        # A 200 that is not the one ref object (a list, an empty body, a
+        # payload with no commit) must stop the push loudly: guessing a
+        # remote head here could update the wrong ref or silently strand
+        # the lane's commits behind a success report.
+        raise GitHubError("the ref read for branch %s answered an unexpected "
+                          "payload (%s); refusing to push"
+                          % (branch, type(ref).__name__))
     if remote_head == local_head:
         return local_head
     if remote_head:
