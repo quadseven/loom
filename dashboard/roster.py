@@ -228,7 +228,7 @@ def _counts_text(tick) -> str:
               if name in tick.get("counts", {})]
     parts += ["%s %d" % (name, value) for name, value in tick.get("counts", {}).items()
               if name not in COUNT_ORDER]
-    return " · ".join(parts)
+    return ", ".join(parts)
 
 
 def _render_actor(actor) -> str:
