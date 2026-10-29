@@ -457,6 +457,14 @@ class JournalTests(unittest.TestCase):
                                        measure="p95 2s").splitlines()
         self.assertEqual(lines[2], "- Measure: p95 2s")
 
+    def test_render_journal_with_a_shipped_backlog(self):
+        # loom#2161: the shipped stage's count and median wait ride every
+        # tick journal, right under the tick's own Shipped line.
+        lines = journal.render_journal(NOW, "tick-1", [], [], [], [], 1, 1,
+                                       backlog="215 waiting, median wait 57.8h").splitlines()
+        self.assertEqual(lines[2], "- Shipped: none")
+        self.assertEqual(lines[3], "- Shipped backlog: 215 waiting, median wait 57.8h")
+
     def test_render_report(self):
         lines = journal.render_report(NOW, "tick-1", "m", [], "f", "none", "n").splitlines()
         self.assertEqual(lines[0], journal.REPORT_MARKER)

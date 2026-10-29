@@ -94,7 +94,8 @@ class StatusStreamTest(unittest.TestCase):
                 self.stuck.wait()
             return ["", "## %s" % repo, "", "### Pull requests", "- none"]
         for name, value in (("_readable_section", section),
-                            ("_lane_status", lambda *a, **k: "no lane status yet")):
+                            ("_lane_status", lambda *a, **k: "no lane status yet"),
+                            ("shipped_backlog_line", lambda *a, **k: "0 waiting")):
             patcher = mock.patch.object(brain, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)

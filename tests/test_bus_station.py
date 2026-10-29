@@ -11649,6 +11649,108 @@ class VerifyDispatchTest(Base):
         self.assertEqual(self.briefs("zen"), [])
 
 
+class MedianStub:
+    """A GitHub boundary for Station._shipped_median: one ticket shipped
+    60 hours ago, in the paginate shape metrics.waits_for_repos reads."""
+
+    def __init__(self):
+        self.listings = 0
+        self.error = None
+
+    def paginate(self, path):
+        if "/events" not in path:
+            self.listings += 1
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            return [{"number": 1, "updated_at": stamp}]
+        if self.error is not None:
+            raise self.error
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60 * 3600))
+        return [{"event": "labeled", "label": {"name": "loom:shipped"}, "created_at": stamp}]
+
+
+class VerifyPriorityTest(Base):
+    """loom#2161: while the shipped stage's median wait is at or over
+    VERIFY_PRIORITY_MEDIAN_H, free lanes take verify runs ahead of new
+    build briefs; below it, and when the median cannot be read, the claim
+    order is the one the station has always used."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body=SHIPPED_BODY, state="shipped", events=shipped_at(30))
+        self.fake.add(7, state="briefed", lane="codex")
+
+    def seed(self, name, payload):
+        path = os.path.join(self.home, "state", "station", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(payload, fh)
+
+    def seed_median(self, median_h):
+        # A fresh reserve stamp keeps the loom#964 reserved run out of
+        # these tests: the priority step is the only verify hand-out.
+        self.seed(station.VERIFY_RESERVE_FILE, {"at": time.time()})
+        self.seed(station.VERIFY_PRIORITY_FILE, {"at": time.time(), "median_h": median_h})
+
+    def briefs(self, lane="codex"):
+        try:
+            return sorted(n for n in os.listdir(self.inbox(lane)) if n.endswith(".md"))
+        except OSError:
+            return []
+
+    def test_verify_goes_ahead_of_a_build_brief_while_the_median_is_high(self):
+        self.seed_median(57.8)
+        self.run_pass()
+        self.assertTrue(any("-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertIn("loom:briefed", self.fake.names(7))
+        self.assertNotIn("loom:running", self.fake.names(7))
+
+    def test_the_build_brief_goes_first_while_the_median_is_low(self):
+        self.seed_median(3.0)
+        self.run_pass()
+        self.assertIn("loom:running", self.fake.names(7))
+        self.assertFalse(any("-verify-" in n for n in self.briefs()), self.briefs())
+
+    def test_the_priority_reads_the_median_from_the_waits_read(self):
+        # No stamp on disk: the pass computes the median itself from the
+        # shipped ticket's events (shipped 30h ago, so over the line) and
+        # the verify goes first.
+        self.seed(station.VERIFY_RESERVE_FILE, {"at": time.time()})
+        self.run_pass()
+        self.assertTrue(any("-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertIn("loom:briefed", self.fake.names(7))
+        self.assertNotIn("loom:running", self.fake.names(7))
+
+    def test_an_unreadable_median_keeps_the_present_order(self):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        stub = MedianStub()
+        stub.error = GitHubError("events read failed", 502)
+        st.gh = stub
+        self.assertEqual(st._prioritize_verifies(["codex"]), ["codex"])
+        self.assertEqual(self.briefs(), [])
+
+    def test_the_median_is_read_once_and_then_served_from_its_stamp(self):
+        stub = MedianStub()
+        st = station.Station(stub, self.settings)
+        self.assertAlmostEqual(st._shipped_median(), 60.0, places=1)
+        self.assertAlmostEqual(st._shipped_median(), 60.0, places=1)
+        self.assertEqual(stub.listings, 1)
+        st.now += station.VERIFY_PRIORITY_EVERY
+        stub.error = GitHubError("events read failed", 502)
+        self.assertIsNone(st._shipped_median())
+
+    def test_a_queued_build_ticket_does_not_hold_a_lane_from_a_priority_verify(self):
+        # The queued-holds rule (_verify_pool) keeps a lane a queued build
+        # ticket may take free for that build; the priority hand-out is
+        # the drain the ticket orders, so it does not hold.
+        self.fake.add(9, state="queued", lane="codex")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st._hand_verifies(["codex"])
+        self.assertEqual(self.briefs(), [])
+        st._hand_verifies(["codex"], queued_holds=False)
+        self.assertTrue(any("-verify-" in n for n in self.briefs()), self.briefs())
+
+
 class VerifyResultTest(Base):
     def setUp(self):
         super().setUp()

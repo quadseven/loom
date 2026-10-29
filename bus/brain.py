@@ -1139,6 +1139,27 @@ def _verify_due_lines(due: List[Tuple[datetime, Dict[str, Any]]], now: datetime)
     return lines if due else lines + ["- none"]
 
 
+def shipped_backlog_line(gh: GitHub, repos: Sequence[str], now: float) -> str:
+    """The shipped stage's backlog as one journal line: how many tickets
+    sit shipped and their median wait, in the Hot spots page's own units
+    (hours, one decimal). The numbers come from metrics.shipped_row, the
+    read the dashboard's Hot spots page is built on, so the journal
+    and the page can never disagree (loom#2161). A read that fails says
+    so on the line rather than estimating; a rate limit stops the tick
+    like every other status read. `now` is epoch seconds, as
+    waits_for_repos takes it."""
+    from . import metrics  # metrics imports this module
+    try:
+        row = metrics.shipped_row(gh, list(repos), now)
+    except RateLimited:
+        raise
+    except (GitHubError, OSError, ValueError) as err:
+        return "not read (%s)" % err
+    if row is None or not row.get("n"):
+        return "0 waiting"
+    return "%d waiting, median wait %.1fh" % (row["n"], row["median_h"])
+
+
 def _lane_status(gh: GitHub, lanes_repo: str,
                  authors: Optional[Sequence[str]] = None) -> str:
     """The newest lane status comment a trusted login wrote: a stranger's
@@ -1211,6 +1232,10 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     tail += [""] + _health_lines(env)
     tail += [""] + validation_gap_lines(env)
     tail += ["", "## Lane status", _lane_status(gh, lanes_repo, authors)]
+    # The tick journal's Shipped backlog line is copied from here, so the
+    # drain the ticket orders is in the read every tick already makes
+    # (loom#2161).
+    tail += ["", "## Shipped backlog", "- " + shipped_backlog_line(gh, repos, now.timestamp())]
     _say(out, emit, tail)
     return "\n".join(out)
 

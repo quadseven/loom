@@ -628,6 +628,16 @@ VERIFY_REFUSED_FILE = "verify-refused.json"
 VERIFY_RESERVE_AFTER = 2 * 3600
 VERIFY_RESERVE_EVERY = 1800
 VERIFY_RESERVE_FILE = "verify-reserve.json"
+# While the shipped stage's median wait is at or over this many hours, the
+# backlog is the bottleneck (loom#2161): verify attempts on tickets
+# shipped at least VERIFY_PRIORITY_AFTER ago go to every free lane ahead
+# of new build briefs until the median is back under it. The median is
+# re-read at most once per VERIFY_PRIORITY_EVERY (the reserve cadence);
+# between reads the stamp in VERIFY_PRIORITY_FILE serves.
+VERIFY_PRIORITY_MEDIAN_H = 24.0
+VERIFY_PRIORITY_AFTER = 24 * 3600
+VERIFY_PRIORITY_EVERY = VERIFY_RESERVE_EVERY
+VERIFY_PRIORITY_FILE = "verify-priority.json"
 # The Fabric lead for a ticket's merged work (loom#1437): at most FABRIC_ASKS
 # questions a pass, each up to bus/fabric.py's TIMEOUT, and the first
 # FABRIC_CITES cited pull requests checked against GitHub. FABRIC_ASKED_FILE
@@ -2978,6 +2988,7 @@ class Station:
         # A starved shipped ticket takes one free lane ahead of build work.
         free = self._reserve_verify(free)
         free = self._not_demoted(free)
+        free = self._prioritize_verifies(free)
         if not free:
             self._claim_candidates([])
             self._record_slot_sample(False)
@@ -3571,14 +3582,60 @@ class Station:
         self._hand_verifies(free, starved_for=VERIFY_RESERVE_AFTER, limit=1)
         return [lane for lane in free if self._inbox_empty(lane)]
 
+    def _shipped_median(self) -> Optional[float]:
+        """The shipped stage's median wait in hours, from
+        metrics.waits_for_repos (the Hot spots page's read), or None when
+        it cannot be read: no shipped sample in the window, or the read
+        failed. Re-read at most once per VERIFY_PRIORITY_EVERY; the stamp
+        in VERIFY_PRIORITY_FILE serves between reads, and a failed read is
+        not stamped, so the next pass tries again (loom#2161)."""
+        path = os.path.join(self.state, VERIFY_PRIORITY_FILE)
+        last = _read_json(path, {}, strict=False)
+        if isinstance(last, dict):
+            at, median = last.get("at"), last.get("median_h")
+            fresh = isinstance(at, (int, float)) and 0 <= self.now - float(at) < VERIFY_PRIORITY_EVERY
+            if fresh and (median is None or isinstance(median, (int, float))):
+                return median
+        try:
+            row = metrics.shipped_row(self.gh, self._verify_repos(), self.now)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("could not read the shipped median for verify priority: %s" % err)
+            return None
+        median = row.get("median_h") if row else None
+        _write_json(path, {"at": self.now, "median_h": median})
+        return median
+
+    def _prioritize_verifies(self, free: List[str]) -> List[str]:
+        """While the shipped median wait is at or over
+        VERIFY_PRIORITY_MEDIAN_H, hand a verify run for a ticket shipped
+        at least VERIFY_PRIORITY_AFTER ago to every free lane that can
+        take one before any new build brief is claimed (loom#2161):
+        shipped work waiting on verify is the bottleneck, so the drain
+        outranks new work until the median is back under the line. A
+        median that cannot be read changes nothing. Returns the free
+        lanes that still have an empty inbox."""
+        if not free:
+            return free
+        median = self._shipped_median()
+        if median is None or median < VERIFY_PRIORITY_MEDIAN_H:
+            return free
+        _say("shipped median wait %.1fh is at or over %.0fh: verify runs go to free lanes "
+             "ahead of build briefs" % (median, VERIFY_PRIORITY_MEDIAN_H))
+        self._hand_verifies(free, starved_for=VERIFY_PRIORITY_AFTER, queued_holds=False)
+        return [lane for lane in free if self._inbox_empty(lane)]
+
     def _hand_verifies(self, idle: List[str], starved_for: float = 0.0,
-                       limit: int = 0) -> None:
+                       limit: int = 0, queued_holds: Optional[bool] = None) -> None:
         """Give each idle slot that may verify, has no build work and is
         empty one shipped ticket to verify. The ticket keeps its labels: the
         station moves it when the result comes back (_report_verify).
         starved_for > 0 is the reserved lane's call: only tickets shipped at
         least that long ago, ignoring the lanes queued build work wants, and
-        at most `limit` hand-outs."""
+        at most `limit` hand-outs. queued_holds=None keeps that rule (holds
+        stand unless this is the reserved call); the verify-priority call
+        (loom#2161) passes False, as the drain it orders is the point."""
         lanes = [x for x in idle if provider(x) not in VERIFY_SKIP and self._inbox_empty(x)]
         if not lanes:
             return
@@ -3586,7 +3643,8 @@ class Station:
         attempts = _read_json(path, {}, strict=False)
         attempts = attempts if isinstance(attempts, dict) else {}
         try:
-            pool, held = self._verify_pool(attempts, queued_holds=not starved_for)
+            pool, held = self._verify_pool(
+                attempts, queued_holds=queued_holds if queued_holds is not None else not starved_for)
         except RateLimited:
             raise
         except GitHubError as err:

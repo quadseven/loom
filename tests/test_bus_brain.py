@@ -17,7 +17,7 @@ from urllib.parse import unquote
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, journal, proof, text, tickets
-from bus.github import GitHub, GitHubError
+from bus.github import GitHub, GitHubError, RateLimited
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 # The brain's own login in the escalation fixtures: TRUSTED trusts it.
@@ -403,8 +403,10 @@ class SensitiveResumeTests(unittest.TestCase):
         # unproven-work read and epic list; the lane repo is the same repo,
         # so its issue list is the one already read (loom#2078), and with no
         # loom:lanes issue there is no comments read. Plus ticket issue fetch
-        # for goal home constraint checking.
-        self.assertEqual(gh.requests, 6)
+        # for goal home constraint checking, and the shipped backlog's
+        # waits listing (loom#2161), which names no tickets here, so it
+        # reads no events.
+        self.assertEqual(gh.requests, 7)
 
     def test_status_ranks_open_tickets_across_repos_in_work_order(self):
         def t(number, priority=None, created="2030-01-01T00:00:00Z", labels=("loom:queued",)):
@@ -451,14 +453,16 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_status_reads_lane_comments_with_one_more_request(self):
         lanes_issue = {"number": 9, "title": "Loom lane status", "labels": [{"name": "loom:lanes"}]}
         # The lane repo is the project repo: one issue list serves both
-        # (loom#2078), then the pull requests, then the lane comments.
+        # (loom#2078), then the pull requests, then the lane comments, then
+        # the shipped backlog's waits listing (loom#2161).
         gh = GitHub("t", transport=Fake(
             reply(200, [lanes_issue]), reply(200, []),
             reply(200, [{"body": "<!-- loom:lanes v1 -->\n| codex | yes |", "created_at": "2030-01-01T00:00:00Z",
-                         "user": {"login": "example-brain"}}])))
+                         "user": {"login": "example-brain"}}]),
+            reply(200, [])))
         report = brain.status(gh, [REPO], REPO, env=TRUSTED)
         self.assertIn("| codex | yes |", report)
-        self.assertEqual(gh.requests, 3)
+        self.assertEqual(gh.requests, 4)
 
     def test_status_lists_a_sensitive_pull_request(self):
         ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}], "body": ""}
@@ -3000,7 +3004,11 @@ class EscalateTests(unittest.TestCase):
             report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env=TRUSTED)
         read = sorted(c[1].split("?")[0] for c in fake.calls
                       if c[1].split("?")[0].endswith(("/events", "/comments")) and "/issues/99/" not in c[1])
-        self.assertEqual(read, ["/repos/%s/issues/9/comments" % REPO, "/repos/%s/issues/9/events" % REPO])
+        # The history cap binds the stuck read: only #9's history is read.
+        # #10's events are the shipped backlog's waits read (loom#2161),
+        # which is bounded by its seven-day window, not by the history cap.
+        self.assertEqual(read, ["/repos/%s/issues/10/events" % REPO,
+                                "/repos/%s/issues/9/comments" % REPO, "/repos/%s/issues/9/events" % REPO])
         line = {l.split(" ")[1]: l for l in report.splitlines() if l.startswith("- #")}
         self.assertIn("REPEATEDLY STUCK", line["#9"])
         self.assertIn("not checked for stuck (status reads 1 histories)", line["#10"])
@@ -5613,3 +5621,99 @@ class WaitLabelTests(unittest.TestCase):
                      "wait:after", "wait:window"):
             self.assertIn(name, labels.LABELS)
         self.assertIn("wait:", labels.MANAGED_PREFIXES)
+
+
+class WaitsStub:
+    """A GitHub boundary for brain.shipped_backlog_line: canned ticket
+    listings and event lists in the paginate shape metrics.waits_for_repos
+    reads (the shape test_bus_metrics' SlowEvents serves)."""
+
+    NOW = 1768000000.0
+
+    def __init__(self, events, error=None):
+        self.events = events
+        self.error = error
+
+    @staticmethod
+    def _iso(ts):
+        return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def labeled(self, name, hours_ago):
+        return {"event": "labeled", "label": {"name": name},
+                "created_at": self._iso(self.NOW - hours_ago * 3600)}
+
+    def shipped(self, number, hours_ago):
+        self.events[number] = [self.labeled("loom:shipped", hours_ago)]
+
+    def paginate(self, path):
+        if "/events" not in path:
+            return [{"number": n, "updated_at": self._iso(self.NOW)} for n in sorted(self.events)]
+        if self.error is not None:
+            raise self.error
+        number = int(path.split("/issues/")[1].split("/")[0])
+        return self.events[number]
+
+
+class ShippedBacklogLineTest(unittest.TestCase):
+    """loom#2161: the brain's per-tick shipped count and median wait come
+    from metrics.waits_for_repos, the Hot spots page's own read, and a
+    failed read says so instead of estimating."""
+
+    def test_the_line_counts_shipped_tickets_and_their_median_wait(self):
+        stub = WaitsStub({})
+        stub.shipped(1, 40)
+        stub.shipped(2, 60)
+        stub.shipped(3, 80)
+        stub.events[4] = [stub.labeled("loom:queued", 90)]
+        line = brain.shipped_backlog_line(stub, [REPO], stub.NOW)
+        self.assertEqual(line, "3 waiting, median wait 60.0h")
+
+    def test_no_shipped_tickets_reads_as_zero_waiting(self):
+        stub = WaitsStub({})
+        self.assertEqual(brain.shipped_backlog_line(stub, [REPO], stub.NOW), "0 waiting")
+
+    def test_a_failed_read_says_so_instead_of_estimating(self):
+        stub = WaitsStub({}, error=GitHubError("events read failed", 502))
+        stub.shipped(1, 40)
+        line = brain.shipped_backlog_line(stub, [REPO], stub.NOW)
+        self.assertEqual(line, "not read (events read failed)")
+
+    def test_a_rate_limit_stops_the_read_like_every_other_status_read(self):
+        stub = WaitsStub({}, error=RateLimited("budget spent", 403, "", 0))
+        stub.shipped(1, 40)
+        with self.assertRaises(RateLimited):
+            brain.shipped_backlog_line(stub, [REPO], stub.NOW)
+
+
+class StatusShippedBacklogTest(unittest.TestCase):
+    """The status the brain reads every tick carries the shipped backlog
+    section its journal line is copied from (loom#2161). The waits read is
+    served by the same scripted transport as every other read: a listing
+    of three shipped tickets and their ship events, whose waits (40, 60
+    and 80 hours) have the same median whatever order the parallel
+    events reads take them in."""
+
+    def test_status_carries_the_shipped_backlog(self):
+        now = datetime.now(timezone.utc)
+
+        def iso(ts):
+            return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def shipped_event(hours_ago):
+            return {"event": "labeled", "label": {"name": "loom:shipped"},
+                    "created_at": iso(now - brain.timedelta(hours=hours_ago))}
+
+        gh = GitHub("t", transport=Fake(
+            reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}], "created_at": "2030-01-01T00:00:00Z"},
+                        {"number": 2, "title": "Ticket", "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}], "created_at": "2030-01-01T00:00:00Z"},
+                        {"number": 3, "title": "Ask", "labels": [{"name": "needs-operator"}]}]),
+            reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
+            reply(200, {"data": {"repository": {"p4": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": [{"isResolved": False}]}}, "g1": {"comments": {"nodes": [{"body": "<!-- loom:journal v1 -->", "createdAt": "2030-01-01T01:00:00Z"}]}}}}}),
+            reply(200, []), reply(200, []),
+            reply(200, [{"number": n, "updated_at": iso(now)} for n in (11, 12, 13)]),
+            reply(200, [shipped_event(40)]),
+            reply(200, [shipped_event(60)]),
+            reply(200, [shipped_event(80)])))
+        report = brain.status(gh, [REPO], REPO, env={}, authors=())
+        self.assertIn("## Shipped backlog", report)
+        self.assertIn("- 3 waiting, median wait 60.0h", report)
