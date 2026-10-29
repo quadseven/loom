@@ -19,6 +19,20 @@ SANDBOX = Path(__file__).resolve().parent.parent / "lanes" / "agent_sandbox.sh"
 WRITE_DENY = '(deny file-write* (subpath "/"))'
 NET_DENY = '(deny network-outbound (remote ip "*:*"))'
 
+
+def copy_cat(path):
+    # A copy of cat at path, made executable. macOS kills a copied platform
+    # binary at exec (exit 137) until the copy carries its own signature, so
+    # where codesign exists the copy is signed ad hoc: a probe that runs it
+    # then reports what the sandbox decided, not that the binary was killed.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(shutil.which("cat"), path)
+    path.chmod(0o755)
+    if shutil.which("codesign"):
+        subprocess.run(["codesign", "-f", "-s", "-", str(path)],
+                       check=True, capture_output=True)
+    return path
+
 # Run inside the api profile: try each write and the loopback connection, and
 # print what happened. $1 is the tree, $2 a path outside it, $3 a local port.
 CONFINED_PROBE = r"""
@@ -91,11 +105,10 @@ class AgentSandboxTest(unittest.TestCase):
         # no contents it is a copy of cat, a dedicated binary; pass
         # contents to place a script there instead.
         path = self.scratch / ".local" / "bin" / "agy"
-        path.parent.mkdir(parents=True, exist_ok=True)
         if contents is None:
-            shutil.copy(shutil.which("cat"), path)
-        else:
-            path.write_text(contents)
+            return copy_cat(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
         path.chmod(0o755)
         return path
 
@@ -300,10 +313,7 @@ class AgentSandboxTest(unittest.TestCase):
         for f in (store, state, keychain):
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text("not-a-real-secret\n")
-        helper = state.parent / "bin" / "agentapi"
-        helper.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(shutil.which("cat"), helper)
-        helper.chmod(0o755)
+        helper = copy_cat(state.parent / "bin" / "agentapi")
         script = ('export TOKEN_A="$2" TOKEN_B="$3" KEYCHAIN_FILE="$4" TREE="$1"\n'
                   'p="$(sandbox_profile "$1" "$6" "")" || exit 9\n'
                   'sandbox-exec -p "$p" /bin/bash -c "$5"\n'
