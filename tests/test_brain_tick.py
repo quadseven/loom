@@ -33,6 +33,10 @@ if [ "$2" = bus.brain_memory ]; then
   printf '%s\\n' "${FAKE_PACKET:-}"
   exit "${FAKE_PACKET_EXIT:-0}"
 fi
+if [ "$2" = bus.fabric ]; then
+  printf '%s\\n' "${FAKE_FABRIC:-}"
+  exit 0
+fi
 if [ "$3 $4" = "app token" ]; then
   # FAKE_APP_TOKEN: the Brain App's installation token; unset, minting fails.
   [ -n "${FAKE_APP_TOKEN:-}" ] || { echo "no App key" >&2; exit 2; }
@@ -205,6 +209,17 @@ class BrainTickTest(unittest.TestCase):
         claude = [c for c in calls if c.startswith("claude ")]
         self.assertIn("Read this handoff packet before anything else.", claude[0])
         self.assertIn("## Open commitments (1)", "\n".join(calls))
+
+    def test_fabric_is_asked_by_the_wrapper_before_the_agent(self):
+        _, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                             FAKE_FABRIC="Earlier decision: a fix was merged.")
+        fabric_call = next(i for i, call in enumerate(calls)
+                           if "bus.fabric ask" in call)
+        agent_calls = [(i, call) for i, call in enumerate(calls)
+                       if call.startswith("claude ")]
+        self.assertLess(fabric_call, agent_calls[0][0])
+        self.assertIn("Earlier decision: a fix was merged.", "\n".join(calls))
+        self.assertNotIn("LOOM_FABRIC_KEY_SSM", "\n".join(calls))
 
     def test_no_dashboard_or_a_failed_read_runs_the_tick_without_the_packet(self):
         _, calls = self.tick()
