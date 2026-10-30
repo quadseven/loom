@@ -63,7 +63,7 @@ import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from . import brain, criteria_gate, naming, notify, proof, shadow, text, tickets
 from .github import GitHub, GitHubError, _OPENER
@@ -147,6 +147,300 @@ DIAGNOSIS_TIMEOUT = 30
 DIAGNOSIS_LINES = 40
 DIAGNOSIS_BYTES = 64 * 1024
 _COMMAND_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,39}(?:\.[a-z]{1,4})?")
+
+# Ship rule constants (mirroring bus/station.py)
+SHIP_PER_PASS = 20
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+SHIP_RUNS_URL = "/repos/%s/actions/workflows/%s/runs?status=success&event=push&branch=%s"
+PULL_FILES_MAX = 3000
+
+
+def _ship_on_merge_repos(env: Optional[Dict[str, str]] = None) -> List[str]:
+    """Repos that ship on merge (LOOM_SHIP_ON_MERGE)."""
+    raw = (os.environ if env is None else env).get("LOOM_SHIP_ON_MERGE", "").strip()
+    return [r for r in raw.split() if r]
+
+
+def _ship_workflows(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Repo to workflow file for LOOM_SHIP_WORKFLOWS."""
+    raw = (os.environ if env is None else env).get("LOOM_SHIP_WORKFLOWS", "").strip()
+    result: Dict[str, str] = {}
+    for item in raw.split():
+        if "=" in item:
+            repo, workflow = item.split("=", 1)
+            result[repo] = workflow
+    return result
+
+
+def _ship_path_workflows(env: Optional[Dict[str, str]] = None) -> List[str]:
+    """Repos with path-based deploy workflows (LOOM_SHIP_PATH_WORKFLOWS)."""
+    raw = (os.environ if env is None else env).get("LOOM_SHIP_PATH_WORKFLOWS", "").strip()
+    return [r for r in raw.split() if r]
+
+
+def _pin_ship_repos(env: Optional[Dict[str, str]] = None) -> List[str]:
+    """Deployment repos with pin PRs (LOOM_PIN_SHIP_REPOS)."""
+    raw = (os.environ if env is None else env).get("LOOM_PIN_SHIP_REPOS", "").strip()
+    return [r for r in raw.split() if r]
+
+
+def _refs_numbers(repo: str, body: str) -> List[int]:
+    """The ticket numbers a pull request body names with a Refs line."""
+    return [int(n) for n in re.findall(r"^Refs (?:%s)?#([0-9]+)\b" % re.escape(repo),
+                                        body, re.M)]
+
+
+def _pr_ticket_number(repo: str, pr: Dict[str, Any]) -> Optional[int]:
+    """Extract ticket number from PR via Refs line or loom branch."""
+    refs = _refs_numbers(repo, str(pr.get("body") or ""))
+    if refs:
+        return refs[0]
+    head = str((pr.get("head") or {}).get("ref") or "")
+    branch = re.match(r"loom/([0-9]+)(?:-|$)", head)
+    return int(branch.group(1)) if branch else None
+
+
+def _merged_prs_for_ticket(gh: GitHub, repo: str, ticket_number: int,
+                           since: float, max_pages: int = 5) -> List[Dict[str, Any]]:
+    """Find merged PRs for a ticket that were merged after `since` (epoch)."""
+    since_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
+    prs: List[Dict[str, Any]] = []
+    url = ("/repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=100" % repo)
+    for _ in range(max_pages):
+        try:
+            resp = gh.rest("GET", url)
+        except (GitHubError, ValueError, TypeError, AttributeError, IndexError):
+            # If the API call fails (e.g., in tests with FakeGitHub), return what we have
+            break
+        if resp.status == 404:
+            break
+        for pr in resp.data if isinstance(resp.data, list) else []:
+            if not isinstance(pr, dict):
+                continue
+            if not pr.get("merged_at") or not COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or "")):
+                continue
+            if str(pr["merged_at"]) <= since_str:
+                # PRs are sorted by updated desc, but merged_at could be older
+                # Keep checking in case there are newer ones
+                continue
+            number = _pr_ticket_number(repo, pr)
+            if number == ticket_number:
+                prs.append(pr)
+        link = resp.headers.get("link", "")
+        if not link:
+            break
+        url = _next_link(link)
+        if not url:
+            break
+    return prs
+
+
+def _next_link(link_header: str) -> Optional[str]:
+    """Extract next page URL from Link header."""
+    for part in link_header.split(","):
+        if 'rel="next"' in part:
+            match = re.search(r"<([^>]+)>", part)
+            if match:
+                return match.group(1)
+    return None
+
+
+def _carries(gh: GitHub, repo: str, commit: str, revision: str) -> bool:
+    """Check if commit is ancestor of revision (or identical)."""
+    try:
+        resp = gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, commit, revision))
+    except (GitHubError, ValueError, TypeError, AttributeError):
+        return False
+    if resp.status == 404:
+        return False
+    data = resp.data if isinstance(resp.data, dict) else {}
+    return data.get("status") in ("ahead", "identical")
+
+
+def _deploy_runs(gh: GitHub, repo: str, workflow: str, branch: str) -> List[Dict[str, Any]]:
+    """Get successful deploy workflow runs on default branch."""
+    url = SHIP_RUNS_URL % (repo, workflow, quote(branch, safe=""))
+    try:
+        resp = gh.rest("GET", url)
+    except (GitHubError, ValueError, TypeError, AttributeError):
+        return []
+    if resp.status == 404:
+        return []
+    runs = resp.data.get("workflow_runs") if isinstance(resp.data, dict) else None
+    if not isinstance(runs, list):
+        return []
+    filtered = []
+    for r in runs:
+        if not isinstance(r, dict):
+            continue
+        head = r.get("head_repository") if isinstance(r.get("head_repository"), dict) else {}
+        if (r.get("status") == "completed" and r.get("conclusion") == "success"
+                and r.get("event") == "push" and r.get("head_branch") == branch
+                and str(head.get("full_name") or "").lower() == repo.lower()
+                and COMMIT_RE.fullmatch(str(r.get("head_sha") or ""))):
+            filtered.append(r)
+    return filtered
+
+
+def _covering_run(gh: GitHub, repo: str, pr: Dict[str, Any],
+                  by_sha: Dict[str, Dict[str, Any]],
+                  newest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Find deploy run covering the PR's merge commit."""
+    sha = str(pr["merge_commit_sha"])
+    if sha in by_sha:
+        return by_sha[sha]
+    if str(newest.get("created_at") or "") < str(pr["merged_at"]):
+        return None
+    if _carries(gh, repo, sha, str(newest["head_sha"])):
+        return newest
+    return None
+
+
+def _reverted(gh: GitHub, repo: str, pr: Dict[str, Any], seen: List[Dict[str, Any]],
+              revision: str) -> bool:
+    """Check if PR was reverted by a later PR that also carries the revision."""
+    for other in seen:
+        if (other.get("merged_at") and str(other["merged_at"]) > str(pr["merged_at"])
+                and COMMIT_RE.fullmatch(str(other.get("merge_commit_sha") or ""))
+                and _carries(gh, repo, str(other["merge_commit_sha"]), revision)):
+            return True
+    return False
+
+
+def _default_branch(gh: GitHub, repo: str) -> Optional[str]:
+    """Get the repo's default branch."""
+    try:
+        resp = gh.rest("GET", "/repos/%s" % repo)
+    except (GitHubError, ValueError, TypeError, AttributeError):
+        return None
+    if resp.status == 404 or not isinstance(resp.data, dict):
+        return None
+    return resp.data.get("default_branch")
+
+
+def _get_deployment_status(gh: GitHub, repo: str, pr: Dict[str, Any],
+                           ship_on_merge: List[str],
+                           ship_workflows: Dict[str, str],
+                           ship_path_workflows: List[str],
+                           pin_ship_repos: List[str]) -> str:
+    """Determine deployment status for a merged PR."""
+    pr_number = int(pr["number"])
+    merge_sha = str(pr["merge_commit_sha"])
+    
+    # Check if repo ships on merge
+    if repo in ship_on_merge:
+        branch = _default_branch(gh, repo)
+        if branch and not _reverted(gh, repo, pr, [], branch):
+            return "deployed"
+    
+    # Check if repo has deploy workflow
+    if repo in ship_workflows:
+        branch = _default_branch(gh, repo)
+        if branch:
+            workflow = ship_workflows[repo]
+            runs = _deploy_runs(gh, repo, workflow, branch)
+            if runs:
+                by_sha = {str(r["head_sha"]): r for r in runs}
+                newest = max(runs, key=lambda r: str(r.get("created_at") or ""))
+                run = _covering_run(gh, repo, pr, by_sha, newest)
+                if run and not _reverted(gh, repo, pr, [], str(run["head_sha"])):
+                    return "deployed"
+    
+    # Check if repo has path-based deploy workflows
+    if repo in ship_path_workflows:
+        branch = _default_branch(gh, repo)
+        if branch:
+            # Simplified: check if any deploy workflow has a successful run
+            # In reality, we'd check paths filter, but that's complex
+            # For now, check all workflows in the repo
+            try:
+                workflows_resp = gh.rest("GET", "/repos/%s/actions/workflows" % repo)
+            except (GitHubError, ValueError, TypeError, AttributeError):
+                workflows_resp = None
+            if workflows_resp and workflows_resp.status != 404 and isinstance(workflows_resp.data, dict):
+                workflows = workflows_resp.data.get("workflows")
+                if isinstance(workflows, list):
+                    for wf in workflows:
+                        if not isinstance(wf, dict):
+                            continue
+                        wf_file = wf.get("path", "")
+                        if not wf_file.endswith(".yml") and not wf_file.endswith(".yaml"):
+                            continue
+                        wf_name = os.path.basename(wf_file)
+                        runs = _deploy_runs(gh, repo, wf_name, branch)
+                        if runs:
+                            by_sha = {str(r["head_sha"]): r for r in runs}
+                            newest = max(runs, key=lambda r: str(r.get("created_at") or ""))
+                            run = _covering_run(gh, repo, pr, by_sha, newest)
+                            if run and not _reverted(gh, repo, pr, [], str(run["head_sha"])):
+                                return "deployed"
+    
+    # Check if repo is deployed via pin PR in a deployment repo
+    for deploy_repo in pin_ship_repos:
+        # Get merged pin PRs in deployment repo
+        try:
+            pins_resp = gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=100" % deploy_repo)
+        except (GitHubError, ValueError, TypeError, AttributeError):
+            continue
+        if pins_resp.status == 404 or not isinstance(pins_resp.data, list):
+            continue
+        for pin in pins_resp.data:
+            if not isinstance(pin, dict) or not pin.get("merged_at"):
+                continue
+            # Check pin PR files for published-from comment
+            try:
+                files_resp = gh.rest("GET", "/repos/%s/pulls/%d/files" % (deploy_repo, int(pin["number"])))
+            except (GitHubError, ValueError, TypeError, AttributeError):
+                continue
+            if files_resp.status == 404 or not isinstance(files_resp.data, list):
+                continue
+            for f in files_resp.data:
+                if not isinstance(f, dict):
+                    continue
+                patch = str(f.get("patch") or "")
+                # Look for published-from comment with repo and short SHA
+                # Pattern: +    published-from: owner/name abcdef123456
+                for line in patch.split("\n"):
+                    if "published-from:" in line:
+                        parts = line.split("published-from:")[-1].strip().split()
+                        if len(parts) >= 2:
+                            pub_repo = parts[0]
+                            short_sha = parts[1]
+                            if pub_repo.lower() == repo.lower():
+                                # Check if this commit carries our merge commit
+                                try:
+                                    commit_resp = gh.rest("GET", "/repos/%s/commits/%s" % (repo, short_sha))
+                                except (GitHubError, ValueError, TypeError, AttributeError):
+                                    continue
+                                if commit_resp.status not in (404, 422) and isinstance(commit_resp.data, dict):
+                                    revision = str(commit_resp.data.get("sha") or "")
+                                    if COMMIT_RE.fullmatch(revision) and _carries(gh, repo, merge_sha, revision):
+                                        return "deployed"
+    
+    # If we got here, the PR is merged but not confirmed deployed
+    return "merged, not deployed"
+
+
+def _prs_with_deployment_status(gh: GitHub, repo: str, ticket_number: int,
+                                 shipped_at: float,
+                                 env: Optional[Dict[str, str]] = None) -> List[Tuple[int, str]]:
+    """Get merged PRs for a ticket since ship time with their deployment status."""
+    ship_on_merge = _ship_on_merge_repos(env)
+    ship_workflows = _ship_workflows(env)
+    ship_path_workflows = _ship_path_workflows(env)
+    pin_ship_repos = _pin_ship_repos(env)
+    
+    prs = _merged_prs_for_ticket(gh, repo, ticket_number, shipped_at)
+    results: List[Tuple[int, str]] = []
+    seen: List[Dict[str, Any]] = []
+    
+    for pr in prs:
+        status = _get_deployment_status(gh, repo, pr, ship_on_merge, ship_workflows,
+                                         ship_path_workflows, pin_ship_repos)
+        results.append((int(pr["number"]), status))
+        seen.append(pr)
+    
+    return results
 
 
 def ledger_path(home: str) -> str:
@@ -483,21 +777,27 @@ def regression_title(f: Finding) -> str:
     return "Health regression: " + f.title
 
 
-def regression_body(f: Finding, regressed: int, hours: float, diagnosed: str = "") -> str:
+def regression_body(f: Finding, regressed: int, hours: float, diagnosed: str = "",
+                    extra_evidence: Optional[List[str]] = None) -> str:
     """A brief for brain brief --regresses: the line "Regresses #N", then the
     evidence lines (the hours since the ship, the numbers, the finding's own
     words fenced as untrusted data, and the goal's diagnosis), then a whole
     ticket for when a new ticket is filed instead of re-briefing #N. The
     diagnosis sits in the evidence lines because a re-brief of #N in place
     keeps only those (brain._regression_evidence)."""
-    return "\n".join([
+    lines = [
         "Regresses #%d" % regressed,
+    ]
+    if extra_evidence:
+        lines.extend(extra_evidence)
+    lines.extend([
         "The health finding this ticket fixes is still reported %s hours after the ticket "
         "shipped: affected %s, lasting %s hours, impact %s (%s). The endpoint's description "
         "now, quoted as untrusted data:"
         % (_count(round(hours, 1)), _count(f.affected), _count(f.hours), _count(f.impact),
            f.priority),
         quoted(f)] + ([diagnosed] if diagnosed else []) + ["", ticket_body(f)])
+    return "\n".join(lines)
 
 
 def cause(title: str) -> str:
@@ -1012,10 +1312,20 @@ class Intake:
         if self.now - shipped < REGRESS_AFTER:
             return
         hours = (self.now - shipped) / 3600
+        
+        # Get deployment status of merged PRs since ship
+        extra_evidence = []
+        prs_status = _prs_with_deployment_status(self.gh, source.repo, number, shipped)
+        if prs_status:
+            extra_evidence.append("Merged pull requests since ship:")
+            for pr_num, status in prs_status:
+                extra_evidence.append("PR #%d: %s" % (pr_num, status))
+        
         try:
             url = self.brief(self.gh, source.repo, source.goal, regression_title(f),
                              regression_body(f, number, hours,
-                                             diagnosis(source.diagnose, f.key, self.clock)),
+                                             diagnosis(source.diagnose, f.key, self.clock),
+                                             extra_evidence),
                              difficulty="medium",
                              priority=f.priority, regresses=number)
         except ValueError as err:

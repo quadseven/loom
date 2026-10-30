@@ -61,6 +61,36 @@ class ProblemsTest(unittest.TestCase):
     def test_a_good_body_passes(self):
         self.assertEqual(hunt_plan.problems(GOOD), [])
 
+    def test_what_good_look_like_is_not_an_acceptance_heading(self):
+        # "What good look like" is the label of the review bot's acceptance
+        # check in its report, not a heading that check reads (see the
+        # drift test below): a body whose criteria sit under it has no
+        # criteria section the gate accepts.
+        body = GOOD.replace("## Acceptance criteria", "## What good look like")
+        self.assertTrue(any("missing ## Acceptance criteria" in p
+                            for p in hunt_plan.problems(body)),
+                        hunt_plan.problems(body))
+
+    def test_accepted_acceptance_headings_equal_the_review_bots(self):
+        # The drift catcher: Loom's plan check mirrors the review bot's
+        # check_acceptance in services/_shared/personas/tpm/dor_checks.py
+        # (the grug repo), which reads sections under these two headings
+        # (a trailing qualifier on the heading is tolerated there, as
+        # here, by the same heading match). Deriving
+        # Loom's accepted set through problems(), over the bot's headings
+        # plus the near-misses this check has actually produced (the bot's
+        # report label for it; the brief-side "Acceptance" alias), and
+        # comparing it with the bot's set restated here from that source,
+        # fails loudly if an alias creeps back into the plan check.
+        chief_headings = {"Acceptance criteria", "Test plan"}
+        candidates = chief_headings | {"What good look like", "Acceptance"}
+        accepted_headings = set()
+        for heading in candidates:
+            body = GOOD.replace("## Acceptance criteria", "## " + heading)
+            if hunt_plan.problems(body) == []:
+                accepted_headings.add(heading)
+        self.assertEqual(accepted_headings, chief_headings)
+
     def test_each_blocking_check_is_named(self):
         cases = {
             "## Why has 2 words": GOOD.replace("The page query is slow for every visitor.", "Too slow."),
@@ -74,6 +104,44 @@ class ProblemsTest(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertTrue(any(expected in p for p in hunt_plan.problems(body)),
                                 hunt_plan.problems(body))
+
+
+class PadCriteriaTest(unittest.TestCase):
+    """The gate counts three non-empty bullets under Acceptance criteria. A
+    ticket may state fewer: the factory files a follow-up ticket with the one
+    criterion a lane left not built, and a body the gate refuses holds the
+    pull request until the plan-check invariant fires."""
+
+    def test_a_section_with_the_bullets_the_gate_wants_is_left_alone(self):
+        section = "- [ ] One\n- [ ] Two\n- [ ] Three"
+        self.assertEqual(hunt_plan.pad_criteria(section), section)
+
+    def test_a_thin_section_gets_the_standard_bullets(self):
+        padded = hunt_plan.pad_criteria("- [ ] One")
+        self.assertEqual(len(hunt_plan.bullets(padded)), hunt_plan.MIN_BULLETS)
+        self.assertTrue(padded.startswith("- [ ] One"))
+        for filler in hunt_plan.FILLER_BULLETS:
+            self.assertIn(filler, padded)
+
+    def test_a_section_with_no_criterion_keeps_the_gate_s_refusal(self):
+        # A body with nothing to build is not a body to merge: the gate
+        # refuses it, and so does the check that mirrors the gate.
+        padded = hunt_plan.pad_criteria("")
+        self.assertEqual(padded, "")
+        body = GOOD.replace("- [ ] The page loads in under a second.\n"
+                            "- [ ] A test fails without the cache.\n"
+                            "- [ ] The query runs once a minute.", padded)
+        self.assertTrue(any("non-empty bullets" in p for p in hunt_plan.problems(body)))
+
+    def test_a_padded_body_passes_the_gate(self):
+        thin = GOOD.replace("- [ ] A test fails without the cache.\n", "")
+        self.assertTrue(any("non-empty bullets" in p for p in hunt_plan.problems(thin)))
+        padded = GOOD.replace("- [ ] The page loads in under a second.\n"
+                              "- [ ] A test fails without the cache.\n"
+                              "- [ ] The query runs once a minute.",
+                              hunt_plan.pad_criteria(
+                                  "- [ ] The page loads in under a second."))
+        self.assertEqual(hunt_plan.problems(padded), [])
 
 
 class BriefToPullRequestTest(unittest.TestCase):
@@ -90,7 +158,9 @@ class BriefToPullRequestTest(unittest.TestCase):
 
     def test_a_brief_whose_pull_request_would_fail_is_named(self):
         thin = (BRIEF % "S").replace("- [ ] A test fails without the cache.\n", "")
-        self.assertTrue(any("non-empty bullets" in p for p in brain.plan_problems(thin)))
+        # A brief with fewer criteria than the gate wants still yields a body
+        # it accepts: the body carries the standard bullets.
+        self.assertEqual(brain.plan_problems(thin), [])
         self.assertTrue(brain.plan_problems(BRIEF % "XL"))
         self.assertEqual(brain.plan_problems(BRIEF % "Medium"), [])
 

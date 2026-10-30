@@ -984,6 +984,7 @@ class EveryPathTest(unittest.TestCase):
         ("bus/invariants.py", "_close_settled"): "self._held(",
         ("bus/station.py", "_close_done_ticket"): "shadow.active(",
         ("bus/station.py", "_settle_claimed"): "shadow.active(",
+        ("bus/sweep.py", "_close"): "shadow.guard(",
         ("bus/watch.py", "_close_quiet"): "shadow.guard(",
     }
     # A state of "closed" or "open" that is no write: the guard's own tables

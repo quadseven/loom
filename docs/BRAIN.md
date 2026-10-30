@@ -245,7 +245,10 @@ findings section.
 checks (bus/hunt_plan.py mirrors them: Why of at least 5 words, at least 3
 non-empty Acceptance criteria bullets, a Size of XS, S, M or L, a non-empty
 Out of scope), and files a Size written as a word (Small, Medium, Large) as
-its letter. `brief` (and the station's rewrite step) also refuses a Live
+its letter. A ticket that states fewer than three criteria is not refused:
+the pull request body carries the standard bullets the gate wants
+(`bus/hunt_plan.py` `pad_criteria`), so the body, not the ticket, decides.
+`brief` (and the station's rewrite step) also refuses a Live
 criterion (the acceptance line that starts with "Live") that names no exact
 string in backticks or double quotes; health and friction intake tickets are
 verified by the station's own absence tracking and are exempt. The string is
@@ -822,20 +825,12 @@ labelled `claim:<login>`) still follows its pull request: an open pull
 request by that owner, on a branch of the repo, whose `Refs` line names a
 ticket a trusted login filed, moves it from `loom:queued` to `loom:pr`, and
 from there the closed pull request pass moves it to `loom:merged` on merge
-and shipping follows. A merge that leaves a code criterion unticked in every
-merged pull request for it, and unticked on the ticket, moves the ticket to
-`loom:queued` instead, with a status event naming only those boxes. A box
-marked `; not built: <reason>` is unbuilt, and boxes match after whitespace
-and markdown markup are normalised (loom#2026). The brain's own merge applies
-the same rule after the diff check. It is never
-briefed or claimed this way, and a pull
-request by anyone who does not own the ticket moves nothing. So is a ticket assigned to a login outside
-`LOOM_BRIEF_AUTHORS` or labelled `claim:<login>` for one, or one under a goal home whose `Operator:` line names
-another login: another operator's Loom owns it (docs/LANES.md, "Two Looms on
-shared repos"). A trusted briefer owns nothing here: an issue assigned to or
-claim-labelled for one is skipped too, unless it is a `loom:ticket` that
-briefer authored, which is a hand-off. A claim assigns the ticket to this
-Loom's operator login and labels it `claim:<that login>`.
+and shipping follows. A ticket assigned to or claim-labelled for a second
+contributor, on an open pull request by that contributor, also moves from
+`loom:pr` to `loom:merged` when that pull request is merged (the merge itself
+is the trust for a contributor). This ensures that work done by a second
+contributor through their own pull request still progresses through the Loom
+states to `loom:shipped.
 
 The brain applies the same rule to what it reads: issue bodies, comments and
 reviews from logins outside `LOOM_BRIEF_AUTHORS` and the review bots are
@@ -1584,14 +1579,22 @@ branch after the merge instead (bus/revert.py, every pass, off with
 
 ## Merge-ready
 
-A lane pull request is merge-ready if and only if all four hold:
+A lane pull request is merge-ready if and only if all five hold:
 
 - its head commit's check rollup is `SUCCESS`;
 - the newest submitted review from the review bot (`LOOM_REVIEW_BOT`, else
   `grug-tribe`, and an app, not a person with that login) is not
   `CHANGES_REQUESTED`. Only the newest counts: a `CHANGES_REQUESTED`
-  followed by newer `COMMENTED` reviews no longer blocks, and reviews and
-  replies from anyone else never change the verdict;
+  followed by newer `COMMENTED` reviews no longer blocks, and other apps'
+  reviews never change the verdict;
+- no person (any review author that is not an app) has a standing change
+  request. As GitHub's `reviewDecision` reads it, each person's newest
+  `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED` review counts (login
+  compared without letter case) and a later `COMMENTED` review does not
+  clear a request. The blocker reads `changes requested by a person
+  (LOGIN)`, and `bus.brain merge` refuses with the same words before the
+  merge call (loom#1987), so a tick no longer spends a merge attempt on a
+  GitHub 405 every time;
 - it has no unresolved review thread;
 - every thread the review bot opened (a finding) is older than the head
   commit, so a fix-up commit came after each finding.
@@ -1642,6 +1645,39 @@ updates it again and it keeps the lock. The lock ends when it merges or
 closes, or 40 minutes after the mark (from the label's event on GitHub),
 when the label comes off and the next pass picks again. Operators merging
 by hand follow the same cadence.
+
+### Branch hygiene
+
+The factory's judging reaches a pull request only while its ticket sits at
+`loom:pr` with its review settled, and a held pull request whose update is
+refused is left where it lies, so a pull request outside that path (one
+waiting on its checks, one held for the operator) used to drift behind or
+into a conflict nobody was assigned, found only when someone came to merge
+it (loom#2135). Each repo pass therefore follows its judging with a
+hygiene sweep over the repo's open lane pull requests, oldest first. A
+behind, conflict-free one is brought up to date in small steps (at most
+two a repo a pass, never while another pull request there holds the
+landing lock or in a pass where the repo already landed one, and never on
+a head with a failed check, whose re-runs and fix rounds are the cheaper
+answer). A conflicting one gets exactly one fix round for the conflict,
+open while the head it was opened for is still the head; a round opened
+before fix comments carried their head counts as open for any head, so an
+old round is never doubled. The judged send-back's holds still apply
+there, with one exception: a `loom:human` ticket gets its conflict round
+anyway, because that hold guards the pull request's merge, not its
+branch, and the label stays on the ticket through the move; a
+`needs-brain` ticket and one in the hand-off pool are left to the brain
+and that session. Hygiene never merges anything: a `class:sensitive`
+pull request is maintained exactly like a lane one up to the merge step,
+which stays with the brain or the operator as before. Each action is one
+station log line, and so is each skip the pass decides itself (a held
+landing lock, the per-repo bound, a landing earlier in the pass, a ticket
+with the brain or in the hand-off pool, a round already open, an update
+refused); the lock, bound and landed skips are said once a repo a pass,
+however many pull requests they cover. Pull requests outside the pass's
+remit (not a lane pull request, no ticket in the repo, not yet judged by
+GitHub, a red head the judge is already handling, one brought up to date
+within the cooldown) pass without a line.
 
 ## Merge by change class
 

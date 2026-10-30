@@ -261,6 +261,10 @@ if [ "${FAKE_AGENT:-commit}" = verify-file ]; then
   printf '{"missing": "the station log"}' > verify.json
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = review-file ]; then
+  printf '{"blocking": [], "notes": [], "summary": "sound"}' > review.json
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = limit ]; then
   echo "ERROR: You've hit your usage limit. Try again at 12:21 PM."
   exit 1
@@ -794,6 +798,93 @@ print('leak guard: clean (shape patterns only)')
         self.assertTrue(line.startswith("[transient] public repo leak scan could not run"), line)
         self.assertIn("could not read deny-list", line)
 
+    def test_a_lane_started_without_a_clone_base_does_not_crash_on_an_unbound_variable(self):
+        """launchd starts the local lanes without LOOM_CLONE_BASE; the scanner
+        remote must default like the ticket clone does (git@github.com:), or
+        every run dies at once under set -u and no lane works."""
+        env = self.lane_env()
+        del env["LOOM_CLONE_BASE"]
+        self.drop_brief()
+        result = subprocess.run(["bash", str(RUNNER), "codex"], env=env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertNotIn("unbound variable", result.stderr)
+
+    def test_a_missing_leak_scanner_is_a_factory_incident(self):
+        # No infra-public checkout and no remote to clone it from: the scanner
+        # cannot be had, so a public-repo push is a factory incident (one issue
+        # filed, the ticket held) instead of a transient failure that the
+        # station re-briefs endlessly.
+        self.drop_brief()
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        line = self.failure_line()
+        self.assertTrue(line.startswith("[factory] "), line)
+        self.assertIn("scanner not found", line)
+        self.assertEqual(len([c for c in self.calls() if c.startswith("gh issue create")]), 1)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+        # With an infra-public remote holding the scanner but no local
+        # checkout, the lane clones it before the scan and the push opens.
+        root = Path(self._tmp.name)
+        remotes = root / "remotes"
+        remote = remotes / "quadseven" / "infra-public"
+        remote.parent.mkdir(parents=True)
+        git("init", "-q", "-b", "main", str(remote))
+        scripts = remote / ".github" / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "check_private_leaks.py").write_text(self.scanner.read_text())
+        git("add", ".github/scripts/check_private_leaks.py", cwd=remote)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "scanner", cwd=remote)
+        self.log.write_text("")
+        self.drop_brief("T043-next.md", BRIEF.replace("T042-fix-the-thing", "T043-next"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.loom / "infra-public").exists())
+        self.assertTrue((self.loom / "infra-public" / ".github" / "scripts" / "check_private_leaks.py").exists())
+        self.assertTrue((self.inbox / "done" / "T043-next.md").exists())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+
+        checkout = self.loom / "infra-public"
+        first_head = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                    capture_output=True, text=True, check=True).stdout.strip()
+        (scripts / "scanner-version").write_text("updated\n")
+        git("add", ".github/scripts/scanner-version", cwd=remote)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "update", cwd=remote)
+        self.log.write_text("")
+        self.drop_brief("T044-hourly.md", BRIEF.replace("T042-fix-the-thing", "T044-hourly"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                        capture_output=True, text=True, check=True).stdout.strip(),
+                         first_head)
+
+        stamp = self.loom / "run" / "infra-public.updated"
+        old = time.time() - 2 * 3600
+        stamp.write_text(str(int(old)) + "\n")
+        self.log.write_text("")
+        self.drop_brief("T045-hourly-refresh.md", BRIEF.replace("T042-fix-the-thing", "T045-hourly-refresh"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                           capture_output=True, text=True, check=True).stdout.strip(),
+                            first_head)
+
+        # A refresh whose fetch fails leaves the stamp stale, so the next run
+        # tries again instead of trusting a checkout it could not update.
+        stamp.write_text(str(int(old)) + "\n")
+        remote.rename(remotes / "quadseven" / "infra-public-gone")
+        self.log.write_text("")
+        self.drop_brief("T046-fetch-fails.md", BRIEF.replace("T042-fix-the-thing", "T046-fetch-fails"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stamp.read_text().strip(), str(int(old)))
+
     # A workload that selects a node label, for the live-cluster check
     # (bus/live_cluster.py, loom#1832).
     MANIFEST = ("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
@@ -1087,6 +1178,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("Bugs discovered line 3 left out: the cited issue could not be looked up", log)
         self.assertEqual(hunt_plan.problems(body), [])
 
+    def test_a_one_criterion_ticket_opens_a_body_the_gate_accepts(self):
+        # A follow-up ticket states the one criterion a lane left not built;
+        # its body failed the plan check with 1 bullet of the 3 it wants.
+        thin = BRIEF.replace("## Acceptance criteria\n", "## Acceptance\n").replace(
+            "- [ ] A test covers the thing\n- [ ] Nothing else changes\n", "")
+        self.drop_brief(text=thin)
+        result = self.run_lane(FAKE_SUMMARY="Fix the thing so it works")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("## Acceptance criteria\n- [ ] The thing works\n", body)
+        self.assertEqual(hunt_plan.problems(body), [])
+
     def test_a_body_without_bugs_has_no_bugs_section(self):
         self.drop_brief()
         self.run_lane(FAKE_SUMMARY=self.TICKED)
@@ -1228,6 +1331,57 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual((logs / "T042-fix-the-thing.verify.model").read_text(), "gpt-test-default\n")
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def review_brief(self):
+        """A Luna review brief for PR 7 (loom#2142), whose branch is already
+        on the remote with the lane's first commit, as the station's
+        dispatch leaves it."""
+        work = Path(self._tmp.name) / "pr-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
+        (work / "first.txt").write_text("first try\n")
+        git("add", "first.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "First try", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        issue = {"number": 42, "title": "Fix the thing",
+                 "body": "Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n"}
+        head = self.remote_head(self.FIX_BRANCH)
+        name = tickets.review_name("example/repo", 42, 2)
+        self.drop_brief(name + ".md", tickets.render_review_brief(
+            "example/repo", issue, "codex", 2, 7, self.FIX_BRANCH, "main", head))
+        return name, head
+
+    def test_a_review_brief_records_its_verdict_and_pushes_nothing(self):
+        name, before = self.review_brief()
+        result = self.run_lane(FAKE_AGENT="review-file")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        logs = self.loom / "logs" / "codex"
+        self.assertEqual((logs / (name + ".review.json")).read_text(),
+                         '{"blocking": [], "notes": [], "summary": "sound"}')
+        # The brief's Model: line pins the run to Luna, not the lane default.
+        self.assertEqual((logs / (name + ".review.model")).read_text(), "gpt-6-luna\n")
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("codex ") for c in calls))
+        self.assertFalse(any(c.startswith("gh pr create") for c in calls))
+
+    def test_a_review_brief_without_a_review_pr_is_parked(self):
+        brief = BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: review")
+        self.drop_brief(text=brief)
+        result = self.run_lane(FAKE_AGENT="review-file")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("review brief needs Review-PR", log)
+        self.assertFalse((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_review_run_without_a_verdict_is_parked(self):
+        name, _ = self.review_brief()
+        result = self.run_lane(FAKE_AGENT="noop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("no review.json written", log)
 
     def test_answer_deliverable_without_file_fails_as_no_answer_written(self):
         brief = BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer")
@@ -1624,6 +1778,20 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         body = self.body.read_text()
         self.assertIn("\nSize: S\n", body)
         self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_pr_body_carries_the_bullets_the_gate_wants_for_a_thin_brief(self):
+        # The gate counts three bullets under Acceptance criteria. A ticket
+        # that states fewer (the factory files a follow-up ticket with the one
+        # criterion a lane left not built) still opens a body it accepts: a
+        # body it refuses holds the pull request.
+        self.drop_brief(text=BRIEF.replace(
+            "- [ ] The thing works\n- [ ] A test covers the thing\n"
+            "- [ ] Nothing else changes", "- [ ] The thing works"))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertEqual(hunt_plan.problems(body), [])
+        self.assertIn("- [ ] The thing works", body)
 
     def test_pr_body_has_no_refs_without_an_issue_line(self):
         self.drop_brief()

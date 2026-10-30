@@ -49,6 +49,10 @@ STAMP_RE = re.compile(
     r"^\s*\[?(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:[.,]\d+)?"
     r"(Z|[+-]\d{2}:?\d{2})?(?![\d:])")
 TIMEOUT = 60
+# The station's own verify-result line (station._verify_note), after the time
+# it starts with. It quotes the Live criterion, so a verify run that read it
+# would count the quoted string as an observation (loom#2052).
+VERIFY_NOTE_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)?station: verify of ")
 
 
 def _eligible(value: str) -> bool:
@@ -161,7 +165,8 @@ def safe_line(line: str, known: Iterable[str] = ()) -> bool:
 def _run(command: str, literal: str, windows: Optional[List[float]] = None,
          extra: Optional[Dict[str, str]] = None) -> Tuple[Optional[List[str]], str]:
     """(the lines the command printed for `literal`, without its window line;
-    None with the reason when it gave no answer). The hours of log the command
+    None with the reason when it gave no answer). The station's own verify-result
+    lines (VERIFY_NOTE_RE) are left out. The hours of log the command
     says it read (WINDOW_RE) are added to windows."""
     env = dict(os.environ, LOOM_EVIDENCE_NEEDLE=literal, **(extra or {}))
     try:
@@ -184,6 +189,8 @@ def _run(command: str, literal: str, windows: Optional[List[float]] = None,
     lines = []
     for line in stdout.splitlines():
         reported = WINDOW_RE.match(line)
+        if VERIFY_NOTE_RE.match(line):
+            continue
         if reported:
             if windows is not None:
                 windows.append(float(reported.group(1)))

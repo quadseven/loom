@@ -128,6 +128,22 @@ class SignatureTest(unittest.TestCase):
             self.assertIsNone(watch.stage(line), line)
             self.assertNotIn("<stage>", watch.signature(line), line)
 
+    def test_setup_failure_wording_variants_produce_one_signature(self):
+        # loom#2158: the log watcher filed #2120 ("on the unmodified repo")
+        # and #2122 ("on the default branch") for one factory incident #2061.
+        # Both wordings after "base check exited <n>" must normalize to one signature.
+        line_unmodified = ("[2026-10-13T10:00:01Z] station: could not scan example-owner/repo-a: "
+                           "base check exited 1 on the unmodified repo")
+        line_default_branch = ("[2026-10-13T10:00:01Z] station: could not scan example-owner/repo-a: "
+                               "base check exited 1 on the default branch")
+        self.assertEqual(watch.signature(line_unmodified), watch.signature(line_default_branch))
+        sig = watch.signature(line_unmodified)
+        self.assertIn("base check exited <n> on the <setup-failure>", sig)
+        # Also the "the check exited 125-127 on the unmodified base" variant.
+        line_check_exited = ("[2026-10-13T10:00:01Z] station: could not scan example-owner/repo-a: "
+                             "the check exited 126 on the unmodified base")
+        self.assertEqual(watch.signature(line_check_exited), sig)
+
     def test_which_lines_are_kept(self):
         for line in ("ValueError: bad", "push failed", "Connection refused",
                      "HTTP 502 from the API", "upstream said 404 Not Found"):
