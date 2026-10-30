@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+from datetime import datetime, timezone
 
 from bus.brain import TICK_STEPS as STEPS
 from bus.metrics import TERMINAL_STATES
@@ -149,6 +150,186 @@ def build_brain(record, error, journals, wait_rows=(), waits_error=""):
             "markers": MARKER_RE.findall(newest),
             "ticks": [_tick(j) for j in ordered[:RECENT_TICKS]],
             "ranking": rank_waits(wait_rows, waits_error)}
+
+
+def _journal_holders(journals):
+    holders = {}
+    for journal in journals or []:
+        if not str(journal.get("body") or "").startswith(JOURNAL_MARKER):
+            continue
+        tick = _tick(journal)
+        holder = _brain_name(tick["holder"])
+        if holder != "holder missing" and (holder not in holders or
+                                             str(tick["at"] or "") > str(holders[holder]["at"] or "")):
+            holders[holder] = tick
+    return holders
+
+
+def _brain_name(holder):
+    names = {"operator-session": "operator session", "operator": "operator session",
+             "mastermind": "operator session", "lane-machine": "lane machine",
+             "local-brain": "lane machine", "local": "lane machine"}
+    return names.get(str(holder or "").lower(), str(holder or ""))
+
+
+def _brain_state(holder, record, tick, now):
+    if record and record.get("holder") == holder and record.get("step"):
+        return "running", record.get("step")
+    if tick:
+        try:
+            stamp = datetime.fromisoformat(str(tick.get("at")).replace("Z", "+00:00"))
+            return ("off" if (now - stamp).total_seconds() > 86400 else "paused"), tick.get("line")
+        except (ValueError, TypeError):
+            return "paused", tick.get("line")
+    return "off", "no recent step recorded"
+
+
+def _age(value, now):
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        seconds = max(0, int((now - stamp).total_seconds()))
+    except (ValueError, TypeError):
+        return "time unavailable"
+    if seconds < 3600:
+        return "%d minutes ago" % (seconds // 60)
+    if seconds < 86400:
+        return "%d hours ago" % (seconds // 3600)
+    return "%d days ago" % (seconds // 86400)
+
+
+def build_brains(record, journals, lanes, tickets, pull_requests, comments=(), now=None):
+    """Build the read-only brain, lane and hand-off map from dashboard snapshot data."""
+    now = now or datetime.now(timezone.utc)
+    brains = _build_brain_cards(record, journals, now)
+    lane_cards = _build_lane_cards(lanes, tickets, pull_requests, comments, now)
+    return {"brains": brains, "lanes": lane_cards, "now": now}
+
+
+def _build_brain_cards(record, journals, now):
+    holders = _journal_holders(journals)
+    for holder in ("operator session", "muse", "lane machine"):
+        holders.setdefault(holder, None)
+    if record and record.get("holder"):
+        holders.setdefault(_brain_name(record["holder"]), None)
+    brains = []
+    for holder, tick in sorted(holders.items()):
+        record_holder = _brain_name((record or {}).get("holder"))
+        state, step = _brain_state(holder, record if record_holder == holder else None, tick, now)
+        brains.append({"holder": holder, "state": state, "step": step,
+                       "at": (record or {}).get("started_at") if state == "running" else (tick or {}).get("at"),
+                       "age": _age((record or {}).get("started_at") if state == "running"
+                                   else (tick or {}).get("at"), now)})
+    return brains
+
+
+def _build_lane_cards(lanes, tickets, pull_requests, comments, now):
+    ticket_by_lane = {}
+    for ticket in tickets or []:
+        if ticket.get("lane") and ticket.get("state") in ("running", "pr"):
+            ticket_by_lane[ticket["lane"]] = ticket
+    claim_times = _claim_times(comments)
+    lane_cards = []
+    for lane in lanes or []:
+        name = lane.get("lane")
+        ticket = ticket_by_lane.get(name)
+        lane_cards.append({"lane": name, "holder": "muse" if name == "muse" else "lane machine",
+                           "heartbeat": lane.get("heartbeat"), "ticket": ticket,
+                           "age": _age(lane.get("heartbeat"), now),
+                           "run_started": claim_times.get(_ticket_key(ticket)),
+                           "claim": next((label for label in (ticket or {}).get("labels", [])
+                                          if str(label).startswith("claim:")), None)})
+    prs = []
+    for pr in pull_requests or []:
+        parsed = _lane_pr_ticket(pr)
+        if parsed:
+            prs.append((parsed, pr))
+    for lane in lane_cards:
+        ticket = lane["ticket"]
+        lane["pull_request"] = next((pr for ref, pr in prs if ticket and ref ==
+                                      (ticket.get("repo"), str(ticket.get("number")))), None)
+    return lane_cards
+
+
+def _ticket_key(ticket):
+    if not ticket:
+        return None
+    return str(ticket.get("repo")) + "#" + str(ticket.get("number"))
+
+
+def _claim_times(comments):
+    claims = {}
+    for comment in comments or []:
+        body = str(comment.get("body") or "")
+        match = re.match(r"Claimed for lane (\S+)", body)
+        issue = re.search(r"/issues/(\d+)$", str(comment.get("issue_url") or ""))
+        if match and issue and comment.get("repo"):
+            key = str(comment["repo"]) + "#" + issue.group(1)
+            claims[key] = comment.get("created_at")
+    return claims
+
+
+def _lane_pr_ticket(pr):
+    match = re.search(r"^Loom ticket ([A-Za-z0-9-]+)[./]([A-Za-z0-9_.-]+?)(?:#|-)(\d+)",
+                      str(pr.get("body") or ""), re.M)
+    return (match.group(1) + "/" + match.group(2), match.group(3)) if match else None
+
+
+def render_brains(data):
+    """Render the current brain and lane snapshot without page-time reads."""
+    brains = _render_brain_cards(data.get("brains", []))
+    lane_html = _render_lane_cards(data.get("lanes", []))
+    incident_html = _render_incidents(data.get("lanes", []))
+    return ('<p class="page-lede">Brains, their lanes and the work each lane holds now.</p>'
+            '<section class="section"><h2 class="label">Brains</h2><div class="lane-grid">%s</div></section>'
+            '<section class="section"><h2 class="label">Lanes and hand-offs</h2><div class="lane-grid">%s</div></section>'
+            '<section class="section"><h2 class="label">Factory incident holds</h2>%s</section>') % (
+                brains, lane_html, incident_html)
+
+
+def _render_brain_cards(brain_rows):
+    esc = html.escape
+    brains = "".join('<article class="card"><h2>%s</h2><p>%s</p><p>%s</p></article>' % (
+        esc(brain["holder"]), esc(brain["state"]),
+        esc((brain.get("step") or "step unavailable") + " / last posted " + brain["age"]))
+        for brain in brain_rows) or '<p class="empty-state">No brain ticks have been recorded.</p>'
+    return brains
+
+
+def _render_lane_cards(lane_rows):
+    esc = html.escape
+    lanes = []
+    for lane in lane_rows:
+        ticket = lane.get("ticket")
+        if ticket:
+            href = "/t/%s/%s" % (esc(str(ticket.get("repo") or "")), esc(str(ticket.get("number") or "")))
+            doing = '<a href="%s">%s</a>' % (href, esc(ticket.get("title") or "ticket"))
+            if lane.get("run_started"):
+                doing += ' / run started %s' % esc(lane["run_started"])
+        else:
+            doing = "idle"
+        if lane.get("claim"):
+            doing += " / claimed by " + esc(lane["claim"].partition(":")[2])
+        pr = lane.get("pull_request")
+        pr_link = (' <a href="%s">open PR</a> / brain review' %
+                   esc(str(pr.get("html_url") or "#"))) if pr else ""
+        lanes.append('<article class="card"><h3>%s</h3><p>%s / %s</p><p>%s%s</p><p>%s</p></article>' % (
+            esc(lane.get("lane") or "lane"), esc(lane.get("holder") or "brain"),
+            esc("busy" if ticket else "idle"), doing, pr_link,
+            esc("last heartbeat " + lane["age"])))
+    lane_html = "".join(lanes) or '<p class="empty-state">No lane heartbeats have been recorded.</p>'
+    return lane_html
+
+
+def _render_incidents(lane_rows):
+    esc = html.escape
+    incidents = [ticket for lane in lane_rows for ticket in [lane.get("ticket")]
+                 if ticket and "needs-brain" in (ticket.get("labels") or [])]
+    incident_html = "".join('<p><a href="/t/%s/%s">%s</a> held for brain review</p>' % (
+        esc(str(ticket.get("repo") or "")), esc(str(ticket.get("number") or "")),
+        esc(ticket.get("title") or "ticket")) for ticket in incidents)
+    if not incident_html:
+        incident_html = '<p class="empty-state">No factory incident holds are recorded.</p>'
+    return incident_html
 
 
 TAG_LABELS = {None: "note"}
