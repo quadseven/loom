@@ -61,6 +61,43 @@ class ProblemsTest(unittest.TestCase):
     def test_a_good_body_passes(self):
         self.assertEqual(hunt_plan.problems(GOOD), [])
 
+    def test_grug_issue_983_body_fixture_passes_triage(self):
+        # A sanitized fixture based on the referenced issue body. Keep its
+        # section shape and Why wording while generalizing cross-repo links.
+        body = """## Why
+A prior issue is verified 5-of-6 on the default branch and has been since
+early September. Its sixth criterion is a single query against the live
+store, and it is the only thing keeping the issue open:
+
+> A recorded answer to whether this repository is enrolled in its own
+> hygiene watch, with the query and its output. If it is not, either enroll
+> it or record why not - do not leave it ambiguous.
+
+The flag is a per-repository row read by the watch listing query; it is a
+database fact, not a tree fact, so no checkout and no CI job can produce it.
+The consequence is that every automated verify pass re-derives the same
+five met criteria, writes another comment saying so, and leaves the issue
+open. The issue has accumulated several such comments for one unchanged
+blocker.
+
+## What
+Run the one query against the live store and record it. Then either enroll
+the repository or write down why not.
+
+## Acceptance criteria
+- [ ] Record the flag value with the query and raw output.
+- [ ] If disabled, enroll the repository or record why not.
+- [ ] Link the first weekly watch run and its finding count.
+- [ ] Close the earlier issue when its verification criterion is complete.
+
+Size: XS
+
+## Out of scope
+- Changes to the scanner or its parity corpus.
+- Enrolling any other repository.
+"""
+        self.assertEqual(hunt_plan.problems(body), [])
+
     def test_what_good_look_like_is_not_an_acceptance_heading(self):
         # "What good look like" is the label of the review bot's acceptance
         # check in its report, not a heading that check reads (see the
