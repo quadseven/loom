@@ -1286,7 +1286,11 @@ cannot query the viewer or any other local service.
   without running. Restarts cannot re-run a ticket.
 - Otherwise: fresh clone, the lane's official CLI with the brief, then the
   runner (not the agent) pushes the branch and opens the PR in the format
-  the Chief check requires.
+  the Chief check requires. The body carries the standard Acceptance criteria
+  bullets when the ticket states fewer than the three the check wants (the
+  factory files a follow-up ticket with the one criterion a lane left not
+  built): a body the Chief check refuses holds the pull request until the
+  plan-check invariant fires.
 - `copilot` reads its token from `LOOM_COPILOT_KEY_SSM` and exports it only as
   `COPILOT_GITHUB_TOKEN`. It invokes one `copilot -p` prompt with
   `--allow-all-tools`; the run output, including any CLI usage details, is
