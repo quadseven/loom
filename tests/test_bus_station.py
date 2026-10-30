@@ -208,11 +208,8 @@ class FakeGitHub:
             return reply(200, found) if found else reply(404, {"message": "Not Found"})
         if (method == "GET" and parts.path == "/repos/%s/issues" % station.FACTORY_REPO
                 and "state=closed" in parts.query):
-            # _closed_incidents lists closed issues on the factory repo and
-            # filters by the body marker. When the query also filters on the
-            # loom:factory label, the fake honours it (simulating GitHub):
-            # an incident filed without the label (loom#918) is not returned
-            # by a labels=loom:factory query, only by the marker-based list.
+            # The factory can list incidents for other passes; this fake
+            # honors the label when present and otherwise returns the full set.
             if "labels=loom%3Afactory" in parts.query or "labels=loom:factory" in parts.query:
                 return reply(200, [i for i in self.factory_incidents
                                    if any(l.get("name") == "loom:factory"
@@ -6385,6 +6382,61 @@ class FactoryIncidentTest(Base):
             "body": ("<!-- loom:factory-incident v1 -->\n\nRepo: %s\nKind: environment\n"
                      "Ticket: %s#12\n\ncheck: make check (exit 127)\n" % (REPO, REPO)),
             "labels": labels}]
+        self.fake.issues[99] = dict(self.fake.factory_incidents[0])
+
+    def held_directly(self, incident_ref=None, body_events=()):
+        issue = self.fake.issues[12]
+        issue["labels"] = [{"name": "loom:ticket"}, {"name": "lane:muse"},
+                           {"name": "loom:running"}, {"name": "wait:incident"}]
+        if body_events:
+            issue["body"] = status.with_body_events(issue.get("body", ""), list(body_events))
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"%s#12" % REPO: {"incident": incident_ref or "%s#99" % REPO,
+                                       "at": time.time()}}, fh)
+
+    def test_body_only_incident_ref_requeues_a_held_ticket_without_comments(self):
+        self.fake.add(12, lane="muse", body=PLAIN, state="running")
+        self.held_directly(body_events=[("2030-01-01T00:00:00Z",
+                                         "Lane muse held: factory incident %s#99" % REPO)])
+        self.assertEqual(self.fake.comments[12], [])
+        self.incident()
+        self.fake.issues[99] = dict(self.fake.factory_incidents[0])
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            station.Station(GitHub("token", transport=self.fake), self.settings).release_factory_held()
+        self.assertIn("loom:queued", self.fake.names(12))
+
+    def test_body_only_claim_after_close_keeps_the_held_ticket_running(self):
+        self.fake.add(12, lane="muse", body=PLAIN, state="running")
+        self.held_directly(body_events=[("2030-01-01T00:00:00Z",
+                                         "Lane muse held: factory incident %s#99" % REPO)])
+        self.incident()
+        self.fake.issues[99] = dict(self.fake.factory_incidents[0])
+        self.fake.issues[12]["body"] = status.with_body_events(
+            self.fake.issues[12]["body"], [("2030-01-01T00:20:00Z",
+                "Claimed for lane muse (body sha256 0123456789ab)")])
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            station.Station(GitHub("token", transport=self.fake), self.settings).release_factory_held()
+        self.assertIn("loom:running", self.fake.names(12))
+
+    def test_open_incidents_do_not_read_held_tickets_or_list_closed_issues(self):
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        held = {}
+        for number in range(100, 180):
+            self.fake.add(number, lane="muse", body=PLAIN, state="running")
+            held["%s#%d" % (REPO, number)] = {"incident": "%s#99" % REPO, "at": 0}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(held, fh)
+        self.fake.issues[99] = {"number": 99, "body": "<!-- loom:factory-incident v1 -->",
+                                "state": "open", "labels": []}
+        self.fake.calls.clear()
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            station.Station(GitHub("token", transport=self.fake), self.settings).release_factory_held()
+        paths = [path for method, path in self.fake.calls if method == "GET"]
+        self.assertFalse(any(re.search(r"issues/(?:10[0-9]|1[1-7][0-9])$", p) for p in paths))
+        self.assertFalse(any("state=closed" in p for p in paths))
 
     def test_factory_is_a_failure_class_not_work(self):
         self.assertEqual(station.failure_class("[factory] setup failed: x"), "factory")
@@ -6550,12 +6602,12 @@ class FactoryIncidentTest(Base):
         self.run_pass()
         self.incident()
         with mock.patch.object(station, "FACTORY_REPO", REPO), \
-                mock.patch.object(station.Station, "_closed_incidents",
+                mock.patch.object(station.Station, "_factory_incident",
                                   side_effect=station.GitHubError("boom", 502)), \
                 mock.patch("bus.station._say") as say:
             self.run_pass()
         said = [c.args[0] for c in say.call_args_list]
-        self.assertIn("factory release: could not read the closed incidents: boom", said)
+        self.assertIn("factory release: could not read incident %s#99: boom" % REPO, said)
         self.assertIn("loom:running", self.fake.names(12))
         self.assertFalse(any("back in the queue" in b for b in self.bodies()))
         with mock.patch.object(station, "FACTORY_REPO", REPO):
