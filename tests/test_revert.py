@@ -207,8 +207,10 @@ class RepairsEpic(Base):
         super().setUp()
         self.gh.goals = [{"number": 30, "title": "Loom keeps goals moving", "state": "open",
                           "labels": [{"name": "loom:goal"}]}]
-        self.gh.subs = {30: [{"number": 70, "state": "open", "title": brain.REPAIRS_TITLE,
-                              "labels": [{"name": "epic"}], "body": "Part of #30\n"}]}
+        epic = {"number": 70, "state": "open", "title": brain.REPAIRS_TITLE,
+                "labels": [{"name": "epic"}], "body": "Part of #30\n"}
+        self.gh.issues[70] = epic
+        self.gh.subs = {30: [epic]}
 
     def links(self, epic=70):
         return [w[2]["sub_issue_id"] for w in self.gh.writes

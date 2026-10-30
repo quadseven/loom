@@ -122,6 +122,11 @@ class FakeGitHub:
         m = re.search(r"/pulls/(\d+)/reviews$", path)
         if m:
             return list(self.reviews.get(int(m.group(1)), []))
+        # GET /repos/.../issues/{epic}/sub_issues for epic ticket validation
+        m = re.search(r"/issues/(\d+)/sub_issues", path)
+        if m:
+            # Return empty list - no sub-issues tracked in this fake
+            return []
         raise AssertionError("unexpected paginate %s" % path)
 
     def rest(self, method, path, body=None, etag=None, ok=()):
@@ -408,6 +413,9 @@ class PullRequests(Base):
                        "- [ ] " + criteria[5] + "\n")
         self.gh.ticket(5, "pr", body=ticket_body)
         self.gh.pull(50, 5, body="## Acceptance criteria\n" + pr_criteria)
+        # Epic 60 must exist in the fake for file_under_epic validation
+        self.gh.issues[60] = {"number": 60, "state": "open", "body": "Part of #1\n",
+                              "labels": [{"name": "epic"}], "title": "Intake #1"}
         with mock.patch.object(factory.brain, "placement_epic",
                                         return_value=60) as placed:
             self.go()

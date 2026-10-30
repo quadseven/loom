@@ -2150,7 +2150,23 @@ def _move_to_epic(gh: GitHub, repo: str, epic: int, ticket: Dict[str, Any], goal
     """Move the ticket under the epic: the epic's sub-issue link replaces its
     old parent `goal` (the goal, or the closed epic it sat under), and the
     ticket's Part of line names the epic instead of the old parent. False
-    when GitHub refuses the link."""
+    when GitHub refuses the link. Raises ValueError when the epic is at cap."""
+    try:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, epic)).data or {}
+    except GitHubError as exc:
+        if exc.status == 404:
+            raise ValueError("#%d: no such epic" % epic) from None
+        raise
+    if standing_epic(issue):
+        pass
+    elif is_intake_epic(issue):
+        held = _open_count(_epic_tickets(gh, repo, epic))
+        if held >= EPIC_TICKET_CAP:
+            raise ValueError("epic #%d already holds %d tickets (cap %d)" % (epic, held, EPIC_TICKET_CAP))
+    else:
+        held = len(_epic_tickets(gh, repo, epic))
+        if held >= EPIC_TICKET_CAP:
+            raise ValueError("epic #%d already holds %d tickets (cap %d)" % (epic, held, EPIC_TICKET_CAP))
     parent = _sub_issue_parent(ticket)
     if not _link_to_goal(gh, repo, epic, ticket, under=goal if parent == goal else None):
         return False
@@ -2322,7 +2338,21 @@ def repairs_batch_epic(gh: GitHub, repo: str, goal: int,
 
 def file_under_epic(gh: GitHub, repo: str, epic: int, issue: Dict[str, Any]) -> None:
     """Link a filed issue as the epic's sub-issue; when GitHub refuses, its
-    body gets the epic's Part of line instead."""
+    body gets the epic's Part of line instead. Raises ValueError when the
+    epic is at the ticket cap (except standing epics)."""
+    try:
+        epic_issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, epic)).data or {}
+    except GitHubError as exc:
+        if exc.status == 404:
+            raise ValueError("#%d: no such epic" % epic) from None
+        raise
+    if not standing_epic(epic_issue):
+        if is_intake_epic(epic_issue):
+            held = _open_count(_epic_tickets(gh, repo, epic))
+        else:
+            held = len(_epic_tickets(gh, repo, epic))
+        if held >= EPIC_TICKET_CAP:
+            raise ValueError("epic #%d already holds %d tickets (cap %d)" % (epic, held, EPIC_TICKET_CAP))
     if issue.get("id") is None or not _link_to_goal(gh, repo, epic, issue):
         body = str(issue.get("body") or "")
         if not _names_goal(body, epic) and issue.get("number"):

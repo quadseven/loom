@@ -5088,6 +5088,30 @@ class PlacementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "do not fit one epic"):
             brain.intake_epic(gh, REPO, 1, room=brain.EPIC_TICKET_CAP + 1)
 
+    def test_move_to_epic_refuses_when_target_is_at_cap(self):
+        """_move_to_epic must refuse to move a ticket to an epic at the cap.
+        This is the bug: _move_to_epic doesn't validate capacity."""
+        fake = self.fake_with_epics([brain.EPIC_TICKET_CAP])
+        gh = GitHub("t", transport=fake)
+        ticket = dict(item(500, body="## Why\nx\n\nPart of #1\n", labels=["loom:ticket", "loom:merged"]))
+        ticket["id"] = 1500  # GitHub assigns an id
+        fake.issues[500] = ticket
+        # Epic 60 has 15 tickets (at cap). Moving another ticket to it should fail.
+        with self.assertRaisesRegex(ValueError, "epic #60 already holds 15 tickets"):
+            brain._move_to_epic(gh, REPO, 60, ticket, 1)
+
+    def test_file_under_epic_refuses_when_target_is_at_cap(self):
+        """file_under_epic must refuse to file a ticket under an epic at the cap.
+        This is a safety net: callers should validate via placement_epic/intake_epic first."""
+        fake = self.fake_with_epics([brain.EPIC_TICKET_CAP])
+        gh = GitHub("t", transport=fake)
+        issue = dict(item(500, body="## Why\nx\n\nPart of #60\n", labels=["loom:ticket", "loom:merged"]))
+        issue["id"] = 1500
+        fake.issues[500] = issue
+        # Epic 60 has 15 tickets (at cap). Filing another ticket under it should fail.
+        with self.assertRaisesRegex(ValueError, "epic #60 already holds 15 tickets"):
+            brain.file_under_epic(gh, REPO, 60, issue)
+
 
 class MoveFromGoalTests(unittest.TestCase):
     """loom#951: GitHub refuses a second parent, so a ticket that was a
@@ -5236,6 +5260,13 @@ class OutsideEpicRepo:
             return reply(200, [e for e in self.epics if e.get("state", "open") == "open"])
         if path == "/repos/%s/issues/1" % REPO:
             return reply(200, self.issues[1])
+        # GET /repos/.../issues/{number} for epic lookup in _move_to_epic
+        found = re.match(r"/repos/%s/issues/(\d+)$" % re.escape(REPO), path)
+        if found:
+            number = int(found.group(1))
+            if number in self.issues:
+                return reply(200, self.issues[number])
+            return reply(404, {"message": "Not Found"})
         raise AssertionError("unexpected read %s" % path)
 
     def _write(self, path, payload):
