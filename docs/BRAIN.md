@@ -245,7 +245,10 @@ findings section.
 checks (bus/hunt_plan.py mirrors them: Why of at least 5 words, at least 3
 non-empty Acceptance criteria bullets, a Size of XS, S, M or L, a non-empty
 Out of scope), and files a Size written as a word (Small, Medium, Large) as
-its letter. `brief` (and the station's rewrite step) also refuses a Live
+its letter. A ticket that states fewer than three criteria is not refused:
+the pull request body carries the standard bullets the gate wants
+(`bus/hunt_plan.py` `pad_criteria`), so the body, not the ticket, decides.
+`brief` (and the station's rewrite step) also refuses a Live
 criterion (the acceptance line that starts with "Live") that names no exact
 string in backticks or double quotes; health and friction intake tickets are
 verified by the station's own absence tracking and are exempt. The string is
