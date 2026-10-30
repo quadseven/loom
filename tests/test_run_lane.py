@@ -1178,6 +1178,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("Bugs discovered line 3 left out: the cited issue could not be looked up", log)
         self.assertEqual(hunt_plan.problems(body), [])
 
+    def test_a_one_criterion_ticket_opens_a_body_the_gate_accepts(self):
+        # A follow-up ticket states the one criterion a lane left not built;
+        # its body failed the plan check with 1 bullet of the 3 it wants.
+        thin = BRIEF.replace("## Acceptance criteria\n", "## Acceptance\n").replace(
+            "- [ ] A test covers the thing\n- [ ] Nothing else changes\n", "")
+        self.drop_brief(text=thin)
+        result = self.run_lane(FAKE_SUMMARY="Fix the thing so it works")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("## Acceptance criteria\n- [ ] The thing works\n", body)
+        self.assertEqual(hunt_plan.problems(body), [])
+
     def test_a_body_without_bugs_has_no_bugs_section(self):
         self.drop_brief()
         self.run_lane(FAKE_SUMMARY=self.TICKED)
@@ -1766,6 +1778,20 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         body = self.body.read_text()
         self.assertIn("\nSize: S\n", body)
         self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_pr_body_carries_the_bullets_the_gate_wants_for_a_thin_brief(self):
+        # The gate counts three bullets under Acceptance criteria. A ticket
+        # that states fewer (the factory files a follow-up ticket with the one
+        # criterion a lane left not built) still opens a body it accepts: a
+        # body it refuses holds the pull request.
+        self.drop_brief(text=BRIEF.replace(
+            "- [ ] The thing works\n- [ ] A test covers the thing\n"
+            "- [ ] Nothing else changes", "- [ ] The thing works"))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertEqual(hunt_plan.problems(body), [])
+        self.assertIn("- [ ] The thing works", body)
 
     def test_pr_body_has_no_refs_without_an_issue_line(self):
         self.drop_brief()
@@ -3740,6 +3766,9 @@ exec /usr/bin/git "$@"
         agy = lane_home / "agy"
         self.write_tool(agy, FAKE_AGY)
         self.write_tool(self.bin / "security", FAKE_SECURITY)
+        # The fake agy is a script, which no real codesign would call hardened.
+        fake_codesign = Path(self._tmp.name) / "fake_codesign"
+        self.write_tool(fake_codesign, '#!/bin/sh\necho "CodeDirectory v=20500 size=1 flags=0x10002(adhoc,runtime) hashes=1"\n')
         runas = Path(self._tmp.name) / "runas"
         self.write_tool(runas, FAKE_RUNAS if runas_ok else "#!/usr/bin/env bash\nexit 1\n")
         inbox = self.loom / "briefs" / "agy"
@@ -3754,6 +3783,7 @@ exec /usr/bin/git "$@"
             LOOM_AGY_HOME=str(lane_home),
             LOOM_AGY_WORKDIR=str(workdir),
             LOOM_AGY_BIN=str(agy_bin or agy),
+            LOOM_AGY_CODESIGN=str(fake_codesign),
             LOOM_AGY_KEYCHAIN=str(lane_home / "loom.keychain-db"),
             LOOM_AGY_KEY_SSM="/k/kc",
             LOOM_AGY_MODEL=model,

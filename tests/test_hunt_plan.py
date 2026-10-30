@@ -106,6 +106,44 @@ class ProblemsTest(unittest.TestCase):
                                 hunt_plan.problems(body))
 
 
+class PadCriteriaTest(unittest.TestCase):
+    """The gate counts three non-empty bullets under Acceptance criteria. A
+    ticket may state fewer: the factory files a follow-up ticket with the one
+    criterion a lane left not built, and a body the gate refuses holds the
+    pull request until the plan-check invariant fires."""
+
+    def test_a_section_with_the_bullets_the_gate_wants_is_left_alone(self):
+        section = "- [ ] One\n- [ ] Two\n- [ ] Three"
+        self.assertEqual(hunt_plan.pad_criteria(section), section)
+
+    def test_a_thin_section_gets_the_standard_bullets(self):
+        padded = hunt_plan.pad_criteria("- [ ] One")
+        self.assertEqual(len(hunt_plan.bullets(padded)), hunt_plan.MIN_BULLETS)
+        self.assertTrue(padded.startswith("- [ ] One"))
+        for filler in hunt_plan.FILLER_BULLETS:
+            self.assertIn(filler, padded)
+
+    def test_a_section_with_no_criterion_keeps_the_gate_s_refusal(self):
+        # A body with nothing to build is not a body to merge: the gate
+        # refuses it, and so does the check that mirrors the gate.
+        padded = hunt_plan.pad_criteria("")
+        self.assertEqual(padded, "")
+        body = GOOD.replace("- [ ] The page loads in under a second.\n"
+                            "- [ ] A test fails without the cache.\n"
+                            "- [ ] The query runs once a minute.", padded)
+        self.assertTrue(any("non-empty bullets" in p for p in hunt_plan.problems(body)))
+
+    def test_a_padded_body_passes_the_gate(self):
+        thin = GOOD.replace("- [ ] A test fails without the cache.\n", "")
+        self.assertTrue(any("non-empty bullets" in p for p in hunt_plan.problems(thin)))
+        padded = GOOD.replace("- [ ] The page loads in under a second.\n"
+                              "- [ ] A test fails without the cache.\n"
+                              "- [ ] The query runs once a minute.",
+                              hunt_plan.pad_criteria(
+                                  "- [ ] The page loads in under a second."))
+        self.assertEqual(hunt_plan.problems(padded), [])
+
+
 class BriefToPullRequestTest(unittest.TestCase):
     def test_a_word_size_brief_yields_a_body_the_gate_accepts(self):
         # The runner's body (pr_repair renders it the same way) from a brief
@@ -120,7 +158,9 @@ class BriefToPullRequestTest(unittest.TestCase):
 
     def test_a_brief_whose_pull_request_would_fail_is_named(self):
         thin = (BRIEF % "S").replace("- [ ] A test fails without the cache.\n", "")
-        self.assertTrue(any("non-empty bullets" in p for p in brain.plan_problems(thin)))
+        # A brief with fewer criteria than the gate wants still yields a body
+        # it accepts: the body carries the standard bullets.
+        self.assertEqual(brain.plan_problems(thin), [])
         self.assertTrue(brain.plan_problems(BRIEF % "XL"))
         self.assertEqual(brain.plan_problems(BRIEF % "Medium"), [])
 
