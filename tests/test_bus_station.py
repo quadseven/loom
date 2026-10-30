@@ -9412,16 +9412,17 @@ class ReportsTest(Base):
         made = self.report_due_in(station.STANDUP_LEAD + 900)
         self.assertEqual(made, [])
 
-    def simulated_day(self, goals):
+    def simulated_day(self, goals, today=None):
         """Every station pass (REPORT_CHECK apart) from a reading time
         that is already reported until the same reading time on the next
         calendar day, with a goal that never goes quiet (an open failed
         ticket) and a standup that never repeats (its ticket is renamed each
-        pass): the new comments posted on each goal home."""
+        pass): the new comments posted on each goal home. today pins the New
+        York date the run starts from; the default is the real one."""
         from datetime import datetime as dt, timedelta
         from zoneinfo import ZoneInfo
         # Tomorrow's 10:00 in New York, the operator's morning reading time.
-        day = dt.now(ZoneInfo("America/New_York")).date() + timedelta(days=1)
+        day = (today or dt.now(ZoneInfo("America/New_York")).date()) + timedelta(days=1)
         start = dt(day.year, day.month, day.day, 10, 0,
                    tzinfo=ZoneInfo("America/New_York")).timestamp()
         # The day ends at the same reading time on the next calendar day,
@@ -9457,23 +9458,46 @@ class ReportsTest(Base):
             for number in goals:
                 self.fake.sub_issues[number] = [
                     {"number": number + 1, "title": "Failed task %d" % step, "state": "open",
-                     "created_at": self.ago(REPORT_OVERDUE_AGE * 2),
+                     "created_at": time.strftime(
+                         "%Y-%m-%dT%H:%M:%SZ",
+                         time.gmtime(clock[0] - REPORT_OVERDUE_AGE * 2)),
                      "labels": [{"name": "loom:ticket"}, {"name": "loom:failed"}]}]
             station.Station(GitHub("token", transport=transport), self.settings,
                             now=clock[0]).post_overdue_standups()
             clock[0] += station.REPORT_CHECK + 1
         return posts
 
+    def assert_two_reports_for_the_goal_and_none_for_the_backlog(self, today=None):
+        self.add_goal(40)
+        self.add_goal(50)
+        self.fake.issues[50]["labels"].append({"name": "loom:backlog"})
+        posts = self.simulated_day((40, 50), today)
+        self.assertEqual(posts, {40: 2, 50: 0})
+
     def test_a_simulated_day_posts_at_most_two_reports_per_goal_and_none_for_a_backlog(self):
         # 2026-10-25, "info overload": every report comment emails the
         # operator. A goal home gets at most one per reading time (10:00 and
         # 21:00 New York); a per-repo backlog goal gets none, only its digest
         # line. At 6 hours this was 4 a day on every goal home, backlogs too.
-        self.add_goal(40)
-        self.add_goal(50)
-        self.fake.issues[50]["labels"].append({"name": "loom:backlog"})
-        posts = self.simulated_day((40, 50))
-        self.assertEqual(posts, {40: 2, 50: 0})
+        self.assert_two_reports_for_the_goal_and_none_for_the_backlog()
+
+    def test_a_simulated_day_on_an_ordinary_date_posts_two_reports(self):
+        from datetime import date
+        self.assert_two_reports_for_the_goal_and_none_for_the_backlog(date(2026, 10, 29))
+
+    def test_a_simulated_day_that_is_25_hours_long_posts_two_reports(self):
+        # The next New York day is 25 hours long: clocks go back on 2026-11-01.
+        from datetime import date
+        self.assert_two_reports_for_the_goal_and_none_for_the_backlog(date(2026, 10, 30))
+
+    def test_a_simulated_day_that_is_23_hours_long_posts_two_reports(self):
+        # The next New York day is 23 hours long: clocks go forward on 2027-03-14.
+        from datetime import date
+        self.assert_two_reports_for_the_goal_and_none_for_the_backlog(date(2027, 3, 12))
+
+    def test_a_simulated_day_starting_on_the_day_clocks_go_forward_posts_two_reports(self):
+        from datetime import date
+        self.assert_two_reports_for_the_goal_and_none_for_the_backlog(date(2027, 3, 13))
 
     def test_station_does_not_post_for_a_fresh_report(self):
         self.add_goal()
