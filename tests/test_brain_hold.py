@@ -246,7 +246,9 @@ class BrainStallEscalationTest(unittest.TestCase):
         held_by(self.gh, 5, LOOM_APP, seconds_ago)
 
     def run_pass(self):
-        factory.Factory(self.gh, [REPO], NOW, trusted=TRUSTED).run()
+        # The fake GitHub has no compare endpoint for a head it did not build.
+        with mock.patch.object(factory.Factory, "_behind", return_value=False):
+            factory.Factory(self.gh, [REPO], NOW, trusted=TRUSTED).run()
 
     def asks(self):
         return [c["body"] for c in self.gh.comments[5] if c["body"].startswith(brain.HUMAN_MARKER)]
