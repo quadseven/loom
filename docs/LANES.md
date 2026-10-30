@@ -49,7 +49,9 @@ another reason parks the brief `[transient]`. A lane pod or cluster runner
 (`LOOM_SSM_DIR`) holds no AWS
 key: the scanner reads the deny-list's copy under `LOOM_SSM_DIR` through
 `lanes/k8s/ssm-dir-bin/aws`, a stand-in for the AWS CLI put first on the
-scanner's PATH only. Without that copy it pushes nothing to a public repo.
+scanner's PATH only. Without that copy it pushes nothing to a public repo. The
+station and the brain read the same deny-list for the leak guard on their own
+public comments (docs/BRAIN.md, The public comment leak guard).
 Private repositories skip this scan. Test IP addresses in public changes must
 use the documentation ranges `192.0.2.0/24`, `198.51.100.0/24`, or
 `203.0.113.0/24`; add `leak-guard-allow` on a line only when a deliberate

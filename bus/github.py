@@ -26,6 +26,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -61,6 +62,12 @@ Transport = Callable[[str, str, Dict[str, str], Optional[bytes]],
 _ISSUE_PATH = re.compile(r"^/repos/[^/]+/[^/]+/issues/[0-9]+$")
 # The repo and issue number of an issue-comment list path.
 _COMMENTS_OF = re.compile(r"/repos/([^/]+/[^/]+)/issues/([0-9]+)/comments(?:\?|$)")
+# The repo a write lands on: its text passes the public-repo leak guard.
+_REPO_OF = re.compile(r"^/repos/([^/]+/[^/]+)/")
+# A new comment or an edit of one.
+_COMMENT_WRITE = re.compile(r"^/repos/[^/]+/[^/]+/issues/(?:[0-9]+/comments|comments/[0-9]+)$")
+# A read of one repo, which says whether it is private.
+_REPO_PATH = re.compile(r"^/repos/([^/?]+/[^/?]+)(?:\?|$)")
 
 # Labels that let an issue close as completed with unchecked boxes, mirroring
 # the close-completeness guard's escape hatches.
@@ -280,6 +287,34 @@ def read_ssm(name: str, region: str) -> str:
     if out.returncode != 0 or not out.stdout.strip():
         raise OSError("could not read the parameter from SSM")
     return out.stdout.strip()
+
+
+# The SSM parameter of the leak scanner's deny-list (lanes/run_lane.sh).
+LEAK_DENY_SSM = "/infra/leak-scan/deny-list"
+
+
+def leak_deny_terms(env: Dict[str, str],
+                    read: Callable[[str, str], str] = read_ssm) -> Tuple[str, ...]:
+    """The leak scanner's deny-list terms, read where lanes/run_lane.sh reads
+    them: the copy under LOOM_SSM_DIR when that is set, else the SSM
+    parameter LOOM_LEAK_DENY_SSM. Raises OSError when it cannot be read."""
+    name = env.get("LOOM_LEAK_DENY_SSM", "").strip() or LEAK_DENY_SSM
+    copies = env.get("LOOM_SSM_DIR", "").strip()
+    if copies:
+        with open(copies + name, encoding="utf-8") as fh:
+            return _text.parse_deny_list(fh.read())
+    return _text.parse_deny_list(read(name, env.get("LOOM_AWS_REGION", "").strip() or "us-east-1"))
+
+
+def use_deny_list(gh: "GitHub", env: Dict[str, str]) -> None:
+    """Give the client the leak scanner's deny-list. One that cannot be read
+    is said on stderr and the client keeps the rest of the guard (private
+    repos and private host suffixes): refusing would stop every post."""
+    try:
+        gh.deny_terms = leak_deny_terms(env)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        print("leak guard: could not read the deny-list (%s); deny-listed hosts are "
+              "not replaced in public comments" % err, file=sys.stderr)
 
 
 def read_key_file(path: str) -> str:
@@ -523,6 +558,12 @@ class GitHub:
         # The ledger of this Loom's own fix-rounds edits (bus/fixrounds.py);
         # without one no fix-rounds comment reads as its rounds.
         self.fix_ledger: Optional[str] = None
+        # The leak scanner's deny-list terms (leak_deny_terms): a write's
+        # text on a public repo has every hostname holding one replaced
+        # (bus/text.public_safe, loom#1862). A caller that posts sets them.
+        self.deny_terms: Tuple[str, ...] = ()
+        # Whether each repo is private, read once per client (_repo_private).
+        self._private: Dict[str, bool] = {}
         # Whether this client keeps a ticket's routine events in the issue
         # body's status section and reads them back (bus/status.py, loom#1341).
         # The station, the brain and the dashboard turn it on, together: a
@@ -576,8 +617,10 @@ class GitHub:
         (_with_body_events), so a caller that already holds that issue
         (bus/issue_reads.py) does not read it again (loom#2078)."""
         body = self._without_mentions(method, body)
+        body = self._leak_guarded(method, path, body)
         body = self._keep_status_section(method, path, body)
         resp = self._rest(method, path, body, etag, ok)
+        self._note_visibility(method, path, resp.data)
         if method == "POST" and self.unsubscribe and self.app is None:
             self._leave_thread(path, resp.data)
         if method == "GET" and status.COMMENTS_RE.search(path):
@@ -618,6 +661,54 @@ class GitHub:
                     else:
                         found["variables"] = dict(holder, body=clean)
         return found
+
+    def _leak_guarded(self, method: str, path: str, body: Any) -> Any:
+        """A comment's text made safe for a public repo (bus/text.public_safe):
+        another repo's private issue in words, a private or deny-listed
+        hostname replaced. Every bot comment and comment edit, notify.post's,
+        a status comment's, the metrics comment's, a journal tick's and a fix
+        comment's, funnels through rest(), so this one call covers them all
+        (loom#1862). Of an issue body only the status section the status
+        writer edits in (status.OwnBody) is guarded: the rest holds lines
+        Loom reads back, such as a brief's After: line."""
+        found = _REPO_OF.match(path)
+        if method == "GET" or not found or not isinstance(body, dict) \
+                or not isinstance(body.get("body"), str):
+            return body
+        text = body["body"]
+
+        def safe(part: str) -> str:
+            return _text.public_safe(part, found.group(1), self._repo_private, self.deny_terms)
+        if _COMMENT_WRITE.match(path):
+            clean = safe(text)
+        elif isinstance(body, status.OwnBody):
+            clean = status.with_section_text(text, safe)
+        else:
+            return body
+        return body if clean == text else type(body)(body, body=clean)
+
+    def _note_visibility(self, method: str, path: str, data: Any) -> None:
+        """Keep whether a repo is private from any read of the repo, so the
+        leak guard reuses what the station, the factory and the brain read."""
+        found = _REPO_PATH.match(path)
+        if method == "GET" and found and isinstance(data, dict) \
+                and isinstance(data.get("private"), bool):
+            self._private[found.group(1).lower()] = data["private"]
+
+    def _repo_private(self, repo: str) -> bool:
+        """Whether the repo is private, read once per client. A repo this
+        client cannot see (404) counts as private; any other failed read
+        raises, so nothing is written on an answer the client could not read."""
+        key = repo.lower()
+        if key not in self._private:
+            try:
+                data = self._rest("GET", "/repos/%s" % repo).data
+            except GitHubError as err:
+                if err.status != 404 or isinstance(err, RateLimited):
+                    raise
+                data = None
+            self._private[key] = not isinstance(data, dict) or data.get("private") is not False
+        return self._private[key]
 
     def _with_body_events(self, path: str, items: Any,
                           read: Optional[Callable[[str], Response]] = None) -> Any:

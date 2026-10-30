@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Iterable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
 # The review bot's login is grug-tribe[bot]. Its short name with an at-sign in
 # front is a real, unrelated GitHub user: each mention notifies and subscribes
@@ -136,6 +136,117 @@ def scrub_mentions(text: str, allow: Optional[Iterable[str]] = None) -> str:
 def scrub_paths(text: str) -> str:
     """The text with every local path replaced by <path>."""
     return PATH_RE.sub("<path>", text)
+
+
+# What public_safe rewrites. A github.com link to a repo, or to one of its
+# issues or pull requests, with any trailing path or fragment.
+_GITHUB_LINK = re.compile(
+    r"https?://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9_.-]*[A-Za-z0-9_])"
+    r"(?:/(?:issues|pull)/([0-9]+))?[^\s)\]>`'\"]*")
+# owner/name#N.
+_ISSUE_REF = re.compile(r"(?<![\w./-])([A-Za-z0-9-]+/[A-Za-z0-9_.-]*[A-Za-z0-9_])#([0-9]+)\b")
+# A bare owner/name: a path or a branch has the same shape, so only one under
+# the target repo's own owner is looked up.
+_REPO_NAME = re.compile(r"(?<![\w./:#-])([A-Za-z0-9-]+/[A-Za-z0-9_.-]*[A-Za-z0-9_])(?![\w/#-])")
+# A dotted hostname.
+_HOST = re.compile(
+    r"(?i)(?<![\w.-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9](?![\w-])")
+# An HTML comment: a marker Loom reads back, which no rewrite may change.
+_MARKER = re.compile(r"<!--.*?-->", re.DOTALL)
+PRIVATE_HOST_PLACEHOLDER = "<private-host>"
+REDACTED = "<redacted>"
+
+
+def parse_deny_list(raw: str) -> Tuple[str, ...]:
+    """The leak scanner's deny-list terms (infra-public check_private_leaks):
+    one per line, blank lines and # comments dropped, case-insensitive
+    duplicates dropped."""
+    seen: set = set()
+    terms = []
+    for line in raw.splitlines():
+        term = line.strip()
+        if term and not term.startswith("#") and term.lower() not in seen:
+            seen.add(term.lower())
+            terms.append(term)
+    return tuple(terms)
+
+
+def _deny_rule(term: str) -> "re.Pattern[str]":
+    """A denied term as the leak scanner matches it: bounded where its own
+    edge is a word character, so a domain suffix still matches mid-host."""
+    lead = r"(?<![0-9A-Za-z_])" if term[0].isalnum() or term[0] == "_" else ""
+    trail = r"(?![0-9A-Za-z_])" if term[-1].isalnum() or term[-1] == "_" else ""
+    return re.compile(lead + re.escape(term) + trail, re.I)
+
+
+class _Guard:
+    """public_safe's rewrite of one body for one public target repo."""
+
+    def __init__(self, repo: str, private: Callable[[str], bool],
+                 deny: Iterable[str]) -> None:
+        self.repo = repo.lower()
+        self.owner = self.repo.split("/")[0]
+        self.private = private
+        self.rules = [_deny_rule(t) for t in deny if t]
+
+    def other(self, name: str) -> bool:
+        return name.lower() != self.repo
+
+    def named(self, name: str) -> bool:
+        return self.other(name) and name.lower().split("/")[0] == self.owner
+
+    def host_hit(self, host: str) -> bool:
+        return bool(PRIVATE_HOST_RE.search(host)) or any(r.search(host) for r in self.rules)
+
+    def candidate(self, piece: str) -> bool:
+        """Whether the piece holds anything to rewrite, asking nobody."""
+        return (any(self.other(m.group(1)) for m in _GITHUB_LINK.finditer(piece))
+                or any(self.other(m.group(1)) for m in _ISSUE_REF.finditer(piece))
+                or any(self.named(m.group(1)) for m in _REPO_NAME.finditer(piece))
+                or any(self.host_hit(m.group(0)) for m in _HOST.finditer(piece))
+                or any(r.search(piece) for r in self.rules))
+
+    def _words(self, name: str, number: Optional[str], whole: str) -> str:
+        if not self.other(name) or not self.private(name):
+            return whole
+        return "issue %s of a private repo" % number if number else "a private repo"
+
+    def rewrite(self, piece: str) -> str:
+        piece = _GITHUB_LINK.sub(lambda m: self._words(m.group(1), m.group(2), m.group(0)), piece)
+        piece = _ISSUE_REF.sub(lambda m: self._words(m.group(1), m.group(2), m.group(0)), piece)
+        piece = _REPO_NAME.sub(lambda m: (self._words(m.group(1), None, m.group(0))
+                                          if self.named(m.group(1)) else m.group(0)), piece)
+        piece = _HOST.sub(lambda m: (PRIVATE_HOST_PLACEHOLDER if self.host_hit(m.group(0))
+                                     else m.group(0)), piece)
+        for rule in self.rules:
+            piece = rule.sub(REDACTED, piece)
+        return piece
+
+
+def public_safe(text: str, repo: str, private: Callable[[str], bool],
+                deny: Iterable[str] = ()) -> str:
+    """The text made safe to post on `repo` when that repo is public.
+
+    `private(name)` says whether a repo is private (an unreadable one counts
+    as private). On a public `repo`, another repo's issue that is private
+    (owner/name#N or its github.com link) becomes "issue N of a private repo",
+    its bare name or link "a private repo" (a bare owner/name only under
+    repo's own owner, since a path or a branch has the same shape), and a
+    hostname with a private suffix (PRIVATE_HOST_RE) or holding a `deny` term
+    (the leak scanner's deny-list) becomes <private-host>; any other `deny`
+    term becomes <redacted>. Quoted logs and code are rewritten too; HTML
+    comments, the markers Loom reads back, are not. On a private `repo` the
+    text is returned unchanged, and `private` is asked about `repo` only when
+    the text holds something to rewrite."""
+    guard = _Guard(repo, private, deny)
+    pieces = _MARKER.split(text)
+    if not any(guard.candidate(p) for p in pieces) or private(repo):
+        return text
+    markers = _MARKER.findall(text)
+    out = [guard.rewrite(pieces[0])]
+    for marker, piece in zip(markers, pieces[1:]):
+        out.extend((marker, guard.rewrite(piece)))
+    return "".join(out)
 
 
 def check(text: str) -> None:

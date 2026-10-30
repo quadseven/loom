@@ -13324,9 +13324,10 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
                  hooks: Dict[str, Any]) -> int:
     """The pass run() starts once it holds the lock."""
     if gh is None:
-        from .github import auth_from_env
+        from .github import auth_from_env, use_deny_list
         gh = GitHub(auth_from_env())
         gh.status_in_body = True
+        use_deny_list(gh, dict(os.environ))  # the public-comment leak guard (loom#1862)
     _trust_app_login(settings, gh)
     if gh.cache_dir is None:
         # Every GET is conditional: a list re-read each pass costs a 304.

@@ -1298,6 +1298,33 @@ or `gh pr comment`) outside `bus/notify.py` and the test's allowlist. The
 allowlist lists the lane shell's own comments and may only shrink. A reply on a
 pull request's review thread is not a new issue comment and is not scanned.
 
+### The public comment leak guard
+
+Every comment Loom posts or edits on a public repo passes one leak guard,
+`text.public_safe` in `bus/text.py` (loom#1862). The GitHub client applies it
+in `rest()` to every new comment and comment edit, so `notify.post`, status
+comment edits, the metrics comment, journal ticks, goal reports and fix
+comments (with the CI log lines they quote) all pass it. Of an issue body only
+the status section is guarded: the rest holds lines Loom reads back, such as a
+brief's `After:` line. On a public repo:
+
+- another repo's private issue (`owner/name#N` or its github.com link) is
+  written as "issue N of a private repo", and its bare name or link as "a
+  private repo". A bare `owner/name` is checked only under the target repo's
+  own owner, since a path or a branch has the same shape;
+- a hostname with a private suffix (`PRIVATE_HOST_RE`) or holding a term of
+  the leak scanner's deny-list becomes `<private-host>`, and any other
+  deny-listed term becomes `<redacted>`;
+- HTML comments, the markers Loom reads back, are left as they are.
+
+On a private repo the text is posted as given. Whether a repo is private is
+read once per client, and every read of a repo the station, the factory or the
+brain already makes fills the same cache; a repo the client cannot see counts
+as private. A body with nothing to rewrite costs no read. The station and the
+brain read the deny-list where the lanes do (see docs/LANES.md): the copy
+under `LOOM_SSM_DIR`, else the SSM parameter `LOOM_LEAK_DENY_SSM`. One they
+cannot read is said on stderr and the rest of the guard still applies.
+
 | Kind | What it is |
 | --- | --- |
 | `failure` | A red merge, a revert, or a lane's hand-back that a person may need to read. |

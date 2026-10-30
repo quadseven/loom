@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Dict, Any, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import notify
 
@@ -262,6 +262,17 @@ def body_events(body: Any) -> List[Tuple[str, str]]:
     section, newest first as written; empty when the body has none."""
     found = _section(body)
     return parse(found.group(1)) if found else []
+
+
+def with_section_text(body: str, change: Callable[[str], str]) -> str:
+    """The issue body with `change` applied to its status section's events
+    and nothing else (unchanged when it has no section): the rest of a
+    ticket's body holds lines Loom reads back, such as After:."""
+    text = body.replace("\r\n", "\n")
+    found = _section(text)
+    if not found:
+        return body
+    return text[:found.start(1)] + change(found.group(1)) + text[found.end(1):]
 
 
 def strip_body(body: Any) -> str:

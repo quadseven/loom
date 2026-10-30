@@ -1210,6 +1210,7 @@ class SensitiveResumeTests(unittest.TestCase):
                 fh.write(BODY)
             err = io.StringIO()
             with unittest.mock.patch("bus.brain.auth_from_env", return_value="t"), \
+                    unittest.mock.patch("bus.brain.use_deny_list"), \
                     unittest.mock.patch("bus.brain.GitHub") as client, \
                     contextlib.redirect_stderr(err):
                 client.return_value.requests = 0
@@ -4127,6 +4128,7 @@ class OnboardTests(unittest.TestCase):
         fake = FakeRepo(prs=[pr(9, "s9")], runs={"s9": 1})
         with unittest.mock.patch.object(brain, "GitHub", lambda token, **kw: GitHub(token, transport=fake)), \
                 unittest.mock.patch.object(brain, "auth_from_env", lambda: "t"), \
+                unittest.mock.patch.object(brain, "use_deny_list", lambda gh, env: None), \
                 unittest.mock.patch.dict(os.environ, {"LOOM_REPOS": ""}), \
                 unittest.mock.patch("sys.stdout") as out:
             self.assertEqual(brain.main(["onboard", REPO]), 0)
@@ -4841,6 +4843,7 @@ class EpicFilingTests(unittest.TestCase):
                 fh.write(BODY)
             err = io.StringIO()
             with unittest.mock.patch("bus.brain.auth_from_env", return_value="t"), \
+                    unittest.mock.patch("bus.brain.use_deny_list"), \
                     unittest.mock.patch("bus.brain.GitHub") as client, \
                     contextlib.redirect_stderr(err):
                 client.return_value.requests = 0

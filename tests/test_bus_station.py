@@ -198,6 +198,10 @@ class FakeGitHub:
         if method == "GET" and parts.path == "/repos/%s" % REPO:
             return reply(200, {"full_name": REPO, "private": self.private,
                                "default_branch": "main"})
+        if method == "GET" and parts.path in {"/repos/%s" % r for r, _ in self.foreign}:
+            # A repo an After: line names reads as public, so the public
+            # comment leak guard keeps its references (loom#1862).
+            return reply(200, {"full_name": parts.path[len("/repos/"):], "private": False})
         if method == "GET" and parts.path.startswith("/repos/%s/contents/" % REPO):
             if parts.path.endswith("/.github/workflows"):
                 return reply(200, [])

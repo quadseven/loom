@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
-                     rest_login, unreadable)
+                     rest_login, unreadable, use_deny_list)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
@@ -6592,6 +6592,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gh.status_authors |= {a.lower() for a in os.environ.get("LOOM_BRIEF_AUTHORS", "").split()}
         # The station's fix-rounds comments read as their rounds (loom#1640).
         gh.fix_ledger = fixrounds.ledger_from_env()
+        # Hostnames on the leak scanner's deny-list are replaced in public comments (loom#1862).
+        use_deny_list(gh, dict(os.environ))
         COMMANDS[args.command](gh, args)
         return 0
     except (ValueError, OSError, GitHubError) as exc:
