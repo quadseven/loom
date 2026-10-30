@@ -498,6 +498,11 @@ HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([
 # has nothing that can close it, so the station releases it after this long:
 # the ticket is not held forever.
 HELD_NO_INCIDENT_FOR = 2 * 3600
+# Incident kinds a lane run clears by passing the check on the unmodified
+# base, so a repo held behind one can probe with a held ticket (loom#1095).
+PROBE_KINDS = ("base-check", "environment")
+INCIDENT_REPO_RE = re.compile(r"^Repo: (\S+)$", re.M)
+INCIDENT_KIND_RE = re.compile(r"^Kind: (\S+)$", re.M)
 RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
                       r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
 # The brain's lane order for a retry, after the failed lane's own provider.
@@ -6054,20 +6059,116 @@ class Station:
             return
         for key, info in list(held.items()):
             self._release_held(key, info, closed_incidents)
+        self._probe_factory_held()
 
-    def _closed_incidents(self) -> Dict[str, Dict[str, Any]]:
-        """Closed factory incidents the runner filed, by "owner/repo#n".
+    def _incidents(self, state: str) -> Dict[str, Dict[str, Any]]:
+        """Factory incidents the runner filed, in `state`, by "owner/repo#n".
 
         Incidents are found by the body marker, not the loom:factory label:
         the label may not exist in a repo (loom#918), so filtering on it
-        loses every unlabelled incident. Closed issues are listed without the
+        loses every unlabelled incident. Issues are listed without the
         label and then matched on the marker."""
-        closed: Dict[str, Dict[str, Any]] = {}
+        found: Dict[str, Dict[str, Any]] = {}
         for incident in self._paginate(
-                "/repos/%s/issues?state=closed&per_page=100" % FACTORY_REPO):
+                "/repos/%s/issues?state=%s&per_page=100" % (FACTORY_REPO, state)):
             if isinstance(incident, dict) and INCIDENT_MARKER in str(incident.get("body") or ""):
-                closed["%s#%d" % (FACTORY_REPO, incident.get("number"))] = incident
-        return closed
+                found["%s#%d" % (FACTORY_REPO, incident.get("number"))] = incident
+        return found
+
+    def _closed_incidents(self) -> Dict[str, Dict[str, Any]]:
+        return self._incidents("closed")
+
+    def _open_incidents(self) -> Dict[str, Dict[str, Any]]:
+        return self._incidents("open")
+
+    def _probe_factory_held(self) -> None:
+        """Let one ticket held behind an open base-check or environment
+        incident through as a probe when the repo's default branch head is
+        newer than the incident: only a lane run whose base check passes
+        closes such an incident, so a repo with every ticket held could
+        never clear it. A queued ticket of the repo can still run that
+        check, so while one exists no held ticket moves. A passing probe
+        closes the incident through the existing lane path and the rest
+        release as usual. A failed read probes nothing this pass."""
+        try:
+            open_incidents = self._open_incidents()
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("factory probe: could not read the open incidents: %s" % err)
+            return
+        by_ref: Dict[str, List[Tuple[float, str]]] = {}
+        for key, info in self._held_tickets().items():
+            ref = info.get("incident") if isinstance(info, dict) else None
+            if not ref or ref not in open_incidents:
+                continue
+            at = info.get("at") if isinstance(info, dict) else None
+            stamp = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+            by_ref.setdefault(ref, []).append((stamp, key))
+        for ref in sorted(by_ref):
+            try:
+                self._probe_incident(ref, open_incidents[ref], sorted(by_ref[ref]))
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("factory probe: could not probe %s: %s" % (ref, err))
+
+    def _probe_incident(self, ref: str, incident: Dict[str, Any],
+                        entries: List[Tuple[float, str]]) -> None:
+        body = str(incident.get("body") or "")
+        kind = INCIDENT_KIND_RE.search(body)
+        repo_match = INCIDENT_REPO_RE.search(body)
+        if kind is None or kind.group(1) not in PROBE_KINDS or repo_match is None:
+            return
+        repo = repo_match.group(1)
+        own = [entry for entry in entries if entry[1].rpartition("#")[0] == repo]
+        created = self._epoch(str(incident.get("created_at") or ""))
+        if not own or created is None or self._has_queued_ticket(repo):
+            return
+        if self._default_head_newer(repo, created):
+            self._probe_one(own[0][1], ref)
+
+    def _has_queued_ticket(self, repo: str) -> bool:
+        """Whether an open loom:queued ticket of the repo can still run."""
+        queued = self._paginate(
+            "/repos/%s/issues?labels=loom:queued&state=open&per_page=100" % repo)
+        return any(isinstance(item, dict) and "pull_request" not in item
+                   for item in queued)
+
+    def _default_head_newer(self, repo: str, since: float) -> bool:
+        """Whether the default branch's head commit is newer than `since`."""
+        branch = self._default_branch(repo)
+        if not branch:
+            return False
+        commit = self.gh.rest("GET", "/repos/%s/commits/%s"
+                              % (repo, quote(branch, safe=""))).data
+        if not isinstance(commit, dict):
+            return False
+        committed = self._epoch(str(((commit.get("commit") or {}).get("committer")
+                                     or {}).get("date") or ""))
+        return committed is not None and committed > since
+
+    def _probe_one(self, key: str, ref: str) -> None:
+        """Re-queue one held ticket as its repo's probe for incident `ref`."""
+        repo, _, num = key.rpartition("#")
+        number = int(num) if num.isdigit() else 0
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("factory probe: could not read %s#%d: %s" % (repo, number, err))
+            return
+        if not isinstance(issue, dict) or RUNNING not in _label_names(issue):
+            self._forget_held(key)
+            return
+        cleared = RUNAWAY in _label_names(issue)
+        self._release_one(key, repo, number, issue, cleared,
+                          "Factory incident %s is still open: the ticket is back in the "
+                          "queue as a probe, so a lane run can check the default "
+                          "branch again." % ref)
+        _say("factory probe: %s#%d re-queued as a probe for incident %s"
+             % (repo, number, ref))
 
     def _release_held(self, key: str, info: Any,
                       closed_incidents: Dict[str, Dict[str, Any]]) -> None:

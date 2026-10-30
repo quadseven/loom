@@ -69,6 +69,9 @@ class FakeGitHub:
         self.edits = []
         self.posts = []
         self.factory_incidents = []
+        self.open_factory_incidents = []
+        self.head = "a" * 40
+        self.head_date = "2030-01-01T00:00:00Z"
         self.asks = []
         self.humans = []
         self.digest_issues = []
@@ -218,6 +221,9 @@ class FakeGitHub:
                                    if any(l.get("name") == "loom:factory"
                                           for l in i.get("labels", []))])
             return reply(200, self.factory_incidents)
+        if (method == "GET" and parts.path == "/repos/%s/issues" % station.FACTORY_REPO
+                and "state=open" in parts.query and "labels=" not in parts.query):
+            return reply(200, self.open_factory_incidents)
         if method == "GET" and parts.path == "/search/code":
             return self._code_search(parts.query)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
@@ -251,6 +257,9 @@ class FakeGitHub:
         if method == "GET" and one:
             hit = [p for p in self.pulls if p.get("number") == int(one.group(1))]
             return reply(200, hit[0]) if hit else reply(404, {"message": "Not Found"})
+        if method == "GET" and rest == "commits/main":
+            return reply(200, {"sha": self.head, "commit": {"committer": {
+                "date": self.head_date}}})
         if method == "GET" and rest.startswith("compare/"):
             base = rest[len("compare/"):].split("...", 1)[0]
             return reply(200, {"status": "ahead" if base in self.carried else "behind"})
@@ -365,6 +374,9 @@ class FakeGitHub:
                 return reply(self.rewritten_status, {"message": "Not Found"})
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:rewritten" in self.names(i["number"])])
+        if "labels=loom%3Aqueued" in query or "labels=loom:queued&" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:queued" in self.names(i["number"])])
         if "labels=loom%3Aticket" in query or "labels=loom:ticket&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:ticket" in self.names(i["number"])])
@@ -6653,6 +6665,88 @@ class FactoryNoIncidentHoldTest(Base):
         self.release(now)
         self.assertIn("loom:running", self.fake.names(12))
         self.assertIn("%s#12" % REPO, self.held_entry() or {})
+
+
+class FactoryProbeTest(Base):
+    """A repo whose tickets are all held behind an open base-check incident
+    probes with one ticket when the default branch head has moved since the
+    incident was filed (loom#1095)."""
+
+    CREATED = "2023-11-14T22:00:00Z"
+
+    def held(self, numbers=(12, 13), at=1700000000.0):
+        for number in numbers:
+            self.fake.add(number, lane="muse", body=PLAIN, state="running")
+            self.fake.issues[number]["labels"].append({"name": "wait:incident"})
+        held = {"%s#%d" % (REPO, number): {"incident": "%s#99" % REPO, "at": at}
+                for number in numbers}
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(held, fh)
+        return path
+
+    def held_entry(self):
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    def open_incident(self, kind="base-check"):
+        self.fake.open_factory_incidents = [{
+            "number": 99,
+            "title": "Factory incident: %s base check" % REPO,
+            "state": "open", "created_at": self.CREATED,
+            "body": ("<!-- loom:factory-incident v1 -->\n\nRepo: %s\nKind: %s\n"
+                     "Ticket: %s#12\n\ncheck: make check (exit 1)\n" % (REPO, kind, REPO)),
+            "labels": []}]
+
+    def release(self, now=1700003600.0):
+        runner = station.Station(GitHub("token", transport=self.fake),
+                                 self.settings, now=now)
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            runner.release_factory_held()
+
+    def status_boxes(self, number=12):
+        return "\n".join(c["body"] for c in self.fake.comments[number]
+                         if status.is_status(c.get("body")))
+
+    def test_a_newer_head_requeues_exactly_one_held_ticket_as_a_probe(self):
+        self.held()
+        self.open_incident()
+        self.fake.head_date = "2023-11-14T23:00:00Z"
+        self.release()
+        self.assertEqual(self.fake.names(12),
+                         ["loom:ticket", "lane:muse", "loom:queued"])
+        self.assertIn("probe", self.status_boxes(12))
+        self.assertIn("loom:running", self.fake.names(13))
+        self.assertIn("wait:incident", self.fake.names(13))
+        self.assertEqual(list(self.held_entry() or {}), ["%s#13" % REPO])
+
+    def test_no_probe_when_the_head_is_not_newer_than_the_incident(self):
+        self.held()
+        self.open_incident()
+        self.fake.head_date = self.CREATED
+        self.release()
+        for number in (12, 13):
+            self.assertIn("loom:running", self.fake.names(number))
+            self.assertNotIn("loom:queued", self.fake.names(number))
+        self.assertEqual(sorted(self.held_entry() or {}),
+                         ["%s#12" % REPO, "%s#13" % REPO])
+
+    def test_no_probe_when_a_queued_ticket_can_still_run_the_base_check(self):
+        self.held()
+        self.open_incident()
+        self.fake.add(14, lane="muse", body=PLAIN, state="queued")
+        self.fake.head_date = "2023-11-14T23:00:00Z"
+        self.release()
+        for number in (12, 13):
+            self.assertIn("loom:running", self.fake.names(number))
+            self.assertNotIn("loom:queued", self.fake.names(number))
+        self.assertEqual(sorted(self.held_entry() or {}),
+                         ["%s#12" % REPO, "%s#13" % REPO])
 
 
 class PruneTest(Base):
