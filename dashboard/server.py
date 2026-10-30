@@ -794,7 +794,7 @@ def _empty_epics(empty):
 
 def _needs_sources(document, state):
     """(asks, claims, repos) the Needs-you page reads: needs-operator and
-    loom:human asks from Hunt's document and the store, and the Operators
+    needs:human asks from Hunt's document and the store, and the Operators
     pass's needs:<login> and answered items."""
     asks = list(document.get("needs_operator") or []) + list(getattr(state, "operator_items", []))
     response = getattr(state, "response", None)
@@ -822,7 +822,7 @@ def _answer_bar(mode):
 
 def _needs_you(document, state, *, source_missing=False, who=""):
     """Everything waiting on a person (loom#810): needs-operator and
-    loom:human asks from Hunt's document and the store, and needs:<login>
+    needs:human asks from Hunt's document and the store, and needs:<login>
     items from the Operators pass, each once, filtered by ?who=. Each card
     takes an answer (loom#1777)."""
     asks, claims, repos = _needs_sources(document, state)
@@ -838,7 +838,7 @@ def _needs_you(document, state, *, source_missing=False, who=""):
     if not who:
         out.append(_backlog_asks(document, found, repos))
     counts = getattr(state, "human_counts", None) or document.get("loom_human_counts") or {}
-    out.append('<footer>loom:human counts by repo: %s</footer>' % html.escape(
+    out.append('<footer>needs:human counts by repo: %s</footer>' % html.escape(
         ", ".join("%s: %s" % (repo, count) for repo, count in counts.items()) or "none"))
     return page("Needs you", "needs-you", "".join(out),
                 status="Read only" if mode == "off" else "Answers on")

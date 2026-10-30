@@ -241,7 +241,8 @@ class NeedsTest(unittest.TestCase):
         return store
 
     def needs_reads(self):
-        return [path for path in self.gh.calls if "labels=needs%3A" in path or "/comments?per_page=" in path]
+        return [path for path in self.gh.calls if "needs%3Ahuman" not in path
+                and ("labels=needs%3A" in path or "/comments?per_page=" in path)]
 
     def group(self, body, login):
         return body.split('<details class="tickets-group" id="person-%s"' % login)[1].split("</details>")[0]
