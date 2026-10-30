@@ -17,6 +17,7 @@ import subprocess
 from typing import Any, Dict, List, Tuple
 
 from . import brain, tickets
+from .kinds import HUMAN_KINDS
 from .text import SECRET_RE, scrub_paths
 from .github import GitHub
 
@@ -144,33 +145,116 @@ def build_prompt(issue: Dict[str, Any], comments: List[Dict[str, Any]], fmt: str
 ANSWERED_RE = re.compile(r"^rewrite_agent: answered by ([A-Za-z0-9._:/@-]+)$", re.M)
 
 
-def run_agent(cmd: str, prompt: str, timeout: float) -> str:
-    """The command's stdout. The command line is split like a shell would but
-    run without one."""
+def _argv(cmd: str) -> List[str]:
+    """The command line split like a shell would; it is run without one."""
     try:
         argv = shlex.split(cmd)
     except ValueError as err:
         raise Invalid("the agent command line cannot be parsed: %s" % err) from None
     if not argv:
         raise Invalid("the agent command is empty")
+    return argv
+
+
+def _run(argv: List[str], prompt: str, timeout: float) -> Dict[str, Any]:
+    """What the command did: its exit code and output, or why it did not run."""
     try:
         out = subprocess.run(argv, input=prompt, capture_output=True, text=True,
                              timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise Invalid("the agent command timed out after %ds" % int(timeout)) from None
+        return {"timed_out": True}
     except (OSError, subprocess.SubprocessError, UnicodeError) as err:
-        raise Invalid("the agent command could not run: %s" % type(err).__name__) from None
-    if out.returncode != 0:
-        lines = [line.strip() for line in out.stderr.splitlines() if line.strip()]
-        reason = SECRET_RE.sub("[redacted]", lines[-1]) if lines else "the agent command exited %d" % out.returncode
+        return {"error": type(err).__name__}
+    return {"rc": out.returncode, "stdout": out.stdout[:OUTPUT_MAX], "stderr": out.stderr}
+
+
+def answer_of(result: Dict[str, Any], timeout: float) -> str:
+    """The command's stdout from what it did (_run); Invalid when it timed
+    out, could not run or failed."""
+    if result.get("timed_out"):
+        raise Invalid("the agent command timed out after %ds" % int(timeout))
+    if result.get("error") or not isinstance(result.get("rc"), int):
+        raise Invalid("the agent command could not run: %s" % (result.get("error") or "no exit code"))
+    stderr = str(result.get("stderr") or "")
+    if result["rc"] != 0:
+        lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+        reason = SECRET_RE.sub("[redacted]", lines[-1]) if lines else "the agent command exited %d" % result["rc"]
         reason = scrub_paths(reason)[:300]
-        raise CommandFailure("the agent command exited %d: %s" % (out.returncode, reason))
+        raise CommandFailure("the agent command exited %d: %s" % (result["rc"], reason))
     # The rewriter tries Gemma's free tier, then OpenRouter's, then codex: the
     # log says which answered, so the free tier's share can be read.
-    answered = ANSWERED_RE.search(out.stderr or "")
+    answered = ANSWERED_RE.search(stderr)
     if answered:
         print("rewrite: answered by %s" % answered.group(1), file=sys.stderr)
-    return out.stdout[:OUTPUT_MAX]
+    return str(result.get("stdout") or "")[:OUTPUT_MAX]
+
+
+def run_agent(cmd: str, prompt: str, timeout: float) -> str:
+    """The command's stdout. The command line is split like a shell would but
+    run without one."""
+    return answer_of(_run(_argv(cmd), prompt, timeout), timeout)
+
+
+# A background agent job (start_job): the station writes job.json and
+# prompt.txt in the job's folder, and the job writes result.json (what _run
+# returned) when the command ends. A pass that waited on the model held the
+# station for minutes: rewrite_triaged took 305 s of one pass, 128 requests
+# (loom#1663).
+JOB_FILE = "job.json"
+JOB_PROMPT = "prompt.txt"
+JOB_RESULT = "result.json"
+PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def start_job(cmd: str, prompt: str, timeout: float, folder: str) -> "subprocess.Popen[bytes]":
+    """Start the agent command in its own session, so it outlives the pass;
+    the next pass reads job_result(folder). Invalid when the command line
+    cannot be parsed, CommandFailure when the job cannot start."""
+    argv = _argv(cmd)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    for name in (JOB_RESULT, JOB_RESULT + ".tmp"):
+        if os.path.exists(os.path.join(folder, name)):
+            os.remove(os.path.join(folder, name))
+    with open(os.path.join(folder, JOB_PROMPT), "w", encoding="utf-8") as fh:
+        fh.write(prompt)
+    with open(os.path.join(folder, JOB_FILE), "w", encoding="utf-8") as fh:
+        json.dump({"argv": argv, "timeout": timeout}, fh)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (PACKAGE_ROOT, env.get("PYTHONPATH")) if p)
+    try:
+        return subprocess.Popen([sys.executable, "-m", "bus.rewrite", folder],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+    except (OSError, subprocess.SubprocessError) as err:
+        raise CommandFailure("the agent job could not start: %s" % type(err).__name__) from None
+
+
+def job_result(folder: str) -> Any:
+    """What the job's command did, once it has ended; None while it runs."""
+    try:
+        with open(os.path.join(folder, JOB_RESULT), encoding="utf-8") as fh:
+            found = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {"error": "an unreadable result"}
+    return found if isinstance(found, dict) else {"error": "an unreadable result"}
+
+
+def run_job(folder: str) -> None:
+    """The background job: run the command and write result.json whole."""
+    try:
+        with open(os.path.join(folder, JOB_FILE), encoding="utf-8") as fh:
+            job = json.load(fh)
+        with open(os.path.join(folder, JOB_PROMPT), encoding="utf-8") as fh:
+            prompt = fh.read()
+        result = _run([str(a) for a in job["argv"]], prompt, float(job["timeout"]))
+    except (OSError, ValueError, KeyError, TypeError) as err:
+        result = {"error": type(err).__name__}
+    tmp = os.path.join(folder, JOB_RESULT + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(result, fh)
+    os.replace(tmp, os.path.join(folder, JOB_RESULT))
 
 
 def parse_answer(output: str) -> Dict[str, Any]:
@@ -240,8 +324,8 @@ def validate(answer: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
                 raise Invalid("ask is longer than %d characters" % ASK_MAX)
             brain._check_written_text(ask)
             kind = str(answer.get("kind") or "").strip().lower()
-            if kind not in brain.HUMAN_KINDS:
-                raise Invalid("kind is not one of %s" % ", ".join(brain.HUMAN_KINDS))
+            if kind not in HUMAN_KINDS:
+                raise Invalid("kind is not one of %s" % ", ".join(HUMAN_KINDS))
             return "human", {"ask": "Kind: %s\n%s" % (kind, ask)}
         if action != "brief":
             raise Invalid("action is not brief, human or skip")
@@ -278,15 +362,16 @@ def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
             and not brain.not_work_reason(i)]
 
 
-def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: str,
-                  timeout: float = 600) -> str:
-    """Rewrite one loom:triage issue. Returns "brief", "human" or "skip".
-    Raises Invalid for a bad answer (nothing written); GitHub errors and
-    brain's own refusals (ValueError) pass through."""
-    number = int(issue["number"])
-    comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-    prompt = build_prompt(issue, [c for c in comments if isinstance(c, dict)], brief_format())
-    action, fields = validate(parse_answer(run_agent(cmd, prompt, timeout)))
+def prompt_for(gh: GitHub, repo: str, issue: Dict[str, Any]) -> str:
+    """The rewrite prompt for one issue, with its last comments."""
+    comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, int(issue["number"])))
+    return build_prompt(issue, [c for c in comments if isinstance(c, dict)], brief_format())
+
+
+def apply_answer(gh: GitHub, repo: str, goal: int, number: int, output: str) -> str:
+    """Write what the agent's answer asks for. Returns "brief", "human" or
+    "skip"; Invalid for a bad answer (nothing written)."""
+    action, fields = validate(parse_answer(output))
     if action == "brief":
         # No lane: the ticket is queued and the station's tier pick gives it one.
         brain.brief_intake(gh, repo, goal, fields["title"], fields["body"],
@@ -300,3 +385,16 @@ def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: 
         print("rewrite: %s#%d proposed as person-only, left to the brain: %s"
               % (repo, number, fields["ask"][:200]), file=sys.stderr)
     return action
+
+
+def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: str,
+                  timeout: float = 600) -> str:
+    """Rewrite one loom:triage issue. Returns "brief", "human" or "skip".
+    Raises Invalid for a bad answer (nothing written); GitHub errors and
+    brain's own refusals (ValueError) pass through."""
+    prompt = prompt_for(gh, repo, issue)
+    return apply_answer(gh, repo, goal, int(issue["number"]), run_agent(cmd, prompt, timeout))
+
+
+if __name__ == "__main__":
+    run_job(sys.argv[1])

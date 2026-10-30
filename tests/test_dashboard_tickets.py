@@ -227,14 +227,16 @@ class LatestRunsOffTheRequestTest(unittest.TestCase):
         state.latest_runs = {"example-owner/app#34": {
             "ticket": "example-owner/app#34", "model": "model-transcript",
             "started_at": "2026-10-16T05:00:30Z", "finished_at": "2026-10-16T06:00:00Z"}}
+        # Under the store's 3 s read, with room for a loaded machine: the
+        # calls == 0 checks below are the real proof (2026-10-24).
         started = time.monotonic()
         body = _tickets(state, urlsplit("/tickets"))
-        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertLess(time.monotonic() - started, 2.5)
         self.assertEqual(state.transcripts.calls, 0)
         self.assertEqual(_cell(body, 34, "tickets-model"), "spark / model-transcript")
         started = time.monotonic()
         _floor(state)
-        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertLess(time.monotonic() - started, 2.5)
         self.assertEqual(state.transcripts.calls, 0)
 
     def _ticket_store(self):

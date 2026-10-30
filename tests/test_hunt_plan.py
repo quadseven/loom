@@ -61,6 +61,36 @@ class ProblemsTest(unittest.TestCase):
     def test_a_good_body_passes(self):
         self.assertEqual(hunt_plan.problems(GOOD), [])
 
+    def test_what_good_look_like_is_not_an_acceptance_heading(self):
+        # "What good look like" is the label of the review bot's acceptance
+        # check in its report, not a heading that check reads (see the
+        # drift test below): a body whose criteria sit under it has no
+        # criteria section the gate accepts.
+        body = GOOD.replace("## Acceptance criteria", "## What good look like")
+        self.assertTrue(any("missing ## Acceptance criteria" in p
+                            for p in hunt_plan.problems(body)),
+                        hunt_plan.problems(body))
+
+    def test_accepted_acceptance_headings_equal_the_review_bots(self):
+        # The drift catcher: Loom's plan check mirrors the review bot's
+        # check_acceptance in services/_shared/personas/tpm/dor_checks.py
+        # (the grug repo), which reads sections under these two headings
+        # (a trailing qualifier on the heading is tolerated there, as
+        # here, by the same heading match). Deriving
+        # Loom's accepted set through problems(), over the bot's headings
+        # plus the near-misses this check has actually produced (the bot's
+        # report label for it; the brief-side "Acceptance" alias), and
+        # comparing it with the bot's set restated here from that source,
+        # fails loudly if an alias creeps back into the plan check.
+        chief_headings = {"Acceptance criteria", "Test plan"}
+        candidates = chief_headings | {"What good look like", "Acceptance"}
+        accepted_headings = set()
+        for heading in candidates:
+            body = GOOD.replace("## Acceptance criteria", "## " + heading)
+            if hunt_plan.problems(body) == []:
+                accepted_headings.add(heading)
+        self.assertEqual(accepted_headings, chief_headings)
+
     def test_each_blocking_check_is_named(self):
         cases = {
             "## Why has 2 words": GOOD.replace("The page query is slow for every visitor.", "Too slow."),
@@ -97,7 +127,7 @@ class PadCriteriaTest(unittest.TestCase):
         # A body with nothing to build is not a body to merge: the gate
         # refuses it, and so does the check that mirrors the gate.
         padded = hunt_plan.pad_criteria("")
-        self.assertEqual(len(hunt_plan.bullets(padded)), len(hunt_plan.FILLER_BULLETS))
+        self.assertEqual(padded, "")
         body = GOOD.replace("- [ ] The page loads in under a second.\n"
                             "- [ ] A test fails without the cache.\n"
                             "- [ ] The query runs once a minute.", padded)
@@ -133,6 +163,33 @@ class BriefToPullRequestTest(unittest.TestCase):
         self.assertEqual(brain.plan_problems(thin), [])
         self.assertTrue(brain.plan_problems(BRIEF % "XL"))
         self.assertEqual(brain.plan_problems(BRIEF % "Medium"), [])
+
+    def test_why_opening_with_issue_reference_is_read_as_text(self):
+        # A brief whose Why section opens with an issue reference like
+        # "#214 (Routes 2-4) ..." should be read as body text, not as a heading.
+        # The plan check must find the words in the Why section.
+        brief = """## Why
+#214 (Routes 2-4) The page query is slow for every visitor.
+
+## What
+Cache the query.
+
+## Acceptance criteria
+- [ ] The page loads in under a second.
+- [ ] A test fails without the cache.
+- [ ] The query runs once a minute.
+
+## Size
+Medium
+
+## Out of scope
+- Other pages.
+"""
+        body = pr_repair._render_generated(brief, "lane", "model", "T1")
+        self.assertEqual(hunt_plan.problems(body), [])
+        why = hunt_plan._section_text(body, "Why", "Summary")
+        self.assertIsNotNone(why)
+        self.assertGreaterEqual(len(why.split()), 5)
 
 
 class OneSizeParserTest(unittest.TestCase):
@@ -178,6 +235,32 @@ class OneSizeParserTest(unittest.TestCase):
                 generated = pr_repair._render_generated(body, "lane", "model", "T1")
                 self.assertIn("\nSize: %s\n" % hunt_plan.size_letter(word), generated)
                 self.assertEqual(hunt_plan.problems(generated), [])
+
+    def test_a_size_section_in_markdown_or_with_a_label_reads_as_the_letter(self):
+        # A lane pull request in another repo (2026-10-25): its ticket's
+        # ## Size section said "**Size:** S", brief_size kept its first
+        # word, and the body read
+        # "Size: **Size:**", which the plan check held. Every reader goes
+        # through size_letter, so each form gives the letter everywhere.
+        forms = {"**Size:** S": "S", "Size: S": "S", "**S**": "S", "S (small)": "S",
+                 "Small": "S", "M - medium": "M", "**Size: M**": "M", "`L`": "L",
+                 "- XS": "XS", "Size - M": "M", "__Size__: L": "L"}
+        for line, letter in forms.items():
+            with self.subTest(line=line):
+                body = BRIEF % line
+                self.assertEqual(hunt_plan.size_letter(line), letter)
+                self.assertEqual(hunt_plan.size_letter(hunt_plan.stated_size(body)), letter)
+                self.assertEqual(hunt_plan.brief_size(body), letter)
+                self.assertEqual(pr_repair._brief_size(body), letter)
+                self.assertIn("## Size\n\n%s\n" % letter, hunt_plan.with_size_letter(body))
+                generated = pr_repair._render_generated(body, "lane", "model", "T1")
+                self.assertIn("\nSize: %s\n" % letter, generated)
+                self.assertEqual(hunt_plan.problems(generated), [])
+
+    def test_an_xl_written_with_a_label_is_still_too_big(self):
+        with self.assertRaises(ValueError):
+            hunt_plan.size_letter("**Size:** XL")
+        self.assertEqual(hunt_plan.brief_size(BRIEF % "**Size:** XL"), "XL")
 
     def test_inline_xl_size_is_refused(self):
         # XL on an inline Size: line is still too big: stated_size skips it.

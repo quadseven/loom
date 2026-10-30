@@ -22,8 +22,6 @@ invariant fires.
     python3 -m bus.hunt_plan size WORD    print the letter for a size, or fail
     python3 -m bus.hunt_plan brief-size FILE  print a brief's size as the runner writes it
     python3 -m bus.hunt_plan check FILE   list what a body lacks ("-" = stdin)
-    python3 -m bus.hunt_plan pad-criteria FILE  print an acceptance criteria section
-        with the bullets the gate needs ("-" = stdin)
 """
 from __future__ import annotations
 
@@ -68,14 +66,25 @@ _SIZE_LINE = re.compile(r"^[ \t]*(?:\*\*|__)?size(?:\*\*|__)?[ \t]*:[ \t]*(?:\*\
 SIZE_FORMS = "a ## Size section or a Size: XS|S|M|L line (or Small, Medium, Large)"
 
 
+# Markdown a ticket wraps its size in ("**Size:** S", "`M`"), a list or quote
+# mark before it ("- S"), and the label a line may repeat ("Size: S",
+# "Size - M"). size_letter drops all three before it reads the size.
+_SIZE_MARKUP = re.compile(r"[*_`]")
+_SIZE_LEAD = re.compile(r"^[\s>#-]+")
+_SIZE_LABEL = re.compile(r"^size\b[\s:=-]*", re.IGNORECASE)
+
+
 def size_letter(text: str) -> str:
-    """The gate's letter for a size written as a letter or a word ("Medium",
-    "m", "Size: Small"). ValueError for XL (too big for one pull request)
-    and for anything else."""
-    value = str(text or "").strip()
-    value = re.sub(r"^size\b[:\s\*_]*", "", value, flags=re.IGNORECASE)
-    value = value.strip().strip("*_").strip().rstrip(":.,;").strip().lower()
-    for candidate in (value, value.split(" (")[0].strip(),
+    """The gate's letter for a size written as a letter or a word, with or
+    without markdown or a label: "Medium", "m", "Size: Small", "**Size:** S",
+    "**S**", "S (small)", "M - medium". The one size normalizer: every
+    reader (stated_size, brief_size, with_size_letter, the runner, PR repair)
+    goes through it. ValueError for XL (too big for one pull request) and
+    for anything else."""
+    value = _SIZE_MARKUP.sub("", str(text or "")).strip()
+    value = _SIZE_LABEL.sub("", _SIZE_LEAD.sub("", value)).strip().lower()
+    value = value.rstrip(":.,;").strip()
+    for candidate in (value, value.split(" (")[0].strip(), value.split(" - ")[0].strip(),
                       " ".join(value.split()[:2]), (value.split() or [""])[0]):
         candidate = candidate.rstrip(":.,;")
         if candidate in _TOO_BIG:
@@ -120,7 +129,8 @@ def brief_size(brief: str) -> str:
     try:
         return size_letter(stated)
     except ValueError:
-        return stated.split()[0].rstrip(":") if stated else ""
+        words = _SIZE_LABEL.sub("", _SIZE_MARKUP.sub("", stated).strip()).split()
+        return words[0].rstrip(":") if words else ""
 
 
 def _heading_matches(heading: str, name: str) -> bool:
@@ -179,10 +189,13 @@ def pad_criteria(section: str) -> str:
     """An acceptance criteria section with the bullets the gate needs: the
     ticket's own, plus the standard ones when it states fewer than three.
     The gate counts only non-empty bullets, so an empty placeholder does not
-    stand in for one. A section with no criterion of its own keeps the
-    gate's refusal: a body with nothing to build is not a body to merge."""
+    stand in for one. A section with no criterion of its own is returned as
+    it is and keeps the gate's refusal: a body with nothing to build is not
+    a body to merge."""
     lines = [line for line in str(section or "").split("\n") if line.strip()]
     have = len(bullets("\n".join(lines)))
+    if not have:
+        return str(section or "")
     out = list(lines)
     for filler in FILLER_BULLETS:
         if have >= MIN_BULLETS:
@@ -217,19 +230,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("size").add_argument("word", nargs="+")
     sub.add_parser("check").add_argument("file")
     sub.add_parser("brief-size").add_argument("file")
-    sub.add_parser("pad-criteria").add_argument("file")
     args = parser.parse_args(argv)
     if args.cmd == "brief-size":
         with open(args.file, encoding="utf-8") as fh:
             print(brief_size(fh.read()))
-        return 0
-    if args.cmd == "pad-criteria":
-        if args.file == "-":
-            section = sys.stdin.read()
-        else:
-            with open(args.file, encoding="utf-8") as fh:
-                section = fh.read()
-        print(pad_criteria(section))
         return 0
     if args.cmd == "size":
         try:
