@@ -228,6 +228,33 @@ def _takes(item: Any, lane: str) -> bool:
     return difficulty_of(item) in REMOTE_LANES[lane]["tiers"]
 
 
+NO_ACCEPTANCE_MARKER = "<!-- loom:no-acceptance v1 -->"
+NO_ACCEPTANCE_NOTE = (
+    NO_ACCEPTANCE_MARKER + "\n"
+    "Held for the brain (needs-brain): this ticket has no acceptance "
+    "criteria a lane can prove: add an ## Acceptance criteria section "
+    "with - [ ] checkboxes. It is not claimed or briefed until it has "
+    "at least one - [ ] box under ## Acceptance criteria.")
+
+
+def _hold_no_acceptance(gh: GitHub, repo: str, issue: Dict[str, Any]) -> bool:
+    """True when a queued ticket has no acceptance checkbox and so gets no
+    claim (loom#2249): it gains needs-brain and the one note naming the
+    missing section, once (needs-brain says it was reported). A lane run
+    on such a ticket is parked unrun by the runner, so the refusal
+    belongs before the claim, not after it."""
+    if brain.acceptance_refusal(issue.get("body"), issue) is None:
+        return False
+    if "needs-brain" not in _names(issue):
+        number = int(issue["number"])
+        labels = _names(issue) + ["needs-brain"]
+        gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                {"labels": labels})
+        issue["labels"] = [{"name": name} for name in labels]
+        notify.post(gh, repo, number, NO_ACCEPTANCE_NOTE, notify.HELD)
+    return True
+
+
 def _take(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
           now: float) -> Dict[str, Any]:
     number = int(issue["number"])
@@ -258,6 +285,9 @@ def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
             skipped.append("#%s skipped: lane slots full" % issue["number"])
     else:
         for repo, issue in candidates:
+            if _hold_no_acceptance(gh, repo, issue):
+                skipped.append("#%s skipped: no acceptance criteria" % issue["number"])
+                continue
             branch = tickets.branch_for(int(issue["number"]), str(issue.get("title") or ""))
             pr = _open_or_merged_pull(gh, repo, branch)
             if pr is not None:

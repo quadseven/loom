@@ -629,6 +629,16 @@ ask for."""
 # A ticket with either label is never sent back: a person or the brain has it.
 SEND_BACK_HOLDS = frozenset(("loom:human", "needs-brain"))
 
+# The one note for a queued ticket with no acceptance checkbox (loom#2249):
+# the same marker the remote lane claim writes (bus/lane.py), so either
+# gate's note says the hold was already reported.
+NO_ACCEPTANCE_NOTE = (
+    "<!-- loom:no-acceptance v1 -->\n"
+    "Held for the brain (needs-brain): this ticket has no acceptance "
+    "criteria a lane can prove: add an ## Acceptance criteria section "
+    "with - [ ] checkboxes. It is not claimed or briefed until it has "
+    "at least one - [ ] box under ## Acceptance criteria.")
+
 # The note for a ticket whose lane run failed with its pull request open: the
 # failed run is the finding, so it is not the stock FIX_NOTES that brain.fix
 # refuses to send alone.
@@ -4239,7 +4249,26 @@ class Factory:
             reason = "waits for %s to merge (After:)" % ", ".join(a.short for a in waiting)
             self._waiting(repo, issue["number"], reason)
             return reason
+        if brain.acceptance_refusal(str(issue.get("body") or ""), issue) is not None:
+            return self._hold_no_acceptance(repo, issue)
         return ""
+
+    def _hold_no_acceptance(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Hold a queued ticket with no acceptance checkbox for the brain,
+        once (loom#2249): needs-brain and the one note naming the missing
+        section. It gets no lane and spends no ladder rung: a lane run on
+        it is parked unrun by the runner, and the factory otherwise moved
+        it across lanes all night."""
+        number = int(issue["number"])
+        if "needs-brain" not in _labels(issue):
+            notify.post(self.gh, repo, number, NO_ACCEPTANCE_NOTE, notify.HELD)
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["needs-brain"]})
+            issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
+            self.actions += 1
+            _say("held queued %s#%d for the brain: no acceptance criteria" % (repo, number))
+        self._waiting(repo, number, "no acceptance criteria")
+        return "has no acceptance criteria"
 
     def _brief_wait(self, repo: str, issue: Dict[str, Any]) -> str:
         """Why a queued ticket gets no lane, or "": a stale ticket waits for

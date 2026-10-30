@@ -284,6 +284,24 @@ class RemoteLaneTests(unittest.TestCase):
             self.open_pr(gh)
         self.assertFalse([c for c in gh.calls if c[0] == "POST" and c[1].endswith("/pulls")])
 
+    def test_claim_holds_a_ticket_with_no_acceptance_box_for_the_brain(self):
+        # loom#2249: a queued ticket with no - [ ] box was claimed, and the
+        # runner parked it unrun; five such tickets burned two lane runs
+        # each. The claim now holds it needs-brain, once, naming the
+        # missing section, and spends no claim on it.
+        gh = FakeGitHub(body=BODY.replace("- [ ] ", "- "))
+        self.assertIsNone(lane.claim(gh, ["example/project"], now=1000))
+        self.assertIn("needs-brain", labels(gh))
+        self.assertNotIn("loom:running", labels(gh))
+        self.assertIn("loom:queued", labels(gh))
+        (note,) = gh.comments[4]
+        self.assertIn("## Acceptance criteria", note["body"])
+        self.assertIn("- [ ]", note["body"])
+        # A second claim pass writes nothing more and still claims nothing.
+        self.assertIsNone(lane.claim(gh, ["example/project"], now=1001))
+        self.assertEqual(len(gh.comments[4]), 1)
+        self.assertNotIn("loom:running", labels(gh))
+
     def test_claim_skips_queued_ticket_whose_branch_has_a_pull_request(self):
         gh = FakeGitHub()
         gh.pulls = [{"number": 99, "state": "open"}]

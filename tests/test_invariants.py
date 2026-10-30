@@ -766,6 +766,18 @@ class SettledSubjectTest(StationBase):
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "closed", self.said)
 
+    def test_a_ticketed_invariant_issue_whose_subject_settled_closes_too(self):
+        # loom#2249: an invariant issue rewritten into a ticket keeps
+        # loom:ticket, and the settled pass skipped it for that label alone,
+        # so a cleared breach stayed open and kept being claimed.
+        filed = self.stalled()
+        filed["labels"] = [invariants.LABEL, invariants.TICKET_LABEL]
+        self.leave_open_set(merged_at=stamp(T0 + 100), closed_at=stamp(T0 + 100))
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+        (note,) = self.notes(filed)
+        self.assertIn("pull request #660 merged at %s" % stamp(T0 + 100), note)
+
     def test_an_issue_whose_finding_is_still_live_stays_open(self):
         filed = self.stalled()
         self.run_at(T0 + invariants.CHECK_EVERY)

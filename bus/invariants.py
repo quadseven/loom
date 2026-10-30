@@ -1375,10 +1375,10 @@ class Filer:
             if issue is None or issue.get("state") != "open":
                 self.subjects.pop(key, None)
                 continue
-            if TICKET_LABEL in self._label_names(issue):
-                # Rewritten into work: the ticket path closes it.
-                self.subjects.pop(key, None)
-                continue
+            # A loom:invariant issue rewritten into a ticket keeps
+            # loom:ticket, but its subject settling is still the breach
+            # clearing: the ticket path never closes it, so the settled
+            # check runs for it too (loom#2249).
             why = self._settled_why(invariant, subject, number)
             if why and self._close_settled(number, issue, why):
                 self.subjects.pop(key, None)

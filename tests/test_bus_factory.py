@@ -866,7 +866,7 @@ class PullRequests(Base):
         # 2026-10-17: no codex lane was free for rung 2, and the factory said it
         # tried every rung and moved the ticket to failed.
         self.gh.ticket(5, "pr", lane="claude",
-                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
@@ -894,7 +894,7 @@ class PullRequests(Base):
         # 2026-10-19: grug#1189 waited from 18:25Z with no lane up for its next
         # rung, and its only open thread carried a lane's answer nothing judged.
         self.gh.ticket(5, "pr", lane="claude",
-                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
@@ -911,7 +911,7 @@ class PullRequests(Base):
 
     def test_a_lane_up_for_the_next_rung_climbs_and_the_review_bot_is_not_asked(self):
         self.gh.ticket(5, "pr", lane="claude",
-                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
@@ -924,7 +924,7 @@ class PullRequests(Base):
         # The answer is the App's own, so a stranger's words on a thread are
         # data and never move the pull request.
         self.gh.ticket(5, "pr", lane="claude",
-                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
@@ -943,7 +943,7 @@ class PullRequests(Base):
 
     def test_a_ticket_that_failed_on_a_ladder_model_does_not_get_it_again(self):
         self.gh.ticket(6, "failed", lane="claude",
-                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         self.go()
         self.assertEqual(self.model(6), "gpt-6-luna")
 
@@ -2582,7 +2582,7 @@ class Trust(Base):
 
 
 class Queued(Base):
-    def queued(self, number, body="Difficulty: medium\n\n## Why\nx\n", age=0):
+    def queued(self, number, body="Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n", age=0):
         self.gh.ticket(number, "queued", body=body)
         self.gh.issues[number]["labels"] = [
             {"name": "loom:ticket"}, {"name": "loom:queued"}]
@@ -2594,13 +2594,42 @@ class Queued(Base):
         worker.assign_queued()
         return worker
 
+    def test_a_queued_ticket_with_no_acceptance_box_is_held_for_the_brain(self):
+        # loom#2249: such a ticket was given a lane, claimed, and parked
+        # unrun by the runner, again and again across lanes. The factory
+        # now holds it needs-brain, once, naming the missing section, and
+        # gives it no lane.
+        self.queued(7, body="Difficulty: medium\n\n## Why\nx\n\n"
+                            "## Acceptance criteria\n- It works.\n")
+        worker = self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertEqual(self.lane(7), "")
+        names = [x["name"] for x in self.gh.issues[7]["labels"]]
+        self.assertIn("needs-brain", names)
+        (note,) = [c for c in self.gh.comments[7]
+                   if "## Acceptance criteria" in str(c.get("body") or "")]
+        self.assertIn("- [ ]", note["body"])
+        self.assertIn("no acceptance", worker.waits["%s#7" % REPO])
+        # A second pass writes nothing more.
+        self.assign(available=["codex"])
+        self.assertEqual(len([c for c in self.gh.comments[7]
+                              if "## Acceptance criteria" in str(c.get("body") or "")]), 1)
+
+    def test_a_queued_ticket_with_acceptance_boxes_is_briefed_as_before(self):
+        self.queued(7, body="Difficulty: medium\n\n## Why\nx\n\n"
+                            "## Acceptance criteria\n- [ ] It works.\n")
+        self.assign(available=["codex"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "codex"))
+        names = [x["name"] for x in self.gh.issues[7]["labels"]]
+        self.assertNotIn("needs-brain", names)
+
     def test_a_queued_ticket_that_waits_says_why_in_waits(self):
         # The factory's reason for leaving a ticket where it is reached only
         # the log; nothing saw the same reason repeat for hours (2026-10-21).
-        self.queued(7, body="Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n")
+        self.queued(7, body="Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         self.queued(8)
         self.queued(9, body="Not before: 2099-01-01T00:00:00Z\nDifficulty: medium\n\n## Why\nx\n")
-        self.queued(10, body="Model: <b>`x`\nDifficulty: medium\n\n## Why\nx\n")
+        self.queued(10, body="Model: <b>`x`\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         worker = self.assign(available=[])
         self.assertEqual(worker.waits, {
             "%s#7" % REPO: "no free lane takes model claude-opus-5-5",
@@ -2612,7 +2641,7 @@ class Queued(Base):
         # merged; the station never claimed it, and the lane it reserved sat
         # idle for hours with that one ticket counted against it (2026-10-22).
         self.gh.ticket(5, "pr")
-        self.queued(7, body="After: #5\nDifficulty: medium\n\n## Why\nx\n", age=7200)
+        self.queued(7, body="After: #5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n", age=7200)
         self.queued(8, age=0)
         worker = self.assign(available=["codex"])
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
@@ -2621,12 +2650,12 @@ class Queued(Base):
 
     def test_a_queued_ticket_whose_after_ticket_merged_gets_a_lane(self):
         self.gh.ticket(5, "merged")
-        self.queued(7, body="After: #5\nDifficulty: medium\n\n## Why\nx\n")
+        self.queued(7, body="After: #5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         self.assign(available=["codex"])
         self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "codex"))
 
     def first_label_ticket(self, number, label="loom:regression", model="gpt-6-luna"):
-        self.queued(number, body="Model: %s\nDifficulty: medium\n\n## Why\nx\n" % model)
+        self.queued(number, body="Model: %s\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n" % model)
         self.gh.issues[number]["labels"].append({"name": label})
 
     def busy(self, number, lane):
@@ -2681,7 +2710,7 @@ class Queued(Base):
             self.assertEqual(factory._state(self.gh.issues[7]), "queued")
 
     def test_a_model_ticket_without_a_first_label_waits_for_a_free_lane(self):
-        self.queued(7, body="Model: gpt-6-luna\nDifficulty: medium\n\n## Why\nx\n")
+        self.queued(7, body="Model: gpt-6-luna\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         self.busy(8, "codex")
         self.busy(9, "codex-2")
         worker = self.assign(available=["codex", "codex-2"])
@@ -2689,7 +2718,7 @@ class Queued(Base):
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
 
     def test_queued_ladder_model_uses_a_compatible_lane(self):
-        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
         self.queued(7, body=body)
         self.assign(available=["opencode-go-3", "claude"])
         self.assertEqual(self.lane(7), "claude")
@@ -2700,7 +2729,7 @@ class Queued(Base):
         # running labels, so their idle lanes counted as busy for hours and
         # every queued ticket waited for a free lane.
         self.gh.ticket(6, "running", lane="claude")
-        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
         self.queued(7, body=body)
         worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
                                  available=["claude"], held=["%s#6" % REPO])
@@ -2709,13 +2738,13 @@ class Queued(Base):
 
     def test_a_running_ticket_not_held_still_fills_its_lane(self):
         self.gh.ticket(6, "running", lane="claude")
-        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
         self.queued(7, body=body)
         self.assign(available=["claude"])
         self.assertIn("loom:queued", [x["name"] for x in self.gh.issues[7]["labels"]])
 
     def test_queued_ladder_model_waits_when_only_incompatible_lanes_are_free(self):
-        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
         self.queued(7, body=body)
         self.assign(available=["opencode-go-3"])
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
@@ -2736,7 +2765,7 @@ class Queued(Base):
         self.assign(available=["codex", "codex-2"])
         self.assertEqual(self.lane(7), "codex-2")
 
-    OPUS = "Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n"
+    OPUS = "Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
     OUT = factory.ANTHROPIC + ("claude",)
 
     def test_opus_pin_never_goes_to_agy_when_every_anthropic_lane_is_out(self):
@@ -2784,7 +2813,7 @@ class Queued(Base):
 
     def test_a_p0_queued_ticket_takes_the_free_lane_before_an_older_one(self):
         self.queued(7, age=600)
-        self.queued(8, body="Difficulty: medium\nPriority: P0\n\n## Why\nx\n", age=60)
+        self.queued(8, body="Difficulty: medium\nPriority: P0\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n", age=60)
         self.assign(available=["codex"])
         self.assertEqual(factory._state(self.gh.issues[8]), "briefed")
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
@@ -2803,7 +2832,7 @@ class Queued(Base):
         self.assertEqual(self.lane(7), "opencode-go")
 
     def test_a_pass_that_assigns_no_queued_ticket_says_why_for_the_first(self):
-        self.queued(7, body="Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n", age=600)
+        self.queued(7, body="Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n", age=600)
         self.queued(8, age=60)
         with mock.patch("bus.factory._say") as say:
             self.assign(available=[])
@@ -2820,7 +2849,7 @@ class Queued(Base):
     def test_a_queued_ticket_with_no_difficulty_takes_a_medium_lane(self):
         # A queued ticket whose body had no Difficulty line was in no tier, so
         # no lane could ever take it; one waited a day (2026-10-21).
-        for body in ("Priority: P2\n\n## Why\nx\n", "Difficulty: Medium-ish\n\n## Why\nx\n"):
+        for body in ("Priority: P2\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n", "Difficulty: Medium-ish\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"):
             with self.subTest(body=body):
                 self.queued(7, body=body)
                 self.assign(available=["codex"])
@@ -3141,7 +3170,7 @@ class Tickets(Base):
         said = []
         with mock.patch.object(factory, "_say", said.append):
             self.gh.ticket(8, "failed", lane="codex-2",
-                           body="Model: gpt-6-luna\nDifficulty: medium\n\n## Why\nx\n")
+                           body="Model: gpt-6-luna\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
             self.gh.comments[8] += [{"body": factory.RUNG_MARKER % 2, "user": ME}]
             self.go()
         self.assertEqual(self.moved, [(8, "briefed", "claude")])
@@ -3162,7 +3191,7 @@ class Tickets(Base):
     def test_a_stall_with_no_other_lane_is_said_once_not_every_pass(self):
         # 716 identical lines in two days (loom#1280).
         self.stalled(7, lane="claude",
-                     body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+                     body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         f, said = self.one_lane_stall()
         self.assertEqual(len(said), 1, said)
         self.assertEqual(list(f.waits), ["%s#7" % REPO])
@@ -3172,7 +3201,7 @@ class Tickets(Base):
 
     def test_a_stall_with_a_new_reason_is_said_again(self):
         self.stalled(7, lane="claude",
-                     body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+                     body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         _, said = self.one_lane_stall(known_waits={"%s#7" % REPO: "some older reason"})
         self.assertEqual(len(said), 1, said)
 
@@ -3183,7 +3212,7 @@ class Tickets(Base):
         self.assertNotIn("loom:rung", "".join(c["body"] for c in self.gh.comments[7]))
 
     def test_a_stalled_rung_two_ticket_moves_to_the_other_rung_two_lane(self):
-        self.stalled(7, body="Model: gpt-6-luna\nDifficulty: medium\n\n## Why\nx\n")
+        self.stalled(7, body="Model: gpt-6-luna\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         self.go()
         self.assertEqual((self.lane(7), self.model(7)), ("codex-2", "gpt-6-luna"))
         self.assertNotIn("loom:rung", "".join(c["body"] for c in self.gh.comments[7]))
@@ -3234,7 +3263,7 @@ class Tickets(Base):
     def test_a_stall_never_moves_to_a_lane_with_as_long_a_wait(self):
         # loom#410, #977 and #1073 bounced codex-2 -> codex -> codex-2 for six
         # hours, unclaimed, each move restarting the stall wait (2026-10-21).
-        body = "Model: gpt-6-luna\nDifficulty: medium\n\n## Why\nx\n"
+        body = "Model: gpt-6-luna\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
         self.stalled(7, body=body)
         self.gh.ticket(8, "briefed", lane="codex", body=body)
         for number in (9, 10):
@@ -3256,7 +3285,7 @@ class Tickets(Base):
         self.assertEqual((self.lane(7), self.moved, self.gh.comments[7]), ("codex", [], []))
 
     def test_a_held_ladder_ticket_is_not_spread_off_a_busy_lane(self):
-        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
         for n in (6, 8, 9):
             self.gh.ticket(n, "briefed", lane="claude", body=body)
         self.gh.ticket(7, "briefed", lane="claude", body=body)
@@ -3652,7 +3681,7 @@ class Tickets(Base):
 
     def test_a_paid_rung_limited_longer_than_two_hours_uses_the_strongest_free_lane(self):
         self.gh.private = False
-        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
         self.gh.ticket(7, "briefed", lane="claude", body=body)
         self.go(model_limits={lane: {"claude-sonnet-5-5": NOW + 3 * 3600}
                               for lane in factory.LADDER[0][0]})
@@ -3662,7 +3691,7 @@ class Tickets(Base):
 
     def test_a_paid_rung_freeing_within_two_hours_is_still_waited_for(self):
         self.gh.private = False
-        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
         self.gh.ticket(7, "briefed", lane="claude", body=body)
         self.go(model_limits={lane: {"claude-sonnet-5-5": NOW + 90 * 60}
                               for lane in factory.LADDER[0][0]})
@@ -3670,7 +3699,7 @@ class Tickets(Base):
 
     def test_a_long_paid_wait_skips_free_lanes_the_ticket_already_tried(self):
         self.gh.private = False
-        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
         self.gh.ticket(7, "briefed", lane="claude", body=body)
         self.gh.comments[7].append({"body": "Claimed for lane free-ollama (body sha256 abcdef123456)",
                                     "user": ME})
@@ -3706,7 +3735,7 @@ class Tickets(Base):
         self.assertEqual((self.lane(7), self.model(7)), ("spark", "spark/coder"))
 
     def test_ladder_tickets_queued_on_a_busy_lane_spread_to_free_rungs(self):
-        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
         for n in range(1, 6):
             self.gh.ticket(n, "briefed", lane="claude", body=body)
             self.gh.comments[n].append({"body": factory.RUNG_MARKER % 1, "user": ME})
@@ -3721,7 +3750,7 @@ class Tickets(Base):
         """A ticket whose first attempts ran on gpt-6-luna (its Model: line, two
         codex claims, no rung marker) and that the brain escalated to rung 1."""
         self.gh.ticket(number, state, lane="claude",
-                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         sol_claim = {"body": "Claimed for lane codex (body sha256 0123456789ab)", "user": ME}
         self.gh.comments[number] += [sol_claim, sol_claim, {
             "body": "<!-- loom:escalate v1 -->\nEscalated to rung 1 of 3: claude-sonnet-5-5 "
@@ -3775,7 +3804,7 @@ class Tickets(Base):
         # The anthropic slots out of credit hold no tickets, so rung 3 looked
         # free, and a ticket waiting on a busy claude lane was "spread" to
         # Opus on the same claude lane (2026-10-19).
-        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
         for n in range(1, 6):
             self.gh.ticket(n, "briefed", lane="claude", body=body)
             self.gh.comments[n].append({"body": factory.RUNG_MARKER % 1, "user": ME})
@@ -3791,7 +3820,7 @@ class Tickets(Base):
         # 13 tickets waited on the one claude lane (two for 10 hours) while the
         # other rungs held two or three each and so never counted as free
         # (loom#1280, 2026-10-21).
-        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
         for n in range(1, 9):
             self.gh.ticket(n, "briefed", lane="claude", body=body)
             self.gh.comments[n].append({"body": factory.RUNG_MARKER % 1, "user": ME})
@@ -3810,7 +3839,7 @@ class Tickets(Base):
         self.assertLessEqual(max(loads) - min(loads), 2)
 
     def test_a_one_lane_rung_at_its_limit_keeps_tickets_when_no_rung_is_shorter(self):
-        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
         for n in range(1, 6):
             self.gh.ticket(n, "briefed", lane="claude", body=body)
             self.gh.comments[n].append({"body": factory.RUNG_MARKER % 1, "user": ME})
@@ -3824,7 +3853,7 @@ class Tickets(Base):
         # times in 90 minutes, as each rung looked free by a lane that was
         # out, and was never claimed (2026-10-20).
         self.gh.ticket(1, "briefed", lane="claude",
-                       body="Model: claude-opus-5-5\nDifficulty: medium\n\n## Why\nx\n")
+                       body="Model: claude-opus-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         self.gh.comments[1].append({"body": factory.RUNG_MARKER % 3, "user": ME})
         for n in range(2, 8):
             self.gh.ticket(n, "briefed", lane="claude")  # claude holds 7
@@ -3881,7 +3910,7 @@ class SilentLane(Base):
         self.assertEqual(factory.attempts_since_brief(comments), [])
 
     def test_a_model_ticket_moves_to_a_free_lane_that_takes_its_model(self):
-        self.silent_ticket(body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.silent_ticket(body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n")
         self.go(silent={"codex": 31 * 60})
         self.assertIn("loom:briefed", self.labels())
         self.assertTrue(station.lane_takes_model(self.lane(7), "claude-sonnet-5-5"))
@@ -4346,8 +4375,8 @@ class ForbiddenModels(unittest.TestCase):
 
 class NoLane(Base):
     """Tickets no lane takes are rerouted, then handed off (loom#1831)."""
-    SONNET = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
-    OPUS = "Model: claude-opus-5-5\nDifficulty: medium\n\n## Why\nx\n"
+    SONNET = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
+    OPUS = "Model: claude-opus-5-5\nDifficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] It works.\n"
 
     def queued(self, number, body):
         self.gh.ticket(number, "queued", body=body)
