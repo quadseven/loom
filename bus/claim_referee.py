@@ -12,9 +12,10 @@ and, per issue:
   each label's newest labeled event on the timeline, and removes the others
   with a short status note;
 - removes the engine claim it keeps when nothing on the ticket is newer than
-  IDLE seconds: no event by the claimer or a trusted login, no update of an
-  open pull request one of them wrote that names it, and not the claim's own
-  putting-on. A comment line `waiting: <what> until <time>` by the claimer or
+  IDLE seconds: no ACTIVITY event by the claimer or a trusted login and not
+  the claim's own putting-on. An open pull request one of them wrote that
+  names the ticket holds the claim for as long as it is open: its updated_at
+  moves on anyone's comment, so it is no measure of work. A comment line `waiting: <what> until <time>` by the claimer or
   a trusted login holds the claim until that time plus GRACE, and the time
   counts for at most MAX_WAIT after the comment. The repos take comments from
   strangers: nobody else can keep a claim alive, or end a stated wait.
@@ -26,9 +27,9 @@ An issue with a lane run, an issue assigned to a person, and an issue with no
 Loom label (stale_claims.loom_managed: an operator's own session, which
 bus/claimed.py settles) never expire; a duplicate is still removed. Any claim
 label that is not an engine claim is a person's and is never read or touched.
-A timeline is read only for an issue with two engine claims or one that may
-expire and was not updated within IDLE, so a pass costs a few list reads per
-repo.
+A timeline is read for every issue with two engine claims or one that may
+expire, whatever its updated_at, which a stranger's comment moves. At most
+READS_PER_RUN a run; past that, in_turn takes the next ones the next run.
 
 The first run over the claims that already exist is the first pass: at most
 FIRST_PER_RUN issues a run and no note on any of them, until a run finds
@@ -43,7 +44,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from .stale_claims import CLAIM_PREFIX, _login, _made_by, _stamp, loom_managed, running
+from .stale_claims import (CLAIM_PREFIX, _login, _made_by, _open_pull_of, _stamp, loom_managed,
+                           running)
 
 ENGINE_CLAIMS = ("claim:claude-code", "claim:muse", "claim:dot", "claim:ccqw")
 IDLE = 2 * 3600
@@ -61,6 +63,9 @@ STATE_FILE = "claim-referee.json"
 MAX_BODY = 20000
 MAX_WAIT_LINE = 300
 WAIT_PREFIX = "waiting:"
+# What a writer did. Not mentioned or subscribed, which others cause.
+ACTIVITY = frozenset({"commented", "labeled", "unlabeled", "assigned", "closed", "reopened",
+                      "committed", "cross-referenced"})
 
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -98,14 +103,19 @@ def engine_claims(issue: Dict[str, Any], engine_labels: Iterable[str]) -> List[s
             if isinstance(x, dict) and str(x.get("name") or "").lower() in wanted]
 
 
-def needs_timeline(issue: Dict[str, Any], engine_labels: Iterable[str], now: float) -> bool:
-    """The issue may be due: two engine claims, or one that may expire on an
-    issue not updated within IDLE (or with no readable update time)."""
+def needs_timeline(issue: Dict[str, Any], engine_labels: Iterable[str]) -> bool:
+    """The issue may be due: two engine claims, or one that may expire."""
     claims = engine_claims(issue, engine_labels)
-    if len(claims) > 1:
-        return True
-    updated = _stamp(issue.get("updated_at"))
-    return bool(claims) and may_expire(issue) and (updated is None or now - updated >= IDLE)
+    return len(claims) > 1 or (bool(claims) and may_expire(issue))
+
+
+def in_turn(due: Sequence[Any], now: float) -> List[Any]:
+    """`due` starting READS_PER_RUN further on each run, so that a run that
+    spends its reads does not leave the same issues unread every time."""
+    if not due:
+        return []
+    start = int(now // EVERY) * READS_PER_RUN % len(due)
+    return list(due[start:]) + list(due[:start])
 
 
 def may_expire(issue: Dict[str, Any]) -> bool:
@@ -179,21 +189,20 @@ def wait_until(timeline: Sequence[Dict[str, Any]], writers: Iterable[str]) -> Op
 
 def last_activity(issue: Dict[str, Any], timeline: Sequence[Dict[str, Any]], label: str,
                   writers: Iterable[str]) -> Optional[float]:
-    """The newest real activity on the ticket: an event by one of `writers`,
-    an update of an open pull request one of them wrote naming it, the claim
-    label's putting-on, or the issue's creation."""
+    """The newest real activity on the ticket: an ACTIVITY event by one of
+    `writers`, the claim label's putting-on, or the issue's creation."""
     logins = set(writers)
-    seen = [_stamp(e.get("created_at")) for e in timeline if _made_by(e, logins)]
-    for event in timeline:
-        source = event.get("source") if isinstance(event.get("source"), dict) else {}
-        pull = source.get("issue") if isinstance(source.get("issue"), dict) else {}
-        if (event.get("event") == "cross-referenced" and "pull_request" in pull
-                and pull.get("state") == "open" and _login(pull.get("user")) in logins):
-            seen.append(_stamp(pull.get("updated_at")))
+    seen = [_stamp(e.get("created_at")) for e in timeline
+            if e.get("event") in ACTIVITY and _made_by(e, logins)]
     put = _put_on(timeline, label)
     seen += [put.at if put else None, _stamp(issue.get("created_at"))]
     known = [t for t in seen if t is not None]
     return max(known) if known else None
+
+
+def has_open_pull(timeline: Sequence[Dict[str, Any]], writers: Iterable[str]) -> bool:
+    """An open pull request by one of `writers` references the issue."""
+    return any(_open_pull_of(event, login) for event in timeline for login in writers)
 
 
 def plan(issue: Dict[str, Any], timeline: Iterable[Any], now: float,
@@ -201,7 +210,7 @@ def plan(issue: Dict[str, Any], timeline: Iterable[Any], now: float,
          trusted: Iterable[str]) -> List[Removal]:
     """The engine claims to remove from the issue. Two or more: all but the
     one put on first. The one kept: when the issue may expire, it was idle
-    IDLE seconds and no stated wait holds. Only the claimer and `trusted`
+    IDLE seconds, and no stated wait or open pull request holds it. Only the claimer and `trusted`
     count, never `station`. A claim whose putting-on the timeline does not
     show leaves the issue for a later pass, however many claims it has."""
     events = [e for e in timeline if isinstance(e, dict)]
@@ -223,6 +232,8 @@ def plan(issue: Dict[str, Any], timeline: Iterable[Any], now: float,
     writers.discard("")
     until = wait_until(events, writers)
     if until is not None and now < until + GRACE:
+        return removed
+    if has_open_pull(events, writers):
         return removed
     last = last_activity(issue, events, keep, writers)
     if last is not None and now - last < IDLE:

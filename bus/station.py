@@ -9849,9 +9849,9 @@ class Station:
         own_apps = sorted(self._own_apps())
         trusted = list(self.s.authors) + list(self.s.briefers)
         dry = self.s.claim_referee == "dry"
-        for number, issue in sorted(found.items()):
-            if not claim_referee.needs_timeline(issue, engines, self.now):
-                continue
+        due = [(number, issue) for number, issue in sorted(found.items())
+               if claim_referee.needs_timeline(issue, engines)]
+        for number, issue in claim_referee.in_turn(due, self.now):
             if budget["left"] <= 0 or budget["reads"] <= 0:
                 return False
             budget["reads"] -= 1

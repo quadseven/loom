@@ -696,8 +696,12 @@ only what is its own, and adding an operator is configuration:
   the others with a status note. It removes the claim it keeps when nothing
   on the ticket is newer than 2 hours: no event by the claimer (who put the
   label on) or a trusted login (`LOOM_BRIEF_AUTHORS`, `LOOM_TRUSTED_BRIEFERS`,
-  never the station's own Apps), no update of an open pull request one of them
-  wrote naming it, not the claim's putting-on. A comment line
+  never the station's own Apps), not the claim's putting-on. Only events a
+  writer performed count: a comment, label, assignment, close, reopen, commit
+  or reference, not a mention or subscription. An open pull request one of them
+  wrote naming the ticket holds the claim while it is open, however old. Every
+  claim that may expire has its timeline read, up to 40 a run and the next ones
+  the next run, because a comment by anyone moves `updated_at`. A comment line
   `waiting: <what> until <time>` (ISO time, UTC unless it says otherwise) by
   one of them holds the claim until that time plus 30 minutes; the time counts
   for at most 24 hours after the comment, and the latest stated time wins. A

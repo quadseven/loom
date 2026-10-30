@@ -53,10 +53,10 @@ def commented(by, ago, body="a note"):
             "body": body, "created_at": at(ago)}
 
 
-def pull(by, ago):
+def pull(by, ago, state="open"):
     return {"event": "cross-referenced", "actor": {"login": by}, "created_at": at(5 * HOUR),
             "source": {"type": "issue", "issue": {
-                "pull_request": {}, "state": "open", "user": {"login": by},
+                "pull_request": {}, "state": state, "user": {"login": by},
                 "updated_at": at(ago)}}}
 
 
@@ -115,9 +115,9 @@ class Expiry(unittest.TestCase):
                 commented("engine-a[bot]", HOUR)]
         self.assertEqual([], plan(issue(1), line))
 
-    def test_an_open_pull_request_updated_recently_keeps_the_claim(self):
+    def test_an_open_pull_request_by_the_claimer_holds_however_old(self):
         line = [labeled("claim:engine-a", "engine-a[bot]", 6 * HOUR),
-                pull("engine-a[bot]", 600)]
+                pull("engine-a[bot]", 5 * HOUR)]
         self.assertEqual([], plan(issue(1), line))
 
     def test_a_live_stated_wait_keeps_an_idle_claim(self):
@@ -146,7 +146,7 @@ class Expiry(unittest.TestCase):
         found = issue(1, labels=("claim:a-person",), updated=90 * 24 * HOUR)
         line = [labeled("claim:a-person", "a-person", 90 * 24 * HOUR)]
         self.assertEqual([], plan(found, line))
-        self.assertFalse(claim_referee.needs_timeline(found, ENGINES, time.time()))
+        self.assertFalse(claim_referee.needs_timeline(found, ENGINES))
 
     def test_wait_times(self):
         cases = {"2026-10-30T18:00Z": "2026-10-30T18:00:00Z",
@@ -195,8 +195,25 @@ class WhoCounts(unittest.TestCase):
     def test_a_trusted_comment_is_activity(self):
         self.assertFalse(self.expired(commented("an-operator", 600)))
 
-    def test_a_trusted_pull_request_is_activity(self):
-        self.assertFalse(self.expired(pull("an-operator", 600)))
+    def test_a_trusted_pull_request_holds(self):
+        self.assertFalse(self.expired(pull("an-operator", 5 * HOUR)))
+
+    def test_a_closed_pull_request_does_not_hold_or_count_its_update(self):
+        self.assertTrue(self.expired(pull("engine-a[bot]", 600, state="closed")))
+
+    def test_an_event_nobody_performed_is_not_activity(self):
+        for kind in ("mentioned", "subscribed", "unsubscribed"):
+            with self.subTest(kind=kind):
+                event = {"event": kind, "actor": {"login": "an-operator"}, "created_at": at(600)}
+                self.assertTrue(self.expired(event))
+                event = {"event": kind, "actor": {"login": "engine-a[bot]"}, "created_at": at(600)}
+                self.assertTrue(self.expired(event))
+
+    def test_an_event_a_writer_performed_is_activity(self):
+        for kind in ("unlabeled", "assigned", "closed", "reopened"):
+            with self.subTest(kind=kind):
+                event = {"event": kind, "actor": {"login": "an-operator"}, "created_at": at(600)}
+                self.assertFalse(self.expired(event))
 
     def test_a_later_stranger_comment_does_not_end_a_trusted_wait(self):
         self.assertFalse(self.expired(commented("an-operator", 5 * HOUR, wait_line(HOUR)),
@@ -255,12 +272,12 @@ class NeverExpires(unittest.TestCase):
     def test_a_ticket_with_a_lane_run(self):
         found = issue(1, labels=("claim:engine-a", "loom:running"))
         self.assertEqual([], plan(found, self.LINE))
-        self.assertFalse(claim_referee.needs_timeline(found, ENGINES, time.time()))
+        self.assertFalse(claim_referee.needs_timeline(found, ENGINES))
 
     def test_a_ticket_assigned_to_a_person(self):
         found = issue(1, assignees=("a-person",))
         self.assertEqual([], plan(found, self.LINE))
-        self.assertFalse(claim_referee.needs_timeline(found, ENGINES, time.time()))
+        self.assertFalse(claim_referee.needs_timeline(found, ENGINES))
 
     def test_a_ticket_assigned_to_an_app_still_expires(self):
         found = issue(1, assignees=("engine-a[bot]",))
@@ -270,7 +287,7 @@ class NeverExpires(unittest.TestCase):
         found = issue(1)
         found["labels"] = [{"name": "claim:engine-a"}]
         self.assertEqual([], plan(found, self.LINE))
-        self.assertFalse(claim_referee.needs_timeline(found, ENGINES, time.time()))
+        self.assertFalse(claim_referee.needs_timeline(found, ENGINES))
 
     def test_a_duplicate_on_such_a_ticket_is_still_removed(self):
         found = issue(1, labels=("claim:engine-a", "claim:engine-b", "loom:running"))
@@ -388,11 +405,30 @@ class Step(unittest.TestCase):
 
     def test_timelines_are_read_only_for_claimed_tickets_that_may_be_due(self):
         self.idle(1)
-        self.fake.issues[2] = issue(2, updated=60)          # one claim, touched a minute ago
+        self.fake.issues[2] = issue(2, labels=("claim:engine-a", "loom:running"))
         self.fake.issues[3] = issue(3, labels=("claim:a-person",))
         self.fake.issues[4] = issue(4, labels=())
         self.run_step()
         self.assertEqual(["issues/1/timeline"], [r for r in self.fake.reads if "timeline" in r])
+
+    def test_a_strangers_comment_bumping_the_update_time_hides_nothing(self):
+        self.swept()
+        self.idle(1)
+        self.fake.issues[1] = issue(1, updated=60)
+        self.run_step()
+        self.assertEqual([("DELETE", "issues/1/labels/claim:engine-a", None)], self.fake.writes)
+
+    def test_every_claim_is_read_within_two_passes_past_the_read_budget(self):
+        self.swept()
+        count = claim_referee.READS_PER_RUN + 10
+        for number in range(1, count + 1):
+            self.fake.issues[number] = issue(number)
+            self.fake.timelines[number] = [labeled("claim:engine-a", "engine-a[bot]", 60)]
+        now = time.time()
+        self.run_step(now)
+        self.run_step(now + claim_referee.EVERY)
+        read = {r for r in self.fake.reads if r.endswith("/timeline")}
+        self.assertEqual(count, len(read))
 
     def test_a_briefers_wait_holds_and_the_stations_and_a_strangers_do_not(self):
         self.swept()
@@ -405,7 +441,8 @@ class Step(unittest.TestCase):
         self.fake.timelines[3].append(commented("a-stranger", HOUR, wait_line(HOUR)))
         self.run_step()
         self.assertEqual([("DELETE", "issues/2/labels/claim:engine-a", None),
-                          ("DELETE", "issues/3/labels/claim:engine-a", None)], self.fake.writes)
+                          ("DELETE", "issues/3/labels/claim:engine-a", None)],
+                         sorted(self.fake.writes))
 
     def test_dry_mode_writes_nothing(self):
         self.settings.claim_referee = "dry"
