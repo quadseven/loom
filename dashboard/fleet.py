@@ -164,9 +164,7 @@ def _lane_kind(first_line: str) -> str:
     return "failed" if match.group(2).startswith("failed") else "outcome"
 
 
-def _station_row(comments, lanes, chain_seen) -> Dict[str, Any]:
-    row = _row("station", "Station", "station", cadence=STATION_CADENCE, word="run")
-    row["judged_from_start"] = False
+def _add_station_comments(row: Dict[str, Any], comments) -> None:
     login = _station_login(comments)
     for comment in comments:
         body = str(comment.get("body") or "")
@@ -178,13 +176,22 @@ def _station_row(comments, lanes, chain_seen) -> Dict[str, Any]:
         first = body.split("\n", 1)[0].strip()
         kind = "shipped" if first.startswith("Shipped:") else _lane_kind(first)
         _add(row, _event(at, kind, _gist(body), href=comment.get("html_url")))
+
+
+def _add_lane_table(row: Dict[str, Any], lanes) -> None:
     status = [c for c in lanes or [] if isinstance(c, dict) and str(c.get("body") or "").startswith(views.LANES_MARKER)]
     newest = max(status, key=lambda c: str(c.get("updated_at") or c.get("created_at") or ""), default=None)
-    if newest:
-        at = _stamp(newest.get("updated_at") or newest.get("created_at"))
-        if at is not None:
-            _add(row, _event(at, "status", "lane status table updated", href=newest.get("html_url")))
-    beats = sorted(_stamp(value) for value in chain_seen or () if _stamp(value) is not None)
+    at = _stamp(newest.get("updated_at") or newest.get("created_at")) if newest else None
+    if at is not None:
+        _add(row, _event(at, "status", "lane status table updated", href=newest.get("html_url")))
+
+
+def _station_row(comments, lanes, chain_seen) -> Dict[str, Any]:
+    row = _row("station", "Station", "station", cadence=STATION_CADENCE, word="run")
+    row["judged_from_start"] = False
+    _add_station_comments(row, comments)
+    _add_lane_table(row, lanes)
+    beats = sorted(at for at in map(_stamp, chain_seen or ()) if at is not None)
     for at in beats:
         _add(row, _event(at, "beat", "chain snapshot received", beat=True))
     if beats:
@@ -217,6 +224,42 @@ def _notes_row(comments, homes) -> Dict[str, Any]:
     return row
 
 
+def _add_comment_events(comment: Dict[str, Any], lane) -> None:
+    """The lane events one comment holds: an outcome line, a claim, rounds."""
+    body = str(comment.get("body") or "")
+    at = _stamp(comment.get("created_at"))
+    href = comment.get("html_url")
+    if body.startswith(ROUND_MARKER):
+        for number, when, text, name in ROUND_RE.findall(body):
+            round_at = _stamp(when)
+            if round_at is not None:
+                _add(lane(name), _event(round_at, "round", "round %s: %s" % (number, " ".join(text.split())), href=href))
+    if at is None:
+        return
+    first = body.split("\n", 1)[0].strip()
+    named = LANE_LINE_RE.match(first)
+    if named:
+        _add(lane(named.group(1)), _event(at, _lane_kind(first), first, href=href))
+    claim = CLAIM_RE.search(body)
+    if claim:
+        _add(lane(claim.group(1)), _event(at, "claim", "claimed %s#%s" % (
+            comment.get("repo") or "repo missing", claim.group(2)), href=href))
+
+
+def _add_pull_request_events(pr: Any, lane) -> None:
+    parsed = views.footer(pr.get("body")) if isinstance(pr, dict) else None
+    if not parsed:
+        return
+    repo, ticket, name, model = parsed
+    opened, merged = _stamp(pr.get("created_at")), _stamp(pr.get("merged_at"))
+    number, href = pr.get("number"), pr.get("html_url")
+    if opened is not None:
+        _add(lane(name), _event(opened, "opened", "opened pull request #%s for %s#%s (%s)" % (
+            number, repo, ticket, model), href=href))
+    if merged is not None:
+        _add(lane(name), _event(merged, "merged", "pull request #%s merged" % number, href=href))
+
+
 def _lane_rows(comments, pull_requests, lane_rows) -> List[Dict[str, Any]]:
     rows: Dict[str, Dict[str, Any]] = {}
 
@@ -224,36 +267,9 @@ def _lane_rows(comments, pull_requests, lane_rows) -> List[Dict[str, Any]]:
         return rows.setdefault(name, _row("lane:" + name, name, "lane", meta="no status row"))
 
     for comment in comments:
-        body = str(comment.get("body") or "")
-        at = _stamp(comment.get("created_at"))
-        href = comment.get("html_url")
-        first = body.split("\n", 1)[0].strip()
-        named = LANE_LINE_RE.match(first)
-        if named and at is not None:
-            _add(lane(named.group(1)), _event(at, _lane_kind(first), first, href=href))
-        claim = CLAIM_RE.search(body)
-        if claim and at is not None:
-            _add(lane(claim.group(1)), _event(at, "claim", "claimed %s#%s" % (
-                comment.get("repo") or "repo missing", claim.group(2)), href=href))
-        if body.startswith(ROUND_MARKER):
-            for number, when, text, name in ROUND_RE.findall(body):
-                round_at = _stamp(when)
-                if round_at is not None:
-                    _add(lane(name), _event(round_at, "round", "round %s: %s" % (number, " ".join(text.split())), href=href))
+        _add_comment_events(comment, lane)
     for pr in pull_requests:
-        if not isinstance(pr, dict):
-            continue
-        parsed = views.footer(pr.get("body"))
-        if not parsed:
-            continue
-        repo, ticket, name, model = parsed
-        opened, merged = _stamp(pr.get("created_at")), _stamp(pr.get("merged_at"))
-        number, href = pr.get("number"), pr.get("html_url")
-        if opened is not None:
-            _add(lane(name), _event(opened, "opened", "opened pull request #%s for %s#%s (%s)" % (
-                number, repo, ticket, model), href=href))
-        if merged is not None:
-            _add(lane(name), _event(merged, "merged", "pull request #%s merged" % number, href=href))
+        _add_pull_request_events(pr, lane)
     for item in lane_rows or []:
         name = str(item.get("lane") or "")
         if not name:
@@ -290,24 +306,30 @@ def _cadence_due(row: Dict[str, Any], start: datetime, end: datetime) -> List[da
     return out
 
 
+def _judge_cadence(row: Dict[str, Any], start: datetime, now: datetime, end: datetime) -> None:
+    """Due marks, the next time and missed runs of a row with a cadence."""
+    beats = [e["at"] for e in row["_all"] if e["beat"] and e["at"] <= now]
+    step = timedelta(minutes=row["cadence"])
+    row["due"] = _cadence_due(row, start, end)
+    row["next"] = beats[-1] + step if beats else None
+    if row["observed_from"] is None and row["judged_from_start"]:
+        before = [b for b in beats if b < start]
+        row["observed_from"] = before[-1] if before else start
+    anchor, limit = row["observed_from"], step * MISSED_FACTOR
+    points = ([anchor] + [b for b in beats if b > anchor] + [now]) if anchor is not None else []
+    # strict=False: each point pairs with the next, so the tail is one shorter.
+    row["missed"] = [{"from": a, "to": b, "minutes": int((b - a).total_seconds() // 60)}
+                     for a, b in zip(points, points[1:], strict=False) if b - a > limit]
+    if not [b for b in beats if b >= start] and not row["note"]:
+        row["note"] = "no %s in the last 24 hours" % row["word"]
+
+
 def _finish(row: Dict[str, Any], start: datetime, now: datetime, end: datetime) -> Dict[str, Any]:
     """Events in the window, due marks, missed runs and the next time."""
     row["_all"].sort(key=lambda e: e["at"])
     row["events"] = [e for e in row["_all"] if start <= e["at"] <= now]
-    beats = [e["at"] for e in row["_all"] if e["beat"] and e["at"] <= now]
     if row["cadence"]:
-        step = timedelta(minutes=row["cadence"])
-        row["due"] = _cadence_due(row, start, end)
-        row["next"] = beats[-1] + step if beats else None
-        if row["observed_from"] is None and row["judged_from_start"]:
-            before = [b for b in beats if b < start]
-            row["observed_from"] = before[-1] if before else start
-        anchor, limit = row["observed_from"], step * MISSED_FACTOR
-        points = ([anchor] + [b for b in beats if b > anchor] + [now]) if anchor is not None else []
-        row["missed"] = [{"from": a, "to": b, "minutes": int((b - a).total_seconds() // 60)}
-                         for a, b in zip(points, points[1:]) if b - a > limit]
-        if not [b for b in beats if b >= start] and not row["note"]:
-            row["note"] = "no %s in the last 24 hours" % row["word"]
+        _judge_cadence(row, start, now, end)
     elif row["schedule"]:
         row["due"] = _schedule(row["schedule"], start, end)
         ahead = _schedule(row["schedule"], now, now + timedelta(days=2))

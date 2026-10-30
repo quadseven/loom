@@ -46,7 +46,7 @@ from bus.github import GitHubError
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 from . import views
-from . import brain_view, chain_view, fleet, hot_spots
+from . import brain_view, chain_view, fleet, floor_lanes, hot_spots
 
 def _all_tickets(state):
     payload = state.response()
@@ -240,13 +240,26 @@ def _priorities_card(rows):
     return '<section class="card priorities-card"><span class="label">Priorities</span>%s<a href="/tickets">all tickets &rarr;</a></section>' % body
 
 
+def _floor_live(state, rows=None):
+    """The Floor's two live fragments, one read of the same state the page
+    renders from: the lane strip and the Moving now rows. GET /api/floor/live
+    serves them to the page's script (loom.js), which swaps them in each poll."""
+    rows = _all_tickets(state) if rows is None else rows
+    payload = state.response()
+    fixing = floor_lanes.fix_round_refs(payload.get("issue_comments") or [])
+    lanes = _lane_view_data(payload, rows, state=state)["lanes"]
+    order = {name: index for index, name in enumerate(MOVING_ORDER)}
+    moving = sorted((row for row in rows if row.get("open", True) and row.get("state") in order),
+                    key=lambda row: (order[row["state"]], str(row.get("updated_at") or "")[::-1]))
+    return {"lanes": floor_lanes.strip(lanes, rows, fixing),
+            "moving": "".join(_ticket_row(row) for row in moving[:24]) or '<p class="empty-state">Nothing is moving right now.</p>'}
+
+
 def _floor(state):
     rows = _all_tickets(state)
     runaway = [row for row in rows if "loom:runaway" in (row.get("labels") or []) and row.get("open", True)]
     conveyor, bottleneck = _conveyor(state, rows)
     order = {name: index for index, name in enumerate(MOVING_ORDER)}
-    moving = sorted((row for row in rows if row.get("open", True) and row.get("state") in order),
-                    key=lambda row: (order[row["state"]], str(row.get("updated_at") or "")[::-1]))
     payload = state.response()
     context = getattr(state, "context", None) or payload.get("floor_context", {})
     esc = html.escape
@@ -265,9 +278,11 @@ def _floor(state):
     runaway_rows = "".join(_ticket_row(row) for row in runaway)
     parts.append('<section class="section runaway-tickets"><div class="section-head"><span class="label">Runaway tickets</span></div>%s</section>' % (
         runaway_rows or '<p class="empty-state">None held for review.</p>'))
-    parts.append('<div class="floor-columns"><section class="section"><div class="section-head"><span class="label">Moving now</span>'
-                 '<a href="/tickets">all tickets &rarr;</a></div><div class="ticket-list">%s</div></section>' % (
-                     "".join(_ticket_row(row) for row in moving[:24]) or '<p class="empty-state">Nothing is moving right now.</p>'))
+    live = _floor_live(state, rows)
+    parts.append('<section class="section"><div class="section-head"><span class="label">Lanes - who holds what now</span>'
+                 '<a href="/lanes">all lanes &rarr;</a></div><div data-live="lanes">%s</div></section>' % live["lanes"])
+    parts.append('<div class="floor-columns" data-live-url="/api/floor/live"><section class="section"><div class="section-head"><span class="label">Moving now</span>'
+                 '<a href="/tickets">all tickets &rarr;</a></div><div class="ticket-list" data-live="moving">%s</div></section>' % live["moving"])
     step = context.get("journal_step") or context.get("journal_lead")
     label = "Brain's next move" if context.get("journal_step") else "Brain, last tick"
     if step:
@@ -1311,6 +1326,8 @@ def _dispatch_basic(handler, state, path):
         return handler.send_text(200 if state.ready else 503, "ready" if state.ready else "not ready")
     if path == "/api/tickets":
         return handler.send_json(200, _api_tickets(state.response()))
+    if path == "/api/floor/live":
+        return handler.send_json(200, _floor_live(state))
     if path == "/api/brain/handoff":
         return _handle_brain(handler, state)
     if path == "/api/usage":

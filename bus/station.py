@@ -6045,32 +6045,22 @@ class Station:
         held = self._held_tickets()
         if not held:
             return
-        try:
-            closed_incidents = self._closed_incidents()
-        except RateLimited:
-            raise
-        except GitHubError as err:
-            _say("factory release: could not read the closed incidents: %s" % err)
-            return
-        for key, info in list(held.items()):
-            self._release_held(key, info, closed_incidents)
+        cursor_path = os.path.join(self.state, "factory_held_cursor.json")
+        cursor = _read_json(cursor_path, {}, strict=False)
+        start = cursor.get("next", 0) if isinstance(cursor, dict) else 0
+        entries = list(held.items())
+        start = start if isinstance(start, int) and 0 <= start < len(entries) else 0
+        self._factory_incidents = {}
+        for offset in range(len(entries)):
+            index = (start + offset) % len(entries)
+            try:
+                self._release_held(*entries[index])
+            except TargetReached:
+                _write_json(cursor_path, {"next": (index + 1) % len(entries)})
+                raise
+            _write_json(cursor_path, {"next": (index + 1) % len(entries)})
 
-    def _closed_incidents(self) -> Dict[str, Dict[str, Any]]:
-        """Closed factory incidents the runner filed, by "owner/repo#n".
-
-        Incidents are found by the body marker, not the loom:factory label:
-        the label may not exist in a repo (loom#918), so filtering on it
-        loses every unlabelled incident. Closed issues are listed without the
-        label and then matched on the marker."""
-        closed: Dict[str, Dict[str, Any]] = {}
-        for incident in self._paginate(
-                "/repos/%s/issues?state=closed&per_page=100" % FACTORY_REPO):
-            if isinstance(incident, dict) and INCIDENT_MARKER in str(incident.get("body") or ""):
-                closed["%s#%d" % (FACTORY_REPO, incident.get("number"))] = incident
-        return closed
-
-    def _release_held(self, key: str, info: Any,
-                      closed_incidents: Dict[str, Dict[str, Any]]) -> None:
+    def _release_held(self, key: str, info: Any) -> None:
         """Re-queue one held ticket: a closed and named incident, or a hold
         with no incident (the filing failed) that has outlived
         HELD_NO_INCIDENT_FOR. Forget it once it is no longer running."""
@@ -6079,6 +6069,15 @@ class Station:
         ref = info.get("incident") if isinstance(info, dict) else None
         raw_at = (info or {}).get("at")
         at = float(raw_at) if raw_at is not None else None
+        try:
+            incident = self._factory_incident(ref) if ref else None
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("factory release: could not read incident %s: %s" % (ref, err))
+            return
+        if ref and incident is None:
+            return
         try:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
             comments = self._paginate(
@@ -6115,11 +6114,15 @@ class Station:
             _say("factory release: %s#%d re-queued: incident filing failed"
                  % (repo, number))
             return
-        incident = closed_incidents.get(ref) if ref else None
-        if incident is None or not any(isinstance(c, dict) and ref in str(c.get("body") or "")
-                                       for c in comments):
+        if incident is None:
             return
-        if self._claimed_since(comments, incident):
+        body_events = status.body_events(issue.get("body"))
+        event_comments = list(comments) + [
+            {"body": text, "created_at": created} for created, text in body_events]
+        if not any(ref in str(c.get("body") or "") for c in event_comments
+                   if isinstance(c, dict)):
+            return
+        if self._claimed_since(event_comments, incident):
             return
         cleared = RUNAWAY in _label_names(issue)
         self._release_one(key, repo, number, issue, cleared,
@@ -6127,6 +6130,32 @@ class Station:
                           "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
                                               if cleared else ""))
         _say("factory release: %s#%d re-queued after incident %s closed" % (repo, number, ref))
+
+    def _factory_incident(self, ref: str) -> Optional[Dict[str, Any]]:
+        """Read one named incident once per pass; return it only when closed."""
+        cache = getattr(self, "_factory_incidents", {})
+        if ref in cache:
+            return cache[ref]
+        repo, _, raw_number = ref.rpartition("#")
+        if not repo or not raw_number.isdigit():
+            cache[ref] = None
+            self._factory_incidents = cache
+            return None
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, int(raw_number))).data
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("factory release: could not read incident %s: %s" % (ref, err))
+            cache[ref] = None
+            self._factory_incidents = cache
+            return None
+        if not isinstance(issue, dict) or issue.get("state") != "closed" \
+                or INCIDENT_MARKER not in str(issue.get("body") or ""):
+            issue = None
+        cache[ref] = issue
+        self._factory_incidents = cache
+        return issue
 
     def _green_default_after_hold(self, repo: str, held_at: float) -> bool:
         """Whether a newer commit on the default branch has all checks green."""
@@ -6167,7 +6196,7 @@ class Station:
         self._forget_held(key)
 
     def _claimed_since(self, comments: List[Any], incident: Dict[str, Any]) -> bool:
-        """A lane claim comment is newer than the incident's close."""
+        """A lane claim in a comment or the issue body is newer than close."""
         from . import factory as _factory
         closed = self._epoch(str(incident.get("closed_at") or ""))
         return closed is not None and any(
