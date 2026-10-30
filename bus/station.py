@@ -6121,6 +6121,23 @@ class Station:
             return
         if self._claimed_since(comments, incident):
             return
+
+        # Check for probe condition: repo has multiple tickets held by this incident
+        # and the probe time has passed
+        probe_holds = self._get_held_tickets_by_incident(ref)
+        if len(probe_holds) >= 2:
+            probe_time = 3600  # 1 hour in seconds
+            if at is not None and self.now - at >= probe_time:
+                # Check if default branch has changed since incident
+                default_changed = self._default_branch_changed_since(repo, at)
+                # Check if probe interval has passed (once per hour)
+                probe_interval_key = f"probe_interval_{ref}"
+                last_probe_time = self._get_probe_last_time(probe_interval_key)
+                if default_changed or (last_probe_time is not None and self.now - last_probe_time >= probe_time):
+                    # Run a probe: one ticket passes, others stay held
+                    self._run_probe(ref, probe_holds, repo, at)
+                    return
+
         cleared = RUNAWAY in _label_names(issue)
         self._release_one(key, repo, number, issue, cleared,
                           "Factory incident %s is closed: the ticket is back in the queue "
@@ -6142,20 +6159,68 @@ class Station:
             return False
         return self._default_commit_checks_green(repo, sha)
 
-    def _default_commit_checks_green(self, repo: str, sha: str) -> bool:
-        """Whether all check runs and the combined status for a commit passed."""
-        checks = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
-                              % (repo, sha)).data or {}
-        runs = checks.get("check_runs") if isinstance(checks, dict) else None
-        if not isinstance(runs, list) or not runs or any(
-                not isinstance(run, dict) or run.get("status") != "completed"
-                or run.get("conclusion") != "success" for run in runs):
+    def _default_branch_changed_since(self, repo: str, since_time: float) -> bool:
+        """Whether the repo's default branch has changed since a given time."""
+        try:
+            commit = self.gh.rest("GET", "/repos/%s/commits/%s" % (repo, self._default_branch(repo) or "HEAD")).data
+            if not isinstance(commit, dict):
+                return False
+            committed = self._epoch(str(((commit.get("commit") or {}).get("committer") or {}).get("date") or ""))
+            return committed is not None and committed > since_time
+        except GitHubError as err:
+            _say("could not check default branch change for %s#%s: %s" % (repo, number, err))
             return False
-        status_data = self.gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data or {}
-        return isinstance(status_data, dict) and status_data.get("state") == "success"
 
-    def _release_one(self, key: str, repo: str, number: int, issue: Dict[str, Any],
-                     cleared: bool, text: str) -> None:
+    def _get_probe_last_time(self, probe_key: str) -> Optional[float]:
+        """Get the last probe time for a specific incident from state."""
+        probe_state = _read_json(os.path.join(self.state, "probe_state.json"), {})
+        return probe_state.get(probe_key) if isinstance(probe_state, dict) else None
+
+    def _set_probe_last_time(self, probe_key: str, timestamp: float) -> None:
+        """Set the last probe time for a specific incident in state."""
+        probe_state = _read_json(os.path.join(self.state, "probe_state.json"), {})
+        if not isinstance(probe_state, dict):
+            probe_state = {}
+        probe_state[probe_key] = timestamp
+        _write_json(os.path.join(self.state, "probe_state.json"), probe_state)
+
+    def _get_held_tickets_by_incident(self, incident_ref: str) -> List[Tuple[str, str]]:
+        """Get all held tickets that are held by a specific incident."""
+        held = self._held_tickets()
+        result = []
+        for key, info in held.items():
+            if isinstance(info, dict) and info.get("incident") == incident_ref:
+                result.append((key, info.get("at", self.now)))
+        return sorted(result, key=lambda x: x[1])
+
+    def _run_probe(self, incident_ref: str, held_tickets: List[Tuple[str, str]],
+                    repo: str, incident_time: float) -> None:
+        """Run one held ticket as a probe to test the fix."""
+        if not held_tickets:
+            return
+        
+        # Select the oldest held ticket for the probe
+        key, _ = held_tickets[0]
+        
+        # Mark that we've run a probe for this incident
+        probe_key = f"probe_interval_{incident_ref}"
+        self._set_probe_last_time(probe_key, self.now)
+        
+        # Release the ticket (it will run)
+        # We need to do this by marking it as not held and letting normal flow pick it up
+        self._forget_held(key)
+        
+        # Log the probe run
+        _say("factory probe: running %s as a probe to test incident %s" % (key, incident_ref))
+
+    def _relabel(self, repo: str, number: int, label: str) -> None:
+        """Change a ticket's label to a new state."""
+        issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+        if not isinstance(issue, dict):
+            return
+        labels = [label for label in _label_names(issue) if label != "loom:running"]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": [label] + labels})
         """Move a held running ticket to loom:queued, clear its runaway hold
         when the release cleared one, post the status event, and forget it."""
         self._relabel(repo, number, "loom:queued")
@@ -13271,6 +13336,69 @@ class Station:
                 # token is redacted anyway in case another uploader names it.
                 _say("usage snapshot upload failed twice: %s: %s"
                      % (type(err).__name__, str(err).replace(token, "[token]")))
+
+    def _default_branch_changed_since(self, repo: str, since_time: float) -> bool:
+        """Whether the repo's default branch has changed since a given time."""
+        try:
+            commit = self.gh.rest("GET", "/repos/%s/commits/%s" % (repo, self._default_branch(repo) or "HEAD")).data
+            if not isinstance(commit, dict):
+                return False
+            committed = self._epoch(str(((commit.get("commit") or {}).get("committer") or {}).get("date") or ""))
+            return committed is not None and committed > since_time
+        except GitHubError as err:
+            _say("could not check default branch change for %s#%s: %s" % (repo, number, err))
+            return False
+
+    def _get_probe_last_time(self, probe_key: str) -> Optional[float]:
+        """Get the last probe time for a specific incident from state."""
+        probe_state = _read_json(os.path.join(self.state, "probe_state.json"), {})
+        return probe_state.get(probe_key) if isinstance(probe_state, dict) else None
+
+    def _set_probe_last_time(self, probe_key: str, timestamp: float) -> None:
+        """Set the last probe time for a specific incident in state."""
+        probe_state = _read_json(os.path.join(self.state, "probe_state.json"), {})
+        if not isinstance(probe_state, dict):
+            probe_state = {}
+        probe_state[probe_key] = timestamp
+        _write_json(os.path.join(self.state, "probe_state.json"), probe_state)
+
+    def _get_held_tickets_by_incident(self, incident_ref: str) -> List[Tuple[str, str]]:
+        """Get all held tickets that are held by a specific incident."""
+        held = self._held_tickets()
+        result = []
+        for key, info in held.items():
+            if isinstance(info, dict) and info.get("incident") == incident_ref:
+                result.append((key, info.get("at", self.now)))
+        return sorted(result, key=lambda x: x[1])
+
+    def _run_probe(self, incident_ref: str, held_tickets: List[Tuple[str, str]],
+                    repo: str, incident_time: float) -> None:
+        """Run one held ticket as a probe to test the fix."""
+        if not held_tickets:
+            return
+        
+        # Select the oldest held ticket for the probe
+        key, _ = held_tickets[0]
+        
+        # Mark that we've run a probe for this incident
+        probe_key = f"probe_interval_{incident_ref}"
+        self._set_probe_last_time(probe_key, self.now)
+        
+        # Release the ticket (it will run)
+        # We need to do this by marking it as not held and letting normal flow pick it up
+        self._forget_held(key)
+        
+        # Log the probe run
+        _say("factory probe: running %s as a probe to test incident %s" % (key, incident_ref))
+
+    def _relabel(self, repo: str, number: int, label: str) -> None:
+        """Change a ticket's label to a new state."""
+        issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+        if not isinstance(issue, dict):
+            return
+        labels = [label for label in _label_names(issue) if label != "loom:running"]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": [label] + labels})
 
 
 def _trust_app_login(settings: Settings, gh: GitHub) -> None:
