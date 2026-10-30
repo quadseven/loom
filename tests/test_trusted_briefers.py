@@ -63,11 +63,11 @@ class TrustedBriefIsBuiltTest(Pass):
         self.run_quiet()
         self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
 
-    def test_a_trusted_briefers_queued_ticket_gets_a_lane(self):
+    def test_a_trusted_briefers_queued_ticket_gets_no_lane(self):
         self.settings.factory_on = True
         by_briefer(self.fake, 14, state="queued")
         self.run_quiet()
-        self.assertNotIn("loom:queued", self.fake.names(14))
+        self.assertIn("loom:queued", self.fake.names(14))
 
     def test_without_the_setting_the_same_ticket_is_refused(self):
         self.settings.briefers = []
