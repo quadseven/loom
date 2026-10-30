@@ -3740,6 +3740,9 @@ exec /usr/bin/git "$@"
         agy = lane_home / "agy"
         self.write_tool(agy, FAKE_AGY)
         self.write_tool(self.bin / "security", FAKE_SECURITY)
+        # The fake agy is a script, which no real codesign would call hardened.
+        fake_codesign = Path(self._tmp.name) / "fake_codesign"
+        self.write_tool(fake_codesign, '#!/bin/sh\necho "CodeDirectory v=20500 size=1 flags=0x10002(adhoc,runtime) hashes=1"\n')
         runas = Path(self._tmp.name) / "runas"
         self.write_tool(runas, FAKE_RUNAS if runas_ok else "#!/usr/bin/env bash\nexit 1\n")
         inbox = self.loom / "briefs" / "agy"
@@ -3754,6 +3757,7 @@ exec /usr/bin/git "$@"
             LOOM_AGY_HOME=str(lane_home),
             LOOM_AGY_WORKDIR=str(workdir),
             LOOM_AGY_BIN=str(agy_bin or agy),
+            LOOM_AGY_CODESIGN=str(fake_codesign),
             LOOM_AGY_KEYCHAIN=str(lane_home / "loom.keychain-db"),
             LOOM_AGY_KEY_SSM="/k/kc",
             LOOM_AGY_MODEL=model,

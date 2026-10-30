@@ -86,10 +86,20 @@ class AgentSandboxTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def bash(self, script, *args, lane="opencode-go", **env):
+    def bash(self, script, *args, lane="opencode-go", codesign="hardened", **env):
+        # codesign: what the agy binary check sees. "hardened" and "plain"
+        # stand in for codesign's report on any machine (the stand-in is
+        # defined after sourcing, so only a test can do this); "real" runs
+        # the machine's own codesign.
         full = dict(os.environ, HOME=str(self.home), AGENT_HOME=str(self.scratch), LANE=lane,
-                    AGY_HOME=str(self.scratch), SKILLS=str(self.root / "no-skills"), **env)
-        return subprocess.run(["bash", "-c", '. "$1"; shift; ' + script, "bash", str(SANDBOX),
+                    AGY_HOME=str(self.scratch), SKILLS=str(self.root / "no-skills"))
+        full.update(env)
+        stub = {
+            "hardened": 'agy_codesign_report() { echo "CodeDirectory v=20500 size=1 flags=0x10002(adhoc,runtime) hashes=1"; }; ',
+            "plain": 'agy_codesign_report() { echo "CodeDirectory v=20400 size=1 flags=0x2(adhoc) hashes=1"; }; ',
+            "real": "",
+        }[codesign]
+        return subprocess.run(["bash", "-c", '. "$1"; shift; ' + stub + script, "bash", str(SANDBOX),
                                str(self.tree), *args],
                               capture_output=True, text=True, env=full, timeout=60)
 
@@ -97,6 +107,12 @@ class AgentSandboxTest(unittest.TestCase):
         result = self.bash('sandbox_profile "$1" bash "$2"', mode, lane=lane, **env)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
+
+    @property
+    def agent_env(self):
+        # AGENT_HOME below the lane home, as in the runner (AGY_HOME/tmp),
+        # so agy's binary under .local/bin is not in a writable area.
+        return {"AGENT_HOME": str(self.scratch / "tmp")}
 
     def fake_agy(self, contents=None):
         # A stand-in binary at the path the lane itself launches for agy
@@ -229,7 +245,7 @@ class AgentSandboxTest(unittest.TestCase):
         # its real install path rather than a stand-in found on PATH, and
         # no other process is named anywhere in the profile (#1623).
         agy = self.fake_agy()
-        result = self.bash('sandbox_profile "$1" "$2" ""', str(agy), lane="agy")
+        result = self.bash('sandbox_profile "$1" "$2" ""', str(agy), lane="agy", **self.agent_env)
         self.assertEqual(result.returncode, 0, result.stderr)
         profile = result.stdout
         expected = str(agy.resolve())
@@ -256,11 +272,67 @@ class AgentSandboxTest(unittest.TestCase):
         # binary itself needs a distinguishing rule, not a broader
         # exception.
         agy = self.fake_agy("#!/usr/bin/env bash\nexit 0\n")
-        result = self.bash('sandbox_profile "$1" "$2" ""', str(agy), lane="agy")
+        result = self.bash('sandbox_profile "$1" "$2" ""', str(agy), lane="agy", **self.agent_env)
         self.assertEqual(result.returncode, 0, result.stderr)
         named = re.findall(r'\(process-path "([^"]+)"\)', result.stdout)
         self.assertEqual(sorted(set(named)), [str(agy.resolve())])
         self.assertNotIn(str(Path(shutil.which("bash")).resolve()), named)
+
+    def agy_profile_result(self, agy, **kw):
+        kw.setdefault("lane", "agy")
+        return self.bash('sandbox_profile "$1" "$2" ""', str(agy), **kw)
+
+    def test_a_hardened_agy_binary_is_trusted_with_the_token(self):
+        result = self.agy_profile_result(self.fake_agy(), **self.agent_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("process-path", result.stdout)
+
+    def test_an_agy_binary_without_the_runtime_flag_is_refused(self):
+        # #1623: without the hardened runtime a command could run agy with an
+        # injected library (DYLD_INSERT_LIBRARIES) and read the token in agy's
+        # image. The refusal names the file and what to do.
+        agy = self.fake_agy()
+        result = self.agy_profile_result(agy, codesign="plain", **self.agent_env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(agy.resolve()), result.stderr)
+        self.assertIn("hardened runtime", result.stderr)
+        self.assertIn("codesign -f -s - -o runtime", result.stderr)
+
+    def test_an_unsigned_agy_binary_is_refused(self):
+        result = self.bash('agy_codesign_report() { echo "code object is not signed at all"; return 1; }\n'
+                           'sandbox_profile "$1" "$2" ""', str(self.fake_agy()), lane="agy", **self.agent_env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("hardened runtime", result.stderr)
+
+    def test_an_agy_binary_inside_a_writable_area_is_refused(self):
+        # A binary a sandboxed command can overwrite makes the exception
+        # writable: the worktree, the agent's scratch home, agy's state dir.
+        for where in (self.tree / "agy", self.scratch / "tmp" / "agy",
+                      self.scratch / ".gemini" / "antigravity-cli" / "bin" / "agy"):
+            with self.subTest(where=str(where)):
+                copy_cat(where)
+                result = self.agy_profile_result(where, **self.agent_env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("can write", result.stderr)
+
+    def test_the_agy_check_profile_needs_no_hardened_binary(self):
+        result = self.bash('sandbox_profile "$1" bash check', lane="agy", codesign="plain")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("codesign"), "needs codesign")
+    def test_the_real_codesign_tells_a_hardened_binary_from_a_plain_one(self):
+        agy = self.fake_agy()
+        sign = lambda *flags: subprocess.run(["codesign", "-f", "-s", "-", *flags, str(agy)],
+                                             check=True, capture_output=True)
+        sign("-o", "runtime")
+        ok = self.agy_profile_result(agy, codesign="real", **self.agent_env)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        sign()
+        refused = self.agy_profile_result(agy, codesign="real", **self.agent_env)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("hardened runtime", refused.stderr)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_inside_the_agy_profile_a_command_cannot_read_the_oauth_token(self):
@@ -278,7 +350,7 @@ class AgentSandboxTest(unittest.TestCase):
                   'p="$(sandbox_profile "$1" cat "")" || exit 9\n'
                   'sandbox-exec -p "$p" /bin/bash -c "$5"\n'
                   'sandbox-exec -p "$p" /bin/cat "$2" > /dev/null && echo agy=read || echo agy=denied')
-        result = self.bash(script, str(store), str(state), str(keychain), TOKEN_PROBE, lane="agy")
+        result = self.bash(script, str(store), str(state), str(keychain), TOKEN_PROBE, lane="agy", **self.agent_env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.split(),
                          ["a-direct=denied", "a-hardlink=denied", "a-symlink=denied",
@@ -319,7 +391,7 @@ class AgentSandboxTest(unittest.TestCase):
                   'sandbox-exec -p "$p" /bin/bash -c "$5"\n'
                   'sandbox-exec -p "$p" "$7" "$2" > /dev/null && echo helper=read || echo helper=denied\n'
                   'sandbox-exec -p "$p" "$6" "$2" > /dev/null && echo agy=read || echo agy=denied')
-        result = self.bash(script, str(store), str(state), str(keychain), TOKEN_PROBE, str(agy), str(helper), lane="agy")
+        result = self.bash(script, str(store), str(state), str(keychain), TOKEN_PROBE, str(agy), str(helper), lane="agy", **self.agent_env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.split(),
                          ["a-direct=denied", "a-hardlink=denied", "a-symlink=denied",
@@ -335,7 +407,7 @@ class AgentSandboxTest(unittest.TestCase):
         result = self.bash(
             'p="$(sandbox_profile "$1" bash "")" || exit 9\n'
             'sandbox-exec -p "$p" /bin/bash -c "$2"',
-            AGY_PROBE, lane="agy")
+            AGY_PROBE, lane="agy", **self.agent_env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.split(),
                          ["net=denied", "security=denied"])

@@ -192,6 +192,40 @@ api_rules() {
   esac
 }
 
+# What codesign says about the file at $1 (stdout and stderr together). A
+# function so a test can stand in for it on a machine without codesign or
+# with a binary it cannot sign. LOOM_AGY_CODESIGN names the program to run
+# in place of codesign; it exists for tests only and is never set in
+# production (the agent's own environment cannot reach the runner's).
+agy_codesign_report() {
+  "${LOOM_AGY_CODESIGN:-codesign}" -d --verbose=2 "$1" 2>&1
+}
+
+# Refuse to trust a binary with the token unless it is safe to trust (#1623).
+# The token rule trusts any process whose image is $1, so a command that could
+# make that image run its own code could read the token. Two ways to do so:
+# write the binary (or a library it loads) where the sandbox lets a command
+# write, and set DYLD_INSERT_LIBRARIES or similar for it. The hardened runtime
+# makes dyld ignore those, so $1 must carry the runtime flag in its signature,
+# and must sit where no sandboxed command can write. $2.. are the writable
+# areas. A script or launcher has no signature and so is refused too.
+agy_binary_check() {
+  local bin="$1" area report flags
+  shift
+  for area in "$@"; do
+    [ -n "$area" ] || continue
+    case "$bin/" in "$area"/*)
+      echo "refusing sandbox: agy binary $bin sits inside $area, which the sandboxed commands can write; install agy outside the worktree, the agent's scratch home and agy's state directory" >&2
+      return 1 ;; esac
+  done
+  report="$(agy_codesign_report "$bin")" || report=""
+  flags="$(printf '%s\n' "$report" | sed -n 's/^CodeDirectory .*flags=\(0x[0-9a-fA-F]*\).*/\1/p' | head -n 1)"
+  if [ -z "$flags" ] || [ $(( flags & 0x10000 )) -eq 0 ]; then
+    echo "refusing sandbox: agy binary $bin is not signed with the hardened runtime (codesign -d --verbose=2 shows no runtime flag), so a command could run it with an injected library and read agy's sign-in; re-sign it with: codesign -f -s - -o runtime $bin (or ask the operator to install a hardened-runtime agy), and use the agy binary itself, never a script or launcher" >&2
+    return 1
+  fi
+}
+
 # The rules that keep agy's oauth token files ($1 is the lane user's home,
 # $2 the real path of agy's binary, or empty when no process may read them)
 # from every process but agy's own binary (#1623). agy keeps its sign-in in
@@ -340,7 +374,12 @@ sandbox_profile() {
   # that may read agy's token, except in check mode, where no process may.
   if [ -n "$agy_home" ]; then
     local token_bin=""
-    [ "${3:-}" = check ] || token_bin="$cli_real"
+    if [ "${3:-}" != check ]; then
+      token_bin="$cli_real"
+      agy_binary_check "$token_bin" "$tree" "$(cd "$AGENT_HOME" && pwd -P)" \
+        "$agy_home/.gemini/antigravity-cli" "$agy_home/Library/Application Support/antigravity" \
+        "$agy_home/Library/Caches" "$agy_home/Library/Keychains" || return 1
+    fi
     agy_token_deny="$(agy_token_rules "$agy_home" "$token_bin")" || return 1
   fi
   [ -n "$agy_lane" ] && agy_rules="$(agy_write_rules "$allow_rw")"

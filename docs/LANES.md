@@ -1702,6 +1702,24 @@ Plan:
   its own (the outside-helper design in #1623), not a broader
   exception. The same profile keeps the keychain server and
   `Library/Keychains` denied.
+- The token exception trusts whatever runs as agy's binary, so the runner
+  refuses to start the agy lane (and names the file) unless that binary
+  meets two requirements. It must be signed with the hardened runtime:
+  `codesign -d --verbose=2 <agy>` must show the `runtime` flag (for
+  example `flags=0x10000(runtime)`). Without it a command could write an
+  injection library and run `DYLD_INSERT_LIBRARIES=<lib> <agy>`, and the
+  library would read the token inside agy's image; a hardened binary
+  makes dyld ignore that. To fix a refusal, re-sign with
+  `codesign -f -s - -o runtime <agy>` or ask the operator for a
+  hardened-runtime agy. It must also be the agy binary itself, not an
+  interpreter or launcher image (a script has no signature and is
+  refused; a runtime that honours variables such as NODE_OPTIONS would
+  defeat the rule), and it must sit outside every area a sandboxed
+  command can write: the worktree, the agent's scratch home and agy's
+  state directory, file store and caches. Residual note: a sandboxed
+  command may still overwrite the token file (writes are not denied),
+  which costs agy its sign-in but leaks nothing. Whether the real agy
+  meets the hardened-runtime requirement is shown by the first live run.
 - Before each run, the runner clears agy's memory of earlier runs
   (`agy_forget`), deleting everything in its state directory except sign-in
   and install state. Kept entries in the state directory are `settings.json`,
