@@ -2,7 +2,7 @@
 
 On 2026-10-27 the brain closed a lane pull request "per the operator decision
 recorded on" a ticket, and closed that ticket "per the operator decision",
-when the ticket held only an unanswered loom:human ask: no person had said
+when the ticket held only an unanswered needs:human ask: no person had said
 anything. An unanswered ask is not a decision. The brain may act on its own
 judgment and say so, but text that claims a person's decision is refused
 unless a person's comment or label, posted after the latest ask, records one
@@ -54,7 +54,7 @@ CLAIM_PATTERNS: Tuple[re.Pattern, ...] = tuple(re.compile(p, re.I) for p in (
 # an ask is written as the operator's login on some factories.
 _LOOM_MARKER = "<!-- loom:"
 # Labels the factory sets and clears itself; a person adding one is not a
-# decision. A person taking the ask's own label off (loom:human, needs:*)
+# decision. A person taking the ask's own label off (needs:human, needs:*)
 # is an answer.
 _MACHINE_LABEL = re.compile(r"^(?:loom:|claim:|lane:|wait:|needs)", re.I)
 _ASK_LABEL = re.compile(r"^(?:loom:human|needs:.+|needs-operator)$", re.I)
@@ -77,7 +77,7 @@ _REF = re.compile(
 REF_LIMIT = 5
 
 REFUSAL = ("the text claims a person's decision (%r), but no person's comment or label "
-           "after the latest loom:human ask on %s records one. An unanswered ask is not a "
+           "after the latest needs:human ask on %s records one. An unanswered ask is not a "
            "decision: say the act was the brain's own judgment, or cite the person's "
            "comment by link once one exists")
 
@@ -130,7 +130,7 @@ def is_bot(who: Any) -> bool:
     return not login or login.lower().endswith("[bot]") or kind.lower() == "bot"
 
 
-def _when(value: Any) -> Optional[datetime]:
+def when(value: Any) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
     except ValueError:
@@ -148,7 +148,7 @@ def person_comment(comment: Any) -> bool:
 
 def person_label(event: Any) -> bool:
     """A label a person added or took off, other than the factory's own, or
-    a person taking the ask's label (loom:human, needs:*) off."""
+    a person taking the ask's label (needs:human, needs:*) off."""
     if not isinstance(event, dict) or event.get("event") not in ("labeled", "unlabeled"):
         return False
     name = str((event.get("label") or {}).get("name") or "")
@@ -171,8 +171,8 @@ def body_decision(body: Any, since: Optional[datetime], logins: Iterable[str]) -
 
 
 def latest_ask(comments: Sequence[Any]) -> Optional[datetime]:
-    """When the newest loom:human ask among `comments` was posted."""
-    asks = [_when(c.get("created_at")) for c in comments
+    """When the newest needs:human ask among `comments` was posted."""
+    asks = [when(c.get("created_at")) for c in comments
             if isinstance(c, dict) and answer.HUMAN_MARKER in str(c.get("body") or "")]
     asks = [a for a in asks if a is not None]
     return max(asks) if asks else None
@@ -190,7 +190,7 @@ def recorded(comments: Sequence[Any], events: Sequence[Any],
         return True
 
     def after(item: Dict[str, Any]) -> bool:
-        stamp = _when(item.get("created_at"))
+        stamp = when(item.get("created_at"))
         return since is None or (stamp is not None and stamp > since)
 
     return (any(after(c) and (person_comment(c) or answer.trusted_answer(c, trusted, ops))

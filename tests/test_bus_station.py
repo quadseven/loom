@@ -121,19 +121,21 @@ class FakeGitHub:
              "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))}
             for login, age in journals]
 
-    def _list_asks(self, headers):
-        etag = '"a%d"' % len(self.asks)
+    def _list_asks(self, headers, label):
+        found = [a for a in self.asks if label in [x["name"] for x in a["labels"]]]
+        etag = '"a%d"' % len(found)
         if headers.get("If-None-Match") == etag:
             return reply(304, None, {"ETag": etag})
-        return reply(200, self.asks, {"ETag": etag})
+        return reply(200, found, {"ETag": etag})
 
     def add_ask(self, number, title="Need a decision", author="alice-example",
-                labeller="alice-example", urgent=False, body="", created="2030-01-01T00:00:00Z"):
-        labels = [{"name": "needs-operator"}] + ([{"name": "loom:urgent"}] if urgent else [])
+                labeller="alice-example", urgent=False, body="", created="2030-01-01T00:00:00Z",
+                label="needs-operator"):
+        labels = [{"name": label}] + ([{"name": "loom:urgent"}] if urgent else [])
         self.asks.append({"number": number, "title": title, "user": {"login": author},
                           "labels": labels, "created_at": created, "body": body,
                           "html_url": "https://github.com/%s/issues/%d" % (REPO, number)})
-        self.events[number] = [labeled("needs-operator", labeller)]
+        self.events[number] = [labeled(label, labeller)]
 
     def add_human(self, number, title="Buy the domain", ask="Buy it.", author="alice-example",
                 created="2030-01-01T00:00:00Z", extra=()):
@@ -366,7 +368,9 @@ class FakeGitHub:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:ticket" in self.names(i["number"])])
         if "needs-operator" in query:
-            return self._list_asks(headers)
+            return self._list_asks(headers, "needs-operator")
+        if "needs:human" in query or "needs:quadseven" in query:
+            return self._list_asks(headers, query.split("labels=")[1].split("&")[0])
         if "loom:human" in query:
             return reply(200, self.humans)
         if "loom:goal" in query:
@@ -3270,7 +3274,7 @@ class HandBackTest(unittest.TestCase):
         )
         self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK, review_output)])
         names = [x["name"] for x in self.gh.issue["labels"]]
-        self.assertIn("loom:human", names)
+        self.assertIn("needs:human", names)
         self.assertNotIn("loom:briefed", names)
         # No fix round was sent (no FIX_MARKER comment)
         self.assertFalse(any(str(c.get("body") or "").startswith(tickets.FIX_MARKER)
@@ -3292,7 +3296,7 @@ class HandBackTest(unittest.TestCase):
         self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK, review_output)])
         names = [x["name"] for x in self.gh.issue["labels"]]
         self.assertIn("loom:briefed", names)
-        self.assertNotIn("loom:human", names)
+        self.assertNotIn("needs:human", names)
 
     def test_removed_guarded_path_mixed_with_other_marking_gets_fix_round(self):
         # Ticket names README.md for removal
@@ -3308,7 +3312,7 @@ class HandBackTest(unittest.TestCase):
         self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK, review_output)])
         names = [x["name"] for x in self.gh.issue["labels"]]
         self.assertIn("loom:briefed", names)
-        self.assertNotIn("loom:human", names)
+        self.assertNotIn("needs:human", names)
 
     def test_unresolved_review_bot_thread_is_sent_back(self):
         thread = {"id": "PRRT_fake", "path": "a.py", "line": 4,
@@ -8399,6 +8403,44 @@ class AsksTest(Base):
         with open(ledger) as fh:
             self.assertEqual(json.load(fh)["urgent"], [])
 
+    def test_an_answered_ask_leaves_the_digest_with_no_comment_posted(self):
+        self.fake.add_ask(5, title="Answered")
+        self.fake.add_ask(6, title="Still open")
+        self.fake.events[5][0]["created_at"] = "2030-06-01T00:00:00Z"
+        self.fake.comments[5] = [{"body": "Yes, clear it.", "created_at": "2030-07-01T00:00:00Z",
+                                  "user": {"login": "alice-example"}}]
+        self.go(NOON)
+        text = self.sent[0][1]["content"]
+        self.assertIn("Still open", text)
+        self.assertNotIn("Answered", text)
+        self.assertFalse([p for p in self.fake.paths("POST") if p.endswith("/comments")])
+
+    def test_an_ask_waiting_on_an_open_ticket_leaves_the_digest(self):
+        self.fake.add_ask(5, title="Waits")
+        self.fake.asks[-1]["labels"].append({"name": "wait:blocked"})
+        self.fake.add_ask(6, title="Still open")
+        self.go(NOON)
+        text = self.sent[0][1]["content"]
+        self.assertIn("Still open", text)
+        self.assertNotIn("Waits", text)
+
+    def test_an_ask_filed_with_needs_human_is_listed(self):
+        self.fake.add_ask(5, title="New label", label="needs:human")
+        self.go(NOON)
+        self.assertIn("New label", self.sent[0][1]["content"])
+
+    def test_an_unreadable_ask_holds_the_digest(self):
+        self.fake.add_ask(5, title="Unknown")
+        real = self.fake.__class__.__call__
+
+        def broken(fake, method, url, headers, body):
+            if url.split("?")[0].endswith("/issues/5/events"):
+                return reply(500, {"message": "down"})
+            return real(fake, method, url, headers, body)
+        with mock.patch.object(self.fake.__class__, "__call__", broken):
+            self.go(NOON)
+        self.assertEqual(self.sent, [])
+
     def test_digest_once_per_day_after_the_hour_only(self):
         self.fake.add_ask(5, title="Slow one")
         self.go(EARLY)
@@ -8646,10 +8688,11 @@ class HumanDigestTest(AsksTest):
         listed = re.findall(r"- Item (\d+) ", text)
         self.assertEqual(listed, [str(n) for n in range(139, 134, -1)])
         self.assertTrue(all(len(c) + 30 <= station.DISCORD_MAX for c in self.contents()))
+        # Every issue is read once to judge its ask; the shown ones again for the line.
         self.assertEqual(self.fake.paths("GET").count(
-            "/repos/%s/issues/100/comments?per_page=100" % REPO), 0)
+            "/repos/%s/issues/100/comments?per_page=100" % REPO), 1)
         comment_reads = [p for p in self.fake.paths("GET") if "/comments?" in p]
-        self.assertEqual(len(comment_reads), station.HUMAN_SHOWN)
+        self.assertEqual(len(comment_reads), 40 + station.HUMAN_SHOWN)
         self.assertTrue(all(p.endswith("?per_page=100") for p in comment_reads))
 
     def test_clipped_human_text_does_not_escape_its_ellipsis(self):
@@ -9076,7 +9119,7 @@ class ReportsTest(Base):
             {"number": 46, "title": "Stuck task", "state": "open", "created_at": stuck_old,
              "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]},
             {"number": 47, "title": "Decision task", "state": "open",
-             "labels": [{"name": "loom:ticket"}, {"name": station.NEEDS_OPERATOR}]},
+             "labels": [{"name": "loom:ticket"}, {"name": station.NEEDS_HUMAN}]},
         ]
         self.clock = time.time()
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
@@ -10498,7 +10541,7 @@ class CloseDoneTest(Base):
         # A Live line with nothing to search is still a live criterion with no
         # evidence (bus/criteria_gate.py, 2026-10-22): it goes to the operator.
         self.assertEqual(self.fake.issues[1]["state"], "open")
-        self.assertIn("loom:human", self.fake.names(1))
+        self.assertIn("needs:human", self.fake.names(1))
         self.assertEqual(self.fake.issues[2]["state"], "open")   # window still open or covered by evidence
         self.assertEqual(self.fake.issues[3]["state"], "open")   # a regression stays for the brain
         self.assertEqual(self.fake.issues[4]["state"], "closed") # no Live line, code only
@@ -10789,7 +10832,7 @@ class CloseDoneTest(Base):
         st = station.Station(GitHub("token", transport=request), self.settings, now=10000)
         st.check_repo_access()
         self.assertEqual(len(asks), 1)
-        self.assertIn("needs-operator", asks[0]["labels"])
+        self.assertIn("needs:human", asks[0]["labels"])
         self.assertIn(second, asks[0]["title"])
 
     def test_operator_ask_missing_number_raises(self):

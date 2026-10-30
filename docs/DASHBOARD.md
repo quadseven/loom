@@ -147,13 +147,13 @@ the same pass and interval: one open list per `needs:<login>` label per repo
 result stays shown.
 
 `/needs-you` lists every open item that waits on a person, each once: the
-`needs-operator` and `loom:human` issues ("waits on the operator") from
+`needs:human` and `needs:human` issues ("waits on the operator") from
 Hunt's backlog document and the store's own read, and the `needs:<login>`
 items above ("waits on <login>"), each card marked "needs a human" with its
-ask (the `## Ask` section, else the picked comment, linked; a `loom:human`
-issue's ask is its newest `loom:human` comment). The page makes no request
+ask (the `## Ask` section, else the picked comment, linked; a `needs:human`
+issue's ask is its newest `needs:human` comment). The page makes no request
 of its own: the `needs:<login>` items come from the Operators pass, and a
-`needs-operator` or `loom:human` issue with no `## Ask` in its body takes its
+`needs:human` or `needs:human` issue with no `## Ask` in its body takes its
 ask from a comment read the same way. A card whose ask comment that read has
 not reached yet reads it on demand (`GET /api/needs-you/ask?repo=&number=`,
 from the page's script), under the same rules: never below the budget floor,
@@ -171,12 +171,12 @@ has an optional note. A tap sends `POST /api/needs-you/answer` with `{repo,
 number, choice, note, as}`, and the dashboard posts ONE comment on the
 issue as the Loom GitHub App (`LOOM_GITHUB_APP_*`; without the App the page
 stays read only and says so): `<!-- loom:answer v1 --> Answer from <login>
-(via the dashboard): <choice>. <note>`. It then takes off `loom:human`,
-`needs:<login>` and `needs-operator`, and adds `loom:answer-pending`, which
+(via the dashboard): <choice>. <note>`. It then takes off `needs:human`,
+`needs:<login>` and `needs:human`, and adds `loom:answer-pending`, which
 the station takes off once it has read the answer (docs/BRAIN.md, Operator
 answers). Until then the card leaves the lists and waits under "Answered,
 not yet applied" with the answer, who gave it and when; an answer the
-station has read shows on a card that still waits (a Hold puts `loom:human`
+station has read shows on a card that still waits (a Hold puts `needs:human`
 back).
 
 Only an operator may answer: a login of `LOOM_OPERATORS` (space or comma

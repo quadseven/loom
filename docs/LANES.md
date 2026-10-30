@@ -322,7 +322,7 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 flags `loom:runaway`, and every lane that bills that key stays unavailable
 with `API key expired: renew <the SSM parameter>` in its heartbeat, with no
 `retry_at`, until the value at that parameter changes. The runner opens one
-`needs-operator` ask on the factory repo naming that parameter. opencode
+`needs:human` ask on the factory repo naming that parameter. opencode
 lanes run with `--print-logs --log-level ERROR`, because opencode's own
 output says only "UnknownError: Unexpected server error" for every provider
 fault: the logged error shows an upstream 429 (a limit) or a model opencode
@@ -568,8 +568,8 @@ most 2 questions a pass and 3 citations each; the key is read for each call
 and only asks, never writes. Fabric unset, down, slow or silent builds the
 ticket as before.
 
-Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
-(ETag polls) and forwards those whose author and latest `needs-operator`
+Asks: the station reads open `needs:human` issues in each `LOOM_REPOS` repo
+(ETag polls) and forwards those whose author and latest `needs:human`
 labeller are in `LOOM_BRIEF_AUTHORS` to a Discord webhook whose URL it reads
 from the SSM parameter named by `LOOM_DISCORD_WEBHOOK_SSM` (region
 `LOOM_AWS_REGION`, default us-east-1; never printed, and with the setting

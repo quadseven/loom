@@ -223,7 +223,7 @@ class DoneClose(tbs.Base):
         self.close(roller, cost, rbac)
         for n in (1, 2, 3):
             self.assertEqual(self.fake.issues[n]["state"], "open")
-            self.assertIn("loom:human", self.fake.names(n))
+            self.assertIn("needs:human", self.fake.names(n))
             self.assertEqual(len(self.asks(n)), 1)
         self.assertIn("no check Loom can run", self.asks(1)[0])
         # A second pass asks nothing more.
