@@ -236,7 +236,8 @@ agy_binary_check() {
 # command agy runs (bash, cat, curl) is not agy, so it can neither read a
 # token file nor link, move or delete it, or move its folder, to reach it
 # from another path (a symlink to it is read through the same rule). A
-# command could still write over a token file, which costs agy its
+# command could still overwrite a token file in place (truncate or rewrite
+# it; only link, move and unlink are denied), which costs agy its
 # sign-in, not a leak. In check mode $2 is empty: a validation run never
 # runs agy, so no process there may read the token.
 agy_token_rules() {
