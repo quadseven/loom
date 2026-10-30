@@ -6310,6 +6310,70 @@ def _nothing_to_fix(gh: GitHub, repo: str, pr: int,
             "%s passed on it, and no review thread is open)" % (pr, sha[:12], check))
 
 
+def _rung_by_load(left: Sequence[int], lanes_of: Callable[[int], Tuple[str, ...]],
+                  load: Dict[str, int]) -> Tuple[Optional[Tuple[int, str]],
+                                                 Optional[Tuple[int, str, int]]]:
+    """(rung, lane) for the first rung in `left` with an available lane, on
+    its least-loaded lane (factory.pick_lane), and the (rung, lane, load) it
+    skipped or None. A rung whose one lane holds more than
+    factory.ONE_LANE_MAX gives way to the next rung whose least-loaded lane
+    holds three or more fewer, as the factory's _spread does; with none that
+    much lower the ticket still takes the first rung."""
+    from . import factory  # factory imports this module
+    rungs = [(n, lanes) for n, lanes in ((n, lanes_of(n)) for n in left) if lanes]
+    if not rungs:
+        return None, None
+    n, lanes = rungs[0]
+    lane = factory.pick_lane(lanes, load)
+    held = load.get(lane, 0)
+    if len(lanes) == 1 and held > factory.ONE_LANE_MAX:
+        for later, later_lanes in rungs[1:]:
+            target = factory.pick_lane(later_lanes, load)
+            if load.get(target, 0) <= held - 3:
+                return (later, target), (n, lane, held)
+    return (n, lane), None
+
+
+# Lane load per station repo list, counted on the first escalate in this
+# process and kept current as escalate moves tickets, so a sweep reads each
+# repo once and its later tickets see the earlier ones.
+_LANE_LOAD: Dict[Tuple[str, ...], Dict[str, int]] = {}
+
+
+def _lane_load(gh: GitHub, repo: str) -> Dict[str, int]:
+    """Open briefed and running tickets per lane over every LOOM_REPOS repo
+    and `repo`, as the factory counts them (Factory.count_load): lanes are
+    shared by every repo the station watches. A repo that cannot be read
+    counts as empty and is said on stderr; a count missing a repo is not
+    kept, so the next ticket reads again."""
+    repos = tuple(dict.fromkeys(
+        os.environ.get("LOOM_REPOS", "").replace(",", " ").split() + [repo]))
+    if repos in _LANE_LOAD:
+        return _LANE_LOAD[repos]
+    from . import factory  # factory imports this module
+    counter = factory.Factory(gh, repos, time.time(), trusted=trusted_authors())
+    found: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    for each in repos:
+        try:
+            found[each] = counter._tickets(each)
+        except GitHubError as err:
+            print("lane load: cannot read %s (%s); counted as empty" % (each, err), file=sys.stderr)
+    counter.count_load({each: found.get(each, {}) for each in repos})
+    if len(found) == len(repos):
+        _LANE_LOAD[repos] = counter.load
+    return counter.load
+
+
+def _count_move(load: Dict[str, int], issue: Dict[str, Any], lane: str) -> None:
+    """Count an escalated ticket on its new lane, off the lane it was counted
+    on when it was already briefed or running there."""
+    from . import factory  # factory imports this module
+    old = factory._lane(issue)
+    if factory._state(issue) in ("briefed", "running") and old:
+        load[old] = load.get(old, 0) - 1
+    load[lane] = load.get(lane, 0) + 1
+
+
 def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
              lanes_repo: str = "quadseven/loom") -> str:
     """Move a repeatedly stuck ticket to the lowest untried rung of the model
@@ -6377,27 +6441,31 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
                         ", ".join(history.tried), "; ".join(history.reasons)), notify.RUNAWAY)
         return "needs-brain"
     free = _available_lanes(gh, lanes_repo)
-    choice = None
-    for n in left:
-        lane = next((x for x in rung_lanes(n) if x in free), None)
-        if lane:
-            choice = (n - 1, lane)
-            break
+    load = _lane_load(gh, repo)
+    choice, skipped_load = _rung_by_load(
+        left, lambda n: tuple(x for x in rung_lanes(n) if x in free), load)
     if choice is None:
         raise ValueError("no untried rung has an available lane")
-    rung, lane = choice
+    rung, lane = choice[0] - 1, choice[1]
     model = factory.CLIMB[rung][1]
     reason = "; ".join(history.reasons)
-    comment = "\n".join([ESCALATE_MARKER,
+    comment_lines = [ESCALATE_MARKER]
+    if skipped_load:
+        skipped_rung, skipped_lane, skipped_count = skipped_load
+        comment_lines.append("Skipped rung %d: lane %s load is %d; the next rung's least-loaded lane is at least three lower." % (
+            skipped_rung, skipped_lane, skipped_count))
+    comment_lines.extend([
                          "Escalated to rung %d of %d: %s on lane %s." % (rung + 1, len(factory.CLIMB), model, lane),
                          "Reason: %s (attempts %d, tried %s)." % (reason, history.attempts, ", ".join(history.tried) or "none"),
                          "Rung: %d %s %s" % (rung + 1, model, lane)])
+    comment = "\n".join(comment_lines)
     _check_written_text(comment)
     pr = open_pr if "loom:pr" in names else None
     if pr is not None:
         fix(gh, repo, pr, (repo, number), notes or comment.split("\n")[1], lane, model)
     else:
         move(gh, repo, number, "briefed", lane, None, None, model)
+    _count_move(load, issue, lane)
     # A routine event: the status comment's event list, not a new comment (loom#866).
     add_status_event(gh, repo, number, comment, time.time(), trusted_authors())
     return "rung %d %s on %s" % (rung + 1, model, lane)
