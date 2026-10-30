@@ -9846,7 +9846,8 @@ class Station:
                                         % (repo, quote(label, safe=":"))):
                 if isinstance(issue, dict) and "pull_request" not in issue:
                     found[int(issue["number"])] = issue
-        station_logins = list(self.s.authors) + sorted(self._own_apps())
+        own_apps = sorted(self._own_apps())
+        trusted = list(self.s.authors) + list(self.s.briefers)
         dry = self.s.claim_referee == "dry"
         for number, issue in sorted(found.items()):
             if not claim_referee.needs_timeline(issue, engines, self.now):
@@ -9855,7 +9856,7 @@ class Station:
                 return False
             budget["reads"] -= 1
             timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
-            removals = claim_referee.plan(issue, timeline, self.now, engines, station_logins)
+            removals = claim_referee.plan(issue, timeline, self.now, engines, own_apps, trusted)
             if not removals:
                 continue
             budget["left"] -= 1

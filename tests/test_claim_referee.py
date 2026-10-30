@@ -27,17 +27,20 @@ REPO = "example-owner/example-repo"
 HOUR = 3600
 ENGINES = ("claim:engine-a", "claim:engine-b")
 STATION = ("loom-app[bot]",)
+TRUSTED = ("an-operator", "loom-app[bot]")
 
 
 def at(seconds_ago):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds_ago))
 
 
-def issue(number, labels=("claim:engine-a",), updated=5 * HOUR, created=48 * HOUR):
+def issue(number, labels=("claim:engine-a",), updated=5 * HOUR, created=48 * HOUR,
+          assignees=()):
     return {"number": number, "title": "Issue %d" % number, "state": "open",
             "created_at": at(created), "updated_at": at(updated),
-            "user": {"login": "someone"}, "labels": [{"name": x} for x in labels],
-            "assignees": []}
+            "user": {"login": "someone"},
+            "labels": [{"name": x} for x in labels + ("loom:queued",)],
+            "assignees": [{"login": x} for x in assignees]}
 
 
 def labeled(name, by, ago):
@@ -50,8 +53,24 @@ def commented(by, ago, body="a note"):
             "body": body, "created_at": at(ago)}
 
 
+def pull(by, ago):
+    return {"event": "cross-referenced", "actor": {"login": by}, "created_at": at(5 * HOUR),
+            "source": {"type": "issue", "issue": {
+                "pull_request": {}, "state": "open", "user": {"login": by},
+                "updated_at": at(ago)}}}
+
+
+def wait_line(seconds_ahead):
+    when = time.gmtime(time.time() + seconds_ahead)
+    return "waiting: the deploy run until %s" % time.strftime("%Y-%m-%dT%H:%MZ", when)
+
+
 def plan(found, line, now=None):
-    return claim_referee.plan(found, line, now or time.time(), ENGINES, STATION)
+    return claim_referee.plan(found, line, now or time.time(), ENGINES, STATION, TRUSTED)
+
+
+def labels_of(removals):
+    return [r.label for r in removals]
 
 
 class Duplicates(unittest.TestCase):
@@ -97,11 +116,8 @@ class Expiry(unittest.TestCase):
         self.assertEqual([], plan(issue(1), line))
 
     def test_an_open_pull_request_updated_recently_keeps_the_claim(self):
-        ref = {"event": "cross-referenced", "actor": {"login": "engine-a[bot]"},
-               "created_at": at(5 * HOUR),
-               "source": {"type": "issue", "issue": {
-                   "pull_request": {}, "state": "open", "updated_at": at(600)}}}
-        line = [labeled("claim:engine-a", "engine-a[bot]", 6 * HOUR), ref]
+        line = [labeled("claim:engine-a", "engine-a[bot]", 6 * HOUR),
+                pull("engine-a[bot]", 600)]
         self.assertEqual([], plan(issue(1), line))
 
     def test_a_live_stated_wait_keeps_an_idle_claim(self):
@@ -143,6 +159,133 @@ class Expiry(unittest.TestCase):
                 got = claim_referee.parse_until(text)
                 self.assertEqual(want, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(got)))
         self.assertIsNone(claim_referee.parse_until("tomorrow"))
+
+
+class WhoCounts(unittest.TestCase):
+    """The repo takes comments from strangers: only the claimer and trusted
+    logins hold a claim, or end a hold."""
+
+    def idle_claim(self, *more):
+        return [labeled("claim:engine-a", "engine-a[bot]", 6 * HOUR)] + list(more)
+
+    def expired(self, *more):
+        return labels_of(plan(issue(1), self.idle_claim(*more))) == ["claim:engine-a"]
+
+    def test_a_stranger_cannot_state_a_wait(self):
+        self.assertTrue(self.expired(commented("a-stranger", 600, wait_line(HOUR))))
+
+    def test_another_engine_cannot_state_a_wait(self):
+        self.assertTrue(self.expired(commented("engine-b[bot]", 600, wait_line(HOUR))))
+
+    def test_a_trusted_login_can_state_a_wait(self):
+        self.assertFalse(self.expired(commented("An-Operator", 5 * HOUR, wait_line(HOUR))))
+
+    def test_a_trusted_station_login_cannot_state_a_wait(self):
+        self.assertTrue(self.expired(commented("loom-app[bot]", 5 * HOUR, wait_line(HOUR))))
+
+    def test_a_stranger_comment_is_not_activity(self):
+        self.assertTrue(self.expired(commented("a-stranger", 600)))
+
+    def test_a_stranger_label_is_not_activity(self):
+        self.assertTrue(self.expired(labeled("bug", "a-stranger", 600)))
+
+    def test_a_strangers_pull_request_is_not_activity(self):
+        self.assertTrue(self.expired(pull("a-stranger", 600)))
+
+    def test_a_trusted_comment_is_activity(self):
+        self.assertFalse(self.expired(commented("an-operator", 600)))
+
+    def test_a_trusted_pull_request_is_activity(self):
+        self.assertFalse(self.expired(pull("an-operator", 600)))
+
+    def test_a_later_stranger_comment_does_not_end_a_trusted_wait(self):
+        self.assertFalse(self.expired(commented("an-operator", 5 * HOUR, wait_line(HOUR)),
+                                      commented("a-stranger", 600, wait_line(-3 * HOUR))))
+
+    def test_a_later_shorter_line_does_not_end_a_trusted_wait(self):
+        self.assertFalse(self.expired(commented("an-operator", 5 * HOUR, wait_line(HOUR)),
+                                      commented("engine-a[bot]", 3 * HOUR, wait_line(-3 * HOUR))))
+
+    def test_a_newer_wait_outlasts_a_spent_one(self):
+        self.assertFalse(self.expired(commented("an-operator", 5 * HOUR, wait_line(-3 * HOUR)),
+                                      commented("engine-a[bot]", 3 * HOUR, wait_line(HOUR))))
+
+    def test_a_wait_is_capped_after_its_comment(self):
+        ago = claim_referee.MAX_WAIT + claim_referee.GRACE + 600
+        self.assertTrue(self.expired(commented("engine-a[bot]", ago, wait_line(30 * 86400))))
+
+    def test_a_wait_holds_up_to_the_cap(self):
+        ago = claim_referee.MAX_WAIT - 600
+        self.assertFalse(self.expired(commented("engine-a[bot]", ago, wait_line(30 * 86400))))
+
+
+class WaitParsing(unittest.TestCase):
+    def times(self, body):
+        return [time.strftime("%H:%M", time.gmtime(x)) for x in claim_referee.stated_times(body)]
+
+    def test_a_line_is_found_among_others_in_any_case(self):
+        self.assertEqual(["18:00"], self.times("Pushed.\n  WAITING:\tCI  Until  2026-10-30T18:00Z\nok"))
+
+    def test_the_time_follows_the_last_until(self):
+        self.assertEqual(["18:00"], self.times("waiting: hold until done until 2026-10-30T18:00Z"))
+
+    def test_a_wait_needs_a_what_and_a_time(self):
+        for body in ("waiting: until 2026-10-30T18:00Z", "waiting: CI until",
+                     "waiting: CI", "not waiting: CI until 2026-10-30T18:00Z"):
+            with self.subTest(body=body):
+                self.assertEqual([], self.times(body))
+
+    def test_a_line_over_the_limit_is_skipped(self):
+        what = "x" * claim_referee.MAX_WAIT_LINE
+        self.assertEqual([], self.times("waiting: %s until 2026-10-30T18:00Z" % what))
+
+    def test_a_line_past_the_body_limit_is_not_read(self):
+        padding = "\n" * claim_referee.MAX_BODY
+        self.assertEqual([], self.times(padding + "waiting: CI until 2026-10-30T18:00Z"))
+
+    def test_the_old_pattern_text_stays_cheap(self):
+        started = time.monotonic()
+        self.assertEqual([], self.times("waiting: a" + " until" * 1000000))
+        self.assertLess(time.monotonic() - started, 1)
+
+
+class NeverExpires(unittest.TestCase):
+    LINE = [labeled("claim:engine-a", "engine-a[bot]", 6 * HOUR)]
+
+    def test_a_ticket_with_a_lane_run(self):
+        found = issue(1, labels=("claim:engine-a", "loom:running"))
+        self.assertEqual([], plan(found, self.LINE))
+        self.assertFalse(claim_referee.needs_timeline(found, ENGINES, time.time()))
+
+    def test_a_ticket_assigned_to_a_person(self):
+        found = issue(1, assignees=("a-person",))
+        self.assertEqual([], plan(found, self.LINE))
+        self.assertFalse(claim_referee.needs_timeline(found, ENGINES, time.time()))
+
+    def test_a_ticket_assigned_to_an_app_still_expires(self):
+        found = issue(1, assignees=("engine-a[bot]",))
+        self.assertEqual(["claim:engine-a"], labels_of(plan(found, self.LINE)))
+
+    def test_a_ticket_with_no_loom_label(self):
+        found = issue(1)
+        found["labels"] = [{"name": "claim:engine-a"}]
+        self.assertEqual([], plan(found, self.LINE))
+        self.assertFalse(claim_referee.needs_timeline(found, ENGINES, time.time()))
+
+    def test_a_duplicate_on_such_a_ticket_is_still_removed(self):
+        found = issue(1, labels=("claim:engine-a", "claim:engine-b", "loom:running"))
+        line = self.LINE + [labeled("claim:engine-b", "engine-b[bot]", 5 * HOUR)]
+        self.assertEqual(["claim:engine-b"], labels_of(plan(found, line)))
+
+
+class FailsClosed(unittest.TestCase):
+    def test_one_claim_with_no_labeled_event_stays(self):
+        self.assertEqual([], plan(issue(1), [commented("a-stranger", 6 * HOUR)]))
+
+    def test_one_claim_with_an_unreadable_labeled_event_stays(self):
+        event = labeled("claim:engine-a", "engine-a[bot]", 6 * HOUR)
+        event["created_at"] = "not a time"
+        self.assertEqual([], plan(issue(1), [event]))
 
 
 class Settings(unittest.TestCase):
@@ -247,9 +390,22 @@ class Step(unittest.TestCase):
         self.idle(1)
         self.fake.issues[2] = issue(2, updated=60)          # one claim, touched a minute ago
         self.fake.issues[3] = issue(3, labels=("claim:a-person",))
-        self.fake.issues[4] = issue(4, labels=("loom:queued",))
+        self.fake.issues[4] = issue(4, labels=())
         self.run_step()
         self.assertEqual(["issues/1/timeline"], [r for r in self.fake.reads if "timeline" in r])
+
+    def test_a_briefers_wait_holds_and_the_stations_and_a_strangers_do_not(self):
+        self.swept()
+        self.settings.briefers = ["a-briefer"]
+        self.idle(1)
+        self.fake.timelines[1].append(commented("a-briefer", HOUR, wait_line(HOUR)))
+        self.idle(2)
+        self.fake.timelines[2].append(commented("loom-app[bot]", HOUR, wait_line(HOUR)))
+        self.idle(3)
+        self.fake.timelines[3].append(commented("a-stranger", HOUR, wait_line(HOUR)))
+        self.run_step()
+        self.assertEqual([("DELETE", "issues/2/labels/claim:engine-a", None),
+                          ("DELETE", "issues/3/labels/claim:engine-a", None)], self.fake.writes)
 
     def test_dry_mode_writes_nothing(self):
         self.settings.claim_referee = "dry"

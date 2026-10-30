@@ -694,10 +694,16 @@ only what is its own, and adding an operator is configuration:
   minutes the station reads the open issues carrying one. With two or more it
   keeps the one put on first (each label's newest labeled event) and removes
   the others with a status note. It removes the claim it keeps when nothing
-  on the ticket is newer than 2 hours: no event by anyone but the station, no
-  update of an open pull request naming it, not the claim's putting-on. A
-  comment line `waiting: <what> until <time>` (ISO time, UTC unless it says
-  otherwise) holds the claim until that time plus 30 minutes. A claim label
+  on the ticket is newer than 2 hours: no event by the claimer (who put the
+  label on) or a trusted login (`LOOM_BRIEF_AUTHORS`, `LOOM_TRUSTED_BRIEFERS`,
+  never the station's own Apps), no update of an open pull request one of them
+  wrote naming it, not the claim's putting-on. A comment line
+  `waiting: <what> until <time>` (ISO time, UTC unless it says otherwise) by
+  one of them holds the claim until that time plus 30 minutes; the time counts
+  for at most 24 hours after the comment, and the latest stated time wins. A
+  ticket with `loom:running`, assigned to a person, or with no Loom label never
+  expires; a duplicate on it is still removed. A claim whose labeled event the
+  timeline does not show waits for a later pass. A claim label
   that is not an engine's is a person's and is never touched. The first pass
   over the claims that already exist removes at most 5 a run and posts no
   notes; after it, at most 10 a run, and an expiry never posts a note.
