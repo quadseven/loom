@@ -97,3 +97,7 @@ _Avoid_: review, recheck
 **Journal**:
 The comment the brain leaves on a goal's home issue for each tick that changed something (shipped, briefed, waiting, asks and cost), with a five-line report every two hours.
 _Avoid_: log, summary
+
+**Workhorse**:
+An agent that works a backlog in counted batches and reports by overwriting its own journal issue in place rather than commenting; the brain decides, the workhorse does the counted work.
+_Avoid_: batch brain, sweeper

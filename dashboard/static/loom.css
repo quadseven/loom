@@ -478,6 +478,9 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .recent-ticks .at { width: 40px; flex-shrink: 0; font-size: 11.5px; }
 .recent-ticks li p { margin: 0; color: var(--body-on-bg); }
 .recent-ticks .head { font-size: 10.5px; }
+.roster-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 400px), 1fr)); gap: 16px; }
+.actor-status { font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.actor-down { border-color: var(--bad); background: color-mix(in oklab, var(--bad) 10%, var(--row)); }
 .outcome-ok { color: var(--good-on-bg) !important; }
 .outcome-failed { color: var(--bad-on-bg) !important; }
 .outcome-degraded { color: var(--accent-on-bg) !important; }
