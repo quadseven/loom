@@ -6542,26 +6542,147 @@ class FactoryIncidentTest(Base):
             self.run_pass()
         self.assertIn("loom:queued", self.fake.names(12))
 
-    def test_a_failed_ticket_read_says_so_and_keeps_the_hold(self):
+    def test_a_held_running_ticket_with_no_comments_re_queued_when_incident_ref_in_issue_body(self):
+        """A held loom:running ticket with no comments, whose incident ref is only in the issue body, is re-queued once the incident closes."""
         self.heartbeat("muse")
         self.failed()
         self.run_pass()
+        
+        # Set up the fake repo so its issue body has a status section
+        with mock.patch.object(self.fake, "status_in_body", True):
+            self.fake.add(13, state="running", lane="muse")
+            # Set up the issue with a status section containing the incident ref but no comments
+            self.fake.issues[13]["body"] = (
+                "<!-- loom:status-body v1 begin -->\n"
+                "Loom status for this ticket, newest first. Routine events are kept "
+                "in this section instead of posted as comments.\n\n"
+                "- 2030-01-01T00:00:00Z Factory incident %s#99\n"
+                "<!-- loom:status-body v1 end -->\n\n"
+                "Model: claude-sonnet-5-5\n"
+                "Difficulty: medium\n\n"
+                "## Why\nx\n"
+            )
+            # No comments on issue 13
+            self.fake.comments[13] = []
+            
+            # Mark issue 13 as held for the incident
+            held = _read_json(os.path.join(self.home, "state", "factory_held.json"), {})
+            held["%s#%d" % (REPO, 13)] = {"incident": "%s#99" % REPO, "at": time.time()}
+            _write_json(os.path.join(self.home, "state", "factory_held.json"), held)
+        
+        # Close the incident
         self.incident()
-        for path in ("/repos/%s/issues/12" % REPO, "/repos/%s/issues/12/comments" % REPO):
-            def transport(method, url, headers, body, path=path):
-                if method == "GET" and urlsplit(url).path == path:
-                    raise station.GitHubError("boom", 502)
-                return self.fake(method, url, headers, body)
-            runner = station.Station(GitHub("token", transport=transport), self.settings)
-            with mock.patch.object(station, "FACTORY_REPO", REPO), \
-                    mock.patch("bus.station._say") as say:
-                runner.release_factory_held()
-            said = [c.args[0] for c in say.call_args_list]
-            self.assertIn("factory release: could not read %s#12: boom" % REPO, said)
-            self.assertIn("loom:running", self.fake.names(12))
         with mock.patch.object(station, "FACTORY_REPO", REPO):
             self.run_pass()
-        self.assertIn("loom:queued", self.fake.names(12))
+        
+        self.assertIn("loom:queued", self.fake.names(13))
+        self.assertTrue(any("back in the queue" in b for b in self.bodies()))
+
+    def test_a_claim_recorded_only_in_issue_body_after_incident_closed_leaves_ticket_alone(self):
+        """A claim recorded only in the issue body after the incident closed leaves the ticket alone."""
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        
+        # Set up the fake repo so its issue body has a status section
+        with mock.patch.object(self.fake, "status_in_body", True):
+            self.fake.add(14, state="running", lane="muse")
+            # Set up the issue with a status section containing both the incident ref and a claim
+            self.fake.issues[14]["body"] = (
+                "<!-- loom:status-body v1 begin -->\n"
+                "Loom status for this ticket, newest first. Routine events are kept "
+                "in this section instead of posted as comments.\n\n"
+                "- 2029-12-31T23:00:00Z Factory incident %s#99\n"
+                "- 2030-01-01T00:30:00Z Claimed for lane muse (body sha256 0123456789ab)\n"
+                "<!-- loom:status-body v1 end -->\n\n"
+                "Model: claude-sonnet-5-5\n"
+                "Difficulty: medium\n\n"
+                "## Why\nx\n"
+            )
+            # No comments on issue 14
+            self.fake.comments[14] = []
+            
+            # Mark issue 14 as held for the incident
+            held = _read_json(os.path.join(self.home, "state", "factory_held.json"), {})
+            held["%s#%d" % (REPO, 14)] = {"incident": "%s#99" % REPO, "at": time.time()}
+            _write_json(os.path.join(self.home, "state", "factory_held.json"), held)
+        
+        # Close the incident
+        self.incident()
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        
+        # Ticket should still be running because claim was after incident close
+        self.assertIn("loom:running", self.fake.names(14))
+        self.assertFalse(any("back in the queue" in b for b in self.bodies()))
+
+    def test_release_factory_held_makes_no_per_ticket_read_for_open_incidents(self):
+        """With 80 holds whose incidents are all open, the step makes no per-ticket read and does not list closed issues."""
+        # Create 80 holds with open incidents
+        held = {}
+        for i in range(6, 86):  # Issues 6-85
+            self.fake.add(i, state="running", lane="muse")
+            held["%s#%d" % (REPO, i)] = {"incident": "%s#%99" % REPO, "at": time.time()}
+        
+        _write_json(os.path.join(self.home, "state", "factory_held.json"), held)
+        
+        # Mock the read to track calls
+        read_calls = []
+        original_read = self.fake._issue_call
+        
+        def track_read(method, n, sub, data, query=""):
+            if sub is None:  # This is an issue read
+                read_calls.append(("issue", n))
+            return original_read(method, n, sub, data, query)
+        
+        self.fake._issue_call = track_read
+        
+        # Mock _closed_incidents to return empty (all incidents open)
+        with mock.patch.object(station.Station, "_closed_incidents", return_value={}):
+            self.run_pass()
+        
+        # Reset mock
+        self.fake._issue_call = original_read
+        
+        # The step should have made no per-ticket reads
+        self.assertEqual(len(read_calls), 0)
+
+    def test_release_factory_held_does_not_list_closed_issues(self):
+        """With open incidents, the step does not list closed issues."""
+        # Add a closed issue to the fake repo
+        self.fake.issues[87] = {
+            "number": 87,
+            "state": "closed",
+            "body": "Closed issue",
+            "user": {"login": "alice-example"},
+            "labels": [{"name": "loom:ticket"}]
+        }
+        
+        # Create a hold
+        held = {}
+        held["%s#%87" % REPO] = {"incident": "%s#%99" % REPO, "at": time.time()}
+        _write_json(os.path.join(self.home, "state", "factory_held.json"), held)
+        
+        # Mock the _paginate to track calls
+        paginate_calls = []
+        original_paginate = self.fake.paginate
+        
+        def track_paginate(path):
+            paginate_calls.append(path)
+            return original_paginate(path)
+        
+        self.fake.paginate = track_paginate
+        
+        # Mock _closed_incidents to return empty (all incidents open)
+        with mock.patch.object(station.Station, "_closed_incidents", return_value={}):
+            self.run_pass()
+        
+        # Reset mock
+        self.fake.paginate = original_paginate
+        
+        # The step should not have listed closed issues
+        closed_issue_paths = [p for p in paginate_calls if "/repos/%s/issues?state=closed" % REPO in p]
+        self.assertEqual(len(closed_issue_paths), 0)
 
 
 class FactoryNoIncidentHoldTest(Base):

@@ -6079,22 +6079,24 @@ class Station:
         ref = info.get("incident") if isinstance(info, dict) else None
         raw_at = (info or {}).get("at")
         at = float(raw_at) if raw_at is not None else None
-        try:
-            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
-            comments = self._paginate(
-                "/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
-        except RateLimited:
-            raise
-        except GitHubError as err:
-            _say("factory release: could not read %s#%d: %s" % (repo, number, err))
-            return
-        if not isinstance(issue, dict) or RUNNING not in _label_names(issue):
-            self._forget_held(key)
-            return
+        
+        # Handle incident filing failed case (ref is None)
         if ref is None:
             # The incident filing failed: nothing names an incident that can
             # close this hold, so release it once it has outlived
             # HELD_NO_INCIDENT_FOR instead of holding it forever.
+            try:
+                issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("factory release: could not read %s#%d: %s" % (repo, number, err))
+                return
+                
+            if not isinstance(issue, dict) or RUNNING not in _label_names(issue):
+                self._forget_held(key)
+                return
+                
             green = False
             if at is not None and self.now - at < HELD_NO_INCIDENT_FOR:
                 try:
@@ -6115,18 +6117,54 @@ class Station:
             _say("factory release: %s#%d re-queued: incident filing failed"
                  % (repo, number))
             return
-        incident = closed_incidents.get(ref) if ref else None
-        if incident is None or not any(isinstance(c, dict) and ref in str(c.get("body") or "")
-                                       for c in comments):
+        
+        # Skip reading issue and comments if the incident is still open
+        # We already know the ticket is running from _held_tickets check
+        if ref is not None and ref in closed_incidents:
+            incident = closed_incidents[ref]
+            
+            # Read issue and comments once for both checks
+            try:
+                issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+                comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+            except RateLimited:
+                raise
+            except GitHubError:
+                # If we can't read issue/comments, skip this hold
+                return
+            
+            # Check incident ref in both comments and issue body
+            has_incident_ref = False
+            if incident:
+                # Check comments
+                has_incident_ref = any(isinstance(c, dict) and ref in str(c.get("body") or "")
+                                      for c in comments)
+                # Also check issue body status section if we have the issue
+                if not has_incident_ref and isinstance(issue, dict):
+                    from . import status as status_module
+                    has_incident_ref = any(
+                        ref in event_text
+                        for event_time, event_text in status_module.body_events(issue.get("body"))
+                    )
+            
+            if not has_incident_ref:
+                return
+                
+            # Check if ticket was claimed after the incident closed
+            if self._claimed_since(comments, incident, repo, number):
+                return
+                
+            # Release the ticket
+            cleared = RUNAWAY in _label_names(issue)
+            self._release_one(key, repo, number, issue, cleared,
+                              "Factory incident %s is closed: the ticket is back in the queue "
+                              "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
+                                                  if cleared else ""))
+            _say("factory release: %s#%d re-queued after incident %s closed" % (repo, number, ref))
             return
-        if self._claimed_since(comments, incident):
-            return
-        cleared = RUNAWAY in _label_names(issue)
-        self._release_one(key, repo, number, issue, cleared,
-                          "Factory incident %s is closed: the ticket is back in the queue "
-                          "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
-                                              if cleared else ""))
-        _say("factory release: %s#%d re-queued after incident %s closed" % (repo, number, ref))
+            
+        # No more cases to handle
+        return
 
     def _green_default_after_hold(self, repo: str, held_at: float) -> bool:
         """Whether a newer commit on the default branch has all checks green."""
@@ -6166,15 +6204,40 @@ class Station:
         self._routine(repo, number, text)
         self._forget_held(key)
 
-    def _claimed_since(self, comments: List[Any], incident: Dict[str, Any]) -> bool:
+    def _claimed_since(self, comments: List[Any], incident: Dict[str, Any],
+                        repo: Optional[str] = None, number: Optional[int] = None) -> bool:
         """A lane claim comment is newer than the incident's close."""
         from . import factory as _factory
+        from . import status as status_module
         closed = self._epoch(str(incident.get("closed_at") or ""))
-        return closed is not None and any(
-            isinstance(c, dict)
-            and _factory.CLAIMED_RE.fullmatch(str(c.get("body") or "").strip())
-            and (self._epoch(str(c.get("created_at") or "")) or 0) > closed
-            for c in comments)
+        if closed is None:
+            return False
+        
+        # Check comments for claims
+        for c in comments:
+            if isinstance(c, dict):
+                body = str(c.get("body") or "").strip()
+                if _factory.CLAIMED_RE.fullmatch(body):
+                    created_at = self._epoch(str(c.get("created_at") or ""))
+                    if created_at is not None and created_at > closed:
+                        return True
+        
+        # Also check issue body if repo and number are provided
+        if repo is not None and number is not None:
+            try:
+                issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+                if isinstance(issue, dict):
+                    # Check issue body events for claims
+                    for event_time, event_text in status_module.body_events(issue.get("body")):
+                        if _factory.CLAIMED_RE.fullmatch(event_text.strip()):
+                            event_at = self._epoch(event_time)
+                            if event_at is not None and event_at > closed:
+                                return True
+            except (RateLimited, GitHubError):
+                # If we can't read the issue, skip body check
+                pass
+        
+        return False
 
     def _held_tickets(self) -> Dict[str, Any]:
         """Tickets the station held for a factory incident and has not yet
