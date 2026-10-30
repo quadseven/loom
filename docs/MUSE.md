@@ -788,7 +788,9 @@ already failed it, and never a free lane:
 
 A rung with one lane up holds a bounded few waiting tickets: past
 `ONE_LANE_MAX` (4), the overflow climbs to an untried rung whose least-loaded
-lane holds three or more fewer, even though that lane is not free. A stall the
+lane holds three or more fewer, even though that lane is not free. `bus.brain
+escalate` picks its rung by the same rule, counting the load over every
+`LOOM_REPOS` repo once per process and adding each ticket it moves. A stall the
 factory cannot move (no other lane of the rung or tier) is said once, when the
 ticket starts waiting for that reason, and then shows as a wait the station times.
 
