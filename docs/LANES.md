@@ -689,6 +689,19 @@ only what is its own, and adding an operator is configuration:
   (events by this Loom's App logins) are not activity for this lapse, so a
   ticket that moves between lanes and the brain still lapses; only the claim
   label's own putting-on, a person's act, or a pull request update count.
+- Engine claims have one referee (`bus/claim_referee.py`). Each engine that
+  works the backlog has one claim label (`LOOM_ENGINE_CLAIMS`). Every 30
+  minutes the station reads the open issues carrying one. With two or more it
+  keeps the one put on first (each label's newest labeled event) and removes
+  the others with a status note. It removes the claim it keeps when nothing
+  on the ticket is newer than 2 hours: no event by anyone but the station, no
+  update of an open pull request naming it, not the claim's putting-on. A
+  comment line `waiting: <what> until <time>` (ISO time, UTC unless it says
+  otherwise) holds the claim until that time plus 30 minutes. A claim label
+  that is not an engine's is a person's and is never touched. The first pass
+  over the claims that already exist removes at most 5 a run and posts no
+  notes; after it, at most 10 a run, and an expiry never posts a note.
+  `LOOM_CLAIM_REFEREE=dry` logs each removal instead, `off` skips the step.
 - The claim marks a run, not a ticket's whole life. Any station or brain move
   out of `loom:running` (a retry, a limit, a failure, a pull request opened, a
   merge) removes this Loom's own `claim:<login>` label in the same labels
