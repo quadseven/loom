@@ -9812,44 +9812,60 @@ class Station:
         if isinstance(last, (int, float)) and 0 <= self.now - last < claim_referee.EVERY:
             return
         first = not state.get("swept")
-        left = claim_referee.FIRST_PER_RUN if first else claim_referee.PER_RUN
-        whole = True
+        budget = {"left": claim_referee.FIRST_PER_RUN if first else claim_referee.PER_RUN,
+                  "spent": 0}
+        whole = False
         due: List[Tuple[str, Dict[str, Any]]] = []
-        start = spent = 0
+        start = 0
         try:
-            for repo in self._verify_repos():
-                if self._deferred():
-                    whole = False
-                    break
-                try:
-                    due += self._claims_due(repo)
-                except RateLimited:
-                    raise
-                except GitHubError as err:
-                    whole = False
-                    _say("could not read the claims of %s: %s" % (repo, err))
+            due, listed = self._all_claims_due()
             ordered, start = claim_referee.in_turn(due, state.get("turn"))
-            own_apps = sorted(self._own_apps())
-            trusted = list(self.s.authors) + list(self.s.briefers)
-            for repo, issue in ordered:
-                if left <= 0 or spent >= claim_referee.READS_PER_RUN or self._deferred():
-                    whole = False
-                    break
-                try:
-                    left -= self._referee_claim(repo, issue, first, own_apps, trusted)
-                except RateLimited:
-                    raise
-                except GitHubError as err:
-                    whole = False
-                    _say("could not referee %s#%s: %s" % (repo, issue.get("number"), err))
-                spent += 1
+            whole = self._referee_in_turn(ordered, first, budget) and listed
         finally:
             state["_at"] = self.now
-            state["turn"] = (start + spent) % len(due) if due else 0
+            state["turn"] = (start + budget["spent"]) % len(due) if due else 0
             if first and whole and self.s.claim_referee == "on":
                 state["swept"] = True
                 _say("the first claim referee pass is done")
             _write_json(path, state)
+
+    def _all_claims_due(self) -> Tuple[List[Tuple[str, Dict[str, Any]]], bool]:
+        """(every repo's issues whose engine claims may be due, whether every
+        repo could be listed)."""
+        due: List[Tuple[str, Dict[str, Any]]] = []
+        listed = True
+        for repo in self._verify_repos():
+            if self._deferred():
+                return due, False
+            try:
+                due += self._claims_due(repo)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not read the claims of %s: %s" % (repo, err))
+                listed = False
+        return due, listed
+
+    def _referee_in_turn(self, ordered: Sequence[Tuple[str, Dict[str, Any]]], first: bool,
+                         budget: Dict[str, int]) -> bool:
+        """Referee `ordered` within `budget` (issues changed, timelines read),
+        which keeps its count if a read raises; False when some went unread."""
+        own_apps = sorted(self._own_apps())
+        trusted = list(self.s.authors) + list(self.s.briefers)
+        whole = True
+        for repo, issue in ordered:
+            if (budget["left"] <= 0 or budget["spent"] >= claim_referee.READS_PER_RUN
+                    or self._deferred()):
+                return False
+            try:
+                budget["left"] -= self._referee_claim(repo, issue, first, own_apps, trusted)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                whole = False
+                _say("could not referee %s#%s: %s" % (repo, issue.get("number"), err))
+            budget["spent"] += 1
+        return whole
 
     def _claims_due(self, repo: str) -> List[Tuple[str, Dict[str, Any]]]:
         """The repo's open issues whose engine claims may be due, by number."""
