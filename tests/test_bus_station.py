@@ -9413,8 +9413,9 @@ class ReportsTest(Base):
         self.assertEqual(made, [])
 
     def simulated_day(self, goals):
-        """Every station pass (REPORT_CHECK apart) for 24 hours from a
-        reading time that is already reported, with a goal that never goes quiet (an open failed
+        """Every station pass (REPORT_CHECK apart) from a reading time
+        that is already reported until the same reading time on the next
+        calendar day, with a goal that never goes quiet (an open failed
         ticket) and a standup that never repeats (its ticket is renamed each
         pass): the new comments posted on each goal home."""
         from datetime import datetime as dt, timedelta
@@ -9423,6 +9424,14 @@ class ReportsTest(Base):
         day = dt.now(ZoneInfo("America/New_York")).date() + timedelta(days=1)
         start = dt(day.year, day.month, day.day, 10, 0,
                    tzinfo=ZoneInfo("America/New_York")).timestamp()
+        # The day ends at the same reading time on the next calendar day,
+        # not 24 clock hours later: on the day before a clock change that
+        # day is 23 or 25 hours long, and a 24-hour window would stop an
+        # hour short of (or run an hour past) the next 10:00 reading time,
+        # losing the report that is posted in its lead.
+        next_day = day + timedelta(days=1)
+        end = dt(next_day.year, next_day.month, next_day.day, 10, 0,
+                 tzinfo=ZoneInfo("America/New_York")).timestamp()
         clock = [start]
         posts = {number: 0 for number in goals}
 
@@ -9443,7 +9452,7 @@ class ReportsTest(Base):
             self.fake.comments[number][0]["created_at"] = time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime(start - station.STANDUP_LEAD))
         step = 0
-        while clock[0] < start + 24 * 3600:
+        while clock[0] < end:
             step += 1
             for number in goals:
                 self.fake.sub_issues[number] = [
