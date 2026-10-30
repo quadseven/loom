@@ -184,6 +184,23 @@
     });
   }
 
+  // The Floor (loom#2157): the lane strip and the Moving now rows are
+  // swapped in from /api/floor/live, so a ticket that changes hands or stage
+  // shows without a reload.
+  const liveHost = document.querySelector('[data-live-url]');
+  if (liveHost) {
+    window.loomPoll(liveHost.dataset.liveUrl, 5000, (payload) => {
+      ['lanes', 'moving'].forEach((name) => {
+        const slot = document.querySelector(`[data-live="${name}"]`);
+        // The fragments are the dashboard's own server-rendered HTML, every
+        // ticket and lane value escaped (dashboard/floor_lanes.py).
+        if (slot && typeof payload[name] === 'string' && slot.innerHTML !== payload[name]) {
+          slot.innerHTML = payload[name]; // nosemgrep: elder-js-unescaped-html-sink
+        }
+      });
+    });
+  }
+
   // Needs you (loom#1777): one-tap answers. The answer token and the
   // operator it answers as are kept in this browser only.
   const store = {

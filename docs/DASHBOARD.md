@@ -84,6 +84,19 @@ answers the station's live usage readings, `{readings, received_at}`, to the
 same two tokens: a brain off the lane machine reads usage there
 (`python3 -m bus.usage --live`), never from its own machine's files.
 
+The Floor's lane strip (loom#2157) shows every lane the Lanes page shows,
+with the open tickets in flight on it (briefed, running, pull request,
+merged, shipped, by the ticket's `lane:` label) and what the lane is doing:
+implementing, fix round (a running ticket with a `loom:fix` comment), in
+review, landing, verifying, or waiting for the station or to ship. A lane with
+no ticket reads "idle, able to take work" or "idle, held" with its reason, from
+the same lane status comment and usage heartbeats as the Lanes page. The strip
+and the Moving now rows are one read of that state, served at
+`GET /api/floor/live` as `{lanes, moving}` HTML fragments that the Floor's
+script swaps in every 5 seconds while the tab is visible. A change shows as
+soon as the background refresh (`LOOM_DASHBOARD_REFRESH_SECONDS`, default 60)
+or a usage heartbeat has read it.
+
 `/tickets` lists the tickets in flight in one table per goal home; `?done=1`
 lists merged, shipped, verified and closed ones, and `state`, `goal` and
 `model` filter it. Its model column is the model of the newest run among
