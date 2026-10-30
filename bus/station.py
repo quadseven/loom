@@ -11049,6 +11049,8 @@ class Station:
         state[key] = self.now
 
     def _standup_waiting_line(self, home: str, children: List[Any]) -> str:
+        """The data-only report's "Waiting on you:" line. A public home names
+        only public repos; a private home names every repo."""
         counts: Dict[str, int] = {}
         visibility: Dict[str, bool] = {}
         home_waiting = set()
@@ -11063,7 +11065,7 @@ class Station:
                 home_waiting = {int(issue.get("number") or 0) for issue in waiting}
         share = len(home_waiting & {int(child.get("number") or 0)
                                     for child in children if isinstance(child, dict)})
-        return waiting_line(counts, share, visibility)
+        return waiting_line(counts, share, visibility if self._public(home) else None)
 
     @staticmethod
     def _report_due(at: float) -> float:

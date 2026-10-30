@@ -9061,10 +9061,41 @@ class ReportsTest(Base):
                   for n in (51, 52)]
         with mock.patch.object(brain, "_issues", side_effect=[
                 first, second]), \
-                mock.patch.object(st, "_public", side_effect=[True, False]):
+                mock.patch.object(st, "_public", side_effect=lambda repo: repo == REPO):
             line = st._standup_waiting_line(REPO, children)
         self.assertEqual(line, "Waiting on you: 4 open loom:human (2 in %s, 2 in private repos; "
                          "1 of them under this goal), listed in the daily digest" % REPO)
+
+    def test_station_data_report_names_every_repo_on_a_private_home(self):
+        gh = GitHub("token", transport=self.fake)
+        st = station.Station(gh, self.settings, now=time.time())
+        st.s.repos = [REPO, "other-owner/other-repo"]
+        waiting = [{"number": 41, "state": "open", "labels": [{"name": "loom:human"}]}]
+        with mock.patch.object(brain, "_issues", return_value=waiting), \
+                mock.patch.object(st, "_public", return_value=False):
+            line = st._standup_waiting_line(REPO, [])
+        self.assertIn("1 in %s" % REPO, line)
+        self.assertIn("1 in other-owner/other-repo", line)
+        self.assertNotIn("private repos", line)
+
+    def test_station_data_report_folds_a_repo_it_cannot_read_on_a_public_home(self):
+        gh = GitHub("token", transport=self.fake)
+        st = station.Station(gh, self.settings, now=time.time())
+        st.s.repos = [REPO, "other-owner/other-repo"]
+        waiting = [{"number": 41, "state": "open", "labels": [{"name": "loom:human"}]}]
+        real = st.gh.rest
+
+        def rest(method, path, *args, **kwargs):
+            if path == "/repos/other-owner/other-repo":
+                raise station.GitHubError("not found", 404)
+            return mock.Mock(data={"private": False}) if path == "/repos/%s" % REPO \
+                else real(method, path, *args, **kwargs)
+
+        with mock.patch.object(brain, "_issues", return_value=waiting), \
+                mock.patch.object(st.gh, "rest", side_effect=rest):
+            line = st._standup_waiting_line(REPO, [])
+        self.assertEqual(line, "Waiting on you: 2 open loom:human (1 in %s, 1 in private repos; "
+                         "0 of them under this goal), listed in the daily digest" % REPO)
 
     def test_station_standup_lists_the_tickets_of_the_goals_epics(self):
         self.add_goal()

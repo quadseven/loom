@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import brain, journal, quiet  # noqa: E402
-from bus.github import GitHub  # noqa: E402
+from bus.github import GitHub, GitHubError  # noqa: E402
 from tests.test_quiet import (GOAL, ME, NOW, REPO, GoalHome, ago, report_comment,  # noqa: E402
                               ticket)
 
@@ -84,6 +84,12 @@ class CheckTest(unittest.TestCase):
             journal.waiting_line({"pub/a": 25, "unk/b": 7}, 4, public={"pub/a": True}),
             "Waiting on you: 32 open loom:human (25 in pub/a, 7 in private repos; 4 of them "
             "under this goal), listed in the daily digest")
+
+    def test_an_empty_visibility_map_names_no_repo(self):
+        self.assertEqual(
+            journal.waiting_line({"unk/a": 25, "unk/b": 7}, 4, public={}),
+            "Waiting on you: 32 open loom:human (32 in private repos; 4 of them under this "
+            "goal), listed in the daily digest")
 
     def test_a_needs_you_with_nothing_after_it_does_not_read_the_next_line(self):
         text = quiet.REPORT_MARKER + "\nNeeds you:\n" + journal.waiting_line({REPO: 3}, 1)
@@ -191,6 +197,24 @@ class StatusTest(unittest.TestCase):
             brain.status(gh, [REPO], REPO, env={"LOOM_BRIEF_AUTHORS": ME}, now=NOW,
                          authors=[ME], public={REPO: True})
         self.assertEqual(lines.call_args.args[2], {REPO: True})
+
+    def test_repo_visibility_counts_an_unreadable_repo_as_private(self):
+        gh = mock.Mock()
+        gh.rest.side_effect = [mock.Mock(data={"private": False}),
+                               mock.Mock(data={"private": True}),
+                               GitHubError("not found", 404),
+                               mock.Mock(data=None)]
+        self.assertEqual(brain.repo_visibility(gh, ["o/a", "o/b", "o/c", "o/d"]),
+                         {"o/a": True, "o/b": False, "o/c": False, "o/d": False})
+
+    def test_the_status_command_reads_and_passes_each_repos_visibility(self):
+        gh = mock.Mock()
+        gh.rest.side_effect = [mock.Mock(data={"private": False}), GitHubError("gone", 404)]
+        args = mock.Mock(repos=["o/a", "o/b"], lanes_repo="o/a", repo_budget=None)
+        with mock.patch.object(brain, "status") as status, \
+                mock.patch.object(brain, "_print_clock"):
+            brain._cmd_status(gh, args)
+        self.assertEqual(status.call_args.kwargs["public"], {"o/a": True, "o/b": False})
 
 
 if __name__ == "__main__":

@@ -372,19 +372,19 @@ def waiting_line(by_repo: Dict[str, int], share: int = 0,
     its own line, apart from "Needs you:", so that "nothing" never sits next
     to a non-zero count and a moving count never reads as a new ask (loom#1775).
 
-    `public` maps each repo to whether it may be named by name. For a public
-    goal home, repos that are not public are folded into one "N in private
-    repos" part and only public repos are named; a private home keeps every
-    repo named. The total and the "under this goal" count stay the same. A
-    repo whose visibility cannot be read counts as private. With no `public`
-    map every repo is named, as today."""
+    `public` maps each repo to whether it may be named by name; a caller
+    writing for a public goal home passes it. Repos it does not mark public
+    are folded into one "N in private repos" part and only public repos are
+    named. The total and the "under this goal" count stay the same. A repo
+    whose visibility cannot be read counts as private. With no `public` map,
+    as for a private home, every repo is named."""
     counts = [(repo, int(n)) for repo, n in by_repo.items() if int(n) > 0]
     total = sum(n for _, n in counts)
     if total == 0:
         return "Waiting on you: nothing"
     counts.sort(key=lambda item: (-item[1], item[0]))
-    nameable = [(repo, n) for repo, n in counts if not public or public.get(repo)]
-    folded = sum(n for repo, n in counts if public and not public.get(repo))
+    nameable = [(repo, n) for repo, n in counts if public is None or public.get(repo)]
+    folded = sum(n for repo, n in counts if public is not None and not public.get(repo))
     parts = ["%d in %s" % (n, repo) for repo, n in nameable]
     if folded:
         parts.append("%d in private repos" % folded)
