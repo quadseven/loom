@@ -8,6 +8,7 @@ from dashboard.shell import VIEWS
 NOW = datetime(2030, 1, 8, 12, 0, tzinfo=timezone.utc)
 START = NOW - timedelta(hours=24)
 REPO = "example-owner/sample"
+REF_41 = REPO + "#41"
 ISSUES = "https://api.github.com/repos/example-owner/sample/issues/%d"
 STATION = {"login": "station-bot[bot]", "type": "Bot"}
 BRAIN = {"login": "brain-bot[bot]", "type": "Bot"}
@@ -28,9 +29,9 @@ def comment(at, body, user=STATION, number=41):
 
 JOURNALS = [
     journal("2030-01-07T11:50:00Z", "muse", "nothing, before the window"),
-    journal("2030-01-08T09:00:00Z", "muse", "example-owner/sample#41 to codex"),
+    journal("2030-01-08T09:00:00Z", "muse", REF_41 + " to codex"),
     journal("2030-01-08T09:30:00Z", "muse", "<script>alert(1)</script> to claude"),
-    journal("2030-01-08T11:35:00Z", "muse", "example-owner/sample#42 to codex"),
+    journal("2030-01-08T11:35:00Z", "muse", REPO + "#42 to codex"),
     journal("2030-01-08T07:00:00Z", "operator-session", "a tally"),
     # A holder that last ticked days ago is not in today's fleet.
     journal("2030-01-05T07:00:00Z", "old-holder", "a tick from three days ago"),
@@ -93,7 +94,7 @@ class FleetBuildTest(unittest.TestCase):
     def test_journal_ticks_are_events_timed_by_the_tick_with_their_gist(self):
         muse = row(build(), "brain:muse")
         self.assertEqual([e["at"].strftime("%H:%M") for e in muse["events"]], ["09:00", "09:30", "11:35"])
-        self.assertEqual(muse["events"][0]["gist"], "ok: Briefed: example-owner/sample#41 to codex")
+        self.assertEqual(muse["events"][0]["gist"], "ok: Briefed: %s to codex" % REF_41)
         self.assertTrue(all(e["beat"] for e in muse["events"]))
         self.assertEqual(muse["cadence"], 30)
         self.assertEqual(muse["next"], datetime(2030, 1, 8, 12, 5, tzinfo=timezone.utc))
@@ -140,7 +141,7 @@ class FleetBuildTest(unittest.TestCase):
                          "round 1: Lane codex (model-x) pushed 1 commit for: Acceptance criteria not ticked")
         muse_lane = row(data, "lane:muse")
         self.assertEqual([(e["kind"], e["gist"]) for e in muse_lane["events"]],
-                         [("claim", "claimed example-owner/sample#2250")])
+                         [("claim", "claimed %s#2250" % REPO)])
         self.assertEqual(row(data, "lane:claude")["events"][0]["kind"], "failed")
 
     def test_reports_and_notes_rows_carry_their_new_york_due_marks(self):
@@ -171,7 +172,7 @@ class FleetRenderTest(unittest.TestCase):
         self.assertIn('class="fleet-miss"', self.page)
         self.assertIn("no tick for 125 minutes, cadence 30", self.page)
         self.assertIn("no run for 40 minutes, cadence 10", self.page)
-        self.assertIn('class="fleet-gist">09:00 ok: Briefed: example-owner/sample#41 to codex', self.page)
+        self.assertIn('class="fleet-gist">09:00 ok: Briefed: %s to codex' % REF_41, self.page)
         self.assertIn("next 12:05", self.page)
         # The axis: 24 hours back and 2 ahead, one pixel a minute, with the now line.
         self.assertIn('style="--fleet-w:%dpx"' % (26 * 60), self.page)
