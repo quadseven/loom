@@ -390,7 +390,7 @@ utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
 
 # Body of one "## <name>" section of the brief, blank lines dropped.
 section() {
-  awk -v h="## $1" '$0 == h {on=1; next} /^#+ / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
+  awk -v h="## $1" '$0 == h {on=1; next} /^##? / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
 }
 
 # The acceptance criteria of $1, blank lines dropped: its "## Acceptance

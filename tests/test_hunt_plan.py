@@ -105,6 +105,70 @@ class ProblemsTest(unittest.TestCase):
                 self.assertTrue(any(expected in p for p in hunt_plan.problems(body)),
                                 hunt_plan.problems(body))
 
+    def test_demoted_why_heading_is_named_instead_of_counted_as_zero(self):
+        body = """### Why
+This is a substantial explanation for the requested change.
+
+## Acceptance criteria
+- [ ] First criterion.
+- [ ] Second criterion.
+- [ ] Third criterion.
+
+Size: S
+
+## Out of scope
+- Other changes.
+"""
+        problems = hunt_plan.problems(body)
+        self.assertTrue(any("no ## Why heading (found ### Why)" in problem
+                            for problem in problems), problems)
+        self.assertFalse(any("0 words" in problem for problem in problems), problems)
+
+    def test_why_words_include_lower_level_subheadings(self):
+        body = """## Why
+Short intro.
+
+### Further notes
+These nested details explain the issue and make the section long enough.
+
+## Summary
+Cache the query.
+"""
+        why = hunt_plan._section_text(body, "Why")
+        self.assertIsNotNone(why)
+        self.assertGreaterEqual(len(why.split()), 5)
+        self.assertNotIn("Cache the query.", why)
+
+    def test_reported_body_shape_names_the_nested_why_heading(self):
+        body = """## Further notes
+### Why
+The current behavior loses useful context across several related steps.
+The explanation remains here as multiple paragraphs under the nested heading.
+
+## What
+Keep the context available to triage.
+"""
+        problems = hunt_plan.problems(body)
+        self.assertTrue(any("no ## Why heading (found ### Why)" in problem
+                            for problem in problems), problems)
+        self.assertFalse(any("0 words" in problem for problem in problems), problems)
+
+
+class BriefSectionTest(unittest.TestCase):
+    def test_brief_section_keeps_nested_subheadings_until_next_level_two(self):
+        brief = """## Why
+Short intro.
+
+### Further notes
+These nested details belong to the Why section.
+
+## What
+Cache the query.
+"""
+        self.assertEqual(
+            pr_repair._brief_section(brief, "Why"),
+            "Short intro.\n### Further notes\nThese nested details belong to the Why section.")
+
 
 class PadCriteriaTest(unittest.TestCase):
     """The gate counts three non-empty bullets under Acceptance criteria. A

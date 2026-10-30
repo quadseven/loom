@@ -1110,6 +1110,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("pull request body rebuilt from the brief", self.run_log())
         self.assertEqual(self.sticky_bodies(), [])
 
+    def test_generated_why_includes_text_under_nested_brief_headings(self):
+        brief = BRIEF.replace(
+            "The thing is broken for every user.",
+            "Short intro.\n\n### Further notes\n"
+            "These nested details explain the problem across several steps.")
+        self.drop_brief(text=brief)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        why = self.body.read_text().split("## Why\n", 1)[1].split("\n\n## Summary", 1)[0]
+        self.assertEqual(why, "Short intro.\n### Further notes\n"
+                         "These nested details explain the problem across several steps.")
+
     def test_a_brief_that_cannot_fill_the_body_opens_a_marked_pull_request_and_notes_the_ticket(self):
         brief = BRIEF.replace("S: one function.", "big")
         self.drop_brief(text=brief)
