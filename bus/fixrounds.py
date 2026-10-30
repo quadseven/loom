@@ -65,6 +65,46 @@ SHOWN_LINES = 12
 LINE_CHARS = 300
 # The ledger keeps the newest edits only; an older comment reads opaque.
 LEDGER_KEEP = 5000
+_REVISION = re.compile(r"^[0-9a-f]{40}$")
+
+
+def transition_finding(finding: Mapping[str, Any], action: str, revision: str,
+                      current_revision: str, commit: str = "",
+                      commit_files: Iterable[str] = (),
+                      reason_accepted: bool = False) -> Optional[Dict[str, Any]]:
+    """Apply one idempotent finding transition at its recorded PR revision.
+
+    Answers require a pushed commit touching the finding's cited path, or an
+    explicit reviewer acceptance. Stale revisions and skipped states refuse.
+    """
+    recorded = str(finding.get("revision") or "").lower()
+    submitted = str(revision or "").lower()
+    current = str(current_revision or "").lower()
+    state = str(finding.get("state") or "pending")
+    if not (_REVISION.fullmatch(recorded) and submitted == recorded == current):
+        return None
+    result = dict(finding)
+    if action == "picked_up":
+        if state == "picked_up":
+            return result
+        if state != "pending":
+            return None
+        result["state"] = "picked_up"
+        return result
+    if action != "answered":
+        return None
+    if state == "answered":
+        return result
+    if state != "picked_up":
+        return None
+    path = str(finding.get("path") or "")
+    if not reason_accepted and (not _REVISION.fullmatch(str(commit or "").lower())
+                                or path not in set(commit_files)):
+        return None
+    result.update(state="answered", answer_revision=submitted)
+    if commit:
+        result["commit"] = str(commit).lower()
+    return result
 
 
 def is_rounds(body: Any) -> bool:

@@ -3916,6 +3916,26 @@ class FixRoundsInPlaceTest(unittest.TestCase):
                 "comments": {"nodes": [{"databaseId": 9, "body": "change this",
                                          "author": {"login": "grug-tribe[bot]"}}]}}
 
+    def test_finding_revision_protocol_requires_pickup_and_cited_commit(self):
+        finding = {"id": "PRRT_1", "path": "a.py", "revision": "a" * 40,
+                   "state": "pending"}
+        picked = fixrounds.transition_finding(finding, "picked_up", "a" * 40,
+                                               "a" * 40)
+        self.assertEqual(picked["state"], "picked_up")
+        self.assertEqual(fixrounds.transition_finding(picked, "picked_up", "a" * 40,
+                                                       "a" * 40), picked)
+        stale = fixrounds.transition_finding(picked, "answered", "b" * 40,
+                                              "b" * 40, "c" * 40, ["a.py"])
+        self.assertIsNone(stale)
+        wrong_file = fixrounds.transition_finding(picked, "answered", "a" * 40,
+                                                   "a" * 40, "c" * 40, ["other.py"])
+        self.assertIsNone(wrong_file)
+        answered = fixrounds.transition_finding(picked, "answered", "a" * 40,
+                                                 "a" * 40, "c" * 40, ["a.py"])
+        self.assertEqual(answered["state"], "answered")
+        self.assertEqual(fixrounds.transition_finding(answered, "answered", "a" * 40,
+                                                       "a" * 40, "c" * 40, ["a.py"]), answered)
+
     def lane_pushes(self, sha):
         """The lane claimed the round, ran it and pushed: the ticket is back
         at loom:pr."""
