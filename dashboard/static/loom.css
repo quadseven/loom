@@ -806,3 +806,42 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 @media (max-width: 959px) {
   .tree-row a, .tree-bar .chip { display: inline-flex; min-height: 44px; align-items: center; }
 }
+
+/* Fleet timeline (loom#2280): one row per engine, one pixel a minute. The
+   axis scrolls inside its own box, so a phone never scrolls the page
+   sideways; the row heads stay put. A mark's gist is a fixed strip shown
+   on hover or focus, so a tap on a phone shows it without any script. */
+.fleet-span { margin: -8px 0 12px; }
+.fleet-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--row); }
+.fleet-grid { width: max-content; min-width: 100%; }
+.fleet-row { display: flex; align-items: stretch; border-top: 1px solid var(--line); }
+.fleet-row:first-child { border-top: 0; }
+.fleet-head { position: sticky; left: 0; z-index: 2; display: grid; flex: 0 0 156px; align-content: center; gap: 2px; padding: 8px 10px; border-right: 1px solid var(--line); background: var(--row); font-size: 13px; }
+.fleet-head strong { font-weight: 600; overflow-wrap: anywhere; }
+.fleet-head .machine-fact { font-size: 10.5px; line-height: 1.35; overflow-wrap: anywhere; }
+.fleet-track { position: relative; flex: 0 0 var(--fleet-w); min-height: 44px; }
+.fleet-axis .fleet-track { min-height: 22px; }
+.fleet-hour { position: absolute; top: 3px; padding-left: 4px; border-left: 1px solid var(--line-strong); color: var(--muted); font: 10px var(--font-mono); white-space: nowrap; }
+.fleet-due, .fleet-next, .fleet-now { position: absolute; top: 0; bottom: 0; width: 0; }
+.fleet-due { border-left: 1px dashed var(--line-strong); }
+.fleet-next { border-left: 2px dotted var(--info); }
+.fleet-now { border-left: 2px solid var(--accent); }
+.fleet-ev { position: absolute; top: 10px; width: 12px; height: 24px; margin-left: -6px; border-radius: 3px; background: var(--info); cursor: pointer; }
+.fleet-ev.ev-tick-failed, .fleet-ev.ev-failed { background: var(--bad); }
+.fleet-ev.ev-shipped, .fleet-ev.ev-merged { background: var(--good); }
+.fleet-ev.ev-heartbeat, .fleet-ev.ev-status, .fleet-ev.ev-note { background: var(--muted); }
+.fleet-ev.ev-beat { top: 18px; width: 4px; height: 8px; margin-left: -2px; background: var(--dim); }
+.fleet-ev.ev-report { background: var(--accent); }
+.fleet-miss { position: absolute; top: 19px; height: 6px; background: repeating-linear-gradient(90deg, var(--bad) 0 5px, transparent 5px 9px); cursor: pointer; }
+.fleet-ev:focus, .fleet-miss:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+.fleet-gist { display: none; position: fixed; left: 16px; right: 16px; bottom: 24px; z-index: 12; padding: 10px 12px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface); color: var(--text); font: 13px/1.45 var(--font-sans); overflow-wrap: anywhere; }
+.fleet-ev:hover .fleet-gist, .fleet-ev:focus .fleet-gist, .fleet-miss:hover .fleet-gist, .fleet-miss:focus .fleet-gist { display: block; }
+.fleet-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 12px 0 8px; padding: 0; list-style: none; }
+.fleet-legend li { display: flex; align-items: center; gap: 6px; }
+.fleet-legend i { position: static; display: inline-block; width: 12px; height: 14px; margin: 0; }
+.fleet-legend .fleet-due, .fleet-legend .fleet-next, .fleet-legend .fleet-now { width: 0; }
+.fleet-legend .fleet-miss { width: 28px; height: 6px; }
+@media (max-width: 959px) {
+  .fleet-head { flex-basis: 124px; }
+  .fleet-gist { left: 16px; right: 16px; bottom: calc(88px + env(safe-area-inset-bottom)); }
+}
