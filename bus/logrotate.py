@@ -25,7 +25,7 @@ from typing import Callable, Dict, List
 
 Say = Callable[[str], None]
 
-LSOF = "/usr/sbin/lsof"
+LSOF = shutil.which("lsof") or "/usr/sbin/lsof"
 LSOF_TIMEOUT = 30
 # KeepAlive services (lanes/mac/install.sh): launchd opens these paths once,
 # so a renamed one would never get a successor.
