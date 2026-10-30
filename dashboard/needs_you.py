@@ -27,6 +27,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote
 
 from bus import answer as answers_lib
+from bus.kinds import HUMAN_KINDS, HUMAN_KIND_RE
 
 from . import operators, views
 
@@ -191,9 +192,13 @@ KINDS = (
     ("decide", "Decisions", "a reply settles each one"),
     ("access", "Access and credentials", "a sign-in, a key, a grant or a purchase"),
     ("device", "On a device or in person", "hands on a machine, a phone or a cable"),
+    ("unknown", "Unknown kind", "kind not recognized; Loom needs to learn it"),
     ("other", "Other asks", ""),
     ("missing", "No exact ask written", "an agent should write one; nothing here says what to do"),
 )
+
+# Regex for the "Kind: K" line.
+_HUMAN_KIND_RE = re.compile(HUMAN_KIND_RE, re.MULTILINE)
 _ACCESS_RE = re.compile(r"\b(sign in|log in|oauth|api key|token|credentials?|password|secret|rotate|"
                         r"grant|access|role|mint|reconnect|buy|buying|purchase|usd)\b", re.I)
 _DEVICE_RE = re.compile(r"\b(handsets?|phones?|router|monitor|power(ed)?[ -](it )?(on|off|cycle)|plug|"
@@ -243,10 +248,16 @@ def current_answer(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def action_kind(entry: Dict[str, Any]) -> str:
-    """decide, access, device, other, or missing (no ask written)."""
+    """decide, access, device, unknown, other, or missing (no ask written)."""
     text = ask_text(entry)
     if not text:
         return "missing"
+    # Check for explicit "Kind: X" in the ask - if present and not a known human kind, it's unknown
+    kind_match = _HUMAN_KIND_RE.search(text)
+    if kind_match:
+        kind_value = kind_match.group(1).strip().lower()
+        if kind_value not in HUMAN_KINDS:
+            return "unknown"
     for kind, pattern in (("access", _ACCESS_RE), ("device", _DEVICE_RE), ("decide", _DECIDE_RE)):
         if pattern.search(text):
             return kind
@@ -374,16 +385,19 @@ def _who_name(login: str) -> str:
 
 def summary(shown: List[Dict[str, Any]]) -> str:
     """One headline: how many items wait, on whom, how many a reply settles,
-    and the oldest."""
+    how many have unknown kind, and the oldest."""
     esc = html.escape
     tally = counts(shown)
     whom = ", ".join("%d on %s" % (count, _who_name(login)) for login, count in
                      sorted(tally.items(), key=lambda pair: (-pair[1], pair[0])))
     decide = sum(1 for entry in shown if action_kind(entry) == "decide")
+    unknown = sum(1 for entry in shown if action_kind(entry) == "unknown")
     oldest = next(iter(_oldest_first(shown)), None)
     parts = ['<p class="needs-headline"><strong>%d item%s wait on people</strong>: %s.</p>' % (
         len(shown), "" if len(shown) == 1 else "s", esc(whom))]
     facts = ["%d settled by a reply" % decide]
+    if unknown:
+        facts.append("%d unknown kind" % unknown)
     if oldest is not None and _since(oldest):
         facts.append("Oldest: %s, %s" % (ref(oldest), views.format_age(_since(oldest)) or "age unknown"))
     parts.append('<p class="machine-fact">%s.</p>' % esc("; ".join(facts)))
@@ -553,15 +567,16 @@ def goal_caps_section(stored: Any, now: float) -> str:
         return ""
     esc = html.escape
     rows = "".join(
-        '<li class="card"><strong>%s</strong> stuck at its cap for %.0f hours: %d of %d in flight, '
-        '%d blocked on no lane.</li>' % (
+        '<li class="card"><strong>%s</strong> has been full for %.0f hours: %d of %d tickets in '
+        'progress (the limit), %d with no lane able to take them. Waits on: Loom.</li>' % (
             esc(goal["goal"]), max(0.0, now - goal["since"]) / 3600, goal["in_flight"], goal["cap"],
             goal["no_lane"])
         for goal in stored["goals"])
-    return ('<section class="needs-group needs-goal-caps" data-kind="goal-caps"><h2>Goals stuck at '
-            'their cap (%d)</h2><p class="muted">the station skips their triage rewrites; tickets no '
-            'lane takes are rerouted after hours and go to the hand-off pool within a day</p>'
-            '<ul>%s</ul></section>') % (len(stored["goals"]), rows)
+    return ('<section class="needs-group needs-goal-caps" data-kind="goal-caps"><h2>Stuck in Loom, '
+            'not waiting on you (%d)</h2><p class="muted">Loom is working these itself: it skips '
+            'their triage rewrites, reroutes tickets no lane takes after a few hours, and hands '
+            'them to the hand-off pool within a day. Nothing to do unless one is still stuck '
+            'after a day.</p><ul>%s</ul></section>') % (len(stored["goals"]), rows)
 
 
 

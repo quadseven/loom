@@ -189,7 +189,7 @@ by `OWNER/NAME` (`example-owner/app#7`) is one item when only one
 configured repo has that name. The Floor's "Needs you" count is the same
 deduplicated list.
 
-Above the cards, "Goals stuck at their cap" lists each goal the station found
+Above the cards, "Stuck in Loom, not waiting on you" lists each goal the station found
 at its in-flight cap for over 6 hours: how long, its count against the cap,
 and how many of its in-flight tickets wait with no lane that takes them
 (docs/BRAIN.md, Tickets no lane takes). The station sends the list with the

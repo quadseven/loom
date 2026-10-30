@@ -858,12 +858,13 @@ class InvariantsCloseTest(ShadowCase):
     NOW = 1_800_000_000.0
     NUMBER = 77
 
-    def wire(self, state="open", labels=("loom:triage", "loom:invariant")):
+    def wire(self, state="open", labels=("loom:triage", "loom:invariant"),
+             key="lane-pr-stalled/ad09a1c365b8", age=86400):
         breach = {"number": self.NUMBER, "state": state, "title": "Lane pull request #5 open",
-                  "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW - 86400)),
+                  "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW - age)),
                   "closed_at": None if state == "open" else time.strftime(
                       "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW - 3600)),
-                  "body": invariants.MARKER % "lane-pr-stalled/ad09a1c365b8" + "\nA breach.",
+                  "body": invariants.MARKER % key + "\nA breach.",
                   "labels": [{"name": name} for name in labels]}
         sent = []
 
@@ -882,12 +883,29 @@ class InvariantsCloseTest(ShadowCase):
             return 404, {}, b"{}"
         return transport, sent
 
-    def run_filer(self, transport, breaches=()):
+    def run_filer(self, transport, breaches=(), **kwargs):
         said = []
         with mock.patch("bus.github.urllib_transport", transport):
             gh = GitHub("t")
-            invariants.Filer(gh, REPO, 30, {}, self.NOW, said.append).run(list(breaches))
+            invariants.Filer(gh, REPO, 30, {}, self.NOW, said.append,
+                             **kwargs).run(list(breaches))
         return said
+
+    def test_a_settled_close_is_held_in_shadow_and_recorded(self):
+        # loom#2022: the settled close asks the same guard before its note.
+        subject = "%s#5" % REPO
+        key = invariants.Breach("lane-pr-stalled", subject, "", (), 0.0).key
+        transport, sent = self.wire(labels=("loom:triage", "loom:invariant", "loom:recurring"),
+                                    key=key, age=600)
+        said = self.run_filer(transport, subjects={key: subject},
+                              settled=lambda inv, sub: "lane pull request #5 merged at x")
+        self.assertEqual(sent, [], "shadow mode sent a close or a note")
+        [entry] = self.entries()
+        self.assertEqual((entry["action"], entry["number"], entry["source"]),
+                         (shadow.CLOSE, self.NUMBER, "station invariants"))
+        self.assertIn("settled", entry.get("reason", ""))
+        self.assertTrue(any("would close" in line for line in said), said)
+        self.assertFalse(any("closed settled" in line for line in said), said)
 
     def test_a_cleared_breach_closes_in_shadow_too(self):
         # 2026-10-26: 35 breach issues the station had marked cleared stayed
@@ -963,8 +981,10 @@ class EveryPathTest(unittest.TestCase):
         ("bus/invariants.py", "_reopen"): "self._held(",
         ("bus/invariants.py", "_fold"): "self._held(",
         ("bus/invariants.py", "_close_quiet"): "self._held(",
+        ("bus/invariants.py", "_close_settled"): "self._held(",
         ("bus/station.py", "_close_done_ticket"): "shadow.active(",
         ("bus/station.py", "_settle_claimed"): "shadow.active(",
+        ("bus/sweep.py", "_close"): "shadow.guard(",
         ("bus/watch.py", "_close_quiet"): "shadow.guard(",
     }
     # A state of "closed" or "open" that is no write: the guard's own tables

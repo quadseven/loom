@@ -10,6 +10,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import hunt_plan, lane, station  # noqa: E402
+from bus.github import GitHubError  # noqa: E402
 
 # The lane's own App login, trusted as the station's LOOM_BRIEF_AUTHORS is
 # (docs/MUSE.md): every comment the fake posts is written as it.
@@ -45,10 +46,17 @@ class FakeGitHub:
         if path == "/repos/example/project":
             return type("Response", (), {"data": {"private": self.private,
                                                      "default_branch": "main"}})()
-        if path.endswith("/issues/4") and method == "GET":
-            return type("Response", (), {"data": self.issues[4]})()
-        if path.endswith("/issues/4/labels") and method == "PUT":
-            self.issues[4]["labels"] = [{"name": x} for x in body["labels"]]
+        m = re.search(r"/issues/(\d+)$", path)
+        if m and method == "GET":
+            n = int(m.group(1))
+            if n not in self.issues:
+                raise GitHubError("GET %s -> 404" % path, 404, "")
+            return type("Response", (), {"data": self.issues[n]})()
+        m = re.search(r"/issues/(\d+)/labels$", path)
+        if m and method == "PUT":
+            n = int(m.group(1))
+            if n in self.issues:
+                self.issues[n]["labels"] = [{"name": x} for x in body["labels"]]
         m = re.search(r"/issues/(\d+)/comments$", path)
         if m and method == "POST":
             n = int(m.group(1))
@@ -68,6 +76,10 @@ class FakeGitHub:
         if path.endswith("/pulls") and method == "POST":
             return type("Response", (), {"data": {"number": 9, "html_url": "https://example.com/pr/9"}})()
         return type("Response", (), {"data": {}})()
+
+    def app_login(self):
+        # The App identity the lane authenticates as, as GitHub.app_login reads it.
+        return APP
 
     def paginate(self, path):
         names = [x["name"] for x in self.issues[4]["labels"]]
@@ -368,6 +380,63 @@ class OutsiderCommentTests(unittest.TestCase):
         lane.heartbeat(gh, "example/project", 4, now=1000)
         self.assertFalse(any(m == "PATCH" for m, _, _ in gh.calls))
         self.assertEqual("<!-- loom:remote-claim v1 muse 4 1000.000 -->", gh.comments[4][-1]["body"])
+
+
+class OwnAppLoginTests(unittest.TestCase):
+    """The lane trusts its own App login even when LOOM_BRIEF_AUTHORS omits
+    it (loom#2008): otherwise it never finds its last marker and posts a new
+    comment, and a notification email, every tick."""
+
+    ENVS = ({"LOOM_BRIEF_AUTHORS": "operator-example"}, {"LOOM_BRIEF_AUTHORS": ""}, None)
+
+    def env(self, values):
+        if values is None:
+            patcher = mock.patch.dict(os.environ, {}, clear=False)
+            patcher.start()
+            os.environ.pop("LOOM_BRIEF_AUTHORS", None)
+        else:
+            patcher = mock.patch.dict(os.environ, values)
+            patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_two_lane_heartbeats_leave_one_status_comment(self):
+        for values in self.ENVS:
+            with self.subTest(env=values):
+                self.env(values)
+                gh = FakeGitHub()
+                lane.lane_heartbeat(gh, "example/project", now=1000)
+                lane.lane_heartbeat(gh, "example/project", now=2000)
+                self.assertEqual(len(gh.comments[9]), 1)
+                self.assertIn(" 2000.000 ", gh.comments[9][0]["body"])
+
+    def test_repeated_claim_beats_edit_one_claim_comment(self):
+        for values in self.ENVS:
+            with self.subTest(env=values):
+                self.env(values)
+                gh = FakeGitHub()
+                gh.issues[4]["labels"] = [{"name": "loom:running"}, {"name": "lane:muse"}]
+                for at in (1000, 1100, 1200):
+                    lane.heartbeat(gh, "example/project", 4, now=at)
+                self.assertEqual(len(gh.comments[4]), 1)
+                self.assertEqual(gh.comments[4][0]["body"],
+                                 "<!-- loom:remote-claim v1 muse 4 1200.000 1000.000 -->")
+
+    def test_an_outsider_marker_still_does_not_count(self):
+        self.env({"LOOM_BRIEF_AUTHORS": "operator-example"})
+        gh = FakeGitHub()
+        gh.comments[9].append({"id": 900, "body": "<!-- loom:remote-heartbeat v1 muse 1.000 -->",
+                               "created_at": "now", "user": {"login": OUTSIDER}})
+        lane.lane_heartbeat(gh, "example/project", now=1000)
+        self.assertEqual(gh.comments[9][0]["body"], "<!-- loom:remote-heartbeat v1 muse 1.000 -->")
+        self.assertEqual(len(gh.comments[9]), 2)
+
+    def test_a_client_without_an_app_login_trusts_only_the_configured_logins(self):
+        self.env({"LOOM_BRIEF_AUTHORS": "operator-example"})
+        gh = FakeGitHub()
+        gh.app_login = lambda: None
+        lane.lane_heartbeat(gh, "example/project", now=1000)
+        lane.lane_heartbeat(gh, "example/project", now=2000)
+        self.assertEqual(len(gh.comments[9]), 2)
 
 
 class DefaultDifficultyTests(unittest.TestCase):
@@ -737,6 +806,77 @@ class PushBranchTests(unittest.TestCase):
             git("add", "file.txt")
         with self.assertRaises(GitHubError):
             self._push_one_commit(edit, refs_post_status=500)
+
+
+class ConfirmClaimTests(unittest.TestCase):
+    def test_confirm_claim_refuses_a_ticket_that_does_not_exist(self):
+        gh = FakeGitHub()
+        with self.assertRaises(ValueError) as caught:
+            lane.confirm_claim(gh, "example/project", 99, now=1000)
+        self.assertIn("does not exist", str(caught.exception))
+
+    def test_confirm_claim_refuses_a_closed_ticket(self):
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        gh.issues[4]["state"] = "closed"
+        with self.assertRaises(ValueError) as caught:
+            lane.confirm_claim(gh, "example/project", 4, now=1000)
+        self.assertIn("not open", str(caught.exception))
+
+    def test_confirm_claim_refuses_a_ticket_that_is_not_running(self):
+        gh = FakeGitHub()
+        with self.assertRaises(ValueError) as caught:
+            lane.confirm_claim(gh, "example/project", 4, now=1000)
+        self.assertIn("loom:running", str(caught.exception))
+
+    def test_confirm_claim_refuses_a_ticket_held_by_another_lane(self):
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        gh.issues[4]["labels"] = [{"name": x} for x in
+                                  ("loom:ticket", "loom:running", "lane:codex")]
+        with self.assertRaises(ValueError) as caught:
+            lane.confirm_claim(gh, "example/project", 4, now=1000)
+        self.assertIn("lane muse", str(caught.exception))
+
+    def test_confirm_claim_refuses_without_a_claim_comment(self):
+        gh = FakeGitHub()
+        gh.issues[4]["labels"] = [{"name": x} for x in
+                                  ("loom:ticket", "loom:running", "lane:muse")]
+        with self.assertRaises(ValueError) as caught:
+            lane.confirm_claim(gh, "example/project", 4, now=1000)
+        self.assertIn("no live claim", str(caught.exception))
+
+    def test_confirm_claim_refuses_a_pull_request(self):
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        gh.issues[4]["pull_request"] = {"url": "https://example.com/pulls/4"}
+        with self.assertRaises(ValueError) as caught:
+            lane.confirm_claim(gh, "example/project", 4, now=1000)
+        self.assertIn("pull request", str(caught.exception))
+
+    def test_confirm_claim_refuses_a_ticket_without_brief_headers(self):
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        gh.issues[4]["body"] = "## Why\nA body with no brief headers.\n"
+        with self.assertRaises(ValueError) as caught:
+            lane.confirm_claim(gh, "example/project", 4, now=1000)
+        self.assertIn("no brief headers", str(caught.exception))
+
+    def test_confirm_claim_returns_the_ticket_and_its_brief_headers(self):
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        got = lane.confirm_claim(gh, "example/project", 4, now=1000)
+        self.assertEqual(got["number"], 4)
+        self.assertEqual(got["title"], "Add a feature")
+        self.assertEqual(got["headers"], {"Difficulty": "medium"})
+
+    def test_confirm_claim_refuses_a_stale_claim(self):
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        with self.assertRaises(ValueError) as caught:
+            lane.confirm_claim(gh, "example/project", 4,
+                              now=1000 + lane.CLAIM_AGE + 1)
+        self.assertIn("no live claim", str(caught.exception))
 
 
 if __name__ == "__main__":
