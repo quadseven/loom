@@ -810,6 +810,52 @@ class SettledSubjectTest(StationBase):
         (note,) = self.notes(filed)
         self.assertIn("epic #40 is closed", note)
 
+    def test_a_merged_pr_without_subject_map_entry_settles_its_issue(self):
+        """loom#2257: a lane-pr-stalled issue whose PR merged while the
+        station was down (no subject map entry) still settles on the next
+        pass by reading the PR state from the REST API."""
+        filed = self.stalled()
+        # Simulate the PR being merged while the station was down.
+        # Clear the local pulls cache so the breach is NOT detected this pass.
+        self.gh.pulls[REPO] = []
+        # The PR state from REST API shows merged.
+        self.gh.pull_state[(REPO, 660)] = {
+            "state": "closed", "merged_at": stamp(T0 + 100), "closed_at": stamp(T0 + 100)
+        }
+        # The subject map (self.subjects) has no entry for this breach key
+        # because the breach is not detected in the current pass.
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+        self.assertEqual(filed["state_reason"], "not_planned")
+        (note,) = self.notes(filed)
+        self.assertIn("pull request #660 merged at %s" % stamp(T0 + 100), note)
+        self.assertIn(invariants.CLEARED_TEXT, note)
+
+    def test_an_open_pr_without_subject_map_entry_stays_open(self):
+        """loom#2257: a lane-pr-stalled issue whose PR is still open but
+        has no subject map entry (breach not detected this pass) stays open."""
+        filed = self.stalled()
+        # The PR is still open - in the local pulls cache.
+        # The breach IS detected this pass, so it has a subject map entry.
+        # This test verifies the normal path still works.
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "open")
+        self.assertEqual(self.notes(filed), [])
+
+    def test_a_closed_unmerged_pr_without_subject_map_entry_settles_its_issue(self):
+        """loom#2257: a lane-pr-stalled issue whose PR was closed unmerged
+        while the station was down (no subject map entry) still settles."""
+        filed = self.stalled()
+        # Simulate the PR being closed unmerged while the station was down.
+        self.gh.pulls[REPO] = []
+        self.gh.pull_state[(REPO, 660)] = {
+            "state": "closed", "merged_at": None, "closed_at": stamp(T0 + 100)
+        }
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+        (note,) = self.notes(filed)
+        self.assertIn("pull request #660 was closed unmerged at %s" % stamp(T0 + 100), note)
+
 
 class FilerTest(unittest.TestCase):
     def setUp(self):

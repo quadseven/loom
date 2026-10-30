@@ -1383,6 +1383,32 @@ class Filer:
             if why and self._close_settled(number, issue, why):
                 self.subjects.pop(key, None)
 
+        # Also check open lane-pr-stalled issues from the listing that have no
+        # subject map entry (the breach was not detected this pass, e.g. PR
+        # merged while station was down). The listing has the issue; the
+        # settled callback reads PR state from the REST API.
+        if self.settled is not None:
+            for key, number in listing.items():
+                if self.writes + 2 > WRITES_MAX:
+                    return
+                if key in current or key in self.subjects:
+                    continue
+                if not key.startswith("lane-pr-stalled/"):
+                    continue
+                if number in self._listed_closed:
+                    continue
+                issue = self._issue(number)
+                if issue is None or issue.get("state") != "open":
+                    continue
+                if TICKET_LABEL in self._label_names(issue):
+                    continue
+                invariant = "lane-pr-stalled"
+                subject = key.split("/", 1)[1]
+                why = self._settled_why(invariant, subject, number)
+                if why and self._close_settled(number, issue, why):
+                    # The issue is closed; nothing more to track.
+                    pass
+
     def _settled_why(self, invariant: str, subject: str, number: int) -> Optional[str]:
         """The caller's word on whether the subject settled; None when it has
         none or cannot read it this pass (a rate limit still stops the pass)."""
