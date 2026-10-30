@@ -9423,6 +9423,11 @@ class ReportsTest(Base):
         day = dt.now(ZoneInfo("America/New_York")).date() + timedelta(days=1)
         start = dt(day.year, day.month, day.day, 10, 0,
                    tzinfo=ZoneInfo("America/New_York")).timestamp()
+        # The same reading time the next day, not 24 hours on: a clock change
+        # makes that day 23 or 25 hours long.
+        next_day = day + timedelta(days=1)
+        end = dt(next_day.year, next_day.month, next_day.day, 10, 0,
+                 tzinfo=ZoneInfo("America/New_York")).timestamp()
         clock = [start]
         posts = {number: 0 for number in goals}
 
@@ -9443,7 +9448,7 @@ class ReportsTest(Base):
             self.fake.comments[number][0]["created_at"] = time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime(start - station.STANDUP_LEAD))
         step = 0
-        while clock[0] < start + 24 * 3600:
+        while clock[0] < end:
             step += 1
             for number in goals:
                 self.fake.sub_issues[number] = [
