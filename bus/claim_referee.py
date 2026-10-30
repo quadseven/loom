@@ -13,9 +13,12 @@ and, per issue:
   with a short status note;
 - removes the engine claim it keeps when nothing on the ticket is newer than
   IDLE seconds: no ACTIVITY event by the claimer or a trusted login and not
-  the claim's own putting-on. An open pull request one of them wrote that
-  names the ticket holds the claim for as long as it is open: its updated_at
-  moves on anyone's comment, so it is no measure of work. A comment line `waiting: <what> until <time>` by the claimer or
+  the claim's own putting-on. An open pull request one of them wrote, in the
+  same repo, that one of them referenced from the ticket holds the claim for
+  MAX_PULL_HOLD after that reference: updated_at moves on anyone's comment, so
+  it is no measure of work, and an abandoned pull request must not pin a
+  ticket. stale_claims.stale keeps its own looser rule for operators' claims,
+  which a pull request of any age or repo holds. A comment line `waiting: <what> until <time>` by the claimer or
   a trusted login holds the claim until that time plus GRACE, and the time
   counts for at most MAX_WAIT after the comment. The repos take comments from
   strangers: nobody else can keep a claim alive, or end a stated wait.
@@ -28,8 +31,9 @@ Loom label (stale_claims.loom_managed: an operator's own session, which
 bus/claimed.py settles) never expire; a duplicate is still removed. Any claim
 label that is not an engine claim is a person's and is never read or touched.
 A timeline is read for every issue with two engine claims or one that may
-expire, whatever its updated_at, which a stranger's comment moves. At most
-READS_PER_RUN a run; past that, in_turn takes the next ones the next run.
+expire, whatever its updated_at, which a stranger's comment moves. All repos
+share one due list and at most READS_PER_RUN a run; the state file keeps the
+place in it, so the next run reads on from where this one stopped.
 
 The first run over the claims that already exist is the first pass: at most
 FIRST_PER_RUN issues a run and no note on any of them, until a run finds
@@ -44,14 +48,15 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from .stale_claims import (CLAIM_PREFIX, _login, _made_by, _open_pull_of, _stamp, loom_managed,
-                           running)
+from .stale_claims import CLAIM_PREFIX, _login, _made_by, _stamp, loom_managed, running
 
 ENGINE_CLAIMS = ("claim:claude-code", "claim:muse", "claim:dot", "claim:ccqw")
 IDLE = 2 * 3600
 GRACE = 30 * 60
 # A stated wait's time counts for at most this long after its comment.
 MAX_WAIT = 24 * 3600
+# A writer's open pull request holds the claim this long after its reference.
+MAX_PULL_HOLD = 7 * 24 * 3600
 EVERY = 1800
 PER_RUN = 10
 FIRST_PER_RUN = 5
@@ -109,13 +114,13 @@ def needs_timeline(issue: Dict[str, Any], engine_labels: Iterable[str]) -> bool:
     return len(claims) > 1 or (bool(claims) and may_expire(issue))
 
 
-def in_turn(due: Sequence[Any], now: float) -> List[Any]:
-    """`due` starting READS_PER_RUN further on each run, so that a run that
-    spends its reads does not leave the same issues unread every time."""
+def in_turn(due: Sequence[Any], turn: Any) -> Tuple[List[Any], int]:
+    """`due` from the saved place `turn` on, wrapping, and the place it
+    started from, which a run moves on by the reads it spent."""
     if not due:
-        return []
-    start = int(now // EVERY) * READS_PER_RUN % len(due)
-    return list(due[start:]) + list(due[:start])
+        return [], 0
+    start = turn % len(due) if isinstance(turn, int) and not isinstance(turn, bool) else 0
+    return list(due[start:]) + list(due[:start]), start
 
 
 def may_expire(issue: Dict[str, Any]) -> bool:
@@ -200,9 +205,23 @@ def last_activity(issue: Dict[str, Any], timeline: Sequence[Dict[str, Any]], lab
     return max(known) if known else None
 
 
-def has_open_pull(timeline: Sequence[Dict[str, Any]], writers: Iterable[str]) -> bool:
-    """An open pull request by one of `writers` references the issue."""
-    return any(_open_pull_of(event, login) for event in timeline for login in writers)
+def has_open_pull(issue: Dict[str, Any], timeline: Sequence[Dict[str, Any]],
+                  writers: Iterable[str], now: float) -> bool:
+    """A writer referenced an open pull request by a writer, in the issue's
+    repo, within MAX_PULL_HOLD."""
+    logins = set(writers)
+    home = str(issue.get("repository_url") or "").lower()
+    for event in timeline:
+        source = event.get("source") if isinstance(event.get("source"), dict) else {}
+        pull = source.get("issue") if isinstance(source.get("issue"), dict) else {}
+        said = _stamp(event.get("created_at"))
+        if (event.get("event") == "cross-referenced" and "pull_request" in pull
+                and pull.get("state") == "open" and _login(event.get("actor")) in logins
+                and _login(pull.get("user")) in logins
+                and home and str(pull.get("repository_url") or "").lower() == home
+                and said is not None and now - said < MAX_PULL_HOLD):
+            return True
+    return False
 
 
 def plan(issue: Dict[str, Any], timeline: Iterable[Any], now: float,
@@ -233,7 +252,7 @@ def plan(issue: Dict[str, Any], timeline: Iterable[Any], now: float,
     until = wait_until(events, writers)
     if until is not None and now < until + GRACE:
         return removed
-    if has_open_pull(events, writers):
+    if has_open_pull(issue, events, writers, now):
         return removed
     last = last_activity(issue, events, keep, writers)
     if last is not None and now - last < IDLE:

@@ -9800,7 +9800,9 @@ class Station:
         run finds nothing more to remove (the first pass over the claims that
         already exist), at most FIRST_PER_RUN issues a run and no notes; then
         at most PER_RUN, a duplicate's removal noted in the ticket's status.
-        "dry" logs each removal and writes nothing."""
+        All repos share one due list and READS_PER_RUN timeline reads, and
+        the state file keeps the place in the list across runs. "dry" logs
+        each removal and writes nothing."""
         if self.s.claim_referee not in ("on", "dry"):
             return
         path = os.path.join(self.state, claim_referee.STATE_FILE)
@@ -9810,31 +9812,47 @@ class Station:
         if isinstance(last, (int, float)) and 0 <= self.now - last < claim_referee.EVERY:
             return
         first = not state.get("swept")
-        budget = {"left": claim_referee.FIRST_PER_RUN if first else claim_referee.PER_RUN,
-                  "reads": claim_referee.READS_PER_RUN}
+        left = claim_referee.FIRST_PER_RUN if first else claim_referee.PER_RUN
         whole = True
+        due: List[Tuple[str, Dict[str, Any]]] = []
+        start = spent = 0
         try:
             for repo in self._verify_repos():
                 if self._deferred():
                     whole = False
                     break
                 try:
-                    whole = self._referee_claims_repo(repo, budget, first) and whole
+                    due += self._claims_due(repo)
                 except RateLimited:
                     raise
                 except GitHubError as err:
                     whole = False
-                    _say("could not referee the claims of %s: %s" % (repo, err))
+                    _say("could not read the claims of %s: %s" % (repo, err))
+            ordered, start = claim_referee.in_turn(due, state.get("turn"))
+            own_apps = sorted(self._own_apps())
+            trusted = list(self.s.authors) + list(self.s.briefers)
+            for repo, issue in ordered:
+                if left <= 0 or spent >= claim_referee.READS_PER_RUN or self._deferred():
+                    whole = False
+                    break
+                try:
+                    left -= self._referee_claim(repo, issue, first, own_apps, trusted)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    whole = False
+                    _say("could not referee %s#%s: %s" % (repo, issue.get("number"), err))
+                spent += 1
         finally:
             state["_at"] = self.now
+            state["turn"] = (start + spent) % len(due) if due else 0
             if first and whole and self.s.claim_referee == "on":
                 state["swept"] = True
                 _say("the first claim referee pass is done")
             _write_json(path, state)
 
-    def _referee_claims_repo(self, repo: str, budget: Dict[str, int], first: bool) -> bool:
-        """Referee the repo's engine-claimed issues within `budget` (issues
-        changed, timelines read); False when the budget ran out first."""
+    def _claims_due(self, repo: str) -> List[Tuple[str, Dict[str, Any]]]:
+        """The repo's open issues whose engine claims may be due, by number."""
         engines = self.s.engine_claims
         present = {str(label.get("name") or "").lower() for label in self.gh.paginate(
             "/repos/%s/labels" % repo) if isinstance(label, dict)}
@@ -9846,31 +9864,31 @@ class Station:
                                         % (repo, quote(label, safe=":"))):
                 if isinstance(issue, dict) and "pull_request" not in issue:
                     found[int(issue["number"])] = issue
-        own_apps = sorted(self._own_apps())
-        trusted = list(self.s.authors) + list(self.s.briefers)
+        return [(repo, issue) for _, issue in sorted(found.items())
+                if claim_referee.needs_timeline(issue, engines)]
+
+    def _referee_claim(self, repo: str, issue: Dict[str, Any], first: bool,
+                       own_apps: Sequence[str], trusted: Sequence[str]) -> int:
+        """Read one issue's timeline and apply plan(): 1 if it changed, or
+        would in dry mode, else 0."""
+        number = int(issue["number"])
+        timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
+        removals = claim_referee.plan(issue, timeline, self.now, self.s.engine_claims,
+                                      own_apps, trusted)
+        if not removals:
+            return 0
         dry = self.s.claim_referee == "dry"
-        due = [(number, issue) for number, issue in sorted(found.items())
-               if claim_referee.needs_timeline(issue, engines)]
-        for number, issue in claim_referee.in_turn(due, self.now):
-            if budget["left"] <= 0 or budget["reads"] <= 0:
-                return False
-            budget["reads"] -= 1
-            timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
-            removals = claim_referee.plan(issue, timeline, self.now, engines, own_apps, trusted)
-            if not removals:
-                continue
-            budget["left"] -= 1
-            for removal in removals:
-                if dry:
-                    _say("%s#%d: would remove %s: %s" % (repo, number, removal.label, removal.why))
-                else:
-                    self._unlabel(repo, number, removal, source="station referee_claims")
-            duplicates = [r for r in removals if r.duplicate]
-            if duplicates and not first and not dry:
-                self._routine(repo, number, "Removed the claim label %s: %s. One engine "
-                              "claim per ticket." % (", ".join(r.label for r in duplicates),
-                                                     duplicates[0].why))
-        return True
+        for removal in removals:
+            if dry:
+                _say("%s#%d: would remove %s: %s" % (repo, number, removal.label, removal.why))
+            else:
+                self._unlabel(repo, number, removal, source="station referee_claims")
+        duplicates = [r for r in removals if r.duplicate]
+        if duplicates and not first and not dry:
+            self._routine(repo, number, "Removed the claim label %s: %s. One engine "
+                          "claim per ticket." % (", ".join(r.label for r in duplicates),
+                                                 duplicates[0].why))
+        return 1
 
     def _foreign_claimed(self, repo: str) -> Dict[int, Dict[str, Any]]:
         """The repo's open issues another operator claims by label, or that

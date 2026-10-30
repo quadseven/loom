@@ -28,6 +28,8 @@ HOUR = 3600
 ENGINES = ("claim:engine-a", "claim:engine-b")
 STATION = ("loom-app[bot]",)
 TRUSTED = ("an-operator", "loom-app[bot]")
+REPO_URL = "https://api.example.com/repos/%s" % REPO
+OTHER_REPO = "example-owner/other-repo"
 
 
 def at(seconds_ago):
@@ -38,7 +40,7 @@ def issue(number, labels=("claim:engine-a",), updated=5 * HOUR, created=48 * HOU
           assignees=()):
     return {"number": number, "title": "Issue %d" % number, "state": "open",
             "created_at": at(created), "updated_at": at(updated),
-            "user": {"login": "someone"},
+            "user": {"login": "someone"}, "repository_url": REPO_URL,
             "labels": [{"name": x} for x in labels + ("loom:queued",)],
             "assignees": [{"login": x} for x in assignees]}
 
@@ -53,11 +55,12 @@ def commented(by, ago, body="a note"):
             "body": body, "created_at": at(ago)}
 
 
-def pull(by, ago, state="open"):
-    return {"event": "cross-referenced", "actor": {"login": by}, "created_at": at(5 * HOUR),
+def pull(by, ago, state="open", referenced=5 * HOUR, source_repo=REPO_URL, referrer=None):
+    return {"event": "cross-referenced", "actor": {"login": referrer or by},
+            "created_at": at(referenced),
             "source": {"type": "issue", "issue": {
                 "pull_request": {}, "state": state, "user": {"login": by},
-                "updated_at": at(ago)}}}
+                "repository_url": source_repo, "updated_at": at(ago)}}}
 
 
 def wait_line(seconds_ahead):
@@ -198,6 +201,28 @@ class WhoCounts(unittest.TestCase):
     def test_a_trusted_pull_request_holds(self):
         self.assertFalse(self.expired(pull("an-operator", 5 * HOUR)))
 
+    def test_a_pull_request_in_another_repo_does_not_hold(self):
+        other = "https://api.example.com/repos/a-stranger/a-fork"
+        self.assertTrue(self.expired(pull("an-operator", 600, source_repo=other)))
+
+    def test_a_pull_request_with_no_known_repo_does_not_hold(self):
+        self.assertTrue(self.expired(pull("an-operator", 600, source_repo=None)))
+
+    def test_a_reference_by_a_stranger_to_a_writers_pull_does_not_hold(self):
+        self.assertTrue(self.expired(pull("an-operator", 600, referrer="a-stranger")))
+
+    def test_an_abandoned_pull_request_stops_holding(self):
+        ago = claim_referee.MAX_PULL_HOLD + HOUR
+        line = [labeled("claim:engine-a", "engine-a[bot]", ago + HOUR),
+                pull("engine-a[bot]", 600, referenced=ago)]
+        self.assertEqual(["claim:engine-a"], labels_of(plan(issue(1), line)))
+
+    def test_a_pull_request_holds_up_to_its_limit(self):
+        ago = claim_referee.MAX_PULL_HOLD - HOUR
+        line = [labeled("claim:engine-a", "engine-a[bot]", ago + HOUR),
+                pull("engine-a[bot]", 600, referenced=ago)]
+        self.assertEqual([], plan(issue(1), line))
+
     def test_a_closed_pull_request_does_not_hold_or_count_its_update(self):
         self.assertTrue(self.expired(pull("engine-a[bot]", 600, state="closed")))
 
@@ -318,12 +343,13 @@ class Settings(unittest.TestCase):
 
 
 class Fake:
-    def __init__(self):
+    def __init__(self, repo=REPO):
+        self.repo = repo
         self.issues, self.timelines, self.writes, self.reads = {}, {}, [], []
 
     def __call__(self, method, url, headers, body):
         parts = urlsplit(url)
-        rest = parts.path[len("/repos/%s/" % REPO):]
+        rest = parts.path[len("/repos/%s/" % self.repo):]
         query = parse_qs(parts.query)
         if method != "GET":
             self.writes.append((method, unquote(rest), json.loads(body) if body else None))
@@ -341,6 +367,20 @@ class Fake:
         if rest.endswith("/timeline"):
             number = int(rest.split("/")[1])
             return 200, {}, json.dumps(self.timelines.get(number, [])).encode()
+        raise AssertionError("unexpected %s %s" % (method, url))
+
+
+class Repos:
+    """Sends each request to the fake of the repo in its path."""
+
+    def __init__(self, *fakes):
+        self.fakes = fakes
+
+    def __call__(self, method, url, headers, body):
+        path = urlsplit(url).path
+        for fake in self.fakes:
+            if path.startswith("/repos/%s/" % fake.repo):
+                return fake(method, url, headers, body)
         raise AssertionError("unexpected %s %s" % (method, url))
 
 
@@ -362,9 +402,18 @@ class Step(unittest.TestCase):
         with open(self.state_path(), "w") as fh:
             json.dump({"swept": True}, fh)
 
-    def run_step(self, now=None):
-        station.Station(GitHub("t", transport=self.fake), self.settings,
+    def run_step(self, now=None, transport=None):
+        station.Station(GitHub("t", transport=transport or self.fake), self.settings,
                         now=now or time.time()).referee_claims()
+
+    def live(self, fake, count):
+        """`count` claims put on a minute ago: each read, none removed."""
+        for number in range(1, count + 1):
+            fake.issues[number] = issue(number)
+            fake.timelines[number] = [labeled("claim:engine-a", "engine-a[bot]", 60)]
+
+    def read(self, fake):
+        return [r for r in fake.reads if r.endswith("/timeline")]
 
     def idle(self, number, labels=("claim:engine-a",)):
         self.fake.issues[number] = issue(number, labels=labels)
@@ -418,17 +467,44 @@ class Step(unittest.TestCase):
         self.run_step()
         self.assertEqual([("DELETE", "issues/1/labels/claim:engine-a", None)], self.fake.writes)
 
-    def test_every_claim_is_read_within_two_passes_past_the_read_budget(self):
+    def test_every_claim_is_read_in_turn_whatever_the_count(self):
+        reads = claim_referee.READS_PER_RUN
+        for count in (reads // 2, reads, reads + 10, reads * 2, reads * 3):
+            with self.subTest(count=count):
+                self.swept()
+                self.fake = Fake()
+                self.live(self.fake, count)
+                now = time.time()
+                passes = -(-count // reads)
+                for turn in range(passes):
+                    self.run_step(now + turn * claim_referee.EVERY)
+                self.assertEqual(count, len(set(self.read(self.fake))))
+
+    def test_a_later_repo_is_not_starved_by_the_shared_read_budget(self):
+        reads = claim_referee.READS_PER_RUN
+        for first, second in ((reads, reads), (reads + 10, 5), (reads * 2, reads // 2)):
+            with self.subTest(first=first, second=second):
+                self.swept()
+                self.settings.repos = [REPO, OTHER_REPO]
+                one, two = Fake(), Fake(OTHER_REPO)
+                self.live(one, first)
+                self.live(two, second)
+                now = time.time()
+                passes = -(-(first + second) // reads)
+                for turn in range(passes):
+                    self.run_step(now + turn * claim_referee.EVERY, Repos(one, two))
+                self.assertEqual(first, len(set(self.read(one))))
+                self.assertEqual(second, len(set(self.read(two))))
+
+    def test_a_run_ended_by_the_change_limit_advances_only_past_its_reads(self):
         self.swept()
-        count = claim_referee.READS_PER_RUN + 10
-        for number in range(1, count + 1):
-            self.fake.issues[number] = issue(number)
-            self.fake.timelines[number] = [labeled("claim:engine-a", "engine-a[bot]", 60)]
+        for number in range(1, 13):
+            self.idle(number)
         now = time.time()
         self.run_step(now)
-        self.run_step(now + claim_referee.EVERY)
-        read = {r for r in self.fake.reads if r.endswith("/timeline")}
-        self.assertEqual(count, len(read))
+        self.assertEqual(claim_referee.PER_RUN, len(set(self.read(self.fake))))
+        with open(self.state_path()) as fh:
+            self.assertEqual(claim_referee.PER_RUN, json.load(fh)["turn"])
 
     def test_a_briefers_wait_holds_and_the_stations_and_a_strangers_do_not(self):
         self.swept()
