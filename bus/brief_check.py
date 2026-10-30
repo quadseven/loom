@@ -21,7 +21,7 @@ Before the station hands a ticket to a lane (`check`), it reads:
   ask to add already exists on the default branch. A merged pull request of
   the ticket's own repo is bus/station.py's verify-before-build, which sends
   the ticket to a verify run. A stale ticket goes back to the queue with
-  `loom:human` and one ask naming the evidence, once per piece of evidence:
+  `needs:human` and one ask naming the evidence, once per piece of evidence:
   when the operator gives it back to the factory, the same evidence does not
   hold it again.
 - health: a ticket health intake filed (its health marker), or one whose Why
@@ -462,5 +462,5 @@ def ask(verdict: Verdict) -> str:
     return ("Kind: decision\n%s\nThis ticket did not go to a build lane: %s. A lane that "
             "builds a stale ticket rewrites working code to match it. Close the ticket if "
             "its work is done, or rewrite it to what is still missing and remove "
-            "`loom:human`; this evidence will not hold it again."
+            "`needs:human`; this evidence will not hold it again."
             % (ASK_MARKER % verdict.key, verdict.reason))

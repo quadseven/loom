@@ -3844,7 +3844,7 @@ class HumanAndRefsTests(unittest.TestCase):
                          {"body": brain.HUMAN_MARKER + "\nBuy a test phone.\nKind: hardware"})
         self.assertEqual(fake.calls[2][0], "DELETE")
         self.assertTrue(fake.calls[2][1].endswith("/issues/6/labels/loom%3Atriage"))
-        self.assertEqual(fake.calls[3][2], {"labels": ["loom:human"]})
+        self.assertEqual(fake.calls[3][2], {"labels": ["needs:human"]})
 
     def test_human_refusals_write_nothing(self):
         cases = [(item(6, labels=["loom:human"]), "Kind: money\nBuy it."),
@@ -4117,7 +4117,7 @@ class OnboardTests(unittest.TestCase):
         issue = posted[0][2]
         self.assertEqual(issue["title"], "Goal: Loom or a person works every open %s issue" % REPO)
         self.assertEqual(issue["labels"], ["loom:goal", "loom:backlog"])
-        for part in ("## Destination", "## Metric", "## Rules", "loom:human",
+        for part in ("## Destination", "## Metric", "## Rules", "needs:human",
                      "never closes an issue", "train on prompts"):
             self.assertIn(part, issue["body"])
         self.assertIn("backlog goal home: #100, created", lines)

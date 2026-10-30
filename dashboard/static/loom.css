@@ -247,6 +247,8 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .lane-held .lane-dot, .lane-dot.lane-held { background: var(--bad); }
 .lane-held .lane-state { color: var(--bad-on-bg); }
 .lane-state { font-size: 11px; }
+.lane-tickets { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }
+.lane-activity { color: var(--accent-on-bg); font: 11px var(--font-mono); }
 .lane-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding-top: 6px; border-top: 1px solid var(--line); color: var(--muted); font: 11px var(--font-mono); }
 .lane-model { color: var(--muted); font: 11px var(--font-mono); overflow-wrap: anywhere; }
 .lane-quota { display: inline-flex; align-items: center; gap: 6px; }

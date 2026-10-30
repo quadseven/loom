@@ -5014,7 +5014,7 @@ echo fixed > fix.txt
         self.expired_key_lane()
         filed = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(filed), 1, self.calls())
-        self.assertIn("--label needs-operator", filed[0])
+        self.assertIn("--label needs:human", filed[0])
         self.assertIn("renew /k/go", filed[0])
         # The next lane to hit that key finds the open ask and edits one
         # repeat comment on it, so the operator has one thread to answer, not
@@ -5541,7 +5541,7 @@ exit %d
         self.assertTrue(self.beat()["available"])
         ask = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(ask), 1, self.calls())
-        self.assertIn("--label needs-operator", ask[0])
+        self.assertIn("--label needs:human", ask[0])
         self.assertIn("renew the codex lane sign-in", ask[0])
 
     def test_a_cli_sign_in_that_timed_out_is_auth_not_transient(self):

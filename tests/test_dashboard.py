@@ -561,7 +561,7 @@ class BacklogHelperTest(unittest.TestCase):
         self.assertLess(body.index("#3"), body.index("#4"))
         self.assertIn("idle", body)
         self.assertIn("Exact ask", body)
-        self.assertIn("loom:human counts by repo", body)
+        self.assertIn("needs:human counts by repo", body)
 
 
 class LanesAndImprovingTest(unittest.TestCase):

@@ -48,7 +48,10 @@ from . import scope_fit
 from . import shadow
 from . import urgency
 from . import stale_claims
+from . import ask_state
+from . import brief_check
 from . import label_pass
+from .labels import HUMAN_LABELS, NEEDS_HUMAN, needs_human
 from . import factory
 from . import friction_intake
 from . import evidence
@@ -187,7 +190,6 @@ LANES_MARKER = "<!-- loom:lanes v1 -->"
 LANES_LABEL = "loom:lanes"
 LANES_TITLE = "Loom lane status"
 LANES_REPUBLISH = 3600
-NEEDS_OPERATOR = "needs-operator"
 URGENT = "loom:urgent"
 REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
@@ -195,7 +197,7 @@ POST_TIMEOUT = 30
 # A usage snapshot that fails once is sent again after this pause (loom#345).
 USAGE_RETRY_PAUSE = 2
 DIGEST_HEAD = "Asks waiting for you:"
-# Open loom:human issues wait for the daily digest.
+# Open needs:human issues wait for the daily digest.
 HUMAN = "loom:human"
 # Why a ticket waits (bus/labels.py): one wait:* label at a time.
 WAIT = "wait:"
@@ -660,8 +662,8 @@ STATELESS_TEXT = ("Queued: this ticket carried no state label, so nothing would 
 # Labels that mean someone or something already holds a ticket: any Loom
 # state or hold, a person's claim, an operator ask, or a wait.
 _HOLD_LABELS = {"loom:" + state for state in brain.STATES} | {
-    "loom:triage", "loom:human", "loom:held", "loom:ready", "loom:awaiting-evidence",
-    "loom:closed-unmerged", "needs-operator", "needs-brain"}
+    "loom:triage", "loom:held", "loom:ready", "loom:awaiting-evidence",
+    "loom:closed-unmerged", "needs-brain", *HUMAN_LABELS}
 
 
 def _holds_ticket(name: str) -> bool:
@@ -4443,7 +4445,7 @@ class Station:
         """Whether the ticket goes to no build lane (bus/brief_check.py): a
         health ticket whose cause is missing or names only the measurement
         goes back to the queue with needs-brain; a stale or already-shipped
-        one goes back to the queue with loom:human and one ask. A read the
+        one goes back to the queue with needs:human and one ask. A read the
         check needs that fails holds the ticket for the next pass. A
         regression or revert ticket is checked for its cause only: its merged
         pull request is why it exists."""
@@ -6045,32 +6047,22 @@ class Station:
         held = self._held_tickets()
         if not held:
             return
-        try:
-            closed_incidents = self._closed_incidents()
-        except RateLimited:
-            raise
-        except GitHubError as err:
-            _say("factory release: could not read the closed incidents: %s" % err)
-            return
-        for key, info in list(held.items()):
-            self._release_held(key, info, closed_incidents)
+        cursor_path = os.path.join(self.state, "factory_held_cursor.json")
+        cursor = _read_json(cursor_path, {}, strict=False)
+        start = cursor.get("next", 0) if isinstance(cursor, dict) else 0
+        entries = list(held.items())
+        start = start if isinstance(start, int) and 0 <= start < len(entries) else 0
+        self._factory_incidents = {}
+        for offset in range(len(entries)):
+            index = (start + offset) % len(entries)
+            try:
+                self._release_held(*entries[index])
+            except TargetReached:
+                _write_json(cursor_path, {"next": (index + 1) % len(entries)})
+                raise
+            _write_json(cursor_path, {"next": (index + 1) % len(entries)})
 
-    def _closed_incidents(self) -> Dict[str, Dict[str, Any]]:
-        """Closed factory incidents the runner filed, by "owner/repo#n".
-
-        Incidents are found by the body marker, not the loom:factory label:
-        the label may not exist in a repo (loom#918), so filtering on it
-        loses every unlabelled incident. Closed issues are listed without the
-        label and then matched on the marker."""
-        closed: Dict[str, Dict[str, Any]] = {}
-        for incident in self._paginate(
-                "/repos/%s/issues?state=closed&per_page=100" % FACTORY_REPO):
-            if isinstance(incident, dict) and INCIDENT_MARKER in str(incident.get("body") or ""):
-                closed["%s#%d" % (FACTORY_REPO, incident.get("number"))] = incident
-        return closed
-
-    def _release_held(self, key: str, info: Any,
-                      closed_incidents: Dict[str, Dict[str, Any]]) -> None:
+    def _release_held(self, key: str, info: Any) -> None:
         """Re-queue one held ticket: a closed and named incident, or a hold
         with no incident (the filing failed) that has outlived
         HELD_NO_INCIDENT_FOR. Forget it once it is no longer running."""
@@ -6079,6 +6071,15 @@ class Station:
         ref = info.get("incident") if isinstance(info, dict) else None
         raw_at = (info or {}).get("at")
         at = float(raw_at) if raw_at is not None else None
+        try:
+            incident = self._factory_incident(ref) if ref else None
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("factory release: could not read incident %s: %s" % (ref, err))
+            return
+        if ref and incident is None:
+            return
         try:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
             comments = self._paginate(
@@ -6115,11 +6116,15 @@ class Station:
             _say("factory release: %s#%d re-queued: incident filing failed"
                  % (repo, number))
             return
-        incident = closed_incidents.get(ref) if ref else None
-        if incident is None or not any(isinstance(c, dict) and ref in str(c.get("body") or "")
-                                       for c in comments):
+        if incident is None:
             return
-        if self._claimed_since(comments, incident):
+        body_events = status.body_events(issue.get("body"))
+        event_comments = list(comments) + [
+            {"body": text, "created_at": created} for created, text in body_events]
+        if not any(ref in str(c.get("body") or "") for c in event_comments
+                   if isinstance(c, dict)):
+            return
+        if self._claimed_since(event_comments, incident):
             return
         cleared = RUNAWAY in _label_names(issue)
         self._release_one(key, repo, number, issue, cleared,
@@ -6127,6 +6132,32 @@ class Station:
                           "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
                                               if cleared else ""))
         _say("factory release: %s#%d re-queued after incident %s closed" % (repo, number, ref))
+
+    def _factory_incident(self, ref: str) -> Optional[Dict[str, Any]]:
+        """Read one named incident once per pass; return it only when closed."""
+        cache = getattr(self, "_factory_incidents", {})
+        if ref in cache:
+            return cache[ref]
+        repo, _, raw_number = ref.rpartition("#")
+        if not repo or not raw_number.isdigit():
+            cache[ref] = None
+            self._factory_incidents = cache
+            return None
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, int(raw_number))).data
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("factory release: could not read incident %s: %s" % (ref, err))
+            cache[ref] = None
+            self._factory_incidents = cache
+            return None
+        if not isinstance(issue, dict) or issue.get("state") != "closed" \
+                or INCIDENT_MARKER not in str(issue.get("body") or ""):
+            issue = None
+        cache[ref] = issue
+        self._factory_incidents = cache
+        return issue
 
     def _green_default_after_hold(self, repo: str, held_at: float) -> bool:
         """Whether a newer commit on the default branch has all checks green."""
@@ -6167,7 +6198,7 @@ class Station:
         self._forget_held(key)
 
     def _claimed_since(self, comments: List[Any], incident: Dict[str, Any]) -> bool:
-        """A lane claim comment is newer than the incident's close."""
+        """A lane claim in a comment or the issue body is newer than close."""
         from . import factory as _factory
         closed = self._epoch(str(incident.get("closed_at") or ""))
         return closed is not None and any(
@@ -6298,7 +6329,7 @@ class Station:
                 ])
                 ask += f"\n\n{accept_block}"
                 brain.human(self.gh, repo, number, ask)
-                _say("%s#%d: only removed-guarded-path on named paths; moved to loom:human for accept-removal"
+                _say("%s#%d: only removed-guarded-path on named paths; moved to needs:human for accept-removal"
                      % (repo, number))
                 return
         # An infra timeout (bus/flake.py) is no lane's to fix: it is re-run
@@ -7784,18 +7815,24 @@ class Station:
     # -- asks -------------------------------------------------------------
     def _poll_asks(self, repo: str) -> List[Dict[str, Any]]:
         # A conditional read, like _poll.
-        items = self.gh.rest(
-            "GET", "/repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, NEEDS_OPERATOR)).data
-        items = items if isinstance(items, list) else []
-        return [i for i in items if isinstance(i, dict) and "pull_request" not in i
-                and i.get("html_url") and "number" in i]
+        found: Dict[int, Dict[str, Any]] = {}
+        for label in HUMAN_LABELS:
+            if label == HUMAN:
+                continue
+            items = self.gh.rest(
+                "GET", "/repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, label)).data
+            for i in items if isinstance(items, list) else []:
+                if isinstance(i, dict) and "pull_request" not in i and i.get("html_url") \
+                        and "number" in i:
+                    found.setdefault(int(i["number"]), i)
+        return list(found.values())
 
     def _ask_trusted(self, repo: str, issue: Dict[str, Any]) -> bool:
         allowed = {a.lower() for a in self.s.authors}
         if tickets._login(issue.get("user")) not in allowed:
             return False
         events = self._paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
-        actor = tickets._latest_label_actor(events, lambda n: n == NEEDS_OPERATOR)
+        actor = tickets._latest_label_actor(events, lambda n: n in HUMAN_LABELS)
         return actor is not None and actor in allowed
 
     @staticmethod
@@ -7820,7 +7857,7 @@ class Station:
         return True
 
     def _gather_human(self) -> Optional[List[Tuple[str, Dict[str, Any]]]]:
-        """(repo, issue) for every open loom:human issue, newest first; None
+        """(repo, issue) for every open needs:human issue, newest first; None
         when any repo could not be read (the digest waits for a whole list)."""
         found: List[Tuple[str, Dict[str, Any]]] = []
         for repo in self.s.repos:
@@ -7841,7 +7878,7 @@ class Station:
         return found
 
     def _human_ask(self, repo: str, issue: Dict[str, Any]) -> str:
-        """The first line of the newest loom:human comment from an allowed
+        """The first line of the newest needs:human comment from an allowed
         login (the brain's ask), or "" when there is none."""
         allowed = {a.lower() for a in self.s.authors}
         # paginate follows the next links, so the newest comment is read however
@@ -7897,7 +7934,7 @@ class Station:
             except GitHubError as err:
                 _say("could not list asks in %s: %s" % (repo, err))
                 return None
-        # A loom:human issue waits in the digest's own list, never alone.
+        # A needs:human issue waits in the digest's own list, never alone.
         asks = [a for a in asks if HUMAN not in _label_names(a[1])]
         asks.sort(key=lambda a: (str(a[1].get("created_at") or ""), a[0], int(a[1]["number"])))
         return [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
@@ -8108,6 +8145,27 @@ class Station:
             _write_json(path, sent)
         return True
 
+    def _ask_inputs(self, repo: str, issue: Dict[str, Any]) -> Tuple[
+            List[Any], List[Any], List[str], List[str], List[int]]:
+        """What bus/ask_state.py reads for one ask: its comments, its events,
+        who may answer, and the open issues its Blocked on section names."""
+        number = int(issue["number"])
+        comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+        events = self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
+        trusted = list(self.s.authors)
+        blockers = []
+        for other in brief_check.blocked_on(issue.get("body")):
+            if other != number and (self.gh.rest(
+                    "GET", "/repos/%s/issues/%d" % (repo, other)).data or {}).get("state") != "closed":
+                blockers.append(other)
+        return comments, events, trusted, answer.operators(trusted=trusted), blockers
+
+    def _ask_open(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """A person can act on this ask today: it is not answered in the
+        ticket and waits on nothing else. The digest only reads; the label
+        pass (clean_labels) takes the label off."""
+        return ask_state.state(issue, *self._ask_inputs(repo, issue)) == ask_state.OPEN
+
     def _new_digest_plan(self, keyed: List[Tuple[str, str, Dict[str, Any]]],
                          covered: Any, today: str) -> Optional[Dict[str, Any]]:
         """Build the day's fixed plan after every ask and human item can be read."""
@@ -8117,6 +8175,14 @@ class Station:
         asks = [a for a in keyed if trust.get(a[0])]
         found = self._gather_human()
         if found is None:
+            return None
+        try:
+            asks = [a for a in asks if self._ask_open(a[1], a[2])]
+            found = [f for f in found if self._ask_open(f[0], f[1])]
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read an ask for the digest: %s; next pass" % err)
             return None
         human = self._human_text(found) if found else ""
         if human is None or (not asks and not human):
@@ -9361,7 +9427,7 @@ class Station:
         """Whether a done ticket stays open because a live or operator
         criterion has no evidence (bus/criteria_gate.py): a live one with a
         check Loom can run gets the check; one with none, a failed check, or
-        an operator action sends the ticket to loom:human with one ask, once.
+        an operator action sends the ticket to needs:human with one ask, once.
         2026-10-22 audit: at least 12 tickets of the private deployment repo
         closed shipped on green CI with live criteria never checked."""
         number = int(issue["number"])
@@ -9376,7 +9442,7 @@ class Station:
         waiting = [t for k, t in gaps if k == criteria_gate.LIVE
                    and criteria_gate.check_of(t) is not None
                    and criteria_gate.key(t) not in failed]
-        if waiting or "loom:human" in _label_names(issue) or not self._live_ask_room():
+        if waiting or needs_human(_label_names(issue)) or not self._live_ask_room():
             return True
         try:
             brain.human(self.gh, repo, number, criteria_gate.ask(gaps, failed))
@@ -9664,9 +9730,16 @@ class Station:
                     or tickets.owned_elsewhere(issue, self.s.authors, self.s.briefers)):
                 continue
             seen.add(number)
-            events = (self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
-                      if label_pass.needs_events(issue) else None)
-            found = label_pass.plan(issue, events, station_logins)
+            ask = (needs_human(_label_names(issue)) and changed < left
+                   and str(issue.get("state") or "open") == "open")
+            if ask:
+                comments, events, trusted, ops, blockers = self._ask_inputs(repo, issue)
+                found = label_pass.plan(issue, events, station_logins, comments=comments,
+                                        trusted=trusted, ops=ops, blockers=blockers)
+            else:
+                events = (self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
+                          if label_pass.needs_events(issue) else None)
+                found = label_pass.plan(issue, events, station_logins)
             key = "%s#%d" % (repo, number)
             if found.note and notes.get(key) != found.note:
                 _say("health note %s: %s" % (key, found.note))
@@ -9674,12 +9747,27 @@ class Station:
                 notes[key] = found.note
             else:
                 notes.pop(key, None)
-            if not found.remove or changed >= left:
+            if not (found.remove or found.add) or changed >= left:
                 continue
+            self._add_labels(repo, number, found.add)
             for removal in found.remove:
                 self._unlabel(repo, number, removal)
             changed += 1
         return changed
+
+    def _add_labels(self, repo: str, number: int, names: Sequence[str]) -> None:
+        """Add labels, or in shadow record that they would be added. Added
+        before any removal, so a failed write never leaves a ticket with no
+        ask label."""
+        if not names:
+            return
+        if shadow.active(repo):
+            shadow.record_held(shadow.LABEL, repo, number, "issue",
+                               reason="add %s" % ", ".join(names), label=names[0],
+                               source="station clean_labels")
+            return
+        self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": list(names)})
+        _say("%s#%d: add %s" % (repo, number, ", ".join(names)))
 
     def _unlabel(self, repo: str, number: int, removal: "label_pass.Removal") -> None:
         """Remove one label, or in shadow record that it would be removed."""
@@ -11217,9 +11305,11 @@ class Station:
         return found
 
     def _standup_ask_status(self, issue: Dict[str, Any], labels: Set[str]) -> Tuple[bool, bool]:
+        if needs_human(labels):
+            return True, "loom:queued" in labels
         has_needs = any(self.NEEDS_LABEL_PATTERN.match(l) for l in labels)
         has_ask = self._has_ask_comment(issue) if has_needs else False
-        is_waiting = bool(labels & {NEEDS_OPERATOR, HUMAN}) or (has_needs and has_ask)
+        is_waiting = has_needs and has_ask
         is_queued = ("loom:queued" in labels) or (has_needs and not has_ask)
         return is_waiting, is_queued
 
@@ -13019,7 +13109,7 @@ class Station:
         made = self.gh.rest("POST", "/repos/%s/issues" % home, {
             "title": "Give the Loom App access to %s" % repo,
             "body": "## Ask\nGive the Loom App access to `%s` so station steps can run there." % repo,
-            "labels": [NEEDS_OPERATOR]}).data
+            "labels": [NEEDS_HUMAN]}).data
         if not isinstance(made, dict) or "number" not in made:
             raise GitHubError("no operator access ask was created in %s" % home)
         state[key] = int(made["number"])

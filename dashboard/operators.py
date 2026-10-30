@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from bus import answer, brain, tickets
+from bus.labels import NEEDS_HUMAN, needs_human
 
 NEUTRAL_TITLE = ("LOOM_BRIEF_AUTHORS is not set on the dashboard, so it cannot tell this Loom's "
                  "claims from another operator's")
@@ -137,7 +138,7 @@ _CLAIM_COMMENT_RE = re.compile(r"<!--\s*ccqw:handoff\b", re.I)
 def needs_labels(names: Iterable[str]) -> List[str]:
     """The needs:<login> label names in a repo's label list."""
     return [name for name in names if isinstance(name, str) and name.lower().startswith(NEEDS_PREFIX)
-            and _login(name[len(NEEDS_PREFIX):])]
+            and name.lower() != NEEDS_HUMAN and _login(name[len(NEEDS_PREFIX):])]
 
 
 def needs_of(labels: Iterable[str]) -> List[str]:
@@ -197,11 +198,11 @@ HUMAN_MARKER = brain.HUMAN_MARKER
 
 def ask_names(labels: Iterable[str]) -> List[str]:
     """The lower-case needs labels an ask comment may mention, and
-    loom:human when the item carries it."""
+    needs:human when the item carries it."""
     labels = list(labels)
     names = [name.lower() for name in needs_labels(labels)]
-    names += ["needs-operator"] if "needs-operator" in labels else []
-    return names + [HUMAN_LABEL] if HUMAN_LABEL in labels else names
+    names += [name for name in ("needs-operator", NEEDS_HUMAN) if name in labels]
+    return names + [HUMAN_LABEL] if needs_human(labels) else names
 
 
 def _ask_lines(body: str) -> List[str]:
@@ -243,7 +244,7 @@ def _is_claim_comment(body: str) -> bool:
 
 def ask_comment(comments: Iterable[Any], names: Iterable[str], *, strict: bool = False) -> Optional[Dict[str, Any]]:
     """The comment that holds an item's ask, from its comments oldest first:
-    on a loom:human item the newest loom:human ask comment; else the newest
+    on a needs:human item the newest needs:human ask comment; else the newest
     comment that names the ask; else the latest non-claim comment (unless strict);
     None with none. An answer comment (bus/answer.py) and a pure claim/handoff
     comment are never the ask."""
