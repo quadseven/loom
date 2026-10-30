@@ -798,6 +798,17 @@ print('leak guard: clean (shape patterns only)')
         self.assertTrue(line.startswith("[transient] public repo leak scan could not run"), line)
         self.assertIn("could not read deny-list", line)
 
+    def test_a_lane_started_without_a_clone_base_does_not_crash_on_an_unbound_variable(self):
+        """launchd starts the local lanes without LOOM_CLONE_BASE; the scanner
+        remote must default like the ticket clone does (git@github.com:), or
+        every run dies at once under set -u and no lane works."""
+        env = self.lane_env()
+        del env["LOOM_CLONE_BASE"]
+        self.drop_brief()
+        result = subprocess.run(["bash", str(RUNNER), "codex"], env=env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertNotIn("unbound variable", result.stderr)
+
     def test_a_missing_leak_scanner_is_a_factory_incident(self):
         # No infra-public checkout and no remote to clone it from: the scanner
         # cannot be had, so a public-repo push is a factory incident (one issue
@@ -1165,6 +1176,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         log = self.run_log()
         self.assertIn("Bugs discovered line 2 left out: the line cites no issue", log)
         self.assertIn("Bugs discovered line 3 left out: the cited issue could not be looked up", log)
+        self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_a_one_criterion_ticket_opens_a_body_the_gate_accepts(self):
+        # A follow-up ticket states the one criterion a lane left not built;
+        # its body failed the plan check with 1 bullet of the 3 it wants.
+        thin = BRIEF.replace("## Acceptance criteria\n", "## Acceptance\n").replace(
+            "- [ ] A test covers the thing\n- [ ] Nothing else changes\n", "")
+        self.drop_brief(text=thin)
+        result = self.run_lane(FAKE_SUMMARY="Fix the thing so it works")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("## Acceptance criteria\n- [ ] The thing works\n", body)
         self.assertEqual(hunt_plan.problems(body), [])
 
     def test_a_body_without_bugs_has_no_bugs_section(self):
@@ -1755,6 +1778,20 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         body = self.body.read_text()
         self.assertIn("\nSize: S\n", body)
         self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_pr_body_carries_the_bullets_the_gate_wants_for_a_thin_brief(self):
+        # The gate counts three bullets under Acceptance criteria. A ticket
+        # that states fewer (the factory files a follow-up ticket with the one
+        # criterion a lane left not built) still opens a body it accepts: a
+        # body it refuses holds the pull request.
+        self.drop_brief(text=BRIEF.replace(
+            "- [ ] The thing works\n- [ ] A test covers the thing\n"
+            "- [ ] Nothing else changes", "- [ ] The thing works"))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertEqual(hunt_plan.problems(body), [])
+        self.assertIn("- [ ] The thing works", body)
 
     def test_pr_body_has_no_refs_without_an_issue_line(self):
         self.drop_brief()

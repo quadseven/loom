@@ -245,7 +245,10 @@ findings section.
 checks (bus/hunt_plan.py mirrors them: Why of at least 5 words, at least 3
 non-empty Acceptance criteria bullets, a Size of XS, S, M or L, a non-empty
 Out of scope), and files a Size written as a word (Small, Medium, Large) as
-its letter. `brief` (and the station's rewrite step) also refuses a Live
+its letter. A ticket that states fewer than three criteria is not refused:
+the pull request body carries the standard bullets the gate wants
+(`bus/hunt_plan.py` `pad_criteria`), so the body, not the ticket, decides.
+`brief` (and the station's rewrite step) also refuses a Live
 criterion (the acceptance line that starts with "Live") that names no exact
 string in backticks or double quotes; health and friction intake tickets are
 verified by the station's own absence tracking and are exempt. The string is
@@ -1642,6 +1645,39 @@ updates it again and it keeps the lock. The lock ends when it merges or
 closes, or 40 minutes after the mark (from the label's event on GitHub),
 when the label comes off and the next pass picks again. Operators merging
 by hand follow the same cadence.
+
+### Branch hygiene
+
+The factory's judging reaches a pull request only while its ticket sits at
+`loom:pr` with its review settled, and a held pull request whose update is
+refused is left where it lies, so a pull request outside that path (one
+waiting on its checks, one held for the operator) used to drift behind or
+into a conflict nobody was assigned, found only when someone came to merge
+it (loom#2135). Each repo pass therefore follows its judging with a
+hygiene sweep over the repo's open lane pull requests, oldest first. A
+behind, conflict-free one is brought up to date in small steps (at most
+two a repo a pass, never while another pull request there holds the
+landing lock or in a pass where the repo already landed one, and never on
+a head with a failed check, whose re-runs and fix rounds are the cheaper
+answer). A conflicting one gets exactly one fix round for the conflict,
+open while the head it was opened for is still the head; a round opened
+before fix comments carried their head counts as open for any head, so an
+old round is never doubled. The judged send-back's holds still apply
+there, with one exception: a `loom:human` ticket gets its conflict round
+anyway, because that hold guards the pull request's merge, not its
+branch, and the label stays on the ticket through the move; a
+`needs-brain` ticket and one in the hand-off pool are left to the brain
+and that session. Hygiene never merges anything: a `class:sensitive`
+pull request is maintained exactly like a lane one up to the merge step,
+which stays with the brain or the operator as before. Each action is one
+station log line, and so is each skip the pass decides itself (a held
+landing lock, the per-repo bound, a landing earlier in the pass, a ticket
+with the brain or in the hand-off pool, a round already open, an update
+refused); the lock, bound and landed skips are said once a repo a pass,
+however many pull requests they cover. Pull requests outside the pass's
+remit (not a lane pull request, no ticket in the repo, not yet judged by
+GitHub, a red head the judge is already handling, one brought up to date
+within the cooldown) pass without a line.
 
 ## Merge by change class
 
