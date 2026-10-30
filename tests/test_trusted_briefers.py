@@ -66,6 +66,7 @@ class TrustedBriefIsBuiltTest(Pass):
     def test_a_trusted_briefers_queued_ticket_gets_a_lane(self):
         self.settings.factory_on = True
         by_briefer(self.fake, 14, state="queued")
+        self.fake.issues[14]["body"] += "\n## Acceptance criteria\n- [ ] It works.\n"
         self.run_quiet()
         self.assertNotIn("loom:queued", self.fake.names(14))
 
