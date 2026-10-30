@@ -80,6 +80,13 @@ class PublicSafeTest(unittest.TestCase):
         self.assertEqual(text.public_safe(body, PUBLIC, self.private),
                          "issue 5 of a private repo and a private repo.")
 
+    def test_a_link_without_a_scheme_and_a_path_in_a_private_repo_are_written_in_words(self):
+        body = "www.github.com/%s/issues/6 and github.com/%s, file %s/src/x.py" % (
+            HIDDEN, HIDDEN, HIDDEN)
+        self.assertEqual(text.public_safe(body, PUBLIC, self.private),
+                         "issue 6 of a private repo and a private repo, "
+                         "file a private repo/src/x.py")
+
     def test_a_bare_name_of_another_owner_is_never_looked_up(self):
         asked = []
 
@@ -170,6 +177,17 @@ class EveryPathTest(unittest.TestCase):
         client(t).rest("POST", "/repos/%s/issues/30/comments" % PUBLIC, {"body": body})
         self.assertIn("1: issue 9 of a private repo", t.sent()[0])
         self.assertIsNone(REF.search(t.sent()[0]))
+
+    def test_a_review_thread_reply_is_guarded(self):
+        t = Routed()
+        client(t).rest("POST", "/repos/%s/pulls/4/comments/11/replies" % PUBLIC,
+                       {"body": "as in %s#2" % HIDDEN})
+        self.assertEqual(t.sent(), ["as in issue 2 of a private repo"])
+
+    def test_a_graphql_writer_guards_its_text_through_the_client(self):
+        gh = client(Routed(), deny=("blocked-example.test",))
+        self.assertEqual(gh.public_safe(PUBLIC, "> pull reg.blocked-example.test failed"),
+                         "> pull <private-host> failed")
 
     def test_the_same_body_on_a_private_repo_is_unchanged(self):
         t = Routed()

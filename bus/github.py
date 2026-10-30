@@ -64,8 +64,10 @@ _ISSUE_PATH = re.compile(r"^/repos/[^/]+/[^/]+/issues/[0-9]+$")
 _COMMENTS_OF = re.compile(r"/repos/([^/]+/[^/]+)/issues/([0-9]+)/comments(?:\?|$)")
 # The repo a write lands on: its text passes the public-repo leak guard.
 _REPO_OF = re.compile(r"^/repos/([^/]+/[^/]+)/")
-# A new comment or an edit of one.
-_COMMENT_WRITE = re.compile(r"^/repos/[^/]+/[^/]+/issues/(?:[0-9]+/comments|comments/[0-9]+)$")
+# A new comment or an edit of one, on an issue or a pull request's review.
+_COMMENT_WRITE = re.compile(
+    r"^/repos/[^/]+/[^/]+/(?:issues/(?:[0-9]+/comments|comments/[0-9]+)"
+    r"|pulls/(?:[0-9]+/comments(?:/[0-9]+/replies)?|comments/[0-9]+))$")
 # A read of one repo, which says whether it is private.
 _REPO_PATH = re.compile(r"^/repos/([^/?]+/[^/?]+)(?:\?|$)")
 
@@ -676,16 +678,19 @@ class GitHub:
                 or not isinstance(body.get("body"), str):
             return body
         text = body["body"]
-
-        def safe(part: str) -> str:
-            return _text.public_safe(part, found.group(1), self._repo_private, self.deny_terms)
         if _COMMENT_WRITE.match(path):
-            clean = safe(text)
+            clean = self.public_safe(found.group(1), text)
         elif isinstance(body, status.OwnBody):
-            clean = status.with_section_text(text, safe)
+            clean = status.with_section_text(text, lambda part: self.public_safe(found.group(1), part))
         else:
             return body
         return body if clean == text else type(body)(body, body=clean)
+
+    def public_safe(self, repo: str, text: str) -> str:
+        """The text made safe to post on repo (bus/text.public_safe), with
+        this client's visibility cache and deny-list. A GraphQL write names
+        no repo in its path, so its caller calls this itself."""
+        return _text.public_safe(text, repo, self._repo_private, self.deny_terms)
 
     def _note_visibility(self, method: str, path: str, data: Any) -> None:
         """Keep whether a repo is private from any read of the repo, so the

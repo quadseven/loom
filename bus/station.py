@@ -7509,6 +7509,11 @@ class Station:
             return
         body = "Lane %s %s\n\n%s" % (
             lane, factory.ANSWER_REPLY, "\n".join("> " + line for line in said.splitlines()))
+        # A GraphQL reply names no repo in its path, so rest() cannot apply
+        # the public comment leak guard to it (loom#1862).
+        guard = getattr(self.gh, "public_safe", None)
+        if callable(guard):
+            body = guard(repo, body)
         try:
             _text.check(body)
         except ValueError as err:

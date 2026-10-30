@@ -139,15 +139,16 @@ def scrub_paths(text: str) -> str:
 
 
 # What public_safe rewrites. A github.com link to a repo, or to one of its
-# issues or pull requests, with any trailing path or fragment.
+# issues or pull requests, with any trailing path or fragment but not the
+# punctuation after it.
 _GITHUB_LINK = re.compile(
-    r"https?://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9_.-]*[A-Za-z0-9_])"
-    r"(?:/(?:issues|pull)/([0-9]+))?[^\s)\]>`'\"]*")
+    r"(?<![\w.-])(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9-]+/[A-Za-z0-9_.-]*[A-Za-z0-9_])"
+    r"(?:/(?:issues|pull)/([0-9]+))?(?:[/?#][^\s)\]>`'\"]*[^\s)\]>`'\".,;:!?])?")
 # owner/name#N.
 _ISSUE_REF = re.compile(r"(?<![\w./-])([A-Za-z0-9-]+/[A-Za-z0-9_.-]*[A-Za-z0-9_])#([0-9]+)\b")
-# A bare owner/name: a path or a branch has the same shape, so only one under
-# the target repo's own owner is looked up.
-_REPO_NAME = re.compile(r"(?<![\w./:#-])([A-Za-z0-9-]+/[A-Za-z0-9_.-]*[A-Za-z0-9_])(?![\w/#-])")
+# A bare owner/name, or one with a path in it after: a path or a branch has
+# the same shape, so only one under the target repo's own owner is looked up.
+_REPO_NAME = re.compile(r"(?<![\w./:#-])([A-Za-z0-9-]+/[A-Za-z0-9_.-]*[A-Za-z0-9_])(?![\w#-])")
 # A dotted hostname.
 _HOST = re.compile(
     r"(?i)(?<![\w.-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9](?![\w-])")
