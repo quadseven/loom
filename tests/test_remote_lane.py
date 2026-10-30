@@ -302,6 +302,18 @@ class RemoteLaneTests(unittest.TestCase):
         self.assertEqual(len(gh.comments[4]), 1)
         self.assertNotIn("loom:running", labels(gh))
 
+    def test_claim_still_names_the_missing_section_when_needs_brain_was_already_set(self):
+        # The label alone is not the reason: a ticket held needs-brain for
+        # another reason still gets the one note naming the missing
+        # section, and no second one (loom#2249).
+        gh = FakeGitHub(body=BODY.replace("- [ ] ", "- "))
+        gh.issues[4]["labels"].append({"name": "needs-brain"})
+        self.assertIsNone(lane.claim(gh, ["example/project"], now=1000))
+        (note,) = gh.comments[4]
+        self.assertIn("## Acceptance criteria", note["body"])
+        self.assertIsNone(lane.claim(gh, ["example/project"], now=1001))
+        self.assertEqual(len(gh.comments[4]), 1)
+
     def test_claim_skips_queued_ticket_whose_branch_has_a_pull_request(self):
         gh = FakeGitHub()
         gh.pulls = [{"number": 99, "state": "open"}]

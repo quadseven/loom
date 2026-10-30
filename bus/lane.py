@@ -228,30 +228,26 @@ def _takes(item: Any, lane: str) -> bool:
     return difficulty_of(item) in REMOTE_LANES[lane]["tiers"]
 
 
-NO_ACCEPTANCE_MARKER = "<!-- loom:no-acceptance v1 -->"
-NO_ACCEPTANCE_NOTE = (
-    NO_ACCEPTANCE_MARKER + "\n"
-    "Held for the brain (needs-brain): this ticket has no acceptance "
-    "criteria a lane can prove: add an ## Acceptance criteria section "
-    "with - [ ] checkboxes. It is not claimed or briefed until it has "
-    "at least one - [ ] box under ## Acceptance criteria.")
-
-
 def _hold_no_acceptance(gh: GitHub, repo: str, issue: Dict[str, Any]) -> bool:
     """True when a queued ticket has no acceptance checkbox and so gets no
     claim (loom#2249): it gains needs-brain and the one note naming the
-    missing section, once (needs-brain says it was reported). A lane run
-    on such a ticket is parked unrun by the runner, so the refusal
-    belongs before the claim, not after it."""
+    missing section (brain.NO_ACCEPTANCE_NOTE). The note is owed even
+    when needs-brain was already set by another hold, so a later pass
+    posts it whenever no note carries the marker. A lane run on such a
+    ticket is parked unrun by the runner, so the refusal belongs before
+    the claim, not after it."""
     if brain.acceptance_refusal(issue.get("body"), issue) is None:
         return False
+    number = int(issue["number"])
     if "needs-brain" not in _names(issue):
-        number = int(issue["number"])
         labels = _names(issue) + ["needs-brain"]
         gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                 {"labels": labels})
         issue["labels"] = [{"name": name} for name in labels]
-        notify.post(gh, repo, number, NO_ACCEPTANCE_NOTE, notify.HELD)
+        notify.post(gh, repo, number, brain.NO_ACCEPTANCE_NOTE, notify.HELD)
+    elif not any(brain.NO_ACCEPTANCE_MARKER in str(c.get("body") or "")
+                 for c in _comments(gh, repo, number)):
+        notify.post(gh, repo, number, brain.NO_ACCEPTANCE_NOTE, notify.HELD)
     return True
 
 
@@ -276,18 +272,25 @@ def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
         raise ValueError("unknown remote lane: %s" % lane)
     now = time.time() if now is None else now
     active = _recover_and_count(gh, repos, lane, now)
-    candidates = _candidates(gh, repos, lane)
+    found = _candidates(gh, repos, lane)
     skipped: List[str] = []
     claimed_result: Optional[Dict[str, Any]] = None
+
+    # A ticket with no acceptance checkbox is held for the brain before
+    # slots or branches are considered (loom#2249): it is never a claim
+    # candidate, however full or free the lane is.
+    candidates: List[Tuple[str, Dict[str, Any]]] = []
+    for repo, issue in found:
+        if _hold_no_acceptance(gh, repo, issue):
+            skipped.append("#%s skipped: no acceptance criteria" % issue["number"])
+        else:
+            candidates.append((repo, issue))
 
     if active >= REMOTE_LANES[lane]["slots"]:
         for _repo, issue in candidates:
             skipped.append("#%s skipped: lane slots full" % issue["number"])
     else:
         for repo, issue in candidates:
-            if _hold_no_acceptance(gh, repo, issue):
-                skipped.append("#%s skipped: no acceptance criteria" % issue["number"])
-                continue
             branch = tickets.branch_for(int(issue["number"]), str(issue.get("title") or ""))
             pr = _open_or_merged_pull(gh, repo, branch)
             if pr is not None:
@@ -305,7 +308,7 @@ def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
             claimed_result = _take(gh, repo, issue, lane, now)
             break
 
-    summary = "scanned %d repos, found %d candidates" % (len(repos), len(candidates))
+    summary = "scanned %d repos, found %d candidates" % (len(repos), len(found))
     if skipped:
         summary += ": " + "; ".join(skipped)
     print(summary, file=sys.stderr)

@@ -2615,6 +2615,19 @@ class Queued(Base):
         self.assertEqual(len([c for c in self.gh.comments[7]
                               if "## Acceptance criteria" in str(c.get("body") or "")]), 1)
 
+    def test_a_queued_ticket_already_needs_brain_still_gets_the_reason_once(self):
+        self.queued(7, body="Difficulty: medium\n\n## Why\nx\n\n"
+                            "## Acceptance criteria\n- It works.\n")
+        self.gh.issues[7]["labels"].append({"name": "needs-brain"})
+        self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        notes = [c for c in self.gh.comments[7]
+                 if "## Acceptance criteria" in str(c.get("body") or "")]
+        self.assertEqual(len(notes), 1)
+        self.assign(available=["codex"])
+        self.assertEqual(len([c for c in self.gh.comments[7]
+                              if "## Acceptance criteria" in str(c.get("body") or "")]), 1)
+
     def test_a_queued_ticket_with_acceptance_boxes_is_briefed_as_before(self):
         self.queued(7, body="Difficulty: medium\n\n## Why\nx\n\n"
                             "## Acceptance criteria\n- [ ] It works.\n")

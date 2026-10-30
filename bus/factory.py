@@ -629,16 +629,6 @@ ask for."""
 # A ticket with either label is never sent back: a person or the brain has it.
 SEND_BACK_HOLDS = frozenset(("loom:human", "needs-brain"))
 
-# The one note for a queued ticket with no acceptance checkbox (loom#2249):
-# the same marker the remote lane claim writes (bus/lane.py), so either
-# gate's note says the hold was already reported.
-NO_ACCEPTANCE_NOTE = (
-    "<!-- loom:no-acceptance v1 -->\n"
-    "Held for the brain (needs-brain): this ticket has no acceptance "
-    "criteria a lane can prove: add an ## Acceptance criteria section "
-    "with - [ ] checkboxes. It is not claimed or briefed until it has "
-    "at least one - [ ] box under ## Acceptance criteria.")
-
 # The note for a ticket whose lane run failed with its pull request open: the
 # failed run is the finding, so it is not the stock FIX_NOTES that brain.fix
 # refuses to send alone.
@@ -4256,15 +4246,22 @@ class Factory:
     def _hold_no_acceptance(self, repo: str, issue: Dict[str, Any]) -> str:
         """Hold a queued ticket with no acceptance checkbox for the brain,
         once (loom#2249): needs-brain and the one note naming the missing
-        section. It gets no lane and spends no ladder rung: a lane run on
-        it is parked unrun by the runner, and the factory otherwise moved
-        it across lanes all night."""
+        section (brain.NO_ACCEPTANCE_NOTE). The note is owed even when
+        needs-brain was already set by another hold, so it is posted
+        whenever no note carries the marker. It gets no lane and spends
+        no ladder rung: a lane run on it is parked unrun by the runner,
+        and the factory otherwise moved it across lanes all night."""
         number = int(issue["number"])
         if "needs-brain" not in _labels(issue):
-            notify.post(self.gh, repo, number, NO_ACCEPTANCE_NOTE, notify.HELD)
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": ["needs-brain"]})
             issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
+            notify.post(self.gh, repo, number, brain.NO_ACCEPTANCE_NOTE, notify.HELD)
+            self.actions += 1
+            _say("held queued %s#%d for the brain: no acceptance criteria" % (repo, number))
+        elif not any(brain.NO_ACCEPTANCE_MARKER in str(c.get("body") or "")
+                     for c in self._comments(repo, number)):
+            notify.post(self.gh, repo, number, brain.NO_ACCEPTANCE_NOTE, notify.HELD)
             self.actions += 1
             _say("held queued %s#%d for the brain: no acceptance criteria" % (repo, number))
         self._waiting(repo, number, "no acceptance criteria")
