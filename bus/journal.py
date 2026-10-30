@@ -117,12 +117,17 @@ def _items(value: Union[str, Iterable[str], None]) -> str:
 
 
 def render_journal(when, holder, shipped, briefed, waiting, asks,
-                   requests, minutes, measure=None) -> str:
+                   requests, minutes, measure=None, backlog=None) -> str:
     head = [JOURNAL_MARKER, "Tick %s, %s" % (_when(when), holder)]
     if measure is not None:
         head.append("- Measure: %s" % _items(measure))
-    return "\n".join(head + [
-        "- Shipped: %s" % _items(shipped),
+    lines = ["- Shipped: %s" % _items(shipped)]
+    if backlog is not None:
+        # loom#2161: the shipped stage's backlog (brain.shipped_backlog_line,
+        # the Hot spots read) rides every tick journal under the tick's own
+        # Shipped line, so the verify drain is visible tick over tick.
+        lines.append("- Shipped backlog: %s" % backlog)
+    return "\n".join(head + lines + [
         "- Briefed: %s" % _items(briefed),
         "- Waiting: %s" % _items(waiting),
         "- Asks: %s" % _items(asks),

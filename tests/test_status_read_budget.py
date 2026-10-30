@@ -46,8 +46,10 @@ STUCK_COUNT = 24
 # remote brain's pass of it ran past the 120 s budget. After loom#2078 the
 # same pass reads 159 times. This fake makes 276 reads before and 157 after;
 # the bound holds a loom-sized pass to about 60 percent of the reads that ran
-# past the budget.
-READ_BOUND = 180
+# past the budget. loom#2161 adds the shipped backlog's waits read (one
+# events read per ticket the sections had not already read; this fake makes
+# 204 in all), and the bound keeps the same headroom over the measured pass.
+READ_BOUND = 225
 
 
 def _issue(number, labels, body="", **extra):

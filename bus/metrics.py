@@ -159,6 +159,16 @@ def waits_for_repos(gh: GitHub, repos: Sequence[str], now: float,
     return summarize_waits(tickets)
 
 
+def shipped_row(gh: GitHub, repos: Sequence[str], now: float) -> Dict[str, Any] | None:
+    """The shipped stage's row of waits_for_repos ({\"state\", \"median_h\",
+    \"worst_h\", \"worst_ticket\", \"n\"}), or None when the read names no
+    shipped row. The brain's journal line and the station's verify
+    priority both read the shipped backlog through here, so they can
+    never disagree with the Hot spots page or each other (loom#2161)."""
+    rows, _bottleneck = waits_for_repos(gh, repos, now)
+    return next((row for row in rows if row.get("state") == "shipped"), None)
+
+
 def waits_main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m bus.metrics")
     sub = parser.add_subparsers(dest="command", required=True)
