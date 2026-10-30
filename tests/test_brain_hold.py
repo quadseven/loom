@@ -231,3 +231,55 @@ class StationStampTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BrainStallEscalationTest(unittest.TestCase):
+    """loom#1250: a ticket with an open lane pull request that has waited on
+    the brain for brain_hold.STALL_AGE goes to a person once per head commit."""
+
+    def setUp(self):
+        self.gh = FakeGitHub()
+
+    def stalled(self, seconds_ago=5 * 3600):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        held_by(self.gh, 5, LOOM_APP, seconds_ago)
+
+    def run_pass(self):
+        factory.Factory(self.gh, [REPO], NOW, trusted=TRUSTED).run()
+
+    def asks(self):
+        return [c["body"] for c in self.gh.comments[5] if c["body"].startswith(brain.HUMAN_MARKER)]
+
+    def test_a_pull_request_waiting_four_hours_goes_to_a_person_with_one_named_ask(self):
+        self.stalled()
+        self.run_pass()
+        self.assertIn("loom:human", factory._labels(self.gh.issues[5]))
+        asks = self.asks()
+        self.assertEqual(len(asks), 1)
+        self.assertIn("#50", asks[0])
+        self.assertIn("python3 -m bus.brain merge %s#50" % REPO, asks[0])
+        self.assertIn("python3 -m bus.brain fix", asks[0])
+
+    def test_a_younger_wait_or_no_open_lane_pull_request_is_left_alone(self):
+        self.stalled(seconds_ago=3 * 3600)
+        self.gh.ticket(6, "pr")
+        held_by(self.gh, 6, LOOM_APP, 5 * 3600)
+        self.run_pass()
+        for number in (5, 6):
+            self.assertNotIn("loom:human", factory._labels(self.gh.issues[number]))
+            self.assertEqual(
+                [c for c in self.gh.comments[number] if c["body"].startswith(brain.HUMAN_MARKER)], [])
+
+    def test_later_passes_on_the_same_head_post_nothing_and_a_new_head_asks_again(self):
+        self.stalled()
+        self.run_pass()
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(len(self.asks()), 1)
+        self.assertEqual(factory._labels(self.gh.issues[5]).count("loom:human"), 1)
+        self.gh.pulls[50]["head"]["sha"] = "sha50b"
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(len(self.asks()), 2)
+        self.assertEqual(factory._labels(self.gh.issues[5]).count("loom:human"), 1)
