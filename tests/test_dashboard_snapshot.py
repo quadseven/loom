@@ -23,11 +23,13 @@ class SlowGitHub:
         self.active = 0
         self.max_active = 0
         self.request_time = 0.0
+        self.first_started = self.last_finished = None
         self.lock = threading.Lock()
 
     def paginate(self, path):
         started = time.monotonic()
         with self.lock:
+            self.first_started = self.first_started or started
             self.active += 1
             self.max_active = max(self.max_active, self.active)
         try:
@@ -48,7 +50,8 @@ class SlowGitHub:
         finally:
             with self.lock:
                 self.active -= 1
-                self.request_time += time.monotonic() - started
+                self.last_finished = time.monotonic()
+                self.request_time += self.last_finished - started
 
     def paginate_parallel(self, path, workers=8):
         return self.paginate(path)
@@ -249,11 +252,12 @@ class SnapshotTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             store = TicketStore(REPOS, gh=gh)
             store.open_issues[REPOS[1]] = [{"number": 7}]
-            started = time.monotonic()
             store._read_open_issues(10000.0)
-            elapsed = time.monotonic() - started
         self.assertGreater(gh.max_active, 1)
-        self.assertLess(elapsed, gh.request_time * 0.7)
+        # The span of the reads themselves, not the call's wall clock: the
+        # pool's start and stop on a busy runner is a large share of three
+        # 50 ms reads and failed this on CI with the reads overlapping.
+        self.assertLess(gh.last_finished - gh.first_started, gh.request_time * 0.7)
         self.assertEqual({repo: [row["number"] for row in rows] for repo, rows in store.open_issues.items()},
                          {REPOS[0]: [1], REPOS[1]: [7], REPOS[2]: [3]})
         self.assertEqual(list(store.open_issues), REPOS)
