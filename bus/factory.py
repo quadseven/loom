@@ -2242,11 +2242,32 @@ class Factory:
                      {"labels": kept})
         issue["labels"] = [{"name": x} for x in kept]
 
+    def _past_ladder_pr_green(self, repo: str, pr: Dict[str, Any]) -> bool:
+        """True when a past-ladder pull request's head has green checks and no
+        conflict, so it stays open for the brain's ruling."""
+        number = int(pr["number"])
+        details = brain._pr_graphql(self.gh, repo, number)
+        sha = str((pr.get("head") or {}).get("sha") or details.get("headRefOid") or "")
+        if not sha:
+            return False
+        if pr.get("mergeable") is False or details.get("mergeable") == "CONFLICTING":
+            return False
+        if not brain._checks_green(details):
+            return False
+        runs = self._runs.get(sha)
+        if runs is None and sha:
+            runs = self._runs[sha] = self._check_runs(repo, sha)
+        return not any(r.get("conclusion") in brain.FAILED_CONCLUSIONS for r in (runs or ()))
+
     def _close_past_ladder_pr(self, repo: str, pr: Dict[str, Any]) -> None:
         """Close an open lane pull request whose ticket is past the last rung of
         the model ladder, naming why, so the lane does not stall on it
-        indefinitely. The brain re-briefs the work as a new loom:ticket."""
+        indefinitely. Leaves it open when its head has green checks and no
+        conflict, for the brain's ruling."""
         number = int(pr["number"])
+        if self._past_ladder_pr_green(repo, pr):
+            _say("%s#%d kept open past the model ladder: its head has green checks" % (repo, number))
+            return
         comment = ("Closed by the station: its ticket is past the last rung of the "
                    "model ladder and is left loom:failed for the brain, which re-briefs "
                    "the work as a new loom:ticket.")
@@ -2487,6 +2508,8 @@ class Factory:
             for pr in prs:
                 if self.actions >= MAX_ACTIONS:
                     return
+                if "past the last rung of the model ladder" in ended and self._past_ladder_pr_green(repo, pr):
+                    continue
                 self._close_ended_pr(repo, pr, ended)
                 closed.add(int(pr["number"]))
         elif len(prs) > 1:
