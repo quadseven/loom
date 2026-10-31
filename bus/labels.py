@@ -99,6 +99,8 @@ LABELS: Dict[str, Dict[str, str]] = {
     "needs-operator": {"color": "b60205", "description": "Old name of needs:human"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs:human: forward now"},
+    "closed-unproven": {"color": "fbca04", "description": "Closed on merged code with its Live box unproven; a reopen counts against this close"},
+    "loom:proof-due": {"color": "fbca04", "description": "Rolling list of Live boxes of tickets closed unproven"},
     "loom:regression": {"color": "b60205", "description": "Fixes a measured regression of a shipped ticket"},
     "loom:revert": {"color": "b60205", "description": "Reverts the merge that turned the default branch red"},
     "class:sensitive": {"color": "b60205", "description": "Touches a sensitive path; needs extra scrutiny"},

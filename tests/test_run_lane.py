@@ -1,6 +1,7 @@
 """lanes/run_lane.sh run as a process: a temp loom home, a local bare repo as
 the remote, and fake agent and gh commands on PATH that record their calls."""
 
+import hashlib
 import json
 import os
 import re
@@ -5963,6 +5964,83 @@ exit %d
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertIn("setup failed: interpreter loom-test-python is not on PATH", self.lane_log())
         self.assertEqual([(r["phase"], r["ok"]) for r in self.records()], [("prepare", False)])
+
+    def broken_sha256sum(self):
+        """A directory whose sha256sum cannot execute, as an x86_64 link does
+        on an arm64 host without Rosetta, and the first PATH with it."""
+        broken = Path(self._tmp.name) / "intel-bin"
+        self.write_tool(broken / "sha256sum", "#!/bin/sh\necho 'Bad CPU type in executable' >&2\nexit 126\n")
+        return broken, f"{broken}:{self.lane_env()['PATH']}"
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_lane_resolves_sha256sum_to_one_that_runs(self):
+        # 30 runs of one repo's base check failed on the lane machine's
+        # x86_64 Homebrew sha256sum, though that repo's main was green.
+        broken, path = self.broken_sha256sum()
+        self.drop_brief()
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
+                        'log="$FAKE_LOG"\n'
+                        'echo "tool $(command -v sha256sum)" >> "$log"\n'
+                        "echo \"digest $(printf abc | sha256sum)\" >> \"$log\"\n"
+                        'echo "path $PATH" >> "$log"\n')
+        self.run_lane(PATH=path)
+        seen = dict(line.split(" ", 1) for line in self.calls()
+                    if line.startswith(("tool ", "digest ", "path ")))
+        tool, digest, lane_path = seen["tool"], seen["digest"], seen["path"]
+        self.assertNotEqual(tool, str(broken / "sha256sum"))
+        self.assertTrue(digest.startswith(hashlib.sha256(b"abc").hexdigest()), digest)
+        # Only the broken tool's directory and those after it are shadowed.
+        dirs = lane_path.split(":")
+        self.assertEqual(dirs[dirs.index(str(broken)) - 1], str(Path(tool).parent))
+
+    def test_a_runnable_sha256sum_goes_just_before_a_broken_one_mid_path(self):
+        # What the lane plist gives: the broken directory is not first, and
+        # the directories ahead of it keep their place.
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{.*?\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("tool_runs", "runnable_sha256sum_on_path"))
+        broken, _ = self.broken_sha256sum()
+        real = Path(shutil.which("sha256sum", path="/sbin:/usr/bin:/bin")).parent
+        first = Path(self._tmp.name) / "first-bin"
+        first.mkdir()
+        rest = "/usr/bin:/bin"
+        env = {"PATH": f"{first}:{broken}:{rest}", "LOOM_SHA256SUM_DIRS": str(real)}
+        result = subprocess.run([shutil.which("bash"), "-c",
+                                 "set -uo pipefail\n" + funcs + 'runnable_sha256sum_on_path\nprintf %s "$PATH"'],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.stdout, f"{first}:{real}:{broken}:{rest}", result.stderr)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_no_runnable_sha256sum_is_a_lane_host_fault_not_a_base_check(self):
+        broken, path = self.broken_sha256sum()
+        self.contract_repo()
+        self.drop_brief()
+        self.write_tool(Path(self._tmp.name) / "pybin" / "loom-test-python",
+                        f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        result = self.run_lane(PATH=f"{Path(self._tmp.name) / 'pybin'}:{path}",
+                               LOOM_SHA256SUM_DIRS="/nonexistent",
+                               GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="protocol.file.allow",
+                               GIT_CONFIG_VALUE_0="always")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"lane host fault: sha256sum at {broken / 'sha256sum'} cannot run", self.lane_log())
+        self.assertEqual([(r["phase"], r["ok"]) for r in self.records()], [("prepare", False)])
+        created = [c for c in self.calls() if c.startswith("gh issue create")]
+        self.assertTrue(created, self.calls())
+        self.assertFalse([c for c in created if "base-check" in c], created)
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+
+    def test_key_digest_is_unchanged_where_sha256sum_works(self):
+        text = RUNNER.read_text()
+        func = re.search(r"^key_digest\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        want = hashlib.sha256(b"the key").hexdigest()[:16]
+        fakes = Path(self._tmp.name) / "digest-bin"
+        fakes.mkdir()
+        real = shutil.which("sha256sum", path="/sbin:/usr/bin:/bin")
+        for tool, target in (("sha256sum", real), ("cut", shutil.which("cut"))):
+            (fakes / tool).symlink_to(target)
+        result = subprocess.run([shutil.which("bash"), "-c", func + 'key_digest "the key"'],
+                                env={"PATH": str(fakes)}, capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), want, result.stderr)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_prepared_workspace_checks_the_agents_commit_before_the_pr(self):
