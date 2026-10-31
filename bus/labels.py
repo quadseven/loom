@@ -15,7 +15,7 @@ from .stale_claims import OVERFLOW_CLAIM
 HANDOFF = "handoff:claude"
 
 LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
-         "zai", "workersai", "agy", "spark"]
+         "zai", "workersai", "agy", "spark", "copilot"]
 # Extra slots: parallel copies of a lane on the same provider (run_lane.sh
 # maps a slot to its lane). anthropic has credits that expire, so it gets the
 # most; claude has none, because it spends the operator's own subscription.

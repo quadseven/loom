@@ -788,6 +788,18 @@ class SensitiveResumeTests(unittest.TestCase):
                         env={"LOOM_BRIEF_AUTHORS": "alice-example"})
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
+    def test_merge_refuses_a_box_said_to_be_already_done_with_no_code(self):
+        body = ("Refs %s#9\n\n## Acceptance criteria\n"
+                "- [x] one box is built\n"
+                "- [ ] another; not built: already in tree") % REPO
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                                {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []))
+        with self.assertRaisesRegex(ValueError, "cites no code"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
     # loom#1711: a ticked criterion that another repo of the owner must build.
     FOREIGN = "`other-repo` converts the two groups into one"
     SIBLINGS = {"LOOM_REPOS": "%s example-owner/other-repo" % REPO}
@@ -1826,6 +1838,20 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertIn("Pull request #8 merged and left ticket criteria unbuilt", note)
         for text in ("Second works.", "Third works.", "Fourth works."):
             self.assertIn(text, note)
+        self.assertNotIn("First works", note)
+
+    def test_the_brains_requeue_note_names_a_live_box_left_open_too(self):
+        # loom#2333: the note names every open box, not only the code ones.
+        body = ("## Acceptance criteria\n- [ ] First works; test.\n- [ ] Second works.\n"
+                "- [ ] Verify the shape holds\n")
+        pull = ("## Acceptance criteria\n- [x] First works; test.\n"
+                "- [ ] Second works.; not built: needs a key\n"
+                "- [ ] Verify the shape holds; not built: needs a key\n")
+        labels, fake = self._merge_with_files(self.CALLED, ticket_body=body, pull_body=pull)
+        self.assertEqual(labels, ["loom:ticket", "loom:queued"])
+        note = [c[2]["body"] for c in fake.calls if c[1].endswith("/issues/9/comments")][0]
+        self.assertIn("Second works.", note)
+        self.assertIn("Verify the shape holds", note)
         self.assertNotIn("First works", note)
 
     def test_merge_of_a_pull_request_that_builds_every_box_marks_merged(self):

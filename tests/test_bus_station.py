@@ -30,7 +30,7 @@ from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
 from bus import labels as labels_module  # noqa: E402
-from bus.github import AppToken, GitHub, GitHubError, TargetReached  # noqa: E402
+from bus.github import AppToken, GitHub, GitHubError, RateLimited, TargetReached  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 REPO = "example-owner/example-repo"
@@ -888,6 +888,28 @@ class ReconcilePullRequestTest(Base):
         st.reconcile_pull_requests()
         self.assertEqual(self.fake.paths("PUT"), [])
         self.assertEqual(self.fake.names(12), before)
+
+    def test_the_requeue_note_names_every_open_box_of_any_kind(self):
+        # loom#2333: six boxes were left and the note named one. A box read as
+        # a live check is still open, so the ticket's next reader must see it.
+        criteria = ("## Acceptance criteria\n- [ ] Count the names\n- [ ] Build the first\n"
+                    "- [ ] Verify the shape holds\n- [x] Already ticked on the ticket\n")
+        self.fake.add(12, state="pr", body=BODY + "\n" + criteria)
+        self.merged_with("- [ ] Count the names; not built: no time\n- [x] Build the first\n"
+                         "- [ ] Verify the shape holds; not built: no time\n")
+        self.assertIn("loom:queued", self.fake.names(12))
+        note = [c["body"] for c in status.expand(self.fake.comments[12], AUTHORS)][0]
+        self.assertIn("Count the names", note)
+        self.assertIn("Verify the shape holds", note)
+        self.assertNotIn("Build the first", note)
+        self.assertNotIn("Already ticked", note)
+
+    def test_only_a_live_box_open_does_not_send_the_ticket_back(self):
+        criteria = ("## Acceptance criteria\n- [ ] Build the first\n"
+                    "- [ ] Verify the shape holds\n")
+        self.fake.add(12, state="pr", body=BODY + "\n" + criteria)
+        self.merged_with("- [x] Build the first\n- [ ] Verify the shape holds\n")
+        self.assertIn("loom:merged", self.fake.names(12))
 
     def test_a_pr_merged_before_the_requeue_does_not_requeue_the_ticket_again(self):
         self.merged_with("- [x] First works; test.\n")
@@ -3936,7 +3958,7 @@ class StampedReviewFake(ReviewFake):
                                 fixrounds.load_ledger(self.fix_ledger))
 
     def _post_comment(self, data):
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
         self.next_id += 1
         self.new_comments += 1
         self.comments.append({"id": self.next_id, "body": data["body"],
@@ -3947,7 +3969,7 @@ class StampedReviewFake(ReviewFake):
     def _patch_comment(self, comment_id, data):
         comment = next(c for c in self.comments if c.get("id") == comment_id)
         comment["body"] = data["body"]
-        comment["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        comment["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
         return mock.Mock(data=dict(comment))
 
     def _get(self, path):
@@ -3988,13 +4010,26 @@ class FixRoundsInPlaceTest(unittest.TestCase):
 
     def round(self, n, rounds="10"):
         self.lane_pushes(str(n) * 40)
-        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": rounds}), \
+        # The round follows its claim on the clock too: _fix_for orders them
+        # by the times the status comment and the rounds comment carry.
+        after_claim = time.time() + 60 * self.claims + 30
+        with mock.patch("time.time", return_value=after_claim), \
+             mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": rounds}), \
              mock.patch("bus.brain._failing_checks", return_value=[("lint-%d" % n, "log %d" % n)]), \
              mock.patch("bus.brain._open_threads", return_value=[self.thread("PRRT_%d" % n)]):
             self.station.hand_back()
 
     def fixes(self):
         return [c for c in self.gh.comments if str(c["body"]).startswith(tickets.FIX_MARKER)]
+
+    def assert_refused_or_ended(self, comments):
+        """An edited rounds comment reads as one comment at its first post
+        time. With no claim after that it is refused. A later claim ends it, so
+        a restart is never held by an old comment, and it is not built on."""
+        unclaimed = [c for c in comments if not status.is_status(c.get("body"))]
+        with self.assertRaisesRegex(ValueError, "edited after it was posted"):
+            self.station._fix_for(REPO, unclaimed)
+        self.assertIsNone(self.station._fix_for(REPO, comments))
 
     def test_three_rounds_on_one_pull_request_are_one_comment_listing_all_three(self):
         for n in (1, 2, 3):
@@ -4065,8 +4100,7 @@ class FixRoundsInPlaceTest(unittest.TestCase):
             self.round(n)
         self.fixes()[0]["updated_at"] = "2099-01-01T00:00:00Z"
         comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
-        with self.assertRaisesRegex(ValueError, "edited after it was posted"):
-            self.station._fix_for(REPO, comments)
+        self.assert_refused_or_ended(comments)
         # Read per comment: the edited one is one round, never its rounds.
         self.assertEqual(station.Station._fix_round_count(comments, self.authors), 1)
         self.round(3)
@@ -4088,8 +4122,7 @@ class FixRoundsInPlaceTest(unittest.TestCase):
         comment["updated_at"] = stamp
         comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
         self.assertEqual(station.Station._fix_round_count(comments, self.authors), 1)
-        with self.assertRaisesRegex(ValueError, "edited after it was posted"):
-            self.station._fix_for(REPO, comments)
+        self.assert_refused_or_ended(comments)
 
     def test_round_counters_never_read_a_strangers_rounds(self):
         self.round(1)
@@ -4362,6 +4395,35 @@ class PassBudgetTest(Base):
     def test_a_pass_within_its_budget_runs_every_step_and_starts_over(self):
         self.run_pass()
         self.assertEqual(self.rotation(), 0)
+
+    def seed_rotation(self, step):
+        self.write(os.path.join(self.home, "state", "station", station.STEP_ROTATION_FILE),
+                   json.dumps({"next": step}))
+
+    def test_a_step_a_rate_limit_stops_does_not_start_the_next_pass(self):
+        # loom#2321: on 2026-10-31 check_invariants hit the search limit each
+        # pass, the raise skipped the rotation write, and the next pass began
+        # on it again, so the 39 other steps waited for hours.
+        def limited(_station):
+            raise RateLimited("GET /search/issues -> 403", 403, "", 0)
+
+        later = mock.Mock(__name__="release_factory_held")
+        self.seed_rotation(0)
+        with mock.patch.object(station.Station, "check_invariants", limited), \
+                mock.patch.object(station.Station, "release_factory_held", later):
+            self.run_pass()
+            later.assert_not_called()
+            self.assertGreater(self.rotation(), 0)
+            self.run_pass()
+        later.assert_called_once()
+
+    def test_a_step_that_crashes_keeps_its_place_in_the_rotation(self):
+        self.seed_rotation(0)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(station.Station, "_timed", side_effect=[True, KeyError("x")]):
+            with self.assertRaises(KeyError):
+                st._run_steps()
+        self.assertEqual(self.rotation(), 1)
 
 
 class CorruptStateTest(Base):
@@ -5129,6 +5191,88 @@ class FixTest(Base):
         self.assertEqual(self.listing(), [])
         self.assertIn("loom:pr", self.fake.names(12))
         self.assertNotIn("loom:running", self.fake.names(12))
+
+    def restarted_after_a_round(self, pull):
+        """A claimed attempt, a fix round on pull request 99, the pull request
+        ended, then a rung 0 restart back to loom:briefed."""
+        self.fake.add(12, events=[dict(labeled("loom:briefed", "alice-example"),
+                                       created_at="2030-01-02T00:00:00Z"),
+                                  labeled("lane:codex", "bob-example")])
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)")
+        self.comment(12, FIX_BODY)
+        self.comment(12, "<!-- loom:rung 0 --> Restarted on rung 0.")
+        self.fake.pulls.append(dict({"number": 99, "state": "closed", "base": {"ref": "main"},
+                                     "head": {"ref": "loom/12-fix-the-thing"}}, **pull))
+
+    def assert_normal_brief(self):
+        brief = self.claimed_brief()
+        self.assertNotIn("Fix-PR:", brief)
+        self.assertNotIn("\n## Fix\n", brief)
+        self.assertIn("\nBranch: loom/12-fix-the-thing-r2\n", brief)
+        self.assertIn("loom:running", self.fake.names(12))
+
+    def test_a_rung_0_restart_after_a_merged_pull_request_gets_a_normal_brief(self):
+        self.restarted_after_a_round({"merged_at": "2030-01-01T12:00:00Z",
+                                      "merge_commit_sha": "%040x" % 99})
+        self.fake.issues[12]["labels"].append({"name": "loom:regression"})
+        with mock.patch.object(station, "_say") as say:
+            self.run_pass()
+        self.assert_normal_brief()
+        self.assertNotIn("loom:pr", self.fake.names(12))
+        self.assertFalse([c for c in say.call_args_list
+                          if "merged before its fix round" in str(c)])
+
+    def test_a_rung_0_restart_after_a_closed_pull_request_gets_a_normal_brief(self):
+        self.restarted_after_a_round({"merged_at": None})
+        self.run_pass()
+        self.assert_normal_brief()
+
+    def test_a_fix_after_a_rung_0_restart_still_runs_as_a_fix_round(self):
+        self.fake.add(12)
+        self.comment(12, "<!-- loom:rung 0 --> Restarted on rung 0.")
+        self.comment(12, FIX_BODY)
+        self.fake.pulls.append({"number": 99, "state": "open", "merged_at": None,
+                                "base": {"ref": "main"}, "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        self.assertIn("Fix-PR: 99\n", self.claimed_brief("example-owner.example-repo-12"))
+
+    def test_a_climb_or_a_strangers_rung_0_does_not_end_a_fix(self):
+        self.fake.add(12)
+        self.comment(12, FIX_BODY)
+        self.comment(12, "<!-- loom:rung 2 --> Moved up the ladder.")
+        self.comment(12, "<!-- loom:rung 0 --> Restart it.", author="stranger")
+        self.fake.pulls.append({"number": 99, "state": "open", "merged_at": None,
+                                "base": {"ref": "main"}, "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        self.assertIn("Fix-PR: 99\n", self.claimed_brief("example-owner.example-repo-12"))
+
+    def status_comment(self, claimed_at, author="alice-example"):
+        return {"id": 2, "user": {"login": author}, "created_at": "2030-01-01T00:00:00Z",
+                "updated_at": claimed_at,
+                "body": status.render([(claimed_at, "Claimed for lane codex (body sha256 0123456789ab)")])}
+
+    def fix_comment(self):
+        at = "2030-01-02T00:00:00Z"
+        return {"id": 3, "user": {"login": "alice-example"}, "body": FIX_BODY,
+                "created_at": at, "updated_at": at}
+
+    def fix_of(self, comments):
+        return station.Station(GitHub("token", transport=self.fake), self.settings)._fix_for(REPO, comments)
+
+    def test_a_fix_posted_before_the_status_comment_claim_is_not_current(self):
+        self.assertIsNone(self.fix_of([self.fix_comment(), self.status_comment("2030-01-02T00:00:01Z")]))
+        # The status comment keeps its place in the list and its first post
+        # time, so only the event's own time puts the claim after the fix.
+        self.assertIsNone(self.fix_of([self.status_comment("2030-01-02T00:00:01Z"), self.fix_comment()]))
+
+    def test_a_fix_posted_after_the_status_comment_claim_is_current(self):
+        found = self.fix_of([self.status_comment("2030-01-01T23:59:59Z"), self.fix_comment()])
+        self.assertEqual(found[0].pr, 99)
+
+    def test_a_strangers_status_comment_does_not_end_a_fix(self):
+        found = self.fix_of([self.fix_comment(),
+                             self.status_comment("2030-01-02T00:00:01Z", author="stranger")])
+        self.assertEqual(found[0].pr, 99)
 
     def test_a_fix_for_an_open_pull_request_is_briefed(self):
         self.fake.add(12)

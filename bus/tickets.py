@@ -541,6 +541,21 @@ ANSWER_NOTE = (
     "finding on a strong model's round; anything else still needs a fix.")
 
 
+# Every review thread a fix brief lists needs an answer (2026-10-31: about two
+# thirds of open threads on lane pull requests were findings no round
+# answered, so the merge gate held them). The runner posts each entry after
+# the push and names any listed thread left without one (lanes/run_lane.sh
+# unanswered_threads).
+REPLIES_NOTE = (
+    "Answer every review thread listed below: write .loom/replies.json as a JSON "
+    "array with one {\"thread\": \"THREAD_ID\", \"reply\": \"TEXT\", \"resolve\": true} "
+    "object per thread (THREAD_ID is the id after `### Thread`). When this round's "
+    "change fixes the finding, set resolve true and say in the reply what changed "
+    "and where. When you do not fix it, set resolve false and give a concrete reason "
+    "that points at the code. A thread answered in `.loom-answers/` needs no entry "
+    "here. The runner posts the entries after the push and reports every listed "
+    "thread left without an answer.")
+
 # Where a run that timed out or hit a limit after editing left its edits (lanes/run_lane.sh
 # preserve_timedout), as the failure reason names it.
 TIMEDOUT_RE = re.compile(r"the edits are on branch ([A-Za-z0-9._/-]+-timedout-[0-9]+)")
@@ -711,11 +726,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += ("\n## Fix\n\nThis ticket already has pull request #%d on branch %s. "
                  "Fix what is listed below on that branch: change only what the findings "
                  "need and keep the rest of the work.\n\n%s\n\n"
-                 "You may also write .loom/replies.json as a JSON array of "
-                 "{\"thread\": \"THREAD_ID\", \"reply\": \"TEXT\", \"resolve\": true} "
-                 "objects; the runner posts these after pushing and resolves threads marked "
-                 "true.\n\n%s\n"
-                 % (fix.pr, fix.branch, ANSWER_NOTE, fix.findings))
+                 "%s\n\n%s\n"
+                 % (fix.pr, fix.branch, ANSWER_NOTE, REPLIES_NOTE, fix.findings))
     return text
 
 
