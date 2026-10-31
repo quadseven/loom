@@ -18,6 +18,7 @@ NOW = datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc)
 AUTHORS = ["allowed-bot"]
 PR = (REPO, 7)
 TICKET = (REPO, 9)
+BRIEFED = (REPO, 10)
 
 
 def at(minutes_ago: int) -> str:
@@ -343,6 +344,48 @@ class ResumeCommandTests(unittest.TestCase):
                          "holder=muse -->" % REPO, line)
         line = brain.defer(GitHub("t", transport=Routes(routes)), "failed", TICKET, "muse")
         self.assertIn("rev=failed-c2", line)
+
+    def test_needs_brain_defer_is_durable_and_resolution_keeps_other_defers(self):
+        routes = self.routes()
+        ticket = {"state": "open", "comments": 2, "labels": [
+            {"name": "loom:ticket"}, {"name": "loom:briefed"},
+            {"name": "needs-brain"}, {"name": "claim:human"}, {"name": "wait:operator"}]}
+        routes[("GET", "/repos/%s/issues/10" % REPO)] = (200, ticket)
+        fake = Routes(routes)
+        marker = brain.defer(GitHub("t", transport=fake), "needs-brain", BRIEFED, "muse",
+                             note="decision needs review")
+        self.assertIn("stage=needs-brain", marker)
+        self.assertEqual([], fake.posted)
+        self.assertTrue(all(method == "GET" for method, _ in fake.calls))
+
+        journals = [comment(journal(10, "muse", marker, marker,
+                                    handoff.defer_marker("failed", TICKET, "failed-c2", "muse")))]
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, journals)
+        out = brain.resume(GitHub("t", transport=Routes(routes)), [REPO], "lane-machine",
+                           LOCK_REPO, NOW, {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
+        self.assertIn("- stage needs-brain: yielded by muse", out)
+        self.assertIn("- resume needs-brain %s#10: decision needs review" % REPO, out)
+        self.assertEqual(1, sum(line.startswith("- resume needs-brain") for line in out.splitlines()))
+        self.assertEqual(ticket["labels"], routes[("GET", "/repos/%s/issues/10" % REPO)][1]["labels"])
+
+        resolved = handoff.done_marker("needs-brain", BRIEFED, "lane-machine")
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, journals + [
+            comment(journal(5, "lane-machine", resolved))])
+        after = brain.resume(GitHub("t", transport=Routes(routes)), [REPO], "lane-machine",
+                             LOCK_REPO, NOW, {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
+        self.assertNotIn("- resume needs-brain", after)
+        self.assertIn("- resume failed %s#9" % REPO, after)
+
+    def test_needs_brain_defer_requires_both_briefed_and_needs_brain(self):
+        for labels in ([{"name": "loom:ticket"}, {"name": "loom:briefed"}],
+                       [{"name": "loom:ticket"}, {"name": "needs-brain"}]):
+            with self.subTest(labels=labels):
+                routes = self.routes()
+                routes[("GET", "/repos/%s/issues/10" % REPO)] = (
+                    200, {"state": "open", "comments": 2, "labels": labels})
+                with self.assertRaisesRegex(ValueError, "loom:briefed ticket with needs-brain"):
+                    brain.defer(GitHub("t", transport=Routes(routes)), "needs-brain", BRIEFED,
+                                "muse", note="decision needs review")
 
     def test_defer_refuses_an_unknown_stage_with_a_value_error(self):
         with self.assertRaises(ValueError) as caught:
