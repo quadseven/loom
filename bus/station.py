@@ -6228,13 +6228,30 @@ class Station:
     def _factory_probe_candidate(self, repo: str, incident: Dict[str, Any],
                                  ref: str) -> Optional[Tuple[str, Dict[str, Any]]]:
         """Return the due probe head and ledger, if this incident may probe."""
-        incident_body = str(incident.get("body") or "")
-        kind = re.search(r"^Kind:\s*(\S+)", incident_body, re.M)
-        if not kind or kind.group(1) not in ("base-check", "environment"):
+        if not self._factory_probe_kind(incident) or self._has_queued_ticket(repo):
             return None
+        head = self._factory_probe_head(repo)
+        if head is None:
+            return None
+        sha, committed = head
+        probes = self._factory_probes()
+        record = probes.get(ref) if isinstance(probes.get(ref), dict) else {}
+        if not self._factory_probe_due(incident, sha, committed, record, self.now):
+            return None
+        return sha, probes
+
+    def _factory_probe_kind(self, incident: Dict[str, Any]) -> bool:
+        """Whether the incident is of a kind a passing lane run can close."""
+        kind = re.search(r"^Kind:\s*(\S+)", str(incident.get("body") or ""), re.M)
+        return bool(kind) and kind.group(1) in ("base-check", "environment")
+
+    def _has_queued_ticket(self, repo: str) -> bool:
+        """Whether a queued ticket of the repo can still run the base check."""
         queued = self._paginate("/repos/%s/issues?labels=loom:queued&state=open&per_page=100" % repo)
-        if any(isinstance(item, dict) and "pull_request" not in item for item in queued):
-            return None
+        return any(isinstance(item, dict) and "pull_request" not in item for item in queued)
+
+    def _factory_probe_head(self, repo: str) -> Optional[Tuple[str, float]]:
+        """The default branch head's sha and commit time, read once per pass."""
         branch = self._default_branch(repo)
         if not branch:
             return None
@@ -6250,17 +6267,12 @@ class Station:
         committed = self._epoch(str(((commit.get("commit") or {}).get("committer") or {}).get("date") or ""))
         if not sha or committed is None:
             return None
-        path = os.path.join(self.state, "factory_probes.json")
-        probes = _read_json(path, {}, strict=False)
-        if not isinstance(probes, dict):
-            probes = {}
-        record = probes.get(ref) if isinstance(probes.get(ref), dict) else {}
-        incident_at = self._epoch(str(incident.get("created_at") or ""))
-        if incident_at is None or self.now - incident_at < FACTORY_PROBE_AFTER:
-            return None
-        if not self._factory_probe_due(incident, sha, committed, record, self.now):
-            return None
-        return sha, probes
+        return sha, committed
+
+    def _factory_probes(self) -> Dict[str, Any]:
+        """The ledger of the last probe per incident."""
+        probes = _read_json(os.path.join(self.state, "factory_probes.json"), {}, strict=False)
+        return probes if isinstance(probes, dict) else {}
 
     def _release_factory_probe(self, key: str, repo: str, number: int, ref: str,
                                sha: str, probes: Dict[str, Any]) -> None:

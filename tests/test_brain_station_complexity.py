@@ -15,6 +15,8 @@ TARGETS = (
     ("bus/brain.py", "_ready_sensitive"),
     ("bus/station.py", "Station._deliver_unlinked"),
     ("bus/station.py", "Station._claim"),
+    ("bus/station.py", "Station._probe_factory_held"),
+    ("bus/station.py", "Station._factory_probe_candidate"),
 )
 
 
