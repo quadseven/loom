@@ -30,7 +30,7 @@ from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
 from bus import labels as labels_module  # noqa: E402
-from bus.github import AppToken, GitHub, GitHubError, TargetReached  # noqa: E402
+from bus.github import AppToken, GitHub, GitHubError, RateLimited, TargetReached  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 REPO = "example-owner/example-repo"
@@ -4350,6 +4350,35 @@ class PassBudgetTest(Base):
     def test_a_pass_within_its_budget_runs_every_step_and_starts_over(self):
         self.run_pass()
         self.assertEqual(self.rotation(), 0)
+
+    def seed_rotation(self, step):
+        self.write(os.path.join(self.home, "state", "station", station.STEP_ROTATION_FILE),
+                   json.dumps({"next": step}))
+
+    def test_a_step_a_rate_limit_stops_does_not_start_the_next_pass(self):
+        # loom#2321: on 2026-10-31 check_invariants hit the search limit each
+        # pass, the raise skipped the rotation write, and the next pass began
+        # on it again, so the 39 other steps waited for hours.
+        def limited(_station):
+            raise RateLimited("GET /search/issues -> 403", 403, "", 0)
+
+        later = mock.Mock(__name__="release_factory_held")
+        self.seed_rotation(0)
+        with mock.patch.object(station.Station, "check_invariants", limited), \
+                mock.patch.object(station.Station, "release_factory_held", later):
+            self.run_pass()
+            later.assert_not_called()
+            self.assertGreater(self.rotation(), 0)
+            self.run_pass()
+        later.assert_called_once()
+
+    def test_a_step_that_crashes_keeps_its_place_in_the_rotation(self):
+        self.seed_rotation(0)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(station.Station, "_timed", side_effect=[True, KeyError("x")]):
+            with self.assertRaises(KeyError):
+                st._run_steps()
+        self.assertEqual(self.rotation(), 1)
 
 
 class CorruptStateTest(Base):
