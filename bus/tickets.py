@@ -1024,6 +1024,48 @@ def claimed_by(issue: Dict[str, Any]) -> List[str]:
     return [login for login in found if login]
 
 
+# A lane's report labels a ticket loom:pr a moment after its pull request opens,
+# and a pass reads open pull requests once: this long past the label, a missing
+# pull request is really missing.
+PULL_GONE_GRACE = 600
+
+
+def pull_gone(timeline: Iterable[Any], repo: str, number: int, now: float,
+              authors: Iterable[str]) -> bool:
+    """Whether a ticket at loom:pr, with no open pull request in its repo
+    linking it, has nothing to wait for. Its timeline may show a pull request
+    by one of `authors` in another repo that names it (still open), or one
+    that merged after the ticket's last brief and fell outside the closed page
+    the station reads: those keep the label. A merge from before the last
+    brief is spent. A stranger's pull request counts for nothing: anyone can
+    write a Refs line in any repo."""
+    allowed = {a.lower() for a in authors}
+    events = [e for e in timeline if isinstance(e, dict)]
+    labelled = [(str((e.get("label") or {}).get("name") or ""), str(e.get("created_at") or ""))
+                for e in events if e.get("event") == "labeled"]
+    put = max((at for name, at in labelled if name == "loom:pr"), default="")
+    if not put or now - calendar.timegm(time.strptime(put, "%Y-%m-%dT%H:%M:%SZ")) < PULL_GONE_GRACE:
+        return False
+    briefed = max((at for name, at in labelled if name in ("loom:queued", "loom:briefed")),
+                  default="")
+    line = re.compile(r"^Refs %s#%d\b" % (re.escape(repo), number), re.M)
+    bare = re.compile(r"^Refs #%d\b" % number, re.M)
+    home = "/repos/%s" % repo.lower()
+    for event in events:
+        source = event.get("source") if isinstance(event.get("source"), dict) else {}
+        pull = source.get("issue") if isinstance(source.get("issue"), dict) else {}
+        body = str(pull.get("body") or "")
+        here = str(pull.get("repository_url") or "").lower().endswith(home)
+        if (event.get("event") != "cross-referenced" or "pull_request" not in pull
+                or _login(pull.get("user")) not in allowed
+                or not (line.search(body) or (here and bare.search(body)))):
+            continue
+        merged = str((pull.get("pull_request") or {}).get("merged_at") or "")
+        if pull.get("state") == "open" or merged > briefed:
+            return False
+    return True
+
+
 def owned_elsewhere(issue: Dict[str, Any], authors: Iterable[str],
                     briefers: Iterable[str] = ()) -> Optional[str]:
     """The login that owns an issue when it is another operator's, else None.

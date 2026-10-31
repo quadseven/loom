@@ -397,6 +397,55 @@ class PullRequests(Base):
         self.assertEqual(len(self.gh.filed), 1)
         self.assertIn("- [ ] A5", self.gh.filed[0]["body"])
 
+    def test_moves_are_counted_since_the_last_claim_or_hold(self):
+        def note(at, body, who=ME["login"]):
+            return {"created_at": "2030-01-01T00:00:%02dZ" % at, "body": body,
+                    "user": {"login": who}}
+        rung = "<!-- loom:rung 2 -->\nNot a failure (9 tickets wait on lane a): the factory " \
+               "moved this ticket up the model ladder to rung 2, m on lane b."
+        stall = "Not a failure (briefed 3 hours on lane b with no claim): the factory moved " \
+                "this ticket to lane c, in its difficulty tier."
+        climb = "%s\nEscalated to rung 1 of 3: m on lane a." % brain.ESCALATE_MARKER
+        claim = "Claimed for lane a (body sha256 %s)" % ("0" * 12)
+        self.assertEqual(factory.unclaimed_moves(
+            [note(1, rung), note(2, stall), note(3, climb)], [ME["login"]]), 3)
+        self.assertEqual(factory.unclaimed_moves(
+            [note(1, rung), note(2, claim), note(3, climb)], [ME["login"]]), 1)
+        self.assertEqual(factory.unclaimed_moves(
+            [note(1, rung), note(2, factory.MOVE_CAP_MARKER), note(3, stall)], [ME["login"]]), 1)
+
+    def test_a_strangers_comment_neither_adds_a_move_nor_resets_the_count(self):
+        def note(at, body, who):
+            return {"created_at": "2030-01-01T00:00:%02dZ" % at, "body": body,
+                    "user": {"login": who}}
+        climb = "%s\nEscalated" % brain.ESCALATE_MARKER
+        claim = "Claimed for lane a (body sha256 %s)" % ("0" * 12)
+        self.assertEqual(factory.unclaimed_moves([note(1, climb, "stranger")], [ME["login"]]), 0)
+        self.assertEqual(factory.unclaimed_moves(
+            [note(1, climb, ME["login"]), note(2, claim, "stranger"),
+             note(3, factory.MOVE_CAP_MARKER, "stranger")], [ME["login"]]), 1)
+        self.assertEqual(factory.unclaimed_moves([note(1, "quoted " + climb, ME["login"])], [ME["login"]]), 0)
+
+    def test_a_ticket_moved_to_the_cap_with_no_claim_is_held_for_the_brain(self):
+        """loom#2333: a ticket went between two rungs 13 times with no run."""
+        self.gh.ticket(5, "briefed", lane="claude")
+        self.gh.comments[5] = [{"id": n, "user": ME, "created_at": "2030-01-01T00:00:00Z",
+                                "body": "%s\nmoved" % brain.ESCALATE_MARKER} for n in range(6)]
+        run = factory.Factory.__new__(factory.Factory)
+        run.gh, run.actions, run.trusted = self.gh, 0, {ME["login"]}
+        self.assertTrue(run._move_capped(REPO, self.gh.issues[5], self.gh.comments[5]))
+        names = [x["name"] for x in self.gh.issues[5]["labels"]]
+        self.assertIn("needs-brain", names)
+        self.assertIn(factory.RUNAWAY, names)
+        self.assertTrue(any(factory.MOVE_CAP_MARKER in str(c.get("body"))
+                            for c in self.gh.comments[5]))
+
+    def test_the_move_cap_can_be_turned_off(self):
+        with mock.patch.dict(os.environ, {"LOOM_UNCLAIMED_MOVE_CAP": "0"}):
+            self.assertFalse(brain.past_move_cap(100))
+        with mock.patch.dict(os.environ, {"LOOM_UNCLAIMED_MOVE_CAP": "2"}):
+            self.assertTrue(brain.past_move_cap(2))
+
     def test_a_criterion_follow_up_is_filed_under_an_epic_not_under_its_ticket(self):
         # loom#951: it said "Part of" the ticket it came from, which is no
         # epic, so it sat in none.

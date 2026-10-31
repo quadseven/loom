@@ -519,6 +519,11 @@ BRIEF_RES = (
     re.compile(r"the factory moved this ticket up the model ladder to rung \d+, \S+ on lane ([a-z0-9-]+)\."),
 )
 RUNAWAY = "loom:runaway"
+# A ticket no lane takes stops moving after this many moves (loom#2333): one
+# went between two rungs 13 times in a week with no run. LOOM_UNCLAIMED_MOVE_CAP
+# sets it; 0 turns the cap off.
+UNCLAIMED_MOVE_CAP = 6
+MOVE_CAP_MARKER = "<!-- loom:move-cap v1 -->"
 NO_REASON = "agent made no commit and wrote no reason"
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
                  ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved isOutdated path line originalLine'
@@ -742,6 +747,28 @@ def class_of(item: Dict[str, Any]) -> str:
 
 def _lane(issue: Dict[str, Any]) -> str:
     return next((x[5:] for x in _labels(issue) if x.startswith("lane:")), "")
+
+
+def move_cap() -> int:
+    """LOOM_UNCLAIMED_MOVE_CAP as a whole number, else the default."""
+    raw = os.environ.get("LOOM_UNCLAIMED_MOVE_CAP", "").strip()
+    return int(raw) if raw.isdigit() else UNCLAIMED_MOVE_CAP
+
+
+def unclaimed_moves(comments: Sequence[Dict[str, Any]], authors: Sequence[str]) -> int:
+    """The moves between lanes or rungs since a lane last claimed the ticket
+    or the cap last held it: status events and escalations written by
+    `authors`. These repos take comments from strangers, whose text could
+    otherwise hold a ticket or keep one moving."""
+    count = 0
+    for comment in sorted(brain.trusted_comments(comments, authors), key=lambda c: str(c.get("created_at") or "")):
+        body = str(comment.get("body") or "")
+        if CLAIM_RE.match(body) or body.startswith(MOVE_CAP_MARKER):
+            count = 0
+        elif (body.startswith(brain.ESCALATE_MARKER)
+              or any(rx.search(body) for rx in BRIEF_RES[1:])):
+            count += 1
+    return count
 
 
 def rung_of(comments: Sequence[Dict[str, Any]]) -> int:
@@ -2099,6 +2126,17 @@ class Factory:
                          if self._up(lane) and self._serves(lane, CLIMB[n - 1][1]))
                 for n in range(1, len(CLIMB) + 1)}
 
+    def _move_capped(self, repo: str, issue: Dict[str, Any],
+                     comments: Sequence[Dict[str, Any]]) -> bool:
+        """Hold a ticket moved move_cap() times with no claim for the brain."""
+        moves = unclaimed_moves(comments, sorted(self.trusted))
+        if not brain.past_move_cap(moves):
+            return False
+        names = brain.hold_unclaimed(self.gh, repo, int(issue["number"]), _labels(issue), moves)
+        issue["labels"] = [{"name": x} for x in names]
+        self.actions += 1
+        return True
+
     def _rungs_left(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
                     footer: Optional[Tuple[str, str]] = None) -> List[int]:
         """The rungs the ticket may still climb to that have a lane for its
@@ -2117,6 +2155,8 @@ class Factory:
         number = int(issue["number"])
         if RUNAWAY in _labels(issue):
             return None  # held until a brain clears the label
+        if self._move_capped(repo, issue, comments):
+            return None
         tried, reached = self._tried(issue, comments, failed_here, footer)
         up = self._up_lanes(repo)
         rung = next_rung(tried | ({skip} - {0}), self.load, {n for n in up if up[n]}, reached,
@@ -4019,6 +4059,8 @@ class Factory:
             return
         if any(CLAIM_RE.match(str(c.get("body") or "")) and _ts(c.get("created_at")) >= since
                for c in comments):
+            return
+        if self._move_capped(repo, issue, comments):
             return
         old = _lane(issue)
         rung = current_rung(issue)
