@@ -361,6 +361,47 @@ class Guardrail(Case):
         self.assertIn("1 of 1", self.control("status"))
         self.assertIn("Paused", self.proof_issues()[0]["body"])
 
+    def asks(self):
+        number = self.proof_issues()[0]["number"]
+        return [c for c in self.fake.comments.get(number, []) if "evidence close stopped" in c["body"]]
+
+    def test_a_stop_raises_one_ask_however_many_passes_see_it(self):
+        self.ticket(1)
+        self.close_pass()
+        self.reopen(1)
+        self.ticket(2)
+        now = time.time()
+        for step in range(3):
+            self.close_pass(now + step * 300)
+        self.assertEqual(len(self.asks()), 1)
+        number = self.proof_issues()[0]["number"]
+        self.assertIn("needs:human", self.fake.names(number))
+        self.assertIn("resume", self.asks()[0]["body"])
+
+    def test_a_stop_after_a_resume_raises_a_new_ask(self):
+        self.ticket(1)
+        self.close_pass()
+        self.reopen(1)
+        self.close_pass()
+        self.fake.issues[self.proof_issues()[0]["number"]]["labels"] = [
+            {"name": "loom:proof-due"}]
+        self.control("resume")
+        now = time.time() + 60
+        self.fake.issues[1]["state"] = "closed"
+        self.close_pass(now)
+        self.ticket(2)
+        self.close_pass(now + 60)
+        self.reopen(2)
+        self.close_pass(now + 120)
+        self.assertEqual(len(self.asks()), 2)
+
+    def test_an_operators_own_pause_asks_nothing(self):
+        self.ticket(1)
+        self.close_pass()
+        self.control("pause")
+        self.close_pass()
+        self.assertEqual(self.asks(), [])
+
     def test_a_reopen_at_the_limit_does_not_stop_it(self):
         now = time.time()
         for number in range(1, 21):
