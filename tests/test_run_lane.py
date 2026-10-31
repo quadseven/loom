@@ -1949,6 +1949,42 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
                                capture_output=True, text=True, check=True).stdout.split()
         self.assertNotIn(".loom/replies.json", files)
 
+    def test_a_fix_round_that_leaves_a_listed_thread_without_a_reply_says_so(self):
+        # 2026-10-31: about two thirds of open review threads on lane pull
+        # requests were findings the lane never answered, so the merge gate
+        # held those pull requests with nobody told why.
+        name, _ = self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7",
+                               FAKE_REPLIES='[{"thread":"PRRT_other","reply":"Done","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("%s: review threads left without a reply: PRRT_1" % name, log)
+        [note] = self.sticky_bodies()
+        self.assertIn("Review threads this round left without a reply: PRRT_1", note)
+
+    def test_a_listed_thread_with_a_reply_entry_is_posted_resolved_and_not_flagged(self):
+        name, _ = self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7",
+                               FAKE_REPLIES='[{"thread":"PRRT_1","reply":"Renamed in a.py.","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c and "PRRT_1" in c for c in calls))
+        self.assertTrue(any("resolveReviewThread" in c and "PRRT_1" in c for c in calls))
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertNotIn("left without a reply", log)
+        [note] = self.sticky_bodies()
+        self.assertNotIn("left without a reply", note)
+
+    def test_a_listed_thread_answered_in_loom_answers_is_not_flagged(self):
+        name, _ = self.fix_brief()
+        secret = Path(self._tmp.name) / "outside-secret"
+        secret.write_text("unused\n")
+        result = self.run_lane(FAKE_AGENT="answer", FAKE_GH_EXISTING="7",
+                               FAKE_SECRET_FILE=str(secret))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertNotIn("left without a reply", log)
+
     def test_fix_runner_never_replies_to_or_resolves_a_thread_on_another_pull_request(self):
         self.fix_brief()
         replies = ('[{"thread":"PRRT_elsewhere","reply":"Addressed","resolve":true},'
