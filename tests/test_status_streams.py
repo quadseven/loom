@@ -65,7 +65,7 @@ class EachTest(unittest.TestCase):
                 self.stuck.wait()
             return repo
         got = list(per_repo.each([HANG, FAST], read, BUDGET, workers=1))
-        self.assertEqual(got, [(HANG, False, None), (FAST, True, FAST)])
+        self.assertCountEqual(got, [(HANG, False, None), (FAST, True, FAST)])
 
     def test_an_error_is_raised_when_its_repo_comes_up(self) -> None:
         def read(repo: str) -> str:
@@ -187,6 +187,57 @@ class ResumeStreamTest(unittest.TestCase):
         self.assertTrue(self.parts[0].startswith("# Resume for tester"))
         self.assertIn("## Sensitive pull requests", self.parts[-1])
         self.assertIn("## Lane proof audit", self.parts[-1])
+
+
+class SecondTryTest(unittest.TestCase):
+    """On 2026-10-31 one slow or dropped read cost a remote brain the loom
+    section of status and all of resume: a repo gets one more try, and one
+    repo's dropped connection does not end the run."""
+
+    def setUp(self) -> None:
+        self.stuck = Stuck()
+        self.addCleanup(self.stuck.release.set)
+        self.calls: list = []
+
+    def test_a_slow_read_is_read_again_with_a_fresh_budget(self) -> None:
+        def read(repo):
+            self.calls.append(repo)
+            if len(self.calls) == 1:
+                self.stuck.wait()
+            return "answer"
+        got = list(per_repo.each([FAST], read, 0.1, workers=2))
+        self.assertEqual([(FAST, True, "answer")], got)
+        self.assertEqual(2, len(self.calls))
+
+    def test_a_dropped_read_is_read_again(self) -> None:
+        def read(repo):
+            self.calls.append(repo)
+            if len(self.calls) == 1:
+                raise GitHubError("request failed: RemoteDisconnected", 0, "")
+            return "answer"
+        self.assertEqual([(FAST, True, "answer")],
+                         list(per_repo.each([FAST], read, 5, workers=2)))
+
+    def test_a_connection_that_stays_down_gives_up_that_repo_alone(self) -> None:
+        down = GitHubError("request failed: RemoteDisconnected", 0, "")
+
+        def read(repo):
+            if repo == HANG:
+                raise down
+            return "answer"
+        got = dict((repo, (done, value)) for repo, done, value
+                   in per_repo.each([HANG, FAST], read, 5, workers=2))
+        self.assertEqual((False, down), got[HANG])
+        self.assertEqual((True, "answer"), got[FAST])
+        self.assertIn("connection failed twice", per_repo.not_read(5, down))
+
+    def test_a_refusal_still_ends_the_run(self) -> None:
+        def read(repo):
+            self.calls.append(repo)
+            raise GitHubError("forbidden", 403, "")
+        with self.assertRaises(GitHubError):
+            list(per_repo.each([FAST], read, 5, workers=2))
+        self.assertEqual(1, len(self.calls))
 
 
 class ReadsSideBySideTest(unittest.TestCase):
