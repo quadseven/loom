@@ -8250,6 +8250,30 @@ class StatusTest(Base):
         self.go(3601 - 0)
         self.assertEqual(len(self.fake.edits), 1)
 
+    def test_a_pass_stopped_at_the_target_still_publishes_an_old_table(self):
+        self.go()
+        self.fake.edits.clear()
+        self.fake.add(12, state="briefed", lane="codex")
+        self.write(self.inbox("codex", "x.claiming"), "Issue: %s#12\n" % REPO)
+        # Room for the publish, none for the half-done claim's event read.
+        gh = GitHub("token", transport=self.fake, target=4)
+        runner = station.Station(gh, self.settings, now=time.time() + station.LANES_REPUBLISH + 1)
+        with mock.patch.object(station.Station, "_run_steps") as late_steps:
+            with self.assertRaises(TargetReached):
+                runner.run_pass()
+        late_steps.assert_not_called()
+        self.assertEqual(len(self.fake.edits), 1)
+
+    def test_a_fresh_table_spends_no_request(self):
+        self.go()
+        gh = GitHub("token", transport=self.fake)
+        runner = station.Station(gh, self.settings, now=time.time() + station.LANES_REPUBLISH - 60)
+        # With no remote cache, reading the lane rows would spend a request.
+        os.remove(os.path.join(runner.state, "remote-status.json"))
+        self.fake.calls.clear()
+        runner._publish_lanes_when_old()
+        self.assertEqual(self.fake.calls, [])
+
     def test_never_contains_a_reason(self):
         d = os.path.join(self.home, "state", "usage")
         self.write(os.path.join(d, "zen.json"), json.dumps({

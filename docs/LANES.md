@@ -419,8 +419,11 @@ beat written while the pass runs counts, one stamped more than a minute
 ahead of the clock does not) and keeps one comment on the
 open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
 `origin`; the issue is created when missing) current. It edits the comment
-only when a yes or no changes, when an anthropic run is recorded, and at
-least hourly, and never publishes the heartbeat's reason. With anthropic
+only when a yes or no changes, when an anthropic run is recorded, and when
+the table is older than 15 minutes (`LANES_REPUBLISH`), which it does at the
+start of the pass so a pass that stops at its request target still publishes.
+It never publishes the heartbeat's reason. `bus.brain status` prints the
+table's age beside `Updated` and calls it stale past the same age. With anthropic
 spend recorded or a budget set, it ends with the spend line ("Anthropic
 spend" below).
 
