@@ -9415,9 +9415,33 @@ class Station:
             _say("evidence close paused: %s; python3 -m bus.evidence_close resume restarts it"
                  % run.paused)
             self._say_paused(state, run.paused)
+            self._ask_about_stop(state, run.paused)
         else:
             state.pop("paused_said", None)
+            state.pop("stop_asked", None)
         return run
+
+    def _ask_about_stop(self, state: Dict[str, Any], why: str) -> None:
+        """One needs:human ask when the reopen guardrail stops this close, on
+        a repo's Proof due issue: the log and that issue's body reach nobody.
+        Its rate text changes as reopens count, so the ask is per stop, not
+        per text; a resume ends the stop. An operator's own pause asks nothing."""
+        if state.get("stop_asked") or why == evidence_close.OPERATOR_PAUSED:
+            return
+        repos = sorted({str(c.get("repo")) for c in evidence_close.closes(state)})
+        if not repos:
+            return
+        try:
+            brain.human(self.gh, repos[0], self._proof_due_issue(repos[0]),
+                        evidence_close.stop_ask(why))
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not ask about the evidence close stop: %s" % err)
+            return
+        except ValueError as err:
+            _say("evidence close stop: no new ask: %s" % err)
+        state["stop_asked"] = True
 
     def _say_paused(self, state: Dict[str, Any], why: str) -> None:
         """Write the pause into each repo's Proof due issue, once."""
