@@ -5627,7 +5627,9 @@ exit %d
         self.assertTrue(self.failure_line().startswith("[limit] "), self.failure_line())
         beat = self.beat()
         self.assertFalse(beat["available"])
-        self.assertIn(beat["retry_at"], {t - t % 86400 + 86400 for t in (before, after)})
+        # Within a minute of midnight the 60 second floor in agent_cli.sh wins.
+        self.assertIn(beat["retry_at"], {max(t - t % 86400 + 86400, t + 60)
+                                         for t in range(before, after + 1)})
 
     def test_a_limit_holds_the_lane_unavailable_until_the_providers_reset(self):
         reset = int(time.time()) + 7200
