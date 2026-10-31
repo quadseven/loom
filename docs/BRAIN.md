@@ -1652,8 +1652,10 @@ lane to untick it and end it `; not built: belongs in <repo>`, so the station
 files the follow-up in that repo; a criterion already ending that way passes.
 
 A ticket at `loom:pr` with no open pull request linking it goes back to
-`loom:queued` on the next pass, once the label is 10 minutes old, unless a pull
-request in another repo still names it. A ticket moved `LOOM_UNCLAIMED_MOVE_CAP`
+`loom:queued` on the next pass, once the label is 10 minutes old, unless a
+trusted author's pull request in another repo still names it, or one merged
+after the ticket's last brief and outside the closed page the station reads.
+A ticket moved `LOOM_UNCLAIMED_MOVE_CAP`
 times (default 6, 0 is off) with no lane claiming it stops moving: it takes
 `needs-brain` and `loom:runaway` with one comment (loom#2333).
 
