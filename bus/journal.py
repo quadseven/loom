@@ -317,7 +317,7 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
     _decision_claim.check(gh, repo, issue_number, text, list(trusted),
                           _answer.operators(None, list(trusted) or None))
     if text.startswith(JOURNAL_MARKER):
-        text = with_steps(with_tick(text, holder), steps)
+        text = with_steps(with_tick(text, holder, now), steps)
         _text.check(text)
         mine = todays_journal(gh, repo, issue_number, text)
         if mine is not None:
