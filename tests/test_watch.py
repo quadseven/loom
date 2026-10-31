@@ -9,7 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, handoff, station, text, watch  # noqa: E402
+from bus import brain, handoff, logrotate, station, text, watch  # noqa: E402
 from bus.github import Response  # noqa: E402
 
 LANES_REPO = "example-owner/lanes"
@@ -127,6 +127,22 @@ class SignatureTest(unittest.TestCase):
                      "brain: run_factory failed: boom"):
             self.assertIsNone(watch.stage(line), line)
             self.assertNotIn("<stage>", watch.signature(line), line)
+
+    def test_setup_failure_wording_variants_produce_one_signature(self):
+        # loom#2158: the log watcher filed #2120 ("on the unmodified repo")
+        # and #2122 ("on the default branch") for one factory incident #2061.
+        # Both wordings after "base check exited <n>" must normalize to one signature.
+        line_unmodified = ("[2026-10-13T10:00:01Z] station: could not scan example-owner/repo-a: "
+                           "base check exited 1 on the unmodified repo")
+        line_default_branch = ("[2026-10-13T10:00:01Z] station: could not scan example-owner/repo-a: "
+                               "base check exited 1 on the default branch")
+        self.assertEqual(watch.signature(line_unmodified), watch.signature(line_default_branch))
+        sig = watch.signature(line_unmodified)
+        self.assertIn("base check exited <n> on the <setup-failure>", sig)
+        # Also the "the check exited 125-127 on the unmodified base" variant.
+        line_check_exited = ("[2026-10-13T10:00:01Z] station: could not scan example-owner/repo-a: "
+                             "the check exited 126 on the unmodified base")
+        self.assertEqual(watch.signature(line_check_exited), sig)
 
     def test_which_lines_are_kept(self):
         for line in ("ValueError: bad", "push failed", "Connection refused",
@@ -789,6 +805,18 @@ class OffsetTest(WatchBase):
         os.rename(self.log, self.log + ".1")
         self.append(LINE_403, LINE_403, LINE_403)
         self.run_at(T0 + 60)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.assertEqual(self.saved()["logs"]["station"]["offset"], os.path.getsize(self.log))
+
+    def test_a_log_rotated_away_keeps_being_read_once_its_writer_makes_a_new_one(self):
+        self.append("x" * 500)
+        self.run_at(T0)
+        logrotate.rotate(os.path.dirname(self.log), 100, 2, T0 + 30, lambda _: None,
+                         writers=lambda _: False)
+        self.assertFalse(os.path.exists(self.log))
+        self.run_at(T0 + 60)
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0 + 120)
         self.assertEqual(len(self.gh.issues), 1)
         self.assertEqual(self.saved()["logs"]["station"]["offset"], os.path.getsize(self.log))
 

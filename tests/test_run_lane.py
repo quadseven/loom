@@ -798,6 +798,17 @@ print('leak guard: clean (shape patterns only)')
         self.assertTrue(line.startswith("[transient] public repo leak scan could not run"), line)
         self.assertIn("could not read deny-list", line)
 
+    def test_a_lane_started_without_a_clone_base_does_not_crash_on_an_unbound_variable(self):
+        """launchd starts the local lanes without LOOM_CLONE_BASE; the scanner
+        remote must default like the ticket clone does (git@github.com:), or
+        every run dies at once under set -u and no lane works."""
+        env = self.lane_env()
+        del env["LOOM_CLONE_BASE"]
+        self.drop_brief()
+        result = subprocess.run(["bash", str(RUNNER), "codex"], env=env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertNotIn("unbound variable", result.stderr)
+
     def test_a_missing_leak_scanner_is_a_factory_incident(self):
         # No infra-public checkout and no remote to clone it from: the scanner
         # cannot be had, so a public-repo push is a factory incident (one issue
@@ -1099,6 +1110,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("pull request body rebuilt from the brief", self.run_log())
         self.assertEqual(self.sticky_bodies(), [])
 
+    def test_generated_why_includes_text_under_nested_brief_headings(self):
+        brief = BRIEF.replace(
+            "The thing is broken for every user.",
+            "Short intro.\n\n### Further notes\n"
+            "These nested details explain the problem across several steps.")
+        self.drop_brief(text=brief)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        why = self.body.read_text().split("## Why\n", 1)[1].split("\n\n## Summary", 1)[0]
+        self.assertEqual(why, "Short intro.\n### Further notes\n"
+                         "These nested details explain the problem across several steps.")
+
     def test_a_brief_that_cannot_fill_the_body_opens_a_marked_pull_request_and_notes_the_ticket(self):
         brief = BRIEF.replace("S: one function.", "big")
         self.drop_brief(text=brief)
@@ -1165,6 +1188,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         log = self.run_log()
         self.assertIn("Bugs discovered line 2 left out: the line cites no issue", log)
         self.assertIn("Bugs discovered line 3 left out: the cited issue could not be looked up", log)
+        self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_a_one_criterion_ticket_opens_a_body_the_gate_accepts(self):
+        # A follow-up ticket states the one criterion a lane left not built;
+        # its body failed the plan check with 1 bullet of the 3 it wants.
+        thin = BRIEF.replace("## Acceptance criteria\n", "## Acceptance\n").replace(
+            "- [ ] A test covers the thing\n- [ ] Nothing else changes\n", "")
+        self.drop_brief(text=thin)
+        result = self.run_lane(FAKE_SUMMARY="Fix the thing so it works")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("## Acceptance criteria\n- [ ] The thing works\n", body)
         self.assertEqual(hunt_plan.problems(body), [])
 
     def test_a_body_without_bugs_has_no_bugs_section(self):
@@ -1755,6 +1790,20 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         body = self.body.read_text()
         self.assertIn("\nSize: S\n", body)
         self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_pr_body_carries_the_bullets_the_gate_wants_for_a_thin_brief(self):
+        # The gate counts three bullets under Acceptance criteria. A ticket
+        # that states fewer (the factory files a follow-up ticket with the one
+        # criterion a lane left not built) still opens a body it accepts: a
+        # body it refuses holds the pull request.
+        self.drop_brief(text=BRIEF.replace(
+            "- [ ] The thing works\n- [ ] A test covers the thing\n"
+            "- [ ] Nothing else changes", "- [ ] The thing works"))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertEqual(hunt_plan.problems(body), [])
+        self.assertIn("- [ ] The thing works", body)
 
     def test_pr_body_has_no_refs_without_an_issue_line(self):
         self.drop_brief()
@@ -3729,6 +3778,9 @@ exec /usr/bin/git "$@"
         agy = lane_home / "agy"
         self.write_tool(agy, FAKE_AGY)
         self.write_tool(self.bin / "security", FAKE_SECURITY)
+        # The fake agy is a script, which no real codesign would call hardened.
+        fake_codesign = Path(self._tmp.name) / "fake_codesign"
+        self.write_tool(fake_codesign, '#!/bin/sh\necho "CodeDirectory v=20500 size=1 flags=0x10002(adhoc,runtime) hashes=1"\n')
         runas = Path(self._tmp.name) / "runas"
         self.write_tool(runas, FAKE_RUNAS if runas_ok else "#!/usr/bin/env bash\nexit 1\n")
         inbox = self.loom / "briefs" / "agy"
@@ -3743,6 +3795,7 @@ exec /usr/bin/git "$@"
             LOOM_AGY_HOME=str(lane_home),
             LOOM_AGY_WORKDIR=str(workdir),
             LOOM_AGY_BIN=str(agy_bin or agy),
+            LOOM_AGY_CODESIGN=str(fake_codesign),
             LOOM_AGY_KEYCHAIN=str(lane_home / "loom.keychain-db"),
             LOOM_AGY_KEY_SSM="/k/kc",
             LOOM_AGY_MODEL=model,
@@ -4973,7 +5026,7 @@ echo fixed > fix.txt
         self.expired_key_lane()
         filed = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(filed), 1, self.calls())
-        self.assertIn("--label needs-operator", filed[0])
+        self.assertIn("--label needs:human", filed[0])
         self.assertIn("renew /k/go", filed[0])
         # The next lane to hit that key finds the open ask and edits one
         # repeat comment on it, so the operator has one thread to answer, not
@@ -5500,7 +5553,7 @@ exit %d
         self.assertTrue(self.beat()["available"])
         ask = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(ask), 1, self.calls())
-        self.assertIn("--label needs-operator", ask[0])
+        self.assertIn("--label needs:human", ask[0])
         self.assertIn("renew the codex lane sign-in", ask[0])
 
     def test_a_cli_sign_in_that_timed_out_is_auth_not_transient(self):

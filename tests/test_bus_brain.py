@@ -2910,7 +2910,48 @@ def lane_models(**models):
 LADDER_LANES = {"claude": "claude-sonnet-5-5", "codex": "gpt-6-luna"}
 
 
+def briefed_on(load, author=BRAIN):
+    """Open briefed tickets, `load[lane]` on each lane, in the shape the
+    GitHub issues list returns them (author included), so the factory's own
+    ticket read and trust filter decide which ones count."""
+    lanes = [lane for lane, count in load.items() for _ in range(count)]
+    return [{"number": 100 + i, "user": {"login": author}, "labels": [
+        {"name": "loom:ticket"}, {"name": "loom:briefed"}, {"name": "lane:" + lane}]}
+        for i, lane in enumerate(lanes)]
+
+
+class LoadRouted(Routed):
+    """Routed, answering each repo's open ticket list from `by_repo` (a
+    GitHubError for a repo in `unreadable`) and recording the repos read."""
+
+    def __init__(self, routes, by_repo, unreadable=(), author=BRAIN):
+        super().__init__(routes)
+        self.by_repo = by_repo
+        self.author = author
+        self.unreadable = unreadable
+        self.read = []
+
+    def __call__(self, method, url, headers, body):
+        if "labels=loom:ticket&state=open" in url:
+            repo = url.split("/repos/")[1].split("/issues")[0]
+            self.read.append(repo)
+            self.calls.append((method, url.split("api.github.com")[1], None))
+            if repo in self.unreadable:
+                return reply(500, {"message": "boom"})
+            return reply(200, briefed_on(self.by_repo.get(repo, {}), self.author))
+        return super().__call__(method, url, headers, body)
+
+
 class EscalateTests(unittest.TestCase):
+    def setUp(self):
+        # escalate counts lane load once per process over LOOM_REPOS: start
+        # each test from no count and the ticket's own repo only.
+        brain._LANE_LOAD.clear()
+        self.addCleanup(brain._LANE_LOAD.clear)
+        env = unittest.mock.patch.dict(os.environ, {"LOOM_REPOS": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
     def run_escalate(self, routes):
         fake = Routed(routes)
         gh = GitHub("t", transport=fake)
@@ -3040,6 +3081,113 @@ class EscalateTests(unittest.TestCase):
             stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")], free=("claude", "anthropic-2")))
         self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
         self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: claude-opus-5-5\n\n" + BODY}])
+
+    def escalate_over_repos(self, by_repo, history=(), unreadable=()):
+        """escalate on a failed ticket with claude and codex free, LOOM_REPOS
+        naming every repo in `by_repo`, and `by_repo[repo]` the open briefed
+        tickets per lane in each: (fake, outcome, repos read)."""
+        fake = LoadRouted(ticket_routes(stuck_ticket("failed"), TWICE, list(history),
+                                        free=("claude", "codex")), by_repo, unreadable)
+        authors = (os.environ.get("LOOM_BRIEF_AUTHORS", "") + " " + BRAIN).strip()
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": authors,
+                                                   "LOOM_REPOS": " ".join(by_repo)}):
+            outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        return fake, outcome, fake.read
+
+    def escalate_with_load(self, load, history=()):
+        """escalate with `load[lane]` open briefed tickets on each lane of
+        the ticket's own repo: (fake, outcome)."""
+        fake, outcome, _ = self.escalate_over_repos({REPO: load}, history)
+        return fake, outcome
+
+    def test_escalate_spreads_one_lane_overflow_to_a_less_loaded_rung(self):
+        fake, outcome = self.escalate_with_load({"codex": 5, "claude": 1}, [claim("2030-01-01T00:11:00Z")])
+        self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
+        note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
+        self.assertIn("Skipped rung 2: lane codex load is 5", note)
+
+    def test_escalate_spreads_rung_one_overflow_to_rung_two(self):
+        fake, outcome = self.escalate_with_load({"claude": 5, "codex": 1})
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
+        note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
+        self.assertIn("Skipped rung 1: lane claude load is 5", note)
+
+    def test_escalate_counts_only_tickets_the_factory_trusts(self):
+        # The factory's own ticket read drops a ticket whose author may not
+        # brief, so a lane full of them is not full.
+        fake = LoadRouted(ticket_routes(stuck_ticket("failed"), TWICE, [], free=("claude", "codex")),
+                          {REPO: {"claude": 5}}, author="stranger")
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": BRAIN, "LOOM_REPOS": ""}):
+            outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+
+    def test_escalate_takes_a_briefed_ticket_off_its_old_lane_in_the_count(self):
+        # The stuck ticket sat briefed on claude, so it was counted there:
+        # moving it to codex takes one off claude and puts one on codex.
+        fake = LoadRouted(ticket_routes(stuck_ticket("briefed", created=OLD), [], [],
+                                        free=("claude", "codex")), {REPO: {"claude": 5, "codex": 1}})
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": BRAIN, "LOOM_REPOS": ""}):
+            outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
+        self.assertEqual(brain._LANE_LOAD[(REPO,)], {"claude": 4, "codex": 2})
+
+    def test_escalate_without_a_readable_repo_still_climbs_and_says_so(self):
+        # One repo of the station cannot be read: the sweep goes on with
+        # that repo counted as empty, says so on stderr, and does not keep
+        # the partial count for the next ticket.
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            fake, outcome, _ = self.escalate_over_repos(
+                {REPO: {"claude": 5, "codex": 1}, "example-owner/other-repo": {}},
+                unreadable=("example-owner/other-repo",))
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
+        self.assertIn("lane load: cannot read example-owner/other-repo", buf.getvalue())
+        self.assertEqual(brain._LANE_LOAD, {})
+
+    def test_escalate_counts_lane_load_in_every_station_repo(self):
+        # Lanes are shared by every repo the station watches: rung 1's one
+        # lane full in another repo is full for this ticket too.
+        fake, outcome, read = self.escalate_over_repos(
+            {REPO: {}, "example-owner/other-repo": {"claude": 5}})
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
+        self.assertEqual(read, [REPO, "example-owner/other-repo"])
+        self.assertIn("Skipped rung 1: lane claude load is 5",
+                      fake.sent("POST", "/issues/9/comments")[-1]["body"])
+
+    def test_escalate_sweep_reads_load_once_and_counts_its_own_moves(self):
+        from bus import factory
+        by_repo = {REPO: {}, "example-owner/other-repo": {"claude": factory.ONE_LANE_MAX}}
+        _, first, read = self.escalate_over_repos(by_repo)
+        self.assertEqual(first, "rung 1 claude-sonnet-5-5 on claude")
+        _, second, read_again = self.escalate_over_repos(by_repo)
+        self.assertEqual(read_again, [])
+        # The first move put claude over ONE_LANE_MAX, so the next spills.
+        self.assertEqual(second, "rung 2 gpt-6-luna on codex")
+        self.assertEqual(brain._LANE_LOAD[tuple(by_repo)],
+                         {"claude": factory.ONE_LANE_MAX + 1, "codex": 1})
+
+    def test_escalate_keeps_rung_order_when_one_lane_is_under_the_limit(self):
+        from bus import factory
+        fake, outcome = self.escalate_with_load({"claude": factory.ONE_LANE_MAX - 1, "codex": 0})
+        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+        self.assertNotIn("Skipped rung", fake.sent("POST", "/issues/9/comments")[-1]["body"])
+
+    def test_escalate_keeps_rung_order_when_one_lane_is_at_the_limit(self):
+        from bus import factory
+        fake, outcome = self.escalate_with_load({"claude": factory.ONE_LANE_MAX, "codex": 0})
+        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+        self.assertNotIn("Skipped rung", fake.sent("POST", "/issues/9/comments")[-1]["body"])
+
+    def test_escalate_keeps_an_overflowing_rung_when_no_later_lane_is_three_lower(self):
+        fake, outcome = self.escalate_with_load({"claude": 5, "codex": 3})
+        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+        self.assertNotIn("Skipped rung", fake.sent("POST", "/issues/9/comments")[-1]["body"])
+
+    def test_escalate_keeps_rung_two_after_rung_one_was_tried(self):
+        from bus import factory
+        _, outcome = self.escalate_with_load(
+            {"codex": factory.ONE_LANE_MAX - 1, "claude": 1}, [claim("2030-01-01T00:11:00Z")])
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
 
     def test_escalate_uses_the_codex_standin_and_anthropic_slot(self):
         _, outcome = self.run_escalate(ticket_routes(
@@ -3696,7 +3844,7 @@ class HumanAndRefsTests(unittest.TestCase):
                          {"body": brain.HUMAN_MARKER + "\nBuy a test phone.\nKind: hardware"})
         self.assertEqual(fake.calls[2][0], "DELETE")
         self.assertTrue(fake.calls[2][1].endswith("/issues/6/labels/loom%3Atriage"))
-        self.assertEqual(fake.calls[3][2], {"labels": ["loom:human"]})
+        self.assertEqual(fake.calls[3][2], {"labels": ["needs:human"]})
 
     def test_human_refusals_write_nothing(self):
         cases = [(item(6, labels=["loom:human"]), "Kind: money\nBuy it."),
@@ -3969,7 +4117,7 @@ class OnboardTests(unittest.TestCase):
         issue = posted[0][2]
         self.assertEqual(issue["title"], "Goal: Loom or a person works every open %s issue" % REPO)
         self.assertEqual(issue["labels"], ["loom:goal", "loom:backlog"])
-        for part in ("## Destination", "## Metric", "## Rules", "loom:human",
+        for part in ("## Destination", "## Metric", "## Rules", "needs:human",
                      "never closes an issue", "train on prompts"):
             self.assertIn(part, issue["body"])
         self.assertIn("backlog goal home: #100, created", lines)
