@@ -233,6 +233,8 @@ _IP_RE = re.compile(r"\b[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?::[0-9]+)?\b"
 # A host under a suffix that only resolves on a private network.
 _HOST_RE = re.compile(r"(?i)\b(?:[a-z0-9-]+\.)+(?:local|lan|home|internal|corp|intranet|ts\.net)\b")
 _REF_RE = re.compile(r"(?<![A-Za-z0-9_./-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+\b")
+# A ticket id such as owner.name-123 or owner.name-123-r2.
+_TICKET_RE = re.compile(r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+-[0-9]+(?:-r[0-9]+)?(?![A-Za-z0-9_.-])")
 # owner/name: two words around one slash, each with a letter.
 _REPO_RE = re.compile(r"(?<![A-Za-z0-9_./<-])[A-Za-z0-9_.-]*[A-Za-z][A-Za-z0-9_.-]*"
                       r"/[A-Za-z0-9_.-]*[A-Za-z][A-Za-z0-9_.-]*(?![A-Za-z0-9_/>-])")
@@ -284,6 +286,7 @@ def _norm(piece: str) -> str:
     piece = _IP_RE.sub("<ip>", piece)
     piece = _HOST_RE.sub("<host>", piece)
     piece = _REF_RE.sub("<repo>#<n>", piece)
+    piece = _TICKET_RE.sub("<repo>", piece)
     piece = _REPO_RE.sub("<repo>", piece)
     piece = _NUMBER_REF_RE.sub("#<n>", piece)
     piece = _UUID_RE.sub("<id>", piece)
@@ -346,6 +349,7 @@ def redact(line: str) -> str:
     line = _IP_RE.sub("<ip>", line)
     line = _HOST_RE.sub("<host>", line)
     line = _REF_RE.sub(lambda m: "<repo>#" + m.group(0).rsplit("#", 1)[1], line)
+    line = _TICKET_RE.sub("<repo>", line)
     line = _REPO_RE.sub("<repo>", line)
     line = " ".join(line.replace("`", "'").split())
     return _shorten(line)
