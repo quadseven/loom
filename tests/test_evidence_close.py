@@ -300,7 +300,13 @@ class Shadow(Case):
             with self.assertRaises(ShadowHeld):
                 gh.rest("PATCH", "/repos/%s/issues/1" % REPO,
                         {"state": "closed", "labels": ["loom:shipped"]})
-        self.assertEqual(self.fake.issues[1]["state"], "open")
+            self.assertEqual(self.fake.issues[1]["state"], "open")
+            # The named ticket's plain close is the one request that passes.
+            self.fake.issues[1]["labels"].append({"name": "force-close"})
+            gh.rest("PATCH", "/repos/%s/issues/1" % REPO,
+                    {"state": "closed", "state_reason": "completed"})
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+        self.assertEqual(self.fake.issues[2]["state"], "open")
 
 
 class Guardrail(Case):
