@@ -45,9 +45,11 @@ STUCK_COUNT = 24
 # requests) counted 270 reads, about 95 s of reads run six at a time, and the
 # remote brain's pass of it ran past the 120 s budget. After loom#2078 the
 # same pass reads 159 times. This fake makes 276 reads before and 157 after;
-# the bound holds a loom-sized pass to about 60 percent of the reads that ran
-# past the budget.
-READ_BOUND = 180
+# the bound holds a loom-sized pass to about 70 percent of the reads that ran
+# past the budget. Each READY pull request adds one compare with its base
+# (loom#1990): this fake's 41 READY lines make 198 reads, about 70 s at the
+# profile's rate, and a live pass has far fewer READY lines.
+READ_BOUND = 200
 
 
 def _issue(number, labels, body="", **extra):
@@ -135,7 +137,10 @@ class LoomSizedFake:
         if bare.endswith("/files"):
             return self._reply([{"filename": "bus/a.py", "patch": "+x"}])
         if PULL.match(bare):
-            return self._reply({"state": "open", "mergeable": True, "mergeable_state": "clean"})
+            return self._reply({"state": "open", "mergeable": True, "mergeable_state": "clean",
+                                "base": {"ref": "main"}, "head": {"sha": "head1"}})
+        if "/compare/main..." in bare:
+            return self._reply({"behind_by": 0})
         return self._reply([])
 
     def _subs(self, number):

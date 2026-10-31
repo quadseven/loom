@@ -1634,8 +1634,13 @@ When a trusted brain fix is still pending on the linked ticket, status adds
 For a line that would otherwise be READY, status also reads what `bus.brain
 merge` refuses on, through the same functions merge uses (loom#1643): a
 ticket not at `loom:pr` (`ticket at loom:running, not loom:pr`), a REST
-`mergeable_state` of `dirty` (`conflicts with the default branch`), and a
-risk tier outside `LOOM_AUTO_MERGE_TIERS` (`held for the operator: <tier>`).
+`mergeable_state` of `dirty` (`conflicts with the default branch`), a head
+behind its base (`behind its base by N commits: ...`, or `compare with its
+base unreadable` when the read fails), and a risk tier outside
+`LOOM_AUTO_MERGE_TIERS` (`held for the operator: <tier>`). `bus.brain merge`
+refuses a head behind its base on every path, `--adopt` and reverts included,
+because its checks ran against the old base (loom#1990). The factory's landing
+brings such a pull request up to date; it lands once it passes on the new head.
 A ticked acceptance criterion that names another repo of the same owner
 (`OWNER/NAME`, or a backticked name that is a `LOOM_REPOS` repo of that owner)
 was not built by this pull request: that repo builds it. Status prints
@@ -2089,7 +2094,8 @@ ticketless pull request when all of these hold:
   with `success` on the head commit, or `neutral` for a `class:docs` or
   `class:tests` pull request only. A logic, sensitive or unlabeled pull
   request requires `success`;
-- every review thread is resolved.
+- every review thread is resolved;
+- its head is not behind its base.
 
 It pins the head SHA in the squash merge, deletes the branch only after
 GitHub confirms the merge, and comments on the pull request that it was

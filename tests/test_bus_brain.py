@@ -50,16 +50,27 @@ def epic_issue(body="Done when: done.\n\nSize: S\n\nPart of #1\n", **extra):
 class Fake:
     """Replies in order. The reads that resolve epic #2 (the epic, its
     sub-issues and the open ticket list) are answered apart and not
-    recorded, so a brief's calls keep their places."""
+    recorded, so a brief's calls keep their places. So is the merge gate's
+    base compare of a merge fixture's head (a proof's own compare stays in
+    the queue), kept in `compares`: `behind_by` is what it answers, and None
+    makes it fail."""
 
     def __init__(self, *replies, epic=None):
         self.replies = list(replies)
         self.calls = []
+        self.behind_by = 0
+        self.compares = []
         self.epic = epic_issue() if epic is None else epic
         self.epic_tickets = []
 
     def __call__(self, method, url, headers, body):
         path = url.split("api.github.com")[-1]
+        if method == "GET" and path in ("/repos/%s/compare/main...%s" % (REPO, head)
+                                        for head in ("checked", "head1")):
+            self.compares.append(path)
+            if self.behind_by is None:
+                return reply(404, {"message": "Not Found"})
+            return reply(200, {"behind_by": self.behind_by})
         if method == "GET" and self.epic is not False:
             if path == "/repos/%s/issues/%d" % (REPO, EPIC):
                 return reply(200, self.epic)
@@ -98,7 +109,8 @@ def merge_takes(ticket=4):
     ticket at loom:pr, a mergeable REST answer and an app-code file."""
     return (reply(200, {"number": ticket, "state": "open",
                         "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}),
-            reply(200, {"mergeable": True, "mergeable_state": "clean"}),
+            reply(200, {"mergeable": True, "mergeable_state": "clean",
+                        "base": {"ref": "main"}, "head": {"sha": "head1"}}),
             reply(200, [{"filename": "bus/a.py", "patch": "+x"}]))
 
 
@@ -1522,7 +1534,7 @@ class SensitiveResumeTests(unittest.TestCase):
         fake.assert_all_used()
 
     def _merge_replies(self, changes=None):
-        pr = {"state": "open", "draft": False, "body": "Refs %s#9" % REPO, "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": REPO}}, "base": {"repo": {"full_name": REPO}}, "mergeable": True}
+        pr = {"state": "open", "draft": False, "body": "Refs %s#9" % REPO, "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": REPO}}, "base": {"ref": "main", "repo": {"full_name": REPO}}, "mergeable": True}
         details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work", "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": []}, "files": {"totalCount": 1, "nodes": [{"path": "bus/a.py"}]}}
         if changes:
             pr.update(changes.get("pr", {}))
@@ -1756,6 +1768,73 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(result, {"merged": True, "pull_request": (REPO, 8),
                                   "ticket": (REPO, 9), "head_sha": "checked"})
         self.assertTrue(fake.calls[-2][1].endswith("/repos/%s/issues/9" % REPO))
+
+    def _ticketed_merge_fake(self):
+        pr, query = self._merge_replies()
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        return Fake(pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204),
+                    reply(200, []), reply(200, issue), reply(200, {}))
+
+    def test_merge_refuses_a_pull_request_behind_its_base_without_a_merge_put(self):
+        fake = self._ticketed_merge_fake()
+        fake.behind_by = 3
+        with self.assertRaisesRegex(ValueError, "behind its base.*up to date.*new head"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertEqual(fake.compares, ["/repos/%s/compare/main...checked" % REPO])
+        self.assertFalse(any(call[0] == "PUT" for call in fake.calls))
+
+    def test_merge_goes_ahead_when_the_compare_says_behind_by_zero(self):
+        fake = self._ticketed_merge_fake()
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertTrue(result["merged"])
+        self.assertEqual(fake.compares, ["/repos/%s/compare/main...checked" % REPO])
+
+    def test_merge_stops_when_the_base_compare_fails(self):
+        fake = self._ticketed_merge_fake()
+        fake.behind_by = None
+        with self.assertRaises(GitHubError):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any(call[0] == "PUT" for call in fake.calls))
+
+    def test_merge_refusals_list_behind_its_base(self):
+        fake = Fake(*merge_takes())
+        fake.behind_by = 3
+        found = brain._merge_refusals(GitHub("t", transport=fake), REPO,
+                                      {"number": 8, "head": {"ref": "loom/4-work"}}, (REPO, 4))
+        self.assertTrue(any(x.startswith("behind its base") for x in found), found)
+        self.assertEqual(fake.compares, ["/repos/%s/compare/main...head1" % REPO])
+
+    def test_merge_refusals_stay_silent_for_an_up_to_date_pull_request(self):
+        fake = Fake(*merge_takes())
+        found = brain._merge_refusals(GitHub("t", transport=fake), REPO,
+                                      {"number": 8, "head": {"ref": "loom/4-work"}}, (REPO, 4))
+        self.assertFalse(any("base" in x for x in found), found)
+
+    def test_merge_refusals_name_a_compare_that_failed(self):
+        fake = Fake(*merge_takes())
+        fake.behind_by = None
+        found = brain._merge_refusals(GitHub("t", transport=fake), REPO,
+                                      {"number": 8, "head": {"ref": "loom/4-work"}}, (REPO, 4))
+        self.assertIn("compare with its base unreadable", found)
+
+    def test_status_says_blocked_not_ready_for_a_pull_request_behind_its_base(self):
+        pr = {"number": 4, "title": "Docs", "head": {"ref": "loom/4-work", "sha": "head1"},
+              "labels": [{"name": "class:docs"}]}
+        ticket_issue = {"number": 4, "state": "open", "labels": [{"name": "loom:ticket"}], "body": ""}
+        fake = Fake(reply(200, []), reply(200, [pr]),
+                    reply(200, {"data": {"repository": {"p4": ready_node()}}}),
+                    *merge_takes(), reply(200, []), reply(200, ticket_issue))
+        fake.behind_by = 3
+
+        def transport(method, url, headers, body):
+            if "/check-runs?" in url:
+                return reply(200, {"check_runs": [
+                    {"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]})
+            return fake(method, url, headers, body)
+
+        report = brain.status(GitHub("t", transport=transport), [REPO], REPO, env={}, authors=())
+        self.assertIn("behind its base", report)
+        self.assertNotIn("- #4 Docs - READY", report)
 
     def _merge_with_files(self, files, labels=("loom:ticket", "loom:pr"), search_items=None,
                           ticket_body="", pull_body=None):
@@ -2008,7 +2087,7 @@ class SensitiveResumeTests(unittest.TestCase):
         pr = {"state": "open", "draft": False, "body": "A build fix.",
               "user": {"login": "example-brain"},
               "head": {"ref": "fix/build", "sha": "head1", "repo": {"full_name": REPO}},
-              "base": {"repo": {"full_name": REPO}}, "mergeable": True}
+              "base": {"ref": "main", "repo": {"full_name": REPO}}, "mergeable": True}
         details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "fix/build",
                    "headRefOid": "head1", "headRepository": {"nameWithOwner": REPO},
                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
@@ -2036,6 +2115,14 @@ class SensitiveResumeTests(unittest.TestCase):
         # The pull request is told it was adopted, after the branch is deleted.
         self.assertEqual(fake.calls[-1][0], "POST")
         self.assertIn(brain.ADOPT_MARKER, fake.calls[-1][2]["body"])
+
+    def test_adopt_refuses_a_pull_request_behind_its_base_without_a_merge_put(self):
+        fake = Fake(*self._merge_replies_for_adopt())
+        fake.behind_by = 3
+        with self.assertRaisesRegex(ValueError, "behind its base"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, adopt=True, env=self.TRUSTED)
+        self.assertEqual(fake.compares, ["/repos/%s/compare/main...head1" % REPO])
+        self.assertFalse(any(call[0] == "PUT" for call in fake.calls))
 
     def test_adopt_merges_a_docs_pr_with_a_neutral_review_on_its_head(self):
         runs = [{"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]

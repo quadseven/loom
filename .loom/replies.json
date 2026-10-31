@@ -1,0 +1,22 @@
+[
+ {
+  "thread": "PRRT_kwDOVESCW86yQef-",
+  "reply": "Fixed: test_merge_refusals_list_behind_its_base and test_status_says_blocked_not_ready_for_a_pull_request_behind_its_base in tests/test_bus_brain.py.",
+  "resolve": true
+ },
+ {
+  "thread": "PRRT_kwDOVESCW86yQegJ",
+  "reply": "Fixed: test_merge_refuses_a_pull_request_behind_its_base_without_a_merge_put, with test_adopt_refuses_a_pull_request_behind_its_base_without_a_merge_put for --adopt, which the earlier code skipped. Both assert the exact compare URL and that no PUT is sent.",
+  "resolve": true
+ },
+ {
+  "thread": "PRRT_kwDOVESCW86yQegO",
+  "reply": "Fixed: test_merge_goes_ahead_when_the_compare_says_behind_by_zero merges and asserts the compare was made.",
+  "resolve": true
+ },
+ {
+  "thread": "PRRT_kwDOVESCW86yQegR",
+  "reply": "Fixed: the first criterion now has its test, test_merge_refuses_a_pull_request_behind_its_base_without_a_merge_put in tests/test_bus_brain.py.",
+  "resolve": true
+ }
+]

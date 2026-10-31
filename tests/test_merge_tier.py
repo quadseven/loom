@@ -282,6 +282,7 @@ def routes(files, conclusion="success", threads=(), merged_last_hour=0, ticket_l
         "threads": pages if pages is not None else (None if threads is None
                                                      else [list(threads)]),
         "/repos/%s/compare/abc1234...main" % REPO: {"status": carried},
+        "/repos/%s/compare/main...checked" % REPO: {"behind_by": 0},
         "/repos/%s/commits/abc1234" % REPO: {"files": commit_files or []},
         "/repos/%s/commits/checked/check-runs" % REPO: {"check_runs": [
             {"name": "Grug - Elder", "status": "completed", "conclusion": conclusion}]},

@@ -149,6 +149,7 @@ class Base(unittest.TestCase):
             "head": {"ref": "revert-41-loom/40-roll", "sha": "r" * 40,
                      "repo": {"full_name": REPO}},
             "base": {"ref": "main", "repo": {"full_name": REPO}}}
+        self.gh.routes["/repos/%s/compare/main...%s" % (REPO, "r" * 40)] = {"behind_by": 0}
         self.gh.routes["graph"] = {
             "isDraft": False, "mergeable": "MERGEABLE", "headRefName": "revert-41-loom/40-roll",
             "headRefOid": "r" * 40, "headRepository": {"nameWithOwner": REPO},
@@ -274,6 +275,15 @@ class Revert(Base):
     def setUp(self):
         super().setUp()
         self.sync_run("failure", notes=[note("rollout-aborted", "apps/app revision 6: aborted")])
+
+    def test_a_revert_behind_its_base_is_refused_and_left_for_the_operator(self):
+        self.watch()
+        self.revert_ready()
+        self.gh.routes["/repos/%s/compare/main...%s" % (REPO, "r" * 40)] = {"behind_by": 2}
+        self.watch(now=NOW + 60)
+        self.assertEqual(self.merged(), [])
+        self.assertNotEqual(self.entry()["state"], deploy_watch.REVERTED)
+        self.assertIn("behind its base", self.pages[0])
 
     def test_a_failed_deploy_is_reverted_through_the_revert_path_and_paged_once(self):
         self.failed_then_reverted()
