@@ -234,6 +234,13 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("fabric env LOOM_FABRIC_KEY_SSM=/example/fabric-key", calls)
         self.assertIn("env-claude LOOM_FABRIC_KEY_SSM=absent", calls)
         self.assertIn("Earlier decision: a fix was merged.", "\n".join(calls))
+        # The dummy configuration value itself is in no agent call's
+        # arguments or prompt (the ticket's test plan, literally).
+        agent_lines = [c for c in calls
+                       if c.startswith(("claude ", "codex ", "opencode "))]
+        self.assertTrue(agent_lines)
+        for line in agent_lines:
+            self.assertNotIn("/example/fabric-key", line)
         # Unconfigured: no Fabric request is made and the child still runs
         # with the variable absent.
         self.log.unlink()
