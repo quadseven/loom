@@ -792,6 +792,72 @@ class SettledSubjectTest(StationBase):
         (note,) = self.notes(filed)
         self.assertIn("epic #40 holds 15 tickets, within the cap of 15", note)
 
+    def test_a_closed_epic_holding_many_tickets_files_nothing(self):
+        self.gh.subs[(REPO, GOAL)] = [epic(40, state="closed")]
+        self.gh.subs[(REPO, 40)] = [ticket(n, state="closed") for n in range(50, 66)]
+        self.run_at(T0)
+        self.assertEqual(self.breaches(), [], self.said)
+
+    def test_an_open_epic_over_the_cap_that_closes_settles_its_issue(self):
+        self.gh.subs[(REPO, GOAL)] = [epic(40)]
+        self.gh.subs[(REPO, 40)] = [ticket(n, state="closed") for n in range(50, 66)]
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertEqual(filed["state"], "open")
+        self.gh.subs[(REPO, GOAL)] = [epic(40, state="closed")]
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+        (note,) = self.notes(filed)
+        self.assertIn("epic #40 is closed", note)
+
+    def test_a_merged_pr_without_subject_map_entry_settles_its_issue(self):
+        """loom#2257: a lane-pr-stalled issue whose PR merged while the
+        station was down (no subject map entry) still settles on the next
+        pass by reading the PR state from the REST API."""
+        filed = self.stalled()
+        # Simulate the PR being merged while the station was down.
+        # Clear the local pulls cache so the breach is NOT detected this pass.
+        self.gh.pulls[REPO] = []
+        # The PR state from REST API shows merged.
+        self.gh.pull_state[(REPO, 660)] = {
+            "state": "closed", "merged_at": stamp(T0 + 100), "closed_at": stamp(T0 + 100)
+        }
+        # The subject map (self.subjects) has no entry for this breach key
+        # because the breach is not detected in the current pass.
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+        self.assertEqual(filed["state_reason"], "not_planned")
+        (note,) = self.notes(filed)
+        self.assertIn("pull request #660 merged at %s" % stamp(T0 + 100), note)
+        self.assertIn(invariants.CLEARED_TEXT, note)
+
+    def test_an_open_pr_without_subject_map_entry_stays_open(self):
+        """loom#2257: a lane-pr-stalled issue whose PR is still open but
+        has no subject map entry (breach not detected this pass) stays open."""
+        filed = self.stalled()
+        # Simulate the PR leaving the local pulls cache while remaining open
+        # according to the REST API.
+        self.gh.pulls[REPO] = []
+        self.gh.pull_state[(REPO, 660)] = {"state": "open", "merged_at": None}
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "open")
+        self.assertEqual(self.notes(filed), [])
+        self.assertIn(("GET", "/repos/%s/pulls/660" % REPO), self.gh.calls)
+
+    def test_a_closed_unmerged_pr_without_subject_map_entry_settles_its_issue(self):
+        """loom#2257: a lane-pr-stalled issue whose PR was closed unmerged
+        while the station was down (no subject map entry) still settles."""
+        filed = self.stalled()
+        # Simulate the PR being closed unmerged while the station was down.
+        self.gh.pulls[REPO] = []
+        self.gh.pull_state[(REPO, 660)] = {
+            "state": "closed", "merged_at": None, "closed_at": stamp(T0 + 100)
+        }
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+        (note,) = self.notes(filed)
+        self.assertIn("pull request #660 was closed unmerged at %s" % stamp(T0 + 100), note)
+
 
 class FilerTest(unittest.TestCase):
     def setUp(self):
@@ -1700,6 +1766,17 @@ class StandingEpicTest(unittest.TestCase):
         found = invariants.epic_over_cap(f)
         self.assertEqual([b.subject for b in found], ["%s#50" % REPO, "%s#51" % REPO])
         self.assertIn("100 sub-issues", found[0].title)
+
+
+    def test_a_closed_epic_is_not_over_the_ticket_cap(self):
+        """loom#2140: a finished epic keeps its closed tickets, so it can
+        never drop under the cap; only an open epic is flagged."""
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        mk = lambda n, open_, tickets: invariants.EpicShape(  # noqa: E731
+            Ref("%s#%d" % (REPO, n), "#%d" % n), open_, tickets, ())
+        f = Facts(T0, shapes=[invariants.GoalShape(
+            goal, 6, (mk(60, False, 16), mk(61, False, 40), mk(62, True, 16)), ())])
+        self.assertEqual([b.subject for b in invariants.epic_over_cap(f)], ["%s#62" % REPO])
 
 
 class RollPinOffTest(StationBase):

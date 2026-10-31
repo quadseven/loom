@@ -89,7 +89,7 @@ LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_HOME/infra-public/.github/scripts/check
 # The remote infra-public is cloned from, LOOM_CLONE_BASE-prefixed like the
 # ticket repos the lane clones. Override it on a machine without network.
 INFRA_PUBLIC="$LOOM_HOME/infra-public"
-INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE}quadseven/infra-public"
+INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE:-git@github.com:}quadseven/infra-public"
 INFRA_PUBLIC_STAMP="$LOOM_HOME/run/infra-public.updated"
 # The SSM parameter of the shared deny-list: names and products with no
 # generic shape, which only this list catches. Every scan passes it.
@@ -390,7 +390,7 @@ utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
 
 # Body of one "## <name>" section of the brief, blank lines dropped.
 section() {
-  awk -v h="## $1" '$0 == h {on=1; next} /^#+ / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
+  awk -v h="## $1" '$0 == h {on=1; next} /^##? / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
 }
 
 # The acceptance criteria of $1, blank lines dropped: its "## Acceptance
@@ -1141,7 +1141,8 @@ park() {
 # startup files, ~/.gemini config, MCP servers). Other lanes get no rules here.
 # antigravity-oauth-token is agy's sign-in when it cannot reach the keychain
 # (the sandbox denies /usr/bin/security): wiped, every run asked for a browser
-# login (2026-10-22 to 10-24, #1620).
+# login (2026-10-22 to 10-24, #1620). The sandbox profile lets only agy's own
+# binary read it (agy_token_rules in lanes/agent_sandbox.sh, #1623).
 AGY_STATE_KEEP=(settings.json bin builtin installation_id jetski_state.pbtxt updater last_check.timestamp log cli.log crashes cache antigravity-oauth-token)
 AGY_CACHE_KEEP=(onboarding.json default_project_id.txt)
 # agy keeps its sign-in in its file store, Library/Application Support/
@@ -1684,7 +1685,7 @@ ask_sign_in() {
   file_ask "$title" "$body" "Sign-in failed again"
 }
 
-# File a needs-operator ask titled $1 with body $2, or, with one already open,
+# File a needs:human ask titled $1 with body $2, or, with one already open,
 # keep one comment on it with a running count headed $3, never one per failure.
 file_ask() {
   local title="$1" body="$2" headline="$3" number existing
@@ -1696,10 +1697,10 @@ file_ask() {
     return 0
   fi
   number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
-             --label needs-operator --body "$body" 2>>"$LOG" ||
+             --label needs:human --body "$body" 2>>"$LOG" ||
            gh issue create --repo "$FACTORY_REPO" --title "$title" --body "$body" 2>>"$LOG")"
   number="${number##*/}"
-  case "$number" in ''|*[!0-9]*) echo "needs-operator ask filing failed" >> "$LOG" ;; esac
+  case "$number" in ''|*[!0-9]*) echo "needs:human ask filing failed" >> "$LOG" ;; esac
   return 0
 }
 
@@ -1785,6 +1786,7 @@ import json
 import sys
 
 text = tool = False
+events_processed = False
 for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
     try:
         event = json.loads(line)
@@ -1792,6 +1794,7 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
         continue
     if not isinstance(event, dict):
         continue
+    events_processed = True
     kind = event.get("type")
     part = event.get("part") if isinstance(event.get("part"), dict) else {}
     if kind == "step_start":
@@ -1800,6 +1803,8 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
         text = True
     elif kind in ("tool_use", "tool") or part.get("type") == "tool":
         tool = True
+if not events_processed:
+    sys.exit(1)
 sys.exit(0 if text and not tool else 1)
 PY
 }
@@ -2030,7 +2035,7 @@ record() {
 # failing line or command, and the exit code.
 FACTORY_REPO=quadseven/loom
 INCIDENT_MARKER="<!-- loom:factory-incident v1 -->"
-# The marker on the body of the needs-operator ask an expired key files.
+# The marker on the body of the needs:human ask an expired key files.
 KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"
 # The markers on the one comment that counts repeats on an open ask or incident.
 KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"

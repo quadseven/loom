@@ -233,6 +233,8 @@ _IP_RE = re.compile(r"\b[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?::[0-9]+)?\b"
 # A host under a suffix that only resolves on a private network.
 _HOST_RE = re.compile(r"(?i)\b(?:[a-z0-9-]+\.)+(?:local|lan|home|internal|corp|intranet|ts\.net)\b")
 _REF_RE = re.compile(r"(?<![A-Za-z0-9_./-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+\b")
+# A ticket id such as owner.name-123 or owner.name-123-r2.
+_TICKET_RE = re.compile(r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+-[0-9]+(?:-r[0-9]+)?(?![A-Za-z0-9_.-])")
 # owner/name: two words around one slash, each with a letter.
 _REPO_RE = re.compile(r"(?<![A-Za-z0-9_./<-])[A-Za-z0-9_.-]*[A-Za-z][A-Za-z0-9_.-]*"
                       r"/[A-Za-z0-9_.-]*[A-Za-z][A-Za-z0-9_.-]*(?![A-Za-z0-9_/>-])")
@@ -242,6 +244,13 @@ _HEX_RE = re.compile(r"\b0x[0-9a-fA-F]+\b|\b(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])
 # A long word mixing letters and digits: a node id, a session id, a token.
 _ID_RE = re.compile(r"\b(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[A-Za-z])[A-Za-z0-9_]{10,}\b")
 _NUM_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+# A setup failure message whose wording varies but names the same failure
+# class: "base check exited <n> on the unmodified repo" and "base check exited
+# <n> on the default branch" are the same factory incident (loom#2158).
+# Also "the check exited <n> on the unmodified base" (exit 125-127).
+_SETUP_FAILURE_RE = re.compile(
+    r"(?i)(base check exited <n> on the )(?:unmodified repo|default branch)"
+    r"|(the check exited <n> on the unmodified base)")
 _LEAD_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)+")
 
 Say = Callable[[str], None]
@@ -277,12 +286,19 @@ def _norm(piece: str) -> str:
     piece = _IP_RE.sub("<ip>", piece)
     piece = _HOST_RE.sub("<host>", piece)
     piece = _REF_RE.sub("<repo>#<n>", piece)
+    piece = _TICKET_RE.sub("<repo>", piece)
     piece = _REPO_RE.sub("<repo>", piece)
     piece = _NUMBER_REF_RE.sub("#<n>", piece)
     piece = _UUID_RE.sub("<id>", piece)
     piece = _HEX_RE.sub("<hex>", piece)
     piece = _ID_RE.sub("<id>", piece)
-    return _NUM_RE.sub("<n>", piece)
+    piece = _NUM_RE.sub("<n>", piece)
+    def _setup_failure(m: "re.Match[str]") -> str:
+        if m.group(1):
+            return m.group(1) + "<setup-failure>"
+        return "base check exited <n> on the <setup-failure>"
+    piece = _SETUP_FAILURE_RE.sub(_setup_failure, piece)
+    return piece
 
 
 def stage(line: str) -> Optional[str]:
@@ -333,6 +349,7 @@ def redact(line: str) -> str:
     line = _IP_RE.sub("<ip>", line)
     line = _HOST_RE.sub("<host>", line)
     line = _REF_RE.sub(lambda m: "<repo>#" + m.group(0).rsplit("#", 1)[1], line)
+    line = _TICKET_RE.sub("<repo>", line)
     line = _REPO_RE.sub("<repo>", line)
     line = " ".join(line.replace("`", "'").split())
     return _shorten(line)

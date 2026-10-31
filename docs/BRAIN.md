@@ -55,16 +55,16 @@ that talks to GitHub about tickets.
 | `loom:closed-unmerged` | The linked pull request closed without merging. |
 | `loom:shipped` | Deployed. Loom's own tickets are shipped by the station when it deploys the revision that carries their pull request (see Shipping Loom itself); other repos keep their goal home's ship rules, under whoever owns shipping there (which may not be the brain). |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
-| `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
+| `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `needs:human`. |
 | `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
-| `loom:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
+| `needs:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
 | `loom:answer-pending` | An operator answered the item's ask on the dashboard's Needs you page (`<!-- loom:answer v1 -->` comment, `bus/answer.py`); the station has not read it yet. The factory reads it on its next pass and takes the label off (see Operator answers). |
 | `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:blocked`, `wait:superseded`, `wait:window`, `wait:live-event` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, its brief's Blocked on section names an issue still open, its brief says another issue supersedes it (the factory gives neither a lane), a deploy or roll window, or (`wait:live-event`, on a shipped ticket) its Live box needs a rare event the log has not shown in 7 days since it shipped. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
 | `handoff:claude` | The hand-off pool, machine-readable. Two routes lead into it: a ticket no lane of this Loom took for a day, with no other lane or model rung its tier allows free (see Tickets no lane takes), which is `loom:queued` with no lane and holds no slot of its goal's in-flight cap (one at `loom:pr` still counts); and a ticket whose fix rounds stopped on the same failures, with no rung of the model ladder left or the round cap reached on its rung (see the station's hand-back below), which is `loom:failed` with one note naming what still fails. The factory moves neither any more. The second operator's session works this pool (its goal issue, #1036) and may claim such a ticket at any state; taking the label off returns the ticket to this Loom. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
-| `needs-operator` | An ask for the operator (see Asks). |
-| `loom:urgent` | With `needs-operator`: forward now, not in the daily batch. |
+| `needs:human` | An ask for the operator (see Asks). |
+| `loom:urgent` | With `needs:human`: forward now, not in the daily batch. |
 | `loom:digest` | The issue holding the full daily digest of asks, in each repo with asks. |
 | `loom:regression` | A ticket admitted for a measured regression of a shipped ticket (`brief --regresses`). Claimed and landed before other tickets. |
 | `loom:revert` | A ticket the station filed to revert the merge that turned a default branch red (see Red default branch). Claimed and landed before every other ticket. |
@@ -81,7 +81,7 @@ The station's `clean_labels` step (bus/label_pass.py, loom#2024) keeps that
 true. At most once an hour, on at most 20 issues a run, it removes from each
 open issue (and each closed one still at `loom:triage`) that no other
 operator owns: every state label but the newest the station set; `needs-brain`
-when `loom:human` or a `needs:<login>` label says a person holds the issue;
+when `needs:human` or a `needs:<login>` label says a person holds the issue;
 `loom:triage` once the issue is a `loom:ticket` or closed; and the `lane:*`
 label of a ticket at `loom:answered`, whose lane answered with no change. A
 body `Part of #N` naming another issue than the sub-issue parent is changed
@@ -245,7 +245,10 @@ findings section.
 checks (bus/hunt_plan.py mirrors them: Why of at least 5 words, at least 3
 non-empty Acceptance criteria bullets, a Size of XS, S, M or L, a non-empty
 Out of scope), and files a Size written as a word (Small, Medium, Large) as
-its letter. `brief` (and the station's rewrite step) also refuses a Live
+its letter. A ticket that states fewer than three criteria is not refused:
+the pull request body carries the standard bullets the gate wants
+(`bus/hunt_plan.py` `pad_criteria`), so the body, not the ticket, decides.
+`brief` (and the station's rewrite step) also refuses a Live
 criterion (the acceptance line that starts with "Live") that names no exact
 string in backticks or double quotes; health and friction intake tickets are
 verified by the station's own absence tracking and are exempt. The string is
@@ -379,7 +382,7 @@ repo for Loom in one step, and a second run changes nothing:
 - opens the repo's backlog goal home when none is open: `loom:goal` and
   `loom:backlog`, titled "Goal: Loom or a person works every open
   <owner/name> issue" (docs/NAMING.md), with the destination, the metric (open issues not
-  yet tickets, tickets, `loom:human`) and the rules (triage never closes an
+  yet tickets, tickets, `needs:human`) and the rules (triage never closes an
   issue; a private repo's briefs never go to lanes that train on prompts);
 - writes `Operator: LOGIN` above the first heading of a backlog goal home it
   opens (docs/LANES.md): `--operator`, else, when another operator's goal home
@@ -400,7 +403,7 @@ repo for Loom in one step, and a second run changes nothing:
 
 `python3 -m bus.brain triage <owner/name> --goal N [--limit 25]` walks the
 repo's open issues oldest first and labels at most `--limit` of them. It
-skips pull requests, epics (an `epic` label or sub-issues), `needs-operator`
+skips pull requests, epics (an `epic` label or sub-issues), `needs:human`
 asks, `wayfinder:*` planning issues, factory incidents, issues labelled
 `awaiting-live-check` (finished work waiting to be seen live, not new work)
 and anything with a `loom:` label. A ready issue (Why, What,
@@ -555,8 +558,8 @@ labelled `loom:triage` before a skip existed is not rewritten into a ticket.
 It only briefs or skips: when its model answers that only a person can do the
 work, the issue keeps `loom:triage`, gains `needs-brain` (no comment), and the
 station leaves it alone from then on; the brain decides whether it becomes a
-ticket or `loom:human`. Free rewrite models labelled factory work as
-person-only, and every `loom:human` reaches the operator's digest.
+ticket or `needs:human`. Free rewrite models labelled factory work as
+person-only, and every `needs:human` reaches the operator's digest.
 Set `LOOM_REWRITE_CMD` (public repos) and `LOOM_REWRITE_PRIVATE_CMD` (private
 repos) to command lines that read a prompt on stdin and print one JSON object.
 `lanes/rewrite_agent.sh <key-ssm|-> <provider/model[,provider/model...]>`
@@ -913,9 +916,9 @@ completed, when a pull request in another repo of the owner that names it in
 full has merged, when a pull request a person linked in it or its comments
 merged after it was filed, or when every file its criteria ask to add already
 exists on the default branch. A stale ticket goes back to `loom:queued` with
-`loom:human` and one ask (`Kind: decision`) naming the evidence; the factory
-gives a queued `loom:human` ticket no lane. Each piece of evidence holds it
-once: once the operator removes `loom:human`, the same evidence does not hold
+`needs:human` and one ask (`Kind: decision`) naming the evidence; the factory
+gives a queued `needs:human` ticket no lane. Each piece of evidence holds it
+once: once the operator removes `needs:human`, the same evidence does not hold
 it again. The audit of 2026-10-22 found a rewrite of an issue whose leak-scan
 caller and deny-list layer had shipped weeks before; the lane read "out of
 scope" as "must be absent" and deleted the working deny-list layer, in two
@@ -963,7 +966,11 @@ confidence`) is not sent back: a lane cannot fix it. The station leaves the
 ticket at `loom:pr` with no fix comment, no round counted and no
 `loom:ready`, and the factory asks the review bot to review the head again
 (`/grug improve`, once per head commit). Real failures beside it are sent
-back without it.
+back without it. The same request goes to any open lane pull request whose
+review check failed degraded, whatever state its ticket is in or whatever else
+fails on the head, once per head commit and at most `claimed.REREVIEW_PER_RUN`
+requests a factory pass; the log names each request against that bound and the
+pull request that waits for the next pass.
 
 A review check that failed only on a split request is not sent back either.
 When its summary carries a `Reviewability` note of kind `cross-cohort-proof`,
@@ -1121,7 +1128,7 @@ on as `[auth]`. The hold lifts only when the value at that parameter changes
 (the operator renewed it). A lane that reads no key parameter at all (codex,
 claude and zen sign in with the CLI's own file) is not held: nothing there
 changes, so its next pass fails the same way, and the ask below still says
-which lane to fix. The runner files one `needs-operator` ask on the factory
+which lane to fix. The runner files one `needs:human` ask on the factory
 repo naming the exact parameter, and comments on that ask instead of filing a
 second one.
 
@@ -1301,7 +1308,7 @@ pull request's review thread is not a new issue comment and is not scanned.
 | Kind | What it is |
 | --- | --- |
 | `failure` | A red merge, a revert, or a lane's hand-back that a person may need to read. |
-| `ask` | The exact thing only a person can do (`loom:human`). |
+| `ask` | The exact thing only a person can do (`needs:human`). |
 | `answer` | An operator's answer to an ask, posted from the dashboard's Needs you page (`bus/answer.py`, see Operator answers). |
 | `runaway` | A hold or release of a ticket that ran past its attempts. |
 | `proof-refused` | The station stops handing a ticket out to verify after refused proofs. |
@@ -1373,7 +1380,24 @@ reasons stay in the local viewer.
 
 ## Asks
 
-An ask is an issue labelled `needs-operator` in the goal's repo, holding one
+One label asks a person: `needs:human` (loom#2278). `needs-operator`,
+`needs:quadseven` and `loom:human` are old names of it: every reader treats
+them as `needs:human`, and the label pass (`bus/label_pass.py`) moves one to
+`needs:human` only when it writes to that ticket anyway. No pass relabels on
+its own, and none posts a comment.
+
+The label comes off when the answer is in the ticket (`bus/ask_state.py`): a
+comment after the ask by an operator or trusted person that is not a
+question, a dashboard answer, a trusted brain's line starting `Finished:` or
+`Done:`, or a `## Decision (<login>, <date>)` heading in the body. An answer
+that names a command in backticks adds `needs-brain`, so the brain sees who
+can run it. An ask whose Blocked on section names an open issue gets
+`wait:blocked`. The digest skips answered and waiting asks at once, even
+before the label pass runs; the dashboard still lists a waiting ask. A
+claimed ticket is left to its holder, and the digest still skips it when
+answered.
+
+An ask is an issue labelled `needs:human` in the goal's repo, holding one
 exact question or action and what the brain does in each case. The station
 forwards asks to the operator's Discord webhook (URL read from SSM on the
 lane machine, never on Muse's VM): `loom:urgent` asks within a minute, the
@@ -1388,10 +1412,11 @@ good observation and the first failing one ("last good read 04:28Z, first
 failing read 09:02Z"). The last good read is not the start. Every text a
 `bus` command posts is checked for this (`bus/text.py`).
 
-Open `loom:human` issues are not asks: the station never posts one on its
+Open issues still on the old `loom:human` name are never posted on their
 own. They are listed once a day under "Waiting on you" at the end of the
 same digest (the 15 newest, grouped by repo, each with the first line of
-its `loom:human` comment), so hundreds of them still make one message.
+its ask comment), so hundreds of them still make one message. Once such an
+issue moves to `needs:human`, it is listed with the asks.
 
 ## The tick
 
@@ -1643,6 +1668,39 @@ closes, or 40 minutes after the mark (from the label's event on GitHub),
 when the label comes off and the next pass picks again. Operators merging
 by hand follow the same cadence.
 
+### Branch hygiene
+
+The factory's judging reaches a pull request only while its ticket sits at
+`loom:pr` with its review settled, and a held pull request whose update is
+refused is left where it lies, so a pull request outside that path (one
+waiting on its checks, one held for the operator) used to drift behind or
+into a conflict nobody was assigned, found only when someone came to merge
+it (loom#2135). Each repo pass therefore follows its judging with a
+hygiene sweep over the repo's open lane pull requests, oldest first. A
+behind, conflict-free one is brought up to date in small steps (at most
+two a repo a pass, never while another pull request there holds the
+landing lock or in a pass where the repo already landed one, and never on
+a head with a failed check, whose re-runs and fix rounds are the cheaper
+answer). A conflicting one gets exactly one fix round for the conflict,
+open while the head it was opened for is still the head; a round opened
+before fix comments carried their head counts as open for any head, so an
+old round is never doubled. The judged send-back's holds still apply
+there, with one exception: a `needs:human` ticket gets its conflict round
+anyway, because that hold guards the pull request's merge, not its
+branch, and the label stays on the ticket through the move; a
+`needs-brain` ticket and one in the hand-off pool are left to the brain
+and that session. Hygiene never merges anything: a `class:sensitive`
+pull request is maintained exactly like a lane one up to the merge step,
+which stays with the brain or the operator as before. Each action is one
+station log line, and so is each skip the pass decides itself (a held
+landing lock, the per-repo bound, a landing earlier in the pass, a ticket
+with the brain or in the hand-off pool, a round already open, an update
+refused); the lock, bound and landed skips are said once a repo a pass,
+however many pull requests they cover. Pull requests outside the pass's
+remit (not a lane pull request, no ticket in the repo, not yet judged by
+GitHub, a red head the judge is already handling, one brought up to date
+within the cooldown) pass without a line.
+
 ## Merge by change class
 
 Every lane pull request carries one change class (`class:<name>`, set by the
@@ -1692,7 +1750,7 @@ review, when either holds (`bus/operator_hold.py`):
 
 The factory checks before it lands a pull request, and `bus.brain merge`
 checks before it merges one, so whichever reaches it first holds it. The
-ticket goes to `loom:human` with one exact ask (`Kind: decision`): do the
+ticket goes to `needs:human` with one exact ask (`Kind: decision`): do the
 steps, or check that the placement is safe for the data and the nodes it
 lands on, then merge the pull request by hand. Loom never merges it, and the
 ask is posted once. `bus.brain status` marks a pull request whose body
@@ -1703,7 +1761,7 @@ declares steps `blocked: held for the operator`.
 The dashboard's Needs you page takes an answer to each ask in one tap
 (loom#1777, docs/DASHBOARD.md). It posts one comment as the Loom App,
 `<!-- loom:answer v1 --> Answer from <login> (via the dashboard): <choice>.
-<note>`, takes off `loom:human`, `needs:<login>` and `needs-operator`, and
+<note>`, takes off `needs:human`, `needs:<login>` and `needs:human`, and
 adds `loom:answer-pending`. An answer counts only when its author is trusted
 (`LOOM_BRIEF_AUTHORS`, where the App's bot login is) or is the operator it
 names, and the login it names is an operator (`LOOM_OPERATORS`, else the
@@ -1718,7 +1776,7 @@ Hold. Merge lifts that hold only, in the factory and in `bus.brain merge`:
 the risk tier's review check, open findings and hourly cap, the checks, the
 criteria and shadow mode still decide, so in shadow mode the merge is still
 only recorded. Hold keeps the pull request held with no new ask, and the
-factory puts `loom:human` back so it keeps waiting on a person. An answer
+factory puts `needs:human` back so it keeps waiting on a person. An answer
 counts only for the pull request the newest hold ask names, given after that
 ask and not before the head commit it would merge; a newer ask, or a newer
 head, asks again. Each Merge or Hold is written once to the shadow ledger as
@@ -1728,7 +1786,7 @@ it pairs with; the ledger's counts and digest leave verdicts out.
 A ticket whose every acceptance criterion is a check on a live host or
 network (a command run on a host, a reach test from a network, a port, a
 firewall or ACL rule, a check across the hosts, or a Live line, and none
-naming a test) gets no lane: the factory puts it to `loom:human` with one
+naming a test) gets no lane: the factory puts it to `needs:human` with one
 ask instead of giving it one, and `bus.brain brief` refuses it. The
 station's close of a shipped ticket whose Live line names nothing to search
 leaves it open while an unticked criterion is such a host or network check:
@@ -1856,7 +1914,7 @@ criterion is one of three kinds:
   ticked now, unless an operator made the last body edit, and posts one
   incident note naming it. A no-change report on a ticket with an open
   decision box does not move it to `loom:merged`, whatever merged: it goes to
-  `loom:human` with a `Kind: decision` ask (loom#2029).
+  `needs:human` with a `Kind: decision` ask (loom#2029).
 
 A tick is nobody's evidence: not the ticket's, not the lane's pull request
 body's. The station's done close leaves a shipped ticket open while a live
@@ -1872,7 +1930,7 @@ expected string names that exact status or Location.
 Each result is kept in the station's `live-checks.json` and written to the
 ticket's status; the answer itself is never written. A criterion with no
 runnable check, a failed check, or an operator criterion sends the ticket to
-`loom:human` with one ask (`Kind: decision`), once, and at most 4 such asks
+`needs:human` with one ask (`Kind: decision`), once, and at most 4 such asks
 an hour. A verify lane's proof that passes a live or operator criterion
 without station evidence is refused.
 
@@ -2179,7 +2237,7 @@ per-repo backlog goal never gets one: its status is one line in the
 station's twice-daily Discord digest, and `journal` refuses a report there. The report ends with two lines: "Needs you:" (only what only
 the operator can do for this goal, or "nothing new for this goal"; it alone
 decides new comment or edit in place) and "Waiting on you:" (the count of
-open `loom:human` issues by repo and this goal's share, or "nothing"). `status`
+open `needs:human` issues by repo and this goal's share, or "nothing"). `status`
 prints each goal's "Waiting on you:" line under "## Waiting on you"; `journal`
 refuses a report that puts the count on the "Needs you:" line or says
 "nothing" beside a count (loom#1775).
@@ -2261,8 +2319,8 @@ A goal is quiet since its newest valid report when all of these hold:
   `loom:verified` or `loom:failed` was updated after it;
 - no open `loom:invariant` issue names the goal (`Part of #N`) or sits in
   its scope;
-- no open ticket in its scope asks the operator (`loom:human`,
-  `needs-operator`);
+- no open ticket in its scope asks the operator (`needs:human`,
+  `needs:human`);
 - nothing in its scope is stuck: no open ticket carries `loom:failed`,
   `loom:runaway`, `loom:regression` or `needs-brain`, and none has sat in
   `loom:pr` past the stuck age (6 hours);

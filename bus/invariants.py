@@ -621,7 +621,8 @@ def epic_over_cap(f: Facts) -> List[Breach]:
     """An epic holding more than EPIC_TICKETS tickets (its sub-issues and
     the issues whose Part of line names it, each once), or any epic, the
     standing repairs epic too, holding GitHub's limit of sub-issues: GitHub
-    refuses its next link (loom#2023)."""
+    refuses its next link (loom#2023). A closed epic is finished work whose
+    closed tickets can never leave it, so it is never over a cap (loom#2140)."""
     if f.shapes is None:
         return []
     out = []
@@ -637,7 +638,7 @@ def epic_over_cap(f: Facts) -> List[Breach]:
                          epic.epic.label, shape.goal.label, epic.sub_issues,
                          SUB_ISSUE_LIMIT),),
                     f.now))
-            elif epic.tickets > EPIC_TICKETS and not epic.standing:
+            elif epic.open and epic.tickets > EPIC_TICKETS and not epic.standing:
                 out.append(Breach(
                     "epic-over-cap", epic.epic.key,
                     "Epic %s holds %d tickets (cap %d)" % (epic.epic.label, epic.tickets,
@@ -1381,6 +1382,32 @@ class Filer:
             why = self._settled_why(invariant, subject, number)
             if why and self._close_settled(number, issue, why):
                 self.subjects.pop(key, None)
+
+        # Also check open lane-pr-stalled issues from the listing that have no
+        # subject map entry (the breach was not detected this pass, e.g. PR
+        # merged while station was down). The listing has the issue; the
+        # settled callback reads PR state from the REST API.
+        if self.settled is not None:
+            for key, number in listing.items():
+                if self.writes + 2 > WRITES_MAX:
+                    return
+                if key in current or key in self.subjects:
+                    continue
+                if not key.startswith("lane-pr-stalled/"):
+                    continue
+                if number in self._listed_closed:
+                    continue
+                issue = self._issue(number)
+                if issue is None or issue.get("state") != "open":
+                    continue
+                if TICKET_LABEL in self._label_names(issue):
+                    continue
+                invariant = "lane-pr-stalled"
+                subject = key.split("/", 1)[1]
+                why = self._settled_why(invariant, subject, number)
+                if why and self._close_settled(number, issue, why):
+                    # The issue is closed; nothing more to track.
+                    pass
 
     def _settled_why(self, invariant: str, subject: str, number: int) -> Optional[str]:
         """The caller's word on whether the subject settled; None when it has

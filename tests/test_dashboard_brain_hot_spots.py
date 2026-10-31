@@ -44,7 +44,8 @@ class BrainViewTest(unittest.TestCase):
             {"holder": "muse", "started_at": None, "step": None},
             [{"created_at": "2030-01-08T10:00:00Z", "body":
               "<!-- loom:journal v1 -->\nTick 2030-01-08T10:00:00Z, muse\n- Next: review the open work"}],
-            [{"lane": "codex-2", "available": True, "heartbeat": "2030-01-08T11:55:00Z"}],
+            [{"lane": "codex-2", "available": True, "heartbeat": "2030-01-08T11:55:00Z"},
+             {"lane": "codex-1", "available": True, "heartbeat": "2030-01-08T11:54:00Z"}],
             [{"repo": "example-owner/sample", "number": 52, "title": "Sample task", "state": "running",
               "lane": "codex-2", "html_url": "https://github.com/example-owner/sample/issues/52",
               "labels": ["claim:codex-2"]}], [],
@@ -53,6 +54,7 @@ class BrainViewTest(unittest.TestCase):
         self.assertIn("muse", body)
         self.assertIn("paused", body)
         self.assertIn("codex-2", body)
+        self.assertIn('<h3>codex-1</h3><p>lane machine / idle</p><p>idle</p>', body)
         self.assertIn('href="/t/example-owner/sample/52"', body)
         self.assertIn("Sample task", body)
 

@@ -94,7 +94,7 @@ class DecisionTicks(tbs.Base):
              "user": {"login": "carol-example"}}])
         names = self.fake.names(12)
         self.assertNotIn("loom:merged", names)
-        self.assertIn("loom:human", names)
+        self.assertIn("needs:human", names)
         asks = [c["body"] for c in self.fake.comments[12]
                 if c["body"].startswith(station.HUMAN_MARKER)]
         self.assertEqual(len(asks), 1)
@@ -111,7 +111,7 @@ class DecisionTicks(tbs.Base):
              "merge_commit_sha": "%040x" % 77, "body": "Refs %s#12" % REPO,
              "head": {"ref": "a-fix"}, "user": {"login": "carol-example"}}])
         self.assertIn("loom:merged", self.fake.names(12))
-        self.assertNotIn("loom:human", self.fake.names(12))
+        self.assertNotIn("needs:human", self.fake.names(12))
 
 
 if __name__ == "__main__":
