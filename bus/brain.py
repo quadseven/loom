@@ -1139,7 +1139,7 @@ def _verify_due_lines(due: List[Tuple[datetime, Dict[str, Any]]], now: datetime)
     return lines if due else lines + ["- none"]
 
 
-def _lane_status(gh: GitHub, lanes_repo: str,
+def _lane_status(gh: GitHub, lanes_repo: str, now: datetime,
                  authors: Optional[Sequence[str]] = None) -> str:
     """The newest lane status comment a trusted login wrote: a stranger's
     copy of the marker is not printed, nor picks a lane."""
@@ -1151,7 +1151,16 @@ def _lane_status(gh: GitHub, lanes_repo: str,
     marked = [c for c in comments if str(c.get("body") or "").startswith(LANES_MARKER)]
     if not marked:
         return "no lane status yet"
-    return max(marked, key=lambda c: c.get("created_at", ""))["body"]
+    body = max(marked, key=lambda c: c.get("created_at", ""))["body"]
+    m = re.search(r"Updated (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)", body)
+    if m:
+        dt = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        age = int(((now or datetime.now(timezone.utc)) - dt).total_seconds() / 60)
+        if age > 60:
+            body = body.replace(m.group(0), m.group(0) + " (stale, %d min)" % age)
+        else:
+            body = body.replace(m.group(0), m.group(0) + " (%d min)" % age)
+    return body
 
 
 def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
@@ -1210,7 +1219,7 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     tail += [""] + waiting_lines(waiting, repos)
     tail += [""] + _health_lines(env)
     tail += [""] + validation_gap_lines(env)
-    tail += ["", "## Lane status", _lane_status(gh, lanes_repo, authors)]
+    tail += ["", "## Lane status", _lane_status(gh, lanes_repo, now or datetime.now(timezone.utc), authors)]
     _say(out, emit, tail)
     return "\n".join(out)
 
@@ -6225,7 +6234,7 @@ def _stuck_marks(histories: Dict[int, History], skipped: List[int]) -> Dict[int,
 
 def _available_lanes(gh: GitHub, lanes_repo: str,
                      authors: Optional[Sequence[str]] = None) -> List[str]:
-    rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", _lane_status(gh, lanes_repo, authors),
+    rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", _lane_status(gh, lanes_repo, datetime.now(timezone.utc), authors),
                       re.M)
     return rows
 

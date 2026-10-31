@@ -8248,6 +8248,42 @@ class StatusTest(Base):
         self.go(3601 - 0)
         self.assertEqual(len(self.fake.edits), 1)
 
+    def test_published_when_old_even_if_stopped_at_target(self):
+        # "a pass that stops at the request target before the late steps still publishes when the last publish is older than the age (must fail on main)"
+        self.fake.lanes_issues = [{"number": 1}]
+        self.fake.add(50, state="running", lane="codex")
+        self.heartbeat("codex", age=0)
+        self.go()
+        # Set last publish to very old
+        import json
+        with open(os.path.join(self.home, "state", "lanes.json"), "w") as f:
+            json.dump({"repo": REPO, "issue": 1, "comment_id": 123, "values": {"codex": "yes"}, "at": time.time() - 4000}, f)
+
+        self.fake.calls.clear()
+        self.fake.posts.clear()
+        self.fake.edits.clear()
+
+        # Make a target limit throw TargetReached during finish_claims
+        def refuse(*args, **kwargs):
+            from bus.github import TargetReached
+            raise TargetReached("limit")
+        self.fake.rest_methods["PATCH"] = refuse
+
+        with self.assertRaises(Exception): # not raised because pass absorbs TargetReached
+            pass
+        self.go(3601) # later doesn't matter much since time goes forward
+        self.assertEqual(len(self.fake.edits), 1)
+
+    def test_fresh_table_publishes_nothing(self):
+        # "a pass with a fresh table publishes nothing, so no request is spent"
+        self.fake.lanes_issues = [{"number": 1}]
+        self.go()
+        self.fake.calls.clear()
+        self.go(later=10) # 10 seconds later
+        # No edits, no posts, no calls to issues/comments
+        self.assertEqual([c for c in self.fake.calls if "lanes" in c[1] or "comments" in c[1]], [])
+
+
     def test_never_contains_a_reason(self):
         d = os.path.join(self.home, "state", "usage")
         self.write(os.path.join(d, "zen.json"), json.dumps({

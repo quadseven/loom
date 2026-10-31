@@ -13322,6 +13322,15 @@ class Station:
             synced.append(repo)
             _write_json(path, {"digest": digest, "repos": synced})
 
+    def _lanes_stale(self) -> bool:
+        saved = _read_json(os.path.join(self.state, "lanes.json"), {}, strict=False)
+        if not isinstance(saved, dict):
+            return True
+        last_at = saved.get("at")
+        if isinstance(last_at, bool) or not isinstance(last_at, (int, float)):
+            return True
+        return self.now - last_at > LANES_REPUBLISH
+
     def run_pass(self) -> None:
         if self._budget_exhausted():
             return
@@ -13333,6 +13342,8 @@ class Station:
         # From loom#1915 until this change every such pass skipped them, and
         # no lane tree was pruned for hours on 2026-10-26.
         try:
+            if self._lanes_stale():
+                self.publish_lanes()
             self.sync_labels()
             self.finish_claims()
             try:

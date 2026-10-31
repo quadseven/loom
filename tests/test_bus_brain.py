@@ -388,6 +388,17 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertIsNone(brain.goal_trunk({"body": "## Why\nno trunk"}))
         self.assertIsNone(brain.goal_trunk({"body": None}))
 
+
+    def test_status_marks_a_table_older_than_the_age_as_stale_with_its_age_in_minutes(self):
+        body = "<!-- loom:lanes v1 -->\nUpdated 2030-01-01T12:00:00Z\n| codex | yes |"
+        fake = Fake(reply(200, [{"number": 1, "labels": [{"name": "loom:lanes"}]}]),
+                    reply(200, [{"body": body, "user": {"login": "trusted"}}]))
+        now = datetime(2030, 1, 1, 13, 5, 0, tzinfo=timezone.utc)
+        out = []
+        brain.status(GitHub("t", transport=fake), [], emit=out.append, env={"LOOM_BRIEF_AUTHORS": "trusted"}, now=now)
+        rendered = "\n".join(out)
+        self.assertIn("Updated 2030-01-01T12:00:00Z (stale, 65 min)", rendered)
+
     def test_status_sections_and_request_ceiling(self):
         gh = GitHub("t", transport=Fake(
             reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}], "created_at": "2030-01-01T00:00:00Z"},
