@@ -410,7 +410,7 @@ class SensitiveResumeTests(unittest.TestCase):
                         {"number": 3, "title": "Ask", "labels": [{"name": "needs-operator"}]}]),
             reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
             reply(200, {"data": {"repository": {"p4": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": [{"isResolved": False}]}}, "g1": {"comments": {"nodes": [{"body": "<!-- loom:journal v1 -->", "createdAt": "2030-01-01T01:00:00Z"}]}}}}}),
-            reply(200, []), reply(200, []), reply(200, [])))
+            reply(200, []), reply(200, []), reply(200, []), reply(200, {"private": False})))
         report = brain.status(gh, [REPO], REPO, env={}, authors=())
         for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "#4 PR - blocked: 1 unresolved threads"):
             self.assertIn(section, report)
@@ -418,8 +418,9 @@ class SensitiveResumeTests(unittest.TestCase):
         # unproven-work read and epic list; the lane repo is the same repo,
         # so its issue list is the one already read (loom#2078), and with no
         # loom:lanes issue there is no comments read. Plus ticket issue fetch
-        # for goal home constraint checking.
-        self.assertEqual(gh.requests, 6)
+        # for goal home constraint checking. Plus the repo's visibility, for
+        # its "Waiting on you:" line.
+        self.assertEqual(gh.requests, 7)
 
     def test_status_ranks_open_tickets_across_repos_in_work_order(self):
         def t(number, priority=None, created="2030-01-01T00:00:00Z", labels=("loom:queued",)):

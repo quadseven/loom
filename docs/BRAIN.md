@@ -2285,8 +2285,13 @@ per-repo backlog goal never gets one: its status is one line in the
 station's twice-daily Discord digest, and `journal` refuses a report there. The report ends with two lines: "Needs you:" (only what only
 the operator can do for this goal, or "nothing new for this goal"; it alone
 decides new comment or edit in place) and "Waiting on you:" (the count of
-open `needs:human` issues by repo and this goal's share, or "nothing"). `status`
-prints each goal's "Waiting on you:" line under "## Waiting on you"; `journal`
+open `needs:human` issues by repo and this goal's share, or "nothing"). A goal
+home known to be private names every repo; any other home names only public
+repos and folds the rest into one "N in private repos" part, and a repo whose
+visibility cannot be read counts as private. `status`
+prints each goal's "Waiting on you:" line under "## Waiting on you", the
+station's data-only report carries the same line (left out when a repo cannot
+be counted, and a count that moved alone edits the last report); `journal`
 refuses a report that puts the count on the "Needs you:" line or says
 "nothing" beside a count (loom#1775).
 
