@@ -2480,10 +2480,38 @@ prepare_validation() {
   exclude_untracked
 }
 
+# Run changed Python tests on the base code in the check sandbox. This separate
+# pass has its own timeout because it archives the base tree and runs tests.
+final_base_tests() {
+  local rev="$1" helper="$CHECK_HOME/vacuous.py" command rc log_offset names
+  cp "$LOOM_ROOT/bus/vacuous.py" "$helper" || {
+    VALIDATION_REASON="validation environment unavailable: could not stage the base-test gate"
+    return 125
+  }
+  printf -v command '%q %q %q %q %q --timeout 120' \
+    python3 "$helper" "$TREE" "$BASE" "$rev"
+  log_offset="$(wc -c < "$LOG")"
+  contract_run "$command"
+  rc=$?
+  names="$(tail -c +$((log_offset + 1)) "$LOG" \
+    | sed -n -e 's/^base-pass: /passes on base: /p' \
+             -e 's/^base-timeout: /timed out on base: /p' \
+    | head -5 | tr '\n' ';')"
+  record base-tests "$command" "$rc" "$rev" "$([ "$rc" -eq 0 ] && echo true || echo false)"
+  case "$rc" in
+    0) return 0 ;;
+    124) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate timed out" ;;
+    125|126|127) VALIDATION_REASON="validation environment unavailable: the base-test gate exited $rc" ;;
+    *) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate failed" ;;
+  esac
+  [ -z "$names" ] || VALIDATION_REASON="$VALIDATION_REASON: ${names%;}"
+  return "$rc"
+}
+
 # After the agent, on the committed branch head: the same check again. Sets
 # VALIDATION_REASON when it did not pass.
 final_validation() {
-  local rc first_exit rev changed ok=false
+  local rc first_exit rev changed ok=false gate_rc
   VALIDATION_REASON=""
   safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
   rev="$(safe_git rev-parse HEAD)"
@@ -2495,6 +2523,15 @@ final_validation() {
     return 1
   fi
   contract_run "$C_CHECK"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    final_base_tests "$rev"; gate_rc=$?
+    if [ "$gate_rc" -ne 0 ]; then
+      [ "$gate_rc" -eq 124 ] || [ "$gate_rc" -eq 125 ] || [ "$gate_rc" -eq 126 ] ||
+        [ "$gate_rc" -eq 127 ] || record base-tests-finding "$VALIDATION_REASON" "$gate_rc" "$rev" false
+      drop_check_home
+      return 1
+    fi
+  fi
   if validation_interpreter_denied "$rc" "$(tail -c +$((LOG_START + 1)) "$LOG")"; then
     VALIDATION_REASON="validation environment unavailable: Python interpreter query was denied by the sandbox"
     note_factory_incident environment "$VALIDATION_REASON" VALIDATION_REASON
