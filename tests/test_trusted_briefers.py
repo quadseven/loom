@@ -24,7 +24,7 @@ ENV = {"LOOM_BRIEF_AUTHORS": " ".join(AUTHORS), "LOOM_TRUSTED_BRIEFERS": BRIEFER
 
 def by_briefer(fake, number, state="briefed", lane="codex"):
     """A loom:ticket the trusted briefer authored and labelled."""
-    fake.add(number, author=BRIEFER, state=state, lane=lane,
+    fake.add(number, author=BRIEFER, state=state, lane=lane, body=READY_BODY,
              events=[labeled("loom:" + state, BRIEFER), labeled("lane:" + lane, BRIEFER)])
 
 
