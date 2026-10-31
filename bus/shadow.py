@@ -72,6 +72,7 @@ import argparse
 import calendar
 import contextlib
 import contextvars
+import http.client
 import json
 import os
 import re
@@ -79,8 +80,13 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.error
 from typing import Any, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import unquote
+
+# Avoid circular import: GitHub is imported inside functions that need it
+if False:
+    from .github import GitHub
 
 SWITCH = "LOOM_SHADOW"
 REPOS = "LOOM_SHADOW_REPOS"
@@ -775,6 +781,412 @@ def _tally_lines(entries: Sequence[Mapping[str, Any]]) -> List[str]:
         for (repo, tier, action), n in sorted(tally.items())]
 
 
+# -- enhanced report ---------------------------------------------------------
+
+class PROutcome(NamedTuple):
+    """The outcome of a pull request from GitHub."""
+    state: str              # "open", "closed"
+    merged: bool
+    merged_at: Optional[str]
+    merged_by: Optional[str]
+    head_sha: str
+    base_sha: str
+    closed_at: Optional[str]
+
+
+class IssueOutcome(NamedTuple):
+    """The outcome of an issue from GitHub."""
+    state: str              # "open", "closed"
+    closed_at: Optional[str]
+    state_reason: str       # "completed", "not_planned"
+    labels: Tuple[str, ...]
+    body: str
+
+
+def _fetch_pr(gh: Any, repo: str, number: int) -> Optional[PROutcome]:
+    """Fetch a pull request from GitHub; None on expected failures."""
+    try:
+        resp = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number))
+        data = resp.data
+        if not isinstance(data, dict):
+            return None
+        merged = bool(data.get("merged"))
+        merged_at = data.get("merged_at")
+        merged_by = None
+        user = data.get("merged_by")
+        if isinstance(user, dict):
+            merged_by = str(user.get("login") or "")
+        head_sha = str(data.get("head", {}).get("sha") or "")
+        base_sha = str(data.get("base", {}).get("sha") or "")
+        closed_at = data.get("closed_at")
+        state = str(data.get("state") or "open")
+        return PROutcome(state, merged, merged_at, merged_by, head_sha, base_sha, closed_at)
+    except (urllib.error.HTTPError, urllib.error.URLError, http.client.HTTPException,
+            ValueError, KeyError, TypeError, AttributeError, OSError):  # noqa: BLE001
+        return None
+
+
+def _fetch_issue(gh: Any, repo: str, number: int) -> Optional[IssueOutcome]:
+    """Fetch an issue from GitHub; None on expected failures."""
+    try:
+        resp = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number))
+        data = resp.data
+        if not isinstance(data, dict):
+            return None
+        state = str(data.get("state") or "open")
+        closed_at = data.get("closed_at")
+        state_reason = str(data.get("state_reason") or "completed")
+        labels = []
+        for x in data.get("labels") or []:
+            name = x.get("name") if isinstance(x, dict) else x
+            if isinstance(name, str):
+                labels.append(name.strip().lower())
+        body = str(data.get("body") or "")
+        return IssueOutcome(state, closed_at, state_reason, tuple(labels), body)
+    except (urllib.error.HTTPError, urllib.error.URLError, http.client.HTTPException,
+            ValueError, KeyError, TypeError, AttributeError, OSError):  # noqa: BLE001
+        return None
+
+
+def _verdict_for(entries: Sequence[Mapping[str, Any]], repo: str, number: int) -> Optional[str]:
+    """Find the operator-verdict for a would-merge (merge/hold), or None."""
+    for e in entries:
+        if (e.get("action") == VERDICT
+                and str(e.get("repo") or "").lower() == repo.lower()
+                and int(e.get("number") or 0) == number):
+            return str(e.get("label") or "").lower()
+    return None
+
+
+def _would_merge_sha(entry: Mapping[str, Any]) -> str:
+    """The head SHA a would-merge would have merged."""
+    return str(entry.get("sha") or "")
+
+
+def is_damaging_would_merge(would_merge: Mapping[str, Any],
+                            pr_outcome: Optional[PROutcome],
+                            verdict: Optional[str]) -> bool:
+    """Whether a would-merge was damaging.
+
+    Damaging if:
+    - Operator verdict was "hold" (operator explicitly did not merge)
+    - PR was closed unmerged
+    - PR was merged but with a different head SHA than would-merge (merged after changes)
+    - PR was merged and later reverted (merged_by is not the factory bot, or we detect revert)
+    Clean if:
+    - Operator verdict was "merge" AND PR was merged as-is (same head SHA)
+    - PR is still open (no decision yet)
+    """
+    if pr_outcome is None:
+        return False  # cannot determine, assume clean
+    if verdict == "hold":
+        return True
+    if pr_outcome.state == "closed" and not pr_outcome.merged:
+        return True  # closed unmerged
+    if pr_outcome.merged:
+        would_sha = _would_merge_sha(would_merge)
+        if would_sha and pr_outcome.head_sha != would_sha:
+            return True  # merged after changes (different head SHA)
+        # Check if merged by someone other than the factory bot (likely reverted or manual)
+        # The factory bot login ends with [bot]
+        if pr_outcome.merged_by and not pr_outcome.merged_by.endswith("[bot]"):
+            return True  # merged by a person, likely after changes or revert
+    return False
+
+
+def is_wrong_would_close(would_close: Mapping[str, Any],
+                         issue_outcome: Optional[IssueOutcome]) -> bool:
+    """Whether a would-close was wrong.
+
+    Wrong if the would-close was for a ticket (has loom:ticket or similar work label)
+    and the issue has unchecked acceptance criteria in its body.
+    """
+    if issue_outcome is None:
+        return False  # cannot determine, assume not wrong
+    # Only consider it a "would-close of a ticket" if it has a work label
+    labels = set(issue_outcome.labels)
+    work_labels = {"loom:ticket", "loom:goal", "loom:backlog", "loom:rewritten"}
+    if not (labels & work_labels):
+        return False  # not a work ticket close
+    # Check for unchecked acceptance criteria in the issue body
+    from bus import proof
+    unchecked = [text for checked, text in proof.criteria(issue_outcome.body) if not checked]
+    return bool(unchecked)
+
+
+def _pair_merge_outcomes(
+    entries: Sequence[Mapping[str, Any]], verdicts: Sequence[Mapping[str, Any]], gh: Any
+) -> List[Dict[str, Any]]:
+    """Pair would-merges with their PR outcomes and operator verdicts."""
+    would_merges = [e for e in entries if e.get("action") == MERGE]
+    merge_pairs = []
+    for wm in would_merges:
+        repo = str(wm.get("repo") or "")
+        number = int(wm.get("number") or 0)
+        pr = _fetch_pr(gh, repo, number) if repo and number else None
+        verdict = _verdict_for(verdicts, repo, number)
+        damaging = is_damaging_would_merge(wm, pr, verdict)
+        merge_pairs.append({
+            "would_merge": wm,
+            "pr_outcome": pr,
+            "verdict": verdict,
+            "damaging": damaging,
+        })
+    return merge_pairs
+
+
+def _pair_close_outcomes(
+    entries: Sequence[Mapping[str, Any]], gh: Any
+) -> List[Dict[str, Any]]:
+    """Pair would-closes with their issue outcomes."""
+    would_closes = [e for e in entries if e.get("action") == CLOSE]
+    close_pairs = []
+    for wc in would_closes:
+        repo = str(wc.get("repo") or "")
+        number = int(wc.get("number") or 0)
+        issue = _fetch_issue(gh, repo, number) if repo and number else None
+        wrong = is_wrong_would_close(wc, issue)
+        close_pairs.append({
+            "would_close": wc,
+            "issue_outcome": issue,
+            "wrong": wrong,
+        })
+    return close_pairs
+
+
+def _compute_repo_tier_counts(
+    merge_pairs: Sequence[Dict[str, Any]], close_pairs: Sequence[Dict[str, Any]]
+) -> Dict[Tuple[str, str], Dict[str, int]]:
+    """Compute per-repo, per-tier decision and damage counts."""
+    by_repo_tier: Dict[Tuple[str, str], Dict[str, int]] = {}
+
+    for pair in merge_pairs:
+        wm = pair["would_merge"]
+        repo = str(wm.get("repo") or "?")
+        tier = str(wm.get("tier") or "-")
+        key = (repo, tier)
+        if key not in by_repo_tier:
+            by_repo_tier[key] = {"decisions": 0, "damaging": 0, "clean_streak": 0}
+        by_repo_tier[key]["decisions"] += 1
+        if pair["damaging"]:
+            by_repo_tier[key]["damaging"] += 1
+            by_repo_tier[key]["clean_streak"] = 0
+        else:
+            by_repo_tier[key]["clean_streak"] += 1
+
+    for pair in close_pairs:
+        wc = pair["would_close"]
+        repo = str(wc.get("repo") or "?")
+        tier = str(wc.get("tier") or "-")
+        key = (repo, tier)
+        if key not in by_repo_tier:
+            by_repo_tier[key] = {"decisions": 0, "damaging": 0, "wrong_closes": 0, "clean_streak": 0}
+        by_repo_tier[key]["decisions"] += 1
+        if pair["wrong"]:
+            by_repo_tier[key]["wrong_closes"] = by_repo_tier[key].get("wrong_closes", 0) + 1
+            by_repo_tier[key]["clean_streak"] = 0
+        else:
+            by_repo_tier[key]["clean_streak"] += 1
+
+    return by_repo_tier
+
+
+def _compute_report_data(entries: Sequence[Mapping[str, Any]], gh: Any) -> Dict[str, Any]:
+    """Compute enhanced report data: pair would-actions with outcomes, count damage."""
+    verdicts = [e for e in entries if e.get("action") == VERDICT]
+    merge_pairs = _pair_merge_outcomes(entries, verdicts, gh)
+    close_pairs = _pair_close_outcomes(entries, gh)
+    by_repo_tier = _compute_repo_tier_counts(merge_pairs, close_pairs)
+    return {
+        "merge_pairs": merge_pairs,
+        "close_pairs": close_pairs,
+        "by_repo_tier": by_repo_tier,
+    }
+
+
+def _format_pr_outcome(pr: Optional[PROutcome], verdict: Optional[str]) -> str:
+    """Format a PR outcome for display."""
+    if pr is None:
+        return "outcome: unknown"
+    if pr.state == "open":
+        return "outcome: still open"
+    if pr.merged:
+        if verdict == "merge":
+            return "outcome: merged as-is (operator merge)"
+        if verdict == "hold":
+            return "outcome: merged (operator held, but merged anyway)"
+        return "outcome: merged"
+    return "outcome: closed unmerged"
+
+
+def _format_issue_outcome(issue: Optional[IssueOutcome]) -> str:
+    """Format an issue outcome for display."""
+    if issue is None:
+        return "outcome: unknown"
+    if issue.state == "open":
+        return "outcome: still open"
+    reason = issue.state_reason or "completed"
+    return "outcome: closed (%s)" % reason
+
+
+def _format_merge_pairs(merge_pairs: Sequence[Dict[str, Any]]) -> List[str]:
+    """Format merge pairs with their outcomes for the report."""
+    lines = ["Would-merges (%d):" % len(merge_pairs)]
+    for pair in merge_pairs:
+        wm = pair["would_merge"]
+        pr = pair["pr_outcome"]
+        verdict = pair["verdict"]
+        damaging = pair["damaging"]
+        what = "merge"
+        if wm.get("label"):
+            what += " " + str(wm["label"])
+        ref = "%s#%s" % (wm.get("repo") or "?", wm.get("number") or "?")
+        extra = []
+        if wm.get("tier"):
+            extra.append("tier=%s" % wm["tier"])
+        if wm.get("sha"):
+            extra.append("sha=%s" % str(wm["sha"])[:12])
+        line = "  %s  would %-16s %-28s %s  %s" % (
+            wm.get("time"), what, ref, " ".join(extra), wm.get("url") or "")
+        if damaging:
+            line += "  [DAMAGING]"
+        lines.append(line)
+        if verdict:
+            lines.append("    operator verdict: %s" % verdict)
+        lines.append("    %s" % _format_pr_outcome(pr, verdict))
+        if wm.get("gates"):
+            lines.append("    gates passed: %s" % ", ".join(str(g) for g in wm["gates"]))
+        for key, name in (("reason", "reason"), ("source", "from")):
+            if wm.get(key):
+                lines.append("    %s: %s" % (name, wm[key]))
+    lines.append("")
+    return lines
+
+
+def _format_close_pairs(close_pairs: Sequence[Dict[str, Any]]) -> List[str]:
+    """Format close pairs with their outcomes for the report."""
+    lines = ["Would-closes (%d):" % len(close_pairs)]
+    for pair in close_pairs:
+        wc = pair["would_close"]
+        issue = pair["issue_outcome"]
+        wrong = pair["wrong"]
+        what = "close"
+        if wc.get("label"):
+            what += " " + str(wc["label"])
+        ref = "%s#%s" % (wc.get("repo") or "?", wc.get("number") or "?")
+        extra = []
+        if wc.get("tier"):
+            extra.append("tier=%s" % wc["tier"])
+        if wc.get("sha"):
+            extra.append("sha=%s" % str(wc["sha"])[:12])
+        line = "  %s  would %-16s %-28s %s  %s" % (
+            wc.get("time"), what, ref, " ".join(extra), wc.get("url") or "")
+        if wrong:
+            line += "  [WRONG]"
+        lines.append(line)
+        lines.append("    %s" % _format_issue_outcome(issue))
+        if wc.get("gates"):
+            lines.append("    gates passed: %s" % ", ".join(str(g) for g in wc["gates"]))
+        for key, name in (("reason", "reason"), ("source", "from")):
+            if wc.get(key):
+                lines.append("    %s: %s" % (name, wc[key]))
+    lines.append("")
+    return lines
+
+
+def _format_repo_tier_summary(by_repo_tier: Dict[Tuple[str, str], Dict[str, int]]) -> List[str]:
+    """Format per-repo, per-tier summary for the report."""
+    lines = ["By repo, tier:"]
+    for (repo, tier), counts in sorted(by_repo_tier.items()):
+        parts = ["decisions=%d" % counts["decisions"]]
+        if counts.get("damaging"):
+            parts.append("damaging=%d" % counts["damaging"])
+        if counts.get("wrong_closes"):
+            parts.append("wrong-closes=%d" % counts["wrong_closes"])
+        parts.append("clean-since-last-damage=%d" % counts.get("clean_streak", 0))
+        lines.append("  %s tier=%s: %s" % (repo, tier, ", ".join(parts)))
+    return lines
+
+
+def enhanced_report_lines(entries: Sequence[Mapping[str, Any]], gh: Any,
+                          since: float, path: str) -> List[str]:
+    """Enhanced report lines with GitHub outcomes and damage counts."""
+    data = _compute_report_data(entries, gh)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
+
+    lines = ["Enhanced shadow report since %s (%s)" % (stamp, path), ""]
+
+    merge_pairs = data["merge_pairs"]
+    if merge_pairs:
+        lines.extend(_format_merge_pairs(merge_pairs))
+
+    close_pairs = data["close_pairs"]
+    if close_pairs:
+        lines.extend(_format_close_pairs(close_pairs))
+
+    by_repo_tier = data["by_repo_tier"]
+    if by_repo_tier:
+        lines.extend(_format_repo_tier_summary(by_repo_tier))
+
+    return lines
+
+
+def enhanced_report_json(entries: Sequence[Mapping[str, Any]], gh: Any) -> List[Dict[str, Any]]:
+    """Enhanced report as JSON-serializable data."""
+    data = _compute_report_data(entries, gh)
+    out = []
+    for pair in data["merge_pairs"]:
+        wm = pair["would_merge"]
+        pr = pair["pr_outcome"]
+        out.append({
+            "type": "would-merge",
+            "time": wm.get("time"),
+            "repo": wm.get("repo"),
+            "number": wm.get("number"),
+            "tier": wm.get("tier"),
+            "sha": wm.get("sha"),
+            "gates": wm.get("gates"),
+            "reason": wm.get("reason"),
+            "url": wm.get("url"),
+            "verdict": pair["verdict"],
+            "pr_state": pr.state if pr else None,
+            "pr_merged": pr.merged if pr else None,
+            "pr_merged_at": pr.merged_at if pr else None,
+            "pr_head_sha": pr.head_sha if pr else None,
+            "damaging": pair["damaging"],
+        })
+    for pair in data["close_pairs"]:
+        wc = pair["would_close"]
+        issue = pair["issue_outcome"]
+        out.append({
+            "type": "would-close",
+            "time": wc.get("time"),
+            "repo": wc.get("repo"),
+            "number": wc.get("number"),
+            "tier": wc.get("tier"),
+            "sha": wc.get("sha"),
+            "gates": wc.get("gates"),
+            "reason": wc.get("reason"),
+            "url": wc.get("url"),
+            "issue_state": issue.state if issue else None,
+            "issue_closed_at": issue.closed_at if issue else None,
+            "issue_state_reason": issue.state_reason if issue else None,
+            "wrong": pair["wrong"],
+        })
+    # Summary
+    for (repo, tier), counts in sorted(data["by_repo_tier"].items()):
+        out.append({
+            "type": "summary",
+            "repo": repo,
+            "tier": tier,
+            "decisions": counts["decisions"],
+            "damaging": counts.get("damaging", 0),
+            "wrong_closes": counts.get("wrong_closes", 0),
+            "clean_streak": counts.get("clean_streak", 0),
+        })
+    return out
+
+
 # -- the brain rung's gh ------------------------------------------------------
 # lanes/mac/brain.sh runs the brain's model with a GitHub token, so the model
 # could merge or close with gh itself. Its gh asks gh_guard() first.
@@ -1060,6 +1472,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rep.add_argument("--repo", default="")
     rep.add_argument("--ledger", default="")
     rep.add_argument("--json", action="store_true")
+    rep.add_argument("--enhanced", action="store_true",
+                     help="pair with GitHub outcomes, count damage and clean streaks")
     sub.add_parser("status", help="say which repos are in shadow and where the ledger is")
     sub.add_parser("prompt", help="print the brain tick prompt's Shadow mode sentence")
     args = parser.parse_args(argv)
@@ -1078,10 +1492,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     path = args.ledger or ledger_path()
     entries = read(path, since, args.repo)
-    if args.json:
-        print(json.dumps(entries, indent=2, sort_keys=True))
+    if args.enhanced:
+        # Need a GitHub client for enhanced report (import here to avoid circular import)
+        from .github import GitHub
+        gh = GitHub()
+        if args.json:
+            print(json.dumps(enhanced_report_json(entries, gh), indent=2, sort_keys=True))
+        else:
+            print("\n".join(enhanced_report_lines(entries, gh, since, path)))
     else:
-        print("\n".join(report_lines(entries, since, path)))
+        if args.json:
+            print(json.dumps(entries, indent=2, sort_keys=True))
+        else:
+            print("\n".join(report_lines(entries, since, path)))
     return 0
 
 
