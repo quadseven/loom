@@ -8850,8 +8850,8 @@ class ReportDigestTest(Base):
         self.settings.report_digest = ((10, 0), (21, 0))
         self.settings.authors = list(AUTHORS)
         self.sent = []
-        day = time.localtime()
-        self.base = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, 0, 0, 0, 0, 0, -1))
+        # A day and its neighbours with no clock change: at() counts 24 hour days.
+        self.base = time.mktime((2030, 5, 7, 0, 0, 0, 0, 0, -1))
 
     def at(self, hour, minute=0, days=0):
         gh = GitHub("token", transport=self.fake)
