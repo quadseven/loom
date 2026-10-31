@@ -144,7 +144,7 @@ Commands:
 - Full suite, as `.loom/validation.conf` runs it: `python3 -B .github/unittest_parallel.py --allow-skips`. It takes several minutes.
 - One module: `python3 -B -m unittest tests.test_merge_tier`.
 - Without `--allow-skips` a skip is a failure. That is the required CI form, and it needs macOS with `sandbox-exec`, `ps` and a localhost port.
-- Leak check before a push: `python3 -B "$LOOM_HOME/infra-public/.github/scripts/check_private_leaks.py" --text-file <file> --deny-list-ssm /infra/leak-scan/deny-list`. CI here has no deny-list, so only this form catches people's names.
+- Leak check before a push: run `.github/scripts/check_private_leaks.py` from `quadseven/infra-public` with `--text-file <file>` and `--deny-list-ssm` naming the private deny-list. CI here has no deny-list, so only this form catches people's names.
 
 Checks:
 
@@ -191,7 +191,7 @@ Several AI brains work this repo beside the operator: Claude Code, Muse, Dot and
 
 `loom:ticket` marks every ticket. `loom:failed` means the runner gave up; the reason is on the ticket. `wait:*` names why a ticket is held. `needs:human` is an ask for a person. `loom:factory` marks a fault in the factory itself.
 
-**CI and required checks.** Required checks differ per repo, so read them live: `gh api repos/<owner>/<repo>/rules/branches/<default-branch>`. Every repo needs a PR and `Grug - Chief`; most add test jobs; some add `Grug - Elder`. Run each command in `.loom/validation.conf` before pushing, and read the failing workflow file before guessing at a red check.
+**CI and required checks.** Required checks differ per repo, so read them live: `gh api repos/<owner>/<repo>/rules/branches/<default-branch>`. Every repo needs a PR and `Grug - Chief`; some add test jobs; some add `Grug - Elder`. Run each command in `.loom/validation.conf` before pushing, and read the failing workflow file before guessing at a red check.
 
 - Shared workflows come from `quadseven/infra-public`, pinned by full SHA.
 - Leak scan: reads the diff and the PR title and body, and a scan that cannot run is red. It has 9 rules: tailnet hosts, tailnet IPs, private-range IPs, server names, node names, user paths, MAC addresses, the stray mention, and cross-repo refs. A ref of the form `name#N` or `owner/name#N` to any other repo fails, public or not, except a bare `name#N` for a repo in `allowed-repo-refs` in `check.leak-scan.yml`. Bare `#N` means this repo. A line with `leak-guard-allow` is exempt and visible in review; use it only for a real false positive.
