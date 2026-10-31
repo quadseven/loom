@@ -458,8 +458,10 @@ PULL_FILES_MAX = 3000
 # comments are read once), the count and refusal last logged (each logged
 # when it changes), and when a brief was last refused: the repo is tried
 # again ADOPT_RETRY seconds later, not every pass. A pull request is adopted
-# only once it is ADOPT_GRACE old, and is re-read just before its ticket is
-# filed: one closed or merged since the pass read the open list gets no ticket.
+# only once it is ADOPT_GRACE old, one on a branch outside loom/ only once it
+# has also gone ADOPT_GRACE with no commit or comment, and it is re-read just
+# before its ticket is filed: one closed or merged since the pass read the
+# open list gets no ticket.
 ADOPTED_MARKER = "<!-- loom:adopted v1 ticket=%s#%d -->"
 ADOPTED_RE = re.compile(r"<!-- loom:adopted v1 ticket=[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+ -->")
 ADOPTS_MARKER = "<!-- loom:adopts pr=%d -->"
@@ -475,7 +477,13 @@ ADOPT_RETRY = 600
 # the 54 that merged did so within 2 hours of their ticket. Those pull
 # requests had a person or a session driving them, so the ticket was only
 # bookkeeping; a pull request that really stalls is still adopted after this.
-ADOPT_GRACE = 2 * 3600
+# The 2 hours that gave (#1182) were too short: of the 711 pull requests the
+# operator's account opened outside loom/ branches over 2026-10-17 to
+# 2026-10-31, 85 ran past 2 hours, 30 past 24, 23 past 36, 22 past 48 and 21
+# past 72, so the curve is flat from here (p99 27 hours). Of the 44 such pull
+# requests adopted over those days, 42 would still get a ticket at 2 hours and
+# 6 at this grace with the quiet rule. A stall waits 2 days for its ticket.
+ADOPT_GRACE = 48 * 3600
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # Automatic retries (docs/BRAIN.md "Claim and outcome"). The runner starts
 # each failure reason with its class; a reason without one is a work failure.
@@ -5269,20 +5277,30 @@ class Station:
 
     def _adoptable_pulls(self, repo: str) -> List[Dict[str, Any]]:
         """The repo's open pull requests that are not drafts, come from a
-        trusted author on a branch of the repo itself and are at least
-        ADOPT_GRACE old, oldest first. One whose created_at is missing or
-        unreadable counts as old enough, so it is never left unadopted.
-        Whether an open ticket links one (a Refs line or a loom/N branch) is
-        checked by the caller."""
+        trusted author on a branch of the repo itself and are past the grace
+        (_past_adopt_grace), oldest first. Whether an open ticket links one
+        (a Refs line or a loom/N branch) is checked by the caller."""
         authors = {a.lower() for a in self.s.authors}
         found = [pr for pr in self._open_pulls(repo)
                  if isinstance(pr, dict) and pr.get("state", "open") == "open"
                  and not pr.get("draft") and tickets._login(pr.get("user")) in authors
                  and brain._same_repo(repo, pr, {}) and not self._owned_elsewhere(repo, pr)
-                 and self.now - (self._epoch(str(pr.get("created_at") or "")) or 0)
-                 >= ADOPT_GRACE]
+                 and self._past_adopt_grace(pr)]
         return sorted(found, key=lambda pr: (str(pr.get("created_at") or ""),
                                              int(pr.get("number") or 0)))
+
+    def _past_adopt_grace(self, pr: Dict[str, Any]) -> bool:
+        """The pull request is ADOPT_GRACE old and, on a branch outside
+        loom/ (a person or a session drives those), has gone ADOPT_GRACE
+        with no commit or comment. updated_at moves on a push and on a
+        comment, so it needs no read per pull request; a label moves it too,
+        which only delays a ticket. A stamp that is missing or unreadable
+        counts as old enough, so a pull request is never left unadopted."""
+        stamps = [pr.get("created_at")]
+        if not str((pr.get("head") or {}).get("ref") or "").startswith("loom/"):
+            stamps.append(pr.get("updated_at"))
+        newest = max(self._epoch(str(stamp or "")) or 0 for stamp in stamps)
+        return self.now - newest >= ADOPT_GRACE
 
     def _marked_adopted(self, repo: str, number: int) -> bool:
         """A trusted author marked the pull request adopted."""
