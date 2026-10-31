@@ -139,6 +139,11 @@ Neither needs a model:
   resolved: a loom:pr ticket whose pull request fails only the plan check on
   its body has the body rebuilt and the hold lifted; any other goes to the
   hand-off pool with one note (loom#1872). A person's hold is never lifted.
+- A ticket with an open lane pull request that has carried needs-brain for
+  brain_hold.STALL_AGE (4 hours, under the 6-hour lane-pr-stalled limit) goes
+  to loom:human with one comment naming the pull request, the merge command
+  and the fix command (_escalate_brain_stall, loom#1250). The comment ends
+  with the head commit; later passes on that head post nothing more.
 - A revert ticket (bus/revert.py, REVERT_LABEL) lands first when its own
   pull request is green, even while the default branch is red. Its medium
   and low findings are deferred at once instead of after a fix round, and
@@ -4701,6 +4706,33 @@ class Factory:
                     return pr
         return None
 
+    def _escalate_brain_stall(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Send a ticket with an open lane pull request that has carried
+        needs-brain for brain_hold.STALL_AGE to a person (loom#1250): loom:human
+        and one comment naming the pull request and the ask. The comment ends
+        with the head commit it was posted for, so later passes post nothing
+        more for that head and a new head may ask once more."""
+        number = int(issue["number"])
+        pr = self._open_lane_pull(repo, number)
+        if pr is None:
+            return
+        loom = brain_hold.loom_logins(self.trusted)
+        found = brain_hold.setter(self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number)), loom)
+        if not found.at or self.now - found.at < brain_hold.STALL_AGE:
+            return
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        key = brain_hold.STALL_MARKER % sha
+        if not sha or any(key in str(c.get("body") or "") for c in self._comments(repo, number)):
+            return
+        notify.post(self.gh, repo, number, brain_hold.stall_ask(
+            repo, number, int(pr["number"]), sha, (self.now - found.at) / 3600), notify.ASK)
+        if "loom:human" not in _labels(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["loom:human"]})
+        self.actions += 1
+        _say("sent %s#%d to a person: its pull request #%s waited on the brain"
+             % (repo, number, pr["number"]))
+
     def _hold_repair(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
                      note: str) -> Optional[bool]:
         """For a held loom:pr ticket: True when its pull request's body was
@@ -4810,6 +4842,9 @@ class Factory:
             self._guarded(self.pull_request, repo, pr, tickets)
         self._guarded(lambda r, _: self._hygiene(r, prs, tickets), repo, {})
         self._guarded(lambda r, _: self._close_unmerged_follow_ups(r), repo, {})
+        for issue in list(tickets.values()):
+            if brain_hold.LABEL in _labels(issue):
+                self._guarded(self._escalate_brain_stall, repo, issue)
         steps = {"failed": lambda r, i: self.failed(r, i, linked), "briefed": self.briefed,
                  "running": self.running, "merged": self.settle_deferred,
                  "shipped": self.settle_deferred, "verified": self.settle_deferred}

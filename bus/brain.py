@@ -1216,7 +1216,7 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     waiting: Dict[str, Dict[str, Any]] = {}
     for repo, done, value in per_repo.each(repos, read, seconds, READ_WORKERS):
         if not done:
-            _say(out, emit, ["", "## %s" % repo, "", _skip_line(repo, per_repo.timed_out(seconds))])
+            _say(out, emit, ["", "## %s" % repo, "", _skip_line(repo, per_repo.not_read(seconds, value))])
             continue
         section, into, waits = value
         found.update(into)
@@ -5861,7 +5861,7 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     # section, so one stale LOOM_REPOS entry does not end the run (loom#800).
     # A timed-out repo is left out the same way.
     repos = [r for r in dict.fromkeys(repos) if r not in unread and r not in timed]
-    _say(out, emit, _resume_head(holder, authors, goals, unread, timed, seconds, now))
+    _say(out, emit, _resume_head(holder, authors, goals, unread, timed, now))
     latest = _latest_marks(goals)
     gone = dict(unread)  # a snapshot: a late read never sees a later change
     check, trusted = review_check_name(env), trusted_authors(env)
@@ -5872,7 +5872,7 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
 
     for repo, done, value in per_repo.each(repos, gather, seconds, READ_WORKERS):
         if not done:
-            _say(out, emit, ["", _skip_line(repo, per_repo.timed_out(seconds))])
+            _say(out, emit, ["", _skip_line(repo, per_repo.not_read(seconds, value))])
             continue
         read[repo] = value
         if value["lines"]:
@@ -5882,12 +5882,12 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
 
 
 def _resume_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str], seconds: float
-                     ) -> Tuple[List[GoalJournals], Dict[str, str], List[str]]:
+                     ) -> Tuple[List[GoalJournals], Dict[str, str], Dict[str, str]]:
     """Every goal's journals across `repos`, in the order of `repos`, read
     repo by repo under the budget: (goals, unreadable repos with the reason,
-    timed-out repos)."""
+    repos not read in time with the reason)."""
     unread: Dict[str, str] = {}
-    timed: List[str] = []
+    timed: Dict[str, str] = {}
 
     def journals(repo: str) -> Tuple[List[GoalJournals], Dict[str, str]]:
         skipped: Dict[str, str] = {}
@@ -5899,7 +5899,7 @@ def _resume_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str], s
             by_repo[repo], skipped = value
             unread.update(skipped)
         else:
-            timed.append(repo)
+            timed[repo] = per_repo.not_read(seconds, value)
     return [g for repo in dict.fromkeys(repos) for g in by_repo.get(repo, [])], unread, timed
 
 
@@ -5916,7 +5916,7 @@ def _latest_marks(goals: Sequence[GoalJournals]
 
 
 def _resume_head(holder: str, authors: Sequence[str], goals: Sequence[GoalJournals],
-                 unread: Dict[str, str], timed: Sequence[str], seconds: float,
+                 unread: Dict[str, str], timed: Dict[str, str],
                  now: datetime) -> List[str]:
     """The heading, the freshness line, and the repos left out."""
     head = ["# Resume for %s" % holder, "", trusted_line(authors), "",
@@ -5927,7 +5927,7 @@ def _resume_head(holder: str, authors: Sequence[str], goals: Sequence[GoalJourna
         head += [_skip_line(repo, reason) for repo, reason in sorted(unread.items())]
     if timed:
         head += ["", "## Timed-out repos (read again next tick)"]
-        head += [_skip_line(repo, per_repo.timed_out(seconds)) for repo in timed]
+        head += [_skip_line(repo, reason) for repo, reason in timed.items()]
     return head
 
 

@@ -889,6 +889,33 @@ post_replies() {
   rm -f "$REPLIES_FILE"
 }
 
+# The review threads a fix brief lists (the "### Thread PRRT_..." lines of its
+# ## Fix section) that this round left without an answer: no entry in its
+# replies file and no file kept from .loom-answers. Prints them ", "-joined,
+# or nothing. The brief requires an answer for every one (bus/tickets.py
+# REPLIES_NOTE); an unanswered thread holds the merge gate, so the round says
+# which ones it left.
+unanswered_threads() {
+  python3 - "$BRIEF" "${REPLIES_FILE:-}" "$INBOX/answers/$TICKET" <<'PY' 2>> "$LOG"
+import json, os, re, sys
+brief, replies, answers = sys.argv[1:]
+with open(brief, encoding="utf-8", errors="replace") as stream:
+    parts = stream.read().rsplit("\n## Fix\n", 1)
+listed = (re.findall(r"^### Thread (PRRT_[A-Za-z0-9_-]{1,100}) ", parts[1], re.M)
+          if len(parts) > 1 else [])
+answered = set()
+if replies and os.path.isfile(replies):
+    try:
+        with open(replies, encoding="utf-8") as stream:
+            answered |= {entry["thread"] for entry in json.load(stream)}
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print("the replies file could not be read: %s" % error, file=sys.stderr)
+if os.path.isdir(answers):
+    answered |= {name[:-3] for name in os.listdir(answers) if name.endswith(".md")}
+print(", ".join(dict.fromkeys(t for t in listed if t not in answered)))
+PY
+}
+
 # Reconcile the generated title/body sections of an existing PR with the
 # approved ticket revision in the brief, preserving reviewer-authored text
 # outside those sections. Scope changes are logged with old/new body hashes.
@@ -4008,6 +4035,7 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
     : > "$LOGDIR/$TICKET.pushed"
   fi
   if [ -n "$FIX_PR" ]; then
+    UNANSWERED="$(unanswered_threads)"
     post_replies
     ITEMS="$(fix_items "$BRIEF")"
     if [ "$COMMITTED" -eq 1 ]; then
@@ -4035,6 +4063,12 @@ $LIVE_NOTES"
       COMMENT="$COMMENT
 
 Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+    fi
+    if [ -n "$UNANSWERED" ]; then
+      echo "[$(date -u +%FT%TZ)] $TICKET: review threads left without a reply: $UNANSWERED" >> "$LOG"
+      COMMENT="$COMMENT
+
+Review threads this round left without a reply: $UNANSWERED"
     fi
     # One comment per pull request, edited each round; the push and the body
     # edit are already on the pull request's timeline.

@@ -271,7 +271,9 @@ there runs or steers the next tick.
 Each tick writes `$LOOM_HOME/state/brain.json` (how it ended, and the
 holder, lane and model that ran) and touches
 `$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock
-included. When no rung has usage, the tick takes no lock and runs no CLI: it
+included. A rung with no heartbeat, or an old one, has unknown fuel: it runs
+after the rungs with known usage, and its log line says so. When every rung
+says it has no usage or cannot run, the tick takes no lock and runs no CLI: it
 records `skipped` with each rung's reason and leaves `brain-ok` alone, so
 the brain-stopped check below reports it with that reason. The station adds a `brain` row to the lane status. The brain also
 runs on Muse, so the station reads GitHub too: while no local tick has ended
@@ -456,7 +458,8 @@ operator is brought up to date with its base while it waits, and still never
 merges on the factory's say-so. Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
-starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
+starts a ticket's ladder again and ends any fix round posted before it, so
+the restart runs as a normal attempt on a fresh branch. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
 `claude-opus-5-5`), each
 climb recorded as a `<!-- loom:rung N -->` comment.
 A climb takes the lowest rung the ticket has not run on since its ladder
@@ -1379,8 +1382,12 @@ cannot query the viewer or any other local service.
 - `copilot` reads its token from `LOOM_COPILOT_KEY_SSM` and exports it only as
   `COPILOT_GITHUB_TOKEN`. It invokes one `copilot -p` prompt with
   `--allow-all-tools`; the run output, including any CLI usage details, is
-  retained in the lane log. Monthly usage-limit messages hold the lane until
-  the next UTC month begins.
+  retained in the lane log. Monthly usage-limit messages, and the Free plan's
+  "exceeded your ... allowance" and "you have no quota" answers, hold the lane
+  instead of failing the ticket until the next UTC month begins. Those two
+  answers count only on this lane and only in the last lines of its run. `lanes/mac/install.sh` installs it with
+  the default lanes; set `LOOM_COPILOT_KEY_SSM` when installing, or the lane
+  reports itself unavailable.
 - Model choice on the priced Anthropic routes follows
   docs/USAGE_ROUTING.md ("October 2026 price changes"): high-volume
   subtasks pin `claude-haiku-5-5`; cache-heavy work stays on
