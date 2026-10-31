@@ -2103,9 +2103,10 @@ pull request's line, so a brain sees them and adopts them.
 The station adopts the rest (decision 0002, item 1). Each pass, for the
 oldest open pull request in a scanned repo that is not a draft, comes from
 a `LOOM_BRIEF_AUTHORS` login on a branch of the repo itself, opened at
-least 2 hours ago (`ADOPT_GRACE`; one with no creation time counts as old
-enough), and that no open ticket links (by a `Refs` line or a `loom/N`
-branch), it re-reads the pull request and, if it is still open and not
+least 48 hours ago (`ADOPT_GRACE`; one with no creation time counts as old
+enough), quiet for that long as well when its branch is outside `loom/`
+(no commit or comment, read from `updated_at`), and that no open ticket
+links (by a `Refs` line or a `loom/N` branch), it re-reads the pull request and, if it is still open and not
 merged, files one
 ticket under the repo's goal home: "Land or supersede #N", in the normal
 brief format with `Difficulty: medium`. The lane that takes it lands the
