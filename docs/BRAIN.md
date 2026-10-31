@@ -1646,6 +1646,13 @@ merge` refuses with the same reason (loom#1711). Send a brain fix asking the
 lane to untick it and end it `; not built: belongs in <repo>`, so the station
 files the follow-up in that repo; a criterion already ending that way passes.
 
+A `; not built:` reason that says the work is already there must cite code on
+the pull request's base branch: `<path>:<line>`, `<path>#L<line>`,
+`<path>::<symbol>`, or `` `<path>` `<symbol>` ``. Status prints
+`blocked: a criterion says it is already done and cites no code`, `bus.brain
+merge` refuses, and the factory sends the pull request back when a citation is
+missing or the base cannot back it (bus/already_done.py, loom#2333).
+
 Status also prints a "Waiting on the brain" section: every open lane pull
 request whose ticket carries `needs-brain`, oldest first, with its ticket,
 its age in hours and its merge-ready line. The factory sets `needs-brain`
