@@ -171,6 +171,8 @@ def pin_one(gh: GitHub, source: str, revision: str, spec: dict[str, str],
     # its pull request never goes dirty when the default branch moves. The pin
     # file is computed from the default branch's text, not the branch's.
     head = gh.rest("GET", "/repos/%s/git/ref/heads/%s" % (repo, quote(base, safe=""))).data
+    # Save the current branch content before force-patching
+    current_text, current_file_sha = content(gh, repo, path, branch) if exists else (old_text, "")
     if exists:
         # GitHub reads a ref at git/ref/<ref> but updates it at git/refs/<ref>;
         # a PATCH to the read path answers 404 (loom#1405).
@@ -179,7 +181,6 @@ def pin_one(gh: GitHub, source: str, revision: str, spec: dict[str, str],
     else:
         gh.rest("POST", "/repos/%s/git/refs" % repo,
                 {"ref": "refs/heads/" + branch, "sha": head["object"]["sha"]})
-    _, file_sha = content(gh, repo, path, branch)
     updated = replace(replace(old_text, spec["revision_var"], revision),
                       spec["sha256_var"], digest)
     title = "Pin Loom dashboard to %s" % revision[:12]
