@@ -625,8 +625,8 @@ class StationTest(StationBase):
                                     "1 open tickets sit under no epic across 1 goal homes"),
             "epic-over-cap": (lambda: self.gh.subs.update({
                 (REPO, GOAL): [epic(40)],
-                (REPO, 40): [ticket(n, state="closed") for n in range(50, 66)]}),
-                "holds 16 tickets (cap 15)"),
+                (REPO, 40): [ticket(n) for n in range(50, 66)]}),
+                "holds 16 open tickets (cap 15)"),
             "goal-epics-over-cap": (lambda: self.gh.subs.update({
                 (REPO, GOAL): [epic(n) for n in range(40, 47)]}),
                 "has 7 open epics (cap 6)"),
@@ -672,7 +672,7 @@ class StationTest(StationBase):
                                 part_of(73, "closed"), part_of(50)]
         self.run_at(T0)
         (filed,) = self.gh.filed()
-        self.assertIn("Epic #40 holds 17 tickets (cap 15)", filed["title"])
+        self.assertIn("Epic #40 holds 16 open tickets (cap 15)", filed["title"])
 
     def test_epic_over_cap_flags_the_standing_repairs_epic_at_the_sub_issue_limit(self):
         repairs = dict(epic(50), title=brain.REPAIRS_TITLE,
@@ -782,10 +782,10 @@ class SettledSubjectTest(StationBase):
 
     def test_an_epic_back_at_its_cap_closes_its_issue(self):
         self.gh.subs[(REPO, GOAL)] = [epic(40)]
-        self.gh.subs[(REPO, 40)] = [ticket(n, state="closed") for n in range(50, 66)]
+        self.gh.subs[(REPO, 40)] = [ticket(n) for n in range(50, 66)]
         self.run_at(T0)
         (filed,) = self.breaches()
-        self.assertIn("holds 16 tickets (cap 15)", filed["title"])
+        self.assertIn("holds 16 open tickets (cap 15)", filed["title"])
         self.gh.subs[(REPO, 40)] = self.gh.subs[(REPO, 40)][:15]
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "closed", self.said)
@@ -800,7 +800,7 @@ class SettledSubjectTest(StationBase):
 
     def test_an_open_epic_over_the_cap_that_closes_settles_its_issue(self):
         self.gh.subs[(REPO, GOAL)] = [epic(40)]
-        self.gh.subs[(REPO, 40)] = [ticket(n, state="closed") for n in range(50, 66)]
+        self.gh.subs[(REPO, 40)] = [ticket(n) for n in range(50, 66)]
         self.run_at(T0)
         (filed,) = self.breaches()
         self.assertEqual(filed["state"], "open")
@@ -1341,7 +1341,9 @@ class InvariantTest(unittest.TestCase):
             self.assertEqual(check(f), [])
             self.assertEqual(check(Facts(T0)), [])  # not read: nothing found
         bad = invariants.GoalShape(self.goal, 1, (
-            invariants.EpicShape(e40, True, 16, ()),
+            invariants.EpicShape(e40, True, 16,
+                                 tuple(Ref("%s#%d" % (REPO, n), "#%d" % n)
+                                       for n in range(100, 116))),
             invariants.EpicShape(Ref("%s#41" % REPO, "#41"), True, 1, ()),
             invariants.EpicShape(Ref("%s#42" % REPO, "#42"), False, 2, (t7,))), (t7,))
         f = Facts(T0, shapes=[bad])
@@ -1767,13 +1769,43 @@ class StandingEpicTest(unittest.TestCase):
         self.assertEqual([b.subject for b in found], ["%s#50" % REPO, "%s#51" % REPO])
         self.assertIn("100 sub-issues", found[0].title)
 
+    def test_closed_tickets_do_not_put_an_open_epic_over_the_ticket_cap(self):
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        epic = invariants.EpicShape(
+            Ref("%s#40" % REPO, "#40"), True, 19,
+            tuple(Ref("%s#%d" % (REPO, n), "#%d" % n) for n in range(100, 113)))
+        facts = Facts(T0, shapes=[invariants.GoalShape(goal, 6, (epic,), ())])
+
+        self.assertEqual(invariants.epic_over_cap(facts), [])
+
+    def test_sixteen_open_tickets_put_an_epic_over_the_ticket_cap(self):
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        epic = invariants.EpicShape(
+            Ref("%s#40" % REPO, "#40"), True, 16,
+            tuple(Ref("%s#%d" % (REPO, n), "#%d" % n) for n in range(100, 116)))
+        facts = Facts(T0, shapes=[invariants.GoalShape(goal, 6, (epic,), ())])
+
+        (breach,) = invariants.epic_over_cap(facts)
+        self.assertIn("16 open tickets (cap 15)", breach.title)
+
+    def test_closed_sub_issues_still_count_toward_github_limit(self):
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        epic = invariants.EpicShape(
+            Ref("%s#50" % REPO, "#50"), True, 100, (), False, 100)
+        facts = Facts(T0, shapes=[invariants.GoalShape(goal, 6, (epic,), ())])
+
+        (breach,) = invariants.epic_over_cap(facts)
+        self.assertIn("100 sub-issues", breach.title)
+
 
     def test_a_closed_epic_is_not_over_the_ticket_cap(self):
         """loom#2140: a finished epic keeps its closed tickets, so it can
         never drop under the cap; only an open epic is flagged."""
         goal = Ref("%s#%d" % (REPO, GOAL), "#30")
         mk = lambda n, open_, tickets: invariants.EpicShape(  # noqa: E731
-            Ref("%s#%d" % (REPO, n), "#%d" % n), open_, tickets, ())
+            Ref("%s#%d" % (REPO, n), "#%d" % n), open_, tickets,
+            tuple(Ref("%s#%d" % (REPO, n * 100 + i), "#%d" % (n * 100 + i))
+                  for i in range(tickets)) if open_ else ())
         f = Facts(T0, shapes=[invariants.GoalShape(
             goal, 6, (mk(60, False, 16), mk(61, False, 40), mk(62, True, 16)), ())])
         self.assertEqual([b.subject for b in invariants.epic_over_cap(f)], ["%s#62" % REPO])
