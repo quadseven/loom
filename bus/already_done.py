@@ -33,10 +33,10 @@ _REASON_RE = re.compile(r";\s*not built:\s*(\S.*)$", re.I)
 CLAIM_RE = re.compile(r"\balready\b|\bin[- ]tree\b", re.I)
 _PATH = r"(?:[\w.-]+/)*[\w.-]+\.[A-Za-z0-9]+"
 _CITE_RE = re.compile(r"(?<![\w/.:-])(?P<path>%s)"
-                      r"(?:::(?P<symbol>[A-Za-z_][\w.]*)"
+                      r"(?:::(?P<symbol>[A-Za-z_]\w*(?:\.\w+)*)"
                       r"|(?::|#L)(?P<line>[1-9][0-9]*)(?:-L?[0-9]+)?)?" % _PATH)
 # After a path in a code span, the next code span names the symbol.
-_NEXT_SPAN_RE = re.compile(r"`\s*`([A-Za-z_][\w.]*)`")
+_NEXT_SPAN_RE = re.compile(r"`\s*`([A-Za-z_]\w*(?:\.\w+)*)\.?`")
 
 Read = Callable[[str], Optional[str]]
 
