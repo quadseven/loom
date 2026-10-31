@@ -165,7 +165,8 @@ WITHHELD = "(withheld: the line fails the written-text check)"
 # pass, before any other clear, whatever labels it carries (loom#2022: five
 # lane-pr-stalled issues stayed open up to a day after their pull requests
 # merged or closed, and an operator closed them by hand).
-SETTLES = ("lane-pr-stalled", "epic-over-cap")
+EPIC_OVER_CAP = "epic-over-cap"
+SETTLES = ("lane-pr-stalled", EPIC_OVER_CAP)
 
 Say = Callable[[str], None]
 # (invariant, subject) -> why the subject is settled, in words a public issue
@@ -631,7 +632,7 @@ def epic_over_cap(f: Facts) -> List[Breach]:
         for epic in shape.epics:
             if epic.open and epic.sub_issues >= SUB_ISSUE_LIMIT:
                 out.append(Breach(
-                    "epic-over-cap", epic.epic.key,
+                    EPIC_OVER_CAP, epic.epic.key,
                     "Epic %s holds %d sub-issues (GitHub's limit %d)"
                     % (epic.epic.label, epic.sub_issues, SUB_ISSUE_LIMIT),
                     ("Epic %s of goal home %s holds %d sub-issues; GitHub refuses a sub-issue "
@@ -641,7 +642,7 @@ def epic_over_cap(f: Facts) -> List[Breach]:
                     f.now))
             elif epic.open and len(epic.open_tickets) > EPIC_TICKETS and not epic.standing:
                 out.append(Breach(
-                    "epic-over-cap", epic.epic.key,
+                    EPIC_OVER_CAP, epic.epic.key,
                     "Epic %s holds %d open tickets (cap %d)"
                     % (epic.epic.label, len(epic.open_tickets), EPIC_TICKETS),
                     ("Epic %s of goal home %s holds %d open tickets; an epic holds at most %d, "
