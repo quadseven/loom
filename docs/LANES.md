@@ -689,6 +689,31 @@ only what is its own, and adding an operator is configuration:
   (events by this Loom's App logins) are not activity for this lapse, so a
   ticket that moves between lanes and the brain still lapses; only the claim
   label's own putting-on, a person's act, or a pull request update count.
+- Engine claims have one referee (`bus/claim_referee.py`). Each engine that
+  works the backlog has one claim label (`LOOM_ENGINE_CLAIMS`). Every 30
+  minutes the station reads the open issues carrying one. With two or more it
+  keeps the one put on first (each label's newest labeled event) and removes
+  the others with a status note. It removes the claim it keeps when nothing
+  on the ticket is newer than 2 hours: no event by the claimer (who put the
+  label on) or a trusted login (`LOOM_BRIEF_AUTHORS`, `LOOM_TRUSTED_BRIEFERS`,
+  never the station's own Apps), not the claim's putting-on. Only events a
+  writer performed count: a comment, label, assignment, close, reopen, commit
+  or reference, not a mention or subscription. An open pull request one of them
+  wrote in the same repo, referenced from the ticket by one of them, holds the
+  claim for 7 days after that reference. Every claim that may expire has its
+  timeline read, because a comment by anyone moves `updated_at`: all repos share
+  one list and 40 reads a run, and the next run reads on from where it stopped.
+  A comment line
+  `waiting: <what> until <time>` (ISO time, UTC unless it says otherwise) by
+  one of them holds the claim until that time plus 30 minutes; the time counts
+  for at most 24 hours after the comment, and the latest stated time wins. A
+  ticket with `loom:running`, assigned to a person, or with no Loom label never
+  expires; a duplicate on it is still removed. A claim whose labeled event the
+  timeline does not show waits for a later pass. A claim label
+  that is not an engine's is a person's and is never touched. The first pass
+  over the claims that already exist removes at most 5 a run and posts no
+  notes; after it, at most 10 a run, and an expiry never posts a note.
+  `LOOM_CLAIM_REFEREE=dry` logs each removal instead, `off` skips the step.
 - The claim marks a run, not a ticket's whole life. Any station or brain move
   out of `loom:running` (a retry, a limit, a failure, a pull request opened, a
   merge) removes this Loom's own `claim:<login>` label in the same labels
