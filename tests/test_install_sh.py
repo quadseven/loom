@@ -215,11 +215,14 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_SHIP_PATH_WORKFLOWS</key><string>example-owner/infra</string>", plist)
 
     def test_disk_settings_are_written_to_station_plist(self):
-        result = self.run_install(LOOM_LOG_KEEP_DAYS="14", LOOM_DISK_FREE_MIN_GB="20")
+        result = self.run_install(LOOM_LOG_KEEP_DAYS="14", LOOM_DISK_FREE_MIN_GB="20",
+                                  LOOM_LOG_MAX_GB="9", LOOM_LOG_ROTATE_MB="30")
         self.assertEqual(result.returncode, 0, result.stderr)
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_LOG_KEEP_DAYS</key><string>14</string>", plist)
         self.assertIn("<key>LOOM_MIN_FREE_GB</key><string>20</string>", plist)
+        self.assertIn("<key>LOOM_LOG_MAX_GB</key><string>9</string>", plist)
+        self.assertIn("<key>LOOM_LOG_ROTATE_MB</key><string>30</string>", plist)
 
     def test_pass_deadline_is_written_to_station_plist(self):
         result = self.run_install(LOOM_PASS_DEADLINE="2400")
@@ -233,6 +236,13 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_SETTLE_CLAIMED</key><string>on</string>", plist)
         self.assertIn("<key>LOOM_SETTLE_CLAIMED_MAX</key><string>5</string>", plist)
+
+    def test_claim_referee_settings_are_written_to_station_plist(self):
+        result = self.run_install(LOOM_CLAIM_REFEREE="dry", LOOM_ENGINE_CLAIMS="claim:x claim:y")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_CLAIM_REFEREE</key><string>dry</string>", plist)
+        self.assertIn("<key>LOOM_ENGINE_CLAIMS</key><string>claim:x claim:y</string>", plist)
 
     def test_trusted_briefers_are_written_to_station_and_brain_plists(self):
         result = self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example")

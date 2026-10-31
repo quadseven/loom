@@ -409,14 +409,16 @@ class TicketStore:
     def _read_operator_repo(self, repo):
         try:
             asks = self.gh.paginate("/repos/%s/issues?labels=needs-operator&state=open" % quote(repo, safe="/"))
+            asks += self.gh.paginate("/repos/%s/issues?labels=needs%%3Ahuman&state=open" % quote(repo, safe="/"))
             humans = self.gh.paginate("/repos/%s/issues?labels=loom%%3Ahuman&state=open" % quote(repo, safe="/"))
         except (GitHubError, OSError, ValueError) as exc:
             return repo, [], 0, "%s operator items: %s" % (repo, self._error_reason(exc))
         humans = [row for row in humans if isinstance(row, dict) and "pull_request" not in row]
-        found = [_operator_item(repo, issue, "needs_operator")
-                 for issue in asks if isinstance(issue, dict) and "pull_request" not in issue]
-        # A loom:human issue waits on the operator too (loom#1777): its ask is
-        # the loom:human comment, read with the needs-operator asks.
+        unique = {issue.get("number"): issue for issue in asks
+                  if isinstance(issue, dict) and "pull_request" not in issue}
+        found = [_operator_item(repo, issue, "needs_operator") for issue in unique.values()]
+        # A needs:human issue waits on the operator too (loom#1777): its ask is
+        # the needs:human comment, read with the needs-operator asks.
         listed = {item["number"] for item in found}
         found += [_operator_item(repo, issue, "loom_human") for issue in humans
                   if issue.get("number") not in listed]
@@ -1248,7 +1250,7 @@ class TicketStore:
 
 
 def _operator_item(repo: str, issue: Dict[str, Any], queue: str) -> Dict[str, Any]:
-    """A needs-operator or loom:human issue as the Needs-you page reads it."""
+    """A needs-operator or needs:human issue as the Needs-you page reads it."""
     return {"repo": repo, "number": issue.get("number"), "title": issue.get("title", ""),
             "html_url": issue.get("html_url"),
             "ask": (issue.get("body") or issue.get("title", "")) if queue == "needs_operator" else "",

@@ -20,7 +20,7 @@ from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, l
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
-from .labels import HANDOFF, LANES, REMOTE_LANES
+from .labels import HANDOFF, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 from . import tick_clock
 
@@ -102,6 +102,11 @@ TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "t
 RUNAWAY = "loom:runaway"
 STEP_MARKER = "loom:tick="
 LANES_MARKER = "<!-- loom:lanes v1 -->"
+# A lane table older than this many seconds is republished by the station on
+# its next pass, and called stale by status. Passes came 7 to 12 minutes apart
+# on 2026-10-31, so 15 minutes keeps publishes within 30 minutes of each other.
+LANES_REPUBLISH = 900
+LANES_UPDATED_RE = re.compile(r"^Updated (\S+)$", re.M)
 TRIAGE_MARKER = "<!-- loom:triage v1 -->"
 # The marker on a factory incident issue body (lanes/run_lane.sh files it).
 FACTORY_INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
@@ -121,7 +126,7 @@ def _check_decision_claim(gh: GitHub, repo: str, number: int, written: Any,
                           env: Optional[Dict[str, str]] = None) -> None:
     """Refuse text bound for repo#number that cites a person's decision no
     person recorded (bus/decision_claim.py, loom#2089): an unanswered
-    loom:human ask is not a decision, so the brain says it acted on its own
+    needs:human ask is not a decision, so the brain says it acted on its own
     judgment instead."""
     trusted = trusted_authors(env)
     decision_claim.check(gh, repo, number, written, trusted, answer.operators(env, trusted))
@@ -1018,7 +1023,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   waiting: Optional[Dict[str, Dict[str, Any]]] = None) -> List[str]:
     """The repo's status section; with into, its open tickets are kept
     there under the repo's name for the cross-repo Priorities section. With
-    waiting, so are the repo's open loom:human count and, per goal, the share
+    waiting, so are the repo's open needs:human count and, per goal, the share
     under that goal (waiting_lines). Each issue is read once per repo
     (loom#2057): every helper below shares the first answer."""
     gh = issue_reads.once(gh)
@@ -1063,7 +1068,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
               for i in issues if "loom:invariant" in _labels(i)] or ["- none"]
     lines += ["", "### Needs operator"]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
-              for i in issues if "needs-operator" in _labels(i)]
+              for i in issues if needs_human(_labels(i))]
     return lines
 
 
@@ -1154,6 +1159,20 @@ def _lane_status(gh: GitHub, lanes_repo: str,
     return max(marked, key=lambda c: c.get("created_at", ""))["body"]
 
 
+def _dated_lane_status(table: str, now: datetime) -> str:
+    """The table with its age beside `Updated`, called stale past
+    LANES_REPUBLISH. A table with no readable time prints unchanged."""
+    match = LANES_UPDATED_RE.search(table)
+    if match is None:
+        return table
+    updated = _stamp(match.group(1))
+    if updated is None:
+        return table
+    age = max(0, (now - updated).total_seconds())
+    note = " (%d min old%s)" % (age // 60, ", stale" if age > LANES_REPUBLISH else "")
+    return table[:match.end()] + note + table[match.end():]
+
+
 def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
            env: Optional[Dict[str, str]] = None, now: Optional[datetime] = None,
            authors: Optional[Sequence[str]] = None,
@@ -1210,7 +1229,7 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     tail += [""] + waiting_lines(waiting, repos)
     tail += [""] + _health_lines(env)
     tail += [""] + validation_gap_lines(env)
-    tail += ["", "## Lane status", _lane_status(gh, lanes_repo, authors)]
+    tail += ["", "## Lane status", _dated_lane_status(_lane_status(gh, lanes_repo, authors), now)]
     _say(out, emit, tail)
     return "\n".join(out)
 
@@ -1227,13 +1246,13 @@ PRIORITIES_SHOWN = 10
 
 
 def open_human(issues: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """The open loom:human issues among `issues` (pull requests left out)."""
+    """The open needs:human issues among `issues` (pull requests left out)."""
     return [i for i in issues if isinstance(i, dict) and "pull_request" not in i
-            and i.get("state", "open") == "open" and "loom:human" in _labels(i)]
+            and i.get("state", "open") == "open" and needs_human(_labels(i))]
 
 
 def goal_human_share(children: Sequence[Dict[str, Any]], issues: Sequence[Dict[str, Any]]) -> int:
-    """How many of the repo's open loom:human `issues` are among the goal's
+    """How many of the repo's open needs:human `issues` are among the goal's
     `children` (the goal_tree walk, as every other goal count): the goal's
     own share of what waits on the operator (loom#1775)."""
     waiting = {int(i.get("number") or 0) for i in open_human(issues)}
@@ -2083,7 +2102,7 @@ def _movable_ticket(issue: Dict[str, Any]) -> bool:
     if issue.get("state") != "open" or "pull_request" in issue:
         return False
     names = _labels(issue)
-    if "loom:ticket" not in names or "epic" in names or "needs-operator" in names:
+    if "loom:ticket" not in names or "epic" in names or needs_human(names):
         return False
     return bool(issue.get("id"))
 
@@ -3172,7 +3191,7 @@ def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
         # Another operator's Loom owns an issue assigned to them.
         return "another operator's"
     names = _labels(issue)
-    if any(name.startswith("loom:") for name in names) or "needs-operator" in names:
+    if any(name.startswith("loom:") for name in names) or needs_human(names):
         return "already labelled"
     return not_work_reason(issue)
 
@@ -3251,7 +3270,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
 
 # Why only a person can do it. Anything a lane, the brain or the station can
 # do with the repo, the GitHub API, logs or a diagnosis is not one of these,
-# and neither is work the unproven-work gate only delays: 174 loom:human
+# and neither is work the unproven-work gate only delays: 174 needs:human
 # issues on 2026-10-18 were mostly such work, parked as "waiting on you".
 from bus.kinds import HUMAN_KINDS, HUMAN_KIND_RE
 import re
@@ -3270,7 +3289,7 @@ def human_kind(ask: str) -> Tuple[str, str]:
 
 
 def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
-    """Mark an open issue loom:human: only a person can do it. The ask starts
+    """Mark an open issue needs:human: only a person can do it. The ask starts
     with "Kind: K" (HUMAN_KINDS) and one comment names the exact thing needed;
     loom:triage, if any, comes off."""
     kind, ask = human_kind(ask)
@@ -3278,13 +3297,13 @@ def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
         raise ValueError("the ask must name the exact thing a person has to do")
     _check_written_text(ask)
     names = _labels(_open_issue(gh, repo, number))
-    if "loom:human" in names:
-        raise ValueError("#%d is already loom:human" % number)
+    if needs_human(names):
+        raise ValueError("#%d is already needs:human" % number)
     notify.post(gh, repo, number, "%s\n%s\nKind: %s" % (HUMAN_MARKER, ask, kind),
                 notify.ASK)
     if "loom:triage" in names:
         _remove_label(gh, repo, number, "loom:triage")
-    gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": ["loom:human"]})
+    gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [NEEDS_HUMAN]})
 
 
 # The backlog goal home's title (docs/NAMING.md); the loom:backlog label, not
@@ -3310,20 +3329,20 @@ def _backlog_body(repo: str) -> str:
         "## Destination",
         "",
         "Every open issue in %s is either a Loom ticket worked by a lane or "
-        "labelled `loom:human` with one comment naming what only a person can do."
+        "labelled `needs:human` with one comment naming what only a person can do."
         % repo,
         "",
         "## Metric",
         "",
-        "- Open issues not yet tickets (neither `loom:ticket` nor `loom:human`): "
+        "- Open issues not yet tickets (neither `loom:ticket` nor `needs:human`): "
         "falls to 0.",
         "- Open `loom:ticket` issues: rise, then fall as they ship.",
-        "- Open `loom:human` issues: each has its ask.",
+        "- Open `needs:human` issues: each has its ask.",
         "",
         "## Rules",
         "",
         "- Triage never closes an issue. It rewrites one as a ticket, marks what "
-        "is missing with `loom:triage`, or hands it to a person with `loom:human`.",
+        "is missing with `loom:triage`, or hands it to a person with `needs:human`.",
         "- If this repo is private, its briefs never go to a lane whose provider "
         "may train on prompts.",
         "- No pull request merges here without the review check.",
@@ -4103,7 +4122,7 @@ def _refuse_operator_hold(gh: GitHub, repo: str, number: int, pr: Dict[str, Any]
                           verdict: Optional[Callable[[], Optional[answer.Answer]]] = None) -> None:
     """Refuse a lane pull request that waits for the operator
     (bus/operator_hold.py): it declares operator steps before merge, changes
-    placement, or deletes or mostly replaces a doc its ticket does not name. Its ticket goes to loom:human with
+    placement, or deletes or mostly replaces a doc its ticket does not name. Its ticket goes to needs:human with
     one exact ask. On 2026-10-22 the brain merged one whose body left a VM
     resize and a data migration to the operator, and the deploy took the
     service down."""
@@ -5339,7 +5358,7 @@ def _check_stage_item(gh: GitHub, stage: str, repo: str, number: int) -> None:
         "review": ("pull_request" in issue, "a review item is a pull request"),
         "merge": ("pull_request" in issue, "a merge item is a pull request"),
         "failed": ("loom:failed" in names, "a failed item is a loom:failed ticket"),
-        "ask": ("needs-operator" in names, "an ask item is a needs-operator issue"),
+        "ask": (needs_human(names), "an ask item is a needs:human issue"),
         "regression": ("pull_request" not in issue, "a regression item is an issue"),
         "brief": ("loom:goal" in names, "a brief item is a loom:goal issue"),
     }
@@ -6299,6 +6318,70 @@ def _nothing_to_fix(gh: GitHub, repo: str, pr: int,
             "%s passed on it, and no review thread is open)" % (pr, sha[:12], check))
 
 
+def _rung_by_load(left: Sequence[int], lanes_of: Callable[[int], Tuple[str, ...]],
+                  load: Dict[str, int]) -> Tuple[Optional[Tuple[int, str]],
+                                                 Optional[Tuple[int, str, int]]]:
+    """(rung, lane) for the first rung in `left` with an available lane, on
+    its least-loaded lane (factory.pick_lane), and the (rung, lane, load) it
+    skipped or None. A rung whose one lane holds more than
+    factory.ONE_LANE_MAX gives way to the next rung whose least-loaded lane
+    holds three or more fewer, as the factory's _spread does; with none that
+    much lower the ticket still takes the first rung."""
+    from . import factory  # factory imports this module
+    rungs = [(n, lanes) for n, lanes in ((n, lanes_of(n)) for n in left) if lanes]
+    if not rungs:
+        return None, None
+    n, lanes = rungs[0]
+    lane = factory.pick_lane(lanes, load)
+    held = load.get(lane, 0)
+    if len(lanes) == 1 and held > factory.ONE_LANE_MAX:
+        for later, later_lanes in rungs[1:]:
+            target = factory.pick_lane(later_lanes, load)
+            if load.get(target, 0) <= held - 3:
+                return (later, target), (n, lane, held)
+    return (n, lane), None
+
+
+# Lane load per station repo list, counted on the first escalate in this
+# process and kept current as escalate moves tickets, so a sweep reads each
+# repo once and its later tickets see the earlier ones.
+_LANE_LOAD: Dict[Tuple[str, ...], Dict[str, int]] = {}
+
+
+def _lane_load(gh: GitHub, repo: str) -> Dict[str, int]:
+    """Open briefed and running tickets per lane over every LOOM_REPOS repo
+    and `repo`, as the factory counts them (Factory.count_load): lanes are
+    shared by every repo the station watches. A repo that cannot be read
+    counts as empty and is said on stderr; a count missing a repo is not
+    kept, so the next ticket reads again."""
+    repos = tuple(dict.fromkeys(
+        os.environ.get("LOOM_REPOS", "").replace(",", " ").split() + [repo]))
+    if repos in _LANE_LOAD:
+        return _LANE_LOAD[repos]
+    from . import factory  # factory imports this module
+    counter = factory.Factory(gh, repos, time.time(), trusted=trusted_authors())
+    found: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    for each in repos:
+        try:
+            found[each] = counter._tickets(each)
+        except GitHubError as err:
+            print("lane load: cannot read %s (%s); counted as empty" % (each, err), file=sys.stderr)
+    counter.count_load({each: found.get(each, {}) for each in repos})
+    if len(found) == len(repos):
+        _LANE_LOAD[repos] = counter.load
+    return counter.load
+
+
+def _count_move(load: Dict[str, int], issue: Dict[str, Any], lane: str) -> None:
+    """Count an escalated ticket on its new lane, off the lane it was counted
+    on when it was already briefed or running there."""
+    from . import factory  # factory imports this module
+    old = factory._lane(issue)
+    if factory._state(issue) in ("briefed", "running") and old:
+        load[old] = load.get(old, 0) - 1
+    load[lane] = load.get(lane, 0) + 1
+
+
 def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
              lanes_repo: str = "quadseven/loom") -> str:
     """Move a repeatedly stuck ticket to the lowest untried rung of the model
@@ -6366,27 +6449,31 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
                         ", ".join(history.tried), "; ".join(history.reasons)), notify.RUNAWAY)
         return "needs-brain"
     free = _available_lanes(gh, lanes_repo)
-    choice = None
-    for n in left:
-        lane = next((x for x in rung_lanes(n) if x in free), None)
-        if lane:
-            choice = (n - 1, lane)
-            break
+    load = _lane_load(gh, repo)
+    choice, skipped_load = _rung_by_load(
+        left, lambda n: tuple(x for x in rung_lanes(n) if x in free), load)
     if choice is None:
         raise ValueError("no untried rung has an available lane")
-    rung, lane = choice
+    rung, lane = choice[0] - 1, choice[1]
     model = factory.CLIMB[rung][1]
     reason = "; ".join(history.reasons)
-    comment = "\n".join([ESCALATE_MARKER,
+    comment_lines = [ESCALATE_MARKER]
+    if skipped_load:
+        skipped_rung, skipped_lane, skipped_count = skipped_load
+        comment_lines.append("Skipped rung %d: lane %s load is %d; the next rung's least-loaded lane is at least three lower." % (
+            skipped_rung, skipped_lane, skipped_count))
+    comment_lines.extend([
                          "Escalated to rung %d of %d: %s on lane %s." % (rung + 1, len(factory.CLIMB), model, lane),
                          "Reason: %s (attempts %d, tried %s)." % (reason, history.attempts, ", ".join(history.tried) or "none"),
                          "Rung: %d %s %s" % (rung + 1, model, lane)])
+    comment = "\n".join(comment_lines)
     _check_written_text(comment)
     pr = open_pr if "loom:pr" in names else None
     if pr is not None:
         fix(gh, repo, pr, (repo, number), notes or comment.split("\n")[1], lane, model)
     else:
         move(gh, repo, number, "briefed", lane, None, None, model)
+    _count_move(load, issue, lane)
     # A routine event: the status comment's event list, not a new comment (loom#866).
     add_status_event(gh, repo, number, comment, time.time(), trusted_authors())
     return "rung %d %s on %s" % (rung + 1, model, lane)
