@@ -176,6 +176,18 @@ if [ "${LOOM_DASHBOARD:-}" = 1 ]; then
 fi
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
+# LOOM_TRUSTED_BRIEFERS is kept nowhere but the installed plists, so a reinstall
+# that leaves it unset keeps the station plist's list instead of silently
+# dropping every trusted login. Setting it, even to empty, replaces the list.
+if [ -z "${LOOM_TRUSTED_BRIEFERS+set}" ] && [ -e "$AGENTS/com.loom.station.plist" ]; then
+  LOOM_TRUSTED_BRIEFERS="$(python3 -B -c '
+import plistlib, sys
+with open(sys.argv[1], "rb") as plist:
+    print(plistlib.load(plist).get("EnvironmentVariables", {}).get("LOOM_TRUSTED_BRIEFERS", ""))
+' "$AGENTS/com.loom.station.plist")" ||
+    { echo "cannot read LOOM_TRUSTED_BRIEFERS from $AGENTS/com.loom.station.plist: set it in the environment" >&2; exit 1; }
+  export LOOM_TRUSTED_BRIEFERS
+fi
 
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark copilot
@@ -312,8 +324,8 @@ done
 # turns briefed ticket issues into local briefs and reports outcomes
 # (docs/BRAIN.md). It reads LOOM_REPOS,
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
-# with LOOM_REPOS empty it stays idle. LOOM_TRUSTED_BRIEFERS (default empty)
-# names another operator's logins whose loom:ticket briefs it builds without
+# with LOOM_REPOS empty it stays idle. LOOM_TRUSTED_BRIEFERS (default: the
+# installed station plist's value, else empty) names another operator's logins whose loom:ticket briefs it builds without
 # adopting their claims (docs/LANES.md, Trusted briefers). It also reads LOOM_STATUS_REPO (default:
 # this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
 # LOOM_DIGEST_HOUR, LOOM_REPORT_DIGEST_TIMES (local times of the report digest,
