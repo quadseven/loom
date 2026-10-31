@@ -653,6 +653,9 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
      open needs:human (25 in OWNER/NAME, 3 in OWNER/OTHER; 4 of them under
      this goal), listed in the daily digest", or "Waiting on you: nothing"
      when none is open. The daily digest lists them, so do not list them here.
+     On a goal home that is not known to be private, the line names only
+     public repos and folds the rest into "N in private repos"; a repo whose
+     visibility cannot be read counts as private. Copy it as printed.
      "nothing" never sits beside a count on one line (the operator read
      "Needs you: nothing. needs:human: 28 in OWNER/NAME." as both, 2026-10-25).
    Write sentences, not ticket lists: name a ticket only where the operator
