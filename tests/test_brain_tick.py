@@ -34,8 +34,9 @@ if [ "$2" = bus.brain_memory ]; then
   exit "${FAKE_PACKET_EXIT:-0}"
 fi
 if [ "$2" = bus.fabric ]; then
+  printf 'fabric env LOOM_FABRIC_KEY_SSM=%s\\n' "${LOOM_FABRIC_KEY_SSM:-absent}" >> "$FAKE_LOG"
   printf '%s\\n' "${FAKE_FABRIC:-}"
-  exit 0
+  exit "${FAKE_FABRIC_EXIT:-0}"
 fi
 if [ "$3 $4" = "app token" ]; then
   # FAKE_APP_TOKEN: the Brain App's installation token; unset, minting fails.
@@ -63,6 +64,7 @@ exit 0
 # $FAKE_<NAME>_OUT, then exits $FAKE_<NAME>_EXIT (default 0).
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%(name)s %%s\\n' "$*" >> "$FAKE_LOG"
+printf 'env-%(name)s LOOM_FABRIC_KEY_SSM=%%s\\n' "${LOOM_FABRIC_KEY_SSM:-absent}" >> "$FAKE_LOG"
 printf 'cwd %%s\\n' "$PWD" >> "$FAKE_LOG"
 printf 'gh-path-%(name)s %%s\\n' "$(command -v gh)" >> "$FAKE_LOG"
 [ -z "${FAKE_%(var)s_OUT:-}" ] || printf '%%s\\n' "$FAKE_%(var)s_OUT"
@@ -219,7 +221,78 @@ class BrainTickTest(unittest.TestCase):
                        if call.startswith("claude ")]
         self.assertLess(fabric_call, agent_calls[0][0])
         self.assertIn("Earlier decision: a fix was merged.", "\n".join(calls))
-        self.assertNotIn("LOOM_FABRIC_KEY_SSM", "\n".join(calls))
+        # The configuration's name is part of no agent call's arguments.
+        self.assertFalse(any("LOOM_FABRIC_KEY_SSM" in c
+                             for c in calls if c.startswith("claude ")))
+
+    def test_fabric_configuration_reaches_the_responder_but_not_the_child(self):
+        # loom#2203: the wrapper's trusted Fabric request runs with the
+        # configuration in its own environment; the agent child must never
+        # see it, while the answer still reaches the prompt.
+        _, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                             FAKE_FABRIC="Earlier decision: a fix was merged.")
+        self.assertIn("fabric env LOOM_FABRIC_KEY_SSM=/example/fabric-key", calls)
+        self.assertIn("env-claude LOOM_FABRIC_KEY_SSM=absent", calls)
+        self.assertIn("Earlier decision: a fix was merged.", "\n".join(calls))
+        # Unconfigured: no Fabric request is made and the child still runs
+        # with the variable absent.
+        self.log.unlink()
+        _, calls = self.tick()
+        self.assertFalse(any("bus.fabric" in c for c in calls))
+        self.assertIn("env-claude LOOM_FABRIC_KEY_SSM=absent", calls)
+
+    def test_fabric_configuration_does_not_reach_the_codex_child(self):
+        self.usage("codex", True)
+        _, calls = self.tick(LOOM_BRAIN_LADDER="codex",
+                             LOOM_CODEX_MODEL="gpt-test-high",
+                             LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                             FAKE_FABRIC="Earlier decision: a fix was merged.")
+        self.assertIn("fabric env LOOM_FABRIC_KEY_SSM=/example/fabric-key", calls)
+        self.assertIn("env-codex LOOM_FABRIC_KEY_SSM=absent", calls)
+
+    def test_fabric_configuration_does_not_reach_the_spark_child(self):
+        self.usage("spark", True)
+        _, calls = self.tick(LOOM_BRAIN_LADDER="spark",
+                             LOOM_SPARK_MODEL="spark/coder",
+                             LOOM_SPARK_URL="http://spark.invalid:8000/v1",
+                             LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                             FAKE_FABRIC="Earlier decision: a fix was merged.")
+        self.assertIn("fabric env LOOM_FABRIC_KEY_SSM=/example/fabric-key", calls)
+        self.assertFalse(any("LOOM_FABRIC_KEY_SSM" in c
+                             for c in calls if c.startswith("opencode setting ")),
+                         calls)
+        # The spark child did run, with its recorded environment present,
+        # and the Fabric answer reached its prompt.
+        settings = [c for c in calls if c.startswith("opencode setting ")]
+        self.assertIn("opencode setting LOOM_REPOS=example/project", settings)
+        opencode = [c for c in calls if c.startswith("opencode run ")]
+        self.assertEqual(1, len(opencode))
+        self.assertIn("Earlier decision: a fix was merged.", "\n".join(calls))
+
+    def test_a_failed_fabric_request_still_hides_the_configuration(self):
+        # The responder failing must fail closed: no configuration in the
+        # child environment, no Fabric context in the prompt, tick runs on.
+        run, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                               FAKE_FABRIC="untrusted partial answer",
+                               FAKE_FABRIC_EXIT="1")
+        self.assertEqual(0, run.returncode)
+        self.assertIn("env-claude LOOM_FABRIC_KEY_SSM=absent", calls)
+        claude = [c for c in calls if c.startswith("claude ")]
+        self.assertEqual(1, len(claude))
+        self.assertNotIn("untrusted partial answer", claude[0])
+        self.assertIn("could not read Fabric context",
+                      (self.home / "logs" / "brain.log").read_text())
+        # The production shape of an unavailable responder (bus/fabric.py
+        # answers a refusal or an unreachable service with an empty string
+        # and exit 0) fails just as safely: no Fabric section in the prompt.
+        self.log.unlink()
+        run, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                               FAKE_FABRIC="")
+        self.assertEqual(0, run.returncode)
+        self.assertIn("env-claude LOOM_FABRIC_KEY_SSM=absent", calls)
+        claude = [c for c in calls if c.startswith("claude ")]
+        self.assertEqual(1, len(claude))
+        self.assertNotIn("Fabric workspace context", claude[0])
 
     def test_no_dashboard_or_a_failed_read_runs_the_tick_without_the_packet(self):
         _, calls = self.tick()
