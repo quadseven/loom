@@ -372,3 +372,94 @@ class OneSizeParserTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# The shape of a real triage refusal (loom#2031): an issue whose original
+# text was kept under "## Further notes" with every heading demoted one
+# level. Its Why is several sentences long, under "### Why".
+DEMOTED = """## Status
+
+Status: two criteria met, one needs the operator, one is blocked by it.
+
+Part of #654
+
+## Further notes
+
+Original issue text, kept below unchanged in substance (headings demoted one level).
+
+### Why
+
+The parent issue is verified five of six on main. Its sixth criterion is a
+single query against the live store, and it is the only thing keeping the
+issue open. Every automated verify pass re-derives the same five met
+criteria, writes another comment saying so, and leaves the issue open.
+
+### What
+
+Run the one query against the live store and record it.
+
+### Acceptance criteria
+
+> **Status:** AC1 and AC4 met.
+
+- [x] The value of the setting is recorded in a comment, with the query and its output.
+- [ ] If the value is false, the repo is enrolled or a reason is recorded.
+- [ ] If the repo is enrolled, the first weekly run covering it is linked here.
+- [x] The parent's criterion is ticked and the parent is closed.
+
+Size: XS
+
+### Out of scope
+
+- Any change to the scanner or its corpus.
+- Enrolling any other repo.
+
+## Ask
+
+The operator: enable the setting in the dashboard, yes or no.
+"""
+
+
+def _promoted(body):
+    """DEMOTED with its section headings written at level two."""
+    for name in ("Why", "What", "Acceptance criteria", "Out of scope"):
+        body = body.replace("\n### %s\n" % name, "\n## %s\n" % name)
+    return body
+
+
+class DemotedHeadingTest(unittest.TestCase):
+    def _refusal(self, body):
+        with self.assertRaises(ValueError) as caught:
+            brain._check_brief_args("A title", body, None, None, None)
+        return str(caught.exception)
+
+    def test_a_why_under_a_demoted_heading_is_named_not_counted_as_zero(self):
+        message = self._refusal(DEMOTED)
+        self.assertIn("no ## Why heading (found ### Why)", message)
+        self.assertNotIn("0 words", message)
+        self.assertIn("no ## Acceptance criteria heading (found ### Acceptance criteria)",
+                      message)
+
+    def test_a_missing_why_says_so_without_a_found_heading(self):
+        message = self._refusal((BRIEF % "S").replace("## Why\n", "## Reason\n"))
+        self.assertIn("no ## Why heading", message)
+        self.assertNotIn("found", message)
+        self.assertNotIn("0 words", message)
+
+    def test_the_demoted_fixture_passes_once_its_headings_are_level_two(self):
+        body = _promoted(DEMOTED)
+        brain._check_brief_args("A title", body, None, None, None)
+        self.assertEqual(brain.plan_problems(body), [])
+
+    def test_why_words_include_text_under_lower_level_subheadings(self):
+        brief = (BRIEF % "S").replace(
+            "## Why\nThe page query is slow for every visitor.\n",
+            "## Why\n### Background\nThe page query is slow for every visitor.\n"
+            "#### Detail\nIt runs on every request.\n")
+        body = pr_repair._render_generated(brief, "lane", "model", "T1")
+        self.assertEqual(hunt_plan.problems(body), [])
+        why = hunt_plan._section_text(body, "Why")
+        self.assertIn("The page query is slow for every visitor.", why)
+        self.assertIn("It runs on every request.", why)
+        # The section still ends at the next heading of the same level.
+        self.assertNotIn("Cache the query.", why)
