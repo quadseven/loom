@@ -406,6 +406,44 @@ class StoreGoals(unittest.TestCase):
         self.assertNotIn("No report on this goal in the last two weeks", found[0])
         self.assertIn("Smaller goal", found[0][found[0].index("goal-children"):])
 
+
+    def test_a_404_goal_home_is_treated_as_no_goal(self):
+        from dashboard.github import TicketStore
+        from bus.github import GitHubError
+
+        class NotFoundGitHub:
+            def rest(self, method, path):
+                raise GitHubError("Not Found", 404)
+
+        gh = NotFoundGitHub()
+        store = TicketStore([REPO], gh=gh, budget_floor=500)
+        entry = {"title": "Old Title", "parent": "old-parent", "is_goal": True, "read_at": 1000}
+
+        res = store._read_goal_home(f"{REPO}#30", entry, 2000, {})
+
+        self.assertEqual(res["title"], None)
+        self.assertEqual(res["parent"], None)
+        self.assertEqual(res["is_goal"], False)
+        self.assertEqual(res["is_missing"], True)
+
+    def test_a_transient_error_keeps_the_previously_read_entry(self):
+        from dashboard.github import TicketStore
+
+        class ErrorGitHub:
+            def rest(self, method, path):
+                raise ValueError("transient")
+
+        gh = ErrorGitHub()
+        store = TicketStore([REPO], gh=gh, budget_floor=500)
+        entry = {"title": "Old Title", "parent": "old-parent", "is_goal": True, "read_at": 1000}
+
+        res = store._read_goal_home(f"{REPO}#30", entry, 2000, {})
+
+        self.assertEqual(res["title"], "Old Title")
+        self.assertEqual(res["parent"], "old-parent")
+        self.assertEqual(res["is_goal"], True)
+        self.assertEqual(res["read_at"], 0)
+
     def test_a_first_pass_below_the_floor_says_why_the_cards_are_empty(self):
         self.store._last_remaining, self.store._reset_at = 10, 2000000000
         self.store.refresh()
