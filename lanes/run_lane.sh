@@ -845,23 +845,31 @@ PY
   rm -f "$source"
 }
 
+# Whether this round's commits changed file $1.
+round_changed() {
+  safe_git diff --name-only "$BASE..HEAD" 2>> "$LOG" | grep -Fxq -- "$1"
+}
+
 # The reply text reaches gh as a -f field value (a GraphQL variable), never
 # spliced into the query or a shell command line, so it cannot inject anything.
 # The agent names the thread ids, so each one is checked first: a thread on
 # any pull request but this round's own ($REPO#$FIX_PR) is skipped, and so is
 # a reply bus/text.py refuses. Resolving a thread is a merge gate input; an
-# agent must never answer or resolve one on another pull request.
+# agent must never answer or resolve one on another pull request, and a reply
+# alone resolves nothing: the round's commits have to change the thread's file.
+# A reply the thread already holds is not posted again, so a re-sent round
+# never duplicates one. A reason with no commit goes in .loom-answers instead.
 post_replies() {
-  local entry thread body resolve owner text_file
+  local entry thread body resolve node owner text_file
   [ -n "$REPLIES_FILE" ] && [ -f "$REPLIES_FILE" ] || return 0
   while IFS= read -r entry; do
     thread="$(jq -r '.thread' <<< "$entry")"
     body="$(jq -r '.reply' <<< "$entry")"
     resolve="$(jq -r '.resolve' <<< "$entry")"
-    owner="$(timeout "$NET_TIMEOUT" gh api graphql \
-         -f 'query=query($threadId:ID!){node(id:$threadId){... on PullRequestReviewThread{pullRequest{number repository{nameWithOwner}}}}}' \
-         -f "threadId=$thread" \
-         --jq '.data.node.pullRequest | "\(.repository.nameWithOwner)#\(.number)"' 2>> "$LOG")" || owner=""
+    node="$(timeout "$NET_TIMEOUT" gh api graphql \
+         -f 'query=query($threadId:ID!){node(id:$threadId){... on PullRequestReviewThread{path pullRequest{number repository{nameWithOwner}} comments(last:50){nodes{body}}}}}' \
+         -f "threadId=$thread" 2>> "$LOG")" || node=""
+    owner="$(jq -r '.data.node.pullRequest | "\(.repository.nameWithOwner)#\(.number)"' <<< "$node" 2>> "$LOG")" || owner=""
     if [ "$owner" != "$REPO#$FIX_PR" ]; then
       echo "review thread $thread is not on $REPO#$FIX_PR; its reply was skipped" >> "$LOG"
       continue
@@ -874,13 +882,20 @@ post_replies() {
       continue
     fi
     rm -f "$text_file"
-    if ! timeout "$NET_TIMEOUT" gh api graphql \
+    if jq -e --arg body "$body" 'any(.data.node.comments.nodes[]?; .body == $body)' <<< "$node" > /dev/null 2>> "$LOG"; then
+      echo "review thread $thread already holds this reply; it was not posted again" >> "$LOG"
+    elif ! timeout "$NET_TIMEOUT" gh api graphql \
          -f 'query=mutation($threadId:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){comment{id}}}' \
          -f "threadId=$thread" -f "body=$body" >> "$LOG" 2>&1; then
       echo "reply to review thread $thread failed" >> "$LOG"
       continue
     fi
-    if [ "$resolve" = true ] && ! timeout "$NET_TIMEOUT" gh api graphql \
+    [ "$resolve" = true ] || continue
+    if ! round_changed "$(jq -r '.data.node.path // ""' <<< "$node" 2>> "$LOG")"; then
+      echo "review thread $thread stays open: this round's commits do not change its file" >> "$LOG"
+      continue
+    fi
+    if ! timeout "$NET_TIMEOUT" gh api graphql \
          -f 'query=mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{isResolved}}}' \
          -f "threadId=$thread" >> "$LOG" 2>&1; then
       echo "resolving review thread $thread failed" >> "$LOG"

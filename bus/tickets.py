@@ -712,8 +712,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                  "need and keep the rest of the work.\n\n%s\n\n"
                  "You may also write .loom/replies.json as a JSON array of "
                  "{\"thread\": \"THREAD_ID\", \"reply\": \"TEXT\", \"resolve\": true} "
-                 "objects; the runner posts these after pushing and resolves threads marked "
-                 "true.\n\n%s\n"
+                 "objects; the runner posts these after pushing and resolves a thread marked "
+                 "true only when this round's commits change the thread's file.\n\n%s\n"
                  % (fix.pr, fix.branch, ANSWER_NOTE, fix.findings))
     return text
 

@@ -1023,8 +1023,10 @@ refused, as an untrusted ticket is. The runner then checks out that branch,
 pushes the agent's work onto it (fast-forward only, never forced) and
 comments on the pull request; it never opens a second one. The sandboxed agent
 can write `.loom/replies.json` with thread ids, reply text and a resolve
-boolean. The runner posts valid entries after a successful push and resolves
-those marked true; missing or invalid files produce no replies. An entry
+boolean. The runner posts valid entries after a successful push, skips a reply
+the thread already holds, and resolves those marked true only when the round's
+commits change the thread's file; missing or invalid files produce no replies.
+An entry
 whose thread is not on the round's own pull request, or whose text
 `bus/text.py` refuses, is skipped and logged. A fix brief
 whose pull request is no longer open is parked as failed (a merged one is

@@ -39,7 +39,9 @@ Findings. Each thread a fix round answers has a record in a second ledger
 round worked on. The runner writes that head beside the answers, which is the
 lane's pickup; the station refuses an answer whose head is no longer the pull
 request's (`transition_finding`), and a finding is answered only when the
-thread can be resolved on it.
+thread can be resolved on it. The runner's other reply route,
+.loom/replies.json, resolves a thread only when the round's commits change the
+thread's file (lanes/run_lane.sh post_replies).
 """
 
 from __future__ import annotations

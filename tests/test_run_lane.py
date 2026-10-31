@@ -103,16 +103,19 @@ if [ "$1" = api ]; then
       printf '%s %s' "${where%/issues/*}" "${where##*/}" > "$store/$id.on"
       cp "${6#body=@}" "$store/$id"; exit 0 ;;
   esac
-  # A review thread's pull request: every thread is on example/repo#7 except  # leak-guard-allow: fixture repo
-  # the ids listed in $FAKE_GH_FOREIGN_THREADS, which are on another one.
+  # A review thread: every thread is on example/repo#7 except  # leak-guard-allow: fixture repo
+  # the ids listed in $FAKE_GH_FOREIGN_THREADS, which are on another one. It
+  # cites $FAKE_THREAD_PATH and holds the comment $FAKE_THREAD_REPLY.
   case "$*" in
     "api graphql -f query=query("*"node(id:"*)
       thread=""
       for arg in "$@"; do case "$arg" in threadId=*) thread="${arg#threadId=}" ;; esac; done
+      name=example/repo number=7
       case " ${FAKE_GH_FOREIGN_THREADS:-} " in
-        *" $thread "*) echo "example/other#3" ;;  # leak-guard-allow: fixture repo
-        *) echo "example/repo#7" ;;  # leak-guard-allow: fixture repo
+        *" $thread "*) name=example/other number=3 ;;
       esac
+      printf '{"data":{"node":{"path":"%s","pullRequest":{"number":%s,"repository":{"nameWithOwner":"%s"}},"comments":{"nodes":[{"body":"%s"}]}}}}\\n' \
+        "${FAKE_THREAD_PATH:-fix.txt}" "$number" "$name" "${FAKE_THREAD_REPLY:-a finding}"
       exit 0 ;;
   esac
   # The shadow guard reads an issue before it lets a close go: the issue
@@ -1961,6 +1964,26 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
                              and "PRRT_elsewhere" in c for c in calls))
         self.assertTrue(any("resolveReviewThread" in c and "PRRT_fake" in c for c in calls))
 
+    def test_fix_runner_leaves_open_a_thread_whose_file_the_round_did_not_change(self):
+        self.fix_brief()
+        replies = '[{"thread":"PRRT_fake","reply":"Addressed","resolve":true}]'
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES=replies,
+                               FAKE_THREAD_PATH="other.py")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c for c in calls))
+        self.assertFalse(any("resolveReviewThread" in c for c in calls))
+
+    def test_a_resent_reply_is_not_posted_twice(self):
+        self.fix_brief()
+        replies = '[{"thread":"PRRT_fake","reply":"Addressed","resolve":true}]'
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES=replies,
+                               FAKE_THREAD_REPLY="Addressed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertFalse(any("addPullRequestReviewThreadReply" in c for c in calls))
+        self.assertTrue(any("resolveReviewThread" in c for c in calls))
+
     def test_fix_runner_skips_a_reply_the_text_check_refuses(self):
         self.fix_brief()
         # Not ASCII, so bus/text.py and checked_text refuse it.
@@ -2023,7 +2046,8 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
         self.assertTrue(any("addPullRequestReviewThreadReply" in c for c in calls))
-        self.assertTrue(any("resolveReviewThread" in c for c in calls))
+        # No commit touched the thread's file, so the reply alone resolves nothing.
+        self.assertFalse(any("resolveReviewThread" in c for c in calls))
         self.assertFalse(any(c.startswith("git push") for c in calls))
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
