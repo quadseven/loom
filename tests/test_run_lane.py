@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 import unittest
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -3290,6 +3291,36 @@ exec /usr/bin/git "$@"
         kind, retry_at, credit = self.classified("\n".join([self.TEST_402, limit]), limit)
         self.assertEqual((kind, credit), ("limit", "none"))
         self.assert_next_occurrence(retry_at, 10, 28, before)
+
+    def stated_reset_at(self, now, phrase):
+        """What stated_reset prints with the clock at now, in New York: its
+        Python process reads a pinned time.time."""
+        with tempfile.TemporaryDirectory() as pin:
+            Path(pin, "sitecustomize.py").write_text("import time\ntime.time = lambda: %d\n" % now)
+            script = (RUNNER.parent / "agent_cli.sh").read_text() + 'stated_reset "$1"'
+            result = subprocess.run(["bash", "-c", script, "x", phrase], capture_output=True,
+                                    text=True, check=True,
+                                    env={**os.environ, "PYTHONPATH": pin, "TZ": "America/New_York"})
+        return int(result.stdout)
+
+    def test_a_stated_time_of_day_is_its_next_occurrence_across_a_clock_change(self):
+        zone = ZoneInfo("America/New_York")
+        def at(month, day, hour, minute, fold=0):
+            year = 2027 if month < 6 else 2026
+            return int(datetime(year, month, day, hour, minute, tzinfo=zone, fold=fold).timestamp())
+        cases = (
+            (at(10, 31, 10, 27), "10:28 AM", at(10, 31, 10, 28)),
+            (at(10, 31, 10, 28), "10:28 AM", at(11, 1, 10, 28)),  # 25 hours away
+            (at(11, 1, 1, 30), "1:15 AM", at(11, 1, 1, 15, fold=1)),  # the repeat of the hour
+            (at(11, 1, 1, 30, fold=1), "1:45 AM", at(11, 1, 1, 45, fold=1)),
+            (at(11, 1, 1, 30, fold=1), "1:15 AM", at(11, 2, 1, 15)),
+            (at(11, 1, 2, 30), "2:15 AM", at(11, 2, 2, 15)),
+            (at(3, 13, 10, 28), "10:28 AM", at(3, 14, 10, 28)),  # 23 hours away
+            (at(3, 14, 1, 30), "2:30 AM", at(3, 14, 3, 30)),  # a time the night skips
+        )
+        for now, stated, expected in cases:
+            with self.subTest(now=now, stated=stated):
+                self.assertEqual(self.stated_reset_at(now, "try again at " + stated), expected)
 
     def test_a_402_from_the_provider_is_out_of_credit(self):
         tail = "Error: 402 Payment Required: your credit balance is too low"
