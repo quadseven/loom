@@ -5171,6 +5171,20 @@ class FixTest(Base):
         self.assertIn("loom:pr", self.fake.names(12))
         self.assertNotIn("loom:running", self.fake.names(12))
 
+    def test_a_fix_for_a_merge_already_judged_is_spent_and_does_not_park_the_ticket(self):
+        # loom#2333: the merge sent the ticket back for the rest, the old fix
+        # ask still stood, and every brief parked the ticket at loom:pr.
+        self.fake.add(12)
+        self.comment(12, FIX_BODY)
+        self.comment(12, tickets.UNBUILT_NOTE % (99, "Second works."))
+        self.fake.pulls.append({"number": 99, "state": "closed",
+                                "merged_at": "2030-01-02T12:00:00Z",
+                                "merge_commit_sha": "%040x" % 99, "base": {"ref": "main"},
+                                "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        # It is a new build now, so the brief check judges it, as any build.
+        self.assertNotIn("loom:pr", self.fake.names(12))
+
     def test_a_fix_for_an_open_pull_request_is_briefed(self):
         self.fake.add(12)
         self.comment(12, "Lane codex opened a pull request: https://example.com/pull/99")
