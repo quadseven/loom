@@ -14,7 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bus import invariants, station  # noqa: E402
 from bus.invariants import Facts, Ref  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401 - shadow off: these tests close
-from test_invariants import AUTHOR, GOAL, OTHER, REPO, T0, FakeGH, epic, stamp  # noqa: E402
+from bus.github import GitHubError  # noqa: E402
+from test_invariants import (  # noqa: E402
+    AUTHOR, GOAL, OTHER, REPO, T0, FakeGH, StationBase, epic, stamp)
 
 
 class RolledKindTest(unittest.TestCase):
@@ -279,6 +281,58 @@ class RolledKindTest(unittest.TestCase):
         self.assertEqual(self.stalled([self.pull(201, opened=T0 - 23 * 3600)]), [])
         (b,) = self.stalled([self.pull(201, opened=T0 - 25 * 3600)])
         self.assertEqual(b.subject, "%s#201" % REPO)
+
+
+class PullErrorsGH(FakeGH):
+    """FakeGH whose open pull request listing fails for the repos in errors."""
+
+    def __init__(self):
+        super().__init__()
+        self.errors = set()
+
+    def rest(self, method, path, body=None):
+        for repo in self.errors:
+            if path.startswith("/repos/%s/pulls?" % repo):
+                raise GitHubError("Bad Gateway", 502)
+        return super().rest(method, path, body)
+
+
+class UnreadRepoTest(StationBase):
+    def setUp(self):
+        super().setUp()
+        self.gh = PullErrorsGH()
+
+    def notes(self, filed):
+        return [c["body"] for c in self.gh.comments.get((REPO, filed["number"]), [])]
+
+    def test_a_repo_whose_pull_requests_cannot_be_read_keeps_its_tracking_issue(self):
+        """One repo's open pull requests answer an error: its tracking issue
+        is not emptied or closed, and the other repo's still updates."""
+        self.lane_ticket(602)
+        self.lane_pull(660, 602, T0 - 25 * 3600)
+        self.lane_ticket(603)
+        self.gh.pulls[OTHER] = [{"number": 770, "created_at": stamp(T0 - 25 * 3600),
+                                 "head": {"ref": "loom/603-thing", "sha": "abc770"},
+                                 "labels": [], "user": {"login": AUTHOR}}]
+        self.bot_threads(2)
+        self.run_at(T0)
+        rolled = {i["title"]: i for i in self.breaches()}
+        self.assertEqual(len(rolled), 2, sorted(rolled))
+        (own,) = [i for t, i in rolled.items() if t.endswith(REPO)]
+        (hidden,) = [i for t, i in rolled.items() if "private repo" in t]
+        body = hidden["body"]
+        self.assertIn("pull request 770 of a private repo", body)
+        # The private repo's listing fails from now on; #660 merges.
+        self.gh.errors.add(OTHER)
+        self.gh.pulls[REPO] = []
+        self.gh.pull_state[(REPO, 660)] = {"state": "closed", "merged_at": stamp(T0 + 60)}
+        for n in range(1, 5):
+            self.run_at(T0 + n * invariants.CLEAR_AFTER)
+        self.assertEqual(hidden["body"], body)
+        self.assertEqual(hidden["state"], "open")
+        self.assertNotIn((REPO, hidden["number"]), self.gh.comments)
+        self.assertIn(invariants.ROLL_NONE, own["body"])
+        self.assertEqual(own["state"], "closed", self.said)
 
 
 class OldIssueSubjectTest(unittest.TestCase):
