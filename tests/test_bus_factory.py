@@ -765,15 +765,24 @@ class PullRequests(Base):
         self.gh.ticket(5, "pr")
         self.gh.comments[5].append({"body": FIX_ASKED, "user": ME})
         seen = []
-        for _ in range(3):
-            self.gh.pull(50, 5, resolved=False)
-            self.gh.issues[5]["labels"] = [{"name": x} for x in
-                                           ("loom:ticket", "loom:pr", "lane:" + (self.lane(5) or "codex"))]
-            self.go()
-            self.gh.comments[5].append(CLAIM)
-            seen.append((self.lane(5), self.model(5)))
+        with lane_models():
+            for _ in range(3):
+                self.gh.pull(50, 5, resolved=False)
+                self.gh.issues[5]["labels"] = [{"name": x} for x in
+                                               ("loom:ticket", "loom:pr", "lane:" + (self.lane(5) or "codex"))]
+                self.go()
+                self.gh.comments[5].append(CLAIM)
+                seen.append((self.lane(5), self.model(5)))
         self.assertEqual(seen, [("claude", "claude-sonnet-5-5"), ("codex", "gpt-6-luna"),
                                 ("claude", "claude-opus-5-5")])
+
+    def test_the_rung_ladder_test_ignores_the_lane_model_settings_of_the_machine(self):
+        # A machine that runs lanes sets LOOM_CLAUDE_MODEL. Set to a model
+        # that is not rung 1, it held the ladder test above on one rung.
+        for model in ("claude-opus-5-5", "gpt-6-luna"):
+            with self.subTest(model), mock.patch.dict(os.environ, {"LOOM_CLAUDE_MODEL": model}):
+                self.setUp()
+                self.test_the_rungs_go_sonnet_then_sol_then_opus()
 
     def test_past_the_last_rung_it_is_left_failed_for_the_brain(self):
         self.gh.ticket(5, "pr")
@@ -4498,6 +4507,30 @@ class BranchHygiene(Base):
         self.gh.pull(60, 6, created=3600, runs=self.WAITING)
         self.go()
         self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_a_behind_conflict_free_pull_request_at_briefed_is_updated(self):
+        self.gh.ticket(5, "briefed")
+        self.gh.pull(50, 5, created=7200, runs=self.WAITING)
+        self.gh.behind[50] = 3
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_a_behind_conflict_free_pull_request_at_failed_is_updated(self):
+        self.gh.ticket(5, "failed")
+        self.gh.pull(50, 5, created=7200, runs=self.WAITING)
+        self.gh.behind[50] = 3
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_a_behind_conflict_free_pull_request_at_running_is_left_alone(self):
+        self.gh.ticket(5, "running")
+        self.gh.pull(50, 5, created=7200, runs=self.WAITING)
+        self.gh.behind[50] = 3
+        self.go()
+        self.assertEqual(self.updates(), [])
         self.assertEqual((self.merged, self.fixed), ([], []))
 
     def test_a_dirty_pull_request_gets_a_fix_round_naming_it(self):

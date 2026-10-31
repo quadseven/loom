@@ -147,13 +147,13 @@ the same pass and interval: one open list per `needs:<login>` label per repo
 result stays shown.
 
 `/needs-you` lists every open item that waits on a person, each once: the
-`needs-operator` and `loom:human` issues ("waits on the operator") from
+`needs:human` and `needs:human` issues ("waits on the operator") from
 Hunt's backlog document and the store's own read, and the `needs:<login>`
 items above ("waits on <login>"), each card marked "needs a human" with its
-ask (the `## Ask` section, else the picked comment, linked; a `loom:human`
-issue's ask is its newest `loom:human` comment). The page makes no request
+ask (the `## Ask` section, else the picked comment, linked; a `needs:human`
+issue's ask is its newest `needs:human` comment). The page makes no request
 of its own: the `needs:<login>` items come from the Operators pass, and a
-`needs-operator` or `loom:human` issue with no `## Ask` in its body takes its
+`needs:human` or `needs:human` issue with no `## Ask` in its body takes its
 ask from a comment read the same way. A card whose ask comment that read has
 not reached yet reads it on demand (`GET /api/needs-you/ask?repo=&number=`,
 from the page's script), under the same rules: never below the budget floor,
@@ -171,12 +171,12 @@ has an optional note. A tap sends `POST /api/needs-you/answer` with `{repo,
 number, choice, note, as}`, and the dashboard posts ONE comment on the
 issue as the Loom GitHub App (`LOOM_GITHUB_APP_*`; without the App the page
 stays read only and says so): `<!-- loom:answer v1 --> Answer from <login>
-(via the dashboard): <choice>. <note>`. It then takes off `loom:human`,
-`needs:<login>` and `needs-operator`, and adds `loom:answer-pending`, which
+(via the dashboard): <choice>. <note>`. It then takes off `needs:human`,
+`needs:<login>` and `needs:human`, and adds `loom:answer-pending`, which
 the station takes off once it has read the answer (docs/BRAIN.md, Operator
 answers). Until then the card leaves the lists and waits under "Answered,
 not yet applied" with the answer, who gave it and when; an answer the
-station has read shows on a card that still waits (a Hold puts `loom:human`
+station has read shows on a card that still waits (a Hold puts `needs:human`
 back).
 
 Only an operator may answer: a login of `LOOM_OPERATORS` (space or comma
@@ -340,6 +340,28 @@ only on its next pass. A hold whose until-time has passed is read as ended
 (loom#809): `/usage` counts that lane free and asks nothing about it, and
 `/lanes` says the hold ended and that no heartbeat has come since, instead of
 a past "until" read as a live hold.
+
+`/fleet` (Fleet timeline, loom#2280) draws every engine as a row over the
+last 24 hours and the next 2, one pixel a minute, from the snapshot the
+other pages read; the page makes no GitHub request. The rows: one per
+journal holder on the goal homes (the brains the docs give a cadence, the
+Muse brain every 30 minutes and the lane-machine brain hourly, are drawn
+even when silent; any other holder appears when it journals), Reports
+(every `loom:report` comment, with the reading times, 10:00 and 21:00 New
+York, as due marks), Station (its comments, shipped notes, lane outcomes
+and status events, by the login that writes the station-only comments,
+plus its `POST /api/chain` snapshots, kept in memory as its 10 minute
+heartbeat), Operator notes (people's comments on the goal homes, with the
+operators summary times, 09:05 and 17:05 New York, as due marks) and one
+row per lane (claims, rounds, outcomes, lane pull requests opened and
+merged, and the newest heartbeat from the lane status table). Each mark
+shows its one-line gist on hover or tap, as a strip at the foot of the
+screen, with no script. A row with a cadence marks any silence longer than
+the cadence plus 50 percent as a missed run, with the length of the gap;
+the station's silences are judged from its chain snapshots only, so before
+the first one the row says so instead of marking misses. A lane has no
+cadence, so a quiet lane is not a missed run. The axis scrolls inside its
+own box; the row heads stay put.
 
 ## The bench (loom#969)
 
