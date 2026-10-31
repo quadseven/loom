@@ -271,10 +271,29 @@ def as_operator_comments(comments: Iterable[Any], trusted: Iterable[str], ops: I
     return out
 
 
+# A "merge ... or hold" ask that names its pull request in the same
+# sentence: "Merge #12 now or hold it", "merge pull request #34, or keep
+# holding it". The number may also sit just before the sentence ("Pull
+# request #12: merge or hold"), in the words before the match.
+_MERGE_HOLD_NUMBER_WINDOW = 60
+
+
 def held_pr(text: Any) -> Optional[int]:
-    """The pull request a lane hold ask (bus.operator_hold.ask) names, or None."""
-    found = HELD_PR_RE.search(" ".join(str(text or "").split()))
-    return int(found.group(1)) if found else None
+    """The pull request a held pull request ask names, or None: a lane hold
+    ask (bus.operator_hold.ask), or an operator ask naming "merge ... or
+    hold" of one pull request."""
+    clean = " ".join(str(text or "").split())
+    found = HELD_PR_RE.search(clean)
+    if found:
+        return int(found.group(1))
+    match = _MERGE_HOLD_RE.search(clean)
+    if match is None:
+        return None
+    named = re.findall(r"#([0-9]+)", match.group(0))
+    if not named:
+        before = clean[max(0, match.start() - _MERGE_HOLD_NUMBER_WINDOW):match.start()]
+        named = re.findall(r"#([0-9]+)", before)
+    return int(named[-1]) if named else None
 
 
 def _hold_asks(comments: Iterable[Any], trusted: Iterable[str]) -> List[Tuple[int, Mapping[str, Any]]]:

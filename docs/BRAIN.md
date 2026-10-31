@@ -1779,6 +1779,20 @@ head, asks again. Each Merge or Hold is written once to the shadow ledger as
 an `operator-verdict` entry (its label the verdict), beside the would-merge
 it pairs with; the ledger's counts and digest leave verdicts out.
 
+When the person merges or closes that pull request themselves, the wait is
+withdrawn on the station's next pass: for an open issue still carrying
+`loom:human`, a `needs:<login>` label or `needs-operator` whose newest
+person ask is a held pull request ask (the hold ask's words, or an operator
+ask naming "merge ... or hold" of one pull request), the station reads the
+pull request. A merged one earns one note ("pull request #N merged at T, so
+this no longer waits on a person"), the wait labels come off, and the
+ticket's state follows the merge path; a closed unmerged one is withdrawn
+the same way and follows the closed-unmerged rule. A pull request still
+open leaves the issue unchanged. The withdrawal is once per ask: with the
+wait labels off, the issue no longer qualifies (and no longer shows on the
+Needs you page, which lists asks by those labels), and a later ask on the
+same issue is read fresh.
+
 A ticket whose every acceptance criterion is a check on a live host or
 network (a command run on a host, a reach test from a network, a port, a
 firewall or ACL rule, a check across the hosts, or a Live line, and none
