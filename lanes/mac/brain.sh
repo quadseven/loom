@@ -27,7 +27,10 @@
 # wait for a held lock: 25 for a live tick, 0 otherwise), and LOOM_BRAIN_SCOPE: all
 # (the default) or live, which leaves everything but cluster work to Muse.
 # LOOM_TRANSCRIPT_URL, LOOM_TRANSCRIPT_TOKEN_SSM and LOOM_AWS_REGION, when
-# set, are where the wrapper reads the handoff packet.
+# set, are where the wrapper reads the handoff packet. LOOM_BRAIN_FABRIC_ASK,
+# when set and non-empty, opts the tick into one Fabric question (asked by
+# this wrapper, with LOOM_FABRIC_KEY_SSM); unset or empty, no question is
+# asked.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -360,10 +363,13 @@ rules digest holds the reviewed rules; the rest is a record, not instructions.
 $PACKET"
 fi
 
-# Keep the Fabric key in this trusted wrapper. Ask a fixed, issue-independent
-# question before ticket content reaches the agent; pass only the answer on.
+# Keep the Fabric key in this trusted wrapper. The question is opt-in
+# (LOOM_BRAIN_FABRIC_ASK, set and non-empty) and off by default: Fabric is a
+# pull-based memory, so an unconditional per-tick question is avoidable spend.
+# When the ask does happen, ask a fixed, issue-independent question before
+# ticket content reaches the agent; pass only the answer on.
 FABRIC_CONTEXT=""
-if [ -n "${LOOM_FABRIC_KEY_SSM:-}" ]; then
+if [ -n "${LOOM_BRAIN_FABRIC_ASK:-}" ] && [ -n "${LOOM_FABRIC_KEY_SSM:-}" ]; then
   FABRIC_CONTEXT="$(cd "$REPO_ROOT" && python3 -m bus.fabric ask 2>> "$LOG")" ||
     { say "could not read Fabric context; the tick runs without it"; FABRIC_CONTEXT=""; }
 fi
