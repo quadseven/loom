@@ -6207,16 +6207,25 @@ class Station:
             return
         checked.add(ref)
         self._factory_probe_checked = checked
+        candidate = self._factory_probe_candidate(repo, incident, ref)
+        if candidate is None:
+            return
+        sha, probes = candidate
+        self._release_factory_probe(key, repo, number, ref, sha, probes)
+
+    def _factory_probe_candidate(self, repo: str, incident: Dict[str, Any],
+                                 ref: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """Return the due probe head and ledger, if this incident may probe."""
         incident_body = str(incident.get("body") or "")
         kind = re.search(r"^Kind:\s*(\S+)", incident_body, re.M)
         if not kind or kind.group(1) not in ("base-check", "environment"):
-            return
+            return None
         queued = self._paginate("/repos/%s/issues?labels=loom:queued&state=open&per_page=100" % repo)
         if any(isinstance(item, dict) and "pull_request" not in item for item in queued):
-            return
+            return None
         branch = self._default_branch(repo)
         if not branch:
-            return
+            return None
         cache = getattr(self, "_factory_probe_heads", {})
         if repo not in cache:
             cache[repo] = self.gh.rest(
@@ -6224,11 +6233,11 @@ class Station:
             self._factory_probe_heads = cache
         commit = cache[repo]
         if not isinstance(commit, dict):
-            return
+            return None
         sha = str(commit.get("sha") or "")
         committed = self._epoch(str(((commit.get("commit") or {}).get("committer") or {}).get("date") or ""))
         if not sha or committed is None:
-            return
+            return None
         path = os.path.join(self.state, "factory_probes.json")
         probes = _read_json(path, {}, strict=False)
         if not isinstance(probes, dict):
@@ -6236,9 +6245,15 @@ class Station:
         record = probes.get(ref) if isinstance(probes.get(ref), dict) else {}
         incident_at = self._epoch(str(incident.get("created_at") or ""))
         if incident_at is None or self.now - incident_at < FACTORY_PROBE_AFTER:
-            return
+            return None
         if not self._factory_probe_due(incident, sha, committed, record, self.now):
-            return
+            return None
+        return sha, probes
+
+    def _release_factory_probe(self, key: str, repo: str, number: int, ref: str,
+                               sha: str, probes: Dict[str, Any]) -> None:
+        """Record and re-queue one ticket for a factory incident probe."""
+        path = os.path.join(self.state, "factory_probes.json")
         try:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
         except RateLimited:
