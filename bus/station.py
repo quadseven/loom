@@ -40,6 +40,7 @@ from . import brain_memory
 from . import brain_hold
 from . import claimed
 from . import claim_referee
+from . import evidence_close
 from . import fabric
 from . import fixrounds
 from . import logrotate
@@ -849,6 +850,18 @@ def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
         mtime = os.path.getmtime(log_path)
         return datetime.fromtimestamp(mtime, tz=timezone.utc)
     except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def _content_text(data: Any) -> Optional[str]:
+    """The text of a contents API answer; None for a file it does not carry
+    (over 1 MB) or an answer that is not a file."""
+    if not isinstance(data, dict) or data.get("encoding") != "base64" \
+            or not isinstance(data.get("content"), str):
+        return None
+    try:
+        return base64.b64decode(data["content"]).decode("utf-8", "replace")
+    except ValueError:
         return None
 
 
@@ -9317,12 +9330,25 @@ class Station:
         no done ticket closes while a live or operator criterion has no
         evidence (_evidence_holds, bus/criteria_gate.py). A shipped ticket
         whose live criteria name a read-only proof is proved first, and closed
-        on it when every criterion has evidence (_prove_live, #1608)."""
+        on it when every criterion has evidence (_prove_live, #1608). Since
+        2026-10-31 one close revises that rule: a ticket whose one Live box is
+        its only open box, and whose merged change still stands, closes as
+        closed-unproven (_evidence_close, bus/evidence_close.py)."""
         if self._deferred():
             return
-        left = CLOSE_DONE_PER_PASS
         self._live_budget = LIVE_CHECKS_PER_PASS
         self._proof_budget = LIVE_PROOFS_PER_PASS
+        self._evidence = self._evidence_pass()
+        try:
+            self._close_done_repos(CLOSE_DONE_PER_PASS)
+        finally:
+            if self._evidence_state is not None:
+                _write_json(self._evidence_path(), self._evidence_state)
+            if self._evidence.counts["read"] or self._evidence.counts["waiting"]:
+                _say(evidence_close.bound_line(self._evidence))
+
+    def _close_done_repos(self, left: int) -> None:
+        """close_done_tickets' walk: at most `left` closes."""
         log_root = os.path.join(self.s.home, "logs")
         for repo in self._verify_repos():
             for issue in self._tickets_open(repo):
@@ -9331,12 +9357,185 @@ class Station:
                 if self._prove_live(repo, issue):
                     left -= 1
                     continue
+                verdict = self._evidence_close(repo, issue)
+                if verdict == evidence_close.CLOSED:
+                    left -= 1
+                if verdict != evidence_close.OTHER:
+                    continue
                 why = self._done_reason(issue, self._earliest_record(repo, issue, log_root))
                 if not why or self._evidence_holds(repo, issue):
                     continue
                 if self._close_done_ticket(repo, issue, why):
                     left -= 1
                     _say("closed done %s#%d: %s" % (repo, int(issue["number"]), why))
+
+    def _evidence_path(self) -> str:
+        return os.path.join(self.state, evidence_close.STATE_FILE)
+
+    def _evidence_pass(self) -> evidence_close.Pass:
+        """This pass's evidence close budget, with any reopen since the last
+        pass counted. A repo with no such close costs no read."""
+        try:
+            state = evidence_close.read_file(self._evidence_path())
+            control = evidence_close.read_file(
+                os.path.join(self.state, evidence_close.CONTROL_FILE))
+        except ValueError as err:
+            # The file stays as it is for the operator to read.
+            self._evidence_state = None
+            _say("evidence close paused: %s" % err)
+            return evidence_close.new_pass({}, {"paused": True}, self.now)
+        self._evidence_state = state
+        unread = ""
+        for repo in sorted({str(c.get("repo")) for c in evidence_close.closes(state)}):
+            try:
+                found = self._paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                       % (repo, evidence_close.LABEL))
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                # An unread count is not a low one.
+                unread = "the reopens of %s could not be read (%s)" % (repo, type(err).__name__)
+                continue
+            evidence_close.mark_reopened(state, repo, [
+                int(i["number"]) for i in found
+                if isinstance(i, dict) and "pull_request" not in i and "number" in i], self.now)
+        run = evidence_close.new_pass(state, control, self.now)
+        if unread and not run.paused:
+            _say("evidence close: not closing this pass: %s" % unread)
+            return run._replace(paused=unread)
+        if run.paused:
+            _say("evidence close paused: %s; python3 -m bus.evidence_close resume restarts it"
+                 % run.paused)
+            self._say_paused(state, run.paused)
+        else:
+            state.pop("paused_said", None)
+        return run
+
+    def _say_paused(self, state: Dict[str, Any], why: str) -> None:
+        """Write the pause into each repo's Proof due issue, once."""
+        if state.get("paused_said") == why:
+            return
+        try:
+            for repo in sorted({str(c.get("repo")) for c in evidence_close.closes(state)}):
+                self._write_proof_due(repo, [], why)
+            state["paused_said"] = why
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not write the evidence close pause: %s" % err)
+
+    def _evidence_close(self, repo: str, issue: Dict[str, Any]) -> str:
+        """The narrow evidence close of one ticket (bus/evidence_close.py):
+        CLOSED when it closed, WAIT when it stays for a later pass with no
+        other close path run on it, OTHER when the usual done close decides."""
+        run = self._evidence
+        boxes = evidence_close.boxes(str(issue.get("body") or ""))
+        names = _label_names(issue)
+        ticket = "%s#%d" % (repo, int(issue["number"]))
+        state = self._evidence_state
+        if (run.paused or not boxes or evidence_close.label_hold(names)
+                or evidence_close.refused_recently(state, ticket, self.now)
+                or self._live_has_own_proof(repo, issue, boxes[0])):
+            return evidence_close.OTHER
+        if min(run.left) <= 0:
+            run.counts["waiting"] += 1
+            return evidence_close.WAIT
+        run.left[1] -= 1
+        run.counts["read"] += 1
+        branch, pulls, error = self._merged_pull_facts(repo, issue)
+        verdict, why = evidence_close.pulls_verdict(pulls, error)
+        if verdict == evidence_close.WAIT:
+            return verdict
+        why = why or evidence_close.tier_refusal(repo, pulls, str(issue.get("body") or "")) \
+            or self._symbol_refusal(repo, branch, pulls) or self._unmeetable_refusal(repo, issue)
+        if why:
+            evidence_close.note_refused(state, ticket, why, self.now)
+            _say("evidence close: not closing %s: %s" % (ticket, why))
+            return evidence_close.OTHER
+        return self._close_unproven(repo, issue, boxes[0])
+
+    def _live_has_own_proof(self, repo: str, issue: Dict[str, Any], box: str) -> bool:
+        """Whether Loom proves this box itself, so it keeps that path: a
+        station proof, a runnable check or a time window."""
+        return (criteria_gate.check_of(box) is not None or bool(_live_time_window(box))
+                or self._provable(issue, self._proof_sources(repo)))
+
+    def _symbol_refusal(self, repo: str, branch: str, pulls: List[Dict[str, Any]]) -> str:
+        """Why the default branch no longer holds what the pull requests
+        changed, or ""."""
+        wanted, why = evidence_close.symbol_files(pulls)
+        if why:
+            return why
+        for path, (added, removed) in sorted(wanted.items()):
+            answer = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s" % (
+                repo, quote(path, safe="/"), quote(branch, safe="")), ok=(404,))
+            text = "" if answer.status == 404 else _content_text(answer.data)
+            if text is None:
+                return "%s cannot be read" % path
+            why = evidence_close.symbol_refusal(path, text, added, removed)
+            if why:
+                return why
+        return ""
+
+    def _unmeetable_refusal(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why the Live box is not known to be meetable, or "". A lookup that
+        failed proves nothing either way, and reads as not known."""
+        reads: Dict[str, Any] = {"searches": UNMEETABLE_SEARCHES, "big": {}}
+        if self._unmeetable_live(repo, issue, reads):
+            return "its Live box cannot be met as written"
+        seen = _read_json(os.path.join(self.state, UNMEETABLE_FILE), {}, strict=False)
+        live = brain.live_criterion(issue.get("body"), limit=None)
+        known = self._unmeetable_known((seen if isinstance(seen, dict) else {}).get(
+            "%s#%d" % (repo, int(issue["number"]))), unmeetable.key(live))
+        return "" if known is False else "its Live box could not be looked up"
+
+    def _close_unproven(self, repo: str, issue: Dict[str, Any], box: str) -> str:
+        """List the box in the repo's Proof due issue, then close the ticket.
+        Nothing closes unlisted."""
+        number = int(issue["number"])
+        run = self._evidence
+        try:
+            where = self._write_proof_due(repo, [(number, box)], "")
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("evidence close: could not list %s#%d: %s" % (repo, number, err))
+            return evidence_close.WAIT
+        reason = "unproven, by the evidence close: its pull requests merged on green CI and " \
+                 "what they changed is still on the default branch. Its Live box is listed " \
+                 "in #%d" % where
+        with shadow.evidence_close(repo, number):
+            landed = self._close_done_ticket(repo, issue, reason, unproven=True)
+        if not landed and (self._issue_state(repo, number) or ("",))[0] != "closed":
+            return evidence_close.WAIT
+        evidence_close.record(self._evidence_state, repo, number, box, self.now)
+        run.left[0] -= 1
+        run.counts["closed"] += 1
+        _say("closed unproven %s#%d: %s" % (repo, number, reason))
+        return evidence_close.CLOSED
+
+    def _write_proof_due(self, repo: str, extra: List[Tuple[int, str]], paused: str) -> int:
+        """Write the repo's rolling Proof due issue and return its number."""
+        number = self._proof_due_issue(repo)
+        body = evidence_close.proof_body(repo, self._evidence_state, extra,
+                                         self._note_text, paused)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+        return number
+
+    def _proof_due_issue(self, repo: str) -> int:
+        """The repo's open Proof due issue, filed when it has none."""
+        found = self._paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                               % (repo, evidence_close.PROOF_LABEL))
+        numbers = sorted(int(i["number"]) for i in found
+                         if isinstance(i, dict) and "pull_request" not in i and "number" in i)
+        if numbers:
+            return numbers[0]
+        made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+            "title": evidence_close.PROOF_TITLE, "labels": [evidence_close.PROOF_LABEL],
+            "body": "The station lists the Live boxes of tickets closed unproven here."}).data
+        if not isinstance(made, dict) or "number" not in made:
+            raise GitHubError("no issue was created in %s" % repo)
+        return int(made["number"])
 
     def _earliest_record(self, repo: str, issue: Dict[str, Any],
                          log_root: str) -> Optional[datetime]:
@@ -9653,11 +9852,14 @@ class Station:
         return True
 
     def _close_done_ticket(self, repo: str, issue: Dict[str, Any],
-                           reason: str) -> bool:
+                           reason: str, unproven: bool = False) -> bool:
         """Close one done ticket with `reason`; True when the close writes
-        landed, False when GitHub refused and the run moves on."""
+        landed, False when GitHub refused and the run moves on. `unproven` is
+        the evidence close, which carries its label and is not held in shadow
+        (bus/shadow.py evidence_close)."""
         number = int(issue["number"])
-        if shadow.active(repo):
+        marks = [CLOSE_DONE_LABEL] + ([evidence_close.LABEL] if unproven else [])
+        if shadow.active(repo) and not unproven:
             # Before the status note and the force-close label.
             held = shadow.record_held(shadow.CLOSE, repo, number, "issue", source="station done close",
                                  reason=reason, gates=["shipped", "every criterion has evidence"])
@@ -9676,13 +9878,12 @@ class Station:
             # hold. Without it the guard reopened 46 of 175 such closes,
             # each with an email (2026-10-19).
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
-                         {"labels": [CLOSE_DONE_LABEL]})
+                         {"labels": marks})
             self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
                          {"state": "closed", "state_reason": "completed"})
             kept = brain.closing_labels(_label_names(issue), self.s.authors)
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
-                         {"labels": kept if CLOSE_DONE_LABEL in kept
-                          else kept + [CLOSE_DONE_LABEL]})
+                         {"labels": kept + [m for m in marks if m not in kept]})
         except RateLimited:
             raise
         except GitHubError as err:

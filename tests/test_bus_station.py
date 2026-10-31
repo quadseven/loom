@@ -314,7 +314,8 @@ class FakeGitHub:
             return reply(201, {"number": 900})
         if method == "POST" and rest == "issues":
             if (data.get("title") == "Add the repository validation contract"
-                    or data.get("title", "").startswith(("Land or supersede #", "Epic: "))):
+                    or data.get("title", "").startswith(("Land or supersede #", "Epic: ",
+                                                         "Proof due"))):
                 number = max(self.issues.keys(), default=0) + 1
                 made = {"number": number, "id": 1000 + number, "title": data["title"],
                         "body": data["body"], "state": "open",
@@ -341,6 +342,10 @@ class FakeGitHub:
         return reply(201, {"id": 77})
 
     def _get_issues(self, query, headers):
+        for label in ("closed-unproven", "loom:proof-due"):
+            if "labels=%s&" % label in query:
+                return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and label in self.names(i["number"])])
         if "labels=loom:audit-failed&" in query:
             return reply(200, [i for i in self.issues.values()
                                if "loom:audit-failed" in self.names(i["number"])])
