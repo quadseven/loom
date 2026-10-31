@@ -3671,10 +3671,8 @@ class Station:
         """One missing-evidence note on every shipped ticket older than
         VERIFY_NOTE_AFTER that no verify attempt has ever reached
         (loom#2092), until the pass's step budget defers the rest to the
-        next run. The pool is the reserved lane's own (_verify_pool with
-        queued_holds=False): a ticket in it with an attempt on the ledger
-        has been reached and is spared, and a ticket the pool leaves to the
-        brain (proof refused too often) has attempts by construction. At
+        next run. The pool is _note_pool: a ticket with an attempt on the
+        ledger has been reached and is spared. At
         most once per VERIFY_NOTE_EVERY; a GitHub failure listing the pool
         is logged and the run is not stamped, so the next pass retries."""
         path = os.path.join(self.state, VERIFY_NOTE_FILE)
@@ -3687,7 +3685,7 @@ class Station:
         attempts = _read_json(os.path.join(self.state, VERIFY_FILE), {}, strict=False)
         attempts = attempts if isinstance(attempts, dict) else {}
         try:
-            pool, _held = self._verify_pool(attempts, queued_holds=False)
+            pool = self._note_pool(attempts, ledger)
         except RateLimited:
             raise
         except GitHubError as err:
@@ -3699,12 +3697,12 @@ class Station:
                 if self._deferred():
                     deferred = True
                     break
-                number = int(issue["number"])
-                if "%s#%d" % (repo, number) in attempts:
+                if self._proven(repo, int(issue["number"])):
                     continue
-                shipped_at = float(issue.get("shipped_at", 0) or 0)
+                shipped_at = self._shipped_stamp(repo, issue)
                 if not shipped_at or self.now - shipped_at < VERIFY_NOTE_AFTER:
                     continue
+                issue["shipped_at"] = shipped_at
                 self._note_one_shipped(repo, issue, ledger)
         finally:
             # A run the step budget cut short is not stamped: the cadence
@@ -3714,6 +3712,32 @@ class Station:
             if not deferred:
                 ledger["_at"] = self.now
             _write_json(path, ledger)
+
+    def _note_pool(self, attempts: Dict[str, Any], ledger: Dict[str, Any]
+                   ) -> List[Tuple[str, Dict[str, Any]]]:
+        """The open shipped tickets a note pass reads: every one with no
+        attempt and no fresh note, by cheap filters only. It is wider than
+        _verify_pool on purpose (loom#964): a Live box that names no exact
+        string or cannot be met gets no verify lane, so on 2026-10-31 thirteen
+        such tickets waited with no note at all."""
+        pool = []
+        asked = _read_json(os.path.join(self.state, UNMEETABLE_FILE), {}, strict=False)
+        asked = asked if isinstance(asked, dict) else {}
+        for repo in self._verify_repos():
+            for issue in self._tickets_open(repo):
+                key = "%s#%d" % (repo, int(issue["number"]))
+                # A box flagged unmeetable already carries its restate ask.
+                if (asked.get(key) or {}).get("reasons"):
+                    continue
+                seen = ledger.get(key)
+                written = seen.get("at") if isinstance(seen, dict) else None
+                labels = _label_names(issue)
+                if ("loom:shipped" not in labels or "loom:verified" in labels or key in attempts
+                        or (isinstance(written, (int, float))
+                            and 0 <= self.now - float(written) < VERIFY_NOTE_REFRESH)):
+                    continue
+                pool.append((repo, issue))
+        return pool
 
     def _note_one_shipped(self, repo: str, issue: Dict[str, Any],
                           ledger: Dict[str, Any]) -> None:
