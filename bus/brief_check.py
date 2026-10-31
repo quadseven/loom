@@ -311,10 +311,63 @@ def source_shipped(gh: Any, repo: str, body: str) -> Optional[Verdict]:
     return None
 
 
-def _names_ticket(text: str, repo: str, number: int) -> bool:
+_IGNORED_HEADINGS = ("out of scope", "not in scope", "follow-ups", "follow ups",
+                      "followups", "follow-up", "follow up", "followup")
+
+
+def _is_ignored_heading(title: str) -> bool:
+    t = title.strip().lower().rstrip(":").strip()
+    return any(t == h or t.startswith(h + " ") or t.startswith(h + ":")
+               for h in _IGNORED_HEADINGS)
+
+
+def _strip_ignored_contexts(text: str) -> str:
+    """Drop references that do not count as the ticket being built: those
+    under an Out of scope / Not in scope / Follow-ups heading, and those in
+    a sentence that says the ticket was filed or is a follow-up."""
+    lines = (text or "").replace("\r", "").split("\n")
+    out: List[str] = []
+    skip = False
+    skip_level = 0
+    for line in lines:
+        m = re.match(r"^(#{1,6})\s*(.*)$", line)
+        if m:
+            level = len(m.group(1))
+            title = m.group(2).strip()
+            if _is_ignored_heading(title):
+                skip = True
+                skip_level = level
+                out.append("")
+                continue
+            if skip and level <= skip_level:
+                skip = False
+            if skip:
+                out.append("")
+                continue
+            out.append(line)
+        else:
+            if skip:
+                out.append("")
+            else:
+                out.append(line)
+    text = "\n".join(out)
+    filed_re = re.compile(r"filed\s+for|filed\s+as|follow[- ]?ups?", re.I)
+    result_lines: List[str] = []
+    for line in text.split("\n"):
+        sentences = re.split(r"(?<=[.!?])\s+", line)
+        kept = [s for s in sentences if not filed_re.search(s)]
+        result_lines.append(" ".join(kept))
+    return "\n".join(result_lines)
+
+
+def _names_ticket_raw(text: str, repo: str, number: int) -> bool:
     lowered = (text or "").lower()
     return ("%s#%d" % (repo.lower(), number) in re.sub(r"\s+", "", lowered)
             or "github.com/%s/issues/%d" % (repo.lower(), number) in lowered)
+
+
+def _names_ticket(text: str, repo: str, number: int) -> bool:
+    return _names_ticket_raw(_strip_ignored_contexts(text), repo, number)
 
 
 def _is_revert(pr: Mapping[str, Any]) -> bool:
@@ -371,18 +424,18 @@ def _person_texts(issue: Mapping[str, Any], comments: Sequence[Mapping[str, Any]
         if _login(c).lower() in people and (c.get("user") or {}).get("type") != "Bot"]
 
 
-def _merged_at(gh: Any, where: str, number: int) -> str:
-    """When the pull request merged, "" when it did not, is a revert, or is
-    no pull request."""
+def _merged_at(gh: Any, where: str, number: int) -> Tuple[str, str]:
+    """When the pull request merged and its body, ("", "") when it did not,
+    is a revert, or is no pull request."""
     try:
         pr = gh.rest("GET", "/repos/%s/pulls/%d" % (where, number)).data or {}
     except GitHubError as err:
         if err.status == 404:
-            return ""  # an issue, not a pull request, or gone
+            return "", ""  # an issue, not a pull request, or gone
         raise
     if not isinstance(pr, dict) or _is_revert(pr):
-        return ""
-    return str(pr.get("merged_at") or "")
+        return "", ""
+    return str(pr.get("merged_at") or ""), str(pr.get("body") or "")
 
 
 def merged_linked(gh: Any, repo: str, issue: Mapping[str, Any],
@@ -395,8 +448,12 @@ def merged_linked(gh: Any, repo: str, issue: Mapping[str, Any],
     links = [(r, n) for r, n in _links(_person_texts(issue, comments, trusted))
              if r.partition("/")[0].lower() == owner and (r, n) != (repo, int(issue["number"]))]
     for where, num in links[:LINKS_READ]:
-        merged = _merged_at(gh, where, num)
+        merged, body = _merged_at(gh, where, num)
         if merged and _ts(merged) > filed:
+            ticket_number = int(issue["number"])
+            if (_names_ticket_raw(body, repo, ticket_number)
+                    and not _names_ticket(body, repo, ticket_number)):
+                continue
             return Verdict(STALE, "pr-%s#%d" % (where, num),
                            "pull request %s#%d, linked on this ticket, merged at %s, after "
                            "the ticket was filed" % (where, num, merged))

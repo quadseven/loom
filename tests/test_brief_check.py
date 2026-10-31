@@ -250,6 +250,32 @@ class Stale(unittest.TestCase):
         self.fake.routes["/repos/%s/pulls/45" % OTHER] = {"merged_at": iso(90000), "title": "x"}
         self.assertIsNone(self.check(comments=said))
 
+    def test_a_merged_pull_request_that_names_it_only_under_out_of_scope_does_not_hold(self):
+        self.fake.routes["/repos/%s/issues/206/timeline" % REPO] = [{
+            "event": "cross-referenced", "source": {"type": "issue", "issue": {
+                "number": 31, "body": "## Out of scope\n- Earning %s#206 the Crescent Key.\n" % REPO,
+                "title": "Ship the caller",
+                "repository": {"full_name": OTHER},
+                "pull_request": {"merged_at": iso(3600)}}}}]
+        self.assertIsNone(self.check())
+
+    def test_a_merged_pull_request_that_names_it_only_in_a_filed_note_does_not_hold(self):
+        for body in ("(%s#206 filed for a way out of the exit yard)\n" % REPO,
+                     "Filed as %s#206 for the rest of the work.\n" % REPO):
+            self.fake.routes["/repos/%s/issues/206/timeline" % REPO] = [{
+                "event": "cross-referenced", "source": {"type": "issue", "issue": {
+                    "number": 31, "body": body, "title": "Ship the caller",
+                    "repository": {"full_name": OTHER},
+                    "pull_request": {"merged_at": iso(3600)}}}}]
+            self.assertIsNone(self.check())
+
+    def test_a_linked_pull_request_that_names_it_only_under_out_of_scope_does_not_hold(self):
+        said = [comment("Shipping it in https://github.com/%s/pull/45 instead." % OTHER)]
+        self.fake.routes["/repos/%s/pulls/45" % OTHER] = {
+            "merged_at": iso(3600), "title": "x",
+            "body": "## Out of scope\n- %s#206 is not part of this.\n" % REPO}
+        self.assertIsNone(self.check(comments=said))
+
     def test_a_strangers_link_decides_nothing(self):
         # Security review: anyone can comment on a public ticket, and a
         # link to any merged pull request held it as shipped.
