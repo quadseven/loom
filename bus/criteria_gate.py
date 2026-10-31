@@ -36,7 +36,10 @@ GitHub client, or a read-only `kubectl get ...` / `kubectl rollout status ...`
 backticked or double-quoted strings must appear in the answer. The result is
 kept in the station's state and written to the ticket's status. A criterion
 with no runnable check, a check that keeps failing, and every operator
-criterion send the ticket to needs:human with one ask, once.
+criterion send the ticket to needs:human with one ask, once. In a repo with an
+opted-in live-evidence adapter (bus/live_adapter.py) a live criterion with no
+runnable check goes to a verify run first: the station reads the step the run
+answers with itself, and the ask names that step and why it failed (loom#1855).
 """
 from __future__ import annotations
 

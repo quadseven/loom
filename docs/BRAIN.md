@@ -1985,6 +1985,17 @@ adapter keep themselves read-only (a SELECT-only user, a reader that cannot
 exec). An adapter error, a timeout or too much output is no evidence, and the
 status line names it.
 
+A live criterion with no check or proof the station can run, such as a Live box
+written in prose, goes to a verify run first in a repo that declares an adapter
+and is in `LOOM_LIVE_EVIDENCE_REPOS` (#1855), not to `needs:human`. The verify
+brief names the adapter's log sources and its SQL route, and the run may answer `{"step": "<templated step>",
+"criterion": "<the box>"}`. The station reads that step through the adapter
+itself and proves the box on its own read, never on the lane's prose; the
+close comment quotes the matching lines. A run that returns no step, or a step
+the station's read refuses or fails, raises one `needs:human` ask that names
+the step tried and why it failed, even on a ticket the done close would pass
+over. A repo with no adapter gets today's ask.
+
 ## Post-merge watch
 
 After a Loom auto-merge (a `loom/` lane pull request merged by a Loom App,

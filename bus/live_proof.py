@@ -22,7 +22,8 @@ Each live criterion of the ticket names at most one proof step (`step_of`):
   strings that must appear in that log since the deploy (or must not, over
   the window named), or a `sql:<SELECT ...>` span with the strings its
   answer must contain. The target repo declares how each is read; Loom
-  knows only the form.
+  knows only the form. A verify run may answer a live criterion with no
+  runnable check with one of these (`adapter_step`, loom#1855).
 
 A step that would write is refused, not run (`refusal`): a `gh api` call
 with a method or a field, a kubectl verb other than get or rollout status, a
@@ -250,6 +251,21 @@ def step_of(text: str) -> Tuple[Optional[Step], str]:
     if found:
         return Step(LOG, found[0], tuple(found[1:]), hours), ""
     return None, "no proof Loom can run"
+
+
+def adapter_step(text: str) -> Tuple[Optional[Step], str]:
+    """(the adapter step a verify run's answer names, or None; why it is not
+    one): only the templated `log:<source>` and `sql:<SELECT ...>` forms
+    count, so the lane's answer never names a URL, a command or a bare log
+    string for the station to run."""
+    step, why = step_of(text)
+    if step is None or not step.source or step.kind not in (LOG, QUERY):
+        return None, why or "it is not a `log:<source>` or `sql:<SELECT ...>` step"
+    # The lane picks the step, so it must name something to find: a bare
+    # SELECT or an absence alone would pass on almost any answer.
+    if not (step.expects if step.kind == QUERY else step.target):
+        return None, "it names no string for the read to find"
+    return step, ""
 
 
 def _step_refusal(step: Step) -> str:

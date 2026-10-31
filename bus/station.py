@@ -335,6 +335,8 @@ SOURCES_FILE = "sources.json"
 # a pass.
 LIVE_CHECKS_FILE = "live-checks.json"
 LIVE_CHECK_RETRY = 6 * 3600
+# What a prose Live box's ask says when its verify run returned no step.
+NO_STEP = "the verify run returned no step"
 LIVE_CHECKS_PER_PASS = 5
 # The read-only live proof of shipped tickets (bus/live_proof.py): ticket ->
 # {"contract", "next_at", "said"}. A ticket is proved again at its next_at, or
@@ -738,16 +740,19 @@ NOTE_MAX = 1500
 
 def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
                attempts: Dict[str, Any], now: float,
-               refused: Optional[Dict[str, Any]] = None
+               refused: Optional[Dict[str, Any]] = None,
+               prose: Optional[Callable[[str, Dict[str, Any]], bool]] = None
                ) -> List[Tuple[str, Dict[str, Any]]]:
     """Shipped tickets without a proof, oldest ship event first, outside
     cooldown. A ticket whose proof was refused VERIFY_REFUSAL_CAP times
-    (`refused`: ticket -> reasons) is left to the brain."""
+    (`refused`: ticket -> reasons) is left to the brain. A Live line naming
+    no string is skipped, unless `prose` says its repo's live-evidence
+    adapter lets a verify run turn the ticket's box into a step (loom#1855)."""
     due = []
     for repo, issue in issues:
         labels = _label_names(issue)
         needles = live_needles(issue.get("body"))
-        if needles is not None and not needles:
+        if needles is not None and not needles and not (prose and prose(repo, issue)):
             continue
         key = "%s#%s" % (repo, issue.get("number"))
         if (issue.get("state") != "open" or "loom:ticket" not in labels
@@ -3411,7 +3416,8 @@ class Station:
         # read only when its cooldown is over.
         found = []
         reads: Dict[str, Any] = {"searches": UNMEETABLE_SEARCHES, "big": {}}
-        for repo, issue in verify_due(shipped, attempts, self.now, refused):
+        for repo, issue in verify_due(shipped, attempts, self.now, refused,
+                                     self._prose_wanted):
             if self._unmeetable_live(repo, issue, reads):
                 continue
             issue["shipped_at"] = self._shipped_stamp(repo, issue)
@@ -3419,7 +3425,7 @@ class Station:
             issue["health_proof"] = health.proof_of(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))), self.s.authors)
             found.append((repo, issue))
-        return verify_due(found, attempts, self.now, refused), held
+        return verify_due(found, attempts, self.now, refused, self._prose_wanted), held
 
     def _unmeetable_live(self, repo: str, issue: Dict[str, Any], reads: Dict[str, Any]) -> bool:
         """True when the ticket's Live box can never be met as written
@@ -3659,6 +3665,7 @@ class Station:
         text = tickets.render_verify_brief(
             repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
         text += self._verify_github_data(repo, issue)
+        text += self._adapter_section(repo, issue)
         sent = tickets.pending_verifies(self._status_texts(repo, number))
         if sent:
             text += tickets.merged_first_section(sent)
@@ -3950,6 +3957,15 @@ class Station:
             return True
         self._verify_clear(lane)
         result, why = self._read_verify(lane, name)
+        if result is not None and "step" in result and set(result) <= {"step", "criterion"}:
+            self._run_verify_step(repo, number, result)
+            return True
+        self._apply_verify_answer(lane, repo, number, name, result, why)
+        self._note_no_step(repo, number)
+        return True
+
+    def _apply_verify_answer(self, lane: str, repo: str, number: int, name: str,
+                             result: Optional[Dict[str, Any]], why: str) -> None:
         if result is None:
             self._verify_note(repo, number, lane, why)
         elif set(result) == {"missing"}:
@@ -3960,112 +3976,126 @@ class Station:
             self._refute_merged(lane, repo, number, result["unmet"])
         else:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
-        return True
+
+    def _prose_gaps(self, repo: str, number: int, body: str) -> List[str]:
+        """The ticket's live criteria with no station evidence and no check or
+        proof the station can run, in a repo whose live-evidence adapter the
+        operator opted in: a verify run may turn each into an adapter step
+        (loom#1855). Empty for a repo with no adapter."""
+        sources = self._proof_sources(repo)
+        if sources.source_log is None and sources.sql is None:
+            return []
+        gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
+        return [t for k, t in gaps if k == criteria_gate.LIVE
+                and criteria_gate.check_of(t) is None and not self._station_step(t, sources)]
+
+    def _prose_open(self, repo: str, number: int, body: str) -> List[str]:
+        """The prose gaps no verify run has answered yet."""
+        mine = self._live_checks().get("%s#%d" % (repo, number))
+        mine = mine if isinstance(mine, dict) else {}
+        return [t for t in self._prose_gaps(repo, number, body)
+                if criteria_gate.key(t) not in mine]
+
+    def _prose_wanted(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether a verify run should look at this ticket's prose Live box."""
+        return bool(self._prose_open(repo, int(issue["number"]), str(issue.get("body") or "")))
+
+    def _adapter_section(self, repo: str, issue: Dict[str, Any]) -> str:
+        """The verify brief's adapter section for a ticket's open prose boxes."""
+        prose = self._prose_open(repo, int(issue["number"]), str(issue.get("body") or ""))
+        runner = self._live_adapter(repo)
+        if not prose or runner is None:
+            return ""
+        adapter = runner.adapter
+        return tickets.adapter_section(prose, adapter.sources if adapter.log else (),
+                                       adapter.sql is not None)
+
+    def _record_prose(self, repo: str, number: int, text: str, step: str, ok: bool,
+                      seen: str) -> None:
+        """Keep what the station's own read of a prose box found, in its live
+        check state, and say it on the ticket."""
+        state = self._live_checks()
+        state.setdefault("%s#%d" % (repo, number), {})[criteria_gate.key(text)] = {
+            "result": "pass" if ok else "fail", "at": self.now, "seen": seen, "step": step}
+        _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
+        self._routine(repo, number, "Live step %s: %s for: %s" % (
+            "pass" if ok else "fail", _clip(" ".join(seen.split()), 200),
+            _clip(" ".join(text.split()), 160)))
+
+    def _note_no_step(self, repo: str, number: int) -> None:
+        """A verify run that left a prose box with no step: record it, so the
+        gate asks a person once (_evidence_holds)."""
+        if self._live_adapter(repo) is None:
+            return
+        issue = self._issue(repo, number)
+        names = _label_names(issue)
+        if issue.get("state") != "open" or "loom:shipped" not in names or "loom:verified" in names:
+            return
+        for text in self._prose_open(repo, number, str(issue.get("body") or "")):
+            self._record_prose(repo, number, text, "", False, NO_STEP)
 
     @staticmethod
-    def _review_findings(value: Any) -> Optional[List[Dict[str, Any]]]:
-        """A review.json finding list, cleaned, or None when its shape is
-        not a list of findings: each entry keeps its finding text (whitespace
-        collapsed, capped), an optional file and an optional line."""
-        if not isinstance(value, list):
-            return None
-        out: List[Dict[str, Any]] = []
-        for entry in value[:REVIEW_FINDINGS_MAX]:
-            if not isinstance(entry, dict) or not isinstance(entry.get("finding"), str):
-                return None
-            finding = " ".join(entry["finding"].split())[:REVIEW_FINDING_CHARS]
-            if not finding:
-                return None
-            item: Dict[str, Any] = {"finding": finding}
-            if isinstance(entry.get("file"), str) and entry["file"]:
-                item["file"] = entry["file"]
-            if isinstance(entry.get("line"), int) and entry["line"] > 0:
-                item["line"] = entry["line"]
-            out.append(item)
-        return out
+    def _step_target(open_: List[str], named: Any) -> Optional[str]:
+        """The open prose criterion a verify step answers: the one it names,
+        or the only one there is."""
+        if isinstance(named, str):
+            want = " ".join(named.split()).casefold()
+            return next((t for t in open_ if " ".join(t.split()).casefold() == want), None)
+        return open_[0] if len(open_) == 1 else None
 
-    @staticmethod
-    def _finding_line(finding: Dict[str, Any]) -> str:
-        where = ""
-        if "file" in finding:
-            where = "`%s`%s: " % (finding["file"],
-                                  " (line %d)" % finding["line"] if "line" in finding else "")
-        return where + finding["finding"]
+    def _read_verify_step(self, repo: str, issue: Dict[str, Any], text: str,
+                          raw: Any) -> bool:
+        """Read one verify step through the repo's adapter and record what the
+        station saw for the criterion `text`; whether the read proved it."""
+        step, why = live_proof.adapter_step(raw if isinstance(raw, str) else "")
+        if step is None:
+            ok, seen = False, "refused: %s" % why
+        else:
+            ok, seen = live_proof.run(step, self._shipped_stamp(repo, issue),
+                                      self._proof_sources(repo), now=self.now)
+        shown = self._note_text(raw)
+        if not ok:
+            seen = "the verify run's step %s failed: %s" % (shown, self._note_text(seen))
+        self._record_prose(repo, int(issue["number"]), text, shown, ok, seen)
+        return ok
 
-    def _report_review(self, lane: str, kind: str, repo: str, number: int,
-                       name: str, text: str) -> bool:
-        """Apply a finished Luna review run (loom#2142): post the lane's
-        review.json on the pull request as a verdict in the Elder's markings
-        shape, with its blocking findings as review threads when they name a
-        file and a line, so the factory's gate and fix rounds read them
-        exactly like the review bot's own. A failed run, an unreadable
-        result or a result in the wrong shape posts nothing: the factory
-        dispatches again after its retry window. A result also posts
-        nothing when it did not come from the review slot's own Luna run:
-        the gate trusts the posted verdict, so no other lane or model may
-        speak it."""
-        if kind == "failed":
-            _say("Luna review run %s on lane %s failed; %s#%d keeps waiting for "
-                 "a verdict" % (name, lane, repo, number))
-            return True
-        if lane != factory.LUNA_REVIEW_LANE:
-            _say("Luna review run %s reported on lane %s, not the review slot "
-                 "%s; its verdict is not posted" % (name, lane, factory.LUNA_REVIEW_LANE))
-            return True
-        model = self._review_model(lane, name)
-        if model != factory.LUNA_MODEL:
-            _say("Luna review run %s recorded model %s, not %s; its verdict is "
-                 "not posted" % (name, model or "none", factory.LUNA_MODEL))
-            return True
-        result, why = self._read_review(lane, name)
-        if result is None:
-            _say("Luna review run %s left no usable verdict: %s" % (name, why))
-            return True
-        blocking = self._review_findings(result.get("blocking"))
-        notes = self._review_findings(result.get("notes"))
-        summary = result.get("summary")
-        pr_field = self._field(text, "Review-PR")
-        sha = self._field(text, "Head-Sha")
-        if (blocking is None or notes is None or not isinstance(summary, str)
-                or not pr_field.isdigit() or not sha):
-            _say("Luna review run %s wrote a verdict in the wrong shape; "
-                 "nothing posted" % name)
-            return True
-        pr_number = int(pr_field)
-        # Each anchored blocking finding becomes a review thread of its own
-        # (one pulls/comments post per finding), so the factory's fix rounds
-        # and rebuttal reads meet them exactly like the review bot's threads.
-        for finding in [f for f in blocking if "file" in f and "line" in f]:
-            try:
-                self.gh.rest("POST", "/repos/%s/pulls/%d/comments" % (repo, pr_number), {
-                    "commit_id": sha, "path": finding["file"],
-                    "line": finding["line"], "side": "RIGHT",
-                    "body": finding["finding"]})
-            except GitHubError as err:
-                _say("could not post a Luna review thread on %s#%d (%s); the "
-                     "finding still lands in the verdict comment" % (repo, pr_number, err))
-        lines = [factory.LUNA_REVIEW_MARKER % sha,
-                 "Elder markings - %d blocking, %d total"
-                 % (len(blocking), len(blocking) + len(notes)),
-                 "", " ".join(summary.split())[:1000] or "The lane gave no summary.",
-                 "",
-                 "This verdict comes from a Codex Luna review (lane %s, gpt-6-luna "
-                 "through `codex exec`) while the Elder review route is degraded. "
-                 "The merge gate reads it for this head in the degraded check's "
-                 "place." % lane]
-        if blocking:
-            lines += ["", "Blocking findings:"] + \
-                     ["- " + self._finding_line(f) for f in blocking]
-        if notes:
-            lines += ["", "Notes:"] + ["- " + self._finding_line(f) for f in notes]
-        try:
-            notify.post(self.gh, repo, pr_number, "\n".join(lines), notify.RECORD)
-        except GitHubError as err:
-            _say("could not post the Luna verdict on %s#%d (%s)" % (repo, pr_number, err))
-            return True
-        _say("posted the Luna verdict on %s#%d: %d blocking, %d total"
-             % (repo, pr_number, len(blocking), len(blocking) + len(notes)))
-        return True
+    def _prose_evidence(self, repo: str, number: int, body: str) -> Dict[str, str]:
+        """What the station's own reads saw for each live criterion that
+        passed, by criterion text, for the close note."""
+        mine = self._live_checks().get("%s#%d" % (repo, number))
+        mine = mine if isinstance(mine, dict) else {}
+        found = {t: mine.get(criteria_gate.key(t)) for _, t in criteria_gate.needing_evidence(body)}
+        return {t: str(v.get("seen")) for t, v in found.items()
+                if isinstance(v, dict) and v.get("result") == "pass"}
+
+    def _run_verify_step(self, repo: str, number: int, result: Dict[str, Any]) -> None:
+        """Read a verify run's templated step through the repo's adapter
+        and prove the prose box on that read alone (loom#1855); a refused or
+        failed step is recorded for the one ask. A ticket proven on it, with
+        no other gap, is verified and closed quoting the lines."""
+        issue = self._issue(repo, number)
+        names = _label_names(issue)
+        body = str(issue.get("body") or "")
+        open_ = self._prose_open(repo, number, body)
+        if issue.get("state") != "open" or "loom:shipped" not in names \
+                or "loom:verified" in names or not open_:
+            _say("%s#%d has no prose live criterion to read; its verify step is dropped"
+                 % (repo, number))
+            return
+        text = self._step_target(open_, result.get("criterion"))
+        if text is None:
+            seen = "the verify run's step %s names no open criterion" % self._note_text(
+                result["step"])
+            for each in open_:
+                self._record_prose(repo, number, each, "", False, seen)
+            return
+        if not self._read_verify_step(repo, issue, text, result["step"]) \
+                or criteria_gate.unverified(body, self._live_passed(repo, number, body)):
+            return
+        outcome = live_proof.Outcome(True, self._prose_evidence(repo, number, body), [], None)
+        _, held = self._close_proven(repo, issue, outcome, self._shipped_stamp(repo, issue))
+        if held:
+            _say("could not close %s#%d on its verify step: %s" % (repo, number, held))
 
     def _refute_merged(self, lane: str, repo: str, number: int, why: Any) -> None:
         """A verify run's answer that the merged change does not meet the
@@ -9170,6 +9200,9 @@ class Station:
                     left -= 1
                     continue
                 why = self._done_reason(issue, self._earliest_record(repo, issue, log_root))
+                if self._prose_ask_due(repo, issue):
+                    self._evidence_holds(repo, issue)
+                    continue
                 if not why or self._evidence_holds(repo, issue):
                     continue
                 if self._close_done_ticket(repo, issue, why):
@@ -9447,6 +9480,26 @@ class Station:
         }
         return record, verify_data.proof_facts(branch, pulls), ""
 
+    def _prose_failures(self, repo: str, number: int, prose: Sequence[str]) -> Dict[str, str]:
+        """What each prose box's verify step saw when it failed, by key."""
+        mine = self._live_checks().get("%s#%d" % (repo, number))
+        mine = mine if isinstance(mine, dict) else {}
+        found = {criteria_gate.key(t): mine.get(criteria_gate.key(t)) for t in prose}
+        return {k: str(v.get("seen")) for k, v in found.items()
+                if isinstance(v, dict) and v.get("result") == "fail"}
+
+    def _prose_ask_due(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether a shipped ticket has a verify step or answer that failed:
+        its ask is due even when the done close would pass over the ticket (a
+        Live line with a date window or log strings, a host check)."""
+        labels = set(_label_names(issue))
+        if ("loom:shipped" not in labels or "loom:verified" in labels
+                or labels & set(CLOSE_DONE_HOLDS)):
+            return False
+        number = int(issue["number"])
+        return bool(self._prose_failures(repo, number, self._prose_gaps(
+            repo, number, str(issue.get("body") or ""))))
+
     def _live_ask_room(self) -> bool:
         """Whether another unverified-criteria ask fits this hour; takes it."""
         state = self._live_checks()
@@ -9461,8 +9514,10 @@ class Station:
     def _evidence_holds(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether a done ticket stays open because a live or operator
         criterion has no evidence (bus/criteria_gate.py): a live one with a
-        check Loom can run gets the check; one with none, a failed check, or
-        an operator action sends the ticket to needs:human with one ask, once.
+        check Loom can run gets the check, and one with none in an opted-in
+        adapter repo gets a verify run first (_prose_gaps); one with none, a
+        failed check or step, or an operator action sends the ticket to
+        needs:human with one ask, once.
         2026-10-22 audit: at least 12 tickets of the private deployment repo
         closed shipped on green CI with live criteria never checked."""
         number = int(issue["number"])
@@ -9474,8 +9529,10 @@ class Station:
         gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
         if not gaps:
             return False
+        prose = self._prose_gaps(repo, number, body)
+        failed.update(self._prose_failures(repo, number, prose))
         waiting = [t for k, t in gaps if k == criteria_gate.LIVE
-                   and criteria_gate.check_of(t) is not None
+                   and (criteria_gate.check_of(t) is not None or t in prose)
                    and criteria_gate.key(t) not in failed]
         if waiting or needs_human(_label_names(issue)) or not self._live_ask_room():
             return True

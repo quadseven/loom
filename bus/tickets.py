@@ -893,6 +893,26 @@ def render_review_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
     return text
 
 
+def adapter_section(prose: Sequence[str], sources: Sequence[str], sql: bool) -> str:
+    """The verify brief's section for live criteria in prose in a repo with a
+    live-evidence adapter (loom#1855): the criteria, the adapter's log sources
+    and SQL route, and the third answer a run may give, a step the station
+    reads through the adapter itself."""
+    routes = ["- log sources: %s" % (", ".join("`log:%s`" % s for s in sources) or "none")]
+    routes.append("- SQL: a read-only SELECT, written `sql:SELECT ...`" if sql else "- SQL: none")
+    return ("\n## Live evidence adapter\n\nThese live criteria name no check the station can "
+            "run:\n%s\n\nThe repo declares a read-only live-evidence adapter the station "
+            "reads for you. Its routes:\n%s\n\nYou have no network, so you cannot read them; "
+            "answer verify.json with a third form instead, a step the station runs itself "
+            "and proves the criterion on only if its own read finds the strings:\n\n"
+            "```json\n{\"step\": \"`log:<source>` `<string to find>`\", "
+            "\"criterion\": \"<the criterion text, exactly>\"}\n```\n\n"
+            "For SQL, `{\"step\": \"`sql:SELECT ...` `<string the answer must contain>`\"}`. "
+            "Put every step span in backticks. Name the criterion when more than one is listed. "
+            "Answer {\"missing\": ...} when no step proves it." % (
+                "\n".join("- %s" % " ".join(t.split()) for t in prose), "\n".join(routes)))
+
+
 def _login(value: Any) -> str:
     return str((value or {}).get("login") or "").lower() if isinstance(value, dict) else ""
 
