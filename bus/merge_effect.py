@@ -11,7 +11,7 @@ cannot tell never holds a real change back.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from . import change_class
 
@@ -22,6 +22,11 @@ _DEFS = (
     re.compile(r"^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\("),
     re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w-]*)\s*\(\)\s*\{"),
     re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\("),
+)
+# Also a symbol a later change can undo: a class or a module constant.
+_SYMBOLS = _DEFS + (
+    re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_]\w*)"),
+    re.compile(r"^([A-Z][A-Z0-9_]+)\s*(?::[^=]+)?=[^=]"),
 )
 _SKIP_NAMES = {"main", "setUp", "tearDown", "init", "__init__"}
 _CODE_EXTS = (".py", ".go", ".sh", ".js", ".ts", ".jsx", ".tsx")
@@ -38,17 +43,35 @@ def _removed(patch: str) -> List[str]:
     return [x for x in patch.splitlines() if x.startswith("-") and not x.startswith("---")]
 
 
-def _defined(lines: Sequence[str]) -> Dict[str, str]:
+def _defined(lines: Sequence[str], defs: Sequence[Any] = _DEFS) -> Dict[str, str]:
     """name -> its defining line, for each definition among the added lines."""
     found: Dict[str, str] = {}
     for line in lines:
-        for rx in _DEFS:
+        for rx in defs:
             match = rx.match(line)
             if match and match.group(1) not in _SKIP_NAMES \
                     and not match.group(1).startswith("test"):
                 found[match.group(1)] = line
                 break
     return found
+
+
+def is_code(path: str) -> bool:
+    """A source file whose symbols this module can read."""
+    return path.endswith(_CODE_EXTS)
+
+
+def symbols_in(text: str) -> Set[str]:
+    """The symbols a source file's text defines."""
+    return set(_defined(text.splitlines(), _SYMBOLS))
+
+
+def changed_symbols(patch: str) -> Tuple[Set[str], Set[str]]:
+    """(added, removed): the symbols a patch adds, and the ones it removes
+    and does not add back."""
+    added = set(_defined(_added(patch), _SYMBOLS))
+    removed = set(_defined([x[1:] for x in _removed(patch)], _SYMBOLS))
+    return added, removed - added
 
 
 def _name(f: Mapping[str, Any]) -> str:

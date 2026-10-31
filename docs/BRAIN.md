@@ -54,6 +54,8 @@ that talks to GitHub about tickets.
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:closed-unmerged` | The linked pull request closed without merging. |
 | `loom:shipped` | Deployed. Loom's own tickets are shipped by the station when it deploys the revision that carries their pull request (see Shipping Loom itself); other repos keep their goal home's ship rules, under whoever owns shipping there (which may not be the brain). |
+| `closed-unproven` | The station closed the ticket on merged code with its Live box unproven (see The evidence close). It stays on a reopened ticket, and such a ticket never closes this way again. |
+| `loom:proof-due` | The repo's one rolling Proof due issue (see The evidence close). Never a ticket. |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
 | `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `needs:human`. |
 | `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
@@ -974,7 +976,11 @@ confidence`) is not sent back: a lane cannot fix it. The station leaves the
 ticket at `loom:pr` with no fix comment, no round counted and no
 `loom:ready`, and the factory asks the review bot to review the head again
 (`/grug improve`, once per head commit). Real failures beside it are sent
-back without it.
+back without it. The same request goes to any open lane pull request whose
+review check failed degraded, whatever state its ticket is in or whatever else
+fails on the head, once per head commit and at most `claimed.REREVIEW_PER_RUN`
+requests a factory pass; the log names each request against that bound and the
+pull request that waits for the next pass.
 
 A review check that failed only on a split request is not sent back either.
 When its summary carries a `Reviewability` note of kind `cross-cohort-proof`,
@@ -1653,7 +1659,8 @@ request whose ticket carries `needs-brain`, oldest first, with its ticket,
 its age in hours and its merge-ready line. The factory sets `needs-brain`
 when a ticket runs out of fix rounds as well as for a sensitive change, and a
 logic pull request with failing checks appeared in no other section, so it
-waited until the `lane-pr-stalled` invariant filed it (loom#1411). The brain
+waited until the `lane-pr-stalled` invariant listed it (loom#1411; since
+loom#2099 a line of that invariant's one tracking issue per repo, docs/LANES.md). The brain
 takes these first: merge it, or send it back with `bus.brain fix`.
 
 ### Landing lock
@@ -1816,7 +1823,8 @@ operator:
   Muse, the deploy-watch revert path, the roll pin);
 - an issue close (a done or verified ticket, an epic, a rewritten source
   issue, an operator-claimed issue, an invariant breach that cleared or was
-  folded into its rolling issue) and a move to `loom:shipped`;
+  folded into its rolling issue) and a move to `loom:shipped`, except the
+  evidence close (see The evidence close);
 - an issue reopen (an invariant breach seen again, a failed audit's ticket
   or source issue);
 - a label that grants a merge (`ready-to-land`), and any GraphQL label write
@@ -1993,6 +2001,49 @@ adapter keep themselves read-only (a SELECT-only user, a reader that cannot
 exec). An adapter error, a timeout or too much output is no evidence, and the
 status line names it.
 
+### The evidence close
+
+By the operator's ruling of 2026-10-31 (loom#2325), one close revises the
+rule above, for one kind of ticket. The station closes a `loom:shipped`
+ticket with its one Live box unproven when all of these hold:
+
+- that Live box is the ticket's only unticked box;
+- it has no regression, urgent, runaway, `needs-brain` or `loom:audit-failed`
+  label, no open ask, no `wait:` label, and never closed this way before;
+- every linked pull request is merged, green on its merge commit (a neutral
+  review check counts, and at least one check succeeded), and on the default
+  branch;
+- every pull request's tier is below deploy-config;
+- each symbol a pull request added is still defined on the default branch,
+  and each one it removed is still gone, read from the file itself;
+- Loom has no check of its own for the box (a station proof, a runnable check
+  or a time window), and the box is known to be meetable
+  (`bus/unmeetable.py`).
+
+A doubt refuses: a missing patch, an unreadable file, a failed lookup. A
+refused ticket goes to the usual done close and is read again after 6 hours.
+Checks still running leave the ticket for a later pass with no ask.
+
+The close carries `closed-unproven` and `force-close`, and is the one close
+that passes through shadow. The station names the ticket in code, so no label
+or `gh` call can ask for it. Merges stay held. The box is first written into
+the repo's one rolling Proof due issue, edited in place, so nothing closes
+unlisted. The close makes no AI call.
+
+At most 3 closes and 6 tickets read a pass, and 10 closes a day. Each pass
+that reads one logs its counts and these bounds in one `evidence close:` line.
+Clearing a stock in bulk is not this close's job.
+
+Reopens stay at or below 5% of the last 100 closes. One listing per repo finds
+reopened tickets, and a reopen stays counted after the ticket closes again.
+Above the limit this close stops, says so in the log and in each Proof due
+issue, and the usual done close takes over. A first reopen in fewer than 20
+closes stops it too. The count is a floor: it sees only reopens someone made.
+
+    python3 -m bus.evidence_close status
+    python3 -m bus.evidence_close pause
+    python3 -m bus.evidence_close resume    # closes before now stop counting
+
 ## Post-merge watch
 
 After a Loom auto-merge (a `loom/` lane pull request merged by a Loom App,
@@ -2107,9 +2158,10 @@ pull request's line, so a brain sees them and adopts them.
 The station adopts the rest (decision 0002, item 1). Each pass, for the
 oldest open pull request in a scanned repo that is not a draft, comes from
 a `LOOM_BRIEF_AUTHORS` login on a branch of the repo itself, opened at
-least 2 hours ago (`ADOPT_GRACE`; one with no creation time counts as old
-enough), and that no open ticket links (by a `Refs` line or a `loom/N`
-branch), it re-reads the pull request and, if it is still open and not
+least 48 hours ago (`ADOPT_GRACE`; one with no creation time counts as old
+enough), quiet for that long as well when its branch is outside `loom/`
+(no commit or comment, read from `updated_at`), and that no open ticket
+links (by a `Refs` line or a `loom/N` branch), it re-reads the pull request and, if it is still open and not
 merged, files one
 ticket under the repo's goal home: "Land or supersede #N", in the normal
 brief format with `Difficulty: medium`. The lane that takes it lands the

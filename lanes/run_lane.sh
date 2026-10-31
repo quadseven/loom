@@ -310,6 +310,33 @@ mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
 PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
 
+# A check that hashes a file needs a sha256sum this machine can execute. The
+# lane plist puts the Intel Homebrew bin directory ahead of everything but the
+# arm64 one, and an x86_64 coreutils link there never runs on an arm64 host
+# without Rosetta (#2317). The macOS system binary sits in /sbin, on no lane's
+# PATH, so its directory goes in just before the one that holds the broken
+# tool: it can shadow only that directory and those after it.
+tool_runs() { printf '' | "$1" > /dev/null 2>&1; }
+runnable_sha256sum_on_path() {
+  local found dir holder tail
+  found="$(command -v sha256sum)"
+  [ -n "$found" ] && tool_runs "$found" && return 0
+  for dir in ${LOOM_SHA256SUM_DIRS:-/sbin /usr/bin /bin}; do
+    [ -x "$dir/sha256sum" ] && tool_runs "$dir/sha256sum" || continue
+    if [ -n "$found" ]; then
+      holder="$(dirname "$found")"
+      case "$PATH" in
+        "$holder":*) PATH="$dir:$PATH" ;;
+        *) tail="${PATH#*:"$holder":}"; PATH="${PATH%%:"$holder":*}:$dir:$holder:$tail" ;;
+      esac
+    else
+      PATH="$PATH:$dir"
+    fi
+    return 0
+  done
+}
+runnable_sha256sum_on_path
+
 field() { grep -m1 "^$1:" "$2" | cut -d' ' -f2-; }
 
 # LOOM_<LANE>_<SUFFIX>, e.g. opencode-go + MODEL -> LOOM_OPENCODE_GO_MODEL.
@@ -2327,7 +2354,7 @@ exclude_untracked() {
 # Only a red default branch check is a base-check factory incident. Returns
 # 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
-  local rc interp="" subs="" changed what baseline_rev
+  local rc interp="" subs="" changed what baseline_rev tool=""
   SETUP_REASON=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
@@ -2335,6 +2362,11 @@ prepare_validation() {
   if ! sandbox_ready; then
     SETUP_REASON="$SANDBOX_WHY"
     note_factory_incident environment "$SANDBOX_WHY" SETUP_REASON
+  elif ! tool="$(command -v sha256sum)" || ! tool_runs "$tool"; then
+    # The host's fault, whatever the repo: a check that hashes a file would
+    # read as a red default branch and file a base-check incident.
+    SETUP_REASON="lane host fault: sha256sum${tool:+ at $tool} cannot run"
+    note_factory_incident environment "sha256sum: ${tool:-not on PATH}" SETUP_REASON
   elif [ -n "$C_INTERP" ] && ! interp="$(command -v "$C_INTERP")"; then
     SETUP_REASON="interpreter $C_INTERP is not on PATH"
     note_factory_incident environment "interpreter: $C_INTERP" SETUP_REASON
