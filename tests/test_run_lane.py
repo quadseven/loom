@@ -5969,6 +5969,7 @@ exit %d
         self.write_tool(broken / "sha256sum", "#!/bin/sh\necho 'Bad CPU type in executable' >&2\nexit 126\n")
         return broken, f"{broken}:{self.lane_env()['PATH']}"
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_lane_resolves_sha256sum_to_one_that_runs(self):
         # 30 runs of one repo's base check failed on the lane machine's
         # x86_64 Homebrew sha256sum, though that repo's main was green.
