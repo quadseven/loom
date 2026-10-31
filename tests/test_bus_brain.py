@@ -1817,6 +1817,20 @@ class SensitiveResumeTests(unittest.TestCase):
             self.assertIn(text, note)
         self.assertNotIn("First works", note)
 
+    def test_the_brains_requeue_note_names_a_live_box_left_open_too(self):
+        # loom#2333: the note names every open box, not only the code ones.
+        body = ("## Acceptance criteria\n- [ ] First works; test.\n- [ ] Second works.\n"
+                "- [ ] Verify the shape holds\n")
+        pull = ("## Acceptance criteria\n- [x] First works; test.\n"
+                "- [ ] Second works.; not built: needs a key\n"
+                "- [ ] Verify the shape holds; not built: needs a key\n")
+        labels, fake = self._merge_with_files(self.CALLED, ticket_body=body, pull_body=pull)
+        self.assertEqual(labels, ["loom:ticket", "loom:queued"])
+        note = [c[2]["body"] for c in fake.calls if c[1].endswith("/issues/9/comments")][0]
+        self.assertIn("Second works.", note)
+        self.assertIn("Verify the shape holds", note)
+        self.assertNotIn("First works", note)
+
     def test_merge_of_a_pull_request_that_builds_every_box_marks_merged(self):
         pull = ("## Acceptance criteria\n- [x] First works; test.\n- [x] Second works.\n"
                 "- [x] `Third` works\n- [x] Fourth  works.\n")
