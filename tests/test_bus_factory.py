@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 from unittest import mock
 
-from bus import brain, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
+from bus import brain, claimed, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
 from bus.github import GitHubError, Response
 from bus.tickets import FIX_MARKER
 
@@ -4764,6 +4764,71 @@ class LunaReview(Base):
         self.assertIn("loom:factory", self.gh.filed[0]["labels"])
         self.assertIn("sha50", self.gh.filed[0]["title"])
         self.assertEqual(self.fixed, [])
+
+
+class DegradedReviewAgain(Base):
+    """A degraded partial review gets one re-review request whatever state
+    its ticket is in (loom#2286). The titles and summaries are the live
+    check's words."""
+
+    PARTIAL = {"title": "WARN Elder review coverage partial",
+               "summary": "Degraded review (partial_review): not a verdict. Comment "
+                          "`/grug improve` to re-run once the backend recovers.\n\n"
+                          "Grug walked part of the diff."}
+    FINDINGS = {"title": "Living Hunt de6963f3..9559b01a - Elder markings - 1 blocking, 1 total",
+                "summary": "## Markings Board\n\n| high | `bus/station.py` | It drops the "
+                           "line `Degraded review (partial_review): not a verdict`. |"}
+
+    def head(self, number, ticket, output, state="failed"):
+        """A lane pull request whose review check failed with this output, on
+        a ticket at `state` that the factory's ticket steps leave alone."""
+        self.gh.ticket(ticket, state)
+        self.gh.issues[ticket]["labels"].append({"name": factory.HANDOFF_LABEL})
+        self.gh.pull(number, ticket, green=False)
+        self.gh.runs["sha%d" % number] = [
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+             "conclusion": "failure", "output": dict(output),
+             "details_url": "https://github.com/%s/actions/runs/79/job/1" % REPO}]
+
+    def asks(self, number):
+        marker = factory.REVIEW_AGAIN_MARKER % ("sha%d" % number)
+        return [c for c in self.gh.comments.get(number, [])
+                if marker in str(c.get("body") or "")]
+
+    def test_a_degraded_head_off_the_pr_state_gets_one_request(self):
+        self.head(50, 5, self.PARTIAL)
+        with mock.patch.object(factory, "_say") as said:
+            self.go()
+        self.assertEqual(len(self.asks(50)), 1)
+        self.assertIn("/grug improve", self.asks(50)[0]["body"])
+        self.assertIn("1 of %d" % claimed.REREVIEW_PER_RUN,
+                      "\n".join(str(call.args[0]) for call in said.call_args_list))
+
+    def test_a_second_pass_on_that_head_posts_no_second_request(self):
+        self.head(50, 5, self.PARTIAL)
+        self.go()
+        self.go()
+        self.assertEqual(len(self.asks(50)), 1)
+
+    def test_an_elder_failure_with_real_findings_gets_no_request(self):
+        self.head(50, 5, self.FINDINGS, state="pr")
+        self.head(52, 7, self.PARTIAL)
+        self.go()
+        self.assertEqual(self.asks(50), [])
+        self.assertEqual([n for n, _, _ in self.fixed], [50])
+        self.assertEqual(len(self.asks(52)), 1)
+
+    def test_requests_stop_at_the_bound_and_the_rest_wait_for_the_next_pass(self):
+        heads = range(claimed.REREVIEW_PER_RUN + 1)
+        for n in heads:
+            self.head(50 + n, 5 + n, self.PARTIAL)
+        with mock.patch.object(factory, "_say") as said:
+            self.go()
+        self.assertEqual(sum(len(self.asks(50 + n)) for n in heads), claimed.REREVIEW_PER_RUN)
+        self.assertIn("waits for the next pass",
+                      "\n".join(str(call.args[0]) for call in said.call_args_list))
+        self.go()
+        self.assertEqual(sum(len(self.asks(50 + n)) for n in heads), len(heads))
 
 
 if __name__ == "__main__":
