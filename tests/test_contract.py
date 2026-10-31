@@ -54,9 +54,27 @@ class ContractFormTests(unittest.TestCase):
 
     def test_unreadable_contracts_are_refused(self):
         for text in ("", "interpreter: uv\nbogus line\n", "lint |  | a.yml | s\n",
-                     "deploy | make | a.yml | s\n", "[lint]\nrun = \"x\"\n"):
+                     "deploy | make | a.yml | s\n", "[lint]\nrun = \"x\"\n", "[lint]\ncommand =\n"):
             with self.assertRaises(ValueError, msg=text):
                 contract.normalize(text)
+
+    def test_unquoted_command_parses(self):
+        text = ('[lint]\ncommand = uv run ruff check .\nworkflow = a.yml\nstep = lint\n')
+        self.assertEqual(contract.normalize(text),
+                         "interpreter: uv\ncheck: uv run ruff check .\n")
+
+    def test_quoted_command_parses_unchanged(self):
+        text = '[test]\ncommand = "uv run pytest -q"\n'
+        self.assertEqual(contract.normalize(text),
+                         "interpreter: uv\ncheck: uv run pytest -q\n")
+
+    def test_unquoted_four_tables_join_in_kind_order(self):
+        text = ('[lint]\ncommand = uv run ruff check .\nworkflow = a.yml\nstep = lint\n\n'
+                '[format]\ncommand = uv run ruff format --check .\nworkflow = a.yml\nstep = format\n\n'
+                '[type]\ncommand = uv run ty check\nworkflow = a.yml\nstep = type\n\n'
+                '[test]\ncommand = uv run pytest -q\nworkflow = a.yml\nstep = test\n')
+        self.assertEqual(contract.normalize(text),
+                         "interpreter: uv\ncheck: uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pytest -q\n")
 
 
 if __name__ == "__main__":

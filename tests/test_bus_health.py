@@ -801,6 +801,157 @@ class RegressionThroughBrain(unittest.TestCase):
         self.assertEqual(ticket["body"].count("## Regression"), 1)
 
 
+class RegressionDeploymentStatus(Base):
+    """A regression re-brief lists merged PRs with their deployment status."""
+
+    def test_regression_rebrief_includes_deployment_status_lines(self):
+        # Test that regression_body includes extra_evidence lines for PR deployment status
+        f = health._finding(finding())[0]
+        body = health.regression_body(f, 100, 26.0, "", extra_evidence=[
+            "Merged pull requests since ship:",
+            "PR #123: deployed",
+            "PR #124: merged, not deployed",
+            "PR #125: deploy state unknown"
+        ])
+        evidence = "\n".join(brain._regression_evidence(body, 100))
+        self.assertIn("PR #123: deployed", evidence)
+        self.assertIn("PR #124: merged, not deployed", evidence)
+        self.assertIn("PR #125: deploy state unknown", evidence)
+        # The extra evidence appears before the finding description
+        self.assertLess(evidence.index("PR #123: deployed"), evidence.index("The health finding"))
+        self.assertLess(evidence.index("PR #124: merged, not deployed"), evidence.index("The health finding"))
+        self.assertLess(evidence.index("PR #125: deploy state unknown"), evidence.index("The health finding"))
+
+
+class Diagnosis(Base):
+    """A goal home's diagnosis command is quoted in every health brief and
+    regression re-brief, cleaned and capped like finding text (loom#1243)."""
+
+    BLOCK = "untrusted data from the diagnosis command"
+
+    def run_with(self, command, now=NOW):
+        intake = health.Intake(self.gh, self.state, now, "2030-01-02T00:00:00Z",
+                               self.said.append, read=self.read, brief=self.brief,
+                               clock=lambda: NOW + 5)
+        intake.run([health.Source(REPO, 1, URL, command)])
+        return intake
+
+    def test_a_health_brief_quotes_the_command_output_cleaned_and_capped(self):
+        # The key arrives in the environment; markdown control is cleaned;
+        # 45 lines are cut to 40 with a note; blank lines are dropped.
+        command = ("printf 'key %s\\n\\n12 of 30 runs ended `stalled` # see\\n' "
+                   "\"$LOOM_HEALTH_KEY\"; i=0; while [ $i -lt 45 ]; do "
+                   "echo \"row $i ready 2/3\"; i=$((i+1)); done")
+        self.run_with(command)
+        self.assertEqual(len(self.briefs), 1)
+        body = self.briefs[0]["body"]
+        self.assertIn(self.BLOCK, body)
+        self.assertIn("The diagnosis command printf ran at %s" % stamp(NOW + 5), body)
+        block = body.split(self.BLOCK, 1)[1].split("```text\n", 1)[1].split("\n```", 1)[0]
+        lines = block.split("\n")
+        self.assertEqual(lines[0], "key slow-search:Ana")
+        self.assertEqual(lines[1], "12 of 30 runs ended stalled see")
+        self.assertEqual(len(lines), health.DIAGNOSIS_LINES + 1)
+        self.assertEqual(lines[-1], "(cut at 40 of 47 lines)")
+        self.assertNotIn("row 38", block)
+        # It sits in the Why, after the finding's own quote, and the brief
+        # still passes the checks brain brief applies.
+        self.assertLess(body.index("evidence: 3 members"), body.index(self.BLOCK))
+        self.assertLess(body.index(self.BLOCK), body.index("## What"))
+        brain._check_brief_args(self.briefs[0]["title"], body, None, None, None)
+        brain._check_written_text(body)
+
+    def test_the_command_line_itself_never_reaches_the_brief(self):
+        self.run_with("SECRET_TOKEN_VALUE=x true; echo fine 2>/dev/null")
+        body = self.briefs[0]["body"]
+        self.assertIn("The diagnosis command the goal's command ran at", body)
+        self.assertNotIn("SECRET", body)
+        self.assertNotIn("/dev/null", body)
+        self.assertEqual(health.command_name("/opt/goal/bin/diagnose.sh --db x"), "diagnose.sh")
+        self.assertEqual(health.command_name("'unclosed"), "the goal's command")
+
+    def test_without_a_command_or_when_it_fails_the_brief_says_which(self):
+        cases = [
+            ("", "No diagnosis command is set for this goal home"),
+            ("echo partial; exit 3", "ran at %s and failed (exit 3)" % stamp(NOW + 5)),
+            ("true", "and printed nothing"),
+            ("echo see https://example.test/x", "its output was refused (line 1 looks "
+                                                "like it names a URL)"),
+            ("echo ok; echo token=abc", "its output was refused (line 2 looks like it "
+                                        "names a credential)"),
+            ("printf 'caf\\303\\251\\n'", "printed text that is not ASCII"),
+        ]
+        for command, said in cases:
+            with self.subTest(command=command):
+                self.setUp()
+                self.run_with(command)
+                body = self.briefs[0]["body"]
+                self.assertIn(said, body)
+                self.assertIn("so this brief carries only the endpoint's line", body)
+                self.assertNotIn(self.BLOCK, body)
+                self.assertNotIn("partial", body)
+                self.assertNotIn("example.test/x", body)
+                self.assertNotIn("abc", body)
+
+    def test_a_command_that_runs_too_long_is_stopped(self):
+        with unittest.mock.patch.object(health, "DIAGNOSIS_TIMEOUT", 1):
+            started = time.monotonic()
+            self.run_with("echo early; sleep 20")
+            self.assertLess(time.monotonic() - started, 10)
+        body = self.briefs[0]["body"]
+        self.assertIn("and timed out after 1 seconds", body)
+        self.assertNotIn("early", body)
+
+    def test_a_regression_brief_carries_it_in_the_evidence_lines(self):
+        Regression.shipped_ticket(self)
+        self.run_with("echo 110 clears stopped in 96 hours; echo 65 waited on range")
+        made = [b for b in self.briefs if b["regresses"] is not None]
+        self.assertEqual(len(made), 1)
+        body = made[0]["body"]
+        # brain keeps only the lines after "Regresses #N" when it re-briefs
+        # the ticket in place, so the block must be among them.
+        evidence = "\n".join(brain._regression_evidence(body, 100))
+        self.assertIn(self.BLOCK, evidence)
+        self.assertIn("```text\n110 clears stopped in 96 hours\n65 waited on range\n```",
+                      evidence)
+        # Run once, quoted once.
+        self.assertEqual(body.count(self.BLOCK), 1)
+        brain._check_brief_args(made[0]["title"], body, None, None, None)
+
+    def test_the_ticket_re_briefed_through_brain_carries_the_block(self):
+        f = health._finding(finding())[0]
+        ticket = {"number": 100, "state": "open", "html_url": "https://example.test/t/100",
+                  "body": "Difficulty: medium\nPriority: P1\n\n" + health.ticket_body(f),
+                  "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]}
+        repo = RegressionThroughBrain.Repo(ticket)
+        doc = {"checked_at": "2030-01-02T00:00:00Z", "findings": [finding()]}
+        with unittest.mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "16"}):
+            health.Intake(repo, {}, NOW, "2030-01-02T00:00:00Z", lambda line: None,
+                          read=lambda url: doc, clock=lambda: NOW).run(
+                [health.Source(REPO, 1, URL, "echo 12 of 30 runs stalled")])
+        regression = ticket["body"].split("## Regression", 1)[1]
+        self.assertIn(self.BLOCK, regression)
+        self.assertIn("```text\n12 of 30 runs stalled\n```", regression)
+        tickets.parse(ticket["body"])
+
+    def test_the_setting_maps_goal_homes_to_commands(self):
+        raw = json.dumps({REPO + "#1": "echo one", REPO + "#2": "echo two"})
+        s = station.Settings.from_env({"LOOM_REPOS": REPO, "LOOM_HEALTH_DIAGNOSE_CMDS": raw})
+        self.assertEqual(s.health_diagnose, {REPO + "#1": "echo one", REPO + "#2": "echo two"})
+        sources, problems = health.parse_sources("%s#1=%s %s#3=%s" % (REPO, URL, REPO, URL),
+                                                 s.health_diagnose)
+        self.assertEqual((sources, problems), ([health.Source(REPO, 1, URL, "echo one"),
+                                                health.Source(REPO, 3, URL, "")], []))
+        for bad in ("not json", "[1]", json.dumps({REPO: "echo"}),
+                    json.dumps({REPO + "#1": ""}), json.dumps({REPO + "#1": 3})):
+            with self.subTest(bad=bad):
+                commands, problem = health.diagnose_commands(bad)
+                self.assertEqual(commands, {})
+                self.assertTrue(problem)
+                self.assertNotIn(bad, problem)
+        self.assertEqual(health.diagnose_commands(""), ({}, ""))
+
+
 class Proof(Base):
     """A shipped ticket whose finding stays absent 24 hours is given the
     Live criterion's evidence (loom#585)."""

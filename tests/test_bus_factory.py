@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 from unittest import mock
 
-from bus import brain, factory, labels, merge_tier, station, status, tickets
+from bus import brain, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
 from bus.github import GitHubError, Response
 from bus.tickets import FIX_MARKER
 
@@ -107,7 +107,7 @@ class FakeGitHub:
             return [p for p in self.pulls.values() if p.get("state") == "closed"]
         if path.endswith("/pulls?state=all") or re.search(r"/pulls\?.*state=all", path) or path.endswith("/pulls"):
             return list(self.pulls.values())
-        if path.endswith("/issues?labels=loom:triage&state=open"):
+        if re.search(r"/issues\?labels=loom:(triage|factory)&state=open$", path):
             return list(self.filed)
         if "/issues?labels=loom%3Aanswer-pending&state=open" in path:
             return [i for i in self.issues.values() if i.get("state") == "open"
@@ -146,8 +146,12 @@ class FakeGitHub:
             # A one-line change, unless the test gave the file its own patch.
             return Response(200, [{"filename": n, "patch": self.patches.get(
                 n, "@@ -1 +1 @@\n-old\n+new")} for n in names])
+        if path == "/repos/%s/commits/main" % REPO:
+            return Response(200, {"sha": "shamain"})
         m = re.search(r"/commits/(\w+)/check-runs", path)
         if m:
+            if m.group(1) == "shamain":
+                return Response(200, {"check_runs": self.runs.get("shamain", [])})
             return Response(200, {"check_runs": self.runs[m.group(1)]})
         m = re.search(r"/compare/main\.\.\.sha(\d+)$", path)
         if m:
@@ -173,7 +177,9 @@ class FakeGitHub:
         raise AssertionError("unexpected GET %s" % path)
 
     def transport(self, method, url, headers, body):
-        return 200, {}, self.logs[url.rsplit("/", 1)[1]].encode("utf-8")
+        # A job with no log given answers as an expired log does.
+        log = self.logs.get(url.rsplit("/", 1)[1])
+        return (404, {}, b"") if log is None else (200, {}, log.encode("utf-8"))
 
     def _write(self, method, path, body):
         self.writes.append((method, path, body))
@@ -210,6 +216,10 @@ class FakeGitHub:
                     have = [x["name"] for x in self.pulls[number].get("labels", [])]
                     self.pulls[number]["labels"] = [
                         {"name": x} for x in dict.fromkeys(have + list(body["labels"]))]
+                    # As GitHub does: each label put on leaves a labeled event.
+                    self.events.setdefault(number, []).extend(
+                        {"event": "labeled", "label": {"name": x}, "created_at": iso(0)}
+                        for x in body["labels"] if x not in have)
             elif m.group(2) == "/comments":
                 self.next_comment = getattr(self, "next_comment", 1000) + 1
                 self.comments.setdefault(number, []).append(
@@ -255,18 +265,22 @@ class Base(unittest.TestCase):
         tiers.start()
         self.addCleanup(tiers.stop)
         self.gh = FakeGitHub()
+        # Each test's pull request reuses head shas; the reclass memo is per station process.
+        factory._CLASSED.clear()
+        factory._KEPT_AT.clear()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
         self.humans = []
         self.placed = []
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
-           down=(), limit_until=None, scope=None, known_waits=None, demoted=None):
+           down=(), limit_until=None, scope=None, known_waits=None, demoted=None,
+           no_lane_since=None, review_brief=None, now=NOW):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
                 raise GitHubError("PUT /repos/%s/pulls/%d/merge -> 405" % (repo, number), 405)
             self.merged.append((number, ticket))
-        def fix(gh, repo, number, ticket, notes, lane=None, model=None):
+        def fix(gh, repo, number, ticket, notes, lane=None, model=None, authors=None):
             f.notes = notes
             if lane:
                 gh.issues[ticket[1]]["labels"] = [
@@ -287,12 +301,13 @@ class Base(unittest.TestCase):
             self.humans.append((number, ask))
             gh.comments[number].append({"body": brain.HUMAN_MARKER + "\n" + ask, "user": ME})
             gh.issues[number]["labels"].append({"name": "loom:human"})
-        f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
+        f = factory.Factory(self.gh, [REPO], now, trusted=["Alice-Example"],
                             merge=merge, fix=fix, move=move, close=close, human=human, place=place,
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
                             silent=silent, down=down, limit_until=limit_until, scope=scope,
-                            known_waits=known_waits, demoted=demoted)
+                            known_waits=known_waits, demoted=demoted,
+                            no_lane_since=no_lane_since, review_brief=review_brief)
         f.run()
         return f
 
@@ -690,10 +705,12 @@ class PullRequests(Base):
         self.assertEqual(self.model(6), "claude-sonnet-5-5")
 
     def test_age_climbs_once_per_window_not_every_round(self):
+        # An open thread, not a conflict: a conflict alone never climbs, by
+        # age either (loom#1963).
         self.gh.ticket(5, "pr")
         self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME,
                                  "created_at": iso(3600)}, CLAIM]
-        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 2)
+        self.gh.pull(50, 5, resolved=False, created=factory.STUCK_AGE * 2)
         self.go()
         self.assertEqual(self.model(5), None, "climbed an hour after the last climb")
         self.assertEqual(len(self.fixed), 1)
@@ -704,24 +721,68 @@ class PullRequests(Base):
 
     def test_an_old_pull_request_climbs_on_its_first_send_back(self):
         self.gh.ticket(5, "pr")
-        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE + 60)
+        self.gh.pull(50, 5, resolved=False, created=factory.STUCK_AGE + 60)
         self.go()
         self.assertEqual(self.model(5), "claude-sonnet-5-5")
         self.assertEqual(len(self.fixed), 1)
+
+    def test_an_old_conflicting_pull_request_gets_a_brief_on_its_lane_without_climbing(self):
+        # loom#1963: a ready pull request that hand merges left conflicting
+        # read as stuck by age, and waited for a rung instead of a brief.
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.issues[5]["labels"].append({"name": "loom:ready"})
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM]
+        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 3)
+        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.model(5), None)
+        self.assertEqual((self.moved, self.closed), ([], []))
+
+    def test_a_conflict_past_the_last_rung_gets_a_brief_not_a_give_up(self):
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.comments[5] += ALL_RUNGS
+        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 3)
+        self.go()
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual((self.moved, self.closed), ([], []))
+
+    def test_a_conflict_on_a_ticket_a_person_holds_gets_a_hygiene_round_only(self):
+        # Changed by loom#2135: the judged send-back still refuses a ticket
+        # a person holds, which left an operator-held pull request's
+        # conflict unassigned until the operator came to merge it. Branch
+        # hygiene opens the conflict round anyway (the loom:human hold
+        # guards the merge, not the branch, and stays on the ticket);
+        # nothing else about the ticket moves.
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5]["labels"].append({"name": "loom:human"})
+        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 3)
+        self.go()
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual((self.moved, self.closed, self.merged), ([], [], []))
+        self.assertIn("loom:human", [x["name"] for x in self.gh.issues[5]["labels"]])
 
     def test_the_rungs_go_sonnet_then_sol_then_opus(self):
         self.gh.ticket(5, "pr")
         self.gh.comments[5].append({"body": FIX_ASKED, "user": ME})
         seen = []
-        for _ in range(3):
-            self.gh.pull(50, 5, resolved=False)
-            self.gh.issues[5]["labels"] = [{"name": x} for x in
-                                           ("loom:ticket", "loom:pr", "lane:" + (self.lane(5) or "codex"))]
-            self.go()
-            self.gh.comments[5].append(CLAIM)
-            seen.append((self.lane(5), self.model(5)))
+        with lane_models():
+            for _ in range(3):
+                self.gh.pull(50, 5, resolved=False)
+                self.gh.issues[5]["labels"] = [{"name": x} for x in
+                                               ("loom:ticket", "loom:pr", "lane:" + (self.lane(5) or "codex"))]
+                self.go()
+                self.gh.comments[5].append(CLAIM)
+                seen.append((self.lane(5), self.model(5)))
         self.assertEqual(seen, [("claude", "claude-sonnet-5-5"), ("codex", "gpt-6-luna"),
                                 ("claude", "claude-opus-5-5")])
+
+    def test_the_rung_ladder_test_ignores_the_lane_model_settings_of_the_machine(self):
+        # A machine that runs lanes sets LOOM_CLAUDE_MODEL. Set to a model
+        # that is not rung 1, it held the ladder test above on one rung.
+        for model in ("claude-opus-5-5", "gpt-6-luna"):
+            with self.subTest(model), mock.patch.dict(os.environ, {"LOOM_CLAUDE_MODEL": model}):
+                self.setUp()
+                self.test_the_rungs_go_sonnet_then_sol_then_opus()
 
     def test_past_the_last_rung_it_is_left_failed_for_the_brain(self):
         self.gh.ticket(5, "pr")
@@ -922,6 +983,82 @@ class PullRequests(Base):
             "brought %s#50 up to date with its base; it lands once its checks "
             "and review pass on the new head" % REPO)
 
+    def test_a_held_ready_pull_request_behind_its_base_is_kept_current_never_merged(self):
+        # loom#1963: a pull request held for the operator never reached
+        # _land, the only update-branch call, so it drifted into a conflict.
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 4
+        with mock.patch.object(factory.Factory, "_operator_holds", return_value=True):
+            self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+        self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
+                       {"expected_head_sha": "sha50"}), self.gh.writes)
+
+    def test_a_clean_sensitive_pull_request_behind_its_base_is_kept_current_never_merged(self):
+        # 2026-10-27: the brain's merge gate refuses a pull request behind its
+        # base, and nothing brought a sensitive one up to date, so green
+        # sensitive pull requests waited behind by 4 to 66 commits.
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:sensitive", "needs-brain"))
+        self.gh.behind[50] = 4
+        self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+        self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
+                       {"expected_head_sha": "sha50"}), self.gh.writes)
+
+    def test_a_held_pull_request_up_to_date_with_its_base_is_left_alone(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        with mock.patch.object(factory.Factory, "_risk_holds", return_value=True):
+            self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+        self.assertEqual([w for w in self.gh.writes if w[1].endswith("/update-branch")], [])
+
+    def test_held_pull_requests_behind_their_base_take_turns_being_kept_current(self):
+        # 2026-10-27: one held pull request (the first in landing order) took
+        # the repo's one keep-current slot pass after pass as merges kept
+        # putting it behind again, so green sensitive ones fell 10 to 71
+        # commits behind and never reached the brain's merge gate.
+        for ticket, number, created in ((5, 50, 7200), (6, 60, 3600)):
+            self.gh.ticket(ticket, "pr")
+            self.gh.pull(number, ticket, created=created)
+            self.gh.behind[number] = 3
+        with mock.patch.object(factory.Factory, "_operator_holds", return_value=True):
+            self.go()
+            self.go()
+        updated = [w[1] for w in self.gh.writes if w[1].endswith("/update-branch")]
+        self.assertEqual(updated, ["/repos/%s/pulls/50/update-branch" % REPO,
+                                   "/repos/%s/pulls/60/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_a_held_pull_request_whose_update_is_refused_is_not_sent_back(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 1
+        self.gh.update_status = 422
+        with mock.patch.object(factory.Factory, "_operator_holds", return_value=True):
+            self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_a_held_update_does_not_stop_another_pull_request_landing(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=7200)
+        self.gh.behind[50] = 2
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6, created=3600)
+        self.gh.behind[60] = 2
+        real = factory.Factory._operator_holds
+        with mock.patch.object(factory.Factory, "_operator_holds", autospec=True,
+                               side_effect=lambda f, repo, number, *a, **k:
+                               number == 50 or real(f, repo, number, *a, **k)):
+            self.go()
+        self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
+                       {"expected_head_sha": "sha50"}), self.gh.writes)
+        self.assertIn(("PUT", "/repos/%s/pulls/60/update-branch" % REPO,
+                       {"expected_head_sha": "sha60"}), self.gh.writes)
+        self.assertEqual(self.merged, [])
+
     def test_a_refused_update_goes_back_for_a_fix_round_like_a_conflict(self):
         # 2026-10-20: an update that cannot be applied cleanly goes back for
         # a fix round, as a conflict does, instead of silently waiting.
@@ -937,17 +1074,21 @@ class PullRequests(Base):
     def test_an_updated_pull_request_lands_on_a_later_pass_once_green(self):
         # First pass: the pull request is behind, so it is updated, not
         # merged. Second pass: its new head is up to date and green, so it
-        # merges with no further update call.
+        # merges with no further update call. The update takes the landing
+        # lock (loom#2066) and the merge gives it back.
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)
         self.gh.behind[50] = 3
         self.go()
         self.assertEqual((self.merged, self.fixed), ([], []))
-        self.assertEqual(len(self.gh.writes), 1)
+        self.assertEqual([w[:2] for w in self.gh.writes],
+                         [("PUT", "/repos/%s/pulls/50/update-branch" % REPO),
+                          ("POST", "/repos/%s/issues/50/labels" % REPO)])
         self.gh.behind[50] = 0
         self.go()
         self.assertEqual(self.merged, [(50, (REPO, 5))])
-        self.assertEqual(len(self.gh.writes), 1)
+        self.assertEqual(self.gh.writes[2:], [
+            ("DELETE", "/repos/%s/issues/50/labels/loom%%3Alanding" % REPO, None)])
 
     def test_each_repo_lands_one_pull_request_a_pass_oldest_first(self):
         self.gh.ticket(5, "pr")
@@ -1009,12 +1150,125 @@ class PullRequests(Base):
         self.go()
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
 
+    def _red_from_base(self, base_conclusion="success", behind=2, failing="unittest"):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": failing, "status": "completed", "conclusion": "failure",
+             "details_url": "https://github.com/%s/actions/runs/77/job/1" % REPO},
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "success"}]
+        self.gh.behind[50] = behind
+        self.gh.runs["shamain"] = [
+            {"name": "unittest", "status": "completed", "conclusion": base_conclusion}]
+
+    UPDATE = ("PUT", "/repos/%s/pulls/50/update-branch" % REPO, {"expected_head_sha": "sha50"})
+
+    def test_a_check_red_from_the_base_and_green_on_main_is_updated_not_sent_back(self):
+        # loom#1961: four pull requests failed tests their main had fixed;
+        # a re-run reuses the old merge commit, and a fix round waits on a lane.
+        self._red_from_base()
+        f = self.go()
+        self.assertIn(self.UPDATE, self.gh.writes)
+        self.assertEqual((self.fixed, self.merged), ([], []))
+        self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
+        self.assertEqual(f.actions, 1)
+
+    def test_a_check_also_red_on_main_is_run_again_not_updated(self):
+        self._red_from_base(base_conclusion="failure")
+        self.go()
+        self.assertNotIn(self.UPDATE, self.gh.writes)
+        self.assertIn(("POST", "/repos/%s/actions/runs/77/rerun-failed-jobs" % REPO, None),
+                      self.gh.writes)
+
+    def test_a_check_that_never_ran_on_main_is_not_updated(self):
+        self._red_from_base(failing="e2e")
+        self.go()
+        self.assertNotIn(self.UPDATE, self.gh.writes)
+        self.assertIn(("POST", "/repos/%s/actions/runs/77/rerun-failed-jobs" % REPO, None),
+                      self.gh.writes)
+
+    def test_a_red_pull_request_up_to_date_with_main_is_not_updated(self):
+        self._red_from_base(behind=0)
+        self.gh.attempts["77"] = 2
+        self.go()
+        self.assertNotIn(self.UPDATE, self.gh.writes)
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_failed_review_never_takes_the_update_path(self):
+        self._red_from_base()
+        self.gh.runs["sha50"][1]["conclusion"] = "failure"
+        self.gh.runs["shamain"].append(
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "success"})
+        self.go()
+        self.assertNotIn(self.UPDATE, self.gh.writes)
+        self.assertEqual(len(self.fixed), 1)
+
+    def test_a_refused_update_of_a_base_red_check_falls_back_to_the_old_path(self):
+        self._red_from_base()
+        self.gh.update_status = 422
+        self.gh.attempts["77"] = 2
+        self.go()
+        self.assertIn(self.UPDATE, self.gh.writes)
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+
     def test_a_failed_review_is_never_run_again(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, green=False)
         self.gh.runs["sha50"] = [
             {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
              "details_url": "https://github.com/%s/actions/runs/78/job/1" % REPO}]
+        self.go()
+        self.assertEqual(len(self.fixed), 1)
+        self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
+
+    INSTALL_TIMEOUT = ("Setting up build-essential ...\n"
+                       "##[error]The action 'Install what the core's own Dockerfile installs' "
+                       "has timed out after 10 minutes.")
+
+    def flaky_head(self, log):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"id": 501, "name": "adapter", "status": "completed", "conclusion": "failure",
+             "details_url": "https://github.com/%s/actions/runs/88/job/501" % REPO},
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
+             "output": {"title": "FAIL Elder found 1 problem", "summary": "Fix the null check."},
+             "details_url": "https://grug.example"}]
+        self.gh.logs["501"] = log
+
+    def test_an_infra_timeout_is_run_again_even_when_the_review_also_failed(self):
+        # loom#1962: the adapter job timed out installing packages beside a
+        # failing review; _run_again refused on the review and the job was
+        # never re-run, so the fix round read it as a stuck failure.
+        self.flaky_head(self.INSTALL_TIMEOUT)
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertIn(("POST", "/repos/%s/actions/runs/88/rerun-failed-jobs" % REPO, None),
+                      self.gh.writes)
+        self.assertEqual(self.merged, [])
+
+    def test_an_infra_timeout_on_its_second_attempt_goes_back_as_before(self):
+        self.flaky_head(self.INSTALL_TIMEOUT)
+        self.gh.attempts["88"] = 2
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
+
+    def test_a_refused_rerun_of_an_infra_timeout_is_judged_as_usual(self):
+        self.flaky_head(self.INSTALL_TIMEOUT)
+        write = self.gh._write
+
+        def refuse(method, path, body):
+            if path.endswith("/rerun-failed-jobs"):
+                raise GitHubError("POST %s -> 500" % path, 500)
+            return write(method, path, body)
+        self.gh._write = refuse
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_real_test_failure_beside_a_failed_review_is_not_run_again(self):
+        self.flaky_head("FAILED tests/test_a.py::test_x - assert 1 == 2\n##[error]Process completed "
+                        "with exit code 1.")
         self.go()
         self.assertEqual(len(self.fixed), 1)
         self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
@@ -1294,6 +1548,164 @@ HIT = "  %s:%d  [%s] %s - why"
 TEXT = "/home/runner/work/_temp/text.md"
 
 
+OTHER = "example-org/other-repo"
+LANDING = "loom:landing"
+
+
+def landing_event(seconds_ago):
+    return {"event": "labeled", "label": {"name": LANDING}, "created_at": iso(seconds_ago)}
+
+
+class TwoRepos:
+    """Two fake repos behind one client: OTHER's calls go to the second
+    fake with its name read as REPO, so each fake keeps its own state."""
+
+    def __init__(self, one, two):
+        self.one, self.two = one, two
+        self.requests = 0
+
+    def _route(self, path):
+        return (self.two, path.replace(OTHER, REPO)) if OTHER in path else (self.one, path)
+
+    def paginate(self, path):
+        gh, path = self._route(path)
+        return gh.paginate(path)
+
+    def rest(self, method, path, body=None, etag=None, ok=()):
+        gh, path = self._route(path)
+        return gh.rest(method, path, body, etag, ok)
+
+    def graphql(self, query, variables=None):
+        name = OTHER.split("/")[1]
+        gh = (self.two if '"%s"' % name in query or name in (variables or {}).values()
+              else self.one)
+        return gh.graphql(query, variables)
+
+    def transport(self, method, url, headers, body):
+        return self.one.transport(method, url, headers, body)
+
+
+class LandingLock(Base):
+    """loom#2066: one green lane pull request at a time is brought up to
+    date and landed in a repo, so main does not move under it."""
+
+    def updates(self, gh=None):
+        return [w[1].split("/")[-2] for w in (gh or self.gh).writes
+                if w[1].endswith("/update-branch")]
+
+    def carries(self, number, gh=None):
+        return LANDING in [x["name"] for x in (gh or self.gh).pulls[number]["labels"]]
+
+    def held_by_50(self, seconds_ago=600, gh=None):
+        """PR 50 holds the lock, marked seconds_ago, its checks still running."""
+        gh = gh or self.gh
+        gh.ticket(5, "pr")
+        gh.pull(50, 5, labels=(LANDING,), runs=(("unittest", "in_progress"),))
+        gh.events[50] = [landing_event(seconds_ago)]
+
+    def test_of_two_green_behind_pull_requests_only_the_oldest_is_updated_and_marked(self):
+        for ticket, number, created in ((5, 50, 7200), (6, 60, 3600)):
+            self.gh.ticket(ticket, "pr")
+            self.gh.pull(number, ticket, created=created)
+            self.gh.behind[number] = 3
+        self.go()
+        self.assertEqual(self.updates(), ["50"])
+        self.assertTrue(self.carries(50))
+        self.assertFalse(self.carries(60))
+        self.assertEqual(self.merged, [])
+
+    def test_while_a_fresh_lock_is_held_no_other_pull_request_is_updated_or_landed(self):
+        self.held_by_50()
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6)
+        self.gh.behind[60] = 2
+        self.gh.ticket(7, "pr")
+        self.gh.pull(70, 7)
+        self.go()
+        self.assertEqual((self.updates(), self.merged), ([], []))
+        self.assertTrue(self.carries(50))
+
+    def test_the_brain_merge_step_refuses_another_pull_request_while_the_lock_is_held(self):
+        self.held_by_50()
+        self.gh.ticket(7, "pr")
+        self.gh.pull(70, 7)
+        args = brain.parser().parse_args(["merge", "%s#70" % REPO])
+        with mock.patch.object(brain, "merge") as merge, \
+                mock.patch("time.time", return_value=NOW):
+            with self.assertRaisesRegex(ValueError, "#50 holds the repo's landing lock"):
+                brain._cmd_merge(self.gh, args)
+            merge.assert_not_called()
+            # The holder itself merges, and its lock comes off.
+            brain._cmd_merge(self.gh, brain.parser().parse_args(["merge", "%s#50" % REPO]))
+        self.assertEqual(merge.call_args.args[1:3], (REPO, 50))
+        self.assertFalse(self.carries(50))
+
+    def test_a_lock_40_minutes_old_is_released_and_the_next_one_taken(self):
+        self.held_by_50(seconds_ago=40 * 60)
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6)
+        self.gh.behind[60] = 2
+        self.go()
+        self.assertFalse(self.carries(50))
+        self.assertEqual(self.updates(), ["60"])
+        self.assertTrue(self.carries(60))
+
+    def test_the_landing_pull_request_lands_when_current_and_its_lock_comes_off(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=(LANDING,), created=60)
+        self.gh.events[50] = [landing_event(600)]
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6, created=7200)
+        self.gh.behind[60] = 2
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertFalse(self.carries(50))
+        self.assertEqual(self.updates(), [])
+
+    def test_the_landing_pull_request_behind_again_is_updated_and_keeps_the_lock(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=(LANDING,), created=60)
+        self.gh.events[50] = [landing_event(600)]
+        self.gh.behind[50] = 1
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6, created=7200)
+        self.go()
+        self.assertEqual((self.updates(), self.merged), (["50"], []))
+        self.assertTrue(self.carries(50))
+        self.assertEqual(self.gh.events[50], [landing_event(600)])
+
+    def test_a_landing_pull_request_merged_elsewhere_holds_nothing(self):
+        self.gh.ticket(5, "merged")
+        self.gh.pull(50, 5, labels=(LANDING,), state="closed", merged_at=iso(60))
+        self.gh.events[50] = [landing_event(600)]
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6)
+        self.gh.behind[60] = 2
+        self.go()
+        self.assertEqual(self.updates(), ["60"])
+        self.assertTrue(self.carries(60))
+
+    def test_a_lock_in_one_repo_does_not_block_another_repo(self):
+        other = FakeGitHub()
+        self.held_by_50()
+        self.gh.ticket(7, "pr")
+        self.gh.pull(70, 7)
+        other.ticket(6, "pr")
+        other.pull(60, 6, body="Refs %s#6\n" % OTHER, branch="loom/6-some-title")
+        both = TwoRepos(self.gh, other)
+        merged = []
+        f = factory.Factory(both, [REPO, OTHER], NOW, trusted=["Alice-Example"],
+                            merge=lambda gh, repo, number, ticket: merged.append((repo, number)),
+                            fix=mock.Mock(), move=mock.Mock(), close=mock.Mock(),
+                            human=mock.Mock(), place=mock.Mock())
+        f.run()
+        self.assertEqual(merged, [(OTHER, 60)])
+        with mock.patch.object(brain, "merge") as merge, \
+                mock.patch("time.time", return_value=NOW):
+            brain._cmd_merge(both, brain.parser().parse_args(["merge", "%s#60" % OTHER]))
+        self.assertEqual(merge.call_args.args[1:3], (OTHER, 60))
+
+
 def leak_log(diff_hits=(), text_hits=()):
     """A leak-scan job log as GitHub serves it: stamped lines, two sections."""
     lines = ["##[group]Run set -euo pipefail", "##[endgroup]", "--- PR diff ---"]
@@ -1333,7 +1745,8 @@ class LeakScanText(Base):
     def test_a_body_only_failure_edits_the_body_and_sends_nothing_to_the_lane(self):
         self.leaky(BODY_ONLY)
         self.gh.attempts["77"] = 1
-        self.go()
+        with mock.patch("bus.factory._say") as say:
+            self.go()
         self.assertEqual(self.fixed, [])
         self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
         self.assertEqual(len(self.pr_edits()), 1)
@@ -1348,6 +1761,8 @@ class LeakScanText(Base):
         # The comment names lines, never the flagged text.
         self.assertNotIn("other-repo", note)
         self.assertNotIn("build-box", note)
+        say.assert_any_call("rewrote 2 flagged line(s) of %s#50's text after the leak scan failed on its text"
+                            % REPO)
 
     def test_a_diff_failure_still_goes_back_to_the_lane(self):
         self.leaky(leak_log(diff_hits=[(10, "private-issue-ref")],
@@ -1356,14 +1771,19 @@ class LeakScanText(Base):
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
         self.assertEqual(self.pr_edits(), [])
 
-    def test_a_second_failure_on_the_same_head_is_not_edited_again(self):
+    def test_a_repeated_text_failure_is_held_for_the_brain_with_its_location(self):
         self.leaky(BODY_ONLY)
         self.go()
         self.assertEqual(len(self.pr_edits()), 1)
         self.gh.pulls[50]["body"] = LEAK_BODY
         self.go()
         self.assertEqual(len(self.pr_edits()), 1)
-        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.fixed, [])
+        self.assertIn("needs-brain", factory._labels(self.gh.issues[5]))
+        notes = [c["body"] for c in self.gh.comments[5]
+                 if factory.BODY_LEAK_HOLD_MARKER % "sha50" in c["body"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("line 4 (private-issue-ref)", notes[0])
 
     def test_another_failing_check_goes_back_to_the_lane(self):
         self.leaky(BODY_ONLY)
@@ -1500,6 +1920,166 @@ FIXED = "Fixed in 1234567: the flagged code changed and this review does not rai
 NO_CHANGE = "Lane claude made no change for the fix to #50 and said why on the pull request"
 
 
+PLAN_TICKET = """Difficulty: medium
+
+## Why
+The page query is slow for every visitor on the home page.
+
+## What
+Cache the page query.
+
+## Acceptance
+- [ ] The query runs once per minute.
+- [ ] A stale entry is dropped.
+- [ ] A test fails without the cache.
+
+## Size
+**Size:** S
+
+## Out of scope
+- Other pages.
+"""
+
+# The body the runner wrote for PLAN_TICKET before #1838 and the size fix:
+# an empty criteria section and the size's label as its letter (two lane
+# pull requests in other repos, 2026-10-25).
+PLAN_BODY = """Intent: logic.
+
+## Why
+The page query is slow for every visitor on the home page.
+
+## Summary
+Cache the page query.
+
+## Acceptance criteria
+
+
+Size: **Size:**
+
+## Out of scope
+- Other pages.
+
+## Operator steps before merge
+none stated
+
+---
+Loom ticket example-org.example-repo-5, lane codex, model gpt-6-luna.
+Refs %s""" % ("%s#%d" % (REPO, 5))
+
+BODY_FAIL = ("what good look like", "fail", "## Acceptance criteria has 0 non-empty bullets")
+SIZE_FAIL = ("how big", "fail", "no Size: XS/S/M/L/XL in body")
+
+
+class PlanBodyRepair(Base):
+    """loom#1837: a pull request held by the plan check on its body alone is
+    rebuilt from its ticket, never sent to a lane whose agent edits code."""
+
+    def held(self, ticket_body=PLAN_TICKET, chief_done=None, extra_runs=()):
+        self.gh.ticket(5, "pr", body=ticket_body)
+        self.gh.pull(50, 5, green=False, body=PLAN_BODY)
+        chief = {"name": CHIEF, "status": "completed", "conclusion": "failure",
+                 "output": {"title": "Hunt Plan hold",
+                            "summary": chief_summary([BODY_FAIL, SIZE_FAIL])}}
+        if chief_done is not None:
+            chief["completed_at"] = chief_done
+        self.gh.runs["sha50"] = [chief, {"name": factory.DEFAULT_REVIEW_CHECK,
+                                         "status": "completed", "conclusion": "success"}
+                                 ] + list(extra_runs)
+
+    def body_edits(self):
+        return [w for w in self.gh.writes if w[0] == "PATCH" and w[1].endswith("/pulls/50")]
+
+    def notes(self):
+        return [c for c in self.gh.comments[5]
+                if c["body"].startswith(pr_repair.PLAN_NOTE_MARKER)]
+
+    def test_a_body_only_failure_rebuilds_the_body_from_the_ticket_and_sends_no_round(self):
+        self.held()
+        self.go()
+        self.assertEqual(self.fixed, [])
+        body = self.gh.pulls[50]["body"]
+        self.assertEqual(hunt_plan.problems(body), [])
+        self.assertIn("- [ ] A stale entry is dropped.", body)
+        self.assertIn("\nSize: S\n", body)
+        self.assertTrue(body.startswith("Intent: logic."))
+        self.assertEqual(len(self.body_edits()), 1)
+        events = [c["body"] for c in status.expand(self.gh.comments[5], [ME["login"]])]
+        self.assertTrue(any(factory.PLAN_REPAIR_MARKER % "sha50" in e for e in events))
+        # Kept on the status comment: one comment, no new one per attempt.
+        self.assertEqual(len(self.gh.comments[5]), 1)
+
+    def test_the_repair_runs_once_per_head_then_waits_for_the_check_to_read_it_again(self):
+        self.held()
+        self.go()
+        self.gh.pulls[50]["body"] = PLAN_BODY  # as if the edit had not reached the check
+        self.go()
+        self.assertEqual(len(self.body_edits()), 1)
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(len(self.gh.comments[5]), 1)
+
+    def test_a_check_that_read_the_repaired_body_and_still_fails_goes_the_usual_way(self):
+        self.held()
+        self.go()
+        self.gh.runs["sha50"][0]["completed_at"] = iso(-60)
+        self.go()
+        self.assertEqual(len(self.body_edits()), 1)
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_ticket_that_cannot_fill_the_body_is_held_with_one_note_and_no_round(self):
+        self.held(ticket_body=PLAN_TICKET.replace("## Acceptance\n", "## Notes\n"))
+        self.go()
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.body_edits(), [])
+        self.assertIn("needs-brain", factory._labels(self.gh.issues[5]))
+        notes = self.notes()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("## Acceptance criteria", notes[0]["body"])
+        self.assertNotIn("## Size", notes[0]["body"])  # the ticket fills the size
+        self.assertEqual(len(self.gh.comments[5]), 1)
+
+    def test_the_hold_lifts_once_the_ticket_gains_what_it_lacked(self):
+        self.held(ticket_body=PLAN_TICKET.replace("## Acceptance\n", "## Notes\n"))
+        self.go()
+        self.gh.issues[5]["body"] = PLAN_TICKET
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(hunt_plan.problems(self.gh.pulls[50]["body"]), [])
+        self.assertNotIn("needs-brain", factory._labels(self.gh.issues[5]))
+        notes = self.notes()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("hold is lifted", notes[0]["body"])
+
+    def test_a_needs_brain_set_for_another_reason_stays_when_the_hold_lifts(self):
+        # Security review: the plan hold takes off only a needs-brain it
+        # added itself, which its note records.
+        self.held(ticket_body=PLAN_TICKET.replace("## Acceptance\n", "## Notes\n"))
+        self.gh.issues[5]["labels"].append({"name": "needs-brain"})
+        self.go()
+        self.assertNotIn("set-needs-brain", self.notes()[0]["body"])
+        self.gh.issues[5]["body"] = PLAN_TICKET
+        self.go()
+        self.assertEqual(hunt_plan.problems(self.gh.pulls[50]["body"]), [])
+        self.assertIn("needs-brain", factory._labels(self.gh.issues[5]))
+        self.assertIn("hold is lifted", self.notes()[0]["body"])
+
+    def test_the_runners_note_is_edited_not_posted_again(self):
+        self.held(ticket_body=PLAN_TICKET.replace("## Acceptance\n", "## Notes\n"))
+        self.gh.comments[5].append({"id": 77, "body": pr_repair.PLAN_NOTE_MARKER +
+                                    "\nThe runner's words.", "user": ME, "created_at": iso(60)})
+        self.go()
+        notes = self.notes()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Held for the brain", notes[0]["body"])
+
+    def test_another_failing_check_still_goes_back_to_the_lane(self):
+        self.held(extra_runs=[{"name": "unittest", "status": "completed",
+                               "conclusion": "failure"}])
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.body_edits(), [])
+
+
 class ReviewBotThreads(Base):
     def thread(self, *comments):
         nodes = [{"author": a, "body": b} for a, b in comments]
@@ -1516,6 +2096,34 @@ class ReviewBotThreads(Base):
         self.assertIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
         self.assertEqual(self.merged, [(50, (REPO, 5))])
         self.assertEqual((self.fixed, factory.rung_of(self.gh.comments[5])), ([], 0))
+
+    def test_a_thread_whose_bot_root_comment_starts_with_fixed_in_and_has_no_later_comment_is_resolved(self):
+        self.gh.ticket(5, "pr", lane="codex")
+        self.gh.comments[5].append({"body": FIX_ASKED.replace("### Check: lint\n\n    E1\n\n", ""),
+                                    "user": ME})
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((BOT, "Fixed in abc1234: the flagged code changed and this review clears it."))
+        self.go()
+        self.assertIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertEqual((self.fixed, factory.rung_of(self.gh.comments[5])), ([], 0))
+
+    def test_an_edited_bot_root_comment_with_a_later_person_comment_stays_open(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((BOT, "Fixed in abc1234: finding"), (ME, "this still breaks when x is empty"))
+        self.go()
+        self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [])
+
+    def test_an_edited_bot_root_comment_with_a_later_lane_comment_stays_open(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((BOT, "Fixed in abc1234: finding"),
+                    (ME, "Lane codex %s already guarded" % factory.ANSWER_REPLY))
+        self.go()
+        self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [])
 
     def test_a_person_with_the_bot_login_does_not_resolve_a_thread(self):
         self.gh.ticket(5, "pr")
@@ -1540,6 +2148,37 @@ class ReviewBotThreads(Base):
         self.go()
         self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
         self.assertEqual(self.merged, [])
+
+    def stuck_case(self, author, lane="codex", model=None):
+        """Ticket 5's last round asked about a finding at a.py:3; the open
+        thread, under a new id, holds the same rule at a.py:5."""
+        self.gh.ticket(5, "pr", lane=lane)
+        if model:
+            self.gh.issues[5]["body"] = "Model: %s\n" % model + self.gh.issues[5]["body"]
+        self.gh.comments[5].append({"body": FIX_MARKER + "\nPull request: x#50\n\n"
+                                    "### Thread PRRT_old (comment 1) at a.py:3\n\n"
+                                    "    grug-tribe: high | `rule-x` | quick win", "user": ME})
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((author, "high | `rule-x` | quick win"))
+        self.gh.details[50]["reviewThreads"]["nodes"][0].update(path="a.py", line=5)
+        self.go()
+
+    def test_the_review_bots_finding_posted_again_climbs_the_ladder(self):
+        self.stuck_case(BOT)
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+
+    def test_a_stuck_send_back_past_the_last_rung_goes_to_the_hand_off_pool(self):
+        self.stuck_case(BOT, lane="claude", model="claude-opus-5-5")
+        self.assertIn((5, "failed", None), self.moved)
+        self.assertIn(factory.HANDOFF_LABEL, [x["name"] for x in self.gh.issues[5]["labels"]])
+        self.assertEqual(self.fixed, [])
+
+    def test_a_strangers_thread_at_the_same_place_never_counts_toward_stuck(self):
+        # On a public repo anyone can open a thread: one copying a finding's
+        # path, line and rule must not climb the ticket or stop its rounds.
+        self.stuck_case({"__typename": "User", "login": "a-stranger"})
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+        self.assertEqual(self.lane(5), "codex")
 
     def test_a_no_change_round_waits_for_the_review_it_asked_for(self):
         self.gh.ticket(5, "pr", lane="claude")
@@ -1835,6 +2474,34 @@ class ChangeClasses(Base):
         self.assertEqual(self.merged, [])
         self.assertEqual(len(self.fixed), 1)
 
+    def test_a_docs_pull_request_that_gained_a_sensitive_file_is_left_for_the_brain(self):
+        # 2026-10-27: opened as class:docs, a fix round added code; the label stayed docs.
+        self.gh.contents[".loom/sensitive-paths"] = "bus/brain.py\n"
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:docs",), files=("docs/a.md", "bus/brain.py"))
+        self.go()
+        self.assertEqual(self.merged, [])
+        names = [x["name"] for x in self.gh.pulls[50]["labels"]]
+        self.assertEqual([n for n in names if n.startswith("class:")], ["class:sensitive"])
+        self.assertIn("needs-brain", names)
+
+    def test_a_docs_pull_request_that_gained_code_is_relabeled_logic(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:docs",), files=("docs/a.md", "bus/a.py", "tests/test_a.py"))
+        self.go()
+        names = [x["name"] for x in self.gh.pulls[50]["labels"]]
+        self.assertEqual([n for n in names if n.startswith("class:")], ["class:logic"])
+
+    def test_a_class_is_never_lowered_from_the_files(self):
+        # No sensitive-paths file read means no sensitive class from the files;
+        # the label the lane set stands.
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:sensitive", "needs-brain"))
+        self.go()
+        names = [x["name"] for x in self.gh.pulls[50]["labels"]]
+        self.assertIn("class:sensitive", names)
+        self.assertNotIn("class:logic", names)
+
     def test_a_sensitive_pull_request_already_marked_is_left_alone(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, labels=("class:sensitive", "needs-brain"))
@@ -1889,7 +2556,7 @@ class SendBackNeedsAFinding(Base):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, green=False)
         refused = []
-        def fix(gh, repo, number, ticket, notes, lane=None, model=None):
+        def fix(gh, repo, number, ticket, notes, lane=None, model=None, authors=None):
             refused.append(number)
             return False
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"], fix=fix,
@@ -2192,6 +2859,17 @@ class Queued(Base):
 
 
 class Tickets(Base):
+    def test_a_ticket_in_the_hand_off_pool_is_never_rebriefed(self):
+        # Its fix rounds stopped on the same failures: the second operator's
+        # session has it, so the factory leaves it failed.
+        self.gh.ticket(6, "failed", lane="spark")
+        self.gh.issues[6]["labels"].append({"name": factory.HANDOFF_LABEL})
+        self.gh.pull(60, 6, runs=(("unittest", "in_progress"),))
+        self.go()
+        self.assertEqual(self.moved, [])
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.lane(6), "spark")
+
     def test_a_failed_ticket_without_a_pull_request_is_rebriefed_a_rung_up(self):
         self.gh.ticket(6, "failed", lane="zai")
         self.go()
@@ -2385,6 +3063,88 @@ class Tickets(Base):
         self.assertEqual(self.gh.pulls[70]["state"], "closed")
         self.assertIn("past the last rung of the model ladder", self.gh.pulls[70]["body"])
         self.assertNotIn("close this pull request", self.gh.pulls[70]["body"])
+
+    def test_a_handed_off_ticket_past_the_ladder_closes_its_lane_pull_request(self):
+        # loom#2027: the hand-off pool skips the failed step, so its pull
+        # request stayed open for days and kept a lane-pr-stalled finding open.
+        self.gh.ticket(7, "failed")
+        self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
+        self.gh.comments[7] += ALL_RUNGS + [
+            {"body": factory.GAVE_UP + " (x; ran on none).", "user": ME}]
+        self.gh.pull(70, 7, resolved=False)
+        self.go()
+        self.assertEqual([c[0] for c in self.closed], [70])
+        note = self.closed[0][1]
+        self.assertIn("#7", note)
+        self.assertIn("past the last rung of the model ladder", note)
+        self.assertIn("hand-off pool (%s)" % factory.HANDOFF_LABEL, note)
+        self.assertEqual(self.gh.pulls[70]["state"], "closed")
+        self.assertEqual(self.gh.comments.get(70, []), [])
+        self.assertEqual((self.moved, self.fixed, self.merged), ([], [], []))
+        self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
+        self.go()  # once: nothing more on the next pass
+        self.assertEqual(len(self.closed), 1)
+
+    def test_a_ticket_rewritten_as_a_newer_ticket_closes_its_lane_pull_request(self):
+        self.gh.ticket(7, "pr")
+        self.gh.pull(70, 7)
+        self.gh.ticket(9, "queued", body="Difficulty: medium\n\n## Why\nx\n\n"
+                                         "Rewritten from issue 7.\n")
+        self.go()
+        self.assertEqual(len(self.closed), 1)
+        number, note = self.closed[0]
+        self.assertEqual(number, 70)
+        self.assertIn("superseded", note)
+        self.assertIn("#7 was rewritten as ticket #9", note)
+        self.assertEqual(self.merged, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "closed")
+
+    def test_a_ticket_labelled_rewritten_closes_its_pull_request_naming_the_new_ticket(self):
+        self.gh.ticket(7, "pr")
+        self.gh.issues[7]["labels"].append({"name": "loom:rewritten"})
+        self.gh.comments[7].append({"body": brain.TRIAGE_MARKER + "\nRewritten as ticket #12, "
+                                            "which refs this issue.", "user": ME})
+        self.gh.pull(70, 7)
+        self.go()
+        self.assertEqual([c[0] for c in self.closed], [70])
+        self.assertIn("rewritten as ticket #12", self.closed[0][1])
+
+    def test_a_rewritten_failed_ticket_reads_its_comments_once_for_both_checks(self):
+        self.gh.ticket(7, "failed")
+        self.gh.issues[7]["labels"].append({"name": "loom:rewritten"})
+        self.gh.comments[7] += ALL_RUNGS + [
+            {"body": factory.GAVE_UP + " (x; ran on none).", "user": ME}]
+        self.gh.pull(70, 7)
+        f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"])
+        with mock.patch.object(f, "_comments", wraps=f._comments) as read:
+            note = f._ended_note(REPO, self.gh.issues[7], {})
+        self.assertIn("past the last rung", note)
+        self.assertEqual(read.call_count, 1)
+
+    def test_a_strangers_rewritten_comment_closes_nothing(self):
+        self.gh.ticket(7, "pr")
+        self.gh.issues[7]["labels"].append({"name": "loom:rewritten"})
+        self.gh.comments[7].append({"body": "Rewritten as ticket #12, which refs this issue.",
+                                    "user": STRANGER})
+        self.gh.pull(70, 7)
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+
+    def test_a_lane_pull_request_whose_ticket_is_in_a_fix_round_stays_open(self):
+        # A failed ticket with rungs left goes back for a fix round on its
+        # open pull request; nothing closes it.
+        self.gh.ticket(7, "failed", lane="zai")
+        self.gh.comments[7].append(self.ZAI_CLAIM)
+        self.gh.pull(70, 7, resolved=False)
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+        self.assertEqual([f[:2] for f in self.fixed], [(70, (REPO, 7))])
+        # And on its next pass, at loom:pr with the round queued.
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
 
     def test_a_failed_ticket_climbed_to_the_last_ladder_rung_alerts(self):
         said = []
@@ -2722,6 +3482,17 @@ class Tickets(Base):
         self.assertEqual(factory.TIERS["medium"][6:11], factory.FREE_POOL)
         self.assertEqual(factory.lanes_of("medium", True)[4:7],
                          ("free-ollama", "free-gemma", "openrouter"))
+
+    def test_a_slot_on_cluster_runners_never_takes_a_private_repos_ticket(self):
+        # A runner's inputs and logs live in the public repo's Actions, so the
+        # dispatch refuses a private repo; the factory gave free-gemma private
+        # tickets anyway, each costing a claim and a park (2026-10-27).
+        with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
+            self.assertNotIn("free-gemma", factory.lanes_of("medium", True))
+            self.assertIn("free-gemma", factory.lanes_of("medium", False))
+            self.assertTrue(factory.public_only("free-gemma"))
+        self.assertIn("free-gemma", factory.lanes_of("medium", True))
+        self.assertFalse(factory.public_only("free-gemma"))
 
     def test_the_free_lanes_take_medium_work_before_the_paid_codex_lanes(self):
         # Operator 2026-10-19: "I always want my free tier used up".
@@ -3179,6 +3950,20 @@ class SilentLane(Base):
 
 
 class Helpers(unittest.TestCase):
+    def test_a_finding_reposted_under_a_new_thread_id_still_counts_as_stuck(self):
+        # The review bot may post the same finding again as a new thread, a
+        # few lines lower after the round's edits: comparing ids alone read
+        # that as progress.
+        last = {"body": "%s\nPull request: %s#7, branch loom/12-x\n\n"
+                        "### Thread PRRT_old (comment 5) at web/staged.js:54\n\n"
+                        "    grug-tribe: high | _security_ | `unvalidated-external-input` | quick"
+                        % (FIX_MARKER, REPO), "user": ME}
+        new = {"id": "PRRT_new", "path": "web/staged.js", "line": 59,
+               "root": {"nodes": [{"body": "high | _security_ | `unvalidated-external-input` |"}]}}
+        other = dict(new, line=59 + 40)
+        self.assertTrue(factory.stuck([last], ["PRRT_new"], False, 0.0, NOW, threads=[new]))
+        self.assertFalse(factory.stuck([last], ["PRRT_new"], False, 0.0, NOW, threads=[other]))
+
     def test_with_model_replaces_or_inserts_the_header(self):
         self.assertEqual(factory.with_model("Difficulty: hard\nModel: a\n\n## Why\nModel: x", "b"),
                          "Difficulty: hard\nModel: b\n\n## Why\nModel: x")
@@ -3334,6 +4119,12 @@ class Helpers(unittest.TestCase):
         self.assertIsNone(scope({"LOOM_SCOPE_CHECK_URL": "http://gw.invalid/v1"}))
         self.assertTrue(callable(scope({"LOOM_SCOPE_CHECK_URL": "https://gw.invalid/free-public/gemini/v1"})))
 
+    def test_the_station_wires_the_luna_review_writer_into_the_factory(self):
+        with tempfile.TemporaryDirectory() as home:
+            settings = station.Settings(home, [REPO], ["alice-example"], [], factory_on=True)
+            st = station.Station(FakeGitHub(), settings, now=NOW)
+            self.assertEqual(st._factory().review_brief, st._write_review_brief)
+
 
     def test_the_station_tells_the_factory_which_tickets_it_holds(self):
         with tempfile.TemporaryDirectory() as home:
@@ -3359,8 +4150,10 @@ class Helpers(unittest.TestCase):
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
                          model_limits=None, silent=None, down=(), limit_until=None,
-                         benched=(), known_waits=None, plan_check=None, demoted=None):
+                         benched=(), known_waits=None, plan_check=None, demoted=None,
+                         no_lane_since=None, review_brief=None):
                 self.silent_running, self.silent, self.waits = {}, silent, {}
+                self.settled = set()
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))
 
@@ -3558,6 +4351,419 @@ class ForbiddenModels(unittest.TestCase):
         self.assertTrue(station.lane_takes_model("agy", "gemini-3.8-flash-high"))
         for model in ("gemini-4-argon-high", "claude-opus-5-5", "gpt-oss-120b"):
             self.assertFalse(station.lane_takes_model("agy", model), model)
+
+
+class NoLane(Base):
+    """Tickets no lane takes are rerouted, then handed off (loom#1831)."""
+    SONNET = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+    OPUS = "Model: claude-opus-5-5\nDifficulty: medium\n\n## Why\nx\n"
+
+    def queued(self, number, body):
+        self.gh.ticket(number, "queued", body=body)
+        self.gh.issues[number]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"}]
+        self.gh.issues[number]["created_at"] = iso(0)
+
+    def assign(self, waited, available, **kwargs):
+        key = "%s#7" % REPO
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=available, no_lane_since={key: NOW - waited},
+                                 **kwargs)
+        worker.assign_queued()
+        return worker
+
+    def notes(self, number):
+        return "".join(c["body"] for c in self.gh.comments.get(number, []))
+
+    def test_the_reroute_hours_come_from_the_environment(self):
+        self.assertEqual(factory.no_lane_reroute({}), 6 * 3600)
+        self.assertEqual(factory.no_lane_reroute({"LOOM_NO_LANE_REROUTE": "2"}), 2 * 3600)
+        self.assertEqual(factory.no_lane_reroute({"LOOM_NO_LANE_REROUTE": "0.5"}), 1800)
+        for bad in ("", "x", "0", "-3", "nan", "inf"):
+            self.assertEqual(factory.no_lane_reroute({"LOOM_NO_LANE_REROUTE": bad}), 6 * 3600, bad)
+        # Never past the hand-off: by 24 hours at the latest it leaves.
+        self.assertEqual(factory.no_lane_reroute({"LOOM_NO_LANE_REROUTE": "48"}), 24 * 3600)
+
+    def test_no_lane_reasons_are_told_from_other_waits(self):
+        for reason in ("no free lane takes model claude-sonnet-5-5", "no free lane in tier medium",
+                       "stalled on lane claude: no other lane of its rung is available",
+                       "on lane codex, at a limit: no free lane in its tier"):
+            self.assertTrue(factory.no_lane(reason), reason)
+        for reason in ("waits for #5 to merge (After:)", "waits for a person (loom:human)",
+                       "stalled on lane codex: another lane of its tier waits as long"):
+            self.assertFalse(factory.no_lane(reason), reason)
+
+    def test_a_queued_ticket_no_lane_takes_for_six_hours_moves_to_another_rung(self):
+        # 2026-10-25: 89 tickets waited on "no free lane takes model
+        # claude-sonnet-5-5", some since 10-23, while codex had room.
+        self.queued(7, self.SONNET)
+        self.gh.ticket(8, "running", lane="claude")
+        worker = self.assign(7 * 3600, ["claude", "codex"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7), self.model(7)),
+                         ("briefed", "codex", "gpt-6-luna"))
+        self.assertIn(factory.RUNG_MARKER % 2, self.notes(7))
+        self.assertIn("rerouted this ticket to rung 2", self.notes(7))
+        self.assertNotIn("%s#7" % REPO, worker.waits)
+        self.assertIn("%s#7" % REPO, worker.settled)
+
+    def test_a_queued_ticket_waiting_under_six_hours_stays_where_it_is(self):
+        self.queued(7, self.SONNET)
+        self.gh.ticket(8, "running", lane="claude")
+        worker = self.assign(5 * 3600, ["claude", "codex"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-sonnet-5-5"))
+        self.assertEqual(worker.waits["%s#7" % REPO], "no free lane takes model claude-sonnet-5-5")
+        self.assertNotIn("%s#7" % REPO, worker.settled)
+
+    def test_a_reroute_never_leaves_the_tickets_tier(self):
+        # Easy work never runs on a ladder lane (TIERS): no reroute, it waits.
+        self.queued(7, "Model: claude-sonnet-5-5\nDifficulty: easy\n\n## Why\nx\n")
+        self.gh.ticket(8, "running", lane="claude")
+        self.assign(7 * 3600, ["claude", "codex"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-sonnet-5-5"))
+
+    def test_a_stalled_briefed_ticket_is_rerouted_after_six_hours(self):
+        self.gh.private = False
+        self.stalled(7)
+        f = self.go(available=["claude", "codex"], no_lane_since={"%s#7" % REPO: NOW - 7 * 3600})
+        self.assertEqual((self.lane(7), self.model(7)), ("codex", "gpt-6-luna"))
+        self.assertIn("%s#7" % REPO, f.settled)
+
+    def stalled(self, number):
+        self.gh.ticket(number, "briefed", lane="claude", body=self.SONNET)
+        self.gh.events[number] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                                   "created_at": iso(factory.BRIEFED_STALL + 600)}]
+
+    def test_a_ticket_no_lane_takes_for_a_day_goes_to_the_hand_off_pool_once(self):
+        # Opus is the strong rung: no reroute is allowed below it.
+        self.queued(7, self.OPUS)
+        worker = self.assign(25 * 3600, [])
+        names = [x["name"] for x in self.gh.issues[7]["labels"]]
+        self.assertIn(factory.HANDOFF_LABEL, names)
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertFalse([x for x in names if x.startswith("lane:")])
+        self.assertIn("hand-off pool", self.notes(7))
+        self.assertIn("%s#7" % REPO, worker.settled)
+        self.assertFalse(brain._in_flight(self.gh.issues[7]))
+        comments = [dict(c) for c in self.gh.comments[7]]
+        # The next pass leaves it alone: no second note, no lane, no wait.
+        again = self.assign(26 * 3600, ["claude"])
+        self.assertEqual(self.gh.comments[7], comments)
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertNotIn("%s#7" % REPO, again.waits)
+
+    def test_a_ticket_with_no_reroute_waits_until_its_day_is_out(self):
+        self.queued(7, self.OPUS)
+        worker = self.assign(23 * 3600, [])
+        self.assertNotIn(factory.HANDOFF_LABEL, [x["name"] for x in self.gh.issues[7]["labels"]])
+        self.assertIn("%s#7" % REPO, worker.waits)
+
+    def test_a_ticket_a_lane_takes_settles_its_wait(self):
+        self.queued(7, self.SONNET)
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["claude"])
+        worker.assign_queued()
+        self.assertEqual(self.lane(7), "claude")
+        self.assertIn("%s#7" % REPO, worker.settled)
+
+    def test_the_hand_off_pool_leaves_the_cap_but_a_pr_ticket_still_counts(self):
+        def ticket(state, *extra):
+            return {"state": "open", "labels": [{"name": x} for x in
+                                                ("loom:ticket", "loom:" + state) + extra]}
+        self.assertTrue(brain._in_flight(ticket("queued")))
+        self.assertFalse(brain._in_flight(ticket("queued", factory.HANDOFF_LABEL)))
+        self.assertFalse(brain._in_flight(ticket("briefed", factory.HANDOFF_LABEL)))
+        self.assertTrue(brain._in_flight(ticket("pr")))
+        self.assertTrue(brain._in_flight(ticket("pr", factory.HANDOFF_LABEL)))
+
+
+def conflict_round_comment(number, ticket):
+    """A loom:fix comment sending a pull request back for its conflict, in
+    the shape brain.fix writes (the header names the pull request, and the
+    body carries the conflict line)."""
+    return {"body": FIX_MARKER + "\nPull request: %s#%d, branch loom/%d-some-title\n" % (REPO, number, ticket)
+            + brain.BRAIN_FIX_MARKER + "\n\n" + factory.FIX_NOTES
+            + "\n\n- The branch conflicts with the default branch\n",
+            "user": ME}
+
+
+class BranchHygiene(Base):
+    """The standing branch-hygiene pass (loom#2135): every open lane pull
+    request is kept current or sent back for its conflict over its lifetime,
+    not only at merge time. The setups keep the judge path out of the way
+    (its checks still running, so it waits) unless the test says otherwise,
+    so what moves is the hygiene pass."""
+
+    WAITING = (("unittest", "in_progress"), (factory.DEFAULT_REVIEW_CHECK, "in_progress"))
+
+    def updates(self):
+        return [w[1] for w in self.gh.writes if w[1].endswith("/update-branch")]
+
+    def test_a_behind_pull_request_is_brought_up_to_date_and_a_current_one_left_alone(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=7200, runs=self.WAITING)
+        self.gh.behind[50] = 3
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6, created=3600, runs=self.WAITING)
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_a_behind_conflict_free_pull_request_at_briefed_is_updated(self):
+        self.gh.ticket(5, "briefed")
+        self.gh.pull(50, 5, created=7200, runs=self.WAITING)
+        self.gh.behind[50] = 3
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_a_behind_conflict_free_pull_request_at_failed_is_updated(self):
+        self.gh.ticket(5, "failed")
+        self.gh.pull(50, 5, created=7200, runs=self.WAITING)
+        self.gh.behind[50] = 3
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_a_behind_conflict_free_pull_request_at_running_is_left_alone(self):
+        self.gh.ticket(5, "running")
+        self.gh.pull(50, 5, created=7200, runs=self.WAITING)
+        self.gh.behind[50] = 3
+        self.go()
+        self.assertEqual(self.updates(), [])
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_a_dirty_pull_request_gets_a_fix_round_naming_it(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+        f = self.go()
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertIn("conflict", f.notes)
+        self.assertEqual(self.merged, [])
+
+    def test_a_dirty_pull_request_with_a_round_open_gets_no_second_round(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+        self.gh.comments[5].append(conflict_round_comment(50, 5))
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.merged, [])
+
+    def test_no_update_while_another_pull_request_holds_the_landing_lock(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=3600, labels=("loom:landing",), runs=self.WAITING)
+        self.gh.events[50] = [landing_event(600)]
+        self.gh.behind[50] = 2
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6, created=7200, runs=self.WAITING)
+        self.gh.behind[60] = 2
+        self.go()
+        self.assertEqual(self.updates(), [])
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_updates_are_bounded_per_repo_per_pass_oldest_first(self):
+        for ticket, number, created in ((5, 50, 10800), (6, 60, 7200), (7, 70, 3600)):
+            self.gh.ticket(ticket, "pr")
+            self.gh.pull(number, ticket, created=created, runs=self.WAITING)
+            self.gh.behind[number] = 1
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO,
+                                          "/repos/%s/pulls/60/update-branch" % REPO])
+
+    def test_a_sensitive_pull_request_is_kept_current_and_never_merged(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:sensitive",), runs=self.WAITING)
+        self.gh.behind[50] = 4
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_a_dirty_sensitive_pull_request_gets_a_fix_round_and_is_never_merged(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, mergeable=False, labels=("class:sensitive",), runs=self.WAITING)
+        self.go()
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.merged, [])
+
+    def test_a_conflict_on_an_operator_held_ticket_still_gets_its_round(self):
+        # loom#1599's stall: the ticket sits at loom:human (its merge waits
+        # for the operator), and the held send-back path never assigns the
+        # conflict. Hygiene maintains the branch anyway: a fix round is not
+        # a merge, and the hold stays on the ticket.
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5]["labels"].append({"name": "loom:human"})
+        self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+        self.go()
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.merged, [])
+
+    def test_a_conflict_on_a_needs_brain_ticket_waits_for_the_brain(self):
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5]["labels"].append({"name": "needs-brain"})
+        self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.merged, [])
+
+    def test_a_dirty_pull_request_whose_ticket_a_lane_already_holds_is_left_alone(self):
+        self.gh.ticket(5, "queued")
+        self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.merged, [])
+
+
+class LunaReview(Base):
+    """The Codex Luna review fallback (loom#2142): when the review check is
+    degraded (its model route is exhausted) and the review bot's re-ask has
+    already failed on the same head, the factory dispatches one review brief
+    to the Luna lane slot instead of a fix round no lane can close, and the
+    gate reads the lane's verdict for that head like the review bot's own."""
+
+    DEGRADED = {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+                "conclusion": "failure",
+                "output": {"title": "WARN Grug eyes clouded",
+                           "summary": "Degraded review (all_failed): not a verdict. "
+                                      "Comment /grug improve to re-run once the backend recovers."},
+                "details_url": "https://github.com/%s/actions/runs/80/job/1" % REPO}
+
+    def degraded_pr(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [dict(self.DEGRADED)]
+
+    def writer(self):
+        calls = []
+
+        def write(repo, pr_number, sha, issue):
+            calls.append((repo, pr_number, sha, int(issue["number"])))
+            return True
+        return calls, write
+
+    def seed(self, body, ago=0, user=None):
+        self.gh.comments.setdefault(50, []).append(
+            {"body": body, "user": user or ME, "created_at": iso(ago)})
+
+    def test_parse_luna_verdict_reads_the_markings_line(self):
+        body = (factory.LUNA_REVIEW_MARKER % "sha50" +
+                "\nElder markings - 2 blocking, 5 total\n\nFindings follow.")
+        self.assertEqual(factory.parse_luna_verdict(body, "sha50"), (2, 5))
+        self.assertIsNone(factory.parse_luna_verdict(body, "sha99"))
+        self.assertIsNone(factory.parse_luna_verdict(
+            "Elder markings - 0 blocking, 0 total", "sha50"))
+        self.assertIsNone(factory.parse_luna_verdict(
+            factory.LUNA_REVIEW_MARKER % "sha50" + "\nno markings here", "sha50"))
+
+    def test_a_degraded_review_still_degraded_after_the_reask_dispatches_a_luna_review(self):
+        self.degraded_pr()
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        self.assertEqual(calls, [])  # the first pass only re-asks the review bot
+        self.go(review_brief=write)
+        self.assertEqual(calls, [(REPO, 50, "sha50", 5)])
+        bodies = [str(c.get("body") or "") for c in self.gh.comments[50]]
+        self.assertTrue(any(factory.LUNA_REQUEST_MARKER % "sha50" in body for body in bodies))
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.merged, [])
+
+    def test_without_a_review_writer_a_second_degraded_review_is_sent_back_as_before(self):
+        self.degraded_pr()
+        self.go()
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_luna_request_already_in_flight_is_not_dispatched_again(self):
+        self.degraded_pr()
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        self.go(review_brief=write)
+        self.go(review_brief=write)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.fixed, [])
+
+    def test_a_luna_request_older_than_the_retry_window_is_dispatched_again(self):
+        self.degraded_pr()
+        self.seed(factory.REVIEW_AGAIN_MARKER % "sha50" + "\n/grug improve")
+        self.seed(factory.LUNA_REQUEST_MARKER % "sha50", ago=2 * factory.LUNA_RETRY_AFTER)
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_clean_luna_verdict_lets_the_pull_request_land(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.runs["sha50"] = [dict(self.DEGRADED)]
+        self.seed(factory.LUNA_REVIEW_MARKER % "sha50" +
+                  "\nElder markings - 0 blocking, 2 total\n\nThe change is sound.")
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertEqual(self.fixed, [])
+
+    def test_a_blocking_luna_verdict_does_not_excuse_the_check(self):
+        self.degraded_pr()
+        self.seed(factory.REVIEW_AGAIN_MARKER % "sha50" + "\n/grug improve")
+        self.seed(factory.LUNA_REVIEW_MARKER % "sha50" +
+                  "\nElder markings - 2 blocking, 3 total\n\nTwo findings block.")
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        self.assertEqual(calls, [])  # a verdict exists: nothing new to dispatch
+        self.assertEqual(self.merged, [])
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_an_untrusted_luna_verdict_is_ignored(self):
+        self.degraded_pr()
+        self.seed(factory.REVIEW_AGAIN_MARKER % "sha50" + "\n/grug improve")
+        self.seed(factory.LUNA_REVIEW_MARKER % "sha50" +
+                  "\nElder markings - 0 blocking, 0 total",
+                  user={"login": "mallory-example"})
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        self.assertEqual(len(calls), 1)  # no trusted verdict: the lane is asked
+        self.assertEqual(self.merged, [])
+
+    def test_a_luna_verdict_for_another_head_is_ignored(self):
+        self.degraded_pr()
+        self.seed(factory.REVIEW_AGAIN_MARKER % "sha50" + "\n/grug improve")
+        self.seed(factory.LUNA_REVIEW_MARKER % "shaOTHER" +
+                  "\nElder markings - 0 blocking, 1 total")
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.merged, [])
+
+    def requests(self):
+        return [c for c in self.gh.comments.get(50, [])
+                if factory.LUNA_REQUEST_MARKER % "sha50" in str(c.get("body") or "")]
+
+    def dispatches(self, count):
+        """Run the factory once to re-ask, then `count` passes a retry window
+        apart; returns the writer's calls."""
+        self.degraded_pr()
+        calls, write = self.writer()
+        self.go(review_brief=write)
+        for n in range(count):
+            self.go(review_brief=write, now=NOW + n * (factory.LUNA_RETRY_AFTER + 1))
+        return calls
+
+    def test_two_dispatches_for_one_head_leave_one_comment_edited(self):
+        calls = self.dispatches(2)
+        self.assertEqual(len(calls), 2)
+        found = self.requests()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["body"].count("Dispatch "), 2)
+
+    def test_three_dispatches_without_a_verdict_file_one_factory_ticket_and_stop(self):
+        calls = self.dispatches(3)
+        self.assertEqual(len(calls), 3)
+        later = self.writer()
+        for n in (4, 6):
+            self.go(review_brief=later[1], now=NOW + n * (factory.LUNA_RETRY_AFTER + 1))
+        self.assertEqual(later[0], [])
+        self.assertEqual(len(self.requests()), 1)
+        self.assertEqual(len(self.gh.filed), 1)
+        self.assertIn("loom:factory", self.gh.filed[0]["labels"])
+        self.assertIn("sha50", self.gh.filed[0]["title"])
+        self.assertEqual(self.fixed, [])
 
 
 if __name__ == "__main__":

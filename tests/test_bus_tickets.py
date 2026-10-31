@@ -528,3 +528,54 @@ class BriefContextTest(unittest.TestCase):
         plain = render_brief(REPO, self.ISSUE, "codex")
         self.assertNotIn("## Operator notes", plain)
         self.assertNotIn("## Linked pull requests", plain)
+
+
+class ReviewBriefTest(unittest.TestCase):
+    """The Luna review brief (loom#2142): a Deliverable: review brief in the
+    verify brief's shape - no branch is pushed and the result is review.json,
+    not a pull request."""
+    BODY = ("## What\n\nLog one line per retry.\n\n"
+            "## Acceptance criteria\n\n"
+            "- [ ] The retry logs one line per attempt\n")
+
+    def brief(self):
+        issue = {"number": 7, "title": "Retry logs", "body": self.BODY}
+        return tickets.render_review_brief(
+            "example-owner/example-repo", issue, "codex-2", 99, 42,
+            "loom/7-retry-logs", "main", "0123456789abcdef0123456789abcdef01234567")
+
+    def test_review_name_follows_the_verify_name_pattern(self):
+        self.assertEqual(
+            tickets.review_name("example-owner/example-repo", 7, 99),
+            tickets.verify_name("example-owner/example-repo", 7, 99).replace(
+                "-verify-", "-review-"))
+
+    def test_the_headers_name_the_pull_request_head_and_the_luna_pin(self):
+        text = self.brief()
+        lines = text.split("\n")
+        self.assertEqual(lines[0], "# Brief: %s" % tickets.review_name(
+            "example-owner/example-repo", 7, 99))
+        for header in ("Repo: example-owner/example-repo",
+                       "Branch: loom/7-retry-logs",
+                       "Lane: codex-2",
+                       "Issue: example-owner/example-repo#7",  # leak-guard-allow: fictional example repos
+                       "Review-PR: 42",
+                       "Head-Sha: 0123456789abcdef0123456789abcdef01234567",
+                       "Base: main",
+                       "Model: gpt-6-luna",
+                       "Deliverable: review"):
+            self.assertIn(header, lines)
+
+    def test_the_brief_states_the_review_contract(self):
+        text = self.brief()
+        self.assertIn("Change no code", text)
+        self.assertIn("review.json in the top of your work directory", text)
+        self.assertIn('"blocking"', text)
+        self.assertIn('"notes"', text)
+        self.assertIn('"summary"', text)
+        self.assertIn("git diff origin/main...HEAD", text)
+
+    def test_the_brief_carries_the_ticket_it_reviews_against(self):
+        text = self.brief()
+        self.assertIn("Retry logs", text)
+        self.assertIn("The retry logs one line per attempt", text)

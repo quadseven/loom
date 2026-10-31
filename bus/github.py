@@ -34,7 +34,7 @@ from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from . import proof, shadow, status, text as _text
+from . import fixrounds, proof, shadow, status, text as _text
 
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
@@ -74,6 +74,10 @@ class GitHubError(Exception):
         super().__init__(message)
         self.status = status
         self.body = body
+
+
+class TargetReached(Exception):
+    """A paginated read was deferred after this pass reached its request target."""
 
 
 class ShadowHeld(GitHubError, ValueError):
@@ -189,6 +193,9 @@ def request_kind(method: str, url: str) -> str:
     if re.search(r"^/repos/[^/]+/[^/]+/pulls$", path):
         return "pulls list"
     return "other"
+
+
+DEFERRABLE_KINDS = {"events", "comments", "other"}
 
 
 def _int(value: Any) -> Optional[int]:
@@ -495,7 +502,8 @@ class GitHub:
                  transport: Optional[Transport] = None,
                  cache_dir: Optional[str] = None,
                  sleep: Callable[[float], None] = time.sleep,
-                 unsubscribe: bool = False) -> None:
+                 unsubscribe: bool = False,
+                 target: Optional[int] = None) -> None:
         # A personal token string, or an AppToken minted on first use.
         self._token = token
         # With a personal token, leave each issue this client opens or
@@ -512,6 +520,9 @@ class GitHub:
         # client's own App bot login is added on first use; a caller adds its
         # trusted writers (the station its LOOM_BRIEF_AUTHORS).
         self.status_authors: set = set()
+        # The ledger of this Loom's own fix-rounds edits (bus/fixrounds.py);
+        # without one no fix-rounds comment reads as its rounds.
+        self.fix_ledger: Optional[str] = None
         # Whether this client keeps a ticket's routine events in the issue
         # body's status section and reads them back (bus/status.py, loom#1341).
         # The station, the brain and the dashboard turn it on, together: a
@@ -528,6 +539,10 @@ class GitHub:
         self.not_modified = 0
         # Requests by request_kind, 304s left out: what the budget counted.
         self.kinds: Dict[str, int] = {}
+        # Counted request ceiling per pass; None leaves it unconstrained.
+        self.target = target
+        # Deferrable reads carried over when counted reached the target.
+        self.carried_over: Dict[str, int] = {}
         self.issue_writes: set[Tuple[str, int]] = set()
         self.comment_edits = False
         # resource (core, graphql, ...) -> (remaining, limit, reset epoch),
@@ -536,6 +551,10 @@ class GitHub:
         # Set by a budget refusal: until then every call fails at once with
         # RateLimited and spends nothing (loom#666).
         self.limited_until: Optional[int] = None
+
+    @property
+    def counted(self) -> int:
+        return self.requests - self.not_modified
 
     def _url(self, path: str) -> str:
         # Absolute URLs (pagination's next links) must stay on the API host:
@@ -550,7 +569,12 @@ class GitHub:
         return self.api + path
 
     def rest(self, method: str, path: str, body: Any = None,
-             etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
+             etag: Optional[str] = None, ok: Tuple[int, ...] = (),
+             issue: Optional[Callable[[str], Response]] = None) -> Response:
+        """One request. `issue`, when given, answers the single-issue read a
+        ticket's first comments page makes for its body's status section
+        (_with_body_events), so a caller that already holds that issue
+        (bus/issue_reads.py) does not read it again (loom#2078)."""
         body = self._without_mentions(method, body)
         body = self._keep_status_section(method, path, body)
         resp = self._rest(method, path, body, etag, ok)
@@ -559,8 +583,15 @@ class GitHub:
         if method == "GET" and status.COMMENTS_RE.search(path):
             # A ticket's status comment reads as one comment per event, so
             # every reader of those events sees them as before (loom#866).
-            expanded = status.expand(resp.data, self._status_logins())
-            expanded = self._with_body_events(path, expanded)
+            writers = self._status_logins()
+            expanded = status.expand(resp.data, writers)
+            expanded = self._with_body_events(path, expanded, issue)
+            # A pull request's one fix comment reads as one comment per
+            # round, so round counting and the lane's brief see every round
+            # (loom#1640).
+            if fixrounds.has_rounds(expanded):
+                expanded = fixrounds.expand(expanded, writers,
+                                            fixrounds.load_ledger(self.fix_ledger))
             if expanded is not resp.data:
                 resp = Response(resp.status, expanded, resp.etag, resp.headers)
         return resp
@@ -588,7 +619,8 @@ class GitHub:
                         found["variables"] = dict(holder, body=clean)
         return found
 
-    def _with_body_events(self, path: str, items: Any) -> Any:
+    def _with_body_events(self, path: str, items: Any,
+                          read: Optional[Callable[[str], Response]] = None) -> Any:
         """The first page of a ticket's comments with the events of its issue
         body's status section added, one pseudo-comment each (loom#1341). They
         carry the issue author's login, trusted only when it is one of ours,
@@ -600,7 +632,9 @@ class GitHub:
         if not allowed or _page_of(path) != 1 or not isinstance(items, list):
             return items
         try:
-            issue = self._rest("GET", "/repos/%s/issues/%s" % found.groups()).data
+            issue_path = "/repos/%s/issues/%s" % found.groups()
+            issue = (read(issue_path) if read is not None
+                     else self._rest("GET", issue_path)).data
         except GitHubError as err:
             if err.status == 404:
                 return items  # the issue is gone or moved: no section to read
@@ -647,7 +681,7 @@ class GitHub:
 
     def _rest(self, method: str, path: str, body: Any = None,
               etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
-        self._hold_in_shadow(method, path, body)
+        acted = self._hold_in_shadow(method, path, body)
         self._refuse_incomplete_close(method, path, body)
         url = self._url(path)
         # A caller's own ETag means the caller keeps the answer; otherwise
@@ -656,6 +690,8 @@ class GitHub:
         headers, payload = self._request(body, etag or (cached or {}).get("etag"))
         status, resp_headers, text = self._send(method, url, headers, payload)
         self._check_status(method, path, status, text, ok)
+        if acted is not None and 200 <= status < 300:
+            shadow.record_acted(acted.action, acted.repo, acted.number, acted.kind)
         if status == 304 and cached is not None:
             return self._from_cache(url, cached, resp_headers)
         data = _json_or_none(text)
@@ -716,25 +752,26 @@ class GitHub:
             else:
                 self.comment_edits = True
 
-    def _hold_in_shadow(self, method: str, path: str, body: Any) -> None:
+    def _hold_in_shadow(self, method: str, path: str, body: Any) -> Optional["shadow.Request"]:
         """Record and refuse a merge, close, ship or merge label, approving
         review, write onto a branch Loom does not own, or branch deletion in a
         repo in shadow mode (bus/shadow.py). Every Python write to GitHub
         passes through here, whichever caller sent it. An exemption (a signal
         issue's close, a label the item already has) needs the item read: a
         read that fails in any way, or an item whose labels cannot be read,
-        holds the whole request."""
+        holds the whole request. Returns the irreversible request it lets
+        through, so _rest records it as acted once GitHub accepts it."""
         if str(method or "").upper() == "GET":
-            return
+            return None
         text = str(path or "")
         if "://" in text and text.startswith(self.api + "/"):
             text = text[len(self.api):]   # an API under a path prefix routes the rest
         found = shadow.classify(method, text, body)
         if found is None or not shadow.active(found.repo or None):
-            return
+            return found
         held = shadow.held_after_read(found, self._shadow_item(found))
         if held is None:
-            return
+            return found
         action, new_labels = held
         reason = "%s %s%s" % (str(method).upper(), shadow.api_path(text),
                               " (%s)" % found.detail if found.detail else "")
@@ -1041,12 +1078,30 @@ class GitHub:
     def paginate(self, path: str) -> List[Any]:
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"
+        self._stop_at_target(request_kind("GET", path))
         return self._paginate_from(path, self.rest("GET", path))
+
+    def _has_target(self) -> bool:
+        return isinstance(self.target, int) and not isinstance(self.target, bool)
+
+    def _stop_at_target(self, kind: str) -> None:
+        """Raise TargetReached, counting the read as carried over, when a
+        deferrable read would go past the pass target. The check and the
+        count share one hold of the lock so threads read one snapshot."""
+        with self._count_lock:
+            target = self.target
+            over = (isinstance(target, int) and not isinstance(target, bool)
+                    and kind in DEFERRABLE_KINDS and self.counted >= target)
+            if over:
+                self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
+        if over:
+            raise TargetReached("%s read carried over at request target" % kind)
 
     def _paginate_from(self, path: str, first: Response) -> List[Any]:
         items: List[Any] = []
         url: Optional[str] = path
         resp = first
+        kind = request_kind("GET", path)
         while url:
             page = resp.data if isinstance(resp.data, list) else []
             items.extend(page)
@@ -1060,6 +1115,7 @@ class GitHub:
                 nxt = _with_page(url, _page_of(url) + 1)
             url = nxt
             if url:
+                self._stop_at_target(kind)
                 resp = self.rest("GET", url)
         return status.resort(items)
 
@@ -1067,6 +1123,8 @@ class GitHub:
         """Read known pages concurrently, preserving their page order."""
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"
+        if self._has_target() and request_kind("GET", path) in DEFERRABLE_KINDS:
+            return self.paginate(path)
         first = self.rest("GET", path)
         last = _last_link(first.headers.get("link", ""))
         if not last or _page_of(last) <= 1:

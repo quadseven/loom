@@ -121,6 +121,37 @@ class FakeGitHub:
         return [(m, p) for m, p in self.requests if m != "GET" and mine.match(p)]
 
 
+class TwoIntakeGitHub(FakeGitHub):
+    """The goal holds its unnumbered intake epic #31 and a newer numbered one,
+    #33, both with room (loom#2030)."""
+    NEWER = 33
+
+    def __init__(self):
+        super().__init__()
+        self.linked_to = []
+
+    def newer(self):
+        return dict(self.intake(), number=self.NEWER, id=1000 + self.NEWER,
+                    title=brain.INTAKE_BATCH_TITLE % 2)
+
+    def _issue_request(self, method, path, rest, data):
+        m = re.fullmatch(r"issues/(\d+)(?:/(\w+))?", rest)
+        number, sub = (int(m.group(1)), m.group(2)) if m else (None, None)
+        if number == GOAL and sub == "sub_issues" and method == "GET":
+            return reply(200, [self.intake(), self.newer()])
+        if number == self.NEWER:
+            if method == "GET" and sub is None:
+                return reply(200, self.newer())
+            if sub == "sub_issues":
+                if method == "POST":
+                    self.linked_to.append((self.NEWER, data["sub_issue_id"]))
+                    return reply(201, {})
+                return reply(200, [])
+        if number == INTAKE and sub == "sub_issues" and method == "POST":
+            self.linked_to.append((INTAKE, data["sub_issue_id"]))
+        return super()._issue_request(method, path, rest, data)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -178,6 +209,15 @@ class RewriteIssueTest(Base):
         self.assertEqual(self.fake.linked, [9001])
         self.assertEqual(self.fake.labels, [(7, ["loom:rewritten"])])
         self.assertEqual(self.fake.removed, [(7, "loom%3Atriage")])
+
+    def test_a_rewrite_files_under_the_newest_intake_epic_with_room_by_number(self):
+        # loom#2030: picking the first exact title match sent rewrites to the
+        # oldest of several intake epics; the newest by number takes them.
+        self.fake = TwoIntakeGitHub()
+        self.assertEqual(self.rewrite(BRIEF), "brief")
+        (ticket,) = self.fake.created
+        self.assertTrue(ticket["body"].endswith("\n\nPart of #%d\n" % TwoIntakeGitHub.NEWER))
+        self.assertEqual(self.fake.linked_to, [(TwoIntakeGitHub.NEWER, 9001)])
 
     def test_the_prompt_holds_the_issue_and_the_brief_format(self):
         self.rewrite(BRIEF)
@@ -341,11 +381,74 @@ class StationRewriteTest(Base):
         # 17 of 72 rewrites ran the model only for intake to refuse the brief
         # at the goal's in-flight cap (2026-10-21).
         self.fake.add_triage(7)
-        with mock.patch.object(brain, "_goal_in_flight", return_value=brain.goal_cap()):
+        with mock.patch.object(brain, "goal_flying",
+                               return_value=[{"number": n} for n in range(brain.goal_cap())]):
             err = self.run_station(self.station(cmd=self.agent(BRIEF)))
         self.assertFalse(os.path.exists(self.prompt_file))
         self.assertEqual(self.fake.created, [])
         self.assertIn("tickets in flight", err)
+
+    def at_cap(self, st, blocked=()):
+        """Run the rewrite step with the goal at its cap and tickets 1.. in
+        flight, of which `blocked` wait with no lane (ticket-waits.json)."""
+        os.makedirs(st.state, exist_ok=True)
+        with open(os.path.join(st.state, "ticket-waits.json"), "w") as fh:
+            json.dump({"%s#%d" % (REPO, n): {"reason": "no free lane takes model claude-sonnet-5-5",
+                                             "since": st.now, "seen": st.now,
+                                             "no_lane_since": st.now} for n in blocked}, fh)
+        flying = [{"number": n} for n in range(1, brain.goal_cap() + 1)]
+        with mock.patch.object(brain, "goal_flying", return_value=flying):
+            return self.run_station(st)
+
+    def test_the_cap_skip_names_the_tickets_blocked_on_no_lane_and_a_stuck_goal(self):
+        # loom#1831: a goal sat at 32 of 28 all day, most of it tickets no
+        # lane takes, and the skip line said only the count.
+        self.fake.add_triage(7)
+        st = self.station(cmd=self.agent(BRIEF))
+        err = self.at_cap(st, blocked=(1, 2, 3))
+        self.assertIn("goal has %d tickets in flight (cap %d), 3 blocked on no lane; skipped"
+                      % (brain.goal_cap(), brain.goal_cap()), err)
+        self.assertNotIn("stuck", err)
+        st.now += station.GOAL_CAP_STUCK + 3600
+        err = self.at_cap(st, blocked=(1, 2))
+        self.assertIn("goal stuck at its cap for 7 hours: %d tickets in flight (cap %d), "
+                      "2 blocked on no lane; skipped" % (brain.goal_cap(), brain.goal_cap()), err)
+        state = json.load(open(os.path.join(st.state, "rewrite.json")))
+        (stuck,) = st._stuck_goals(state)
+        self.assertEqual((stuck["goal"], stuck["no_lane"], stuck["cap"]),
+                         ("%s#%d" % (REPO, GOAL), 2, brain.goal_cap()))
+
+    def test_a_goal_back_under_its_cap_starts_its_clock_again(self):
+        self.fake.add_triage(7)
+        st = self.station(cmd=self.agent(BRIEF))
+        self.at_cap(st)
+        st.now += station.GOAL_CAP_STUCK + 3600
+        with mock.patch.object(brain, "goal_flying", return_value=[]):
+            self.run_station(st)
+        state = json.load(open(os.path.join(st.state, "rewrite.json")))
+        self.assertEqual(st._stuck_goals(state), [])
+        self.assertNotIn("cap", state["%s#%d" % (REPO, GOAL)])
+
+    def test_the_stuck_goals_go_to_the_dashboard(self):
+        self.fake.add_triage(7)
+        st = self.station(cmd=self.agent(BRIEF))
+        st.s.transcript_url, st.s.transcript_token_ssm = "https://dash.example.com/api/transcripts", "/x"
+        sent = []
+        st._transcript_token = lambda: "token"
+        st.upload = lambda url, token, body: sent.append((url, body))
+        self.at_cap(st, blocked=(1,))
+        self.assertEqual(sent[-1][1]["goals"], [])
+        st.now += station.GOAL_CAP_STUCK + 3600
+        self.at_cap(st, blocked=(1,))
+        url, body = sent[-1]
+        self.assertTrue(url.endswith(station.GOAL_CAPS_PATH), url)
+        self.assertEqual([(g["goal"], g["no_lane"]) for g in body["goals"]],
+                         [("%s#%d" % (REPO, GOAL), 1)])
+        # The same list is not sent again within GOAL_CAPS_EVERY.
+        count = len(sent)
+        st.now += 60
+        self.at_cap(st, blocked=(1,))
+        self.assertEqual(len(sent), count)
 
     def test_a_private_repo_with_an_empty_private_command_is_skipped(self):
         self.fake.private = True
