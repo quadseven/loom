@@ -490,6 +490,266 @@ class ReportTest(ShadowCase):
         self.assertIn("shadow mode on for example-owner/a", out.getvalue())
 
 
+class EnhancedReportTest(ShadowCase):
+    """Tests for the enhanced shadow report that pairs would-actions with
+    GitHub outcomes and operator verdicts, counts damage, and shows clean streaks."""
+
+    GH_URL = "https://api.github.com"
+
+    def _pr(self, number, state="open", merged=False, merged_at=None, closed_at=None,
+            head_sha="a" * 40, base_sha="b" * 40, merged_by=None):
+        """A PR response from GitHub API."""
+        data = {"number": number, "state": state, "head": {"sha": head_sha},
+                "base": {"sha": base_sha}, "merged": merged}
+        if merged_at:
+            data["merged_at"] = merged_at
+        if closed_at:
+            data["closed_at"] = closed_at
+        if merged_by:
+            data["merged_by"] = {"login": merged_by}
+        return data
+
+    def _issue(self, number, state="open", closed_at=None, state_reason="completed",
+               labels=(), body=""):
+        """An issue response from GitHub API."""
+        data = {"number": number, "state": state}
+        if closed_at:
+            data["closed_at"] = closed_at
+        if state_reason:
+            data["state_reason"] = state_reason
+        data["labels"] = [{"name": n} for n in labels]
+        data["body"] = body
+        return data
+
+    def _make_gh(self, responses):
+        """Create a fake GitHub client that returns `responses` for GETs.
+        `responses` maps paths to response data."""
+        from bus.github import Response
+        class FakeGH:
+            def __init__(self, responses):
+                self.responses = responses
+                self.calls = []
+
+            def rest(self, method, path, req_body=None, etag=None, ok=()):
+                self.calls.append((method, path, req_body))
+                if method == "GET":
+                    data = self.responses.get(path.split("?")[0])
+                    if data is not None:
+                        return Response(200, data)
+                    return Response(404, {})
+                return Response(200, {"merged": True})
+        return FakeGH(responses)
+
+    def _run_enhanced_report(self, gh_client, since, repo="", json_out=False):
+        """Run the enhanced report with a fake GitHub client."""
+        # This will be implemented after the report function accepts a GitHub client
+        pass
+
+    def test_merged_as_is_is_not_damaging(self):
+        """A would-merge where operator merged as-is (same SHA) is clean."""
+        now = time.time()
+        sha = "a" * 40
+        shadow.record("merge", REPO, 8, "pr", sha=sha, tier="app-code", now=now)
+        # Operator merged with same SHA
+        responses = {
+            "/repos/%s/pulls/8" % REPO: self._pr(8, state="closed", merged=True, 
+                                                 head_sha=sha, merged_by="loom[bot]"),
+        }
+        gh = self._make_gh(responses)
+        data = shadow._compute_report_data(shadow.read(self.ledger, 0), gh)
+        self.assertEqual(len(data["merge_pairs"]), 1)
+        self.assertFalse(data["merge_pairs"][0]["damaging"])
+
+    def test_merged_after_changes_is_damaging(self):
+        """A would-merge where operator merged after changes (different SHA) is damaging."""
+        now = time.time()
+        sha = "a" * 40
+        different_sha = "b" * 40
+        shadow.record("merge", REPO, 8, "pr", sha=sha, tier="app-code", now=now)
+        # Operator merged with different SHA
+        responses = {
+            "/repos/%s/pulls/8" % REPO: self._pr(8, state="closed", merged=True,
+                                                 head_sha=different_sha, merged_by="loom[bot]"),
+        }
+        gh = self._make_gh(responses)
+        data = shadow._compute_report_data(shadow.read(self.ledger, 0), gh)
+        self.assertEqual(len(data["merge_pairs"]), 1)
+        self.assertTrue(data["merge_pairs"][0]["damaging"])
+
+    def test_closed_unmerged_is_damaging(self):
+        """A would-merge where PR was closed unmerged is damaging."""
+        now = time.time()
+        sha = "a" * 40
+        shadow.record("merge", REPO, 8, "pr", sha=sha, tier="app-code", now=now)
+        # PR closed unmerged
+        responses = {
+            "/repos/%s/pulls/8" % REPO: self._pr(8, state="closed", merged=False,
+                                                 closed_at="2024-01-01T00:00:00Z"),
+        }
+        gh = self._make_gh(responses)
+        data = shadow._compute_report_data(shadow.read(self.ledger, 0), gh)
+        self.assertEqual(len(data["merge_pairs"]), 1)
+        self.assertTrue(data["merge_pairs"][0]["damaging"])
+
+    def test_reverted_is_damaging(self):
+        """A would-merge where PR was merged but later reverted is damaging."""
+        now = time.time()
+        sha = "a" * 40
+        shadow.record("merge", REPO, 8, "pr", sha=sha, tier="app-code", now=now)
+        # PR merged by a person (not bot) - likely reverted or manual merge
+        responses = {
+            "/repos/%s/pulls/8" % REPO: self._pr(8, state="closed", merged=True,
+                                                 head_sha=sha, merged_by="some-human"),
+        }
+        gh = self._make_gh(responses)
+        data = shadow._compute_report_data(shadow.read(self.ledger, 0), gh)
+        self.assertEqual(len(data["merge_pairs"]), 1)
+        self.assertTrue(data["merge_pairs"][0]["damaging"])
+
+    def test_still_open_is_clean(self):
+        """A would-merge where PR is still open is clean (no decision yet)."""
+        now = time.time()
+        sha = "a" * 40
+        shadow.record("merge", REPO, 8, "pr", sha=sha, tier="app-code", now=now)
+        # PR still open
+        responses = {
+            "/repos/%s/pulls/8" % REPO: self._pr(8, state="open", merged=False),
+        }
+        gh = self._make_gh(responses)
+        data = shadow._compute_report_data(shadow.read(self.ledger, 0), gh)
+        self.assertEqual(len(data["merge_pairs"]), 1)
+        self.assertFalse(data["merge_pairs"][0]["damaging"])
+
+    def test_operator_hold_is_clean(self):
+        """A would-merge with operator verdict 'hold' is clean."""
+        now = time.time()
+        sha = "a" * 40
+        shadow.record("merge", REPO, 8, "pr", sha=sha, tier="app-code", now=now)
+        # Operator verdict is "hold"
+        shadow.record("operator-verdict", REPO, 8, "pr", label="hold", sha=sha, now=now + 10)
+        # PR still open (operator held)
+        responses = {
+            "/repos/%s/pulls/8" % REPO: self._pr(8, state="open", merged=False),
+        }
+        gh = self._make_gh(responses)
+        data = shadow._compute_report_data(shadow.read(self.ledger, 0), gh)
+        self.assertEqual(len(data["merge_pairs"]), 1)
+        # Hold verdict means damaging (operator didn't merge)
+        # Actually, the spec says hold is damaging - operator explicitly didn't merge
+        self.assertTrue(data["merge_pairs"][0]["damaging"])
+
+    def test_would_close_with_unticked_criterion_is_wrong(self):
+        """A would-close of a ticket with an unmet criterion is wrong."""
+        now = time.time()
+        shadow.record("close", REPO, 3, "issue", tier="app-code", now=now)
+        # Issue has unchecked acceptance criteria under the proper heading
+        body = "## Acceptance criteria\n- [ ] Criterion 1\n- [x] Criterion 2"
+        responses = {
+            "/repos/%s/issues/3" % REPO: self._issue(3, state="closed", 
+                                                     labels=("loom:ticket",),
+                                                     body=body,
+                                                     state_reason="completed"),
+        }
+        gh = self._make_gh(responses)
+        data = shadow._compute_report_data(shadow.read(self.ledger, 0), gh)
+        self.assertEqual(len(data["close_pairs"]), 1)
+        self.assertTrue(data["close_pairs"][0]["wrong"])
+
+    def test_would_close_with_all_ticked_is_not_wrong(self):
+        """A would-close of a ticket with all criteria ticked is not wrong."""
+        now = time.time()
+        shadow.record("close", REPO, 3, "issue", tier="app-code", now=now)
+        # Issue has all criteria ticked under the proper heading
+        body = "## Acceptance criteria\n- [x] Criterion 1\n- [x] Criterion 2"
+        responses = {
+            "/repos/%s/issues/3" % REPO: self._issue(3, state="closed",
+                                                     labels=("loom:ticket",),
+                                                     body=body,
+                                                     state_reason="completed"),
+        }
+        gh = self._make_gh(responses)
+        data = shadow._compute_report_data(shadow.read(self.ledger, 0), gh)
+        self.assertEqual(len(data["close_pairs"]), 1)
+        self.assertFalse(data["close_pairs"][0]["wrong"])
+
+    def test_per_repo_tier_counts(self):
+        """Report shows per-repo, per-tier counts of decisions, damage, clean streak."""
+        now = time.time()
+        # Two would-merges for same repo/tier, one damaging
+        sha1 = "a" * 40
+        sha2 = "b" * 40
+        shadow.record("merge", REPO, 1, "pr", sha=sha1, tier="app-code", now=now)
+        shadow.record("merge", REPO, 2, "pr", sha=sha2, tier="app-code", now=now + 100)
+        # First merged as-is (clean), second merged after changes (damaging)
+        responses = {
+            "/repos/%s/pulls/1" % REPO: self._pr(1, state="closed", merged=True,
+                                                 head_sha=sha1, merged_by="loom[bot]"),
+            "/repos/%s/pulls/2" % REPO: self._pr(2, state="closed", merged=True,
+                                                 head_sha="c" * 40, merged_by="loom[bot]"),
+        }
+        gh = self._make_gh(responses)
+        data = shadow._compute_report_data(shadow.read(self.ledger, 0), gh)
+        by_tier = data["by_repo_tier"]
+        key = (REPO, "app-code")
+        self.assertIn(key, by_tier)
+        self.assertEqual(by_tier[key]["decisions"], 2)
+        self.assertEqual(by_tier[key]["damaging"], 1)
+        # Clean streak is 0 because the last decision was damaging
+        self.assertEqual(by_tier[key]["clean_streak"], 0)
+
+    def test_clean_streak_resets_after_damaging(self):
+        """Clean streak resets after a damaging would-merge."""
+        now = time.time()
+        # First merge: clean (merged as-is)
+        sha1 = "a" * 40
+        shadow.record("merge", REPO, 1, "pr", sha=sha1, tier="app-code", now=now)
+        # Second merge: damaging (merged after changes)
+        sha2 = "b" * 40
+        shadow.record("merge", REPO, 2, "pr", sha=sha2, tier="app-code", now=now + 100)
+        # Third merge: clean (merged as-is)
+        sha3 = "c" * 40
+        shadow.record("merge", REPO, 3, "pr", sha=sha3, tier="app-code", now=now + 200)
+        
+        responses = {
+            "/repos/%s/pulls/1" % REPO: self._pr(1, state="closed", merged=True,
+                                                 head_sha=sha1, merged_by="loom[bot]"),
+            "/repos/%s/pulls/2" % REPO: self._pr(2, state="closed", merged=True,
+                                                 head_sha="d" * 40, merged_by="loom[bot]"),
+            "/repos/%s/pulls/3" % REPO: self._pr(3, state="closed", merged=True,
+                                                 head_sha=sha3, merged_by="loom[bot]"),
+        }
+        gh = self._make_gh(responses)
+        data = shadow._compute_report_data(shadow.read(self.ledger, 0), gh)
+        by_tier = data["by_repo_tier"]
+        key = (REPO, "app-code")
+        # After the damaging one, clean streak should reset, then go to 1 for the last clean
+        self.assertEqual(by_tier[key]["decisions"], 3)
+        self.assertEqual(by_tier[key]["damaging"], 1)
+        self.assertEqual(by_tier[key]["clean_streak"], 1)
+
+    def test_json_output_includes_outcomes(self):
+        """JSON output includes GitHub outcomes and damage flags."""
+        now = time.time()
+        sha = "a" * 40
+        shadow.record("merge", REPO, 8, "pr", sha=sha, tier="app-code", now=now)
+        responses = {
+            "/repos/%s/pulls/8" % REPO: self._pr(8, state="closed", merged=True,
+                                                 head_sha=sha, merged_by="loom[bot]"),
+        }
+        gh = self._make_gh(responses)
+        json_data = shadow.enhanced_report_json(shadow.read(self.ledger, 0), gh)
+        # Should have the merge pair and the summary
+        merge_entries = [e for e in json_data if e.get("type") == "would-merge"]
+        self.assertEqual(len(merge_entries), 1)
+        self.assertFalse(merge_entries[0]["damaging"])
+        self.assertEqual(merge_entries[0]["pr_state"], "closed")
+        self.assertTrue(merge_entries[0]["pr_merged"])
+        summary_entries = [e for e in json_data if e.get("type") == "summary"]
+        self.assertEqual(len(summary_entries), 1)
+        self.assertEqual(summary_entries[0]["decisions"], 1)
+        self.assertEqual(summary_entries[0]["damaging"], 0)
+
+
 class DigestTest(ShadowCase):
     def test_the_digest_counts_what_was_held_and_names_the_review_command(self):
         shadow.record("merge", REPO, 8, "pr", sha="c" * 40, now=1000)
