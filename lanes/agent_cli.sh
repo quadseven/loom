@@ -55,7 +55,7 @@ agent_cli() {
 # (2026-10-20). Providers say the quota is reached, exceeded or exhausted.
 # A full shared free pool ("has no lane available; retry after 1s") is a
 # short limit, not the agent's failure (18 runs, 2026-10-21).
-LIMIT_RE='usage limit|rate[ _-]?limit|has no lane available|quota (reached|exceeded|exhausted|resets?)|exceeded (your |the )?(current )?quota|resource[ _]exhausted|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|hit your (weekly |daily |session )?limit|exceeded your [a-z ]*allowance|you have no quota'
+LIMIT_RE='usage limit|rate[ _-]?limit|has no lane available|quota (reached|exceeded|exhausted|resets?)|exceeded (your |the )?(current )?quota|resource[ _]exhausted|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|hit your (weekly |daily |session )?limit'
 # A bare HTTP status counts only in the short tail: a repo's own test output
 # printed "status=error detail=http 402", and a codex run that exited 0 was
 # classed out of credit and its lane parked a day (2026-10-21).
@@ -84,13 +84,17 @@ AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|h
 # OpenRouter: "free-models-per-day"). The fixed hour retried it, and failed,
 # every hour until then (2026-10-19).
 DAILY_RE='daily (free )?(allocation|allowance|limit|quota)|per[ _-]day'
-MONTHLY_RE='copilot.*(allowance|limit|quota|usage|request)|exceeded your [a-z ]*allowance|monthly ([a-z]+ )*(allocation|allowance|limit|quota)|per[ _-]month|resets? (at|on) the first of (the )?month'
+MONTHLY_RE='copilot.*(allowance|limit|quota|usage|request)|monthly ([a-z]+ )*(allocation|allowance|limit|quota)|per[ _-]month|resets? (at|on) the first of (the )?month'
 # A model the agent CLI no longer offers (opencode drops one models.dev marks
 # deprecated) rests the lane LIMIT_WAIT, then the lane checks the CLI's model
 # list before it claims (model_listed in run_lane.sh). A day's rest assumed
 # the model stays gone; free catalogs rotate within hours (2026-10-21: zen's
 # model was listed again within 13 hours, with the lane parked for 11 more).
 MODEL_GONE_RE='ProviderModelNotFoundError: Model not found'
+# GitHub Copilot Free's spent allowance. These words hold a lane for a month,
+# so they count only on the copilot lane and only in the last lines of its run:
+# a ticket, a diff or a file the agent read can say them on any lane.
+COPILOT_ALLOWANCE_RE='exceeded your [a-z ]*allowance|you have no quota'
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
 # A reset time the provider states ("try again at 11:46 PM", "try again at
@@ -163,6 +167,11 @@ provider_text() {
   grep -vE "$WORK_EVENT_RE" || true
 }
 
+# The epoch the next UTC month begins.
+next_utc_month() {
+  python3 -c 'from datetime import datetime, timezone; n=datetime.now(timezone.utc); y=n.year+(n.month==12); m=1 if n.month==12 else n.month+1; print(int(datetime(y,m,1,tzinfo=timezone.utc).timestamp()))'
+}
+
 classify_failure() {
   local status="$1" whole="$2" edited="$3" now n tail cap stated monthly=0 seen
   tail="${4:-$whole}"
@@ -179,6 +188,8 @@ classify_failure() {
     FAIL_CLASS=auth
   elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
+  elif [ "${LANE:-}" = copilot ] && [[ "$tail" =~ $COPILOT_ALLOWANCE_RE ]]; then
+    FAIL_CLASS=limit RETRY_AT="$(next_utc_month)"
   elif [[ "$seen" =~ $LIMIT_RE ]] || [[ "$tail" =~ $LIMIT_CODE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT)) cap=$LIMIT_WAIT_MAX
     # A reset time or duration the provider states wins: codex's five-hour
@@ -198,7 +209,7 @@ classify_failure() {
       RETRY_AT=$((now - now % 86400 + 86400))
     elif [[ "$whole" =~ $MONTHLY_RE ]]; then
       monthly=1
-      RETRY_AT="$(python3 -c 'from datetime import datetime, timezone; n=datetime.now(timezone.utc); y=n.year+(n.month==12); m=1 if n.month==12 else n.month+1; print(int(datetime(y,m,1,tzinfo=timezone.utc).timestamp()))')"
+      RETRY_AT="$(next_utc_month)"
     fi
     [ "$RETRY_AT" -ge $((now + 60)) ] || RETRY_AT=$((now + 60))
     if [ "$monthly" -eq 0 ] && [ "$RETRY_AT" -gt $((now + cap)) ]; then

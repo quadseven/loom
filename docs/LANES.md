@@ -1382,8 +1382,8 @@ cannot query the viewer or any other local service.
   `--allow-all-tools`; the run output, including any CLI usage details, is
   retained in the lane log. Monthly usage-limit messages, and the Free plan's
   "exceeded your ... allowance" and "you have no quota" answers, hold the lane
-  instead of failing the ticket: an allowance message until the next UTC month
-  begins, a 402 for a day at a time. `lanes/mac/install.sh` installs it with
+  instead of failing the ticket until the next UTC month begins. Those two
+  answers count only on this lane and only in the last lines of its run. `lanes/mac/install.sh` installs it with
   the default lanes; set `LOOM_COPILOT_KEY_SSM` when installing, or the lane
   reports itself unavailable.
 - Model choice on the priced Anthropic routes follows
