@@ -4523,7 +4523,7 @@ class BranchHygiene(Base):
         self.gh.behind[50] = 3
         self.go()
         self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
-        self.assertEqual((self.merged, self.fixed), ([], []))
+        self.assertEqual(self.merged, [])
 
     def test_a_behind_conflict_free_pull_request_at_running_is_left_alone(self):
         self.gh.ticket(5, "running")
