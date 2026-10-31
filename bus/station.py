@@ -1744,6 +1744,11 @@ def _write_json(path: str, data: Any) -> None:
     os.replace(tmp, path)
 
 
+def _restarts_ladder(body: str) -> bool:
+    """Whether a comment restarts the ticket on rung 0."""
+    return any(m.group(1) == "0" for m in factory.RUNG_RE.finditer(body))
+
+
 def _sha12(body: Optional[str]) -> str:
     return hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
 
@@ -2495,21 +2500,25 @@ class Station:
         return found is not None and found[0].pr == pr
 
     def _fix_for(self, repo: str, comments: List[Any]) -> Optional[Tuple[tickets.Fix, Any]]:
-        """Return the newest trusted fix after the last claim, regardless of
-        later non-fix comments. Raises ValueError for an unusable fix."""
+        """Return the newest trusted fix after the last claim or rung 0 restart,
+        regardless of later non-fix comments. A claim also reads from the status
+        comment, and a rung 0 comment ends a fix the same way: without it a
+        restarted ticket replayed the round of a pull request that had ended
+        (loom#2334). Raises ValueError for an unusable fix."""
         allowed = {a.lower() for a in self.s.authors}
-        last_claim, newest_fix = -1, None
+        comments = status.expand(comments, self.s.authors)
+        last_end, newest_fix = -1, None
         for i, c in enumerate(comments):
             if not isinstance(c, dict):
                 continue
             body = str(c.get("body") or "")
             trusted = tickets._login(c.get("user")) in allowed
-            # A stranger's claim marker must not hide a trusted fix.
-            if trusted and CLAIM_RE.fullmatch(body.strip()):
-                last_claim = i
+            # A stranger's claim or rung marker must not hide a trusted fix.
+            if trusted and (CLAIM_RE.fullmatch(body.strip()) or _restarts_ladder(body)):
+                last_end = i
             if trusted and body.startswith(tickets.FIX_MARKER):
                 newest_fix = (i, c, body)
-        if newest_fix is None or newest_fix[0] < last_claim:
+        if newest_fix is None or newest_fix[0] < last_end:
             return None
         # GitHub keeps no editor for comments: one changed after it was
         # posted may carry someone else's words.
@@ -5122,35 +5131,43 @@ class Station:
         rotation = _read_json(rotation_path, {}, strict=False)
         start = rotation.get("next") if isinstance(rotation, dict) else 0
         start = start if isinstance(start, int) and 0 <= start < len(steps) else 0
-        stopped_at = None
-        for offset in range(len(steps)):
-            if self._deferred():
-                stopped_at = (start + offset) % len(steps)
-                break
-            # Past the budget the rest of the loop waits for the next pass,
-            # which starts here: claims, fix rounds and deploys come round
-            # every few minutes instead of after a 40-minute pass, and every
-            # step still runs in turn, in the same order.
-            if offset and time.monotonic() - loop_started >= PASS_STEP_BUDGET:
-                stopped_at = (start + offset) % len(steps)
-                _say("pass budget reached after %ds of steps: %d step(s) wait for the next pass, from %s"
-                     % (time.monotonic() - loop_started, len(steps) - offset,
-                        steps[stopped_at].__name__))
-                break
-            step = steps[(start + offset) % len(steps)]
-            try:
-                if not self._timed(step):
-                    # The carried-over step starts the next pass's loop.
-                    stopped_at = (start + offset) % len(steps)
-                    break
-            except RateLimited:
-                raise
-            except (GitHubError, OSError, ValueError) as err:
-                _say("%s failed: %s" % (step.__name__, err))
+        # Where the next pass starts, kept current so the write below records
+        # it however the loop ends.
+        next_step = start
         try:
-            _write_json(rotation_path, {"next": stopped_at if stopped_at is not None else 0})
-        except OSError as err:
-            _say("could not record the step rotation: %s" % err)
+            for offset in range(len(steps)):
+                next_step = (start + offset) % len(steps)
+                if self._deferred():
+                    break
+                # Past the budget the rest of the loop waits for the next pass,
+                # which starts here: claims, fix rounds and deploys come round
+                # every few minutes instead of after a 40-minute pass, and every
+                # step still runs in turn, in the same order.
+                if offset and time.monotonic() - loop_started >= PASS_STEP_BUDGET:
+                    _say("pass budget reached after %ds of steps: %d step(s) wait for the next pass, from %s"
+                         % (time.monotonic() - loop_started, len(steps) - offset,
+                            steps[next_step].__name__))
+                    break
+                step = steps[next_step]
+                try:
+                    if not self._timed(step):
+                        # The carried-over step starts the next pass's loop.
+                        break
+                except RateLimited:
+                    # The next step starts the next pass: on 2026-10-31 a step
+                    # that hit the search limit each pass held the 39 after it
+                    # for hours (loom#2321).
+                    next_step = (next_step + 1) % len(steps)
+                    raise
+                except (GitHubError, OSError, ValueError) as err:
+                    _say("%s failed: %s" % (step.__name__, err))
+            else:
+                next_step = 0
+        finally:
+            try:
+                _write_json(rotation_path, {"next": next_step})
+            except OSError as err:
+                _say("could not record the step rotation: %s" % err)
 
     def _timed(self, step: Any) -> bool:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
@@ -10880,6 +10897,9 @@ class Station:
         if self._num(checked) and 0 <= self.now - checked < invariants.CHECK_EVERY:
             return
         state["checked"] = self.now
+        # Before the reads: a check they stop waits CHECK_EVERY like any other,
+        # rather than costing each pass its 270 requests again (loom#2321).
+        invariants.save(path, state)
         goal = self._invariant_goal()
         self._invariant_repo = goal[0] if goal else ""
         facts = self._invariant_facts(state)

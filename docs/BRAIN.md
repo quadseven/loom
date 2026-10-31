@@ -1021,10 +1021,15 @@ request's branch, gets a `Fix-PR: <number>` header and ends with a `## Fix`
 section holding the comment. A fix comment edited after it was posted is
 refused, as an untrusted ticket is. The runner then checks out that branch,
 pushes the agent's work onto it (fast-forward only, never forced) and
-comments on the pull request; it never opens a second one. The sandboxed agent
-can write `.loom/replies.json` with thread ids, reply text and a resolve
-boolean. The runner posts valid entries after a successful push and resolves
-those marked true; missing or invalid files produce no replies. An entry
+comments on the pull request; it never opens a second one. The brief requires
+the sandboxed agent to answer every review thread it lists: one entry per
+thread in `.loom/replies.json` (thread id, reply text, and a resolve boolean,
+true when the round fixed it, false with a concrete reason when it declines),
+or an answer file in `.loom-answers/`. The runner posts valid entries after a
+successful push and resolves those marked true; missing or invalid files
+produce no replies. A listed thread left with neither is named in the log and
+in the round comment on the pull request ("Review threads this round left
+without a reply"). An entry
 whose thread is not on the round's own pull request, or whose text
 `bus/text.py` refuses, is skipped and logged. A fix brief
 whose pull request is no longer open is parked as failed (a merged one is
@@ -1646,6 +1651,13 @@ merge` refuses with the same reason (loom#1711). Send a brain fix asking the
 lane to untick it and end it `; not built: belongs in <repo>`, so the station
 files the follow-up in that repo; a criterion already ending that way passes.
 
+A `; not built:` reason that says the work is already there must cite code on
+the pull request's base branch: `<path>:<line>`, `<path>#L<line>`,
+`<path>::<symbol>`, or `` `<path>` `<symbol>` ``. Status prints
+`blocked: a criterion says it is already done and cites no code`, `bus.brain
+merge` refuses, and the factory sends the pull request back when a citation is
+missing or the base cannot back it (bus/already_done.py, loom#2333).
+
 Status also prints a "Waiting on the brain" section: every open lane pull
 request whose ticket carries `needs-brain`, oldest first, with its ticket,
 its age in hours and its merge-ready line. The factory sets `needs-brain`
@@ -2260,9 +2272,12 @@ repos finish), then the sections that span every repo (Runaway tickets,
 Priorities, Waiting on you and the rest for `status`; Sensitive pull
 requests, Finished epics, Verify due and Lane proof audit for `resume`).
 Each repo's reads have a budget, `--repo-budget SECONDS` or
-`LOOM_REPO_BUDGET`, 120 seconds by default; a repo past it prints
-`skipped <repo>: timed out after ...` and is left out of the cross-repo
-sections, and the run goes on with the other repos. Within a repo, the
+`LOOM_REPO_BUDGET`, 120 seconds by default. A repo past it, or one whose
+connection failed, is read once more with a fresh budget, keeping the answers
+the first try finished. A repo that fails again prints `skipped <repo>:
+timed out after ...` or `skipped <repo>: connection failed twice: ...` and is
+left out of the cross-repo sections, and the run goes on with the other
+repos. Within a repo, the
 reads per pull request, per stuck ticket and per epic run side by side, so
 one repo's status takes about a third of the time it did when they ran one
 after another.

@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
-from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
+from . import already_done, audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
@@ -641,6 +641,8 @@ def _unbuilt_criteria_reason(body: str) -> str:
                 if criteria_gate.kind(text) != criteria_gate.LIVE]
     if criteria and all(_NOT_BUILT.search(text) for text in criteria):
         return "blocked: no criterion built"
+    if already_done.uncited(body):
+        return "blocked: a criterion says it is already done and cites no code"
     return ""
 
 
@@ -704,8 +706,9 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
         if not sha or not _review_check_passed(gh, repo, sha, check):
             return (line.removesuffix("READY")
                     + "blocked: review check has not passed on the head commit")
-    if line.endswith(" - READY") and _unbuilt_criteria_reason(str(pr.get("body") or "")):
-        return line.removesuffix("READY") + "blocked: no criterion built"
+    unbuilt = _unbuilt_criteria_reason(str(pr.get("body") or ""))
+    if line.endswith(" - READY") and unbuilt:
+        return line.removesuffix("READY") + unbuilt
     foreign = _foreign_criteria_reason(str(pr.get("body") or ""), repo)
     if line.endswith(" - READY") and foreign:
         return line.removesuffix("READY") + foreign
@@ -1213,7 +1216,7 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     waiting: Dict[str, Dict[str, Any]] = {}
     for repo, done, value in per_repo.each(repos, read, seconds, READ_WORKERS):
         if not done:
-            _say(out, emit, ["", "## %s" % repo, "", _skip_line(repo, per_repo.timed_out(seconds))])
+            _say(out, emit, ["", "## %s" % repo, "", _skip_line(repo, per_repo.not_read(seconds, value))])
             continue
         section, into, waits = value
         found.update(into)
@@ -1549,36 +1552,33 @@ def _sub_issue_of(issue: Dict[str, Any], repo: str, goal: int) -> bool:
     return str(issue.get("parent_issue_url") or "").endswith("/repos/%s/issues/%d" % (repo, goal))
 
 
-# GitHub search allows five operators: four ORs join five Part of phrases.
-PART_OF_BATCH = 5
-
-
 def part_of_linked(gh: GitHub, repo: str, epics: Sequence[int]
                    ) -> Dict[int, List[Dict[str, Any]]]:
-    """For each epic, the loom:ticket issues, open or closed, whose body has
-    a Part of line naming it: one search per PART_OF_BATCH epics. goal_tree
-    reads only open ones, so a closed ticket linked by its Part of line alone
-    went uncounted (loom#2023: 13 sub-issues and 4 such links read as 16)."""
+    """For each epic, the loom:ticket issues, open or closed, with no parent
+    issue whose body has a Part of line naming it: one search whatever the
+    number of epics, since a ticket with a parent is a sub-issue goal_tree has
+    read. goal_tree reads only open Part of tickets, so a closed ticket linked
+    by its Part of line alone went uncounted (loom#2023: 13 sub-issues and 4
+    such links read as 16). One search per five epics spent more than GitHub's
+    30 searches a minute on 2026-10-31 (loom#2321)."""
     out: Dict[int, List[Dict[str, Any]]] = {int(n): [] for n in epics}
-    numbers = sorted(out)
-    for start in range(0, len(numbers), PART_OF_BATCH):
-        chunk = numbers[start:start + PART_OF_BATCH]
-        phrases = " OR ".join('"%s"' % part_of_line(n) for n in chunk)
-        q = quote("repo:%s is:issue label:loom:ticket in:body %s" % (repo, phrases))
-        url: Optional[str] = "/search/issues?q=%s&per_page=100" % q
-        for _ in range(SEARCH_PAGES):
-            if not url:
-                break
-            resp = gh.rest("GET", url)
-            data = resp.data if isinstance(resp.data, dict) else {}
-            for item in data.get("items") or []:
-                if (not isinstance(item, dict) or "pull_request" in item
-                        or "loom:ticket" not in _labels(item)):
-                    continue
-                for n in chunk:
-                    if _names_goal(item.get("body"), n):
-                        out[n].append(item)
-            url = _next_link(resp.headers.get("link", ""))
+    if not out:
+        return out
+    q = quote('repo:%s is:issue label:loom:ticket in:body "Part of #" no:parent-issue' % repo)
+    url: Optional[str] = "/search/issues?q=%s&per_page=100" % q
+    for _ in range(SEARCH_PAGES):
+        if not url:
+            break
+        resp = gh.rest("GET", url)
+        data = resp.data if isinstance(resp.data, dict) else {}
+        for item in data.get("items") or []:
+            if (not isinstance(item, dict) or "pull_request" in item
+                    or "loom:ticket" not in _labels(item)):
+                continue
+            for n in out:
+                if _names_goal(item.get("body"), n):
+                    out[n].append(item)
+        url = _next_link(resp.headers.get("link", ""))
     return out
 
 
@@ -3861,6 +3861,10 @@ def merge(gh: GitHub, repo: str, number: int,
             reason = _unbuilt_criteria_reason(str(pr.get("body") or ""))
             if reason:
                 raise ValueError(reason)
+            unproven = already_done.unproven(str(pr.get("body") or ""),
+                                             already_done.base_reader(gh, repo, pr))
+            if unproven:
+                raise ValueError("blocked: no code on the base backs: " + "; ".join(unproven))
         reason = _foreign_criteria_reason(str(pr.get("body") or ""), repo, env)
         if reason:
             raise ValueError(reason)
@@ -5862,7 +5866,7 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     # section, so one stale LOOM_REPOS entry does not end the run (loom#800).
     # A timed-out repo is left out the same way.
     repos = [r for r in dict.fromkeys(repos) if r not in unread and r not in timed]
-    _say(out, emit, _resume_head(holder, authors, goals, unread, timed, seconds, now))
+    _say(out, emit, _resume_head(holder, authors, goals, unread, timed, now))
     latest = _latest_marks(goals)
     gone = dict(unread)  # a snapshot: a late read never sees a later change
     check, trusted = review_check_name(env), trusted_authors(env)
@@ -5873,7 +5877,7 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
 
     for repo, done, value in per_repo.each(repos, gather, seconds, READ_WORKERS):
         if not done:
-            _say(out, emit, ["", _skip_line(repo, per_repo.timed_out(seconds))])
+            _say(out, emit, ["", _skip_line(repo, per_repo.not_read(seconds, value))])
             continue
         read[repo] = value
         if value["lines"]:
@@ -5883,12 +5887,12 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
 
 
 def _resume_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str], seconds: float
-                     ) -> Tuple[List[GoalJournals], Dict[str, str], List[str]]:
+                     ) -> Tuple[List[GoalJournals], Dict[str, str], Dict[str, str]]:
     """Every goal's journals across `repos`, in the order of `repos`, read
     repo by repo under the budget: (goals, unreadable repos with the reason,
-    timed-out repos)."""
+    repos not read in time with the reason)."""
     unread: Dict[str, str] = {}
-    timed: List[str] = []
+    timed: Dict[str, str] = {}
 
     def journals(repo: str) -> Tuple[List[GoalJournals], Dict[str, str]]:
         skipped: Dict[str, str] = {}
@@ -5900,7 +5904,7 @@ def _resume_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str], s
             by_repo[repo], skipped = value
             unread.update(skipped)
         else:
-            timed.append(repo)
+            timed[repo] = per_repo.not_read(seconds, value)
     return [g for repo in dict.fromkeys(repos) for g in by_repo.get(repo, [])], unread, timed
 
 
@@ -5917,7 +5921,7 @@ def _latest_marks(goals: Sequence[GoalJournals]
 
 
 def _resume_head(holder: str, authors: Sequence[str], goals: Sequence[GoalJournals],
-                 unread: Dict[str, str], timed: Sequence[str], seconds: float,
+                 unread: Dict[str, str], timed: Dict[str, str],
                  now: datetime) -> List[str]:
     """The heading, the freshness line, and the repos left out."""
     head = ["# Resume for %s" % holder, "", trusted_line(authors), "",
@@ -5928,7 +5932,7 @@ def _resume_head(holder: str, authors: Sequence[str], goals: Sequence[GoalJourna
         head += [_skip_line(repo, reason) for repo, reason in sorted(unread.items())]
     if timed:
         head += ["", "## Timed-out repos (read again next tick)"]
-        head += [_skip_line(repo, per_repo.timed_out(seconds)) for repo in timed]
+        head += [_skip_line(repo, reason) for repo, reason in timed.items()]
     return head
 
 
