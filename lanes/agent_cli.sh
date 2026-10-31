@@ -174,7 +174,8 @@ classify_failure() {
   seen="$whole"
   [ "$status" -eq 0 ] && seen="$tail"
   FAIL_CLASS=work RETRY_AT="" OUT_OF_CREDIT=""
-  now="$(date +%s)"
+  now="${LOOM_NOW_EPOCH:-$(date +%s)}"
+  now="${now%.*}"
   shopt -s nocasematch
   if [[ "$tail" =~ $AUTH_RE ]]; then
     FAIL_CLASS=auth
