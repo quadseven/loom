@@ -271,7 +271,9 @@ there runs or steers the next tick.
 Each tick writes `$LOOM_HOME/state/brain.json` (how it ended, and the
 holder, lane and model that ran) and touches
 `$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock
-included. When no rung has usage, the tick takes no lock and runs no CLI: it
+included. A rung with no heartbeat, or an old one, has unknown fuel: it runs
+after the rungs with known usage, and its log line says so. When every rung
+says it has no usage or cannot run, the tick takes no lock and runs no CLI: it
 records `skipped` with each rung's reason and leaves `brain-ok` alone, so
 the brain-stopped check below reports it with that reason. The station adds a `brain` row to the lane status. The brain also
 runs on Muse, so the station reads GitHub too: while no local tick has ended
@@ -774,7 +776,9 @@ when it is unset) or any `LOOM_REPOS` repo has an owner outside
 
 `LOOM_TRUSTED_BRIEFERS` (space separated GitHub logins, default empty) lets
 another operator hand work to this Loom's lanes without this Loom adopting
-their claims. It is briefing trust only:
+their claims. A reinstall that leaves it unset keeps the list in the installed
+station plist; set it, even to empty, to replace the list. It is briefing trust
+only:
 
 - A `loom:ticket` authored by a trusted briefer is trusted for briefing and
   building exactly like one from `LOOM_BRIEF_AUTHORS`: the station's claim and
