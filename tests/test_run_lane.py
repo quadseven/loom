@@ -2566,8 +2566,11 @@ exec /usr/bin/git "$@"
         answers = self.inbox / "answers" / name
         # Only the regular file named for a thread; the symlink, the hard link
         # to a file outside the tree and the FIFO are dropped unread.
-        self.assertEqual(sorted(os.listdir(answers)), ["PRRT_1.md"])
+        self.assertEqual(sorted(os.listdir(answers)), [".head", "PRRT_1.md"])
         self.assertEqual((answers / "PRRT_1.md").read_text(), "Not valid: a.py:2 already guards it.\n")
+        # The round pushed, so its answers stand against the head it pushed.
+        self.assertEqual((answers / ".head").read_text().strip(),
+                         self.remote_head(self.FIX_BRANCH))
         files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only",
                                 self.remote_head(self.FIX_BRANCH)], capture_output=True, text=True).stdout.split()
         self.assertIn("fix.txt", files)

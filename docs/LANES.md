@@ -473,10 +473,16 @@ A fix brief may answer a finding instead of fixing it: the agent writes the
 reason to `.loom-answers/<thread id>.md`, the runner moves that folder out of
 the tree (never committed; links dropped unread), and the station posts each
 answer as the reply on its thread, redacted and text-checked. The station
+refuses an answer unposted when the pull request has moved past the head the
+round recorded beside its answers (its own push counts), and keeps each
+finding's state (pending, picked up, answered) at that head in
+`state/fix-findings.json` (bus/fixrounds.py). A re-sent answer posts no second
+reply. The station
 resolves the thread only when the round ran on a ladder model, the thread
 is the review bot's own medium or low finding, and the answer holds on the
 pull request head (bus/rebuttal.py, loom#2081): "Fixed in <sha>" names the
-head or one of its ancestors (any case), or the answer cites files and lines
+head or one of its ancestors (any case) and that commit touches the thread's
+file, or the answer cites files and lines
 the head has and, when it names backticked symbols, at least one of them is
 there, every "`f` is called by `g`" claim is a real call there,
 and a dead-code finding's symbol has a call. An answer that cites nothing
