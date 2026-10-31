@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
-from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
+from . import already_done, audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
@@ -641,6 +641,8 @@ def _unbuilt_criteria_reason(body: str) -> str:
                 if criteria_gate.kind(text) != criteria_gate.LIVE]
     if criteria and all(_NOT_BUILT.search(text) for text in criteria):
         return "blocked: no criterion built"
+    if already_done.uncited(body):
+        return "blocked: a criterion says it is already done and cites no code"
     return ""
 
 
@@ -704,8 +706,9 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
         if not sha or not _review_check_passed(gh, repo, sha, check):
             return (line.removesuffix("READY")
                     + "blocked: review check has not passed on the head commit")
-    if line.endswith(" - READY") and _unbuilt_criteria_reason(str(pr.get("body") or "")):
-        return line.removesuffix("READY") + "blocked: no criterion built"
+    unbuilt = _unbuilt_criteria_reason(str(pr.get("body") or ""))
+    if line.endswith(" - READY") and unbuilt:
+        return line.removesuffix("READY") + unbuilt
     foreign = _foreign_criteria_reason(str(pr.get("body") or ""), repo)
     if line.endswith(" - READY") and foreign:
         return line.removesuffix("READY") + foreign
@@ -3876,6 +3879,10 @@ def merge(gh: GitHub, repo: str, number: int,
             reason = _unbuilt_criteria_reason(str(pr.get("body") or ""))
             if reason:
                 raise ValueError(reason)
+            unproven = already_done.unproven(str(pr.get("body") or ""),
+                                             already_done.base_reader(gh, repo, pr))
+            if unproven:
+                raise ValueError("blocked: no code on the base backs: " + "; ".join(unproven))
         reason = _foreign_criteria_reason(str(pr.get("body") or ""), repo, env)
         if reason:
             raise ValueError(reason)
@@ -3908,7 +3915,8 @@ def _settle_merged_ticket(gh: GitHub, repo: str, number: int, pr_body: str,
                           association: Tuple[str, int], issue: Dict[str, Any]) -> None:
     """Move the ticket of the pull request just merged: to loom:queued with a
     note when the diff or the boxes left it unbuilt, else to loom:merged."""
-    reason = _unbuilt_reason(gh, repo, number, issue) or _unbuilt_boxes(pr_body, issue)
+    reason = "; ".join(x for x in (_unbuilt_reason(gh, repo, number, issue),
+                                   _unbuilt_boxes(pr_body, issue)) if x)
     if reason:
         move(gh, association[0], association[1], "queued",
              note=tickets.UNBUILT_NOTE % (number, reason))
@@ -3917,12 +3925,16 @@ def _settle_merged_ticket(gh: GitHub, repo: str, number: int, pr_body: str,
 
 
 def _unbuilt_boxes(pr_body: str, issue: Dict[str, Any]) -> str:
-    """The ticket's code boxes the merged pull request body leaves unbuilt,
-    joined for the requeue note, else "". A partial merge goes back to
-    loom:queued for the rest instead of loom:merged (loom#2026), as the
-    station's own reading of a merged pull request does."""
+    """When the merged pull request body leaves a code box unbuilt, every box
+    it leaves open, joined for the requeue note, else "". A partial merge goes
+    back to loom:queued for the rest instead of loom:merged (loom#2026), as the
+    station's own reading of a merged pull request does, and its note names
+    all that is left (loom#2333)."""
     from . import factory
-    return "; ".join(factory.unbuilt_criteria(str(issue.get("body") or ""), [pr_body]))
+    body = str(issue.get("body") or "")
+    if not factory.unbuilt_criteria(body, [pr_body]):
+        return ""
+    return "; ".join(factory.unticked_criteria(body, [pr_body]))
 
 
 def _unbuilt_reason(gh: GitHub, repo: str, number: int, issue: Dict[str, Any]) -> str:
