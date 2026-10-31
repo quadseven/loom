@@ -55,7 +55,7 @@ agent_cli() {
 # (2026-10-20). Providers say the quota is reached, exceeded or exhausted.
 # A full shared free pool ("has no lane available; retry after 1s") is a
 # short limit, not the agent's failure (18 runs, 2026-10-21).
-LIMIT_RE='usage limit|rate[ _-]?limit|has no lane available|quota (reached|exceeded|exhausted|resets?)|exceeded (your |the )?(current )?quota|resource[ _]exhausted|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|hit your (weekly |daily |session )?limit'
+LIMIT_RE='usage limit|rate[ _-]?limit|has no lane available|quota (reached|exceeded|exhausted|resets?)|exceeded (your |the )?(current )?quota|resource[ _]exhausted|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|hit your (weekly |daily |session )?limit|exceeded your [a-z ]*allowance|you have no quota'
 # A bare HTTP status counts only in the short tail: a repo's own test output
 # printed "status=error detail=http 402", and a codex run that exited 0 was
 # classed out of credit and its lane parked a day (2026-10-21).
@@ -84,7 +84,7 @@ AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|h
 # OpenRouter: "free-models-per-day"). The fixed hour retried it, and failed,
 # every hour until then (2026-10-19).
 DAILY_RE='daily (free )?(allocation|allowance|limit|quota)|per[ _-]day'
-MONTHLY_RE='copilot.*(allowance|limit|quota|usage|request)|monthly ([a-z]+ )*(allocation|allowance|limit|quota)|per[ _-]month|resets? (at|on) the first of (the )?month'
+MONTHLY_RE='copilot.*(allowance|limit|quota|usage|request)|exceeded your [a-z ]*allowance|monthly ([a-z]+ )*(allocation|allowance|limit|quota)|per[ _-]month|resets? (at|on) the first of (the )?month'
 # A model the agent CLI no longer offers (opencode drops one models.dev marks
 # deprecated) rests the lane LIMIT_WAIT, then the lane checks the CLI's model
 # list before it claims (model_listed in run_lane.sh). A day's rest assumed

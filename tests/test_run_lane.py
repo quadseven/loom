@@ -3165,6 +3165,18 @@ exec /usr/bin/git "$@"
             return int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp())
         self.assertIn(int(retry_at), (next_month(before), next_month(datetime.now(timezone.utc))))
 
+    def test_copilot_allowance_wordings_hold_the_lane_instead_of_failing_the_ticket(self):
+        # The Free allowance runs out with no "usage limit" in the message; a
+        # "work" class would send the next ticket straight into the same wall.
+        for said in ("You have exceeded your premium request allowance",
+                     "Error: You have no quota"):
+            script = (RUNNER.parent / "agent_cli.sh").read_text() + (
+                'classify_failure 1 "%s" ""; printf "%%s %%s\\n" "$FAIL_CLASS" "$RETRY_AT"' % said)
+            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+            kind, retry_at = result.stdout.split()
+            self.assertEqual(kind, "limit", said)
+            self.assertGreater(int(retry_at), time.time() + 1800, said)
+
     def assert_next_occurrence(self, retry_at, hour, minute, before):
         """retry_at is the next hour:minute on the local clock, read from the
         clock before and after the run so it may cross that time, and by the
