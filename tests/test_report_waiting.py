@@ -1,6 +1,6 @@
 """A goal report keeps "Needs you:" apart from the count of what waits (loom#1775).
 
-On 2026-10-25 a report ended "Needs you: nothing. loom:human: 28 in <repo>."
+On 2026-10-25 a report ended "Needs you: nothing. needs:human: 28 in <repo>."
 and the operator read it as "nothing needed" and "28 things needed" at once.
 The count now has its own "Waiting on you:" line; `journal` compares only the
 "Needs you:" line, so a moving count alone edits the last report in place, and
@@ -24,7 +24,7 @@ from bus.github import GitHub  # noqa: E402
 from tests.test_quiet import (GOAL, ME, NOW, REPO, GoalHome, ago, report_comment,  # noqa: E402
                               ticket)
 
-OLD = quiet.REPORT_MARKER + "\nTicket 41 opened.\nNeeds you: nothing. loom:human: 28 in %s." % REPO
+OLD = quiet.REPORT_MARKER + "\nTicket 41 opened.\nNeeds you: nothing. needs:human: 28 in %s." % REPO
 NEEDS = "Needs you: nothing new for this goal"
 
 
@@ -33,7 +33,7 @@ def report(count_line, needs=NEEDS):
 
 
 def human(number, *labels):
-    return ticket(number, "loom:human", *labels, created_at=ago(1))
+    return ticket(number, "needs:human", *labels, created_at=ago(1))
 
 
 class CheckTest(unittest.TestCase):
@@ -43,12 +43,12 @@ class CheckTest(unittest.TestCase):
 
     def test_a_count_on_a_real_ask_is_refused_too(self):
         # The count moves; the ask must not move with it.
-        with self.assertRaisesRegex(journal.ReportInvalid, "carries a loom:human count"):
-            journal.check_report(quiet.REPORT_MARKER + "\nNeeds you: decide #44. loom:human: 3 in r/n.")
+        with self.assertRaisesRegex(journal.ReportInvalid, "carries a needs:human count"):
+            journal.check_report(quiet.REPORT_MARKER + "\nNeeds you: decide #44. needs:human: 3 in r/n.")
 
     def test_nothing_beside_a_count_on_the_waiting_line_is_refused(self):
         with self.assertRaisesRegex(journal.ReportInvalid, "Waiting on you"):
-            journal.check_report(report("Waiting on you: nothing, 28 open loom:human"))
+            journal.check_report(report("Waiting on you: nothing, 28 open needs:human"))
 
     def test_the_two_line_forms_pass(self):
         journal.check_report(report(journal.waiting_line({REPO: 28}, 4)))
@@ -59,7 +59,7 @@ class CheckTest(unittest.TestCase):
     def test_the_helper_writes_the_line_from_data(self):
         self.assertEqual(
             journal.waiting_line({"o/a": 25, "o/b": 3, "o/c": 0}, 4),
-            "Waiting on you: 28 open loom:human (25 in o/a, 3 in o/b; 4 of them under this "
+            "Waiting on you: 28 open needs:human (25 in o/a, 3 in o/b; 4 of them under this "
             "goal), listed in the daily digest")
         self.assertEqual(journal.waiting_line({"o/a": 0}), "Waiting on you: nothing")
         self.assertEqual(journal.waiting_line({}), "Waiting on you: nothing")
@@ -95,7 +95,7 @@ class PostTest(unittest.TestCase):
         self.post(home, report(journal.waiting_line({REPO: 27}, 3)))
         self.assertEqual(home.posts, [])  # no new comment, so no email
         self.assertEqual([ident for ident, _ in home.edits], [5])
-        self.assertIn("Waiting on you: 27 open loom:human", home.edits[0][1])
+        self.assertIn("Waiting on you: 27 open needs:human", home.edits[0][1])
 
     def test_a_changed_needs_you_still_posts_a_new_comment(self):
         home = self.home(report(journal.waiting_line({REPO: 28}, 4)))
@@ -128,12 +128,12 @@ class StatusTest(unittest.TestCase):
         return out.split("## Waiting on you")[1].split("\n## ")[0]
 
     def test_status_fills_the_line_with_the_repo_count_and_the_goals_share(self):
-        # Three loom:human issues in the repo; two sit under the goal.
+        # Three needs:human issues in the repo; two sit under the goal.
         mine = [human(41), human(42)]
         other = human(77)
         home = GoalHome([report_comment(1, ago(7))], mine, issues=mine + [other])
         section = self.status(home)
-        self.assertIn("- %s#%d: Waiting on you: 3 open loom:human (3 in %s; 2 of them under "
+        self.assertIn("- %s#%d: Waiting on you: 3 open needs:human (3 in %s; 2 of them under "
                       "this goal), listed in the daily digest" % (REPO, GOAL, REPO), section)
 
     def test_status_says_nothing_only_when_nothing_waits(self):

@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import quote
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 from . import answer
 from . import audit
@@ -41,6 +41,7 @@ from . import brain_hold
 from . import claimed
 from . import fabric
 from . import fixrounds
+from . import logrotate
 from . import flake
 from . import rebuttal
 from . import runners
@@ -48,7 +49,10 @@ from . import scope_fit
 from . import shadow
 from . import urgency
 from . import stale_claims
+from . import ask_state
+from . import brief_check
 from . import label_pass
+from .labels import HUMAN_LABELS, NEEDS_HUMAN, needs_human
 from . import factory
 from . import friction_intake
 from . import evidence
@@ -127,6 +131,15 @@ TREE_KEEP = 3600
 # size is logged. On 2026-10-17 logs/ held 4.2 GB, growing 0.6 GB a day, and
 # the disk was down to 8 GB free.
 LOG_KEEP_DAYS = 7
+# logs/ as a whole stays under LOOM_LOG_MAX_GB (0 for no limit, loom#2268):
+# past it the oldest finished runs go first, whatever their age, except
+# anything prune_logs keeps and anything changed in the last LOG_FLOOR
+# seconds. The service logs at the top of logs/ rotate past LOOM_LOG_ROTATE_MB
+# (bus/logrotate.py), LOG_ROTATE_KEEP compressed copies each.
+LOG_MAX_GB = 10.0
+LOG_FLOOR = 24 * 3600
+LOG_ROTATE_MB = 20.0
+LOG_ROTATE_KEEP = 5
 # While the home's disk has less than LOOM_MIN_FREE_GB free the station claims
 # no new work (loom#1808): on 2026-10-25 the disk fell to 300 MB free and every
 # lane run failed at once. The older name LOOM_DISK_FREE_MIN_GB is still read.
@@ -134,8 +147,11 @@ DISK_FREE_MIN_GB = 15.0
 DISK_GUARD_FILE = "disk-guard.json"
 # A finished opencode run's session store under its log folder (lanes/
 # run_lane.sh archive_transcripts): 100-440 MB a run on 2026-10-25, 14 GB of
-# the 17 GB in logs/ (loom#1808). Compressed once its transcript is uploaded.
+# the 17 GB in logs/ (loom#1808). Compressed once its transcript is uploaded,
+# or SESSION_UNSENT_KEEP seconds after the run while it waits: the upload reads
+# either form, and a backlog held 7 GB raw on 2026-10-30 (loom#2268).
 SESSION_DB_PARTS = (".local", "share", "opencode", "opencode.db")
+SESSION_UNSENT_KEEP = 24 * 3600
 # The ticket states after which a lane tree serves no fix round: its tree,
 # check copy and idle run scratch go at once, not after TREE_KEEP.
 TREE_DONE_STATES = frozenset(("loom:merged", "loom:shipped", "loom:verified",
@@ -154,6 +170,7 @@ DISK_EVERY = 3600
 THIN_EVERY = 1800
 THIN_FILE = "snapshot-thin.json"
 GB = 1024 ** 3
+MB = 1024 ** 2
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
 ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
 ANSWER_MAX = 3000
@@ -187,7 +204,6 @@ LANES_MARKER = "<!-- loom:lanes v1 -->"
 LANES_LABEL = "loom:lanes"
 LANES_TITLE = "Loom lane status"
 LANES_REPUBLISH = 3600
-NEEDS_OPERATOR = "needs-operator"
 URGENT = "loom:urgent"
 REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
@@ -195,7 +211,7 @@ POST_TIMEOUT = 30
 # A usage snapshot that fails once is sent again after this pause (loom#345).
 USAGE_RETRY_PAUSE = 2
 DIGEST_HEAD = "Asks waiting for you:"
-# Open loom:human issues wait for the daily digest.
+# Open needs:human issues wait for the daily digest.
 HUMAN = "loom:human"
 # Why a ticket waits (bus/labels.py): one wait:* label at a time.
 WAIT = "wait:"
@@ -662,8 +678,8 @@ STATELESS_TEXT = ("Queued: this ticket carried no state label, so nothing would 
 # Labels that mean someone or something already holds a ticket: any Loom
 # state or hold, a person's claim, an operator ask, or a wait.
 _HOLD_LABELS = {"loom:" + state for state in brain.STATES} | {
-    "loom:triage", "loom:human", "loom:held", "loom:ready", "loom:awaiting-evidence",
-    "loom:closed-unmerged", "needs-operator", "needs-brain"}
+    "loom:triage", "loom:held", "loom:ready", "loom:awaiting-evidence",
+    "loom:closed-unmerged", "needs-brain", *HUMAN_LABELS}
 
 
 def _holds_ticket(name: str) -> bool:
@@ -887,6 +903,8 @@ class Settings:
                  ship_path_workflows: Sequence[str] = (),
                  no_topup: Sequence[str] = (),
                  log_keep_days: int = LOG_KEEP_DAYS,
+                 log_max_bytes: int = int(LOG_MAX_GB * GB),
+                 log_rotate_bytes: int = int(LOG_ROTATE_MB * MB),
                  disk_free_min_gb: float = DISK_FREE_MIN_GB,
                  settle_claimed: str = "off",
                  settle_claimed_max: int = claimed.PER_RUN,
@@ -930,6 +948,8 @@ class Settings:
         # Days a lane's logs are kept (0: forever), and the free disk under
         # which every pass warns (Station.tend_disk).
         self.log_keep_days = log_keep_days
+        self.log_max_bytes = log_max_bytes
+        self.log_rotate_bytes = log_rotate_bytes
         self.disk_free_min_gb = disk_free_min_gb
         # Repos whose merged tickets ship at merge (ship_on_merge), and repos
         # whose merged tickets ship when their deploy workflow succeeds on the
@@ -1094,6 +1114,8 @@ class Settings:
                    ship_path_workflows=words("LOOM_SHIP_PATH_WORKFLOWS"),
                    no_topup=words("LOOM_NO_TOPUP"),
                    log_keep_days=_keep_days(env.get("LOOM_LOG_KEEP_DAYS", "")),
+                   log_max_bytes=int(_log_size(env, "LOOM_LOG_MAX_GB", LOG_MAX_GB) * GB),
+                   log_rotate_bytes=int(_log_size(env, "LOOM_LOG_ROTATE_MB", LOG_ROTATE_MB) * MB),
                    disk_free_min_gb=_free_floor(env.get("LOOM_MIN_FREE_GB", "").strip()
                                                 or env.get("LOOM_DISK_FREE_MIN_GB", "")),
                    settle_claimed=claimed.mode(env.get("LOOM_SETTLE_CLAIMED", "")),
@@ -1123,6 +1145,21 @@ def _keep_days(raw: str) -> int:
         return int(raw)
     _say("ignoring LOOM_LOG_KEEP_DAYS %r: not a whole number of days" % raw)
     return LOG_KEEP_DAYS
+
+
+def _log_size(env: Dict[str, str], name: str, default: float) -> float:
+    """A non-negative size setting, else the default, said once."""
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not (value >= 0 and math.isfinite(value)):
+        _say("ignoring %s %r: not a size" % (name, raw))
+        return default
+    return value
 
 
 def _free_floor(raw: str) -> float:
@@ -4445,7 +4482,7 @@ class Station:
         """Whether the ticket goes to no build lane (bus/brief_check.py): a
         health ticket whose cause is missing or names only the measurement
         goes back to the queue with needs-brain; a stale or already-shipped
-        one goes back to the queue with loom:human and one ask. A read the
+        one goes back to the queue with needs:human and one ask. A read the
         check needs that fails holds the ticket for the next pass. A
         regression or revert ticket is checked for its cause only: its merged
         pull request is why it exists."""
@@ -6402,7 +6439,7 @@ class Station:
                 ])
                 ask += f"\n\n{accept_block}"
                 brain.human(self.gh, repo, number, ask)
-                _say("%s#%d: only removed-guarded-path on named paths; moved to loom:human for accept-removal"
+                _say("%s#%d: only removed-guarded-path on named paths; moved to needs:human for accept-removal"
                      % (repo, number))
                 return
         # An infra timeout (bus/flake.py) is no lane's to fix: it is re-run
@@ -7888,18 +7925,24 @@ class Station:
     # -- asks -------------------------------------------------------------
     def _poll_asks(self, repo: str) -> List[Dict[str, Any]]:
         # A conditional read, like _poll.
-        items = self.gh.rest(
-            "GET", "/repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, NEEDS_OPERATOR)).data
-        items = items if isinstance(items, list) else []
-        return [i for i in items if isinstance(i, dict) and "pull_request" not in i
-                and i.get("html_url") and "number" in i]
+        found: Dict[int, Dict[str, Any]] = {}
+        for label in HUMAN_LABELS:
+            if label == HUMAN:
+                continue
+            items = self.gh.rest(
+                "GET", "/repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, label)).data
+            for i in items if isinstance(items, list) else []:
+                if isinstance(i, dict) and "pull_request" not in i and i.get("html_url") \
+                        and "number" in i:
+                    found.setdefault(int(i["number"]), i)
+        return list(found.values())
 
     def _ask_trusted(self, repo: str, issue: Dict[str, Any]) -> bool:
         allowed = {a.lower() for a in self.s.authors}
         if tickets._login(issue.get("user")) not in allowed:
             return False
         events = self._paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
-        actor = tickets._latest_label_actor(events, lambda n: n == NEEDS_OPERATOR)
+        actor = tickets._latest_label_actor(events, lambda n: n in HUMAN_LABELS)
         return actor is not None and actor in allowed
 
     @staticmethod
@@ -7924,7 +7967,7 @@ class Station:
         return True
 
     def _gather_human(self) -> Optional[List[Tuple[str, Dict[str, Any]]]]:
-        """(repo, issue) for every open loom:human issue, newest first; None
+        """(repo, issue) for every open needs:human issue, newest first; None
         when any repo could not be read (the digest waits for a whole list)."""
         found: List[Tuple[str, Dict[str, Any]]] = []
         for repo in self.s.repos:
@@ -7945,7 +7988,7 @@ class Station:
         return found
 
     def _human_ask(self, repo: str, issue: Dict[str, Any]) -> str:
-        """The first line of the newest loom:human comment from an allowed
+        """The first line of the newest needs:human comment from an allowed
         login (the brain's ask), or "" when there is none."""
         allowed = {a.lower() for a in self.s.authors}
         # paginate follows the next links, so the newest comment is read however
@@ -8001,7 +8044,7 @@ class Station:
             except GitHubError as err:
                 _say("could not list asks in %s: %s" % (repo, err))
                 return None
-        # A loom:human issue waits in the digest's own list, never alone.
+        # A needs:human issue waits in the digest's own list, never alone.
         asks = [a for a in asks if HUMAN not in _label_names(a[1])]
         asks.sort(key=lambda a: (str(a[1].get("created_at") or ""), a[0], int(a[1]["number"])))
         return [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
@@ -8212,6 +8255,27 @@ class Station:
             _write_json(path, sent)
         return True
 
+    def _ask_inputs(self, repo: str, issue: Dict[str, Any]) -> Tuple[
+            List[Any], List[Any], List[str], List[str], List[int]]:
+        """What bus/ask_state.py reads for one ask: its comments, its events,
+        who may answer, and the open issues its Blocked on section names."""
+        number = int(issue["number"])
+        comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+        events = self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
+        trusted = list(self.s.authors)
+        blockers = []
+        for other in brief_check.blocked_on(issue.get("body")):
+            if other != number and (self.gh.rest(
+                    "GET", "/repos/%s/issues/%d" % (repo, other)).data or {}).get("state") != "closed":
+                blockers.append(other)
+        return comments, events, trusted, answer.operators(trusted=trusted), blockers
+
+    def _ask_open(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """A person can act on this ask today: it is not answered in the
+        ticket and waits on nothing else. The digest only reads; the label
+        pass (clean_labels) takes the label off."""
+        return ask_state.state(issue, *self._ask_inputs(repo, issue)) == ask_state.OPEN
+
     def _new_digest_plan(self, keyed: List[Tuple[str, str, Dict[str, Any]]],
                          covered: Any, today: str) -> Optional[Dict[str, Any]]:
         """Build the day's fixed plan after every ask and human item can be read."""
@@ -8221,6 +8285,14 @@ class Station:
         asks = [a for a in keyed if trust.get(a[0])]
         found = self._gather_human()
         if found is None:
+            return None
+        try:
+            asks = [a for a in asks if self._ask_open(a[1], a[2])]
+            found = [f for f in found if self._ask_open(f[0], f[1])]
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read an ask for the digest: %s; next pass" % err)
             return None
         human = self._human_text(found) if found else ""
         if human is None or (not asks and not human):
@@ -9465,7 +9537,7 @@ class Station:
         """Whether a done ticket stays open because a live or operator
         criterion has no evidence (bus/criteria_gate.py): a live one with a
         check Loom can run gets the check; one with none, a failed check, or
-        an operator action sends the ticket to loom:human with one ask, once.
+        an operator action sends the ticket to needs:human with one ask, once.
         2026-10-22 audit: at least 12 tickets of the private deployment repo
         closed shipped on green CI with live criteria never checked."""
         number = int(issue["number"])
@@ -9480,7 +9552,7 @@ class Station:
         waiting = [t for k, t in gaps if k == criteria_gate.LIVE
                    and criteria_gate.check_of(t) is not None
                    and criteria_gate.key(t) not in failed]
-        if waiting or "loom:human" in _label_names(issue) or not self._live_ask_room():
+        if waiting or needs_human(_label_names(issue)) or not self._live_ask_room():
             return True
         try:
             brain.human(self.gh, repo, number, criteria_gate.ask(gaps, failed))
@@ -9768,9 +9840,16 @@ class Station:
                     or tickets.owned_elsewhere(issue, self.s.authors, self.s.briefers)):
                 continue
             seen.add(number)
-            events = (self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
-                      if label_pass.needs_events(issue) else None)
-            found = label_pass.plan(issue, events, station_logins)
+            ask = (needs_human(_label_names(issue)) and changed < left
+                   and str(issue.get("state") or "open") == "open")
+            if ask:
+                comments, events, trusted, ops, blockers = self._ask_inputs(repo, issue)
+                found = label_pass.plan(issue, events, station_logins, comments=comments,
+                                        trusted=trusted, ops=ops, blockers=blockers)
+            else:
+                events = (self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
+                          if label_pass.needs_events(issue) else None)
+                found = label_pass.plan(issue, events, station_logins)
             key = "%s#%d" % (repo, number)
             if found.note and notes.get(key) != found.note:
                 _say("health note %s: %s" % (key, found.note))
@@ -9778,12 +9857,27 @@ class Station:
                 notes[key] = found.note
             else:
                 notes.pop(key, None)
-            if not found.remove or changed >= left:
+            if not (found.remove or found.add) or changed >= left:
                 continue
+            self._add_labels(repo, number, found.add)
             for removal in found.remove:
                 self._unlabel(repo, number, removal)
             changed += 1
         return changed
+
+    def _add_labels(self, repo: str, number: int, names: Sequence[str]) -> None:
+        """Add labels, or in shadow record that they would be added. Added
+        before any removal, so a failed write never leaves a ticket with no
+        ask label."""
+        if not names:
+            return
+        if shadow.active(repo):
+            shadow.record_held(shadow.LABEL, repo, number, "issue",
+                               reason="add %s" % ", ".join(names), label=names[0],
+                               source="station clean_labels")
+            return
+        self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": list(names)})
+        _say("%s#%d: add %s" % (repo, number, ", ".join(names)))
 
     def _unlabel(self, repo: str, number: int, removal: "label_pass.Removal") -> None:
         """Remove one label, or in shadow record that it would be removed."""
@@ -11321,9 +11415,11 @@ class Station:
         return found
 
     def _standup_ask_status(self, issue: Dict[str, Any], labels: Set[str]) -> Tuple[bool, bool]:
+        if needs_human(labels):
+            return True, "loom:queued" in labels
         has_needs = any(self.NEEDS_LABEL_PATTERN.match(l) for l in labels)
         has_ask = self._has_ask_comment(issue) if has_needs else False
-        is_waiting = bool(labels & {NEEDS_OPERATOR, HUMAN}) or (has_needs and has_ask)
+        is_waiting = has_needs and has_ask
         is_queued = ("loom:queued" in labels) or (has_needs and not has_ask)
         return is_waiting, is_queued
 
@@ -12819,9 +12915,11 @@ class Station:
 
     def tend_disk(self) -> None:
         """Keep the loom home bounded and say how big it is (loom#643). Every
-        DISK_EVERY seconds the lane logs past retention go (prune_logs),
-        finished runs' session stores are compressed (compress_sessions), and
-        the home's size is logged, by top-level folder. The free space below
+        DISK_EVERY seconds the service logs rotate, the lane logs past
+        retention go (prune_logs), finished runs' session stores are
+        compressed (compress_sessions), logs/ is held to its limit
+        (limit_logs), and the home's size is logged, by top-level folder. The
+        free space below
         the floor stops claims instead (disk_low)."""
         free = self._disk_free()
         path = os.path.join(self.state, "disk.json")
@@ -12829,8 +12927,11 @@ class Station:
         last = saved.get("at") if isinstance(saved, dict) else None
         if self._num(last) and 0 <= self.now - last < DISK_EVERY:
             return
+        logrotate.rotate(os.path.join(self.s.home, "logs"), self.s.log_rotate_bytes,
+                         LOG_ROTATE_KEEP, self.now, _say)
         self.prune_logs()
         self.compress_sessions()
+        self.limit_logs()
         sizes: Dict[str, int] = {}
         try:
             names = os.listdir(self.s.home)
@@ -12854,7 +12955,8 @@ class Station:
         """gzip each finished run's opencode session store (SESSION_DB_PARTS
         under logs/<slot>/<run>/) to opencode.db.gz, once no brief of that
         name is waiting or running and its transcript is not waiting for the
-        dashboard (_logs_kept). bus/sessions.py reads the compressed store,
+        dashboard (_logs_kept) or has waited SESSION_UNSENT_KEEP seconds.
+        bus/sessions.py reads the compressed store,
         and prune_logs removes it with the run's other logs after
         log_keep_days. The -wal and -shm files go too: the readers open the
         store immutable and never read them. Times are kept, so retention
@@ -12875,11 +12977,13 @@ class Station:
             except OSError as err:
                 _say("cannot list lane %s's logs to compress session stores: %s" % (slot, err))
                 continue
-            keep = live | {k.split("/", 1)[1] for k in pending if k.startswith(slot + "/")}
+            unsent = {k.split("/", 1)[1] for k in pending if k.startswith(slot + "/")}
             for name in names:
-                if name in keep:
+                if name in live:
                     continue
                 try:
+                    if name in unsent and self._store_is_fresh(os.path.join(folder, name)):
+                        continue
                     sizes = _gzip_session_db(os.path.join(folder, name))
                 except OSError as err:
                     _say("cannot compress the session store of %s/%s: %s" % (slot, name, err))
@@ -12891,6 +12995,14 @@ class Station:
         if count:
             _say("compressed %d finished run session store(s): %s to %s"
                  % (count, _gb(before), _gb(after)))
+
+    def _store_is_fresh(self, run: str) -> bool:
+        """Whether a run's session store changed in SESSION_UNSENT_KEEP."""
+        try:
+            changed = os.lstat(os.path.join(run, *SESSION_DB_PARTS)).st_mtime
+        except OSError:
+            return True
+        return self.now - changed < SESSION_UNSENT_KEEP
 
     def _logs_kept(self) -> Optional[Tuple[Set[str], Set[str]]]:
         """(names, slot/name keys) whose lane logs stay however old: every
@@ -12917,19 +13029,13 @@ class Station:
                     pending.add("%s/%s" % (lane, name))
         return live, pending
 
-    def prune_logs(self) -> None:
-        """Remove each entry of a lane's log folder (logs/<slot>/: a run's
-        log, result and records, its archived transcripts) whose newest file
-        is older than log_keep_days, unless _logs_kept keeps its ticket. The
-        station's own logs in logs/ are not touched."""
-        if self.s.log_keep_days <= 0:
-            return
+    def _lane_log_entries(self) -> Iterator[Tuple[str, str]]:
+        """(slot/name, path) of each entry in a lane's log folder that
+        _logs_kept does not keep. None comes when that cannot be read."""
         kept = self._logs_kept()
         if kept is None:
             return
         live, pending = kept
-        cutoff = self.now - self.s.log_keep_days * 24 * 3600
-        removed = freed = 0
         for slot in LANES:
             folder = os.path.join(self.s.home, "logs", slot)
             try:
@@ -12944,22 +13050,68 @@ class Station:
             keep = live | {k.split("/", 1)[1] for k in pending if k.startswith(slot + "/")}
             for name in names:
                 # A run's files are <ticket>, <ticket>.log, <ticket>.result...
-                if any(name == t or name.startswith(t + ".") for t in keep):
+                if not any(name == t or name.startswith(t + ".") for t in keep):
+                    yield "%s/%s" % (slot, name), os.path.join(folder, name)
+
+    def prune_logs(self) -> None:
+        """Remove each entry of a lane's log folder (logs/<slot>/: a run's
+        log, result and records, its archived transcripts) whose newest file
+        is older than log_keep_days, unless _logs_kept keeps its ticket. The
+        service logs in logs/ rotate instead (bus/logrotate.py)."""
+        if self.s.log_keep_days <= 0:
+            return
+        cutoff = self.now - self.s.log_keep_days * 24 * 3600
+        removed = freed = 0
+        for key, path in self._lane_log_entries():
+            try:
+                newest, size = _tree_stat(path)
+                if newest >= cutoff:
                     continue
-                path = os.path.join(folder, name)
-                try:
-                    newest, size = _tree_stat(path)
-                    if newest >= cutoff:
-                        continue
-                    _remove(path)
-                except OSError as err:
-                    _say("cannot remove old lane log %s/%s: %s" % (slot, name, err))
-                    continue
-                removed += 1
-                freed += size
+                _remove(path)
+            except OSError as err:
+                _say("cannot remove old lane log %s: %s" % (key, err))
+                continue
+            removed += 1
+            freed += size
         if removed:
             _say("removed %d lane log(s) older than %d days (%s)"
                  % (removed, self.s.log_keep_days, _gb(freed)))
+
+    def limit_logs(self) -> None:
+        """Hold logs/ under log_max_bytes: past it, remove the oldest lane
+        log entries prune_logs could remove, sparing anything changed in the
+        last LOG_FLOOR seconds, then say the size against the limit."""
+        limit = self.s.log_max_bytes
+        if limit <= 0:
+            return
+        try:
+            total = _tree_stat(os.path.join(self.s.home, "logs"))[1]
+        except OSError as err:
+            _say("cannot measure logs/: %s" % err)
+            return
+        removed = 0
+        if total > limit:
+            found = []
+            for key, path in self._lane_log_entries():
+                try:
+                    newest, size = _tree_stat(path)
+                except OSError:
+                    continue
+                if self.now - newest >= LOG_FLOOR:
+                    found.append((newest, size, key, path))
+            for _, size, key, path in sorted(found):
+                if total <= limit:
+                    break
+                try:
+                    _remove(path)
+                except OSError as err:
+                    _say("cannot remove lane log %s: %s" % (key, err))
+                    continue
+                total -= size
+                removed += 1
+        _say("logs hold %s, %s the %s limit%s"
+             % (_gb(total), "over" if total > limit else "under", _gb(limit),
+                "; removed the %d oldest lane log(s)" % removed if removed else ""))
 
     # -- the GitHub budget --------------------------------------------------
     def _budget_state(self) -> Dict[str, Any]:
@@ -13123,7 +13275,7 @@ class Station:
         made = self.gh.rest("POST", "/repos/%s/issues" % home, {
             "title": "Give the Loom App access to %s" % repo,
             "body": "## Ask\nGive the Loom App access to `%s` so station steps can run there." % repo,
-            "labels": [NEEDS_OPERATOR]}).data
+            "labels": [NEEDS_HUMAN]}).data
         if not isinstance(made, dict) or "number" not in made:
             raise GitHubError("no operator access ask was created in %s" % home)
         state[key] = int(made["number"])

@@ -473,7 +473,7 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    lane using `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE`,
    or close it with
    `python3 -m bus.brain close OWNER/NAME#N --reason not_planned --note TEXT`.
-6. First run `python3 -m bus.brain step asks --holder muse`. Read every open `needs-operator` issue in `LOOM_REPOS`. Do yourself
+6. First run `python3 -m bus.brain step asks --holder muse`. Read every open `needs:human` issue in `LOOM_REPOS`. Do yourself
    whatever does not need the operator's own hands, money, accounts or a
    decision the goal home reserves for the operator: fix it, ticket it, or
    record the decision the evidence supports. Then comment what was done and
@@ -486,7 +486,7 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    journal line ("on the brain's own judgment: ..."), with the evidence.
    Never cite an operator decision unless a person's comment or label
    records it, after the latest ask, on the issue or on a ticket you name
-   (a person taking `loom:human` or `needs:*` off, or a body heading
+   (a person taking `needs:human` or `needs:*` off, or a body heading
    `## Decision (LOGIN, YYYY-MM-DD)` by an operator dated on or after the
    ask, also counts); then link it. `close`, `close-epic`, `move`, `reply`,
    `audit`, `prioritize`, `defer`, `fix`, `escalate` and `bus journal`
@@ -555,7 +555,7 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    unproven-work gate only delays stays `loom:triage`, and anything a lane,
    the brain or the station can do with the repo, the GitHub API, logs, a
    read of a running system or a diagnosis is a brief. When an open
-   `loom:human` issue turns out to be work the brain can do after all,
+   `needs:human` issue turns out to be work the brain can do after all,
    remove the label and brief it the same way (`brief --refs M`). Never
    close an issue or mark one done from triage: an old issue that looks finished stays
    open for a person to close (the sweep, step 9, is the one place the brain
@@ -587,8 +587,8 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    --refs`). The command enforces the rest: it runs only from the triage
    or sweep step, never after the journal; at most 10 actions a tick; it
    skips an issue with any hold label the station honours (every `loom:`
-   state, loom:triage, loom:human, loom:held, loom:ready,
-   loom:awaiting-evidence, loom:closed-unmerged, needs-operator,
+   state, loom:triage, needs:human, loom:held, loom:ready,
+   loom:awaiting-evidence, loom:closed-unmerged, needs:human,
    needs-brain, any `claim:*` or `wait:*`), any `needs:*` or `handoff:*`
    label, loom:backlog, awaiting-live-check or loom:goal, an epic (the
    label or any sub-issue), or an open pull request naming it;
@@ -650,11 +650,11 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
      compares to tell a new ask from an unchanged one.
    - Waiting on you: the next line, always. Copy it from the "## Waiting on
      you" section of `status`, which fills it from data: "Waiting on you: 28
-     open loom:human (25 in OWNER/NAME, 3 in OWNER/OTHER; 4 of them under
+     open needs:human (25 in OWNER/NAME, 3 in OWNER/OTHER; 4 of them under
      this goal), listed in the daily digest", or "Waiting on you: nothing"
      when none is open. The daily digest lists them, so do not list them here.
      "nothing" never sits beside a count on one line (the operator read
-     "Needs you: nothing. loom:human: 28 in OWNER/NAME." as both, 2026-10-25).
+     "Needs you: nothing. needs:human: 28 in OWNER/NAME." as both, 2026-10-25).
    Write sentences, not ticket lists: name a ticket only where the operator
    may want to open it, and never more than one or two per line. Numbers
    over adjectives. A goal home that asks for an extra line gets it in place
@@ -674,7 +674,7 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    "Needs you:" line exact, so an unchanged ask reads as unchanged. Only
    that line is compared: a "Waiting on you:" count that moved alone edits
    the last report in place (loom#1775). A report whose "Needs you:" line
-   carries a `loom:human` count, or whose "Waiting on you:" line says
+   carries a `needs:human` count, or whose "Waiting on you:" line says
    "nothing" beside a number, is refused: `journal` posts nothing, prints
    `not posted:` and the reason, and exits 2, a failed step to rewrite.
 11. First run `python3 -m bus.brain step unlock --holder muse`. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
@@ -895,7 +895,7 @@ and its ticket:
 
 Loom merges on its own only the tiers in `LOOM_AUTO_MERGE_TIERS` (default
 `docs-tests,app-code`). Any other tier is held for the operator: the factory
-puts its ticket to `loom:human` with one ask (`Kind: decision`, posted once),
+puts its ticket to `needs:human` with one ask (`Kind: decision`, posted once),
 and `bus.brain merge` refuses it with "held for the operator". The operator
 merges it by hand.
 
@@ -939,7 +939,7 @@ pages, and a list that cannot be read in full refuses the merge. The adopt path
 - Write ASCII only. Do not use em dashes.
 - Public repos get no personal names, hostnames, domains, IPs, local paths or
   private repo names.
-- Put asks in a `needs-operator` issue with one exact ask. Use `loom:urgent`
+- Put asks in a `needs:human` issue with one exact ask. Use `loom:urgent`
   only for something breaking now.
 - Date an outage by its window: the last good observation and the first
   failing one ("last good read 04:28Z, first failing read 09:02Z"). Never
