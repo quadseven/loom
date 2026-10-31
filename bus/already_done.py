@@ -87,7 +87,8 @@ def _resolves(cite: Cite, read: Read) -> bool:
         return False
     if cite.line:
         return cite.line <= len(text.splitlines())
-    return cite.symbol.rsplit(".", 1)[-1] in text
+    name = re.escape(cite.symbol.rsplit(".", 1)[-1])
+    return re.search(r"(?<!\w)%s(?!\w)" % name, text) is not None
 
 
 def unproven(body: str, read: Read) -> List[str]:

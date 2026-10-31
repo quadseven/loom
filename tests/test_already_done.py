@@ -52,7 +52,8 @@ class AlreadyDoneTest(unittest.TestCase):
             self.assertEqual(already_done.unproven(boxes, FILES.get), [], cite)
 
     def test_a_citation_the_base_cannot_back_is_no_proof(self):
-        for cite in ("bus/absent.py:4", "bus/proof.py:99", "bus/proof.py::absent"):
+        for cite in ("bus/absent.py:4", "bus/proof.py:99", "bus/proof.py::absent",
+                     "bus/proof.py::crit"):
             boxes = body("- [ ] A; not built: already in tree at %s" % cite)
             self.assertEqual(already_done.uncited(boxes), [], cite)
             self.assertEqual(len(already_done.unproven(boxes, FILES.get)), 1, cite)
