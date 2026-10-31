@@ -325,7 +325,7 @@ class StationClaim(unittest.TestCase):
         asks = [b["body"] for m, p, b in fake.writes if m == "POST" and p.endswith("/comments")]
         self.assertEqual(len(asks), 1)
         self.assertIn("<!-- loom:stale-brief source-124 -->", asks[0])
-        self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO, {"labels": ["loom:human"]}),
+        self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO, {"labels": ["needs:human"]}),
                       fake.writes)
 
     def test_a_health_ticket_with_no_cause_goes_to_the_brain(self):
@@ -376,10 +376,139 @@ class FactoryQueue(unittest.TestCase):
         worker = factory.Factory(self.gh, [self.repo], NOW, trusted=["alice-example"])
         worker.assign_queued()
         self.assertEqual(worker.waits["%s#7" % self.repo], "health ticket names no cause")
-        self.assertEqual(worker.waits["%s#8" % self.repo], "waits for a person (loom:human)")
+        self.assertEqual(worker.waits["%s#8" % self.repo], "waits for a person (needs:human)")
         self.assertEqual((self.lane_of(7), self.lane_of(8)), ([], []))
         self.assertNotIn("%s#9" % self.repo, worker.waits)
 
+
+# loom#2033, made generic: a rewrite whose own brief said a later issue
+# supersedes the work and that issue is blocked, with the original's own
+# "Blocked by" section quoted below it. The station queued it and two lanes
+# took it, the second finding nothing to build.
+SUPERSEDED_REWRITE = """Model: gpt-6-luna
+Difficulty: medium
+
+## Why
+The issue asks for timed traces around core load, ROM load, and shader or context
+initialization so failures during startup can be located even when logs go quiet.
+A later comment says issue #21 supersedes this work by sending those spans through
+the agent spool, and that #21 is blocked on #15.
+
+## What
+Implement startup spans through the agent spool as described by #21.
+
+## Acceptance criteria
+- [ ] Core load, ROM load, and shader or context initialization emit spans.
+- [ ] Spans are closed on failure as well as success.
+- [ ] Sampling and export work off the frame loop.
+
+## Size
+M
+
+## Out of scope
+- Adding a general-purpose tracing framework.
+
+Part of #30
+
+## Further notes
+
+The quoted original issue below is kept for reference; its boxes are not claimed.
+
+<details><summary>Original issue</summary>
+
+> Original title: trace core load and ROM load
+>
+> ## Blocked by
+>
+> - #9 - the worker stops after one cycle.
+
+</details>
+"""
+
+BLOCKED_BRIEF = """Difficulty: medium
+
+## Why
+Ship the export once the transport lands.
+
+## Blocked on
+- #15 - the shared transport.
+- #16
+
+## Acceptance criteria
+- [ ] Spans export. See #40 for context.
+"""
+
+
+class SupersededOrBlocked(unittest.TestCase):
+    """loom#2033: the queue step gives no lane to a brief that says it is
+    superseded, or whose Blocked on section names an open issue."""
+
+    def test_the_brief_says_which_issue_supersedes_it(self):
+        self.assertEqual(brief_check.superseded_by(SUPERSEDED_REWRITE), 21)
+        for text, want in (("Superseded by #21.", 21), ("superseded by issue #7", 7),
+                           ("#8 now supersedes this ticket", 8),
+                           ("This is not superseded by #21.", None),
+                           ("> Superseded by #21", None), ("A superseded test.", None)):
+            with self.subTest(text=text):
+                self.assertEqual(brief_check.superseded_by(text), want)
+
+    def test_only_the_brief_s_own_blocked_on_section_counts(self):
+        self.assertEqual(brief_check.blocked_on(BLOCKED_BRIEF), [15, 16])
+        self.assertEqual(brief_check.blocked_on("## Why\nBlocked on: #3 and #4\n"), [3, 4])
+        # The quoted original's Blocked by section is the source's words.
+        self.assertEqual(brief_check.blocked_on(SUPERSEDED_REWRITE), [])
+        self.assertEqual(brief_check.blocked_on("## Why\nwhy\n"), [])
+
+    def setUp(self):
+        from test_bus_factory import FakeGitHub, REPO as FREPO
+        self.repo = FREPO
+        self.gh = FakeGitHub()
+
+    def queued(self, number, body):
+        self.gh.ticket(number, "queued", body=body)
+        self.gh.issues[number]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"}]
+
+    def names(self, number):
+        return [x["name"] for x in self.gh.issues[number]["labels"]]
+
+    def assign(self):
+        worker = factory.Factory(self.gh, [self.repo], NOW, trusted=["alice-example"],
+                                 available=["codex", "codex-2", "openrouter"])
+        worker.assign_queued()
+        return worker
+
+    def test_a_superseded_brief_gets_no_lane_and_its_label(self):
+        self.queued(12, SUPERSEDED_REWRITE.replace("Model: gpt-6-luna\n", ""))
+        worker = self.assign()
+        self.assertEqual(worker.waits["%s#12" % self.repo], "superseded by #21")
+        self.assertIn("wait:superseded", self.names(12))
+        self.assertIn("loom:queued", self.names(12))
+        self.assertFalse(any(n.startswith("lane:") for n in self.names(12)))
+        # A second pass labels nothing again.
+        writes = len(self.gh.writes)
+        self.assign()
+        self.assertEqual(len(self.gh.writes), writes)
+
+    def test_a_model_pinned_superseded_brief_gets_no_lane(self):
+        self.queued(12, SUPERSEDED_REWRITE)
+        worker = self.assign()
+        self.assertEqual(worker.waits["%s#12" % self.repo], "superseded by #21")
+        self.assertFalse(any(n.startswith("lane:") for n in self.names(12)))
+
+    def test_a_brief_blocked_on_an_open_issue_waits_until_it_closes(self):
+        self.gh.ticket(15, "running")
+        self.gh.ticket(16, "merged")
+        self.gh.issues[16]["state"] = "closed"
+        self.queued(7, BLOCKED_BRIEF)
+        worker = self.assign()
+        self.assertEqual(worker.waits["%s#7" % self.repo], "blocked on #15")
+        self.assertIn("wait:blocked", self.names(7))
+        self.assertFalse(any(n.startswith("lane:") for n in self.names(7)))
+        self.gh.issues[15]["state"] = "closed"
+        worker = self.assign()
+        self.assertNotIn("%s#7" % self.repo, worker.waits)
+        self.assertTrue(any(n.startswith("lane:") for n in self.names(7)))
+        self.assertNotIn("wait:blocked", self.names(7))
 
 if __name__ == "__main__":
     unittest.main()

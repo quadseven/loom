@@ -121,6 +121,37 @@ class FakeGitHub:
         return [(m, p) for m, p in self.requests if m != "GET" and mine.match(p)]
 
 
+class TwoIntakeGitHub(FakeGitHub):
+    """The goal holds its unnumbered intake epic #31 and a newer numbered one,
+    #33, both with room (loom#2030)."""
+    NEWER = 33
+
+    def __init__(self):
+        super().__init__()
+        self.linked_to = []
+
+    def newer(self):
+        return dict(self.intake(), number=self.NEWER, id=1000 + self.NEWER,
+                    title=brain.INTAKE_BATCH_TITLE % 2)
+
+    def _issue_request(self, method, path, rest, data):
+        m = re.fullmatch(r"issues/(\d+)(?:/(\w+))?", rest)
+        number, sub = (int(m.group(1)), m.group(2)) if m else (None, None)
+        if number == GOAL and sub == "sub_issues" and method == "GET":
+            return reply(200, [self.intake(), self.newer()])
+        if number == self.NEWER:
+            if method == "GET" and sub is None:
+                return reply(200, self.newer())
+            if sub == "sub_issues":
+                if method == "POST":
+                    self.linked_to.append((self.NEWER, data["sub_issue_id"]))
+                    return reply(201, {})
+                return reply(200, [])
+        if number == INTAKE and sub == "sub_issues" and method == "POST":
+            self.linked_to.append((INTAKE, data["sub_issue_id"]))
+        return super()._issue_request(method, path, rest, data)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -178,6 +209,15 @@ class RewriteIssueTest(Base):
         self.assertEqual(self.fake.linked, [9001])
         self.assertEqual(self.fake.labels, [(7, ["loom:rewritten"])])
         self.assertEqual(self.fake.removed, [(7, "loom%3Atriage")])
+
+    def test_a_rewrite_files_under_the_newest_intake_epic_with_room_by_number(self):
+        # loom#2030: picking the first exact title match sent rewrites to the
+        # oldest of several intake epics; the newest by number takes them.
+        self.fake = TwoIntakeGitHub()
+        self.assertEqual(self.rewrite(BRIEF), "brief")
+        (ticket,) = self.fake.created
+        self.assertTrue(ticket["body"].endswith("\n\nPart of #%d\n" % TwoIntakeGitHub.NEWER))
+        self.assertEqual(self.fake.linked_to, [(TwoIntakeGitHub.NEWER, 9001)])
 
     def test_the_prompt_holds_the_issue_and_the_brief_format(self):
         self.rewrite(BRIEF)

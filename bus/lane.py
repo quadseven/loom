@@ -22,11 +22,24 @@ from .labels import REMOTE_LANES
 CLAIM_RE = re.compile(r"^<!-- loom:remote-claim v1 ([^ ]+) ([0-9]+) ([0-9.]+)(?: ([0-9.]+))? -->$")
 CLAIM_AGE = 2 * 3600
 PR_AGE = 3 * 3600
+# push_branch's ref read: the sentinel a 404 leaves behind, so an empty or
+# malformed 200 payload is never mistaken for "the branch is not there".
+_NO_REF = object()
 
 
 def _names(issue: Dict[str, Any]) -> List[str]:
     return [str(x.get("name") if isinstance(x, dict) else x)
             for x in issue.get("labels") or []]
+
+
+def _missing_hold_label(issue: Dict[str, Any], lane: str) -> Optional[str]:
+    """The first label a ticket held by this lane must carry that it lacks:
+    loom:running, then the lane's own label. None when it carries both."""
+    names = _names(issue)
+    for label in ("loom:running", "lane:" + lane):
+        if label not in names:
+            return label
+    return None
 
 
 def _own_login(gh: GitHub) -> Optional[str]:
@@ -281,7 +294,7 @@ def heartbeat(gh: GitHub, repo: str, number: int, lane: str = "muse",
         raise ValueError("unknown remote lane: %s" % lane)
     now = time.time() if now is None else now
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
-    if "loom:running" not in _names(issue) or "lane:" + lane not in _names(issue):
+    if _missing_hold_label(issue, lane) is not None:
         raise ValueError("ticket is not held by this remote lane")
     comments = _comments(gh, repo, number)
     held = [c for c in _claims(comments, lane) if comments[c[0]].get("id")]
@@ -291,6 +304,52 @@ def heartbeat(gh: GitHub, repo: str, number: int, lane: str = "muse",
                 {"body": _claim_body(lane, number, now, first)})
         return
     notify.post(gh, repo, number, _claim_body(lane, number, now), notify.RECORD)
+
+
+def confirm_claim(gh: GitHub, repo: str, number: int, lane: str = "muse",
+                  now: Optional[float] = None) -> Dict[str, Any]:
+    """Confirm a ticket reference is real and held by this lane before a run
+    implements from it. A run takes its ticket from claim's own return; any
+    other reference (a hand-off, a note, a message) is confirmed here first,
+    so a reference to a ticket that does not exist stops the run before it
+    spends work (loom#2136). Returns the ticket's repo, number, title and
+    brief headers. Raises ValueError with the reason when the ticket is not
+    this lane's to work. (Confirm, not verify: the glossary reserves Verify
+    for proof on the live system after a change ships.)"""
+    if lane not in REMOTE_LANES:
+        raise ValueError("unknown remote lane: %s" % lane)
+    now = time.time() if now is None else now
+    try:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    except GitHubError as err:
+        if err.status == 404:
+            raise ValueError("ticket %s#%d does not exist" % (repo, number)) from err
+        raise
+    if "pull_request" in issue:
+        raise ValueError("ticket %s#%d is a pull request, not a ticket" % (repo, number))
+    if issue.get("state") != "open":
+        raise ValueError("ticket %s#%d is not open" % (repo, number))
+    missing = _missing_hold_label(issue, lane)
+    if missing == "loom:running":
+        raise ValueError("ticket %s#%d is not loom:running" % (repo, number))
+    if missing is not None:
+        raise ValueError("ticket %s#%d is not held by lane %s" % (repo, number, lane))
+    live = False
+    for _, beat, _ in _claims(_comments(gh, repo, number), lane):
+        live = now - beat <= CLAIM_AGE
+    if not live:
+        raise ValueError("ticket %s#%d has no live claim comment from lane %s"
+                         % (repo, number, lane))
+    try:
+        headers = tickets.parse(issue.get("body"))[0]
+    except ValueError as err:
+        raise ValueError("ticket %s#%d has an unreadable brief: %s"
+                         % (repo, number, err)) from err
+    if not headers:
+        raise ValueError("ticket %s#%d has no brief headers" % (repo, number))
+    return {"repo": repo, "number": number,
+            "title": str(issue.get("title") or ""),
+            "headers": headers}
 
 
 def lane_heartbeat(gh: GitHub, repo: str, lane: str = "muse",
@@ -393,14 +452,35 @@ def push_branch(gh: GitHub, repo: str, number: int) -> str:
         raise ValueError("current branch %r does not match the ticket branch %r"
                          % (current, branch))
     local_head = _git("rev-parse", "HEAD")
+    # Read the branch through the singular ref endpoint. The plural
+    # /git/refs/heads/{branch} path prefix-matches, so when earlier attempt
+    # branches (the -r3/-r4 shape) share the branch name as a prefix it
+    # answers a list, and the read crashed on .get (loom#2160). The singular
+    # endpoint answers the one exact ref, or 404 when the branch is not
+    # there; the PATCH below still updates at the plural path, which is the
+    # endpoint GitHub defines for updates.
     try:
-        ref = gh.rest("GET", "/repos/%s/git/refs/heads/%s"
-                      % (repo, quote(branch, safe=""))).data or {}
-        remote_head = str(((ref.get("object") or {}).get("sha")) or "")
+        ref = gh.rest("GET", "/repos/%s/git/ref/heads/%s"
+                      % (repo, quote(branch, safe=""))).data
     except GitHubError as err:
         if err.status != 404:
             raise
+        ref = _NO_REF
+    obj = ref.get("object") if isinstance(ref, dict) else None
+    if ref is _NO_REF:
         remote_head = ""
+    elif (isinstance(obj, dict) and obj.get("sha")
+            and ref.get("ref") in (None, "refs/heads/" + branch)):
+        remote_head = str(obj["sha"])
+    else:
+        # A 200 that is not the one ref object (a list, an empty body, a
+        # payload with no commit, or one naming a different ref) must stop
+        # the push loudly: guessing a remote head here could update the
+        # wrong ref or silently strand the lane's commits behind a success
+        # report.
+        raise GitHubError("the ref read for branch %s answered an unexpected "
+                          "payload (%s); refusing to push"
+                          % (branch, type(ref).__name__))
     if remote_head == local_head:
         return local_head
     if remote_head:
@@ -503,6 +583,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--title")
     p = sub.add_parser("push")
     p.add_argument("ticket", help="OWNER/NAME#N")
+    p = sub.add_parser("confirm-claim")
+    p.add_argument("ticket", help="OWNER/NAME#N")
+    p.add_argument("--lane", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "claim":
@@ -528,6 +611,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gh = GitHub(auth_from_env())
         if args.command == "heartbeat":
             heartbeat(gh, repo, number, args.lane)
+        elif args.command == "confirm-claim":
+            found = confirm_claim(gh, repo, number, args.lane)
+            print("%s#%d: %s" % (found["repo"], found["number"], found["title"]))
+            for key, value in found["headers"].items():
+                print("%s: %s" % (key, value))
         elif args.command == "push":
             sha = push_branch(gh, repo, number)
             print(sha)

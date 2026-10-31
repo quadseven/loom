@@ -801,6 +801,28 @@ class RegressionThroughBrain(unittest.TestCase):
         self.assertEqual(ticket["body"].count("## Regression"), 1)
 
 
+class RegressionDeploymentStatus(Base):
+    """A regression re-brief lists merged PRs with their deployment status."""
+
+    def test_regression_rebrief_includes_deployment_status_lines(self):
+        # Test that regression_body includes extra_evidence lines for PR deployment status
+        f = health._finding(finding())[0]
+        body = health.regression_body(f, 100, 26.0, "", extra_evidence=[
+            "Merged pull requests since ship:",
+            "PR #123: deployed",
+            "PR #124: merged, not deployed",
+            "PR #125: deploy state unknown"
+        ])
+        evidence = "\n".join(brain._regression_evidence(body, 100))
+        self.assertIn("PR #123: deployed", evidence)
+        self.assertIn("PR #124: merged, not deployed", evidence)
+        self.assertIn("PR #125: deploy state unknown", evidence)
+        # The extra evidence appears before the finding description
+        self.assertLess(evidence.index("PR #123: deployed"), evidence.index("The health finding"))
+        self.assertLess(evidence.index("PR #124: merged, not deployed"), evidence.index("The health finding"))
+        self.assertLess(evidence.index("PR #125: deploy state unknown"), evidence.index("The health finding"))
+
+
 class Diagnosis(Base):
     """A goal home's diagnosis command is quoted in every health brief and
     regression re-brief, cleaned and capped like finding text (loom#1243)."""

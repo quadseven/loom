@@ -23,11 +23,13 @@ class SlowGitHub:
         self.active = 0
         self.max_active = 0
         self.request_time = 0.0
+        self.first_started = self.last_finished = None
         self.lock = threading.Lock()
 
     def paginate(self, path):
         started = time.monotonic()
         with self.lock:
+            self.first_started = self.first_started or started
             self.active += 1
             self.max_active = max(self.max_active, self.active)
         try:
@@ -48,7 +50,8 @@ class SlowGitHub:
         finally:
             with self.lock:
                 self.active -= 1
-                self.request_time += time.monotonic() - started
+                self.last_finished = time.monotonic()
+                self.request_time += self.last_finished - started
 
     def paginate_parallel(self, path, workers=8):
         return self.paginate(path)
@@ -249,11 +252,12 @@ class SnapshotTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             store = TicketStore(REPOS, gh=gh)
             store.open_issues[REPOS[1]] = [{"number": 7}]
-            started = time.monotonic()
             store._read_open_issues(10000.0)
-            elapsed = time.monotonic() - started
         self.assertGreater(gh.max_active, 1)
-        self.assertLess(elapsed, gh.request_time * 0.7)
+        # The span of the reads themselves, not the call's wall clock: the
+        # pool's start and stop on a busy runner is a large share of three
+        # 50 ms reads and failed this on CI with the reads overlapping.
+        self.assertLess(gh.last_finished - gh.first_started, gh.request_time * 0.7)
         self.assertEqual({repo: [row["number"] for row in rows] for repo, rows in store.open_issues.items()},
                          {REPOS[0]: [1], REPOS[1]: [7], REPOS[2]: [3]})
         self.assertEqual(list(store.open_issues), REPOS)
@@ -413,6 +417,110 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(titles, {"%s#%d" % (repo, n): "Goal %d" % n for n in range(1, 8)})
         self.assertEqual(parents, dict({"%s#%d" % (repo, n): "%s#7" % repo for n in range(1, 7)},
                                        **{"%s#7" % repo: None}))
+
+    def test_a_goal_home_that_does_not_exist_is_no_goal(self):
+        repo = REPOS[0]
+
+        class Goals:
+            rate = {}
+
+            def rest(self, method, path, body=None):
+                number = int(path.rsplit("/", 1)[1])
+                if number == 2:
+                    raise GitHubError("Not Found", 404, "")
+                return type("R", (), {"data": {"number": number, "title": "Goal %d" % number,
+                                               "body": "Parent goal: #2",
+                                               "labels": [{"name": "loom:goal"}]}})()
+
+        rows = [{"goal": "%s#1" % repo}, {"goal": "%s#2" % repo}]
+        with patch.dict(os.environ, {}, clear=True):
+            store = TicketStore([repo], gh=Goals())
+            titles, parents = store._goal_info(rows)
+        # Goal 2's issue is a 404: it is in neither map, and goal 1 does
+        # not roll up into it, though the tickets name both.
+        self.assertEqual(titles, {"%s#1" % repo: "Goal 1"})
+        self.assertEqual(parents, {"%s#1" % repo: None})
+
+    def test_tickets_naming_a_goal_home_that_does_not_exist_get_no_goal(self):
+        repo = REPOS[0]
+
+        class Goals:
+            rate = {}
+
+            def rest(self, method, path, body=None):
+                raise GitHubError("Not Found", 404, "")
+
+        row = {"repo": repo, "number": 5, "goal": "%s#9" % repo, "epic": None,
+               "state": "shipped", "open": False, "labels": []}
+        data = {"tickets": {repo: [row]}, "issue_comments": [], "comment_errors": {}}
+        with patch.dict(os.environ, {}, clear=True):
+            store = TicketStore([repo], gh=Goals())
+            store._read_goal_context(data, [], [], [])
+        self.assertIsNone(row["goal"])
+        self.assertNotIn("%s#9" % repo, data["goal_context"])
+
+    def test_a_goal_home_read_that_fails_transiently_keeps_the_earlier_read(self):
+        repo = REPOS[0]
+        goal = "%s#1" % repo
+
+        class Flaky:
+            rate = {}
+            failing = False
+
+            def rest(self, method, path, body=None):
+                if self.failing:
+                    raise GitHubError("Server Error", 500, "")
+                return type("R", (), {"data": {"number": 1, "title": "Goal 1", "body": "",
+                                               "labels": [{"name": "loom:goal"}]}})()
+
+        gh = Flaky()
+        with patch.dict(os.environ, {}, clear=True):
+            store = TicketStore([repo], gh=gh)
+            titles, _ = store._goal_info([{"goal": goal}])
+            self.assertEqual(titles, {goal: "Goal 1"})
+            gh.failing = True
+            store._goal_info_cache[goal]["read_at"] = 0
+            titles, parents = store._goal_info([{"goal": goal}])
+        self.assertEqual(titles, {goal: "Goal 1"})
+        self.assertEqual(parents, {goal: None})
+
+    def test_a_goal_home_that_fails_transiently_on_first_read_stays_unread(self):
+        repo = REPOS[0]
+        goal = "%s#1" % repo
+
+        class Down:
+            rate = {}
+
+            def rest(self, method, path, body=None):
+                raise OSError("connection reset")
+
+        with patch.dict(os.environ, {}, clear=True):
+            store = TicketStore([repo], gh=Down())
+            titles, parents = store._goal_info([{"goal": goal}])
+        # Not a 404: the goal stays in both maps, unread, for the next pass.
+        self.assertEqual(titles, {goal: None})
+        self.assertEqual(parents, {goal: None})
+
+    def test_a_missing_goal_home_is_not_read_again_within_the_ttl(self):
+        repo = REPOS[0]
+        goal = "%s#9" % repo
+
+        class Gone:
+            rate = {}
+            reads = 0
+
+            def rest(self, method, path, body=None):
+                self.reads += 1
+                raise GitHubError("Not Found", 404, "")
+
+        gh = Gone()
+        with patch.dict(os.environ, {}, clear=True):
+            store = TicketStore([repo], gh=gh)
+            store._goal_info([{"goal": goal}])
+            titles, parents = store._goal_info([{"goal": goal}])
+        self.assertEqual(gh.reads, 1)
+        self.assertEqual(titles, {})
+        self.assertEqual(parents, {})
 
 
 class Overlap:

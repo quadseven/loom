@@ -32,7 +32,7 @@ and by `bus.brain merge` before it merges one:
   carried so its finding vanished, and a sibling held refunds back to stay
   above the floor.
 
-A held pull request is never merged by Loom. Its ticket goes to loom:human
+A held pull request is never merged by Loom. Its ticket goes to needs:human
 with one exact ask, and the operator merges it by hand after the steps.
 
 A ticket whose every acceptance criterion is a check on a live host or
@@ -427,15 +427,15 @@ GENERIC_WHY = "its body, its ticket or its manifests declare work an operator do
 
 def hold(gh: Any, repo: str, ticket: int, number: int, why: Sequence[str],
          human: Callable[..., Any]) -> str:
-    """Put the ticket to loom:human with the ask. Returns "asked", "already"
-    (an earlier pass asked: the ticket is loom:human) or why the ask could
+    """Put the ticket to needs:human with the ask. Returns "asked", "already"
+    (an earlier pass asked: the ticket is needs:human) or why the ask could
     not be written; the hold stands either way, since only the merge gate
     keeps the pull request from landing."""
     try:
         human(gh, repo, ticket, ask(number, why))
         return "asked"
     except ValueError as err:
-        if "already loom:human" in str(err):
+        if "already needs:human" in str(err):
             return "already"
         first = str(err)
     # The quoted steps may hold text a comment must not carry (a private

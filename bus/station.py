@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import quote
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 from . import answer
 from . import audit
@@ -39,15 +39,22 @@ from . import converge
 from . import brain_memory
 from . import brain_hold
 from . import claimed
+from . import claim_referee
+from . import evidence_close
 from . import fabric
 from . import fixrounds
+from . import logrotate
 from . import flake
+from . import rebuttal
 from . import runners
 from . import scope_fit
 from . import shadow
 from . import urgency
 from . import stale_claims
+from . import ask_state
+from . import brief_check
 from . import label_pass
+from .labels import HUMAN_LABELS, NEEDS_HUMAN, needs_human
 from . import factory
 from . import friction_intake
 from . import evidence
@@ -71,6 +78,7 @@ from . import verify_data
 from . import text as _text
 from . import tickets
 from . import transcripts
+from . import unmeetable
 from . import brief_check
 from . import criteria_gate
 from . import live_adapter, live_proof
@@ -78,7 +86,7 @@ from . import deploy_watch
 from . import scorecard
 from . import watch
 from . import labels
-from .brain import HUMAN_MARKER
+from .brain import HUMAN_MARKER, LANES_REPUBLISH
 from . import brain
 from .github import (GitHub, GitHubError, RateLimited, TargetReached, _OPENER,
                      _next_link, read_ssm, rest_login, unreadable)
@@ -125,6 +133,15 @@ TREE_KEEP = 3600
 # size is logged. On 2026-10-17 logs/ held 4.2 GB, growing 0.6 GB a day, and
 # the disk was down to 8 GB free.
 LOG_KEEP_DAYS = 7
+# logs/ as a whole stays under LOOM_LOG_MAX_GB (0 for no limit, loom#2268):
+# past it the oldest finished runs go first, whatever their age, except
+# anything prune_logs keeps and anything changed in the last LOG_FLOOR
+# seconds. The service logs at the top of logs/ rotate past LOOM_LOG_ROTATE_MB
+# (bus/logrotate.py), LOG_ROTATE_KEEP compressed copies each.
+LOG_MAX_GB = 10.0
+LOG_FLOOR = 24 * 3600
+LOG_ROTATE_MB = 20.0
+LOG_ROTATE_KEEP = 5
 # While the home's disk has less than LOOM_MIN_FREE_GB free the station claims
 # no new work (loom#1808): on 2026-10-25 the disk fell to 300 MB free and every
 # lane run failed at once. The older name LOOM_DISK_FREE_MIN_GB is still read.
@@ -132,8 +149,11 @@ DISK_FREE_MIN_GB = 15.0
 DISK_GUARD_FILE = "disk-guard.json"
 # A finished opencode run's session store under its log folder (lanes/
 # run_lane.sh archive_transcripts): 100-440 MB a run on 2026-10-25, 14 GB of
-# the 17 GB in logs/ (loom#1808). Compressed once its transcript is uploaded.
+# the 17 GB in logs/ (loom#1808). Compressed once its transcript is uploaded,
+# or SESSION_UNSENT_KEEP seconds after the run while it waits: the upload reads
+# either form, and a backlog held 7 GB raw on 2026-10-30 (loom#2268).
 SESSION_DB_PARTS = (".local", "share", "opencode", "opencode.db")
+SESSION_UNSENT_KEEP = 24 * 3600
 # The ticket states after which a lane tree serves no fix round: its tree,
 # check copy and idle run scratch go at once, not after TREE_KEEP.
 TREE_DONE_STATES = frozenset(("loom:merged", "loom:shipped", "loom:verified",
@@ -152,12 +172,13 @@ DISK_EVERY = 3600
 THIN_EVERY = 1800
 THIN_FILE = "snapshot-thin.json"
 GB = 1024 ** 3
+MB = 1024 ** 2
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
 ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
 ANSWER_MAX = 3000
 STRONG_MODELS = frozenset(model for _, model in factory.CLIMB)
-THREAD_QUERY = ('query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread { isResolved'
-                ' pullRequest { number repository { nameWithOwner } }'
+THREAD_QUERY = ('query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread { isResolved path'
+                ' pullRequest { number headRefOid repository { nameWithOwner } }'
                 ' comments(first:1) { nodes { body author { __typename login } } } } } }')
 REPLY_MUTATION = ('mutation($id:ID!,$body:String!) { addPullRequestReviewThreadReply('
                   'input:{pullRequestReviewThreadId:$id,body:$body}) { comment { id } } }')
@@ -184,8 +205,6 @@ REASON_MAX = 300
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 LANES_LABEL = "loom:lanes"
 LANES_TITLE = "Loom lane status"
-LANES_REPUBLISH = 3600
-NEEDS_OPERATOR = "needs-operator"
 URGENT = "loom:urgent"
 REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
@@ -193,7 +212,7 @@ POST_TIMEOUT = 30
 # A usage snapshot that fails once is sent again after this pause (loom#345).
 USAGE_RETRY_PAUSE = 2
 DIGEST_HEAD = "Asks waiting for you:"
-# Open loom:human issues wait for the daily digest.
+# Open needs:human issues wait for the daily digest.
 HUMAN = "loom:human"
 # Why a ticket waits (bus/labels.py): one wait:* label at a time.
 WAIT = "wait:"
@@ -376,6 +395,16 @@ SHIP_XREF_MAX = 3
 SHIP_LOOKUP_RETRY = 6 * 3600
 SHIP_LOOKUPS_FILE = "ship_lookups.json"
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+# An open issue at one of these states whose linked pull request merged and
+# deployed ships too: only loom:pr tickets are reconciled from their pull
+# request, so a triage or queued issue a pull request named sat there after
+# the deploy (loom#2025).
+EARLY_SHIP_STATES = ("loom:triage", "loom:queued")
+SETTLE_LANDED_SET = frozenset(SETTLE_LANDED)
+# A ticket the ship rules found deployed but that stayed at loom:merged (its
+# move failed) is kept in DEPLOYED_SEEN_FILE with when it was first found;
+# past MERGED_UNSHIPPED_AFTER it is a merged-not-shipped invariant breach.
+DEPLOYED_SEEN_FILE = "deployed_seen.json"
 # The handoff packet is rebuilt at most this often, or sooner when a brain
 # tick on this machine just ended (publish_handoff).
 HANDOFF_EVERY = 600
@@ -401,6 +430,20 @@ SHIP_RUNS_URL = ("/repos/%s/actions/workflows/%s/runs?status=success&event=push"
 PUBLISHED_RE = re.compile(r"^\+\s*#\s*Published from\s+([A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?)"
                           r"[\s,][^\n]*?\bmerge\s+([0-9a-f]{7,40})\b", re.M)
 PIN_SHIP_LOOKBACK = 7 * 24 * 3600
+# Shipping through a downstream roll (loom#2025): a repo that deploys only when
+# another repo rolls it declares that in ROLL_SIGNAL_FILE on its default
+# branch, one roll record a line: `<OWNER/NAME> <path> <key>`. The record is
+# the file at <path> on that repo's default branch; its `<key>=<sha>` (or
+# `<key>: <sha>`) line names the source commit the roll deployed. Each pass,
+# the repo's open loom:merged tickets whose merge commit that commit carries
+# move to loom:shipped.
+ROLL_SIGNAL_FILE = ".loom/ship-roll"
+# Each repo's ROLL_SIGNAL_FILE is read at most every ROLL_SIGNAL_EVERY seconds
+# (ROLL_SIGNALS_FILE keeps the text, or None for a repo without one), so a
+# repo that declares no roll costs one request an hour, not two a pass.
+ROLL_SIGNALS_FILE = "roll_signals.json"
+ROLL_SIGNAL_EVERY = 3600
+ROLL_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,99}")
 PIN_SHIP_SETTLE = 3600
 PIN_SHIPS_FILE = "pin_ships.json"
 SHIP_PATH_FILES = "ship_path_files.json"
@@ -416,8 +459,10 @@ PULL_FILES_MAX = 3000
 # comments are read once), the count and refusal last logged (each logged
 # when it changes), and when a brief was last refused: the repo is tried
 # again ADOPT_RETRY seconds later, not every pass. A pull request is adopted
-# only once it is ADOPT_GRACE old, and is re-read just before its ticket is
-# filed: one closed or merged since the pass read the open list gets no ticket.
+# only once it is ADOPT_GRACE old, one on a branch outside loom/ only once it
+# has also gone ADOPT_GRACE with no commit or comment, and it is re-read just
+# before its ticket is filed: one closed or merged since the pass read the
+# open list gets no ticket.
 ADOPTED_MARKER = "<!-- loom:adopted v1 ticket=%s#%d -->"
 ADOPTED_RE = re.compile(r"<!-- loom:adopted v1 ticket=[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+ -->")
 ADOPTS_MARKER = "<!-- loom:adopts pr=%d -->"
@@ -433,7 +478,13 @@ ADOPT_RETRY = 600
 # the 54 that merged did so within 2 hours of their ticket. Those pull
 # requests had a person or a session driving them, so the ticket was only
 # bookkeeping; a pull request that really stalls is still adopted after this.
-ADOPT_GRACE = 2 * 3600
+# The 2 hours that gave (#1182) were too short: of the 711 pull requests the
+# operator's account opened outside loom/ branches over 2026-10-17 to
+# 2026-10-31, 85 ran past 2 hours, 30 past 24, 23 past 36, 22 past 48 and 21
+# past 72, so the curve is flat from here (p99 27 hours). Of the 44 such pull
+# requests adopted over those days, 42 would still get a ticket at 2 hours and
+# 6 at this grace with the quiet rule. A stall waits 2 days for its ticket.
+ADOPT_GRACE = 48 * 3600
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # Automatic retries (docs/BRAIN.md "Claim and outcome"). The runner starts
 # each failure reason with its class; a reason without one is a work failure.
@@ -455,6 +506,9 @@ DECISION_REVERT_MARKER = "<!-- loom:decision-revert v1 -->"
 DECISION_ASK = ("Kind: decision\nA merged pull request already carries this ticket's work, "
                 "but these boxes ask for an operator decision: %s. Decide, tick each box, "
                 "and move the ticket on, or say what to change.")
+# A no-change answer that leaves a code acceptance box unproven (loom#2032).
+NO_CHANGE_UNPROVEN_NOTE = ("The answer does not prove every acceptance box, so the ticket is "
+                           "back at loom:queued instead of settling. Not proven: %s")
 # A base check that failed before the agent ran: it could not start (exit
 # 125 to 127) or it was red on the unmodified repo or default branch. On a
 # cluster runner that is often the runner image (a tool the repo's check
@@ -551,6 +605,11 @@ IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
 CACHE_KEEP = 24 * 3600
 VERIFY_INTERVAL = 6 * 3600
+# A Luna review verdict's findings (loom#2142): at most this many per list,
+# each finding's text collapsed and capped, so a lane's review.json can
+# never turn the verdict comment into a wall.
+REVIEW_FINDINGS_MAX = 50
+REVIEW_FINDING_CHARS = 500
 # A shipped ticket whose Live box has seen no matching log line this many days
 # after it shipped waits on a rare event, not on a verifier: it gets
 # wait:live-event and is held apart from open work (loom#1220).
@@ -561,6 +620,25 @@ EVIDENCE_WINDOW_HOURS = 24.0
 # loom:awaiting-evidence label: a reason, not a word.
 MISSING_MIN = 20
 VERIFY_FILE = "verify-runs.json"
+# Live boxes that can never be met as written (bus/unmeetable.py): ticket ->
+# {"key": box text key, "reasons": [...], "at": checked}. A flagged box gets
+# one restate ask and no verify lane until its text changes; a clean result
+# is checked again after UNMEETABLE_RECHECK. Code searches have their own
+# small GitHub budget, so at most UNMEETABLE_SEARCHES run a pass.
+UNMEETABLE_FILE = "unmeetable-live.json"
+UNMEETABLE_RECHECK = 24 * 3600
+UNMEETABLE_SEARCHES = 4
+# GitHub's code search index skips files of 384 KB and over, so a search
+# that finds nothing says nothing about them: the station reads each such
+# file itself (at most UNMEETABLE_BIG_READS a repo, else the answer is
+# unknown) before it calls a string absent. The margin covers KB vs KiB.
+UNINDEXED_BYTES = 350 * 1000
+UNMEETABLE_BIG_READS = 8
+# Files no log line is printed from; never read.
+UNREAD_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".pdf", ".zip",
+                   ".gz", ".tgz", ".bz2", ".xz", ".jar", ".whl", ".woff", ".woff2",
+                   ".ttf", ".otf", ".mp3", ".mp4", ".webm", ".mov", ".so", ".dylib",
+                   ".a", ".o", ".bin", ".exe", ".dll", ".wasm", ".sqlite", ".db", ".pyc")
 LIVE_EVENT_MARKER = "<!-- loom:wait-live-event v1 -->"
 # A shipped ticket whose proof was refused this many times leaves the verify
 # queue and goes to the brain with the refusals listed (loom#1307): the
@@ -575,6 +653,18 @@ VERIFY_REFUSED_FILE = "verify-refused.json"
 VERIFY_RESERVE_AFTER = 2 * 3600
 VERIFY_RESERVE_EVERY = 1800
 VERIFY_RESERVE_FILE = "verify-reserve.json"
+# A shipped ticket still unverified this long after its ship with no verify
+# attempt ever recorded gets one missing-evidence note (loom#2092): the
+# reserved lane reaches one ticket per VERIFY_RESERVE_EVERY, so the rest of
+# the backlog waited unrecorded -- one ticket sat five days with only its
+# Shipped note. The note pass runs on the reserve's cadence, and a noted
+# ticket's note is refreshed in place at most once a VERIFY_NOTE_REFRESH,
+# never re-posted; VERIFY_NOTE_FILE keeps when each was last written.
+VERIFY_NOTE_AFTER = 24 * 3600
+VERIFY_NOTE_EVERY = VERIFY_RESERVE_EVERY
+VERIFY_NOTE_REFRESH = 24 * 3600
+VERIFY_NOTE_FILE = "verify-notes.json"
+VERIFY_NOTE_MARKER = "<!-- loom:verify-note v1 -->"
 # The Fabric lead for a ticket's merged work (loom#1437): at most FABRIC_ASKS
 # questions a pass, each up to bus/fabric.py's TIMEOUT, and the first
 # FABRIC_CITES cited pull requests checked against GitHub. FABRIC_ASKED_FILE
@@ -607,8 +697,8 @@ STATELESS_TEXT = ("Queued: this ticket carried no state label, so nothing would 
 # Labels that mean someone or something already holds a ticket: any Loom
 # state or hold, a person's claim, an operator ask, or a wait.
 _HOLD_LABELS = {"loom:" + state for state in brain.STATES} | {
-    "loom:triage", "loom:human", "loom:held", "loom:ready", "loom:awaiting-evidence",
-    "loom:closed-unmerged", "needs-operator", "needs-brain"}
+    "loom:triage", "loom:held", "loom:ready", "loom:awaiting-evidence",
+    "loom:closed-unmerged", "needs-brain", *HUMAN_LABELS}
 
 
 def _holds_ticket(name: str) -> bool:
@@ -700,6 +790,22 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
         item[0], int(item[1].get("number", 0))))
 
 
+def verify_note_text(shipped_at: float, now: float) -> str:
+    """The missing-evidence note for a shipped ticket no verify attempt has
+    reached (loom#2092): a dated statement of how long the ticket has waited,
+    so it stays true as history once written and a refresh only moves the
+    date and the wait forward."""
+    waited = max(0, int((now - shipped_at) // 3600))
+    return (VERIFY_NOTE_MARKER + "\n"
+            "Missing-evidence note (station, %s): this ticket shipped about "
+            "%d hours ago and no verify attempt had reached it when the "
+            "station checked, so its proof is still missing either way. It "
+            "stays in the verify queue; this one note is refreshed in place "
+            "while the wait continues, so the ticket never waits unrecorded. "
+            "(loom#2092)"
+            % (time.strftime("%Y-%m-%d", time.gmtime(now)), waited))
+
+
 def live_needles(body: Optional[str]) -> Optional[List[str]]:
     """Needles for a Live criterion, or None when the ticket has no Live line."""
     live = brain.live_criterion(body, limit=None)
@@ -744,6 +850,18 @@ def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
         mtime = os.path.getmtime(log_path)
         return datetime.fromtimestamp(mtime, tz=timezone.utc)
     except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def _content_text(data: Any) -> Optional[str]:
+    """The text of a contents API answer; None for a file it does not carry
+    (over 1 MB) or an answer that is not a file."""
+    if not isinstance(data, dict) or data.get("encoding") != "base64" \
+            or not isinstance(data.get("content"), str):
+        return None
+    try:
+        return base64.b64decode(data["content"]).decode("utf-8", "replace")
+    except ValueError:
         return None
 
 
@@ -832,10 +950,14 @@ class Settings:
                  ship_path_workflows: Sequence[str] = (),
                  no_topup: Sequence[str] = (),
                  log_keep_days: int = LOG_KEEP_DAYS,
+                 log_max_bytes: int = int(LOG_MAX_GB * GB),
+                 log_rotate_bytes: int = int(LOG_ROTATE_MB * MB),
                  disk_free_min_gb: float = DISK_FREE_MIN_GB,
                  settle_claimed: str = "off",
                  settle_claimed_max: int = claimed.PER_RUN,
                  claim_idle_hours: int = 0,
+                 claim_referee: str = "off",
+                 engine_claims: Sequence[str] = claim_referee.ENGINE_CLAIMS,
                  agy_workdir: str = "",
                  thin_snapshots: bool = False,
                  urgency_config: Optional[urgency.Config] = None,
@@ -861,6 +983,12 @@ class Settings:
         # alone this long comes back to this Loom (bus/stale_claims.py); 0, the
         # default for a Settings built in code, is off; from_env defaults to 24.
         self.claim_idle_hours = claim_idle_hours
+        # LOOM_CLAIM_REFEREE: "on" (from_env's default) keeps one engine claim
+        # per ticket and expires idle ones (bus/claim_referee.py), "dry" logs
+        # what it would remove, "off" skips it; off for a Settings built in
+        # code. LOOM_ENGINE_CLAIMS names the engine claim labels.
+        self.claim_referee = claim_referee
+        self.engine_claims = tuple(x.lower() for x in engine_claims)
         # LOOM_SETTLE_CLAIMED: "on" settles operator-claimed issues whose pull
         # requests merged, "dry" (from_env's default) logs what it would do,
         # "off" skips it; off for a Settings built in code, like the factory
@@ -875,6 +1003,8 @@ class Settings:
         # Days a lane's logs are kept (0: forever), and the free disk under
         # which every pass warns (Station.tend_disk).
         self.log_keep_days = log_keep_days
+        self.log_max_bytes = log_max_bytes
+        self.log_rotate_bytes = log_rotate_bytes
         self.disk_free_min_gb = disk_free_min_gb
         # Repos whose merged tickets ship at merge (ship_on_merge), and repos
         # whose merged tickets ship when their deploy workflow succeeds on the
@@ -1039,11 +1169,15 @@ class Settings:
                    ship_path_workflows=words("LOOM_SHIP_PATH_WORKFLOWS"),
                    no_topup=words("LOOM_NO_TOPUP"),
                    log_keep_days=_keep_days(env.get("LOOM_LOG_KEEP_DAYS", "")),
+                   log_max_bytes=int(_log_size(env, "LOOM_LOG_MAX_GB", LOG_MAX_GB) * GB),
+                   log_rotate_bytes=int(_log_size(env, "LOOM_LOG_ROTATE_MB", LOG_ROTATE_MB) * MB),
                    disk_free_min_gb=_free_floor(env.get("LOOM_MIN_FREE_GB", "").strip()
                                                 or env.get("LOOM_DISK_FREE_MIN_GB", "")),
                    settle_claimed=claimed.mode(env.get("LOOM_SETTLE_CLAIMED", "")),
                    settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")),
                    claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")),
+                   claim_referee=claim_referee.mode(env.get("LOOM_CLAIM_REFEREE", "")),
+                   engine_claims=claim_referee.engines(env.get("LOOM_ENGINE_CLAIMS", "")),
                    agy_workdir=_agy_workdir(env),
                    thin_snapshots=env.get("LOOM_THIN_SNAPSHOTS", "1").strip() != "0",
                    urgency_config=urgency.Config.from_env(env),
@@ -1068,6 +1202,21 @@ def _keep_days(raw: str) -> int:
         return int(raw)
     _say("ignoring LOOM_LOG_KEEP_DAYS %r: not a whole number of days" % raw)
     return LOG_KEEP_DAYS
+
+
+def _log_size(env: Dict[str, str], name: str, default: float) -> float:
+    """A non-negative size setting, else the default, said once."""
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not (value >= 0 and math.isfinite(value)):
+        _say("ignoring %s %r: not a size" % (name, raw))
+        return default
+    return value
 
 
 def _free_floor(raw: str) -> float:
@@ -1595,6 +1744,11 @@ def _write_json(path: str, data: Any) -> None:
     os.replace(tmp, path)
 
 
+def _restarts_ladder(body: str) -> bool:
+    """Whether a comment restarts the ticket on rung 0."""
+    return any(m.group(1) == "0" for m in factory.RUNG_RE.finditer(body))
+
+
 def _sha12(body: Optional[str]) -> str:
     return hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
 
@@ -1842,6 +1996,45 @@ READY_RE = re.compile(r"Ready: checks and review passed on head ([0-9a-f]{40})\b
 OLD_READY_RE = re.compile(r"<!-- loom:ready-head ([0-9a-f]+) -->")
 
 
+def _unindexed_entries(tree: List[Any]) -> List[Dict[str, Any]]:
+    """The blobs of a git tree listing the code search index skips
+    (UNINDEXED_BYTES and over), leaving out files no log line is printed from."""
+    return [entry for entry in tree if isinstance(entry, dict)
+            and entry.get("type") == "blob" and isinstance(entry.get("size"), int)
+            and entry["size"] >= UNINDEXED_BYTES
+            and not str(entry.get("path") or "").lower().endswith(UNREAD_SUFFIXES)]
+
+
+def parse_roll_signals(text: str) -> List[Tuple[str, str, str]]:
+    """The roll records a ROLL_SIGNAL_FILE declares: (repo, path, key), one
+    a line, `#` comments. Raises on a malformed line, so a typo is never read
+    as 'nothing rolls this repo'."""
+    found = []
+    for raw in text.splitlines():
+        words = raw.split("#", 1)[0].split()
+        if not words:
+            continue
+        if len(words) != 3:
+            raise ValueError("%s: a line is <OWNER/NAME> <path> <key>" % ROLL_SIGNAL_FILE)
+        repo, path, key = words
+        if (not tickets.REPO_RE.fullmatch(repo) or path.startswith("/")
+                or any(part in ("", ".", "..") for part in path.split("/"))
+                or not ROLL_KEY_RE.fullmatch(key)):
+            raise ValueError("%s: %r is not <OWNER/NAME> <path> <key>"
+                             % (ROLL_SIGNAL_FILE, raw.strip()))
+        found.append((repo, path, key))
+    return found
+
+
+def rolled_commit(record: str, key: str) -> str:
+    """The full commit a roll record's `<key>=<sha>` or `<key>: <sha>` line
+    names (quotes allowed); "" when it names none, or two different ones."""
+    pattern = re.compile(r"^\s*(?:export\s+)?%s\s*[=:]\s*[\"']?([0-9a-f]{40})[\"']?\s*(?:#.*)?$"
+                         % re.escape(key), re.M)
+    shas = set(pattern.findall(record))
+    return shas.pop() if len(shas) == 1 else ""
+
+
 class Station:
     def __init__(self, gh: GitHub, settings: Settings,
                  now: Optional[float] = None,
@@ -1931,6 +2124,7 @@ class Station:
         self._claimed_rereviews: Dict[str, Any] = {}
         self._claimed_writes = 0
         self._branch_cache: Dict[str, str] = {}
+        self._stale_asks_withdrawn = 0
         # Per pass: each path-scoped repo's workflow filters, and its deploy runs.
         self._path_filters: Dict[str, Dict[str, List[str]]] = {}
         self._manual_listed: Dict[str, List[str]] = {}
@@ -2306,21 +2500,25 @@ class Station:
         return found is not None and found[0].pr == pr
 
     def _fix_for(self, repo: str, comments: List[Any]) -> Optional[Tuple[tickets.Fix, Any]]:
-        """Return the newest trusted fix after the last claim, regardless of
-        later non-fix comments. Raises ValueError for an unusable fix."""
+        """Return the newest trusted fix after the last claim or rung 0 restart,
+        regardless of later non-fix comments. A claim also reads from the status
+        comment, and a rung 0 comment ends a fix the same way: without it a
+        restarted ticket replayed the round of a pull request that had ended
+        (loom#2334). Raises ValueError for an unusable fix."""
         allowed = {a.lower() for a in self.s.authors}
-        last_claim, newest_fix = -1, None
+        comments = status.expand(comments, self.s.authors)
+        last_end, newest_fix = -1, None
         for i, c in enumerate(comments):
             if not isinstance(c, dict):
                 continue
             body = str(c.get("body") or "")
             trusted = tickets._login(c.get("user")) in allowed
-            # A stranger's claim marker must not hide a trusted fix.
-            if trusted and CLAIM_RE.fullmatch(body.strip()):
-                last_claim = i
+            # A stranger's claim or rung marker must not hide a trusted fix.
+            if trusted and (CLAIM_RE.fullmatch(body.strip()) or _restarts_ladder(body)):
+                last_end = i
             if trusted and body.startswith(tickets.FIX_MARKER):
                 newest_fix = (i, c, body)
-        if newest_fix is None or newest_fix[0] < last_claim:
+        if newest_fix is None or newest_fix[0] < last_end:
             return None
         # GitHub keeps no editor for comments: one changed after it was
         # posted may carry someone else's words.
@@ -3280,13 +3478,176 @@ class Station:
         # The cheap filters first: the events and comments of a ticket are
         # read only when its cooldown is over.
         found = []
+        reads: Dict[str, Any] = {"searches": UNMEETABLE_SEARCHES, "big": {}}
         for repo, issue in verify_due(shipped, attempts, self.now, refused):
+            if self._unmeetable_live(repo, issue, reads):
+                continue
             issue["shipped_at"] = self._shipped_stamp(repo, issue)
             issue["has_proof"] = self._proven(repo, int(issue["number"]))
             issue["health_proof"] = health.proof_of(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))), self.s.authors)
             found.append((repo, issue))
         return verify_due(found, attempts, self.now, refused), held
+
+    def _unmeetable_live(self, repo: str, issue: Dict[str, Any], reads: Dict[str, Any]) -> bool:
+        """True when the ticket's Live box can never be met as written
+        (bus/unmeetable.py): it waits on a closed issue or an unmerged closed
+        pull request, or on a log string no file of the repo contains. The
+        first time a box text is flagged one restate ask is posted; until the
+        text changes the ticket is not handed to a verify lane again (loom#2028:
+        two such tickets went through lane after lane and came back unmet).
+        `reads` holds this pass's source lookups (_source_has)."""
+        live = brain.live_criterion(issue.get("body"), limit=None)
+        if live == "(no Live criterion on the ticket)":
+            return False
+        number = int(issue["number"])
+        ticket = "%s#%d" % (repo, number)
+        box = unmeetable.key(live)
+        path = os.path.join(self.state, UNMEETABLE_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        known = self._unmeetable_known(state.get(ticket), box)
+        if known is not None:
+            return known
+        unknown: List[bool] = []
+        found = unmeetable.reasons(live, repo, number, self._issue_state,
+                                   lambda term: self._source_has(repo, term, reads, unknown))
+        if not found:
+            if not unknown:
+                state[ticket] = {"key": box, "reasons": [], "at": self.now}
+                _write_json(path, state)
+            return False
+        if self._ask_restate(repo, number, live, found):
+            state[ticket] = {"key": box, "reasons": found, "at": self.now}
+            _write_json(path, state)
+            _say("not verifying %s: its Live box cannot be met as written (%s)"
+                 % (ticket, "; ".join(found)))
+        return True
+
+    def _unmeetable_known(self, seen: Any, box: str) -> Optional[bool]:
+        """The recorded answer for this box text: True when it was flagged,
+        False when it was clean within UNMEETABLE_RECHECK, else None."""
+        if not isinstance(seen, dict) or seen.get("key") != box:
+            return None
+        if seen.get("reasons"):
+            return True
+        at = seen.get("at")
+        if isinstance(at, (int, float)) and 0 <= self.now - at < UNMEETABLE_RECHECK:
+            return False
+        return None
+
+    def _issue_state(self, repo: str, number: int) -> Optional[Tuple[str, bool]]:
+        """(state, merged) of an issue or pull request, None when unreadable."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+        except RateLimited:
+            raise
+        except GitHubError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        pull = data.get("pull_request")
+        return str(data.get("state") or ""), bool(isinstance(pull, dict) and pull.get("merged_at"))
+
+    def _source_has(self, repo: str, term: unmeetable.Term, reads: Dict[str, Any],
+                    unknown: List[bool]) -> Optional[bool]:
+        """Whether the repo's source holds `term`; None when unknown
+        (`unknown` is marked). A code search that finds the term's fixed part
+        is enough to say yes. One that finds nothing is not proof (loom#2050):
+        the index skips files over 384 KB, so those are read directly and
+        searched line by line with the term's wildcards; only when that read
+        covers them all is the answer no."""
+        found = self._code_search_hits(repo, term.literal, reads)
+        if found is None:
+            unknown.append(True)
+            return None
+        if found:
+            return True
+        big = self._unindexed_sources(repo, reads)
+        if big is None:
+            unknown.append(True)
+            return None
+        return unmeetable.holds(term, big)
+
+    def _code_search_hits(self, repo: str, text: str, reads: Dict[str, Any]) -> Optional[int]:
+        """How many files a code search of the repo finds `text` in; None
+        when the search was not run, failed or was incomplete."""
+        if reads["searches"] <= 0:
+            return None
+        reads["searches"] -= 1
+        try:
+            data = self.gh.rest("GET", "/search/code?q=%s+repo:%s" % (
+                quote('"%s"' % text, safe=""), repo)).data
+        except GitHubError:
+            # The search budget is apart from the core one: a refused search
+            # proves nothing and ends this pass's searches.
+            reads["searches"] = 0
+            return None
+        if not isinstance(data, dict) or data.get("incomplete_results") \
+                or not isinstance(data.get("total_count"), int):
+            return None
+        return data["total_count"]
+
+    def _unindexed_sources(self, repo: str, reads: Dict[str, Any]) -> Optional[List[str]]:
+        """The text of every file on the repo's default branch the code
+        search index skips (UNINDEXED_BYTES and over), read once a pass;
+        None when the tree or a file cannot be read, the tree listing is
+        truncated, or there are more such files than UNMEETABLE_BIG_READS."""
+        cache = reads["big"]
+        if repo in cache:
+            return cache[repo]
+        cache[repo] = None
+        try:
+            data = self.gh.rest("GET", "/repos/%s/git/trees/HEAD?recursive=1" % repo).data
+        except RateLimited:
+            raise
+        except GitHubError:
+            return None
+        if not isinstance(data, dict) or data.get("truncated") \
+                or not isinstance(data.get("tree"), list):
+            return None
+        big = _unindexed_entries(data["tree"])
+        if len(big) > UNMEETABLE_BIG_READS:
+            return None
+        texts = []
+        for entry in big:
+            text = self._blob_text(repo, str(entry.get("sha") or ""))
+            if text is None:
+                return None
+            texts.append(text)
+        cache[repo] = texts
+        return texts
+
+    def _blob_text(self, repo: str, sha: str) -> Optional[str]:
+        """A file's text read by its blob SHA; None when it cannot be read."""
+        try:
+            blob = self.gh.rest("GET", "/repos/%s/git/blobs/%s" % (repo, sha)).data
+        except RateLimited:
+            raise
+        except GitHubError:
+            return None
+        if not isinstance(blob, dict) or blob.get("encoding") != "base64" \
+                or not isinstance(blob.get("content"), str):
+            return None
+        try:
+            return base64.b64decode(blob["content"]).decode("utf-8", errors="replace")
+        except ValueError:
+            return None
+
+    def _ask_restate(self, repo: str, number: int, live: str, found: List[str]) -> bool:
+        """Post the one restate ask for this box text unless a comment
+        already carries it; False when GitHub refused (tried next pass)."""
+        try:
+            comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+            if not unmeetable.asked(list(comments), live):
+                notify.post(self.gh, repo, number, unmeetable.ask(
+                    live, [self._note_text(r) for r in found]), notify.HELD)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not ask to restate the Live box of %s#%d: %s" % (repo, number, err))
+            return False
+        return True
 
     def _audit_holds(self) -> Dict[str, float]:
         """The lanes a failed audit of their proof holds from verify runs,
@@ -3314,6 +3675,88 @@ class Station:
         _write_json(path, {"at": self.now})
         self._hand_verifies(free, starved_for=VERIFY_RESERVE_AFTER, limit=1)
         return [lane for lane in free if self._inbox_empty(lane)]
+
+    def note_stale_shipped(self) -> None:
+        """One missing-evidence note on every shipped ticket older than
+        VERIFY_NOTE_AFTER that no verify attempt has ever reached
+        (loom#2092), until the pass's step budget defers the rest to the
+        next run. The pool is the reserved lane's own (_verify_pool with
+        queued_holds=False): a ticket in it with an attempt on the ledger
+        has been reached and is spared, and a ticket the pool leaves to the
+        brain (proof refused too often) has attempts by construction. At
+        most once per VERIFY_NOTE_EVERY; a GitHub failure listing the pool
+        is logged and the run is not stamped, so the next pass retries."""
+        path = os.path.join(self.state, VERIFY_NOTE_FILE)
+        ledger = _read_json(path, {}, strict=False)
+        ledger = ledger if isinstance(ledger, dict) else {}
+        last = ledger.get("_at")
+        if isinstance(last, (int, float)) \
+                and 0 <= self.now - float(last) < VERIFY_NOTE_EVERY:
+            return
+        attempts = _read_json(os.path.join(self.state, VERIFY_FILE), {}, strict=False)
+        attempts = attempts if isinstance(attempts, dict) else {}
+        try:
+            pool, _held = self._verify_pool(attempts, queued_holds=False)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not list shipped tickets for verify notes: %s" % err)
+            return
+        deferred = False
+        try:
+            for repo, issue in pool:
+                if self._deferred():
+                    deferred = True
+                    break
+                number = int(issue["number"])
+                if "%s#%d" % (repo, number) in attempts:
+                    continue
+                shipped_at = float(issue.get("shipped_at", 0) or 0)
+                if not shipped_at or self.now - shipped_at < VERIFY_NOTE_AFTER:
+                    continue
+                self._note_one_shipped(repo, issue, ledger)
+        finally:
+            # A run the step budget cut short is not stamped: the cadence
+            # stamp would suppress the retry for a whole VERIFY_NOTE_EVERY
+            # while the tail of the pool is still unnoted. The notes already
+            # written keep their per-ticket stamps either way.
+            if not deferred:
+                ledger["_at"] = self.now
+            _write_json(path, ledger)
+
+    def _note_one_shipped(self, repo: str, issue: Dict[str, Any],
+                          ledger: Dict[str, Any]) -> None:
+        """Write the ticket's missing-evidence note, or refresh it in place
+        when the last write is older than VERIFY_NOTE_REFRESH (loom#2092).
+        The ledger is this pass's copy of VERIFY_NOTE_FILE; the caller
+        writes it back. A note already on the ticket is found by its
+        marker, so a lost ledger costs one comment read, never a second
+        note; a note that cannot be named (no id) still counts as noted."""
+        number = int(issue["number"])
+        key = "%s#%d" % (repo, number)
+        seen = ledger.get(key)
+        seen = seen if isinstance(seen, dict) else {}
+        written = seen.get("at")
+        if isinstance(written, (int, float)) \
+                and 0 <= self.now - float(written) < VERIFY_NOTE_REFRESH:
+            return
+        text = verify_note_text(float(issue.get("shipped_at", 0) or 0), self.now)
+        try:
+            comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+            note = next((c for c in comments if isinstance(c, dict)
+                         and VERIFY_NOTE_MARKER in str(c.get("body") or "")), None)
+            if note is None:
+                notify.post(self.gh, repo, number, text, notify.RECORD)
+                _say("noted %s: shipped over 24h with no verify attempt" % key)
+            elif isinstance(note.get("id"), int):
+                self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, note["id"]),
+                             {"body": text})
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not note %s as unverified: %s" % (key, err))
+            return
+        ledger[key] = {"at": self.now}
 
     def _hand_verifies(self, idle: List[str], starved_for: float = 0.0,
                        limit: int = 0) -> None:
@@ -3378,6 +3821,34 @@ class Station:
         claiming = self._write_brief(lane, tickets.verify_name(repo, number, stamp), text)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
+
+    def _write_review_brief(self, repo: str, pr_number: int, sha: str,
+                            issue: Dict[str, Any]) -> bool:
+        """The factory's Luna review writer (loom#2142): render the review
+        brief for the pull request's current head and hand it to the Luna
+        review slot. False when the pull request cannot be read or its head
+        has moved since the factory asked: no verdict may ever be posted
+        for a commit nobody asked about."""
+        try:
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data or {}
+        except GitHubError as err:
+            _say("could not read %s#%d for its Luna review brief: %s" % (repo, pr_number, err))
+            return False
+        head = pr.get("head") or {}
+        base = pr.get("base") or {}
+        if (str(head.get("sha") or "") != sha or not head.get("ref") or not base.get("ref")):
+            return False
+        stamp = int(self.now)
+        text = tickets.render_review_brief(
+            repo, issue, factory.LUNA_REVIEW_LANE, stamp, pr_number,
+            str(head["ref"]), str(base["ref"]), sha)
+        claiming = self._write_brief(
+            factory.LUNA_REVIEW_LANE,
+            tickets.review_name(repo, int(issue["number"]), stamp), text)
+        os.replace(claiming, claiming[:-len(".claiming")] + ".md")
+        _say("handed %s#%d head %s to lane %s to review"
+             % (repo, pr_number, sha[:12], factory.LUNA_REVIEW_LANE))
+        return True
 
     def _verify_github_data(self, repo: str, issue: Dict[str, Any]) -> str:
         """The verify brief's GitHub section: the lane has no network, so the
@@ -3568,19 +4039,38 @@ class Station:
         except GitHubError as err:
             _say("could not clear the awaiting label on %s#%d: %s" % (repo, number, err))
 
-    def _read_verify(self, lane: str, name: str) -> Tuple[Optional[Dict[str, Any]], str]:
-        """(the lane's verify.json, "") or (None, why it cannot be used)."""
-        path = os.path.join(self.s.home, "logs", lane, name + ".verify.json")
+    def _read_result(self, lane: str, name: str, filename: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """(the lane's result file, "") or (None, why it cannot be used): the
+        shared reader behind _read_verify and _read_review."""
+        path = os.path.join(self.s.home, "logs", lane, name + "." + filename)
         try:
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
         except FileNotFoundError:
-            return None, "The run wrote no verify.json."
+            return None, "The run wrote no %s." % filename
         except ValueError:
-            return None, "Its verify.json is not valid JSON."
+            return None, "Its %s is not valid JSON." % filename
         if not isinstance(data, dict):
-            return None, "Its verify.json is not a JSON object."
+            return None, "Its %s is not a JSON object." % filename
         return data, ""
+
+    def _read_verify(self, lane: str, name: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """(the lane's verify.json, "") or (None, why it cannot be used)."""
+        return self._read_result(lane, name, "verify.json")
+
+    def _review_model(self, lane: str, name: str) -> str:
+        """The model the review run used, as the runner recorded it next to
+        review.json; "" when it recorded none."""
+        path = os.path.join(self.s.home, "logs", lane, name + ".review.model")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except FileNotFoundError:
+            return ""
+
+    def _read_review(self, lane: str, name: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """(the lane's review.json, "") or (None, why it cannot be used)."""
+        return self._read_result(lane, name, "review.json")
 
     def _report_verify(self, lane: str, kind: str, repo: str, number: int, name: str) -> bool:
         """Apply a finished verify run. A failed run changes nothing: the
@@ -3620,6 +4110,111 @@ class Station:
             self._refute_merged(lane, repo, number, result["unmet"])
         else:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
+        return True
+
+    @staticmethod
+    def _review_findings(value: Any) -> Optional[List[Dict[str, Any]]]:
+        """A review.json finding list, cleaned, or None when its shape is
+        not a list of findings: each entry keeps its finding text (whitespace
+        collapsed, capped), an optional file and an optional line."""
+        if not isinstance(value, list):
+            return None
+        out: List[Dict[str, Any]] = []
+        for entry in value[:REVIEW_FINDINGS_MAX]:
+            if not isinstance(entry, dict) or not isinstance(entry.get("finding"), str):
+                return None
+            finding = " ".join(entry["finding"].split())[:REVIEW_FINDING_CHARS]
+            if not finding:
+                return None
+            item: Dict[str, Any] = {"finding": finding}
+            if isinstance(entry.get("file"), str) and entry["file"]:
+                item["file"] = entry["file"]
+            if isinstance(entry.get("line"), int) and entry["line"] > 0:
+                item["line"] = entry["line"]
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _finding_line(finding: Dict[str, Any]) -> str:
+        where = ""
+        if "file" in finding:
+            where = "`%s`%s: " % (finding["file"],
+                                  " (line %d)" % finding["line"] if "line" in finding else "")
+        return where + finding["finding"]
+
+    def _report_review(self, lane: str, kind: str, repo: str, number: int,
+                       name: str, text: str) -> bool:
+        """Apply a finished Luna review run (loom#2142): post the lane's
+        review.json on the pull request as a verdict in the Elder's markings
+        shape, with its blocking findings as review threads when they name a
+        file and a line, so the factory's gate and fix rounds read them
+        exactly like the review bot's own. A failed run, an unreadable
+        result or a result in the wrong shape posts nothing: the factory
+        dispatches again after its retry window. A result also posts
+        nothing when it did not come from the review slot's own Luna run:
+        the gate trusts the posted verdict, so no other lane or model may
+        speak it."""
+        if kind == "failed":
+            _say("Luna review run %s on lane %s failed; %s#%d keeps waiting for "
+                 "a verdict" % (name, lane, repo, number))
+            return True
+        if lane != factory.LUNA_REVIEW_LANE:
+            _say("Luna review run %s reported on lane %s, not the review slot "
+                 "%s; its verdict is not posted" % (name, lane, factory.LUNA_REVIEW_LANE))
+            return True
+        model = self._review_model(lane, name)
+        if model != factory.LUNA_MODEL:
+            _say("Luna review run %s recorded model %s, not %s; its verdict is "
+                 "not posted" % (name, model or "none", factory.LUNA_MODEL))
+            return True
+        result, why = self._read_review(lane, name)
+        if result is None:
+            _say("Luna review run %s left no usable verdict: %s" % (name, why))
+            return True
+        blocking = self._review_findings(result.get("blocking"))
+        notes = self._review_findings(result.get("notes"))
+        summary = result.get("summary")
+        pr_field = self._field(text, "Review-PR")
+        sha = self._field(text, "Head-Sha")
+        if (blocking is None or notes is None or not isinstance(summary, str)
+                or not pr_field.isdigit() or not sha):
+            _say("Luna review run %s wrote a verdict in the wrong shape; "
+                 "nothing posted" % name)
+            return True
+        pr_number = int(pr_field)
+        # Each anchored blocking finding becomes a review thread of its own
+        # (one pulls/comments post per finding), so the factory's fix rounds
+        # and rebuttal reads meet them exactly like the review bot's threads.
+        for finding in [f for f in blocking if "file" in f and "line" in f]:
+            try:
+                self.gh.rest("POST", "/repos/%s/pulls/%d/comments" % (repo, pr_number), {
+                    "commit_id": sha, "path": finding["file"],
+                    "line": finding["line"], "side": "RIGHT",
+                    "body": finding["finding"]})
+            except GitHubError as err:
+                _say("could not post a Luna review thread on %s#%d (%s); the "
+                     "finding still lands in the verdict comment" % (repo, pr_number, err))
+        lines = [factory.LUNA_REVIEW_MARKER % sha,
+                 "Elder markings - %d blocking, %d total"
+                 % (len(blocking), len(blocking) + len(notes)),
+                 "", " ".join(summary.split())[:1000] or "The lane gave no summary.",
+                 "",
+                 "This verdict comes from a Codex Luna review (lane %s, gpt-6-luna "
+                 "through `codex exec`) while the Elder review route is degraded. "
+                 "The merge gate reads it for this head in the degraded check's "
+                 "place." % lane]
+        if blocking:
+            lines += ["", "Blocking findings:"] + \
+                     ["- " + self._finding_line(f) for f in blocking]
+        if notes:
+            lines += ["", "Notes:"] + ["- " + self._finding_line(f) for f in notes]
+        try:
+            notify.post(self.gh, repo, pr_number, "\n".join(lines), notify.RECORD)
+        except GitHubError as err:
+            _say("could not post the Luna verdict on %s#%d (%s)" % (repo, pr_number, err))
+            return True
+        _say("posted the Luna verdict on %s#%d: %d blocking, %d total"
+             % (repo, pr_number, len(blocking), len(blocking) + len(notes)))
         return True
 
     def _refute_merged(self, lane: str, repo: str, number: int, why: Any) -> None:
@@ -4035,7 +4630,7 @@ class Station:
         """Whether the ticket goes to no build lane (bus/brief_check.py): a
         health ticket whose cause is missing or names only the measurement
         goes back to the queue with needs-brain; a stale or already-shipped
-        one goes back to the queue with loom:human and one ask. A read the
+        one goes back to the queue with needs:human and one ask. A read the
         check needs that fails holds the ticket for the next pass. A
         regression or revert ticket is checked for its cause only: its merged
         pull request is why it exists."""
@@ -4105,8 +4700,9 @@ class Station:
             # A log line, not a comment: each comment emails the operator
             # (2026-10-18), and the ticket's labels already say it waits.
             _say("%s#%d waits: no free lane takes model %s" % (repo, number, model))
-            self._event("model_wait", "no free lane takes model %s" % model,
-                        "%s#%d" % (repo, number), lane, model)
+            if not already_waiting:
+                self._event("model_wait", "no free lane takes model %s" % model,
+                            "%s#%d" % (repo, number), lane, model)
             return None
         names.append("lane:" + target)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
@@ -4189,7 +4785,8 @@ class Station:
             if tickets.merged_before_regression_requeue(ticket, pr.get("merged_at"), events):
                 return
         left: List[str] = []
-        if target == "loom:merged":
+        merged = target == "loom:merged"
+        if merged:
             left = self._unbuilt_criteria(ticket, [pr, *landed])
             if left:
                 events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
@@ -4203,7 +4800,11 @@ class Station:
                        "merged", "shipped", "verified", "closed-unmerged")
         states = {"loom:" + state for state in state_names}
         kept = self._drop_claim(name for name in labels if name not in states)
-        cleared = target == "loom:merged" and RUNAWAY in kept
+        # A merged pull request lands the lane's run, so a runaway hold the run
+        # caused is cleared even when the ticket is requeued to build criteria
+        # the pull request left unbuilt; otherwise a runaway ticket can never
+        # be claimed again (bus/station.py, test_a_runaway_ticket_is_not_claimed).
+        cleared = merged and RUNAWAY in kept
         if cleared:
             kept = [name for name in kept if name != RUNAWAY]
         kept.append(target)
@@ -4365,6 +4966,35 @@ class Station:
                 self._reconcile_pr_ticket(repo, pr, pool, landed)
                 if merged:
                     self._deliver_unlinked(repo, pr, unlinked)
+        # Also check contributor-linked tickets for merging
+        for pr in closed if isinstance(closed, list) else []:
+            if isinstance(pr, dict) and pr.get("state") == "closed":
+                merged = self._terminal_label(pr) == "loom:merged"
+                if not merged:
+                    continue
+                # Find tickets linked by this contributor PR
+                author = tickets._login(pr.get("user"))
+                if author in trusted_authors:
+                    continue
+                # Look for tickets this contributor owns and linked by this PR
+                number = self._pr_ticket_number(repo, pr)
+                if number is not None:
+                    ticket = tickets_by_number.get(number)
+                    if ticket is not None and self._contributor_ticket(repo, pr, author) is ticket:
+                        # This is a contributor-linked ticket
+                        pool = tickets_by_number if merged else waiting
+                        self._reconcile_pr_ticket(repo, pr, pool, landed)
+                        # Check if it moved to merged
+                        if "loom:merged" in _label_names(ticket):
+                            _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
+                    ticket = tickets_by_number.get(number)
+                    if ticket is not None and self._contributor_ticket(repo, pr, author) is ticket:
+                        # This is a contributor-linked ticket
+                        pool = tickets_by_number if merged else waiting
+                        self._reconcile_pr_ticket(repo, pr, pool, landed)
+                        # Check if it moved to merged
+                        if "loom:merged" in _label_names(ticket):
+                            _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
 
     def _unlinked_tickets(self, repo: str, linked: Dict[int, Dict[str, Any]],
                           found: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
@@ -4473,14 +5103,17 @@ class Station:
         loop step a pass and a full turn of the loop took hours."""
         loop_started = time.monotonic()
         # Below the budget floor these wait for the reset; trees are local.
-        steps = (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_merged,
+        steps = (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_rolls,
+                     self.ship_merged,
                      self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.close_done_tickets, self.settle_orphan_sources,
                      self.settle_claimed_tickets, self.release_stale_claims,
+                     self.referee_claims,
                      self.clean_labels,
                      self.queue_stateless_tickets,
+                     self.note_stale_shipped,
                      self.restate_shipped_live,
                      self.health_intake, self.intake_friction,
                      # The packet after the tick's row, so it renders that tick.
@@ -4496,35 +5129,43 @@ class Station:
         rotation = _read_json(rotation_path, {}, strict=False)
         start = rotation.get("next") if isinstance(rotation, dict) else 0
         start = start if isinstance(start, int) and 0 <= start < len(steps) else 0
-        stopped_at = None
-        for offset in range(len(steps)):
-            if self._deferred():
-                stopped_at = (start + offset) % len(steps)
-                break
-            # Past the budget the rest of the loop waits for the next pass,
-            # which starts here: claims, fix rounds and deploys come round
-            # every few minutes instead of after a 40-minute pass, and every
-            # step still runs in turn, in the same order.
-            if offset and time.monotonic() - loop_started >= PASS_STEP_BUDGET:
-                stopped_at = (start + offset) % len(steps)
-                _say("pass budget reached after %ds of steps: %d step(s) wait for the next pass, from %s"
-                     % (time.monotonic() - loop_started, len(steps) - offset,
-                        steps[stopped_at].__name__))
-                break
-            step = steps[(start + offset) % len(steps)]
-            try:
-                if not self._timed(step):
-                    # The carried-over step starts the next pass's loop.
-                    stopped_at = (start + offset) % len(steps)
-                    break
-            except RateLimited:
-                raise
-            except (GitHubError, OSError, ValueError) as err:
-                _say("%s failed: %s" % (step.__name__, err))
+        # Where the next pass starts, kept current so the write below records
+        # it however the loop ends.
+        next_step = start
         try:
-            _write_json(rotation_path, {"next": stopped_at if stopped_at is not None else 0})
-        except OSError as err:
-            _say("could not record the step rotation: %s" % err)
+            for offset in range(len(steps)):
+                next_step = (start + offset) % len(steps)
+                if self._deferred():
+                    break
+                # Past the budget the rest of the loop waits for the next pass,
+                # which starts here: claims, fix rounds and deploys come round
+                # every few minutes instead of after a 40-minute pass, and every
+                # step still runs in turn, in the same order.
+                if offset and time.monotonic() - loop_started >= PASS_STEP_BUDGET:
+                    _say("pass budget reached after %ds of steps: %d step(s) wait for the next pass, from %s"
+                         % (time.monotonic() - loop_started, len(steps) - offset,
+                            steps[next_step].__name__))
+                    break
+                step = steps[next_step]
+                try:
+                    if not self._timed(step):
+                        # The carried-over step starts the next pass's loop.
+                        break
+                except RateLimited:
+                    # The next step starts the next pass: on 2026-10-31 a step
+                    # that hit the search limit each pass held the 39 after it
+                    # for hours (loom#2321).
+                    next_step = (next_step + 1) % len(steps)
+                    raise
+                except (GitHubError, OSError, ValueError) as err:
+                    _say("%s failed: %s" % (step.__name__, err))
+            else:
+                next_step = 0
+        finally:
+            try:
+                _write_json(rotation_path, {"next": next_step})
+            except OSError as err:
+                _say("could not record the step rotation: %s" % err)
 
     def _timed(self, step: Any) -> bool:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
@@ -4666,20 +5307,30 @@ class Station:
 
     def _adoptable_pulls(self, repo: str) -> List[Dict[str, Any]]:
         """The repo's open pull requests that are not drafts, come from a
-        trusted author on a branch of the repo itself and are at least
-        ADOPT_GRACE old, oldest first. One whose created_at is missing or
-        unreadable counts as old enough, so it is never left unadopted.
-        Whether an open ticket links one (a Refs line or a loom/N branch) is
-        checked by the caller."""
+        trusted author on a branch of the repo itself and are past the grace
+        (_past_adopt_grace), oldest first. Whether an open ticket links one
+        (a Refs line or a loom/N branch) is checked by the caller."""
         authors = {a.lower() for a in self.s.authors}
         found = [pr for pr in self._open_pulls(repo)
                  if isinstance(pr, dict) and pr.get("state", "open") == "open"
                  and not pr.get("draft") and tickets._login(pr.get("user")) in authors
                  and brain._same_repo(repo, pr, {}) and not self._owned_elsewhere(repo, pr)
-                 and self.now - (self._epoch(str(pr.get("created_at") or "")) or 0)
-                 >= ADOPT_GRACE]
+                 and self._past_adopt_grace(pr)]
         return sorted(found, key=lambda pr: (str(pr.get("created_at") or ""),
                                              int(pr.get("number") or 0)))
+
+    def _past_adopt_grace(self, pr: Dict[str, Any]) -> bool:
+        """The pull request is ADOPT_GRACE old and, on a branch outside
+        loom/ (a person or a session drives those), has gone ADOPT_GRACE
+        with no commit or comment. updated_at moves on a push and on a
+        comment, so it needs no read per pull request; a label moves it too,
+        which only delays a ticket. A stamp that is missing or unreadable
+        counts as old enough, so a pull request is never left unadopted."""
+        stamps = [pr.get("created_at")]
+        if not str((pr.get("head") or {}).get("ref") or "").startswith("loom/"):
+            stamps.append(pr.get("updated_at"))
+        newest = max(self._epoch(str(stamp or "")) or 0 for stamp in stamps)
+        return self.now - newest >= ADOPT_GRACE
 
     def _marked_adopted(self, repo: str, number: int) -> bool:
         """A trusted author marked the pull request adopted."""
@@ -4880,7 +5531,8 @@ class Station:
         return revision, float(at)
 
     def _merged_pulls(self, repo: str, wanted: set,
-                      seen: Optional[List[Dict[str, Any]]] = None) -> Dict[int, Dict[str, Any]]:
+                      seen: Optional[List[Dict[str, Any]]] = None,
+                      beyond: Optional[set] = None) -> Dict[int, Dict[str, Any]]:
         """Each wanted ticket's latest merged pull request, found by its Refs
         line or loom branch in the most recently updated closed pull requests
         (the URL reconciliation reads), stopping once every one is found, then
@@ -4888,7 +5540,10 @@ class Station:
         ticket names or one past the window (_ticket_pull_beyond_window): every
         ship rule reads this, and only the deploy rule looked those up, so 33
         adoption tickets in other repos never shipped (2026-10-20).
-        Every merged pull request read is added to seen when it is given."""
+        Every merged pull request read is added to seen when it is given.
+        With beyond given, only those tickets are looked up past the window:
+        an open triage or queued issue mostly has no merged pull request, and
+        looking each one up every pass would spend the API budget."""
         found: Dict[int, Dict[str, Any]] = {}
         url: Optional[str] = ("/repos/%s/pulls?state=closed&sort=updated"
                               "&direction=desc&per_page=100" % repo)
@@ -4911,13 +5566,21 @@ class Station:
         # ticket whose newest merged pull request is one stays merged
         # (a ticket shipped through its own revert, 2026-10-21).
         found = {n: pr for n, pr in found.items() if not revert.looks_like_revert(pr)}
-        for number in sorted(wanted - set(found))[:SHIP_PER_PASS]:
+        missing = wanted - set(found)
+        self._add_beyond_window(repo, missing if beyond is None else missing & beyond,
+                                found, seen)
+        return found
+
+    def _add_beyond_window(self, repo: str, missing: set, found: Dict[int, Dict[str, Any]],
+                           seen: Optional[List[Dict[str, Any]]]) -> None:
+        """Add the merged pull request of up to SHIP_PER_PASS missing tickets
+        found past the closed pull window (_ticket_pull_beyond_window)."""
+        for number in sorted(missing)[:SHIP_PER_PASS]:
             pr = self._ticket_pull_beyond_window(repo, number)
             if pr is not None and not revert.looks_like_revert(pr):
                 found[number] = pr
                 if seen is not None:
                     seen.append(pr)
-        return found
 
     def ship_deployed(self) -> None:
         """Move each open merged ticket of the repo this checkout deploys
@@ -4930,9 +5593,10 @@ class Station:
             return
         revision, at = deployed
         merged = self._merged_tickets(repo)
-        if not merged:
+        early = self._early_tickets(repo)
+        if not merged and not early:
             return
-        latest = self._merged_pulls(repo, merged)
+        latest = self._merged_pulls(repo, merged | set(early), beyond=merged)
         groups = self._ticket_pulls(repo, set(latest))
         hands = self._hand_reverts(repo, self._closed_pulls(repo))
         carried = sorted((str(pr["merged_at"]), number, pr)
@@ -4940,11 +5604,57 @@ class Station:
                          if self.ancestor(str(pr["merge_commit_sha"]), revision)
                          and not self._all_reverted(groups.get(number) or [pr], hands,
                                                     revision, self.ancestor))
-        for _, number, pr in carried[:SHIP_PER_PASS]:
-            self._ship_one(repo, number, pr,
-                           "the station deployed revision %s at %s" % (
-                               revision[:12], self._utc(at)),
-                           "deployed %s" % revision[:12])
+        shipped = 0
+        for _, number, pr in carried:
+            if shipped >= SHIP_PER_PASS:
+                break
+            if number in early and not self._early_ships(repo, early[number], pr):
+                continue
+            how = "the station deployed revision %s at %s" % (revision[:12], self._utc(at))
+            if self._ship_one(repo, number, pr, how, "deployed %s" % revision[:12]):
+                shipped += 1
+                if number in early:
+                    self._drop_triage(repo, number, early[number])
+
+    def _early_tickets(self, repo: str) -> Dict[int, Dict[str, Any]]:
+        """The repo's open issues at a state before a pull request
+        (EARLY_SHIP_STATES), by number: a pull request that names one can
+        merge and deploy while the issue waits there, and only loom:pr
+        tickets are reconciled from their pull request (loom#2025)."""
+        found: Dict[int, Dict[str, Any]] = {}
+        for label in EARLY_SHIP_STATES:
+            for issue in self._paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                        % (repo, label)):
+                if (isinstance(issue, dict) and "pull_request" not in issue
+                        and isinstance(issue.get("number"), int)
+                        and label in _label_names(issue)
+                        and not SETTLE_LANDED_SET.intersection(_label_names(issue))):
+                    found[int(issue["number"])] = issue
+        return found
+
+    def _early_ships(self, repo: str, issue: Dict[str, Any], pr: Dict[str, Any]) -> bool:
+        """Whether a triage or queued issue ships with this deployed pull
+        request: not another operator's, not a regression re-opened after it,
+        and not sent back for work after it merged (a merge that left
+        criteria unbuilt requeues the ticket, tickets.merged_before_requeue)."""
+        names = _label_names(issue)
+        if "loom:regression" in names or brain.owned_elsewhere(issue) is not None:
+            return False
+        events = self._paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
+        return not tickets.merged_before_requeue(pr.get("merged_at"), events)
+
+    def _drop_triage(self, repo: str, number: int, issue: Dict[str, Any]) -> None:
+        """Remove loom:triage from an issue that shipped: a move keeps it, and
+        the rewrite step would then turn shipped work into a new ticket."""
+        if "loom:triage" not in _label_names(issue):
+            return
+        try:
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                         % (repo, number, quote("loom:triage", safe="")), ok=(404,))
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not drop loom:triage from %s#%d: %s" % (repo, number, err))
 
     def _ticket_pull_beyond_window(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
         """The merged pull request of a merged ticket that _merged_pulls did
@@ -5041,15 +5751,59 @@ class Station:
         pull request's merge commit was deployed; whether it moved."""
         note = "Shipped: %s, which carries pull request #%d (merge commit %s)." % (
             how, int(pr["number"]), str(pr["merge_commit_sha"])[:12])
+        key = "%s#%d" % (repo, number)
         try:
             brain.move(self.gh, repo, number, "shipped", note=note)
         except RateLimited:
             raise
         except (GitHubError, ValueError) as err:
             _say("could not ship %s#%d: %s" % (repo, number, err))
+            self._deployed_seen(key, True)
             return False
+        self._deployed_seen(key, False)
         _say("shipped %s#%d: %s carries #%d" % (repo, number, what, int(pr["number"])))
         return True
+
+    def _deployed_seen(self, key: str, seen: bool) -> None:
+        """Keep when a ship rule first found the ticket deployed
+        (DEPLOYED_SEEN_FILE) until it moves; the merged-not-shipped
+        invariant reads what is left (loom#2025)."""
+        path = os.path.join(self.state, DEPLOYED_SEEN_FILE)
+        saved = _read_json(path, {}, strict=False)
+        ledger = {k: v for k, v in (saved.items() if isinstance(saved, dict) else ())
+                  if isinstance(k, str) and self._num(v)}
+        if seen == (key in ledger):
+            return
+        if seen:
+            ledger[key] = self.now
+        else:
+            ledger.pop(key, None)
+        _write_json(path, ledger)
+
+    def _invariant_unshipped(self) -> List[Tuple[invariants.Ref, float]]:
+        """Each ticket a ship rule found deployed that is still an open
+        loom:merged ticket, with when it was first found deployed. A ticket
+        that moved, closed or left loom:merged by other hands is dropped."""
+        path = os.path.join(self.state, DEPLOYED_SEEN_FILE)
+        saved = _read_json(path, {}, strict=False)
+        ledger = {k: v for k, v in (saved.items() if isinstance(saved, dict) else ())
+                  if isinstance(k, str) and self._num(v)}
+        by_repo: Dict[str, List[Tuple[int, float]]] = {}
+        for key, at in ledger.items():
+            repo, _, number = key.rpartition("#")
+            if tickets.REPO_RE.fullmatch(repo) and number.isdigit():
+                by_repo.setdefault(repo, []).append((int(number), float(at)))
+        kept: Dict[str, float] = {}
+        found: List[Tuple[invariants.Ref, float]] = []
+        for repo, items in sorted(by_repo.items()):
+            merged = self._merged_tickets(repo)
+            for number, at in sorted(items):
+                if number in merged:
+                    kept["%s#%d" % (repo, number)] = at
+                    found.append((self._invariant_ref(repo, number), at))
+        if kept != ledger:
+            _write_json(path, kept)
+        return found
 
     # -- shipping on merge or on a deploy workflow --------------------------
     def ship_merged(self) -> None:
@@ -5287,6 +6041,64 @@ class Station:
                 and str(head.get("full_name") or "").lower() == repo.lower()
                 and bool(COMMIT_RE.fullmatch(str(run.get("head_sha") or ""))))
 
+    # -- shipping through a downstream roll -------------------------------
+    def ship_rolls(self) -> None:
+        """Move the open merged tickets of each watched repo that declares a
+        roll record (ROLL_SIGNAL_FILE) to loom:shipped once the source commit
+        the record names carries their pull request's merge commit, unless a
+        later revert the commit also carries undid it (loom#2025)."""
+        path = os.path.join(self.state, ROLL_SIGNALS_FILE)
+        saved = _read_json(path, {}, strict=False)
+        known = saved if isinstance(saved, dict) else {}
+        kept: Dict[str, Any] = {}
+        try:
+            for repo in [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]:
+                try:
+                    text = self._roll_signal(repo, known.get(repo), kept)
+                    merged = self._merged_tickets(repo) if text else set()
+                    if not merged:
+                        continue
+                    for deploy, where, key in parse_roll_signals(text or ""):
+                        self._ship_roll(repo, merged, deploy, where, key)
+                except RateLimited:
+                    raise
+                except (GitHubError, ValueError) as err:
+                    _say("could not ship %s by its roll record: %s" % (repo, err))
+        finally:
+            _write_json(path, kept)
+
+    def _roll_signal(self, repo: str, cached: Any, kept: Dict[str, Any]) -> Optional[str]:
+        """The repo's ROLL_SIGNAL_FILE text, None when it has none: read
+        again only ROLL_SIGNAL_EVERY after the last read."""
+        if (isinstance(cached, dict) and self._num(cached.get("at"))
+                and 0 <= self.now - cached["at"] < ROLL_SIGNAL_EVERY
+                and isinstance(cached.get("text"), (str, type(None)))):
+            kept[repo] = cached
+            return cached["text"]
+        text = self._contents_text(repo, ROLL_SIGNAL_FILE)
+        kept[repo] = {"text": text, "at": self.now}
+        return text
+
+    def _ship_roll(self, repo: str, merged: set, deploy: str, path: str, key: str) -> None:
+        record = self._contents_text(deploy, path)
+        revision = rolled_commit(record or "", key)
+        if not revision:
+            _say("%s: the roll record names no %s commit" % (repo, key))
+            return
+        seen: List[Dict[str, Any]] = []
+        latest = self._merged_pulls(repo, merged, seen)
+        carried = sorted((str(pr["merged_at"]), number, pr) for number, pr in latest.items()
+                         if self._carries(repo, str(pr["merge_commit_sha"]), revision)
+                         and not self._reverted(repo, pr, seen, revision))
+        for name in (deploy, repo):
+            if name not in self._publics:
+                self._publics[name] = self._public(name)
+        # A ship note on a public ticket never names a private repo.
+        where = deploy if (self._publics[deploy] or not self._publics[repo]) else "a private repo"
+        how = "a roll record in %s names %s revision %s" % (where, repo, revision[:12])
+        for _, number, pr in carried[:SHIP_PER_PASS]:
+            self._ship_one(repo, number, pr, how, "roll %s" % revision[:12])
+
     # -- shipping through a pin pull request ------------------------------
     def ship_pins(self) -> None:
         """Move the open merged tickets each recently merged pin pull request
@@ -5440,32 +6252,22 @@ class Station:
         held = self._held_tickets()
         if not held:
             return
-        try:
-            closed_incidents = self._closed_incidents()
-        except RateLimited:
-            raise
-        except GitHubError as err:
-            _say("factory release: could not read the closed incidents: %s" % err)
-            return
-        for key, info in list(held.items()):
-            self._release_held(key, info, closed_incidents)
+        cursor_path = os.path.join(self.state, "factory_held_cursor.json")
+        cursor = _read_json(cursor_path, {}, strict=False)
+        start = cursor.get("next", 0) if isinstance(cursor, dict) else 0
+        entries = list(held.items())
+        start = start if isinstance(start, int) and 0 <= start < len(entries) else 0
+        self._factory_incidents = {}
+        for offset in range(len(entries)):
+            index = (start + offset) % len(entries)
+            try:
+                self._release_held(*entries[index])
+            except TargetReached:
+                _write_json(cursor_path, {"next": (index + 1) % len(entries)})
+                raise
+            _write_json(cursor_path, {"next": (index + 1) % len(entries)})
 
-    def _closed_incidents(self) -> Dict[str, Dict[str, Any]]:
-        """Closed factory incidents the runner filed, by "owner/repo#n".
-
-        Incidents are found by the body marker, not the loom:factory label:
-        the label may not exist in a repo (loom#918), so filtering on it
-        loses every unlabelled incident. Closed issues are listed without the
-        label and then matched on the marker."""
-        closed: Dict[str, Dict[str, Any]] = {}
-        for incident in self._paginate(
-                "/repos/%s/issues?state=closed&per_page=100" % FACTORY_REPO):
-            if isinstance(incident, dict) and INCIDENT_MARKER in str(incident.get("body") or ""):
-                closed["%s#%d" % (FACTORY_REPO, incident.get("number"))] = incident
-        return closed
-
-    def _release_held(self, key: str, info: Any,
-                      closed_incidents: Dict[str, Dict[str, Any]]) -> None:
+    def _release_held(self, key: str, info: Any) -> None:
         """Re-queue one held ticket: a closed and named incident, or a hold
         with no incident (the filing failed) that has outlived
         HELD_NO_INCIDENT_FOR. Forget it once it is no longer running."""
@@ -5474,6 +6276,15 @@ class Station:
         ref = info.get("incident") if isinstance(info, dict) else None
         raw_at = (info or {}).get("at")
         at = float(raw_at) if raw_at is not None else None
+        try:
+            incident = self._factory_incident(ref) if ref else None
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("factory release: could not read incident %s: %s" % (ref, err))
+            return
+        if ref and incident is None:
+            return
         try:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
             comments = self._paginate(
@@ -5510,11 +6321,15 @@ class Station:
             _say("factory release: %s#%d re-queued: incident filing failed"
                  % (repo, number))
             return
-        incident = closed_incidents.get(ref) if ref else None
-        if incident is None or not any(isinstance(c, dict) and ref in str(c.get("body") or "")
-                                       for c in comments):
+        if incident is None:
             return
-        if self._claimed_since(comments, incident):
+        body_events = status.body_events(issue.get("body"))
+        event_comments = list(comments) + [
+            {"body": text, "created_at": created} for created, text in body_events]
+        if not any(ref in str(c.get("body") or "") for c in event_comments
+                   if isinstance(c, dict)):
+            return
+        if self._claimed_since(event_comments, incident):
             return
         cleared = RUNAWAY in _label_names(issue)
         self._release_one(key, repo, number, issue, cleared,
@@ -5522,6 +6337,32 @@ class Station:
                           "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
                                               if cleared else ""))
         _say("factory release: %s#%d re-queued after incident %s closed" % (repo, number, ref))
+
+    def _factory_incident(self, ref: str) -> Optional[Dict[str, Any]]:
+        """Read one named incident once per pass; return it only when closed."""
+        cache = getattr(self, "_factory_incidents", {})
+        if ref in cache:
+            return cache[ref]
+        repo, _, raw_number = ref.rpartition("#")
+        if not repo or not raw_number.isdigit():
+            cache[ref] = None
+            self._factory_incidents = cache
+            return None
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, int(raw_number))).data
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("factory release: could not read incident %s: %s" % (ref, err))
+            cache[ref] = None
+            self._factory_incidents = cache
+            return None
+        if not isinstance(issue, dict) or issue.get("state") != "closed" \
+                or INCIDENT_MARKER not in str(issue.get("body") or ""):
+            issue = None
+        cache[ref] = issue
+        self._factory_incidents = cache
+        return issue
 
     def _green_default_after_hold(self, repo: str, held_at: float) -> bool:
         """Whether a newer commit on the default branch has all checks green."""
@@ -5562,7 +6403,7 @@ class Station:
         self._forget_held(key)
 
     def _claimed_since(self, comments: List[Any], incident: Dict[str, Any]) -> bool:
-        """A lane claim comment is newer than the incident's close."""
+        """A lane claim in a comment or the issue body is newer than close."""
         from . import factory as _factory
         closed = self._epoch(str(incident.get("closed_at") or ""))
         return closed is not None and any(
@@ -5603,13 +6444,6 @@ class Station:
             data = self.gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % repo).data
             self._pulls[repo] = data if isinstance(data, list) else []
         return self._pulls[repo]
-
-    def _elder_markings(self, summary: str) -> List[Tuple[str, List[str]]]:
-        """Parse Elder review markings from a review check summary.
-        Returns list of (marking_kind, paths) tuples."""
-        text = str(summary or "")
-        return [(m.group(1), [p.strip("` ") for p in re.findall(r"`([^`]+)`", m.group(2))])
-                for m in _ELDER_MARKING_RE.finditer(text)]
 
     def _elder_markings_with_accept(self, summary: str, sha: str) -> List[Tuple[str, List[str], List[str]]]:
         """Parse Elder review markings and their accept-removal lines.
@@ -5700,15 +6534,20 @@ class Station:
                 ])
                 ask += f"\n\n{accept_block}"
                 brain.human(self.gh, repo, number, ask)
-                _say("%s#%d: only removed-guarded-path on named paths; moved to loom:human for accept-removal"
+                _say("%s#%d: only removed-guarded-path on named paths; moved to needs:human for accept-removal"
                      % (repo, number))
                 return
         # An infra timeout (bus/flake.py) is no lane's to fix: it is re-run
         # once before any round, whatever else fails, and never reads as a
-        # stuck failure after (loom#1962).
+        # stuck failure after (loom#1962). A cancelled job, a job that failed
+        # before any repo code ran, and pytest reporting only timeout or
+        # connection errors (no test failures) are the same shape. The station
+        # re-runs each head commit's failed jobs once, records it on the
+        # ticket's status comment and waits: a second red on the same head
+        # counts as a fix round as usual.
         flaky = [name for name, tail in failed if name not in (
             self.s.review_check, self.s.plan_check) and flake.infra_flake(tail)]
-        if flaky and self._rerun_flaky(repo, number, pr_number, sha, flaky):
+        if flaky and self._rerun_flaky(repo, number, pr_number, sha, flaky, comments):
             self._remove_ready_if_present(repo, number, names)
             return
         self._note_first_push(repo, pr_number, comments, failed)
@@ -5746,31 +6585,76 @@ class Station:
                                    comments, names, failed, threads, rounds, flaky)
 
     def _rerun_flaky(self, repo: str, number: int, pr_number: int, sha: str,
-                     flaky: List[str]) -> bool:
+                     flaky: List[str], comments: List[Any]) -> bool:
         """Re-run the workflow runs of the infra-failed checks on this head
-        once (flake.rerun_once). False when each was already re-run, or when
-        GitHub refused the read or the re-run: the fix round then goes as it
-        did before this re-run existed."""
+        once (flake.rerun_once), record it on the ticket's status comment and
+        wait. Returns True when a re-run was started and the ticket should
+        wait for it; False when it was already re-run on this head, no re-run
+        is due, or GitHub refused the re-run: the fix round then goes as it
+        did before this re-run existed (a second red on this head counts as
+        usual)."""
+        if self._already_re_ran(repo, sha):
+            return False
         try:
             runs = brain.newest_check_runs((self.gh.rest(
                 "GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data
                 or {}).get("check_runs") or [])
-            if not flake.rerun_once(self.gh, repo, runs, flaky):
+            done = flake.rerun_once(self.gh, repo, runs, flaky)
+            if not done:
                 return False
         except GitHubError as err:
-            _say("%s#%d: could not re-run %s on %s#%d (%s); the fix round goes as usual"
-                 % (repo, number, ", ".join(sorted(flaky)), repo, pr_number, err))
+            self._cannot_re_run(repo, err)
             return False
+        self._record_re_run(repo, number, sha, flaky, comments)
         _say("%s#%d: re-ran %s on %s#%d once before a fix round: an infra failure"
              % (repo, number, ", ".join(sorted(flaky)), repo, pr_number))
         return True
 
+    def _already_re_ran(self, repo: str, sha: str) -> bool:
+        """Whether this Loom already re-ran the failed jobs of `sha` on this
+        repo once (state/ci_reruns.json), so a second red on the same head
+        counts as a fix round instead of another re-run."""
+        record = _read_json(os.path.join(self.state, "ci_reruns.json"), {}, strict=False)
+        return "%s#%s" % (repo, sha) in record
+
+    def _record_re_run(self, repo: str, number: int, sha: str, flaky: List[str],
+                       comments: List[Any]) -> None:
+        """Remember the re-run (state/ci_reruns.json) and note it on the
+        ticket's status comment so the next pass reads it back and waits."""
+        record = _read_json(os.path.join(self.state, "ci_reruns.json"), {}, strict=False)
+        record["%s#%s" % (repo, sha)] = self.now
+        _write_json(os.path.join(self.state, "ci_reruns.json"), record)
+        status.add(self.gh, repo, number,
+                   "Re-ran %s once before a fix round (infra failure, head %s): "
+                   "waiting on the re-run." % (", ".join(sorted(flaky)), sha[:12]),
+                   self.now, self.s.authors)
+
+    def _cannot_re_run(self, repo: str, err: GitHubError) -> None:
+        """Say once per repo that the Loom App cannot re-run jobs because it
+        lacks the actions: write permission, so the operator knows to install
+        it (docs/LANES.md). Other refusals keep the earlier behaviour."""
+        said = _read_json(os.path.join(self.state, "ci_rerun_refused.json"), {}, strict=False)
+        if repo in said:
+            return
+        said[repo] = self.now
+        _write_json(os.path.join(self.state, "ci_rerun_refused.json"), said)
+        if getattr(err, "status", 0) in (401, 403):
+            _say("%s: cannot re-run infra-failed jobs: the Loom App has no actions: "
+                 "write permission (%s); a fix round goes as usual" % (repo, err))
+        else:
+            _say("%s: could not re-run infra-failed jobs (%s); a fix round goes as usual"
+                 % (repo, err))
+
     def _no_round(self, failed: List[Tuple[str, str]], threads: List[Any]) -> bool:
-        """Nothing a lane round could fix: no failure at all, or the plan check
-        alone, which fails on the pull request's body; the factory rebuilds
-        that from the ticket (factory._judge, loom#1837), so it is also no
-        round to judge stuck."""
-        return not threads and all(name == self.s.plan_check for name, _ in failed)
+        """Whether failed checks need no lane round because they read PR text."""
+        if threads:
+            return False
+        if all(name == self.s.plan_check for name, _ in failed):
+            return True
+        return bool(failed) and all(
+            factory.LEAK_CHECK_RE.search(name)
+            and factory.body_leak_hits(tail.splitlines()) is not None
+            for name, tail in failed)
 
     def _note_first_push(self, repo: str, pr_number: int, comments: List[Any],
                          failed: List[Tuple[str, str]]) -> None:
@@ -6122,6 +7006,8 @@ class Station:
             return True
         if self._field(text, "Deliverable") == "verify":
             return self._report_verify(lane, kind, repo, number, name)
+        if self._field(text, "Deliverable") == "review":
+            return self._report_review(lane, kind, repo, number, name, text)
         self._revert_decision_ticks(repo, number, lane, text)
         if kind == "done":
             if self._field(text, "Deliverable") == "answer":
@@ -6693,6 +7579,8 @@ class Station:
         said = self._no_change_said(lane, name)
         issue = self._issue(repo, number)
         names = _label_names(issue)
+        if self._unproven_no_change(repo, number, issue, said):
+            return
         undoes = bool(set(names) & {REGRESSION, factory.REVERT_LABEL})
         merged = self._merged_linked(repo, issue) if (
             issue.get("state") == "open" and RUNNING in names and not undoes) else []
@@ -6725,6 +7613,25 @@ class Station:
                     "again." % ("This is a regression or revert ticket" if undoes else
                                 "No merged pull request references this ticket"))
         self._routine(repo, number, "%s\n\n%s" % (said, note))
+
+    def _unproven_no_change(self, repo: str, number: int, issue: Dict[str, Any],
+                            said: str) -> bool:
+        """Send a running ticket back to loom:queued, naming each box, when a
+        no-change answer leaves a code acceptance box unproven (neither the
+        ticket nor the answer's checklist ticks it). On 2026-10-17 a lane's
+        no-op answer settled a ticket whose third box still failed, and it
+        went on to loom:merged (loom#2032). True when it requeued."""
+        if issue.get("state") != "open" or RUNNING not in _label_names(issue):
+            return False
+        left = factory.unproven_criteria(str(issue.get("body") or ""), said)
+        if not left:
+            return False
+        self._relabel(repo, number, "loom:queued")
+        self._routine(repo, number, "%s\n\n%s" % (said, NO_CHANGE_UNPROVEN_NOTE % "; ".join(
+            " ".join(text.split())[:criteria_gate.ASK_WIDTH] for text in left)))
+        _say("%s#%d: a no-change answer left %d box(es) unproven, requeued"
+             % (repo, number, len(left)))
+        return True
 
     def _merged_cited(self, repo: str, issue: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Merged pull requests the Fabric workspace cites as already doing
@@ -6802,9 +7709,10 @@ class Station:
                              brief: str, asked: Optional[Set[str]]) -> None:
         """Post each answer the lane wrote as the reply on its thread: an open
         thread on one of prs and, unless asked is None, one the brief asked
-        about. It is resolved when the round ran on a ladder model and the
-        thread is the review bot's own medium or low finding; otherwise it
-        stays open, and the factory reads it as a finding that survived."""
+        about. It is resolved when the round ran on a ladder model, the
+        thread is the review bot's own medium or low finding, and the answer
+        holds on the head (bus/rebuttal.py); otherwise it stays open, and the
+        factory reads it as a finding that survived."""
         folder = os.path.join(self.inbox(lane), "answers", name)
         try:
             entries = sorted(os.listdir(folder))
@@ -6844,7 +7752,8 @@ class Station:
             return
         self.gh.graphql(REPLY_MUTATION, {"id": thread_id, "body": body})
         root = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
-        settled = strong and _bot_minor(root, self.s.review_bot)
+        settled = (strong and _bot_minor(root, self.s.review_bot)
+                   and self._answer_holds(repo, pr, lane, thread_id, node, said))
         if settled:
             try:
                 self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
@@ -6857,6 +7766,20 @@ class Station:
                 _say("could not resolve %s on %s#%d: %s" % (thread_id, repo, pr, err))
         _say("posted lane %s's answer on %s#%d thread %s%s" % (
             lane, repo, pr, thread_id, " and resolved it" if settled else ""))
+
+    def _answer_holds(self, repo: str, pr: int, lane: str, thread_id: str,
+                      node: Dict[str, Any], said: str) -> bool:
+        """The answer settles its thread only when what it cites holds on
+        the head (bus/rebuttal.py, loom#2081): a false "it has a caller"
+        answer once merged dead code."""
+        root = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
+        head = str((node.get("pullRequest") or {}).get("headRefOid") or "")
+        why = rebuttal.check_on_head(self.gh, repo, head, said,
+                                     str(node.get("path") or ""), str(root.get("body") or ""))
+        if why:
+            _say("left %s on %s#%d open: lane %s's answer does not hold on the head: %s"
+                 % (thread_id, repo, pr, lane, why))
+        return not why
 
     def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str) -> None:
         """A fix brief that ended with nothing committed. Most often the lane
@@ -6981,16 +7904,38 @@ class Station:
             raise GitHubError("no issue was created in %s" % repo)
         return int(made["number"])
 
-    def _lanes_unchanged(self, repo: str, values: Dict[str, str]) -> bool:
-        """Same yes/no values published to the same repo within the hour."""
+    def _fresh_lanes_record(self, repo: str) -> Optional[Dict[str, Any]]:
+        """The saved record of a publish to `repo` within LANES_REPUBLISH;
+        None when there is none. It reads no GitHub state."""
         saved = _read_json(os.path.join(self.state, "lanes.json"), {}, strict=False)
         if not isinstance(saved, dict):
-            return False
+            return None
         last_at = saved.get("at")
         if isinstance(last_at, bool) or not isinstance(last_at, (int, float)):
-            return False
-        return (saved.get("repo") == repo and saved.get("values") == values
-                and 0 <= self.now - last_at <= LANES_REPUBLISH)
+            return None
+        fresh = saved.get("repo") == repo and 0 <= self.now - last_at <= LANES_REPUBLISH
+        return saved if fresh else None
+
+    def _lanes_unchanged(self, repo: str, values: Dict[str, str]) -> bool:
+        """Same yes/no values published to the same repo within the age."""
+        saved = self._fresh_lanes_record(repo)
+        return saved is not None and saved.get("values") == values
+
+    def _publish_lanes_when_old(self) -> None:
+        """Republish a lane table past LANES_REPUBLISH at the start of a pass.
+        Passes stop at the request target before the late publish_lanes step,
+        which left brains reading a table hours old on 2026-10-30 (loom#2273).
+        A fresh table spends no request here, and below the budget floor the
+        table waits as the step does; status then calls it stale."""
+        repo = self.s.status_repo
+        if not repo or self._fresh_lanes_record(repo) is not None or self._deferred():
+            return
+        try:
+            self._timed(self.publish_lanes)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("publish_lanes failed: %s" % err)
 
     def _spend_shown(self) -> Optional[spend.Summary]:
         """The anthropic spend, once there is a budget or a recorded run."""
@@ -7077,7 +8022,7 @@ class Station:
         summary = self._spend_shown()
         if summary is not None:
             # A new run (or a budget change) republishes; the clock alone waits
-            # for the hourly republish.
+            # for LANES_REPUBLISH.
             values["anthropic spend"] = "%d runs, $%.2f, budget %s" % (
                 summary.runs, summary.spent, self.s.anthropic.usd)
         # A changed scorecard (bus/scorecard.py) republishes too.
@@ -7097,18 +8042,24 @@ class Station:
     # -- asks -------------------------------------------------------------
     def _poll_asks(self, repo: str) -> List[Dict[str, Any]]:
         # A conditional read, like _poll.
-        items = self.gh.rest(
-            "GET", "/repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, NEEDS_OPERATOR)).data
-        items = items if isinstance(items, list) else []
-        return [i for i in items if isinstance(i, dict) and "pull_request" not in i
-                and i.get("html_url") and "number" in i]
+        found: Dict[int, Dict[str, Any]] = {}
+        for label in HUMAN_LABELS:
+            if label == HUMAN:
+                continue
+            items = self.gh.rest(
+                "GET", "/repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, label)).data
+            for i in items if isinstance(items, list) else []:
+                if isinstance(i, dict) and "pull_request" not in i and i.get("html_url") \
+                        and "number" in i:
+                    found.setdefault(int(i["number"]), i)
+        return list(found.values())
 
     def _ask_trusted(self, repo: str, issue: Dict[str, Any]) -> bool:
         allowed = {a.lower() for a in self.s.authors}
         if tickets._login(issue.get("user")) not in allowed:
             return False
         events = self._paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
-        actor = tickets._latest_label_actor(events, lambda n: n == NEEDS_OPERATOR)
+        actor = tickets._latest_label_actor(events, lambda n: n in HUMAN_LABELS)
         return actor is not None and actor in allowed
 
     @staticmethod
@@ -7133,7 +8084,7 @@ class Station:
         return True
 
     def _gather_human(self) -> Optional[List[Tuple[str, Dict[str, Any]]]]:
-        """(repo, issue) for every open loom:human issue, newest first; None
+        """(repo, issue) for every open needs:human issue, newest first; None
         when any repo could not be read (the digest waits for a whole list)."""
         found: List[Tuple[str, Dict[str, Any]]] = []
         for repo in self.s.repos:
@@ -7154,7 +8105,7 @@ class Station:
         return found
 
     def _human_ask(self, repo: str, issue: Dict[str, Any]) -> str:
-        """The first line of the newest loom:human comment from an allowed
+        """The first line of the newest needs:human comment from an allowed
         login (the brain's ask), or "" when there is none."""
         allowed = {a.lower() for a in self.s.authors}
         # paginate follows the next links, so the newest comment is read however
@@ -7210,7 +8161,7 @@ class Station:
             except GitHubError as err:
                 _say("could not list asks in %s: %s" % (repo, err))
                 return None
-        # A loom:human issue waits in the digest's own list, never alone.
+        # A needs:human issue waits in the digest's own list, never alone.
         asks = [a for a in asks if HUMAN not in _label_names(a[1])]
         asks.sort(key=lambda a: (str(a[1].get("created_at") or ""), a[0], int(a[1]["number"])))
         return [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
@@ -7421,6 +8372,27 @@ class Station:
             _write_json(path, sent)
         return True
 
+    def _ask_inputs(self, repo: str, issue: Dict[str, Any]) -> Tuple[
+            List[Any], List[Any], List[str], List[str], List[int]]:
+        """What bus/ask_state.py reads for one ask: its comments, its events,
+        who may answer, and the open issues its Blocked on section names."""
+        number = int(issue["number"])
+        comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+        events = self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
+        trusted = list(self.s.authors)
+        blockers = []
+        for other in brief_check.blocked_on(issue.get("body")):
+            if other != number and (self.gh.rest(
+                    "GET", "/repos/%s/issues/%d" % (repo, other)).data or {}).get("state") != "closed":
+                blockers.append(other)
+        return comments, events, trusted, answer.operators(trusted=trusted), blockers
+
+    def _ask_open(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """A person can act on this ask today: it is not answered in the
+        ticket and waits on nothing else. The digest only reads; the label
+        pass (clean_labels) takes the label off."""
+        return ask_state.state(issue, *self._ask_inputs(repo, issue)) == ask_state.OPEN
+
     def _new_digest_plan(self, keyed: List[Tuple[str, str, Dict[str, Any]]],
                          covered: Any, today: str) -> Optional[Dict[str, Any]]:
         """Build the day's fixed plan after every ask and human item can be read."""
@@ -7430,6 +8402,14 @@ class Station:
         asks = [a for a in keyed if trust.get(a[0])]
         found = self._gather_human()
         if found is None:
+            return None
+        try:
+            asks = [a for a in asks if self._ask_open(a[1], a[2])]
+            found = [f for f in found if self._ask_open(f[0], f[1])]
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read an ask for the digest: %s; next pass" % err)
             return None
         human = self._human_text(found) if found else ""
         if human is None or (not asks and not human):
@@ -8367,12 +9347,25 @@ class Station:
         no done ticket closes while a live or operator criterion has no
         evidence (_evidence_holds, bus/criteria_gate.py). A shipped ticket
         whose live criteria name a read-only proof is proved first, and closed
-        on it when every criterion has evidence (_prove_live, #1608)."""
+        on it when every criterion has evidence (_prove_live, #1608). Since
+        2026-10-31 one close revises that rule: a ticket whose one Live box is
+        its only open box, and whose merged change still stands, closes as
+        closed-unproven (_evidence_close, bus/evidence_close.py)."""
         if self._deferred():
             return
-        left = CLOSE_DONE_PER_PASS
         self._live_budget = LIVE_CHECKS_PER_PASS
         self._proof_budget = LIVE_PROOFS_PER_PASS
+        self._evidence = self._evidence_pass()
+        try:
+            self._close_done_repos(CLOSE_DONE_PER_PASS)
+        finally:
+            if self._evidence_state is not None:
+                _write_json(self._evidence_path(), self._evidence_state)
+            if self._evidence.counts["read"] or self._evidence.counts["waiting"]:
+                _say(evidence_close.bound_line(self._evidence))
+
+    def _close_done_repos(self, left: int) -> None:
+        """close_done_tickets' walk: at most `left` closes."""
         log_root = os.path.join(self.s.home, "logs")
         for repo in self._verify_repos():
             for issue in self._tickets_open(repo):
@@ -8381,12 +9374,185 @@ class Station:
                 if self._prove_live(repo, issue):
                     left -= 1
                     continue
+                verdict = self._evidence_close(repo, issue)
+                if verdict == evidence_close.CLOSED:
+                    left -= 1
+                if verdict != evidence_close.OTHER:
+                    continue
                 why = self._done_reason(issue, self._earliest_record(repo, issue, log_root))
                 if not why or self._evidence_holds(repo, issue):
                     continue
                 if self._close_done_ticket(repo, issue, why):
                     left -= 1
                     _say("closed done %s#%d: %s" % (repo, int(issue["number"]), why))
+
+    def _evidence_path(self) -> str:
+        return os.path.join(self.state, evidence_close.STATE_FILE)
+
+    def _evidence_pass(self) -> evidence_close.Pass:
+        """This pass's evidence close budget, with any reopen since the last
+        pass counted. A repo with no such close costs no read."""
+        try:
+            state = evidence_close.read_file(self._evidence_path())
+            control = evidence_close.read_file(
+                os.path.join(self.state, evidence_close.CONTROL_FILE))
+        except ValueError as err:
+            # The file stays as it is for the operator to read.
+            self._evidence_state = None
+            _say("evidence close paused: %s" % err)
+            return evidence_close.new_pass({}, {"paused": True}, self.now)
+        self._evidence_state = state
+        unread = ""
+        for repo in sorted({str(c.get("repo")) for c in evidence_close.closes(state)}):
+            try:
+                found = self._paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                       % (repo, evidence_close.LABEL))
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                # An unread count is not a low one.
+                unread = "the reopens of %s could not be read (%s)" % (repo, type(err).__name__)
+                continue
+            evidence_close.mark_reopened(state, repo, [
+                int(i["number"]) for i in found
+                if isinstance(i, dict) and "pull_request" not in i and "number" in i], self.now)
+        run = evidence_close.new_pass(state, control, self.now)
+        if unread and not run.paused:
+            _say("evidence close: not closing this pass: %s" % unread)
+            return run._replace(paused=unread)
+        if run.paused:
+            _say("evidence close paused: %s; python3 -m bus.evidence_close resume restarts it"
+                 % run.paused)
+            self._say_paused(state, run.paused)
+        else:
+            state.pop("paused_said", None)
+        return run
+
+    def _say_paused(self, state: Dict[str, Any], why: str) -> None:
+        """Write the pause into each repo's Proof due issue, once."""
+        if state.get("paused_said") == why:
+            return
+        try:
+            for repo in sorted({str(c.get("repo")) for c in evidence_close.closes(state)}):
+                self._write_proof_due(repo, [], why)
+            state["paused_said"] = why
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not write the evidence close pause: %s" % err)
+
+    def _evidence_close(self, repo: str, issue: Dict[str, Any]) -> str:
+        """The narrow evidence close of one ticket (bus/evidence_close.py):
+        CLOSED when it closed, WAIT when it stays for a later pass with no
+        other close path run on it, OTHER when the usual done close decides."""
+        run = self._evidence
+        boxes = evidence_close.boxes(str(issue.get("body") or ""))
+        names = _label_names(issue)
+        ticket = "%s#%d" % (repo, int(issue["number"]))
+        state = self._evidence_state
+        if (run.paused or not boxes or evidence_close.label_hold(names)
+                or evidence_close.refused_recently(state, ticket, self.now)
+                or self._live_has_own_proof(repo, issue, boxes[0])):
+            return evidence_close.OTHER
+        if min(run.left) <= 0:
+            run.counts["waiting"] += 1
+            return evidence_close.WAIT
+        run.left[1] -= 1
+        run.counts["read"] += 1
+        branch, pulls, error = self._merged_pull_facts(repo, issue)
+        verdict, why = evidence_close.pulls_verdict(pulls, error)
+        if verdict == evidence_close.WAIT:
+            return verdict
+        why = why or evidence_close.tier_refusal(repo, pulls, str(issue.get("body") or "")) \
+            or self._symbol_refusal(repo, branch, pulls) or self._unmeetable_refusal(repo, issue)
+        if why:
+            evidence_close.note_refused(state, ticket, why, self.now)
+            _say("evidence close: not closing %s: %s" % (ticket, why))
+            return evidence_close.OTHER
+        return self._close_unproven(repo, issue, boxes[0])
+
+    def _live_has_own_proof(self, repo: str, issue: Dict[str, Any], box: str) -> bool:
+        """Whether Loom proves this box itself, so it keeps that path: a
+        station proof, a runnable check or a time window."""
+        return (criteria_gate.check_of(box) is not None or bool(_live_time_window(box))
+                or self._provable(issue, self._proof_sources(repo)))
+
+    def _symbol_refusal(self, repo: str, branch: str, pulls: List[Dict[str, Any]]) -> str:
+        """Why the default branch no longer holds what the pull requests
+        changed, or ""."""
+        wanted, why = evidence_close.symbol_files(pulls)
+        if why:
+            return why
+        for path, (added, removed) in sorted(wanted.items()):
+            answer = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s" % (
+                repo, quote(path, safe="/"), quote(branch, safe="")), ok=(404,))
+            text = "" if answer.status == 404 else _content_text(answer.data)
+            if text is None:
+                return "%s cannot be read" % path
+            why = evidence_close.symbol_refusal(path, text, added, removed)
+            if why:
+                return why
+        return ""
+
+    def _unmeetable_refusal(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why the Live box is not known to be meetable, or "". A lookup that
+        failed proves nothing either way, and reads as not known."""
+        reads: Dict[str, Any] = {"searches": UNMEETABLE_SEARCHES, "big": {}}
+        if self._unmeetable_live(repo, issue, reads):
+            return "its Live box cannot be met as written"
+        seen = _read_json(os.path.join(self.state, UNMEETABLE_FILE), {}, strict=False)
+        live = brain.live_criterion(issue.get("body"), limit=None)
+        known = self._unmeetable_known((seen if isinstance(seen, dict) else {}).get(
+            "%s#%d" % (repo, int(issue["number"]))), unmeetable.key(live))
+        return "" if known is False else "its Live box could not be looked up"
+
+    def _close_unproven(self, repo: str, issue: Dict[str, Any], box: str) -> str:
+        """List the box in the repo's Proof due issue, then close the ticket.
+        Nothing closes unlisted."""
+        number = int(issue["number"])
+        run = self._evidence
+        try:
+            where = self._write_proof_due(repo, [(number, box)], "")
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("evidence close: could not list %s#%d: %s" % (repo, number, err))
+            return evidence_close.WAIT
+        reason = "unproven, by the evidence close: its pull requests merged on green CI and " \
+                 "what they changed is still on the default branch. Its Live box is listed " \
+                 "in #%d" % where
+        with shadow.evidence_close(repo, number):
+            landed = self._close_done_ticket(repo, issue, reason, unproven=True)
+        if not landed and (self._issue_state(repo, number) or ("",))[0] != "closed":
+            return evidence_close.WAIT
+        evidence_close.record(self._evidence_state, repo, number, box, self.now)
+        run.left[0] -= 1
+        run.counts["closed"] += 1
+        _say("closed unproven %s#%d: %s" % (repo, number, reason))
+        return evidence_close.CLOSED
+
+    def _write_proof_due(self, repo: str, extra: List[Tuple[int, str]], paused: str) -> int:
+        """Write the repo's rolling Proof due issue and return its number."""
+        number = self._proof_due_issue(repo)
+        body = evidence_close.proof_body(repo, self._evidence_state, extra,
+                                         self._note_text, paused)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+        return number
+
+    def _proof_due_issue(self, repo: str) -> int:
+        """The repo's open Proof due issue, filed when it has none."""
+        found = self._paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                               % (repo, evidence_close.PROOF_LABEL))
+        numbers = sorted(int(i["number"]) for i in found
+                         if isinstance(i, dict) and "pull_request" not in i and "number" in i)
+        if numbers:
+            return numbers[0]
+        made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+            "title": evidence_close.PROOF_TITLE, "labels": [evidence_close.PROOF_LABEL],
+            "body": "The station lists the Live boxes of tickets closed unproven here."}).data
+        if not isinstance(made, dict) or "number" not in made:
+            raise GitHubError("no issue was created in %s" % repo)
+        return int(made["number"])
 
     def _earliest_record(self, repo: str, issue: Dict[str, Any],
                          log_root: str) -> Optional[datetime]:
@@ -8674,7 +9840,7 @@ class Station:
         """Whether a done ticket stays open because a live or operator
         criterion has no evidence (bus/criteria_gate.py): a live one with a
         check Loom can run gets the check; one with none, a failed check, or
-        an operator action sends the ticket to loom:human with one ask, once.
+        an operator action sends the ticket to needs:human with one ask, once.
         2026-10-22 audit: at least 12 tickets of the private deployment repo
         closed shipped on green CI with live criteria never checked."""
         number = int(issue["number"])
@@ -8689,7 +9855,7 @@ class Station:
         waiting = [t for k, t in gaps if k == criteria_gate.LIVE
                    and criteria_gate.check_of(t) is not None
                    and criteria_gate.key(t) not in failed]
-        if waiting or "loom:human" in _label_names(issue) or not self._live_ask_room():
+        if waiting or needs_human(_label_names(issue)) or not self._live_ask_room():
             return True
         try:
             brain.human(self.gh, repo, number, criteria_gate.ask(gaps, failed))
@@ -8703,11 +9869,14 @@ class Station:
         return True
 
     def _close_done_ticket(self, repo: str, issue: Dict[str, Any],
-                           reason: str) -> bool:
+                           reason: str, unproven: bool = False) -> bool:
         """Close one done ticket with `reason`; True when the close writes
-        landed, False when GitHub refused and the run moves on."""
+        landed, False when GitHub refused and the run moves on. `unproven` is
+        the evidence close, which carries its label and is not held in shadow
+        (bus/shadow.py evidence_close)."""
         number = int(issue["number"])
-        if shadow.active(repo):
+        marks = [CLOSE_DONE_LABEL] + ([evidence_close.LABEL] if unproven else [])
+        if shadow.active(repo) and not unproven:
             # Before the status note and the force-close label.
             held = shadow.record_held(shadow.CLOSE, repo, number, "issue", source="station done close",
                                  reason=reason, gates=["shipped", "every criterion has evidence"])
@@ -8726,13 +9895,12 @@ class Station:
             # hold. Without it the guard reopened 46 of 175 such closes,
             # each with an email (2026-10-19).
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
-                         {"labels": [CLOSE_DONE_LABEL]})
+                         {"labels": marks})
             self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
                          {"state": "closed", "state_reason": "completed"})
             kept = brain.closing_labels(_label_names(issue), self.s.authors)
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
-                         {"labels": kept if CLOSE_DONE_LABEL in kept
-                          else kept + [CLOSE_DONE_LABEL]})
+                         {"labels": kept + [m for m in marks if m not in kept]})
         except RateLimited:
             raise
         except GitHubError as err:
@@ -8977,9 +10145,16 @@ class Station:
                     or tickets.owned_elsewhere(issue, self.s.authors, self.s.briefers)):
                 continue
             seen.add(number)
-            events = (self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
-                      if label_pass.needs_events(issue) else None)
-            found = label_pass.plan(issue, events, station_logins)
+            ask = (needs_human(_label_names(issue)) and changed < left
+                   and str(issue.get("state") or "open") == "open")
+            if ask:
+                comments, events, trusted, ops, blockers = self._ask_inputs(repo, issue)
+                found = label_pass.plan(issue, events, station_logins, comments=comments,
+                                        trusted=trusted, ops=ops, blockers=blockers)
+            else:
+                events = (self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
+                          if label_pass.needs_events(issue) else None)
+                found = label_pass.plan(issue, events, station_logins)
             key = "%s#%d" % (repo, number)
             if found.note and notes.get(key) != found.note:
                 _say("health note %s: %s" % (key, found.note))
@@ -8987,23 +10162,152 @@ class Station:
                 notes[key] = found.note
             else:
                 notes.pop(key, None)
-            if not found.remove or changed >= left:
+            if not (found.remove or found.add) or changed >= left:
                 continue
+            self._add_labels(repo, number, found.add)
             for removal in found.remove:
                 self._unlabel(repo, number, removal)
             changed += 1
         return changed
 
-    def _unlabel(self, repo: str, number: int, removal: "label_pass.Removal") -> None:
-        """Remove one label, or in shadow record that it would be removed."""
+    def _add_labels(self, repo: str, number: int, names: Sequence[str]) -> None:
+        """Add labels, or in shadow record that they would be added. Added
+        before any removal, so a failed write never leaves a ticket with no
+        ask label."""
+        if not names:
+            return
+        if shadow.active(repo):
+            shadow.record_held(shadow.LABEL, repo, number, "issue",
+                               reason="add %s" % ", ".join(names), label=names[0],
+                               source="station clean_labels")
+            return
+        self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": list(names)})
+        _say("%s#%d: add %s" % (repo, number, ", ".join(names)))
+
+    def _unlabel(self, repo: str, number: int, removal: Any,
+                 source: str = "station clean_labels") -> None:
+        """Remove one label (a removal with .label and .why), or in shadow
+        record that it would be removed."""
         why = "remove %s: %s" % (removal.label, removal.why)
         if shadow.active(repo):
             shadow.record_held(shadow.UNLABEL, repo, number, "issue", reason=why,
-                               label=removal.label, source="station clean_labels")
+                               label=removal.label, source=source)
             return
         self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
                      % (repo, number, quote(removal.label, safe="")), ok=(404,))
         _say("%s#%d: %s" % (repo, number, why))
+
+    def referee_claims(self) -> None:
+        """One claim per ticket, idle engine claims expire (bus/claim_referee.py,
+        loom#2277). At most once every claim_referee.EVERY seconds. Until a
+        run finds nothing more to remove (the first pass over the claims that
+        already exist), at most FIRST_PER_RUN issues a run and no notes; then
+        at most PER_RUN, a duplicate's removal noted in the ticket's status.
+        All repos share one due list and READS_PER_RUN timeline reads, and
+        the state file keeps the place in the list across runs. "dry" logs
+        each removal and writes nothing."""
+        if self.s.claim_referee not in ("on", "dry"):
+            return
+        path = os.path.join(self.state, claim_referee.STATE_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        last = state.get("_at")
+        if isinstance(last, (int, float)) and 0 <= self.now - last < claim_referee.EVERY:
+            return
+        first = not state.get("swept")
+        budget = {"left": claim_referee.FIRST_PER_RUN if first else claim_referee.PER_RUN,
+                  "spent": 0}
+        whole = False
+        due: List[Tuple[str, Dict[str, Any]]] = []
+        start = 0
+        try:
+            due, listed = self._all_claims_due()
+            ordered, start = claim_referee.in_turn(due, state.get("turn"))
+            whole = self._referee_in_turn(ordered, first, budget) and listed
+        finally:
+            state["_at"] = self.now
+            state["turn"] = (start + budget["spent"]) % len(due) if due else 0
+            if first and whole and self.s.claim_referee == "on":
+                state["swept"] = True
+                _say("the first claim referee pass is done")
+            _write_json(path, state)
+
+    def _all_claims_due(self) -> Tuple[List[Tuple[str, Dict[str, Any]]], bool]:
+        """(every repo's issues whose engine claims may be due, whether every
+        repo could be listed)."""
+        due: List[Tuple[str, Dict[str, Any]]] = []
+        listed = True
+        for repo in self._verify_repos():
+            if self._deferred():
+                return due, False
+            try:
+                due += self._claims_due(repo)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not read the claims of %s: %s" % (repo, err))
+                listed = False
+        return due, listed
+
+    def _referee_in_turn(self, ordered: Sequence[Tuple[str, Dict[str, Any]]], first: bool,
+                         budget: Dict[str, int]) -> bool:
+        """Referee `ordered` within `budget` (issues changed, timelines read),
+        which keeps its count if a read raises; False when some went unread."""
+        own_apps = sorted(self._own_apps())
+        trusted = list(self.s.authors) + list(self.s.briefers)
+        whole = True
+        for repo, issue in ordered:
+            if (budget["left"] <= 0 or budget["spent"] >= claim_referee.READS_PER_RUN
+                    or self._deferred()):
+                return False
+            try:
+                budget["left"] -= self._referee_claim(repo, issue, first, own_apps, trusted)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                whole = False
+                _say("could not referee %s#%s: %s" % (repo, issue.get("number"), err))
+            budget["spent"] += 1
+        return whole
+
+    def _claims_due(self, repo: str) -> List[Tuple[str, Dict[str, Any]]]:
+        """The repo's open issues whose engine claims may be due, by number."""
+        engines = self.s.engine_claims
+        present = {str(label.get("name") or "").lower() for label in self.gh.paginate(
+            "/repos/%s/labels" % repo) if isinstance(label, dict)}
+        found: Dict[int, Dict[str, Any]] = {}
+        for label in engines:
+            if label not in present:
+                continue
+            for issue in self._paginate("/repos/%s/issues?labels=%s&state=open"
+                                        % (repo, quote(label, safe=":"))):
+                if isinstance(issue, dict) and "pull_request" not in issue:
+                    found[int(issue["number"])] = issue
+        return [(repo, issue) for _, issue in sorted(found.items())
+                if claim_referee.needs_timeline(issue, engines)]
+
+    def _referee_claim(self, repo: str, issue: Dict[str, Any], first: bool,
+                       own_apps: Sequence[str], trusted: Sequence[str]) -> int:
+        """Read one issue's timeline and apply plan(): 1 if it changed, or
+        would in dry mode, else 0."""
+        number = int(issue["number"])
+        timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
+        removals = claim_referee.plan(issue, timeline, self.now, self.s.engine_claims,
+                                      own_apps, trusted)
+        if not removals:
+            return 0
+        dry = self.s.claim_referee == "dry"
+        for removal in removals:
+            if dry:
+                _say("%s#%d: would remove %s: %s" % (repo, number, removal.label, removal.why))
+            else:
+                self._unlabel(repo, number, removal, source="station referee_claims")
+        duplicates = [r for r in removals if r.duplicate]
+        if duplicates and not first and not dry:
+            self._routine(repo, number, "Removed the claim label %s: %s. One engine "
+                          "claim per ticket." % (", ".join(r.label for r in duplicates),
+                                                 duplicates[0].why))
+        return 1
 
     def _foreign_claimed(self, repo: str) -> Dict[int, Dict[str, Any]]:
         """The repo's open issues another operator claims by label, or that
@@ -9583,13 +10887,17 @@ class Station:
         """Check the factory's own invariants on what the station reads
         (bus/invariants.py), at most every invariants.CHECK_EVERY seconds,
         and file one loom:invariant issue per breach on the invariant goal
-        home. Below the budget floor nothing is filed."""
+        home, the kinds in invariants.ROLLED as one tracking issue per kind
+        and repo (loom#2099). Below the budget floor nothing is filed."""
         path = os.path.join(self.state, "invariants.json")
         state = invariants.load(path, _say)
         checked = state.get("checked")
         if self._num(checked) and 0 <= self.now - checked < invariants.CHECK_EVERY:
             return
         state["checked"] = self.now
+        # Before the reads: a check they stop waits CHECK_EVERY like any other,
+        # rather than costing each pass its 270 requests again (loom#2321).
+        invariants.save(path, state)
         goal = self._invariant_goal()
         self._invariant_repo = goal[0] if goal else ""
         facts = self._invariant_facts(state)
@@ -9604,9 +10912,13 @@ class Station:
             subjects = state.get("subjects")
             if not isinstance(subjects, dict):
                 subjects = state["subjects"] = {}
+            seen = state.get("seen")
+            if not isinstance(seen, dict):
+                seen = state["seen"] = {}
             invariants.Filer(self.gh, goal[0], goal[1], issues, self.now, _say,
                              write=not self._deferred(), authors=self.s.authors,
-                             subjects=subjects,
+                             subjects=subjects, seen=seen,
+                             read=invariants.read_kinds(facts), unread=facts.unread,
                              settled=lambda inv, subject: self._invariant_settled(
                                  facts, inv, subject)).run(breaches)
         invariants.save(path, state)
@@ -9641,9 +10953,12 @@ class Station:
 
     @staticmethod
     def _epic_settled(facts: invariants.Facts, subject: str) -> Optional[str]:
-        """An epic this pass read at or under its ticket cap, or None."""
+        """An epic this pass read closed, or at or under its ticket cap, or
+        None (loom#2140: a closed epic keeps its closed tickets)."""
         for shape in facts.shapes or []:
             for epic in shape.epics:
+                if epic.epic.key == subject and not epic.open:
+                    return "epic %s is closed" % epic.epic.label
                 if epic.epic.key == subject and epic.tickets <= invariants.EPIC_TICKETS:
                     return "epic %s holds %d tickets, within the cap of %d" % (
                         epic.epic.label, epic.tickets, invariants.EPIC_TICKETS)
@@ -9731,7 +11046,8 @@ class Station:
             epics.append(invariants.EpicShape(
                 ref(epic), epic.get("state", "open") == "open", len(union),
                 tuple(ref(t) for t in union.values() if t.get("state") != "closed"),
-                brain.standing_epic(epic), brain.sub_issue_count(self.gh, repo, epic, found)))
+                brain.standing_epic(epic), brain.sub_issue_count(self.gh, repo, epic, found),
+                title=str(epic.get("title") or "")))
         return invariants.GoalShape(self._invariant_ref(repo, number),
                                     brain.goal_epic_cap(goal), tuple(epics), outside)
 
@@ -9776,6 +11092,7 @@ class Station:
                            ("runs", self._invariant_runs),
                            ("silent_runs", self._invariant_silent),
                            ("waits", self._invariant_waits),
+                           ("unshipped", self._invariant_unshipped),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):
             try:
@@ -9819,6 +11136,7 @@ class Station:
             _say("invariants: could not read the plan checks: %s" % err)
         try:
             facts.lane_pulls = self._invariant_lane_pulls()
+            facts.unread = {"lane-pr-stalled": tuple(self._lane_pulls_unread)}
         except RateLimited:
             raise
         except (GitHubError, OSError) as err:
@@ -9942,9 +11260,12 @@ class Station:
         """The open lane pull requests the stalled invariant reads: trusted, on
         a loom/ branch and opened over invariants.PR_STALLED ago (loom#715).
         A pull request that cannot be read is logged and skipped, so one
-        unreadable repo or ticket costs that pull request and no other."""
+        unreadable repo or ticket costs that pull request and no other; each
+        such repo is kept in self._lane_pulls_unread, and its tracking issue
+        is left as it is this pass (loom#2099)."""
         authors = {a.lower() for a in self.s.authors}
         out: List[invariants.LanePull] = []
+        self._lane_pulls_unread: List[str] = []
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
                 continue
@@ -9954,6 +11275,7 @@ class Station:
                 raise
             except GitHubError as err:
                 _say("invariants: could not read the open pull requests of %s: %s" % (repo, err))
+                self._lane_pulls_unread.append(repo)
                 continue
             for pr in pulls:
                 at = self._stalled_since(pr, authors)
@@ -9966,6 +11288,8 @@ class Station:
                 except GitHubError as err:
                     _say("invariants: left out pull request %s#%s, unreadable: %s"
                          % (repo, pr.get("number"), err))
+                    if repo not in self._lane_pulls_unread:
+                        self._lane_pulls_unread.append(repo)
         return out
 
     def _stalled_since(self, pr: Dict[str, Any], authors: set) -> Optional[float]:
@@ -10459,14 +11783,20 @@ class Station:
             "Needs you: Open asks: %s." % rows(groups["asks"]), "",
             STANDUP_FOOTER])
 
-    @staticmethod
-    def _standup_summary(groups: Dict[str, List[Dict[str, Any]]]) -> str:
+    def _standup_summary(self, groups: Dict[str, List[Dict[str, Any]]], station: Optional["Station"] = None) -> str:
         """"3 merged, 2 in flight": the counts of a standup's groups, or ""."""
         counts = [(len(groups[k]), word) for k, word in (
             ("merged", "merged"), ("verified", "verified"), ("sent_back", "shipped"),
             ("failed", "failed"), ("regressed", "regressed"), ("aged_pr", "stuck"),
-            ("in_flight", "in flight"), ("queued", "queued"), ("asks", "waiting on you"))]
-        return ", ".join("%d %s" % (n, word) for n, word in counts if n)
+            ("in_flight", "in flight"), ("queued", "queued"), ("asks", "waiting on you"))
+            if k in groups]
+        st = station or self
+        stale = getattr(st, "_stale_asks_withdrawn", 0)
+        summary = ", ".join("%d %s" % (n, word) for n, word in counts if n)
+        if stale > 0:
+            word = "stale ask withdrawn" if stale == 1 else "stale asks withdrawn"
+            summary = (summary + ", " if summary else "") + ("%d %s" % (stale, word))
+        return summary
 
     def _standup_ticket_groups(self, children: List[Any], since: Optional[float] = None
                                ) -> Dict[str, List[Dict[str, Any]]]:
@@ -10481,9 +11811,14 @@ class Station:
                     groups[group].append(issue)
         return groups
 
+    @staticmethod
+    def _issue_label_names(issue: Dict[str, Any]) -> List[str]:
+        return [str(l.get("name", "")) if isinstance(l, dict) else str(l)
+                for l in issue.get("labels", [])]
+
     def _standup_groups_of(self, issue: Dict[str, Any], since: Optional[float]) -> List[str]:
         """The standup headings one ticket belongs under."""
-        labels = {label.get("name") for label in issue.get("labels", [])}
+        labels = set(self._issue_label_names(issue))
         updated = self._epoch(str(issue.get("updated_at") or ""))
         recent = since is None or (updated is not None and updated >= since)
         found = [group for label, group in (("loom:merged", "merged"),
@@ -10492,22 +11827,35 @@ class Station:
                  if label in labels and recent]
         if issue.get("state") != "open" or "loom:ticket" not in labels:
             return found
+        found.extend(self._open_standup_groups(issue, labels))
+        return found
+
+    def _open_standup_groups(self, issue: Dict[str, Any], labels: Set[str]) -> List[str]:
         created = self._epoch(str(issue.get("created_at") or ""))
         aged = created is not None and self.now - created > factory.STUCK_AGE
-        # Queued is not in flight: no lane holds it yet (2026-10-21, a goal
-        # report named a queued ticket "in flight" twice while nothing ran).
+        is_waiting, is_queued = self._standup_ask_status(issue, labels)
+        found = []
         for group, hit in (("failed", "loom:failed" in labels),
                            ("regressed", "loom:regression" in labels),
                            ("aged_pr", "loom:pr" in labels and aged),
                            ("in_flight", bool(labels & {"loom:briefed", "loom:running",
                                                         "loom:pr"})),
-                           ("queued", "loom:queued" in labels),
+                           ("queued", is_queued),
                            ("needs_difficulty", "loom:queued" in labels and
                             not factory.has_difficulty(issue)),
-                           ("asks", bool(labels & {NEEDS_OPERATOR, HUMAN}))):
+                           ("asks", is_waiting)):
             if hit:
                 found.append(group)
         return found
+
+    def _standup_ask_status(self, issue: Dict[str, Any], labels: Set[str]) -> Tuple[bool, bool]:
+        if needs_human(labels):
+            return True, "loom:queued" in labels
+        has_needs = any(self.NEEDS_LABEL_PATTERN.match(l) for l in labels)
+        has_ask = self._has_ask_comment(issue) if has_needs else False
+        is_waiting = has_needs and has_ask
+        is_queued = ("loom:queued" in labels) or (has_needs and not has_ask)
+        return is_waiting, is_queued
 
     @staticmethod
     def _standup_rows(items: List[Dict[str, Any]]) -> str:
@@ -10516,6 +11864,171 @@ class Station:
             for issue in items[:STANDUP_ROWS_MAX]) or "none"
         more = len(items) - STANDUP_ROWS_MAX
         return shown + (" and %d more" % more if more > 0 else "")
+
+    # -- stale ask detection -----------------------------------------------
+    STALE_ASK_PATTERN = re.compile(r"stale-when:\s*commit\s+([0-9a-f]{7,40})\s+live", re.I)
+    ISSUE_EXISTS_PATTERN = re.compile(r"stale-when:\s*issue\s+exists", re.I)
+    NEEDS_LABEL_PATTERN = re.compile(r"^needs:([a-z0-9_.-]+)$", re.I)
+    _ASK_HEADING_PATTERN = re.compile(r"^##\s*Ask\b", re.M | re.I)
+    _ASK_WORD_PATTERN = re.compile(r"[*_]*(?:exact\s+)?ask\b", re.I)
+
+    def _parse_stale_when(self, comment_body: str) -> Optional[str]:
+        """Parse an ask comment for a stale-when line: 'stale-when: commit <sha> live' or
+        'stale-when: issue exists'."""
+        stale_when = self.STALE_ASK_PATTERN.search(comment_body)
+        if stale_when:
+            return stale_when.group(1).lower()
+        if self.ISSUE_EXISTS_PATTERN.search(comment_body):
+            return "issue exists"
+        return None
+
+    def _check_commit_live(self, repo: str, commit_sha: str) -> bool:
+        """Check if a commit SHA exists in the repo's default branch git history."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/commits/%s" % (repo, commit_sha)).data or {}
+            return bool(isinstance(data, dict) and data.get("sha"))
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not check commit %s in %s: %s" % (commit_sha, repo, err))
+            return False
+
+    def _check_issue_exists(self, repo: str, issue_number: int) -> bool:
+        """Check if an issue number exists in a repo."""
+        try:
+            data = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, issue_number)).data or {}
+            return bool(isinstance(data, dict) and data.get("number"))
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not check issue %d in %s: %s" % (issue_number, repo, err))
+            return False
+
+    def _get_issue_comments(self, repo: str, issue_number: int) -> List[Dict[str, Any]]:
+        """Fetch comments for an issue, returning empty list on error."""
+        try:
+            items = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, issue_number))
+            return [c for c in items if isinstance(c, dict)]
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not fetch comments for %s#%d: %s" % (repo, issue_number, err))
+            return []
+
+    def _is_ask_text(self, body: str) -> bool:
+        """Check whether a comment or issue body contains ask indicators."""
+        if not body:
+            return False
+        if body.startswith(HUMAN_MARKER):
+            return True
+        patterns = (self.STALE_ASK_PATTERN, self.ISSUE_EXISTS_PATTERN,
+                    self._ASK_HEADING_PATTERN, self._ASK_WORD_PATTERN)
+        if any(p.search(body) for p in patterns):
+            return True
+        return any(self.NEEDS_LABEL_PATTERN.search(w) for w in body.split())
+
+    def _has_ask_comment(self, issue: Dict[str, Any]) -> bool:
+        """Check if an issue has an ask comment."""
+        repo = issue.get("repository", {}).get("full_name") or (self.s.repos[0] if self.s.repos else "")
+        number = int(issue.get("number") or 0)
+        comments = self._get_issue_comments(repo, number)
+        if any(self._is_ask_text(str(c.get("body") or "")) for c in comments):
+            return True
+        return self._is_ask_text(str(issue.get("body") or ""))
+
+    def _target_labels_after_withdrawal(self, labels: List[str], reason: str) -> List[str]:
+        remaining = [name for name in labels if not self.NEEDS_LABEL_PATTERN.match(name)]
+        if not any(k in remaining for k in ("awaiting-live-check", "loom:queued")):
+            target = "awaiting-live-check" if reason.startswith(("commit", "roll")) else "loom:queued"
+            remaining.append(target)
+        return remaining
+
+    def _withdraw_stale_ask(self, repo: str, issue: Dict[str, Any], reason: str) -> bool:
+        """Withdraw a stale ask: post a note and move issue back to working state,
+        removing needs:<login> label. Returns True if withdrawn, False otherwise."""
+        labels = self._issue_label_names(issue)
+        if not any(self.NEEDS_LABEL_PATTERN.match(lbl) for lbl in labels):
+            return False
+
+        number = int(issue.get("number") or 0)
+        body = "Stale ask withdrawn: %s" % reason
+
+        try:
+            notify.post(self.gh, repo, number, body, notify.NOTE)
+            remaining = self._target_labels_after_withdrawal(labels, reason)
+            new_label_objs = [{"name": name} for name in remaining]
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                         {"labels": new_label_objs})
+            issue["labels"] = new_label_objs
+            return True
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("failed to withdraw stale ask on %s#%d: %s" % (repo, number, err))
+            return False
+
+    def _issue_and_comment_texts(self, repo: str, issue: Dict[str, Any]) -> List[str]:
+        number = int(issue.get("number") or 0)
+        comments = self._get_issue_comments(repo, number)
+        texts = [str(c.get("body") or "") for c in comments if isinstance(c, dict)]
+        body = str(issue.get("body") or "")
+        if body:
+            texts.append(body)
+        return texts
+
+    def _is_commit_deployed(self, repo: str, sha: str, deployed_commits: Set[str]) -> bool:
+        return (sha in deployed_commits
+                or any(d.startswith(sha) or sha.startswith(d) for d in deployed_commits)
+                or self._check_commit_live(repo, sha))
+
+    def _withdraw_if_commit_live(self, repo: str, issue: Dict[str, Any],
+                                 texts: List[str], deployed_commits: Set[str]) -> bool:
+        for text in texts:
+            m = self.STALE_ASK_PATTERN.search(text)
+            if not m:
+                continue
+            sha = m.group(1).lower()
+            if self._is_commit_deployed(repo, sha, deployed_commits):
+                return self._withdraw_stale_ask(repo, issue, "commit %s is live" % sha[:12])
+        return False
+
+    def _withdraw_if_issue_exists(self, repo: str, issue: Dict[str, Any],
+                                  texts: List[str], deployed_issues: Set[Tuple[str, int]]) -> bool:
+        if not any(self.ISSUE_EXISTS_PATTERN.search(text) for text in texts):
+            return False
+        for dep_repo, dep_num in deployed_issues:
+            if self._check_issue_exists(dep_repo, dep_num):
+                return self._withdraw_stale_ask(repo, issue, "issue %s exists" % dep_num)
+        return False
+
+    def _process_stale_ask_issue(self, issue: Dict[str, Any],
+                                 deployed_commits: Set[str],
+                                 deployed_issues: Set[Tuple[str, int]]) -> bool:
+        if issue.get("state") != "open":
+            return False
+        labels = self._issue_label_names(issue)
+        if not any(self.NEEDS_LABEL_PATTERN.match(lbl) for lbl in labels):
+            return False
+
+        repo = issue.get("repository", {}).get("full_name") or (self.s.repos[0] if self.s.repos else "")
+        if not self._has_ask_comment(issue):
+            return self._withdraw_stale_ask(repo, issue, "no ask comment")
+
+        texts = self._issue_and_comment_texts(repo, issue)
+        return (self._withdraw_if_commit_live(repo, issue, texts, deployed_commits)
+                or self._withdraw_if_issue_exists(repo, issue, texts, deployed_issues))
+
+    def _check_and_withdraw_stale_asks(self, issues: List[Dict[str, Any]],
+                                       deployed_commits: Set[str],
+                                       deployed_issues: Set[Tuple[str, int]],
+                                       last_check: float) -> int:
+        """Check all issues with needs:<login> labels and withdraw stale ones.
+        Returns the number of asks withdrawn as stale."""
+        withdrawn = 0
+        for issue in issues:
+            if self._process_stale_ask_issue(issue, deployed_commits, deployed_issues):
+                withdrawn += 1
+        return withdrawn
 
     # -- the brain -------------------------------------------------------
     def _brain(self) -> Optional[Tuple[Dict[str, Any], Optional[float]]]:
@@ -11229,7 +12742,8 @@ class Station:
                                benched=pairs,
                                limit_until=self.limit_until(),
                                known_waits=self._saved_waits(),
-                               no_lane_since=self._no_lane_since(), **extra)
+                               no_lane_since=self._no_lane_since(),
+                               review_brief=self._write_review_brief, **extra)
 
     def _no_lane_since(self) -> Dict[str, float]:
         """Each ticket's first no-lane wait as _record_waits kept it."""
@@ -11264,6 +12778,7 @@ class Station:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
         deploy_watch.Watch(self.gh, repos, self.now, trusted=self.s.authors,
                            state_dir=self.state, page=self._page_operator).run()
+        self._check_stale_asks(0, force=True)
 
     def _page_operator(self, message: str) -> Optional[bool]:
         """Send one message to the operator, with the mention: True when it
@@ -11834,9 +13349,11 @@ class Station:
 
     def tend_disk(self) -> None:
         """Keep the loom home bounded and say how big it is (loom#643). Every
-        DISK_EVERY seconds the lane logs past retention go (prune_logs),
-        finished runs' session stores are compressed (compress_sessions), and
-        the home's size is logged, by top-level folder. The free space below
+        DISK_EVERY seconds the service logs rotate, the lane logs past
+        retention go (prune_logs), finished runs' session stores are
+        compressed (compress_sessions), logs/ is held to its limit
+        (limit_logs), and the home's size is logged, by top-level folder. The
+        free space below
         the floor stops claims instead (disk_low)."""
         free = self._disk_free()
         path = os.path.join(self.state, "disk.json")
@@ -11844,8 +13361,11 @@ class Station:
         last = saved.get("at") if isinstance(saved, dict) else None
         if self._num(last) and 0 <= self.now - last < DISK_EVERY:
             return
+        logrotate.rotate(os.path.join(self.s.home, "logs"), self.s.log_rotate_bytes,
+                         LOG_ROTATE_KEEP, self.now, _say)
         self.prune_logs()
         self.compress_sessions()
+        self.limit_logs()
         sizes: Dict[str, int] = {}
         try:
             names = os.listdir(self.s.home)
@@ -11869,7 +13389,8 @@ class Station:
         """gzip each finished run's opencode session store (SESSION_DB_PARTS
         under logs/<slot>/<run>/) to opencode.db.gz, once no brief of that
         name is waiting or running and its transcript is not waiting for the
-        dashboard (_logs_kept). bus/sessions.py reads the compressed store,
+        dashboard (_logs_kept) or has waited SESSION_UNSENT_KEEP seconds.
+        bus/sessions.py reads the compressed store,
         and prune_logs removes it with the run's other logs after
         log_keep_days. The -wal and -shm files go too: the readers open the
         store immutable and never read them. Times are kept, so retention
@@ -11890,11 +13411,13 @@ class Station:
             except OSError as err:
                 _say("cannot list lane %s's logs to compress session stores: %s" % (slot, err))
                 continue
-            keep = live | {k.split("/", 1)[1] for k in pending if k.startswith(slot + "/")}
+            unsent = {k.split("/", 1)[1] for k in pending if k.startswith(slot + "/")}
             for name in names:
-                if name in keep:
+                if name in live:
                     continue
                 try:
+                    if name in unsent and self._store_is_fresh(os.path.join(folder, name)):
+                        continue
                     sizes = _gzip_session_db(os.path.join(folder, name))
                 except OSError as err:
                     _say("cannot compress the session store of %s/%s: %s" % (slot, name, err))
@@ -11906,6 +13429,14 @@ class Station:
         if count:
             _say("compressed %d finished run session store(s): %s to %s"
                  % (count, _gb(before), _gb(after)))
+
+    def _store_is_fresh(self, run: str) -> bool:
+        """Whether a run's session store changed in SESSION_UNSENT_KEEP."""
+        try:
+            changed = os.lstat(os.path.join(run, *SESSION_DB_PARTS)).st_mtime
+        except OSError:
+            return True
+        return self.now - changed < SESSION_UNSENT_KEEP
 
     def _logs_kept(self) -> Optional[Tuple[Set[str], Set[str]]]:
         """(names, slot/name keys) whose lane logs stay however old: every
@@ -11932,19 +13463,13 @@ class Station:
                     pending.add("%s/%s" % (lane, name))
         return live, pending
 
-    def prune_logs(self) -> None:
-        """Remove each entry of a lane's log folder (logs/<slot>/: a run's
-        log, result and records, its archived transcripts) whose newest file
-        is older than log_keep_days, unless _logs_kept keeps its ticket. The
-        station's own logs in logs/ are not touched."""
-        if self.s.log_keep_days <= 0:
-            return
+    def _lane_log_entries(self) -> Iterator[Tuple[str, str]]:
+        """(slot/name, path) of each entry in a lane's log folder that
+        _logs_kept does not keep. None comes when that cannot be read."""
         kept = self._logs_kept()
         if kept is None:
             return
         live, pending = kept
-        cutoff = self.now - self.s.log_keep_days * 24 * 3600
-        removed = freed = 0
         for slot in LANES:
             folder = os.path.join(self.s.home, "logs", slot)
             try:
@@ -11959,22 +13484,68 @@ class Station:
             keep = live | {k.split("/", 1)[1] for k in pending if k.startswith(slot + "/")}
             for name in names:
                 # A run's files are <ticket>, <ticket>.log, <ticket>.result...
-                if any(name == t or name.startswith(t + ".") for t in keep):
+                if not any(name == t or name.startswith(t + ".") for t in keep):
+                    yield "%s/%s" % (slot, name), os.path.join(folder, name)
+
+    def prune_logs(self) -> None:
+        """Remove each entry of a lane's log folder (logs/<slot>/: a run's
+        log, result and records, its archived transcripts) whose newest file
+        is older than log_keep_days, unless _logs_kept keeps its ticket. The
+        service logs in logs/ rotate instead (bus/logrotate.py)."""
+        if self.s.log_keep_days <= 0:
+            return
+        cutoff = self.now - self.s.log_keep_days * 24 * 3600
+        removed = freed = 0
+        for key, path in self._lane_log_entries():
+            try:
+                newest, size = _tree_stat(path)
+                if newest >= cutoff:
                     continue
-                path = os.path.join(folder, name)
-                try:
-                    newest, size = _tree_stat(path)
-                    if newest >= cutoff:
-                        continue
-                    _remove(path)
-                except OSError as err:
-                    _say("cannot remove old lane log %s/%s: %s" % (slot, name, err))
-                    continue
-                removed += 1
-                freed += size
+                _remove(path)
+            except OSError as err:
+                _say("cannot remove old lane log %s: %s" % (key, err))
+                continue
+            removed += 1
+            freed += size
         if removed:
             _say("removed %d lane log(s) older than %d days (%s)"
                  % (removed, self.s.log_keep_days, _gb(freed)))
+
+    def limit_logs(self) -> None:
+        """Hold logs/ under log_max_bytes: past it, remove the oldest lane
+        log entries prune_logs could remove, sparing anything changed in the
+        last LOG_FLOOR seconds, then say the size against the limit."""
+        limit = self.s.log_max_bytes
+        if limit <= 0:
+            return
+        try:
+            total = _tree_stat(os.path.join(self.s.home, "logs"))[1]
+        except OSError as err:
+            _say("cannot measure logs/: %s" % err)
+            return
+        removed = 0
+        if total > limit:
+            found = []
+            for key, path in self._lane_log_entries():
+                try:
+                    newest, size = _tree_stat(path)
+                except OSError:
+                    continue
+                if self.now - newest >= LOG_FLOOR:
+                    found.append((newest, size, key, path))
+            for _, size, key, path in sorted(found):
+                if total <= limit:
+                    break
+                try:
+                    _remove(path)
+                except OSError as err:
+                    _say("cannot remove lane log %s: %s" % (key, err))
+                    continue
+                total -= size
+                removed += 1
+        _say("logs hold %s, %s the %s limit%s"
+             % (_gb(total), "over" if total > limit else "under", _gb(limit),
+                "; removed the %d oldest lane log(s)" % removed if removed else ""))
 
     # -- the GitHub budget --------------------------------------------------
     def _budget_state(self) -> Dict[str, Any]:
@@ -12138,10 +13709,63 @@ class Station:
         made = self.gh.rest("POST", "/repos/%s/issues" % home, {
             "title": "Give the Loom App access to %s" % repo,
             "body": "## Ask\nGive the Loom App access to `%s` so station steps can run there." % repo,
-            "labels": [NEEDS_OPERATOR]}).data
+            "labels": [NEEDS_HUMAN]}).data
         if not isinstance(made, dict) or "number" not in made:
             raise GitHubError("no operator access ask was created in %s" % home)
         state[key] = int(made["number"])
+
+    def _get_deployed_items(self) -> Tuple[Set[str], Set[Tuple[str, int]]]:
+        """Get the set of deployed commits and issue numbers from roll and bridge ship events."""
+        deployed_commits: Set[str] = set()
+        deployed_issues: Set[Tuple[str, int]] = set()
+
+        try:
+            from . import deploy_watch
+
+            ledger_path = os.path.join(self.state, deploy_watch.LEDGER)
+            ledger = _read_json(ledger_path, {}, strict=False)
+
+            if isinstance(ledger, dict):
+                for entry in ledger.get("merges", {}).values():
+                    if isinstance(entry, dict):
+                        sha = str(entry.get("sha") or "")
+                        if sha:
+                            deployed_commits.add(sha.lower())
+                            if len(sha) >= 7:
+                                deployed_commits.add(sha[:7].lower())
+                            if len(sha) >= 12:
+                                deployed_commits.add(sha[:12].lower())
+
+                        ticket = entry.get("ticket")
+                        repo = str(entry.get("repo") or "")
+                        if ticket and repo:
+                            try:
+                                deployed_issues.add((repo, int(ticket)))
+                            except (ValueError, TypeError) as err:
+                                _say("invalid ticket in deploy ledger: %s" % err)
+        except Exception as err:
+            _say("could not read deploy items: %s" % err)
+
+        return deployed_commits, deployed_issues
+
+    def _open_needs_issues(self) -> List[Dict[str, Any]]:
+        """Find open issues carrying needs:<login> labels across configured repos."""
+        found: List[Dict[str, Any]] = []
+        for repo in self.s.repos:
+            try:
+                items = self._paginate("/repos/%s/issues?state=open&per_page=100" % repo)
+                for item in items:
+                    if isinstance(item, dict) and "pull_request" not in item:
+                        labels = self._issue_label_names(item)
+                        if any(self.NEEDS_LABEL_PATTERN.match(lbl) for lbl in labels):
+                            if "repository" not in item:
+                                item["repository"] = {"full_name": repo}
+                            found.append(item)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not read issues in %s: %s" % (repo, err))
+        return found
 
     def roll_source_pins(self) -> None:
         if self.s.roll_ship_docs:
@@ -12152,6 +13776,34 @@ class Station:
                 raise GitHubError("invalid roll ship document or pin: %s" % err) from err
             except health.NotLooked as err:
                 raise GitHubError("roll family gate could not be read: %s" % err) from err
+            self._check_stale_asks(0, force=True)
+
+    def _check_stale_asks(self, last_check: Optional[float] = None, force: bool = False) -> int:
+        """Check and withdraw stale needs:login asks after each deploy event and daily.
+        Returns the number of asks withdrawn as stale."""
+        try:
+            check_time = float(last_check) if isinstance(last_check, (int, float)) else 0.0
+            if not force and check_time > 0 and self.now - check_time < 86400:
+                return 0
+            deployed_commits, deployed_issues = self._get_deployed_items()
+            issues = self._open_needs_issues()
+            withdrawn = self._check_and_withdraw_stale_asks(issues, deployed_commits, deployed_issues, check_time)
+            self._stale_asks_withdrawn += withdrawn
+            if withdrawn:
+                _say("stale ask detection: withdrew %d asks" % withdrawn)
+            stale_asks_path = os.path.join(self.state, "stale_asks_check.json")
+            saved = _read_json(stale_asks_path, {}, strict=False)
+            if not isinstance(saved, dict):
+                saved = {}
+            saved["at"] = self.now
+            saved["withdrawn_today"] = saved.get("withdrawn_today", 0) + withdrawn
+            _write_json(stale_asks_path, saved)
+            return withdrawn
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("stale ask detection failed: %s" % err)
+            return 0
 
     @staticmethod
     def label_digest() -> str:
@@ -12159,17 +13811,25 @@ class Station:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def sync_labels(self) -> None:
-        """Sync every registered repo when the desired label set changes."""
+        """Sync every registered repo when the desired label set changes, and
+        a repo enrolled since the last sync on its first pass: one enrolled
+        later lacked loom:answered, and a lane could not set it (loom#2032).
+        The ledger records the digest and the repos synced at it."""
         path = os.path.join(self.state, "labels.json")
         digest = self.label_digest()
         saved = _read_json(path, {}, strict=False)
+        synced: List[str] = []
         if isinstance(saved, dict) and saved.get("digest") == digest:
+            synced = [r for r in saved.get("repos") or [] if isinstance(r, str)]
+        todo = [repo for repo in self.s.repos if repo not in synced]
+        if not todo:
             return
-        for repo in self.s.repos:
+        for repo in todo:
             changed = labels.ensure_labels(self.gh, repo)
             if changed:
                 _say("labels changed in %s: %s" % (repo, ", ".join(changed)))
-        _write_json(path, {"digest": digest})
+            synced.append(repo)
+            _write_json(path, {"digest": digest, "repos": synced})
 
     def run_pass(self) -> None:
         if self._budget_exhausted():
@@ -12182,6 +13842,7 @@ class Station:
         # From loom#1915 until this change every such pass skipped them, and
         # no lane tree was pruned for hours on 2026-10-26.
         try:
+            self._publish_lanes_when_old()
             self.sync_labels()
             self.finish_claims()
             try:

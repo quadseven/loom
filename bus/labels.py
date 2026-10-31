@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List
+import sys
+from typing import Dict, Iterable, List
 from urllib.parse import quote
 
 from .github import GitHub
@@ -13,7 +14,7 @@ from .github import GitHub
 HANDOFF = "handoff:claude"
 
 LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
-         "zai", "workersai", "agy", "spark"]
+         "zai", "workersai", "agy", "spark", "copilot"]
 # Extra slots: parallel copies of a lane on the same provider (run_lane.sh
 # maps a slot to its lane). anthropic has credits that expire, so it gets the
 # most; claude has none, because it spends the operator's own subscription.
@@ -86,7 +87,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:audit-failed": {"color": "d93f0b", "description": "A lane proof failed the brain's audit; holds that lane's verify runs a day"},
     "loom:triage": {"color": "f9d0c4", "description": "Open issue not yet a ticket; the brain rewrites it"},
     "loom:rewritten": {"color": "ededed", "description": "Rewritten as a ticket that refs this issue"},
-    "loom:human": {"color": "b60205", "description": "Only a person can do this; see the comment"},
+    "loom:human": {"color": "b60205", "description": "Old name of needs:human"},
     "loom:lanes": {"color": "ededed", "description": "The issue holding lane status"},
     "loom:digest": {"color": "ededed", "description": "The issue holding the daily asks digest"},
     "loom:invariant": {"color": "b60205", "description": "Filed by the station: one of the factory's own invariants broke"},
@@ -94,9 +95,12 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:recurring": {"color": "fbca04", "description": "Invariant breached repeatedly; keep open for a fix"},
     "loom:factory": {"color": "b60205", "description": "A factory validation incident"},
     "loom:validation-gap": {"color": "fbca04", "description": "A CI job the repo's .loom/validation.conf does not run"},
-    "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
+    "needs:human": {"color": "b60205", "description": "One exact ask for a person; see the comment. Comes off when the answer is in the ticket"},
+    "needs-operator": {"color": "b60205", "description": "Old name of needs:human"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder; the brain must review or ask"},
-    "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
+    "loom:urgent": {"color": "e11d21", "description": "With needs:human: forward now"},
+    "closed-unproven": {"color": "fbca04", "description": "Closed on merged code with its Live box unproven; a reopen counts against this close"},
+    "loom:proof-due": {"color": "fbca04", "description": "Rolling list of Live boxes of tickets closed unproven"},
     "loom:regression": {"color": "b60205", "description": "Fixes a measured regression of a shipped ticket"},
     "loom:revert": {"color": "b60205", "description": "Reverts the merge that turned the default branch red"},
     "class:sensitive": {"color": "b60205", "description": "Touches a sensitive path; needs extra scrutiny"},
@@ -110,6 +114,8 @@ LABELS: Dict[str, Dict[str, str]] = {
     "wait:lane": {"color": "fef2c0", "description": "Waiting: no free lane takes its model"},
     "wait:incident": {"color": "fef2c0", "description": "Waiting: held for an open factory incident"},
     "wait:after": {"color": "fef2c0", "description": "Waiting: another ticket must merge first (After:)"},
+    "wait:blocked": {"color": "fef2c0", "description": "Waiting: its Blocked on section names an issue still open"},
+    "wait:superseded": {"color": "fef2c0", "description": "Waiting: its brief says another issue supersedes it; the brain closes or re-briefs it"},
     "wait:window": {"color": "fef2c0", "description": "Waiting: a deploy or roll window"},
     "wait:live-event": {"color": "fef2c0", "description": "Waiting: its Live box needs a rare event the log has not shown; held apart from open work"},
     # The hand-off pool (docs/BRAIN.md): tickets this Loom's lanes do not
@@ -122,6 +128,16 @@ for _lane in LANES:
 
 MANAGED_PREFIXES = ("loom:", "lane:", "class:", "wait:")
 WAIT_PREFIX = "wait:"
+# One label asks a person. The old names read as it until a write to the
+# ticket migrates them (bus/label_pass.py, loom#2278).
+NEEDS_HUMAN = "needs:human"
+OLD_HUMAN_LABELS = ("needs-operator", "needs:quadseven", "loom:human")
+HUMAN_LABELS = (NEEDS_HUMAN,) + OLD_HUMAN_LABELS
+
+
+def needs_human(names: Iterable[str]) -> bool:
+    """A person is asked: `names` hold needs:human or an old name of it."""
+    return any(name in HUMAN_LABELS for name in names)
 
 
 def ensure_labels(gh: GitHub, repo: str) -> List[str]:
@@ -151,3 +167,30 @@ def ensure_labels(gh: GitHub, repo: str) -> List[str]:
                     {"color": want["color"], "description": want["description"]})
             changed.append(name)
     return changed
+
+
+def spec(name: str) -> str:
+    """One canonical label as "<color>\\t<description>", for a runner that
+    must create a label its repo lacks before it sets it (lanes/run_lane.sh,
+    loom#2032). ValueError when the name is not a Loom label."""
+    want = LABELS.get(name)
+    if want is None:
+        raise ValueError("not a Loom label: %s" % name)
+    return "%s\t%s" % (want["color"], want["description"])
+
+
+def main(argv: List[str]) -> int:
+    """`python3 -m bus.labels spec NAME` prints NAME's color and description."""
+    if len(argv) != 2 or argv[0] != "spec":
+        print("usage: python3 -m bus.labels spec NAME", file=sys.stderr)
+        return 2
+    try:
+        print(spec(argv[1]))
+    except ValueError as err:
+        print(err, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
