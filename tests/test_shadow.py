@@ -1119,7 +1119,7 @@ class InvariantsCloseTest(ShadowCase):
     NUMBER = 77
 
     def wire(self, state="open", labels=("loom:triage", "loom:invariant"),
-             key="lane-pr-stalled/ad09a1c365b8", age=86400):
+             key="goal-epics-over-cap/ad09a1c365b8", age=86400):
         breach = {"number": self.NUMBER, "state": state, "title": "Lane pull request #5 open",
                   "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW - age)),
                   "closed_at": None if state == "open" else time.strftime(
@@ -1241,7 +1241,8 @@ class EveryPathTest(unittest.TestCase):
         ("bus/invariants.py", "_reopen"): "self._held(",
         ("bus/invariants.py", "_fold"): "self._held(",
         ("bus/invariants.py", "_close_quiet"): "self._held(",
-        ("bus/invariants.py", "_close_settled"): "self._held(",
+        ("bus/invariants.py", "_close_silently"): "self._held(",
+        ("bus/invariants.py", "_roll_clear"): "self._held(",
         ("bus/station.py", "_close_done_ticket"): "shadow.active(",
         ("bus/station.py", "_settle_claimed"): "shadow.active(",
         ("bus/sweep.py", "_close"): "shadow.guard(",
