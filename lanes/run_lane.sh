@@ -450,7 +450,7 @@ BUGS_SECTION="Bugs discovered"
 # What section, or the reason a run changed nothing (no_change_reason). The
 # file itself is never committed.
 summary_note() {
-  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion the change builds; leave every live check (a Live line, or anything seen on a running system, a host, a network or over time) and every operator action unticked, since only the station'"'"'s verifier ticks those; and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If you found a bug outside this ticket, add a ## %s section, one bug per line, each citing its issue as #N (this repo) or OWNER/NAME#N; file the issue first if none exists. The station looks each issue up and leaves out any line whose issue does not exist, is a pull request, or is closed and was not filed in the last two days. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION" "$BUGS_SECTION"
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion the change builds; leave every live check (a Live line, or anything seen on a running system, a host, a network or over time) and every operator action unticked, since only the station'"'"'s verifier ticks those; and for an unbuilt criterion append \"; not built: <reason>\". A reason saying the work is already there must cite the code on the base branch as <path>:<line> or <path>::<symbol>, or the pull request goes back. The runner puts that checklist in the pull request body. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If you found a bug outside this ticket, add a ## %s section, one bug per line, each citing its issue as #N (this repo) or OWNER/NAME#N; file the issue first if none exists. The station looks each issue up and leaves out any line whose issue does not exist, is a pull request, or is closed and was not filed in the last two days. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION" "$BUGS_SECTION"
 }
 
 # How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
@@ -887,6 +887,33 @@ post_replies() {
     fi
   done < <(jq -c '.[]' "$REPLIES_FILE")
   rm -f "$REPLIES_FILE"
+}
+
+# The review threads a fix brief lists (the "### Thread PRRT_..." lines of its
+# ## Fix section) that this round left without an answer: no entry in its
+# replies file and no file kept from .loom-answers. Prints them ", "-joined,
+# or nothing. The brief requires an answer for every one (bus/tickets.py
+# REPLIES_NOTE); an unanswered thread holds the merge gate, so the round says
+# which ones it left.
+unanswered_threads() {
+  python3 - "$BRIEF" "${REPLIES_FILE:-}" "$INBOX/answers/$TICKET" <<'PY' 2>> "$LOG"
+import json, os, re, sys
+brief, replies, answers = sys.argv[1:]
+with open(brief, encoding="utf-8", errors="replace") as stream:
+    parts = stream.read().rsplit("\n## Fix\n", 1)
+listed = (re.findall(r"^### Thread (PRRT_[A-Za-z0-9_-]{1,100}) ", parts[1], re.M)
+          if len(parts) > 1 else [])
+answered = set()
+if replies and os.path.isfile(replies):
+    try:
+        with open(replies, encoding="utf-8") as stream:
+            answered |= {entry["thread"] for entry in json.load(stream)}
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print("the replies file could not be read: %s" % error, file=sys.stderr)
+if os.path.isdir(answers):
+    answered |= {name[:-3] for name in os.listdir(answers) if name.endswith(".md")}
+print(", ".join(dict.fromkeys(t for t in listed if t not in answered)))
+PY
 }
 
 # Reconcile the generated title/body sections of an existing PR with the
@@ -4008,6 +4035,7 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
     : > "$LOGDIR/$TICKET.pushed"
   fi
   if [ -n "$FIX_PR" ]; then
+    UNANSWERED="$(unanswered_threads)"
     post_replies
     ITEMS="$(fix_items "$BRIEF")"
     if [ "$COMMITTED" -eq 1 ]; then
@@ -4035,6 +4063,12 @@ $LIVE_NOTES"
       COMMENT="$COMMENT
 
 Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+    fi
+    if [ -n "$UNANSWERED" ]; then
+      echo "[$(date -u +%FT%TZ)] $TICKET: review threads left without a reply: $UNANSWERED" >> "$LOG"
+      COMMENT="$COMMENT
+
+Review threads this round left without a reply: $UNANSWERED"
     fi
     # One comment per pull request, edited each round; the push and the body
     # edit are already on the pull request's timeline.
