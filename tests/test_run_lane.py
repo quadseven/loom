@@ -2261,6 +2261,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertFalse(missing, "function not found in runner: %s" % ", ".join(missing))
         return "".join(found[n].group(0) for n in names)
 
+    def test_opencode_described_step_rejects_an_empty_event_stream(self):
+        function = self.source_functions("opencode_described_step")
+        self.assertIn("events_processed = False", function)
+        self.assertIn("if not events_processed:", function)
+        code = re.search(r"<<'PY'\n(.*?)\nPY", function, re.S)
+        self.assertIsNotNone(code, "embedded event parser not found")
+        events = self.home / "empty-opencode-events.jsonl"
+        events.write_text("")
+        result = subprocess.run(["python3", "-I", "-c", code.group(1), str(events)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+
     def test_the_agy_run_may_write_its_file_secret_store_and_not_the_keychains(self):
         # 2026-10-24: agy reads its keychain sign-in by running
         # /usr/bin/security, which the lane sandbox denies (#1465), and falls
