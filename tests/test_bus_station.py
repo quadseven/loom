@@ -877,6 +877,28 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("Third works.", note)
         self.assertNotIn("Second works", note)
 
+    def test_the_requeue_note_names_every_open_box_of_any_kind(self):
+        # loom#2333: six boxes were left and the note named one. A box read as
+        # a live check is still open, so the ticket's next reader must see it.
+        criteria = ("## Acceptance criteria\n- [ ] Count the names\n- [ ] Build the first\n"
+                    "- [ ] Verify the shape holds\n- [x] Already ticked on the ticket\n")
+        self.fake.add(12, state="pr", body=BODY + "\n" + criteria)
+        self.merged_with("- [ ] Count the names; not built: no time\n- [x] Build the first\n"
+                         "- [ ] Verify the shape holds; not built: no time\n")
+        self.assertIn("loom:queued", self.fake.names(12))
+        note = [c["body"] for c in status.expand(self.fake.comments[12], AUTHORS)][0]
+        self.assertIn("Count the names", note)
+        self.assertIn("Verify the shape holds", note)
+        self.assertNotIn("Build the first", note)
+        self.assertNotIn("Already ticked", note)
+
+    def test_only_a_live_box_open_does_not_send_the_ticket_back(self):
+        criteria = ("## Acceptance criteria\n- [ ] Build the first\n"
+                    "- [ ] Verify the shape holds\n")
+        self.fake.add(12, state="pr", body=BODY + "\n" + criteria)
+        self.merged_with("- [x] Build the first\n- [ ] Verify the shape holds\n")
+        self.assertIn("loom:merged", self.fake.names(12))
+
     def test_a_pr_merged_before_the_requeue_does_not_requeue_the_ticket_again(self):
         self.merged_with("- [x] First works; test.\n")
         self.requeued("2030-01-03T00:00:00Z")

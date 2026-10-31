@@ -1384,12 +1384,10 @@ def criterion_key(text: str) -> str:
     return " ".join(text.split()).rstrip(".;:,").strip().casefold()
 
 
-def unbuilt_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
-    """The ticket's code boxes that a merge left unbuilt: neither ticked on the
-    ticket nor ticked (without "not built") in any of these merged pull request
-    bodies. A box marked "not built: <reason>" answers a lane's gate but is
-    still unbuilt, so a partial merge sends its ticket back (loom#2026). Live
-    and operator boxes are the verify path's, never named here."""
+def unticked_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
+    """Every ticket box of any kind that a merge left open: neither ticked on
+    the ticket nor ticked (without "not built") in any of these merged pull
+    request bodies. This is what the ticket's requeue note names (loom#2333)."""
     built = set()
     for criterion in [c for body in pull_bodies for c in acceptance_criteria(body)]:
         checked, _, text = criterion.partition(" ")
@@ -1398,11 +1396,18 @@ def unbuilt_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
     left = []
     for criterion in acceptance_criteria(ticket_body):
         checked, _, text = criterion.partition(" ")
-        if checked == "x" or criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE:
-            continue
-        if criterion_key(text) not in built:
+        if checked != "x" and criterion_key(text) not in built:
             left.append(text)
     return left
+
+
+def unbuilt_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
+    """The unticked boxes that send a ticket back for more work: its code
+    boxes. A box marked "not built: <reason>" answers a lane's gate but is
+    still unbuilt, so a partial merge sends its ticket back (loom#2026). Live
+    and operator boxes are the verify path's, so alone they send nothing back."""
+    return [text for text in unticked_criteria(ticket_body, pull_bodies)
+            if criteria_gate.kind(NOT_BUILT_RE.sub("", text)) == criteria_gate.CODE]
 
 
 def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
