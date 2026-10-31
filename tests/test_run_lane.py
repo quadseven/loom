@@ -1949,6 +1949,42 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
                                capture_output=True, text=True, check=True).stdout.split()
         self.assertNotIn(".loom/replies.json", files)
 
+    def test_a_fix_round_that_leaves_a_listed_thread_without_a_reply_says_so(self):
+        # 2026-10-31: about two thirds of open review threads on lane pull
+        # requests were findings the lane never answered, so the merge gate
+        # held those pull requests with nobody told why.
+        name, _ = self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7",
+                               FAKE_REPLIES='[{"thread":"PRRT_other","reply":"Done","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("%s: review threads left without a reply: PRRT_1" % name, log)
+        [note] = self.sticky_bodies()
+        self.assertIn("Review threads this round left without a reply: PRRT_1", note)
+
+    def test_a_listed_thread_with_a_reply_entry_is_posted_resolved_and_not_flagged(self):
+        name, _ = self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7",
+                               FAKE_REPLIES='[{"thread":"PRRT_1","reply":"Renamed in a.py.","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c and "PRRT_1" in c for c in calls))
+        self.assertTrue(any("resolveReviewThread" in c and "PRRT_1" in c for c in calls))
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertNotIn("left without a reply", log)
+        [note] = self.sticky_bodies()
+        self.assertNotIn("left without a reply", note)
+
+    def test_a_listed_thread_answered_in_loom_answers_is_not_flagged(self):
+        name, _ = self.fix_brief()
+        secret = Path(self._tmp.name) / "outside-secret"
+        secret.write_text("unused\n")
+        result = self.run_lane(FAKE_AGENT="answer", FAKE_GH_EXISTING="7",
+                               FAKE_SECRET_FILE=str(secret))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertNotIn("left without a reply", log)
+
     def test_fix_runner_never_replies_to_or_resolves_a_thread_on_another_pull_request(self):
         self.fix_brief()
         replies = ('[{"thread":"PRRT_elsewhere","reply":"Addressed","resolve":true},'
@@ -3164,6 +3200,40 @@ exec /usr/bin/git "$@"
             month = 1 if now.month == 12 else now.month + 1
             return int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp())
         self.assertIn(int(retry_at), (next_month(before), next_month(datetime.now(timezone.utc))))
+
+    def classify_as(self, lane, whole, tail):
+        """(class, retry_at) of a failed run with no edits on `lane`."""
+        script = (RUNNER.parent / "agent_cli.sh").read_text() + (
+            'LANE=%s; classify_failure 1 %s "" %s; printf "%%s|%%s\\n" "$FAIL_CLASS" "$RETRY_AT"'
+            % (shlex.quote(lane), shlex.quote(whole), shlex.quote(tail)))
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+        return result.stdout.strip().split("|")
+
+    def test_copilot_allowance_wordings_hold_the_copilot_lane_for_the_month(self):
+        # The Free allowance runs out with no "usage limit" in the message; a
+        # transient or work class sets no hold, so the next ticket hits the same wall.
+        for said in ("You have exceeded your premium request allowance",
+                     "Error: You have no quota"):
+            kind, retry_at = self.classify_as("copilot", said, said)
+            self.assertEqual(kind, "limit", said)
+            self.assertGreater(int(retry_at), time.time(), said)
+            self.assertEqual(datetime.fromtimestamp(int(retry_at), timezone.utc).day, 1, said)
+
+    def test_copilot_allowance_wordings_hold_no_other_lane(self):
+        # A ticket, diff or file can carry these words on any lane.
+        for said in ("You have exceeded your premium request allowance",
+                     "Error: You have no quota"):
+            kind, retry_at = self.classify_as("zen", said, said)
+            self.assertNotEqual(kind, "limit", said)
+            self.assertEqual(retry_at, "", said)
+
+    def test_copilot_allowance_words_earlier_in_a_run_hold_nothing(self):
+        # Only the run's last lines are the CLI's answer; earlier text can be
+        # the ticket or a file the agent read.
+        said = "the ticket quotes: you have no quota\nsome later output"
+        kind, retry_at = self.classify_as("copilot", said, "some later output")
+        self.assertNotEqual(kind, "limit")
+        self.assertEqual(retry_at, "")
 
     def assert_next_occurrence(self, retry_at, hour, minute, before):
         """retry_at is the next hour:minute on the local clock, read from the

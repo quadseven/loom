@@ -1021,10 +1021,15 @@ request's branch, gets a `Fix-PR: <number>` header and ends with a `## Fix`
 section holding the comment. A fix comment edited after it was posted is
 refused, as an untrusted ticket is. The runner then checks out that branch,
 pushes the agent's work onto it (fast-forward only, never forced) and
-comments on the pull request; it never opens a second one. The sandboxed agent
-can write `.loom/replies.json` with thread ids, reply text and a resolve
-boolean. The runner posts valid entries after a successful push and resolves
-those marked true; missing or invalid files produce no replies. An entry
+comments on the pull request; it never opens a second one. The brief requires
+the sandboxed agent to answer every review thread it lists: one entry per
+thread in `.loom/replies.json` (thread id, reply text, and a resolve boolean,
+true when the round fixed it, false with a concrete reason when it declines),
+or an answer file in `.loom-answers/`. The runner posts valid entries after a
+successful push and resolves those marked true; missing or invalid files
+produce no replies. A listed thread left with neither is named in the log and
+in the round comment on the pull request ("Review threads this round left
+without a reply"). An entry
 whose thread is not on the round's own pull request, or whose text
 `bus/text.py` refuses, is skipped and logged. A fix brief
 whose pull request is no longer open is parked as failed (a merged one is
