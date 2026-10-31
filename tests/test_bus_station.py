@@ -94,6 +94,8 @@ class FakeGitHub:
         self.carried = set()
         self.check_runs_status = 200
         self.head_files = {}
+        # Commit sha -> the files it changed, for a "Fixed in <sha>" answer.
+        self.commit_files = {}
         # Strings a code search of the repo finds nothing for (bus/unmeetable.py);
         # every other search finds one file.
         self.code_absent = set()
@@ -204,6 +206,10 @@ class FakeGitHub:
             if parts.path.endswith("/.github/workflows"):
                 return reply(200, [])
             return self._head_file(parts.path[len("/repos/%s/contents/" % REPO):])
+        changed = re.match(r"/repos/%s/commits/([0-9a-f]+)$" % REPO, parts.path)
+        if method == "GET" and changed and changed.group(1) in self.commit_files:
+            return reply(200, {"sha": changed.group(1).ljust(40, "0"),
+                               "files": [{"filename": f} for f in self.commit_files[changed.group(1)]]})
         other = re.match(r"/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/issues/(\d+)$", parts.path)
         if other and other.group(1) != REPO:
             found = self.foreign.get((other.group(1), int(other.group(2))))
@@ -3964,6 +3970,28 @@ class FixRoundsInPlaceTest(unittest.TestCase):
                 "comments": {"nodes": [{"databaseId": 9, "body": "change this",
                                          "author": {"login": "grug-tribe[bot]"}}]}}
 
+    def test_finding_revision_protocol_requires_pickup_and_cited_commit(self):
+        finding = {"id": "PRRT_1", "path": "a.py", "revision": "a" * 40,
+                   "state": "pending"}
+        picked = fixrounds.transition_finding(finding, "picked_up", "a" * 40,
+                                               "a" * 40)
+        self.assertEqual(picked["state"], "picked_up")
+        self.assertEqual(fixrounds.transition_finding(picked, "picked_up", "a" * 40,
+                                                       "a" * 40), picked)
+        stale = fixrounds.transition_finding(picked, "answered", "b" * 40,
+                                              "b" * 40, "c" * 40, ["a.py"])
+        self.assertIsNone(stale)
+        wrong_file = fixrounds.transition_finding(picked, "answered", "a" * 40,
+                                                   "a" * 40, "c" * 40, ["other.py"])
+        self.assertIsNone(wrong_file)
+        answered = fixrounds.transition_finding(picked, "answered", "a" * 40,
+                                                 "a" * 40, "c" * 40, ["a.py"])
+        self.assertEqual(answered["state"], "answered")
+        self.assertEqual(fixrounds.transition_finding(answered, "answered", "a" * 40,
+                                                       "a" * 40, "c" * 40, ["a.py"]), answered)
+        self.assertEqual(fixrounds.transition_finding(answered, "picked_up", "a" * 40,
+                                                       "a" * 40), answered)
+
     def lane_pushes(self, sha):
         """The lane claimed the round, ran it and pushed: the ticket is back
         at loom:pr."""
@@ -7523,7 +7551,12 @@ class AnswerTest(Base):
             "comments": {"nodes": [{"author": author,
                                     "body": "%s | _correctness_ | `%s`\n\nx" % (severity, kind)}]}}
 
-    def finish(self, answers, model="claude-opus-5-5", kind="done", fix_body=THREAD_FIX):
+    def finding(self, tid="PRRT_abcd1", head="f" * 40):
+        return fixrounds.load_findings(fixrounds.findings_path(self.home))[
+            fixrounds.finding_key(tid, head)]
+
+    def finish(self, answers, model="claude-opus-5-5", kind="done", fix_body=THREAD_FIX,
+               head="f" * 40):
         body = BODY.replace("Model: model-x", "Model: " + model)
         self.fake.add(12, state="running", body=body)
         self.fake.comments[99] = []
@@ -7533,6 +7566,8 @@ class AnswerTest(Base):
         self.write(self.inbox("codex", kind, name + ".md"), brief)
         for tid, text in answers.items():
             self.write(self.inbox("codex", "answers", name, tid + ".md"), text)
+        if answers and head:
+            self.write(self.inbox("codex", "answers", name, ".head"), head + "\n")
         if kind == "failed":
             self.write(os.path.join(self.home, "logs", "codex", name + ".log"),
                        "[2030-01-01T00:01:00Z] x failed: agent made no commit on loom/12-fix-the-thing\n")
@@ -7593,8 +7628,51 @@ class AnswerTest(Base):
     def test_a_fixed_in_answer_resolves_only_for_a_commit_on_the_head(self):
         self.thread()
         self.fake.carried.add("abc1234")
+        self.fake.commit_files["abc1234"] = ["a.py"]
         self.finish({"PRRT_abcd1": "Fixed in abc1234"})
         self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
+
+    def test_a_fixed_in_answer_whose_commit_skips_the_cited_file_stays_open(self):
+        self.thread()
+        self.fake.carried.add("abc1234")
+        self.fake.commit_files["abc1234"] = ["other.py"]
+        self.finish({"PRRT_abcd1": "Fixed in abc1234"})
+        self.assertEqual((len(self.fake.replies), self.fake.resolved), (1, []))
+        self.assertEqual(self.finding()["state"], "picked_up")
+
+    def test_an_answer_against_an_older_head_is_rejected(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "The guard on a.py:2 returns."}, head="e" * 40)
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
+
+    def test_a_fix_round_that_recorded_no_head_is_rejected(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "The guard on a.py:2 returns."}, head="")
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
+
+    def test_an_accepted_answer_is_recorded_as_answered_at_its_revision(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "The guard on a.py:2 returns."})
+        found = self.finding()
+        self.assertEqual((found["state"], found["revision"], found["path"]),
+                         ("answered", "f" * 40, "a.py"))
+
+    def test_resending_an_answer_never_duplicates_its_reply(self):
+        self.thread()
+        said = "The guard on a.py:2 returns."
+        name = self.finish({"PRRT_abcd1": said})
+        posted = self.fake.replies[0][1]
+        self.fake.threads["PRRT_abcd1"]["replies"] = {"nodes": [{"body": posted}]}
+        self.fake.replies.clear()
+        self.fake.resolved.clear()
+        # The report ran twice: the same answers come round again.
+        self.write(self.inbox("codex", "answers", name, "PRRT_abcd1.md"), said)
+        self.write(self.inbox("codex", "answers", name, ".head"), "f" * 40)
+        brief = "Model: claude-opus-5-5\n" + THREAD_FIX
+        station.Station(GitHub("token", transport=self.fake), self.settings)._post_answers(
+            REPO, 99, "codex", name, brief)
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], ["PRRT_abcd1"]))
+        self.assertEqual(self.finding()["state"], "answered")
 
     def test_a_fixed_in_answer_naming_a_foreign_commit_stays_open(self):
         self.thread()

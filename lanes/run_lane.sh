@@ -3030,6 +3030,13 @@ conflict_list() {
 # link, at most 8 KB, named for a thread: a symlink, a hard link to a file
 # outside the tree, a FIFO or a folder swapped for a link is dropped unread,
 # so an answer cannot carry a file the agent could not read itself.
+# Beside them note_answer_head writes the head they stand on: the station
+# refuses a fix round's answer once the pull request has moved past it.
+note_answer_head() {
+  local dir="$INBOX/answers/$TICKET"
+  [ -z "$FIX_PR" ] || [ ! -d "$dir" ] || printf '%s\n' "$1" > "$dir/.head"
+}
+
 keep_answers() {
   local dir="$TREE/.loom-answers" dst="$INBOX/answers/$TICKET"
   # A brief with no pull request keeps them aside: they go to the inbox only
@@ -3068,6 +3075,7 @@ PY
   then
     echo "[$(date -u +%FT%TZ)] $TICKET: the answers in .loom-answers could not be kept" >> "$LOG"
   fi
+  note_answer_head "$BASE"
   rm -rf "$dir"
 }
 
@@ -4033,6 +4041,7 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
     [ -z "$PUSH_OUT" ] || printf '%s\n' "$PUSH_OUT" >> "$LOG"
     # The station reads this marker, not the log, to say the round pushed.
     : > "$LOGDIR/$TICKET.pushed"
+    note_answer_head "$(safe_git rev-parse HEAD 2>> "$LOG")"
   fi
   if [ -n "$FIX_PR" ]; then
     UNANSWERED="$(unanswered_threads)"

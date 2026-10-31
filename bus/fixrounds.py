@@ -33,6 +33,13 @@ GitHub answers each edit with in a ledger (`ledger_path`), and a comment whose
 real updated_at differs was changed by someone else. Nothing in the body is
 trusted for that. Such a comment stays one opaque loom:fix comment: it counts
 as one round, and the lane's brief refuses it as an edited loom:fix comment.
+
+Findings. Each thread a fix round answers has a record in a second ledger
+(`findings_path`), keyed by thread and revision: the pull request head the
+round worked on. The runner writes that head beside the answers, which is the
+lane's pickup; the station refuses an answer whose head is no longer the pull
+request's (`transition_finding`), and a finding is answered only when the
+thread can be resolved on it.
 """
 
 from __future__ import annotations
@@ -65,6 +72,46 @@ SHOWN_LINES = 12
 LINE_CHARS = 300
 # The ledger keeps the newest edits only; an older comment reads opaque.
 LEDGER_KEEP = 5000
+_REVISION = re.compile(r"^[0-9a-f]{40}$")
+
+
+def transition_finding(finding: Mapping[str, Any], action: str, revision: str,
+                      current_revision: str, commit: str = "",
+                      commit_files: Iterable[str] = (),
+                      reason_accepted: bool = False) -> Optional[Dict[str, Any]]:
+    """Apply one idempotent finding transition at its recorded PR revision.
+
+    Answers require a pushed commit touching the finding's cited path, or an
+    explicit reviewer acceptance. Stale revisions and skipped states refuse.
+
+    bus/station.py calls this for each lane answer. It takes the commit's
+    changed files as data and does no GitHub I/O, so callers fetch them first.
+    """
+    recorded = str(finding.get("revision") or "").lower()
+    submitted = str(revision or "").lower()
+    current = str(current_revision or "").lower()
+    state = str(finding.get("state") or "pending")
+    if not (_REVISION.fullmatch(recorded) and submitted == recorded == current):
+        return None
+    result = dict(finding)
+    if action == "picked_up":
+        if state == "pending":
+            result["state"] = "picked_up"
+        return result
+    if action != "answered":
+        return None
+    if state == "answered":
+        return result
+    if state != "picked_up":
+        return None
+    path = str(finding.get("path") or "")
+    if not reason_accepted and (not _REVISION.fullmatch(str(commit or "").lower())
+                                or path not in set(commit_files)):
+        return None
+    result.update(state="answered", answer_revision=submitted)
+    if commit:
+        result["commit"] = str(commit).lower()
+    return result
 
 
 def is_rounds(body: Any) -> bool:
@@ -127,33 +174,62 @@ def ledger_from_env(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
     return ledger_path(home) if home else None
 
 
-def load_ledger(path: Optional[str]) -> Dict[str, str]:
-    """comment id -> the updated_at GitHub answered this Loom's last edit
-    with; empty when there is no ledger or it cannot be read."""
-    if not path:
-        return {}
+def findings_path(home: str) -> str:
+    return os.path.join(home, "state", "fix-findings.json")
+
+
+def finding_key(thread: str, revision: str) -> str:
+    return "%s@%s" % (thread, revision)
+
+
+def load_findings(path: str) -> Dict[str, Dict[str, Any]]:
+    """finding_key -> finding record; empty when it cannot be read, so a lost
+    ledger starts each finding again at pending."""
+    data = _read(path)
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+
+
+def record_finding(path: str, finding: Mapping[str, Any]) -> None:
+    """Keep one finding's newest record. Raises OSError."""
+    _store(path, finding_key(str(finding["id"]), str(finding["revision"])), dict(finding))
+
+
+def _read(path: str) -> Dict[str, Any]:
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
         return {}
-    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    return data if isinstance(data, dict) else {}
 
 
-def record(path: str, ident: int, updated_at: str) -> None:
-    """Note this Loom's edit of comment `ident`. Raises OSError."""
+def _store(path: str, key: str, value: Any) -> None:
+    """Move `key` to the newest end of the ledger at `path`, under its lock."""
     import fcntl
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path + ".lock", "a", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        data = load_ledger(path)
-        data.pop(str(ident), None)
-        data[str(ident)] = updated_at
+        data = _read(path)
+        data.pop(key, None)
+        data[key] = value
         kept = dict(list(data.items())[-LEDGER_KEEP:])
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(kept, fh)
         os.replace(tmp, path)
+
+
+def load_ledger(path: Optional[str]) -> Dict[str, str]:
+    """comment id -> the updated_at GitHub answered this Loom's last edit
+    with; empty when there is no ledger or it cannot be read."""
+    if not path:
+        return {}
+    return {str(k): str(v) for k, v in _read(path).items()}
+
+
+def record(path: str, ident: int, updated_at: str) -> None:
+    """Note this Loom's edit of comment `ident`. Raises OSError."""
+    _store(path, str(ident), updated_at)
 
 
 def _verified(comment: Dict[str, Any], ledger: Mapping[str, str]) -> bool:
