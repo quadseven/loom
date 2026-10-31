@@ -85,7 +85,7 @@ from . import deploy_watch
 from . import scorecard
 from . import watch
 from . import labels
-from .brain import HUMAN_MARKER
+from .brain import HUMAN_MARKER, LANES_REPUBLISH
 from . import brain
 from .github import (GitHub, GitHubError, RateLimited, TargetReached, _OPENER,
                      _next_link, read_ssm, rest_login, unreadable)
@@ -204,7 +204,6 @@ REASON_MAX = 300
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 LANES_LABEL = "loom:lanes"
 LANES_TITLE = "Loom lane status"
-LANES_REPUBLISH = 3600
 URGENT = "loom:urgent"
 REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
@@ -645,6 +644,18 @@ VERIFY_REFUSED_FILE = "verify-refused.json"
 VERIFY_RESERVE_AFTER = 2 * 3600
 VERIFY_RESERVE_EVERY = 1800
 VERIFY_RESERVE_FILE = "verify-reserve.json"
+# A shipped ticket still unverified this long after its ship with no verify
+# attempt ever recorded gets one missing-evidence note (loom#2092): the
+# reserved lane reaches one ticket per VERIFY_RESERVE_EVERY, so the rest of
+# the backlog waited unrecorded -- one ticket sat five days with only its
+# Shipped note. The note pass runs on the reserve's cadence, and a noted
+# ticket's note is refreshed in place at most once a VERIFY_NOTE_REFRESH,
+# never re-posted; VERIFY_NOTE_FILE keeps when each was last written.
+VERIFY_NOTE_AFTER = 24 * 3600
+VERIFY_NOTE_EVERY = VERIFY_RESERVE_EVERY
+VERIFY_NOTE_REFRESH = 24 * 3600
+VERIFY_NOTE_FILE = "verify-notes.json"
+VERIFY_NOTE_MARKER = "<!-- loom:verify-note v1 -->"
 # The Fabric lead for a ticket's merged work (loom#1437): at most FABRIC_ASKS
 # questions a pass, each up to bus/fabric.py's TIMEOUT, and the first
 # FABRIC_CITES cited pull requests checked against GitHub. FABRIC_ASKED_FILE
@@ -768,6 +779,22 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
         not item[1].get("health_proof"),
         float(item[1].get("shipped_at", 0) or 0),
         item[0], int(item[1].get("number", 0))))
+
+
+def verify_note_text(shipped_at: float, now: float) -> str:
+    """The missing-evidence note for a shipped ticket no verify attempt has
+    reached (loom#2092): a dated statement of how long the ticket has waited,
+    so it stays true as history once written and a refresh only moves the
+    date and the wait forward."""
+    waited = max(0, int((now - shipped_at) // 3600))
+    return (VERIFY_NOTE_MARKER + "\n"
+            "Missing-evidence note (station, %s): this ticket shipped about "
+            "%d hours ago and no verify attempt had reached it when the "
+            "station checked, so its proof is still missing either way. It "
+            "stays in the verify queue; this one note is refreshed in place "
+            "while the wait continues, so the ticket never waits unrecorded. "
+            "(loom#2092)"
+            % (time.strftime("%Y-%m-%d", time.gmtime(now)), waited))
 
 
 def live_needles(body: Optional[str]) -> Optional[List[str]]:
@@ -3619,6 +3646,88 @@ class Station:
         self._hand_verifies(free, starved_for=VERIFY_RESERVE_AFTER, limit=1)
         return [lane for lane in free if self._inbox_empty(lane)]
 
+    def note_stale_shipped(self) -> None:
+        """One missing-evidence note on every shipped ticket older than
+        VERIFY_NOTE_AFTER that no verify attempt has ever reached
+        (loom#2092), until the pass's step budget defers the rest to the
+        next run. The pool is the reserved lane's own (_verify_pool with
+        queued_holds=False): a ticket in it with an attempt on the ledger
+        has been reached and is spared, and a ticket the pool leaves to the
+        brain (proof refused too often) has attempts by construction. At
+        most once per VERIFY_NOTE_EVERY; a GitHub failure listing the pool
+        is logged and the run is not stamped, so the next pass retries."""
+        path = os.path.join(self.state, VERIFY_NOTE_FILE)
+        ledger = _read_json(path, {}, strict=False)
+        ledger = ledger if isinstance(ledger, dict) else {}
+        last = ledger.get("_at")
+        if isinstance(last, (int, float)) \
+                and 0 <= self.now - float(last) < VERIFY_NOTE_EVERY:
+            return
+        attempts = _read_json(os.path.join(self.state, VERIFY_FILE), {}, strict=False)
+        attempts = attempts if isinstance(attempts, dict) else {}
+        try:
+            pool, _held = self._verify_pool(attempts, queued_holds=False)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not list shipped tickets for verify notes: %s" % err)
+            return
+        deferred = False
+        try:
+            for repo, issue in pool:
+                if self._deferred():
+                    deferred = True
+                    break
+                number = int(issue["number"])
+                if "%s#%d" % (repo, number) in attempts:
+                    continue
+                shipped_at = float(issue.get("shipped_at", 0) or 0)
+                if not shipped_at or self.now - shipped_at < VERIFY_NOTE_AFTER:
+                    continue
+                self._note_one_shipped(repo, issue, ledger)
+        finally:
+            # A run the step budget cut short is not stamped: the cadence
+            # stamp would suppress the retry for a whole VERIFY_NOTE_EVERY
+            # while the tail of the pool is still unnoted. The notes already
+            # written keep their per-ticket stamps either way.
+            if not deferred:
+                ledger["_at"] = self.now
+            _write_json(path, ledger)
+
+    def _note_one_shipped(self, repo: str, issue: Dict[str, Any],
+                          ledger: Dict[str, Any]) -> None:
+        """Write the ticket's missing-evidence note, or refresh it in place
+        when the last write is older than VERIFY_NOTE_REFRESH (loom#2092).
+        The ledger is this pass's copy of VERIFY_NOTE_FILE; the caller
+        writes it back. A note already on the ticket is found by its
+        marker, so a lost ledger costs one comment read, never a second
+        note; a note that cannot be named (no id) still counts as noted."""
+        number = int(issue["number"])
+        key = "%s#%d" % (repo, number)
+        seen = ledger.get(key)
+        seen = seen if isinstance(seen, dict) else {}
+        written = seen.get("at")
+        if isinstance(written, (int, float)) \
+                and 0 <= self.now - float(written) < VERIFY_NOTE_REFRESH:
+            return
+        text = verify_note_text(float(issue.get("shipped_at", 0) or 0), self.now)
+        try:
+            comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+            note = next((c for c in comments if isinstance(c, dict)
+                         and VERIFY_NOTE_MARKER in str(c.get("body") or "")), None)
+            if note is None:
+                notify.post(self.gh, repo, number, text, notify.RECORD)
+                _say("noted %s: shipped over 24h with no verify attempt" % key)
+            elif isinstance(note.get("id"), int):
+                self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, note["id"]),
+                             {"body": text})
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not note %s as unverified: %s" % (key, err))
+            return
+        ledger[key] = {"at": self.now}
+
     def _hand_verifies(self, idle: List[str], starved_for: float = 0.0,
                        limit: int = 0) -> None:
         """Give each idle slot that may verify, has no build work and is
@@ -4974,6 +5083,7 @@ class Station:
                      self.referee_claims,
                      self.clean_labels,
                      self.queue_stateless_tickets,
+                     self.note_stale_shipped,
                      self.restate_shipped_live,
                      self.health_intake, self.intake_friction,
                      # The packet after the tick's row, so it renders that tick.
@@ -7746,16 +7856,38 @@ class Station:
             raise GitHubError("no issue was created in %s" % repo)
         return int(made["number"])
 
-    def _lanes_unchanged(self, repo: str, values: Dict[str, str]) -> bool:
-        """Same yes/no values published to the same repo within the hour."""
+    def _fresh_lanes_record(self, repo: str) -> Optional[Dict[str, Any]]:
+        """The saved record of a publish to `repo` within LANES_REPUBLISH;
+        None when there is none. It reads no GitHub state."""
         saved = _read_json(os.path.join(self.state, "lanes.json"), {}, strict=False)
         if not isinstance(saved, dict):
-            return False
+            return None
         last_at = saved.get("at")
         if isinstance(last_at, bool) or not isinstance(last_at, (int, float)):
-            return False
-        return (saved.get("repo") == repo and saved.get("values") == values
-                and 0 <= self.now - last_at <= LANES_REPUBLISH)
+            return None
+        fresh = saved.get("repo") == repo and 0 <= self.now - last_at <= LANES_REPUBLISH
+        return saved if fresh else None
+
+    def _lanes_unchanged(self, repo: str, values: Dict[str, str]) -> bool:
+        """Same yes/no values published to the same repo within the age."""
+        saved = self._fresh_lanes_record(repo)
+        return saved is not None and saved.get("values") == values
+
+    def _publish_lanes_when_old(self) -> None:
+        """Republish a lane table past LANES_REPUBLISH at the start of a pass.
+        Passes stop at the request target before the late publish_lanes step,
+        which left brains reading a table hours old on 2026-10-30 (loom#2273).
+        A fresh table spends no request here, and below the budget floor the
+        table waits as the step does; status then calls it stale."""
+        repo = self.s.status_repo
+        if not repo or self._fresh_lanes_record(repo) is not None or self._deferred():
+            return
+        try:
+            self._timed(self.publish_lanes)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("publish_lanes failed: %s" % err)
 
     def _spend_shown(self) -> Optional[spend.Summary]:
         """The anthropic spend, once there is a budget or a recorded run."""
@@ -7842,7 +7974,7 @@ class Station:
         summary = self._spend_shown()
         if summary is not None:
             # A new run (or a budget change) republishes; the clock alone waits
-            # for the hourly republish.
+            # for LANES_REPUBLISH.
             values["anthropic spend"] = "%d runs, $%.2f, budget %s" % (
                 summary.runs, summary.spent, self.s.anthropic.usd)
         # A changed scorecard (bus/scorecard.py) republishes too.
@@ -13460,6 +13592,7 @@ class Station:
         # no lane tree was pruned for hours on 2026-10-26.
         try:
             self.compare_send_back_counts()
+            self._publish_lanes_when_old()
             self.sync_labels()
             self.finish_claims()
             try:
