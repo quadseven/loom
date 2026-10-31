@@ -314,7 +314,8 @@ class FakeGitHub:
             return reply(201, {"number": 900})
         if method == "POST" and rest == "issues":
             if (data.get("title") == "Add the repository validation contract"
-                    or data.get("title", "").startswith(("Land or supersede #", "Epic: "))):
+                    or data.get("title", "").startswith(("Land or supersede #", "Epic: ",
+                                                         "Proof due"))):
                 number = max(self.issues.keys(), default=0) + 1
                 made = {"number": number, "id": 1000 + number, "title": data["title"],
                         "body": data["body"], "state": "open",
@@ -341,6 +342,10 @@ class FakeGitHub:
         return reply(201, {"id": 77})
 
     def _get_issues(self, query, headers):
+        for label in ("closed-unproven", "loom:proof-due"):
+            if "labels=%s&" % label in query:
+                return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and label in self.names(i["number"])])
         if "labels=loom:audit-failed&" in query:
             return reply(200, [i for i in self.issues.values()
                                if "loom:audit-failed" in self.names(i["number"])])
@@ -1172,10 +1177,11 @@ class AdoptUntrackedPullRequestTest(Base):
         self.fake.add_goal(30)
 
     def pull(self, number, author="alice-example", head_repo=REPO, ref="fix/stray-files",
-             body="", draft=False, created="2020-01-01T00:00:00Z", title="Tidy the docs"):
+             body="", draft=False, created="2020-01-01T00:00:00Z", title="Tidy the docs",
+             updated=None):
         self.fake.comments.setdefault(number, [])
         pr = {"number": number, "state": "open", "title": title, "user": {"login": author},
-              "body": body, "draft": draft, "created_at": created,
+              "body": body, "draft": draft, "created_at": created, "updated_at": updated or created,
               "head": {"ref": ref, "repo": {"full_name": head_repo}},
               "base": {"ref": "main", "repo": {"full_name": REPO}}}
         self.fake.pulls.append(pr)
@@ -1269,6 +1275,47 @@ class AdoptUntrackedPullRequestTest(Base):
         self.assertEqual([c["title"] for c in self.adoptions()],
                          ["Land or supersede #99: Tidy the docs"])
         self.assertEqual(len(self.markers(99)), 1)
+
+    def test_a_session_pull_request_a_day_old_is_not_adopted(self):
+        # #1182's 2 hours adopted pull requests a person or session was still
+        # driving: 85 of 711 ran past 2 hours, 22 past 48 (2026-10-17 to -31).
+        start = calendar.timegm((2030, 1, 1, 12, 0, 0))
+        self.pull(99, created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start - 24 * 3600)))
+        self.adopt(now=start)
+        self.assertEqual(self.adoptions(), [])
+        self.assertGreater(station.ADOPT_GRACE, 24 * 3600)
+        self.assertLessEqual(station.ADOPT_GRACE, 72 * 3600)
+
+    def stamp(self, epoch):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+    def test_recent_activity_holds_a_session_pull_request_past_the_grace(self):
+        start = calendar.timegm((2030, 1, 1, 12, 0, 0))
+        old = self.stamp(start - 5 * station.ADOPT_GRACE)
+        self.pull(99, created=old, updated=self.stamp(start - 3600))
+        self.adopt(now=start)
+        self.assertEqual(self.adoptions(), [])
+        self.assertEqual(self.fake.comments[99], [])
+        self.adopt(now=start - 3600 + station.ADOPT_GRACE)
+        self.assertEqual([c["title"] for c in self.adoptions()],
+                         ["Land or supersede #99: Tidy the docs"])
+
+    def test_a_loom_branch_waits_on_age_alone(self):
+        # The quiet rule is for branches a person or session drives; a lane's
+        # branch with no ticket is orphaned however busy its bots are.
+        start = calendar.timegm((2030, 1, 1, 12, 0, 0))
+        pr = {"created_at": self.stamp(start - station.ADOPT_GRACE),
+              "updated_at": self.stamp(start - 60)}
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=start)
+        self.assertTrue(runner._past_adopt_grace(dict(pr, head={"ref": "loom/12-fix-the-thing"})))
+        self.assertFalse(runner._past_adopt_grace(dict(pr, head={"ref": "fix/stray-files"})))
+
+    def test_a_pull_request_with_no_updated_time_waits_on_age_alone(self):
+        self.pull(99)
+        self.fake.pulls[-1].pop("updated_at")
+        self.adopt()
+        self.assertEqual([c["title"] for c in self.adoptions()],
+                         ["Land or supersede #99: Tidy the docs"])
 
     def test_a_pull_request_merged_since_the_listing_is_not_adopted(self):
         # The open list is read once a pass; eight tickets were filed at or

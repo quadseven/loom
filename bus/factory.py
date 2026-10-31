@@ -178,7 +178,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, bench, brain, brain_hold, brief_check, change_class, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
+from . import answer, bench, brain, brain_hold, brief_check, change_class, claimed, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -275,10 +275,12 @@ DEGRADED_REVIEW_MARK = "Degraded review ("
 
 def degraded_review(title: str, summary: str) -> bool:
     """True when a review check's output is a partial or degraded result, not
-    a verdict: the summary carries the review bot's degraded marker, or the
-    title names a partial-review form anywhere (a hunt title puts a commit
-    range before it, "Living Hunt a..b - WARN ...")."""
-    return (DEGRADED_REVIEW_MARK in str(summary or "")
+    a verdict: a summary line opens with the review bot's degraded marker (a
+    finding that quotes those words sits inside its own line and is a
+    verdict), or the title names a partial-review form anywhere (a hunt title
+    puts a commit range before it, "Living Hunt a..b - WARN ...")."""
+    return (any(line.startswith(DEGRADED_REVIEW_MARK)
+                for line in str(summary or "").splitlines())
             or any(mark in str(title or "") for mark in PARTIAL_REVIEW_TITLES))
 
 
@@ -1746,6 +1748,8 @@ class Factory:
         self.hygiene_updates: Dict[str, int] = {}
         self._hygiene_noted: set = set()
         self._runs: Dict[str, List[Dict[str, Any]]] = {}
+        # Re-review requests posted this pass (claimed.REREVIEW_PER_RUN bounds it).
+        self._review_asks = 0
         # The tickets named by After: lines, and closed tickets whose lane
         # pull requests are still open, read once a pass.
         self._depends: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -3422,17 +3426,57 @@ class Factory:
         if not degraded_review(str(output.get("title") or ""),
                                str(output.get("summary") or "")):
             return False
+        return self._ask_review_again(repo, number, sha)
+
+    def _ask_review_again(self, repo: str, number: int, sha: str) -> bool:
+        """Post this head's one re-review request, or wait for the next pass
+        once claimed.REREVIEW_PER_RUN went out on this one. False when a
+        marker for this head is already on the pull request."""
         marker = REVIEW_AGAIN_MARKER % sha
         # A trusted marker only: a stranger's copy must not stop the ask.
         for comment in self._trusted_comments(repo, number):
             if marker in str(comment.get("body") or ""):
                 return False
+        if self._review_asks >= claimed.REREVIEW_PER_RUN:
+            _say("%s#%d waits for the next pass: %d re-review requests is the bound for one"
+                 % (repo, number, claimed.REREVIEW_PER_RUN))
+            return True
         notify.post(self.gh, repo, number, "%s\n%s" % (marker, REVIEW_AGAIN),
                     notify.REVIEW_REQUEST)
+        self._review_asks += 1
         self.actions += 1
-        _say("asked the review bot to review %s#%d again after a partial review"
-             % (repo, number))
+        _say("asked the review bot to review %s#%d again after a partial review "
+             "(%d of %d this pass)" % (repo, number, self._review_asks,
+                                       claimed.REREVIEW_PER_RUN))
         return True
+
+    def _rereview_degraded(self, repo: str) -> None:
+        """The one re-review request of every open lane head whose newest
+        review check failed degraded. _judge reaches only a loom:pr ticket's
+        head with nothing else wrong, so a head on a ticket at loom:failed or
+        loom:briefed sat with a red check nothing could clear (loom#2286).
+        This runs after the repo pass: _judge asks first, and a head it asked
+        for carries the marker this reads."""
+        for pr in self.gh.paginate("/repos/%s/pulls?state=open" % repo):
+            if not isinstance(pr, dict) or not self._is_lane_pr(pr):
+                continue
+            sha = str((pr.get("head") or {}).get("sha") or "")
+            if not sha or not self._head_degraded(repo, sha):
+                continue
+            capped = self._review_asks >= claimed.REREVIEW_PER_RUN
+            if self._ask_review_again(repo, int(pr["number"]), sha) and capped:
+                return
+
+    def _head_degraded(self, repo: str, sha: str) -> bool:
+        """True when this head's newest review check concluded failure with a
+        degraded output, whatever else fails on it."""
+        runs = self._runs.get(sha)
+        if runs is None:
+            runs = self._runs[sha] = self._check_runs(repo, sha)
+        return any(r.get("name") == self.review_check and r.get("conclusion") == "failure"
+                   and degraded_review(str((r.get("output") or {}).get("title") or ""),
+                                       str((r.get("output") or {}).get("summary") or ""))
+                   for r in runs)
 
     def _review_degraded(self, sha: str) -> bool:
         """True when the only non-green run on this head is the review check
@@ -4748,6 +4792,8 @@ class Factory:
         before = _placements(tickets)
         for repo in self.repos:
             self._repo_pass(repo, tickets[repo])
+            # Outside _repo_pass: its MAX_ACTIONS return must not skip this.
+            self._guarded(lambda r, _: self._rereview_degraded(r), repo, {})
         self._no_lane_moves(tickets, before)
 
     def _repo_pass(self, repo: str, tickets: Dict[int, Dict[str, Any]]) -> None:
