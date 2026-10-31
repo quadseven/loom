@@ -7207,7 +7207,7 @@ class LogRetentionTest(Base):
         self.settings.transcript_token_ssm = "/loom/token"
         running = self.session_run("openrouter", "example.repo-3")
         self.write(self.inbox("openrouter", "example.repo-3.md"), "brief\n")
-        unsent = self.session_run("openrouter", "example.repo-4")
+        unsent = self.session_run("openrouter", "example.repo-4", days=0)
         sent = self.session_run("openrouter", "example.repo-5")
         for name in ("example.repo-4", "example.repo-5"):
             self.write(self.inbox("openrouter", "done", name + ".md"), "brief\n")
@@ -7218,6 +7218,18 @@ class LogRetentionTest(Base):
         self.assertTrue(os.path.exists(unsent))
         self.assertFalse(os.path.exists(sent))
         self.assertTrue(os.path.exists(sent + ".gz"))
+
+    def test_an_unsent_runs_store_is_compressed_after_a_day(self):
+        # loom#2268: on 2026-10-30 unsent runs held 7 GB of raw stores in
+        # 13 GB of logs. The upload reads either form.
+        self.settings.transcript_url = "https://dashboard.example.com/api/transcripts"
+        self.settings.transcript_token_ssm = "/loom/token"
+        unsent = self.session_run("openrouter", "example.repo-4", days=2)
+        self.write(self.inbox("openrouter", "done", "example.repo-4.md"), "brief\n")
+        self.write(os.path.join(self.home, "state", "station", "transcripts.json"), "{}")
+        self.tend()
+        self.assertFalse(os.path.exists(unsent))
+        self.assertTrue(os.path.exists(unsent + ".gz"))
 
     def test_a_compressed_store_goes_with_its_run_after_retention(self):
         db = self.session_run("opencode-go", "example.repo-6", days=3)
@@ -7230,6 +7242,72 @@ class LogRetentionTest(Base):
         os.remove(os.path.join(self.home, "state", "station", "disk.json"))
         self.tend()
         self.assertFalse(os.path.exists(os.path.join(self.home, "logs", "opencode-go", "example.repo-6")))
+
+    def test_a_service_log_past_the_limit_is_rotated_by_the_hourly_tend(self):
+        self.settings.log_rotate_bytes = 100
+        log = os.path.join(self.home, "logs", "station.log")
+        self.write(log, "x" * 500)
+        said = self.tend()
+        self.assertFalse(os.path.exists(log))
+        names = os.listdir(os.path.join(self.home, "logs"))
+        self.assertEqual(len([n for n in names if n.startswith("station.log.")]), 1)
+        self.assertTrue(any(s.startswith("rotated station.log") for s in said), said)
+
+    def test_a_lane_run_log_past_the_limit_stays_where_the_station_reads_it(self):
+        self.settings.log_rotate_bytes = 100
+        log = self.aged(os.path.join(self.home, "logs", "codex", "example.repo-1.log"), 0, "x" * 500)
+        self.tend()
+        self.assertTrue(os.path.exists(log))
+
+    def over_limit(self, slot, name, days, size=4096 * 4):
+        return self.aged(os.path.join(self.home, "logs", slot, name), days, "x" * size)
+
+    def test_logs_over_the_limit_lose_their_oldest_finished_runs_first(self):
+        oldest = self.over_limit("codex", "example.repo-1.log", 6)
+        older = self.over_limit("claude", "example.repo-2.log", 5)
+        newer = self.over_limit("codex", "example.repo-3.log", 4)
+        total = station._tree_stat(os.path.join(self.home, "logs"))[1]
+        self.settings.log_max_bytes = total - 1
+        said = self.tend()
+        self.assertFalse(os.path.exists(oldest))
+        self.assertTrue(os.path.exists(older))
+        self.assertTrue(os.path.exists(newer))
+        self.assertTrue(any(s.startswith("logs hold ") for s in said), said)
+
+    def test_the_limit_never_takes_a_running_run_or_a_fresh_one(self):
+        running = self.over_limit("codex", "example.repo-1.log", 6)
+        self.write(self.inbox("codex", "example.repo-1.md"), "brief\n")
+        fresh = self.over_limit("codex", "example.repo-2.log", 0)
+        self.settings.log_max_bytes = 1
+        said = self.tend()
+        self.assertTrue(os.path.exists(running))
+        self.assertTrue(os.path.exists(fresh))
+        self.assertTrue(any(s.startswith("logs hold ") and "over the" in s for s in said), said)
+
+    def test_the_limit_never_takes_an_unsent_run(self):
+        self.settings.transcript_url = "https://dashboard.example.com/api/transcripts"
+        self.settings.transcript_token_ssm = "/loom/token"
+        unsent = self.over_limit("codex", "example.repo-1.log", 6)
+        self.write(self.inbox("codex", "done", "example.repo-1.md"), "brief\n")
+        self.write(os.path.join(self.home, "state", "station", "transcripts.json"), "{}")
+        self.settings.log_max_bytes = 1
+        self.tend()
+        self.assertTrue(os.path.exists(unsent))
+
+    def test_a_zero_limit_turns_the_size_limit_off(self):
+        log = self.over_limit("codex", "example.repo-1.log", 6)
+        self.settings.log_max_bytes = 0
+        self.tend()
+        self.assertTrue(os.path.exists(log))
+
+    def test_log_limits_are_read_from_the_environment(self):
+        loaded = station.Settings.from_env({"LOOM_LOG_MAX_GB": "2.5", "LOOM_LOG_ROTATE_MB": "7"})
+        self.assertEqual(loaded.log_max_bytes, int(2.5 * 1024 ** 3))
+        self.assertEqual(loaded.log_rotate_bytes, 7 * 1024 ** 2)
+        with mock.patch("bus.station._say"):
+            loaded = station.Settings.from_env({"LOOM_LOG_MAX_GB": "x", "LOOM_LOG_ROTATE_MB": "-1"})
+        self.assertEqual(loaded.log_max_bytes, int(station.LOG_MAX_GB * 1024 ** 3))
+        self.assertEqual(loaded.log_rotate_bytes, int(station.LOG_ROTATE_MB * 1024 ** 2))
 
     def test_a_linked_session_store_is_never_followed(self):
         outside = os.path.join(self._tmp.name, "outside.db")
