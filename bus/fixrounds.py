@@ -76,6 +76,10 @@ def transition_finding(finding: Mapping[str, Any], action: str, revision: str,
 
     Answers require a pushed commit touching the finding's cited path, or an
     explicit reviewer acceptance. Stale revisions and skipped states refuse.
+
+    This is the exported API the station calls to check a lane's pickup or
+    answer against a finding record; it takes the commit's changed files as
+    data and does no GitHub I/O, so callers fetch them first.
     """
     recorded = str(finding.get("revision") or "").lower()
     submitted = str(revision or "").lower()
