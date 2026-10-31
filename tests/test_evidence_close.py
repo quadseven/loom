@@ -361,6 +361,59 @@ class Guardrail(Case):
         self.assertIn("1 of 1", self.control("status"))
         self.assertIn("Paused", self.proof_issues()[0]["body"])
 
+    def asks(self):
+        found = []
+        for issue in self.proof_issues():
+            for comment in self.fake.comments.get(issue["number"], []):
+                if "evidence close is stopped" in str(comment.get("body") or ""):
+                    found.append(comment)
+        return found
+
+    def test_a_stop_raises_one_ask_however_many_passes_see_it(self):
+        self.ticket(1)
+        self.ticket(2)
+        self.close_pass()
+        self.reopen(1)
+        self.ticket(3)
+        self.close_pass()
+        self.reopen(2)
+        self.close_pass()
+        self.close_pass()
+        self.assertEqual(self.fake.issues[3]["state"], "open")
+        [issue] = self.proof_issues()
+        self.assertIn("needs:human", self.fake.names(issue["number"]))
+        found = self.asks()
+        self.assertEqual(len(found), 1, found)
+        body = str(found[0].get("body") or "")
+        self.assertIn("closes reopened, above 5%", body)
+        self.assertIn("python3 -m bus.evidence_close resume", body)
+
+    def test_an_operators_own_pause_asks_nothing(self):
+        self.ticket(1)
+        self.close_pass()
+        self.control("pause")
+        self.ticket(2)
+        self.close_pass()
+        self.close_pass()
+        self.assertEqual(self.fake.issues[2]["state"], "open")
+        [issue] = self.proof_issues()
+        self.assertNotIn("needs:human", self.fake.names(issue["number"]))
+        self.assertEqual(self.asks(), [])
+
+    def test_a_later_stop_after_a_resume_raises_a_new_one(self):
+        self.ticket(1)
+        self.close_pass()
+        self.reopen(1)
+        self.close_pass()
+        self.assertEqual(len(self.asks()), 1)
+        self.control("resume")
+        self.ticket(2)
+        self.close_pass(time.time() + 5)
+        self.assertEqual(self.fake.issues[2]["state"], "closed")
+        self.reopen(2)
+        self.close_pass(time.time() + 10)
+        self.assertEqual(len(self.asks()), 2, self.asks())
+
     def test_a_reopen_at_the_limit_does_not_stop_it(self):
         now = time.time()
         for number in range(1, 21):

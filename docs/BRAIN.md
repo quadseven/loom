@@ -2036,6 +2036,11 @@ reopened tickets, and a reopen stays counted after the ticket closes again.
 Above the limit this close stops, says so in the log and in each Proof due
 issue, and the usual done close takes over. A first reopen in fewer than 20
 closes stops it too. The count is a floor: it sees only reopens someone made.
+A guardrail stop also raises one `needs:human` ask on the repo's Proof due
+issue, naming the reason and the resume command: a state flag holds it once
+per stop (a changing reopen count raises nothing new) and clears when the
+close runs again, so a later stop asks again. An operator's own pause raises
+no ask.
 
     python3 -m bus.evidence_close status
     python3 -m bus.evidence_close pause

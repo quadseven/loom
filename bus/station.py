@@ -9426,20 +9426,48 @@ class Station:
             self._say_paused(state, run.paused)
         else:
             state.pop("paused_said", None)
+            state.pop("paused_asked", None)
         return run
 
     def _say_paused(self, state: Dict[str, Any], why: str) -> None:
-        """Write the pause into each repo's Proof due issue, once."""
-        if state.get("paused_said") == why:
+        """Write the pause into each repo's Proof due issue, once per stop.
+        A guardrail stop also raises one needs:human ask there, naming the
+        reason and the resume command: the `paused_asked` flag holds it, so
+        many passes and a changing reopen count raise nothing new, and the
+        flag clears in _evidence_pass when the close runs again, so a later
+        stop asks again. An operator's own pause raises no ask."""
+        operator = why == evidence_close.OPERATOR_PAUSE
+        if state.get("paused_said") == why and (operator or state.get("paused_asked")):
             return
         try:
             for repo in sorted({str(c.get("repo")) for c in evidence_close.closes(state)}):
-                self._write_proof_due(repo, [], why)
+                if state.get("paused_said") == why:
+                    number = self._proof_due_issue(repo)
+                else:
+                    number = self._write_proof_due(repo, [], why)
+                if not operator and not state.get("paused_asked"):
+                    self._ask_proof_due(repo, number, why)
             state["paused_said"] = why
+            if not operator:
+                state["paused_asked"] = True
         except RateLimited:
             raise
-        except GitHubError as err:
+        except (GitHubError, ValueError) as err:
             _say("could not write the evidence close pause: %s" % err)
+
+    def _ask_proof_due(self, repo: str, number: int, why: str) -> None:
+        """Raise a guardrail stop's needs:human ask on the Proof due issue."""
+        try:
+            brain.human(self.gh, repo, number, evidence_close.ask(why))
+        except ValueError as err:
+            if "already needs:human" not in str(err):
+                raise
+            # A later stop, and the earlier ask's label is still on the
+            # issue: the ask itself is new, so post it in the shape
+            # brain.human writes, without re-adding a label it carries.
+            kind, text = brain.human_kind(evidence_close.ask(why))
+            notify.post(self.gh, repo, number,
+                        "%s\n%s\nKind: %s" % (HUMAN_MARKER, text, kind), notify.ASK)
 
     def _evidence_close(self, repo: str, issue: Dict[str, Any]) -> str:
         """The narrow evidence close of one ticket (bus/evidence_close.py):

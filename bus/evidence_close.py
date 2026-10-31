@@ -30,8 +30,10 @@ never closed unlisted. It is the one close that passes through shadow
 The guardrail: reopens stay at or below MAX_REOPEN_RATE of the last WINDOW
 closes. A reopened ticket keeps the label, so one listing per repo finds it,
 and it stays counted after it closes again. Above the limit this close type
-stops until the operator resumes it. The first reopen of a young run stops it
-too, on purpose: fewer than 20 closes cannot hold one at 5%.
+stops until the operator resumes it, and the stop raises one needs:human ask
+on the repo's Proof due issue (the station holds the flag; an operator's own
+pause raises none). The first reopen of a young run stops it too, on purpose:
+fewer than 20 closes cannot hold one at 5%.
 
     python3 -m bus.evidence_close status
     python3 -m bus.evidence_close pause
@@ -52,6 +54,8 @@ from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Seq
 from . import claimed, labels, merge_effect, merge_tier, proof, tickets, verify_data
 
 LABEL = "closed-unproven"
+OPERATOR_PAUSE = "the operator paused it"
+RESUME_COMMAND = "python3 -m bus.evidence_close resume"
 PROOF_LABEL = "loom:proof-due"
 PROOF_TITLE = "Proof due: Live boxes of tickets closed unproven"
 STATE_FILE = "evidence-close.json"
@@ -235,10 +239,18 @@ def rate(state: Mapping[str, Any], control: Mapping[str, Any]) -> Tuple[int, int
     return len([c for c in recent if c.get("reopened")]), len(recent)
 
 
+def ask(why: str) -> str:
+    """The one needs:human ask a guardrail stop raises on a repo's Proof due
+    issue: the reason it stopped and the command that restarts it."""
+    return ("Kind: decision\nThe evidence close is stopped: %s. Read the reopened "
+            "closes listed in this issue, then run `%s` to restart this close, "
+            "or leave it stopped." % (why, RESUME_COMMAND))
+
+
 def paused_why(state: Mapping[str, Any], control: Mapping[str, Any]) -> str:
     """Why this close type is stopped, or ""."""
     if control.get("paused"):
-        return "the operator paused it"
+        return OPERATOR_PAUSE
     reopened, total = rate(state, control)
     if total and reopened / total > MAX_REOPEN_RATE:
         return "%d of %d closes reopened, above %d%%" % (
