@@ -322,7 +322,7 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 flags `loom:runaway`, and every lane that bills that key stays unavailable
 with `API key expired: renew <the SSM parameter>` in its heartbeat, with no
 `retry_at`, until the value at that parameter changes. The runner opens one
-`needs-operator` ask on the factory repo naming that parameter. opencode
+`needs:human` ask on the factory repo naming that parameter. opencode
 lanes run with `--print-logs --log-level ERROR`, because opencode's own
 output says only "UnknownError: Unexpected server error" for every provider
 fault: the logged error shows an upstream 429 (a limit) or a model opencode
@@ -568,8 +568,8 @@ most 2 questions a pass and 3 citations each; the key is read for each call
 and only asks, never writes. Fabric unset, down, slow or silent builds the
 ticket as before.
 
-Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
-(ETag polls) and forwards those whose author and latest `needs-operator`
+Asks: the station reads open `needs:human` issues in each `LOOM_REPOS` repo
+(ETag polls) and forwards those whose author and latest `needs:human`
 labeller are in `LOOM_BRIEF_AUTHORS` to a Discord webhook whose URL it reads
 from the SSM parameter named by `LOOM_DISCORD_WEBHOOK_SSM` (region
 `LOOM_AWS_REGION`, default us-east-1; never printed, and with the setting
@@ -996,8 +996,18 @@ The loom home is kept bounded by the station and the runner (loom#643).
   `LOOM_LOG_KEEP_DAYS` days (default 7; `0` keeps them all). An entry is kept
   however old while a brief of its name is waiting or running in a lane
   inbox, and, while transcripts are uploaded, until the ledger holds the run
-  as sent or settled; an unreadable inbox or ledger removes nothing. The
-  station's own logs at the top of `logs/` are not touched.
+  as sent or settled; an unreadable inbox or ledger removes nothing.
+- `logs/` as a whole stays under `LOOM_LOG_MAX_GB` (default 10; `0` for no
+  limit, loom#2268). Past it the oldest entries go first, younger than
+  `LOOM_LOG_KEEP_DAYS` if need be, but never one kept above or one changed in
+  the last day. `station.log` says `logs hold ...` every hour, and says
+  `over` when what is left is kept.
+- Each `*.log` at the top of `logs/` past `LOOM_LOG_ROTATE_MB` (default 20)
+  is renamed to `<name>.<UTC stamp>` (`bus/logrotate.py`), and the next start
+  of its service makes a new one. A process still running keeps writing the
+  renamed file, so no line is lost, and the file is compressed once `lsof`
+  shows nothing holds it. Five `.gz` copies of each log stay. `viewer.log`
+  and `dashboard.log` are not rotated: launchd opens them once.
 - The runner removes a check's scratch home (`run/<slot>-check`) after the
   final check and when it exits, so `run/` holds one only while that lane runs.
 - While the home's disk has less than `LOOM_MIN_FREE_GB` free (default 15;
@@ -1021,8 +1031,8 @@ The loom home is kept bounded by the station and the runner (loom#643).
   every pass meanwhile.
 - Every hour the station removes the old lane logs, compresses each finished
   run's opencode session store (`logs/<slot>/<run>/.local/share/opencode/
-  opencode.db`, to `opencode.db.gz`, once its transcript is uploaded; the
-  readers read either), and logs the home's size by top-level folder
+  opencode.db`, to `opencode.db.gz`, once its transcript is uploaded or a
+  day after the run; the readers read either), and logs the home's size by top-level folder
   (`loom home holds ...`), kept in `state/station/disk.json`. A compressed
   store goes with its run's other logs after `LOOM_LOG_KEEP_DAYS`.
 

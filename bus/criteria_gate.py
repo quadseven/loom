@@ -36,7 +36,7 @@ GitHub client, or a read-only `kubectl get ...` / `kubectl rollout status ...`
 backticked or double-quoted strings must appear in the answer. The result is
 kept in the station's state and written to the ticket's status. A criterion
 with no runnable check, a check that keeps failing, and every operator
-criterion send the ticket to loom:human with one ask, once.
+criterion send the ticket to needs:human with one ask, once.
 """
 from __future__ import annotations
 

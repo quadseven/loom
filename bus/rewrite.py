@@ -379,7 +379,7 @@ def apply_answer(gh: GitHub, repo: str, goal: int, number: int, output: str) -> 
     elif action == "human":
         # The rewrite model only proposes it: free models labelled factory
         # work as person-only (GitHub access as "a credential", a Datadog
-        # monitor while Datadog is off), and every loom:human lands in the
+        # monitor while Datadog is off), and every needs:human lands in the
         # operator's digest. The brain decides; the issue stays loom:triage.
         gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [NEEDS_BRAIN]})
         print("rewrite: %s#%d proposed as person-only, left to the brain: %s"

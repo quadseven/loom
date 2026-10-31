@@ -51,7 +51,7 @@ ANSWER = "answer"
 
 KINDS = {
     FAILURE: "a red merge, a revert, or a lane's hand-back that a person may need to read",
-    ASK: "the exact thing only a person can do (loom:human)",
+    ASK: "the exact thing only a person can do (needs:human)",
     RUNAWAY: "a hold or release of a ticket that ran past its attempts",
     PROOF_REFUSED: "the station stops handing a ticket out to verify after refused proofs",
     FIX_BRIEF: "a loom:fix brief (the station edits later rounds into it, bus/fixrounds.py)",
