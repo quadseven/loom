@@ -1133,7 +1133,8 @@ the sandboxed agent to answer every review thread it lists: one entry per
 thread in `.loom/replies.json` (thread id, reply text, and a resolve boolean,
 true when the round fixed it, false with a concrete reason when it declines),
 or an answer file in `.loom-answers/`. The runner posts valid entries after a
-successful push and resolves those marked true; missing or invalid files
+successful push, skips a reply the thread already holds, and resolves those
+marked true only when the round's commits change the thread's file; missing or invalid files
 produce no replies. A listed thread left with neither is named in the log and
 in the round comment on the pull request ("Review threads this round left
 without a reply"). An entry
