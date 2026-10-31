@@ -371,7 +371,13 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    The station posts it in the channel as a reply, so it must stand on its
    own and fit in a phone message.
    Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse`. It
-   refuses unless you hold the lock. Each `resume` line it prints is stage
+   refuses unless you hold the lock. It writes each repo's goal sections as
+   it reads them and logs progress to stderr (the repo, the requests so far,
+   and every rate-limit or retry wait); a killed run keeps what it wrote.
+   With `--deadline MINUTES` (default 8) it stops reading at that point,
+   prints `resume skipped OWNER/NAME: deadline` for each repo it did not
+   finish (`resume skipped sensitive: deadline` when it stopped in the
+   sensitive pull requests) and exits 0: work those repos next tick. Each `resume` line it prints is stage
    work another brain yielded (Handing off stage work): finish those items
    first, before measuring anything or starting new work, under the same
    rules as the steps below (a merge still needs a ready pull request).

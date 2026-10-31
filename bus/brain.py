@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
+from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
@@ -5810,12 +5810,19 @@ def _ready_sensitive_in(gh: GitHub, repo: str, now: datetime, check: str
 
 def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
                             env: Optional[Dict[str, str]],
-                            ready: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+                            ready: Optional[List[Dict[str, Any]]] = None,
+                            pulls: Optional[Callable[[str], List[Any]]] = None) -> List[str]:
     """Ready sensitive PRs needing brain attention (or the `ready` already
-    read for `repos`), oldest first."""
+    read for `repos`), oldest first. `pulls` reads a repo's open pull
+    requests (default: straight from GitHub)."""
     if ready is None:
         check = review_check_name(env)
-        ready = [item for repo in repos for item in _ready_sensitive_in(gh, repo, now, check)]
+        if pulls is None:
+            ready = [item for repo in repos for item in _ready_sensitive_in(gh, repo, now, check)]
+        else:
+            ready = [item for repo in repos
+                     for item in (_ready_sensitive(gh, repo, pr, now, check) for pr in pulls(repo))
+                     if item is not None]
     ready = list(ready)
     ready.sort(key=lambda item: (item["created"], item["repo"], int(item["pr"]["number"])))
     out = ["", "## Sensitive pull requests (up to %d, oldest first)" % SENSITIVE_RESUME_MAX]
@@ -5828,6 +5835,184 @@ def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
             item["repo"], pr["number"], ticket[0], ticket[1], title,
             pr.get("title", ""), _age(pr, now), open_threads))
     return out if ready else out + ["- none"]
+
+
+class _PastDeadline(Exception):
+    """The resume deadline passed, or a rate-limit wait would pass it."""
+
+
+class _ResumeRead:
+    """One resume run: reads goals and writes each goal's section through
+    `emit` as soon as it is read, so a run that is killed keeps what it
+    finished. Reads go through `retrying`, which stops at the deadline and
+    sits out a rate-limit wait only when it ends before the deadline."""
+
+    def __init__(self, gh: GitHub, authors: Sequence[str], emit: Callable[[str], None],
+                 deadline: float) -> None:
+        self.gh = gh
+        self.authors = authors
+        self.emit = emit
+        self.deadline = deadline
+        self.unread: Dict[str, str] = {}
+        self.goals: List[GoalJournals] = []
+        self.latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark] = {}
+
+    def log(self, text: str) -> None:
+        print(text, file=sys.stderr, flush=True)
+
+    def check(self) -> None:
+        if _clock() >= self.deadline:
+            raise _PastDeadline()
+
+    def retrying(self, read: Callable[[], Any]) -> Any:
+        """read(), after a rate-limit wait if GitHub refuses for budget."""
+        while True:
+            self.check()
+            try:
+                return read()
+            except RateLimited as err:
+                self._wait_out(err)
+
+    def _wait_out(self, err: RateLimited) -> None:
+        wait = max(0.0, err.until - time.time())
+        if _clock() + wait >= self.deadline:
+            raise _PastDeadline()
+        self.log("resume: waiting %.0fs for the GitHub rate limit (resets %s)"
+                 % (wait, _utc(err.until)))
+        _sleep(wait)
+
+    def read_repo(self, repo: str) -> None:
+        """Write the section of every goal in `repo`, once all its journals
+        are read; an unreadable repo is recorded in `unread` and left out
+        (github.unreadable). A repo already found unreadable is not read again."""
+        if repo in self.unread:
+            return
+        self.log("resume: reading %s (requests: %d)" % (repo, self.gh.requests))
+        try:
+            found = [self._read_goal(repo, issue)
+                     for issue in self.retrying(lambda: _issues(self.gh, repo))
+                     if "loom:goal" in _labels(issue)]
+        except GitHubError as err:
+            reason = unreadable(err)
+            if reason is None:
+                raise
+            self.unread[repo] = reason
+            return
+        self.goals += found
+        self._note_marks(found)
+        for goal in found:
+            self.emit("\n".join(self._goal_lines(goal)))
+
+    def open_pulls(self, repo: str) -> List[Any]:
+        """The repo's open pull requests; a repo GitHub will not show
+        (github.unreadable) is recorded in `unread` and reads as none."""
+        try:
+            return self.retrying(lambda: self.gh.paginate("/repos/%s/pulls?state=open" % repo))
+        except GitHubError as err:
+            reason = unreadable(err)
+            if reason is None:
+                raise
+            self.unread[repo] = reason
+            return []
+
+    def _goal_lines(self, goal: GoalJournals) -> List[str]:
+        return self.retrying(lambda: _goal_resume_lines(
+            self.gh, goal[0], goal[1], goal[2], self.latest, goal[3], self.unread))
+
+    def _read_goal(self, repo: str, issue: Dict[str, Any]) -> GoalJournals:
+        comments = self.retrying(lambda: _goal_home_comments(self.gh, repo, int(issue["number"])))
+        return (repo, issue, handoff.journals(comments, self.authors),
+                handoff.untrusted_journal_logins(comments, self.authors))
+
+    def _note_marks(self, found: Sequence[GoalJournals]) -> None:
+        """Keep the newest mark of each handoff across the goals read so far."""
+        for _, _, journals, _ in found:
+            for mark in handoff.marks(journals):
+                key = _mark_key(mark)
+                if key not in self.latest or mark.at >= self.latest[key].at:
+                    self.latest[key] = mark
+
+
+def _read_goals(read: _ResumeRead, repos: Sequence[str]) -> None:
+    """Read each repo's goals; at the deadline name every repo not finished."""
+    for index, repo in enumerate(repos):
+        try:
+            read.check()
+            read.read_repo(repo)
+        except _PastDeadline:
+            for left in repos[index:]:
+                read.emit("resume skipped %s: deadline" % left)
+            return
+
+
+def _resume_sensitive(read: _ResumeRead, repos: Sequence[str], now: datetime,
+                      env: Optional[Dict[str, str]]) -> None:
+    """The sensitive pull requests, written before the goals as resume always
+    listed them. The deadline is checked before each repo's pull requests are
+    read; past it the section is named and the goals that follow are too."""
+    try:
+        lines = read.retrying(lambda: _sensitive_resume_lines(read.gh, repos, now, env,
+                                                              pulls=read.open_pulls))
+    except _PastDeadline:
+        read.emit("resume skipped sensitive: deadline")
+        return
+    read.emit("\n".join(lines))
+
+
+def _stream_resume_tail(read: _ResumeRead, repos: Sequence[str], holder: str,
+                 now: datetime, env: Optional[Dict[str, str]]) -> None:
+    """Everything after the goals: the freshness rule, then the sections that
+    read across repos. Past the deadline the sections left are named."""
+    gh, goals = read.gh, [(r, i) for r, i, _, _ in read.goals]
+    read.emit("")
+    read.emit(_freshness_line(handoff.peer_journals([j for _, _, f, _ in read.goals for j in f],
+                                                    holder, now)))
+    sections = (("finished-epics", lambda: _finished_epic_resume_lines(gh, goals)),
+                ("verify", lambda: _verify_resume_lines(gh, repos, now)),
+                ("audit", lambda: _audit_resume_lines(gh, repos, now, env)))
+    for index, (_, build) in enumerate(sections):
+        try:
+            lines = read.retrying(build)
+        except _PastDeadline:
+            read.emit("resume skipped %s: deadline" % ",".join(n for n, _ in sections[index:]))
+            return
+        read.emit("\n".join(lines))
+
+
+def stream_resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
+                  emit: Callable[[str], None], deadline_minutes: float = 8,
+                  now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None) -> None:
+    """What the lock holder may finish for other brains: the live resume items
+    on every goal, with each goal's stage owners, and whether broad GitHub
+    work is open to it under the freshness rule (handoff.QUIET). Refuses
+    unless `holder` holds the lock, so only the lock holder acts on it.
+
+    The sensitive pull requests come first, then each repo's goal sections go
+    to `emit` as soon as they are read. Progress goes
+    to stderr before each repo, and a line whenever the run waits on GitHub.
+    After `deadline_minutes` it reads no more and emits
+    `resume skipped OWNER/NAME: deadline` for each repo it did not finish;
+    the freshness line and the sections across repos follow the goals.
+    A repo's sections are written once all its goals' journals are read, so
+    a handoff finished by a goal in a repo not yet read still shows until
+    the item itself reads as finished or closed."""
+    now = now or datetime.now(timezone.utc)
+    authors = require_trusted_authors(env, "resume")
+    _lock_holder(gh, lock_repo, holder, now)
+    read = _ResumeRead(gh, authors, emit, _clock() + deadline_minutes * 60)
+    gh.on_wait = lambda seconds: read.log("resume: waiting %.0fs to retry a GitHub read" % seconds)
+    try:
+        _resume_sensitive(read, repos, now, env)
+        emit("# Resume for %s" % holder)
+        emit("")
+        emit(trusted_line(authors))
+        _read_goals(read, repos)
+        if read.unread:
+            emit("\n".join(["", "## Skipped repos (fix LOOM_REPOS)"]
+                            + [_skip_line(r, why) for r, why in sorted(read.unread.items())]))
+        _stream_resume_tail(read, [r for r in repos if r not in read.unread], holder, now, env)
+    finally:
+        gh.on_wait = None
 
 
 def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
@@ -5843,7 +6028,11 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     the heading once every repo's goal journals are read, then each repo's
     goal items as that repo's reads finish, then the sections that span every
     repo. A repo whose read runs past the per-repo budget is named as timed
-    out and left out of every later section."""
+    out and left out of every later section.
+
+    The sensitive pull requests are read before the goals: a repo
+    GitHub will not show there is named as skipped and left out of
+    every later read, so its goals are never read at all."""
     now = now or datetime.now(timezone.utc)
     authors = require_trusted_authors(env, "resume")
     seconds = per_repo.budget(env, budget)
@@ -5852,7 +6041,18 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     # issue listing, comments and events once (loom#2078).
     gh = issue_reads.once(gh)
     out: List[str] = []
-    goals, unread, timed = _resume_journals(gh, repos, authors, seconds)
+    check, trusted = review_check_name(env), trusted_authors(env)
+    # The sensitive pull requests are read first, as resume lists them
+    # first: a repo GitHub will not show there is named once and left out
+    # of every later read, so its goals are never read at all. Any other
+    # fault ends the run, as a fault in the goal reads does. These reads
+    # run under the per-repo budget too: a repo past it is timed out.
+    ready, unread, timed = _resume_ready_sensitive(gh, repos, now, check, seconds)
+    goals, skipped, late = _resume_journals(
+        gh, [r for r in dict.fromkeys(repos) if r not in unread and r not in timed],
+        authors, seconds)
+    unread.update(skipped)
+    timed += late
     # A moved or forbidden repo is named once and left out of every later
     # section, so one stale LOOM_REPOS entry does not end the run (loom#800).
     # A timed-out repo is left out the same way.
@@ -5860,11 +6060,11 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     _say(out, emit, _resume_head(holder, authors, goals, unread, timed, seconds, now))
     latest = _latest_marks(goals)
     gone = dict(unread)  # a snapshot: a late read never sees a later change
-    check, trusted = review_check_name(env), trusted_authors(env)
     read: Dict[str, Dict[str, Any]] = {}
 
     def gather(repo: str) -> Dict[str, Any]:
-        return _resume_repo(gh, repo, goals, latest, gone, now, check, trusted)
+        return _resume_repo(gh, repo, goals, latest, gone, now, check, trusted,
+                            sensitive=ready[repo])
 
     for repo, done, value in per_repo.each(repos, gather, seconds, READ_WORKERS):
         if not done:
@@ -5899,6 +6099,34 @@ def _resume_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str], s
     return [g for repo in dict.fromkeys(repos) for g in by_repo.get(repo, [])], unread, timed
 
 
+def _resume_ready_sensitive(gh: GitHub, repos: Sequence[str], now: datetime, check: str,
+                            seconds: float
+                            ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, str], List[str]]:
+    """Each repo's ready sensitive pull requests, read repo by repo under the
+    budget: (ready by repo, unreadable repos with the reason, timed-out
+    repos). A fault that is not unreadable (github.unreadable) is raised."""
+    def sensitive(repo: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        try:
+            return _ready_sensitive_in(gh, repo, now, check), None
+        except GitHubError as err:
+            reason = unreadable(err)
+            if reason is None:
+                raise
+            return [], reason
+
+    ready: Dict[str, List[Dict[str, Any]]] = {}
+    unread: Dict[str, str] = {}
+    timed: List[str] = []
+    for repo, done, value in per_repo.each(repos, sensitive, seconds, READ_WORKERS):
+        if not done:
+            timed.append(repo)
+        elif value[1] is None:
+            ready[repo] = value[0]
+        else:
+            unread[repo] = value[1]
+    return ready, unread, timed
+
+
 def _latest_marks(goals: Sequence[GoalJournals]
                   ) -> Dict[Tuple[str, Tuple[str, int], str], handoff.Mark]:
     """The newest mark of each handoff across every goal's journals."""
@@ -5930,9 +6158,12 @@ def _resume_head(holder: str, authors: Sequence[str], goals: Sequence[GoalJourna
 def _resume_repo(gh: GitHub, repo: str, goals: Sequence[GoalJournals],
                  latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark],
                  gone: Dict[str, str], now: datetime, check: str,
-                 trusted: Sequence[str]) -> Dict[str, Any]:
+                 trusted: Sequence[str],
+                 sensitive: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """One repo's resume reads: its goals' resume lines, printed as the repo
-    finishes, and its share of each cross-repo section."""
+    finishes, and its share of each cross-repo section. `sensitive`, when
+    given, is the repo's ready sensitive pull requests already read by
+    resume; the part reads them itself otherwise."""
     mine = [g for g in goals if g[0] == repo]
 
     def goal_lines() -> List[str]:
@@ -5951,7 +6182,7 @@ def _resume_repo(gh: GitHub, repo: str, goals: Sequence[GoalJournals],
     # and the first exception in this order is raised, as a loop would.
     parts: List[Tuple[str, Callable[[], Any]]] = [
         ("lines", goal_lines),
-        ("sensitive", lambda: _ready_sensitive_in(gh, repo, now, check)),
+        ("sensitive", lambda: _ready_sensitive_in(gh, repo, now, check) if sensitive is None else sensitive),
         ("epics", lambda: _finished_epic_lines(gh, [(r, i) for r, i, _, _ in mine])),
         ("verify", lambda: _verify_due_in(gh, repo, now)),
         ("audit", lambda: audit.due(gh, [repo], trusted, now.timestamp()))]
@@ -6485,7 +6716,7 @@ def parser() -> argparse.ArgumentParser:
     df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note"); df.add_argument("--lock-repo", default="quadseven/loom")
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True); dn.add_argument("--resolves", help="brief defer key this done finishes")
     sb = sub.add_parser("step-budget", help="the tick's elapsed minutes and whether a step may be deferred on budget"); sb.add_argument("--lock-repo", default="quadseven/loom")
-    rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom"); rs.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET)
+    rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom"); rs.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); rs.add_argument("--deadline", type=float, nargs="?", const=8, default=None, metavar="MINUTES", help="stream each repo as it is read, stop reading after MINUTES (default 8) and name the repos not reached")
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
     sw = sub.add_parser("sweep"); sw.add_argument("--file", required=True, help="JSON list of sweep actions (docs/MUSE.md, step 9)"); sw.add_argument("--holder", required=True); sw.add_argument("--lock-repo", default="quadseven/loom")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check"); ob.add_argument("--operator")
@@ -6653,6 +6884,10 @@ def _cmd_done(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
+    if args.deadline is not None:
+        stream_resume(gh, [_repo(x) for x in args.repos], args.holder, _repo(args.lock_repo),
+                      lambda text: print(text, flush=True), args.deadline)
+        return
     _print_clock(gh, _repo(args.lock_repo))
     resume(gh, [_repo(x) for x in args.repos], args.holder, _repo(args.lock_repo),
            emit=_flushed, budget=args.repo_budget)
