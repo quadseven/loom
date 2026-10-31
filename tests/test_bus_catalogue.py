@@ -313,6 +313,16 @@ class ModelCatalogueTests(unittest.TestCase):
         models = catalogue.fetch_remote_models("file:///etc/passwd")
         self.assertEqual(models, [])
 
+    def test_network_fetch_rejects_private_address(self):
+        with self.assertRaisesRegex(ValueError, "public addresses"):
+            catalogue.fetch_remote_models("http://127.0.0.1/models")
+
+    def test_allowance_tracker_preserves_supplied_empty_mapping(self):
+        buckets = {}
+        tracker = catalogue.AllowanceTracker(buckets)
+        tracker.record_call("opencode-go", "model")
+        self.assertIn("opencode-go:model", buckets)
+
     def test_preferred_model_selected_until_limited(self):
         cat = {
             "opencode-go/mimo-v2.6-flash": catalogue.ModelEntry(

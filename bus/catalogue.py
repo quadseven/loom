@@ -8,17 +8,51 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 import json
+import ipaddress
 import os
 from pathlib import Path
 import sys
+import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 OPENCODE_GO_MODELS_URL = "https://opencode.ai/inference/go/v1/models"
 DISCOVERY_INTERVAL = 3600
 PROBE_TIMEOUT = 15
+
+
+def _validate_public_url(url: str) -> None:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("model discovery URL must use http(s) and a public host")
+    try:
+        addresses = [ipaddress.ip_address(parsed.hostname)] if _is_ip_address(parsed.hostname) else [
+            ipaddress.ip_address(item[4][0])
+            for item in socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80),
+                                           type=socket.SOCK_STREAM)
+        ]
+    except (OSError, ValueError) as err:
+        raise ValueError("model discovery host could not be resolved") from err
+    if not addresses or any(not address.is_global for address in addresses):
+        raise ValueError("model discovery URL must resolve only to public addresses")
+
+
+def _is_ip_address(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+class _PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any,
+                         newurl: str) -> Optional[urllib.request.Request]:
+        _validate_public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 DEFAULT_ALLOWLIST: Set[str] = {
     "beam-free",
@@ -116,7 +150,12 @@ def fetch_remote_models(url: str, timeout: int = PROBE_TIMEOUT,
         return []
     req = urllib.request.Request(url, headers={"User-Agent": "loom-model-discovery"})  # noqa: S310 - scheme checked above
     try:
-        resp = fetch(req) if fetch is not None else urllib.request.urlopen(req, timeout=timeout)  # noqa: S310
+        if fetch is None:
+            _validate_public_url(url)
+            opener = urllib.request.build_opener(_PublicRedirectHandler())
+            resp = opener.open(req, timeout=timeout)  # noqa: S310
+        else:
+            resp = fetch(req)
         with resp:
             raw = resp.read()
             data = json.loads(raw.decode("utf-8"))
@@ -157,7 +196,7 @@ class AllowanceTracker:
     """Tracks allowance buckets and local call counts per provider and model."""
 
     def __init__(self, buckets: Optional[Dict[str, AllowanceBucket]] = None):
-        self._buckets: Dict[str, AllowanceBucket] = buckets or {}
+        self._buckets: Dict[str, AllowanceBucket] = {} if buckets is None else buckets
 
     def _key(self, provider: str, model: str) -> str:
         clean_model = model.strip()
