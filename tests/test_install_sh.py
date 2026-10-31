@@ -215,11 +215,14 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_SHIP_PATH_WORKFLOWS</key><string>example-owner/infra</string>", plist)
 
     def test_disk_settings_are_written_to_station_plist(self):
-        result = self.run_install(LOOM_LOG_KEEP_DAYS="14", LOOM_DISK_FREE_MIN_GB="20")
+        result = self.run_install(LOOM_LOG_KEEP_DAYS="14", LOOM_DISK_FREE_MIN_GB="20",
+                                  LOOM_LOG_MAX_GB="9", LOOM_LOG_ROTATE_MB="30")
         self.assertEqual(result.returncode, 0, result.stderr)
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_LOG_KEEP_DAYS</key><string>14</string>", plist)
         self.assertIn("<key>LOOM_MIN_FREE_GB</key><string>20</string>", plist)
+        self.assertIn("<key>LOOM_LOG_MAX_GB</key><string>9</string>", plist)
+        self.assertIn("<key>LOOM_LOG_ROTATE_MB</key><string>30</string>", plist)
 
     def test_pass_deadline_is_written_to_station_plist(self):
         result = self.run_install(LOOM_PASS_DEADLINE="2400")

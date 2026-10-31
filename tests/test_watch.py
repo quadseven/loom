@@ -9,7 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, handoff, station, text, watch  # noqa: E402
+from bus import brain, handoff, logrotate, station, text, watch  # noqa: E402
 from bus.github import Response  # noqa: E402
 
 LANES_REPO = "example-owner/lanes"
@@ -813,6 +813,18 @@ class OffsetTest(WatchBase):
         os.rename(self.log, self.log + ".1")
         self.append(LINE_403, LINE_403, LINE_403)
         self.run_at(T0 + 60)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.assertEqual(self.saved()["logs"]["station"]["offset"], os.path.getsize(self.log))
+
+    def test_a_log_rotated_away_keeps_being_read_once_its_writer_makes_a_new_one(self):
+        self.append("x" * 500)
+        self.run_at(T0)
+        logrotate.rotate(os.path.dirname(self.log), 100, 2, T0 + 30, lambda _: None,
+                         writers=lambda _: False)
+        self.assertFalse(os.path.exists(self.log))
+        self.run_at(T0 + 60)
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0 + 120)
         self.assertEqual(len(self.gh.issues), 1)
         self.assertEqual(self.saved()["logs"]["station"]["offset"], os.path.getsize(self.log))
 

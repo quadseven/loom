@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import quote
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 from . import answer
 from . import audit
@@ -41,6 +41,7 @@ from . import brain_hold
 from . import claimed
 from . import fabric
 from . import fixrounds
+from . import logrotate
 from . import flake
 from . import rebuttal
 from . import runners
@@ -130,6 +131,15 @@ TREE_KEEP = 3600
 # size is logged. On 2026-10-17 logs/ held 4.2 GB, growing 0.6 GB a day, and
 # the disk was down to 8 GB free.
 LOG_KEEP_DAYS = 7
+# logs/ as a whole stays under LOOM_LOG_MAX_GB (0 for no limit, loom#2268):
+# past it the oldest finished runs go first, whatever their age, except
+# anything prune_logs keeps and anything changed in the last LOG_FLOOR
+# seconds. The service logs at the top of logs/ rotate past LOOM_LOG_ROTATE_MB
+# (bus/logrotate.py), LOG_ROTATE_KEEP compressed copies each.
+LOG_MAX_GB = 10.0
+LOG_FLOOR = 24 * 3600
+LOG_ROTATE_MB = 20.0
+LOG_ROTATE_KEEP = 5
 # While the home's disk has less than LOOM_MIN_FREE_GB free the station claims
 # no new work (loom#1808): on 2026-10-25 the disk fell to 300 MB free and every
 # lane run failed at once. The older name LOOM_DISK_FREE_MIN_GB is still read.
@@ -137,8 +147,11 @@ DISK_FREE_MIN_GB = 15.0
 DISK_GUARD_FILE = "disk-guard.json"
 # A finished opencode run's session store under its log folder (lanes/
 # run_lane.sh archive_transcripts): 100-440 MB a run on 2026-10-25, 14 GB of
-# the 17 GB in logs/ (loom#1808). Compressed once its transcript is uploaded.
+# the 17 GB in logs/ (loom#1808). Compressed once its transcript is uploaded,
+# or SESSION_UNSENT_KEEP seconds after the run while it waits: the upload reads
+# either form, and a backlog held 7 GB raw on 2026-10-30 (loom#2268).
 SESSION_DB_PARTS = (".local", "share", "opencode", "opencode.db")
+SESSION_UNSENT_KEEP = 24 * 3600
 # The ticket states after which a lane tree serves no fix round: its tree,
 # check copy and idle run scratch go at once, not after TREE_KEEP.
 TREE_DONE_STATES = frozenset(("loom:merged", "loom:shipped", "loom:verified",
@@ -157,6 +170,7 @@ DISK_EVERY = 3600
 THIN_EVERY = 1800
 THIN_FILE = "snapshot-thin.json"
 GB = 1024 ** 3
+MB = 1024 ** 2
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
 ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
 ANSWER_MAX = 3000
@@ -887,6 +901,8 @@ class Settings:
                  ship_path_workflows: Sequence[str] = (),
                  no_topup: Sequence[str] = (),
                  log_keep_days: int = LOG_KEEP_DAYS,
+                 log_max_bytes: int = int(LOG_MAX_GB * GB),
+                 log_rotate_bytes: int = int(LOG_ROTATE_MB * MB),
                  disk_free_min_gb: float = DISK_FREE_MIN_GB,
                  settle_claimed: str = "off",
                  settle_claimed_max: int = claimed.PER_RUN,
@@ -930,6 +946,8 @@ class Settings:
         # Days a lane's logs are kept (0: forever), and the free disk under
         # which every pass warns (Station.tend_disk).
         self.log_keep_days = log_keep_days
+        self.log_max_bytes = log_max_bytes
+        self.log_rotate_bytes = log_rotate_bytes
         self.disk_free_min_gb = disk_free_min_gb
         # Repos whose merged tickets ship at merge (ship_on_merge), and repos
         # whose merged tickets ship when their deploy workflow succeeds on the
@@ -1094,6 +1112,8 @@ class Settings:
                    ship_path_workflows=words("LOOM_SHIP_PATH_WORKFLOWS"),
                    no_topup=words("LOOM_NO_TOPUP"),
                    log_keep_days=_keep_days(env.get("LOOM_LOG_KEEP_DAYS", "")),
+                   log_max_bytes=int(_log_size(env, "LOOM_LOG_MAX_GB", LOG_MAX_GB) * GB),
+                   log_rotate_bytes=int(_log_size(env, "LOOM_LOG_ROTATE_MB", LOG_ROTATE_MB) * MB),
                    disk_free_min_gb=_free_floor(env.get("LOOM_MIN_FREE_GB", "").strip()
                                                 or env.get("LOOM_DISK_FREE_MIN_GB", "")),
                    settle_claimed=claimed.mode(env.get("LOOM_SETTLE_CLAIMED", "")),
@@ -1123,6 +1143,21 @@ def _keep_days(raw: str) -> int:
         return int(raw)
     _say("ignoring LOOM_LOG_KEEP_DAYS %r: not a whole number of days" % raw)
     return LOG_KEEP_DAYS
+
+
+def _log_size(env: Dict[str, str], name: str, default: float) -> float:
+    """A non-negative size setting, else the default, said once."""
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not (value >= 0 and math.isfinite(value)):
+        _say("ignoring %s %r: not a size" % (name, raw))
+        return default
+    return value
 
 
 def _free_floor(raw: str) -> float:
@@ -12805,9 +12840,11 @@ class Station:
 
     def tend_disk(self) -> None:
         """Keep the loom home bounded and say how big it is (loom#643). Every
-        DISK_EVERY seconds the lane logs past retention go (prune_logs),
-        finished runs' session stores are compressed (compress_sessions), and
-        the home's size is logged, by top-level folder. The free space below
+        DISK_EVERY seconds the service logs rotate, the lane logs past
+        retention go (prune_logs), finished runs' session stores are
+        compressed (compress_sessions), logs/ is held to its limit
+        (limit_logs), and the home's size is logged, by top-level folder. The
+        free space below
         the floor stops claims instead (disk_low)."""
         free = self._disk_free()
         path = os.path.join(self.state, "disk.json")
@@ -12815,8 +12852,11 @@ class Station:
         last = saved.get("at") if isinstance(saved, dict) else None
         if self._num(last) and 0 <= self.now - last < DISK_EVERY:
             return
+        logrotate.rotate(os.path.join(self.s.home, "logs"), self.s.log_rotate_bytes,
+                         LOG_ROTATE_KEEP, self.now, _say)
         self.prune_logs()
         self.compress_sessions()
+        self.limit_logs()
         sizes: Dict[str, int] = {}
         try:
             names = os.listdir(self.s.home)
@@ -12840,7 +12880,8 @@ class Station:
         """gzip each finished run's opencode session store (SESSION_DB_PARTS
         under logs/<slot>/<run>/) to opencode.db.gz, once no brief of that
         name is waiting or running and its transcript is not waiting for the
-        dashboard (_logs_kept). bus/sessions.py reads the compressed store,
+        dashboard (_logs_kept) or has waited SESSION_UNSENT_KEEP seconds.
+        bus/sessions.py reads the compressed store,
         and prune_logs removes it with the run's other logs after
         log_keep_days. The -wal and -shm files go too: the readers open the
         store immutable and never read them. Times are kept, so retention
@@ -12861,11 +12902,13 @@ class Station:
             except OSError as err:
                 _say("cannot list lane %s's logs to compress session stores: %s" % (slot, err))
                 continue
-            keep = live | {k.split("/", 1)[1] for k in pending if k.startswith(slot + "/")}
+            unsent = {k.split("/", 1)[1] for k in pending if k.startswith(slot + "/")}
             for name in names:
-                if name in keep:
+                if name in live:
                     continue
                 try:
+                    if name in unsent and self._store_is_fresh(os.path.join(folder, name)):
+                        continue
                     sizes = _gzip_session_db(os.path.join(folder, name))
                 except OSError as err:
                     _say("cannot compress the session store of %s/%s: %s" % (slot, name, err))
@@ -12877,6 +12920,14 @@ class Station:
         if count:
             _say("compressed %d finished run session store(s): %s to %s"
                  % (count, _gb(before), _gb(after)))
+
+    def _store_is_fresh(self, run: str) -> bool:
+        """Whether a run's session store changed in SESSION_UNSENT_KEEP."""
+        try:
+            changed = os.lstat(os.path.join(run, *SESSION_DB_PARTS)).st_mtime
+        except OSError:
+            return True
+        return self.now - changed < SESSION_UNSENT_KEEP
 
     def _logs_kept(self) -> Optional[Tuple[Set[str], Set[str]]]:
         """(names, slot/name keys) whose lane logs stay however old: every
@@ -12903,19 +12954,13 @@ class Station:
                     pending.add("%s/%s" % (lane, name))
         return live, pending
 
-    def prune_logs(self) -> None:
-        """Remove each entry of a lane's log folder (logs/<slot>/: a run's
-        log, result and records, its archived transcripts) whose newest file
-        is older than log_keep_days, unless _logs_kept keeps its ticket. The
-        station's own logs in logs/ are not touched."""
-        if self.s.log_keep_days <= 0:
-            return
+    def _lane_log_entries(self) -> Iterator[Tuple[str, str]]:
+        """(slot/name, path) of each entry in a lane's log folder that
+        _logs_kept does not keep. None comes when that cannot be read."""
         kept = self._logs_kept()
         if kept is None:
             return
         live, pending = kept
-        cutoff = self.now - self.s.log_keep_days * 24 * 3600
-        removed = freed = 0
         for slot in LANES:
             folder = os.path.join(self.s.home, "logs", slot)
             try:
@@ -12930,22 +12975,68 @@ class Station:
             keep = live | {k.split("/", 1)[1] for k in pending if k.startswith(slot + "/")}
             for name in names:
                 # A run's files are <ticket>, <ticket>.log, <ticket>.result...
-                if any(name == t or name.startswith(t + ".") for t in keep):
+                if not any(name == t or name.startswith(t + ".") for t in keep):
+                    yield "%s/%s" % (slot, name), os.path.join(folder, name)
+
+    def prune_logs(self) -> None:
+        """Remove each entry of a lane's log folder (logs/<slot>/: a run's
+        log, result and records, its archived transcripts) whose newest file
+        is older than log_keep_days, unless _logs_kept keeps its ticket. The
+        service logs in logs/ rotate instead (bus/logrotate.py)."""
+        if self.s.log_keep_days <= 0:
+            return
+        cutoff = self.now - self.s.log_keep_days * 24 * 3600
+        removed = freed = 0
+        for key, path in self._lane_log_entries():
+            try:
+                newest, size = _tree_stat(path)
+                if newest >= cutoff:
                     continue
-                path = os.path.join(folder, name)
-                try:
-                    newest, size = _tree_stat(path)
-                    if newest >= cutoff:
-                        continue
-                    _remove(path)
-                except OSError as err:
-                    _say("cannot remove old lane log %s/%s: %s" % (slot, name, err))
-                    continue
-                removed += 1
-                freed += size
+                _remove(path)
+            except OSError as err:
+                _say("cannot remove old lane log %s: %s" % (key, err))
+                continue
+            removed += 1
+            freed += size
         if removed:
             _say("removed %d lane log(s) older than %d days (%s)"
                  % (removed, self.s.log_keep_days, _gb(freed)))
+
+    def limit_logs(self) -> None:
+        """Hold logs/ under log_max_bytes: past it, remove the oldest lane
+        log entries prune_logs could remove, sparing anything changed in the
+        last LOG_FLOOR seconds, then say the size against the limit."""
+        limit = self.s.log_max_bytes
+        if limit <= 0:
+            return
+        try:
+            total = _tree_stat(os.path.join(self.s.home, "logs"))[1]
+        except OSError as err:
+            _say("cannot measure logs/: %s" % err)
+            return
+        removed = 0
+        if total > limit:
+            found = []
+            for key, path in self._lane_log_entries():
+                try:
+                    newest, size = _tree_stat(path)
+                except OSError:
+                    continue
+                if self.now - newest >= LOG_FLOOR:
+                    found.append((newest, size, key, path))
+            for _, size, key, path in sorted(found):
+                if total <= limit:
+                    break
+                try:
+                    _remove(path)
+                except OSError as err:
+                    _say("cannot remove lane log %s: %s" % (key, err))
+                    continue
+                total -= size
+                removed += 1
+        _say("logs hold %s, %s the %s limit%s"
+             % (_gb(total), "over" if total > limit else "under", _gb(limit),
+                "; removed the %d oldest lane log(s)" % removed if removed else ""))
 
     # -- the GitHub budget --------------------------------------------------
     def _budget_state(self) -> Dict[str, Any]:
