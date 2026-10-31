@@ -13,7 +13,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, invariants, metrics, station  # noqa: E402
-from bus.github import GitHubError, Response  # noqa: E402
+from bus.github import GitHubError, RateLimited, Response  # noqa: E402
 from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run, SilentRun, Wait  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401 - shadow off: these tests close
 
@@ -679,6 +679,27 @@ class StationTest(StationBase):
         self.run_at(T0)
         (filed,) = self.gh.filed()
         self.assertIn("Epic #40 of goal home #30: 17 tickets (cap 15)", filed["body"])
+
+    def test_a_goal_makes_one_part_of_search_however_many_epics_it_holds(self):
+        """loom#2321: one search per five epics, about 35 a check, spent
+        GitHub's 30 a minute and stopped the pass inside this step."""
+        self.gh.subs[(REPO, GOAL)] = [epic(n) for n in range(40, 47)]
+        self.gh.search_items = [dict(ticket(70, "closed"), body="Why.\n\nPart of #46\n")]
+        self.run_at(T0)
+        searches = [path for _, path in self.gh.calls if path.startswith("/search/issues?")]
+        self.assertEqual(len(searches), 1, searches)
+        self.assertIn("no%3Aparent-issue", searches[0])
+
+    def test_a_check_a_rate_limit_stopped_waits_like_any_other(self):
+        """loom#2321: checked was saved only after the reads, so a stopped
+        check ran again next pass and hit the same limit."""
+        limited = RateLimited("GET /search/issues -> 403", 403, "", 0)
+        with mock.patch.object(station.Station, "_invariant_facts", side_effect=limited):
+            with self.assertRaises(RateLimited):
+                self.run_at(T0)
+        with mock.patch.object(station.Station, "_invariant_facts") as facts:
+            self.run_at(T0 + 1)
+        facts.assert_not_called()
 
     def test_epic_over_cap_flags_the_standing_repairs_epic_at_the_sub_issue_limit(self):
         repairs = dict(epic(50), title=brain.REPAIRS_TITLE,
