@@ -2547,6 +2547,11 @@ class Station:
             self._refuse(repo, issue, str(err))
             return False
         fix, fix_comment_id = fix_source if fix_source else (None, None)
+        if fix is not None and fix.pr in tickets.judged_pulls(self._status_texts(repo, number)):
+            # The station already read this merged pull request and sent the
+            # ticket back for the rest, so the old fix ask is spent. It parked
+            # the ticket at loom:pr on every brief (loom#2333).
+            fix, fix_comment_id = None, None
         if self._held_before_claim(repo, issue, fix, comments):
             return False
 
@@ -4986,6 +4991,31 @@ class Station:
                         # Check if it moved to merged
                         if "loom:merged" in _label_names(ticket):
                             _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
+        for number, ticket in tickets_by_number.items():
+            self._clear_pull_gone(repo, number, ticket, open_prs)
+
+    def _clear_pull_gone(self, repo: str, number: int, ticket: Dict[str, Any],
+                         open_prs: List[Dict[str, Any]]) -> None:
+        """A ticket cannot hold loom:pr with no open pull request: it goes
+        back to the queue for a lane (loom#2333). Reconcile, above, has moved
+        every ticket whose pull request closed in the window it reads."""
+        names = _label_names(ticket)
+        if ("loom:pr" not in names or any(_covers_pr(ticket, repo, p) for p in open_prs)
+                or self._adopted_pull_number(ticket) is not None
+                or self._owned_elsewhere(repo, ticket)):
+            return
+        timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
+        if not tickets.pull_gone(timeline, repo, number, self.now):
+            return
+        states = {"loom:" + state for state in brain.STATES}
+        kept = self._drop_claim(n for n in names if n not in states
+                                and not n.startswith(("lane:", WAIT)))
+        kept.append("loom:queued")
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        ticket["labels"] = [{"name": name} for name in kept]
+        self._routine(repo, number, "No open pull request carries this ticket, so it left "
+                      "loom:pr and is back at loom:queued.")
+        _say("%s#%d: loom:pr with no open pull request, requeued" % (repo, number))
 
     def _unlinked_tickets(self, repo: str, linked: Dict[int, Dict[str, Any]],
                           found: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:

@@ -877,6 +877,30 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("Third works.", note)
         self.assertNotIn("Second works", note)
 
+    def stale_pr(self, put="2030-01-05T00:00:00Z", **pull):
+        """Ticket 12 at loom:pr since `put`, with a merge judged long before."""
+        self.merged_with("- [x] First works; test.\n")
+        self.fake.events[12].append(dict(labeled("loom:pr", "alice-example"), created_at=put))
+        self.fake.issues[12]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                                          {"name": "lane:codex"}]
+        self.fake.timelines = getattr(self.fake, "timelines", {})
+        self.fake.timelines[12] = list(self.fake.events[12]) + [pull] if pull else list(self.fake.events[12])
+        self.fake.pulls.clear()
+        self.fake.calls.clear()
+        with mock.patch("bus.station.time.time", return_value=4102444800.0):
+            station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+
+    def test_loom_pr_with_no_open_pull_request_clears_on_the_next_pass(self):
+        # loom#2333: the label stayed 4 days with no open pull request.
+        self.stale_pr()
+        self.assertEqual(sorted(self.fake.names(12)), ["loom:queued", "loom:ticket"])
+
+    def test_loom_pr_stays_for_an_open_pull_request_in_another_repo(self):
+        self.stale_pr(**{"event": "cross-referenced", "created_at": "2030-01-05T00:00:00Z",
+                         "source": {"issue": {"state": "open", "pull_request": {},
+                                              "body": "Refs %s#12" % REPO}}})
+        self.assertIn("loom:pr", self.fake.names(12))
+
     def test_a_pr_merged_before_the_requeue_does_not_requeue_the_ticket_again(self):
         self.merged_with("- [x] First works; test.\n")
         self.requeued("2030-01-03T00:00:00Z")
