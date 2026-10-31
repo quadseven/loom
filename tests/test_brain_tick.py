@@ -369,7 +369,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("tick start (lane codex, model gpt-test-high, scope all)", log)
         self.assertEqual("python3 -m bus unlock example/loom --holder lane-machine", calls[-1])
 
-    def test_a_stale_heartbeat_has_no_usage(self):
+    def test_a_stale_heartbeat_goes_after_a_fresh_one(self):
         # A runner that stopped writes no heartbeat; its old one does not count.
         self.usage("claude", True, age=3600)
         self.usage("codex", True)
@@ -390,11 +390,47 @@ class BrainTickTest(unittest.TestCase):
 
     def test_a_dead_runners_lock_does_not_keep_an_aged_heartbeat(self):
         self.usage("claude", True, age=1800)
+        self.usage("codex", True)
         lock = self.home / "run" / "claude.lock"
         lock.mkdir(parents=True)
         (lock / "pid").write_text("999999\n")
-        _, calls = self.tick()
+        _, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
         self.assertEqual([], self.agent_calls(calls, "claude"))
+        self.assertEqual(1, len(self.agent_calls(calls, "codex")))
+
+    def test_stale_heartbeats_read_as_fuel_unknown_and_the_tick_still_runs(self):
+        # From 15:34Z on 2026-10-28 a crashing lane runner wrote no heartbeat
+        # for 28 hours, and each hourly tick stood down though nothing said
+        # the lanes had no usage.
+        self.usage("claude", True, age=99846)
+        self.usage("codex", True, age=99350)
+        run, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
+        self.assertEqual(0, run.returncode)
+        self.assertEqual(1, len(self.agent_calls(calls, "claude")))
+        self.assertEqual(1, sum(1 for c in calls if " -m bus lock " in c))
+        last, ok = self.beat()
+        self.assertEqual(("ok", "claude"), (last["outcome"], last["lane"]))
+        self.assertTrue(ok)
+        log = (self.home / "logs" / "brain.log").read_text()
+        self.assertIn("fuel unknown for lane claude (usage heartbeat is", log)
+
+    def test_a_missing_heartbeat_reads_as_fuel_unknown(self):
+        (self.home / "state" / "usage" / "claude.json").unlink()
+        _, calls = self.tick()
+        self.assertEqual(1, len(self.agent_calls(calls, "claude")))
+
+    def test_a_rung_with_known_usage_goes_before_one_with_unknown_fuel(self):
+        (self.home / "state" / "usage" / "claude.json").unlink()
+        self.usage("codex", True)
+        _, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
+        self.assertEqual([], self.agent_calls(calls, "claude"))
+        self.assertEqual(1, len(self.agent_calls(calls, "codex")))
+
+    def test_a_heartbeat_that_says_unavailable_still_stands_the_rung_down(self):
+        self.usage("claude", False, "limit: out of credit", age=99846)
+        run, calls = self.tick()
+        self.assertEqual(0, run.returncode)
+        self.assertEqual([], calls)
 
     def test_a_limit_failure_moves_the_tick_to_the_next_rung_once(self):
         for lane in ("codex", "spark"):
@@ -438,6 +474,7 @@ class BrainTickTest(unittest.TestCase):
 
     def test_no_rung_with_usage_skips_with_a_reason_and_runs_nothing(self):
         self.usage("claude", False, "limit: out of credit")
+        self.usage("codex", False, "limit: out of quota")
         self.usage("spark", True)
         run, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
         self.assertEqual(0, run.returncode)
@@ -448,7 +485,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertNotIn("started", last)
         self.assertIn("no brain lane has usage", last["reason"])
         self.assertIn("claude: unavailable (limit: out of credit)", last["reason"])
-        self.assertIn("codex: no usage heartbeat", last["reason"])
+        self.assertIn("codex: unavailable (limit: out of quota)", last["reason"])
         self.assertIn("spark: LOOM_SPARK_URL is not set", last["reason"])
         # Not a good tick: the station's brain-stopped check sees it go stale.
         self.assertFalse(ok)
