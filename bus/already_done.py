@@ -101,13 +101,16 @@ def unproven(body: str, read: Read) -> List[str]:
 def base_reader(gh: Any, repo: str, pr: Dict[str, Any]) -> Read:
     """Read a path from the pull request's base branch, each path once. A
     missing file, a directory or a file too large for the contents API reads
-    as None. Any other failed read raises, so the gate waits for a later pass
+    as None, and so does a `..` path, which would leave this repo's contents
+    route. Any other failed read raises, so the gate waits for a later pass
     and never passes unchecked."""
     base = pr.get("base") or {}
     ref = str(base.get("ref") or base.get("sha") or "")
     seen: Dict[str, Optional[str]] = {}
 
     def read(path: str) -> Optional[str]:
+        if ".." in path.split("/"):
+            return None
         if path not in seen:
             seen[path] = _decoded(gh.rest(
                 "GET", "/repos/%s/contents/%s?ref=%s" % (repo, quote(path), quote(ref, safe="")),

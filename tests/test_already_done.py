@@ -71,6 +71,12 @@ class AlreadyDoneTest(unittest.TestCase):
         read("bus/proof.py")
         self.assertEqual(gh.paths, ["/repos/o/r/contents/bus/proof.py?ref=main"])
 
+    def test_the_base_reader_refuses_a_path_that_leaves_the_repo(self):
+        gh = GhStub(404)
+        read = already_done.base_reader(gh, "o/r", {"base": {"ref": "main"}})
+        self.assertIsNone(read("bus/../../../other/contents/a.py"))
+        self.assertEqual(gh.paths, [])
+
     def test_the_base_reader_reads_a_missing_file_as_none(self):
         read = already_done.base_reader(GhStub(404), "o/r", {"base": {"ref": "main"}})
         self.assertIsNone(read("bus/absent.py"))
