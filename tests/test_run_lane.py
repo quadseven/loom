@@ -3167,7 +3167,7 @@ exec /usr/bin/git "$@"
 
     def test_copilot_allowance_wordings_hold_the_lane_instead_of_failing_the_ticket(self):
         # The Free allowance runs out with no "usage limit" in the message; a
-        # "work" class would send the next ticket straight into the same wall.
+        # transient or work class sets no hold, so the next ticket hits the same wall.
         for said in ("You have exceeded your premium request allowance",
                      "Error: You have no quota"):
             script = (RUNNER.parent / "agent_cli.sh").read_text() + (
