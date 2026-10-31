@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import sys
-from typing import Dict, List
+from typing import Dict, Iterable, List
 from urllib.parse import quote
 
 from .github import GitHub
@@ -87,7 +87,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:audit-failed": {"color": "d93f0b", "description": "A lane proof failed the brain's audit; holds that lane's verify runs a day"},
     "loom:triage": {"color": "f9d0c4", "description": "Open issue not yet a ticket; the brain rewrites it"},
     "loom:rewritten": {"color": "ededed", "description": "Rewritten as a ticket that refs this issue"},
-    "loom:human": {"color": "b60205", "description": "Only a person can do this; see the comment"},
+    "loom:human": {"color": "b60205", "description": "Old name of needs:human"},
     "loom:lanes": {"color": "ededed", "description": "The issue holding lane status"},
     "loom:digest": {"color": "ededed", "description": "The issue holding the daily asks digest"},
     "loom:invariant": {"color": "b60205", "description": "Filed by the station: one of the factory's own invariants broke"},
@@ -95,9 +95,12 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:recurring": {"color": "fbca04", "description": "Invariant breached repeatedly; keep open for a fix"},
     "loom:factory": {"color": "b60205", "description": "A factory validation incident"},
     "loom:validation-gap": {"color": "fbca04", "description": "A CI job the repo's .loom/validation.conf does not run"},
-    "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
+    "needs:human": {"color": "b60205", "description": "One exact ask for a person; see the comment. Comes off when the answer is in the ticket"},
+    "needs-operator": {"color": "b60205", "description": "Old name of needs:human"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder; the brain must review or ask"},
-    "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
+    "loom:urgent": {"color": "e11d21", "description": "With needs:human: forward now"},
+    "closed-unproven": {"color": "fbca04", "description": "Closed on merged code with its Live box unproven; a reopen counts against this close"},
+    "loom:proof-due": {"color": "fbca04", "description": "Rolling list of Live boxes of tickets closed unproven"},
     "loom:regression": {"color": "b60205", "description": "Fixes a measured regression of a shipped ticket"},
     "loom:revert": {"color": "b60205", "description": "Reverts the merge that turned the default branch red"},
     "class:sensitive": {"color": "b60205", "description": "Touches a sensitive path; needs extra scrutiny"},
@@ -125,6 +128,16 @@ for _lane in LANES:
 
 MANAGED_PREFIXES = ("loom:", "lane:", "class:", "wait:")
 WAIT_PREFIX = "wait:"
+# One label asks a person. The old names read as it until a write to the
+# ticket migrates them (bus/label_pass.py, loom#2278).
+NEEDS_HUMAN = "needs:human"
+OLD_HUMAN_LABELS = ("needs-operator", "needs:quadseven", "loom:human")
+HUMAN_LABELS = (NEEDS_HUMAN,) + OLD_HUMAN_LABELS
+
+
+def needs_human(names: Iterable[str]) -> bool:
+    """A person is asked: `names` hold needs:human or an old name of it."""
+    return any(name in HUMAN_LABELS for name in names)
 
 
 def ensure_labels(gh: GitHub, repo: str) -> List[str]:

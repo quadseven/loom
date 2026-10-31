@@ -479,7 +479,8 @@ class RemoteBeatTests(unittest.TestCase):
 
 class FakeGitDatabase:
     """A GitHub API fake that speaks the git-database endpoints push_branch
-    needs: ref reads, blob/tree/commit creation, ref creation."""
+    needs: ref reads at the singular git/ref/ path, blob/tree/commit
+    creation, ref creation, and ref updates at the plural git/refs/ path."""
 
     def __init__(self, tree_sha="t" * 40, commit_sha="c" * 40, trees=None,
                  commits=None):
@@ -506,8 +507,12 @@ class FakeGitDatabase:
         from urllib.parse import unquote
         self.calls.append((method, path))
         self.bodies.append((method, path, body))
-        if method == "GET" and "/git/refs/heads/" in path:
-            branch = unquote(path.split("/git/refs/heads/", 1)[1])
+        # Like GitHub: a ref is read at the singular git/ref/<ref> path,
+        # which answers the one exact ref or 404 (the plural git/refs/ path
+        # prefix-matches and can answer a list; push_branch no longer reads
+        # there, loom#2160). Updates still arrive at git/refs/<ref> below.
+        if method == "GET" and "/git/ref/heads/" in path:
+            branch = unquote(path.split("/git/ref/heads/", 1)[1])
             if branch in self.refs:
                 return type("Response", (), {"data": {
                     "object": {"sha": self.refs[branch]}}})()

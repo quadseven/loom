@@ -148,6 +148,15 @@ def _section_text(body: str, *names: str) -> Optional[str]:
     return None
 
 
+def _demoted_heading(body: str, name: str) -> Optional[str]:
+    """The first heading for name below level two, if the brief has one."""
+    for line in body.splitlines():
+        match = re.match(r"^(#{3,})[ \t]+(.+?)[ \t#]*$", line)
+        if match and _heading_matches(match.group(2), name):
+            return "%s %s" % (match.group(1), match.group(2).strip())
+    return None
+
+
 def bullets(section: str) -> List[str]:
     """The non-empty bullets of a section, as the gate counts them."""
     return _BULLET.findall(str(section or ""))
@@ -160,7 +169,11 @@ def problems(body: str) -> List[str]:
     out: List[str] = []
     why = _section_text(body, "Why", "Summary")
     if why is None:
-        out.append("missing ## Why (or ## Summary) section")
+        demoted = _demoted_heading(body, "Why")
+        if demoted:
+            out.append("no ## Why heading (found %s)" % demoted)
+        else:
+            out.append("missing ## Why (or ## Summary) section")
     elif len(why.split()) < 5:
         out.append("## Why has %d words; need >=5" % len(why.split()))
     criteria = _section_text(body, "Acceptance criteria")

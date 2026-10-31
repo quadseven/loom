@@ -310,6 +310,33 @@ mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
 PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
 
+# A check that hashes a file needs a sha256sum this machine can execute. The
+# lane plist puts the Intel Homebrew bin directory ahead of everything but the
+# arm64 one, and an x86_64 coreutils link there never runs on an arm64 host
+# without Rosetta (#2317). The macOS system binary sits in /sbin, on no lane's
+# PATH, so its directory goes in just before the one that holds the broken
+# tool: it can shadow only that directory and those after it.
+tool_runs() { printf '' | "$1" > /dev/null 2>&1; }
+runnable_sha256sum_on_path() {
+  local found dir holder tail
+  found="$(command -v sha256sum)"
+  [ -n "$found" ] && tool_runs "$found" && return 0
+  for dir in ${LOOM_SHA256SUM_DIRS:-/sbin /usr/bin /bin}; do
+    [ -x "$dir/sha256sum" ] && tool_runs "$dir/sha256sum" || continue
+    if [ -n "$found" ]; then
+      holder="$(dirname "$found")"
+      case "$PATH" in
+        "$holder":*) PATH="$dir:$PATH" ;;
+        *) tail="${PATH#*:"$holder":}"; PATH="${PATH%%:"$holder":*}:$dir:$holder:$tail" ;;
+      esac
+    else
+      PATH="$PATH:$dir"
+    fi
+    return 0
+  done
+}
+runnable_sha256sum_on_path
+
 field() { grep -m1 "^$1:" "$2" | cut -d' ' -f2-; }
 
 # LOOM_<LANE>_<SUFFIX>, e.g. opencode-go + MODEL -> LOOM_OPENCODE_GO_MODEL.
@@ -390,7 +417,7 @@ utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
 
 # Body of one "## <name>" section of the brief, blank lines dropped.
 section() {
-  awk -v h="## $1" '$0 == h {on=1; next} /^#+ / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
+  awk -v h="## $1" '$0 == h {on=1; next} /^##? / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
 }
 
 # The acceptance criteria of $1, blank lines dropped: its "## Acceptance
@@ -1141,7 +1168,8 @@ park() {
 # startup files, ~/.gemini config, MCP servers). Other lanes get no rules here.
 # antigravity-oauth-token is agy's sign-in when it cannot reach the keychain
 # (the sandbox denies /usr/bin/security): wiped, every run asked for a browser
-# login (2026-10-22 to 10-24, #1620).
+# login (2026-10-22 to 10-24, #1620). The sandbox profile lets only agy's own
+# binary read it (agy_token_rules in lanes/agent_sandbox.sh, #1623).
 AGY_STATE_KEEP=(settings.json bin builtin installation_id jetski_state.pbtxt updater last_check.timestamp log cli.log crashes cache antigravity-oauth-token)
 AGY_CACHE_KEEP=(onboarding.json default_project_id.txt)
 # agy keeps its sign-in in its file store, Library/Application Support/
@@ -1684,7 +1712,7 @@ ask_sign_in() {
   file_ask "$title" "$body" "Sign-in failed again"
 }
 
-# File a needs-operator ask titled $1 with body $2, or, with one already open,
+# File a needs:human ask titled $1 with body $2, or, with one already open,
 # keep one comment on it with a running count headed $3, never one per failure.
 file_ask() {
   local title="$1" body="$2" headline="$3" number existing
@@ -1696,10 +1724,10 @@ file_ask() {
     return 0
   fi
   number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
-             --label needs-operator --body "$body" 2>>"$LOG" ||
+             --label needs:human --body "$body" 2>>"$LOG" ||
            gh issue create --repo "$FACTORY_REPO" --title "$title" --body "$body" 2>>"$LOG")"
   number="${number##*/}"
-  case "$number" in ''|*[!0-9]*) echo "needs-operator ask filing failed" >> "$LOG" ;; esac
+  case "$number" in ''|*[!0-9]*) echo "needs:human ask filing failed" >> "$LOG" ;; esac
   return 0
 }
 
@@ -1785,6 +1813,7 @@ import json
 import sys
 
 text = tool = False
+events_processed = False
 for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
     try:
         event = json.loads(line)
@@ -1792,6 +1821,7 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
         continue
     if not isinstance(event, dict):
         continue
+    events_processed = True
     kind = event.get("type")
     part = event.get("part") if isinstance(event.get("part"), dict) else {}
     if kind == "step_start":
@@ -1800,6 +1830,8 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
         text = True
     elif kind in ("tool_use", "tool") or part.get("type") == "tool":
         tool = True
+if not events_processed:
+    sys.exit(1)
 sys.exit(0 if text and not tool else 1)
 PY
 }
@@ -2030,7 +2062,7 @@ record() {
 # failing line or command, and the exit code.
 FACTORY_REPO=quadseven/loom
 INCIDENT_MARKER="<!-- loom:factory-incident v1 -->"
-# The marker on the body of the needs-operator ask an expired key files.
+# The marker on the body of the needs:human ask an expired key files.
 KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"
 # The markers on the one comment that counts repeats on an open ask or incident.
 KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"
@@ -2322,7 +2354,7 @@ exclude_untracked() {
 # Only a red default branch check is a base-check factory incident. Returns
 # 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
-  local rc interp="" subs="" changed what baseline_rev
+  local rc interp="" subs="" changed what baseline_rev tool=""
   SETUP_REASON=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
@@ -2330,6 +2362,11 @@ prepare_validation() {
   if ! sandbox_ready; then
     SETUP_REASON="$SANDBOX_WHY"
     note_factory_incident environment "$SANDBOX_WHY" SETUP_REASON
+  elif ! tool="$(command -v sha256sum)" || ! tool_runs "$tool"; then
+    # The host's fault, whatever the repo: a check that hashes a file would
+    # read as a red default branch and file a base-check incident.
+    SETUP_REASON="lane host fault: sha256sum${tool:+ at $tool} cannot run"
+    note_factory_incident environment "sha256sum: ${tool:-not on PATH}" SETUP_REASON
   elif [ -n "$C_INTERP" ] && ! interp="$(command -v "$C_INTERP")"; then
     SETUP_REASON="interpreter $C_INTERP is not on PATH"
     note_factory_incident environment "interpreter: $C_INTERP" SETUP_REASON
