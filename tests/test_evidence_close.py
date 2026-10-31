@@ -378,6 +378,23 @@ class Guardrail(Case):
         self.assertIn("needs:human", self.fake.names(number))
         self.assertIn("resume", self.asks()[0]["body"])
 
+    def test_a_stop_after_a_resume_raises_a_new_ask(self):
+        self.ticket(1)
+        self.close_pass()
+        self.reopen(1)
+        self.close_pass()
+        self.fake.issues[self.proof_issues()[0]["number"]]["labels"] = [
+            {"name": "loom:proof-due"}]
+        self.control("resume")
+        now = time.time() + 60
+        self.fake.issues[1]["state"] = "closed"
+        self.close_pass(now)
+        self.ticket(2)
+        self.close_pass(now + 60)
+        self.reopen(2)
+        self.close_pass(now + 120)
+        self.assertEqual(len(self.asks()), 2)
+
     def test_an_operators_own_pause_asks_nothing(self):
         self.ticket(1)
         self.close_pass()
