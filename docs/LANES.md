@@ -456,7 +456,8 @@ operator is brought up to date with its base while it waits, and still never
 merges on the factory's say-so. Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
-starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
+starts a ticket's ladder again and ends any fix round posted before it, so
+the restart runs as a normal attempt on a fresh branch. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
 `claude-opus-5-5`), each
 climb recorded as a `<!-- loom:rung N -->` comment.
 A climb takes the lowest rung the ticket has not run on since its ladder
@@ -1211,7 +1212,7 @@ Each invariant is one function returning breaches with evidence:
   `Epic cap: N until DATE` exception), and a closed epic that still holds
   open tickets. These replaced the goal home sub-issue count check.
 - An open lane pull request whose plan check failed more than 30 minutes ago.
-- An open lane pull request nothing drives for over 6 hours (the time a lane
+- An open lane pull request nothing drives for over 24 hours (the time a lane
   has to open one): no open `loom:ticket` carries it, its ticket is past the
   last rung of the model ladder (`loom:failed`), its ticket is marked
   `needs-brain`, or it holds unresolved review threads from the review bot
@@ -1245,7 +1246,51 @@ hold that comes and goes never closes and reopens an issue (each reopen mailed
 the people watching it). The lanes it listed move into a "Hold log" in the body
 (a line per hold, newest first, the last 20).
 
-Each breach files one issue labelled `loom:triage` and `loom:invariant` under
+Four kinds file no issue per violation at all (loom#2099): `lane-pr-stalled`,
+`plan-check-failed`, `epic-over-cap` and `epic-title-shared`
+(`invariants.ROLLED`). Each restates state the pull request, the epic or
+`python3 -m bus.brain status` already shows, and filing one ticket per
+violation was most of 185 invariant issues in 7 days (109 stalled lane pull
+requests, 36 over-cap epics, 13 failed plan checks), every one closing itself
+later. Instead each kind has one tracking
+issue per subject repo, titled `Invariant: <kind> in <repo>` (a private repo
+named in words with a short hash), labelled `loom:invariant` only (not
+`loom:triage`, so the rewriter never turns the list into a ticket and freezes
+it). Its body lists every current violation, a line each with its link and
+when it started (`since <time>`: a lane pull request's open time, a plan
+check's completion, else when the station first saw it, kept in
+`invariants.json` under `seen`), and a "Last checked" line. The station
+rewrites the body only when the list changes: an unchanged list, or only a
+newer check time, writes nothing. When a kind's list empties, the next pass
+rewrites it to "Current violations: none." with a "Clear since" time; once it
+has said none for 6 hours (`CLEAR_AFTER`) the issue closes as not planned
+with one cleared note, which a later clear edits in place rather than posting
+again; a violation that returns reopens that same issue (the one "Broken
+again" note, edited in place), so the kind keeps one stable issue number. A
+pass that could not read a kind's facts (the lane pull requests, the plan
+checks, the goal shapes) leaves its tracking issue as it is, and so does a
+pass that could not read one repo's open pull requests for that repo's
+lane-pr-stalled issue: the other repos' issues still update. Closing it rather than leaving it
+open keeps an empty list from holding a goal out of quiet (docs/BRAIN.md).
+The per-violation issues these kinds filed before this close into the
+tracking issue of their kind and their own subject repo as the station meets
+them: closed as not planned with no comment, their note at the foot of the
+body, and a running count in one comment on the tracking issue, edited in
+place (a comment on each would mail everyone watching). The subject comes from
+the station's map, else the `subject=` of the issue's marker, else a reference
+in its text, and only one that hashes back to the key counts. The marker names
+a subject only where the breach's public text already does, so a private repo
+never reaches it. One whose repo cannot be told (a private repo the title
+names in words) closes with a note naming no tracking issue, and one with a
+known repo and no open tracking issue waits out `CLEAR_AFTER` first. At most
+`FOLD_MAX` (2) old issues close a pass, each logged, so the migration cannot
+spend the GitHub budget.
+One rewritten into a `loom:ticket` is work the factory carries and is never
+folded, nor is one asking an operator (`needs:<login>`); every other kind,
+`lane-no-success` with its per-lane keys for the dead-lane release included,
+files as below.
+
+Each other breach files one issue labelled `loom:triage` and `loom:invariant` under
 the standing repairs epic (docs/BRAIN.md, Filing under an epic; the goal home
 itself when that epic cannot be read) of the invariant goal home
 (`LOOM_INVARIANT_GOAL`; empty means
@@ -1264,11 +1309,14 @@ ticket gets one separate invariant issue that refs the ticket (loom#1223
 flipped 18 times in a day before this). Issues and pull requests in a private repo are named in words, and
 failure reasons have repos, paths and credentials replaced. One pass files
 or reopens at most 5, and below the GitHub budget floor files nothing.
-A `lane-pr-stalled` or `epic-over-cap` issue whose subject settled for good
+A per-violation `lane-pr-stalled` or `epic-over-cap` issue filed before
+loom#2099 whose subject settled for good
 (its pull request merged or was closed unmerged, its epic is back at the
 cap) closes on the first pass the breach is gone, whatever labels it carries
-(not a `loom:ticket`), with one note naming how; these closes come before
-the other clears and read no comments (loom#2022). Other cleared issues
+(not a `loom:ticket`), with one note in its body naming how; these closes
+come before the other clears, read no comments (loom#2022), and walk the
+issue listing rather than the local map, so one filed before the map or gone
+while the station was down settles too (loom#2257). Other cleared issues
 close once the breach has been gone 6 hours.
 `python3 -m bus.brain status` lists the open ones under "Invariants broken"
 for the brain's report, and the station's own standup on that goal home
