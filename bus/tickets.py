@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import answer, proof, status
+from .stale_claims import outside_hold
 
 # The runner's own patterns (lanes/run_lane.sh).
 MODEL_RE = re.compile(r"[A-Za-z0-9._:][A-Za-z0-9._:/@-]*")
@@ -1034,7 +1035,14 @@ def owned_elsewhere(issue: Dict[str, Any], authors: Iterable[str],
     its own operator logins (LOOM_BRIEF_AUTHORS); anything else is left
     alone. A trusted briefer (LOOM_TRUSTED_BRIEFERS) owns nothing for this
     Loom, except that a loom:ticket they authored is handed to it even when
-    they assigned or claim-labelled it to themselves."""
+    they assigned or claim-labelled it to themselves.
+
+    Outside work beats anything of ours (loom#2333): an issue under
+    outside_hold, or assigned to a person who is not one of ours, is theirs
+    even beside our claim or operator. An App assignee owns nothing."""
+    held = outside_hold(issue)
+    if held:
+        return held
     logins = assignees(issue) + claimed_by(issue)
     if not logins:
         return None
@@ -1043,6 +1051,10 @@ def owned_elsewhere(issue: Dict[str, Any], authors: Iterable[str],
     if (author and author not in allowed
             and brief_author_trusted(issue, (), briefers)):
         allowed.add(author)
+    outsider = next((a for a in assignees(issue)
+                     if a not in allowed and not a.endswith("[bot]")), None)
+    if outsider:
+        return outsider
     if any(login in allowed for login in logins):
         return None
     return logins[0]
