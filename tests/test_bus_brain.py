@@ -5589,6 +5589,104 @@ class MoveOutsideEpicTests(unittest.TestCase):
         self.assertEqual(fake.subs[20], [23, 24, 25])
 
 
+class DedupeIntakeEpicTests(unittest.TestCase):
+    """loom#2155: two open intake epics of one repo shared the old unnumbered
+    title; the older one takes a batch number and its tickets move under the
+    newest."""
+
+    def repo(self, epics):
+        """A repo with the given (number, title, children) intake epics."""
+        fake = OutsideEpicRepo()
+        fake.epics = []
+        for number, title, children in epics:
+            epic = dict(item(number, body="Part of #1\n", labels=("epic",)), title=title)
+            fake.issues[number] = epic
+            fake.epics.append(epic)
+            fake.subs[number] = []
+            for child in children:
+                fake.issues[child["number"]] = child
+                fake.subs[number].append(child["number"])
+        return fake
+
+    @staticmethod
+    def ticket(number, part=53, labels=("loom:ticket",), **extra):
+        extra.setdefault("parent_issue_url",
+                         "https://api.github.com/repos/%s/issues/%d" % (REPO, part))
+        return item(number, body="## Why\nwhy\n\nPart of #%d\n" % part,
+                    labels=labels, **extra)
+
+    def dedupe(self, fake):
+        return brain.dedupe_intake_epics(GitHub("t", transport=fake), REPO)
+
+    def test_the_older_duplicate_takes_a_batch_number_and_its_tickets_move_to_the_newest(self):
+        fake = self.repo([
+            (53, brain.INTAKE_TITLE, [self.ticket(54, state="closed"),
+                                      self.ticket(65)]),
+            (56, brain.INTAKE_TITLE, []),
+        ])
+        self.assertEqual(self.dedupe(fake), (1, 1))
+        # The newest keeps its title; the older takes the next batch number.
+        self.assertEqual(fake.issues[56]["title"], brain.INTAKE_TITLE)
+        self.assertEqual(fake.issues[53]["title"], brain.INTAKE_BATCH_TITLE % 1)
+        # The open ticket moved under the newest, and its Part of line too.
+        self.assertEqual(fake.subs[56], [65])
+        self.assertNotIn(65, fake.subs[53])
+        self.assertIn("Part of #56", fake.issues[65]["body"])
+        # The closed ticket stays where it was.
+        self.assertEqual(fake.subs[53], [54])
+        links = [c[2] for c in fake.writes() if c[1].endswith("/sub_issues")]
+        self.assertEqual(links, [{"sub_issue_id": 1065, "replace_parent": True}])
+
+    def test_a_renamed_epic_takes_a_batch_number_no_open_intake_epic_uses(self):
+        fake = self.repo([
+            (53, brain.INTAKE_TITLE, []),
+            (56, brain.INTAKE_TITLE, []),
+            (70, brain.INTAKE_BATCH_TITLE % 4, []),
+        ])
+        self.assertEqual(self.dedupe(fake), (1, 0))
+        self.assertEqual(fake.issues[53]["title"], brain.INTAKE_BATCH_TITLE % 5)
+
+    def test_the_newest_epic_takes_only_the_room_it_has(self):
+        # The newest holds 14 of its 15 tickets, so only one moves and the
+        # other stays under the renamed older epic rather than overfilling it.
+        full = [self.ticket(100 + i, part=56) for i in range(brain.EPIC_TICKET_CAP - 1)]
+        fake = self.repo([
+            (53, brain.INTAKE_TITLE, [self.ticket(65), self.ticket(66)]),
+            (56, brain.INTAKE_TITLE, full),
+        ])
+        self.assertEqual(self.dedupe(fake), (1, 1))
+        self.assertEqual(fake.subs[56][-1], 65)
+        self.assertEqual(len(fake.subs[56]), brain.EPIC_TICKET_CAP)
+        self.assertEqual(fake.subs[53], [66])
+
+    def test_three_duplicates_become_three_titles_and_gather_under_the_newest(self):
+        fake = self.repo([
+            (53, brain.INTAKE_TITLE, [self.ticket(65)]),
+            (54, brain.INTAKE_TITLE, [self.ticket(66, part=54)]),
+            (56, brain.INTAKE_TITLE, []),
+        ])
+        self.assertEqual(self.dedupe(fake), (2, 2))
+        self.assertEqual(sorted(fake.issues[n]["title"] for n in (53, 54, 56)),
+                         sorted([brain.INTAKE_TITLE, brain.INTAKE_BATCH_TITLE % 1,
+                                 brain.INTAKE_BATCH_TITLE % 2]))
+        self.assertEqual(fake.subs[56], [65, 66])
+
+    def test_an_epic_an_ask_a_closed_ticket_and_a_single_title_stay_alone(self):
+        inner = dict(item(60, body="Part of #53\n", labels=("epic",)), title="Epic: inner")
+        ask = self.ticket(61, labels=("loom:ticket", "needs-operator"))
+        done = self.ticket(62, state="closed")
+        live = self.ticket(63)
+        fake = self.repo([(53, brain.INTAKE_TITLE, [inner, ask, done, live]),
+                          (56, brain.INTAKE_TITLE, [])])
+        self.assertEqual(self.dedupe(fake), (1, 1))
+        self.assertEqual(fake.subs[53], [60, 61, 62])
+        self.assertEqual(fake.subs[56], [63])
+        # A lone intake epic is not renamed, and nothing is moved.
+        lone = self.repo([(57, brain.INTAKE_TITLE, [self.ticket(67)])])
+        self.assertEqual(self.dedupe(lone), (0, 0))
+        self.assertEqual(lone.writes(), [])
+
+
 class CloseEpicTests(unittest.TestCase):
     """loom#638: the brain closes a finished epic with a one-line note."""
 

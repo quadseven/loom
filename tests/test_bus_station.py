@@ -473,7 +473,7 @@ class FakeGitHub:
         return None
 
     def _patch_issue(self, n, data):
-        for key in ("body", "state", "state_reason"):
+        for key in ("title", "body", "state", "state_reason"):
             if key in data:
                 self.issues[n][key] = data[key]
         return reply(200, {})
@@ -489,7 +489,11 @@ class FakeGitHub:
         if method == "PATCH" and sub is None:
             return self._patch_issue(n, data)
         if method == "POST" and sub == "sub_issues":
-            self.sub_issues.setdefault(n, []).append(self.issues.get(data["sub_issue_id"] - 1000, {}))
+            child = dict(self.issues.get(data["sub_issue_id"] - 1000, {}))
+            if data.get("replace_parent") and "number" in child:
+                for kids in self.sub_issues.values():
+                    kids[:] = [k for k in kids if k.get("number") != child["number"]]
+            self.sub_issues.setdefault(n, []).append(child)
             return reply(201, {})
         if method in ("POST", "PUT") and sub == "labels":
             return self._update_labels(method, n, data)
@@ -12772,6 +12776,61 @@ class OutsideEpicTest(Base):
         log = self.run_pass_quiet()
         self.assertEqual(self.fake.sub_issues[60], [])
         self.assertNotIn("outside-epic: moved", log)
+
+
+class DedupeEpicTitleTest(Base):
+    """The station's pass gives two open intake epics of one repo distinct
+    titles and moves the older one's tickets under the newest (loom#2155)."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake.epics = []
+
+    def ticket(self, number, epic):
+        return {"number": number, "id": 1000 + number, "state": "open",
+                "title": "A ticket", "body": "## Why\nwhy\n\nPart of #%d\n" % epic,
+                "labels": [{"name": "loom:ticket"}],
+                "parent_issue_url": "https://api.github.com/repos/%s/issues/%d" % (REPO, epic)}
+
+    def intake(self, number, goal, children=()):
+        epic = {"number": number, "id": 1000 + number, "state": "open",
+                "title": brain.INTAKE_TITLE,
+                "body": "Done when: x.\n\nSize: at most 15 tickets.\n\nPart of #%d\n" % goal,
+                "labels": [{"name": "epic"}]}
+        self.fake.issues[number] = epic
+        self.fake.epics.append(epic)
+        self.fake.sub_issues[number] = list(children)
+        for child in children:
+            self.fake.issues[child["number"]] = child
+
+    def run_pass_quiet(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            runner.dedupe_epic_titles()
+        return out.getvalue()
+
+    def test_the_older_duplicate_is_renamed_and_its_ticket_moves_to_the_newest(self):
+        self.fake.add_goal(1)
+        self.fake.add_goal(2)
+        self.intake(53, 1, [self.ticket(65, 53)])
+        self.intake(56, 2)
+        log = self.run_pass_quiet()
+        self.assertEqual(self.fake.issues[53]["title"], brain.INTAKE_BATCH_TITLE % 1)
+        self.assertEqual(self.fake.issues[56]["title"], brain.INTAKE_TITLE)
+        self.assertEqual([i["number"] for i in self.fake.sub_issues[56]], [65])
+        self.assertIn("Part of #56", self.fake.issues[65]["body"])
+        self.assertRegex(log, r"epic-titles: renamed 1, moved 1 in %s" % REPO)
+
+    def test_the_pass_waits_an_hour_between_runs(self):
+        self.fake.add_goal(1)
+        self.intake(53, 1)
+        self.intake(56, 1)
+        self.run_pass_quiet()
+        self.intake(57, 1)
+        log = self.run_pass_quiet()
+        self.assertEqual(self.fake.issues[57]["title"], brain.INTAKE_TITLE)
+        self.assertNotIn("epic-titles: renamed", log)
 
 
 class TwoLoomsTest(Base):
