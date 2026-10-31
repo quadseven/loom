@@ -966,7 +966,11 @@ confidence`) is not sent back: a lane cannot fix it. The station leaves the
 ticket at `loom:pr` with no fix comment, no round counted and no
 `loom:ready`, and the factory asks the review bot to review the head again
 (`/grug improve`, once per head commit). Real failures beside it are sent
-back without it.
+back without it. The same request goes to any open lane pull request whose
+review check failed degraded, whatever state its ticket is in or whatever else
+fails on the head, once per head commit and at most `claimed.REREVIEW_PER_RUN`
+requests a factory pass; the log names each request against that bound and the
+pull request that waits for the next pass.
 
 A review check that failed only on a split request is not sent back either.
 When its summary carries a `Reviewability` note of kind `cross-cohort-proof`,
