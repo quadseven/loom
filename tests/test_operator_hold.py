@@ -287,7 +287,7 @@ class HostOnlyRefusedAsk(unittest.TestCase):
         worker.assign_queued()
         self.assertEqual(factory._state(gh.issues[7]), "queued")
         self.assertFalse(factory._lane(gh.issues[7]))
-        self.assertNotIn("loom:human", factory._labels(gh.issues[7]))
+        self.assertNotIn("needs:human", factory._labels(gh.issues[7]))
 
 
 class Rewrite(unittest.TestCase):
@@ -455,7 +455,7 @@ class BrainMerge(unittest.TestCase):
         self.assertIn("merge #8 yourself", asked[0]["body"])
         self.assertIn("Kind: decision", asked[0]["body"])
         labels = [b for m, p, b in fake.writes if p.endswith("/issues/9/labels")]
-        self.assertEqual(labels, [{"labels": ["loom:human"]}])
+        self.assertEqual(labels, [{"labels": ["needs:human"]}])
 
     def test_a_body_that_says_do_not_merge_until_is_refused(self):
         # Replay case operator-step-02: on main this merged on green checks.
@@ -517,7 +517,11 @@ class BrainMerge(unittest.TestCase):
         node = {"commits": {"nodes": [{"commit": {"committedDate": "2030-01-01T12:45:00Z",
                                                   "statusCheckRollup": {"state": "SUCCESS"}}}]},
                 "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}}
-        lines = brain._pull_request_lines(GitHub("t", transport=Route({})), BRAIN_REPO, [pr],
+        routes = {"/repos/%s/issues/9" % BRAIN_REPO: {
+                      "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]},
+                  "/repos/%s/pulls/8/files" % BRAIN_REPO: [{"filename": "bus/a.py"}],
+                  "/repos/%s/pulls/8" % BRAIN_REPO: {"mergeable": True}}
+        lines = brain._pull_request_lines(GitHub("t", transport=Route(routes)), BRAIN_REPO, [pr],
                                           {"prs": {8: node}}, "grug-tribe")
         self.assertIn("blocked: held for the operator", lines[1])
 

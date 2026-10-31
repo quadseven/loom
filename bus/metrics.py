@@ -13,10 +13,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Sequence
 
-from . import audit, brain, proof, quiet
+from . import audit, brain, naming, proof, quiet
 from .github import GitHub, GitHubError, auth_from_env
 from .factory import lacks_test
-from .labels import LANES
+from .labels import HUMAN_LABELS, LANES, needs_human
 
 WAIT_STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
 WAIT_WINDOW = 7 * 86400
@@ -278,6 +278,9 @@ class Totals:
     # Goal homes quiet since their last report (bus/quiet.py): owed no report,
     # so their last one is still current (loom#1534).
     quiet_goals: List[str] = field(default_factory=list)
+    # Goal homes whose report is past its reading time and grace
+    # (brain.goal_ledger "overdue"): what the visibility number fails on.
+    overdue_goals: List[str] = field(default_factory=list)
     goal_repos: set[str] = field(default_factory=set)
     # Repos with an open ticket a lane can work (WORKABLE): a goal repo with
     # none, such as a backlog goal whose every issue is done or a person's
@@ -456,18 +459,23 @@ class Collector:
         total.goals += len(goals)
         if goals:
             total.goal_repos.add(repo)
-        for goal in goals:
+        # A backlog goal posts no report (its line is in the digest), so it
+        # is owed none and its report age is not counted.
+        for goal in (g for g in goals if not naming.is_backlog_home(g)):
             key = "%s#%d" % (repo, goal["number"])
             newest = max((stamp(c.get("created_at"))
                           for c in self.issue_comments(repo, int(goal["number"]))
                           if self.trusted_comment(c)
                           and str(c.get("body") or "").startswith(REPORT)), default=0.0)
-            # Only a report past the cadence needs the quiet read.
-            if newest and self.now - newest > brain.REPORT_EVERY \
-                    and self._quiet(repo, int(goal["number"]), issues):
+            # Only a report past its reading time needs the quiet read.
+            late = not newest or self.now >= brain.next_report_due(
+                datetime.fromtimestamp(newest, timezone.utc)).timestamp() + brain.REPORT_GRACE
+            if newest and late and self._quiet(repo, int(goal["number"]), issues):
                 total.quiet_goals.append(key)
                 continue
             total.report_ages[key] = self.now - newest if newest else float("inf")
+            if late:
+                total.overdue_goals.append(key)
 
     def _quiet(self, repo: str, number: int, issues: List[Dict[str, Any]]) -> bool:
         """Whether the goal is quiet since its last report; a failed read
@@ -547,8 +555,8 @@ class Collector:
                 and any(state in labels for state in WORKABLE)):
             total.workable_repos.add(repo)
         created = stamp(issue.get("created_at"))
-        if created >= self.since and ("needs-operator" in labels or
-                self.label_time(repo, issue, "needs-operator")):
+        if created >= self.since and (needs_human(labels) or any(
+                self.label_time(repo, issue, name) for name in HUMAN_LABELS)):
             total.asks += 1
         if ("loom:urgent" in labels and issue.get("state") == "open"
                 and self._urgent_regression(repo, issue, created)):
@@ -683,17 +691,18 @@ def autonomy_number(total: Totals) -> Number:
 
 
 def visibility_number(total: Totals) -> Number:
-    """Each goal home's newest report is no older than the report cadence
-    (brain.REPORT_EVERY: 6 hours since the operator chose it on 2026-10-18).
-    A goal quiet since its last report is owed none, so it passes (loom#1534)."""
-    from .brain import REPORT_EVERY
-    max_age = max(total.report_ages.values(),
-                  default=0.0 if total.quiet_goals else float("inf"))
+    """Each goal home's newest report was written for its last reading time
+    (brain.REPORT_TIMES, 10:00 and 21:00 New York since 2026-10-25): none is
+    past its due time and grace. A goal quiet since its last report is owed
+    none, so it passes (loom#1534); a backlog goal posts none and is not
+    counted."""
+    from .brain import REPORT_TIMES
     return Number("Visibility", "%s" % ", ".join(
-        ["%s %.1fh" % (r, age / 3600) for r, age in total.report_ages.items()]
+        ["%s %.1fh%s" % (r, age / 3600, " late" if r in total.overdue_goals else "")
+         for r, age in total.report_ages.items()]
         + ["%s quiet" % r for r in total.quiet_goals]),
-                  "each goal report <=%gh" % (REPORT_EVERY / 3600),
-                  bool(total.goals) and max_age <= REPORT_EVERY)
+                  "each goal reported by %s" % " and ".join("%02d:%02d" % t for t in REPORT_TIMES),
+                  bool(total.goals) and not total.overdue_goals)
 
 
 def self_repair_number(total: Totals) -> Number:

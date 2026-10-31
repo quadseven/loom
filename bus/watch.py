@@ -20,7 +20,9 @@ with the count and the first and last example lines (redacted, then passed
 through the written-text check). A signature already open as an issue gets a
 count comment at most once an hour, with when it was last seen: one rolling
 issue per signature. A signature not seen for a DAY has its open issue closed as
-not planned, with one comment that says when it was last seen. The issue a signature was filed on is remembered until
+not planned, with one comment that says when it was last seen; an issue that
+became a ticket closes as completed once it carries loom:shipped or
+loom:verified, and is left open to its own state machine before that. The issue a signature was filed on is remembered until
 it closes, so a signature that comes back after a quiet day, on an issue the
 brain has since retitled or relabelled, is counted there, not filed twice. Offsets and signatures are kept in the
 station's state directory (watch.json); no model is involved.
@@ -53,6 +55,7 @@ import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import handoff
+from . import naming
 from . import notify
 from . import shadow
 from . import text as _text
@@ -78,6 +81,11 @@ TITLE_MAX = 200
 EXAMPLE_MAX = 2000
 EXAMPLE_HEAD = 1200
 LABEL = "loom:triage"
+# A signature that became a ticket and shipped closes as completed, not as
+# not planned: its fix shipped (loom#1934). A ticket not yet shipped is left
+# open for its own state machine.
+SHIPPED_LABELS = ("loom:shipped", "loom:verified")
+TICKET_LABEL = "loom:ticket"
 MARKER = "<!-- loom:watch v1 -->"
 # The station prints the watcher's own lines with this prefix; they name
 # signatures (which say "error") and must never count as hits themselves.
@@ -225,6 +233,8 @@ _IP_RE = re.compile(r"\b[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?::[0-9]+)?\b"
 # A host under a suffix that only resolves on a private network.
 _HOST_RE = re.compile(r"(?i)\b(?:[a-z0-9-]+\.)+(?:local|lan|home|internal|corp|intranet|ts\.net)\b")
 _REF_RE = re.compile(r"(?<![A-Za-z0-9_./-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+\b")
+# A ticket id such as owner.name-123 or owner.name-123-r2.
+_TICKET_RE = re.compile(r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+-[0-9]+(?:-r[0-9]+)?(?![A-Za-z0-9_.-])")
 # owner/name: two words around one slash, each with a letter.
 _REPO_RE = re.compile(r"(?<![A-Za-z0-9_./<-])[A-Za-z0-9_.-]*[A-Za-z][A-Za-z0-9_.-]*"
                       r"/[A-Za-z0-9_.-]*[A-Za-z][A-Za-z0-9_.-]*(?![A-Za-z0-9_/>-])")
@@ -234,6 +244,13 @@ _HEX_RE = re.compile(r"\b0x[0-9a-fA-F]+\b|\b(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])
 # A long word mixing letters and digits: a node id, a session id, a token.
 _ID_RE = re.compile(r"\b(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[A-Za-z])[A-Za-z0-9_]{10,}\b")
 _NUM_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+# A setup failure message whose wording varies but names the same failure
+# class: "base check exited <n> on the unmodified repo" and "base check exited
+# <n> on the default branch" are the same factory incident (loom#2158).
+# Also "the check exited <n> on the unmodified base" (exit 125-127).
+_SETUP_FAILURE_RE = re.compile(
+    r"(?i)(base check exited <n> on the )(?:unmodified repo|default branch)"
+    r"|(the check exited <n> on the unmodified base)")
 _LEAD_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)+")
 
 Say = Callable[[str], None]
@@ -269,12 +286,19 @@ def _norm(piece: str) -> str:
     piece = _IP_RE.sub("<ip>", piece)
     piece = _HOST_RE.sub("<host>", piece)
     piece = _REF_RE.sub("<repo>#<n>", piece)
+    piece = _TICKET_RE.sub("<repo>", piece)
     piece = _REPO_RE.sub("<repo>", piece)
     piece = _NUMBER_REF_RE.sub("#<n>", piece)
     piece = _UUID_RE.sub("<id>", piece)
     piece = _HEX_RE.sub("<hex>", piece)
     piece = _ID_RE.sub("<id>", piece)
-    return _NUM_RE.sub("<n>", piece)
+    piece = _NUM_RE.sub("<n>", piece)
+    def _setup_failure(m: "re.Match[str]") -> str:
+        if m.group(1):
+            return m.group(1) + "<setup-failure>"
+        return "base check exited <n> on the <setup-failure>"
+    piece = _SETUP_FAILURE_RE.sub(_setup_failure, piece)
+    return piece
 
 
 def stage(line: str) -> Optional[str]:
@@ -325,6 +349,7 @@ def redact(line: str) -> str:
     line = _IP_RE.sub("<ip>", line)
     line = _HOST_RE.sub("<host>", line)
     line = _REF_RE.sub(lambda m: "<repo>#" + m.group(0).rsplit("#", 1)[1], line)
+    line = _TICKET_RE.sub("<repo>", line)
     line = _REPO_RE.sub("<repo>", line)
     line = " ".join(line.replace("`", "'").split())
     return _shorten(line)
@@ -521,6 +546,19 @@ def _checked(line: str) -> str:
     except ValueError:
         return WITHHELD
     return line
+
+
+def quiet_reason(issue: Dict[str, Any]) -> Optional[str]:
+    """The state_reason a quiet signature's open issue closes with: completed
+    once it became a ticket that shipped, not_planned for a bare signature,
+    None for a ticket not yet shipped, which its own state machine closes
+    (loom#1934)."""
+    labels = set(naming.label_names(issue))
+    if labels.intersection(SHIPPED_LABELS):
+        return "completed"
+    if TICKET_LABEL in labels:
+        return None
+    return "not_planned"
 
 
 class Watcher:
@@ -1038,18 +1076,22 @@ class Watcher:
         self._told(rec)
         return "counted"
 
-    def _quiet_body(self, rec: Dict[str, Any]) -> str:
+    def _quiet_body(self, rec: Dict[str, Any], shipped: bool = False) -> str:
+        close = ("Its fix shipped. Closing as completed. A new sighting files or reopens it."
+                 if shipped else "Closing as not planned. A new sighting files or reopens it.")
         return "\n".join([
             MARKER,
             "This signature has not been seen for %d hours. Last seen %s."
             % (DAY // 3600,
                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_num(rec.get("last")) or self.now))),
             "",
-            "Closing as not planned. A new sighting files or reopens it."])
+            close])
 
     def _close_quiet(self, sigs: Dict[str, Any]) -> None:
         """Close the open issue of each signature not seen for a DAY, as not
-        planned. A signature that comes back files again as usual."""
+        planned, or as completed when it became a ticket that shipped. An
+        unshipped ticket is left open. A signature that comes back files
+        again as usual."""
         for key, rec in sorted(sigs.items(), key=lambda kv: kv[1].get("first", 0)):
             number = _num(rec.get("issue")) if isinstance(rec, dict) else None
             last = _num(rec.get("last")) if isinstance(rec, dict) else None
@@ -1060,17 +1102,20 @@ class Watcher:
             try:
                 issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (self.repo, int(number))).data
                 if isinstance(issue, dict) and issue.get("state") == "open":
+                    reason = quiet_reason(issue)
+                    if reason is None:
+                        continue   # the link is kept, so a return is counted there
                     # Before the note, so a close shadow mode holds (the
                     # signature became a ticket) says nothing (loom#1551).
                     if shadow.guard("PATCH", "/repos/%s/issues/%d" % (self.repo, int(number)),
-                                    {"state": "closed", "state_reason": "not_planned"}, issue,
+                                    {"state": "closed", "state_reason": reason}, issue,
                                     source="watch quiet close") is not None:
                         continue
-                    body = self._quiet_body(rec)
+                    body = self._quiet_body(rec, reason == "completed")
                     _text.check(body)
                     notify.post(self.gh, self.repo, number, body, notify.CLOSED)
                     self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
-                                 {"state": "closed", "state_reason": "not_planned"})
+                                 {"state": "closed", "state_reason": reason})
                     self.writes += 2
                     self.say("watch: closed quiet %s#%d" % (self.repo, number))
             except (GitHubError, OSError, ValueError) as err:

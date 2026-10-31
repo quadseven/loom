@@ -72,3 +72,27 @@ easy / medium / hard, then matched to the cheapest lane whose tier fits:
 
 Lanes report their catalogs; new models appear automatically. When a lane
 is near its budget or rate-limited, the dispatcher routes around it.
+
+## October 2026 price changes
+
+Routing decisions recorded 2026-10-28, from the vendors' October price
+changes. Prices are US dollars per million tokens.
+
+- High-volume subtasks on priced Anthropic routes pin `claude-haiku-5-5`.
+  Haiku 5.5 (released 2026-10-07) costs $0.10 input / $0.50 output for
+  prompts up to 100k tokens ($0.50 / $2.50 above that), against Haiku 4.5's
+  $1.00 / $5.00. Triage, extraction, classification and other small,
+  well-scoped subtasks that would otherwise burn a priced Sonnet or Opus
+  route belong on it. The cheap tier stops at 100k prompt tokens (cache
+  reads and writes count toward the prompt), so volume pins keep their
+  prompts short.
+- Cache-heavy work stays on `claude-sonnet-5-5`. On 2026-10-07 its
+  cache-read price halved, $0.20 to $0.10 (cache writes unchanged at
+  $2.50 for the 5-minute cache and $4.00 for the 1-hour cache), which the
+  vendor puts at roughly 20% cheaper on most agentic workloads. Work that
+  re-reads a large shared context - the model ladder's first rung above
+  all (bus/factory.py) - is exactly the traffic that benefits, so the
+  price change widened Sonnet's lead for that shape of work instead of
+  opening the rung to a smaller model.
+- The spark slots' local model is under evaluation, not changed: see
+  "Mellum 2.1 evaluation" in docs/LANES.md.

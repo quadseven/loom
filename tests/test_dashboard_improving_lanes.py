@@ -197,8 +197,8 @@ class NeedsYouTest(unittest.TestCase):
         self.assertNotIn("It is too broad", html)
         self.assertLess(html.index("example-owner/sample#7"), html.index("<details"))
         self.assertIn("From the backlog (1)", html)
-        self.assertEqual(html.count("example-owner/sample#7"), 1)
-        self.assertIn("loom:human counts by repo: example-owner/sample: 2", html)
+        self.assertEqual(html.count("example-owner/sample" + "#7 - "), 1)
+        self.assertIn("needs:human counts by repo: example-owner/sample: 2", html)
 
     def test_an_ask_without_an_ask_section_says_so_instead_of_repeating_the_title(self):
         item = {"repo": "example-owner/sample", "number": 3, "title": "Move the drive",

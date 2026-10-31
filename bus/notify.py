@@ -46,13 +46,15 @@ JOURNAL = "journal"
 EVIDENCE = "evidence"
 STATUS = "status"
 RECORD = "record"
+# An operator's answer to an ask, posted from the dashboard (bus/answer.py).
+ANSWER = "answer"
 
 KINDS = {
     FAILURE: "a red merge, a revert, or a lane's hand-back that a person may need to read",
-    ASK: "the exact thing only a person can do (loom:human)",
+    ASK: "the exact thing only a person can do (needs:human)",
     RUNAWAY: "a hold or release of a ticket that ran past its attempts",
     PROOF_REFUSED: "the station stops handing a ticket out to verify after refused proofs",
-    FIX_BRIEF: "a loom:fix brief that sends findings back to a lane",
+    FIX_BRIEF: "a loom:fix brief (the station edits later rounds into it, bus/fixrounds.py)",
     MERGED: "a pull request merged, or a ticket moved to loom:merged",
     SHIPPED: "a ticket moved to loom:shipped",
     VERIFIED: "a ticket moved to loom:verified",
@@ -71,6 +73,7 @@ KINDS = {
     EVIDENCE: "evidence a scan adds to the issue it files",
     STATUS: "the first status comment of a ticket (later events edit it)",
     RECORD: "a marker comment Loom reads back (a claim, a heartbeat, a handoff packet)",
+    ANSWER: "an operator's answer to an ask, posted from the dashboard's Needs you page",
 }
 
 

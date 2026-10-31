@@ -7,7 +7,7 @@ import os
 import unittest
 from unittest import mock
 
-from dashboard import server
+from dashboard import needs_you, server
 from dashboard.github import OPERATOR_CLAIMS_SECONDS, TicketStore
 from tests.test_dashboard_operators_page import ENV, FakeGitHub, _issue
 
@@ -141,7 +141,7 @@ class NeedsYouPageTest(unittest.TestCase):
         code, filtered = handler.result
         self.assertEqual(code, 200)
         self.assertEqual(sorted(card.split(" -")[0].rsplit("#", 1)[-1] for card in
-                                (c.split("<span>", 1)[1] for c in self.cards(filtered))), ["40", "43"])
+                                (c.split("<span class=\"ask-ref\">", 1)[1] for c in self.cards(filtered))), ["40", "43"])
         self.assertIn('href="/needs-you?who=%s" aria-current="true"' % OWNER, filtered)
         operator = self.page(who=needs_you.who_param("operator"))
         self.assertEqual(len(self.cards(operator)), 2)
@@ -179,5 +179,235 @@ class RefKeyTest(unittest.TestCase):
         self.assertNotEqual(needs_you.ref_key("grug", 1, names), needs_you.ref_key("one-owner/grug", 1, names))
 
 
+class GoalCapsTest(NeedsYouPageTest):
+    """The station's goals stuck at their in-flight cap (loom#1831)."""
+    GOAL = {"goal": "%s#5" % REPO, "since": 0.0, "in_flight": 32, "cap": 28, "no_lane": 20}
+    PATH = "/api/goal-caps"
+
+    def post(self, body, auth="Bearer YOUR_UPLOAD_TOKEN_HERE"):
+        import io
+        from email.message import Message
+        handler_type = server._handler_for(self.store)
+        handler = handler_type.__new__(handler_type)
+        handler.path = self.PATH
+        handler.headers = Message()
+        raw = json.dumps(body).encode()
+        handler.headers["Content-Length"] = str(len(raw))
+        if auth:
+            handler.headers["Authorization"] = auth
+        handler.rfile = io.BytesIO(raw)
+        result = []
+        handler.send_json = lambda code, value: result.append((code, value))
+        with mock.patch.dict(os.environ, {"LOOM_UPLOAD_TOKEN": "YOUR_UPLOAD_TOKEN_HERE"}):
+            handler.do_POST()
+        return result[0]
+
+    def test_a_goal_stuck_at_its_cap_shows_with_its_no_lane_count(self):
+        now = 10 * 3600.0
+        with mock.patch.object(server.time, "time", return_value=now):
+            self.assertEqual(self.post({"goals": [self.GOAL]}, auth="")[0], 401)
+            self.assertEqual(self.post({"goals": [self.GOAL]}), (201, {"goals": 1}))
+            body = self.page()
+        self.assertIn("Stuck in Loom, not waiting on you (1)", body)
+        self.assertIn("%s#5</strong> has been full for 10 hours: 32 of 28 tickets in "
+                      "progress (the limit), 20 with no lane able to take them. "
+                      "Waits on: Loom." % REPO, body)
+
+    def test_an_old_or_empty_report_shows_nothing(self):
+        self.assertEqual(needs_you.goal_caps_section({"goals": [self.GOAL], "received_at": 0.0},
+                                                     needs_you.GOAL_CAPS_MAX_AGE + 1), "")
+        self.assertEqual(needs_you.goal_caps_section({"goals": [], "received_at": 0.0}, 1.0), "")
+        self.assertEqual(needs_you.goal_caps_section(None, 1.0), "")
+
+    def test_a_malformed_report_is_refused(self):
+        for body in ({}, {"goals": "x"}, {"goals": [dict(self.GOAL, goal="<b>x</b>")]},
+                     {"goals": [dict(self.GOAL, no_lane="3")]},
+                     {"goals": [dict(self.GOAL, cap=True)]}):
+            self.assertEqual(self.post(body)[0], 400, body)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecutiveSummaryTest(NeedsYouPageTest):
+    """loom#810 follow-up: the page reads as an executive summary. A headline
+    says how much waits and on whom, a short list says where to start, and
+    the items are grouped by the kind of action they need, oldest first."""
+
+    def test_the_page_opens_with_a_headline_naming_the_counts_and_the_oldest_item(self):
+        body = self.page()
+        summary = body.split('<section class="needs-summary', 1)[1].split("</section>", 1)[0]
+        self.assertIn("4 items wait on people", summary)
+        self.assertIn("2 on %s" % OWNER, summary)
+        self.assertIn("Oldest: %s#40" % REPO, summary)
+        self.assertLess(body.index("needs-summary"), body.index('class="card ask-card"'))
+
+    def test_start_here_lists_at_most_three_items(self):
+        body = self.page()
+        start = body.split('<ol class="needs-start">', 1)[1].split("</ol>", 1)[0]
+        self.assertEqual(start.count("<li>"), 3)
+        self.assertIn("%s#40" % REPO, start)
+
+    def test_items_are_grouped_by_the_action_they_need_oldest_first(self):
+        body = self.page()
+        self.assertIn("Access and credentials (3)", body)
+        self.assertIn("Decisions (1)", body)
+        access = body.split("Access and credentials (3)", 1)[1].split("</section>", 1)[0]
+        order = [access.index("%s#%d -" % (REPO, n)) for n in (40, 41, 43)]
+        self.assertEqual(order, sorted(order))
+        self.assertNotIn("%s#42 -" % REPO, access)
+
+    def test_each_item_is_one_line_that_opens_to_the_whole_ask(self):
+        card = needs_you.card({"repo": REPO, "number": 7, "title": "Long ask", "who": [OWNER],
+                               "unblocks": 0, "body_ask": "Rotate the key. Then paste its id here.",
+                               "comment_ask": None, "comment_url": ""})
+        line, rest = card.split("</summary>", 1)
+        self.assertIn("Long ask", line)
+        self.assertIn("Rotate the key.", line)
+        self.assertNotIn("paste its id", line)
+        self.assertIn("<blockquote>Rotate the key. Then paste its id here.</blockquote>", rest)
+
+    def test_start_here_names_the_longest_waiting_items(self):
+        start = self.page().split('<ol class="needs-start">', 1)[1].split("</ol>", 1)[0]
+        self.assertLess(start.index("%s#40" % REPO), start.index("%s#41" % REPO))
+
+    def test_the_action_kind_comes_from_the_ask(self):
+        kind = needs_you.action_kind
+        self.assertEqual(kind({"body_ask": "Plug a monitor into the box and power it on."}), "device")
+        self.assertEqual(kind({"body_ask": "Create an OAuth client and paste its id."}), "access")
+        self.assertEqual(kind({"body_ask": "Reply yes or no."}), "decide")
+        self.assertEqual(kind({"body_ask": "Merge PR 12 as is, or reply hold."}), "decide")
+        self.assertEqual(kind({"body_ask": "", "comment_ask": ""}), "missing")
+        self.assertEqual(kind({"body_ask": "Look at the log."}), "other")
+
+    def test_the_lead_skips_the_lead_in_that_only_says_who_it_waits_on(self):
+        lead = needs_you.first_sentence
+        self.assertEqual(lead("**Needs the operator (one ask).** Merge PR 12 as is, or reply hold. More."),
+                         "Merge PR 12 as is, or reply hold.")
+        self.assertEqual(lead("Exact ask (owner): open Accounts and reconnect it. Then sync."),
+                         "open Accounts and reconnect it.")
+        self.assertEqual(lead("Ask (needs:ccqw): one open box is left."), "one open box is left.")
+
+
+class BrainHoldsTest(NeedsYouPageTest):
+    """The station's needs-brain holds older than a day, a repo a row (loom#1872)."""
+    ROW = {"repo": REPO, "old": 7, "person": 1, "unknown": 2}
+    PATH = "/api/brain-holds"
+    post = GoalCapsTest.post
+
+    def test_each_repos_old_holds_show_with_who_set_them(self):
+        with mock.patch.object(server.time, "time", return_value=1000.0):
+            self.assertEqual(self.post({"repos": [self.ROW]}, auth="")[0], 401)
+            self.assertEqual(self.post({"repos": [self.ROW]}), (201, {"repos": 1}))
+            body = self.page()
+        self.assertIn("needs-brain holds older than a day (7)", body)
+        self.assertIn("%s</strong>: 7 held over a day (1 set by a person, 2 by an unknown "
+                      "setter)." % REPO, body)
+
+    def test_an_old_or_empty_report_shows_nothing(self):
+        self.assertEqual(needs_you.brain_holds_section({"repos": [self.ROW], "received_at": 0.0},
+                                                       needs_you.BRAIN_HOLDS_MAX_AGE + 1), "")
+        self.assertEqual(needs_you.brain_holds_section(
+            {"repos": [dict(self.ROW, old=0)], "received_at": 0.0}, 1.0), "")
+        self.assertEqual(needs_you.brain_holds_section(None, 1.0), "")
+
+    def test_a_malformed_report_is_refused(self):
+        for body in ({}, {"repos": "x"}, {"repos": [dict(self.ROW, repo="<b>x</b>")]},
+                     {"repos": [dict(self.ROW, old="3")]},
+                     {"repos": [dict(self.ROW, person=True)]}):
+            self.assertEqual(self.post(body)[0], 400, body)
+
+
+class AcceptanceCriteriaTest(unittest.TestCase):
+    """Acceptance criteria for loom#1859: three gaps in the Needs-you page."""
+
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, dict(ENV, LOOM_BRIEF_AUTHORS=LOOM))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _make_store(self, gh):
+        store = TicketStore([REPO], gh=gh, budget_floor=500)
+        store._waits_refreshed_at = float("inf")
+        store.refresh()
+        return store
+
+    def page(self, document=None, who=""):
+        return server._needs_you(document or {}, self.store, who=who)
+
+    def cards(self, body):
+        return [part.split("</article>")[0] for part in body.split('<article class="card ask-card"')[1:]]
+
+    def card(self, body, number):
+        return next(card for card in self.cards(body) if "%s#%d<" % (REPO, number) in card
+                    or "%s#%d -" % (REPO, number) in card)
+
+    def test_claim_comment_is_skipped_when_picking_ask(self):
+        """Issue with only a claim comment after the wait label shows no claim text as ask."""
+        # An issue labelled needs:owner with a claim comment (bot handoff) and no other ask comment
+        claim_issue = _issue(50, "Claim test", ["needs:" + OWNER], hours=10)
+        claim_issue["comments"] = 2
+        pages = {
+            "/repos/%s/labels" % REPO: [{"name": "needs:" + OWNER}],
+            "/repos/%s/issues?labels=needs%%3A%s&" % (REPO, OWNER): [claim_issue],
+        }
+        url = "https://github.com/%s/issues/%d#issuecomment-%d"
+        rest = {
+            "/repos/%s/issues/50/comments?per_page=100&page=1" % REPO: [
+                {"body": "Opened for the work.", "html_url": url % (REPO, 50, 1)},
+                {"body": "<!-- ccqw:handoff v1 -->\nLabelled needs:%s.\n\nDetail." % OWNER,
+                 "html_url": url % (REPO, 50, 2)}],
+        }
+        gh = FakeGitHub(pages, rest)
+        store = self._make_store(gh)
+        body = server._needs_you({}, store)
+        card = self.card(body, 50)
+        # The claim comment should not be picked as the ask
+        self.assertNotIn("Labelled needs", card)
+        self.assertNotIn("ccqw:handoff", card)
+        # Should show "No exact ask" since there's no real ask comment
+        self.assertIn("No exact ask is written", card)
+
+    def test_ask_from_comment_is_copied_to_body_ask_section(self):
+        """Ask only in a comment gets copied to body's ## Ask section once."""
+        # This tests the station's behavior of copying the ask from a comment to the body.
+        # The station edits the issue body to add "## Ask" section. The dashboard then
+        # reads body_ask from the body, which takes precedence over comment_ask.
+        issue = _issue(51, "Copy ask test", ["needs:" + OWNER], hours=10)
+        issue["comments"] = 1
+        # Simulate station copying ask to body: body now has ## Ask section
+        issue["body"] = "## Ask\n\nThis ask was copied from a comment\n"
+        pages = {
+            "/repos/%s/labels" % REPO: [{"name": "needs:" + OWNER}],
+            "/repos/%s/issues?labels=needs%%3A%s&" % (REPO, OWNER): [issue],
+        }
+        gh = FakeGitHub(pages, {})
+        store = self._make_store(gh)
+        body = server._needs_you({}, store)
+        card = self.card(body, 51)
+        # Body ask should be shown (blockquote), not the comment source
+        self.assertIn("<blockquote>This ask was copied from a comment</blockquote>", card)
+        # The "from a comment" SOURCE link should NOT appear when body_ask is present
+        self.assertNotIn('class="machine-fact ask-source">', card)
+
+    def test_unknown_kind_is_flagged_and_counted(self):
+        """Kind: command shows as unknown kind and counted in standup line."""
+        from dashboard import needs_you
+        # Create an entry with an unknown kind in its ask
+        entry = {
+            "repo": REPO, "number": 52, "title": "Unknown kind test",
+            "who": [OWNER], "unblocks": 0,
+            "body_ask": "Kind: command\n\nDo something.",
+            "comment_ask": None, "comment_url": "",
+        }
+        # The action_kind should return "unknown" for unknown kinds
+        kind = needs_you.action_kind(entry)
+        self.assertEqual(kind, "unknown")
+        # The summary should count unknown kinds
+        summary_html = needs_you.summary([entry])
+        self.assertIn("unknown kind", summary_html.lower())
+        # The groups should have an "unknown" group
+        groups_html = needs_you.groups([entry])
+        self.assertIn('data-kind="unknown"', groups_html)
+        self.assertIn("Unknown", groups_html)

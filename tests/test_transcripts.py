@@ -129,6 +129,25 @@ class Formats(Fixture):
         self.assertEqual([(e["role"], e["text"]) for e in self.body("opencode-go-3")["events"]],
                          [("user", "Fix it"), ("assistant", "Fixed.")])
 
+    def test_a_compressed_opencode_store_still_becomes_events(self):
+        # The station gzips a finished run's store (loom#1808); the reader
+        # reads the compressed one.
+        from bus import station
+        run = self.home / "logs/opencode-go-3/T1"
+        db = run / ".local/share/opencode/opencode.db"
+        db.parent.mkdir(parents=True)
+        con = sqlite3.connect(db)
+        con.execute("create table session_message (id text, session_id text, type text, "
+                    "seq int, data text)")
+        con.execute("insert into session_message values ('r0', 's', 'user', 0, ?)",
+                    (json.dumps({"text": "Fix it"}),))
+        con.commit()
+        con.close()
+        self.assertIsNotNone(station._gzip_session_db(str(run)))
+        self.assertFalse(db.exists())
+        self.assertEqual([(e["role"], e["text"]) for e in self.body("opencode-go-3")["events"]],
+                         [("user", "Fix it")])
+
     def test_a_plain_log_run_is_its_last_attempt_as_one_log_event(self):
         self.write(self.home / "logs/zen/T1.log",
                    "[2026-10-12T09:00:00Z] T1 start, lane zen\nold attempt\n"
