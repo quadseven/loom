@@ -3201,6 +3201,40 @@ exec /usr/bin/git "$@"
             return int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp())
         self.assertIn(int(retry_at), (next_month(before), next_month(datetime.now(timezone.utc))))
 
+    def classify_as(self, lane, whole, tail):
+        """(class, retry_at) of a failed run with no edits on `lane`."""
+        script = (RUNNER.parent / "agent_cli.sh").read_text() + (
+            'LANE=%s; classify_failure 1 %s "" %s; printf "%%s|%%s\\n" "$FAIL_CLASS" "$RETRY_AT"'
+            % (shlex.quote(lane), shlex.quote(whole), shlex.quote(tail)))
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+        return result.stdout.strip().split("|")
+
+    def test_copilot_allowance_wordings_hold_the_copilot_lane_for_the_month(self):
+        # The Free allowance runs out with no "usage limit" in the message; a
+        # transient or work class sets no hold, so the next ticket hits the same wall.
+        for said in ("You have exceeded your premium request allowance",
+                     "Error: You have no quota"):
+            kind, retry_at = self.classify_as("copilot", said, said)
+            self.assertEqual(kind, "limit", said)
+            self.assertGreater(int(retry_at), time.time(), said)
+            self.assertEqual(datetime.fromtimestamp(int(retry_at), timezone.utc).day, 1, said)
+
+    def test_copilot_allowance_wordings_hold_no_other_lane(self):
+        # A ticket, diff or file can carry these words on any lane.
+        for said in ("You have exceeded your premium request allowance",
+                     "Error: You have no quota"):
+            kind, retry_at = self.classify_as("zen", said, said)
+            self.assertNotEqual(kind, "limit", said)
+            self.assertEqual(retry_at, "", said)
+
+    def test_copilot_allowance_words_earlier_in_a_run_hold_nothing(self):
+        # Only the run's last lines are the CLI's answer; earlier text can be
+        # the ticket or a file the agent read.
+        said = "the ticket quotes: you have no quota\nsome later output"
+        kind, retry_at = self.classify_as("copilot", said, "some later output")
+        self.assertNotEqual(kind, "limit")
+        self.assertEqual(retry_at, "")
+
     def assert_next_occurrence(self, retry_at, hour, minute, before):
         """retry_at is the next hour:minute on the local clock, read from the
         clock before and after the run so it may cross that time, and by the
