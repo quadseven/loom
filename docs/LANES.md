@@ -2100,4 +2100,6 @@ lane log names each line left out. On a fix round the PR text repair
 refuses while any line is rejected, with a reason asking the lane to file
 the issue and cite it, or drop the line; a round whose summary has no such
 section keeps the body's earlier one. In a public repo another repo's
-citation is written as "issue N of another repo".
+citation is written as "issue N of another repo". The PR text repair does
+the same to every such reference it renders from the ticket, so a fix round
+never restores one the leak scan flagged.

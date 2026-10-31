@@ -917,7 +917,9 @@ superseded, when the issue it was rewritten from is already closed as
 completed, when a pull request in another repo of the owner that names it in
 full has merged, when a pull request a person linked in it or its comments
 merged after it was filed, or when every file its criteria ask to add already
-exists on the default branch. A stale ticket goes back to `loom:queued` with
+exists on the default branch. A name in such a pull request's body does not
+count when it sits under an Out of scope, Not in scope or Follow-ups heading,
+or in a sentence saying the ticket was filed or is a follow-up. A stale ticket goes back to `loom:queued` with
 `needs:human` and one ask (`Kind: decision`) naming the evidence; the factory
 gives a queued `needs:human` ticket no lane. Each piece of evidence holds it
 once: once the operator removes `needs:human`, the same evidence does not hold

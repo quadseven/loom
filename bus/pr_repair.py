@@ -92,6 +92,22 @@ def _brief_section(brief: str, name: str) -> str:
 _CRITERIA_HEADINGS = ("## acceptance criteria", "## acceptance")
 
 
+def _public_brief(brief: str, repo: Optional[str], public: bool) -> str:
+    """The brief with each reference to another repo's issue in words when
+    the repo is public: the body is rendered from it on every fix round, and
+    the runner's first body already words them (lanes/run_lane.sh). Wording
+    the brief, not the body, keeps criteria matching the ticket's."""
+    if not public or not repo:
+        return brief
+    from .factory import SCAN_REF_RE  # the factory imports this module
+    owner, _, name = repo.lower().partition("/")
+
+    def words(m: "re.Match[str]") -> str:
+        own = m.group(2).lower() == name and (m.group(1) or owner).lower() == owner
+        return m.group(0) if own else "issue %s of another repo" % m.group(3)
+    return SCAN_REF_RE.sub(words, brief)
+
+
 def _brief_criteria(brief: str) -> str:
     """The acceptance criteria of a brief or summary, as
     lanes/run_lane.sh::criteria_section reads them: its "## Acceptance
@@ -379,7 +395,7 @@ def reconcile_text(brief: str, current_title: str, current_body: str,
         "changed": False,
         "reason": "",
     }
-    brief = _normalise(brief)
+    brief = _public_brief(_normalise(brief), repo, public)
     summary = _read_summary(summary_path)
 
     # Every bug the lane reports must cite a real issue (loom#1779): a

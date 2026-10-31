@@ -214,6 +214,40 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(result["old_hash"], result["new_hash"])
         self.assertEqual(result["reason"], "")
 
+    def foreign_ref_brief(self):
+        ref = "%s#%d" % ("example-owner/other-repo", 7)
+        self.write_brief(BRIEF.replace("The thing is broken for every user.",
+                                       "The thing broke after %s merged." % ref)
+                         .replace("- [ ] The thing works", "- [ ] The thing works after %s" % ref))
+        return ref
+
+    def test_a_public_repair_puts_another_repos_ref_in_words(self):
+        # Each fix round rendered the ticket's cross-repo reference back into
+        # the body, so the leak scan on the body failed again.
+        ref = self.foreign_ref_brief()
+        result = pr_repair.reconcile(self.brief, "Fix the thing", RUNNER_BODY, "codex", "gpt-test",
+                                     "T42", repo="example-owner/example-repo", lookup=None)
+        self.assertTrue(result["changed"])
+        self.assertNotIn(ref, result["body"])
+        self.assertIn("The thing broke after issue 7 of another repo merged.", result["body"])
+        self.assertIn("Refs " + "%s#%d" % ("example-owner/example-repo", 42), result["body"])
+
+    def test_a_worded_body_stays_settled_and_keeps_its_ticks(self):
+        self.foreign_ref_brief()
+        worded = pr_repair.reconcile(self.brief, "Fix the thing", RUNNER_BODY, "codex", "gpt-test",
+                                     "T42", repo="example-owner/example-repo", lookup=None)["body"]
+        ticked = worded.replace("- [ ] The thing works after", "- [x] The thing works after")
+        result = pr_repair.reconcile(self.brief, "Fix the thing", ticked, "codex", "gpt-test",
+                                     "T42", repo="example-owner/example-repo", lookup=None)
+        self.assertFalse(result["changed"])
+
+    def test_a_private_repair_leaves_another_repos_ref_as_written(self):
+        ref = self.foreign_ref_brief()
+        result = pr_repair.reconcile(self.brief, "Fix the thing", RUNNER_BODY, "codex", "gpt-test",
+                                     "T42", repo="example-owner/example-repo", public=False,
+                                     lookup=None)
+        self.assertIn(ref, result["body"])
+
     def test_updates_generated_sections_and_keeps_reviewer_prefix(self):
         old_body = RUNNER_BODY
         current = "A reviewer note at the top.\n\n" + old_body
