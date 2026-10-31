@@ -11,12 +11,12 @@ import types
 import unittest
 import unittest.mock
 from contextlib import redirect_stderr
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, journal, proof, text, tickets
+from bus import brain, journal, proof, station, text, tickets
 from bus.github import GitHub, GitHubError
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
@@ -387,6 +387,21 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(brain.goal_trunk({"body": "Trunk: side\n\n## Why\n"}), "side")
         self.assertIsNone(brain.goal_trunk({"body": "## Why\nno trunk"}))
         self.assertIsNone(brain.goal_trunk({"body": None}))
+
+    def test_status_gives_the_lane_table_its_age_and_calls_an_old_one_stale(self):
+        def lane_section(age_minutes):
+            table = brain.LANES_MARKER + "\nUpdated 2030-01-01T12:00:00Z\n\n| codex | yes | - |"
+            gh = GitHub("t", transport=Fake(
+                reply(200, [{"number": 1, "labels": [{"name": "loom:lanes"}]}]),
+                reply(200, [{"body": table, "user": {"login": BRAIN}}]), epic=False))
+            now = datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc) + timedelta(minutes=age_minutes)
+            return brain.status(gh, [], REPO, env=TRUSTED, now=now)
+
+        limit = station.LANES_REPUBLISH // 60
+        self.assertIn("Updated 2030-01-01T12:00:00Z (%d min old, stale)\n" % (limit + 1),
+                      lane_section(limit + 1))
+        self.assertIn("Updated 2030-01-01T12:00:00Z (%d min old)\n" % (limit - 1),
+                      lane_section(limit - 1))
 
     def test_status_sections_and_request_ceiling(self):
         gh = GitHub("t", transport=Fake(
