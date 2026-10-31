@@ -33,7 +33,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - name: coreutils timeout
         run: command -v timeout || brew install coreutils
       - name: unittest (no test may skip)
@@ -43,3 +43,24 @@ jobs:
         run: |
           set -o pipefail
           python -B .github/unittest_parallel.py 2>&1 | tee unittest.out
+
+  unittest-linux:
+    # Linux: the cluster lanes (lane.yml, LOOM_SANDBOX=bwrap) run this suite
+    # on unmodified main before touching a ticket, and hold every ticket as
+    # a factory incident when it fails there (loom#1937). Tests that need
+    # macOS sandbox-exec or the keychain skip here, so skips are allowed;
+    # a failure still fails the job. Loom is public, so a hosted runner is fine.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+      - name: unittest on Linux (skips allowed)
+        shell: bash
+        run: |
+          set -o pipefail
+          python -B .github/unittest_parallel.py --allow-skips 2>&1 | tee unittest.out

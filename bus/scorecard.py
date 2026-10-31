@@ -35,6 +35,11 @@ why, and it stays demoted until the operator clears it
 before it. Verify runs are not build tickets: a demoted lane still takes
 them.
 
+Each merged record also gets a settled difficulty, scored blind from the
+merged diff, the send-backs and the review findings (bus/difficulty.py),
+beside the perceived one on the ticket's Difficulty: line, and the status
+comment compares the two per lane, model and kind.
+
 A read that fails keeps the last scorecard and every demotion: nothing is
 cleared by an error. A scorecard file that is there but cannot be read
 demotes every lane until the operator repairs or removes it. The scorecard lives in the station's `scorecard.json`,
@@ -50,7 +55,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from . import labels, merge_tier, revert
+from . import change_class, difficulty, labels, merge_tier, revert
 from .github import GitHubError
 
 FILE = "scorecard.json"
@@ -132,17 +137,25 @@ def footer(body: Any) -> Optional[Tuple[str, str]]:
     return (found[-1][0], found[-1][1]) if found else None
 
 
-def review_outcome(threads: Sequence[Mapping[str, Any]],
-                   by_bot: Callable[[Mapping[str, Any]], bool],
-                   env: Optional[Mapping[str, str]] = None) -> str:
-    """clean, findings or bad-work, from every review thread's opening
-    comment that the review bot wrote."""
+def review_findings(threads: Sequence[Mapping[str, Any]],
+                    by_bot: Callable[[Mapping[str, Any]], bool]) -> List[str]:
+    """The review bot's findings: each review thread's opening comment that
+    the bot wrote and that reads as a finding."""
     found = []
     for thread in threads:
         comments = (thread.get("comments") or {}).get("nodes") or []
         root = (comments[0] if comments else None) or {}
         if by_bot(root) and merge_tier.finding(str(root.get("body") or "")):
             found.append(str(root.get("body") or ""))
+    return found
+
+
+def review_outcome(threads: Sequence[Mapping[str, Any]],
+                   by_bot: Callable[[Mapping[str, Any]], bool],
+                   env: Optional[Mapping[str, str]] = None) -> str:
+    """clean, findings or bad-work, from every review thread's opening
+    comment that the review bot wrote."""
+    found = review_findings(threads, by_bot)
     if any(merge_tier.bad_work(body, env) for body in found):
         return BAD_WORK
     return FINDINGS if found else CLEAN
@@ -244,12 +257,18 @@ class Scorecard:
             # Kept only once its review is read: a record with no review
             # would count as clean.
             record = {"lane": labels.base_lane(ran[0]), "model": ran[1],
+                      "kind": change_class.class_of(pr) or "-",
                       "at": _ts(pr.get("merged_at") or pr.get("closed_at"))}
             self._first_read(gh, repo, pr, record, bot)
             self.data["records"][key] = record
         record["merged"] = bool(pr.get("merged_at"))
         record["reverted"] = bool(record.get("reverted")) or (
             record["merged"] and any(revert.undoes(r, pr) for r in reverts))
+        if record["merged"] and record.get("settled") not in difficulty.LEVELS:
+            try:
+                self._settle(gh, repo, pr, record, bot)
+            except (GitHubError, ValueError, KeyError, TypeError) as err:
+                _say("%s has no settled difficulty yet: %s" % (key, err))
 
     def _first_read(self, gh: Any, repo: str, pr: Dict[str, Any], record: Dict[str, Any],
                     bot: str) -> None:
@@ -268,6 +287,41 @@ class Scorecard:
                        and str(c.get("body") or "").startswith(tickets.FIX_MARKER))
         record["sent_back"] = sent
         record["review"] = review_outcome(threads, lambda c: brain.by_bot(dict(c), bot), self.env)
+        record["findings"] = len(review_findings(threads, lambda c: brain.by_bot(dict(c), bot)))
+
+    def _settle(self, gh: Any, repo: str, pr: Dict[str, Any], record: Dict[str, Any],
+                bot: str) -> None:
+        """The merged pull request's settled difficulty, scored blind from its
+        diff, send-backs and review findings, and the ticket's perceived
+        difficulty kept beside it. Nothing is written to the ticket. A read
+        that fails leaves the record unsettled for the next refresh."""
+        from . import brain
+        number = int(pr["number"])
+        record.setdefault("kind", change_class.class_of(pr) or "-")
+        if not isinstance(record.get("findings"), int):
+            threads = merge_tier.review_threads(gh, repo, number)
+            record["findings"] = len(review_findings(
+                threads, lambda c: brain.by_bot(dict(c), bot)))
+        full = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+        sizes = [full.get(k) if isinstance(full, dict) else None
+                 for k in ("additions", "deletions", "changed_files")]
+        if not all(isinstance(n, int) for n in sizes):
+            raise ValueError("the merged diff's size cannot be read")
+        try:
+            ticket = brain._ticket_association(repo, pr)
+        except ValueError:
+            ticket = None
+        guess = ""
+        if ticket is not None:
+            issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data
+            guess = difficulty.perceived(issue.get("body") if isinstance(issue, dict) else "")
+        # The scorer is called with the merged work alone: never `guess`.
+        level, why = difficulty.settle(sizes[0], sizes[1], sizes[2],
+                                       int(record.get("sent_back") or 0),
+                                       int(record["findings"]),
+                                       record.get("review") == BAD_WORK)
+        record["perceived"] = guess
+        record["settled"], record["settled_why"] = level, why
 
     def _deploys(self, ledger: Mapping[str, Any]) -> None:
         """Mark each merge the post-merge watch found failed (its revert
@@ -370,7 +424,7 @@ class Scorecard:
             lines.append("| %s | %s | %s | %s |" % (
                 lane, model or "-", " | ".join(str(got[c]) for c in COLUMNS),
                 "yes" if lane in demoted else "no"))
-        return lines
+        return lines + difficulty.markdown(self.data["records"], self.now)
 
 
 def demoted_slots(demoted: Mapping[str, str], slots: Iterable[str]) -> Dict[str, str]:

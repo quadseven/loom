@@ -43,7 +43,12 @@ homes may also be specific goal issues as `OWNER/NAME#N`. Set
 the last two weeks of issue and review comments in `LOOM_REPOS`. With
 `LOOM_BRIEF_AUTHORS` set, only those logins' comments count as station
 outcomes, and `LOOM_REVIEW_BOT` names the review bot whose findings are
-counted (default `grug-tribe`). `.env.example` lists the dashboard variables with placeholder
+counted (default `grug-tribe`). `/chain` shows the command chain from the operator down to the review bot.
+Its station and audit layers come from the station, which posts each
+watched repo's shadow mode (`bus.shadow`) and the last held and acted
+actions to `POST /api/chain` with the upload token every ten minutes: the
+held side from the shadow ledger, the acted side from `acted.jsonl` beside
+it, a line for each merge or close GitHub accepted from Loom. `.env.example` lists the dashboard variables with placeholder
 values. Set `LOOM_UPLOAD_TOKEN` to the same private value for the dashboard
 and station so completed runs can upload to `POST /api/transcripts`.
 Keep the dashboard ingress tailnet-only; the bearer token authenticates
@@ -78,6 +83,19 @@ read, for brains that must not write the rules they follow. `GET /api/usage`
 answers the station's live usage readings, `{readings, received_at}`, to the
 same two tokens: a brain off the lane machine reads usage there
 (`python3 -m bus.usage --live`), never from its own machine's files.
+
+The Floor's lane strip (loom#2157) shows every lane the Lanes page shows,
+with the open tickets in flight on it (briefed, running, pull request,
+merged, shipped, by the ticket's `lane:` label) and what the lane is doing:
+implementing, fix round (a running ticket with a `loom:fix` comment), in
+review, landing, verifying, or waiting for the station or to ship. A lane with
+no ticket reads "idle, able to take work" or "idle, held" with its reason, from
+the same lane status comment and usage heartbeats as the Lanes page. The strip
+and the Moving now rows are one read of that state, served at
+`GET /api/floor/live` as `{lanes, moving}` HTML fragments that the Floor's
+script swaps in every 5 seconds while the tab is visible. A change shows as
+soon as the background refresh (`LOOM_DASHBOARD_REFRESH_SECONDS`, default 60)
+or a usage heartbeat has read it.
 
 `/tickets` lists the tickets in flight in one table per goal home; `?done=1`
 lists merged, shipped, verified and closed ones, and `state`, `goal` and
@@ -129,18 +147,68 @@ the same pass and interval: one open list per `needs:<login>` label per repo
 result stays shown.
 
 `/needs-you` lists every open item that waits on a person, each once: the
-`needs-operator` issues ("waits on the operator") from Hunt's backlog
-document and the store's own read, and the `needs:<login>` items above
-("waits on <login>"), each card marked "needs a human" with its ask (the
-`## Ask` section, else the picked comment, linked). It makes no request of
-its own: the `needs:<login>` items come from the Operators pass, and a
-`needs-operator` issue with no `## Ask` in its body takes its ask from a
-comment read the same way. Chips at the top filter it with plain links:
+`needs:human` and `needs:human` issues ("waits on the operator") from
+Hunt's backlog document and the store's own read, and the `needs:<login>`
+items above ("waits on <login>"), each card marked "needs a human" with its
+ask (the `## Ask` section, else the picked comment, linked; a `needs:human`
+issue's ask is its newest `needs:human` comment). The page makes no request
+of its own: the `needs:<login>` items come from the Operators pass, and a
+`needs:human` or `needs:human` issue with no `## Ask` in its body takes its
+ask from a comment read the same way. A card whose ask comment that read has
+not reached yet reads it on demand (`GET /api/needs-you/ask?repo=&number=`,
+from the page's script), under the same rules: never below the budget floor,
+and at most 30 such reads in each 15 minute Operators interval; beyond them
+the card says the next refresh reads it.
+
+Each card takes an answer in one tap (loom#1777). Its buttons come from the
+ask's own words (`bus.answer.options`, no model): "reply with one number" is
+a number field; a lane pull request held for the operator, or "merge ... or
+hold", is Merge or Hold; "keep ... or close" is Keep or Close; "reply yes or
+no" or "(reply yes)" is Yes or No; "Reply a or b" or "(a) ... (b)" is a, b
+(and c, d when offered); "reply done", or `Kind:` account, physical or
+hardware, is Done or Not now; anything else is a text field. Every card also
+has an optional note. A tap sends `POST /api/needs-you/answer` with `{repo,
+number, choice, note, as}`, and the dashboard posts ONE comment on the
+issue as the Loom GitHub App (`LOOM_GITHUB_APP_*`; without the App the page
+stays read only and says so): `<!-- loom:answer v1 --> Answer from <login>
+(via the dashboard): <choice>. <note>`. It then takes off `needs:human`,
+`needs:<login>` and `needs:human`, and adds `loom:answer-pending`, which
+the station takes off once it has read the answer (docs/BRAIN.md, Operator
+answers). Until then the card leaves the lists and waits under "Answered,
+not yet applied" with the answer, who gave it and when; an answer the
+station has read shows on a card that still waits (a Hold puts `needs:human`
+back).
+
+Only an operator may answer: a login of `LOOM_OPERATORS` (space or comma
+separated; an entry `IDENTITY=LOGIN` maps a proxy identity to a login),
+else the person logins of `LOOM_BRIEF_AUTHORS`. The ingress is tailnet-only
+and sets no identity header, so the request carries a bearer token,
+`LOOM_ANSWER_TOKEN` (or `LOOM_UPLOAD_TOKEN`), that the page asks for once
+under "Answering from this browser" and keeps in the browser's local
+storage with the operator it answers as. A missing or wrong token is refused
+(401), and so is a login outside the list (403). Set `LOOM_IDENTITY_HEADER`
+to a header name only when the proxy in front sets that header from the
+signed-in identity and drops any copy the client sent (Tailscale serve's
+`Tailscale-User-Login`, or a forward_auth proxy); the header's identity is
+then mapped to an operator and no token is asked. One click posts at most
+one comment: answers to one item post one at a time (409 while one is
+posting), an answer that repeats the item's newest one (same choice, no
+newer ask) posts nothing and only finishes the label changes, and each login
+may answer 20 times in 10 minutes (429). An answer the written-text check
+refuses (a closing keyword, a credential, a local path) is refused (400). Chips at the top filter it with plain links:
 All, one per login with its count, and Operator (`?who=<login>`,
 `?who=operator`). A repo named bare (`app#7`, as Hunt's document does) and
 by `OWNER/NAME` (`example-owner/app#7`) is one item when only one
 configured repo has that name. The Floor's "Needs you" count is the same
 deduplicated list.
+
+Above the cards, "Stuck in Loom, not waiting on you" lists each goal the station found
+at its in-flight cap for over 6 hours: how long, its count against the cap,
+and how many of its in-flight tickets wait with no lane that takes them
+(docs/BRAIN.md, Tickets no lane takes). The station sends the list with the
+upload token (`POST /api/goal-caps`, `{goals: [{goal, since, in_flight, cap,
+no_lane}], at}`) when it changes and at most every 10 minutes; the dashboard
+keeps it in memory and shows nothing once the newest report is an hour old.
 
 `/free` lists, per repo, the open issues free for the operator named by
 `?operator=<login>` (anyone, with none), from `bus.free`, the function
@@ -272,6 +340,28 @@ only on its next pass. A hold whose until-time has passed is read as ended
 (loom#809): `/usage` counts that lane free and asks nothing about it, and
 `/lanes` says the hold ended and that no heartbeat has come since, instead of
 a past "until" read as a live hold.
+
+`/fleet` (Fleet timeline, loom#2280) draws every engine as a row over the
+last 24 hours and the next 2, one pixel a minute, from the snapshot the
+other pages read; the page makes no GitHub request. The rows: one per
+journal holder on the goal homes (the brains the docs give a cadence, the
+Muse brain every 30 minutes and the lane-machine brain hourly, are drawn
+even when silent; any other holder appears when it journals), Reports
+(every `loom:report` comment, with the reading times, 10:00 and 21:00 New
+York, as due marks), Station (its comments, shipped notes, lane outcomes
+and status events, by the login that writes the station-only comments,
+plus its `POST /api/chain` snapshots, kept in memory as its 10 minute
+heartbeat), Operator notes (people's comments on the goal homes, with the
+operators summary times, 09:05 and 17:05 New York, as due marks) and one
+row per lane (claims, rounds, outcomes, lane pull requests opened and
+merged, and the newest heartbeat from the lane status table). Each mark
+shows its one-line gist on hover or tap, as a strip at the foot of the
+screen, with no script. A row with a cadence marks any silence longer than
+the cadence plus 50 percent as a missed run, with the length of the gap;
+the station's silences are judged from its chain snapshots only, so before
+the first one the row says so instead of marking misses. A lane has no
+cadence, so a quiet lane is not a missed run. The axis scrolls inside its
+own box; the row heads stay put.
 
 ## The bench (loom#969)
 

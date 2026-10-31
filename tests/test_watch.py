@@ -9,7 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, handoff, station, text, watch  # noqa: E402
+from bus import brain, handoff, logrotate, station, text, watch  # noqa: E402
 from bus.github import Response  # noqa: E402
 
 LANES_REPO = "example-owner/lanes"
@@ -127,6 +127,22 @@ class SignatureTest(unittest.TestCase):
                      "brain: run_factory failed: boom"):
             self.assertIsNone(watch.stage(line), line)
             self.assertNotIn("<stage>", watch.signature(line), line)
+
+    def test_setup_failure_wording_variants_produce_one_signature(self):
+        # loom#2158: the log watcher filed #2120 ("on the unmodified repo")
+        # and #2122 ("on the default branch") for one factory incident #2061.
+        # Both wordings after "base check exited <n>" must normalize to one signature.
+        line_unmodified = ("[2026-10-13T10:00:01Z] station: could not scan example-owner/repo-a: "
+                           "base check exited 1 on the unmodified repo")
+        line_default_branch = ("[2026-10-13T10:00:01Z] station: could not scan example-owner/repo-a: "
+                               "base check exited 1 on the default branch")
+        self.assertEqual(watch.signature(line_unmodified), watch.signature(line_default_branch))
+        sig = watch.signature(line_unmodified)
+        self.assertIn("base check exited <n> on the <setup-failure>", sig)
+        # Also the "the check exited 125-127 on the unmodified base" variant.
+        line_check_exited = ("[2026-10-13T10:00:01Z] station: could not scan example-owner/repo-a: "
+                             "the check exited 126 on the unmodified base")
+        self.assertEqual(watch.signature(line_check_exited), sig)
 
     def test_which_lines_are_kept(self):
         for line in ("ValueError: bad", "push failed", "Connection refused",
@@ -423,6 +439,53 @@ class FilingTest(WatchBase):
         self.assertTrue(any(line.startswith("watch: closed quiet") for line in self.said))
         self.run_at(T0 + 600)
         self.assertEqual(len(self.gh.comments), 1)
+
+    def quiet_labelled_issue(self, labels):
+        """As quiet_issue(25), with the issue relabelled before the quiet pass,
+        as GitHub returns labels (objects with a name)."""
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0 - 25 * 3600)
+        self.gh.issues[1]["labels"] = [{"name": name} for name in labels]
+        self.run_at(T0)
+
+    def test_a_quiet_signature_that_shipped_closes_as_completed(self):
+        # loom#1934: a signature that became a ticket and shipped is done
+        # work, not dropped work. Shadow mode off, as Loom runs since it left
+        # shadow; in shadow the hold keeps the issue open.
+        self.enterContext(mock.patch.dict(os.environ, {"LOOM_SHADOW": "0"}))
+        for shipped in ("loom:shipped", "loom:verified"):
+            with self.subTest(label=shipped):
+                self.setUp()
+                self.quiet_labelled_issue(["loom:ticket", shipped])
+                issue = self.gh.issues[1]
+                self.assertEqual(issue["state"], "closed")
+                self.assertEqual(issue["state_reason"], "completed")
+                (note,) = self.gh.comments
+                self.assertIn("shipped", note[1])
+                self.assertNotIn("not planned", note[1])
+
+    def test_a_quiet_signature_that_is_an_unshipped_ticket_stays_open(self):
+        # Shadow off: the ticket stays open by the watcher's own rule, not by
+        # the shadow hold.
+        self.enterContext(mock.patch.dict(os.environ, {"LOOM_SHADOW": "0"}))
+        self.quiet_labelled_issue(["loom:ticket", "loom:running"])
+        self.assertEqual(self.gh.issues[1]["state"], "open")
+        self.assertEqual(self.gh.comments, [])
+        self.assertFalse(any("closed quiet" in line for line in self.said))
+        # The ticket closes on its own; the next pass writes nothing to it.
+        self.gh.issues[1]["state"] = "closed"
+        self.run_at(T0 + 600)
+        self.assertEqual(self.gh.comments, [])
+        self.assertNotIn("state_reason", self.gh.issues[1])
+
+    def test_a_bare_quiet_signature_still_closes_as_not_planned(self):
+        self.enterContext(mock.patch.dict(os.environ, {"LOOM_SHADOW": "0"}))
+        self.quiet_labelled_issue(["loom:triage"])
+        issue = self.gh.issues[1]
+        self.assertEqual(issue["state"], "closed")
+        self.assertEqual(issue["state_reason"], "not_planned")
+        (note,) = self.gh.comments
+        self.assertIn("not planned", note[1])
 
     def test_an_issue_whose_signature_was_last_seen_23_hours_ago_stays_open(self):
         self.quiet_issue(23)
@@ -742,6 +805,18 @@ class OffsetTest(WatchBase):
         os.rename(self.log, self.log + ".1")
         self.append(LINE_403, LINE_403, LINE_403)
         self.run_at(T0 + 60)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.assertEqual(self.saved()["logs"]["station"]["offset"], os.path.getsize(self.log))
+
+    def test_a_log_rotated_away_keeps_being_read_once_its_writer_makes_a_new_one(self):
+        self.append("x" * 500)
+        self.run_at(T0)
+        logrotate.rotate(os.path.dirname(self.log), 100, 2, T0 + 30, lambda _: None,
+                         writers=lambda _: False)
+        self.assertFalse(os.path.exists(self.log))
+        self.run_at(T0 + 60)
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0 + 120)
         self.assertEqual(len(self.gh.issues), 1)
         self.assertEqual(self.saved()["logs"]["station"]["offset"], os.path.getsize(self.log))
 

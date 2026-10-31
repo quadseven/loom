@@ -339,6 +339,34 @@ def _run_line(run: Optional[Dict[str, Any]]) -> str:
                                            " / started %s UTC" % started if started else "")
 
 
+def _live_run(record: Dict[str, Any], status: Optional[Dict[str, str]],
+              detail: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The lane's claimed but unfinished run: lane, model, claim time, and the
+    current step (base check, agent or final check), or None when nothing is
+    live. The station's claim names the lane and when it started, the ticket
+    row names the model, and the lane's run log names the step."""
+    if not status or status.get("kind") != "live":
+        return None
+    lane = status.get("lane") or record.get("lane") or "its lane"
+    model = record.get("model") or "model missing"
+    started_at = ""
+    for comment in (detail or {}).get("comments") or []:
+        if CLAIM_RE.match(str(comment.get("body") or "").strip()):
+            started_at = comment.get("created_at") or ""
+            break
+    return {"lane": lane, "model": model, "started_at": started_at,
+            "step": (detail or {}).get("step") or ""}
+
+
+def _live_run_line(live_run: Dict[str, Any]) -> str:
+    started = _hm(live_run.get("started_at"))
+    started_text = " / claimed %s UTC" % started if started else ""
+    return "lane %s / %s%s / %s" % (
+        live_run.get("lane") or "its lane",
+        live_run.get("model") or "model missing",
+        started_text, live_run.get("step") or "step missing")
+
+
 def _chip(run: Dict[str, Any], selected: Optional[Dict[str, Any]]) -> str:
     outcome = str(run.get("outcome") or "")
     tone = "done" if outcome == "done" else "failed" if outcome == "failed" else "other"
@@ -500,16 +528,17 @@ def _status_row(selected, status, live: bool, waiting: bool) -> str:
     return ""
 
 
-def _transcript_pane(runs, selected, events, review_threads, running, status=None, waiting=False):
+def _transcript_pane(runs, selected, events, review_threads, running, status=None, waiting=False,
+                     live_run=None):
     parts = ['<section class="ticket-pane transcript-pane" data-pane="transcript">']
     if len(runs) > 1:
         parts.append('<div class="attempts">%s</div>' % "".join(_chip(run, selected) for run in runs))
     parts.append('<div class="run-line"><span>%s</span><label class="thought-toggle"><input type="checkbox" checked data-thought-toggle> thoughts</label></div>'
-                 % _esc(_run_line(selected)))
+                 % _esc(_run_line(selected) if not live_run else _live_run_line(live_run)))
     live = _is_live(running, status)
     parts.append('<div class="run-events" data-attempt="%s" data-running="%s">' % (
         _esc((selected or {}).get("attempt") or ""), "true" if live else "false"))
-    if selected is None:
+    if selected is None and not live_run:
         parts.append('<p class="empty-state">No transcript yet: no attempt has finished and been stored for this ticket.</p>')
     elif not events:
         parts.append('<p class="empty-state">Transcript missing: no events were stored for this attempt.</p>')
@@ -615,15 +644,20 @@ def render(record, runs, selected, events, pull_requests=(), review_threads=(), 
                          or str(run.get("attempt")) == str(selected)), runs[-1] if runs else None)
     threads = list(review_threads) or list(((detail or {}).get("pull_request") or {}).get("threads") or [])
     last = bool(runs) and selected is not None and selected.get("id") == runs[-1].get("id")
+    status = _detail_status(detail)
+    running = record.get("state") == "running"
+    live = _is_live(running, status)
+    live_run = _live_run(record, status, detail) if live and selected is None else None
     parts = [_header(record, runs)]
     parts.append('<nav class="ticket-segments" aria-label="Ticket panes">' + ''.join(
         '<a href="?tab=%s" data-ticket-tab="%s">%s</a>' % (tab, tab, tab) for tab in ("transcript", "path", "pr")) + '</nav>')
     parts.append('<div class="ticket-columns">')
     parts.append(_path_pane(record, detail))
     # A briefed ticket the station put back after a limit waits for its next
-    # claim: it says what it waits for too.
-    parts.append(_transcript_pane(runs, selected, events, threads if last else [], record.get("state") == "running",
-                                  _detail_status(detail), record.get("state") == "briefed"))
+    # claim: it says what it waits for too. A claimed, unfinished run shows the
+    # lane, model, claim time and current step instead of "No run yet".
+    parts.append(_transcript_pane(runs, selected, events, threads if last else [], running, status,
+                                  record.get("state") == "briefed", live_run))
     parts.append(_pr_pane(record, runs, detail))
     parts.append('</div>')
     return ''.join(parts)

@@ -13,6 +13,10 @@ WORKFLOWS = Path(__file__).resolve().parent.parent / ".github" / "workflows"
 USES = re.compile(r"^\s*(?:-\s+)?uses:\s*([^\s#]+)", re.MULTILINE)
 SHA = re.compile(r"@[0-9a-f]{40}$")
 LEAK_SCAN = "quadseven/infra-public/.github/workflows/_reusable.leak-scan.yml@"
+PYTHON_VERSION = re.compile(r"^\s*python-version:\s*['\"]?([^'\"\s#]+)", re.MULTILINE)
+# The lane and station images run python:3.13-slim, so CI tests the
+# interpreter the code runs under, not an older one (infra-public#175).
+RUNTIME_PYTHON = "3.13"
 
 
 def workflow_files() -> list[Path]:
@@ -53,6 +57,18 @@ class LeakScanCaller(unittest.TestCase):
         # edited: a title or body can leak long after the last push.
         self.assertIn("types: [opened, synchronize, reopened, edited]", text)
         self.assertIn("contents: read", text)
+
+
+class PythonVersion(unittest.TestCase):
+    def test_every_setup_python_runs_the_runtime_python(self):
+        found = []
+        for path in workflow_files():
+            for version in PYTHON_VERSION.findall(path.read_text()):
+                found.append(version)
+                self.assertEqual(version, RUNTIME_PYTHON,
+                                 "%s: python-version %s, the lanes run %s"
+                                 % (path.name, version, RUNTIME_PYTHON))
+        self.assertGreater(len(found), 0, "no python-version: line found")
 
 
 class HygieneLinter(unittest.TestCase):

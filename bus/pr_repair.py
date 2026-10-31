@@ -1,7 +1,14 @@
 """Reconcile an existing pull request title/body with a revised ticket brief.
 
 The runner calls this for fix-mode briefs so a corrected ticket revision can
-repair generated PR sections without an artificial code commit.
+repair generated PR sections without an artificial code commit. The same
+code rebuilds a body that fails the review bot's plan checks (plan_repair):
+the runner before it opens a pull request, the factory when the plan check
+is the only failing check, and a one-off sweep of open pull requests.
+
+    python3 -m bus.pr_repair BRIEF LANE MODEL TICKET (--pr-json F | --apply PR --repo R)
+    python3 -m bus.pr_repair plan BRIEF BODY LANE MODEL TICKET --out FILE
+    python3 -m bus.pr_repair sweep (--dry-run | --apply) [--repo R ...]
 """
 from __future__ import annotations
 
@@ -13,9 +20,9 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import hunt_plan, text
+from . import bug_refs, hunt_plan, text
 
 # Headings the runner injects into the PR body, in order.
 GENERATED_HEADINGS = ("## Why", "## Summary", "## Acceptance criteria",
@@ -64,12 +71,38 @@ def _brief_section(brief: str, name: str) -> str:
     blank lines are stripped.
     """
     import re
-    heading_re = re.compile(r"^#+ ")
+    heading_re = re.compile(r"^##? ")
     lines = brief.split("\n")
     out: list[str] = []
     on = False
     for line in lines:
         if line == "## %s" % name:
+            on = True
+            continue
+        if on:
+            if heading_re.match(line):
+                break
+            if line.strip():
+                out.append(line)
+    return "\n".join(out)
+
+
+# The headings a ticket writes its criteria under, lower-cased; mirrors
+# lanes/run_lane.sh::criteria_section.
+_CRITERIA_HEADINGS = ("## acceptance criteria", "## acceptance")
+
+
+def _brief_criteria(brief: str) -> str:
+    """The acceptance criteria of a brief or summary, as
+    lanes/run_lane.sh::criteria_section reads them: its "## Acceptance
+    criteria" section in any case, or its "## Acceptance" section, blank
+    lines dropped. Read as exactly "## Acceptance criteria", a ticket with
+    "## Acceptance" rendered an empty section every fix round (2026-10-25)."""
+    heading_re = re.compile(r"^#+ ")
+    out: list[str] = []
+    on = False
+    for line in brief.split("\n"):
+        if line.rstrip().lower() in _CRITERIA_HEADINGS:
             on = True
             continue
         if on:
@@ -139,8 +172,8 @@ def _checklist(brief: str, current_body: str, summary: str) -> str:
     from its summary when it wrote any, else the pull request's own when it
     names the ticket's criteria (so a round keeps earlier ticks). Rendering
     the ticket's every round dropped every tick a lane made (2026-10-20)."""
-    ticket = _brief_section(brief, "Acceptance criteria")
-    lane = _brief_section(summary, "Acceptance criteria") if summary else ""
+    ticket = _brief_criteria(brief)
+    lane = _brief_criteria(summary) if summary else ""
     if lane:
         return _lane_ticks(ticket, lane)
     # The body's section runs on to its Size: line; its checklist is the
@@ -166,27 +199,62 @@ def _operator_steps(brief: str, current_body: str, summary: str) -> str:
     return OPERATOR_NONE
 
 
+def _body_bugs(current_body: str) -> str:
+    """The current body's bugs section, as an earlier round verified it."""
+    found = _brief_section(current_body, bug_refs.HEADING) if current_body else ""
+    found = found.split("\n" + FOOTER_RULE + "\n", 1)[0]
+    return "" if found == FOOTER_RULE else found.removesuffix("\n" + FOOTER_RULE)
+
+
+def _bugs(current_body: str, summary: str, repo: Optional[str], public: bool,
+          lookup: bug_refs.Lookup) -> Tuple[str, str]:
+    """(bugs section, refusal reason): the summary's lines when every one
+    cites a real issue, else a reason; the body's own section when the
+    summary has none (so a round keeps what an earlier one verified)."""
+    lines = bug_refs.section(summary) if summary else []
+    if not lines:
+        return _body_bugs(current_body), ""
+    if not repo:
+        return "", bug_refs.refusal([bug_refs.Rejected(
+            i, "no repo to look the cited issue up in") for i in range(1, len(lines) + 1)])
+    kept, rejected = bug_refs.check(lines, repo, lookup)
+    if rejected:
+        return "", bug_refs.refusal(rejected)
+    return bug_refs.render(kept, repo, public), ""
+
+
 def _render_generated(brief: str, lane: str, model: str, ticket: str,
                       acceptance: Optional[str] = None,
-                      operator_steps: str = OPERATOR_NONE) -> str:
+                      operator_steps: str = OPERATOR_NONE, bugs: str = "") -> str:
     """Render the generated sections the way lanes/run_lane.sh::pr_body does."""
     _check_footer_fields(ticket, lane, model)
     why = _brief_section(brief, "Why")
-    summary = _brief_section(brief, "What")
+    # Briefs write the change under "## What" or "## Summary"; a Why left
+    # empty falls back to that change, else the title, so the body keeps a
+    # non-empty ## Why for the plan check (loom#1468).
+    summary = _brief_section(brief, "What") or _brief_section(brief, "Summary")
+    if not why.strip():
+        why = summary if summary.strip() else (_brief_title(brief) or "")
     if acceptance is None:
-        acceptance = _brief_section(brief, "Acceptance criteria")
+        acceptance = _brief_criteria(brief)
+    # The gate wants three bullets under Acceptance criteria; a ticket may
+    # state fewer, and a body it refuses holds the pull request.
+    acceptance = hunt_plan.pad_criteria(acceptance)
     size = _brief_size(brief)
     out_of_scope = _brief_section(brief, "Out of scope")
     issue = _field(brief, "Issue")
     refs = ""
     if _ISSUE_RE.fullmatch(issue):
         refs = "\nRefs %s" % issue
+    # The verified bugs section, only when a lane reported one
+    # (lanes/run_lane.sh::pr_body writes it in the same place).
+    bugs_part = "## %s\n%s\n\n" % (bug_refs.HEADING, bugs) if bugs else ""
     return (
         "## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\n"
-        "Size: %s\n\n## Out of scope\n%s\n\n## %s\n%s\n\n%s\n%s ticket %s, lane %s, "
+        "Size: %s\n\n## Out of scope\n%s\n\n## %s\n%s\n\n%s%s\n%s ticket %s, lane %s, "
         "model %s.%s" % (
             why, summary, acceptance, size, out_of_scope, OPERATOR_SECTION, operator_steps,
-            FOOTER_RULE, FOOTER_PREFIX, ticket, lane, model, refs))
+            bugs_part, FOOTER_RULE, FOOTER_PREFIX, ticket, lane, model, refs))
 
 
 def _find_heading(body: str, heading: str) -> int:
@@ -249,9 +317,25 @@ def _split_current(body: str) -> Tuple[str, str, str]:
     return prefix, generated, suffix
 
 
+def _read_summary(summary_path: Optional[str]) -> str:
+    """The lane's Intent summary, "" when there is none or it is unreadable,
+    with local paths as <path>: a model that writes its tool's file path into
+    it (infra-5956-r3, 2026-10-25) must not stop every repair."""
+    if not summary_path:
+        return ""
+    try:
+        with open(summary_path, encoding="utf-8") as fh:
+            summary = _normalise(fh.read())
+    except OSError:
+        return ""
+    return text.LOCAL_PATH_RE.sub("<path>", summary)
+
+
 def reconcile(brief_path: str, current_title: str, current_body: str,
               lane: str, model: str, ticket: str,
-              summary_path: Optional[str] = None) -> Dict[str, object]:
+              summary_path: Optional[str] = None, repo: Optional[str] = None,
+              public: bool = True,
+              lookup: bug_refs.Lookup = bug_refs.gh_lookup) -> Dict[str, object]:
     """Return new title/body and hashes, or a reason why it cannot be done.
 
     The returned dict has keys:
@@ -277,23 +361,39 @@ def reconcile(brief_path: str, current_title: str, current_body: str,
     except OSError as err:
         result["reason"] = "cannot read brief: %s" % err
         return result
+    return reconcile_text(brief, current_title, current_body, lane, model, ticket,
+                          summary_path, repo, public, lookup)
 
-    summary = ""
-    if summary_path:
-        try:
-            with open(summary_path, encoding="utf-8") as fh:
-                summary = _normalise(fh.read())
-        except OSError:
-            summary = ""
-    # The summary is the lane's own text: a model that writes its tool's file
-    # path into it (infra-5956-r3, 2026-10-25) must not stop every repair.
-    summary = text.LOCAL_PATH_RE.sub("<path>", summary)
+
+def reconcile_text(brief: str, current_title: str, current_body: str,
+                   lane: str, model: str, ticket: str,
+                   summary_path: Optional[str] = None, repo: Optional[str] = None,
+                   public: bool = True,
+                   lookup: bug_refs.Lookup = bug_refs.gh_lookup) -> Dict[str, object]:
+    """reconcile, with the brief's text in hand instead of its path."""
+    result: Dict[str, object] = {
+        "title": current_title,
+        "body": current_body,
+        "old_hash": "",
+        "new_hash": "",
+        "changed": False,
+        "reason": "",
+    }
+    brief = _normalise(brief)
+    summary = _read_summary(summary_path)
+
+    # Every bug the lane reports must cite a real issue (loom#1779): a
+    # rejected line refuses the repair, and the lane files it or drops it.
+    bugs, refused = _bugs(_normalise(current_body), summary, repo, public, lookup)
+    if refused:
+        result["reason"] = refused
+        return result
 
     try:
         desired_generated = _render_generated(
             brief, lane, model, ticket,
             _checklist(brief, _normalise(current_body), summary),
-            _operator_steps(brief, _normalise(current_body), summary))
+            _operator_steps(brief, _normalise(current_body), summary), bugs)
         new_hash = _sha12(_normalise(desired_generated))
         result["new_hash"] = new_hash
         old_hash = _hash_generated(current_body)
@@ -340,6 +440,111 @@ def reconcile(brief_path: str, current_title: str, current_body: str,
     return result
 
 
+# The runner's footer line: ticket, lane and model of the newest run.
+FOOTER_RE = re.compile(r"^Loom ticket (\S+), lane ([A-Za-z0-9_.-]+), model (\S+?)\.(?:\s|$)", re.M)
+# In a pull request body: the runner opened it although its body failed the
+# plan checks and the ticket could not fill the gap (lanes/run_lane.sh).
+PLAN_HOLD_MARKER = "<!-- loom:plan-hold v1 -->"
+# On the ticket: the one note, edited in place, that names what the ticket
+# lacks for the plan checks. The runner and the factory edit the same comment.
+PLAN_NOTE_MARKER = "<!-- loom:plan-hold-note v1 -->"
+# What the ticket needs for each body problem bus/hunt_plan.py names. The
+# runner writes those body sections from these ticket sections.
+_GAPS = (
+    ("## Why", "## Why (five or more words)"),
+    ("Acceptance criteria", "## Acceptance criteria (three or more \"- [ ]\" lines)"),
+    ("Test plan", "## Acceptance criteria (three or more \"- [ ]\" lines)"),
+    ("no Size", "## Size (XS, S, M or L)"),
+    ("Size XL", "a smaller scope: Size XL is too big for one pull request, split the ticket"),
+    ("Out of scope", "## Out of scope (one or more lines)"),
+)
+
+
+def ticket_gaps(found: Sequence[str]) -> List[str]:
+    """The ticket sections that would fill the body problems in `found`
+    (bus/hunt_plan.problems), each once, in the gate's order."""
+    out: List[str] = []
+    for problem in found:
+        gap = next((g for key, g in _GAPS if key in problem), problem)
+        if gap not in out:
+            out.append(gap)
+    return out
+
+
+def footer_fields(body: str) -> Optional[Tuple[str, str, str]]:
+    """(ticket, lane, model) from the newest runner footer in a body, or None."""
+    found = FOOTER_RE.findall(_normalise(body or ""))
+    return found[-1] if found else None
+
+
+def without_hold(body: str) -> str:
+    """The body without the runner's plan-hold marker line."""
+    return "\n".join(line for line in body.split("\n")
+                     if line.strip() != PLAN_HOLD_MARKER).rstrip("\n")
+
+
+def plan_repair(brief: str, title: str, body: str, lane: str, model: str, ticket: str,
+                summary_path: Optional[str] = None, repo: Optional[str] = None,
+                public: bool = True,
+                lookup: bug_refs.Lookup = bug_refs.gh_lookup) -> Dict[str, object]:
+    """Rebuild the parts of a pull request body that fail the plan checks
+    (bus/hunt_plan.problems) from the ticket brief, with the code a fix
+    round's text repair uses (reconcile). The runner calls it before it opens
+    a pull request, the factory when the plan check is the only failing
+    check, and `sweep` on open pull requests. The title is left as it is.
+
+    Returns body (the repaired body, or `body` when nothing passing came
+    of it), before and after (the problems before and after), changed (True
+    only when the new body passes every check) and reason (why reconcile
+    refused, else "")."""
+    before = hunt_plan.problems(body)
+    out: Dict[str, object] = {"body": body, "before": before, "after": before,
+                              "changed": False, "reason": ""}
+    if not before:
+        return out
+    result = reconcile_text(brief, title, body, lane, model, ticket, summary_path,
+                            repo, public, lookup)
+    if result["reason"]:
+        out["reason"] = str(result["reason"])
+        return out
+    new_body = without_hold(str(result["body"]))
+    after = hunt_plan.problems(new_body)
+    out["after"] = after
+    if not after and new_body != _normalise(body):
+        out["body"] = new_body
+        out["changed"] = True
+    return out
+
+
+# In the plan-hold note: the hold added needs-brain itself, so lifting the
+# hold may take it off. Without it the label was already there for another
+# reason and stays (security review).
+PLAN_SET_LABEL = "<!-- loom:plan-hold set-needs-brain pr=%d -->"
+
+
+def hold_note(number: int, check: str, gaps: Sequence[str], set_label: bool = False) -> str:
+    """The ticket's one plan-hold note (PLAN_NOTE_MARKER); set_label records
+    that this hold added needs-brain (PLAN_SET_LABEL)."""
+    return ("%s\n%sHeld for the brain: the body of pull request #%d fails the review bot's "
+            "plan check (%s), and this ticket lacks what the runner writes those parts "
+            "from:\n\n%s\n\nA lane cannot edit the ticket, so no fix round is sent for it. "
+            "Add the missing parts to this ticket; the factory then rebuilds the pull "
+            "request body from it on its next pass and lifts the hold."
+            % (PLAN_NOTE_MARKER, (PLAN_SET_LABEL % number + "\n") if set_label else "",
+               number, check, "\n".join("- " + g for g in gaps)))
+
+
+def hold_set_label(note: str) -> bool:
+    """Whether a plan-hold note says its hold added needs-brain."""
+    return bool(re.search(r"^<!-- loom:plan-hold set-needs-brain pr=\d+ -->$", note, re.M))
+
+
+def lifted_note(number: int) -> str:
+    """The plan-hold note once the ticket filled the gap."""
+    return ("%s\nThe body of pull request #%d was rebuilt from this ticket once it held "
+            "every part the plan check needs; the hold is lifted." % (PLAN_NOTE_MARKER, number))
+
+
 def _net_timeout() -> int:
     try:
         return max(1, int(os.environ.get("NET_TIMEOUT", "120")))
@@ -374,7 +579,203 @@ def _gh_pr_edit(repo: str, number: int, title: str, body: str) -> None:
         os.unlink(body_file)
 
 
+def _plan_main(argv: Sequence[str]) -> int:
+    """`plan`: the runner's check before it opens a pull request."""
+    parser = argparse.ArgumentParser(
+        prog="python3 -m bus.pr_repair plan",
+        description="Rebuild the parts of a new pull request body that fail the plan "
+                    "checks from the ticket brief. Exit 0 with the repaired body in "
+                    "--out; exit 1 with what the ticket lacks on stdout, one per line.")
+    parser.add_argument("brief")
+    parser.add_argument("body", help="file holding the composed body")
+    parser.add_argument("lane")
+    parser.add_argument("model")
+    parser.add_argument("ticket")
+    parser.add_argument("--out", required=True, help="where the repaired body goes")
+    parser.add_argument("--summary")
+    parser.add_argument("--repo")
+    parser.add_argument("--private", action="store_true")
+    args = parser.parse_args(list(argv))
+    try:
+        with open(args.brief, encoding="utf-8") as fh:
+            brief = fh.read()
+        with open(args.body, encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError as err:
+        print("cannot read: %s" % err, file=sys.stderr)
+        return 1
+    found = plan_repair(brief, "", body, args.lane, args.model, args.ticket,
+                        args.summary, args.repo, not args.private)
+    if found["changed"] or not found["before"]:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(str(found["body"]))
+        return 0
+    if found["reason"]:
+        print("repair refused: %s" % found["reason"], file=sys.stderr)
+    for gap in ticket_gaps(list(found["after"])):  # type: ignore[arg-type]
+        print(gap)
+    return 1
+
+
+# The review bot's plan check (bus/factory.py DEFAULT_PLAN_CHECK).
+PLAN_CHECK = "Grug - Chief"
+_GREEN = ("success", "neutral", "skipped")
+
+
+def _gh_api(path: str) -> object:
+    out = subprocess.run(["gh", "api", path], capture_output=True, text=True,
+                         timeout=_net_timeout())
+    if out.returncode != 0:
+        raise RuntimeError("gh api %s failed: %s" % (path, out.stderr.strip()))
+    return json.loads(out.stdout)
+
+
+def _only_plan_failing(runs: Sequence[Dict[str, object]], check: str) -> bool:
+    """Every check on the head has finished, and the plan check is the only
+    one that did not pass."""
+    if not runs or any(r.get("status") != "completed" for r in runs):
+        return False
+    failed = [r for r in runs if r.get("conclusion") not in _GREEN]
+    return len(failed) == 1 and failed[0].get("name") == check
+
+
+def _sweep_ticket(repo: str, pr: Dict[str, object], authors: set,
+                  api) -> Tuple[Optional[Dict[str, object]], str]:
+    """(ticket issue, "") for a pull request the factory would judge, else
+    (None, why it is skipped). The factory's trust gate: not a draft, a
+    loom/ branch in this repo, opened by a trusted login, and linked
+    (brain._ticket_association) to an open loom:ticket at loom:pr that a
+    trusted login filed. A footer or Refs line alone is text anyone can
+    write in a pull request body."""
+    from . import brain, tickets  # brain imports this module
+    head = pr.get("head") or {}
+    if pr.get("draft"):
+        return None, "a draft"
+    if not str(head.get("ref") or "").startswith("loom/"):  # type: ignore[union-attr]
+        return None, "not on a loom/ branch"
+    if str(((head.get("repo") or {}).get("full_name")) or "").lower() != repo.lower():  # type: ignore[union-attr]
+        return None, "its branch is in another repo"
+    if tickets._login(pr.get("user")).lower() not in authors:
+        return None, "not opened by a trusted login"
+    try:
+        association = brain._ticket_association(repo, pr)
+    except ValueError as err:
+        return None, "no ticket: %s" % err
+    if association is None:
+        return None, "no ticket reference"
+    issue = api("repos/%s/issues/%d" % association) or {}
+    if not isinstance(issue, dict):
+        return None, "ticket #%d could not be read" % association[1]
+    refused = brain._ticket_refusal(issue, "pr")
+    if refused:
+        return None, "ticket #%d: %s" % (association[1], refused)
+    if tickets._login(issue.get("user")).lower() not in authors:
+        return None, "ticket #%d was not filed by a trusted login" % association[1]
+    return issue, ""
+
+
+def _sweep_fields(repo: str, pr: Dict[str, object], check: str,
+                  api) -> Optional[Tuple[str, str, str]]:
+    """The runner footer of a pull request whose head has finished every
+    check and fails only `check`, else None."""
+    from . import brain  # brain imports this module
+    fields = footer_fields(str(pr.get("body") or ""))
+    sha = str((pr.get("head") or {}).get("sha") or "")  # type: ignore[union-attr]
+    if fields is None or not sha:
+        return None
+    listed = api("repos/%s/commits/%s/check-runs?filter=all&per_page=100" % (repo, sha))
+    runs = brain.newest_check_runs((listed or {}).get("check_runs") or [])
+    return fields if _only_plan_failing(runs, check) else None
+
+
+def _sweep_one(repo: str, pr: Dict[str, object], issue: Dict[str, object],
+               fields: Tuple[str, str, str], apply: bool, check: str, edit,
+               say) -> Dict[str, object]:
+    """Rebuild one pull request's body from its ticket, report it, and edit
+    it when `apply` and the new body passes. Returns the sweep row."""
+    from . import tickets  # tickets imports the factory, which imports this module
+    number, ticket_number = int(pr["number"]), int(issue["number"])  # type: ignore[arg-type]
+    ticket, lane, model = fields
+    title, body = str(pr.get("title") or ""), str(pr.get("body") or "")
+    found = plan_repair(tickets.render_brief(repo, issue, lane), title, body, lane, model,
+                        ticket, repo=repo)
+    before, after = list(found["before"]), list(found["after"])  # type: ignore[call-overload]
+    if not before:
+        say("%s#%d: the body passes the plan checks; %s fails on something else"
+            % (repo, number, check))
+    elif found["changed"]:
+        say("%s#%d: %s body from ticket #%d (was: %s)"
+            % (repo, number, "repaired" if apply else "would repair", ticket_number,
+               "; ".join(before)))
+        if apply:
+            edit(repo, number, title, str(found["body"]))
+    else:
+        say("%s#%d: not repairable, ticket #%d lacks: %s"
+            % (repo, number, ticket_number, "; ".join(ticket_gaps(after))))
+    return {"repo": repo, "number": number, "before": before, "after": after,
+            "changed": found["changed"]}
+
+
+def sweep(repos: Sequence[str], apply: bool, check: str = PLAN_CHECK,
+          api=_gh_api, edit=None, say=print,
+          authors: Optional[Sequence[str]] = None) -> List[Dict[str, object]]:
+    """Find open lane pull requests whose only failing check is the plan
+    check, and rebuild their bodies from their tickets (plan_repair). Only a
+    pull request the factory itself would judge is read (_sweep_ticket).
+    With apply False nothing is written: each finding is only reported.
+    Returns one row per pull request found: repo, number, before, after,
+    changed."""
+    from . import brain  # brain imports this module
+    edit = edit or _gh_pr_edit
+    trusted = {a.lower() for a in (authors if authors is not None
+                                   else brain.require_trusted_authors(None, "sweep"))}
+    rows: List[Dict[str, object]] = []
+    for repo in repos:
+        pulls = api("repos/%s/pulls?state=open&per_page=100" % repo) or []
+        for pr in pulls if isinstance(pulls, list) else []:
+            fields = _sweep_fields(repo, pr, check, api)
+            if fields is None:
+                continue
+            issue, why = _sweep_ticket(repo, pr, trusted, api)
+            if issue is None:
+                say("%s#%d: skipped, %s" % (repo, int(pr["number"]), why))
+                continue
+            rows.append(_sweep_one(repo, pr, issue, fields, apply, check, edit, say))
+    return rows
+
+
+def _sweep_main(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python3 -m bus.pr_repair sweep",
+        description="Repair the bodies of open lane pull requests that fail only the "
+                    "review bot's plan check, from their tickets.")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true", help="report only")
+    mode.add_argument("--apply", action="store_true", help="edit the bodies")
+    parser.add_argument("--repo", action="append", default=[],
+                        help="owner/name; repeatable (default: LOOM_REPOS)")
+    parser.add_argument("--check", default=os.environ.get("LOOM_PLAN_CHECK", PLAN_CHECK))
+    args = parser.parse_args(list(argv))
+    repos = args.repo or os.environ.get("LOOM_REPOS", "").replace(",", " ").split()
+    if not repos:
+        parser.error("no repos: pass --repo or set LOOM_REPOS")
+    try:
+        rows = sweep(repos, args.apply, args.check)
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as err:
+        print("sweep stopped: %s" % err, file=sys.stderr)
+        return 3
+    print("%d pull request(s) fail only %s; %d %s" % (
+        len(rows), args.check, sum(1 for r in rows if r["changed"]),
+        "repaired" if args.apply else "repairable"))
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "plan":
+        return _plan_main(argv[1:])
+    if argv and argv[0] == "sweep":
+        return _sweep_main(argv[1:])
     parser = argparse.ArgumentParser(
         description="Reconcile a PR title/body with a revised ticket brief.")
     parser.add_argument("brief", help="path to the local brief file")
@@ -383,7 +784,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--apply", type=int, metavar="PR",
                         help="apply the repair to this PR number via gh")
     parser.add_argument("--repo",
-                        help="owner/name repository for --apply")
+                        help="owner/name repository for --apply, and where a "
+                             "bug line's #N is looked up")
+    parser.add_argument("--private", action="store_true",
+                        help="the repo is private: another repo's issue refs in "
+                             "the bugs section stay as written")
     parser.add_argument("lane", help="lane name")
     parser.add_argument("model", help="model id")
     parser.add_argument("ticket", help="ticket id used in the PR footer")
@@ -415,7 +820,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     current_body = str(pr.get("body") or "")
 
     result = reconcile(args.brief, current_title, current_body,
-                       args.lane, args.model, args.ticket, args.summary)
+                       args.lane, args.model, args.ticket, args.summary,
+                       repo=args.repo, public=not args.private)
 
     if not args.apply:
         print(json.dumps(result))

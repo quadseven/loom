@@ -18,8 +18,12 @@
 # check's Pythons in AGENT_UV_PYTHON), uv runs offline from it: the copy is
 # the one extra directory codex may write (uv locks its cache), and the
 # network stays closed.
+# A codex lane run writes its final message to AGENT_LAST_MESSAGE when the
+# runner names one: the reason a run that committed nothing quotes
+# (loom#1799), instead of whatever the agent printed last.
 agent_cli() {
-  local uv_env=() uv_dir=()
+  local uv_env=() uv_dir=() last=()
+  [ "$1:$2" = codex:lane ] && [ -n "${AGENT_LAST_MESSAGE:-}" ] && last=(--output-last-message "$AGENT_LAST_MESSAGE")
   if [ "$1:$2" = codex:lane ] && [ -n "${AGENT_UV_DIR:-}" ]; then
     uv_env=("UV_CACHE_DIR=$AGENT_UV_DIR/cache" "UV_PYTHON_INSTALL_DIR=$AGENT_UV_PYTHON"
             UV_OFFLINE=1 UV_MANAGED_PYTHON=1 PIP_NO_INDEX=1)
@@ -30,7 +34,7 @@ agent_cli() {
     claude:brain) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" \
       --permission-mode bypassPermissions "$3" < /dev/null ;;
     codex:lane) timeout "$AGENT_TIMEOUT" env ${uv_env[@]+"${uv_env[@]}"} codex exec --sandbox workspace-write \
-      ${uv_dir[@]+"${uv_dir[@]}"} --model "$MODEL" "$3" < /dev/null ;;
+      ${uv_dir[@]+"${uv_dir[@]}"} --model "$MODEL" ${last[@]+"${last[@]}"} "$3" < /dev/null ;;
     codex:brain) timeout "$AGENT_TIMEOUT" codex exec --sandbox danger-full-access \
       --skip-git-repo-check --model "$MODEL" "$3" < /dev/null ;;
     *) echo "no agent CLI for lane $1 ($2)" >&2; return 2 ;;
@@ -160,8 +164,14 @@ provider_text() {
 }
 
 classify_failure() {
-  local status="$1" whole="$2" edited="$3" now n tail cap stated monthly=0
+  local status="$1" whole="$2" edited="$3" now n tail cap stated monthly=0 seen
   tail="${4:-$whole}"
+  # A run that exited 0 wrote its answer: a limit phrase earlier in its
+  # output came from a file or test it read (a Makefile echoing "Rate-limiting
+  # wrapper deployed", a test named test_..._rate_limited parked two codex
+  # lanes until midnight, 2026-10-25), so only what its CLI said last counts.
+  seen="$whole"
+  [ "$status" -eq 0 ] && seen="$tail"
   FAIL_CLASS=work RETRY_AT="" OUT_OF_CREDIT=""
   now="$(date +%s)"
   shopt -s nocasematch
@@ -169,7 +179,7 @@ classify_failure() {
     FAIL_CLASS=auth
   elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
-  elif [[ "$whole" =~ $LIMIT_RE ]] || [[ "$tail" =~ $LIMIT_CODE_RE ]]; then
+  elif [[ "$seen" =~ $LIMIT_RE ]] || [[ "$tail" =~ $LIMIT_CODE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT)) cap=$LIMIT_WAIT_MAX
     # A reset time or duration the provider states wins: codex's five-hour
     # limit says "purchase more credits or try again at 10:28 AM", agy's

@@ -82,7 +82,7 @@ State chips (pill, mono 12, only states with tickets) + goal chips; grid of tick
 - **PR**: checks list, files with +/-, grug threads (severity / open/resolved), "Across all attempts" summary (what the failing attempts had in common), and a Proof card (waiting amber / seen live green).
 
 ### Brain
-Tick progress (10 steps: lock, status, merge, verify, failed, asks, brief, triage, journal, unlock; done green 50%, current amber), next move, "Thinking, this tick" (tag colored: regression red, operator amber, merged green, verifying amber, deferred grey), ranking card (members affected x hours lost, with the arithmetic in words, not bare numbers), handoff markers (mono, verbatim), recent ticks with holder and outcome.
+Tick progress (11 steps: lock, status, merge, verify, failed, asks, brief, triage, sweep, journal, unlock; done green 50%, current amber), next move, "Thinking, this tick" (tag colored: regression red, operator amber, merged green, verifying amber, deferred grey), ranking card (members affected x hours lost, with the arithmetic in words, not bare numbers), handoff markers (mono, verbatim), recent ticks with holder and outcome.
 
 ### Hot spots
 "Where it slows" (median wait per state, worst in text, bottleneck amber, note), what grug keeps sending back (count + trend arrow), lane failure rate (5 vertical bars, red above 20%), repeatedly stuck tickets (rung > 0 or failed).

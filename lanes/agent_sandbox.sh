@@ -10,9 +10,145 @@
 
 # The decrypted value of the SSM parameter named $1, or nothing when it
 # cannot be read. The value goes to stdout only: callers capture it.
+# With LOOM_SSM_DIR set (a lane pod), the value is the file at the parameter's
+# name under that folder (/a/b -> $LOOM_SSM_DIR/a/b), a copy of the parameter
+# that the cluster keeps in step with SSM, and no AWS call is made: the pod
+# holds no AWS key. The folder must sit under HOME, which no sandbox shows.
 ssm_value() {
+  if [ -n "${LOOM_SSM_DIR:-}" ]; then
+    case "$1" in /*) ;; *) return 1 ;; esac
+    case "/$1/" in */../*|*/./*) return 1 ;; esac
+    cat "$LOOM_SSM_DIR$1" 2> /dev/null
+    return
+  fi
   timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
     --name "$1" --with-decryption --query Parameter.Value --output text 2> /dev/null
+}
+
+# The sandbox that confines agents and validation runs: LOOM_SANDBOX=seatbelt
+# (macOS sandbox-exec, the default) or bwrap (Linux bubblewrap, for a lane
+# pod on the cluster). Prints the kind, or says why not and returns 1.
+sandbox_kind() {
+  case "${LOOM_SANDBOX:-seatbelt}" in
+    seatbelt | bwrap) printf '%s' "${LOOM_SANDBOX:-seatbelt}" ;;
+    *) echo "unknown LOOM_SANDBOX '${LOOM_SANDBOX}': seatbelt or bwrap" >&2; return 1 ;;
+  esac
+}
+
+# Whether this machine can start the sandbox. SANDBOX_WHY says why not. A
+# bwrap that cannot make its namespaces here (a container without user
+# namespaces, or with a masked /proc) is found before any run, so the lane
+# says it is unavailable instead of failing every brief.
+# bwrap narrows no network, so it also fails closed unless the pod's own
+# egress is narrowed, proved before every pass by egress_denied.
+# shellcheck disable=SC2034 # SANDBOX_WHY is read by the callers
+sandbox_ready() {
+  local kind
+  SANDBOX_WHY=""
+  kind="$(sandbox_kind 2>&1)" || { SANDBOX_WHY="$kind"; return 1; }
+  case "$kind" in
+    seatbelt) command -v sandbox-exec > /dev/null || { SANDBOX_WHY="sandbox-exec not available"; return 1; } ;;
+    bwrap)
+      command -v bwrap > /dev/null || { SANDBOX_WHY="bwrap not available"; return 1; }
+      bwrap --die-with-parent --unshare-pid --ro-bind / / --dev /dev --proc /proc true > /dev/null 2>&1 ||
+        { SANDBOX_WHY="bwrap cannot start a sandbox here (user namespaces or /proc denied)"; return 1; }
+      egress_denied || return 1 ;;
+  esac
+}
+
+# Whether the pod's egress is narrowed, proved, not assumed. Every
+# must-be-blocked destination must fail to connect: those in
+# LOOM_EGRESS_DENY_PROBES (IPv4:port, literal addresses only, so a name that
+# does not resolve can never pass as blocked; separated by spaces or commas,
+# as the cluster's secret holds them), plus the API server at
+# KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT when the pod has them. And
+# the positive control LOOM_EGRESS_ALLOW_PROBE (host:port, the provider's or
+# gateway's HTTPS endpoint) must connect, so a pod with no network or no DNS
+# does not pass because every connection fails. Each try takes at most
+# LOOM_EGRESS_PROBE_SECONDS (default 3). Sets SANDBOX_WHY when it fails.
+# shellcheck disable=SC2034 # SANDBOX_WHY is read by sandbox_ready's callers
+egress_denied() {
+  local target host port wait="${LOOM_EGRESS_PROBE_SECONDS:-3}" denied allow="${LOOM_EGRESS_ALLOW_PROBE:-}"
+  local ipv4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
+  [[ "$wait" =~ ^[1-9][0-9]?$ ]] || wait=3
+  denied="${LOOM_EGRESS_DENY_PROBES:-}"
+  denied="${denied//,/ }"
+  [[ "$denied" =~ [^[:space:]] ]] ||
+    { SANDBOX_WHY="bwrap narrows no network: set LOOM_EGRESS_DENY_PROBES to the addresses the pod's egress policy blocks"; return 1; }
+  [ -n "$allow" ] ||
+    { SANDBOX_WHY="bwrap narrows no network: set LOOM_EGRESS_ALLOW_PROBE to an HTTPS endpoint the lane must reach"; return 1; }
+  if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+    denied="$denied $KUBERNETES_SERVICE_HOST:${KUBERNETES_SERVICE_PORT:-443}"
+  fi
+  for target in $denied; do
+    host="${target%:*}" port="${target##*:}"
+    [[ "$host" =~ $ipv4 && "$port" =~ ^[1-9][0-9]{0,4}$ ]] ||
+      { SANDBOX_WHY="egress probe '$target' is not IPv4:port (a name could fail to resolve and pass as blocked)"; return 1; }
+    if probe_connects "$host" "$port" "$wait"; then
+      SANDBOX_WHY="egress not narrowed: $target accepts connections, so no agent runs here"
+      return 1
+    fi
+  done
+  host="${allow%:*}" port="${allow##*:}"
+  [[ "$host" =~ ^[A-Za-z0-9.-]+$ && "$port" =~ ^[1-9][0-9]{0,4}$ ]] ||
+    { SANDBOX_WHY="LOOM_EGRESS_ALLOW_PROBE '$allow' is not host:port"; return 1; }
+  probe_connects "$host" "$port" "$wait" ||
+    { SANDBOX_WHY="egress unproven: $allow did not connect, so the blocked probes prove nothing"; return 1; }
+}
+
+# Whether a TCP connection to $1:$2 opens within $3 seconds.
+probe_connects() {
+  # shellcheck disable=SC2016 # $1 and $2 expand in the child shell
+  timeout "$3" bash -c 'exec 3<> "/dev/tcp/$1/$2"' _ "$1" "$2" > /dev/null 2>&1
+}
+
+# SANDBOX_CMD: the command words that run a command inside the profile $1
+# (from sandbox_profile), to be followed by the command and its arguments.
+# Seatbelt takes the profile text; bwrap takes the profile's lines as its
+# arguments, ending with --.
+sandbox_command() {
+  local kind line
+  kind="$(sandbox_kind)" || return 1
+  SANDBOX_CMD=()
+  if [ "$kind" = seatbelt ]; then
+    SANDBOX_CMD=(sandbox-exec -p "$1")
+    return 0
+  fi
+  SANDBOX_CMD=(bwrap)
+  while IFS= read -r line; do
+    [ -n "$line" ] && SANDBOX_CMD+=("$line")
+  done <<< "$1"
+  SANDBOX_CMD+=(--)
+}
+
+# The bubblewrap form of sandbox_profile, one argument per line. The variables
+# are sandbox_profile's, already canonical and checked. The root is an empty
+# tmpfs: only the system folders (BWRAP_SYSTEM_DIRS) are bound in, read-only,
+# so nothing else on the machine is there at all (HOME with the loom home and
+# the copied SSM values, /run/secrets, /var/run/secrets, the loom checkout).
+# Then the tree and the scratch home are bound writable, .git read-only, and
+# the CLI's folder, the skill snapshot and the check's uv files read-only.
+# /tmp is a private tmpfs; the root itself is read-only. Check runs get the same root as agent runs: their
+# writes go to the tree, the check home and /tmp only. A fresh /proc in a new
+# PID namespace hides the runner's processes and their environments.
+# /run/secrets and /var/run/secrets are masked again with empty tmpfs in case
+# a system folder ever reaches them. The network is the pod's (sandbox_ready
+# requires its egress narrowed).
+BWRAP_SYSTEM_DIRS="/usr /bin /sbin /lib /lib32 /lib64 /libx32 /etc /opt"
+bwrap_profile() {
+  local p
+  printf '%s\n' --die-with-parent --new-session --unshare-pid --unshare-ipc --unshare-uts
+  for p in $BWRAP_SYSTEM_DIRS; do printf '%s\n' --ro-bind-try "$p" "$p"; done
+  printf '%s\n' --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run/secrets --tmpfs /var/run/secrets
+  printf '%s\n' --bind "$tree" "$tree"
+  [ -e "$tree/.git" ] && printf '%s\n' --ro-bind "$tree/.git" "$tree/.git"
+  printf '%s\n' --bind "$agent_home" "$agent_home"
+  for p in "$cli_root" "$cli_link" ${skills:+"$skills"} $uv_files; do
+    printf '%s\n' --ro-bind "$p" "$p"
+  done
+  # The root tmpfs itself takes no writes (remount-ro does not reach the
+  # binds and /tmp, which are mounts of their own).
+  printf '%s\n' --remount-ro / --chdir "$tree"
 }
 
 # The ports an API-lane agent may connect to, space-separated: 443, its
@@ -56,6 +192,79 @@ api_rules() {
   esac
 }
 
+# What codesign says about the file at $1 (stdout and stderr together). A
+# function so a test can stand in for it on a machine without codesign or
+# with a binary it cannot sign. LOOM_AGY_CODESIGN names the program to run
+# in place of codesign; it exists for tests only and is never set in
+# production (the agent's own environment cannot reach the runner's).
+agy_codesign_report() {
+  "${LOOM_AGY_CODESIGN:-codesign}" -d --verbose=2 "$1" 2>&1
+}
+
+# Refuse to trust a binary with the token unless it is safe to trust (#1623).
+# The token rule trusts any process whose image is $1, so a command that could
+# make that image run its own code could read the token. Two ways to do so:
+# write the binary (or a library it loads) where the sandbox lets a command
+# write, and set DYLD_INSERT_LIBRARIES or similar for it. The hardened runtime
+# makes dyld ignore those, so $1 must carry the runtime flag in its signature,
+# and must sit where no sandboxed command can write. $2.. are the writable
+# areas. A script or launcher has no signature and so is refused too.
+agy_binary_check() {
+  local bin="$1" area report flags
+  shift
+  for area in "$@"; do
+    [ -n "$area" ] || continue
+    case "$bin/" in "$area"/*)
+      echo "refusing sandbox: agy binary $bin sits inside $area, which the sandboxed commands can write; install agy outside the worktree, the agent's scratch home and agy's state directory" >&2
+      return 1 ;; esac
+  done
+  report="$(agy_codesign_report "$bin")" || report=""
+  flags="$(printf '%s\n' "$report" | sed -n 's/^CodeDirectory .*flags=\(0x[0-9a-fA-F]*\).*/\1/p' | head -n 1)"
+  if [ -z "$flags" ] || [ $(( flags & 0x10000 )) -eq 0 ]; then
+    echo "refusing sandbox: agy binary $bin is not signed with the hardened runtime (codesign -d --verbose=2 shows no runtime flag), so a command could run it with an injected library and read agy's sign-in; re-sign it with: codesign -f -s - -o runtime $bin (or ask the operator to install a hardened-runtime agy), and use the agy binary itself, never a script or launcher" >&2
+    return 1
+  fi
+}
+
+# The rules that keep agy's oauth token files ($1 is the lane user's home,
+# $2 the real path of agy's binary, or empty when no process may read them)
+# from every process but agy's own binary (#1623). agy keeps its sign-in in
+# two files of the one name: its file store (Library/Application
+# Support/antigravity, #1620) and its CLI state directory
+# (.gemini/antigravity-cli). The sandbox cannot tell agy from the commands
+# it launches by where they run, but a rule can name the process: a shell
+# command agy runs (bash, cat, curl) is not agy, so it can neither read a
+# token file nor link, move or delete it, or move its folder, to reach it
+# from another path (a symlink to it is read through the same rule). A
+# command could still overwrite a token file in place (truncate or rewrite
+# it; only link, move and unlink are denied), which costs agy its
+# sign-in, not a leak. In check mode $2 is empty: a validation run never
+# runs agy, so no process there may read the token.
+agy_token_rules() {
+  local home="$1" bin="$2" dir file p only filter
+  for dir in "$home/Library/Application Support/antigravity" "$home/.gemini/antigravity-cli"; do
+    file="$dir/antigravity-oauth-token"
+    for p in "$dir" "$file" ${bin:+"$bin"}; do
+      # shellcheck disable=SC1003 # matching a literal backslash
+      case "$p" in *'"'*|*'\'*|*$'\n'*|"") echo "refusing sandbox: unsafe agy path '$p'" >&2; return 1 ;; esac
+    done
+    # The filter on one path: the path alone, or the path with every
+    # process but $bin excepted.
+    for only in "$file" "$dir"; do
+      if [ -n "$bin" ]; then
+        filter="(require-all (literal \"$only\") (require-not (process-path \"$bin\")))"
+      else
+        filter="(literal \"$only\")"
+      fi
+      if [ "$only" = "$file" ]; then
+        printf '(deny file-read* file-write-unlink file-link %s)\n' "$filter"
+      else
+        printf '(deny file-write-unlink file-link %s)\n' "$filter"
+      fi
+    done
+  done
+}
+
 # Seatbelt profile for agents, in one of three modes ($3): api for every API
 # lane, the triage rewriter and the brain's spark rung; empty for the agy
 # lane; check for a validation run. In every mode: no reads or writes anywhere
@@ -88,7 +297,13 @@ sandbox_profile() {
     *) echo "refusing sandbox: unknown mode $3" >&2; return 1 ;;
   esac
   [ "$LANE" = agy ] && [ "${3:-}" != check ] && { api_network="$(api_rules network)" || return 1; agy_lane=1; }
-  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule="" agy_keychain_deny=""
+  local kind
+  kind="$(sandbox_kind)" || return 1
+  if [ "$kind" = bwrap ] && [ "${3:-}" != api ] && [ "${3:-}" != check ]; then
+    echo "refusing sandbox: bwrap serves api and check runs only, not mode '${3:-}' (lane $LANE)" >&2
+    return 1
+  fi
+  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule="" agy_keychain_deny="" agy_home="" agy_token_deny=""
   if [ -n "${4:-}" ]; then
     [[ "$4" =~ ^[0-9]+$ ]] && [ "$4" -ge 49152 ] && [ "$4" -le 65535 ] ||
       { echo "refusing sandbox: loopback port $4 is not in 49152-65535" >&2; return 1; }
@@ -97,7 +312,8 @@ sandbox_profile() {
   home="$(cd "$HOME" && pwd -P)"
   tree="$(cd "$1" && pwd -P)"
   if [ "$LANE" = agy ] && [ -n "${AGY_HOME:-}" ]; then
-    agy_keychain_deny="(deny file-read* (subpath \"$(cd "$AGY_HOME" && pwd -P)/Library/Keychains\"))"
+    agy_home="$(cd "$AGY_HOME" && pwd -P)" || return 1
+    agy_keychain_deny="(deny file-read* (subpath \"$agy_home/Library/Keychains\"))"
   fi
   [ -d "$SKILLS" ] && skills="$(cd "$SKILLS" && pwd -P)"
   cli_link="$(command -v "$2")" && [ -n "$cli_link" ] || { echo "refusing sandbox: $2 not on PATH" >&2; return 1; }
@@ -106,7 +322,7 @@ sandbox_profile() {
   # Paths go into the profile's string grammar: refuse any that could close it.
   for p in "$home" "$tree" "$cli_link" "$cli_real" "$AGENT_HOME" "$skills"; do
     # shellcheck disable=SC1003 # matching a literal backslash
-    case "$p" in *'"'*|*'\'*) echo "refusing sandbox: unsafe path $p" >&2; return 1 ;; esac
+    case "$p" in *'"'*|*'\'*|*$'\n'*) echo "refusing sandbox: unsafe path $p" >&2; return 1 ;; esac
   done
   # Never let the CLI's directory cover HOME itself.
   case "$home/" in "$cli_root"/*) echo "refusing sandbox: $cli_real sits at or above HOME" >&2; return 1 ;; esac
@@ -134,6 +350,19 @@ sandbox_profile() {
   [ -n "$skills" ] && skills_rules="(allow file-read* (subpath \"$skills\"))
 (deny file-write* (subpath \"$skills\"))
 "
+  if [ "$kind" = bwrap ]; then
+    local agent_home
+    agent_home="$(cd "$AGENT_HOME" && pwd -P)" || return 1
+    # A bind at or above HOME would hand the agent all of HOME (the loom
+    # home, the copied SSM values): writable for the tree or scratch home,
+    # readable for the rest. Every bind must sit below HOME or beside it.
+    for p in "$tree" "$agent_home" "$cli_root" ${skills:+"$skills"} $uv_files; do
+      case "$p" in /) echo "refusing sandbox: $p is the root" >&2; return 1 ;; esac
+      case "$home/" in "$p"/*) echo "refusing sandbox: $p sits at or above HOME" >&2; return 1 ;; esac
+    done
+    bwrap_profile
+    return 0
+  fi
   for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"} $uv_files; do
     p="$(dirname "$p")"
     while [ "${p#"$home"}" != "$p" ] && [ "$p" != "/" ]; do
@@ -142,10 +371,23 @@ sandbox_profile() {
       p="$(dirname "$p")"
     done
   done
+  # The token rules name the profiled CLI's real path as the one process
+  # that may read agy's token, except in check mode, where no process may.
+  if [ -n "$agy_home" ]; then
+    local token_bin=""
+    if [ "${3:-}" != check ]; then
+      token_bin="$cli_real"
+      agy_binary_check "$token_bin" "$tree" "$(cd "$AGENT_HOME" && pwd -P)" \
+        "$agy_home/.gemini/antigravity-cli" "$agy_home/Library/Application Support/antigravity" \
+        "$agy_home/Library/Caches" "$agy_home/Library/Keychains" || return 1
+    fi
+    agy_token_deny="$(agy_token_rules "$agy_home" "$token_bin")" || return 1
+  fi
   [ -n "$agy_lane" ] && agy_rules="$(agy_write_rules "$allow_rw")"
   printf '(version 1)\n(allow default)\n%s(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n%s(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su") (literal "/usr/bin/security"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n%s%s\n' \
     "$api_writes" "$home" "$allow_rw" "$agy_rules" "$tree" "$allow_ro" "$skills_rules" "$meta" "$keychain_deny" "$api_network" "$loopback_rule"
   [ -z "$agy_keychain_deny" ] || printf '%s\n' "$agy_keychain_deny"
+  [ -z "$agy_token_deny" ] || printf '%s\n' "$agy_token_deny"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
@@ -170,6 +412,7 @@ api_agent() {
   fi
   mkdir -p "$AGENT_HOME/tmp"
   profile="$(sandbox_profile "$PWD" "$cli" api "${OPENCODE_SERVER_PORT:-}")" || return 3
+  sandbox_command "$profile" || return 3
   (
     keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" key="$API_KEY" extra="$AGENT_EXTRA_ENV" server_port="${OPENCODE_SERVER_PORT:-}"
     for v in $(compgen -e); do unset "$v"; done
@@ -183,7 +426,7 @@ api_agent() {
     if [ -n "$server_port" ]; then
       OPENCODE_PASSWORD="$(openssl rand -hex 32)" || exit 3
       export OPENCODE_PASSWORD
-      sandbox-exec -p "$profile" "$cli" serve --hostname 127.0.0.1 \
+      "${SANDBOX_CMD[@]}" "$cli" serve --hostname 127.0.0.1 \
         --port "$server_port" > /dev/null 2>&1 < /dev/null &
       server_pid=$!
       trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
@@ -194,14 +437,14 @@ api_agent() {
       deadline=$((SECONDS + 15))
       while [ "$SECONDS" -lt "$deadline" ]; do
         kill -0 "$server_pid" 2>/dev/null || { echo "opencode server stopped before it was ready" >&2; exit 3; }
-        if sandbox-exec -p "$profile" /usr/bin/nc -z -w 1 127.0.0.1 "$server_port" \
+        if "${SANDBOX_CMD[@]}" /usr/bin/nc -z -w 1 127.0.0.1 "$server_port" \
           > /dev/null 2>&1; then ready=1; break; fi
         sleep 0.1
       done
       [ -n "$ready" ] || { echo "opencode server was not ready within 15 seconds" >&2; exit 3; }
-      timeout -k 5 "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < "${AGENT_STDIN:-/dev/null}"
+      timeout -k 5 "$AGENT_TIMEOUT" "${SANDBOX_CMD[@]}" "${@:2}" < "${AGENT_STDIN:-/dev/null}"
     else
-      exec timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < "${AGENT_STDIN:-/dev/null}"
+      exec timeout "$AGENT_TIMEOUT" "${SANDBOX_CMD[@]}" "${@:2}" < "${AGENT_STDIN:-/dev/null}"
     fi
   ) 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
   # The agent writes into a pipe, not the log file: the log lives under HOME,

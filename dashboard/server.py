@@ -39,10 +39,14 @@ from . import tickets_table
 from . import tree as tree_view
 from . import operators as operators_view
 from . import needs_you as needs_you_view
+from . import answers as answers_view
+from bus import answer as bus_answer
+from .github import AskBudget
+from bus.github import GitHubError
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 from . import views
-from . import brain_view, hot_spots
+from . import brain_view, chain_view, fleet, floor_lanes, hot_spots
 
 def _all_tickets(state):
     payload = state.response()
@@ -236,13 +240,26 @@ def _priorities_card(rows):
     return '<section class="card priorities-card"><span class="label">Priorities</span>%s<a href="/tickets">all tickets &rarr;</a></section>' % body
 
 
+def _floor_live(state, rows=None):
+    """The Floor's two live fragments, one read of the same state the page
+    renders from: the lane strip and the Moving now rows. GET /api/floor/live
+    serves them to the page's script (loom.js), which swaps them in each poll."""
+    rows = _all_tickets(state) if rows is None else rows
+    payload = state.response()
+    fixing = floor_lanes.fix_round_refs(payload.get("issue_comments") or [])
+    lanes = _lane_view_data(payload, rows, state=state)["lanes"]
+    order = {name: index for index, name in enumerate(MOVING_ORDER)}
+    moving = sorted((row for row in rows if row.get("open", True) and row.get("state") in order),
+                    key=lambda row: (order[row["state"]], str(row.get("updated_at") or "")[::-1]))
+    return {"lanes": floor_lanes.strip(lanes, rows, fixing),
+            "moving": "".join(_ticket_row(row) for row in moving[:24]) or '<p class="empty-state">Nothing is moving right now.</p>'}
+
+
 def _floor(state):
     rows = _all_tickets(state)
     runaway = [row for row in rows if "loom:runaway" in (row.get("labels") or []) and row.get("open", True)]
     conveyor, bottleneck = _conveyor(state, rows)
     order = {name: index for index, name in enumerate(MOVING_ORDER)}
-    moving = sorted((row for row in rows if row.get("open", True) and row.get("state") in order),
-                    key=lambda row: (order[row["state"]], str(row.get("updated_at") or "")[::-1]))
     payload = state.response()
     context = getattr(state, "context", None) or payload.get("floor_context", {})
     esc = html.escape
@@ -261,9 +278,11 @@ def _floor(state):
     runaway_rows = "".join(_ticket_row(row) for row in runaway)
     parts.append('<section class="section runaway-tickets"><div class="section-head"><span class="label">Runaway tickets</span></div>%s</section>' % (
         runaway_rows or '<p class="empty-state">None held for review.</p>'))
-    parts.append('<div class="floor-columns"><section class="section"><div class="section-head"><span class="label">Moving now</span>'
-                 '<a href="/tickets">all tickets &rarr;</a></div><div class="ticket-list">%s</div></section>' % (
-                     "".join(_ticket_row(row) for row in moving[:24]) or '<p class="empty-state">Nothing is moving right now.</p>'))
+    live = _floor_live(state, rows)
+    parts.append('<section class="section"><div class="section-head"><span class="label">Lanes - who holds what now</span>'
+                 '<a href="/lanes">all lanes &rarr;</a></div><div data-live="lanes">%s</div></section>' % live["lanes"])
+    parts.append('<div class="floor-columns" data-live-url="/api/floor/live"><section class="section"><div class="section-head"><span class="label">Moving now</span>'
+                 '<a href="/tickets">all tickets &rarr;</a></div><div class="ticket-list" data-live="moving">%s</div></section>' % live["moving"])
     step = context.get("journal_step") or context.get("journal_lead")
     label = "Brain's next move" if context.get("journal_step") else "Brain, last tick"
     if step:
@@ -773,26 +792,116 @@ def _empty_epics(empty):
             html.escape(_repo_number(epic))) for epic in empty))
 
 
-def _needs_you(document, state, *, source_missing=False, who=""):
-    """Everything waiting on a person (loom#810): needs-operator asks from
-    Hunt's document and the store, and needs:<login> items from the
-    Operators pass, each once, filtered by ?who=."""
+def _needs_sources(document, state):
+    """(asks, claims, repos) the Needs-you page reads: needs-operator and
+    needs:human asks from Hunt's document and the store, and the Operators
+    pass's needs:<login> and answered items."""
     asks = list(document.get("needs_operator") or []) + list(getattr(state, "operator_items", []))
     response = getattr(state, "response", None)
     claims = (response() if callable(response) else {}).get("operator_claims") or {}
     repos = list(getattr(state, "repos", None) or [])
-    found, cards = needs_you_view.render(asks, claims, who, repos)
+    return asks, claims, repos
+
+
+def _answer_bar(mode):
+    """Who answers from this page and how: the token kept in this browser and
+    the operator it answers as (loom#1777)."""
+    esc = html.escape
+    if mode == "off":
+        return ""
+    if mode == "header":
+        return '<p class="answer-bar machine-fact" data-answer-mode="header">Answers post as the signed-in operator.</p>'
+    ops = bus_answer.operators()
+    choices = "".join('<option value="%s">%s</option>' % (esc(login, quote=True), esc(login)) for login in ops)
+    return ('<details class="answer-bar card" data-answer-mode="token"><summary>Answering from this browser'
+            '</summary><form class="answer-auth" data-answer-auth><label>Answer as <select name="as">%s</select>'
+            '</label><label>Answer token <input name="token" type="password" autocomplete="off" '
+            'placeholder="LOOM_ANSWER_TOKEN"></label><button type="submit">Keep in this browser</button>'
+            '<p class="answer-status" role="status" aria-live="polite"></p></form></details>') % choices
+
+
+def _needs_you(document, state, *, source_missing=False, who=""):
+    """Everything waiting on a person (loom#810): needs-operator and
+    needs:human asks from Hunt's document and the store, and needs:<login>
+    items from the Operators pass, each once, filtered by ?who=. Each card
+    takes an answer (loom#1777)."""
+    asks, claims, repos = _needs_sources(document, state)
+    mode = answers_view.mode(state)
+    found, cards = needs_you_view.render(asks, claims, who, repos, answers_view.posted(state), mode)
     out = ['<p class="page-lede">Only what only a person can do: each item names who it waits on. '
-           'Everything else the brain does itself.</p>']
+           'Everything else the brain does itself.</p>', _answer_bar(mode)]
     if source_missing:
         out.append('<p class="card">Backlog source unavailable: Hunt\'s items are not shown.</p>')
+    out.append(needs_you_view.goal_caps_section(getattr(state, "goal_caps", None), time.time()))
+    out.append(needs_you_view.brain_holds_section(getattr(state, "brain_holds", None), time.time()))
     out.append(cards)
     if not who:
         out.append(_backlog_asks(document, found, repos))
     counts = getattr(state, "human_counts", None) or document.get("loom_human_counts") or {}
-    out.append('<footer>loom:human counts by repo: %s</footer>' % html.escape(
+    out.append('<footer>needs:human counts by repo: %s</footer>' % html.escape(
         ", ".join("%s: %s" % (repo, count) for repo, count in counts.items()) or "none"))
-    return page("Needs you", "needs-you", "".join(out), status="Read only")
+    return page("Needs you", "needs-you", "".join(out),
+                status="Read only" if mode == "off" else "Answers on")
+
+
+def _needs_entry(state, repo, number):
+    raw = _backlog_bytes()
+    asks, claims, repos = _needs_sources(_backlog_document(raw or b"{}"), state)
+    return needs_you_view.find(asks, claims, repo, number, repos, answers_view.posted(state))
+
+
+def _handle_answer_post(handler, state):
+    """POST /api/needs-you/answer (loom#1777): one operator's answer to one
+    listed item, posted as one comment by the Loom App."""
+    try:
+        body = _json_body(handler)
+        if not isinstance(body, dict):
+            raise ValueError("the request is a JSON object")
+    except (ValueError, json.JSONDecodeError) as exc:
+        return handler.send_json(400, {"error": str(exc)})
+    try:
+        login = answers_view.identify(handler.headers, body)
+        repo, number = answers_view.parse_target(body)
+        entry = _needs_entry(state, repo, number)
+        if entry is None:
+            raise answers_view.Refused(404, "%s#%d is not on the Needs you page" % (repo, number))
+        if entry.get("pending"):
+            raise answers_view.Refused(409, "%s#%d is answered; the station has not applied it yet"
+                                       % (repo, number))
+        result = answers_view.post(state, entry, login, body.get("choice"), body.get("note"))
+    except answers_view.Refused as exc:
+        return handler.send_json(exc.code, {"error": str(exc)})
+    entry = _needs_entry(state, repo, number)
+    result["card"] = needs_you_view.card(entry, answers_view.mode(state)) if entry else ""
+    return handler.send_json(200, result)
+
+
+def _handle_ask_get(handler, state, parsed):
+    """GET /api/needs-you/ask?repo=&number= (loom#1777): read one card's ask
+    now, when the refresh pass has not, under its budget rules; answers the
+    card's HTML."""
+    query = parse_qs(parsed.query)
+    try:
+        repo, number = answers_view.parse_target({"repo": query.get("repo", [""])[0],
+                                                  "number": query.get("number", [""])[0]})
+    except answers_view.Refused as exc:
+        return handler.send_json(exc.code, {"error": str(exc)})
+    reader = getattr(state, "read_ask_now", None)
+    if not callable(reader):
+        return handler.send_json(503, {"error": "no ask reader"})
+    try:
+        reader(repo, number)
+    except KeyError as exc:
+        return handler.send_json(404, {"error": str(exc).strip("'\"")})
+    except AskBudget as exc:
+        return handler.send_json(429, {"error": str(exc)})
+    except (GitHubError, OSError, ValueError) as exc:
+        return handler.send_json(502, {"error": str(exc)})
+    entry = _needs_entry(state, repo, number)
+    if entry is None:
+        return handler.send_json(404, {"error": "%s#%d is not on the Needs you page" % (repo, number)})
+    return handler.send_json(200, {"card": needs_you_view.card(entry, answers_view.mode(state)),
+                                   "ask": needs_you_view.ask_text(entry)})
 
 
 def _backlog_asks(document, found, repos):
@@ -933,6 +1042,46 @@ def _handle_usage_post(handler, state):
         return handler.send_json(400, {"error": str(exc)})
 
 
+def _handle_goal_caps_post(handler, state):
+    """POST /api/goal-caps (loom#1831): the station's goals stuck at their
+    in-flight cap, with the upload token, shown on the Needs-you page."""
+    if not _authorized(handler):
+        return handler.send_json(401, {"error": "unauthorized"})
+    try:
+        state.goal_caps = needs_you_view.goal_caps(_json_body(handler), time.time())
+    except (ValueError, json.JSONDecodeError) as exc:
+        return handler.send_json(400, {"error": str(exc)})
+    return handler.send_json(201, {"goals": len(state.goal_caps["goals"])})
+
+
+def _handle_brain_holds_post(handler, state):
+    """POST /api/brain-holds (loom#1872): the station's per-repo counts of
+    needs-brain holds older than a day, with the upload token, shown on the
+    Needs-you page."""
+    if not _authorized(handler):
+        return handler.send_json(401, {"error": "unauthorized"})
+    try:
+        state.brain_holds = needs_you_view.brain_holds(_json_body(handler), time.time())
+    except (ValueError, json.JSONDecodeError) as exc:
+        return handler.send_json(400, {"error": str(exc)})
+    return handler.send_json(201, {"repos": len(state.brain_holds["repos"])})
+
+
+def _handle_chain_post(handler, state):
+    """POST /api/chain: the station's shadow mode per repo and its last held
+    and acted entries, with the upload token, shown on /chain."""
+    if not _authorized(handler):
+        return handler.send_json(401, {"error": "unauthorized"})
+    try:
+        now = time.time()
+        state.chain = chain_view.chain_snapshot(_json_body(handler), now)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return handler.send_json(400, {"error": str(exc)})
+    # The post is the station's heartbeat on /fleet.
+    fleet.remember_beat(state, now)
+    return handler.send_json(201, {"repos": len(state.chain["repos"])})
+
+
 # Brain memory (dashboard/brain_memory.py): the station writes ticks,
 # closings and rules with the upload token. Every brain reads the handoff
 # packet with it or with LOOM_HANDOFF_TOKEN, which can only read.
@@ -977,6 +1126,14 @@ def _handler_for(state):
             path = self.path.split("?", 1)[0]
             if path == "/api/usage":
                 return _handle_usage_post(self, state)
+            if path == "/api/goal-caps":
+                return _handle_goal_caps_post(self, state)
+            if path == "/api/brain-holds":
+                return _handle_brain_holds_post(self, state)
+            if path == "/api/chain":
+                return _handle_chain_post(self, state)
+            if path == "/api/needs-you/answer":
+                return _handle_answer_post(self, state)
             if path in BRAIN_WRITES:
                 return _handle_brain(self, state, BRAIN_WRITES[path])
             if path != "/api/transcripts":
@@ -1019,6 +1176,8 @@ def _dispatch_get(handler, state):
         return _dispatch_ticket_api(handler, state, parsed)
     if path in ("/backlog", "/backlog.json", "/needs-you"):
         return _dispatch_backlog(handler, state, path, parsed)
+    if path == "/api/needs-you/ask":
+        return _handle_ask_get(handler, state, parsed)
     if path in STATIC_ASSETS:
         return _dispatch_static(handler, path)
     if path in ("/improving", "/lanes"):
@@ -1033,6 +1192,10 @@ def _dispatch_get(handler, state):
         return _dispatch_tiers(handler, state)
     if path in ("/brain", "/hot-spots"):
         return _dispatch_brain_hot_spots(handler, state, path)
+    if path == "/fleet":
+        return _dispatch_fleet(handler, state)
+    if path == "/chain":
+        return _dispatch_chain(handler, state)
     if path in ("/", "/goals", "/tickets", "/tree"):
         return _dispatch_view(handler, state, path, parsed)
     if re.fullmatch(r"/t/[^/]+/[^/]+/[0-9]+", path):
@@ -1163,6 +1326,8 @@ def _dispatch_basic(handler, state, path):
         return handler.send_text(200 if state.ready else 503, "ready" if state.ready else "not ready")
     if path == "/api/tickets":
         return handler.send_json(200, _api_tickets(state.response()))
+    if path == "/api/floor/live":
+        return handler.send_json(200, _floor_live(state))
     if path == "/api/brain/handoff":
         return _handle_brain(handler, state)
     if path == "/api/usage":
@@ -1260,6 +1425,26 @@ def _dispatch_brain_hot_spots(handler, state, path):
         data = hot_spots.build_hot_spots(payload, waits_error, datetime.now(timezone.utc), bot)
         body, title, active = hot_spots.render_hot_spots(data), "Hot spots", "hot-spots"
     return handler.send_page(page(title, active, body, status="stale" if payload.get("stale") else "live"))
+
+
+def _dispatch_fleet(handler, state):
+    """The Fleet timeline, from the snapshot the other pages read and the
+    station's chain snapshot times; the page itself makes no GitHub request."""
+    payload = state.response()
+    lane_rows = _merge_lane_rows(payload.get("lanes") or [])
+    data = fleet.build_fleet(payload, lane_rows, list(getattr(state, "chain_seen", None) or ()),
+                             datetime.now(timezone.utc))
+    return handler.send_page(page("Fleet timeline", "fleet", fleet.render_fleet(data),
+                                  status="stale" if payload.get("stale") else "live"))
+
+
+def _dispatch_chain(handler, state):
+    """The command chain. Its station and audit layers are the station's
+    last POST /api/chain snapshot; the page itself makes no GitHub request."""
+    payload = state.response()
+    data = chain_view.build_chain(payload, getattr(state, "chain", None), time.time())
+    return handler.send_page(page("Command chain", "chain", chain_view.render_chain(data),
+                                  status="stale" if payload.get("stale") else "live"))
 
 
 def _dispatch_results(handler, state):
