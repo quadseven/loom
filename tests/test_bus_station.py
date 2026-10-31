@@ -6418,6 +6418,58 @@ class FactoryIncidentTest(Base):
         self.assertFalse(any(re.search(r"issues/(?:10[0-9]|1[1-7][0-9])$", p) for p in paths))
         self.assertFalse(any("state=closed" in p for p in paths))
 
+    def test_open_incident_probe_requires_changed_head_or_hourly_interval(self):
+        now = 1700000000.0
+        incident = {"created_at": "2023-11-14T21:00:00Z"}
+        self.assertTrue(station.Station(
+            GitHub("token", transport=self.fake), self.settings, now=now
+        )._factory_probe_due(incident, "a" * 40, now, {}, now))
+        self.assertFalse(station.Station(
+            GitHub("token", transport=self.fake), self.settings, now=now
+        )._factory_probe_due(incident, "a" * 40, now,
+                             {"at": now - 120, "head": "a" * 40}, now))
+        self.assertTrue(station.Station(
+            GitHub("token", transport=self.fake), self.settings, now=now
+        )._factory_probe_due(incident, "a" * 40, now - 10000,
+                             {"at": now - 3600, "head": "a" * 40}, now))
+
+    def test_changed_default_head_requeues_one_ticket_when_all_work_is_held(self):
+        now = time.time()
+        filed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 7200))
+        incident = {"state": "open", "created_at": filed,
+                    "body": station.INCIDENT_MARKER + "\nKind: environment"}
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        held = {"%s#%d" % (REPO, n): {"incident": "%s#99" % REPO, "at": now - 7200}
+                for n in (12, 13, 14)}
+        commit = {"sha": "a" * 40, "commit": {"committer": {
+            "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3600))}}}
+        issue = {"labels": [{"name": "loom:running"}, {"name": "loom:ticket"}]}
+        with mock.patch.object(runner, "_held_tickets", return_value=held), \
+                mock.patch.object(runner, "_factory_incident", return_value=incident), \
+                mock.patch.object(runner, "_paginate", return_value=[]), \
+                mock.patch.object(runner, "_default_branch", return_value="main"), \
+                mock.patch.object(runner.gh, "rest", side_effect=[
+                    mock.Mock(data=commit), mock.Mock(data=issue)]), \
+                mock.patch.object(runner, "_release_one") as release:
+            runner.release_factory_held()
+        release.assert_called_once()
+
+    def test_a_queued_ticket_blocks_a_factory_probe(self):
+        now = time.time()
+        filed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 7200))
+        incident = {"state": "open", "created_at": filed,
+                    "body": station.INCIDENT_MARKER + "\nKind: base-check"}
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        held = {"%s#12" % REPO: {"incident": "%s#99" % REPO, "at": now - 7200}}
+        with mock.patch.object(runner, "_held_tickets", return_value=held), \
+                mock.patch.object(runner, "_factory_incident", return_value=incident), \
+                mock.patch.object(runner, "_paginate", return_value=[{"number": 20}]), \
+                mock.patch.object(runner, "_default_branch") as branch, \
+                mock.patch.object(runner, "_release_one") as release:
+            runner.release_factory_held()
+        branch.assert_not_called()
+        release.assert_not_called()
+
     def test_factory_is_a_failure_class_not_work(self):
         self.assertEqual(station.failure_class("[factory] setup failed: x"), "factory")
         self.assertEqual(station.failure_class("[work] agent made no commit"), "work")

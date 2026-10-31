@@ -498,6 +498,8 @@ HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([
 # has nothing that can close it, so the station releases it after this long:
 # the ticket is not held forever.
 HELD_NO_INCIDENT_FOR = 2 * 3600
+FACTORY_PROBE_AFTER = 3600
+FACTORY_PROBE_EVERY = 3600
 RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
                       r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
 # The brain's lane order for a retry, after the failed lane's own provider.
@@ -6078,6 +6080,9 @@ class Station:
             return
         if ref and incident is None:
             return
+        if incident is not None and incident.get("state") == "open":
+            self._probe_factory_held(key, repo, number, ref, incident)
+            return
         try:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
             comments = self._paginate(
@@ -6132,7 +6137,7 @@ class Station:
         _say("factory release: %s#%d re-queued after incident %s closed" % (repo, number, ref))
 
     def _factory_incident(self, ref: str) -> Optional[Dict[str, Any]]:
-        """Read one named incident once per pass; return it only when closed."""
+        """Read one named incident once per pass when its marker is present."""
         cache = getattr(self, "_factory_incidents", {})
         if ref in cache:
             return cache[ref]
@@ -6150,12 +6155,82 @@ class Station:
             cache[ref] = None
             self._factory_incidents = cache
             return None
-        if not isinstance(issue, dict) or issue.get("state") != "closed" \
+        if not isinstance(issue, dict) or issue.get("state") not in ("open", "closed") \
                 or INCIDENT_MARKER not in str(issue.get("body") or ""):
             issue = None
         cache[ref] = issue
         self._factory_incidents = cache
         return issue
+
+    def _probe_factory_held(self, key: str, repo: str, number: int, ref: str,
+                            incident: Dict[str, Any]) -> None:
+        """Re-queue one aged held ticket when the incident's base may be fixed."""
+        checked = getattr(self, "_factory_probe_checked", set())
+        if ref in checked:
+            return
+        checked.add(ref)
+        self._factory_probe_checked = checked
+        incident_body = str(incident.get("body") or "")
+        kind = re.search(r"^Kind:\s*(\S+)", incident_body, re.M)
+        if not kind or kind.group(1) not in ("base-check", "environment"):
+            return
+        queued = self._paginate("/repos/%s/issues?labels=loom:queued&state=open&per_page=100" % repo)
+        if any(isinstance(item, dict) and "pull_request" not in item for item in queued):
+            return
+        branch = self._default_branch(repo)
+        if not branch:
+            return
+        cache = getattr(self, "_factory_probe_heads", {})
+        if repo not in cache:
+            cache[repo] = self.gh.rest(
+                "GET", "/repos/%s/commits/%s" % (repo, quote(branch, safe=""))).data
+            self._factory_probe_heads = cache
+        commit = cache[repo]
+        if not isinstance(commit, dict):
+            return
+        sha = str(commit.get("sha") or "")
+        committed = self._epoch(str(((commit.get("commit") or {}).get("committer") or {}).get("date") or ""))
+        if not sha or committed is None:
+            return
+        path = os.path.join(self.state, "factory_probes.json")
+        probes = _read_json(path, {}, strict=False)
+        if not isinstance(probes, dict):
+            probes = {}
+        record = probes.get(ref) if isinstance(probes.get(ref), dict) else {}
+        incident_at = self._epoch(str(incident.get("created_at") or ""))
+        if incident_at is None or self.now - incident_at < FACTORY_PROBE_AFTER:
+            return
+        if not self._factory_probe_due(incident, sha, committed, record, self.now):
+            return
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("factory probe: could not read %s#%d: %s" % (repo, number, err))
+            return
+        if not isinstance(issue, dict) or RUNNING not in _label_names(issue):
+            self._forget_held(key)
+            return
+        probes[ref] = {"at": self.now, "head": sha}
+        _write_json(path, probes)
+        self._release_one(key, repo, number, issue, RUNAWAY in _label_names(issue),
+                          "Factory incident %s is open; one ticket is back in the queue "
+                          "for a probe." % ref)
+        _say("factory probe: %s#%d re-queued for open incident %s" % (repo, number, ref))
+
+    def _factory_probe_due(self, incident: Dict[str, Any], sha: str, committed: float,
+                           record: Dict[str, Any], now: float) -> bool:
+        """Whether a changed default head or elapsed hourly interval permits a probe."""
+        filed = self._epoch(str(incident.get("created_at") or ""))
+        if filed is None or now - filed < FACTORY_PROBE_AFTER:
+            return False
+        if committed > filed and record.get("head") != sha:
+            return True
+        last = record.get("at")
+        if not isinstance(last, (int, float)) or isinstance(last, bool):
+            last = filed
+        return now - last >= FACTORY_PROBE_EVERY
 
     def _green_default_after_hold(self, repo: str, held_at: float) -> bool:
         """Whether a newer commit on the default branch has all checks green."""
