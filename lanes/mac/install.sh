@@ -496,6 +496,14 @@ if [ "${LOOM_BRAIN:-1}" = 0 ]; then
   rm -f "$PLIST" "$LOOM_HOME/state/brain.json" "$LOOM_HOME/state/brain-ok"
   echo "removed $LABEL (LOOM_BRAIN=0)"
 else
+  # The brain's Fabric question is opt-in (LOOM_BRAIN_FABRIC_ASK) and off by
+  # default, so the brain's plist carries the Fabric key parameter name only
+  # when the opt-in is configured; the station's plist above keeps it always.
+  if [ -n "${LOOM_BRAIN_FABRIC_ASK:-}" ]; then
+    BRAIN_LOOM_ENV="$(loom_env)"
+  else
+    BRAIN_LOOM_ENV="$(loom_env LOOM_FABRIC_KEY_SSM)"
+  fi
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -516,7 +524,7 @@ else
     <key>PATH</key><string>$X_HOME/.local/bin:$X_HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>$X_HOME</string>
     <key>LOOM_HOME</key><string>$X_LOOM</string>
-$(loom_env)
+$BRAIN_LOOM_ENV
 $(app_env BRAIN_)
   </dict>
 </dict>
