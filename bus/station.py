@@ -2546,12 +2546,7 @@ class Station:
         except ValueError as err:
             self._refuse(repo, issue, str(err))
             return False
-        fix, fix_comment_id = fix_source if fix_source else (None, None)
-        if fix is not None and fix.pr in tickets.judged_pulls(self._status_texts(repo, number)):
-            # The station already read this merged pull request and sent the
-            # ticket back for the rest, so the old fix ask is spent. It parked
-            # the ticket at loom:pr on every brief (loom#2333).
-            fix, fix_comment_id = None, None
+        fix, fix_comment_id = self._live_fix(repo, number, fix_source)
         if self._held_before_claim(repo, issue, fix, comments):
             return False
 
@@ -4613,6 +4608,15 @@ class Station:
         _say("%s#%d: merged pull request #%d may already do its work; verifying before any build"
              % (repo, number, int(pr["number"])))
         return True
+
+    def _live_fix(self, repo: str, number: int, found: Optional[Tuple[tickets.Fix, Any]]
+                  ) -> Tuple[Optional[tickets.Fix], Any]:
+        """The fix ask and its comment id, or nothing. An ask for a merged pull
+        request the station already judged is spent: the ticket went back for
+        the rest, and the ask parked it at loom:pr on every brief (loom#2333)."""
+        if found is None or found[0].pr in tickets.judged_pulls(self._status_texts(repo, number)):
+            return None, None
+        return found
 
     def _held_before_claim(self, repo: str, issue: Dict[str, Any], fix: Any,
                            comments: List[Any]) -> bool:
