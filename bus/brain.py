@@ -2175,11 +2175,13 @@ def dedupe_intake_epics(gh: GitHub, repo: str) -> Tuple[int, int]:
 
     Before loom#2030 every intake epic carried the same unnumbered title, so
     two open intake epics still share it. For each title that two or more open
-    intake epics carry, the newest by number is the primary: each older epic's
-    open sub-issue tickets move under it, and the older epic takes the next
-    batch number no open intake epic of the repo uses. A closed ticket or an
-    epic, ask or pull request stays where it is, and an epic that is not an
-    intake epic is left for a person. Returns (renamed, moved)."""
+    intake epics carry, the newest by number is the primary: as many of each
+    older epic's open sub-issue tickets as its room allows move under it, and
+    the older epic takes the next batch number no open intake epic of the repo
+    uses. A ticket past the primary's room stays under the renamed older epic.
+    A closed ticket or an epic, ask or pull request stays where it is, and an
+    epic that is not an intake epic is left for a person. Returns
+    (renamed, moved)."""
     epics = [i for i in gh.paginate("/repos/%s/issues?labels=epic&state=open&per_page=100" % repo)
              if isinstance(i, dict) and "pull_request" not in i and is_intake_epic(i)]
     groups: Dict[str, List[Dict[str, Any]]] = {}
