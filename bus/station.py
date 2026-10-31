@@ -5105,6 +5105,7 @@ class Station:
                      self.clean_labels,
                      self.queue_stateless_tickets,
                      self.note_stale_shipped,
+                     self.compare_send_back_counts,
                      self.restate_shipped_live,
                      self.health_intake, self.intake_friction,
                      # The packet after the tick's row, so it renders that tick.
@@ -13890,6 +13891,48 @@ class Station:
                 _say("watch_logs failed: %s" % err)
         finally:
             self._end_pass_locally()
+
+    def compare_send_back_counts(self) -> None:
+        """Run the one seven-day comparison of bus/send_back.py, at most
+        hourly until it is done; it never runs a second time."""
+        from . import send_back
+        repo = self.s.self_repo
+        if repo not in self.s.repos:
+            return
+        path = os.path.join(self.state, send_back.STATE_FILE)
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        checked = saved.get("checked_at")
+        if saved.get("completed") or (isinstance(checked, (int, float))
+                                      and 0 <= self.now - checked < 3600):
+            return
+        landed = send_back.landed_at(self._paginate(
+            "/repos/%s/commits?path=%s&per_page=100" % (repo, send_back.LANDED_PATH)))
+        landed_at = self._epoch(landed) if landed else None
+        if not landed_at or self.now < landed_at + send_back.WAIT:
+            _write_json(path, {"checked_at": self.now})
+            return
+        comments: List[Any] = []
+        for source in self.s.repos:
+            comments.extend(self._paginate("/repos/%s/pulls/comments?since=%s&per_page=100"
+                                           % (source, send_back.since(self.now))))
+        found = send_back.counts(comments, self.s.review_bot,
+                                 datetime.fromtimestamp(self.now, timezone.utc))
+        _say("send-back comparison for #%d: %s" % (send_back.TICKET, found))
+        if send_back.not_fallen(found):
+            if shadow.active(repo):
+                shadow.record_held(shadow.REOPEN, repo, send_back.TICKET, "issue",
+                                   source="seven-day send-back comparison",
+                                   reason="send-back counts have not fallen")
+            else:
+                existing = self._paginate("/repos/%s/issues/%d/comments"
+                                          % (repo, send_back.TICKET))
+                if not any(send_back.MARKER in str(c.get("body") or "") for c in existing
+                           if isinstance(c, dict)):
+                    self._comment(repo, send_back.TICKET, send_back.report(found), "report")
+                self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, send_back.TICKET),
+                             {"state": "open"})
+        _write_json(path, {"completed": True, "compared_at": self.now, "counts": found})
 
     def _end_pass_locally(self) -> None:
         """Local housekeeping that needs no GitHub request: finished lane
