@@ -1965,6 +1965,43 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertIn("review check", str(caught.exception))
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
+    def test_merge_refuses_a_pull_request_that_is_behind_its_base(self):
+        """A pull request with behind_by: 3 raises ValueError and makes no merge PUT (criterion 1)."""
+        pr, query = self._merge_replies(changes={"pr": {"behind_by": 3}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        search_items = [{"filename": "src/app.py", "patch": "+x"}]
+        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
+                    reply(204), reply(200, []), reply(200, issue), reply(200, issue),
+                    reply(200, {"items": search_items}), reply(200, {}))
+        with self.assertRaisesRegex(ValueError, "behind its base"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_merge_allows_pull_request_when_behind_by_zero(self):
+        """A pull request with behind_by: 0 still merges (criterion 2)."""
+        pr, query = self._merge_replies(changes={"pr": {"behind_by": 0}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
+                    reply(204), reply(200, []), reply(200, issue), reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertTrue(result["merged"])
+
+    def test_merge_refusals_includes_behind_its_base(self):
+        """_merge_refusals lists "behind its base" for a behind-by PR (criterion 3)."""
+        pr = {"number": 8, "title": "Behind PR", "body": "Refs %s#9" % REPO,
+              "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": REPO}},
+              "base": {"ref": "main", "repo": {"full_name": REPO}},
+              "mergeable": True, "state": "open", "draft": False,
+              "behind_by": 3}
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(reply(200, issue), reply(200, pr), reply(200, {
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
+            "reviews": {"nodes": []}, "reviewThreads": {"nodes": []},
+            "headRepository": {"nameWithOwner": REPO},
+            "headRefName": "loom/9-work", "headRefOid": "checked"}), reply(200, {}))
+        refusals = brain._merge_refusals(GitHub("t", transport=fake), REPO, pr, (REPO, 9))
+        self.assertTrue(any("behind its base" in refusal for refusal in refusals))
+
     def test_merge_refuses_a_sensitive_pr_when_the_check_read_is_malformed(self):
         # A malformed check-runs answer is a check that did not pass, not a
         # crash: the reply is a list where the reader expects an object.
