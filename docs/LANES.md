@@ -776,7 +776,9 @@ when it is unset) or any `LOOM_REPOS` repo has an owner outside
 
 `LOOM_TRUSTED_BRIEFERS` (space separated GitHub logins, default empty) lets
 another operator hand work to this Loom's lanes without this Loom adopting
-their claims. It is briefing trust only:
+their claims. A reinstall that leaves it unset keeps the list in the installed
+station plist; set it, even to empty, to replace the list. It is briefing trust
+only:
 
 - A `loom:ticket` authored by a trusted briefer is trusted for briefing and
   building exactly like one from `LOOM_BRIEF_AUTHORS`: the station's claim and
