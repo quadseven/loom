@@ -4509,6 +4509,30 @@ class BranchHygiene(Base):
         self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
         self.assertEqual((self.merged, self.fixed), ([], []))
 
+    def test_a_behind_conflict_free_pull_request_at_briefed_is_updated(self):
+        self.gh.ticket(5, "briefed")
+        self.gh.pull(50, 5, created=7200, runs=self.WAITING)
+        self.gh.behind[50] = 3
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_a_behind_conflict_free_pull_request_at_failed_is_updated(self):
+        self.gh.ticket(5, "failed")
+        self.gh.pull(50, 5, created=7200, runs=self.WAITING)
+        self.gh.behind[50] = 3
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_a_behind_conflict_free_pull_request_at_running_is_left_alone(self):
+        self.gh.ticket(5, "running")
+        self.gh.pull(50, 5, created=7200, runs=self.WAITING)
+        self.gh.behind[50] = 3
+        self.go()
+        self.assertEqual(self.updates(), [])
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
     def test_a_dirty_pull_request_gets_a_fix_round_naming_it(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
