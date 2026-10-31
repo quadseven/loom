@@ -100,6 +100,9 @@ RUNAWAY = "loom:runaway"
 # How often the station moves the tickets that sit under a goal home and
 # under no epic into an open intake epic of that goal (decision 0003).
 OUTSIDE_EPIC_EVERY = 3600
+# How often the station gives the open intake epics of a repo distinct titles
+# and gathers the tickets of the older ones under the newest (loom#2155).
+DEDUPE_EPIC_EVERY = 3600
 # The marker on the comment the station posts when it reviews a runaway hold
 # caused by one dead lane (loom#565): the release, or why the hold stays.
 DEAD_LANE_MARKER = "<!-- loom:runaway-dead-lane v1 lane=%s -->"
@@ -5092,9 +5095,11 @@ class Station:
                      self.publish_handoff, self.relay_operator,
                      self.watch_default_branches, self.watch_deploys, self.score_lanes,
                      self.refresh_bench, self.run_factory, self.lift_brain_holds,
-                     # The move first, so the invariants read a goal whose
-                     # tickets sit under an epic.
-                     self.move_outside_tickets, self.check_invariants,
+                     # The epic repairs first, so the invariants read a goal
+                     # whose tickets sit under one epic and whose intake
+                     # epics have distinct titles.
+                     self.dedupe_epic_titles, self.move_outside_tickets,
+                     self.check_invariants,
                      self.release_factory_held)
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
@@ -10622,6 +10627,38 @@ class Station:
                 continue
             _say("outside-epic: moved %d, left %d for goal #%d in %s"
                  % (moved, left, number, repo))
+        state["checked"] = self.now
+        _write_json(path, state)
+
+    # -- intake epics with one title --------------------------------------
+    def dedupe_epic_titles(self) -> None:
+        """Give the open intake epics of each repo distinct titles and gather
+        the tickets of the older duplicates under the newest, at most every
+        DEDUPE_EPIC_EVERY seconds (loom#2155). One log line per repo changed."""
+        path = os.path.join(self.state, "epic-titles.json")
+        state = _read_json(path, {}, strict=False)
+        if not isinstance(state, dict):
+            state = {}
+        checked = state.get("checked")
+        if self._num(checked) and 0 <= self.now - checked < DEDUPE_EPIC_EVERY:
+            return
+        try:
+            repos = sorted({repo for repo, _ in self._goal_homes()})
+        except RateLimited:
+            raise
+        except (GitHubError, OSError) as err:
+            _say("epic-titles: could not read the goal homes: %s" % err)
+            return
+        for repo in repos:
+            try:
+                renamed, moved = brain.dedupe_intake_epics(self.gh, repo)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("epic-titles: %s failed: %s" % (repo, err))
+                continue
+            if renamed or moved:
+                _say("epic-titles: renamed %d, moved %d in %s" % (renamed, moved, repo))
         state["checked"] = self.now
         _write_json(path, state)
 
