@@ -2169,6 +2169,64 @@ def _reparented_body(body: str, goal: int, epic: int) -> str:
     return _with_part_of(out, epic)
 
 
+def dedupe_intake_epics(gh: GitHub, repo: str) -> Tuple[int, int]:
+    """Give the open intake epics of a repo distinct titles, and move the open
+    tickets of the older ones under the newest (loom#2155).
+
+    Before loom#2030 every intake epic carried the same unnumbered title, so
+    two open intake epics still share it. For each title that two or more open
+    intake epics carry, the newest by number is the primary: each older epic's
+    open sub-issue tickets move under it, and the older epic takes the next
+    batch number no open intake epic of the repo uses. A closed ticket or an
+    epic, ask or pull request stays where it is, and an epic that is not an
+    intake epic is left for a person. Returns (renamed, moved)."""
+    epics = [i for i in gh.paginate("/repos/%s/issues?labels=epic&state=open&per_page=100" % repo)
+             if isinstance(i, dict) and "pull_request" not in i and is_intake_epic(i)]
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for epic in epics:
+        title = " ".join(str(epic.get("title") or "").split()).lower()
+        groups.setdefault(title, []).append(epic)
+    batch = max([n for n in (intake_batch(e.get("title")) for e in epics)
+                 if n is not None] + [0]) + 1
+    renamed = moved = 0
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        group.sort(key=lambda e: int(e.get("number") or 0))
+        primary = int(group[-1]["number"])
+        held = _open_count(_epic_tickets(gh, repo, primary))
+        for older in group[:-1]:
+            number = int(older["number"])
+            children = gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, number))
+            for child in children:
+                if not isinstance(child, dict) or not _movable_ticket(child):
+                    continue
+                if held >= EPIC_TICKET_CAP:
+                    break
+                if _move_under_epic(gh, repo, primary, number, child):
+                    moved += 1
+                    held += 1
+            gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                    {"title": INTAKE_BATCH_TITLE % batch})
+            renamed += 1
+            batch += 1
+    return (renamed, moved)
+
+
+def _move_under_epic(gh: GitHub, repo: str, epic: int, old: int,
+                     ticket: Dict[str, Any]) -> bool:
+    """Move a ticket that sits under the older epic `old` under `epic`: the
+    sub-issue link replaces `old` as the parent, and the Part of line names
+    the new epic. False when GitHub refuses the link."""
+    if not _link_to_goal(gh, repo, epic, ticket, under=old):
+        return False
+    body = str(ticket.get("body") or "")
+    named = _reparented_body(body, old, epic)
+    if named != body:
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, int(ticket["number"])), {"body": named})
+    return True
+
+
 def placement_epic(gh: GitHub, repo: str, named: int, room: int = 1) -> int:
     """The open epic with room for `room` more tickets where a ticket filed
     beside issue `named` belongs (loom#951, loom#1294). `named` is what the

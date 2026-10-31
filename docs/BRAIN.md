@@ -485,7 +485,14 @@ onboard`, and again whenever no open intake epic has room. Each new one takes
 a batch number one past the highest any open epic of the repo carries, so no
 two open intake epics share a title (intake epics opened before this carry the
 title without a batch and are still found). The `epic-title-shared` invariant
-reports two or more open epics of one repo with the same title.
+reports two or more open epics of one repo with the same title. The station
+repairs the intake half of that itself, at most every hour
+(`Station.dedupe_epic_titles`, `brain.dedupe_intake_epics`): for each title
+two or more open intake epics carry, the newest by number keeps it, the older
+ones take the next batch numbers, and their open sub-issue tickets move under
+the newest with their `Part of` lines. Closed tickets and epics, asks and pull
+requests stay where they are, and duplicate titles on epics that are not
+intake epics wait for a person.
 
 Every other path that files a ticket under a goal does the same
 (`brain.placement_epic`): the parts of a split pull request and the follow-up
