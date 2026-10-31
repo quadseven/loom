@@ -845,9 +845,12 @@ PY
   rm -f "$source"
 }
 
-# Whether this round's commits changed file $1.
+# Whether this round's own commits changed file $1. What a merge of the default
+# branch brought in does not count, so a merge commit reads as no change: a
+# round that resolved conflicts leaves the thread open (the safe side).
 round_changed() {
-  safe_git diff --name-only "$BASE..HEAD" 2>> "$LOG" | grep -Fxq -- "$1"
+  safe_git -c core.quotePath=false log --no-merges --format= --name-only "$BASE..HEAD" \
+    ${FIX_UPSTREAM:+"^$FIX_UPSTREAM"} 2>> "$LOG" | grep -Fxq -- "$1"
 }
 
 # The reply text reaches gh as a -f field value (a GraphQL variable), never

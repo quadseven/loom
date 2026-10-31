@@ -2865,6 +2865,17 @@ case "$*" in *"conflicts in: first.txt"*) echo "agent saw conflicts" >> "$FAKE_L
 cat > /dev/null
 """
 
+    def test_a_file_the_default_branch_changed_resolves_no_thread(self):
+        self.fix_brief()
+        self.advance_main("from-main.txt", "main moved\n")
+        replies = '[{"thread":"PRRT_fake","reply":"Addressed","resolve":true}]'
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES=replies,
+                               FAKE_THREAD_PATH="from-main.txt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c for c in calls))
+        self.assertFalse(any("resolveReviewThread" in c for c in calls))
+
     def test_a_fix_brief_merges_a_moved_default_branch_even_with_no_agent_change(self):
         name, before = self.fix_brief()
         self.advance_main("main.txt", "main moved\n")

@@ -1,0 +1,1 @@
+Not valid: `commit_files` is called by `_finding_answered` at bus/station.py:7811, so the helper is in use. Its result goes to `transition_finding`, which refuses the answer when the thread's path is not in the commit's files.
