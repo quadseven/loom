@@ -456,7 +456,8 @@ operator is brought up to date with its base while it waits, and still never
 merges on the factory's say-so. Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
-starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
+starts a ticket's ladder again and ends any fix round posted before it, so
+the restart runs as a normal attempt on a fresh branch. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
 `claude-opus-5-5`), each
 climb recorded as a `<!-- loom:rung N -->` comment.
 A climb takes the lowest rung the ticket has not run on since its ladder
