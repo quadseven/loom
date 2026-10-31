@@ -363,6 +363,9 @@ done
 # LOOM_SETTLE_CLAIMED and LOOM_SETTLE_CLAIMED_MAX (settle operator-claimed
 # issues whose pull requests merged: empty or dry logs only, on writes, off
 # skips; and the most settled a run, default 10, docs/BRAIN.md), and
+# LOOM_CLAIM_REFEREE and LOOM_ENGINE_CLAIMS (one engine claim per ticket, idle
+# engine claims expire: empty or on writes, dry logs only, off skips; and the
+# engine claim labels, empty for the default set, docs/LANES.md), and
 # LOOM_SHADOW, LOOM_SHADOW_REPOS and LOOM_SHADOW_LEDGER (shadow mode: merges
 # and closes are recorded, not taken; on unless LOOM_SHADOW=0, and written as
 # 1 when unset; the repos still in shadow, empty for every repo; the ledger
@@ -423,6 +426,8 @@ cat > "$PLIST" <<EOF
     <key>LOOM_MIN_FREE_GB</key><string>$(xml "${LOOM_MIN_FREE_GB:-${LOOM_DISK_FREE_MIN_GB:-}}")</string>
     <key>LOOM_SETTLE_CLAIMED</key><string>$(xml "${LOOM_SETTLE_CLAIMED:-}")</string>
     <key>LOOM_SETTLE_CLAIMED_MAX</key><string>$(xml "${LOOM_SETTLE_CLAIMED_MAX:-}")</string>
+    <key>LOOM_CLAIM_REFEREE</key><string>$(xml "${LOOM_CLAIM_REFEREE:-}")</string>
+    <key>LOOM_ENGINE_CLAIMS</key><string>$(xml "${LOOM_ENGINE_CLAIMS:-}")</string>
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
