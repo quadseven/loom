@@ -320,6 +320,18 @@ class Base(unittest.TestCase):
 
 
 class PullRequests(Base):
+    def test_vacuous_builtin_lookup_override_sends_back_named_finding(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.contents["bus/a.py"] = (
+            "class _MonitorMap(dict):\n"
+            "    def __getitem__(self, key):\n"
+            "        return next(iter(self.values()))\n")
+        self.gh.contents["tests/test_a.py"] = "def test_map():\n    assert True\n"
+        f = self.go()
+        self.assertEqual(self.merged, [])
+        self.assertIn("_MonitorMap.__getitem__", f.notes)
+
     def test_a_pull_request_with_unbuilt_non_live_criteria_goes_back(self):
         criteria = ["A%d" % n for n in range(1, 6)] + ["Live: observed after deploy"]
         ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n" +

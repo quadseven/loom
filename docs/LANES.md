@@ -86,6 +86,13 @@ pushes nothing, and its record is the `affected` phase. A lane pull request
 in the deploy repo passed its check and went red in CI on two such suites
 (loom#1773).
 
+After the repo check passes, the runner also checks each changed Python test
+against the exact base commit's code in the check sandbox. It copies each
+changed test file into a temporary base tree, then runs each changed test by
+name. A test that passes on base, or one that times out, blocks validation
+and names the test for the lane to fix. The archive and test run have bounded
+timeouts, and paths are validated before any file is written.
+
 The runner's reader (`bus/contract.py`) also accepts a list of
 `<kind> | <command>` lines, or `[kind]`, `[kind.name]` and `[[kind]]` tables
 with a `command = "..."` key, for the kinds lint, format, type and test. It
