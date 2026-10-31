@@ -4437,9 +4437,8 @@ class CorruptStateTest(Base):
         # ones with no state label (loom#1653), the hourly label pass's reads
         # of open issues and of closed ones still at loom:triage (loom#2024),
         # and the hourly read of the repo's roll record declaration (loom#2025),
-        # and the verify-note pass's own build of the verify pool (its
-        # audit-hold read and pool listing, loom#2092).
-        self.assertEqual(self.run_pass().requests, 18)
+        # and the verify-note pass's own pool listing (loom#2092).
+        self.assertEqual(self.run_pass().requests, 17)
 
 
 class TicketsTest(unittest.TestCase):
@@ -12129,6 +12128,15 @@ class VerifyNoteTest(Base):
     def notes(self, number):
         return [c["body"] for c in self.fake.comments[number]
                 if station.VERIFY_NOTE_MARKER in str(c.get("body") or "")]
+
+    def test_a_live_box_naming_no_exact_string_still_gets_a_note(self):
+        # loom#964: the verify pool skips this ticket, so the note pass must
+        # read its own wider pool or the ticket waits with no record.
+        body = "## Acceptance criteria\n\n- [ ] Live: the page feels right\n"
+        self.assertEqual(station.live_needles(body), [])
+        self.fake.add(7, lane="codex", body=body, state="shipped", events=shipped_at(30))
+        self.station().note_stale_shipped()
+        self.assertEqual(len(self.notes(7)), 1)
 
     def test_every_stale_shipped_ticket_gets_a_note_or_has_an_attempt(self):
         self.station().note_stale_shipped()
