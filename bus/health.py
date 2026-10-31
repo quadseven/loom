@@ -245,8 +245,13 @@ def _next_link(link_header: str) -> Optional[str]:
     return None
 
 
+_CARRIES_CACHE: Dict[Tuple[str, str, str], bool] = {}
+
 def _carries(gh: GitHub, repo: str, commit: str, revision: str) -> bool:
     """Check if commit is ancestor of revision (or identical)."""
+    key = (repo, commit, revision)
+    if key in _CARRIES_CACHE:
+        return _CARRIES_CACHE[key]
     try:
         resp = gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, commit, revision))
     except (GitHubError, ValueError, TypeError, AttributeError):
@@ -254,7 +259,9 @@ def _carries(gh: GitHub, repo: str, commit: str, revision: str) -> bool:
     if resp.status == 404:
         return False
     data = resp.data if isinstance(resp.data, dict) else {}
-    return data.get("status") in ("ahead", "identical")
+    result = data.get("status") in ("ahead", "identical")
+    _CARRIES_CACHE[key] = result
+    return result
 
 
 def _deploy_runs(gh: GitHub, repo: str, workflow: str, branch: str) -> List[Dict[str, Any]]:

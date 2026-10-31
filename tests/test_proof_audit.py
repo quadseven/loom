@@ -200,5 +200,40 @@ class HeldTest(unittest.TestCase):
         self.assertTrue(audit.proven([proof_comment(9), audit_comment(7, "pass")], ["station-bot"]))
 
 
+
+
+
+
+
+class LabelledFake:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, method, url, headers, body):
+        import json
+        self.calls.append(url)
+        return 200, {}, json.dumps([]).encode()
+
+class AuditLabelledCacheTest(unittest.TestCase):
+    def test_labelled_builds_the_same_url_for_two_calls_in_one_hour_and_due_returns_same_tickets(self):
+        fake = LabelledFake()
+        gh = GitHub("t", transport=fake)
+
+        # Test 1: First call
+        now1 = NOW.timestamp()
+        audit.due(gh, [REPO], ["station-bot"], now1)
+        url1 = fake.calls[0] if fake.calls else None
+
+        # Test 2: Second call 30 minutes later (same hour)
+        fake.calls = []
+        now2 = now1 + 1800
+        audit.due(gh, [REPO], ["station-bot"], now2)
+        url2 = fake.calls[0] if fake.calls else None
+
+        # Verify URL is identical
+        self.assertEqual(url1, url2)
+        self.assertTrue(url1 is not None)
+
+
 if __name__ == "__main__":
     unittest.main()

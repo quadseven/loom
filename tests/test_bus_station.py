@@ -13512,3 +13512,64 @@ class LunaReviewResultTest(Base):
         self.assertTrue(self.report())
         self.assertEqual(self.verdicts(), [])
         self.assertEqual(self.fake.reviews_posted, [])
+
+
+
+
+class CarriesCacheTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.compares = []
+        self.compares_called = 0
+
+    def transport(self, method, url, headers, body):
+        parts = __import__("urllib").parse.urlsplit(url)
+        compare = __import__("re").match(r"/repos/([^/]+/[^/]+)/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)$", parts.path)
+        if compare:
+            self.compares_called += 1
+            repo, base, head = compare.groups()
+            key = (repo, base, head)
+            if key in self.compares:
+                return 200, {}, b'{"status": "ahead"}'
+            else:
+                return 404, {}, b'{"message": "Not Found"}'
+        return self.fake(method, url, headers, body)
+
+    def test_a_repeated_carries_call_for_the_same_triple_makes_one_request_and_a_404_is_asked_again(self):
+        gh = GitHub("token", transport=self.transport)
+        st = station.Station(gh, self.settings)
+
+        # Setup cache for ahead
+        self.compares.append(("owner/repo", "c1", "r1"))
+
+        # Test 1: non-404 result is cached
+        self.assertTrue(st._carries("owner/repo", "c1", "r1"))
+        self.assertEqual(self.compares_called, 1)
+
+        # Call again, should use cache (calls count stays 1)
+        self.assertTrue(st._carries("owner/repo", "c1", "r1"))
+        self.assertEqual(self.compares_called, 1)
+
+        # Test 2: 404 result is NOT cached
+        # First call gets 404
+        self.assertFalse(st._carries("owner/repo", "c2", "r2"))
+        self.assertEqual(self.compares_called, 2)
+
+        # Second call should make request again
+        self.assertFalse(st._carries("owner/repo", "c2", "r2"))
+        self.assertEqual(self.compares_called, 3)
+
+class ShipPublishedCapTest(Base):
+    def test_the_cap_stops_ship_published_before_extra_compares(self):
+        called = []
+        def transport(method, url, headers, body):
+            called.append(url)
+            return self.fake(method, url, headers, body)
+
+        gh = GitHub("token", transport=transport)
+        st = station.Station(gh, self.settings)
+
+        # Call with left = [0]. If cap stops it, it won't call /commits/ API.
+        result = st._ship_published("source/repo", "abc1234", "deploy", {"number": 1, "merged_at": "2030-01-01T00:00:00Z"}, [0])
+        self.assertFalse(result)
+        self.assertEqual(len(called), 0)

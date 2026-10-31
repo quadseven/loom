@@ -2064,6 +2064,7 @@ class Station:
         self._proof_budget = LIVE_PROOFS_PER_PASS
         # Rewrite agent jobs this pass started, by issue (_start_rewrite).
         self._rewrite_procs: Dict[str, Any] = {}
+        self._carries_cache: Dict[Tuple[str, str, str], bool] = {}
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
         self.upload = upload or post_transcript
@@ -6178,13 +6179,21 @@ class Station:
     def _carries(self, repo: str, commit: str, revision: str) -> bool:
         """The commit is the revision or one of its ancestors in the repo on
         GitHub (the compare API); an unknown commit is not."""
+        key = (repo, commit, revision)
+        if key in self._carries_cache:
+            return self._carries_cache[key]
         resp = self.gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, commit, revision),
                             ok=(404,))
         data = resp.data if resp.status != 404 and isinstance(resp.data, dict) else {}
-        return data.get("status") in ("ahead", "identical")
+        result = data.get("status") in ("ahead", "identical")
+        if resp.status != 404:
+            self._carries_cache[key] = result
+        return result
 
     def _ship_published(self, source: str, short: str, deploy: str, pin: Dict[str, Any],
                         left: List[int]) -> bool:
+        if left[0] <= 0:
+            return False
         commit = self.gh.rest("GET", "/repos/%s/commits/%s" % (source, short),
                               ok=(404, 422))
         revision = str((commit.data or {}).get("sha") or "") \
