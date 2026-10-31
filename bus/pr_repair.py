@@ -71,7 +71,7 @@ def _brief_section(brief: str, name: str) -> str:
     blank lines are stripped.
     """
     import re
-    heading_re = re.compile(r"^#+ ")
+    heading_re = re.compile(r"^##? ")
     lines = brief.split("\n")
     out: list[str] = []
     on = False

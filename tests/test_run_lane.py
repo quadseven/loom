@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import unittest
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -1110,6 +1110,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("pull request body rebuilt from the brief", self.run_log())
         self.assertEqual(self.sticky_bodies(), [])
 
+    def test_generated_why_includes_text_under_nested_brief_headings(self):
+        brief = BRIEF.replace(
+            "The thing is broken for every user.",
+            "Short intro.\n\n### Further notes\n"
+            "These nested details explain the problem across several steps.")
+        self.drop_brief(text=brief)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        why = self.body.read_text().split("## Why\n", 1)[1].split("\n\n## Summary", 1)[0]
+        self.assertEqual(why, "Short intro.\n### Further notes\n"
+                         "These nested details explain the problem across several steps.")
+
     def test_a_brief_that_cannot_fill_the_body_opens_a_marked_pull_request_and_notes_the_ticket(self):
         brief = BRIEF.replace("S: one function.", "big")
         self.drop_brief(text=brief)
@@ -2017,6 +2029,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
 
     def test_a_provider_usage_limit_is_a_limit_not_a_failure(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        started = datetime.now()
         result = self.run_lane(FAKE_AGENT="limit")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
@@ -2026,11 +2039,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertFalse(beat["available"])
         self.assertIn("provider limit reached", beat["reason"])
         # The stated reset time, its next occurrence (2026-10-21).
-        from datetime import datetime, timedelta
-        reset = datetime.now().replace(hour=12, minute=21, second=0, microsecond=0)
-        if reset <= datetime.now():
-            reset += timedelta(days=1)
-        self.assertAlmostEqual(beat["retry_at"], reset.timestamp(), delta=30)
+        self.assert_next_occurrence(beat["retry_at"], 12, 21, started)
         # The next brief waits until the provider limit lifts.
         agents = sum(c.startswith("codex ") for c in self.calls())
         self.drop_brief("T043-next.md", BRIEF.replace("T042", "T043"))
@@ -2087,8 +2096,9 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         # Codex said when its limit resets and the lane retried every hour
         # anyway, a ticket round each time: one ticket failed rounds 6 to 11
         # an hour apart (2026-10-21). A reset days away is trusted up to a week.
-        from datetime import datetime, timedelta
-        later = (datetime.now() + timedelta(days=3)).replace(second=0, microsecond=0)
+        # Noon, as a clock change can repeat or skip the hours before 04:00.
+        later = (datetime.now() + timedelta(days=3)).replace(hour=12, minute=0, second=0,
+                                                             microsecond=0)
         day = later.day
         suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
         stamp = "%s %d%s, %d %s" % (later.strftime("%b"), day, suffix, later.year,
@@ -2101,8 +2111,9 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
 
     def test_a_reset_time_of_day_is_its_next_occurrence(self):
-        from datetime import datetime, timedelta
         later = (datetime.now() + timedelta(hours=5)).replace(second=0, microsecond=0)
+        if later.hour in (1, 2):  # a clock change repeats or skips these hours
+            later += timedelta(hours=2)
         self.drop_brief()
         self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
             "ERROR: You've hit your usage limit. Try again at %s." % later.strftime("%I:%M %p").lstrip("0")))
@@ -2249,6 +2260,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         missing = [n for n, m in found.items() if m is None]
         self.assertFalse(missing, "function not found in runner: %s" % ", ".join(missing))
         return "".join(found[n].group(0) for n in names)
+
+    def test_opencode_described_step_rejects_an_empty_event_stream(self):
+        function = self.source_functions("opencode_described_step")
+        self.assertIn("events_processed = False", function)
+        self.assertIn("if not events_processed:", function)
+        code = re.search(r"<<'PY'\n(.*?)\nPY", function, re.S)
+        self.assertIsNotNone(code, "embedded event parser not found")
+        events = self.home / "empty-opencode-events.jsonl"
+        events.write_text("")
+        result = subprocess.run(["python3", "-I", "-c", code.group(1), str(events)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
 
     def test_the_agy_run_may_write_its_file_secret_store_and_not_the_keychains(self):
         # 2026-10-24: agy reads its keychain sign-in by running
@@ -3128,17 +3151,27 @@ exec /usr/bin/git "$@"
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
     def test_copilot_monthly_usage_limit_holds_until_next_month(self):
+        before = datetime.now(timezone.utc)
         script = (RUNNER.parent / "agent_cli.sh").read_text() + (
             'classify_failure 1 "Copilot monthly usage limit reached" edited; '
             'printf "%s %s\\n" "$FAIL_CLASS" "$RETRY_AT"')
         result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
         kind, retry_at = result.stdout.split()
         self.assertEqual(kind, "limit")
-        now = datetime.now(timezone.utc)
-        year = now.year + (now.month == 12)
-        month = 1 if now.month == 12 else now.month + 1
-        expected = int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp())
-        self.assertEqual(int(retry_at), expected)
+        def next_month(now):
+            year = now.year + (now.month == 12)
+            month = 1 if now.month == 12 else now.month + 1
+            return int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp())
+        self.assertIn(int(retry_at), (next_month(before), next_month(datetime.now(timezone.utc))))
+
+    def assert_next_occurrence(self, retry_at, hour, minute, before):
+        """retry_at is the next hour:minute on the local clock, read from the
+        clock before and after the run so it may cross that time, and by the
+        calendar so a day can be 23 or 25 hours."""
+        def following(now):
+            at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            return int((at if at > now else at + timedelta(days=1)).timestamp())
+        self.assertIn(int(retry_at), (following(before), following(datetime.now())))
 
     def classified(self, whole, tail, status=1):
         script = (RUNNER.parent / "agent_cli.sh").read_text() + (
@@ -3182,9 +3215,10 @@ exec /usr/bin/git "$@"
     def test_a_stated_reset_time_wins_over_a_credit_pattern(self):
         limit = ("ERROR: You've hit your usage limit. Upgrade to Pro, visit the usage page to "
                  "purchase more credits or try again at 10:28 AM.")
+        before = datetime.now()
         kind, retry_at, credit = self.classified("\n".join([self.TEST_402, limit]), limit)
         self.assertEqual((kind, credit), ("limit", "none"))
-        self.assertLess(retry_at - time.time(), 24 * 3600 - 60)
+        self.assert_next_occurrence(retry_at, 10, 28, before)
 
     def test_a_402_from_the_provider_is_out_of_credit(self):
         tail = "Error: 402 Payment Required: your credit balance is too low"
@@ -3207,14 +3241,10 @@ exec /usr/bin/git "$@"
 
     def test_clock_time_stated_reset_still_parses(self):
         phrase = "rate limit: try again at 7:05 PM"
+        before = datetime.now()
         kind, retry_at, _ = self.classified(phrase, phrase)
         self.assertEqual(kind, "limit")
-        from datetime import datetime, timedelta
-        now = datetime.now()
-        expected = now.replace(hour=19, minute=5, second=0, microsecond=0)
-        if expected <= now:
-            expected += timedelta(days=1)
-        self.assertAlmostEqual(retry_at, expected.timestamp(), delta=60)
+        self.assert_next_occurrence(retry_at, 19, 5, before)
 
     def test_a_rate_limit_filename_in_a_tool_result_is_not_a_limit(self):
         self.drop_brief()
@@ -5014,7 +5044,7 @@ echo fixed > fix.txt
         self.expired_key_lane()
         filed = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(filed), 1, self.calls())
-        self.assertIn("--label needs-operator", filed[0])
+        self.assertIn("--label needs:human", filed[0])
         self.assertIn("renew /k/go", filed[0])
         # The next lane to hit that key finds the open ask and edits one
         # repeat comment on it, so the operator has one thread to answer, not
@@ -5541,7 +5571,7 @@ exit %d
         self.assertTrue(self.beat()["available"])
         ask = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(ask), 1, self.calls())
-        self.assertIn("--label needs-operator", ask[0])
+        self.assertIn("--label needs:human", ask[0])
         self.assertIn("renew the codex lane sign-in", ask[0])
 
     def test_a_cli_sign_in_that_timed_out_is_auth_not_transient(self):
@@ -5627,7 +5657,9 @@ exit %d
         self.assertTrue(self.failure_line().startswith("[limit] "), self.failure_line())
         beat = self.beat()
         self.assertFalse(beat["available"])
-        self.assertIn(beat["retry_at"], {t - t % 86400 + 86400 for t in (before, after)})
+        # Within a minute of midnight the 60 second floor in agent_cli.sh wins.
+        self.assertIn(beat["retry_at"], {max(t - t % 86400 + 86400, t + 60)
+                                         for t in range(before, after + 1)})
 
     def test_a_limit_holds_the_lane_unavailable_until_the_providers_reset(self):
         reset = int(time.time()) + 7200

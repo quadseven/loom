@@ -322,7 +322,7 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 flags `loom:runaway`, and every lane that bills that key stays unavailable
 with `API key expired: renew <the SSM parameter>` in its heartbeat, with no
 `retry_at`, until the value at that parameter changes. The runner opens one
-`needs-operator` ask on the factory repo naming that parameter. opencode
+`needs:human` ask on the factory repo naming that parameter. opencode
 lanes run with `--print-logs --log-level ERROR`, because opencode's own
 output says only "UnknownError: Unexpected server error" for every provider
 fault: the logged error shows an upstream 429 (a limit) or a model opencode
@@ -419,8 +419,11 @@ beat written while the pass runs counts, one stamped more than a minute
 ahead of the clock does not) and keeps one comment on the
 open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
 `origin`; the issue is created when missing) current. It edits the comment
-only when a yes or no changes, when an anthropic run is recorded, and at
-least hourly, and never publishes the heartbeat's reason. With anthropic
+only when a yes or no changes, when an anthropic run is recorded, and when
+the table is older than 15 minutes (`LANES_REPUBLISH`), which it does at the
+start of the pass so a pass that stops at its request target still publishes.
+It never publishes the heartbeat's reason. `bus.brain status` prints the
+table's age beside `Updated` and calls it stale past the same age. With anthropic
 spend recorded or a budget set, it ends with the spend line ("Anthropic
 spend" below).
 
@@ -568,8 +571,8 @@ most 2 questions a pass and 3 citations each; the key is read for each call
 and only asks, never writes. Fabric unset, down, slow or silent builds the
 ticket as before.
 
-Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
-(ETag polls) and forwards those whose author and latest `needs-operator`
+Asks: the station reads open `needs:human` issues in each `LOOM_REPOS` repo
+(ETag polls) and forwards those whose author and latest `needs:human`
 labeller are in `LOOM_BRIEF_AUTHORS` to a Discord webhook whose URL it reads
 from the SSM parameter named by `LOOM_DISCORD_WEBHOOK_SSM` (region
 `LOOM_AWS_REGION`, default us-east-1; never printed, and with the setting
@@ -689,6 +692,31 @@ only what is its own, and adding an operator is configuration:
   (events by this Loom's App logins) are not activity for this lapse, so a
   ticket that moves between lanes and the brain still lapses; only the claim
   label's own putting-on, a person's act, or a pull request update count.
+- Engine claims have one referee (`bus/claim_referee.py`). Each engine that
+  works the backlog has one claim label (`LOOM_ENGINE_CLAIMS`). Every 30
+  minutes the station reads the open issues carrying one. With two or more it
+  keeps the one put on first (each label's newest labeled event) and removes
+  the others with a status note. It removes the claim it keeps when nothing
+  on the ticket is newer than 2 hours: no event by the claimer (who put the
+  label on) or a trusted login (`LOOM_BRIEF_AUTHORS`, `LOOM_TRUSTED_BRIEFERS`,
+  never the station's own Apps), not the claim's putting-on. Only events a
+  writer performed count: a comment, label, assignment, close, reopen, commit
+  or reference, not a mention or subscription. An open pull request one of them
+  wrote in the same repo, referenced from the ticket by one of them, holds the
+  claim for 7 days after that reference. Every claim that may expire has its
+  timeline read, because a comment by anyone moves `updated_at`: all repos share
+  one list and 40 reads a run, and the next run reads on from where it stopped.
+  A comment line
+  `waiting: <what> until <time>` (ISO time, UTC unless it says otherwise) by
+  one of them holds the claim until that time plus 30 minutes; the time counts
+  for at most 24 hours after the comment, and the latest stated time wins. A
+  ticket with `loom:running`, assigned to a person, or with no Loom label never
+  expires; a duplicate on it is still removed. A claim whose labeled event the
+  timeline does not show waits for a later pass. A claim label
+  that is not an engine's is a person's and is never touched. The first pass
+  over the claims that already exist removes at most 5 a run and posts no
+  notes; after it, at most 10 a run, and an expiry never posts a note.
+  `LOOM_CLAIM_REFEREE=dry` logs each removal instead, `off` skips the step.
 - The claim marks a run, not a ticket's whole life. Any station or brain move
   out of `loom:running` (a retry, a limit, a failure, a pull request opened, a
   merge) removes this Loom's own `claim:<login>` label in the same labels
@@ -996,8 +1024,18 @@ The loom home is kept bounded by the station and the runner (loom#643).
   `LOOM_LOG_KEEP_DAYS` days (default 7; `0` keeps them all). An entry is kept
   however old while a brief of its name is waiting or running in a lane
   inbox, and, while transcripts are uploaded, until the ledger holds the run
-  as sent or settled; an unreadable inbox or ledger removes nothing. The
-  station's own logs at the top of `logs/` are not touched.
+  as sent or settled; an unreadable inbox or ledger removes nothing.
+- `logs/` as a whole stays under `LOOM_LOG_MAX_GB` (default 10; `0` for no
+  limit, loom#2268). Past it the oldest entries go first, younger than
+  `LOOM_LOG_KEEP_DAYS` if need be, but never one kept above or one changed in
+  the last day. `station.log` says `logs hold ...` every hour, and says
+  `over` when what is left is kept.
+- Each `*.log` at the top of `logs/` past `LOOM_LOG_ROTATE_MB` (default 20)
+  is renamed to `<name>.<UTC stamp>` (`bus/logrotate.py`), and the next start
+  of its service makes a new one. A process still running keeps writing the
+  renamed file, so no line is lost, and the file is compressed once `lsof`
+  shows nothing holds it. Five `.gz` copies of each log stay. `viewer.log`
+  and `dashboard.log` are not rotated: launchd opens them once.
 - The runner removes a check's scratch home (`run/<slot>-check`) after the
   final check and when it exits, so `run/` holds one only while that lane runs.
 - While the home's disk has less than `LOOM_MIN_FREE_GB` free (default 15;
@@ -1021,8 +1059,8 @@ The loom home is kept bounded by the station and the runner (loom#643).
   every pass meanwhile.
 - Every hour the station removes the old lane logs, compresses each finished
   run's opencode session store (`logs/<slot>/<run>/.local/share/opencode/
-  opencode.db`, to `opencode.db.gz`, once its transcript is uploaded; the
-  readers read either), and logs the home's size by top-level folder
+  opencode.db`, to `opencode.db.gz`, once its transcript is uploaded or a
+  day after the run; the readers read either), and logs the home's size by top-level folder
   (`loom home holds ...`), kept in `state/station/disk.json`. A compressed
   store goes with its run's other logs after `LOOM_LOG_KEEP_DAYS`.
 
