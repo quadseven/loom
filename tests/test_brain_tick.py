@@ -210,8 +210,26 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("Read this handoff packet before anything else.", claude[0])
         self.assertIn("## Open commitments (1)", "\n".join(calls))
 
+    def test_fabric_is_not_asked_without_the_opt_in(self):
+        # The Fabric question is opt-in (LOOM_BRAIN_FABRIC_ASK) and off by
+        # default: a tick with only the key set makes no bus.fabric call,
+        # the answer never reaches the prompt, and the tick still runs.
+        run, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                               FAKE_FABRIC="Earlier decision: a fix was merged.")
+        self.assertEqual(0, run.returncode)
+        self.assertFalse(any("bus.fabric" in c for c in calls), calls)
+        self.assertNotIn("Earlier decision: a fix was merged.", "\n".join(calls))
+        self.assertEqual(1, len(self.agent_calls(calls, "claude")))
+        self.log.unlink()
+        run, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                               LOOM_BRAIN_FABRIC_ASK="",
+                               FAKE_FABRIC="Earlier decision: a fix was merged.")
+        self.assertEqual(0, run.returncode)
+        self.assertFalse(any("bus.fabric" in c for c in calls), calls)
+
     def test_fabric_is_asked_by_the_wrapper_before_the_agent(self):
         _, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                             LOOM_BRAIN_FABRIC_ASK="1",
                              FAKE_FABRIC="Earlier decision: a fix was merged.")
         fabric_call = next(i for i, call in enumerate(calls)
                            if "bus.fabric ask" in call)

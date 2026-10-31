@@ -172,6 +172,31 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", plist)
 
+    def test_the_brain_plist_omits_the_fabric_key_without_the_opt_in(self):
+        # The brain's Fabric question is opt-in (LOOM_BRAIN_FABRIC_ASK) and
+        # off by default, so its plist must not carry the key parameter name
+        # at all; the station's plist keeps it exactly as before.
+        env = {k: v for k, v in os.environ.items() if k != "LOOM_BRAIN_FABRIC_ASK"}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            result = self.run_install(LOOM_FABRIC_KEY_SSM="/example/fabric/key")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        brain = (agents / "com.loom.brain.plist").read_text()
+        self.assertNotIn("LOOM_FABRIC_KEY_SSM", brain)
+        station = (agents / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", station)
+
+    def test_the_brain_plist_gets_the_fabric_key_with_the_opt_in(self):
+        result = self.run_install(LOOM_FABRIC_KEY_SSM="/example/fabric/key",
+                                  LOOM_BRAIN_FABRIC_ASK="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        brain = (agents / "com.loom.brain.plist").read_text()
+        self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", brain)
+        self.assertIn("<key>LOOM_BRAIN_FABRIC_ASK</key><string>1</string>", brain)
+        station = (agents / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", station)
+
     def test_roll_ship_documents_are_written_to_station_plist(self):
         documents = '[{"goal":"example-owner/project#12","repo":"example-owner/project","path":"docs/ship.md"}]'
         result = self.run_install(LOOM_ROLL_SHIP_DOCS=documents)
