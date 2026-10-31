@@ -346,6 +346,9 @@ LIVE_PROOFS_PER_PASS = 5
 LIVE_ASKS_PER_HOUR = 4
 SETTLE_LANDED = ("loom:merged", "loom:shipped", "loom:verified")
 REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
+# The note that withdraws a criteria gate ask from a rewritten source
+# (loom#1861); its presence on the source is what makes the withdrawal once.
+REWRITTEN_ASK_MARKER = "<!-- loom:rewritten-ask-withdrawn v1 -->"
 CLOSE_DONE_HOLDS = ("loom:regression", "loom:urgent", RUNAWAY)
 CLOSE_DONE_LABEL = "force-close"
 RESTATE_KEY = "_live_station"
@@ -3380,11 +3383,51 @@ class Station:
 
     # -- verify runs ------------------------------------------------------
     def _tickets_open(self, repo: str) -> List[Dict[str, Any]]:
-        """The repo's open tickets filed by a briefing login."""
+        """The repo's open tickets filed by a briefing login. A
+        loom:rewritten source an open ticket in this list was rewritten
+        from is not a ticket of its own, however many ticket and state
+        labels it kept (loom#1861): the verify sweep and the criteria gate
+        read through here, so both skip it while its ticket is open."""
         found = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        covers: Dict[int, set] = {}
+        for i in found:
+            if isinstance(i, dict):
+                source = tickets.rewritten_source(i.get("body"))
+                if source is not None:
+                    covers.setdefault(source, set()).add(int(i.get("number") or 0))
         return [i for i in found if isinstance(i, dict) and "pull_request" not in i
                 and tickets.brief_author_trusted(i, self.s.authors, self.s.briefers)
-                and not self._owned_elsewhere(repo, i)]
+                and not self._owned_elsewhere(repo, i)
+                and not self._covered_source(i, covers)]
+
+    @staticmethod
+    def _covered_source(issue: Dict[str, Any], covers: Dict[int, set]) -> bool:
+        """Whether `issue` is a loom:rewritten source another open ticket
+        in `covers` (source number -> ticket numbers) was rewritten from."""
+        number = int(issue.get("number") or 0)
+        return ("loom:rewritten" in _label_names(issue)
+                and any(t != number for t in covers.get(number, ())))
+
+    def _open_rewrite_ticket(self, repo: str, issue: Dict[str, Any]) -> Optional[int]:
+        """The open ticket a loom:rewritten source was rewritten as, or
+        None: the pairing the rewrite comment by a briefing login names
+        (_rewritten_as), read back open and labelled loom:ticket. A source
+        whose ticket is closed, or that no trusted comment pairs, is not
+        covered. Callers that already hold the repo's open ticket list use
+        _covered_source instead of paying these reads."""
+        if "loom:rewritten" not in _label_names(issue):
+            return None
+        number = int(issue["number"])
+        ticket = self._rewritten_as(repo, number)
+        if not ticket or ticket == number:
+            return None
+        try:
+            found = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, ticket)).data or {}
+        except GitHubError:
+            return None
+        if found.get("state") == "open" and "loom:ticket" in _label_names(found):
+            return ticket
+        return None
 
     def _queued_lanes(self, repo: str, issues: List[Dict[str, Any]],
                       counts: Dict[Tuple[str, int], int]) -> set:
@@ -4470,6 +4513,11 @@ class Station:
     def _try_ticket(self, repo: str, lane: str, issue: Dict[str, Any],
                     free: List[str]) -> bool:
         if RUNAWAY in _label_names(issue):
+            return False
+        if self._open_rewrite_ticket(repo, issue) is not None:
+            # A rewritten source is no lane's work while its ticket is
+            # open (loom#1861); this also keeps the stale-brief check in
+            # _claim from ever holding it.
             return False
         if self._owned_elsewhere(repo, issue):
             return False
@@ -9611,6 +9659,10 @@ class Station:
         closed shipped on green CI with live criteria never checked."""
         number = int(issue["number"])
         body = str(issue.get("body") or "")
+        if self._open_rewrite_ticket(repo, issue) is not None:
+            # The rewrite ticket holds the same criteria (loom#1861): no
+            # ask is raised on the source while that ticket is open.
+            return True
         gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
         if not gaps:
             return False
@@ -9725,7 +9777,47 @@ class Station:
             ticket = pairs[key]
             if isinstance(ticket, int) and ticket and ticket not in still_open:
                 done += self._settle_source_of(repo, key, ticket, pairs)
+            elif isinstance(ticket, int) and ticket and ticket in still_open:
+                done += self._withdraw_gate_ask(repo, source, ticket)
         return done
+
+    def _withdraw_gate_ask(self, repo: str, source: Dict[str, Any], ticket: int) -> int:
+        """Withdraw a criteria gate ask the station left on a rewritten
+        source whose ticket is still open (loom#1861): one note naming the
+        ticket, and loom:human comes off, so the source no longer waits on
+        a person for a check its ticket holds. 1 when the ask was
+        withdrawn. Only a gate ask counts: a loom:human comment by a
+        briefing login that carries HUMAN_MARKER and the gate's own words
+        (criteria_gate.ask). The withdrawal note carries
+        REWRITTEN_ASK_MARKER, so it is posted once even if the label
+        removal is retried."""
+        if "loom:human" not in _label_names(source):
+            return 0
+        number = int(source["number"])
+        authors = {a.lower() for a in self.s.authors}
+        comments = [c for c in self._paginate(
+            "/repos/%s/issues/%d/comments" % (repo, number)) if isinstance(c, dict)]
+
+        def station_said(c: Dict[str, Any], *needles: str) -> bool:
+            body = str(c.get("body") or "")
+            return (tickets._login(c.get("user")) in authors
+                    and all(n in body for n in needles))
+
+        if not any(station_said(c, HUMAN_MARKER, "acceptance criterion has evidence")
+                   for c in comments):
+            return 0
+        if not any(station_said(c, REWRITTEN_ASK_MARKER, "ticket #%d" % ticket)
+                   for c in comments):
+            notify.post(self.gh, repo, number,
+                        "%s\nWithdrawn: the criteria gate ask above waits on no person. "
+                        "This issue was rewritten as ticket #%d, which is still open and "
+                        "holds the live check; this issue closes when that ticket is "
+                        "verified." % (REWRITTEN_ASK_MARKER, ticket), notify.SOURCE)
+        self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                     % (repo, number, quote("loom:human", safe="")), ok=(404,))
+        _say("withdrew the criteria gate ask from %s#%d: its ticket #%d is still open"
+             % (repo, number, ticket))
+        return 1
 
     def _settle_source_of(self, repo: str, key: str, ticket: int,
                           pairs: Dict[str, Any]) -> int:

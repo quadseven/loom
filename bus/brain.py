@@ -2660,7 +2660,23 @@ def _in_place_refusal(source: Dict[str, Any], env: Optional[Dict[str, str]]) -> 
                                         as_ticket=True):
         return ("its author is not a LOOM_BRIEF_AUTHORS or LOOM_TRUSTED_BRIEFERS login, so the "
                 "station would never claim it (docs/BRAIN.md, Trust)")
+    # A source that is already a ticket, or carries a ticket's state label,
+    # keeps its own history as a source: rewriting it in place would make
+    # one issue both the old ticket and the new one (loom#1861).
+    if _source_ticket_labels(source):
+        return "it is already a ticket, with its own state labels"
     return None
+
+
+# The labels a rewrite takes off its source: loom:ticket itself and every
+# state label a ticket carries (brain.STATES and tickets.TICKET_STATES).
+SOURCE_TICKET_LABELS = frozenset(
+    ["loom:ticket"] + ["loom:" + s for s in STATES + tickets.TICKET_STATES])
+
+
+def _source_ticket_labels(source: Dict[str, Any]) -> List[str]:
+    """The source's labels a rewrite removes, in the order it carries them."""
+    return [name for name in _labels(source) if name in SOURCE_TICKET_LABELS]
 
 
 def _rewrite_in_place(gh: GitHub, repo: str, source: Dict[str, Any], epic: int,
@@ -2831,7 +2847,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     Only a source the station could not claim as a ticket (_in_place_refusal)
     gets a new ticket whose body ends with "Rewritten from issue M." in
     words, and a comment naming the ticket and loom:rewritten in place of
-    loom:triage; it closes as completed when the ticket is verified
+    loom:triage, loom:ticket and every state label the source carries; it
+    closes as completed when the ticket is verified
     (settle_source). The line is words, not "Refs #M": lanes copy the
     brief's sections into their pull request, and the review bot's plan
     check then demands that the original, which is in no epic, belong to one
@@ -2989,15 +3006,19 @@ def _brief_issue(gh: GitHub, repo: str, epic: int, title: str, body: str,
     if source is not None and elsewhere is None:
         return _rewrite_in_place(gh, repo, source, epic, title, body, lane, goal)
     refs = int(source["number"]) if source is not None else None
-    return _filed_rewrite(gh, repo, epic, title, body, lane, refs, elsewhere)
+    return _filed_rewrite(gh, repo, epic, title, body, lane, refs, elsewhere, source)
 
 
 def _filed_rewrite(gh: GitHub, repo: str, epic: int, title: str, body: str,
                    lane: Optional[str], refs: Optional[int],
-                   elsewhere: Optional[str]) -> Dict[str, Any]:
+                   elsewhere: Optional[str],
+                   source: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """File the brief as a new ticket. With refs (a source in-place rewriting
     refuses, see _in_place_refusal), the source gets the rewrite comment and
-    loom:rewritten in place of loom:triage, and closes with the ticket."""
+    loom:rewritten in place of loom:triage, loom:ticket and every state
+    label it carries (loom#1861: a source that kept loom:ticket and
+    loom:shipped was treated as a live ticket of its own), and closes with
+    the ticket."""
     issue = _file_ticket(gh, repo, epic, title, body, lane)
     if refs is not None:
         print("#%d is rewritten as a new ticket #%s: %s" % (refs, issue.get("number"), elsewhere),
@@ -3007,6 +3028,8 @@ def _filed_rewrite(gh: GitHub, repo: str, epic: int, title: str, body: str,
                     "closes as completed when that ticket is verified." % (
                         TRIAGE_MARKER, issue["number"]), notify.SOURCE)
         _remove_label(gh, repo, refs, "loom:triage")
+        for name in _source_ticket_labels(source or {}):
+            _remove_label(gh, repo, refs, name)
         gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, refs),
                 {"labels": ["loom:rewritten"]})
     return issue
@@ -3063,9 +3086,8 @@ def _open_issue(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
 
 def _check_rewritable(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     issue = _open_issue(gh, repo, number)
-    names = _labels(issue)
-    if "loom:ticket" in names or "loom:rewritten" in names:
-        raise ValueError("#%d is already a ticket or already rewritten" % number)
+    if "loom:rewritten" in _labels(issue):
+        raise ValueError("#%d is already rewritten" % number)
     return issue
 
 

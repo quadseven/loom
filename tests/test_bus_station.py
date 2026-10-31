@@ -10656,6 +10656,27 @@ class CloseDoneTest(Base):
         plain = [c["body"] for c in self.fake.comments[5] if not status.is_status(c.get("body"))]
         self.assertEqual(plain, [])
 
+    def test_a_rewritten_source_whose_ticket_is_open_gets_no_human_ask(self):
+        # loom#1861: the source kept loom:ticket and loom:shipped beside
+        # loom:rewritten, so the criteria gate posted its loom:human ask on
+        # the source itself while the rewrite ticket held the same live
+        # check. A source whose rewrite ticket is open is skipped.
+        self.fake.private = False
+        no_needle = SHIPPED_BODY.replace("prints `daily status ready`", "the daily line shows it")
+        self.fake.add(2, lane="codex", body=no_needle, state="shipped")
+        self.fake.issues[2]["labels"].append({"name": "loom:rewritten"})
+        self.fake.comments[2].append({
+            "body": "%s\nRewritten as ticket #12, which refs this issue." % brain.TRIAGE_MARKER,
+            "user": {"login": "alice-example"}})
+        self.fake.add(12, lane="codex", body=SHIPPED_BODY + "\nRewritten from issue 2.\n",
+                      state="shipped")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        self.assertEqual(self.fake.issues[2]["state"], "open")
+        self.assertNotIn("loom:human", self.fake.names(2))
+        self.assertEqual([c["body"] for c in self.fake.comments[2]
+                          if brain.HUMAN_MARKER in c["body"]], [])
+
     def test_a_shipped_ticket_of_unproven_host_checks_stays_open(self):
         # 2026-10-22: a ticket whose criteria were all host checks closed as
         # shipped on a merge that replaced a README; no merge proves them.
@@ -11037,6 +11058,44 @@ class SettleOrphanSourcesTest(Base):
         self.assertEqual(self.fake.issues[2]["state"], "open")
         self.assertEqual(self.fake.issues[3]["state"], "open")
         self.assertIn("not planned", self.fake.comments[3][-1]["body"])
+
+    def test_an_open_tickets_source_loses_its_gate_ask_once(self):
+        # loom#1861: the criteria gate had already posted its loom:human ask
+        # on the source before the skip landed. While the ticket is open the
+        # station withdraws that ask once, with a note naming the ticket.
+        self.fake.private = False
+        self.ticket(12, 2)
+        self.source(2, 12, labels=("loom:rewritten", "loom:ticket", "loom:shipped", "loom:human"))
+        self.fake.comments[2].append({
+            "body": "%s\nThis ticket shipped, but Loom closes a ticket only when every "
+                    "acceptance criterion has evidence, and these have none it can gather: "
+                    "Live: the daily line shows it (no check Loom can run). Check each one, "
+                    "tick it, and close the ticket, or reopen the work if one does not hold."
+                    "\nKind: decision" % brain.HUMAN_MARKER,
+            "user": {"login": "alice-example"}})
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.settle_orphan_sources()
+        self.assertEqual(self.fake.issues[2]["state"], "open")
+        self.assertNotIn("loom:human", self.fake.names(2))
+        notes = [c["body"] for c in self.fake.comments[2] if "Withdrawn" in c["body"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("ticket #12", notes[0])
+        st.now += station.SETTLE_EVERY
+        st.settle_orphan_sources()
+        self.assertEqual([c["body"] for c in self.fake.comments[2] if "Withdrawn" in c["body"]],
+                         notes)
+
+    def test_an_open_tickets_source_keeps_a_human_ask_that_is_not_the_gates(self):
+        self.fake.private = False
+        self.ticket(12, 2)
+        self.source(2, 12, labels=("loom:rewritten", "loom:human"))
+        self.fake.comments[2].append({
+            "body": "%s\nBuy a test phone.\nKind: hardware" % brain.HUMAN_MARKER,
+            "user": {"login": "alice-example"}})
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.settle_orphan_sources()
+        self.assertIn("loom:human", self.fake.names(2))
+        self.assertEqual([c for c in self.fake.comments[2] if "Withdrawn" in c["body"]], [])
 
     def test_a_strangers_comment_or_an_unlanded_close_settles_nothing(self):
         self.fake.private = False
