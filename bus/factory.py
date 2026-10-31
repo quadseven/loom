@@ -139,6 +139,11 @@ Neither needs a model:
   resolved: a loom:pr ticket whose pull request fails only the plan check on
   its body has the body rebuilt and the hold lifted; any other goes to the
   hand-off pool with one note (loom#1872). A person's hold is never lifted.
+- A ticket with an open lane pull request that has carried needs-brain for
+  brain_hold.STALL_AGE (4 hours, under the 6-hour lane-pr-stalled limit) goes
+  to loom:human with one comment naming the pull request, the merge command
+  and the fix command (_escalate_brain_stall, loom#1250). The comment ends
+  with the head commit; later passes on that head post nothing more.
 - A revert ticket (bus/revert.py, REVERT_LABEL) lands first when its own
   pull request is green, even while the default branch is red. Its medium
   and low findings are deferred at once instead of after a fix round, and
@@ -173,7 +178,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, bench, brain, brain_hold, brief_check, change_class, claimed, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -667,6 +672,22 @@ def unticked_notes(missing: Sequence[str]) -> str:
         "without it.",
         "- Then tick each built criterion in the pull request body's ## Acceptance "
         "criteria, or leave it unticked and end its line with \"; not built: <reason>\".",
+        "- Change nothing else."])
+
+
+UNPROVEN_HEADING = "### Criteria said to be already done, with no code cited"
+
+
+def unproven_notes(boxes: Sequence[str]) -> str:
+    """The fix note for boxes that say the work exists and cite no code on
+    the base (bus/already_done.py)."""
+    return "\n".join([UNPROVEN_HEADING, ""] + ["- " + c for c in boxes] + [
+        "", "The factory sent this pull request back: a box that says its work is already "
+        "there must name the code on the base branch that does it.", "",
+        "- Read the base branch. If the work is not there, build it, with a test that fails "
+        "without it, and tick the box.",
+        "- If it is there, end the box \"; not built: already in tree at <path>:<line>\" or "
+        "\"<path>::<symbol>\", with a path and a line or symbol that exist on the base.",
         "- Change nothing else."])
 
 
@@ -1390,12 +1411,10 @@ def criterion_key(text: str) -> str:
     return " ".join(text.split()).rstrip(".;:,").strip().casefold()
 
 
-def unbuilt_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
-    """The ticket's code boxes that a merge left unbuilt: neither ticked on the
-    ticket nor ticked (without "not built") in any of these merged pull request
-    bodies. A box marked "not built: <reason>" answers a lane's gate but is
-    still unbuilt, so a partial merge sends its ticket back (loom#2026). Live
-    and operator boxes are the verify path's, never named here."""
+def unticked_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
+    """Every ticket box of any kind that a merge left open: neither ticked on
+    the ticket nor ticked (without "not built") in any of these merged pull
+    request bodies. This is what the ticket's requeue note names (loom#2333)."""
     built = set()
     for criterion in [c for body in pull_bodies for c in acceptance_criteria(body)]:
         checked, _, text = criterion.partition(" ")
@@ -1404,11 +1423,18 @@ def unbuilt_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
     left = []
     for criterion in acceptance_criteria(ticket_body):
         checked, _, text = criterion.partition(" ")
-        if checked == "x" or criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE:
-            continue
-        if criterion_key(text) not in built:
+        if checked != "x" and criterion_key(text) not in built:
             left.append(text)
     return left
+
+
+def unbuilt_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
+    """The unticked boxes that send a ticket back for more work: its code
+    boxes. A box marked "not built: <reason>" answers a lane's gate but is
+    still unbuilt, so a partial merge sends its ticket back (loom#2026). Live
+    and operator boxes are the verify path's, so alone they send nothing back."""
+    return [text for text in unticked_criteria(ticket_body, pull_bodies)
+            if criteria_gate.kind(NOT_BUILT_RE.sub("", text)) == criteria_gate.CODE]
 
 
 def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
@@ -2232,7 +2258,8 @@ class Factory:
                    comments: List[Dict[str, Any]], why: str,
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
                    no_test: bool = False, unticked: Sequence[str] = (),
-                   ticked: Sequence[str] = (), conflict_only: bool = False) -> None:
+                   ticked: Sequence[str] = (), conflict_only: bool = False,
+                   unproven: Sequence[str] = ()) -> None:
         number = int(issue["number"])
         held = SEND_BACK_HOLDS & set(_labels(issue))
         if held:
@@ -2252,7 +2279,7 @@ class Factory:
         # (loom#1963): a ready pull request that hand merges left
         # conflicting got no brief at all once its age read as stuck.
         if (not conflict_only and stuck(comments, open_threads, checks_failing, age, self.now,
-                                        no_test, unticked, threads)
+                                        no_test, tuple(unticked) + tuple(unproven), threads)
                 and not self._climb_or_stop(repo, pr, issue, comments, why)):
             return
         notes = TEST_NOTES if no_test else FIX_NOTES
@@ -2271,6 +2298,13 @@ class Factory:
                 notes = ticked_notes(ticked)
             except ValueError as err:
                 _say("%s#%d: ticked criteria not quoted in the fix note (%s)"
+                     % (repo, number, err))
+        if unproven:
+            try:
+                brain._check_written_text(unproven_notes(unproven))
+                notes = unproven_notes(unproven)
+            except ValueError as err:
+                _say("%s#%d: unproven criteria not quoted in the fix note (%s)"
                      % (repo, number, err))
         sent = self._open_round(repo, int(pr["number"]), issue, notes)
         if sent is False:
@@ -2989,6 +3023,8 @@ class Factory:
         brain, kept current with its base."""
         missing = missing_criteria(str(issue.get("body") or ""), str(full.get("body") or ""))
         ticked = criteria_gate.lane_ticks(str(issue.get("body") or ""), str(full.get("body") or ""))
+        unproven = already_done.unproven(str(full.get("body") or ""),
+                                         already_done.base_reader(self.gh, repo, full))
         if ticked:
             # Only the station's verifier or the operator ticks a live or
             # operator criterion (bus/criteria_gate.py): a lane's tick on one
@@ -3001,6 +3037,10 @@ class Factory:
                             "unticked acceptance criteria; build these or mark each "
                             "not built with a reason: " + "; ".join(missing),
                             unticked=missing)
+        elif unproven:
+            self._send_back(repo, full, issue, comments,
+                            "a box says its work is already done and cites no code on the "
+                            "base: " + "; ".join(unproven), unproven=unproven)
         elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
@@ -4713,6 +4753,33 @@ class Factory:
                     return pr
         return None
 
+    def _escalate_brain_stall(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Send a ticket with an open lane pull request that has carried
+        needs-brain for brain_hold.STALL_AGE to a person (loom#1250): loom:human
+        and one comment naming the pull request and the ask. The comment ends
+        with the head commit it was posted for, so later passes post nothing
+        more for that head and a new head may ask once more."""
+        number = int(issue["number"])
+        pr = self._open_lane_pull(repo, number)
+        if pr is None:
+            return
+        loom = brain_hold.loom_logins(self.trusted)
+        found = brain_hold.setter(self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number)), loom)
+        if not found.at or self.now - found.at < brain_hold.STALL_AGE:
+            return
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        key = brain_hold.STALL_MARKER % sha
+        if not sha or any(key in str(c.get("body") or "") for c in self._comments(repo, number)):
+            return
+        notify.post(self.gh, repo, number, brain_hold.stall_ask(
+            repo, number, int(pr["number"]), sha, (self.now - found.at) / 3600), notify.ASK)
+        if "loom:human" not in _labels(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["loom:human"]})
+        self.actions += 1
+        _say("sent %s#%d to a person: its pull request #%s waited on the brain"
+             % (repo, number, pr["number"]))
+
     def _hold_repair(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
                      note: str) -> Optional[bool]:
         """For a held loom:pr ticket: True when its pull request's body was
@@ -4822,6 +4889,9 @@ class Factory:
             self._guarded(self.pull_request, repo, pr, tickets)
         self._guarded(lambda r, _: self._hygiene(r, prs, tickets), repo, {})
         self._guarded(lambda r, _: self._close_unmerged_follow_ups(r), repo, {})
+        for issue in list(tickets.values()):
+            if brain_hold.LABEL in _labels(issue):
+                self._guarded(self._escalate_brain_stall, repo, issue)
         steps = {"failed": lambda r, i: self.failed(r, i, linked), "briefed": self.briefed,
                  "running": self.running, "merged": self.settle_deferred,
                  "shipped": self.settle_deferred, "verified": self.settle_deferred}

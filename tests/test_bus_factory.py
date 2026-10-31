@@ -446,6 +446,19 @@ class PullRequests(Base):
         with mock.patch.dict(os.environ, {"LOOM_UNCLAIMED_MOVE_CAP": "2"}):
             self.assertTrue(brain.past_move_cap(2))
 
+    def test_a_box_said_to_be_already_in_tree_with_no_code_is_sent_back(self):
+        """loom#2333: every box read "not built: already in tree" and it merged."""
+        ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n"
+                       "- [ ] A1\n- [ ] A2\n")
+        self.gh.ticket(5, "pr", body=ticket_body)
+        self.gh.pull(50, 5, body="## Acceptance criteria\n- [x] A1\n"
+                                 "- [ ] A2; not built: already in tree\n")
+        f = self.go()
+        self.assertEqual(self.merged, [])
+        self.assertEqual([x[0] for x in self.fixed], [50])
+        self.assertIn(factory.UNPROVEN_HEADING, f.notes)
+        self.assertIn("A2; not built: already in tree", f.notes)
+
     def test_a_criterion_follow_up_is_filed_under_an_epic_not_under_its_ticket(self):
         # loom#951: it said "Part of" the ticket it came from, which is no
         # epic, so it sat in none.
