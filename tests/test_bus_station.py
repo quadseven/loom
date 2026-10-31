@@ -9425,11 +9425,12 @@ class ReportsTest(Base):
             station.REPORT_MARKER)]
         self.assertEqual(len(made), 2)
         body = made[-1]["body"]
-        # 2026-10-25: the headline, one line per heading and the footer.
+        # The headline, one line per heading, the waiting count and the footer.
         lines = [line for line in body.splitlines() if line.strip()]
         self.assertEqual([line.split(":")[0] for line in lines[2:7]],
                          ["Going well", "Not going well", "Still stuck", "Next", "Needs you"])
-        self.assertEqual(len(lines), 8)
+        self.assertEqual(len(lines), 9)
+        self.assertTrue(lines[7].startswith("Waiting on you: "))
         for number, title in ((41, "Merged task"), (42, "Open task"),
                               (43, "Verified task"), (44, "Sent back task"),
                               (45, "Failed task"), (46, "Stuck task"),
@@ -9438,6 +9439,55 @@ class ReportsTest(Base):
         self.assertEqual(body.splitlines()[1], "1 merged, 1 verified, 1 shipped, 1 failed, "
                          "1 stuck, 2 in flight, 1 waiting on you since the last report.")
         brain._check_written_text(body)
+
+    def waiting_line_for(self, home, private, children=()):
+        """The station's line on `home`, with two repos asking and `private`
+        as each repo's visibility (None: unreadable)."""
+        other = "other-owner/other-repo"
+        asks = {REPO: [{"number": n, "state": "open", "labels": [{"name": "needs:human"}]}
+                       for n in (41, 42)],
+                other: [{"number": 51, "state": "open", "labels": [{"name": "needs:human"}]}]}
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        st.s.repos = [REPO, other]
+        with mock.patch.object(brain, "_issues", side_effect=lambda gh, repo: asks[repo]) as read_issues, \
+                mock.patch.object(brain, "repo_private",
+                                  side_effect=lambda gh, repo: private[repo]) as read:
+            line = st._standup_waiting_line(home, list(children))
+            self.assertEqual(st._standup_waiting_line(home, list(children)), line)
+        self.assertEqual(read_issues.call_count, 2)
+        self.assertEqual(read.call_count, 2)
+        return line
+
+    def test_a_data_report_on_a_public_home_folds_private_repos(self):
+        line = self.waiting_line_for(REPO, {REPO: False, "other-owner/other-repo": True},
+                                     [{"number": 41}])
+        self.assertEqual(line, "Waiting on you: 3 open needs:human (2 in %s, 1 in private repos; "
+                         "1 of them under this goal), listed in the daily digest" % REPO)
+
+    def test_a_data_report_on_a_private_home_names_every_repo(self):
+        line = self.waiting_line_for(REPO, {REPO: True, "other-owner/other-repo": True})
+        self.assertIn("(2 in %s, 1 in other-owner/other-repo;" % REPO, line)
+
+    def test_a_data_report_counts_an_unreadable_repo_as_private(self):
+        line = self.waiting_line_for(REPO, {REPO: False, "other-owner/other-repo": None})
+        self.assertIn("(2 in %s, 1 in private repos;" % REPO, line)
+
+    def test_a_data_report_on_an_unreadable_home_names_no_private_repo(self):
+        line = self.waiting_line_for(REPO, {REPO: None, "other-owner/other-repo": False})
+        self.assertIn("(1 in other-owner/other-repo, 2 in private repos;", line)
+
+    def test_a_data_report_without_a_full_count_leaves_the_line_out(self):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        with mock.patch.object(brain, "_issues", side_effect=GitHubError("boom")):
+            self.assertEqual(st._standup_waiting_line(REPO, []), "")
+
+    def test_a_moved_waiting_count_alone_matches_the_last_report(self):
+        body = "%s\nHeadline\nWaiting on you: 3 open needs:human\n\nFooter" % station.REPORT_MARKER
+        moved = body.replace("3 open", "4 open")
+        comments = [{"id": 7, "user": {"login": "me"}, "body": body}]
+        self.assertEqual(station.Station._last_same_report(comments, ["me"], moved), 7)
 
     def test_station_standup_lists_the_tickets_of_the_goals_epics(self):
         self.add_goal()
@@ -9537,7 +9587,7 @@ class ReportsTest(Base):
         self.add_goal()
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
                              now=time.time())
-        quiet = st._overdue_standup_body([], None)
+        quiet = st._overdue_standup_body([], None, waiting=st._standup_waiting_line(REPO, []))
         self.comment(40, 5, quiet + "\n" + station.QUIET_STAMP % "2026-01-01T00:00Z")
         self.fake.comments[40][0]["created_at"] = self.ago(
             REPORT_OVERDUE_AGE)
@@ -9562,7 +9612,7 @@ class ReportsTest(Base):
         old = self.ago(quiet_rule.HEARTBEAT_EVERY + 60)
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
                              now=time.time())
-        quiet = st._overdue_standup_body([], None)
+        quiet = st._overdue_standup_body([], None, waiting=st._standup_waiting_line(REPO, []))
         self.comment(40, 5, quiet + "\n" + station.QUIET_STAMP % "2026-01-01T00:00Z")
         self.comment(40, 6, station.REPORT_MARKER + "\nSame as the last report: the backlog is empty.")
         for c in self.fake.comments[40]:
