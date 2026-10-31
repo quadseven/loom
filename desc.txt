@@ -1,0 +1,25 @@
+## Why
+- test_a_stated_reset_time_wins_over_a_credit_pattern in tests/test_run_lane.py asserts that a reset at 10:28 AM is under 24 hours minus a minute away, which is false for the minute after 10:28 every day and on the day before a clock change.
+
+## Summary
+- Make agent_cli.sh read LOOM_NOW_EPOCH for the pinned clock in stated_reset when calculating dynamic time resets.
+- Use time.mktime exactly as the script does in assert_next_occurrence inside test_run_lane.py to stay matched with test expectations, ensuring the assertion is as strong as it was.
+- Pin the clock in specific time-dependent tests using a mock_clock helper, passing three faked times (around Nov 1 and March) per test without skipping or deleting assertions.
+
+## Acceptance
+- test_a_stated_reset_time_wins_over_a_credit_pattern passes at 10:28 AM and fails there on the old test.
+- The affected tests pass under at least three faked times, including around the November 1 and March clock changes.
+- Each real time-dependent test found is fixed, not skipped.
+
+## Test plan
+- Tested all specific time-dependent tests under `LOOM_NOW_EPOCH` injection in unit tests manually simulating the boundary times.
+- Ran the full test suite utilizing `.github/unittest_parallel.py` to assert test passing status.
+- Verified that all the tests in test_run_lane.py execute cleanly and pass the pinned boundary checks correctly.
+
+## Size
+- M
+
+## Out of scope
+- Changing report or reset timing unless a fault proves to be in the product code.
+
+Refs quadseven/loom#2281
