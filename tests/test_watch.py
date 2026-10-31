@@ -615,6 +615,10 @@ REFUSAL_TITLE = "brain/spark: sandbox refused Read ~/.config/gh/hosts.yml"
 
 
 class CleanLineTest(unittest.TestCase):
+    def test_redact_preserves_ordinary_text_and_pipes(self):
+        line = "ordinary words | x remain unchanged"
+        self.assertEqual(watch.redact(line), line)
+
     def test_ticket_ids_are_redacted_in_signatures_and_examples(self):
         for ticket in ("example.private-thing-253", "example.private-thing-253-r2"):
             line = ticket + " failed: worker crashed"
