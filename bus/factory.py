@@ -4298,7 +4298,33 @@ class Factory:
             reason = "waits for %s to merge (After:)" % ", ".join(a.short for a in waiting)
             self._waiting(repo, issue["number"], reason)
             return reason
+        if brain.acceptance_refusal(str(issue.get("body") or ""), issue) is not None:
+            return self._hold_no_acceptance(repo, issue)
         return ""
+
+    def _hold_no_acceptance(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Hold a queued ticket with no acceptance checkbox for the brain,
+        once (loom#2249): needs-brain and the one note naming the missing
+        section (brain.NO_ACCEPTANCE_NOTE). The note is owed even when
+        needs-brain was already set by another hold, so it is posted
+        whenever no note carries the marker. It gets no lane and spends
+        no ladder rung: a lane run on it is parked unrun by the runner,
+        and the factory otherwise moved it across lanes all night."""
+        number = int(issue["number"])
+        if "needs-brain" not in _labels(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["needs-brain"]})
+            issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
+            notify.post(self.gh, repo, number, brain.NO_ACCEPTANCE_NOTE, notify.HELD)
+            self.actions += 1
+            _say("held queued %s#%d for the brain: no acceptance criteria" % (repo, number))
+        elif not any(brain.NO_ACCEPTANCE_MARKER in str(c.get("body") or "")
+                     for c in self._comments(repo, number)):
+            notify.post(self.gh, repo, number, brain.NO_ACCEPTANCE_NOTE, notify.HELD)
+            self.actions += 1
+            _say("held queued %s#%d for the brain: no acceptance criteria" % (repo, number))
+        self._waiting(repo, number, "no acceptance criteria")
+        return "has no acceptance criteria"
 
     def _brief_wait(self, repo: str, issue: Dict[str, Any]) -> str:
         """Why a queued ticket gets no lane, or "": a stale ticket waits for

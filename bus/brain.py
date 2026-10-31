@@ -3137,6 +3137,19 @@ def acceptance_refusal(body: Optional[str], issue: Optional[Dict[str, Any]] = No
             "is kept; nothing was filed")
 
 
+# The one note a gate posts when it holds a queued ticket with no acceptance
+# checkbox for the brain (loom#2249, bus/factory.py and bus/lane.py): the
+# marker is how a later pass tells the reason was already given, even when
+# needs-brain was set by another hold.
+NO_ACCEPTANCE_MARKER = "<!-- loom:no-acceptance v1 -->"
+NO_ACCEPTANCE_NOTE = (
+    NO_ACCEPTANCE_MARKER + "\n"
+    "Held for the brain (needs-brain): this ticket has no acceptance "
+    "criteria a lane can prove: add an ## Acceptance criteria section "
+    "with - [ ] checkboxes. It is not claimed or briefed until it has "
+    "at least one - [ ] box under ## Acceptance criteria.")
+
+
 def _is_epic(issue: Dict[str, Any]) -> bool:
     summary = issue.get("sub_issues_summary") or {}
     return ("epic" in [name.lower() for name in _labels(issue)]
