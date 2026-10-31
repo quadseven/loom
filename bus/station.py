@@ -41,6 +41,7 @@ from . import brain_hold
 from . import claimed
 from . import claim_referee
 from . import evidence_close
+from . import journal
 from . import fabric
 from . import fixrounds
 from . import logrotate
@@ -243,6 +244,7 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 # The last line of a quiet standup the station edits in place, and of a
 # standup that repeats an earlier one word for word.
 QUIET_STAMP = quiet_rule.HEARTBEAT_STAMP
+WAITING_PREFIX = "Waiting on you:"
 SAME_STAMP = "Unchanged as of %s; this report is edited in place until something changes."
 # Reports come at the reading times (brain.REPORT_TIMES), so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
@@ -2095,6 +2097,9 @@ class Station:
         # Whether each repo is public, and the repo invariant breaches are
         # filed in: what a public issue may name (_invariant_ref).
         self._publics: Dict[str, bool] = {}
+        # Read once a pass, when a data-only report first needs them.
+        self._waiting_asks: Optional[Dict[str, List[Dict[str, Any]]]] = None
+        self._repo_privacy: Dict[str, Optional[bool]] = {}
         self._invariant_repo = ""
         # The GitHub budget as the last pass left it, and the reset it was
         # last reported low for.
@@ -3680,10 +3685,8 @@ class Station:
         """One missing-evidence note on every shipped ticket older than
         VERIFY_NOTE_AFTER that no verify attempt has ever reached
         (loom#2092), until the pass's step budget defers the rest to the
-        next run. The pool is the reserved lane's own (_verify_pool with
-        queued_holds=False): a ticket in it with an attempt on the ledger
-        has been reached and is spared, and a ticket the pool leaves to the
-        brain (proof refused too often) has attempts by construction. At
+        next run. The pool is _note_pool: a ticket with an attempt on the
+        ledger has been reached and is spared. At
         most once per VERIFY_NOTE_EVERY; a GitHub failure listing the pool
         is logged and the run is not stamped, so the next pass retries."""
         path = os.path.join(self.state, VERIFY_NOTE_FILE)
@@ -3696,7 +3699,7 @@ class Station:
         attempts = _read_json(os.path.join(self.state, VERIFY_FILE), {}, strict=False)
         attempts = attempts if isinstance(attempts, dict) else {}
         try:
-            pool, _held = self._verify_pool(attempts, queued_holds=False)
+            pool = self._note_pool(attempts, ledger)
         except RateLimited:
             raise
         except GitHubError as err:
@@ -3708,12 +3711,12 @@ class Station:
                 if self._deferred():
                     deferred = True
                     break
-                number = int(issue["number"])
-                if "%s#%d" % (repo, number) in attempts:
+                if self._proven(repo, int(issue["number"])):
                     continue
-                shipped_at = float(issue.get("shipped_at", 0) or 0)
+                shipped_at = self._shipped_stamp(repo, issue)
                 if not shipped_at or self.now - shipped_at < VERIFY_NOTE_AFTER:
                     continue
+                issue["shipped_at"] = shipped_at
                 self._note_one_shipped(repo, issue, ledger)
         finally:
             # A run the step budget cut short is not stamped: the cadence
@@ -3723,6 +3726,32 @@ class Station:
             if not deferred:
                 ledger["_at"] = self.now
             _write_json(path, ledger)
+
+    def _note_pool(self, attempts: Dict[str, Any], ledger: Dict[str, Any]
+                   ) -> List[Tuple[str, Dict[str, Any]]]:
+        """The open shipped tickets a note pass reads: every one with no
+        attempt and no fresh note, by cheap filters only. It is wider than
+        _verify_pool on purpose (loom#964): a Live box that names no exact
+        string or cannot be met gets no verify lane, so on 2026-10-31 thirteen
+        such tickets waited with no note at all."""
+        pool = []
+        asked = _read_json(os.path.join(self.state, UNMEETABLE_FILE), {}, strict=False)
+        asked = asked if isinstance(asked, dict) else {}
+        for repo in self._verify_repos():
+            for issue in self._tickets_open(repo):
+                key = "%s#%d" % (repo, int(issue["number"]))
+                # A box flagged unmeetable already carries its restate ask.
+                if (asked.get(key) or {}).get("reasons"):
+                    continue
+                seen = ledger.get(key)
+                written = seen.get("at") if isinstance(seen, dict) else None
+                labels = _label_names(issue)
+                if ("loom:shipped" not in labels or "loom:verified" in labels or key in attempts
+                        or (isinstance(written, (int, float))
+                            and 0 <= self.now - float(written) < VERIFY_NOTE_REFRESH)):
+                    continue
+                pool.append((repo, issue))
+        return pool
 
     def _note_one_shipped(self, repo: str, issue: Dict[str, Any],
                           ledger: Dict[str, Any]) -> None:
@@ -4818,10 +4847,12 @@ class Station:
         if left:
             # Routine: the ticket goes back for the rest, and a comment would
             # email the operator on each such merge.
+            every = factory.unticked_criteria(str(ticket.get("body") or ""),
+                                              [str(p.get("body") or "") for p in (pr, *landed)])
             self._routine(repo, number, tickets.UNBUILT_NOTE
-                          % (int(pr["number"]), "; ".join(left)))
+                          % (int(pr["number"]), "; ".join(every)))
             _say("%s#%d: merged pull request #%d left %d criteria unbuilt, requeued"
-                 % (repo, number, int(pr["number"]), len(left)))
+                 % (repo, number, int(pr["number"]), len(every)))
 
     @staticmethod
     def _unbuilt_criteria(ticket: dict, merged: Sequence[dict]) -> List[str]:
@@ -9424,9 +9455,33 @@ class Station:
             _say("evidence close paused: %s; python3 -m bus.evidence_close resume restarts it"
                  % run.paused)
             self._say_paused(state, run.paused)
+            self._ask_about_stop(state, run.paused)
         else:
             state.pop("paused_said", None)
+            state.pop("stop_asked", None)
         return run
+
+    def _ask_about_stop(self, state: Dict[str, Any], why: str) -> None:
+        """One needs:human ask when the reopen guardrail stops this close, on
+        a repo's Proof due issue: the log and that issue's body reach nobody.
+        Its rate text changes as reopens count, so the ask is per stop, not
+        per text; a resume ends the stop. An operator's own pause asks nothing."""
+        if state.get("stop_asked") or why == evidence_close.OPERATOR_PAUSED:
+            return
+        repos = sorted({str(c.get("repo")) for c in evidence_close.closes(state)})
+        if not repos:
+            return
+        try:
+            brain.human(self.gh, repos[0], self._proof_due_issue(repos[0]),
+                        evidence_close.stop_ask(why))
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not ask about the evidence close stop: %s" % err)
+            return
+        except ValueError as err:
+            _say("evidence close stop: no new ask: %s" % err)
+        state["stop_asked"] = True
 
     def _say_paused(self, state: Dict[str, Any], why: str) -> None:
         """Write the pause into each repo's Proof due issue, once."""
@@ -11655,16 +11710,17 @@ class Station:
         named = self._open_breaches(repo, number)
         breaches = named if (repo, number) == self._invariant_goal() else None
         hold = self._gate_hold_for(repo, number)
+        waiting = self._standup_waiting_line(repo, children)
         body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")),
                                           breaches, gate_hold=hold,
-                                          finished=brain.finished_epics(tree))
+                                          finished=brain.finished_epics(tree), waiting=waiting)
         brain._check_written_text(body)
         if hold is None and self._quiet_standup(repo, comments, children, named, body,
                                                 authors, now):
             state[key + " quiet"] = self.now
             return
         quiet = hold is None and body == self._overdue_standup_body(
-            [], None, None if breaches is None else [])
+            [], None, None if breaches is None else [], waiting=waiting)
         previous = self._last_same_report(comments, authors, body)
         if previous is not None:
             # Every new comment emails the goal's author; a report that says
@@ -11676,6 +11732,39 @@ class Station:
         else:
             notify.post(self.gh, repo, number, body, notify.REPORT)
         state[key] = self.now
+
+    def _open_asks(self) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+        """Each repo's open needs:human issues, read as `status` reads them so
+        the two counts agree; None when a repo could not be read."""
+        if self._waiting_asks is not None:
+            return self._waiting_asks
+        found: Dict[str, List[Dict[str, Any]]] = {}
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                found[repo] = brain.open_human(brain._issues(self.gh, repo))
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not count what waits in %s: %s" % (repo, err))
+                return None
+        self._waiting_asks = found
+        return found
+
+    def _standup_waiting_line(self, home: str, children: List[Any]) -> str:
+        """The report's "Waiting on you:" line, naming only what the goal home
+        may show (journal.nameable_repos); "" when the count is partial."""
+        asks = self._open_asks()
+        if asks is None:
+            return ""
+        counts = {repo: len(issues) for repo, issues in asks.items() if issues}
+        for repo in set(counts) | {home}:
+            if repo not in self._repo_privacy:
+                self._repo_privacy[repo] = brain.repo_private(self.gh, repo)
+        private = {repo: self._repo_privacy[repo] for repo in set(counts) | {home}}
+        return journal.waiting_line(counts, brain.goal_human_share(children, asks.get(home, [])),
+                                    journal.nameable_repos(home, private))
 
     @staticmethod
     def _report_due(at: float) -> float:
@@ -11714,8 +11803,12 @@ class Station:
     def _last_same_report(comments: List[Any], authors: List[str], body: str) -> Optional[int]:
         """The id of the goal's latest report by `authors` that says `body`
         (its stamp line aside), else None. Reports in between do not matter:
-        the brain's reports on the same goal never match the station's."""
-        stamps = tuple(stamp.split("%")[0] for stamp in (QUIET_STAMP, SAME_STAMP))
+        the brain's reports on the same goal never match the station's. The
+        "Waiting on you:" line is left out too: a moving count is not news
+        (loom#1775), so it edits the last report instead of emailing a new one."""
+        skipped = tuple(stamp.split("%")[0] for stamp in (QUIET_STAMP, SAME_STAMP)) + (
+            WAITING_PREFIX,)
+        said = "\n".join(line for line in body.splitlines() if not line.startswith(skipped))
         for comment in reversed(comments):
             if not isinstance(comment, dict) or not isinstance(comment.get("id"), int) \
                     or tickets._login(comment.get("user")).lower() not in authors:
@@ -11723,8 +11816,8 @@ class Station:
             text = str(comment.get("body") or "")
             if not text.startswith(REPORT_MARKER):
                 continue
-            kept = [line for line in text.splitlines() if not line.startswith(stamps)]
-            if "\n".join(kept) == body:
+            kept = [line for line in text.splitlines() if not line.startswith(skipped)]
+            if "\n".join(kept) == said:
                 return comment["id"]
         return None
 
@@ -11753,7 +11846,8 @@ class Station:
     def _overdue_standup_body(self, children: List[Any], since: Optional[float] = None,
                               breaches: Optional[List[Dict[str, Any]]] = None,
                               gate_hold: Optional[Dict[str, Any]] = None,
-                              finished: Optional[List[Dict[str, Any]]] = None) -> str:
+                              finished: Optional[List[Dict[str, Any]]] = None,
+                              waiting: str = "") -> str:
         groups = self._standup_ticket_groups(children, since)
         rows = self._standup_rows
         summary = self._standup_summary(groups)
@@ -11765,9 +11859,9 @@ class Station:
                       "%d lanes idle." % (gate_hold["goal"], gate_hold["count"],
                                           gate_hold["limit"], len(gate_hold["tickets"]),
                                           gate_hold["idle"]))
-        # Headline, at most five lines and the footer (2026-10-25, "info
-        # overload"): one line per heading, as journal.REPORT_LINES_MAX holds
-        # a brain's report to.
+        # Headline, at most five lines, the waiting count and the footer
+        # (2026-10-25, "info overload"): one line per heading, as
+        # journal.REPORT_LINES_MAX holds a brain's report to.
         return "\n".join([
             REPORT_MARKER, first,
             "Going well: Merged: %s. Verified: %s. Shipped: %s." %
@@ -11780,7 +11874,8 @@ class Station:
             (rows(groups["in_flight"]), rows(groups["queued"]), rows(groups["needs_difficulty"]))
             + (" Epics with every ticket closed (check the done-when, then close): %s."
                % rows(finished) if finished else ""),
-            "Needs you: Open asks: %s." % rows(groups["asks"]), "",
+            "Needs you: Open asks: %s." % rows(groups["asks"]),
+            *([waiting] if waiting else []), "",
             STANDUP_FOOTER])
 
     def _standup_summary(self, groups: Dict[str, List[Dict[str, Any]]], station: Optional["Station"] = None) -> str:

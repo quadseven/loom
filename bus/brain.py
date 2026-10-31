@@ -1229,7 +1229,7 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     tail = [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
         repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
     tail += [""] + priority_lines(found, now)
-    tail += [""] + waiting_lines(waiting, repos)
+    tail += [""] + waiting_lines(gh, waiting, repos)
     tail += [""] + _health_lines(env)
     tail += [""] + validation_gap_lines(env)
     tail += ["", "## Lane status", _dated_lane_status(_lane_status(gh, lanes_repo, authors), now)]
@@ -1262,18 +1262,36 @@ def goal_human_share(children: Sequence[Dict[str, Any]], issues: Sequence[Dict[s
     return len({int(c.get("number") or 0) for c in children if isinstance(c, dict)} & waiting)
 
 
-def waiting_lines(waiting: Dict[str, Dict[str, Any]], repos: Sequence[str]) -> List[str]:
+def repo_private(gh: GitHub, repo: str) -> Optional[bool]:
+    """Whether `repo` is private; None when that cannot be read."""
+    try:
+        data = gh.rest("GET", "/repos/%s" % repo).data
+    except RateLimited:
+        raise
+    except GitHubError as err:
+        print("could not read whether %s is public: %s" % (repo, err), file=sys.stderr)
+        return None
+    private = data.get("private") if isinstance(data, dict) else None
+    return private if isinstance(private, bool) else None
+
+
+def waiting_lines(gh: GitHub, waiting: Dict[str, Dict[str, Any]],
+                  repos: Sequence[str]) -> List[str]:
     """The "## Waiting on you" section: for each goal, the exact line that goes
     right under "Needs you:" in its report (journal.waiting_line), so the
     report's count comes from data. The repo counts span every repo status
-    read; the share is the goal's own."""
+    read; the share is the goal's own. A goal home that may be public names
+    only public repos (journal.nameable_repos), so with anything waiting each
+    repo's visibility is read."""
     by_repo = {repo: int(waiting[repo]["count"]) for repo in repos if repo in waiting}
+    private = {repo: repo_private(gh, repo) for repo in by_repo} if any(by_repo.values()) else {}
     lines = ["## Waiting on you (paste the line under \"Needs you:\" in each goal's report; "
              "\"Needs you:\" never carries a count)"]
     goals = [(repo, number, share) for repo in repos if repo in waiting
              for number, share in sorted(waiting[repo]["goals"].items())]
     for repo, number, share in goals:
-        lines.append("- %s#%d: %s" % (repo, number, journal.waiting_line(by_repo, share)))
+        lines.append("- %s#%d: %s" % (repo, number, journal.waiting_line(
+            by_repo, share, journal.nameable_repos(repo, private))))
     return lines if goals else lines + ["- no goals"]
 
 
@@ -3897,7 +3915,8 @@ def _settle_merged_ticket(gh: GitHub, repo: str, number: int, pr_body: str,
                           association: Tuple[str, int], issue: Dict[str, Any]) -> None:
     """Move the ticket of the pull request just merged: to loom:queued with a
     note when the diff or the boxes left it unbuilt, else to loom:merged."""
-    reason = _unbuilt_reason(gh, repo, number, issue) or _unbuilt_boxes(pr_body, issue)
+    reason = "; ".join(x for x in (_unbuilt_reason(gh, repo, number, issue),
+                                   _unbuilt_boxes(pr_body, issue)) if x)
     if reason:
         move(gh, association[0], association[1], "queued",
              note=tickets.UNBUILT_NOTE % (number, reason))
@@ -3906,12 +3925,16 @@ def _settle_merged_ticket(gh: GitHub, repo: str, number: int, pr_body: str,
 
 
 def _unbuilt_boxes(pr_body: str, issue: Dict[str, Any]) -> str:
-    """The ticket's code boxes the merged pull request body leaves unbuilt,
-    joined for the requeue note, else "". A partial merge goes back to
-    loom:queued for the rest instead of loom:merged (loom#2026), as the
-    station's own reading of a merged pull request does."""
+    """When the merged pull request body leaves a code box unbuilt, every box
+    it leaves open, joined for the requeue note, else "". A partial merge goes
+    back to loom:queued for the rest instead of loom:merged (loom#2026), as the
+    station's own reading of a merged pull request does, and its note names
+    all that is left (loom#2333)."""
     from . import factory
-    return "; ".join(factory.unbuilt_criteria(str(issue.get("body") or ""), [pr_body]))
+    body = str(issue.get("body") or "")
+    if not factory.unbuilt_criteria(body, [pr_body]):
+        return ""
+    return "; ".join(factory.unticked_criteria(body, [pr_body]))
 
 
 def _unbuilt_reason(gh: GitHub, repo: str, number: int, issue: Dict[str, Any]) -> str:

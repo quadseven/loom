@@ -116,16 +116,20 @@ done = False
 if m:
     hour = int(m.group(4)) % 12 + (12 if m.group(6).upper() == "PM" else 0)
     minute = int(m.group(5)) if m.group(5) else 0
-    now = datetime.now()
+    now = time.time()
     try:
         if m.group(1):
             at = datetime.strptime("%s %s %s" % (m.group(1).title(), m.group(2), m.group(3)), "%b %d %Y")
-            at = at.replace(hour=hour, minute=minute)
+            print(int(at.replace(hour=hour, minute=minute).timestamp()))
         else:
-            at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if at <= now:
-                at += timedelta(days=1)
-        print(int(time.mktime(at.timetuple())))
+            today = datetime.fromtimestamp(now).replace(hour=hour, minute=minute, second=0, microsecond=0)
+            # Compared as epochs: a clock change repeats an hour, and a time in
+            # it comes twice. A skipped time reads as the hour after the skip.
+            stamps = []
+            for day in (today, today + timedelta(days=1)):
+                first = day.timestamp()
+                stamps += [first, max(first, day.replace(fold=1).timestamp())]
+            print(int(min(s for s in stamps if s > now)))
         done = True
     except ValueError:
         pass
