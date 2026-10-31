@@ -6425,7 +6425,8 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     if not history.reasons:
         raise ValueError("ticket is not repeatedly stuck")
     open_pr = int(found_pr["number"]) if found_pr is not None else None
-    moves = factory.unclaimed_moves(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)))
+    moves = factory.unclaimed_moves(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)),
+                                    trusted_authors())
     if past_move_cap(moves):
         hold_unclaimed(gh, repo, number, names, moves)
         return "needs-brain"

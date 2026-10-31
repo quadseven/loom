@@ -755,15 +755,18 @@ def move_cap() -> int:
     return int(raw) if raw.isdigit() else UNCLAIMED_MOVE_CAP
 
 
-def unclaimed_moves(comments: Sequence[Dict[str, Any]]) -> int:
+def unclaimed_moves(comments: Sequence[Dict[str, Any]], authors: Sequence[str]) -> int:
     """The moves between lanes or rungs since a lane last claimed the ticket
-    or the cap last held it: its status events and escalations."""
+    or the cap last held it: status events and escalations written by
+    `authors`. These repos take comments from strangers, whose text could
+    otherwise hold a ticket or keep one moving."""
     count = 0
-    for comment in sorted(comments, key=lambda c: str(c.get("created_at") or "")):
+    for comment in sorted(brain.trusted_comments(comments, authors), key=lambda c: str(c.get("created_at") or "")):
         body = str(comment.get("body") or "")
-        if CLAIMED_RE.search(body) or MOVE_CAP_MARKER in body:
+        if CLAIM_RE.match(body) or body.startswith(MOVE_CAP_MARKER):
             count = 0
-        elif brain.ESCALATE_MARKER in body or any(rx.search(body) for rx in BRIEF_RES[1:]):
+        elif (body.startswith(brain.ESCALATE_MARKER)
+              or any(rx.search(body) for rx in BRIEF_RES[1:])):
             count += 1
     return count
 
@@ -2126,7 +2129,7 @@ class Factory:
     def _move_capped(self, repo: str, issue: Dict[str, Any],
                      comments: Sequence[Dict[str, Any]]) -> bool:
         """Hold a ticket moved move_cap() times with no claim for the brain."""
-        moves = unclaimed_moves(comments)
+        moves = unclaimed_moves(comments, sorted(self.trusted))
         if not brain.past_move_cap(moves):
             return False
         names = brain.hold_unclaimed(self.gh, repo, int(issue["number"]), _labels(issue), moves)

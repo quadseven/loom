@@ -398,8 +398,9 @@ class PullRequests(Base):
         self.assertIn("- [ ] A5", self.gh.filed[0]["body"])
 
     def test_moves_are_counted_since_the_last_claim_or_hold(self):
-        def note(at, body):
-            return {"created_at": "2030-01-01T00:00:%02dZ" % at, "body": body}
+        def note(at, body, who=ME["login"]):
+            return {"created_at": "2030-01-01T00:00:%02dZ" % at, "body": body,
+                    "user": {"login": who}}
         rung = "<!-- loom:rung 2 -->\nNot a failure (9 tickets wait on lane a): the factory " \
                "moved this ticket up the model ladder to rung 2, m on lane b."
         stall = "Not a failure (briefed 3 hours on lane b with no claim): the factory moved " \
@@ -407,19 +408,31 @@ class PullRequests(Base):
         climb = "%s\nEscalated to rung 1 of 3: m on lane a." % brain.ESCALATE_MARKER
         claim = "Claimed for lane a (body sha256 %s)" % ("0" * 12)
         self.assertEqual(factory.unclaimed_moves(
-            [note(1, rung), note(2, stall), note(3, climb)]), 3)
+            [note(1, rung), note(2, stall), note(3, climb)], [ME["login"]]), 3)
         self.assertEqual(factory.unclaimed_moves(
-            [note(1, rung), note(2, claim), note(3, climb)]), 1)
+            [note(1, rung), note(2, claim), note(3, climb)], [ME["login"]]), 1)
         self.assertEqual(factory.unclaimed_moves(
-            [note(1, rung), note(2, factory.MOVE_CAP_MARKER), note(3, stall)]), 1)
+            [note(1, rung), note(2, factory.MOVE_CAP_MARKER), note(3, stall)], [ME["login"]]), 1)
+
+    def test_a_strangers_comment_neither_adds_a_move_nor_resets_the_count(self):
+        def note(at, body, who):
+            return {"created_at": "2030-01-01T00:00:%02dZ" % at, "body": body,
+                    "user": {"login": who}}
+        climb = "%s\nEscalated" % brain.ESCALATE_MARKER
+        claim = "Claimed for lane a (body sha256 %s)" % ("0" * 12)
+        self.assertEqual(factory.unclaimed_moves([note(1, climb, "stranger")], [ME["login"]]), 0)
+        self.assertEqual(factory.unclaimed_moves(
+            [note(1, climb, ME["login"]), note(2, claim, "stranger"),
+             note(3, factory.MOVE_CAP_MARKER, "stranger")], [ME["login"]]), 1)
+        self.assertEqual(factory.unclaimed_moves([note(1, "quoted " + climb, ME["login"])], [ME["login"]]), 0)
 
     def test_a_ticket_moved_to_the_cap_with_no_claim_is_held_for_the_brain(self):
         """loom#2333: a ticket went between two rungs 13 times with no run."""
         self.gh.ticket(5, "briefed", lane="claude")
-        self.gh.comments[5] = [{"id": n, "user": {"login": ME}, "created_at": "2030-01-01T00:00:00Z",
+        self.gh.comments[5] = [{"id": n, "user": ME, "created_at": "2030-01-01T00:00:00Z",
                                 "body": "%s\nmoved" % brain.ESCALATE_MARKER} for n in range(6)]
         run = factory.Factory.__new__(factory.Factory)
-        run.gh, run.actions = self.gh, 0
+        run.gh, run.actions, run.trusted = self.gh, 0, {ME["login"]}
         self.assertTrue(run._move_capped(REPO, self.gh.issues[5], self.gh.comments[5]))
         names = [x["name"] for x in self.gh.issues[5]["labels"]]
         self.assertIn("needs-brain", names)

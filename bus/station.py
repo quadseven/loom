@@ -5000,12 +5000,15 @@ class Station:
         back to the queue for a lane (loom#2333). Reconcile, above, has moved
         every ticket whose pull request closed in the window it reads."""
         names = _label_names(ticket)
-        if ("loom:pr" not in names or any(_covers_pr(ticket, repo, p) for p in open_prs)
+        allowed = {a.lower() for a in self.s.authors}
+        if ("loom:pr" not in names
+                or any(_covers_pr(ticket, repo, p) for p in open_prs
+                       if tickets._login(p.get("user")) in allowed)
                 or self._adopted_pull_number(ticket) is not None
                 or self._owned_elsewhere(repo, ticket)):
             return
         timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
-        if not tickets.pull_gone(timeline, repo, number, self.now):
+        if not tickets.pull_gone(timeline, repo, number, self.now, self.s.authors):
             return
         states = {"loom:" + state for state in brain.STATES}
         kept = self._drop_claim(n for n in names if n not in states

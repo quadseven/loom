@@ -898,8 +898,17 @@ class ReconcilePullRequestTest(Base):
     def test_loom_pr_stays_for_an_open_pull_request_in_another_repo(self):
         self.stale_pr(**{"event": "cross-referenced", "created_at": "2030-01-05T00:00:00Z",
                          "source": {"issue": {"state": "open", "pull_request": {},
+                                              "user": {"login": "alice-example"},
                                               "body": "Refs %s#12" % REPO}}})
         self.assertIn("loom:pr", self.fake.names(12))
+
+    def test_a_strangers_pull_request_does_not_keep_loom_pr(self):
+        self.stale_pr(**{"event": "cross-referenced", "created_at": "2030-01-05T00:00:00Z",
+                         "source": {"issue": {"state": "open", "pull_request": {},
+                                              "user": {"login": "stranger-example"},
+                                              "body": "Refs %s#12" % REPO}}})
+        self.assertNotIn("loom:pr", self.fake.names(12))
+        self.assertIn("loom:queued", self.fake.names(12))
 
     def test_a_pr_merged_before_the_requeue_does_not_requeue_the_ticket_again(self):
         self.merged_with("- [x] First works; test.\n")
