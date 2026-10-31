@@ -1481,9 +1481,10 @@ def _send_dashboard_view(handler, state, path):
         if built is not None:
             body = views.render_improving(built)
         else:
+            when = html.escape(_next_refresh_text(payload.get("next_refresh_at")))
             body = ('<p class="empty-state">Improving data has not been read yet: the tick journals '
                     'and the daily metrics are missing; the dashboard reads them in the background '
-                    'and they arrive on its next refresh.</p>')
+                    'and they refresh %s.</p>' % when)
         title, active = "Improving", "improving"
     else:
         body = views.render_lanes(_lane_view_data(payload, tickets, state=state))

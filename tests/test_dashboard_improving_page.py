@@ -12,11 +12,12 @@ from dashboard.github import TicketStore
 from dashboard.server import _dispatch_get
 
 REPO = "example-owner/one"
+OTHER_TICKET = "%s#%d" % ("example-owner/one", 8)
 JOURNAL = {"id": 41, "user": {"login": "bot"},
            "created_at": "2030-01-02T00:00:00Z",
            "html_url": "https://github.com/example-owner/one/issues/30#issuecomment-41",
            "body": "<!-- loom:journal v1 -->\n"
-                   "- Friction: slow dashboard reads in example-owner/one#8"}
+                   "- Friction: slow dashboard reads in " + OTHER_TICKET}
 METRICS = {"id": 42, "user": {"login": "bot"},
            "created_at": "2030-01-02T00:00:00Z",
            "body": "<!-- loom:metrics v1 -->\n2030-01-02:\n"
@@ -82,7 +83,7 @@ class ImprovingPageTest(unittest.TestCase):
         built = store.response().get("improving_built")
         self.assertIsNotNone(built)
         self.assertEqual([row["friction"] for row in built["records"]],
-                         ["slow dashboard reads in example-owner/one#8"])
+                         ["slow dashboard reads in " + OTHER_TICKET])
         self.assertTrue(built["metrics_available"])
 
     def test_a_page_request_makes_no_github_request_and_no_join(self):
@@ -125,7 +126,7 @@ class ImprovingPageTest(unittest.TestCase):
         self.assertIn("Improving data has not been read yet", body)
         self.assertIn("tick journals", body)
         self.assertIn("daily metrics", body)
-        self.assertIn("next refresh", body)
+        self.assertIn("refresh once GitHub can be reached", body)
         self.assertNotIn("No friction lines in the journals yet.", body)
 
 
