@@ -6597,6 +6597,31 @@ exec /usr/bin/git "$@"
         self.assertIn("--repo quadseven/loom 41", closes[0])
         self.assertFalse(marker.exists())
 
+    def test_a_parsed_contract_closes_the_repos_open_incident(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        marker = self.loom / "state" / "incidents" / "example_repo-contract"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("41\n")
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        closes = [c for c in self.calls() if c.startswith("gh issue close")]
+        self.assertEqual(len(closes), 1, self.calls())
+        self.assertIn("--repo quadseven/loom 41", closes[0])
+        self.assertFalse(marker.exists())
+
+    def test_a_contract_that_still_fails_to_parse_keeps_its_incident_open(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        marker = self.loom / "state" / "incidents" / "example_repo-contract"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("41\n")
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("gh issue close") for c in self.calls()))
+        self.assertTrue(marker.exists())
+
     def test_an_incident_close_shadow_mode_holds_is_not_sent_and_kept(self):
         # Shadow mode (bus/shadow.py): the close asks the gh guard first, which
         # reads the issue; one that is not a factory incident stays open.

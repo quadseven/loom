@@ -2107,11 +2107,12 @@ open_issue() {
 # checks had passed again for hours (2026-10-19).
 INCIDENT_DIR="$LOOM_HOME/state/incidents"
 incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr '/' '_')" "$1"; }
-# Close this repo's environment and base-check incidents once the check has
-# passed on the unmodified base; the station then releases their tickets.
+# Close this repo's environment, contract and base-check incidents once the
+# contract parses and the check has passed on the unmodified base; the station
+# then releases their tickets.
 resolve_factory_incidents() {
   local kind file number
-  for kind in environment base-check; do
+  for kind in environment contract base-check; do
     file="$(incident_file "$kind")"
     [ -f "$file" ] || continue
     number="$(tr -cd '0-9' < "$file")"

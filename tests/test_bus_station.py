@@ -6696,6 +6696,21 @@ class FactoryIncidentTest(Base):
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])
         self.assertTrue(any("back in the queue" in b for b in self.bodies()))
 
+    def test_a_closed_contract_incident_requeues_its_held_ticket(self):
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.incident()
+        self.fake.factory_incidents[0]["title"] = "Factory incident: %s contract" % REPO
+        self.fake.factory_incidents[0]["body"] = (
+            "<!-- loom:factory-incident v1 -->\n\nRepo: %s\nKind: contract\n"
+            "Ticket: %s#12\n\ncontract parse failed\n" % (REPO, REPO))
+        self.fake.issues[99] = dict(self.fake.factory_incidents[0])
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])
+        self.assertTrue(any("back in the queue" in b for b in self.bodies()))
+
     def test_a_factory_hold_and_its_release_post_no_new_comment(self):
         # Closing five incidents released 16 tickets and sent 16 emails at
         # once (2026-10-19): the hold and the release are status events.
