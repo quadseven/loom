@@ -13333,6 +13333,7 @@ class Station:
         # From loom#1915 until this change every such pass skipped them, and
         # no lane tree was pruned for hours on 2026-10-26.
         try:
+            self.compare_send_back_counts()
             self.sync_labels()
             self.finish_claims()
             try:
@@ -13389,6 +13390,54 @@ class Station:
                 _say("watch_logs failed: %s" % err)
         finally:
             self._end_pass_locally()
+
+    def compare_send_back_counts(self) -> None:
+        """Compare the hot-spots categories once, seven days after PR 2170 merges."""
+        repo = self.s.self_repo
+        if repo != "quadseven/loom":
+            return
+        path = os.path.join(self.state, "send-back-comparison-2162.json")
+        saved = _read_json(path, {}, strict=False)
+        if isinstance(saved, dict) and saved.get("completed"):
+            return
+        pull = self.gh.rest("GET", "/repos/%s/pulls/2170" % repo).data
+        merged = pull.get("merged_at") if isinstance(pull, dict) else None
+        merged_at = self._epoch(str(merged)) if merged else 0
+        if not merged_at or self.now < merged_at + 7 * 86400:
+            return
+        from dashboard.hot_spots import SEND_BACK_CATEGORIES, send_back_counts
+        since = self._utc(self.now - 7 * 86400).replace(" ", "T")
+        comments = []
+        for source_repo in self.s.repos:
+            page = "/repos/%s/pulls/comments?since=%s&per_page=100" % (source_repo, since)
+            comments.extend(self._paginate(page))
+        counts = send_back_counts(comments, self.s.review_bot, datetime.fromtimestamp(
+            self.now, timezone.utc))
+        baseline = {"acceptance-criterion-unmet": 9, "weakened-test": 0,
+                    "intent-mismatch": 6}
+        limits = {"acceptance-criterion-unmet": 27, "weakened-test": 18,
+                  "intent-mismatch": 13}
+        _say("send-back comparison for issue 2162: %s" % ", ".join(
+            "%s=%d (baseline %d)" % (category, counts[category], baseline[category])
+            for category in SEND_BACK_CATEGORIES))
+        if any(counts[category] >= limits[category] for category in SEND_BACK_CATEGORIES):
+            if shadow.active(repo):
+                held = shadow.record_held(shadow.REOPEN, repo, 2162, "issue",
+                                          source="seven-day send-back comparison",
+                                          reason="send-back counts remain above threshold")
+                if held["new"]:
+                    _say("shadow mode: would reopen issue 2162 after the send-back comparison")
+                return
+            detail = ", ".join("%s: %d" % (category, counts[category])
+                               for category in SEND_BACK_CATEGORIES)
+            body = "Seven-day send-back comparison after PR 2170: " + detail
+            marker = "<!-- loom:send-back-comparison-2162 -->"
+            existing = self._paginate("/repos/%s/issues/2162/comments" % repo)
+            if not any(isinstance(comment, dict) and marker in str(comment.get("body") or "")
+                       for comment in existing):
+                self._comment(repo, 2162, body + "\n" + marker, "report")
+            self.gh.rest("PATCH", "/repos/%s/issues/2162" % repo, {"state": "open"})
+        _write_json(path, {"completed": True, "compared_at": self.now, "counts": counts})
 
     def _end_pass_locally(self) -> None:
         """Local housekeeping that needs no GitHub request: finished lane

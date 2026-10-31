@@ -210,6 +210,18 @@ class HotSpotsTest(unittest.TestCase):
         self.assertEqual([(r["rule"], r["count"], r["trend"]) for r in rows],
                          [("no-test", 2, "up from 1"), ("em-dash", 1, "down from 2")])
 
+    def test_send_back_category_counts_use_the_live_seven_day_window(self):
+        def finding(category, at, login="review-bot[bot]"):
+            return {"body": "orange medium | _%s_ | `rule` | detail" % category,
+                    "created_at": at, "user": {"login": login, "type": "Bot"}}
+        comments = [finding("acceptance-criterion-unmet", "2030-01-07T00:00:00Z"),
+                    finding("weakened-test", "2030-01-02T00:00:00Z"),
+                    finding("intent-mismatch", "2029-12-30T00:00:00Z"),
+                    finding("intent-mismatch", "2030-01-06T00:00:00Z", "someone")]
+        self.assertEqual(hot_spots.send_back_counts(comments, "review-bot", NOW),
+                         {"acceptance-criterion-unmet": 1, "weakened-test": 1,
+                          "intent-mismatch": 0})
+
     def test_stuck_tickets_are_above_rung_zero_or_failed(self):
         tickets = [{"repo": "example-owner/sample", "number": 5, "title": "Climbing", "state": "pr"},
                    {"repo": "example-owner/sample", "number": 6, "title": "Failed", "state": "failed"},

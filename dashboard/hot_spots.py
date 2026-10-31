@@ -110,6 +110,22 @@ def finding_counts(comments, bot, now):
     return sorted(rows, key=lambda row: (-row["count"], row["rule"]))[:TOP_FINDINGS]
 
 
+SEND_BACK_CATEGORIES = ("acceptance-criterion-unmet", "weakened-test", "intent-mismatch")
+
+
+def send_back_counts(comments, bot, now):
+    """Counts the three tracked finding categories in the live seven-day window."""
+    counts = {category: 0 for category in SEND_BACK_CATEGORIES}
+    for comment in comments or []:
+        if not _by_bot(comment, bot) or not _within(comment, now - WINDOW, now):
+            continue
+        fields = str(comment.get("body") or "").split("\n", 1)[0].split("|")
+        category = fields[1].strip(" _*") if len(fields) > 1 else ""
+        if category in counts:
+            counts[category] += 1
+    return counts
+
+
 def _rungs(comments):
     """{(repo, number): rung} from the newest rung marker on each ticket."""
     newest = {}
