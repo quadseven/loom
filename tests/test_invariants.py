@@ -835,12 +835,14 @@ class SettledSubjectTest(StationBase):
         """loom#2257: a lane-pr-stalled issue whose PR is still open but
         has no subject map entry (breach not detected this pass) stays open."""
         filed = self.stalled()
-        # The PR is still open - in the local pulls cache.
-        # The breach IS detected this pass, so it has a subject map entry.
-        # This test verifies the normal path still works.
+        # Simulate the PR leaving the local pulls cache while remaining open
+        # according to the REST API.
+        self.gh.pulls[REPO] = []
+        self.gh.pull_state[(REPO, 660)] = {"state": "open", "merged_at": None}
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "open")
         self.assertEqual(self.notes(filed), [])
+        self.assertIn(("GET", "/repos/%s/pulls/660" % REPO), self.gh.calls)
 
     def test_a_closed_unmerged_pr_without_subject_map_entry_settles_its_issue(self):
         """loom#2257: a lane-pr-stalled issue whose PR was closed unmerged
