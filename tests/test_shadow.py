@@ -540,11 +540,6 @@ class EnhancedReportTest(ShadowCase):
                 return Response(200, {"merged": True})
         return FakeGH(responses)
 
-    def _run_enhanced_report(self, gh_client, since, repo="", json_out=False):
-        """Run the enhanced report with a fake GitHub client."""
-        # This will be implemented after the report function accepts a GitHub client
-        pass
-
     def test_merged_as_is_is_not_damaging(self):
         """A would-merge where operator merged as-is (same SHA) is clean."""
         now = time.time()

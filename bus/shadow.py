@@ -72,6 +72,7 @@ import argparse
 import calendar
 import contextlib
 import contextvars
+import http.client
 import json
 import os
 import re
@@ -79,6 +80,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.error
 from typing import Any, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import unquote
 
@@ -802,7 +804,7 @@ class IssueOutcome(NamedTuple):
 
 
 def _fetch_pr(gh: Any, repo: str, number: int) -> Optional[PROutcome]:
-    """Fetch a pull request from GitHub; None on any failure."""
+    """Fetch a pull request from GitHub; None on expected failures."""
     try:
         resp = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number))
         data = resp.data
@@ -819,12 +821,13 @@ def _fetch_pr(gh: Any, repo: str, number: int) -> Optional[PROutcome]:
         closed_at = data.get("closed_at")
         state = str(data.get("state") or "open")
         return PROutcome(state, merged, merged_at, merged_by, head_sha, base_sha, closed_at)
-    except Exception:  # noqa: BLE001 - any failure means we cannot determine outcome
+    except (urllib.error.HTTPError, urllib.error.URLError, http.client.HTTPException,
+            ValueError, KeyError, TypeError, AttributeError, OSError):  # noqa: BLE001
         return None
 
 
 def _fetch_issue(gh: Any, repo: str, number: int) -> Optional[IssueOutcome]:
-    """Fetch an issue from GitHub; None on any failure."""
+    """Fetch an issue from GitHub; None on expected failures."""
     try:
         resp = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number))
         data = resp.data
@@ -840,7 +843,8 @@ def _fetch_issue(gh: Any, repo: str, number: int) -> Optional[IssueOutcome]:
                 labels.append(name.strip().lower())
         body = str(data.get("body") or "")
         return IssueOutcome(state, closed_at, state_reason, tuple(labels), body)
-    except Exception:  # noqa: BLE001
+    except (urllib.error.HTTPError, urllib.error.URLError, http.client.HTTPException,
+            ValueError, KeyError, TypeError, AttributeError, OSError):  # noqa: BLE001
         return None
 
 
@@ -910,13 +914,11 @@ def is_wrong_would_close(would_close: Mapping[str, Any],
     return bool(unchecked)
 
 
-def _compute_report_data(entries: Sequence[Mapping[str, Any]], gh: Any) -> Dict[str, Any]:
-    """Compute enhanced report data: pair would-actions with outcomes, count damage."""
+def _pair_merge_outcomes(
+    entries: Sequence[Mapping[str, Any]], verdicts: Sequence[Mapping[str, Any]], gh: Any
+) -> List[Dict[str, Any]]:
+    """Pair would-merges with their PR outcomes and operator verdicts."""
     would_merges = [e for e in entries if e.get("action") == MERGE]
-    would_closes = [e for e in entries if e.get("action") == CLOSE]
-    verdicts = [e for e in entries if e.get("action") == VERDICT]
-
-    # Pair would-merges with PR outcomes and verdicts
     merge_pairs = []
     for wm in would_merges:
         repo = str(wm.get("repo") or "")
@@ -930,8 +932,14 @@ def _compute_report_data(entries: Sequence[Mapping[str, Any]], gh: Any) -> Dict[
             "verdict": verdict,
             "damaging": damaging,
         })
+    return merge_pairs
 
-    # Pair would-closes with issue outcomes
+
+def _pair_close_outcomes(
+    entries: Sequence[Mapping[str, Any]], gh: Any
+) -> List[Dict[str, Any]]:
+    """Pair would-closes with their issue outcomes."""
+    would_closes = [e for e in entries if e.get("action") == CLOSE]
     close_pairs = []
     for wc in would_closes:
         repo = str(wc.get("repo") or "")
@@ -943,9 +951,15 @@ def _compute_report_data(entries: Sequence[Mapping[str, Any]], gh: Any) -> Dict[
             "issue_outcome": issue,
             "wrong": wrong,
         })
+    return close_pairs
 
-    # Per-repo, per-tier counts
+
+def _compute_repo_tier_counts(
+    merge_pairs: Sequence[Dict[str, Any]], close_pairs: Sequence[Dict[str, Any]]
+) -> Dict[Tuple[str, str], Dict[str, int]]:
+    """Compute per-repo, per-tier decision and damage counts."""
     by_repo_tier: Dict[Tuple[str, str], Dict[str, int]] = {}
+
     for pair in merge_pairs:
         wm = pair["would_merge"]
         repo = str(wm.get("repo") or "?")
@@ -974,6 +988,15 @@ def _compute_report_data(entries: Sequence[Mapping[str, Any]], gh: Any) -> Dict[
         else:
             by_repo_tier[key]["clean_streak"] += 1
 
+    return by_repo_tier
+
+
+def _compute_report_data(entries: Sequence[Mapping[str, Any]], gh: Any) -> Dict[str, Any]:
+    """Compute enhanced report data: pair would-actions with outcomes, count damage."""
+    verdicts = [e for e in entries if e.get("action") == VERDICT]
+    merge_pairs = _pair_merge_outcomes(entries, verdicts, gh)
+    close_pairs = _pair_close_outcomes(entries, gh)
+    by_repo_tier = _compute_repo_tier_counts(merge_pairs, close_pairs)
     return {
         "merge_pairs": merge_pairs,
         "close_pairs": close_pairs,
@@ -1006,6 +1029,85 @@ def _format_issue_outcome(issue: Optional[IssueOutcome]) -> str:
     return "outcome: closed (%s)" % reason
 
 
+def _format_merge_pairs(merge_pairs: Sequence[Dict[str, Any]]) -> List[str]:
+    """Format merge pairs with their outcomes for the report."""
+    lines = ["Would-merges (%d):" % len(merge_pairs)]
+    for pair in merge_pairs:
+        wm = pair["would_merge"]
+        pr = pair["pr_outcome"]
+        verdict = pair["verdict"]
+        damaging = pair["damaging"]
+        what = "merge"
+        if wm.get("label"):
+            what += " " + str(wm["label"])
+        ref = "%s#%s" % (wm.get("repo") or "?", wm.get("number") or "?")
+        extra = []
+        if wm.get("tier"):
+            extra.append("tier=%s" % wm["tier"])
+        if wm.get("sha"):
+            extra.append("sha=%s" % str(wm["sha"])[:12])
+        line = "  %s  would %-16s %-28s %s  %s" % (
+            wm.get("time"), what, ref, " ".join(extra), wm.get("url") or "")
+        if damaging:
+            line += "  [DAMAGING]"
+        lines.append(line)
+        if verdict:
+            lines.append("    operator verdict: %s" % verdict)
+        lines.append("    %s" % _format_pr_outcome(pr, verdict))
+        if wm.get("gates"):
+            lines.append("    gates passed: %s" % ", ".join(str(g) for g in wm["gates"]))
+        for key, name in (("reason", "reason"), ("source", "from")):
+            if wm.get(key):
+                lines.append("    %s: %s" % (name, wm[key]))
+    lines.append("")
+    return lines
+
+
+def _format_close_pairs(close_pairs: Sequence[Dict[str, Any]]) -> List[str]:
+    """Format close pairs with their outcomes for the report."""
+    lines = ["Would-closes (%d):" % len(close_pairs)]
+    for pair in close_pairs:
+        wc = pair["would_close"]
+        issue = pair["issue_outcome"]
+        wrong = pair["wrong"]
+        what = "close"
+        if wc.get("label"):
+            what += " " + str(wc["label"])
+        ref = "%s#%s" % (wc.get("repo") or "?", wc.get("number") or "?")
+        extra = []
+        if wc.get("tier"):
+            extra.append("tier=%s" % wc["tier"])
+        if wc.get("sha"):
+            extra.append("sha=%s" % str(wc["sha"])[:12])
+        line = "  %s  would %-16s %-28s %s  %s" % (
+            wc.get("time"), what, ref, " ".join(extra), wc.get("url") or "")
+        if wrong:
+            line += "  [WRONG]"
+        lines.append(line)
+        lines.append("    %s" % _format_issue_outcome(issue))
+        if wc.get("gates"):
+            lines.append("    gates passed: %s" % ", ".join(str(g) for g in wc["gates"]))
+        for key, name in (("reason", "reason"), ("source", "from")):
+            if wc.get(key):
+                lines.append("    %s: %s" % (name, wc[key]))
+    lines.append("")
+    return lines
+
+
+def _format_repo_tier_summary(by_repo_tier: Dict[Tuple[str, str], Dict[str, int]]) -> List[str]:
+    """Format per-repo, per-tier summary for the report."""
+    lines = ["By repo, tier:"]
+    for (repo, tier), counts in sorted(by_repo_tier.items()):
+        parts = ["decisions=%d" % counts["decisions"]]
+        if counts.get("damaging"):
+            parts.append("damaging=%d" % counts["damaging"])
+        if counts.get("wrong_closes"):
+            parts.append("wrong-closes=%d" % counts["wrong_closes"])
+        parts.append("clean-since-last-damage=%d" % counts.get("clean_streak", 0))
+        lines.append("  %s tier=%s: %s" % (repo, tier, ", ".join(parts)))
+    return lines
+
+
 def enhanced_report_lines(entries: Sequence[Mapping[str, Any]], gh: Any,
                           since: float, path: str) -> List[str]:
     """Enhanced report lines with GitHub outcomes and damage counts."""
@@ -1014,81 +1116,17 @@ def enhanced_report_lines(entries: Sequence[Mapping[str, Any]], gh: Any,
 
     lines = ["Enhanced shadow report since %s (%s)" % (stamp, path), ""]
 
-    # Would-merges with outcomes
     merge_pairs = data["merge_pairs"]
     if merge_pairs:
-        lines.append("Would-merges (%d):" % len(merge_pairs))
-        for pair in merge_pairs:
-            wm = pair["would_merge"]
-            pr = pair["pr_outcome"]
-            verdict = pair["verdict"]
-            damaging = pair["damaging"]
-            what = "merge"
-            if wm.get("label"):
-                what += " " + str(wm["label"])
-            ref = "%s#%s" % (wm.get("repo") or "?", wm.get("number") or "?")
-            extra = []
-            if wm.get("tier"):
-                extra.append("tier=%s" % wm["tier"])
-            if wm.get("sha"):
-                extra.append("sha=%s" % str(wm["sha"])[:12])
-            line = "  %s  would %-16s %-28s %s  %s" % (
-                wm.get("time"), what, ref, " ".join(extra), wm.get("url") or "")
-            if damaging:
-                line += "  [DAMAGING]"
-            lines.append(line)
-            if verdict:
-                lines.append("    operator verdict: %s" % verdict)
-            lines.append("    %s" % _format_pr_outcome(pr, verdict))
-            if wm.get("gates"):
-                lines.append("    gates passed: %s" % ", ".join(str(g) for g in wm["gates"]))
-            for key, name in (("reason", "reason"), ("source", "from")):
-                if wm.get(key):
-                    lines.append("    %s: %s" % (name, wm[key]))
-        lines.append("")
+        lines.extend(_format_merge_pairs(merge_pairs))
 
-    # Would-closes with outcomes
     close_pairs = data["close_pairs"]
     if close_pairs:
-        lines.append("Would-closes (%d):" % len(close_pairs))
-        for pair in close_pairs:
-            wc = pair["would_close"]
-            issue = pair["issue_outcome"]
-            wrong = pair["wrong"]
-            what = "close"
-            if wc.get("label"):
-                what += " " + str(wc["label"])
-            ref = "%s#%s" % (wc.get("repo") or "?", wc.get("number") or "?")
-            extra = []
-            if wc.get("tier"):
-                extra.append("tier=%s" % wc["tier"])
-            if wc.get("sha"):
-                extra.append("sha=%s" % str(wc["sha"])[:12])
-            line = "  %s  would %-16s %-28s %s  %s" % (
-                wc.get("time"), what, ref, " ".join(extra), wc.get("url") or "")
-            if wrong:
-                line += "  [WRONG]"
-            lines.append(line)
-            lines.append("    %s" % _format_issue_outcome(issue))
-            if wc.get("gates"):
-                lines.append("    gates passed: %s" % ", ".join(str(g) for g in wc["gates"]))
-            for key, name in (("reason", "reason"), ("source", "from")):
-                if wc.get(key):
-                    lines.append("    %s: %s" % (name, wc[key]))
-        lines.append("")
+        lines.extend(_format_close_pairs(close_pairs))
 
-    # Per-repo, per-tier summary
     by_repo_tier = data["by_repo_tier"]
     if by_repo_tier:
-        lines.append("By repo, tier:")
-        for (repo, tier), counts in sorted(by_repo_tier.items()):
-            parts = ["decisions=%d" % counts["decisions"]]
-            if counts.get("damaging"):
-                parts.append("damaging=%d" % counts["damaging"])
-            if counts.get("wrong_closes"):
-                parts.append("wrong-closes=%d" % counts["wrong_closes"])
-            parts.append("clean-since-last-damage=%d" % counts.get("clean_streak", 0))
-            lines.append("  %s tier=%s: %s" % (repo, tier, ", ".join(parts)))
+        lines.extend(_format_repo_tier_summary(by_repo_tier))
 
     return lines
 
