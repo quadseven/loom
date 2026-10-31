@@ -484,10 +484,10 @@ class FakeGitHub:
         if method == "PATCH" and sub is None:
             return self._patch_issue(n, data)
         if method == "POST" and sub == "sub_issues":
-            child = self.issues.get(data["sub_issue_id"] - 1000, {})
-            if data.get("replace_parent"):
+            child = dict(self.issues.get(data["sub_issue_id"] - 1000, {}))
+            if data.get("replace_parent") and "number" in child:
                 for kids in self.sub_issues.values():
-                    kids[:] = [k for k in kids if k is not child]
+                    kids[:] = [k for k in kids if k.get("number") != child["number"]]
             self.sub_issues.setdefault(n, []).append(child)
             return reply(201, {})
         if method in ("POST", "PUT") and sub == "labels":

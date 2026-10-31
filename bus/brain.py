@@ -2201,7 +2201,8 @@ def dedupe_intake_epics(gh: GitHub, repo: str) -> Tuple[int, int]:
             number = int(older["number"])
             children = gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, number))
             for child in children:
-                if not isinstance(child, dict) or not _movable_ticket(child):
+                if (not isinstance(child, dict) or "number" not in child
+                        or not _movable_ticket(child)):
                     continue
                 if held >= EPIC_TICKET_CAP:
                     break
