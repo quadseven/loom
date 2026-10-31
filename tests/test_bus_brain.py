@@ -410,7 +410,7 @@ class SensitiveResumeTests(unittest.TestCase):
                         {"number": 3, "title": "Ask", "labels": [{"name": "needs-operator"}]}]),
             reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
             reply(200, {"data": {"repository": {"p4": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": [{"isResolved": False}]}}, "g1": {"comments": {"nodes": [{"body": "<!-- loom:journal v1 -->", "createdAt": "2030-01-01T01:00:00Z"}]}}}}}),
-            reply(200, []), reply(200, []), reply(200, [])))
+            reply(200, []), reply(200, []), reply(200, []), reply(200, {"private": False})))
         report = brain.status(gh, [REPO], REPO, env={}, authors=())
         for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "#4 PR - blocked: 1 unresolved threads"):
             self.assertIn(section, report)
@@ -418,8 +418,9 @@ class SensitiveResumeTests(unittest.TestCase):
         # unproven-work read and epic list; the lane repo is the same repo,
         # so its issue list is the one already read (loom#2078), and with no
         # loom:lanes issue there is no comments read. Plus ticket issue fetch
-        # for goal home constraint checking.
-        self.assertEqual(gh.requests, 6)
+        # for goal home constraint checking. Plus the repo's visibility, for
+        # its "Waiting on you:" line.
+        self.assertEqual(gh.requests, 7)
 
     def test_status_ranks_open_tickets_across_repos_in_work_order(self):
         def t(number, priority=None, created="2030-01-01T00:00:00Z", labels=("loom:queued",)):
@@ -774,6 +775,18 @@ class SensitiveResumeTests(unittest.TestCase):
                                                 {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, []))
         with self.assertRaisesRegex(ValueError, "blocked: no criterion built"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_merge_refuses_a_box_said_to_be_already_done_with_no_code(self):
+        body = ("Refs %s#9\n\n## Acceptance criteria\n"
+                "- [x] one box is built\n"
+                "- [ ] another; not built: already in tree") % REPO
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                                {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []))
+        with self.assertRaisesRegex(ValueError, "cites no code"):
             brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
@@ -1815,6 +1828,20 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertIn("Pull request #8 merged and left ticket criteria unbuilt", note)
         for text in ("Second works.", "Third works.", "Fourth works."):
             self.assertIn(text, note)
+        self.assertNotIn("First works", note)
+
+    def test_the_brains_requeue_note_names_a_live_box_left_open_too(self):
+        # loom#2333: the note names every open box, not only the code ones.
+        body = ("## Acceptance criteria\n- [ ] First works; test.\n- [ ] Second works.\n"
+                "- [ ] Verify the shape holds\n")
+        pull = ("## Acceptance criteria\n- [x] First works; test.\n"
+                "- [ ] Second works.; not built: needs a key\n"
+                "- [ ] Verify the shape holds; not built: needs a key\n")
+        labels, fake = self._merge_with_files(self.CALLED, ticket_body=body, pull_body=pull)
+        self.assertEqual(labels, ["loom:ticket", "loom:queued"])
+        note = [c[2]["body"] for c in fake.calls if c[1].endswith("/issues/9/comments")][0]
+        self.assertIn("Second works.", note)
+        self.assertIn("Verify the shape holds", note)
         self.assertNotIn("First works", note)
 
     def test_merge_of_a_pull_request_that_builds_every_box_marks_merged(self):
@@ -3454,6 +3481,25 @@ class PastLastRungTests(unittest.TestCase):
         section = report.split(brain.PAST_RUNG_HEADING, 1)[1].split("\n#", 1)[0]
         query = [c[2]["query"] for c in fake.calls if c[1].endswith("/graphql")][0]
         return section, query
+
+    def test_status_lists_the_kept_pull_request_under_past_the_last_rung(self):
+        # A kept pull request for a past-ladder ticket is listed under "Past the last rung".
+        node = dict(ready_node(threads=[]), mergeable="MERGEABLE", rulingThreads={"nodes": []})
+        past = dict(stuck_ticket("failed"), title="Past", created_at="2030-01-01T00:00:00Z")
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [past]),
+                  ("GET", "/issues/9/events"): reply(200, []),
+                  ("GET", "/issues/9/comments"): reply(200, list(rungs(1, 2, 3))),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [
+                      {"number": 4, "title": "PR", "head": {"ref": "loom/9-work"}}]),
+                  ("POST", "/graphql"): reply(200, {"data": {"repository": {"p4": node}}})}
+        routes.update(lanes_routes(()))
+        fake = Routed(routes)
+        env = {"LOOM_BRIEF_AUTHORS": "example-brain"}
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env=env)
+        section = report.split(brain.PAST_RUNG_HEADING, 1)[1].split("\n#", 1)[0]
+        lines = [l for l in section.splitlines() if l.strip()]
+        self.assertEqual(lines[0], "- #9 Past - PR #4 - mergeable mergeable - 0 unresolved threads")
+        self.assertNotIn("no open pull request", section)
 
     def test_status_lists_a_ticket_past_rung_3_with_its_answered_high_thread(self):
         answered = {"isResolved": False, "comments": {"nodes": [

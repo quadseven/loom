@@ -397,6 +397,19 @@ class PullRequests(Base):
         self.assertEqual(len(self.gh.filed), 1)
         self.assertIn("- [ ] A5", self.gh.filed[0]["body"])
 
+    def test_a_box_said_to_be_already_in_tree_with_no_code_is_sent_back(self):
+        """loom#2333: every box read "not built: already in tree" and it merged."""
+        ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n"
+                       "- [ ] A1\n- [ ] A2\n")
+        self.gh.ticket(5, "pr", body=ticket_body)
+        self.gh.pull(50, 5, body="## Acceptance criteria\n- [x] A1\n"
+                                 "- [ ] A2; not built: already in tree\n")
+        f = self.go()
+        self.assertEqual(self.merged, [])
+        self.assertEqual([x[0] for x in self.fixed], [50])
+        self.assertIn(factory.UNPROVEN_HEADING, f.notes)
+        self.assertIn("A2; not built: already in tree", f.notes)
+
     def test_a_criterion_follow_up_is_filed_under_an_epic_not_under_its_ticket(self):
         # loom#951: it said "Part of" the ticket it came from, which is no
         # epic, so it sat in none.
@@ -3044,12 +3057,36 @@ class Tickets(Base):
         self.go()
         self.assertEqual((self.moved, self.fixed), ([], []))
 
-    def test_a_failed_ticket_past_the_last_rung_closes_its_lane_pull_request(self):
-        # A ticket that ran every rung is left loom:failed for the brain, but
-        # its open lane pull request is closed so the lane does not stall on it.
+    def test_a_past_ladder_ticket_whose_pull_request_head_is_green_keeps_that_pull_request_open(self):
         self.gh.ticket(7, "failed")
         self.gh.comments[7] += ALL_RUNGS
-        self.gh.pull(70, 7, resolved=False)
+        self.gh.pull(70, 7, green=True, mergeable=True, resolved=False)
+        self.go()
+        self.assertEqual((self.moved, self.fixed), ([], []))
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+        self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+        self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
+
+    def test_a_stuck_ticket_past_the_ladder_with_green_head_keeps_its_pull_request_open(self):
+        self.gh.ticket(5, "pr")
+        self.gh.comments[5] += ALL_RUNGS + [{"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, green=True, mergeable=True, resolved=False)
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[50]["state"], "open")
+        self.assertEqual(self.moved, [(5, "failed", None)])
+
+    def test_a_failed_ticket_past_the_last_rung_closes_its_lane_pull_request(self):
+        # A ticket that ran every rung is left loom:failed for the brain, and
+        # its open lane pull request is closed when its head has a failing check.
+        self.gh.ticket(7, "failed")
+        self.gh.comments[7] += ALL_RUNGS
+        self.gh.pull(70, 7, green=False, resolved=False)
         self.go()
         self.assertEqual((self.moved, self.fixed), ([], []))
         self.assertEqual(len(self.closed), 1)
@@ -3071,7 +3108,7 @@ class Tickets(Base):
         self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
         self.gh.comments[7] += ALL_RUNGS + [
             {"body": factory.GAVE_UP + " (x; ran on none).", "user": ME}]
-        self.gh.pull(70, 7, resolved=False)
+        self.gh.pull(70, 7, green=False, resolved=False)
         self.go()
         self.assertEqual([c[0] for c in self.closed], [70])
         note = self.closed[0][1]
