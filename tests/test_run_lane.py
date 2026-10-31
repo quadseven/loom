@@ -589,6 +589,30 @@ def git(*args, cwd=None):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
+
+from unittest import mock
+import os
+
+def mock_clock(year, month, day, hour, minute):
+    def decorator(func):
+        def wrapper(self, *args, **kwargs):
+            from datetime import datetime as dt
+            pinned = dt(year, month, day, hour, minute, 0)
+            class FakedDatetime(dt):
+                @classmethod
+                def now(cls, tz=None):
+                    if tz is None:
+                        return cls(year, month, day, hour, minute, 0)
+                    return dt.now(tz)
+                @classmethod
+                def strptime(cls, *a, **k):
+                    return dt.strptime(*a, **k)
+            with mock.patch("tests.test_run_lane.datetime", FakedDatetime), \
+                 mock.patch.dict(os.environ, {"LOOM_NOW_EPOCH": str(pinned.timestamp())}):
+                return func(self, *args, **kwargs)
+        return wrapper
+    return decorator
+
 class LaneRunnerTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -692,7 +716,7 @@ print('leak guard: clean (shape patterns only)')
                               capture_output=True, text=True, timeout=60)
 
     def lane_env(self, **env):
-        return {
+        res = {
             "HOME": str(self.home),
             "PATH": f"{self.bin}:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
             "LOOM_CLONE_BASE": self.clone_base,
@@ -2028,7 +2052,8 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
 
-    def test_a_provider_usage_limit_is_a_limit_not_a_failure(self):
+    @mock_clock(2026, 11, 1, 10, 27)
+    def test_a_provider_usage_limit_is_a_limit_not_a_failure_2026_11_1_10_27(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         started = datetime.now()
         result = self.run_lane(FAKE_AGENT="limit")
@@ -2047,6 +2072,49 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.run_lane()
         self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
         self.assertTrue((self.inbox / "T043-next.md").exists())
+
+    @mock_clock(2026, 11, 1, 10, 29)
+    def test_a_provider_usage_limit_is_a_limit_not_a_failure_2026_11_1_10_29(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        started = datetime.now()
+        result = self.run_lane(FAKE_AGENT="limit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: [limit] agent exited 1: provider limit reached", log)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("provider limit reached", beat["reason"])
+        # The stated reset time, its next occurrence (2026-10-21).
+        self.assert_next_occurrence(beat["retry_at"], 12, 21, started)
+        # The next brief waits until the provider limit lifts.
+        agents = sum(c.startswith("codex ") for c in self.calls())
+        self.drop_brief("T043-next.md", BRIEF.replace("T042", "T043"))
+        self.run_lane()
+        self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
+        self.assertTrue((self.inbox / "T043-next.md").exists())
+
+    @mock_clock(2026, 3, 1, 10, 27)
+    def test_a_provider_usage_limit_is_a_limit_not_a_failure_2026_3_1_10_27(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        started = datetime.now()
+        result = self.run_lane(FAKE_AGENT="limit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: [limit] agent exited 1: provider limit reached", log)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("provider limit reached", beat["reason"])
+        # The stated reset time, its next occurrence (2026-10-21).
+        self.assert_next_occurrence(beat["retry_at"], 12, 21, started)
+        # The next brief waits until the provider limit lifts.
+        agents = sum(c.startswith("codex ") for c in self.calls())
+        self.drop_brief("T043-next.md", BRIEF.replace("T042", "T043"))
+        self.run_lane()
+        self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
+        self.assertTrue((self.inbox / "T043-next.md").exists())
+
 
     def test_a_timeout_whose_output_only_mentions_a_quota_is_not_a_limit(self):
         # Three Spark lanes were held an hour as "provider limit reached": each
@@ -2093,7 +2161,8 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("[limit]", self.run_log())
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertLessEqual(beat["retry_at"] - time.time(), 120)
-    def test_a_stated_reset_time_holds_the_lane_until_then(self):
+    @mock_clock(2026, 11, 1, 10, 27)
+    def test_a_stated_reset_time_holds_the_lane_until_then_2026_11_1_10_27(self):
         # Codex said when its limit resets and the lane retried every hour
         # anyway, a ticket round each time: one ticket failed rounds 6 to 11
         # an hour apart (2026-10-21). A reset days away is trusted up to a week.
@@ -2111,7 +2180,47 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
 
-    def test_a_reset_time_of_day_is_its_next_occurrence(self):
+    @mock_clock(2026, 11, 1, 10, 29)
+    def test_a_stated_reset_time_holds_the_lane_until_then_2026_11_1_10_29(self):
+        # Codex said when its limit resets and the lane retried every hour
+        # anyway, a ticket round each time: one ticket failed rounds 6 to 11
+        # an hour apart (2026-10-21). A reset days away is trusted up to a week.
+        # Noon, as a clock change can repeat or skip the hours before 04:00.
+        later = (datetime.now() + timedelta(days=3)).replace(hour=12, minute=0, second=0,
+                                                             microsecond=0)
+        day = later.day
+        suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+        stamp = "%s %d%s, %d %s" % (later.strftime("%b"), day, suffix, later.year,
+                                    later.strftime("%I:%M %p").lstrip("0"))
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "ERROR: You've hit your usage limit. Upgrade to Pro or try again at %s." % stamp))
+        self.assertIn("[limit]", self.run_log())
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
+
+    @mock_clock(2026, 3, 1, 10, 27)
+    def test_a_stated_reset_time_holds_the_lane_until_then_2026_3_1_10_27(self):
+        # Codex said when its limit resets and the lane retried every hour
+        # anyway, a ticket round each time: one ticket failed rounds 6 to 11
+        # an hour apart (2026-10-21). A reset days away is trusted up to a week.
+        # Noon, as a clock change can repeat or skip the hours before 04:00.
+        later = (datetime.now() + timedelta(days=3)).replace(hour=12, minute=0, second=0,
+                                                             microsecond=0)
+        day = later.day
+        suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+        stamp = "%s %d%s, %d %s" % (later.strftime("%b"), day, suffix, later.year,
+                                    later.strftime("%I:%M %p").lstrip("0"))
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "ERROR: You've hit your usage limit. Upgrade to Pro or try again at %s." % stamp))
+        self.assertIn("[limit]", self.run_log())
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
+
+
+    @mock_clock(2026, 11, 1, 10, 27)
+    def test_a_reset_time_of_day_is_its_next_occurrence_2026_11_1_10_27(self):
         later = (datetime.now() + timedelta(hours=5)).replace(second=0, microsecond=0)
         if later.hour in (1, 2):  # a clock change repeats or skips these hours
             later += timedelta(hours=2)
@@ -2120,6 +2229,29 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
             "ERROR: You've hit your usage limit. Try again at %s." % later.strftime("%I:%M %p").lstrip("0")))
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
+
+    @mock_clock(2026, 11, 1, 10, 29)
+    def test_a_reset_time_of_day_is_its_next_occurrence_2026_11_1_10_29(self):
+        later = (datetime.now() + timedelta(hours=5)).replace(second=0, microsecond=0)
+        if later.hour in (1, 2):  # a clock change repeats or skips these hours
+            later += timedelta(hours=2)
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "ERROR: You've hit your usage limit. Try again at %s." % later.strftime("%I:%M %p").lstrip("0")))
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
+
+    @mock_clock(2026, 3, 1, 10, 27)
+    def test_a_reset_time_of_day_is_its_next_occurrence_2026_3_1_10_27(self):
+        later = (datetime.now() + timedelta(hours=5)).replace(second=0, microsecond=0)
+        if later.hour in (1, 2):  # a clock change repeats or skips these hours
+            later += timedelta(hours=2)
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            "ERROR: You've hit your usage limit. Try again at %s." % later.strftime("%I:%M %p").lstrip("0")))
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
+
 
     def test_a_stated_reset_duration_holds_the_lane(self):
         self.drop_brief()
@@ -3171,7 +3303,10 @@ exec /usr/bin/git "$@"
         calendar so a day can be 23 or 25 hours."""
         def following(now):
             at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            return int((at if at > now else at + timedelta(days=1)).timestamp())
+            if at <= now:
+                at += timedelta(days=1)
+            import time
+            return int(time.mktime(at.timetuple()))
         self.assertIn(int(retry_at), (following(before), following(datetime.now())))
 
     def classified(self, whole, tail, status=1):
@@ -3213,13 +3348,33 @@ exec /usr/bin/git "$@"
         kind, _, _ = self.classified("\n".join(["working", limit]), limit, status=0)
         self.assertEqual(kind, "limit")
 
-    def test_a_stated_reset_time_wins_over_a_credit_pattern(self):
+    @mock_clock(2026, 11, 1, 10, 27)
+    def test_a_stated_reset_time_wins_over_a_credit_pattern_2026_11_1_10_27(self):
         limit = ("ERROR: You've hit your usage limit. Upgrade to Pro, visit the usage page to "
                  "purchase more credits or try again at 10:28 AM.")
         before = datetime.now()
         kind, retry_at, credit = self.classified("\n".join([self.TEST_402, limit]), limit)
         self.assertEqual((kind, credit), ("limit", "none"))
         self.assert_next_occurrence(retry_at, 10, 28, before)
+
+    @mock_clock(2026, 11, 1, 10, 29)
+    def test_a_stated_reset_time_wins_over_a_credit_pattern_2026_11_1_10_29(self):
+        limit = ("ERROR: You've hit your usage limit. Upgrade to Pro, visit the usage page to "
+                 "purchase more credits or try again at 10:28 AM.")
+        before = datetime.now()
+        kind, retry_at, credit = self.classified("\n".join([self.TEST_402, limit]), limit)
+        self.assertEqual((kind, credit), ("limit", "none"))
+        self.assert_next_occurrence(retry_at, 10, 28, before)
+
+    @mock_clock(2026, 3, 1, 10, 27)
+    def test_a_stated_reset_time_wins_over_a_credit_pattern_2026_3_1_10_27(self):
+        limit = ("ERROR: You've hit your usage limit. Upgrade to Pro, visit the usage page to "
+                 "purchase more credits or try again at 10:28 AM.")
+        before = datetime.now()
+        kind, retry_at, credit = self.classified("\n".join([self.TEST_402, limit]), limit)
+        self.assertEqual((kind, credit), ("limit", "none"))
+        self.assert_next_occurrence(retry_at, 10, 28, before)
+
 
     def test_a_402_from_the_provider_is_out_of_credit(self):
         tail = "Error: 402 Payment Required: your credit balance is too low"
@@ -3240,12 +3395,30 @@ exec /usr/bin/git "$@"
                 self.assertEqual(kind, "limit")
                 self.assertAlmostEqual(retry_at, time.time() + seconds, delta=60)
 
-    def test_clock_time_stated_reset_still_parses(self):
+    @mock_clock(2026, 11, 1, 10, 27)
+    def test_clock_time_stated_reset_still_parses_2026_11_1_10_27(self):
         phrase = "rate limit: try again at 7:05 PM"
         before = datetime.now()
         kind, retry_at, _ = self.classified(phrase, phrase)
         self.assertEqual(kind, "limit")
         self.assert_next_occurrence(retry_at, 19, 5, before)
+
+    @mock_clock(2026, 11, 1, 10, 29)
+    def test_clock_time_stated_reset_still_parses_2026_11_1_10_29(self):
+        phrase = "rate limit: try again at 7:05 PM"
+        before = datetime.now()
+        kind, retry_at, _ = self.classified(phrase, phrase)
+        self.assertEqual(kind, "limit")
+        self.assert_next_occurrence(retry_at, 19, 5, before)
+
+    @mock_clock(2026, 3, 1, 10, 27)
+    def test_clock_time_stated_reset_still_parses_2026_3_1_10_27(self):
+        phrase = "rate limit: try again at 7:05 PM"
+        before = datetime.now()
+        kind, retry_at, _ = self.classified(phrase, phrase)
+        self.assertEqual(kind, "limit")
+        self.assert_next_occurrence(retry_at, 19, 5, before)
+
 
     def test_a_rate_limit_filename_in_a_tool_result_is_not_a_limit(self):
         self.drop_brief()

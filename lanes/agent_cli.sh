@@ -112,7 +112,8 @@ done = False
 if m:
     hour = int(m.group(4)) % 12 + (12 if m.group(6).upper() == "PM" else 0)
     minute = int(m.group(5)) if m.group(5) else 0
-    now = datetime.now()
+    import os
+    now = datetime.fromtimestamp(float(os.environ["LOOM_NOW_EPOCH"])) if "LOOM_NOW_EPOCH" in os.environ else datetime.now()
     try:
         if m.group(1):
             at = datetime.strptime("%s %s %s" % (m.group(1).title(), m.group(2), m.group(3)), "%b %d %Y")
