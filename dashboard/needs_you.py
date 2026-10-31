@@ -9,9 +9,9 @@ where the store keys by OWNER/NAME; each item shows once whichever way it
 was named.
 
 The ask on each card is the issue body's "## Ask" section when it has one,
-else the comment the store picked (operators.pick_ask), linked. A loom:human
+else the comment the store picked (operators.pick_ask), linked. A needs:human
 issue waits on the operator as a needs-operator one does; its ask is its
-loom:human comment.
+needs:human comment.
 
 Each card takes an answer in one tap (loom#1777): the buttons the ask's own
 words offer (bus.answer.options) and an optional note, posted to POST
