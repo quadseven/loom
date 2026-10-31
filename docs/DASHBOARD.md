@@ -341,6 +341,28 @@ only on its next pass. A hold whose until-time has passed is read as ended
 `/lanes` says the hold ended and that no heartbeat has come since, instead of
 a past "until" read as a live hold.
 
+`/fleet` (Fleet timeline, loom#2280) draws every engine as a row over the
+last 24 hours and the next 2, one pixel a minute, from the snapshot the
+other pages read; the page makes no GitHub request. The rows: one per
+journal holder on the goal homes (the brains the docs give a cadence, the
+Muse brain every 30 minutes and the lane-machine brain hourly, are drawn
+even when silent; any other holder appears when it journals), Reports
+(every `loom:report` comment, with the reading times, 10:00 and 21:00 New
+York, as due marks), Station (its comments, shipped notes, lane outcomes
+and status events, by the login that writes the station-only comments,
+plus its `POST /api/chain` snapshots, kept in memory as its 10 minute
+heartbeat), Operator notes (people's comments on the goal homes, with the
+operators summary times, 09:05 and 17:05 New York, as due marks) and one
+row per lane (claims, rounds, outcomes, lane pull requests opened and
+merged, and the newest heartbeat from the lane status table). Each mark
+shows its one-line gist on hover or tap, as a strip at the foot of the
+screen, with no script. A row with a cadence marks any silence longer than
+the cadence plus 50 percent as a missed run, with the length of the gap;
+the station's silences are judged from its chain snapshots only, so before
+the first one the row says so instead of marking misses. A lane has no
+cadence, so a quiet lane is not a missed run. The axis scrolls inside its
+own box; the row heads stay put.
+
 ## The bench (loom#969)
 
 A provider and model that keeps failing is benched for everyone, so Loom and

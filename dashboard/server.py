@@ -46,7 +46,7 @@ from bus.github import GitHubError
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 from . import views
-from . import brain_view, chain_view, floor_lanes, hot_spots
+from . import brain_view, chain_view, fleet, floor_lanes, hot_spots
 
 def _all_tickets(state):
     payload = state.response()
@@ -1073,9 +1073,12 @@ def _handle_chain_post(handler, state):
     if not _authorized(handler):
         return handler.send_json(401, {"error": "unauthorized"})
     try:
-        state.chain = chain_view.chain_snapshot(_json_body(handler), time.time())
+        now = time.time()
+        state.chain = chain_view.chain_snapshot(_json_body(handler), now)
     except (ValueError, json.JSONDecodeError) as exc:
         return handler.send_json(400, {"error": str(exc)})
+    # The post is the station's heartbeat on /fleet.
+    fleet.remember_beat(state, now)
     return handler.send_json(201, {"repos": len(state.chain["repos"])})
 
 
@@ -1189,6 +1192,8 @@ def _dispatch_get(handler, state):
         return _dispatch_tiers(handler, state)
     if path in ("/brain", "/hot-spots"):
         return _dispatch_brain_hot_spots(handler, state, path)
+    if path == "/fleet":
+        return _dispatch_fleet(handler, state)
     if path == "/chain":
         return _dispatch_chain(handler, state)
     if path in ("/", "/goals", "/tickets", "/tree"):
@@ -1420,6 +1425,17 @@ def _dispatch_brain_hot_spots(handler, state, path):
         data = hot_spots.build_hot_spots(payload, waits_error, datetime.now(timezone.utc), bot)
         body, title, active = hot_spots.render_hot_spots(data), "Hot spots", "hot-spots"
     return handler.send_page(page(title, active, body, status="stale" if payload.get("stale") else "live"))
+
+
+def _dispatch_fleet(handler, state):
+    """The Fleet timeline, from the snapshot the other pages read and the
+    station's chain snapshot times; the page itself makes no GitHub request."""
+    payload = state.response()
+    lane_rows = _merge_lane_rows(payload.get("lanes") or [])
+    data = fleet.build_fleet(payload, lane_rows, list(getattr(state, "chain_seen", None) or ()),
+                             datetime.now(timezone.utc))
+    return handler.send_page(page("Fleet timeline", "fleet", fleet.render_fleet(data),
+                                  status="stale" if payload.get("stale") else "live"))
 
 
 def _dispatch_chain(handler, state):
