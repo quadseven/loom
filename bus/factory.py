@@ -175,7 +175,7 @@ from urllib.parse import quote
 
 from . import answer, bench, brain, brain_hold, brief_check, change_class, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
-from .labels import REMOTE_LANES
+from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
 
@@ -302,6 +302,12 @@ LUNA_REVIEW_MARKER = "<!-- loom:luna-review v1 sha=%s -->"
 # A dispatched review that produced no verdict is dispatched again after
 # this long: its lane run may have failed, or never picked the brief up.
 LUNA_RETRY_AFTER = 3600
+# One request comment per head records every dispatch (loom#2207): each adds a
+# line and a hidden stamp to it, and after LUNA_MAX_DISPATCHES without a
+# verdict the head is not dispatched again and a factory ticket is filed.
+LUNA_MAX_DISPATCHES = 3
+_LUNA_DISPATCH_RE = re.compile(r"<!-- loom:luna-dispatch at=(\d+) -->")
+LUNA_STUCK_TITLE = "Luna review of %s#%d head %s got no verdict after %d dispatches"
 _LUNA_MARKINGS_RE = re.compile(r"Elder markings - (\d+) blocking, (\d+) total")
 
 
@@ -627,7 +633,7 @@ plain to the next reader, and say why in the commit message.
 ask for."""
 
 # A ticket with either label is never sent back: a person or the brain has it.
-SEND_BACK_HOLDS = frozenset(("loom:human", "needs-brain"))
+SEND_BACK_HOLDS = frozenset(HUMAN_LABELS + ("needs-brain",))
 
 # The note for a ticket whose lane run failed with its pull request open: the
 # failed run is the finding, so it is not the stock FIX_NOTES that brain.fix
@@ -661,7 +667,7 @@ TICKED_HEADING = "### Live or operator criteria ticked by the lane"
 
 
 def _last_ask(comments: Sequence[Dict[str, Any]]) -> str:
-    """The newest loom:human ask among the comments, or ""."""
+    """The newest needs:human ask among the comments, or ""."""
     asks = [str(c.get("body") or "") for c in comments
             if str(c.get("body") or "").startswith(answer.HUMAN_MARKER)]
     return asks[-1] if asks else ""
@@ -2288,7 +2294,7 @@ class Factory:
         """After NO_CHANGE_LIMIT fix rounds in a row that ended with no commit
         on one failing check, hand the ticket to a person with one comment
         naming the check (2026-10-19: 19 rounds, 19 emails, no fix). The
-        loom:human label stops every later round and comment."""
+        needs:human label stops every later round and comment."""
         stalled = sorted(n for n, k in no_change_rounds(comments).items()
                          if k >= NO_CHANGE_LIMIT)
         if not stalled:
@@ -2589,7 +2595,7 @@ class Factory:
     def _split_summary(self, issue: Dict[str, Any], sha: str) -> Optional[str]:
         """The review check's summary when it is the only failing check and
         failed on a note asking for a split (bus/split.py), else None."""
-        if "loom:human" in _labels(issue):
+        if needs_human(_labels(issue)):
             return None
         failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
         if len(failed) != 1 or failed[0].get("name") != self.review_check:
@@ -3053,7 +3059,7 @@ class Factory:
         """Hand a conflicting pull request's lane exactly one fix round for
         the conflict. The judged send-back refuses a ticket a person or the
         brain holds (SEND_BACK_HOLDS), which is what left an operator-held
-        pull request's conflict unassigned: the loom:human hold guards its
+        pull request's conflict unassigned: the needs:human hold guards its
         merge, not its branch, so hygiene opens the round anyway, and the
         hold stays on the ticket through the move. A needs-brain ticket is
         the brain's own work and is left to it, as is one in the hand-off
@@ -3120,7 +3126,7 @@ class Factory:
         would discard them), and at most HYGIENE_UPDATES_PER_REPO a repo a
         pass. The keep-current cooldown is shared, so a pull request the
         held path just brought up to date is not updated again here."""
-        if _state(issue) not in ("pr", "answered"):
+        if _state(issue) not in ("pr", "answered", "briefed", "failed"):
             return
         held = self._lock(repo)
         if held == number:
@@ -3173,7 +3179,7 @@ class Factory:
         (bus/operator_hold.py): it or its ticket declares operator steps
         before merge, it changes placement, or it deletes or mostly replaces
         a doc its ticket does not name. The ticket goes
-        to loom:human with one exact ask, once; the pull request never lands
+        to needs:human with one exact ask, once; the pull request never lands
         on the factory's say-so, whatever later passes find. The operator's
         own answer to that ask (bus/answer.py) decides instead: Merge lifts
         this hold only, so every other gate still runs; Hold keeps it held
@@ -3197,7 +3203,7 @@ class Factory:
     def _risk_holds(self, repo: str, number: int, full: Dict[str, Any],
                     issue: Dict[str, Any], comments: Sequence[Dict[str, Any]] = ()) -> bool:
         """Whether the pull request's risk tier (bus/merge_tier.py) is one
-        Loom may not merge on its own: its ticket goes to loom:human with one
+        Loom may not merge on its own: its ticket goes to needs:human with one
         ask, once, and the operator merges it. A revert ticket's own pull
         request never waits here when merge_tier.revert_refusal proves it. bus.brain merge refuses the same tiers, and
         adds the review and hourly-cap rules for the tiers it may merge."""
@@ -3256,7 +3262,7 @@ class Factory:
         loom:answer-pending, bus/answer.py) and take the label off: the
         answer is now the operator's newest comment, which the brief, the
         stale-brief check and the merge gates read. A Hold on a lane pull
-        request held for the operator puts loom:human back, so it keeps
+        request held for the operator puts needs:human back, so it keeps
         waiting on a person. An issue whose label no operator answer backs
         loses the label too."""
         items = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
@@ -3271,9 +3277,9 @@ class Factory:
                 _say("%s#%d is labelled %s, but no operator answer backs it; label removed"
                      % (repo, number, answer.ANSWERED_LABEL))
             elif answer.is_hold(found) and answer.held_pr(_last_ask(comments)) is not None:
-                if "loom:human" not in _labels(issue):
+                if not needs_human(_labels(issue)):
                     self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
-                                 {"labels": ["loom:human"]})
+                                 {"labels": [NEEDS_HUMAN]})
                 _say("%s#%d: the operator %s answered hold; it keeps waiting on a person"
                      % (repo, number, found.login))
             else:
@@ -3453,18 +3459,12 @@ class Factory:
         than LUNA_RETRY_AFTER is in flight. True when it dispatched."""
         if self.review_brief is None or not self._review_degraded(sha):
             return False
-        asked = False
-        newest = 0.0
-        for comment in self._trusted_comments(repo, number):
-            body = str(comment.get("body") or "")
-            if parse_luna_verdict(body, sha) is not None:
-                return False  # the lane already answered for this head
-            if REVIEW_AGAIN_MARKER % sha in body:
-                asked = True
-            if LUNA_REQUEST_MARKER % sha in body:
-                newest = max(newest, _ts(comment.get("created_at")))
+        request, stamps, asked = self._luna_requests(repo, number, sha)
+        if asked is None:
+            return False  # the lane already answered for this head
         if not asked:
             return False  # the review bot has not had its re-ask yet
+        newest = max(stamps, default=0)
         if newest and self.now - newest <= LUNA_RETRY_AFTER:
             # A review for this head is already in flight: the pull request
             # waits for the lane's verdict instead of bouncing through a fix
@@ -3472,20 +3472,79 @@ class Factory:
             _say("%s#%d waits for the Luna review of head %s dispatched %ds ago"
                  % (repo, number, sha[:12], int(self.now - newest)))
             return True
+        if len(stamps) >= LUNA_MAX_DISPATCHES:
+            self._luna_stuck(repo, number, sha, len(stamps))
+            return True  # the filed ticket carries it from here
         if not self.review_brief(repo, number, sha, issue):
             return False
+        self._luna_note(repo, number, sha, request, len(stamps) + 1)
+        self.actions += 1
+        _say("dispatched a Luna review of %s#%d head %s on lane %s"
+             % (repo, number, sha[:12], LUNA_REVIEW_LANE))
+        return True
+
+    def _luna_requests(self, repo: str, number: int, sha: str
+                       ) -> Tuple[Optional[Dict[str, Any]], List[int], Optional[bool]]:
+        """(the head's first request comment, each dispatch's epoch seconds,
+        whether the review bot was re-asked); asked is None once a verdict
+        for this head stands."""
+        asked = False
+        request: Optional[Dict[str, Any]] = None
+        stamps: List[int] = []
+        for comment in self._trusted_comments(repo, number):
+            body = str(comment.get("body") or "")
+            if parse_luna_verdict(body, sha) is not None:
+                return None, [], None
+            asked = asked or REVIEW_AGAIN_MARKER % sha in body
+            if LUNA_REQUEST_MARKER % sha in body:
+                request = request or comment
+                # A request written before the stamps counts as one dispatch
+                # at its creation time.
+                stamps += [int(x) for x in _LUNA_DISPATCH_RE.findall(body)] or [
+                    int(_ts(comment.get("created_at")))]
+        return request, stamps, asked
+
+    def _luna_note(self, repo: str, number: int, sha: str,
+                   request: Optional[Dict[str, Any]], sent: int) -> None:
+        """Record dispatch number `sent` on the head's request comment: post
+        it the first time, then edit it in place."""
+        stamp = int(self.now)
+        line = ("Dispatch %d at %s UTC.\n<!-- loom:luna-dispatch at=%d -->"
+                % (sent, datetime.fromtimestamp(stamp, timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M"), stamp))
+        if request is not None:
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(request["id"])),
+                         {"body": str(request.get("body") or "").rstrip() + "\n" + line})
+            return
         notify.post(self.gh, repo, number,
                     "%s\nThe review check is degraded on this head and its re-run "
                     "was degraded too, so a Codex Luna review was dispatched on "
                     "lane %s (gpt-6-luna, through `codex exec`). Its verdict will "
                     "be posted here for this head, and the merge gate reads it "
-                    "while the review route is down."
-                    % (LUNA_REQUEST_MARKER % sha, LUNA_REVIEW_LANE),
-                    notify.NOTE)
+                    "while the review route is down. A dispatch with no verdict "
+                    "is retried on this comment, up to %d times.\n\n%s"
+                    % (LUNA_REQUEST_MARKER % sha, LUNA_REVIEW_LANE,
+                       LUNA_MAX_DISPATCHES, line), notify.NOTE)
+
+    def _luna_stuck(self, repo: str, number: int, sha: str, sent: int) -> None:
+        """File one factory ticket for a head whose Luna review got no verdict
+        after `sent` dispatches, unless an open one already names it."""
+        title = LUNA_STUCK_TITLE % (repo, number, sha[:12], sent)
+        for found in self.gh.paginate("/repos/%s/issues?labels=loom:factory&state=open" % repo):
+            if isinstance(found, dict) and found.get("title") == title and self._trusted(found):
+                return
+        body = ("The review check is degraded on pull request #%d head %s and its re-run "
+                "was too, so its review was dispatched to lane %s %d times with no "
+                "verdict. No further dispatch is made for this head: the pull request "
+                "waits until the lane answers or a new head is pushed.\n\n"
+                "## Why\nThe lane cannot answer, or its run never records a verdict.\n"
+                % (number, sha[:12], LUNA_REVIEW_LANE, sent))
+        brain._check_written_text(title + "\n" + body)
+        self.gh.rest("POST", "/repos/%s/issues" % repo,
+                     {"title": title, "body": body, "labels": ["loom:factory"]})
         self.actions += 1
-        _say("dispatched a Luna review of %s#%d head %s on lane %s"
-             % (repo, number, sha[:12], LUNA_REVIEW_LANE))
-        return True
+        _say("filed a factory ticket: Luna review of %s#%d head %s stuck"
+             % (repo, number, sha[:12]))
 
     def _behind(self, repo: str, full: Dict[str, Any]) -> int:
         base = str((full.get("base") or {}).get("ref") or "")
@@ -4243,10 +4302,10 @@ class Factory:
 
     def _brief_wait(self, repo: str, issue: Dict[str, Any]) -> str:
         """Why a queued ticket gets no lane, or "": a stale ticket waits for
-        the operator's answer (loom:human), and a health ticket for its cause
+        the operator's answer (needs:human), and a health ticket for its cause
         (bus/brief_check.py). Reads nothing."""
-        if "loom:human" in _labels(issue):
-            reason = "waits for a person (loom:human)"
+        if needs_human(_labels(issue)):
+            reason = "waits for a person (needs:human)"
         elif brief_check.health_hold(issue):
             reason = "health ticket names no cause"
         else:
@@ -4285,12 +4344,12 @@ class Factory:
     def _host_only(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether every acceptance criterion of the queued ticket is a check
         on a live host or network (operator_hold.host_only): it gets no lane
-        and goes to loom:human with one ask, once. 2026-10-22: such a ticket
+        and goes to needs:human with one ask, once. 2026-10-22: such a ticket
         was laned, the lane replaced a README to have a diff, and it merged."""
         criteria = operator_hold.host_only(str(issue.get("body") or ""))
         if not criteria:
             return False
-        if "loom:human" in _labels(issue):
+        if needs_human(_labels(issue)):
             return True
         try:
             self.human(self.gh, repo, int(issue["number"]), operator_hold.host_only_ask(criteria))
@@ -4300,7 +4359,7 @@ class Factory:
             _say("held queued %s#%s for a person, but the ask was refused: %s"
                  % (repo, issue["number"], err))
             return True
-        issue["labels"] = list(issue.get("labels") or []) + [{"name": "loom:human"}]
+        issue["labels"] = list(issue.get("labels") or []) + [{"name": NEEDS_HUMAN}]
         self.actions += 1
         _say("held queued %s#%s for a person: every criterion is a host check"
              % (repo, issue["number"]))

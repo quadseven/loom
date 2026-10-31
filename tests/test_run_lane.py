@@ -1110,6 +1110,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("pull request body rebuilt from the brief", self.run_log())
         self.assertEqual(self.sticky_bodies(), [])
 
+    def test_generated_why_includes_text_under_nested_brief_headings(self):
+        brief = BRIEF.replace(
+            "The thing is broken for every user.",
+            "Short intro.\n\n### Further notes\n"
+            "These nested details explain the problem across several steps.")
+        self.drop_brief(text=brief)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        why = self.body.read_text().split("## Why\n", 1)[1].split("\n\n## Summary", 1)[0]
+        self.assertEqual(why, "Short intro.\n### Further notes\n"
+                         "These nested details explain the problem across several steps.")
+
     def test_a_brief_that_cannot_fill_the_body_opens_a_marked_pull_request_and_notes_the_ticket(self):
         brief = BRIEF.replace("S: one function.", "big")
         self.drop_brief(text=brief)
@@ -5014,7 +5026,7 @@ echo fixed > fix.txt
         self.expired_key_lane()
         filed = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(filed), 1, self.calls())
-        self.assertIn("--label needs-operator", filed[0])
+        self.assertIn("--label needs:human", filed[0])
         self.assertIn("renew /k/go", filed[0])
         # The next lane to hit that key finds the open ask and edits one
         # repeat comment on it, so the operator has one thread to answer, not
@@ -5541,7 +5553,7 @@ exit %d
         self.assertTrue(self.beat()["available"])
         ask = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(ask), 1, self.calls())
-        self.assertIn("--label needs-operator", ask[0])
+        self.assertIn("--label needs:human", ask[0])
         self.assertIn("renew the codex lane sign-in", ask[0])
 
     def test_a_cli_sign_in_that_timed_out_is_auth_not_transient(self):

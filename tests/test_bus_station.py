@@ -121,19 +121,21 @@ class FakeGitHub:
              "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))}
             for login, age in journals]
 
-    def _list_asks(self, headers):
-        etag = '"a%d"' % len(self.asks)
+    def _list_asks(self, headers, label):
+        found = [a for a in self.asks if label in [x["name"] for x in a["labels"]]]
+        etag = '"a%d"' % len(found)
         if headers.get("If-None-Match") == etag:
             return reply(304, None, {"ETag": etag})
-        return reply(200, self.asks, {"ETag": etag})
+        return reply(200, found, {"ETag": etag})
 
     def add_ask(self, number, title="Need a decision", author="alice-example",
-                labeller="alice-example", urgent=False, body="", created="2030-01-01T00:00:00Z"):
-        labels = [{"name": "needs-operator"}] + ([{"name": "loom:urgent"}] if urgent else [])
+                labeller="alice-example", urgent=False, body="", created="2030-01-01T00:00:00Z",
+                label="needs-operator"):
+        labels = [{"name": label}] + ([{"name": "loom:urgent"}] if urgent else [])
         self.asks.append({"number": number, "title": title, "user": {"login": author},
                           "labels": labels, "created_at": created, "body": body,
                           "html_url": "https://github.com/%s/issues/%d" % (REPO, number)})
-        self.events[number] = [labeled("needs-operator", labeller)]
+        self.events[number] = [labeled(label, labeller)]
 
     def add_human(self, number, title="Buy the domain", ask="Buy it.", author="alice-example",
                 created="2030-01-01T00:00:00Z", extra=()):
@@ -208,11 +210,8 @@ class FakeGitHub:
             return reply(200, found) if found else reply(404, {"message": "Not Found"})
         if (method == "GET" and parts.path == "/repos/%s/issues" % station.FACTORY_REPO
                 and "state=closed" in parts.query):
-            # _closed_incidents lists closed issues on the factory repo and
-            # filters by the body marker. When the query also filters on the
-            # loom:factory label, the fake honours it (simulating GitHub):
-            # an incident filed without the label (loom#918) is not returned
-            # by a labels=loom:factory query, only by the marker-based list.
+            # The factory can list incidents for other passes; this fake
+            # honors the label when present and otherwise returns the full set.
             if "labels=loom%3Afactory" in parts.query or "labels=loom:factory" in parts.query:
                 return reply(200, [i for i in self.factory_incidents
                                    if any(l.get("name") == "loom:factory"
@@ -369,7 +368,9 @@ class FakeGitHub:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:ticket" in self.names(i["number"])])
         if "needs-operator" in query:
-            return self._list_asks(headers)
+            return self._list_asks(headers, "needs-operator")
+        if "needs:human" in query or "needs:quadseven" in query:
+            return self._list_asks(headers, query.split("labels=")[1].split("&")[0])
         if "loom:human" in query:
             return reply(200, self.humans)
         if "loom:goal" in query:
@@ -3273,7 +3274,7 @@ class HandBackTest(unittest.TestCase):
         )
         self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK, review_output)])
         names = [x["name"] for x in self.gh.issue["labels"]]
-        self.assertIn("loom:human", names)
+        self.assertIn("needs:human", names)
         self.assertNotIn("loom:briefed", names)
         # No fix round was sent (no FIX_MARKER comment)
         self.assertFalse(any(str(c.get("body") or "").startswith(tickets.FIX_MARKER)
@@ -3295,7 +3296,7 @@ class HandBackTest(unittest.TestCase):
         self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK, review_output)])
         names = [x["name"] for x in self.gh.issue["labels"]]
         self.assertIn("loom:briefed", names)
-        self.assertNotIn("loom:human", names)
+        self.assertNotIn("needs:human", names)
 
     def test_removed_guarded_path_mixed_with_other_marking_gets_fix_round(self):
         # Ticket names README.md for removal
@@ -3311,7 +3312,7 @@ class HandBackTest(unittest.TestCase):
         self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK, review_output)])
         names = [x["name"] for x in self.gh.issue["labels"]]
         self.assertIn("loom:briefed", names)
-        self.assertNotIn("loom:human", names)
+        self.assertNotIn("needs:human", names)
 
     def test_unresolved_review_bot_thread_is_sent_back(self):
         thread = {"id": "PRRT_fake", "path": "a.py", "line": 4,
@@ -6365,6 +6366,61 @@ class FactoryIncidentTest(Base):
             "body": ("<!-- loom:factory-incident v1 -->\n\nRepo: %s\nKind: environment\n"
                      "Ticket: %s#12\n\ncheck: make check (exit 127)\n" % (REPO, REPO)),
             "labels": labels}]
+        self.fake.issues[99] = dict(self.fake.factory_incidents[0])
+
+    def held_directly(self, incident_ref=None, body_events=()):
+        issue = self.fake.issues[12]
+        issue["labels"] = [{"name": "loom:ticket"}, {"name": "lane:muse"},
+                           {"name": "loom:running"}, {"name": "wait:incident"}]
+        if body_events:
+            issue["body"] = status.with_body_events(issue.get("body", ""), list(body_events))
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"%s#12" % REPO: {"incident": incident_ref or "%s#99" % REPO,
+                                       "at": time.time()}}, fh)
+
+    def test_body_only_incident_ref_requeues_a_held_ticket_without_comments(self):
+        self.fake.add(12, lane="muse", body=PLAIN, state="running")
+        self.held_directly(body_events=[("2030-01-01T00:00:00Z",
+                                         "Lane muse held: factory incident %s#99" % REPO)])
+        self.assertEqual(self.fake.comments[12], [])
+        self.incident()
+        self.fake.issues[99] = dict(self.fake.factory_incidents[0])
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            station.Station(GitHub("token", transport=self.fake), self.settings).release_factory_held()
+        self.assertIn("loom:queued", self.fake.names(12))
+
+    def test_body_only_claim_after_close_keeps_the_held_ticket_running(self):
+        self.fake.add(12, lane="muse", body=PLAIN, state="running")
+        self.held_directly(body_events=[("2030-01-01T00:00:00Z",
+                                         "Lane muse held: factory incident %s#99" % REPO)])
+        self.incident()
+        self.fake.issues[99] = dict(self.fake.factory_incidents[0])
+        self.fake.issues[12]["body"] = status.with_body_events(
+            self.fake.issues[12]["body"], [("2030-01-01T00:20:00Z",
+                "Claimed for lane muse (body sha256 0123456789ab)")])
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            station.Station(GitHub("token", transport=self.fake), self.settings).release_factory_held()
+        self.assertIn("loom:running", self.fake.names(12))
+
+    def test_open_incidents_do_not_read_held_tickets_or_list_closed_issues(self):
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        held = {}
+        for number in range(100, 180):
+            self.fake.add(number, lane="muse", body=PLAIN, state="running")
+            held["%s#%d" % (REPO, number)] = {"incident": "%s#99" % REPO, "at": 0}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(held, fh)
+        self.fake.issues[99] = {"number": 99, "body": "<!-- loom:factory-incident v1 -->",
+                                "state": "open", "labels": []}
+        self.fake.calls.clear()
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            station.Station(GitHub("token", transport=self.fake), self.settings).release_factory_held()
+        paths = [path for method, path in self.fake.calls if method == "GET"]
+        self.assertFalse(any(re.search(r"issues/(?:10[0-9]|1[1-7][0-9])$", p) for p in paths))
+        self.assertFalse(any("state=closed" in p for p in paths))
 
     def test_factory_is_a_failure_class_not_work(self):
         self.assertEqual(station.failure_class("[factory] setup failed: x"), "factory")
@@ -6530,12 +6586,12 @@ class FactoryIncidentTest(Base):
         self.run_pass()
         self.incident()
         with mock.patch.object(station, "FACTORY_REPO", REPO), \
-                mock.patch.object(station.Station, "_closed_incidents",
+                mock.patch.object(station.Station, "_factory_incident",
                                   side_effect=station.GitHubError("boom", 502)), \
                 mock.patch("bus.station._say") as say:
             self.run_pass()
         said = [c.args[0] for c in say.call_args_list]
-        self.assertIn("factory release: could not read the closed incidents: boom", said)
+        self.assertIn("factory release: could not read incident %s#99: boom" % REPO, said)
         self.assertIn("loom:running", self.fake.names(12))
         self.assertFalse(any("back in the queue" in b for b in self.bodies()))
         with mock.patch.object(station, "FACTORY_REPO", REPO):
@@ -7151,7 +7207,7 @@ class LogRetentionTest(Base):
         self.settings.transcript_token_ssm = "/loom/token"
         running = self.session_run("openrouter", "example.repo-3")
         self.write(self.inbox("openrouter", "example.repo-3.md"), "brief\n")
-        unsent = self.session_run("openrouter", "example.repo-4")
+        unsent = self.session_run("openrouter", "example.repo-4", days=0)
         sent = self.session_run("openrouter", "example.repo-5")
         for name in ("example.repo-4", "example.repo-5"):
             self.write(self.inbox("openrouter", "done", name + ".md"), "brief\n")
@@ -7162,6 +7218,18 @@ class LogRetentionTest(Base):
         self.assertTrue(os.path.exists(unsent))
         self.assertFalse(os.path.exists(sent))
         self.assertTrue(os.path.exists(sent + ".gz"))
+
+    def test_an_unsent_runs_store_is_compressed_after_a_day(self):
+        # loom#2268: on 2026-10-30 unsent runs held 7 GB of raw stores in
+        # 13 GB of logs. The upload reads either form.
+        self.settings.transcript_url = "https://dashboard.example.com/api/transcripts"
+        self.settings.transcript_token_ssm = "/loom/token"
+        unsent = self.session_run("openrouter", "example.repo-4", days=2)
+        self.write(self.inbox("openrouter", "done", "example.repo-4.md"), "brief\n")
+        self.write(os.path.join(self.home, "state", "station", "transcripts.json"), "{}")
+        self.tend()
+        self.assertFalse(os.path.exists(unsent))
+        self.assertTrue(os.path.exists(unsent + ".gz"))
 
     def test_a_compressed_store_goes_with_its_run_after_retention(self):
         db = self.session_run("opencode-go", "example.repo-6", days=3)
@@ -7174,6 +7242,72 @@ class LogRetentionTest(Base):
         os.remove(os.path.join(self.home, "state", "station", "disk.json"))
         self.tend()
         self.assertFalse(os.path.exists(os.path.join(self.home, "logs", "opencode-go", "example.repo-6")))
+
+    def test_a_service_log_past_the_limit_is_rotated_by_the_hourly_tend(self):
+        self.settings.log_rotate_bytes = 100
+        log = os.path.join(self.home, "logs", "station.log")
+        self.write(log, "x" * 500)
+        said = self.tend()
+        self.assertFalse(os.path.exists(log))
+        names = os.listdir(os.path.join(self.home, "logs"))
+        self.assertEqual(len([n for n in names if n.startswith("station.log.")]), 1)
+        self.assertTrue(any(s.startswith("rotated station.log") for s in said), said)
+
+    def test_a_lane_run_log_past_the_limit_stays_where_the_station_reads_it(self):
+        self.settings.log_rotate_bytes = 100
+        log = self.aged(os.path.join(self.home, "logs", "codex", "example.repo-1.log"), 0, "x" * 500)
+        self.tend()
+        self.assertTrue(os.path.exists(log))
+
+    def over_limit(self, slot, name, days, size=4096 * 4):
+        return self.aged(os.path.join(self.home, "logs", slot, name), days, "x" * size)
+
+    def test_logs_over_the_limit_lose_their_oldest_finished_runs_first(self):
+        oldest = self.over_limit("codex", "example.repo-1.log", 6)
+        older = self.over_limit("claude", "example.repo-2.log", 5)
+        newer = self.over_limit("codex", "example.repo-3.log", 4)
+        total = station._tree_stat(os.path.join(self.home, "logs"))[1]
+        self.settings.log_max_bytes = total - 1
+        said = self.tend()
+        self.assertFalse(os.path.exists(oldest))
+        self.assertTrue(os.path.exists(older))
+        self.assertTrue(os.path.exists(newer))
+        self.assertTrue(any(s.startswith("logs hold ") for s in said), said)
+
+    def test_the_limit_never_takes_a_running_run_or_a_fresh_one(self):
+        running = self.over_limit("codex", "example.repo-1.log", 6)
+        self.write(self.inbox("codex", "example.repo-1.md"), "brief\n")
+        fresh = self.over_limit("codex", "example.repo-2.log", 0)
+        self.settings.log_max_bytes = 1
+        said = self.tend()
+        self.assertTrue(os.path.exists(running))
+        self.assertTrue(os.path.exists(fresh))
+        self.assertTrue(any(s.startswith("logs hold ") and "over the" in s for s in said), said)
+
+    def test_the_limit_never_takes_an_unsent_run(self):
+        self.settings.transcript_url = "https://dashboard.example.com/api/transcripts"
+        self.settings.transcript_token_ssm = "/loom/token"
+        unsent = self.over_limit("codex", "example.repo-1.log", 6)
+        self.write(self.inbox("codex", "done", "example.repo-1.md"), "brief\n")
+        self.write(os.path.join(self.home, "state", "station", "transcripts.json"), "{}")
+        self.settings.log_max_bytes = 1
+        self.tend()
+        self.assertTrue(os.path.exists(unsent))
+
+    def test_a_zero_limit_turns_the_size_limit_off(self):
+        log = self.over_limit("codex", "example.repo-1.log", 6)
+        self.settings.log_max_bytes = 0
+        self.tend()
+        self.assertTrue(os.path.exists(log))
+
+    def test_log_limits_are_read_from_the_environment(self):
+        loaded = station.Settings.from_env({"LOOM_LOG_MAX_GB": "2.5", "LOOM_LOG_ROTATE_MB": "7"})
+        self.assertEqual(loaded.log_max_bytes, int(2.5 * 1024 ** 3))
+        self.assertEqual(loaded.log_rotate_bytes, 7 * 1024 ** 2)
+        with mock.patch("bus.station._say"):
+            loaded = station.Settings.from_env({"LOOM_LOG_MAX_GB": "x", "LOOM_LOG_ROTATE_MB": "-1"})
+        self.assertEqual(loaded.log_max_bytes, int(station.LOG_MAX_GB * 1024 ** 3))
+        self.assertEqual(loaded.log_rotate_bytes, int(station.LOG_ROTATE_MB * 1024 ** 2))
 
     def test_a_linked_session_store_is_never_followed(self):
         outside = os.path.join(self._tmp.name, "outside.db")
@@ -8347,6 +8481,44 @@ class AsksTest(Base):
         with open(ledger) as fh:
             self.assertEqual(json.load(fh)["urgent"], [])
 
+    def test_an_answered_ask_leaves_the_digest_with_no_comment_posted(self):
+        self.fake.add_ask(5, title="Answered")
+        self.fake.add_ask(6, title="Still open")
+        self.fake.events[5][0]["created_at"] = "2030-06-01T00:00:00Z"
+        self.fake.comments[5] = [{"body": "Yes, clear it.", "created_at": "2030-07-01T00:00:00Z",
+                                  "user": {"login": "alice-example"}}]
+        self.go(NOON)
+        text = self.sent[0][1]["content"]
+        self.assertIn("Still open", text)
+        self.assertNotIn("Answered", text)
+        self.assertFalse([p for p in self.fake.paths("POST") if p.endswith("/comments")])
+
+    def test_an_ask_waiting_on_an_open_ticket_leaves_the_digest(self):
+        self.fake.add_ask(5, title="Waits")
+        self.fake.asks[-1]["labels"].append({"name": "wait:blocked"})
+        self.fake.add_ask(6, title="Still open")
+        self.go(NOON)
+        text = self.sent[0][1]["content"]
+        self.assertIn("Still open", text)
+        self.assertNotIn("Waits", text)
+
+    def test_an_ask_filed_with_needs_human_is_listed(self):
+        self.fake.add_ask(5, title="New label", label="needs:human")
+        self.go(NOON)
+        self.assertIn("New label", self.sent[0][1]["content"])
+
+    def test_an_unreadable_ask_holds_the_digest(self):
+        self.fake.add_ask(5, title="Unknown")
+        real = self.fake.__class__.__call__
+
+        def broken(fake, method, url, headers, body):
+            if url.split("?")[0].endswith("/issues/5/events"):
+                return reply(500, {"message": "down"})
+            return real(fake, method, url, headers, body)
+        with mock.patch.object(self.fake.__class__, "__call__", broken):
+            self.go(NOON)
+        self.assertEqual(self.sent, [])
+
     def test_digest_once_per_day_after_the_hour_only(self):
         self.fake.add_ask(5, title="Slow one")
         self.go(EARLY)
@@ -8594,10 +8766,11 @@ class HumanDigestTest(AsksTest):
         listed = re.findall(r"- Item (\d+) ", text)
         self.assertEqual(listed, [str(n) for n in range(139, 134, -1)])
         self.assertTrue(all(len(c) + 30 <= station.DISCORD_MAX for c in self.contents()))
+        # Every issue is read once to judge its ask; the shown ones again for the line.
         self.assertEqual(self.fake.paths("GET").count(
-            "/repos/%s/issues/100/comments?per_page=100" % REPO), 0)
+            "/repos/%s/issues/100/comments?per_page=100" % REPO), 1)
         comment_reads = [p for p in self.fake.paths("GET") if "/comments?" in p]
-        self.assertEqual(len(comment_reads), station.HUMAN_SHOWN)
+        self.assertEqual(len(comment_reads), 40 + station.HUMAN_SHOWN)
         self.assertTrue(all(p.endswith("?per_page=100") for p in comment_reads))
 
     def test_clipped_human_text_does_not_escape_its_ellipsis(self):
@@ -9024,7 +9197,7 @@ class ReportsTest(Base):
             {"number": 46, "title": "Stuck task", "state": "open", "created_at": stuck_old,
              "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]},
             {"number": 47, "title": "Decision task", "state": "open",
-             "labels": [{"name": "loom:ticket"}, {"name": station.NEEDS_OPERATOR}]},
+             "labels": [{"name": "loom:ticket"}, {"name": station.NEEDS_HUMAN}]},
         ]
         self.clock = time.time()
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
@@ -9063,7 +9236,7 @@ class ReportsTest(Base):
                 first, second]), \
                 mock.patch.object(st, "_public", side_effect=lambda repo: repo == REPO):
             line = st._standup_waiting_line(REPO, children)
-        self.assertEqual(line, "Waiting on you: 4 open loom:human (2 in %s, 2 in private repos; "
+        self.assertEqual(line, "Waiting on you: 4 open needs:human (2 in %s, 2 in private repos; "
                          "1 of them under this goal), listed in the daily digest" % REPO)
 
     def test_station_data_report_names_every_repo_on_a_private_home(self):
@@ -9094,7 +9267,7 @@ class ReportsTest(Base):
         with mock.patch.object(brain, "_issues", return_value=waiting), \
                 mock.patch.object(st.gh, "rest", side_effect=rest):
             line = st._standup_waiting_line(REPO, [])
-        self.assertEqual(line, "Waiting on you: 2 open loom:human (1 in %s, 1 in private repos; "
+        self.assertEqual(line, "Waiting on you: 2 open needs:human (1 in %s, 1 in private repos; "
                          "0 of them under this goal), listed in the daily digest" % REPO)
 
     def test_station_standup_lists_the_tickets_of_the_goals_epics(self):
@@ -10500,7 +10673,7 @@ class CloseDoneTest(Base):
         # A Live line with nothing to search is still a live criterion with no
         # evidence (bus/criteria_gate.py, 2026-10-22): it goes to the operator.
         self.assertEqual(self.fake.issues[1]["state"], "open")
-        self.assertIn("loom:human", self.fake.names(1))
+        self.assertIn("needs:human", self.fake.names(1))
         self.assertEqual(self.fake.issues[2]["state"], "open")   # window still open or covered by evidence
         self.assertEqual(self.fake.issues[3]["state"], "open")   # a regression stays for the brain
         self.assertEqual(self.fake.issues[4]["state"], "closed") # no Live line, code only
@@ -10791,7 +10964,7 @@ class CloseDoneTest(Base):
         st = station.Station(GitHub("token", transport=request), self.settings, now=10000)
         st.check_repo_access()
         self.assertEqual(len(asks), 1)
-        self.assertIn("needs-operator", asks[0]["labels"])
+        self.assertIn("needs:human", asks[0]["labels"])
         self.assertIn(second, asks[0]["title"])
 
     def test_operator_ask_missing_number_raises(self):

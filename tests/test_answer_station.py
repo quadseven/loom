@@ -114,7 +114,7 @@ class FactoryVerdict(Base):
         self.go()
         self.assertEqual(self.merged, [])
         self.assertEqual(len(self.humans), 1)
-        self.assertIn("loom:human", self.labels())
+        self.assertIn("needs:human", self.labels())
         self.assertNotIn(answer.ANSWERED_LABEL, self.labels())
         self.go()
         self.assertEqual((self.merged, len(self.humans)), ([], 1))
