@@ -1744,6 +1744,11 @@ def _write_json(path: str, data: Any) -> None:
     os.replace(tmp, path)
 
 
+def _restarts_ladder(body: str) -> bool:
+    """Whether a comment restarts the ticket on rung 0."""
+    return any(m.group(1) == "0" for m in factory.RUNG_RE.finditer(body))
+
+
 def _sha12(body: Optional[str]) -> str:
     return hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
 
@@ -2495,21 +2500,25 @@ class Station:
         return found is not None and found[0].pr == pr
 
     def _fix_for(self, repo: str, comments: List[Any]) -> Optional[Tuple[tickets.Fix, Any]]:
-        """Return the newest trusted fix after the last claim, regardless of
-        later non-fix comments. Raises ValueError for an unusable fix."""
+        """Return the newest trusted fix after the last claim or rung 0 restart,
+        regardless of later non-fix comments. A claim also reads from the status
+        comment, and a rung 0 comment ends a fix the same way: without it a
+        restarted ticket replayed the round of a pull request that had ended
+        (loom#2334). Raises ValueError for an unusable fix."""
         allowed = {a.lower() for a in self.s.authors}
-        last_claim, newest_fix = -1, None
+        comments = status.expand(comments, self.s.authors)
+        last_end, newest_fix = -1, None
         for i, c in enumerate(comments):
             if not isinstance(c, dict):
                 continue
             body = str(c.get("body") or "")
             trusted = tickets._login(c.get("user")) in allowed
-            # A stranger's claim marker must not hide a trusted fix.
-            if trusted and CLAIM_RE.fullmatch(body.strip()):
-                last_claim = i
+            # A stranger's claim or rung marker must not hide a trusted fix.
+            if trusted and (CLAIM_RE.fullmatch(body.strip()) or _restarts_ladder(body)):
+                last_end = i
             if trusted and body.startswith(tickets.FIX_MARKER):
                 newest_fix = (i, c, body)
-        if newest_fix is None or newest_fix[0] < last_claim:
+        if newest_fix is None or newest_fix[0] < last_end:
             return None
         # GitHub keeps no editor for comments: one changed after it was
         # posted may carry someone else's words.
@@ -4809,10 +4818,12 @@ class Station:
         if left:
             # Routine: the ticket goes back for the rest, and a comment would
             # email the operator on each such merge.
+            every = factory.unticked_criteria(str(ticket.get("body") or ""),
+                                              [str(p.get("body") or "") for p in (pr, *landed)])
             self._routine(repo, number, tickets.UNBUILT_NOTE
-                          % (int(pr["number"]), "; ".join(left)))
+                          % (int(pr["number"]), "; ".join(every)))
             _say("%s#%d: merged pull request #%d left %d criteria unbuilt, requeued"
-                 % (repo, number, int(pr["number"]), len(left)))
+                 % (repo, number, int(pr["number"]), len(every)))
 
     @staticmethod
     def _unbuilt_criteria(ticket: dict, merged: Sequence[dict]) -> List[str]:
