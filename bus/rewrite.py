@@ -357,9 +357,29 @@ def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
     loom:triage before a rule existed is not rewritten into a ticket."""
     found = gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open"
                         "&sort=created&direction=asc&per_page=100" % repo)
-    return [i for i in found if isinstance(i, dict) and "pull_request" not in i
-            and not brain.owned_elsewhere(i) and NEEDS_BRAIN not in _names(i)
-            and not brain.not_work_reason(i)]
+    out = []
+    authors = brain.trusted_authors()
+    operator = tickets.operator_login(authors)
+    journal_numbers = brain._goal_journal_numbers(gh, repo)
+    for issue in found:
+        if not isinstance(issue, dict) or "pull_request" in issue:
+            continue
+        labels = _names(issue)
+        if operator and operator.lower() in tickets.claimed_by(issue):
+            print("rewrite %s#%d: skipped: operator claim" % (repo, int(issue["number"])),
+                  file=sys.stderr)
+            continue
+        if (brain.goal_journal_title(issue)
+                or int(issue.get("number") or 0) in journal_numbers
+                or "loom:goal" in labels):
+            print("rewrite %s#%d: skipped: goal journal" % (repo, int(issue["number"])),
+                  file=sys.stderr)
+            continue
+        if (brain.owned_elsewhere(issue) or NEEDS_BRAIN in labels
+                or brain.not_work_reason(issue)):
+            continue
+        out.append(issue)
+    return out
 
 
 def prompt_for(gh: GitHub, repo: str, issue: Dict[str, Any]) -> str:
@@ -368,11 +388,20 @@ def prompt_for(gh: GitHub, repo: str, issue: Dict[str, Any]) -> str:
     return build_prompt(issue, [c for c in comments if isinstance(c, dict)], brief_format())
 
 
-def apply_answer(gh: GitHub, repo: str, goal: int, number: int, output: str) -> str:
+def apply_answer(gh: GitHub, repo: str, goal: int, number: int, output: str,
+                 issue: Dict[str, Any]) -> str:
     """Write what the agent's answer asks for. Returns "brief", "human" or
     "skip"; Invalid for a bad answer (nothing written)."""
     action, fields = validate(parse_answer(output))
     if action == "brief":
+        if fields["title"] != str(issue.get("title") or ""):
+            names = _names(issue)
+            operator = tickets.operator_login(brain.trusted_authors())
+            protected = ("loom:goal" in names
+                         or any(name.startswith("wayfinder:") for name in names)
+                         or (operator and operator.lower() in tickets.claimed_by(issue)))
+            if protected:
+                raise Invalid("cannot change the title of a protected issue")
         # No lane: the ticket is queued and the station's tier pick gives it one.
         brain.brief_intake(gh, repo, goal, fields["title"], fields["body"],
                     difficulty=fields["difficulty"], refs=number)
@@ -393,7 +422,8 @@ def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: 
     Raises Invalid for a bad answer (nothing written); GitHub errors and
     brain's own refusals (ValueError) pass through."""
     prompt = prompt_for(gh, repo, issue)
-    return apply_answer(gh, repo, goal, int(issue["number"]), run_agent(cmd, prompt, timeout))
+    return apply_answer(gh, repo, goal, int(issue["number"]),
+                        run_agent(cmd, prompt, timeout), issue=issue)
 
 
 if __name__ == "__main__":

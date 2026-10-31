@@ -3167,14 +3167,46 @@ def not_work_reason(issue: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def goal_journal_title(issue: Dict[str, Any]) -> bool:
+    """Whether an issue title identifies a live goal or its journal."""
+    title = str(issue.get("title") or "").strip().lower()
+    return title.startswith(("goals:", "goal journal", "[goal]"))
+
+
+def goal_journal_numbers(issues: Sequence[Dict[str, Any]]) -> set:
+    """Issue numbers a goal body explicitly names as its journal or live goal."""
+    found = set()
+    for issue in issues:
+        if "loom:goal" not in _labels(issue):
+            continue
+        for line in str(issue.get("body") or "").splitlines():
+            if re.search(r"\b(?:journal|live goal)\b", line, re.I):
+                found.update(int(number) for number in re.findall(r"#(\d+)\b", line))
+    return found
+
+
+def _goal_journal_numbers(gh: GitHub, repo: str) -> set:
+    """The goal issue numbers that are named as journals or live goals."""
+    found = gh.paginate("/repos/%s/issues?labels=loom%%3Agoal&state=open&per_page=100" % repo)
+    return goal_journal_numbers([issue for issue in found if isinstance(issue, dict)])
+
+
 def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
-                 briefers: Sequence[str] = ()) -> Optional[str]:
+                 briefers: Sequence[str] = (), journal_numbers: Optional[set] = None) -> Optional[str]:
     if "pull_request" in issue:
         return "pull request"
     if authors and tickets.owned_elsewhere(issue, authors, briefers):
         # Another operator's Loom owns an issue assigned to them.
         return "another operator's"
     names = _labels(issue)
+    operator = tickets.operator_login(authors)
+    claims = tickets.claimed_by(issue)
+    if goal_journal_title(issue):
+        return "goal journal"
+    if int(issue.get("number") or 0) in (journal_numbers or set()):
+        return "goal journal"
+    if operator and operator.lower() in claims:
+        return "operator claim"
     if any(name.startswith("loom:") for name in names) or needs_human(names):
         return "already labelled"
     return not_work_reason(issue)
@@ -3213,6 +3245,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
     cap = goal_cap()
     authors = trusted_authors()
     briefers = trusted_briefers()
+    journal_numbers = _goal_journal_numbers(gh, repo)
     lines: List[str] = []
     done = 0
     intake: Optional[Tuple[int, int]] = None  # (intake epic, tickets it holds)
@@ -3220,7 +3253,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
         if done >= limit:
             break
         number = int(issue["number"])
-        skip = _triage_skip(issue, authors, briefers)
+        skip = _triage_skip(issue, authors, briefers, journal_numbers)
         if skip:
             continue
         missing = missing_sections(issue.get("body"))

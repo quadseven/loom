@@ -408,7 +408,9 @@ repo's open issues oldest first and labels at most `--limit` of them. It
 skips pull requests, epics (an `epic` label or sub-issues), `needs:human`
 asks, `wayfinder:*` planning issues, factory incidents, issues labelled
 `awaiting-live-check` (finished work waiting to be seen live, not new work)
-and anything with a `loom:` label. A ready issue (Why, What,
+and anything with a `loom:` label. It also leaves goal journal titles,
+journals named by a goal body, and issues carrying this operator's claim
+label alone. A ready issue (Why, What,
 Acceptance criteria with checkboxes, Size and Out of scope, and a body the
 runner accepts) gets `loom:ticket` and `loom:queued` and becomes a sub-issue
 of goal N's intake epic, while the goal is under `LOOM_GOAL_CAP`; past the cap it is left
@@ -557,6 +559,9 @@ The station rewrites `loom:triage` issues without a brain tick (`bus/rewrite.py`
 It applies the same skips as triage (`brain.not_work_reason`: a `wayfinder:*`
 label, `awaiting-live-check`, a factory incident, an epic), so an issue
 labelled `loom:triage` before a skip existed is not rewritten into a ticket.
+It also skips goal journal titles, journals named by a goal body, and issues
+carrying this operator's claim label. A title-changing answer is refused for
+an issue labelled `wayfinder:*`, `loom:goal` or with this operator's claim.
 It only briefs or skips: when its model answers that only a person can do the
 work, the issue keeps `loom:triage`, gains `needs-brain` (no comment), and the
 station leaves it alone from then on; the brain decides whether it becomes a

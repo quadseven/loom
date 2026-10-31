@@ -3692,6 +3692,22 @@ class TriageTests(unittest.TestCase):
         self.assertFalse(any(c[1].endswith("/sub_issues") and c[0] == "POST" for c in routes.calls))
         self.assert_never_edited(routes)
 
+    def test_goal_journal_titles_are_not_added_to_triage(self):
+        routes = Routes([item(20, title="Goals: current direction", body="unclear"),
+                         item(21, title="Goal journal 2030-10-31", body="unclear"),
+                         item(22, title="[goal] live objective", body="unclear"),
+                         item(23, title="Ordinary issue", body="unclear")])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {23: ["loom:triage"]})
+
+    def test_goal_body_named_journal_is_not_added_to_triage(self):
+        goal_issue = item(20, title="Goal: current objective", labels=["loom:goal"],
+                          body="Journal: #21")
+        routes = Routes([goal_issue, item(21, title="Ordinary issue", body="unclear"),
+                         item(22, title="Another issue", body="unclear")])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {22: ["loom:triage"]})
+
     def test_an_inline_size_line_is_a_ready_ticket(self):
         # #668: "Size: S" on a line of its own (any case, optionally bold)
         # is a size, the same as a ## Size section.

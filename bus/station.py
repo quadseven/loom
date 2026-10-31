@@ -9198,7 +9198,7 @@ class Station:
             if issue.get("state") != "open" or "loom:triage" not in _label_names(issue):
                 raise rewrite.Invalid("the issue is no longer open in loom:triage")
             action = rewrite.apply_answer(self.gh, repo, int(job.get("goal") or 0), number,
-                                          output)
+                                          output, issue=issue)
         except RateLimited:
             raise  # the job and its answer wait for the next pass
         except rewrite.CommandFailure as err:

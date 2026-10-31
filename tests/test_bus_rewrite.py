@@ -259,6 +259,36 @@ class RewriteIssueTest(Base):
         self.fake.triage[7]["labels"] = [{"name": "loom:triage"}, {"name": "needs-brain"}]
         self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
 
+    def test_operator_claim_is_skipped_with_one_reason(self):
+        self.fake.add_triage(7)
+        self.fake.triage[7]["labels"].append({"name": "claim:alice-example"})
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "alice-example"}), \
+                contextlib.redirect_stderr(out):
+            self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
+        self.assertEqual(out.getvalue().count("skipped"), 1)
+
+    def test_a_goal_named_journal_is_skipped_with_one_reason(self):
+        self.fake.add_triage(7)
+        self.fake.triage[7]["title"] = "Ordinary issue"
+        goals = [{"number": 30, "title": "Goal: objective",
+                  "labels": [{"name": "loom:goal"}], "body": "Journal: #7"}]
+        gh = self.gh()
+        gh.paginate = mock.Mock(side_effect=[list(self.fake.triage.values()), goals])
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            self.assertEqual(rewrite.candidates(gh, REPO), [])
+        self.assertEqual(out.getvalue().count("skipped"), 1)
+
+    def test_title_change_is_refused_for_a_goal_issue(self):
+        self.fake.add_triage(7)
+        self.fake.triage[7]["labels"].append({"name": "loom:goal"})
+        with self.assertRaisesRegex(rewrite.Invalid, "cannot change the title"):
+            rewrite.apply_answer(self.gh(), REPO, GOAL, 7,
+                                 json.dumps(dict(BRIEF, title="A new title")),
+                                 issue=self.fake.triage[7])
+        self.assertEqual(self.fake.created, [])
+
     def test_work_that_is_not_for_a_lane_is_not_a_candidate(self):
         # loom#34, a wayfinder decision question labelled loom:triage before
         # triage skipped wayfinder issues, became a ticket that churned for
