@@ -3455,6 +3455,25 @@ class PastLastRungTests(unittest.TestCase):
         query = [c[2]["query"] for c in fake.calls if c[1].endswith("/graphql")][0]
         return section, query
 
+    def test_status_lists_the_kept_pull_request_under_past_the_last_rung(self):
+        # A kept pull request for a past-ladder ticket is listed under "Past the last rung".
+        node = dict(ready_node(threads=[]), mergeable="MERGEABLE", rulingThreads={"nodes": []})
+        past = dict(stuck_ticket("failed"), title="Past", created_at="2030-01-01T00:00:00Z")
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [past]),
+                  ("GET", "/issues/9/events"): reply(200, []),
+                  ("GET", "/issues/9/comments"): reply(200, list(rungs(1, 2, 3))),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [
+                      {"number": 4, "title": "PR", "head": {"ref": "loom/9-work"}}]),
+                  ("POST", "/graphql"): reply(200, {"data": {"repository": {"p4": node}}})}
+        routes.update(lanes_routes(()))
+        fake = Routed(routes)
+        env = {"LOOM_BRIEF_AUTHORS": "example-brain"}
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env=env)
+        section = report.split(brain.PAST_RUNG_HEADING, 1)[1].split("\n#", 1)[0]
+        lines = [l for l in section.splitlines() if l.strip()]
+        self.assertEqual(lines[0], "- #9 Past - PR #4 - mergeable mergeable - 0 unresolved threads")
+        self.assertNotIn("no open pull request", section)
+
     def test_status_lists_a_ticket_past_rung_3_with_its_answered_high_thread(self):
         answered = {"isResolved": False, "comments": {"nodes": [
             {"databaseId": 71, "author": self.BOT, "body": "high | correctness | the cache is never cleared\nmore"},

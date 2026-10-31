@@ -3044,12 +3044,36 @@ class Tickets(Base):
         self.go()
         self.assertEqual((self.moved, self.fixed), ([], []))
 
-    def test_a_failed_ticket_past_the_last_rung_closes_its_lane_pull_request(self):
-        # A ticket that ran every rung is left loom:failed for the brain, but
-        # its open lane pull request is closed so the lane does not stall on it.
+    def test_a_past_ladder_ticket_whose_pull_request_head_is_green_keeps_that_pull_request_open(self):
         self.gh.ticket(7, "failed")
         self.gh.comments[7] += ALL_RUNGS
-        self.gh.pull(70, 7, resolved=False)
+        self.gh.pull(70, 7, green=True, mergeable=True, resolved=False)
+        self.go()
+        self.assertEqual((self.moved, self.fixed), ([], []))
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+        self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+        self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
+
+    def test_a_stuck_ticket_past_the_ladder_with_green_head_keeps_its_pull_request_open(self):
+        self.gh.ticket(5, "pr")
+        self.gh.comments[5] += ALL_RUNGS + [{"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, green=True, mergeable=True, resolved=False)
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[50]["state"], "open")
+        self.assertEqual(self.moved, [(5, "failed", None)])
+
+    def test_a_failed_ticket_past_the_last_rung_closes_its_lane_pull_request(self):
+        # A ticket that ran every rung is left loom:failed for the brain, and
+        # its open lane pull request is closed when its head has a failing check.
+        self.gh.ticket(7, "failed")
+        self.gh.comments[7] += ALL_RUNGS
+        self.gh.pull(70, 7, green=False, resolved=False)
         self.go()
         self.assertEqual((self.moved, self.fixed), ([], []))
         self.assertEqual(len(self.closed), 1)
@@ -3071,7 +3095,7 @@ class Tickets(Base):
         self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
         self.gh.comments[7] += ALL_RUNGS + [
             {"body": factory.GAVE_UP + " (x; ran on none).", "user": ME}]
-        self.gh.pull(70, 7, resolved=False)
+        self.gh.pull(70, 7, green=False, resolved=False)
         self.go()
         self.assertEqual([c[0] for c in self.closed], [70])
         note = self.closed[0][1]
