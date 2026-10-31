@@ -3131,7 +3131,7 @@ class Factory:
         would discard them), and at most HYGIENE_UPDATES_PER_REPO a repo a
         pass. The keep-current cooldown is shared, so a pull request the
         held path just brought up to date is not updated again here."""
-        if _state(issue) not in ("pr", "answered"):
+        if _state(issue) not in ("pr", "answered", "briefed", "failed"):
             return
         held = self._lock(repo)
         if held == number:
