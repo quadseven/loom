@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
-from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
+from . import already_done, audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
@@ -641,6 +641,8 @@ def _unbuilt_criteria_reason(body: str) -> str:
                 if criteria_gate.kind(text) != criteria_gate.LIVE]
     if criteria and all(_NOT_BUILT.search(text) for text in criteria):
         return "blocked: no criterion built"
+    if already_done.uncited(body):
+        return "blocked: a criterion says it is already done and cites no code"
     return ""
 
 
@@ -704,8 +706,9 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
         if not sha or not _review_check_passed(gh, repo, sha, check):
             return (line.removesuffix("READY")
                     + "blocked: review check has not passed on the head commit")
-    if line.endswith(" - READY") and _unbuilt_criteria_reason(str(pr.get("body") or "")):
-        return line.removesuffix("READY") + "blocked: no criterion built"
+    unbuilt = _unbuilt_criteria_reason(str(pr.get("body") or ""))
+    if line.endswith(" - READY") and unbuilt:
+        return line.removesuffix("READY") + unbuilt
     foreign = _foreign_criteria_reason(str(pr.get("body") or ""), repo)
     if line.endswith(" - READY") and foreign:
         return line.removesuffix("READY") + foreign
@@ -3858,6 +3861,10 @@ def merge(gh: GitHub, repo: str, number: int,
             reason = _unbuilt_criteria_reason(str(pr.get("body") or ""))
             if reason:
                 raise ValueError(reason)
+            unproven = already_done.unproven(str(pr.get("body") or ""),
+                                             already_done.base_reader(gh, repo, pr))
+            if unproven:
+                raise ValueError("blocked: no code on the base backs: " + "; ".join(unproven))
         reason = _foreign_criteria_reason(str(pr.get("body") or ""), repo, env)
         if reason:
             raise ValueError(reason)
