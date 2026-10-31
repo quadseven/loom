@@ -39,6 +39,7 @@ from . import converge
 from . import brain_memory
 from . import brain_hold
 from . import claimed
+from . import claim_referee
 from . import fabric
 from . import fixrounds
 from . import logrotate
@@ -909,6 +910,8 @@ class Settings:
                  settle_claimed: str = "off",
                  settle_claimed_max: int = claimed.PER_RUN,
                  claim_idle_hours: int = 0,
+                 claim_referee: str = "off",
+                 engine_claims: Sequence[str] = claim_referee.ENGINE_CLAIMS,
                  agy_workdir: str = "",
                  thin_snapshots: bool = False,
                  urgency_config: Optional[urgency.Config] = None,
@@ -934,6 +937,12 @@ class Settings:
         # alone this long comes back to this Loom (bus/stale_claims.py); 0, the
         # default for a Settings built in code, is off; from_env defaults to 24.
         self.claim_idle_hours = claim_idle_hours
+        # LOOM_CLAIM_REFEREE: "on" (from_env's default) keeps one engine claim
+        # per ticket and expires idle ones (bus/claim_referee.py), "dry" logs
+        # what it would remove, "off" skips it; off for a Settings built in
+        # code. LOOM_ENGINE_CLAIMS names the engine claim labels.
+        self.claim_referee = claim_referee
+        self.engine_claims = tuple(x.lower() for x in engine_claims)
         # LOOM_SETTLE_CLAIMED: "on" settles operator-claimed issues whose pull
         # requests merged, "dry" (from_env's default) logs what it would do,
         # "off" skips it; off for a Settings built in code, like the factory
@@ -1121,6 +1130,8 @@ class Settings:
                    settle_claimed=claimed.mode(env.get("LOOM_SETTLE_CLAIMED", "")),
                    settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")),
                    claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")),
+                   claim_referee=claim_referee.mode(env.get("LOOM_CLAIM_REFEREE", "")),
+                   engine_claims=claim_referee.engines(env.get("LOOM_ENGINE_CLAIMS", "")),
                    agy_workdir=_agy_workdir(env),
                    thin_snapshots=env.get("LOOM_THIN_SNAPSHOTS", "1").strip() != "0",
                    urgency_config=urgency.Config.from_env(env),
@@ -4962,6 +4973,7 @@ class Station:
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.close_done_tickets, self.settle_orphan_sources,
                      self.settle_claimed_tickets, self.release_stale_claims,
+                     self.referee_claims,
                      self.clean_labels,
                      self.queue_stateless_tickets,
                      self.restate_shipped_live,
@@ -9894,16 +9906,130 @@ class Station:
         self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": list(names)})
         _say("%s#%d: add %s" % (repo, number, ", ".join(names)))
 
-    def _unlabel(self, repo: str, number: int, removal: "label_pass.Removal") -> None:
-        """Remove one label, or in shadow record that it would be removed."""
+    def _unlabel(self, repo: str, number: int, removal: Any,
+                 source: str = "station clean_labels") -> None:
+        """Remove one label (a removal with .label and .why), or in shadow
+        record that it would be removed."""
         why = "remove %s: %s" % (removal.label, removal.why)
         if shadow.active(repo):
             shadow.record_held(shadow.UNLABEL, repo, number, "issue", reason=why,
-                               label=removal.label, source="station clean_labels")
+                               label=removal.label, source=source)
             return
         self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
                      % (repo, number, quote(removal.label, safe="")), ok=(404,))
         _say("%s#%d: %s" % (repo, number, why))
+
+    def referee_claims(self) -> None:
+        """One claim per ticket, idle engine claims expire (bus/claim_referee.py,
+        loom#2277). At most once every claim_referee.EVERY seconds. Until a
+        run finds nothing more to remove (the first pass over the claims that
+        already exist), at most FIRST_PER_RUN issues a run and no notes; then
+        at most PER_RUN, a duplicate's removal noted in the ticket's status.
+        All repos share one due list and READS_PER_RUN timeline reads, and
+        the state file keeps the place in the list across runs. "dry" logs
+        each removal and writes nothing."""
+        if self.s.claim_referee not in ("on", "dry"):
+            return
+        path = os.path.join(self.state, claim_referee.STATE_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        last = state.get("_at")
+        if isinstance(last, (int, float)) and 0 <= self.now - last < claim_referee.EVERY:
+            return
+        first = not state.get("swept")
+        budget = {"left": claim_referee.FIRST_PER_RUN if first else claim_referee.PER_RUN,
+                  "spent": 0}
+        whole = False
+        due: List[Tuple[str, Dict[str, Any]]] = []
+        start = 0
+        try:
+            due, listed = self._all_claims_due()
+            ordered, start = claim_referee.in_turn(due, state.get("turn"))
+            whole = self._referee_in_turn(ordered, first, budget) and listed
+        finally:
+            state["_at"] = self.now
+            state["turn"] = (start + budget["spent"]) % len(due) if due else 0
+            if first and whole and self.s.claim_referee == "on":
+                state["swept"] = True
+                _say("the first claim referee pass is done")
+            _write_json(path, state)
+
+    def _all_claims_due(self) -> Tuple[List[Tuple[str, Dict[str, Any]]], bool]:
+        """(every repo's issues whose engine claims may be due, whether every
+        repo could be listed)."""
+        due: List[Tuple[str, Dict[str, Any]]] = []
+        listed = True
+        for repo in self._verify_repos():
+            if self._deferred():
+                return due, False
+            try:
+                due += self._claims_due(repo)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not read the claims of %s: %s" % (repo, err))
+                listed = False
+        return due, listed
+
+    def _referee_in_turn(self, ordered: Sequence[Tuple[str, Dict[str, Any]]], first: bool,
+                         budget: Dict[str, int]) -> bool:
+        """Referee `ordered` within `budget` (issues changed, timelines read),
+        which keeps its count if a read raises; False when some went unread."""
+        own_apps = sorted(self._own_apps())
+        trusted = list(self.s.authors) + list(self.s.briefers)
+        whole = True
+        for repo, issue in ordered:
+            if (budget["left"] <= 0 or budget["spent"] >= claim_referee.READS_PER_RUN
+                    or self._deferred()):
+                return False
+            try:
+                budget["left"] -= self._referee_claim(repo, issue, first, own_apps, trusted)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                whole = False
+                _say("could not referee %s#%s: %s" % (repo, issue.get("number"), err))
+            budget["spent"] += 1
+        return whole
+
+    def _claims_due(self, repo: str) -> List[Tuple[str, Dict[str, Any]]]:
+        """The repo's open issues whose engine claims may be due, by number."""
+        engines = self.s.engine_claims
+        present = {str(label.get("name") or "").lower() for label in self.gh.paginate(
+            "/repos/%s/labels" % repo) if isinstance(label, dict)}
+        found: Dict[int, Dict[str, Any]] = {}
+        for label in engines:
+            if label not in present:
+                continue
+            for issue in self._paginate("/repos/%s/issues?labels=%s&state=open"
+                                        % (repo, quote(label, safe=":"))):
+                if isinstance(issue, dict) and "pull_request" not in issue:
+                    found[int(issue["number"])] = issue
+        return [(repo, issue) for _, issue in sorted(found.items())
+                if claim_referee.needs_timeline(issue, engines)]
+
+    def _referee_claim(self, repo: str, issue: Dict[str, Any], first: bool,
+                       own_apps: Sequence[str], trusted: Sequence[str]) -> int:
+        """Read one issue's timeline and apply plan(): 1 if it changed, or
+        would in dry mode, else 0."""
+        number = int(issue["number"])
+        timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
+        removals = claim_referee.plan(issue, timeline, self.now, self.s.engine_claims,
+                                      own_apps, trusted)
+        if not removals:
+            return 0
+        dry = self.s.claim_referee == "dry"
+        for removal in removals:
+            if dry:
+                _say("%s#%d: would remove %s: %s" % (repo, number, removal.label, removal.why))
+            else:
+                self._unlabel(repo, number, removal, source="station referee_claims")
+        duplicates = [r for r in removals if r.duplicate]
+        if duplicates and not first and not dry:
+            self._routine(repo, number, "Removed the claim label %s: %s. One engine "
+                          "claim per ticket." % (", ".join(r.label for r in duplicates),
+                                                 duplicates[0].why))
+        return 1
 
     def _foreign_claimed(self, repo: str) -> Dict[int, Dict[str, Any]]:
         """The repo's open issues another operator claims by label, or that
