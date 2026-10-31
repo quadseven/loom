@@ -3188,6 +3188,16 @@ def _oldest_open_issues(gh: GitHub, repo: str):
     while url:
         resp = gh.rest("GET", url)
         for item in resp.data if isinstance(resp.data, list) else []:
+            if isinstance(item, dict) and "pull_request" not in item:
+                title = str(item.get("title") or "").lower()
+                body = str(item.get("body") or "")
+                # Skip issues that look like goals (acceptance criterion 2)
+                if (title.startswith("goals:") or 
+                    title.startswith("goal journal") or
+                    "[goal]" in title or
+                    re.search(r"\[goal\]", body) or
+                    "goal journal" in body):
+                    continue
             yield item
         url = _next_link(resp.headers.get("link", ""))
 

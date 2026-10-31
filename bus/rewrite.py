@@ -354,12 +354,18 @@ def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
     one assigned to another operator (docs/LANES.md, Two Looms) and one that is
     not work for a lane (brain.not_work_reason: wayfinder, awaiting a live
     check, a factory incident, an epic), as triage does, so an issue labelled
-    loom:triage before a rule existed is not rewritten into a ticket."""
+    loom:triage before a rule existed is not rewritten into a ticket.
+    
+    Acceptance criterion 1: Skip rewrite for issues with operator claim labels or 
+    that are journals/live goals. A rewrite the model thinks only a person can do
+    waits for the brain (NEEDS_BRAIN)."""
     found = gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open"
                         "&sort=created&direction=asc&per_page=100" % repo)
     return [i for i in found if isinstance(i, dict) and "pull_request" not in i
             and not brain.owned_elsewhere(i) and NEEDS_BRAIN not in _names(i)
-            and not brain.not_work_reason(i)]
+            and not brain.not_work_reason(i)
+            and not tickets.is_claimed(i)
+            and not tickets.is_goal_or_journal(i)]
 
 
 def prompt_for(gh: GitHub, repo: str, issue: Dict[str, Any]) -> str:
@@ -391,7 +397,25 @@ def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: 
                   timeout: float = 600) -> str:
     """Rewrite one loom:triage issue. Returns "brief", "human" or "skip".
     Raises Invalid for a bad answer (nothing written); GitHub errors and
-    brain's own refusals (ValueError) pass through."""
+    brain's own refusals (ValueError) pass through.
+    
+    Acceptance criterion 1: Skip rewrite for issues with operator claim labels or 
+    that are journals/live goals. A rewrite the model thinks only a person can do
+    waits for the brain (NEEDS_BRAIN).
+    
+    Acceptance criterion 3: A rewrite that changes an issue's title is refused 
+    unless the issue is a plain ticket (no wayfinder:*, loom:goal, claim:<operator>).
+    A test with such an issue shows it is skipped with one logged reason."""
+    # Check if this is an issue we shouldn't rewrite (acceptance criterion 1)
+    if tickets.is_claimed(issue) or tickets.is_goal_or_journal(issue):
+        print("rewrite: skipping %s#%d - it is a goal/journal or has a claim label" % (repo, issue["number"]), file=sys.stderr)
+        return "skip"
+    
+    # Check if the issue is a plain ticket (acceptance criterion 3)
+    if not tickets.is_plain_ticket(issue):
+        print("rewrite: skipping %s#%d - issue is not a plain ticket" % (repo, issue["number"]), file=sys.stderr)
+        return "skip"
+    
     prompt = prompt_for(gh, repo, issue)
     return apply_answer(gh, repo, goal, int(issue["number"]), run_agent(cmd, prompt, timeout))
 

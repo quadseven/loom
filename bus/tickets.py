@@ -1014,6 +1014,77 @@ def claim_label(login: str) -> str:
     return CLAIM_LABEL_PREFIX + login.lower()
 
 
+def _names(issue: Dict[str, Any]) -> set:
+    """The issue's label names as strings."""
+    return {str(x.get("name") if isinstance(x, dict) else x)
+            for x in issue.get("labels") or []}
+
+
+def is_claimed(issue: Dict[str, Any]) -> bool:
+    """Whether the issue carries a claim label (claim:<login>)."""
+    for label in issue.get("labels") or []:
+        name = str(label.get("name") if isinstance(label, dict) else label or "")
+        if name.startswith(CLAIM_LABEL_PREFIX) and len(name) > len(CLAIM_LABEL_PREFIX):
+            return True
+    return False
+
+
+def claimed_by(issue: Dict[str, Any]) -> List[str]:
+    """The lower-case logins named by the issue's claim:<login> labels."""
+    found = []
+    for label in issue.get("labels") or []:
+        name = str(label.get("name") if isinstance(label, dict) else label or "")
+        if name.lower().startswith(CLAIM_LABEL_PREFIX) and len(name) > len(CLAIM_LABEL_PREFIX):
+            found.append(name[len(CLAIM_LABEL_PREFIX):].strip().lower())
+    return [login for login in found if login]
+
+
+def is_goal_or_journal(issue: Dict[str, Any], goal: Optional[int] = None) -> bool:
+    """Whether the issue is a goal home, journal or named as such in the body.
+    
+    A goal home has loom:goal in its labels.
+    A journal has JOURNAL_MARKER at the start of its body.
+    An issue can name a goal in its body with a "Part of #<number>" line.
+    """
+    from .brain import JOURNAL_MARKER
+    
+    # Check if it's a goal home
+    if "loom:goal" in _names(issue):
+        return True
+    
+    # Check if it's a journal
+    if issue.get("body") and issue["body"].startswith(JOURNAL_MARKER):
+        return True
+    
+    # Check if it names a goal in its body
+    body = str(issue.get("body") or "")
+    import re
+    if re.search(r"^Part of #\d+(?!\d)", body, re.M):
+        return True
+    
+    # Check if it names a goal from a specific goal number
+    if goal is not None and re.search(r"^Part of #%d(?!\d)" % goal, body, re.M):
+        return True
+    
+    return False
+
+
+def has_wayfinder_label(issue: Dict[str, Any]) -> bool:
+    """Whether the issue has any wayfinder label (wayfinder:*.)."""
+    for label in issue.get("labels") or []:
+        name = str(label.get("name") if isinstance(label, dict) else label or "")
+        if name.startswith("wayfinder:"):
+            return True
+    return False
+
+
+def is_plain_ticket(issue: Dict[str, Any]) -> bool:
+    """Whether the issue is a plain ticket (no wayfinder, no goal, no claim)."""
+    return (not has_wayfinder_label(issue) and 
+            not is_goal_or_journal(issue) and 
+            not is_claimed(issue))
+
+
 def claimed_by(issue: Dict[str, Any]) -> List[str]:
     """The lower-case logins named by the issue's claim:<login> labels."""
     found = []
