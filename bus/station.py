@@ -2482,10 +2482,11 @@ class Station:
         return found is not None and found[0].pr == pr
 
     def _fix_for(self, repo: str, comments: List[Any]) -> Optional[Tuple[tickets.Fix, Any]]:
-        """Return the newest trusted fix after the last claim, regardless of
-        later non-fix comments. Raises ValueError for an unusable fix."""
+        """Return the newest trusted fix after the last claim or rung reset.
+        Raises ValueError for an unusable fix."""
         allowed = {a.lower() for a in self.s.authors}
-        last_claim, newest_fix = -1, None
+        comments = status.expand(comments, self.s.authors)
+        last_claim, last_reset, newest_fix = -1, -1, None
         for i, c in enumerate(comments):
             if not isinstance(c, dict):
                 continue
@@ -2494,9 +2495,11 @@ class Station:
             # A stranger's claim marker must not hide a trusted fix.
             if trusted and CLAIM_RE.fullmatch(body.strip()):
                 last_claim = i
+            if trusted and "<!-- loom:rung 0 -->" in body:
+                last_reset = i
             if trusted and body.startswith(tickets.FIX_MARKER):
                 newest_fix = (i, c, body)
-        if newest_fix is None or newest_fix[0] < last_claim:
+        if newest_fix is None or newest_fix[0] < max(last_claim, last_reset):
             return None
         # GitHub keeps no editor for comments: one changed after it was
         # posted may carry someone else's words.

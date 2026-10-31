@@ -5113,6 +5113,41 @@ class FixTest(Base):
         self.assertIn("loom:pr", self.fake.names(12))
         self.assertNotIn("loom:running", self.fake.names(12))
 
+    def test_rung_zero_restart_ignores_a_fix_for_a_merged_pull_request(self):
+        self.fake.add(12)
+        self.comment(12, FIX_BODY)
+        self.comment(12, "<!-- loom:rung 0 --> restart")
+        self.fake.pulls.append({"number": 99, "state": "closed",
+                                "merged_at": "2030-01-02T12:00:00Z",
+                                "merge_commit_sha": "%040x" % 99, "base": {"ref": "main"},
+                                "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        brief = self.claimed_brief()
+        self.assertNotIn("Fix-PR:", brief)
+        self.assertIn("Branch: loom/12-", brief)
+        self.assertEqual(self.fake.names(12)[1], "loom:running")
+
+    def test_rung_zero_restart_ignores_a_fix_for_a_closed_pull_request(self):
+        self.fake.add(12)
+        self.comment(12, FIX_BODY)
+        self.comment(12, "<!-- loom:rung 0 --> restart")
+        self.fake.pulls.append({"number": 99, "state": "closed", "merged_at": None,
+                                "base": {"ref": "main"}, "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        self.assertNotEqual(self.listing(), [])
+        self.assertNotIn("Fix-PR:", self.claimed_brief())
+
+    def test_status_claim_ends_older_fix_but_not_a_fix_posted_after_claim(self):
+        claim = "Claimed for lane codex (body sha256 0123456789ab)"
+        fix = {"id": 1, "user": {"login": AUTHORS[0]}, "body": FIX_BODY,
+               "created_at": "2030-01-01T00:00:00Z", "updated_at": "2030-01-01T00:00:00Z"}
+        status_claim = {"id": 2, "user": {"login": AUTHORS[0]},
+                        "body": "<!-- loom:status v1 -->\n- 2030-01-02T00:00:00Z " + claim,
+                        "created_at": "2030-01-02T00:00:00Z", "updated_at": "2030-01-02T00:00:00Z"}
+        self.assertIsNone(self.station._fix_for(REPO, [fix, status_claim]))
+        status_claim["body"] = "<!-- loom:status v1 -->\n- 2029-12-31T00:00:00Z " + claim
+        self.assertIsNotNone(self.station._fix_for(REPO, [status_claim, fix]))
+
     def test_a_fix_for_an_open_pull_request_is_briefed(self):
         self.fake.add(12)
         self.comment(12, "Lane codex opened a pull request: https://example.com/pull/99")
