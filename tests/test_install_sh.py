@@ -277,6 +277,34 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn(entry, (agents / "com.loom.station.plist").read_text())
         self.assertIn(entry, (agents / "com.loom.brain.plist").read_text())
 
+    def trusted_briefers_entries(self):
+        agents = self.home / "Library" / "LaunchAgents"
+        found = [re.search(r"<key>LOOM_TRUSTED_BRIEFERS</key><string>(.*?)</string>",
+                           (agents / (label + ".plist")).read_text())
+                 for label in ("com.loom.station", "com.loom.brain")]
+        return [match.group(1) if match else "" for match in found]
+
+    def test_a_reinstall_with_the_setting_unset_keeps_the_installed_briefers(self):
+        self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example app[bot]").returncode, 0)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.trusted_briefers_entries(), ["dana-example app[bot]"] * 2)
+
+    def test_a_reinstall_that_sets_the_briefers_replaces_them_even_with_empty(self):
+        self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example").returncode, 0)
+        self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="lee-example").returncode, 0)
+        self.assertEqual(self.trusted_briefers_entries(), ["lee-example"] * 2)
+        self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="").returncode, 0)
+        self.assertEqual(self.trusted_briefers_entries(), ["", ""])
+
+    def test_an_unreadable_installed_plist_stops_a_reinstall_that_names_no_briefers(self):
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        (agents / "com.loom.station.plist").write_text("not a plist")
+        result = self.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LOOM_TRUSTED_BRIEFERS", result.stderr)
+
     def test_goal_limits_are_written_to_station_and_brain_plists(self):
         result = self.run_install(LOOM_GOAL_CAP="28", LOOM_UNVERIFIED_LIMIT="60",
                                   LOOM_NO_LANE_REROUTE="4")
