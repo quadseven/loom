@@ -669,6 +669,14 @@ only what is its own, and adding an operator is configuration:
   routing and pull request pass, `bus.brain move`, the station's claim, pull
   request adoption and the verify picker all skip one assigned to anyone
   else. The station logs each skip once (`state/station/owned.json`).
+- Outside work beats a claim of ours. A `claim:overflow` label, an `overflow:`
+  price with no `overflow paid:` label yet, or a person outside
+  `LOOM_BRIEF_AUTHORS` among the assignees makes a ticket someone else's even
+  with this Loom's claim or operator on it. An App assignee owns nothing. The
+  hand-back pass, `bus.brain escalate`, `bus.brain fix`, the status stuck marks
+  and remote lanes skip it too. `claim:overflow` is a person's claim: it is
+  never an engine claim, never expires and is never removed. A contributor's
+  own pull request still moves their ticket to `loom:pr` and `loom:merged`.
 - A claim is not forever. Once an hour the station reads each open issue
   another operator claims (a `claim:<login>` label not its own, or an
   assignment to a `LOOM_TRUSTED_BRIEFERS` login). When neither the claim nor

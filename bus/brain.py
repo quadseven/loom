@@ -3757,7 +3757,7 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     if issue.get("state") != "open":
         raise ValueError("cannot move a closed issue")
     owner = owned_elsewhere(issue)
-    if owner is not None and state in ("queued", "briefed", "running"):
+    if owner is not None and state in ("queued", "briefed", "running", "pr", "failed"):
         raise ValueError("#%d is assigned to %s, another operator's; leave it to their Loom"
                          % (number, owner))
     if state == "queued" and lane in REMOTE_LANES:
@@ -3854,6 +3854,9 @@ def merge(gh: GitHub, repo: str, number: int,
                    or factory.DEFAULT_REVIEW_BOT)
             _validate_sensitive_merge(gh, repo, details, bot, review_check_name(env))
         association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
+        owner = owned_elsewhere(issue, env)
+        if owner is not None:
+            raise ValueError("#%d is held by %s; leave it to them" % (association[1], owner))
         _refuse_pending_fix(gh, association, env)
         verdict = _verdict_reader(gh, repo, number, details, association, env)
         _refuse_operator_hold(gh, repo, number, pr, details, association, issue, verdict)
@@ -3893,6 +3896,8 @@ def _settle_merged_ticket(gh: GitHub, repo: str, number: int, pr_body: str,
                           association: Tuple[str, int], issue: Dict[str, Any]) -> None:
     """Move the ticket of the pull request just merged: to loom:queued with a
     note when the diff or the boxes left it unbuilt, else to loom:merged."""
+    if owned_elsewhere(issue) is not None:
+        return
     reason = _unbuilt_reason(gh, repo, number, issue) or _unbuilt_boxes(pr_body, issue)
     if reason:
         move(gh, association[0], association[1], "queued",
@@ -5116,6 +5121,7 @@ def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
         (ticket[0] == repo, "ticket and pull request must be in the same repository"),
         (_ticket_association(repo, pr) == ticket, "pull request is not linked to the ticket"),
         (issue.get("state") == "open" and "loom:ticket" in names, "ticket is not an open loom:ticket"),
+        (owned_elsewhere(issue) is None, "ticket is held by someone outside this Loom"),
         # A failed ticket is one a runaway hold left after its run ended.
         (bool({"loom:briefed", "loom:running", "loom:pr", "loom:failed"} & set(names)),
          "ticket is not loom:briefed, loom:running, loom:pr or loom:failed"),
@@ -6219,7 +6225,8 @@ def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime
     """The histories of stuck-state tickets, and the numbers it skipped. Each
     history is two paginated reads, so status reads at most STATUS_HISTORY_MAX
     per repo, the least recently updated first (the likeliest to be stuck)."""
-    candidates = sorted((i for i in found if any("loom:" + x in _labels(i) for x in STUCK_STATES)),
+    candidates = sorted((i for i in found if any("loom:" + x in _labels(i) for x in STUCK_STATES)
+                         and owned_elsewhere(i) is None),
                         key=lambda i: str(i.get("updated_at") or ""))
     waiting = held or {}
     read = candidates[:STATUS_HISTORY_MAX]
@@ -6379,6 +6386,9 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     _check_decision_claim(gh, repo, number, notes)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     names = _labels(issue)
+    owner = owned_elsewhere(issue)
+    if owner is not None:
+        raise ValueError("#%d is held by %s; the ladder leaves it alone" % (number, owner))
     if RUNAWAY in names:
         raise ValueError("ticket is held for runaway review")
     if issue.get("state") != "open" or "loom:ticket" not in names:
