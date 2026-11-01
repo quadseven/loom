@@ -426,6 +426,10 @@ A new App is easiest made from
 
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
+A free lane takes work: not at a limit, its heartbeat says available, and not
+down or demoted (bus/scorecard.py). The same test picks every tier move,
+stall move and automatic retry, so no ticket is given a lane only to step
+straight off it again.
 It skips future `Not before:` times and tickets without a readable Difficulty.
 The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
@@ -1288,7 +1292,7 @@ Each invariant is one function returning breaches with evidence:
 - Goal homes whose body names a roll (the word `roll` or `rolls`) that no
   `LOOM_ROLL_SHIP_DOCS` entry names (`roll-pin-off`, one rolling issue for
   every such goal): the station opens no source-pin pull request when their
-  module changes merge (README.md, Roll source pins). The issue says when
+  module changes merge (docs/ROLL_PINS.md). The issue says when
   the setting is empty, which turns the pass off.
 - Tickets still at `loom:merged` 24 hours after a ship rule found their merge
   commit deployed, because the move to `loom:shipped` failed

@@ -344,7 +344,17 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    with the Rules below and the commit they come from. Open defers of a
    brain no longer ticking (the packet marks them open work for any brain)
    are finished before new work, through `resume` as below.
-   Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and,
+   Run `python3 -m bus.brain status $LOOM_REPOS --deadline 1.5`. It reads
+   the repos side by side, the heaviest first, prints each repo's section as
+   soon as that repo is read, and logs progress to stderr. `--deadline
+   MINUTES` (default 1.5) stops the reads inside your 2-minute command
+   timeout: it prints `status skipped OWNER/NAME: deadline` for each repo
+   it did not finish, then the sections across repos from the repos it
+   read, ends with `status partial: not read this run: ...`, and exits 3. A
+   repo that timed out or that GitHub answered with a fault is named in its
+   section and also exits 3. Exit 3 means partial, not failed: a repo it
+   names is not a repo with nothing ready; read it next tick, or run status
+   for the named repos alone. Read the lane status and,
    for each goal, its latest journal, report, measurement and completed
    action, and its report deadline. Every goal under "Reports owed before
    unlock" gets its report in the report step this tick, in every scope,
