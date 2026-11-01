@@ -7,7 +7,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
-from . import app, brain, decision_claim, journal, labels, lock, naming, station, tick_clock
+from . import app, brain, decision_claim, goal_consolidate, journal, labels, lock, naming, station, tick_clock
 from .github import GitHub, GitHubError, Transport, auth_from_env, openssl_sign
 
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
@@ -46,6 +46,9 @@ def _parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("labels", help="create the loom labels on repos")
     s.add_argument("repos", nargs="+", type=_repo, metavar="OWNER/NAME")
+    s = sub.add_parser("consolidate-goals", help="survey a goal consolidation plan; --apply runs it")
+    s.add_argument("--file", required=True, help="JSON plan (docs/BRAIN.md, Consolidating goal homes)")
+    s.add_argument("--apply", action="store_true", help="write the changes; without it nothing is written")
     s = sub.add_parser("lock", help="take the brain tick lock")
     s.add_argument("repo", type=_repo, metavar="OWNER/NAME")
     s.add_argument("--holder", required=True)
@@ -113,6 +116,8 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
             changed = labels.ensure_labels(gh, repo)
             print("%s: %s" % (repo, ", ".join(changed) if changed else "no changes"))
         return 0
+    if args.command == "consolidate-goals":
+        return goal_consolidate.run(gh, args.file, args.apply)
     if args.command == "lock":
         ok, current_holder = lock.acquire(gh, args.repo, args.holder, args.minutes)
         print("lock acquired" if ok else "lock held by %s" % current_holder)

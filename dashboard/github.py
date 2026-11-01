@@ -521,7 +521,8 @@ class TicketStore:
         data["goal_context"] = goals.goal_context(
             rows, list(data.get("issue_comments", [])) + reports, titles, metric_comments,
             os.environ.get("LOOM_METRICS_GOAL", "").strip() or None, datetime.now(timezone.utc),
-            parents=parents, unread=unread, epics=epics)
+            parents=parents, unread=unread, epics=epics,
+            queues={goal for goal, entry in cache.items() if entry.get("is_queue")})
         data["goal_context_error"] = ""
 
     def _read_dashboard(self, data: Dict[str, Any]) -> None:
@@ -884,6 +885,7 @@ class TicketStore:
         return {"title": str(issue.get("title") or "") or None,
                 "parent": goals.parent_of(repo, issue, configured),
                 "is_goal": "loom:goal" in names, "is_epic": is_epic,
+                "is_queue": "loom:backlog" in names,
                 "epic_goal": goals.epic_goal_of(repo, issue, configured) if is_epic else None,
                 "open": issue.get("state", "open") != "closed", "read_at": now}
 

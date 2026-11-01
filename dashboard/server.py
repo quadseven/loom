@@ -453,9 +453,10 @@ def _goal_card(goal, children, grouped, goal_data, missing, now):
         if any(row.get("state") == name for row in tickets))
     title = strip_kind(info.get("title")) or _short_ref(goal)
     measure = info.get("measure")
+    smaller = [child for child in children if not (goal_data.get(child) or {}).get("queue")]
     child_html = ('<ul class="goal-children" aria-label="Smaller goals in this goal">%s</ul>' % "".join(
         _goal_child_row(child, goal_data.get(child) or {}, grouped.get(child, []), now)
-        for child in sorted(children, key=lambda c: -len(grouped.get(c, []))))) if children else ""
+        for child in sorted(smaller, key=lambda c: -len(grouped.get(c, []))))) if smaller else ""
     return (
         '<article class="goal-card card"><div class="machine-fact">%s</div><h2>%s</h2>'
         '<div class="goal-metric"><div>%s</div>'

@@ -10,7 +10,7 @@ import unittest
 import unittest.mock
 from datetime import datetime, timezone
 
-from dashboard import goals, server, views
+from dashboard import github as dashboard_github, goals, server, views
 
 NOW = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 REPO = "example-owner/sample"
@@ -288,6 +288,31 @@ class RollUp(unittest.TestCase):
         self.assertIn("Smaller goal", children)
         self.assertIn("sample#41 / 2 in flight / report", children)
         self.assertIn('href="/tickets?goal=%s"' % server.quote(REPO + "#41", safe=""), children)
+
+    def test_a_queue_under_a_goal_is_no_row_in_its_card(self):
+        rows = goal_rows((7, 30, "pr"), (8, 41, "running"), (9, 42, "running"))
+        names = {REPO + "#30": "Main goal", REPO + "#41": "Smaller goal", REPO + "#42": "Intake funnel"}
+        context = goals.goal_context(rows, [], names, [], None, NOW, queues={REPO + "#42"},
+                                     parents={REPO + "#41": REPO + "#30", REPO + "#42": REPO + "#30"})
+        found = cards(server._goals(goals_state(rows, context)))
+        self.assertEqual(len(found), 1)
+        self.assertIn("Smaller goal", found[0])
+        self.assertNotIn("Intake funnel", found[0])
+
+    def test_a_goal_home_read_says_whether_it_is_a_queue(self):
+        def read(*names):
+            issue = {"title": "Home", "labels": [{"name": name} for name in names]}
+            store = unittest.mock.Mock()
+            store.gh.rest.return_value.data = issue
+            return dashboard_github.TicketStore._read_goal_home(store, REPO + "#42", None, 0, {REPO})
+        self.assertTrue(read("loom:goal", "loom:backlog")["is_queue"])
+        self.assertFalse(read("loom:goal")["is_queue"])
+
+    def test_a_queue_with_no_parent_keeps_its_card_so_its_tickets_stay_visible(self):
+        rows = goal_rows((8, 42, "running"))
+        context = goals.goal_context(rows, [], {REPO + "#42": "Intake funnel"}, [], None, NOW,
+                                     queues={REPO + "#42"})
+        self.assertIn("Intake funnel", cards(server._goals(goals_state(rows, context)))[0])
 
     def test_a_parent_with_no_tickets_of_its_own_still_gets_the_card(self):
         rows = goal_rows((8, 41, "running"))

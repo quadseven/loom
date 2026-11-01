@@ -402,6 +402,31 @@ repo for Loom in one step, and a second run changes nothing:
   the repo added. It does not edit any config. Copy that line into the
   brain's and the station's settings yourself.
 
+## Consolidating goal homes
+
+`python3 -m bus consolidate-goals --file PLAN.json [--apply]` turns a long
+list of goal homes into a few top-level goals. The plan stays a local file
+under `state/`, because it names real repos. Its form is in the docstring of
+`bus/goal_consolidate.py`: `top` lists at most 10 homes, and each entry in
+`homes` is a `sub-goal`, `queue` or `merge` with a `parent`.
+
+Without `--apply` the command only reads and prints each step. Every home is
+read first, and any problem stops the whole run with nothing written: a merge
+into a closed or missing home, a queue with no `loom:backlog` label, a closed
+or missing top-level home, an open home under a closed parent. A plan that
+loops, that names a home twice, or whose chain reaches no top-level home is
+refused before any read. A repo in shadow mode also stops the run. A home with
+no issue behind it is reported and skipped, since the Goals page already drops
+it.
+
+A merge moves the home's open tickets to the parent, then closes the home as
+a duplicate. A failed move leaves the home open, and running the plan again
+finishes the job, since a home already in place is left alone. A sub-goal or
+queue keeps its own tickets. A home gets a `Parent goal:` line and an epic gets
+a `Part of` line and a sub-issue link, because those are what the Goals page
+reads. A survivor at GitHub's limit of 100 sub-issues refuses the link, and the
+`Part of` line then carries it.
+
 ## Triage
 
 `python3 -m bus.brain triage <owner/name> --goal N [--limit 25]` walks the

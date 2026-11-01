@@ -291,7 +291,9 @@ zero. A redirect is not followed, and an answer over 4 MiB is refused.
 
 `/goals` shows one card per top-level goal home. A goal home rolls up into a
 bigger one through a `Parent goal: OWNER/NAME#N` line in its body or its
-GitHub sub-issue parent, and then shows as a row inside that card. A pass
+GitHub sub-issue parent, and then shows as a row inside that card. A
+`loom:backlog` home under a parent is intake, so it gets no row there, while
+one with no parent keeps its card so its tickets stay visible. A pass
 below the budget floor keeps the goal cards of the last pass that read them.
 Each ticket record carries `epic` and `goal` (decision 0003): the issue its
 `Part of` line or sub-issue parent names is its epic when that issue is

@@ -14,6 +14,8 @@ reason, never a stand-in.
   OWNER/NAME#N` line in the goal home's body or its GitHub sub-issue parent.
   The Goals page shows one card per top-level goal (rollup) with the smaller
   goals as rows inside it.
+- queue: a loom:backlog home. Under a parent it is intake, not a smaller goal,
+  so it gets no row in the parent's card (bus/goal_consolidate.py).
 """
 from __future__ import annotations
 
@@ -295,7 +297,8 @@ def goal_context(rows: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, An
                  metrics_goal: Optional[str], now: datetime,
                  parents: Optional[Dict[str, Optional[str]]] = None,
                  unread: Optional[Dict[str, str]] = None,
-                 epics: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Dict[str, Any]]:
+                 epics: Optional[Dict[str, Dict[str, Any]]] = None,
+                 queues: Iterable[str] = ()) -> Dict[str, Dict[str, Any]]:
     """One record per goal the tickets name (their `Part of` line), and one
     per parent goal those goals roll up into.
 
@@ -304,8 +307,10 @@ def goal_context(rows: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, An
     that repo gets that reason instead of "no report", and a goal with
     tickets there gets it instead of a proof count. `epics` maps each epic
     the tickets name to its title, open flag and goal; each goal record
-    lists its epics with their ticket counts."""
+    lists its epics with their ticket counts. `queues` holds the loom:backlog
+    homes; their records say queue."""
     parents, unread = dict(parents or {}), dict(unread or {})
+    queues = set(queues)
     by_goal: Dict[str, List[str]] = {}
     states: Dict[str, str] = {}
     live_held: set = set()
@@ -339,6 +344,7 @@ def goal_context(rows: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, An
            for goal, tickets in by_goal.items()}
     for goal, record in out.items():
         record["epics"] = epic_rows(goal, rows, epics or {})
+        record["queue"] = goal in queues
     factory = _factory(metric_comments, now) if metrics_goal in out else None
     if factory:
         out[metrics_goal].update(factory)
