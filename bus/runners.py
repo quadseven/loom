@@ -72,6 +72,11 @@ INPUT_LIMIT = 65535
 # Provider lanes a runner may run: API lanes whose key the workflow's role
 # can read, and the gateway-served spark and free lanes.
 RUNNER_LANES = ("opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark")
+# Slots that run on cluster runners wherever any runner slot does, with the
+# settings the station's plist does not hold. A plist changes only by a
+# reinstall, which replaces every lane; these deploy by merge, beside the Mac
+# lane they will replace (docs/LANE_RUNNERS_PLAN.md).
+TRACKED_SLOTS = {"free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"}}
 # A run no runner has taken after this many seconds is cancelled and parked:
 # the runner set may be scaled to zero.
 QUEUE_MAX = 1800
@@ -135,6 +140,11 @@ def _fault(err: BaseException) -> str:
     return "%s: %s" % (type(err).__name__, text) if text else type(err).__name__
 
 
+def tracked_setting(name: str) -> str:
+    """A TRACKED_SLOTS setting's value, empty when no slot sets it."""
+    return next((v[name] for v in TRACKED_SLOTS.values() if name in v), "")
+
+
 def provider(slot: str) -> str:
     """The provider lane of a slot, as run_lane.sh maps it."""
     if re.fullmatch(r"free-[a-z]+", slot):
@@ -147,11 +157,13 @@ def _prefix(name: str) -> str:
 
 
 def runner_slots(env: Optional[Dict[str, str]] = None) -> List[str]:
-    """The slots LOOM_RUNNER_SLOTS sends to cluster runners: known slots of a
-    RUNNER_LANES provider only. Empty by default, so nothing changes until
-    the operator sets it."""
+    """The slots LOOM_RUNNER_SLOTS sends to cluster runners, then TRACKED_SLOTS:
+    known slots of a RUNNER_LANES provider only. Empty by default, so nothing
+    changes until the operator sets it."""
     env = os.environ if env is None else env
-    names = re.split(r"[\s,]+", str(env.get("LOOM_RUNNER_SLOTS") or "").strip())
+    names = [n for n in re.split(r"[\s,]+", str(env.get("LOOM_RUNNER_SLOTS") or "").strip()) if n]
+    if names:
+        names += list(TRACKED_SLOTS)
     return [n for n in dict.fromkeys(names) if n in LANES and provider(n) in RUNNER_LANES]
 
 
@@ -170,7 +182,7 @@ def setting_allowed(slot: str, name: str) -> bool:
 def lane_settings(slot: str, env: Dict[str, str]) -> Dict[str, str]:
     """The slot's settings from the station's environment: names and values
     only, never a secret (keys stay in SSM and are named by *_KEY_SSM)."""
-    out: Dict[str, str] = {}
+    out: Dict[str, str] = dict(TRACKED_SLOTS.get(slot, {}))
     for name, value in env.items():
         if name.startswith("LOOM_GITHUB_APP_"):
             continue
