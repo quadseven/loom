@@ -271,7 +271,9 @@ there runs or steers the next tick.
 Each tick writes `$LOOM_HOME/state/brain.json` (how it ended, and the
 holder, lane and model that ran) and touches
 `$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock
-included. When no rung has usage, the tick takes no lock and runs no CLI: it
+included. A rung with no heartbeat, or an old one, has unknown fuel: it runs
+after the rungs with known usage, and its log line says so. When every rung
+says it has no usage or cannot run, the tick takes no lock and runs no CLI: it
 records `skipped` with each rung's reason and leaves `brain-ok` alone, so
 the brain-stopped check below reports it with that reason. The station adds a `brain` row to the lane status. The brain also
 runs on Muse, so the station reads GitHub too: while no local tick has ended
@@ -282,6 +284,16 @@ local tick or a journal is at most 2 hours old. Only when both are older does
 the station send one urgent Discord message, naming the newest journal's time
 and goal, then one more when the brain is back. A GitHub read error never
 counts as stale; that pass makes no decision.
+
+A live brain hides a stopped one in that check, since any fresh journal
+counts. `LOOM_BRAIN_BACKUP_HOLDERS` (holder names, as a journal's
+`Tick <time>, <holder>` line gives them, such as `lane-machine`; empty is off)
+judges each named holder on its own journal ticks from the same read: when a
+holder's newest tick is over 2 hours old, or it has none in the last day, the
+station sends one urgent Discord message naming it, then one more when it
+ticks again. Each holder keeps its own alert state in
+`state/station/brain-holders-alert.json`, apart from the brain-stopped alert
+above (loom#2141).
 
 ## The station
 
@@ -456,7 +468,8 @@ operator is brought up to date with its base while it waits, and still never
 merges on the factory's say-so. Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
-starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
+starts a ticket's ladder again and ends any fix round posted before it, so
+the restart runs as a normal attempt on a fresh branch. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
 `claude-opus-5-5`), each
 climb recorded as a `<!-- loom:rung N -->` comment.
 A climb takes the lowest rung the ticket has not run on since its ladder
@@ -669,6 +682,14 @@ only what is its own, and adding an operator is configuration:
   routing and pull request pass, `bus.brain move`, the station's claim, pull
   request adoption and the verify picker all skip one assigned to anyone
   else. The station logs each skip once (`state/station/owned.json`).
+- Outside work beats a claim of ours. A `claim:overflow` label, an `overflow:`
+  price with no `overflow paid:` label yet, or a person outside
+  `LOOM_BRIEF_AUTHORS` among the assignees makes a ticket someone else's even
+  with this Loom's claim or operator on it. An App assignee owns nothing. The
+  hand-back pass, `bus.brain escalate`, `bus.brain fix`, the status stuck marks
+  and remote lanes skip it too. `claim:overflow` is a person's claim: it is
+  never an engine claim, never expires and is never removed. A contributor's
+  own pull request still moves their ticket to `loom:pr` and `loom:merged`.
 - A claim is not forever. Once an hour the station reads each open issue
   another operator claims (a `claim:<login>` label not its own, or an
   assignment to a `LOOM_TRUSTED_BRIEFERS` login). When neither the claim nor
@@ -773,7 +794,9 @@ when it is unset) or any `LOOM_REPOS` repo has an owner outside
 
 `LOOM_TRUSTED_BRIEFERS` (space separated GitHub logins, default empty) lets
 another operator hand work to this Loom's lanes without this Loom adopting
-their claims. It is briefing trust only:
+their claims. A reinstall that leaves it unset keeps the list in the installed
+station plist; set it, even to empty, to replace the list. It is briefing trust
+only:
 
 - A `loom:ticket` authored by a trusted briefer is trusted for briefing and
   building exactly like one from `LOOM_BRIEF_AUTHORS`: the station's claim and
@@ -795,6 +818,41 @@ their claims. It is briefing trust only:
 The installer writes the setting into the station plist and the brain
 plist, and the brain passes it to a sandboxed rung, like
 `LOOM_BRIEF_AUTHORS`.
+
+### Ask answerers
+
+`LOOM_ASK_ANSWERERS` (space separated GitHub logins, an App as `<slug>[bot]`,
+default empty) names logins that may answer an ask with two line forms, without
+any other trust. A reinstall that leaves it unset keeps the list in the
+installed station plist, and `LOOM_BRIEF_AUTHORS` is kept the same way; set
+either, even to empty, to replace it. Unset, asks are judged as if the setting
+did not exist.
+
+- Each form starts a line and has words after its colon on that line:
+  `Finished: <the step>`, or `Operator answer YYYY-MM-DD: <the answer>` dated
+  from the ask's day to the comment's own day. The comment must follow the
+  ask. A line in a fenced or indented block, in an HTML comment, or in a comment
+  with a Loom marker does not count. `Done:` and every other comment from these
+  logins leave the ask open, prose from a person login included. Only the line
+  is the answer: the rest of the comment reaches neither the `needs-brain`
+  check nor the printed answer.
+- Only the judges of an ask read it: the label pass (`bus/label_pass.py`), the
+  station's ask inputs (the digest and the pass) and `python3 -m bus.needs_you`.
+- It grants nothing else. Ownership, proofs, audits, journals, adoption,
+  merges, briefing, holds, revert labels, dashboard operators and
+  `decision_claim.person_comment` read their own settings, and a listed login
+  gains no standing in any of them. A listed bot's line is no person's record
+  for the decision claim guard, nor is the ask label's removal after it.
+- Taking `needs:human` off lifts that hold in `evidence_close.label_hold`, so a
+  listed login can clear the way to a close without closing anything itself.
+- The guard runs inside Loom's write commands. `close`, `reply`, `bus journal`
+  and the rest still refuse the dated line with no person's record, but a
+  listed login that posts with its own GitHub client passes no guard. List only
+  a login whose writer records what the operator said and nothing else.
+
+The installer writes the setting into the station plist and the brain plist,
+and the brain passes it to a sandboxed rung. Muse sets the same value
+(docs/MUSE.md).
 
 ### Verify runs
 
@@ -1379,8 +1437,12 @@ cannot query the viewer or any other local service.
 - `copilot` reads its token from `LOOM_COPILOT_KEY_SSM` and exports it only as
   `COPILOT_GITHUB_TOKEN`. It invokes one `copilot -p` prompt with
   `--allow-all-tools`; the run output, including any CLI usage details, is
-  retained in the lane log. Monthly usage-limit messages hold the lane until
-  the next UTC month begins.
+  retained in the lane log. Monthly usage-limit messages, and the Free plan's
+  "exceeded your ... allowance" and "you have no quota" answers, hold the lane
+  instead of failing the ticket until the next UTC month begins. Those two
+  answers count only on this lane and only in the last lines of its run. `lanes/mac/install.sh` installs it with
+  the default lanes; set `LOOM_COPILOT_KEY_SSM` when installing, or the lane
+  reports itself unavailable.
 - Model choice on the priced Anthropic routes follows
   docs/USAGE_ROUTING.md ("October 2026 price changes"): high-volume
   subtasks pin `claude-haiku-5-5`; cache-heavy work stays on

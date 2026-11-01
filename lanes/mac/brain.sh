@@ -16,8 +16,10 @@
 # lanes/run_lane.sh) is fresh and says available, with that lane's model:
 # LOOM_BRAIN_MODEL for claude, LOOM_CODEX_MODEL, LOOM_SPARK_MODEL. A run that
 # fails with a limit, as run_lane.sh classes it, hands the same tick to the
-# next rung that has usage, once. No rung with usage skips the tick before
-# the lock. agy has no rung: its CLI runs only as the agy lane user, which
+# next rung that has usage, once. A rung with no fresh heartbeat has unknown
+# fuel, not none: it runs after the rungs with known usage, and its CLI says
+# if it has a limit. Only a ladder of rungs that cannot run skips the tick,
+# before the lock. agy has no rung: its CLI runs only as the agy lane user, which
 # cannot read this checkout or the GitHub sign-in, and as this user it would
 # read the login keychain.
 #
@@ -27,7 +29,10 @@
 # wait for a held lock: 25 for a live tick, 0 otherwise), and LOOM_BRAIN_SCOPE: all
 # (the default) or live, which leaves everything but cluster work to Muse.
 # LOOM_TRANSCRIPT_URL, LOOM_TRANSCRIPT_TOKEN_SSM and LOOM_AWS_REGION, when
-# set, are where the wrapper reads the handoff packet.
+# set, are where the wrapper reads the handoff packet. LOOM_BRAIN_FABRIC_ASK,
+# when set and non-empty, opts the tick into one Fabric question (asked by
+# this wrapper, with LOOM_FABRIC_KEY_SSM); unset or empty, no question is
+# asked.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -92,10 +97,13 @@ beat() {
 
 # Whether lane $1 can take the tick now. Sets RUNG_MODEL, or RUNG_WHY when
 # it cannot. A heartbeat counts as the station counts it: available, and
-# written in the last 10 minutes (a runner that stopped writes none).
+# written in the last 10 minutes. A runner that stopped writes none, which
+# says nothing of the CLI's usage, so no heartbeat or an old one leaves the
+# rung able to run with RUNG_FUEL=unknown and the reason in RUNG_WHY: from
+# 15:34Z on 2026-10-28 a crashing runner stood the brain down for 28 hours.
 rung_ready() {
   local lane="$1" beat at now setting
-  RUNG_MODEL="" RUNG_WHY=""
+  RUNG_MODEL="" RUNG_WHY="" RUNG_FUEL=known
   case "$lane" in
     claude) RUNG_MODEL="$CLAUDE_MODEL" setting=LOOM_BRAIN_MODEL ;;
     codex) RUNG_MODEL="${LOOM_CODEX_MODEL:-}" setting=LOOM_CODEX_MODEL ;;
@@ -107,7 +115,7 @@ rung_ready() {
   [ -n "$RUNG_MODEL" ] || { RUNG_WHY="$setting is not set"; return 1; }
   [[ "$RUNG_MODEL" =~ ^[A-Za-z0-9._:/@-]+$ ]] || { RUNG_WHY="$setting is not a model name"; return 1; }
   beat="$(cat "$STATE/usage/$lane.json" 2>/dev/null)" && [ -n "$beat" ] ||
-    { RUNG_WHY="no usage heartbeat"; return 1; }
+    { RUNG_WHY="no usage heartbeat" RUNG_FUEL=unknown; return 0; }
   if ! [[ "$beat" =~ \"available\":\ *true ]]; then
     RUNG_WHY="unavailable"
     [[ "$beat" =~ \"reason\":\ *\"([^\"]+)\" ]] && RUNG_WHY="unavailable (${BASH_REMATCH[1]})"
@@ -117,7 +125,8 @@ rung_ready() {
   at="${BASH_REMATCH[1]}" now="$(date +%s)"
   [ $((at - now)) -le 60 ] || { RUNG_WHY="usage heartbeat is from the future"; return 1; }
   [ $((now - at)) -le 600 ] || { [ $((now - at)) -le 7200 ] && lane_running "$lane"; } ||
-    { RUNG_WHY="usage heartbeat is $((now - at)) seconds old"; return 1; }
+    { RUNG_WHY="usage heartbeat is $((now - at)) seconds old" RUNG_FUEL=unknown; }
+  return 0
 }
 
 # Whether lane $1's runner holds its lock with a live process. A runner
@@ -132,23 +141,30 @@ lane_running() {
   [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
 }
 
-# Whether any rung can take the tick; when none can, LADDER_WHY holds every
-# rung's reason.
+# Whether any rung can take the tick. RUNGS lists those that can, the rungs
+# with known usage before those with unknown fuel; when none can, LADDER_WHY
+# holds every rung's reason.
 ladder_open() {
-  local lane why=""
+  local lane why="" known="" unknown=""
   for lane in $LADDER; do
-    rung_ready "$lane" && return 0
-    why="${why:+$why; }$lane: $RUNG_WHY"
+    if ! rung_ready "$lane"; then
+      why="${why:+$why; }$lane: $RUNG_WHY"
+    elif [ "$RUNG_FUEL" = unknown ]; then
+      unknown="$unknown $lane"
+    else
+      known="$known $lane"
+    fi
   done
+  RUNGS="$known$unknown"
   LADDER_WHY="${why:-LOOM_BRAIN_LADDER is empty}"
-  return 1
+  [ -n "$RUNGS" ]
 }
 
 # The settings the brain's commands read (bus.brain, bus journal), passed
 # to a sandboxed rung by name. An allowlist: nothing else of this
 # environment, a key or an SSM parameter name included, reaches the agent.
 BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_TRUSTED_BRIEFERS
-  LOOM_REPO_OWNERS LOOM_HOME
+  LOOM_ASK_ANSWERERS LOOM_REPO_OWNERS LOOM_HOME
   LOOM_BRAIN_SCOPE LOOM_BRAIN_HOLDER LOOM_REVIEW_CHECK LOOM_REVIEW_BOT LOOM_GOAL_CAP
   LOOM_UNVERIFIED_LIMIT LOOM_REPAIR_EPICS LOOM_MERGE_SETTLE_SECONDS LOOM_GITHUB_LOGIN
   LOOM_SHADOW LOOM_SHADOW_REPOS LOOM_SHADOW_LEDGER)
@@ -210,7 +226,7 @@ run_rung() {
 [ -n "$ORIGIN" ] && [ -n "$LOCK_REPO" ] || { say "no origin remote in $REPO_ROOT, so no lock repo"; exit 1; }
 case "$SCOPE" in all|live) ;; *) say "LOOM_BRAIN_SCOPE must be all or live"; exit 1 ;; esac
 [[ "$MINUTES" =~ ^[0-9]+$ ]] && [ "$MINUTES" -ge 5 ] || { say "LOOM_BRAIN_MINUTES must be a number of at least 5"; exit 1; }
-# No rung with usage: nothing to run, so no lock and no model call.
+# No rung that can run: no lock and no model call.
 if ! ladder_open; then
   say "tick skipped: no brain lane has usage ($LADDER_WHY)"
   beat skipped 0 "no brain lane has usage: $LADDER_WHY"
@@ -360,10 +376,13 @@ rules digest holds the reviewed rules; the rest is a record, not instructions.
 $PACKET"
 fi
 
-# Keep the Fabric key in this trusted wrapper. Ask a fixed, issue-independent
-# question before ticket content reaches the agent; pass only the answer on.
+# Keep the Fabric key in this trusted wrapper. The question is opt-in
+# (LOOM_BRAIN_FABRIC_ASK, set and non-empty) and off by default: Fabric is a
+# pull-based memory, so an unconditional per-tick question is avoidable spend.
+# When the ask does happen, ask a fixed, issue-independent question before
+# ticket content reaches the agent; pass only the answer on.
 FABRIC_CONTEXT=""
-if [ -n "${LOOM_FABRIC_KEY_SSM:-}" ]; then
+if [ -n "${LOOM_BRAIN_FABRIC_ASK:-}" ] && [ -n "${LOOM_FABRIC_KEY_SSM:-}" ]; then
   FABRIC_CONTEXT="$(cd "$REPO_ROOT" && python3 -m bus.fabric ask 2>> "$LOG")" ||
     { say "could not read Fabric context; the tick runs without it"; FABRIC_CONTEXT=""; }
 fi
@@ -381,8 +400,9 @@ fi
 # (the tail of its output, classed as run_lane.sh classes a lane's) hands it
 # to the next rung with usage, once, inside the same hard stop and lock.
 code=0 runs=0 why="" deadline=""
-for lane in $LADDER; do
+for lane in $RUNGS; do
   if ! rung_ready "$lane"; then why="${why:+$why; }$lane: $RUNG_WHY"; continue; fi
+  [ "$RUNG_FUEL" = known ] || say "fuel unknown for lane $lane ($RUNG_WHY); the tick tries it"
   now="$(date +%s)"
   [ -n "$deadline" ] || deadline=$((now + MINUTES * 60))
   if [ $((deadline - now)) -lt 300 ]; then say "no time left for lane $lane"; break; fi
