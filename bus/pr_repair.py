@@ -68,7 +68,8 @@ def _brief_section(brief: str, name: str) -> str:
     """The "## <name>" section of a brief, mirroring lanes/run_lane.sh::section.
 
     Blank lines are dropped (the runner's sed does this), and leading/trailing
-    blank lines are stripped.
+    blank lines are stripped. The section runs to the next heading of level
+    one or two: text under a "### " subheading belongs to it (loom#2031).
     """
     import re
     heading_re = re.compile(r"^##? ")
