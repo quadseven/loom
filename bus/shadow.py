@@ -1027,7 +1027,7 @@ def _says_no_reason(argv: Sequence[str]) -> bool:
     if "api" in args and any(re.fullmatch(r"state=(closed|open)", a) for a in args):
         return True    # no comment can come with it: only bus.brain closes this way
     if not any(pair[0] in ("issue", "pr") and pair[1] in ("close", "reopen")
-               for pair in zip(args, args[1:])):
+               for pair in zip(args, args[1:], strict=False)):
         return False
     for index, arg in enumerate(args):
         if arg.startswith("--comment="):
