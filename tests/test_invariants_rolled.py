@@ -491,6 +491,14 @@ class SettleBeforeFilingTest(unittest.TestCase):
         self.run_filer(self.others("a"))
         self.assertEqual(issue["state"], "open")
 
+    def test_a_failing_settle_is_logged_and_filing_goes_on(self):
+        with mock.patch.object(invariants.Filer, "_settle", side_effect=OSError("disk gone")):
+            self.run_filer(self.others("a", 1))
+        self.assertTrue(any("could not close settled issues" in s and "disk gone" in s
+                            for s in self.said), self.said)
+        self.assertTrue(any(i["title"].startswith("Lane a-0") for i in self.gh.issues.values()),
+                        self.gh.issues)
+
 
 if __name__ == "__main__":
     unittest.main()
