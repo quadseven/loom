@@ -32,6 +32,11 @@
 # folder with the run's model beside it (<ticket>.verify.model), and the
 # station checks it and moves the ticket, naming lane and model as the proof's
 # maker. No pull request.
+# A review brief (Deliverable: review, from the station, loom#2142) also
+# changes no code: its tree is the reviewed pull request's own branch (a
+# Review-PR: <number> line names it, cloned like a fix brief's), the agent
+# leaves review.json in its tree, and the runner copies it to the lane's log
+# folder the same way; the station posts the verdict on the pull request.
 # Lanes never merge. codex runs sandboxed: no network, no .git writes.
 #
 # Env: LOOM_REPO_OWNERS (required: space-separated GitHub owners whose repos
@@ -77,7 +82,15 @@ LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_ROOT/../infra-public/.github/scripts/check_private_leaks.py}"
+# The leak scanner a public-repo push reads lives in infra-public, kept at
+# $LOOM_HOME/infra-public and fast-forwarded at most hourly
+# (keep_scanner_current). The default reads it from there.
+LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_HOME/infra-public/.github/scripts/check_private_leaks.py}"
+# The remote infra-public is cloned from, LOOM_CLONE_BASE-prefixed like the
+# ticket repos the lane clones. Override it on a machine without network.
+INFRA_PUBLIC="$LOOM_HOME/infra-public"
+INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE:-git@github.com:}quadseven/infra-public"
+INFRA_PUBLIC_STAMP="$LOOM_HOME/run/infra-public.updated"
 # The SSM parameter of the shared deny-list: names and products with no
 # generic shape, which only this list catches. Every scan passes it.
 LEAK_DENY_SSM="${LOOM_LEAK_DENY_SSM:-/infra/leak-scan/deny-list}"
@@ -106,6 +119,30 @@ leak_scan() {
   fi
   env ${LOOM_AWS_REGION:+AWS_REGION="$LOOM_AWS_REGION"} timeout "$NET_TIMEOUT" \
     python3 -B "$LEAK_SCANNER" "$@" --deny-list-ssm "$LEAK_DENY_SSM"
+}
+# Keep $INFRA_PUBLIC cloned and fast-forward it at most once an hour, so the
+# leak scanner a public-repo push needs is present before any lane scans.
+# The first lane that needs it clones it; a later run fetches at most hourly,
+# gated by the stamp file. Returns 0 when the checkout is usable, 1 when it
+# cannot be had (the scanner stays missing and the run becomes an incident).
+keep_scanner_current() {
+  local now stamp=0
+  now="$(date +%s)"
+  [ -f "$INFRA_PUBLIC_STAMP" ] && stamp="$(tr -cd '0-9' < "$INFRA_PUBLIC_STAMP")"
+  if [ -d "$INFRA_PUBLIC/.git" ]; then
+    if [ $((now - stamp)) -ge 3600 ]; then
+      (cd "$INFRA_PUBLIC" && timeout "$NET_TIMEOUT" git fetch -q origin \
+          && timeout "$NET_TIMEOUT" git merge -q --ff-only FETCH_HEAD) >> "$LOG" 2>&1 && date +%s > "$INFRA_PUBLIC_STAMP"
+    fi
+    return 0
+  fi
+  mkdir -p "$LOOM_HOME"
+  if timeout "$NET_TIMEOUT" git clone -q "$INFRA_PUBLIC_REMOTE" "$INFRA_PUBLIC" >> "$LOG" 2>&1; then
+    date +%s > "$INFRA_PUBLIC_STAMP"
+    return 0
+  fi
+  echo "could not clone the leak scanner's repo $INFRA_PUBLIC_REMOTE" >&2
+  return 1
 }
 INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
@@ -273,6 +310,33 @@ mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
 PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
 
+# A check that hashes a file needs a sha256sum this machine can execute. The
+# lane plist puts the Intel Homebrew bin directory ahead of everything but the
+# arm64 one, and an x86_64 coreutils link there never runs on an arm64 host
+# without Rosetta (#2317). The macOS system binary sits in /sbin, on no lane's
+# PATH, so its directory goes in just before the one that holds the broken
+# tool: it can shadow only that directory and those after it.
+tool_runs() { printf '' | "$1" > /dev/null 2>&1; }
+runnable_sha256sum_on_path() {
+  local found dir holder tail
+  found="$(command -v sha256sum)"
+  [ -n "$found" ] && tool_runs "$found" && return 0
+  for dir in ${LOOM_SHA256SUM_DIRS:-/sbin /usr/bin /bin}; do
+    [ -x "$dir/sha256sum" ] && tool_runs "$dir/sha256sum" || continue
+    if [ -n "$found" ]; then
+      holder="$(dirname "$found")"
+      case "$PATH" in
+        "$holder":*) PATH="$dir:$PATH" ;;
+        *) tail="${PATH#*:"$holder":}"; PATH="${PATH%%:"$holder":*}:$dir:$holder:$tail" ;;
+      esac
+    else
+      PATH="$PATH:$dir"
+    fi
+    return 0
+  done
+}
+runnable_sha256sum_on_path
+
 field() { grep -m1 "^$1:" "$2" | cut -d' ' -f2-; }
 
 # LOOM_<LANE>_<SUFFIX>, e.g. opencode-go + MODEL -> LOOM_OPENCODE_GO_MODEL.
@@ -353,7 +417,7 @@ utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
 
 # Body of one "## <name>" section of the brief, blank lines dropped.
 section() {
-  awk -v h="## $1" '$0 == h {on=1; next} /^#+ / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
+  awk -v h="## $1" '$0 == h {on=1; next} /^##? / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
 }
 
 # The acceptance criteria of $1, blank lines dropped: its "## Acceptance
@@ -386,7 +450,7 @@ BUGS_SECTION="Bugs discovered"
 # What section, or the reason a run changed nothing (no_change_reason). The
 # file itself is never committed.
 summary_note() {
-  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion the change builds; leave every live check (a Live line, or anything seen on a running system, a host, a network or over time) and every operator action unticked, since only the station'"'"'s verifier ticks those; and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If you found a bug outside this ticket, add a ## %s section, one bug per line, each citing its issue as #N (this repo) or OWNER/NAME#N; file the issue first if none exists. The station looks each issue up and leaves out any line whose issue does not exist, is a pull request, or is closed and was not filed in the last two days. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION" "$BUGS_SECTION"
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion the change builds; leave every live check (a Live line, or anything seen on a running system, a host, a network or over time) and every operator action unticked, since only the station'"'"'s verifier ticks those; and for an unbuilt criterion append \"; not built: <reason>\". A reason saying the work is already there must cite the code on the base branch as <path>:<line> or <path>::<symbol>, or the pull request goes back. The runner puts that checklist in the pull request body. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If you found a bug outside this ticket, add a ## %s section, one bug per line, each citing its issue as #N (this repo) or OWNER/NAME#N; file the issue first if none exists. The station looks each issue up and leaves out any line whose issue does not exist, is a pull request, or is closed and was not filed in the last two days. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION" "$BUGS_SECTION"
 }
 
 # How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
@@ -628,12 +692,12 @@ note_plan_hold() {
 # FIX_REASON set when it is not, and with FIX_REASON empty when gh could not
 # say (the brief then waits for the next pass).
 fix_pr_open() {
-  local state
+  local state pr="${1:-$FIX_PR}"
   FIX_REASON=""
-  state="$(timeout "$NET_TIMEOUT" gh pr view "$FIX_PR" -R "$REPO" --json state,headRefName \
+  state="$(timeout "$NET_TIMEOUT" gh pr view "$pr" -R "$REPO" --json state,headRefName \
     --jq '.state + " " + .headRefName')" || return 1
   [ "$state" = "OPEN $BRANCH" ] && return 0
-  FIX_REASON="pull request #$FIX_PR is no longer open on $BRANCH (${state:-no answer})"
+  FIX_REASON="pull request #$pr is no longer open on $BRANCH (${state:-no answer})"
   return 1
 }
 
@@ -825,6 +889,33 @@ post_replies() {
   rm -f "$REPLIES_FILE"
 }
 
+# The review threads a fix brief lists (the "### Thread PRRT_..." lines of its
+# ## Fix section) that this round left without an answer: no entry in its
+# replies file and no file kept from .loom-answers. Prints them ", "-joined,
+# or nothing. The brief requires an answer for every one (bus/tickets.py
+# REPLIES_NOTE); an unanswered thread holds the merge gate, so the round says
+# which ones it left.
+unanswered_threads() {
+  python3 - "$BRIEF" "${REPLIES_FILE:-}" "$INBOX/answers/$TICKET" <<'PY' 2>> "$LOG"
+import json, os, re, sys
+brief, replies, answers = sys.argv[1:]
+with open(brief, encoding="utf-8", errors="replace") as stream:
+    parts = stream.read().rsplit("\n## Fix\n", 1)
+listed = (re.findall(r"^### Thread (PRRT_[A-Za-z0-9_-]{1,100}) ", parts[1], re.M)
+          if len(parts) > 1 else [])
+answered = set()
+if replies and os.path.isfile(replies):
+    try:
+        with open(replies, encoding="utf-8") as stream:
+            answered |= {entry["thread"] for entry in json.load(stream)}
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print("the replies file could not be read: %s" % error, file=sys.stderr)
+if os.path.isdir(answers):
+    answered |= {name[:-3] for name in os.listdir(answers) if name.endswith(".md")}
+print(", ".join(dict.fromkeys(t for t in listed if t not in answered)))
+PY
+}
+
 # Reconcile the generated title/body sections of an existing PR with the
 # approved ticket revision in the brief, preserving reviewer-authored text
 # outside those sections. Scope changes are logged with old/new body hashes.
@@ -932,6 +1023,25 @@ no_change_reason() {
   [ -z "$NO_CHANGE_WHY" ]
 }
 
+# Label the ticket loom:answered. gh refuses a label its repo lacks ("'X'
+# not found"), and a repo enrolled after the station's last label sync lacked
+# loom:answered, so an answer was posted and its ticket left with no state
+# (loom#2032). On a failure, create each Loom label the edit names from the
+# canonical set (bus/labels.py; one that exists already is left as it is)
+# and retry once.
+mark_answered() {
+  local names=(loom:answered loom:running loom:briefed loom:queued) name spec
+  timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered \
+    --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1 && return 0
+  for name in "${names[@]}"; do
+    spec="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.labels spec "$name" 2>> "$LOG")" || return 1
+    timeout "$NET_TIMEOUT" gh label create "$name" -R "$REPO" --color "${spec%%$'\t'*}" \
+      --description "${spec#*$'\t'}" >> "$LOG" 2>&1 || true
+  done
+  timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered \
+    --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1
+}
+
 # Hand an answered run's reason and its thread answers to whoever reports
 # it. The reason goes into the .answered marker. A station brief (an `Issue:
 # OWNER/NAME#N` line) is reported by the station, which records the reason as
@@ -948,7 +1058,7 @@ post_no_change() {
     if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$NO_CHANGE_TEXT" >> "$LOG" 2>&1; then
       echo "answer comment failed"; return 1
     fi
-    if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
+    if ! mark_answered; then
       echo "answer posted but ticket label update failed"; return 1
     fi
   fi
@@ -1085,7 +1195,8 @@ park() {
 # startup files, ~/.gemini config, MCP servers). Other lanes get no rules here.
 # antigravity-oauth-token is agy's sign-in when it cannot reach the keychain
 # (the sandbox denies /usr/bin/security): wiped, every run asked for a browser
-# login (2026-10-22 to 10-24, #1620).
+# login (2026-10-22 to 10-24, #1620). The sandbox profile lets only agy's own
+# binary read it (agy_token_rules in lanes/agent_sandbox.sh, #1623).
 AGY_STATE_KEEP=(settings.json bin builtin installation_id jetski_state.pbtxt updater last_check.timestamp log cli.log crashes cache antigravity-oauth-token)
 AGY_CACHE_KEEP=(onboarding.json default_project_id.txt)
 # agy keeps its sign-in in its file store, Library/Application Support/
@@ -1628,7 +1739,7 @@ ask_sign_in() {
   file_ask "$title" "$body" "Sign-in failed again"
 }
 
-# File a needs-operator ask titled $1 with body $2, or, with one already open,
+# File a needs:human ask titled $1 with body $2, or, with one already open,
 # keep one comment on it with a running count headed $3, never one per failure.
 file_ask() {
   local title="$1" body="$2" headline="$3" number existing
@@ -1640,10 +1751,10 @@ file_ask() {
     return 0
   fi
   number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
-             --label needs-operator --body "$body" 2>>"$LOG" ||
+             --label needs:human --body "$body" 2>>"$LOG" ||
            gh issue create --repo "$FACTORY_REPO" --title "$title" --body "$body" 2>>"$LOG")"
   number="${number##*/}"
-  case "$number" in ''|*[!0-9]*) echo "needs-operator ask filing failed" >> "$LOG" ;; esac
+  case "$number" in ''|*[!0-9]*) echo "needs:human ask filing failed" >> "$LOG" ;; esac
   return 0
 }
 
@@ -1729,6 +1840,7 @@ import json
 import sys
 
 text = tool = False
+events_processed = False
 for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
     try:
         event = json.loads(line)
@@ -1736,6 +1848,7 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
         continue
     if not isinstance(event, dict):
         continue
+    events_processed = True
     kind = event.get("type")
     part = event.get("part") if isinstance(event.get("part"), dict) else {}
     if kind == "step_start":
@@ -1744,6 +1857,8 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
         text = True
     elif kind in ("tool_use", "tool") or part.get("type") == "tool":
         tool = True
+if not events_processed:
+    sys.exit(1)
 sys.exit(0 if text and not tool else 1)
 PY
 }
@@ -1974,7 +2089,7 @@ record() {
 # failing line or command, and the exit code.
 FACTORY_REPO=quadseven/loom
 INCIDENT_MARKER="<!-- loom:factory-incident v1 -->"
-# The marker on the body of the needs-operator ask an expired key files.
+# The marker on the body of the needs:human ask an expired key files.
 KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"
 # The markers on the one comment that counts repeats on an open ask or incident.
 KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"
@@ -1992,11 +2107,11 @@ open_issue() {
 # checks had passed again for hours (2026-10-19).
 INCIDENT_DIR="$LOOM_HOME/state/incidents"
 incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr '/' '_')" "$1"; }
-# Close this repo's environment and base-check incidents once the check has
-# passed on the unmodified base; the station then releases their tickets.
+# Close this repo's environment, contract and base-check incidents once the
+# check has passed on the unmodified base; the station then releases tickets.
 resolve_factory_incidents() {
   local kind file number
-  for kind in environment base-check; do
+  for kind in environment contract base-check; do
     file="$(incident_file "$kind")"
     [ -f "$file" ] || continue
     number="$(tr -cd '0-9' < "$file")"
@@ -2266,7 +2381,7 @@ exclude_untracked() {
 # Only a red default branch check is a base-check factory incident. Returns
 # 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
-  local rc interp="" subs="" changed what baseline_rev
+  local rc interp="" subs="" changed what baseline_rev tool=""
   SETUP_REASON=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
@@ -2274,6 +2389,11 @@ prepare_validation() {
   if ! sandbox_ready; then
     SETUP_REASON="$SANDBOX_WHY"
     note_factory_incident environment "$SANDBOX_WHY" SETUP_REASON
+  elif ! tool="$(command -v sha256sum)" || ! tool_runs "$tool"; then
+    # The host's fault, whatever the repo: a check that hashes a file would
+    # read as a red default branch and file a base-check incident.
+    SETUP_REASON="lane host fault: sha256sum${tool:+ at $tool} cannot run"
+    note_factory_incident environment "sha256sum: ${tool:-not on PATH}" SETUP_REASON
   elif [ -n "$C_INTERP" ] && ! interp="$(command -v "$C_INTERP")"; then
     SETUP_REASON="interpreter $C_INTERP is not on PATH"
     note_factory_incident environment "interpreter: $C_INTERP" SETUP_REASON
@@ -3250,11 +3370,15 @@ for BRIEF in "$INBOX"/*.md; do
   if [ -n "$BASE_BRANCH" ] && ! [[ "$BASE_BRANCH" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
     park "$BRIEF" "brief Base: is not a branch name"; continue
   fi
-  if [ -n "$DELIVERABLE" ] && [ "$DELIVERABLE" != answer ] && [ "$DELIVERABLE" != verify ]; then
-    park "$BRIEF" "brief Deliverable: must be answer or verify"; continue
+  if [ -n "$DELIVERABLE" ] && [ "$DELIVERABLE" != answer ] && [ "$DELIVERABLE" != verify ] \
+     && [ "$DELIVERABLE" != review ]; then
+    park "$BRIEF" "brief Deliverable: must be answer, verify or review"; continue
   fi
   if [ "$DELIVERABLE" = answer ] && ! [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
     park "$BRIEF" "answer brief needs Issue: owner/name#number"; continue
+  fi
+  if [ "$DELIVERABLE" = review ] && ! [[ "$(field Review-PR "$BRIEF" || true)" =~ ^[0-9]+$ ]]; then
+    park "$BRIEF" "review brief needs Review-PR: <number>"; continue
   fi
   # A brief that opens a pull request needs criteria for its body: without
   # them the body's ## Acceptance criteria is empty, the review bot's plan
@@ -3381,11 +3505,14 @@ for BRIEF in "$INBOX"/*.md; do
   fi
 
   FIX_PR="$(field Fix-PR "$BRIEF" || true)"
-  if [ -n "$FIX_PR" ]; then
-    if ! [[ "$FIX_PR" =~ ^[0-9]+$ ]]; then
+  REVIEW_PR="$(field Review-PR "$BRIEF" || true)"
+  # A review brief (Deliverable: review) takes its pull request's branch the
+  # same way a fix brief does: the tree under review is the PR's own head.
+  if [ -n "$FIX_PR" ] || [ -n "$REVIEW_PR" ]; then
+    if [ -n "$FIX_PR" ] && ! [[ "$FIX_PR" =~ ^[0-9]+$ ]]; then
       park "$BRIEF" "brief Fix-PR: is not a pull request number"; continue
     fi
-    if ! fix_pr_open; then
+    if ! fix_pr_open "${FIX_PR:-$REVIEW_PR}"; then
       [ -n "$FIX_REASON" ] && { park "$BRIEF" "$FIX_REASON"; continue; }
       echo "$TICKET: gh pr view failed; will retry next pass" >&2; continue
     fi
@@ -3418,7 +3545,7 @@ for BRIEF in "$INBOX"/*.md; do
   rm -f "$LOGDIR/$TICKET.answered" "$LOGDIR/$TICKET.answered.tmp" "$LOGDIR/$TICKET.pushed"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
-         { [ -n "$FIX_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
+         { [ -n "$FIX_PR" ] || [ -n "$REVIEW_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
     park "$BRIEF" "clone or branch failed" transient; continue
   fi
   if ! BASE="$(git -C "$TREE" rev-parse HEAD)" || [ -z "$BASE" ]; then
@@ -3443,8 +3570,8 @@ for BRIEF in "$INBOX"/*.md; do
       } > "$RUN_BRIEF"
     fi
   fi
-  # A verify run changes no code, so there is nothing to validate.
-  if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
+  # A verify or review run changes no code, so there is nothing to validate.
+  if [ "$DELIVERABLE" != verify ] && [ "$DELIVERABLE" != review ] && ! prepare_validation >> "$LOG" 2>&1; then
     park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
   fi
   resume_earlier_attempt
@@ -3592,6 +3719,21 @@ for BRIEF in "$INBOX"/*.md; do
     mv "$BRIEF" "$INBOX/done/"
     continue
   fi
+  if [ "$DELIVERABLE" = review ]; then
+    # The station reads the result from the log folder and posts the verdict;
+    # the runner moves no label and opens no pull request.
+    RESULT="$TREE/review.json"
+    # Only a file the agent made counts: one the repo tracks was there before.
+    if [ ! -f "$RESULT" ] || [ -L "$RESULT" ] || [ "$(wc -c < "$RESULT")" -gt 65536 ] ||
+       [ -n "$(safe_git ls-files ':(icase)review.json')" ]; then
+      park "$BRIEF" "no review.json written"; continue
+    fi
+    cp "$RESULT" "$LOGDIR/$TICKET.review.json"
+    printf '%s\n' "$MODEL" > "$LOGDIR/$TICKET.review.model"
+    echo "[$(date -u +%FT%TZ)] $TICKET done, review result recorded" >> "$LOG"
+    mv "$BRIEF" "$INBOX/done/"
+    continue
+  fi
   if [ "$DELIVERABLE" = answer ]; then
     ANSWER="$TREE/.loom/answer.md"
     if [ ! -d "$TREE/.loom" ] || [ -L "$TREE/.loom" ] || [ ! -f "$ANSWER" ] || [ -L "$ANSWER" ]; then
@@ -3606,7 +3748,7 @@ for BRIEF in "$INBOX"/*.md; do
     if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$ANSWER_TEXT" >> "$LOG" 2>&1; then
       park "$BRIEF" "answer comment failed" transient; continue
     fi
-    if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
+    if ! mark_answered; then
       park "$BRIEF" "answer posted but ticket label update failed" transient; continue
     fi
     echo "[$(date -u +%FT%TZ)] $TICKET done, answer posted" >> "$LOG"
@@ -3710,9 +3852,14 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
   fi
   if [ "$REPO_PRIVATE" = false ]; then
+    keep_scanner_current || true
     if [ ! -f "$LEAK_SCANNER" ]; then
-      park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed" transient
-      continue
+      # A scanner that still cannot be had is the machine's fault, not the
+      # ticket's: a factory incident holds the ticket and files one issue,
+      # instead of a transient failure the station re-briefs endlessly.
+      SCANNER_REASON=""
+      note_factory_incident scanner "leak scanner not found at $LEAK_SCANNER" SCANNER_REASON
+      park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed$SCANNER_REASON" "$PARK_CLASS"; continue
     fi
     # A fix round that merged the default branch scans what the pull request
     # adds to it: BASE..HEAD would hold all the default branch gained since,
@@ -3888,6 +4035,7 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
     : > "$LOGDIR/$TICKET.pushed"
   fi
   if [ -n "$FIX_PR" ]; then
+    UNANSWERED="$(unanswered_threads)"
     post_replies
     ITEMS="$(fix_items "$BRIEF")"
     if [ "$COMMITTED" -eq 1 ]; then
@@ -3915,6 +4063,12 @@ $LIVE_NOTES"
       COMMENT="$COMMENT
 
 Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+    fi
+    if [ -n "$UNANSWERED" ]; then
+      echo "[$(date -u +%FT%TZ)] $TICKET: review threads left without a reply: $UNANSWERED" >> "$LOG"
+      COMMENT="$COMMENT
+
+Review threads this round left without a reply: $UNANSWERED"
     fi
     # One comment per pull request, edited each round; the push and the body
     # edit are already on the pull request's timeline.

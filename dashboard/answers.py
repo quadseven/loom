@@ -2,7 +2,7 @@
 
 `POST /api/needs-you/answer {repo, number, choice, note, as}` posts the
 operator's answer as ONE comment on the issue, as the Loom GitHub App
-(bus/answer.py has the format), takes off loom:human, needs:<login> and
+(bus/answer.py has the format), takes off needs:human, needs:<login> and
 needs-operator, and adds loom:answer-pending until the station reads it.
 
 Who may answer: an operator of the configured list (bus.answer.operators,
@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import quote
 
 from bus import answer, notify, text
+from bus.labels import HUMAN_LABELS
 from bus.github import GitHubError
 
 from . import needs_you, operators
@@ -186,9 +187,9 @@ def _already(comments: List[Dict[str, Any]], choice: str) -> Optional[Dict[str, 
 
 
 def _waits(issue: Mapping[str, Any], login: str) -> List[str]:
-    """The labels an answer takes off: loom:human, needs:<login> and
-    needs-operator, those the issue carries."""
-    wanted = ("loom:human", operators.NEEDS_PREFIX + login, "needs-operator")
+    """The labels an answer takes off: needs:human, its old names and
+    needs:<login>, those the issue carries."""
+    wanted = HUMAN_LABELS + (operators.NEEDS_PREFIX + login,)
     return [name for name in _labels(issue) if name.lower() in wanted]
 
 

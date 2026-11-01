@@ -249,6 +249,22 @@ def test_render_brief_removes_control_characters_from_finding_summary():
     assert "\x00" not in head and "\x1b" not in head
 
 
+class FixBriefRepliesTest(unittest.TestCase):
+    def test_a_fix_brief_requires_a_reply_entry_for_every_listed_review_thread(self):
+        """A fix round must answer each thread it lists, not optionally."""
+        fix = Fix(108, "loom/108-test",
+                  "### Thread PRRT_one (comment 1) at a.py:1\n    bot: rename\n\n"
+                  "### Thread PRRT_two (comment 2) at b.py:2\n    bot: guard\n")
+        issue = {"number": 108, "title": "T", "body": "Why\n"}
+        text = render_brief("quadseven/loom", issue, "codex", 1, fix)
+        self.assertNotIn("You may also write .loom/replies.json", text)
+        self.assertIn(tickets.REPLIES_NOTE, text)
+        self.assertIn("every review thread listed below", tickets.REPLIES_NOTE)
+        self.assertIn('"resolve": true', tickets.REPLIES_NOTE)
+        self.assertIn("a concrete reason", tickets.REPLIES_NOTE)
+        self.assertLess(text.index(tickets.REPLIES_NOTE), text.index("### Thread PRRT_one"))
+
+
 class AfterLineTest(unittest.TestCase):
     """The After: line: what it accepts, and when it still holds."""
 
@@ -528,3 +544,54 @@ class BriefContextTest(unittest.TestCase):
         plain = render_brief(REPO, self.ISSUE, "codex")
         self.assertNotIn("## Operator notes", plain)
         self.assertNotIn("## Linked pull requests", plain)
+
+
+class ReviewBriefTest(unittest.TestCase):
+    """The Luna review brief (loom#2142): a Deliverable: review brief in the
+    verify brief's shape - no branch is pushed and the result is review.json,
+    not a pull request."""
+    BODY = ("## What\n\nLog one line per retry.\n\n"
+            "## Acceptance criteria\n\n"
+            "- [ ] The retry logs one line per attempt\n")
+
+    def brief(self):
+        issue = {"number": 7, "title": "Retry logs", "body": self.BODY}
+        return tickets.render_review_brief(
+            "example-owner/example-repo", issue, "codex-2", 99, 42,
+            "loom/7-retry-logs", "main", "0123456789abcdef0123456789abcdef01234567")
+
+    def test_review_name_follows_the_verify_name_pattern(self):
+        self.assertEqual(
+            tickets.review_name("example-owner/example-repo", 7, 99),
+            tickets.verify_name("example-owner/example-repo", 7, 99).replace(
+                "-verify-", "-review-"))
+
+    def test_the_headers_name_the_pull_request_head_and_the_luna_pin(self):
+        text = self.brief()
+        lines = text.split("\n")
+        self.assertEqual(lines[0], "# Brief: %s" % tickets.review_name(
+            "example-owner/example-repo", 7, 99))
+        for header in ("Repo: example-owner/example-repo",
+                       "Branch: loom/7-retry-logs",
+                       "Lane: codex-2",
+                       "Issue: example-owner/example-repo#7",  # leak-guard-allow: fictional example repos
+                       "Review-PR: 42",
+                       "Head-Sha: 0123456789abcdef0123456789abcdef01234567",
+                       "Base: main",
+                       "Model: gpt-6-luna",
+                       "Deliverable: review"):
+            self.assertIn(header, lines)
+
+    def test_the_brief_states_the_review_contract(self):
+        text = self.brief()
+        self.assertIn("Change no code", text)
+        self.assertIn("review.json in the top of your work directory", text)
+        self.assertIn('"blocking"', text)
+        self.assertIn('"notes"', text)
+        self.assertIn('"summary"', text)
+        self.assertIn("git diff origin/main...HEAD", text)
+
+    def test_the_brief_carries_the_ticket_it_reviews_against(self):
+        text = self.brief()
+        self.assertIn("Retry logs", text)
+        self.assertIn("The retry logs one line per attempt", text)
