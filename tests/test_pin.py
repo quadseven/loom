@@ -39,22 +39,34 @@ class FakeGitHub:
         self.base_sha = "d" * 40
         self.branch = None
         self.branch_sha = None
+        self.new_blob = None
         self.pull = None
         self.created = 0
         self.calls = []
         self.green = True
+        self.check_status = "completed"
         self.files = [{"filename": "dashboard/server.py"}]
         self.labels = []
         self.list_hides_pull = False
 
     def rest(self, method, path, body=None, ok=()):
         self.calls.append((method, path, body))
-        if "/check-runs?" in path:
-            return SimpleNamespace(data={"check_runs": [{"conclusion": "success" if self.green else "failure"}]})
+        if "/check-runs" in path:
+            return SimpleNamespace(data={"check_runs": [{"status": self.check_status,
+                                      "conclusion": "success" if self.green else "failure"}]})
         if path == "/repos/%s" % TARGET:
             return SimpleNamespace(data={"default_branch": "main"})
         if path.startswith("/repos/%s/contents/" % TARGET):
             return self.contents(method, path, body)
+        if path == "/repos/%s/git/commits/%s" % (TARGET, self.base_sha):
+            return SimpleNamespace(data={"tree": {"sha": "t" * 40}})
+        if path == "/repos/%s/git/blobs" % TARGET and method == "POST":
+            self.new_blob = body["content"]
+            return SimpleNamespace(data={"sha": "b" * 40})
+        if path == "/repos/%s/git/trees" % TARGET and method == "POST":
+            return SimpleNamespace(data={"sha": "t" * 40})
+        if path == "/repos/%s/git/commits" % TARGET and method == "POST":
+            return SimpleNamespace(data={"sha": "f" * 40})
         if (path.startswith("/repos/%s/git/ref/heads/" % TARGET)
                 or path.startswith("/repos/%s/git/refs/heads/" % TARGET)
                 or path == "/repos/%s/git/refs" % TARGET):
@@ -92,6 +104,8 @@ class FakeGitHub:
             if self.branch_sha is None:
                 return SimpleNamespace(status=404, data=None)
             self.branch_sha = body.get("sha", self.branch_sha)
+            if self.new_blob is not None:
+                self.branch = self.new_blob
             return SimpleNamespace(data={"object": {"sha": self.branch_sha}})
         if path.startswith("/repos/%s/git/ref/heads/" % TARGET):
             # Like GitHub: a ref is read at git/ref/<ref>, and a PATCH there
@@ -102,8 +116,8 @@ class FakeGitHub:
                 return SimpleNamespace(status=404, data=None)
             return SimpleNamespace(status=200, data={"object": {"sha": self.branch_sha}})
         if path == "/repos/%s/git/refs" % TARGET and method == "POST":
-            self.branch = self.base
-            self.branch_sha = self.base_sha
+            self.branch = self.new_blob or self.base
+            self.branch_sha = body["sha"]
             return SimpleNamespace(data={})
         raise AssertionError((method, path, body))
 
@@ -230,13 +244,13 @@ class PinRebuildTest(unittest.TestCase):
     def assert_rebuilt(self, gh, revision):
         patches = [c for c in gh.calls if c[0] == "PATCH" and c[1] == self.ref_path()]
         self.assertEqual(len(patches), 1, gh.calls)
-        self.assertEqual(patches[0][2], {"sha": "d" * 40, "force": True})
-        puts = [c for c in gh.calls if c[0] == "PUT" and "/contents/" in c[1]
-                and c[2].get("branch") == BRANCH]
-        self.assertEqual(len(puts), 1, gh.calls)
-        self.assertLess(gh.calls.index(patches[0]), gh.calls.index(puts[0]))
-        content = base64.b64decode(puts[0][2]["content"]).decode()
-        self.assertIn('LOOM_REVISION="%s"' % revision, content)
+        self.assertEqual(patches[0][2], {"sha": "f" * 40, "force": True})
+        self.assertFalse(any(c[0] == "PUT" and "/contents/" in c[1] for c in gh.calls))
+        blob = next(c[2] for c in gh.calls if c[1] == "/repos/%s/git/blobs" % TARGET)
+        self.assertIn('LOOM_REVISION="%s"' % revision, blob["content"])
+        commit = next(c[2] for c in gh.calls if c[1] == "/repos/%s/git/commits" % TARGET
+                      and c[0] == "POST")
+        self.assertEqual(commit["parents"], ["d" * 40])
 
     def test_rebuilds_branch_when_its_base_is_behind_default(self):
         gh = FakeGitHub()
@@ -248,6 +262,39 @@ class PinRebuildTest(unittest.TestCase):
                    "mergeable_state": "dirty", "body": ""}
         pin.pin_one(gh, SOURCE, NEXT, SPEC, lambda: "digest", lambda _: None)
         self.assert_rebuilt(gh, NEXT)
+
+    def test_existing_branch_gets_one_ref_write_to_a_commit_based_on_base(self):
+        gh = FakeGitHub()
+        gh.base = self.pin_text(OLD)
+        gh.branch = self.pin_text(OLD)
+        gh.branch_sha = "e" * 40
+        gh.pull = {"number": 7, "head": {"ref": BRANCH}, "mergeable_state": "dirty",
+                   "body": ""}
+        pin.pin_one(gh, SOURCE, NEXT, SPEC, lambda: "digest", lambda _: None)
+        writes = [call for call in gh.calls if call[0] == "PATCH" and "/git/refs/" in call[1]]
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][2], {"sha": "f" * 40, "force": True})
+        self.assertNotEqual(gh.branch_sha, gh.base_sha)
+        self.assertFalse(any(call[0] == "PUT" and "/contents/" in call[1] for call in gh.calls))
+
+    def test_waits_for_existing_pull_request_checks_before_rewriting_branch(self):
+        gh = FakeGitHub()
+        gh.base = self.pin_text(OLD)
+        gh.branch = self.pin_text(OLD)
+        gh.branch_sha = "e" * 40
+        gh.pull = {"number": 7, "head": {"ref": BRANCH, "sha": "e" * 40},
+                   "mergeable_state": "dirty", "body": ""}
+        gh.check_status = "in_progress"
+        logs = []
+        pin.pin_one(gh, SOURCE, NEXT, SPEC, lambda: "digest", logs.append)
+        self.assertFalse(any(call[0] in ("POST", "PATCH") and "/git/" in call[1]
+                             for call in gh.calls))
+        self.assertTrue(any("waiting for checks" in line for line in logs))
+        gh.check_status = "completed"
+        gh.calls.clear()
+        pin.pin_one(gh, SOURCE, NEXT, SPEC, lambda: "digest", lambda _: None)
+        self.assertEqual(len([call for call in gh.calls if call[0] == "PATCH"
+                              and "/git/refs/" in call[1]]), 1)
 
     def test_rebuilds_when_pull_request_is_dirty(self):
         gh = FakeGitHub()

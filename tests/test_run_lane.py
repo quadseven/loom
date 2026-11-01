@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 import unittest
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -3291,6 +3292,36 @@ exec /usr/bin/git "$@"
         self.assertEqual((kind, credit), ("limit", "none"))
         self.assert_next_occurrence(retry_at, 10, 28, before)
 
+    def stated_reset_at(self, now, phrase):
+        """What stated_reset prints with the clock at now, in New York: its
+        Python process reads a pinned time.time."""
+        with tempfile.TemporaryDirectory() as pin:
+            Path(pin, "sitecustomize.py").write_text("import time\ntime.time = lambda: %d\n" % now)
+            script = (RUNNER.parent / "agent_cli.sh").read_text() + 'stated_reset "$1"'
+            result = subprocess.run(["bash", "-c", script, "x", phrase], capture_output=True,
+                                    text=True, check=True,
+                                    env={**os.environ, "PYTHONPATH": pin, "TZ": "America/New_York"})
+        return int(result.stdout)
+
+    def test_a_stated_time_of_day_is_its_next_occurrence_across_a_clock_change(self):
+        zone = ZoneInfo("America/New_York")
+        def at(month, day, hour, minute, fold=0):
+            year = 2027 if month < 6 else 2026
+            return int(datetime(year, month, day, hour, minute, tzinfo=zone, fold=fold).timestamp())
+        cases = (
+            (at(10, 31, 10, 27), "10:28 AM", at(10, 31, 10, 28)),
+            (at(10, 31, 10, 28), "10:28 AM", at(11, 1, 10, 28)),  # 25 hours away
+            (at(11, 1, 1, 30), "1:15 AM", at(11, 1, 1, 15, fold=1)),  # the repeat of the hour
+            (at(11, 1, 1, 30, fold=1), "1:45 AM", at(11, 1, 1, 45, fold=1)),
+            (at(11, 1, 1, 30, fold=1), "1:15 AM", at(11, 2, 1, 15)),
+            (at(11, 1, 2, 30), "2:15 AM", at(11, 2, 2, 15)),
+            (at(3, 13, 10, 28), "10:28 AM", at(3, 14, 10, 28)),  # 23 hours away
+            (at(3, 14, 1, 30), "2:30 AM", at(3, 14, 3, 30)),  # a time the night skips
+        )
+        for now, stated, expected in cases:
+            with self.subTest(now=now, stated=stated):
+                self.assertEqual(self.stated_reset_at(now, "try again at " + stated), expected)
+
     def test_a_402_from_the_provider_is_out_of_credit(self):
         tail = "Error: 402 Payment Required: your credit balance is too low"
         kind, retry_at, credit = self.classified(tail, tail)
@@ -5969,6 +6000,30 @@ exit %d
 
     # The validation contract (.loom/validation.conf).
 
+    def test_resolve_factory_incidents_closes_contract_incident(self):
+        function = re.search(r"^resolve_factory_incidents\(\) \{\n.*?^\}\n",
+                             RUNNER.read_text(), re.S | re.M).group(0)
+        tmp = Path(self._tmp.name)
+        script = (function +
+                  'incident_file() { printf "%s/%s-%s" "$INCIDENT_DIR" '
+                  '"$(printf "%s" "$REPO" | tr "/" "_")" "$1"; }\n'
+                  'incident_ticket() { printf "a ticket"; }\n'
+                  'python3() { return 0; }\n'
+                  'gh() { printf "gh %s\\n" "$*" >> "$CALLS"; }\n'
+                  'mkdir -p "$INCIDENT_DIR"\nprintf "99\\n" > '
+                  '"$INCIDENT_DIR/example_repo-contract"\nresolve_factory_incidents\n')
+        calls = tmp / "calls"
+        calls.touch()
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env={"INCIDENT_DIR": str(tmp / "incidents"), "REPO": "example/repo",
+                 "FACTORY_REPO": "quadseven/loom", "LOOM_ROOT": str(tmp),
+                 "PWD": str(tmp), "CALLS": str(calls), "LOG": str(self.log)},
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("gh issue close --repo quadseven/loom 99", calls.read_text())
+        self.assertFalse((tmp / "incidents" / "example_repo-contract").exists())
+
     def contract_repo(self, contract=CONTRACT):
         """Give the remote a submodule pinned behind its tip, the contract
         and check.py. Returns the pinned submodule commit."""
@@ -6418,6 +6473,37 @@ exec /usr/bin/git "$@"
         body = Path(f"{self.body}.issue").read_text()
         self.assertIn("Repo: example/repo", body)
         self.assertIn("python: 3.12", body)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_parsing_contract_closes_its_open_incident(self):
+        self.contract_repo()
+        incident = self.loom / "state" / "incidents" / "example_repo-contract"
+        incident.parent.mkdir(parents=True)
+        incident.write_text("99\n")
+        self.drop_brief()
+
+        result = self.run_contract_lane()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text()
+        self.assertIn("gh issue close --repo quadseven/loom 99", calls)
+        self.assertIn("Cleared: the check passed on the unmodified base", calls)
+        self.assertFalse(incident.exists())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_contract_that_still_fails_to_parse_keeps_its_incident_open(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        incident = self.loom / "state" / "incidents" / "example_repo-contract"
+        incident.parent.mkdir(parents=True)
+        incident.write_text("99\n")
+        self.drop_brief()
+
+        result = self.run_contract_lane()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("gh issue close --repo quadseven/loom 99" in call
+                             for call in self.calls()))
+        self.assertEqual(incident.read_text(), "99\n")
 
     def test_a_repeated_factory_incident_updates_the_open_issue(self):
         self.contract_repo(contract=CONTRACT + "python: 3.12\n")

@@ -327,7 +327,8 @@ done
 # with LOOM_REPOS empty it stays idle. LOOM_TRUSTED_BRIEFERS (default: the
 # installed station plist's value, else empty) names another operator's logins whose loom:ticket briefs it builds without
 # adopting their claims (docs/LANES.md, Trusted briefers). It also reads LOOM_STATUS_REPO (default:
-# this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
+# this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_BRAIN_BACKUP_HOLDERS
+# (brain holders each judged on their own journal ticks), LOOM_DISCORD_MENTION,
 # LOOM_DIGEST_HOUR, LOOM_REPORT_DIGEST_TIMES (local times of the report digest,
 # default 10:00,21:00; empty sends each report), LOOM_AWS_REGION, LOOM_RETRY_MAX (automatic retries per
 # ticket, default 2), and LOOM_DISCORD_CHANNEL_ID,
@@ -442,6 +443,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_CLAIM_REFEREE</key><string>$(xml "${LOOM_CLAIM_REFEREE:-}")</string>
     <key>LOOM_ENGINE_CLAIMS</key><string>$(xml "${LOOM_ENGINE_CLAIMS:-}")</string>
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
+    <key>LOOM_BRAIN_BACKUP_HOLDERS</key><string>$(xml "${LOOM_BRAIN_BACKUP_HOLDERS:-}")</string>
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
     <key>LOOM_REPORT_DIGEST_TIMES</key><string>$(xml "${LOOM_REPORT_DIGEST_TIMES-10:00,21:00}")</string>
