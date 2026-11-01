@@ -524,7 +524,10 @@ class Base(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.home = os.path.join(self._tmp.name, "loom")
         self.fake = FakeGitHub()
-        self.settings = station.Settings(self.home, [REPO], list(AUTHORS), list(OWNERS))
+        # No free-space floor: a pass here must not depend on the host's free
+        # disk (loom#2403). The disk-guard tests set their own floor.
+        self.settings = station.Settings(self.home, [REPO], list(AUTHORS), list(OWNERS),
+                                         disk_free_min_gb=0)
         self.heartbeat("codex")
 
     def heartbeat(self, lane, available=True, age=0, limited_models=None):
@@ -7335,6 +7338,7 @@ class DiskGuardTest(Base):
     def setUp(self):
         super().setUp()
         self.fake.default_body = BODY_WITH_CRITERIA
+        self.settings.disk_free_min_gb = station.DISK_FREE_MIN_GB
 
     def pass_with(self, free):
         usage = mock.Mock(free=free, total=500 * 1024 ** 3, used=0)
@@ -7415,10 +7419,29 @@ class DiskGuardTest(Base):
                                                     "LOOM_DISK_FREE_MIN_GB": "12"}).disk_free_min_gb, 20)
 
 
+class FixtureDiskTest(Base):
+    """The shared fixture has no free-space floor, so a pass claims however
+    little the host's disk has free (loom#2403)."""
+
+    def test_a_claiming_pass_claims_with_one_gb_free(self):
+        self.fake.default_body = BODY_WITH_CRITERIA
+        self.fake.add(12)
+        with mock.patch.object(station.Station, "_disk_free", return_value=1024 ** 3), \
+                mock.patch("bus.station._say") as say:
+            self.run_pass()
+        said = [c.args[0] for c in say.call_args_list]
+        self.assertFalse(any(s.startswith("claims paused") for s in said), said)
+        self.assertTrue(any(n.endswith(".md") for n in self.listing()), self.listing())
+
+
 class LogRetentionTest(Base):
     """Lane logs past LOOM_LOG_KEEP_DAYS are removed, and the loom home's
     size and free disk are reported (loom#643)."""
     DAY = 24 * 3600
+
+    def setUp(self):
+        super().setUp()
+        self.settings.disk_free_min_gb = station.DISK_FREE_MIN_GB
 
     def aged(self, path, days, text="x\n"):
         self.write(path, text)
@@ -12982,7 +13005,8 @@ class UnprovenGateTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.home = os.path.join(self._tmp.name, "loom")
         self.fake = FakeGitHub()
-        self.settings = station.Settings(self.home, [REPO], list(AUTHORS), list(OWNERS))
+        self.settings = station.Settings(self.home, [REPO], list(AUTHORS), list(OWNERS),
+                                         disk_free_min_gb=0)
         d = os.path.join(self.home, "state", "usage")
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "codex.json"), "w") as fh:
