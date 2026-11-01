@@ -226,6 +226,16 @@ class ReconcileTest(unittest.TestCase):
         self.assertNotEqual(result["old_hash"], result["new_hash"])
         self.assertEqual(result["reason"], "")
 
+    def test_a_body_rebuild_keeps_the_risk_line(self):
+        line = "Risk: app-code, one-way door, blast radius repo"
+        current = "## Intent\nClass: logic\n%s\n- Fix it\nFiles: 1 logic\n\n%s" % (
+            line, RUNNER_BODY)
+        self.write_brief(BRIEF_CORRECTED)
+        result = pr_repair.reconcile(self.brief, "Fix the thing", current, "codex", "gpt-test", "T42")
+        self.assertTrue(result["changed"])
+        self.assertIn(line, result["body"])
+        self.assertEqual(hunt_plan.problems(result["body"]), hunt_plan.problems(current))
+
     def test_updates_generated_sections_and_keeps_reviewer_suffix(self):
         old_body = RUNNER_BODY
         current = old_body + "\n\nA reviewer note at the bottom."
