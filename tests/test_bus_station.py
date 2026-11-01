@@ -6583,6 +6583,19 @@ class FactoryIncidentTest(Base):
             station.Station(GitHub("token", transport=self.fake), self.settings).release_factory_held()
         self.assertIn("loom:queued", self.fake.names(12))
 
+    def test_closed_contract_incident_requeues_its_held_ticket(self):
+        self.fake.add(12, lane="muse", body=PLAIN, state="running")
+        self.held_directly(body_events=[("2030-01-01T00:00:00Z",
+                                         "Lane muse held: factory incident %s#99" % REPO)])
+        self.incident()
+        self.fake.factory_incidents[0]["title"] = "Factory incident: %s validation contract" % REPO
+        self.fake.factory_incidents[0]["body"] = (
+            "<!-- loom:factory-incident v1 -->\n\nRepo: %s\nKind: contract\n" % REPO)
+        self.fake.issues[99] = dict(self.fake.factory_incidents[0])
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            station.Station(GitHub("token", transport=self.fake), self.settings).release_factory_held()
+        self.assertIn("loom:queued", self.fake.names(12))
+
     def test_body_only_claim_after_close_keeps_the_held_ticket_running(self):
         self.fake.add(12, lane="muse", body=PLAIN, state="running")
         self.held_directly(body_events=[("2030-01-01T00:00:00Z",
