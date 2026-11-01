@@ -847,23 +847,31 @@ def _fetch_issue(gh: Any, repo: str, number: int) -> Optional[IssueOutcome]:
     data = _read_json(gh, "/repos/%s/issues/%d" % (repo, number))
     if data is None:
         return None
-    labels = labels_of(data) or []
+    labels = labels_of(data)
+    if labels is None:
+        print("shadow: %s#%d has no readable labels" % (repo, number), file=sys.stderr)
+        return None
     return IssueOutcome(str(data.get("state") or "open"), data.get("closed_at"),
                         str(data.get("state_reason") or "completed"), tuple(labels),
                         str(data.get("body") or ""))
 
 
-def _fetch_reverts(gh: Any, repo: str) -> Optional[List[Dict[str, Any]]]:
-    """The repo's newest merged revert pull requests, or None when they
-    cannot be read. One page: the 100 newest name a revert in their title or
-    body, far more than a report window holds."""
+def _fetch_reverts(gh: Any, repo: str, first: str) -> Optional[List[Dict[str, Any]]]:
+    """The repo's revert pull requests merged on or after the day `first`
+    (the earliest would-merge's: nothing older can undo one), or None when
+    they cannot all be read: a partial list would pass a reverted merge as
+    clean."""
     from . import revert
-    query = quote("repo:%s is:pr is:merged revert in:title,body" % repo, safe="")
-    data = _read_json(gh, "/search/issues?q=%s&sort=updated&order=desc&per_page=100" % query)
+    query = "repo:%s is:pr is:merged revert in:title,body merged:>=%s" % (repo, first)
+    data = _read_json(gh, "/search/issues?q=%s&per_page=100" % quote(query, safe=""))
     if data is None:
         return None
     items = data.get("items")
-    return [p for p in (items if isinstance(items, list) else []) if revert.looks_like_revert(p)]
+    if (not isinstance(items, list) or data.get("incomplete_results")
+            or int(data.get("total_count") or 0) > len(items)):
+        print("shadow: the revert search for %s came back partial" % repo, file=sys.stderr)
+        return None
+    return [p for p in items if revert.looks_like_revert(p)]
 
 
 def _verdict_for(verdicts: Sequence[Mapping[str, Any]], repo: str, number: int) -> Optional[str]:
@@ -888,7 +896,9 @@ def merge_outcome(would_merge: Mapping[str, Any], pr: Optional[PROutcome],
     if any(revert.undoes(dict(r), pr._asdict()) for r in reverts):
         return REVERTED
     sha = str(would_merge.get("sha") or "")
-    return MERGED_AFTER_CHANGES if sha and pr.head_sha != sha else MERGED_AS_IS
+    if not sha:
+        return UNKNOWN  # no recorded head to compare
+    return MERGED_AS_IS if pr.head_sha == sha else MERGED_AFTER_CHANGES
 
 
 def is_damaging_would_merge(outcome: str, verdict: Optional[str]) -> bool:
@@ -913,17 +923,26 @@ def _merge_bearing(outcome: str, damaging: bool) -> str:
     return UNKNOWN if outcome == UNKNOWN else PENDING
 
 
+def _close_bearing(issue: Optional[IssueOutcome]) -> str:
+    """A would-close that is not wrong: clean only once the issue has closed."""
+    if issue is None:
+        return UNKNOWN
+    return PENDING if issue.state == "open" else CLEAN
+
+
 def _pair_merge_outcomes(entries: Sequence[Mapping[str, Any]], gh: Any) -> List[Dict[str, Any]]:
     """Each would-merge with its pull request's outcome and operator verdict."""
     verdicts = [e for e in entries if e.get("action") == VERDICT]
+    would_merges = [e for e in entries if e.get("action") == MERGE]
+    first = min((str(e.get("time") or "")[:10] for e in would_merges), default="")
     reverts: Dict[str, Optional[List[Dict[str, Any]]]] = {}
     pairs = []
-    for wm in (e for e in entries if e.get("action") == MERGE):
+    for wm in would_merges:
         repo = str(wm.get("repo") or "")
         number = int(wm.get("number") or 0)
         pr = _fetch_pr(gh, repo, number) if repo and number else None
         if repo not in reverts:
-            reverts[repo] = _fetch_reverts(gh, repo) if repo else None
+            reverts[repo] = _fetch_reverts(gh, repo, first) if repo else None
         verdict = _verdict_for(verdicts, repo, number)
         outcome = merge_outcome(wm, pr, reverts[repo])
         damaging = is_damaging_would_merge(outcome, verdict)
@@ -940,7 +959,7 @@ def _pair_close_outcomes(entries: Sequence[Mapping[str, Any]], gh: Any) -> List[
         number = int(wc.get("number") or 0)
         issue = _fetch_issue(gh, repo, number) if repo and number else None
         wrong = is_wrong_would_close(issue)
-        bearing = DAMAGING if wrong else (UNKNOWN if issue is None else CLEAN)
+        bearing = DAMAGING if wrong else _close_bearing(issue)
         pairs.append({"would_close": wc, "issue_outcome": issue, "wrong": wrong,
                       "bearing": bearing})
     return pairs

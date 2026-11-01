@@ -523,7 +523,8 @@ class OutcomeReportTest(ShadowCase):
                 if path.startswith("/search/issues"):
                     if reverts is None:
                         raise GitHubError("GET /search/issues -> 503", 503, "")
-                    return Response(200, {"items": list(reverts)})
+                    return Response(200, {"items": list(reverts), "total_count": len(reverts)}
+                                    if not isinstance(reverts, dict) else reverts)
                 if path not in responses:
                     raise GitHubError("GET %s -> 404" % path, 404, "")
                 return Response(200, responses[path])
@@ -619,6 +620,31 @@ class OutcomeReportTest(ShadowCase):
         self.assertEqual(pair["outcome"], shadow.UNKNOWN)
         self.assertFalse(pair["damaging"])
 
+    def test_a_partial_revert_search_is_unknown(self):
+        for answer in ({"items": [], "incomplete_results": True, "total_count": 0},
+                       {"items": [], "total_count": 101},
+                       {"total_count": 0}):
+            with self.subTest(answer=answer):
+                with mock.patch("sys.stderr", new_callable=io.StringIO):
+                    pair = self._one(self._pr(8), reverts=answer)
+                self.assertEqual(pair["outcome"], shadow.UNKNOWN)
+                os.remove(self.ledger)
+
+    def test_the_revert_search_starts_at_the_earliest_would_merge(self):
+        shadow.record("merge", REPO, 8, "pr", sha=self.SHA, now=86400 * 2)
+        shadow.record("merge", REPO, 9, "pr", sha=self.SHA, now=86400 * 5)
+        gh = self._make_gh(self._pulls(self._pr(8), self._pr(9)))
+        self._data(gh)
+        search = [p for _, p in gh.calls if p.startswith("/search/")][0]
+        self.assertIn("merged%3A%3E%3D1970-01-03", search)
+
+    def test_a_merge_with_no_recorded_sha_is_unknown_unless_reverted(self):
+        self.assertEqual(self._one(self._pr(8), sha="")["outcome"], shadow.UNKNOWN)
+        os.remove(self.ledger)
+        hand = {"number": 99, "title": 'Revert "A change"', "body": ""}
+        self.assertEqual(self._one(self._pr(8), reverts=[hand], sha="")["outcome"],
+                         shadow.REVERTED)
+
     def test_a_code_fault_is_not_taken_for_github_being_down(self):
         class Broken:
             def rest(self, *args, **kwargs):
@@ -655,6 +681,25 @@ class OutcomeReportTest(ShadowCase):
         shadow.record("close", REPO, 3, "issue", tier="app-code", now=1000)
         with mock.patch("sys.stderr", new_callable=io.StringIO):
             data = self._data(self._make_gh({}))
+        self.assertEqual(data["by_repo_tier"][(REPO, "app-code")]["unknown"], 1)
+        self.assertEqual(data["clean_by_repo"][REPO], 0)
+
+    def test_an_open_issue_with_every_box_ticked_is_pending_not_clean(self):
+        body = "## Acceptance criteria\n- [x] One"
+        data = self._data(self._close(self._issue(3, state="open", body=body)))
+        self.assertEqual(data["by_repo_tier"][(REPO, "app-code")]["pending"], 1)
+        self.assertEqual(data["clean_by_repo"][REPO], 0)
+
+    def test_an_open_issue_with_an_unticked_box_is_already_wrong(self):
+        body = "## Acceptance criteria\n- [ ] One"
+        data = self._data(self._close(self._issue(3, state="open", body=body)))
+        self.assertEqual(data["by_repo_tier"][(REPO, "app-code")]["wrong_closes"], 1)
+
+    def test_an_issue_with_unreadable_labels_is_unknown(self):
+        found = self._issue(3)
+        del found["labels"]
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            data = self._data(self._close(found))
         self.assertEqual(data["by_repo_tier"][(REPO, "app-code")]["unknown"], 1)
         self.assertEqual(data["clean_by_repo"][REPO], 0)
 

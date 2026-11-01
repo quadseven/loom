@@ -1902,8 +1902,10 @@ operator did not merge it as is or it was later reverted, and a would-close
 is wrong when its ticket has an unticked acceptance box. The report counts
 decisions, damaging would-merges and wrong would-closes per repo and risk
 tier, then the clean decisions each repo has since its last damaging one,
-within the `--since` window. A still-open pull request or an outcome GitHub
-would not give (`pending`, `unknown`) is neither damage nor clean.
+within the `--since` window. A still-open pull request or issue (`pending`)
+and an outcome the report could not establish (`unknown`: a failed read, a
+partial revert search, or a merge with no recorded head) are neither damage
+nor clean.
 `--ledger-only` lists the ledger's lines with no GitHub read.
 
 The switch fails closed. `LOOM_SHADOW` turns shadow off only when it reads
