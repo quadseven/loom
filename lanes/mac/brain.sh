@@ -386,6 +386,10 @@ if [ -n "${LOOM_BRAIN_FABRIC_ASK:-}" ] && [ -n "${LOOM_FABRIC_KEY_SSM:-}" ]; the
   FABRIC_CONTEXT="$(cd "$REPO_ROOT" && python3 -m bus.fabric ask 2>> "$LOG")" ||
     { say "could not read Fabric context; the tick runs without it"; FABRIC_CONTEXT=""; }
 fi
+# The Fabric request is the wrapper's alone (loom#2203): the configuration
+# that names the key never reaches a brain child, on any rung. Only the
+# answer above is passed on, in the prompt.
+unset LOOM_FABRIC_KEY_SSM
 if [ -n "$FABRIC_CONTEXT" ]; then
   PROMPT="$PROMPT
 
