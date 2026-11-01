@@ -2082,6 +2082,34 @@ record() {
     "$(date -u +%FT%TZ)" >> "$RECORD"
 }
 
+# What failed in a check, from the log past byte $1: the tests it named (unittest
+# FAIL:/ERROR:, pytest FAILED/ERROR, go --- FAIL:) and the tools the shell could
+# not find, else its last line, so a validation record says why (loom#2418).
+check_failures() {  # log offset
+  local out names
+  out="$(tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null)"
+  # LC_ALL=C: a check's output may be any bytes, and BSD sed and cut stop at
+  # one that is not UTF-8.
+  names="$(printf '%s\n' "$out" | LC_ALL=C sed -nE \
+    -e 's/^(FAIL|ERROR): [^ ]+ \(([^)]+)\).*/\2/p' \
+    -e 's/^(FAIL|ERROR): ([^ ]+)$/\2/p' \
+    -e 's/^(FAILED|ERROR) ([^ ]+::[^ ]+).*/\2/p' \
+    -e 's/^--- FAIL: ([^ ]+).*/\1/p' \
+    -e 's/^.*: ([^ :]+): (command )?not found$/missing \1/p' |
+    awk '!seen[$0]++' | head -n 20 | paste -sd ',' - | sed 's/,/, /g')"
+  [ -n "$names" ] || names="$(printf '%s\n' "$out" | LC_ALL=C grep -av '^[[:space:]]*$' | tail -n 1)"
+  printf '%s' "$names" | LC_ALL=C cut -c1-1000
+}
+# The non-empty arguments, joined for a record's detail.
+join_detail() {
+  local part out=""
+  for part in "$@"; do
+    [ -n "$part" ] && out="${out:+$out; }$part"
+  done
+  printf '%s' "$out"
+}
+log_size() { wc -c < "$LOG" 2>/dev/null | tr -d ' '; }
+
 # Base check verdicts survive the per-brief scratch HOME. A green result is
 # reusable for a day; a red result briefly stops more tickets for this repo.
 BASE_VERDICT_DIR="$LOOM_HOME/state/base-verdicts"
@@ -2378,11 +2406,14 @@ check_default_branch() {
     [ "$rc" -eq 0 ] || SETUP_REASON="default branch setup exited $rc"
   fi
   if [ "$rc" -eq 0 ]; then
+    local check_start failures=""
+    check_start="$(log_size)"
     contract_run "$C_CHECK"; DEFAULT_EXIT=$?
     DEFAULT_CHANGED="$(tracked_changes)"
+    [ "$DEFAULT_EXIT" -eq 0 ] || failures="$(check_failures "$check_start")"
     record default-baseline "$C_CHECK" "$DEFAULT_EXIT" "$DEFAULT_REV" \
       "$([ "$DEFAULT_EXIT" -eq 0 ] && [ -z "$DEFAULT_CHANGED" ] && echo true || echo false)" \
-      "${DEFAULT_CHANGED:+changed tracked files: $DEFAULT_CHANGED}"
+      "$(join_detail "${DEFAULT_CHANGED:+changed tracked files: $DEFAULT_CHANGED}" "$failures")"
   fi
   TREE="$branch_tree" CHECK_HOME="$branch_home"
   rm -rf "$branch_home-default"
@@ -2411,6 +2442,7 @@ exclude_untracked() {
 # 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
   local rc interp="" subs="" changed what baseline_rev tool="" verdict_key interpreter_id now cached_verdict=0
+  local check_start=0 failures=""
   SETUP_REASON=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
@@ -2457,8 +2489,10 @@ prepare_validation() {
   # agent's), one line of printable ASCII, at most 1000 characters; and
   # contract_run runs them sandboxed with an emptied environment.
   if [ -n "$C_SETUP" ]; then
+    check_start="$(log_size)"
     contract_run "$C_SETUP"; rc=$?
-    record setup "$C_SETUP" "$rc" "$BASE" "$([ "$rc" -eq 0 ] && echo true || echo false)"
+    [ "$rc" -eq 0 ] || failures="$(check_failures "$check_start")"
+    record setup "$C_SETUP" "$rc" "$BASE" "$([ "$rc" -eq 0 ] && echo true || echo false)" "$failures"
     if [ "$rc" -eq 143 ]; then
       PARK_CLASS=transient
       SETUP_REASON="setup interrupted by SIGTERM"
@@ -2478,10 +2512,12 @@ prepare_validation() {
     echo "base check reused cached verdict for $baseline_rev" >> "$LOG"
     record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && echo true || echo false)" "cached verdict"
   else
+    check_start="$(log_size)"
     contract_run "$C_CHECK"; BASELINE_EXIT=$?
     changed="$(tracked_changes)"
+    [ "$BASELINE_EXIT" -eq 0 ] || failures="$(check_failures "$check_start")"
     record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
-      "${changed:+changed tracked files: $changed}"
+      "$(join_detail "${changed:+changed tracked files: $changed}" "$failures")"
   fi
   if [ "$BASELINE_EXIT" -eq 143 ]; then
     PARK_CLASS=transient
@@ -2509,10 +2545,12 @@ prepare_validation() {
       return 1
     fi
     local first_exit="$BASELINE_EXIT"
+    check_start="$(log_size)" failures=""
     contract_run "$C_CHECK"; BASELINE_EXIT=$?
     changed="$(tracked_changes)"
+    [ "$BASELINE_EXIT" -eq 0 ] || failures="$(check_failures "$check_start")"
     record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
-      "second run after exit $first_exit${changed:+; changed tracked files: $changed}"
+      "$(join_detail "second run after exit $first_exit" "${changed:+changed tracked files: $changed}" "$failures")"
     if [ "$BASELINE_EXIT" -eq 143 ]; then
       PARK_CLASS=transient
       SETUP_REASON="base check interrupted by SIGTERM"
@@ -3652,9 +3690,12 @@ for BRIEF in "$INBOX"/*.md; do
   # it in its own process group (id = its pid) and records that id. If this
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
-  LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
+  LOG_START="$(log_size)"
   if ! agent_gh_config; then park "$BRIEF" "$AGENT_GH_WHY" transient; continue; fi
   rm -f "$LOCK/watchdog-limit"
+  # The job's proof that an agent started: without it a cluster run fails in
+  # Actions (lanes/k8s/lane_job.py run), whatever this runner exits.
+  [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || : > "$LOGDIR/$TICKET.agent-ran"
   ( set -m
     (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
       { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
