@@ -522,6 +522,17 @@ class KeptBetweenRuns(unittest.TestCase):
         self.assertEqual(needs_you.WORKERS, seen["workers"])
 
 
+    def test_workers_under_one_is_refused(self):
+        # Elder on PR 2409: the --workers floor had no test.
+        for bad in ("0", "-1"):
+            err = io.StringIO()
+            with mock.patch.object(needs_you, "run") as run, \
+                    contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as stop:
+                needs_you.main(["--workers", bad])
+            self.assertEqual(2, stop.exception.code)
+            self.assertIn("--workers must be at least 1", err.getvalue())
+            run.assert_not_called()
+
 class Order(unittest.TestCase):
     """The heaviest repo's tickets are read first (loom#2394): its items
     were found last and trailed past the deadline."""
