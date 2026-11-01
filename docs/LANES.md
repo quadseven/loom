@@ -1288,7 +1288,7 @@ Each invariant is one function returning breaches with evidence:
 - Goal homes whose body names a roll (the word `roll` or `rolls`) that no
   `LOOM_ROLL_SHIP_DOCS` entry names (`roll-pin-off`, one rolling issue for
   every such goal): the station opens no source-pin pull request when their
-  module changes merge (README.md, Roll source pins). The issue says when
+  module changes merge (docs/ROLL_PINS.md). The issue says when
   the setting is empty, which turns the pass off.
 - Tickets still at `loom:merged` 24 hours after a ship rule found their merge
   commit deployed, because the move to `loom:shipped` failed

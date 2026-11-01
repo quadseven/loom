@@ -1,114 +1,83 @@
 # Loom
 
-Loom is a software factory. You write a goal; Loom turns it into tickets,
-has AI agents build them on every subscription you pay for, reviews and
-fixes their pull requests, ships them, and checks live that they worked.
+Loom is a software factory that turns a goal issue into tickets, has AI coding lanes build them, reviews and merges the pull requests, ships them, and checks the result.
 
-## How a ticket moves
+Last checked against the code: 2026-11-01.
 
-1. **Goal.** An issue labelled `loom:goal` says what done looks like and how
-   it is measured.
-2. **Brief.** The brain writes tickets for the goal's most important problems.
-3. **Claim.** The station hands each ticket to a free lane.
-4. **Build.** The lane writes the change and a test on its own branch and
-   opens a pull request.
-5. **Review.** The review bot and CI check it. Findings go back to the same
-   lane until the pull request is clean.
-6. **Merge.** The factory merges clean pull requests; risky ones wait for the
-   brain.
-7. **Ship.** The change is deployed under the project's own rules.
-8. **Verify.** The ticket closes only when live evidence shows it worked.
+## Status
 
-Labels on the ticket show where it is: `loom:queued`, `briefed`, `running`,
-`pr`, `merged`, `shipped`, `verified`.
+- Live. The station, the lanes and the brain run as launchd agents on one operator-run macOS machine. The running copy is a plain clone of this repo.
+- Not paused on 2026-11-01: the station deployed the head of main that day, and the journal in issue 30 holds no pause. The code has no pause switch. A pause is the operator's word, carried out by booting out the launchd agents, so read the journal and the station log for the current state.
+- Shadow mode is on. For the 17 repos in `LOOM_SHADOW_REPOS`, Loom records merges and closes instead of taking them, except the narrow evidence close. This repo is not in that list, so Loom merges its own pull requests.
+- Some lanes run on Kubernetes through `.github/workflows/lane.yml`. The operator's dashboard also runs on Kubernetes. Its address is not in this repo.
+- Stale: outside the tests, nothing in this repo calls the scripts in `dispatch/`.
+- Unverified: a fresh install on a new machine, and the moved text in `docs/OVERVIEW.md` and `docs/ROLL_PINS.md`.
 
-## Terms
+## Quick start
 
-| Term | What it is |
-|---|---|
-| Goal | One issue per project that says what Loom is driving toward. |
-| Ticket | One issue for one change: why, what, three checks, size. |
-| Brain | The planner. It decides what to brief and rules on anything stuck. It runs every 30 minutes. |
-| Station | The dispatcher. One process on the lane machine that runs every minute: it hands tickets to free lanes, moves labels, runs the factory and posts reports. It does no coding itself. |
-| Lane | One worker slot: one AI coding tool on one subscription or key (codex, claude, agy, spark and others). Each works one ticket at a time. |
-| Factory | The station's merge step: lands clean pull requests, sends findings back to lanes, and moves stuck work up a model ladder. |
-| Review bot | Reviews every pull request on GitHub. |
-| Dashboard | The live view of all of it: tickets, lanes, the brain, usage, and what needs you. |
+Tests and a local dashboard need only Python 3 and `gh`. The full factory needs macOS with launchd, plus `gh`, `jq`, coreutils `timeout`, a GitHub identity, and AWS SSM for lane keys. Cluster lanes need a self-hosted runner set and an AWS role of the operator's own (`docs/LANES.md`).
 
-## Run it
+```sh
+git clone https://github.com/quadseven/loom.git && cd loom
+python3 -B -m unittest tests.test_merge_tier
+LOOM_REPOS=YOUR_OWNER/YOUR_REPO python3 -m dashboard
+```
 
-1. On the lane machine: `bash lanes/mac/install.sh`, with your repos,
-   trusted logins and each lane's key parameter in the environment. See
-   docs/LANES.md.
-2. Give each project a goal issue labelled `loom:goal`.
-3. Point a brain at it: the installed brain tick, or Muse with docs/MUSE.md.
-4. Test: `python3 -B -m unittest discover -s tests`.
+To run the factory, set the keys from `.env.example` in the environment, including `LOOM_REPOS`, `LOOM_REPO_OWNERS`, `LOOM_STATUS_REPO` and `LOOM_BRIEF_AUTHORS`. Then run `bash lanes/mac/install.sh` and label one issue in each project `loom:goal`.
 
-The dashboard runs with `python3 -m dashboard`; docs/DASHBOARD.md lists its
-settings.
+## How to test
 
-## Rules
+- Required `unittest` check: `python3 -B .github/unittest_parallel.py`. CI runs it on macOS with Python 3.13, and any skip fails it.
+- Lane pre-PR check and `unittest-linux`: `python3 -B .github/unittest_parallel.py --allow-skips`.
+- One module: `python3 -B -m unittest tests.test_merge_tier`.
+- Leak scan: `check.leak-scan.yml`, on every pull request, from the public `quadseven/infra-public` repo. Workflow hygiene: `check.workflow-hygiene.yml`, on `.github/**`.
+- `Grug - Chief` and `Grug - Elder` are the review bot's required checks. They run on GitHub only.
 
-- One ticket, one branch, one pull request. Lanes never merge.
-- Every fix has a test that fails without it.
-- Merged is not shipped, and shipped is not done.
-- Briefs, logs and keys never go to GitHub: this repo is public.
-- GitHub text is ASCII, never names the review bot with an at-sign, and never
-  puts a closing keyword next to an issue number.
+## How it deploys
+
+A merge to main deploys nothing by itself. The station pulls it:
+
+1. launchd runs `lanes/mac/station.sh` every 60 seconds from the runtime clone, the checkout `lanes/mac/install.sh` ran from.
+2. The script fetches main and fast-forwards the clone to the head if `unittest` passed there, or else to the newest of the last 8 commits that passed.
+3. It stays put on local changes, on another branch, on a fetch or check read failure, on a non-fast-forward, or on a commit an open revert ticket names. `LOOM_DEPLOY=0` turns the deploy off.
+4. It records the revision in `state/station/deployed.json` and runs `python3 -m bus station`, which moves the merged tickets to `loom:shipped`.
+5. launchd starts each lane from the same clone every minute, so the next lane pass runs the new code. A brain tick starts from the clone and refreshes its own working checkout.
+
+These do not follow that path:
+
+- Agent settings live in the launchd plists. A settings change needs `lanes/mac/install.sh` run again, which replaces and restarts the agents.
+- The transcript viewer and `com.loom.dashboard` are long-running. They keep their old code until restarted.
+- The cluster dashboard runs a pinned commit. When `dashboard/` changes, the station opens a `pin-bump` pull request in the private deployment repo, and the dashboard moves when that merges.
+- Cluster lanes check out main at each dispatch.
+- A managed repo ships under the rules on its own goal home.
+
+Never edit or pull the runtime clone by hand: local changes stop the deploy.
+
+## Layout
+
+- `bus/`: the station, brain, factory and gates. `python3 -m bus <command>` is the entry point.
+- `lanes/`: the lane runner, the agent sandbox, the Mac installer and the cluster job.
+- `dashboard/`: the live view.
+- `dispatch/`: older goal loop scripts that only the tests call.
+- `tests/`: unittest modules.
+- `docs/`: long reference. `GLOSSARY.md`: the terms.
+- `.loom/`: the pre-PR check and the sensitive path list.
 
 ## Docs
 
-- docs/SDLC.md: the life cycle from ticket to verified
-- docs/BRAIN.md: labels, tickets and the brain's commands
-- docs/MUSE.md: what one brain tick does
-- docs/LANES.md: lanes, the station and the installer
-- docs/BRIEF_FORMAT.md: how a ticket is written
-- docs/NAMING.md: kind labels and title rules for goals, epics, maps and tickets
-- docs/DASHBOARD.md: dashboard settings
-- docs/HEALTH.md: how a project reports live problems that become ranked tickets
+- `docs/OVERVIEW.md`: how a ticket moves, the terms and the rules
+- `docs/SDLC.md`: the life cycle from ticket to verified
+- `docs/ARCHITECTURE.md`: the components
+- `docs/BRAIN.md`: labels, tickets and the brain's commands
+- `docs/MUSE.md`: what one brain tick does
+- `docs/LANES.md`: lanes, the station and the installer
+- `docs/USAGE_ROUTING.md`: how work follows usage limits
+- `docs/BRIEF_FORMAT.md`: how a ticket is written
+- `docs/NAMING.md`: kind labels and title rules
+- `docs/DASHBOARD.md`: dashboard settings
+- `docs/EVIDENCE.md`: the optional evidence endpoint
+- `docs/HEALTH.md`: how a project reports live problems
 
-## Roll source pins
+### Roll source pins
 
-To let the station open a source-pin pull request after a module merge, set
-`LOOM_ROLL_SHIP_DOCS` as shown in `.env.example`. Each entry identifies a goal
-home and its ship document. The document must contain one fenced
-`loom-roll-pins` JSON block:
-
-```loom-roll-pins
-{"deployment_repo":"YOUR_OWNER/YOUR_DEPLOY_REPO","build_workflow":"build-image.yml","sources":[{"repo":"YOUR_OWNER/YOUR_MODULE_REPO","pins":[{"path":"config/source.env","key":"MODULE_SHA"},{"path":"modules/your-module","kind":"gitlink"},{"path":"scripts/drift.py","kind":"dict_dev","entry":"MODULE"}]}]}
-```
-
-An env pin names one `KEY=<40-character SHA>` line; optional quotes are kept.
-A `gitlink` pin names a submodule path. A `dict_dev` pin names a Python
-dictionary entry with a `dev` SHA field; its `deployed_dev` value is left for
-the image pin step. List every location that the roll's source-pin step moves.
-`build_workflow` accepts a workflow file name or a run display name.
-For a module whose deployed revision comes from a fork branch, add
-`revision_repo` and `revision_ref` to that source; the merge still triggers the
-pass, and the named branch supplies the SHA. The station checks merged module
-pull requests each pass (normally every 60 seconds),
-opens one deployment pull request per goal, and updates that pull request if
-another merge lands before it. It leaves the pull request for review. When the
-deployment repository exposes a build run for the pull request's head commit,
-the station comments with the run link on the goal home. The repository
-configuration must give the station token read access to the ship document
-and write access to the deployment repository and goal home.
-A goal home whose body names a roll, but that no `LOOM_ROLL_SHIP_DOCS` entry
-names, gets a `roll-pin-off` invariant issue (docs/LANES.md, Invariants), so
-a pass left unconfigured is raised instead of skipped in silence.
-
-For a roll held by a family gate, set `gate_url` on its
-`LOOM_ROLL_SHIP_DOCS` entry. Keep the real endpoint in the station's private
-environment. It must be HTTPS and return JSON with an `open` field set to a
-boolean or the number 0 or 1.
-While the source-pin pull request is open, each station pass reads the gate.
-A hand-made roll pin is eligible when its title names a roll pin, its body
-says it is held for the family gate, and it changes only pin paths in the
-ship document. While that pull request is open, the station does not create
-a second pin pull request for the same roll.
-A closed gate leaves the pull request held. At an open gate, the station uses
-the brain's ticketless merge checks, including a trusted author, successful
-checks, a passing review check on the head, and resolved threads. If those
-checks refuse the merge, it posts one journal alert per head commit on the
-goal home for the next brain tick. Add the station login to
-`LOOM_BRIEF_AUTHORS` so its roll pin pull requests qualify for the merge.
+Moved to `docs/ROLL_PINS.md`. The `roll-pin-off` invariant issue points here.
