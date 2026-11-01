@@ -217,13 +217,14 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 def urllib_transport(method: str, url: str, headers: Dict[str, str],
-                     body: Optional[bytes]) -> Tuple[int, Dict[str, str], bytes]:
+                     body: Optional[bytes],
+                     timeout: float = TIMEOUT) -> Tuple[int, Dict[str, str], bytes]:
     if not url.startswith("https://"):
         raise GitHubError("refusing a non-https URL: %s" % url.split("?")[0])
     req = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
         # https only (checked above), never file: or custom schemes.
-        with _OPENER.open(req, timeout=TIMEOUT) as resp:  # noqa: S310
+        with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310
             return resp.status, dict(resp.headers.items()), resp.read()
     except urllib.error.HTTPError as err:
         try:
@@ -1145,6 +1146,30 @@ class GitHub:
         elif final.status == 304 and isinstance(final.data, list) and len(final.data) >= _per_page(path):
             items.extend(self.paginate(_with_page(path, _page_of(last) + 1)))
         return status.resort(items)
+
+    def page_plan(self, path: str) -> Tuple[List[Any], List[str]]:
+        """(the first page's items, the URLs of the pages after it), for a
+        caller that reads those pages on its own threads with read_page
+        (bus.needs_you, loom#2394). With no last link the whole list is read
+        here and no URL is left."""
+        if "per_page=" not in path:
+            path += ("&" if "?" in path else "?") + "per_page=100"
+        first = self.rest("GET", path)
+        last = _last_link(first.headers.get("link", ""))
+        if not last or _page_of(last) <= 1:
+            return self._paginate_from(path, first), []
+        items = list(first.data) if isinstance(first.data, list) else []
+        return items, [_with_page(path, page) for page in range(2, _page_of(last) + 1)]
+
+    def read_page(self, url: str, final: bool = False) -> List[Any]:
+        """One page from page_plan. The final page also reads on past it when
+        the list grew after the first page was read."""
+        resp = self.rest("GET", url)
+        items = list(resp.data) if isinstance(resp.data, list) else []
+        nxt = _next_link(resp.headers.get("link", "")) if final else None
+        if nxt:
+            items.extend(self.paginate(nxt))
+        return items
 
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Any:
         resp = self.rest("POST", "/graphql",
