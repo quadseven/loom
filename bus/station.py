@@ -89,8 +89,8 @@ from . import watch
 from . import labels
 from .brain import HUMAN_MARKER, LANES_REPUBLISH
 from . import brain
-from .github import (GitHub, GitHubError, RateLimited, TargetReached, _OPENER,
-                     _next_link, read_ssm, rest_login, unreadable)
+from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, TargetReached,
+                     _OPENER, _next_link, read_ssm, rest_login, unreadable)
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -5787,6 +5787,13 @@ class Station:
             brain.move(self.gh, repo, number, "shipped", note=note)
         except RateLimited:
             raise
+        except ShadowHeld as err:
+            # A label shadow still holds is a hold, not a failed ship: say it
+            # once per ticket, when the ledger first records it (loom#2350).
+            if (err.entry or {}).get("new"):
+                _say("shadow mode holds shipping %s#%d: %s" % (repo, number, err))
+            self._deployed_seen(key, True)
+            return False
         except (GitHubError, ValueError) as err:
             _say("could not ship %s#%d: %s" % (repo, number, err))
             self._deployed_seen(key, True)
