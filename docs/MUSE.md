@@ -220,6 +220,9 @@ project goals. Muse, the lane machine's tick and the operator's interactive
 session are peers here: each improves the brain and the factory, through
 tickets and pull requests like any other work.
 
+- Each tick, add a `- Scoreboard:` line to the journal, copied from
+  `python3 -m bus.review_debt line OWNER/NAME#N`, naming the goal home
+  (docs/BRAIN.md, Review and guard debt).
 - Each tick, note in the journal what slowed the factory down, one
   `- Friction:` line each (docs/BRAIN.md, Journal): a lane PR that failed
   for a reason the runner could catch, a step done by hand that the station
@@ -768,17 +771,17 @@ on hard work):
   model `spark/...`, any repo, private ones included) when lane status shows
   them available; then on a public repo muse, then agy (muse runs
   remotely); then the free lane, one slot per free provider (`free-ollama`,
-  `free-gemma`, `free-nvidia`, `free-kilo`, `free-groq`) at its pinned
+  `free-gemma`, `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`) at its pinned
   route on the spark-gateway, each waiting out its own provider's reset
   (free-ollama is Ollama Cloud and free-gemma is Gemma, both on any repo); else a
   free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
-  opencode-go-4, muse, copilot, free-nvidia, free-kilo and free-groq on public repos only
+  opencode-go-4, muse, copilot, free-nvidia, free-kilo, free-groq and free-openrouter on public repos only
   (opencode-go-4 is Muse Spark, which trains on prompts; free-nvidia to free-groq
-  are NVIDIA NIM, Kilo and Groq).
+  are NVIDIA NIM, Kilo and Groq, and free-openrouter is OpenRouter's free models).
   Never anthropic or claude for an easy ticket.
 - Medium: a spark slot first (any repo); then on a public repo muse, then
   agy; then a free provider slot (`free-ollama`, `free-gemma`, or on a
-  public repo `free-nvidia`, `free-kilo`, `free-groq`); then the other free
+  public repo `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`); then the other free
   lanes, openrouter and workersai, or on a public repo zen and zai (the
   operator wants every free tier used up, 2026-10-19); then codex or opencode-go (opencode-go-4 on public repos only); an
   anthropic slot only when every spark, codex and opencode-go slot already

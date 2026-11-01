@@ -60,6 +60,7 @@ from . import label_pass
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, OVERFLOW_CLAIM, needs_human
 from . import factory
 from . import friction_intake
+from . import review_debt
 from . import evidence
 from . import handoff
 from . import health
@@ -5351,7 +5352,7 @@ class Station:
                      self.queue_stateless_tickets,
                      self.note_stale_shipped,
                      self.restate_shipped_live,
-                     self.health_intake, self.intake_friction,
+                     self.health_intake, self.intake_friction, self.report_review_debt,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
@@ -11135,6 +11136,41 @@ class Station:
         finally:
             _write_json(path, state)
 
+    # -- review debt -------------------------------------------------------
+    def _review_debt_state(self) -> Optional[Dict[str, Any]]:
+        """The kept state, or None when it cannot be read."""
+        try:
+            state = _read_json(os.path.join(self.state, review_debt.STATE_FILE), {})
+        except StateError as err:
+            _say("review debt: %s" % err)
+            return None
+        return state if isinstance(state, dict) else None
+
+    def report_review_debt(self) -> None:
+        """Keep the age of the Loom review and the guards' state, hourly
+        (bus/review_debt.py). The invariants read them from the state."""
+        goal = self._invariant_goal()
+        state = self._review_debt_state()
+        if goal is None or state is None:
+            return
+        try:
+            review_debt.run_pass(self.gh, goal[0], goal[1], state, self.now,
+                                 list(self.s.authors) + review_debt.review_authors(), _say,
+                                 self._verify_repos())
+        finally:
+            _write_json(os.path.join(self.state, review_debt.STATE_FILE), state)
+
+    def _invariant_debt_facts(self, facts: invariants.Facts, kept: Dict[str, Any]) -> None:
+        """Review and guard debt for the invariants. `kept` holds the last
+        good read: a state file that cannot be read must not clear a finding."""
+        state = self._review_debt_state()
+        if state is not None:
+            kept["debt"] = [review_debt.review_at(state), review_debt.no_check(state),
+                            review_debt.unreadable(state)]
+        last = kept.get("debt")
+        if isinstance(last, list) and len(last) == 3:
+            facts.review_at, facts.guards_no_check, facts.guards_unreadable = last
+
     # -- friction intake ---------------------------------------------------
     def intake_friction(self) -> None:
         """File a ticket for a slowdown the tick journals on the invariant
@@ -11452,6 +11488,7 @@ class Station:
                 idle=info["idle"])
             for key, info in gate_held.items()}
         self._invariant_goal_facts(facts)
+        self._invariant_debt_facts(facts, state)
         seen = state.get("brain_seen")
         newest = max([j.at for j in facts.journals or []] + ([seen] if self._num(seen) else []),
                      default=None)

@@ -361,8 +361,10 @@ SPARKS = ("spark", "spark-2", "spark-3", "spark-4")
 # never a Spark. Operator 2026-10-19: make every free provider a lane, spend
 # its allowance and wait out each reset. free-ollama Ollama Cloud and free-gemma
 # Gemma may take private repos; free-nvidia NVIDIA NIM, free-kilo Kilo and free-groq
-# Groq may train on prompts, so they are public only (PUBLIC_ONLY).
-FREE_POOL = ("free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq")
+# Groq may train on prompts, so they are public only (PUBLIC_ONLY), as does
+# free-openrouter, OpenRouter's free models on a cluster runner.
+FREE_POOL = ("free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq",
+             "free-openrouter")
 TIERS: Dict[str, Tuple[str, ...]] = {
     # The operator's priorities: Muse and agy first on public repos, so their
     # allowances are spent before the rest (2026-10-14); then the Sparks,
@@ -458,7 +460,8 @@ FALLBACK: Dict[str, Tuple[str, ...]] = {"medium": ("hard", "easy")}
 # Lanes whose provider may train on prompts: public repos only.
 # opencode-go-4 runs Muse Spark Contributor, which trains on prompts.
 # free-nvidia, free-kilo and free-groq are free providers that may train on prompts.
-PUBLIC_ONLY = ("zen", "zai", "agy", "copilot", "opencode-go-4", "muse", "free-nvidia", "free-kilo", "free-groq")
+PUBLIC_ONLY = ("zen", "zai", "agy", "copilot", "opencode-go-4", "muse", "free-nvidia", "free-kilo", "free-groq",
+               "free-openrouter")
 # A rung whose least-loaded lane already holds this many briefed or running
 # tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
 # than a wait behind a busy lane that is up"). Only lanes that are up and serve
@@ -1046,7 +1049,8 @@ def known_models(env: Optional[Dict[str, str]] = None) -> set:
     env = os.environ if env is None else env
     found = {model for _, model in CLIMB} | set(HARD_MODELS.values())
     found |= {model for _, model, _ in EQUIVALENTS.values()}
-    for key, value in env.items():
+    settings = {**{k: v for s in runners.TRACKED_SLOTS.values() for k, v in s.items()}, **env}
+    for key, value in settings.items():
         if re.fullmatch(r"LOOM_[A-Z0-9_]+_MODELS?", key) and key != "LOOM_BRAIN_MODEL":
             for model in str(value).split():
                 found |= {model} | {"%s-%s" % (model, e) for e in ("low", "medium", "high")}

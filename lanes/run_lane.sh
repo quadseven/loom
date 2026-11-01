@@ -355,6 +355,7 @@ lane_setting() {
       free-nvidia) route=/free-public/nvidia-nim/v1 ;;
       free-kilo) route=/free-public/kilo/v1 ;;
       free-groq) route=/free-public/groq/v1 ;;
+      free-openrouter) route=/free-public/openrouter/v1 ;;
     esac
     value="${LOOM_FREE_GATEWAY_URL%/}$route"
   fi
@@ -1816,6 +1817,54 @@ ladder_reason() {
   printf '%s' "$why"
 }
 
+# Go and Zen slots pick each run's model from the live lists, free models
+# first (bus/model_pick.py), because free models rotate out without notice: a
+# pinned one failed every run until someone repinned it. A model that fails is
+# paused for every slot, and the brief waits for the next pass, up to
+# MODEL_ROTATIONS times, so a run moves on and never retries a broken model.
+# A brief's Model: line and LOOM_<SLOT>_MODEL do not bind these slots;
+# LOOM_MODEL_PICK=off or a LOOM_<SLOT>_MODELS ladder goes back to the pin.
+MODEL_ROTATIONS=3
+PICK_TIMEOUT=300
+MODEL_PICKED="" MODEL_KIND="" MODEL_NOTE="" PICK_UNTIL="" PICK_WHY="" MODEL_PAUSED=""
+picks_model() {
+  [ "${LOOM_MODEL_PICK:-on}" != off ] && [ -z "$(lane_setting MODELS)" ] &&
+    { [ "$LANE" = opencode-go ] || [ "$LANE" = zen ]; }
+}
+model_pick() {
+  PYTHONPATH="$LOOM_ROOT" LOOM_HOME="$LOOM_HOME" timeout "$PICK_TIMEOUT" python3 -B -m bus.model_pick "$@"
+}
+# The reset and reason of an answer that names no model; a pick that died
+# (no answer at all) waits LIMIT_HOLD.
+pick_refused() {
+  local out="${1#$'\t'}"
+  PICK_UNTIL="${out%%$'\t'*}" PICK_WHY="${out#*$'\t'}"
+  [[ "$PICK_UNTIL" =~ ^[0-9]+$ ]] || { PICK_UNTIL=$(( $(date +%s) + LIMIT_HOLD )); PICK_WHY="the model pick gave no answer"; }
+  PICK_WHY="$(printf '%s' "$PICK_WHY" | tr -cd '[:alnum:] ._:;()/-' | cut -c1-200)"
+}
+# 0 with MODEL set for this run; the key goes to the picker on stdin. A run
+# reaches here with the slot's pin in MODEL, which it replaces.
+pick_run_model() {
+  local out paid_ok=true
+  # Paid models run on build work only: a verify, answer or review run waits.
+  [ -z "$DELIVERABLE" ] || paid_ok=false
+  if ! out="$(printf '%s\n' "$API_KEY" | model_pick pick "$LANE" "$SLOT" "$REPO_PRIVATE" "$paid_ok" 2>> "$LOG")"; then
+    pick_refused "$out"
+    return 1
+  fi
+  IFS=$'\t' read -r MODEL_PICKED MODEL_KIND MODEL_NOTE <<< "$out"
+  MODEL="$MODEL_PICKED"
+  echo "[$(date -u +%FT%TZ)] $TICKET model pick: $MODEL ($MODEL_KIND) on lane $SLOT; fallback: $MODEL_NOTE" >> "$LOG"
+}
+# 0 when, from what is already known, no model can run: the station should
+# send this slot nothing until PICK_UNTIL.
+pick_held() {
+  local out
+  out="$(model_pick status "$LANE" 2>/dev/null)"
+  [ $? -eq 3 ] || return 1
+  pick_refused "$out"
+}
+
 # The opencode binary a slot runs: LOOM_<SLOT>_OPENCODE, else opencode from
 # PATH. One slot can try a new major version (its installer would overwrite
 # the binary every other opencode lane runs) without moving the rest.
@@ -3030,10 +3079,10 @@ agy_skills() {
 # Lanes and models whose provider may train on prompts (docs/LANES.md lists
 # them). Their briefs must name a public repo.
 trains_on_prompts() {
-  case "$LANE:$MODEL" in zen:*|zai:*|agy:*|copilot:*|opencode-go:*muse-spark*contributor*) return 0 ;; esac
+  case "$LANE:$MODEL" in zen:*|zai:*|agy:*|copilot:*|opencode-go:opencode/*|opencode-go:*contributor*) return 0 ;; esac
   # Free provider slots that may train on prompts (bus/factory.py PUBLIC_ONLY;
   # tests/test_bus_station.py keeps the two lists equal).
-  case "$SLOT" in free-nvidia|free-kilo|free-groq) return 0 ;; esac
+  case "$SLOT" in free-nvidia|free-kilo|free-groq|free-openrouter) return 0 ;; esac
   return 1
 }
 
@@ -3241,8 +3290,11 @@ agent_watchdog() {
       seen_limit=1
     fi
     if [ "$seen_limit" -eq 1 ] && [[ "$line" =~ AI_RetryError ]]; then
-      provider_at_limit || true
-      hold_provider_limit
+      # A picked model is paused after the run, and the slot stays available.
+      if [ -z "$MODEL_PICKED" ]; then
+        provider_at_limit || true
+        hold_provider_limit
+      fi
       touch "$LOCK/watchdog-limit"
       kill -TERM -- "-$agent" 2>/dev/null || kill -TERM "$agent" 2>/dev/null || true
       sleep 1
@@ -3446,6 +3498,12 @@ elif [ -n "$CONFIGURED_MODELS" ] && ALL_LIMITED_UNTIL="$(all_models_limited_unti
   # account quota on all four of its models, 2026-10-19).
   LIMITED=1
   heartbeat false "limit: all models limited: $(ladder_reason "$CONFIGURED_MODELS")" "$ALL_LIMITED_UNTIL"
+elif picks_model && pick_held; then
+  # Every model is paused. Said available, the station claimed a ticket here
+  # each hour that failed at once (zen, a free limit of 8.6 hours, 2026-11-01).
+  LIMITED=1
+  LIMIT_WHY="no model can run: $PICK_WHY"
+  heartbeat false "limit: $LIMIT_WHY; unavailable until $(utc "$PICK_UNTIL")" "$PICK_UNTIL"
 else
   heartbeat true ""
   lane_meter
@@ -3532,6 +3590,10 @@ for BRIEF in "$INBOX"/*.md; do
         echo "[$(date -u +%FT%TZ)] $TICKET ignores the brief's Model: $PINNED_MODEL: lane $SLOT runs $ONLY_MODEL models only" >> "$LOG"
         PINNED_MODEL="" ;;
     esac
+  fi
+  if [ -n "$PINNED_MODEL" ] && picks_model; then
+    echo "[$(date -u +%FT%TZ)] $TICKET ignores the brief's Model: $PINNED_MODEL: lane $SLOT picks free models first" >> "$LOG"
+    PINNED_MODEL=""
   fi
   MODEL="$PINNED_MODEL"
   if [ -z "$MODEL" ]; then
@@ -3654,8 +3716,23 @@ for BRIEF in "$INBOX"/*.md; do
   fi
 
   # A provider at its usage limit gets no run: the lane is held and the
-  # brief handed on before anything is cloned.
-  if provider_at_limit; then
+  # brief handed on before anything is cloned. A slot that picks its model
+  # asks the picker, which probes each model it tries.
+  MODEL_PICKED="" MODEL_KIND="" MODEL_NOTE=""
+  if picks_model; then
+    if ! pick_run_model; then
+      # The paid models may still serve build work: only that kind of brief
+      # holds the slot.
+      if [ -n "$DELIVERABLE" ]; then
+        park "$BRIEF" "limit: no free model can run: $PICK_WHY" limit; continue
+      fi
+      LIMITED=1
+      LIMIT_WHY="no model can run: $PICK_WHY"
+      heartbeat false "limit: $LIMIT_WHY; unavailable until $(utc "$PICK_UNTIL")" "$PICK_UNTIL"
+      park "$BRIEF" "limit: $LIMIT_WHY" limit; continue
+    fi
+    heartbeat true "model $MODEL in use ($MODEL_KIND)"
+  elif provider_at_limit; then
     hold_provider_limit
     park "$BRIEF" "limit: $LIMIT_WHY" limit; continue
   fi
@@ -3729,6 +3806,13 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "could not remove the agent's gh credential store" transient; continue
   fi
   is_api_lane && archive_transcripts
+  if [ "$MODEL_KIND" = paid ] && [ -f "$WORKDIR/$TICKET.opencode-events" ]; then
+    # An unknown spend fails closed: the marker stops paid picks for an hour.
+    if ! model_pick settle "$MODEL" < "$WORKDIR/$TICKET.opencode-events" 2>> "$LOG"; then
+      date +%s > "$LOOM_HOME/state/usage/go-budget.unsettled"
+      echo "[$(date -u +%FT%TZ)] $TICKET could not settle $MODEL: paid models stop for an hour" | tee -a "$LOG" >&2
+    fi
+  fi
   if ! lane_app_token; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
@@ -3736,7 +3820,7 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
   # A run that timed out may have been retrying a usage limit all along.
-  if { [ "$STATUS" -eq 124 ] || [ -f "$LOCK/watchdog-limit" ]; } && provider_at_limit; then
+  if [ -z "$MODEL_PICKED" ] && { [ "$STATUS" -eq 124 ] || [ -f "$LOCK/watchdog-limit" ]; } && provider_at_limit; then
     hold_provider_limit
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
@@ -3759,6 +3843,28 @@ for BRIEF in "$INBOX"/*.md; do
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
   fi
   [ -f "$LOCK/watchdog-limit" ] && FAIL_CLASS=limit
+  # What ran and how it ended, so a green run that did nothing shows.
+  if [ -n "$MODEL_PICKED" ]; then
+    echo "[$(date -u +%FT%TZ)] $TICKET model report: $MODEL ($MODEL_KIND), fallback: $MODEL_NOTE; exit $STATUS, ${EDITED:-no edits}, class $FAIL_CLASS" >> "$LOG"
+  fi
+  # A picked model that failed is paused for every slot. With nothing to keep,
+  # the brief stays in the inbox and the next pass picks another model.
+  ROTATIONS_FILE="$LOGDIR/$TICKET.rotations"
+  if [ -n "$MODEL_PICKED" ] && { [ "$FAIL_CLASS" = limit ] || [ "$FAIL_CLASS" = transient ] || [ "$STATUS" -eq 124 ]; }; then
+    MODEL_PAUSED="$(printf '%s\n' "$RUN_OUTPUT" | tail -n 40 | model_pick failed "$MODEL" 2>> "$LOG")" || MODEL_PAUSED="$MODEL could not be paused"
+    MODEL_PAUSED="$(printf '%s' "$MODEL_PAUSED" | tr -cd '[:alnum:] ._:;()/-')"
+    echo "[$(date -u +%FT%TZ)] $TICKET $MODEL_PAUSED" >> "$LOG"
+    ROTATIONS="$(cat "$ROTATIONS_FILE" 2>/dev/null)"
+    [[ "$ROTATIONS" =~ ^[0-9]+$ ]] || ROTATIONS=0
+    if [ -z "$EDITED" ] && [ "$ROTATIONS" -lt "$MODEL_ROTATIONS" ]; then
+      printf '%s\n' "$((ROTATIONS + 1))" > "$ROTATIONS_FILE"
+      rm -f "$LOCK/watchdog-limit"
+      echo "[$(date -u +%FT%TZ)] $TICKET rotation $((ROTATIONS + 1)) of $MODEL_ROTATIONS: the next pass picks another model" >> "$LOG"
+      heartbeat true "$MODEL_PAUSED"
+      break
+    fi
+  fi
+  rm -f "$ROTATIONS_FILE"
   # A timeout after editing keeps its edits whatever the failure is classed as,
   # and so does a run cut short by a limit, an expired key or a transient error
   # (a free pool runs dry 20 minutes in): every park below names the branch.
@@ -3768,7 +3874,7 @@ for BRIEF in "$INBOX"/*.md; do
        { [ "$STATUS" -ne 0 ] && [ "$FAIL_CLASS" != work ]; }; }; then
     TIMEDOUT_NOTE="; $(preserve_timedout)"
   fi
-  if [ "$FAIL_CLASS" != transient ]; then
+  if [ "$FAIL_CLASS" != transient ] || [ -n "$MODEL_PICKED" ]; then
     transient_clear
   elif REST_UNTIL="$(transient_strike)"; then
     heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
@@ -3780,7 +3886,11 @@ for BRIEF in "$INBOX"/*.md; do
     # this lane the retry. The rest of the inbox waits for the reset.
     LIMIT_REASON="provider limit reached"
     [[ "$RUN_OUTPUT" =~ $MODEL_GONE_RE ]] && LIMIT_REASON="model $MODEL not found by the agent CLI"
-    if [ -n "$OUT_OF_CREDIT" ]; then
+    if [ -n "$MODEL_PICKED" ]; then
+      # The model is paused; the slot's other models still run.
+      LIMIT_REASON="$MODEL_PAUSED"
+      heartbeat true "$MODEL_PAUSED"
+    elif [ -n "$OUT_OF_CREDIT" ]; then
       LIMIT_REASON="out of credit"
       hold_shared_credit "$RETRY_AT"
       heartbeat false "limit: out of credit; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
