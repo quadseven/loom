@@ -2751,6 +2751,13 @@ class StatusMergeRefusalTests(unittest.TestCase):
         line = self.lines(files=("deploy/app.yaml",))[1]
         self.assertEqual(line, "- #9 Work - blocked: held for the operator: deploy-config")
 
+    def test_a_revert_with_no_refs_to_compare_gets_no_exemption(self):
+        fake = Fake()
+        refusal = brain._behind_refusal(GitHub("t", transport=fake), REPO, 9, {}, brain.merge_tier.REVERT)
+        self.assertIn("the revert's exemption could not be checked", refusal)
+        self.assertIn("no base ref or head sha", refusal)
+        self.assertEqual(fake.calls, [])
+
     def test_a_pull_request_with_no_refs_to_compare_is_not_ready(self):
         line = self.lines(base_ref=None)[1]
         self.assertIn("blocked: pull request has no base ref or head sha to compare", line)
