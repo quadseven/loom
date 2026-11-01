@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bus import brain, journal, proof, station, text, tickets
 from bus.github import GitHub, GitHubError
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
+import sub_issue_graphql  # noqa: E402
 
 # The brain's own login in the escalation fixtures: TRUSTED trusts it.
 BRAIN = "example-brain"
@@ -4927,6 +4928,9 @@ class EpicWalk:
         m = re.match(r"/repos/%s/issues/(\d+)/sub_issues" % re.escape(REPO), path)
         if method == "GET" and m:
             return reply(200, self.subs.get(int(m.group(1)), []))
+        query = json.loads(body or b"{}").get("query", "") if path == "/graphql" else ""
+        if method == "POST" and sub_issue_graphql.asks(query):
+            return reply(200, sub_issue_graphql.answer(query, lambda n: self.subs.get(n, [])))
         if method == "GET" and path.startswith("/repos/%s/issues?labels=loom:ticket&state=open"
                                                % REPO):
             return reply(200, self.open_tickets)

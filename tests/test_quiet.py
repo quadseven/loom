@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bus import __main__ as cli  # noqa: E402
 from bus import brain, handoff, journal, metrics, quiet  # noqa: E402
 from bus.github import GitHub  # noqa: E402
+import sub_issue_graphql  # noqa: E402
 
 REPO = "example-owner/example-repo"
 GOAL = 3
@@ -71,6 +72,10 @@ class GoalHome:
         parts = urlsplit(url)
         path, query = parts.path, parse_qs(parts.query)
         if method == "POST" and path == "/graphql":
+            asked = json.loads(body or b"{}").get("query", "")
+            if sub_issue_graphql.asks(asked):
+                return reply(200, sub_issue_graphql.answer(
+                    asked, lambda n: self.children if n == GOAL else []))
             return reply(200, {"data": {"repository": {
                 "g%d" % GOAL: {"comments": {"nodes": self.graphql_nodes()}}}}})
         if method == "GET" and path == "/user":
