@@ -1996,8 +1996,8 @@ The job, step by step (`lanes/k8s/lane_job.py`):
    log, so a green run means an agent ran. The report steps run either way.
 5. Seals a report of exactly what the station reads for the run: the
    brief's `done/` or `failed/` move, the run log with its failure class
-   line, the `.answered` and `.verify` files, the transcripts, answers and
-   the slot's heartbeat. It is a tar.gz encrypted with a random key, the
+   line, the validation record, the `.image` fingerprint, the `.answered`
+   and `.verify` files, the transcripts, answers and the slot's heartbeat. It is a tar.gz encrypted with a random key, the
    key is RSA-OAEP encrypted to the station's own key
    (`state/runners/report-key.pem`, made on first use), because a public
    repository's artifacts can be downloaded by anyone signed in, and both

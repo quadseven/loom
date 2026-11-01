@@ -2088,15 +2088,17 @@ record() {
 check_failures() {  # log offset
   local out names
   out="$(tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null)"
-  names="$(printf '%s\n' "$out" | sed -nE \
+  # LC_ALL=C: a check's output may be any bytes, and BSD sed and cut stop at
+  # one that is not UTF-8.
+  names="$(printf '%s\n' "$out" | LC_ALL=C sed -nE \
     -e 's/^(FAIL|ERROR): [^ ]+ \(([^)]+)\).*/\2/p' \
-    -e 's/^(FAIL|ERROR): ([^ ]+).*/\2/p' \
+    -e 's/^(FAIL|ERROR): ([^ ]+)$/\2/p' \
     -e 's/^(FAILED|ERROR) ([^ ]+::[^ ]+).*/\2/p' \
     -e 's/^--- FAIL: ([^ ]+).*/\1/p' \
     -e 's/^.*: ([^ :]+): (command )?not found$/missing \1/p' |
     awk '!seen[$0]++' | head -n 20 | paste -sd ',' - | sed 's/,/, /g')"
-  [ -n "$names" ] || names="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 1)"
-  printf '%s' "$names" | cut -c1-1000
+  [ -n "$names" ] || names="$(printf '%s\n' "$out" | LC_ALL=C grep -av '^[[:space:]]*$' | tail -n 1)"
+  printf '%s' "$names" | LC_ALL=C cut -c1-1000
 }
 # The non-empty arguments, joined for a record's detail.
 join_detail() {
@@ -3686,7 +3688,7 @@ for BRIEF in "$INBOX"/*.md; do
   # it in its own process group (id = its pid) and records that id. If this
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
-  LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
+  LOG_START="$(log_size)"
   if ! agent_gh_config; then park "$BRIEF" "$AGENT_GH_WHY" transient; continue; fi
   rm -f "$LOCK/watchdog-limit"
   # The job's proof that an agent started: without it a cluster run fails in

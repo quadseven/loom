@@ -6,7 +6,8 @@ hands each brief that lands in the slot's inbox to the `lane` workflow
 ephemeral self-hosted runner and uploads an encrypted report. Each pass the
 station reads the run's state, and when the run ends it writes the report's
 files (the brief's done/ or failed/ move, the run log with its failure class
-line, the .answered and .verify files, the transcripts and the heartbeat)
+line, the validation record, the runner image's fingerprint, the .answered and
+.verify files, the transcripts and the heartbeat)
 into the loom home exactly where a local runner writes them. The factory and
 the rest of the station read them as they read any lane's.
 
@@ -366,9 +367,12 @@ class Runners:
         if red:
             entry["state"] = "refused"
             self.save(ledger)
-            self._park(slot, ticket, "the base check of %s is red on this runner at %s (%s); "
-                       "another lane takes it" % (repo, red["revision"][:12], red.get("why") or "no reason"),
-                       "transient")
+            # The check's own words stay in the station log: a park's reason
+            # can reach a ticket, and this text comes from a run log.
+            self.say("%s/%s not dispatched: %s is red there: %s"
+                     % (slot, ticket, repo, red.get("why") or "no reason"))
+            self._park(slot, ticket, "the base check of %s is red on this runner at %s; "
+                       "another lane takes it" % (repo, red["revision"][:12]), "transient")
             return
         entry["repo"] = repo
         run_id = uuid.uuid4().hex

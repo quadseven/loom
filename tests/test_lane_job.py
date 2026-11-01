@@ -284,7 +284,7 @@ class LaneJobTest(unittest.TestCase):
         self.assertEqual(job.report_files(str(home), "opencode-go-2", "owner.app-7"), [
             "briefs/opencode-go-2/done/owner.app-7.md",
             "logs/opencode-go-2/owner.app-7.answered", "logs/opencode-go-2/owner.app-7.image",
-         "logs/opencode-go-2/owner.app-7.log",
+        "logs/opencode-go-2/owner.app-7.log",
             "logs/opencode-go-2/owner.app-7.service.log", "state/usage/opencode-go-2.json"])
         r = runners.Runners(None, str(self.tmp / "station"), "o/r", [], {}, lambda r: True, print)
         for rel in job.report_files(str(home), "opencode-go-2", "owner.app-7"):
