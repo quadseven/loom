@@ -404,5 +404,32 @@ class Requests(unittest.TestCase):
         self.assertEqual((0, "Needs you: 3"), (code, text.split("\n")[0]))
 
 
+
+class Pages(unittest.TestCase):
+    """GitHub.page_plan and read_page, the pages needs_you reads on its own
+    threads."""
+
+    def test_the_final_page_reads_on_when_the_list_grew_after_the_first(self):
+        rows = [issue(n, labels=("loom:ticket",)) for n in range(1, 251)]
+        calls = []
+
+        def listing():  # 150 open when page 1 is read, 250 by the last page
+            calls.append(1)
+            return rows[:150] if len(calls) == 1 else rows
+        gh = GitHub("t", transport=GitHubLists({"/repos/%s/issues" % REPO: listing}))
+        first, later = gh.page_plan("/repos/%s/issues?state=open&per_page=100" % REPO)
+        self.assertEqual(100, len(first))
+        self.assertEqual(1, len(later))
+        found = gh.read_page(later[-1], final=True)
+        self.assertEqual(list(range(101, 251)), [i["number"] for i in found])
+
+    def test_a_page_not_final_does_not_read_on(self):
+        rows = [issue(n, labels=("loom:ticket",)) for n in range(1, 251)]
+        fake = GitHubLists({"/repos/%s/issues" % REPO: rows})
+        gh = GitHub("t", transport=fake)
+        _, later = gh.page_plan("/repos/%s/issues?state=open&per_page=100" % REPO)
+        self.assertEqual(list(range(101, 201)), [i["number"] for i in gh.read_page(later[0])])
+        self.assertEqual(2, len(fake.reads))
+
 if __name__ == "__main__":
     unittest.main()
