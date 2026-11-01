@@ -95,6 +95,7 @@ def proven(comments: Iterable[Any], authors: Sequence[str]) -> bool:
 
 def _labelled(gh: GitHub, repo: str, label: str, since: float) -> List[Dict[str, Any]]:
     """The repo's tickets with the label, open or closed, updated since."""
+    since = int(since // 3600) * 3600
     found = gh.paginate("/repos/%s/issues?labels=%s&state=all&since=%s" % (repo, label, _iso(since)))
     return [i for i in found if isinstance(i, dict) and "pull_request" not in i
             and "loom:ticket" in {str((x or {}).get("name")) for x in i.get("labels") or []}]

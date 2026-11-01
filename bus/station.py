@@ -2111,6 +2111,7 @@ class Station:
         self._seen: Dict[str, set] = {}
         self._busy: set = set()
         self._pulls: Dict[str, List[Dict[str, Any]]] = {}
+        self._compare_memo: Dict[Tuple[str, str, str], bool] = {}
         # The tickets named by After: lines, read once a pass.
         self._depends: Dict[str, Optional[Dict[str, Any]]] = {}
         self._remote_beats: Dict[str, Optional[float]] = {}
@@ -6286,13 +6287,22 @@ class Station:
     def _carries(self, repo: str, commit: str, revision: str) -> bool:
         """The commit is the revision or one of its ancestors in the repo on
         GitHub (the compare API); an unknown commit is not."""
+        key = (repo, commit, revision)
+        if key in self._compare_memo:
+            return self._compare_memo[key]
         resp = self.gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, commit, revision),
                             ok=(404,))
+        if resp.status == 404:
+            return False
         data = resp.data if resp.status != 404 and isinstance(resp.data, dict) else {}
-        return data.get("status") in ("ahead", "identical")
+        result = data.get("status") in ("ahead", "identical")
+        self._compare_memo[key] = result
+        return result
 
     def _ship_published(self, source: str, short: str, deploy: str, pin: Dict[str, Any],
                         left: List[int]) -> bool:
+        if left[0] <= 0:
+            return False
         commit = self.gh.rest("GET", "/repos/%s/commits/%s" % (source, short),
                               ok=(404, 422))
         revision = str((commit.data or {}).get("sha") or "") \

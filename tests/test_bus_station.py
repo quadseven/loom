@@ -3356,6 +3356,18 @@ class HandBackTest(unittest.TestCase):
              mock.patch("bus.brain._open_threads", return_value=threads or []):
             self.station.hand_back()
 
+    def test_carries_memoizes_successes_but_retries_missing_commits(self):
+        with mock.patch.object(self.gh, "rest", return_value=mock.Mock(
+                status=200, data={"status": "ahead"})) as request:
+            self.assertTrue(self.station._carries(REPO, "commit", "revision"))
+            self.assertTrue(self.station._carries(REPO, "commit", "revision"))
+            self.assertEqual(request.call_count, 1)
+        with mock.patch.object(self.gh, "rest", return_value=mock.Mock(
+                status=404, data={})) as request:
+            self.assertFalse(self.station._carries(REPO, "unknown", "revision"))
+            self.assertFalse(self.station._carries(REPO, "unknown", "revision"))
+            self.assertEqual(request.call_count, 2)
+
     def test_review_fake_rejects_writes_to_other_ticket_paths(self):
         for method, suffix, data in (("PUT", "labels", {"labels": []}),
                                      ("POST", "comments", {"body": "reply"})):

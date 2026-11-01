@@ -161,6 +161,16 @@ class AuditDueTest(unittest.TestCase):
         self.assertEqual([(repo, issue["number"]) for _, repo, issue, _ in due],
                          [(REPO, 2), (REPO, 1)])
 
+    def test_labelled_listing_rounds_since_to_the_hour_and_due_is_stable(self):
+        self.fake.add(1, ["loom:verified"], [proof_comment(2)])
+        first = audit._labelled(self.gh, REPO, "loom:verified", NOW.timestamp() - 3601)
+        second = audit._labelled(self.gh, REPO, "loom:verified", NOW.timestamp() - 3700)
+        urls = [call[1] for call in self.fake.calls if call[0] == "GET"]
+        self.assertEqual(urls[-2], urls[-1])
+        self.assertEqual(first, second)
+        self.assertEqual([x[2]["number"] for x in audit.due(
+            self.gh, [REPO], ["station-bot"], NOW.timestamp())], [1])
+
     def test_a_proof_newer_than_a_failed_audit_is_due_again(self):
         self.fake.add(1, ["loom:verified"],
                       [proof_comment(9), audit_comment(7), proof_comment(2, verified_by="zai/glm")])
