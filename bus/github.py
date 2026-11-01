@@ -769,6 +769,8 @@ class GitHub:
         found = shadow.classify(method, text, body)
         if found is None or not shadow.active(found.repo or None):
             return found
+        if shadow.evidence_close_passes(found):
+            return found
         held = shadow.held_after_read(found, self._shadow_item(found))
         if held is None:
             return found

@@ -12,6 +12,7 @@ VIEWS = (
     ("chain", "Command chain", "/chain"),
     ("brain", "Brain", "/brain"),
     ("brains", "Brains", "/brains"),
+    ("fleet", "Fleet timeline", "/fleet"),
     ("hot-spots", "Hot spots", "/hot-spots"),
     ("results", "Results", "/results"),
     ("improving", "Improving", "/improving"),

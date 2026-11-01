@@ -114,8 +114,8 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
             print("%s: %s" % (repo, ", ".join(changed) if changed else "no changes"))
         return 0
     if args.command == "lock":
-        ok = lock.acquire(gh, args.repo, args.holder, args.minutes)
-        print("lock acquired" if ok else "lock held by someone else")
+        ok, current_holder = lock.acquire(gh, args.repo, args.holder, args.minutes)
+        print("lock acquired" if ok else "lock held by %s" % current_holder)
         return 0 if ok else 1
     if args.command == "unlock":
         ok = lock.release(gh, args.repo, args.holder)

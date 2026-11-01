@@ -103,7 +103,10 @@ request body. Keep these headings exactly as written; the one exception is
 the criteria, which the runner also reads under `## Acceptance` and in any
 case. A brief with no criteria under either heading is parked as a work
 failure before the agent runs, since its pull request body could not pass
-the review bot's plan check. A brief whose change
-needs a person first (a data migration, a cutover, a VM resize) names those
-steps in `Operator steps before merge`: the pull request is then held for
-the operator instead of merging (docs/BRAIN.md, Operator holds).
+the review bot's plan check. The body carries the standard Acceptance
+criteria bullets when the ticket states fewer than the three that check
+wants, so a ticket with one criterion still opens a body the check accepts.
+A brief whose change needs a person first (a data migration, a cutover, a
+VM resize) names those steps in `Operator steps before merge`: the pull
+request is then held for the operator instead of merging (docs/BRAIN.md,
+Operator holds).
