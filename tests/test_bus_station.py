@@ -111,15 +111,18 @@ class FakeGitHub:
             "labels": [{"name": "loom:ticket"}] + [{"name": x} for x in labels]}
 
     def add_goal(self, number, journals=(), title="Goal"):
-        """journals: (login, age in seconds) pairs, posted as journal comments."""
+        """journals: (login, age in seconds) pairs, posted as journal comments,
+        or (login, age, holder) for a journal whose Tick line names its holder."""
         goal = {"number": number, "title": title, "state": "open",
                 "labels": [{"name": "loom:goal"}]}
         self.goals.append(goal)
         self.issues[number] = dict(goal)
-        self.comments[number] = [
-            {"body": "<!-- loom:journal v1 -->\nTick", "user": {"login": login},
-             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))}
-            for login, age in journals]
+        self.comments[number] = []
+        for login, age, *holder in journals:
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))
+            tick = "Tick %s, %s" % (stamp, holder[0]) if holder else "Tick"
+            self.comments[number].append({"body": "<!-- loom:journal v1 -->\n" + tick,
+                                          "user": {"login": login}, "created_at": stamp})
 
     def _list_asks(self, headers, label):
         found = [a for a in self.asks if label in [x["name"] for x in a["labels"]]]
@@ -10068,6 +10071,68 @@ class BrainTest(Base):
         station.Station(gh, self.settings, read_secret=lambda n, r: URL, post=down).run_pass()
         self.go()
         self.assertEqual(len(self.sent), 1)
+
+    # A backup brain is judged on its own journal ticks (loom#2141): a live
+    # primary brain must not hide a backup that stopped.
+    def test_a_fresh_primary_does_not_hide_a_stale_backup(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.tick(outcome="skipped", ok_age=3 * 3600)
+        self.fake.add_goal(50, [("alice-example", 600, "muse"),
+                                ("alice-example", 3 * 3600, "lane-machine")])
+        self.go()
+        self.go(60)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("Urgent: the Loom brain lane-machine has posted no journal tick since",
+                      self.sent[0])
+
+    def test_a_backup_with_no_journal_in_the_last_day_is_told(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.fake.add_goal(50, [("alice-example", 600, "muse")])
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("lane-machine has posted no journal tick in the last day", self.sent[0])
+
+    def test_a_backup_ticking_again_is_told_once(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.tick(ok_age=60)
+        self.fake.add_goal(50, [("alice-example", 600, "muse"),
+                                ("alice-example", 3 * 3600, "lane-machine")])
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.fake.add_goal(51, [("alice-example", 0, "lane-machine")])
+        self.go(station.JOURNAL_CHECK + 1)
+        self.go(station.JOURNAL_CHECK + 60)
+        self.go(2 * station.JOURNAL_CHECK + 2)
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("The Loom brain lane-machine is ticking again (last journal tick",
+                      self.sent[1])
+
+    def test_a_fresh_backup_is_quiet(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.tick(ok_age=60)
+        self.fake.add_goal(50, [("alice-example", 3 * 3600, "muse"),
+                                ("alice-example", 600, "lane-machine")])
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_no_backup_configured_keeps_a_stale_backup_quiet(self):
+        self.tick(outcome="skipped", ok_age=3 * 3600)
+        self.fake.add_goal(50, [("alice-example", 600, "muse"),
+                                ("alice-example", 3 * 3600, "lane-machine")])
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_a_github_read_error_tells_no_backup_fault(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.fake.goal_error = True
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_backup_holders_are_read_from_the_environment(self):
+        settings = station.Settings.from_env({"LOOM_HOME": self.home,
+                                              "LOOM_BRAIN_BACKUP_HOLDERS": "lane-machine, bad<@1>"})
+        self.assertEqual(settings.brain_holders, ["lane-machine"])
+        self.assertEqual(station.Settings.from_env({"LOOM_HOME": self.home}).brain_holders, [])
 
 
 if __name__ == "__main__":
