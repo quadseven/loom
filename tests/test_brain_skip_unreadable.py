@@ -17,7 +17,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain
-from bus.github import GitHub, GitHubError, unreadable
+from bus.github import GitHub, GitHubError, RateLimited, unreadable
 from tests.test_handoff import (LOCK_REPO, NOW, PR, REPO, Routes, at, comment, defer,
                           journal, lock_routes)
 
@@ -45,6 +45,12 @@ class UnreadableTests(unittest.TestCase):
             GitHubError("x", 403, '{"message": "Resource not accessible by integration"}')))
         self.assertEqual("GraphQL NOT_FOUND", unreadable(
             GitHubError("graphql errors", 200, '[{"type": "NOT_FOUND"}]')))
+
+    def test_a_budget_refusal_is_never_unreadable(self):
+        # The client's own refusal while the window is spent is a 403 with
+        # no body; read as forbidden, it named a rate-limited repo or item
+        # as unreadable and dropped it (loom#1578).
+        self.assertIsNone(unreadable(RateLimited("GET x: GitHub budget exhausted", 403, "", 1)))
 
     def test_a_fault_is_never_unreadable(self):
         for err in (GitHubError("x", 500, "boom"), GitHubError("x", 0, ""),
@@ -111,12 +117,36 @@ class ResumeSkipTests(unittest.TestCase):
         self.assertIn("- skipped %s#7: HTTP 403 Must have admin rights" % REPO, out)
         self.assertNotIn("resume merge %s#7" % REPO, out)
 
-    def test_a_fault_still_ends_the_run(self):
-        for status, body in ((500, {"message": "boom"}),
-                             (403, {"message": "API rate limit exceeded"})):
-            with self.subTest(status=status):
-                with self.assertRaises(GitHubError):
-                    self.resume(self.routes(moved_status=status, moved_body=body))
+    def test_a_fault_is_named_with_what_failed_and_the_others_finish(self):
+        # loom#1578: a fault in one repo no longer ends resume with the repos
+        # after it unread. It is never read as an empty repo either: the
+        # repo is named under the failed repos with the error, and reported
+        # as missed, which the command turns into a nonzero exit.
+        missed = []
+        out, _ = quiet(brain.resume, GitHub("t", transport=Routes(self.routes(
+            moved_status=500, moved_body={"message": "boom"}))), [MOVED, REPO],
+            "lane-machine", LOCK_REPO, NOW, ENV, missed=missed)
+        self.assertIn("## Failed repos (read again next tick)\n- skipped %s: read failed: "
+                      % MOVED, out)
+        # The goal in the other repo defers an item in the faulting repo:
+        # that item is named in its section with the fault, and the goal's
+        # other item still resumes.
+        self.assertIn("- skipped %s#3: read failed: GET /repos/%s/issues/3 -> 500"
+                      % (MOVED, MOVED), out)
+        self.assertEqual([MOVED, "%s#3" % MOVED], missed)
+        self.assertIn("- resume merge %s#7 (deferred by muse at %s)" % (REPO, at(5)), out)
+        self.assertNotIn("Skipped repos", out)
+
+    def test_a_rate_limit_past_the_deadline_is_named_and_not_waited_out(self):
+        missed = []
+        routes = self.routes(moved_status=403, moved_body={"message": "API rate limit exceeded"})
+        out, _ = quiet(brain.resume, GitHub("t", transport=Routes(routes)), [MOVED],
+                       "lane-machine", LOCK_REPO, NOW, ENV, deadline=0.5, missed=missed)
+        self.assertRegex(out, r"## Failed repos \(read again next tick\)\n- skipped %s: "
+                              r"rate limited until \d{4}-\d\d-\d\dT[\d:]+Z, past the deadline"
+                         % MOVED)
+        self.assertEqual([MOVED], missed)
+        self.assertNotIn("Skipped repos", out)
 
 
 class StatusSkipTests(unittest.TestCase):

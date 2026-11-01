@@ -159,6 +159,10 @@ def unreadable(err: GitHubError) -> Optional[str]:
     that is not a rate limit), or a GraphQL NOT_FOUND. None for any other
     failure (5xx, a rate limit, a dropped connection), which must still end
     the command: only these are safe to skip and name."""
+    if isinstance(err, RateLimited):
+        # A refusal the client raises itself while the window is spent
+        # carries a 403 and no body: it is a budget wait, not a missing grant.
+        return None
     body = err.body or ""
     parsed = _json_or_none(body)
     message = str(parsed.get("message") or "") if isinstance(parsed, dict) else ""
