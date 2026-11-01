@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
 from . import runners
@@ -251,6 +251,10 @@ PAST_RUNG_HEADING = "### Past the last rung"
 INVARIANTS_HEADING = "### Invariants broken"
 # Ticketless pull requests a trusted login opened, listed for the brain.
 ADOPT_HEADING = "### Pull requests without a ticket"
+COMMIT_FILE_PAGES = 30  # GitHub lists 3000 files of a commit at most
+MISSED_COMMITS_CAP = 20  # the most commits a behind revert's exemption reads
+BEHIND_REFUSAL = ("behind its base: bring it up to date and pass its checks "
+                  "on the new head")
 ADOPT_MARKER = "<!-- loom:adopt v1 -->"
 # What the brain posts on a pull request it adopts. No at-sign before the
 # review bot's short name, no closing keyword with an issue reference.
@@ -1088,6 +1092,12 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
         return found + [str(err)]
     if tier != merge_tier.REVERT and tier not in merge_tier.auto_tiers(None):
         found.append("held for the operator: %s" % tier)
+    try:
+        behind = _behind_refusal(gh, repo, number, rest, tier)
+    except GitHubError as err:
+        behind = "the base compare could not be read: %s" % err
+    if behind:
+        found.append(behind)
     refusal = _repo_cap_refusal(gh, repo, caps, now)
     if refusal:
         found.append("held by the hourly merge cap: %s" % refusal)
@@ -4414,6 +4424,9 @@ def merge(gh: GitHub, repo: str, number: int,
             raise ValueError(reason)
         _refuse_merge_constraints(gh, repo, number, association, issue)
         tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env, verdict)
+    behind = _behind_refusal(gh, repo, number, pr, tier)
+    if behind:
+        raise ValueError(behind)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
@@ -4774,6 +4787,99 @@ def _same_repo(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -> bool:
 def _mergeable(pr: Dict[str, Any]) -> bool:
     """GitHub's REST answer says the pull request merges cleanly."""
     return pr.get("mergeable") is True
+
+
+def _behind_by(gh: GitHub, repo: str, pr: Dict[str, Any]) -> int:
+    """Commits the base has that the pull request's head lacks. GitHub says a
+    behind pull request is clean, so only the compare tells. A failed read
+    or a reply with no whole count raises: no answer never counts as up to
+    date."""
+    base = str((pr.get("base") or {}).get("ref") or "")
+    head = str((pr.get("head") or {}).get("sha") or "")
+    if not base or not head:
+        raise ValueError("pull request has no base ref or head sha to compare")
+    data = gh.rest("GET", "/repos/%s/compare/%s...%s"
+                   % (repo, quote(base, safe=""), head)).data
+    behind = data.get("behind_by") if isinstance(data, dict) else None
+    if type(behind) is not int or behind < 0:
+        raise ValueError("compare %s...%s gave no count of commits behind" % (base, head))
+    return behind
+
+
+def _changed_paths(files: Any) -> Set[str]:
+    """Every path a commit or pull request file list names, renames included."""
+    if not isinstance(files, list):
+        raise ValueError("no file list")
+    found = set()
+    for item in files:
+        found.add(str(item["filename"]))
+        if item.get("previous_filename"):
+            found.add(str(item["previous_filename"]))
+    return found
+
+
+def _pull_paths(gh: GitHub, repo: str, number: int) -> Set[str]:
+    """Every path a pull request changes. Raises when the list is empty or
+    may be cut: an unread file cannot be shown untouched."""
+    files = operator_hold.pull_files(gh, repo, number)
+    if not files or len(files) >= operator_hold.FILES_CAP:
+        raise ValueError("no complete file list (%d files read)" % len(files))
+    return _changed_paths(files)
+
+
+def _commit_paths(gh: GitHub, repo: str, sha: str) -> Set[str]:
+    """Every path one commit touches, across each page of its file list."""
+    found: Set[str] = set()
+    for page in range(1, COMMIT_FILE_PAGES + 1):
+        files = (gh.rest("GET", "/repos/%s/commits/%s?per_page=100&page=%d"
+                         % (repo, quote(sha, safe=""), page)).data or {}).get("files")
+        found |= _changed_paths(files)
+        if len(files) < 100:
+            return found
+    raise ValueError("commit %s touches too many files to list" % sha)
+
+
+def _missed_paths(gh: GitHub, repo: str, pr: Dict[str, Any], behind: int) -> Set[str]:
+    """Every path a commit on the base since the merge base touches, read
+    commit by commit: a commit undone and landed again nets to no change in
+    the two-point diff. Raises past MISSED_COMMITS_CAP, before any read, and
+    when any part of the list is missing."""
+    if behind > MISSED_COMMITS_CAP:
+        raise ValueError("%d missed commits, past the cap of %d" % (behind, MISSED_COMMITS_CAP))
+    base = quote(str(pr["base"]["ref"]), safe="")
+    head = quote(str(pr["head"]["sha"]), safe="")
+    commits = (gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, head, base)).data
+               or {}).get("commits") or []
+    if len(commits) != behind:
+        raise ValueError("compare listed %d of %d missed commits" % (len(commits), behind))
+    found: Set[str] = set()
+    for commit in commits:
+        found |= _commit_paths(gh, repo, str(commit["sha"]))
+    return found
+
+
+def _behind_refusal(gh: GitHub, repo: str, number: int, pr: Dict[str, Any], tier: str) -> str:
+    """Why merge refuses a pull request for being behind its base, else "".
+    An exempt revert may land behind only when no commit since its merge base
+    touches a file it changes: such a commit may have landed those lines again
+    or reverted them already, so the inverse proven against the old base no
+    longer holds. A read that fails gives no exemption."""
+    if tier != merge_tier.REVERT:
+        try:
+            return BEHIND_REFUSAL if _behind_by(gh, repo, pr) else ""
+        except ValueError as err:
+            return str(err)
+    try:
+        behind = _behind_by(gh, repo, pr)
+        if not behind:
+            return ""
+        shared = _pull_paths(gh, repo, number) & _missed_paths(gh, repo, pr, behind)
+    except (GitHubError, ValueError, TypeError, KeyError, AttributeError) as err:
+        return "%s: the revert's exemption could not be checked (%s)" % (BEHIND_REFUSAL, err)
+    if shared:
+        return "%s: commits since it branched touch %s" % (
+            BEHIND_REFUSAL, ", ".join(sorted(shared)[:5]))
+    return ""
 
 
 def _checks_green(details: Dict[str, Any]) -> bool:

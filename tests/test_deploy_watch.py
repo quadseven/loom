@@ -167,6 +167,7 @@ class Base(unittest.TestCase):
         self.gh.routes["/repos/%s/issues/60/events" % REPO] = [
             {"event": "labeled", "label": {"name": "loom:revert"}, "actor": {"login": labeler}}]
         self.gh.routes["/repos/%s/compare/%s...main" % (REPO, MERGED)] = {"status": "ahead"}
+        self.gh.routes["/repos/%s/compare/main...%s" % (REPO, "r" * 40)] = {"behind_by": 0}
         self.gh.routes["/repos/%s/contents/.github/workflows" % REPO] = []
 
     def merged(self):

@@ -32,8 +32,9 @@ def ready_node(checks="SUCCESS", reviews=(), threads=()):
 
 
 class StubTransport:
-    def __init__(self, routes=None, search_counts=None, search_error=False):
+    def __init__(self, routes=None, search_counts=None, search_error=False, behind_by=0):
         self.routes = dict(routes or {})
+        self.behind_by = behind_by
         self.search_counts = search_counts or {}
         self.search_error = search_error
         self.calls = []
@@ -41,6 +42,8 @@ class StubTransport:
     def __call__(self, method, url, headers, body):
         path = url.split("api.github.com")[1]
         self.calls.append((method, path))
+        if "/compare/" in path:
+            return 200, {}, json.dumps({"behind_by": self.behind_by}).encode()
         if path.startswith("/search/issues"):
             if self.search_error:
                 return 500, {}, b'{"message": "Server Error"}'
@@ -74,7 +77,8 @@ class HourlyMergeCapStatusTests(unittest.TestCase):
         return {
             ("GET", "/issues/7"): reply(200, issue),
             ("GET", "/pulls/9"): reply(200, {"number": 9, "mergeable": True,
-                                             "mergeable_state": "clean"}),
+                                             "mergeable_state": "clean",
+                                             "base": {"ref": "main"}, "head": {"sha": "h"}}),
             ("GET", "/pulls/9/files"): reply(200, [{"filename": "bus/a.py", "patch": "+x"}]),
         }
 
@@ -90,6 +94,15 @@ class HourlyMergeCapStatusTests(unittest.TestCase):
                            "the last hour, the cap is 4 (LOOM_AUTO_MERGE_PER_HOUR)")
         self.assertTrue(lines[1].endswith(expected_suffix), lines[1])
         self.assertIn("blocked: held by the hourly merge cap", lines[1])
+
+    def test_a_pull_request_behind_its_base_is_not_ready_and_nothing_is_written(self):
+        transport = StubTransport(self.routes(), search_counts={"default": 0}, behind_by=3)
+        gh = GitHub("t", transport=transport)
+        with unittest.mock.patch.dict(os.environ, {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}):
+            lines = brain._pull_request_lines(gh, REPO, [self.PR], {"prs": {9: ready_node()}},
+                                              "grug-tribe", now=NOW)
+        self.assertIn("blocked: " + brain.BEHIND_REFUSAL, lines[1])
+        self.assertFalse(any(method == "PUT" for method, _ in transport.calls))
 
     def test_per_repo_cap_blocks_ready_pull_request(self):
         # Per-repo search count is at the per-repo cap (2).
@@ -120,7 +133,8 @@ class HourlyMergeCapStatusTests(unittest.TestCase):
         routes[("GET", "/issues/6")] = reply(200, {"number": 6, "state": "open",
                                                    "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]})
         routes[("GET", "/pulls/8")] = reply(200, {"number": 8, "mergeable": True,
-                                                  "mergeable_state": "clean"})
+                                                  "mergeable_state": "clean",
+                                             "base": {"ref": "main"}, "head": {"sha": "h"}})
         routes[("GET", "/pulls/8/files")] = reply(200, [{"filename": "bus/b.py", "patch": "+x"}])
 
         transport = StubTransport(routes, search_counts={"repo:": 0, "user:": 4})
@@ -153,7 +167,8 @@ class HourlyMergeCapStatusTests(unittest.TestCase):
         routes[("GET", "/issues/6")] = reply(200, {"number": 6, "state": "open",
                                                    "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]})
         routes[("GET", "/pulls/8")] = reply(200, {"number": 8, "mergeable": True,
-                                                  "mergeable_state": "clean"})
+                                                  "mergeable_state": "clean",
+                                             "base": {"ref": "main"}, "head": {"sha": "h"}})
         routes[("GET", "/pulls/8/files")] = reply(200, [{"filename": "bus/b.py", "patch": "+x"}])
         routes[("GET", "/issues")] = reply(200, [])
         routes[("GET", "/pulls")] = reply(200, [pr8, pr9])

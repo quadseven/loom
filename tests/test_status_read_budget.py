@@ -46,8 +46,10 @@ STUCK_COUNT = 24
 # remote brain's pass of it ran past the 120 s budget. After loom#2078 the
 # same pass reads 159 times. This fake makes 276 reads before and 157 after;
 # the bound holds a loom-sized pass to about 60 percent of the reads that ran
-# past the budget.
-READ_BOUND = 180
+# past the budget. Merge's base compare (loom#1990) then adds one read for each
+# pull request that reaches the READY checks, 41 here, so this fake makes 198:
+# about 73 percent of the reads that ran past the budget.
+READ_BOUND = 200
 
 
 def _issue(number, labels, body="", **extra):
@@ -134,12 +136,15 @@ class LoomSizedFake:
             return self._reply(ISSUES)
         if bare == "/repos/%s/pulls" % REPO:
             return self._reply(PULLS)
+        if "/compare/" in bare:
+            return self._reply({"behind_by": 0})
         if bare.startswith("/search/issues"):
             return self._reply({"total_count": 0})
         if bare.endswith("/files"):
             return self._reply([{"filename": "bus/a.py", "patch": "+x"}])
         if PULL.match(bare):
-            return self._reply({"state": "open", "mergeable": True, "mergeable_state": "clean"})
+            return self._reply({"state": "open", "mergeable": True, "mergeable_state": "clean",
+                                "base": {"ref": "main"}, "head": {"sha": "head"}})
         return self._reply([])
 
     def _subs(self, number):
@@ -180,6 +185,7 @@ class StatusReadsALoomSizedRepoInBudget(unittest.TestCase):
                              if re.match(r"- #1\d{3} PR for #\d+ - READY", x)), PULL_COUNT)
         self.assertLessEqual(fake.reads(), READ_BOUND,
                              "status read %d times for a loom-sized repo" % fake.reads())
+        self.assertEqual(sum(n for (_, p), n in fake.calls.items() if "/compare/" in p), PULL_COUNT)
 
     def test_a_listed_issue_is_never_read_again_on_its_own(self):
         fake = LoomSizedFake()
