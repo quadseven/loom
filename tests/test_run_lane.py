@@ -3416,7 +3416,7 @@ exec /usr/bin/git "$@"
         self.assertNotIn("[limit]", log)
         self.assertIn("[transient]", log)
 
-    def api_lane(self, lane, extra="", difficulty="medium", **env):
+    def api_lane(self, lane, extra="", difficulty="medium", brief_header="Demoted-Models: none", **env):
         if not sandbox_caps.LOCALHOST:
             self.skipTest(sandbox_caps.NO_LOCALHOST)
         planted = self.home / ".ssh" / "id_planted"
@@ -3436,7 +3436,7 @@ exec /usr/bin/git "$@"
         self.addCleanup(self.local_service.close)
         port = self.local_service.getsockname()[1]
         (inbox / "T042-fix-the-thing.md").write_text(
-            BRIEF.replace("Lane: codex", f"Lane: {lane}").replace("Difficulty: medium", f"Difficulty: {difficulty}")
+            BRIEF.replace("Lane: codex", f"Lane: {lane}").replace("Difficulty: medium", f"Difficulty: {difficulty}\n{brief_header}")
             + f"\nPROBE_PORT={port}\n{extra}")
         result = self.run_lane(lane, SSH_AUTH_SOCK="/nonexistent/agent.sock", GH_TOKEN="fake-token-not-real", **env)
         return inbox, result
@@ -4370,6 +4370,15 @@ echo fixed > fix.txt
                     LOOM_OPENCODE_GO_MODELS_URL=base + "/go.json",
                     LOOM_ZEN_MODELS_URL=base + "/zen.json",
                     LOOM_MODELS_STATUS_URL=base + "/status.json")
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_runner_without_the_scorecard_skips_models_named_in_the_brief(self):
+        (self.loom / "briefs" / "opencode-go").mkdir(parents=True, exist_ok=True)
+        inbox, result = self.api_lane("opencode-go", extra="", difficulty="medium",
+                                      brief_header="Demoted-Models: opencode-go/gpt-6-luna",
+                                      **self.pick_env(go=self.STRONG_LISTED + ("claude-haiku-5-5",)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-m opencode-go/claude-haiku-5-5", self.runs()[-1])
 
     def pause_models(self, *keys):
         (self.loom / "state" / "usage").mkdir(parents=True, exist_ok=True)

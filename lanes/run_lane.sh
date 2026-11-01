@@ -1853,7 +1853,7 @@ pick_run_model() {
     tier=strong
     [ "$(field Difficulty "$BRIEF" || true)" = easy ] && tier=easy
   fi
-  if ! out="$(printf '%s\n' "$API_KEY" | model_pick pick "$LANE" "$SLOT" "$REPO_PRIVATE" "$tier" 2>> "$LOG")"; then
+  if ! out="$(printf '%s\n' "$API_KEY" | model_pick pick "$LANE" "$SLOT" "$REPO_PRIVATE" "$tier" "$(field Demoted-Models "$BRIEF" || true)" 2>> "$LOG")"; then
     pick_refused "$out"
     return 1
   fi

@@ -26,7 +26,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
@@ -326,11 +326,24 @@ def plan_stop(usage: Optional[Mapping[str, Tuple[float, float]]], now: float
     return None
 
 
-def _demoted(home: Path) -> List[str]:
-    """Models the scorecard demoted (bus/scorecard.py). A demotion binds to
-    the model, so a slot goes on with its other models."""
-    demoted = _read_json(Path(home) / "state" / "station" / "scorecard.json").get("demoted")
-    return [k[len(MODEL_KEY):] for k in demoted if k.startswith(MODEL_KEY)] if isinstance(demoted, dict) else []
+def _demoted(home: Path, brief_line: str) -> Optional[List[str]]:
+    """Models the scorecard demoted (bus/scorecard.py), from its file and the
+    brief's Demoted-Models line, which reaches a runner without the file. None
+    when the file cannot be read, the station could not read it, or neither
+    source exists: then only free models run."""
+    line = brief_line.split()
+    if line == ["unreadable"]:
+        return None
+    path = Path(home) / "state" / "station" / "scorecard.json"
+    if not path.exists():
+        return [m for m in line if m != "none"] if line else None
+    try:
+        demoted = json.loads(path.read_text(encoding="utf-8")).get("demoted")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(demoted, dict):
+        return None
+    return [k[len(MODEL_KEY):] for k in demoted if k.startswith(MODEL_KEY)] + [m for m in line if m != "none"]
 
 
 def _pauses(home: Path, now: float) -> Dict[str, Dict[str, Any]]:
@@ -501,22 +514,27 @@ def settle(home: Path, now: float, model: str, events: Iterable[str],
 
 
 def pick(lane: str, slot: str, private: bool, key: str, home: Path, now: float,
-         env: Mapping[str, str], opener: Opener = _open, tier: str = TIER_NONE) -> Pick:
+         env: Mapping[str, str], opener: Opener = _open, tier: str = TIER_NONE,
+         brief_demoted: str = "") -> Pick:
     """The model of one run, by tier. TIER_STRONG: a strong model the guards
     allow, else a free model other than EASY_ONLY. TIER_EASY: a free model,
     else a paid flash model the guards allow. TIER_NONE: free models only. No
     model: None and when to ask again."""
     free, paid = candidates(lane, private, _lists(home, now, env, opener))
-    demoted = _demoted(home)
+    demoted = _demoted(home, brief_demoted)
+    known = demoted is not None
+    demoted = demoted or []
     free, paid = [m for m in free if m not in demoted], [m for m in paid if m not in demoted]
     strong = tier == TIER_STRONG
+    if not known:
+        paid = []
     if strong:
         free = [m for m in free if m.split("/", 1)[1] not in EASY_ONLY]
         paid = [m for m in paid if m in GO_STRONG]
     else:
         paid = [m for m in paid if tier == TIER_EASY and m not in GO_STRONG]
     held = _pauses(home, now)
-    skipped: List[str] = []
+    skipped: List[str] = [] if known else ["paid models stop: demotions could not be read"]
     waits: List[float] = []
 
     def usable(model: str) -> bool:
@@ -603,9 +621,10 @@ def main(argv: Sequence[str]) -> int:
     home = Path(os.environ.get("LOOM_HOME") or os.path.expanduser("~/loom"))
     now = time.time()
     command = argv[0] if argv else ""
-    if command == "pick" and len(argv) == 5:
+    if command == "pick" and len(argv) == 6:
         key = sys.stdin.readline().strip()
-        got = pick(argv[1], argv[2], argv[3] == "true", key, home, now, os.environ, tier=argv[4])
+        got = pick(argv[1], argv[2], argv[3] == "true", key, home, now, os.environ, tier=argv[4],
+                   brief_demoted=argv[5])
         if got.model is None:
             print("\t%d\t%s" % (got.until, got.note))
             return 3
@@ -623,7 +642,7 @@ def main(argv: Sequence[str]) -> int:
     if command == "settle" and len(argv) == 2:
         settle(home, now, argv[1], sys.stdin)
         return 0
-    print("usage: python3 -m bus.model_pick pick <lane> <slot> <private> <tier> | status <lane> "
+    print("usage: python3 -m bus.model_pick pick <lane> <slot> <private> <tier> <demoted> | status <lane> "
           "| failed <model> | settle <model>", file=sys.stderr)
     return 2
 

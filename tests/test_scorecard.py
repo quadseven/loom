@@ -34,6 +34,7 @@ REPO = "example-owner/example-app"
 BOT = "grug-tribe"
 LANES_LOGIN = "loom-lanes[bot]"
 # The lanes the audit's damaging verdicts reach at the default threshold of 3.
+# The audit's opencode-go records name their models, which each fall short.
 DEMOTED_AT_3 = {"claude", "codex", "spark", "free"}
 
 
@@ -122,6 +123,34 @@ class AuditCounts(unittest.TestCase):
         self.assertEqual(slots, {})
         self.assertTrue(got.clear("model:opencode-go/beam-free"))
         self.assertEqual(got.demoted(), {})
+
+    def test_failed_proof_audits_still_demote_a_picking_lane(self):
+        got = card()
+        got.data["audits"] = {"a%d" % i: {"lane": "opencode-go", "at": NOW - 60} for i in range(3)}
+        self.assertEqual(quiet(got.demote), ["opencode-go"])
+
+    def test_a_record_with_no_model_counts_against_a_picking_lane(self):
+        got = card()
+        got.data["records"] = {"r%d" % i: {"lane": "opencode-go", "model": "unknown", "at": NOW - 60,
+                                           "review": scorecard.BAD_WORK} for i in range(3)}
+        self.assertEqual(quiet(got.demote), ["opencode-go"])
+
+    def test_a_slot_that_does_not_pick_is_still_demoted_by_lane(self):
+        got = card()
+        got.data["records"] = {"r%d" % i: {"lane": "codex", "model": "gpt-6-luna", "at": NOW - 60,
+                                           "review": scorecard.BAD_WORK} for i in range(3)}
+        self.assertEqual(quiet(got.demote), ["codex"])
+
+    def test_the_brief_line_names_demoted_models_or_says_the_card_is_unreadable(self):
+        state = tempfile.mkdtemp()
+        got = card(state=state)
+        self.assertEqual(scorecard.demoted_models_line(got), "none")
+        got.data["demoted"]["model:opencode-go/beam-free"] = {"why": "x"}
+        got.data["demoted"]["codex"] = {"why": "y"}
+        self.assertEqual(scorecard.demoted_models_line(got), "opencode-go/beam-free")
+        with open(os.path.join(state, scorecard.FILE), "w") as out:
+            out.write("{broken")
+        self.assertEqual(scorecard.demoted_models_line(card(state=state)), "unreadable")
 
     def test_demoted_lanes_cover_their_slots(self):
         slots = scorecard.demoted_slots({"codex": "x", "free": "y", "opencode-go": "z"},

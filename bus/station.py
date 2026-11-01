@@ -2599,7 +2599,8 @@ class Station:
                                     notes=tickets.operator_notes(
                                         comments, list(self.s.authors) + list(self.s.briefers)
                                         + list(self.s.owners)),
-                                    linked=self._linked_pulls(repo, number))
+                                    linked=self._linked_pulls(repo, number),
+                                    demoted_models=self._brief_demoted_models(lane))
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
@@ -13005,6 +13006,13 @@ class Station:
             _say("every lane takes no build ticket: %s" % card.unreadable)
             return {lane: card.unreadable for lane in LANES}
         return scorecard.demoted_slots(card.demoted(), LANES)
+
+    def _brief_demoted_models(self, lane: str) -> str:
+        """The Demoted-Models line of a brief for a slot that picks its model,
+        which may run where the scorecard file is not."""
+        if labels.base_lane(lane) not in scorecard.PICKED_LANES:
+            return ""
+        return scorecard.demoted_models_line(scorecard.Scorecard(self.state, self.now))
 
     def benched_pairs(self) -> List[Tuple[str, str]]:
         """The (provider, model) pairs the bench list holds benched now."""

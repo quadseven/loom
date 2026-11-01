@@ -1520,7 +1520,11 @@ cannot query the viewer or any other local service.
   `state/usage/go-budget.jsonl`.
 - A failed review on a Go or Zen slot demotes the model
   (`model:<id>` in the scorecard), not the slots: the picker skips it and the
-  slots go on. `python3 -m bus.scorecard clear model:<id>` clears it.
+  slots go on. `python3 -m bus.scorecard clear model:<id>` clears it. Failed
+  proof audits and records with no model still demote the lane. Each brief for
+  these slots carries a `Demoted-Models:` line, so a runner without the
+  scorecard file skips them too. An unreadable scorecard, or neither source,
+  stops paid models and free models carry on.
   Each run holds up to 500 requests until it settles; output and hidden reasoning
   past 300 tokens per step count as more requests. DeepSeek V4.1 Flash is out
   because of its hidden reasoning. Extra usage stays off.

@@ -109,6 +109,12 @@ ROW_RE = re.compile(r"^\| (?!scorecard lane)([a-z0-9_.-]+) \| ([^|]*) \|((?: [0-
                     % len(COLUMNS))
 
 
+def _model_bound(record: Mapping[str, Any]) -> bool:
+    """Whether a record's outcome binds to its model and not to its lane."""
+    return (labels.base_lane(str(record.get("lane"))) in PICKED_LANES
+            and record.get("model") not in (None, "", "unknown"))
+
+
 def _say(message: str) -> None:
     print("scorecard: %s" % message, flush=True)
 
@@ -374,7 +380,8 @@ class Scorecard:
         counts = {"bad-work findings": 0, "reverts": 0, "failed deploys": 0,
                   "failed proof audits": 0}
         for record in self.data["records"].values():
-            ours = record.get("model") == model if model else record.get("lane") == lane
+            ours = (record.get("model") == model if model
+                    else record.get("lane") == lane and not _model_bound(record))
             if not ours or float(record.get("at") or 0) < since:
                 continue
             counts["bad-work findings"] += int(record.get("review") == BAD_WORK)
@@ -386,16 +393,15 @@ class Scorecard:
         return sum(counts.values()), ["%d %s" % (n, what) for what, n in counts.items() if n]
 
     def lanes(self) -> List[str]:
-        """What can be demoted: a lane, or on a lane whose slots pick their
-        model per run a model (MODEL_KEY), so one model's bad work does not
-        bench the slots running others."""
+        """What can be demoted: every lane, and on a lane whose slots pick
+        their model per run each model (MODEL_KEY), so one model's bad work
+        does not bench the slots running others. Such a lane still answers
+        for failed proof audits and records that name no model (bad)."""
         found = {str(r.get("lane")) for r in self.data["records"].values()}
         found |= {str(e.get("lane")) for e in self.data["audits"].values()}
-        found |= {lane for lane, _ in AUDIT}
-        lanes = {lane for lane in found if labels.base_lane(lane) not in PICKED_LANES}
-        return sorted(lanes | {MODEL_KEY + str(r.get("model")) for r in self.data["records"].values()
-                               if labels.base_lane(str(r.get("lane"))) in PICKED_LANES
-                               and r.get("model") not in (None, "", "unknown")})
+        return sorted(found | {lane for lane, _ in AUDIT}
+                      | {MODEL_KEY + str(r.get("model")) for r in self.data["records"].values()
+                         if _model_bound(r)})
 
     def demote(self) -> List[str]:
         """Demote each lane whose bad outcomes reach the threshold; the
@@ -438,6 +444,15 @@ class Scorecard:
                 lane, model or "-", " | ".join(str(got[c]) for c in COLUMNS),
                 "yes" if lane in demoted or MODEL_KEY + model in demoted else "no"))
         return lines + difficulty.markdown(self.data["records"], self.now)
+
+
+def demoted_models_line(card: "Scorecard") -> str:
+    """The brief's Demoted-Models line, so a runner without the scorecard file
+    still skips them: the models, "none", or "unreadable" for a card the
+    station could not read."""
+    if card.unreadable:
+        return "unreadable"
+    return " ".join(sorted(k[len(MODEL_KEY):] for k in card.demoted() if k.startswith(MODEL_KEY))) or "none"
 
 
 def demoted_slots(demoted: Mapping[str, str], slots: Iterable[str]) -> Dict[str, str]:

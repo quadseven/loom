@@ -736,7 +736,7 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   ci_checks: Optional[List[Tuple[str, str]]] = None,
                   has_contract: bool = True, resume: Optional[str] = None,
                   notes: Sequence[Tuple[str, str, str]] = (),
-                  linked: Sequence[str] = ()) -> str:
+                  linked: Sequence[str] = (), demoted_models: str = "") -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -755,6 +755,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
             # The Finding-<id> prefix also prevents a field() match in the runner.
             summary = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", f.text).split())[:200]
             out.append("Finding-%s: %s" % (f.id, summary))
+    if demoted_models:
+        out.append("Demoted-Models: %s" % demoted_models)
     out += ["%s: %s" % (k, v) for k, v in headers.items()
             if k not in ("Not before", "After", "Priority")]
     if "Model" not in headers and headers.get("Difficulty") == "hard":

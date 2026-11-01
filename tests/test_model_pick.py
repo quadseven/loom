@@ -82,10 +82,11 @@ class ModelPickTest(unittest.TestCase):
         self.home = Path(self._tmp.name)
         self.provider = Provider()
         self.now = NOW
+        self.brief_demoted = "none"
 
     def pick(self, lane="opencode-go", private=False, tier=model_pick.TIER_EASY):
         return model_pick.pick(lane, "slot", private, "fake-key", self.home, self.now,
-                               ENV, self.provider, tier=tier)
+                               ENV, self.provider, tier=tier, brief_demoted=self.brief_demoted)
 
     def later(self, seconds=model_pick.LIST_FRESH + 1):
         self.now += seconds
@@ -262,6 +263,36 @@ class ModelPickTest(unittest.TestCase):
         scorecard.write_text(json.dumps({"demoted": {"model:opencode-go/beam-free": {"why": "x"}}}))
         self.assertEqual(self.pick().model, "opencode-go/iceman-contributor-free")
 
+    def scorecard_file(self):
+        path = self.home / "state" / "station" / "scorecard.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def test_an_unreadable_scorecard_leaves_only_free_models(self):
+        self.scorecard_file().write_text("{broken")
+        got = self.pick(tier=model_pick.TIER_STRONG)
+        self.assertEqual(got.kind, "free")
+        self.assertIn("demotions could not be read", got.note)
+        self.assertFalse(model_pick.budget_file(self.home).exists())
+
+    def test_a_scorecard_with_a_broken_demoted_field_counts_as_unreadable(self):
+        self.scorecard_file().write_text('{"demoted": []}')
+        self.assertEqual(self.pick(tier=model_pick.TIER_STRONG).kind, "free")
+
+    def test_a_missing_scorecard_uses_the_brief_line(self):
+        self.brief_demoted = "%s opencode-go/beam-free" % STRONG
+        got = self.pick(tier=model_pick.TIER_STRONG)
+        self.assertEqual(got.model, model_pick.GO_STRONG[1])
+        self.assertEqual(self.pick(tier=model_pick.TIER_EASY).model, "opencode-go/iceman-contributor-free")
+
+    def test_no_scorecard_and_no_brief_line_leaves_only_free_models(self):
+        self.brief_demoted = ""
+        self.assertEqual(self.pick(tier=model_pick.TIER_STRONG).kind, "free")
+
+    def test_a_brief_line_saying_unreadable_leaves_only_free_models(self):
+        self.brief_demoted = "unreadable"
+        self.assertEqual(self.pick(tier=model_pick.TIER_STRONG).kind, "free")
+
     def test_a_private_repo_never_runs_muse(self):
         for model in model_pick.GO_PAID:
             if model != MUSE:
@@ -366,7 +397,8 @@ class ModelPickTest(unittest.TestCase):
 
     def test_a_list_url_that_is_not_http_opens_nothing(self):
         env = dict(ENV, LOOM_MODELS_STATUS_URL="file:///etc/hosts")
-        got = model_pick.pick("zen", "slot", False, "", self.home, self.now, env, self.provider)
+        got = model_pick.pick("zen", "slot", False, "", self.home, self.now, env, self.provider,
+                              brief_demoted="none")
         self.assertIsNone(got.model)
 
     def test_the_key_never_reaches_a_note_or_a_state_file(self):
