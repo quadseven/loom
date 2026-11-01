@@ -778,6 +778,17 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
+    def test_merge_refuses_a_ticket_held_for_outside_work(self):
+        body = "Refs %s#9\n\n## Acceptance criteria\n- [x] one box" % REPO
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                                                {"name": "claim:overflow"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []))
+        with self.assertRaisesRegex(ValueError, "held by claim:overflow"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                        env={"LOOM_BRIEF_AUTHORS": "alice-example"})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
     def test_merge_refuses_a_box_said_to_be_already_done_with_no_code(self):
         body = ("Refs %s#9\n\n## Acceptance criteria\n"
                 "- [x] one box is built\n"

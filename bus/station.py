@@ -55,7 +55,7 @@ from . import stale_claims
 from . import ask_state
 from . import brief_check
 from . import label_pass
-from .labels import HUMAN_LABELS, NEEDS_HUMAN, needs_human
+from .labels import HUMAN_LABELS, NEEDS_HUMAN, OVERFLOW_CLAIM, needs_human
 from . import factory
 from . import friction_intake
 from . import evidence
@@ -2476,7 +2476,8 @@ class Station:
         if owner is None:
             return False
         self._note_owned("%s#%s" % (repo, issue.get("number")),
-                         "assigned to %s, not a LOOM_BRIEF_AUTHORS login" % owner)
+                         ("assigned to %s, not a LOOM_BRIEF_AUTHORS login" % owner)
+                         if ":" not in owner else "held by %s for outside work" % owner)
         return True
 
     def _goal_elsewhere(self, repo: str, issue: Dict[str, Any]) -> bool:
@@ -4882,7 +4883,8 @@ class Station:
                    "loom:failed")
         for issue in open_tickets:
             if (not isinstance(issue, dict) or "pull_request" in issue
-                    or not set(_label_names(issue)).intersection(waiting)):
+                    or not set(_label_names(issue)).intersection(waiting)
+                    or self._owned_elsewhere(repo, issue)):
                 continue
             number = self._adopted_pull_number(issue)
             if number is None:
@@ -4966,6 +4968,8 @@ class Station:
                 tickets_by_number[number] = ticket
             labels = _label_names(ticket)
             if not set(labels).intersection(("loom:queued", "loom:briefed")):
+                continue
+            if self._owned_elsewhere(repo, ticket):
                 continue
             if not _linked_pr(ticket, repo, pr):
                 continue
@@ -6277,7 +6281,9 @@ class Station:
         """Return completed lane PRs with failed checks or bot findings."""
         rounds = _fix_round_limit()
         for repo in self.scan_repos():
-            issues = self._pr_tickets(repo)
+            # A fix round from here took a hold off a ticket an outside
+            # contributor had just been given (loom#2333).
+            issues = [i for i in self._pr_tickets(repo) if not self._owned_elsewhere(repo, i)]
             if not issues:
                 continue
             prs = self._open_pulls(repo)
@@ -10379,6 +10385,7 @@ class Station:
             "/repos/%s/labels" % repo) if isinstance(label, dict)]
         queries = ["labels=%s" % quote(name, safe=":") for name in names
                    if name.lower().startswith(stale_claims.CLAIM_PREFIX)
+                   and name.lower() != OVERFLOW_CLAIM
                    and name[len(stale_claims.CLAIM_PREFIX):].strip().lower() not in ours]
         queries += ["assignee=%s" % quote(login) for login in self.s.briefers
                     if login.lower() not in ours]
