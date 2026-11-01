@@ -153,7 +153,10 @@ class StatusSkipTests(unittest.TestCase):
     def test_a_moved_repo_gets_a_skipped_line_and_the_others_finish(self):
         routes = {("GET", "/repos/%s/issues" % MOVED): (301, MOVED_BODY),
                   ("GET", "/repos/%s/issues" % REPO): (200, []),
-                  ("GET", "/repos/%s/issues" % LOCK_REPO): (200, [])}
+                  ("GET", "/repos/%s/issues" % LOCK_REPO): (200, []),
+                  # Each repo's size (repo_weights): the moved repo answers null.
+                  ("POST", "/graphql"): (200, {"data": {"r0": None, "r1": {}},
+                                               "errors": [{"type": "NOT_FOUND"}]})}
         out, err = quiet(brain.status, GitHub("t", transport=Routes(routes)), [MOVED, REPO],
                          LOCK_REPO, env=ENV)
         line = "skipped %s: HTTP 301 Moved Permanently: renamed or transferred" % MOVED
@@ -162,11 +165,24 @@ class StatusSkipTests(unittest.TestCase):
         self.assertIn("## %s\n\n### Goals" % REPO, out)
         self.assertIn("## Lane status", out)
 
-    def test_a_fault_still_ends_status(self):
+    def test_a_fault_is_named_as_failed_and_status_is_partial(self):
+        # A fault is not a moved repo: it is not skipped as gone. As resume
+        # does (loom#1578), status names it as failed and reads the other
+        # repos, and its last line says the read is partial (loom#2415).
         routes = {("GET", "/repos/%s/issues" % MOVED): (500, {"message": "boom"}),
-                  ("GET", "/repos/%s/issues" % LOCK_REPO): (200, [])}
-        with self.assertRaises(GitHubError):
-            quiet(brain.status, GitHub("t", transport=Routes(routes)), [MOVED], LOCK_REPO, env=ENV)
+                  ("GET", "/repos/%s/issues" % REPO): (200, []),
+                  ("GET", "/repos/%s/issues" % LOCK_REPO): (200, []),
+                  # Each repo's size (repo_weights): the moved repo answers null.
+                  ("POST", "/graphql"): (200, {"data": {"r0": None, "r1": {}},
+                                               "errors": [{"type": "NOT_FOUND"}]})}
+        missed = []
+        out, err = quiet(brain.status, GitHub("t", transport=Routes(routes)), [MOVED, REPO],
+                         LOCK_REPO, env=ENV, missed=missed)
+        self.assertEqual([MOVED], missed)
+        self.assertRegex(out, r"## %s\n\n- skipped %s: read failed: .*500" % (MOVED, MOVED))
+        self.assertNotIn("renamed or transferred", out)
+        self.assertIn("## %s\n\n### Goals" % REPO, out)
+        self.assertEqual("status partial: not read this run: %s" % MOVED, out.splitlines()[-1])
 
 
 if __name__ == "__main__":
