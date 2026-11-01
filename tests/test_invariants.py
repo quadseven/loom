@@ -981,7 +981,7 @@ class SettleBeforeFilingTest(StationBase):
         self.run_filer(facts, self.others("a"))
         self.assertEqual(filed["state"], "closed", self.said)
         self.assertEqual(filed["state_reason"], "not_planned")
-        self.assertIn("epic issue 35 of %s is closed" % OTHER, filed["body"])
+        self.assertIn("epic issue 35 of %s is closed" % OTHER, "".join(c["body"] for c in self.gh.comments[(REPO, filed["number"])]))
         self.assertTrue(any("closed settled" in line for line in self.said), self.said)
 
     def test_the_reports_drain_while_every_pass_files_something_else(self):
