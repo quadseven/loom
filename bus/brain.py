@@ -247,6 +247,8 @@ PAST_RUNG_HEADING = "### Past the last rung"
 INVARIANTS_HEADING = "### Invariants broken"
 # Ticketless pull requests a trusted login opened, listed for the brain.
 ADOPT_HEADING = "### Pull requests without a ticket"
+BEHIND_REFUSAL = ("behind its base: bring it up to date and pass its checks "
+                  "on the new head")
 ADOPT_MARKER = "<!-- loom:adopt v1 -->"
 # What the brain posts on a pull request it adopts. No at-sign before the
 # review bot's short name, no closing keyword with an issue reference.
@@ -947,10 +949,8 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
         return found + [str(err)]
     if tier != merge_tier.REVERT and tier not in merge_tier.auto_tiers(None):
         found.append("held for the operator: %s" % tier)
-    # Check if behind base
-    behind_reason = _behind_reason(gh, repo, number, pr, ticket, None)
-    if behind_reason:
-        found.append("behind its base: " + behind_reason)
+    if _behind_by(gh, repo, rest):
+        found.append(BEHIND_REFUSAL)
     return found
 
 
@@ -3892,11 +3892,8 @@ def merge(gh: GitHub, repo: str, number: int,
             raise ValueError(reason)
         _refuse_merge_constraints(gh, repo, number, association, issue)
         tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env, verdict)
-        # Check if behind base (only for non-adopt merges)
-        if not adopt:
-            behind_reason = _behind_reason(gh, repo, number, pr, association, env)
-            if behind_reason:
-                raise ValueError("behind its base: " + behind_reason)
+    if _behind_by(gh, repo, pr):
+        raise ValueError(BEHIND_REFUSAL)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
@@ -4253,29 +4250,17 @@ def _mergeable(pr: Dict[str, Any]) -> bool:
     return pr.get("mergeable") is True
 
 
-def _is_behind(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
-               ticket: Optional[Tuple[str, int]] = None,
-               env: Optional[Dict[str, str]] = None) -> bool:
-    """Whether the pull request is behind its base branch."""
+def _behind_by(gh: GitHub, repo: str, pr: Dict[str, Any]) -> int:
+    """Commits the base has that the pull request's head lacks. GitHub says a
+    behind pull request is clean, so only the compare tells. A failed read
+    raises: no answer never counts as up to date."""
     base = str((pr.get("base") or {}).get("ref") or "")
     head = str((pr.get("head") or {}).get("sha") or "")
     if not base or not head:
-        return False
-    try:
-        data = gh.rest("GET", "/repos/%s/compare/%s...%s"
-                       % (repo, quote(base, safe=""), head)).data or {}
-        return int(data.get("behind_by") or 0) > 0
-    except GitHubError:
-        return False
-
-
-def _behind_reason(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
-                   ticket: Optional[Tuple[str, int]] = None,
-                   env: Optional[Dict[str, str]] = None) -> str:
-    """Why merge refuses a pull request that is behind its base, else ""."""
-    if _is_behind(gh, repo, number, pr, ticket, env):
-        return "pull request is behind its base; must be brought up to date and pass its checks on the new head"
-    return ""
+        return 0
+    data = gh.rest("GET", "/repos/%s/compare/%s...%s"
+                   % (repo, quote(base, safe=""), head)).data or {}
+    return int(data.get("behind_by") or 0)
 
 
 def _checks_green(details: Dict[str, Any]) -> bool:

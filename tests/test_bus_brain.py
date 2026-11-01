@@ -1770,6 +1770,33 @@ class SensitiveResumeTests(unittest.TestCase):
                                   "ticket": (REPO, 9), "head_sha": "checked"})
         self.assertTrue(fake.calls[-2][1].endswith("/repos/%s/issues/9" % REPO))
 
+    def _behind_replies(self, behind_by):
+        pr, query = self._merge_replies({"pr": {"base": {"ref": "main", "repo": {"full_name": REPO}}}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        return (pr, query, reply(200, issue), reply(200, {"behind_by": behind_by}))
+
+    def test_merge_refuses_a_pull_request_behind_its_base(self):
+        fake = Fake(*self._behind_replies(3))
+        with self.assertRaisesRegex(ValueError, "behind its base"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertIn("/compare/main...checked", fake.calls[-1][1])
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_merge_lands_a_pull_request_level_with_its_base(self):
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(*self._behind_replies(0), reply(200, {"merged": True}), reply(204),
+                    reply(200, []), reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertTrue(result["merged"])
+        self.assertEqual(fake.calls[4][2], {"merge_method": "squash", "sha": "checked"})
+
+    def test_merge_does_not_land_when_the_compare_cannot_be_read(self):
+        pr, query, issue, _ = self._behind_replies(0)
+        fake = Fake(pr, query, issue, reply(500, {"message": "no"}))
+        with self.assertRaises(GitHubError):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
     def _merge_with_files(self, files, labels=("loom:ticket", "loom:pr"), search_items=None,
                           ticket_body="", pull_body=None):
         pr, query = self._merge_replies(
@@ -2052,6 +2079,13 @@ class SensitiveResumeTests(unittest.TestCase):
     def _merge_replies_for_adopt(self, changes=None):
         return self._adopt_replies(changes) + (reply(200, {"merged": True}),
                                                reply(204), reply(201, {}))
+
+    def test_adopt_refuses_a_pull_request_behind_its_base(self):
+        pr, query, runs = self._adopt_replies({"pr": {"base": {"ref": "main", "repo": {"full_name": REPO}}}})
+        fake = Fake(pr, query, runs, reply(200, {"behind_by": 3}))
+        with self.assertRaisesRegex(ValueError, "behind its base"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, adopt=True, env=self.TRUSTED)
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
     def test_adopt_merges_a_trusted_green_reviewed_threadless_pr_without_a_ticket(self):
         fake = Fake(*self._merge_replies_for_adopt())
@@ -2662,13 +2696,15 @@ class StatusMergeRefusalTests(unittest.TestCase):
           "labels": [{"name": "class:logic"}]}
 
     def lines(self, state="pr", mergeable=True, mergeable_state="clean",
-              files=("bus/a.py", "tests/test_a.py"), env=None):
+              files=("bus/a.py", "tests/test_a.py"), env=None, behind_by=0):
         issue = {"number": 7, "state": "open", "body": "",
                  "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]}
         routes = {
             ("GET", "/issues/7"): reply(200, issue),
             ("GET", "/pulls/9"): reply(200, {"number": 9, "mergeable": mergeable,
-                                             "mergeable_state": mergeable_state}),
+                                             "mergeable_state": mergeable_state,
+                                             "base": {"ref": "main"}, "head": {"sha": "h"}}),
+            ("GET", "/compare/main...h"): reply(200, {"behind_by": behind_by}),
             ("GET", "/pulls/9/files"): reply(200, [{"filename": f, "patch": "+x"} for f in files]),
         }
         gh = GitHub("t", transport=Routed(routes))
@@ -2687,6 +2723,9 @@ class StatusMergeRefusalTests(unittest.TestCase):
     def test_a_tier_outside_the_auto_tiers_is_held_for_the_operator(self):
         line = self.lines(files=("deploy/app.yaml",))[1]
         self.assertEqual(line, "- #9 Work - blocked: held for the operator: deploy-config")
+
+    def test_a_pull_request_behind_its_base_is_not_ready(self):
+        self.assertIn("blocked: " + brain.BEHIND_REFUSAL, self.lines(behind_by=3)[1])
 
     def test_a_pull_request_merge_would_take_is_ready(self):
         self.assertEqual(self.lines()[1], "- #9 Work - READY")
