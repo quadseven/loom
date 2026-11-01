@@ -4,7 +4,9 @@ import json
 import os
 import re
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -259,8 +261,10 @@ class RemoteLaneTests(unittest.TestCase):
         self.assertIn(" 2000.000 ", gh.comments[9][0]["body"])
 
     def open_pr(self, gh):
+        raw = "\n".join(":100644 100644 %s %s M\t%s" % ("0" * 40, "0" * 40, path)
+                        for path in ("bus/lane.py", "tests/test_lane.py"))
         with mock.patch.object(lane, "_git", side_effect=["loom/4-add-a-feature",
-                                                          "bus/lane.py\ntests/test_lane.py"]):
+                                                          "bus/lane.py\ntests/test_lane.py", raw]):
             with mock.patch.object(lane.change_class, "classify", return_value="logic"):
                 with mock.patch.object(lane.change_class, "count_by_class", return_value={
                         "logic": 1, "tests": 1, "docs": 0, "sensitive": 0}):
@@ -273,10 +277,24 @@ class RemoteLaneTests(unittest.TestCase):
         body = next(c for c in gh.calls if c[0] == "POST" and c[1].endswith("/pulls"))[2]["body"]
         self.assertIn("## Intent", body)
         self.assertIn("Class: logic", body)
+        self.assertIn("Risk: app-code, door unstated, blast radius unstated", body)
+        self.assertIn("tier:app-code", [
+            x for c in gh.calls if c[0] == "POST" and "/labels" in c[1] for x in c[2]["labels"]])
         self.assertEqual(hunt_plan.problems(body), [])
         self.assertTrue(body.rstrip().endswith("Refs example/project#4"))
         self.assertIsNone(re.search(r"\b(close[sd]?|fix(es|ed)?|resolve[sd]?)\s+#\d", body, re.I))
         self.assertIn("loom:pr", labels(gh))
+
+    def test_a_lane_summary_in_the_tree_supplies_the_door(self):
+        gh = FakeGitHub()
+        with tempfile.TemporaryDirectory() as tree:
+            summary = Path(tree) / ".loom" / "summary.md"
+            summary.parent.mkdir()
+            summary.write_text("Fix it\n\n## Risk\nDoor: two-way\nBlast radius: repo\n")
+            with mock.patch.object(lane.change_class, "SUMMARY_FILE", str(summary)):
+                self.open_pr(gh)
+        body = next(c for c in gh.calls if c[0] == "POST" and c[1].endswith("/pulls"))[2]["body"]
+        self.assertIn("Risk: app-code, two-way door, blast radius repo", body)
 
     def test_a_ticket_whose_pr_would_fail_the_plan_checks_opens_nothing(self):
         gh = FakeGitHub(body="Difficulty: medium\n\n## What\nAdd the feature.\n")

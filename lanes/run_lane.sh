@@ -450,7 +450,7 @@ BUGS_SECTION="Bugs discovered"
 # What section, or the reason a run changed nothing (no_change_reason). The
 # file itself is never committed.
 summary_note() {
-  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion the change builds; leave every live check (a Live line, or anything seen on a running system, a host, a network or over time) and every operator action unticked, since only the station'"'"'s verifier ticks those; and for an unbuilt criterion append \"; not built: <reason>\". A reason saying the work is already there must cite the code on the base branch as <path>:<line> or <path>::<symbol>, or the pull request goes back. The runner puts that checklist in the pull request body. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If you found a bug outside this ticket, add a ## %s section, one bug per line, each citing its issue as #N (this repo) or OWNER/NAME#N; file the issue first if none exists. The station looks each issue up and leaves out any line whose issue does not exist, is a pull request, or is closed and was not filed in the last two days. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION" "$BUGS_SECTION"
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion the change builds; leave every live check (a Live line, or anything seen on a running system, a host, a network or over time) and every operator action unticked, since only the station'"'"'s verifier ticks those; and for an unbuilt criterion append \"; not built: <reason>\". A reason saying the work is already there must cite the code on the base branch as <path>:<line> or <path>::<symbol>, or the pull request goes back. The runner puts that checklist in the pull request body. Also include a ## Risk section with two lines: \"Door: one-way\" when the change cannot be walked back by a revert, else \"Door: two-way\"; and \"Blast radius: <one word>\" naming what a mistake reaches, such as ticket, repo or fleet. The runner writes the Risk line from them, and a missing answer reads as door unstated. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If you found a bug outside this ticket, add a ## %s section, one bug per line, each citing its issue as #N (this repo) or OWNER/NAME#N; file the issue first if none exists. The station looks each issue up and leaves out any line whose issue does not exist, is a pull request, or is closed and was not filed in the last two days. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION" "$BUGS_SECTION"
 }
 
 # How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
@@ -547,35 +547,47 @@ stray_list() {
 # The ## Intent section for the top of a new lane PR body: the change
 # class, one line per behavior change, and the counts of files by class.
 # Sensitive globs come from SENSITIVE_FILE on the base revision; a missing
-# file means no sensitive class. Sets INTENT_CLASS and INTENT_TEXT.
+# file means no sensitive class. Sets INTENT_CLASS, INTENT_TIER and
+# INTENT_TEXT, with the Risk line bus/risk_line.py computes under the class.
 # The scratch files live under $LOOM_HOME/run, never the default temp
 # directory: a lane sandbox denies that one, and a failed mktemp handed cp
 # an empty target, which macOS cp takes as the working directory.
 prepare_intent() {
-  local brief="$1" dir files_tmp sens_tmp sum_tmp what_tmp out
+  local brief="$1" dir files_tmp sens_tmp sum_tmp what_tmp full_tmp raw_tmp intent_tmp out risked
   INTENT_CLASS="logic"
+  INTENT_TIER=""
   INTENT_TEXT=""
   dir="$(mktemp -d "$LOOM_HOME/run/$SLOT-intent.XXXXXX")" ||
     { echo "intent: could not make a scratch directory; class stays $INTENT_CLASS" >&2; return 0; }
   files_tmp="$dir/files" sens_tmp="$dir/sensitive" sum_tmp="$dir/summary" what_tmp="$dir/what"
+  full_tmp="$dir/full" raw_tmp="$dir/raw" intent_tmp="$dir/intent"
   safe_git diff --name-only "$BASE" HEAD 2>/dev/null | sed '/^[[:space:]]*$/d' > "$files_tmp"
   safe_git cat-file blob "$BASE:$SENSITIVE_FILE" 2>/dev/null > "$sens_tmp"
   # Only the change lines before the summary's first heading: its
   # ## Acceptance criteria checklist goes to the body's own section.
   if [ -f "$WORKDIR/$TICKET.summary.md" ]; then
     awk '/^#+ /{exit} {print}' "$WORKDIR/$TICKET.summary.md" > "$sum_tmp"
+    cp "$WORKDIR/$TICKET.summary.md" "$full_tmp" 2>/dev/null
   elif [ -f "$TREE/$SUMMARY_FILE" ]; then
     awk '/^#+ /{exit} {print}' "$TREE/$SUMMARY_FILE" > "$sum_tmp" 2>/dev/null
+    cp "$TREE/$SUMMARY_FILE" "$full_tmp" 2>/dev/null
   fi
   section What "$brief" > "$what_tmp" 2>/dev/null
+  safe_git -c core.quotePath=false diff --raw -M "$BASE" HEAD 2>/dev/null > "$raw_tmp"
   out="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.change_class --files "$files_tmp" --sensitive "$sens_tmp" --summary "$sum_tmp" --what "$what_tmp" 2>/dev/null)"
-  rm -rf "$dir"
-  [ -n "$out" ] || return 0
+  [ -n "$out" ] || { rm -rf "$dir"; return 0; }
   INTENT_CLASS="$(printf '%s' "$out" | tail -1 | sed 's/^class://')"
   case "$INTENT_CLASS" in sensitive|logic|tests|docs) ;;
     *) INTENT_CLASS="logic" ;;
   esac
   INTENT_TEXT="$(printf '%s' "$out" | sed '$d')"
+  # A failed Risk read costs the line and the label, never the pull request.
+  printf '%s\n' "$INTENT_TEXT" > "$intent_tmp"
+  risked="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.risk_line --repo "$REPO" --class "$INTENT_CLASS" --intent "$intent_tmp" --raw "$raw_tmp" --summary "$full_tmp" --brief "$brief" 2>/dev/null)" || risked=""
+  rm -rf "$dir"
+  [ -n "$risked" ] || { echo "intent: no Risk line; the pull request opens without it" >&2; return 0; }
+  INTENT_TIER="$(printf '%s' "$risked" | tail -1)"
+  INTENT_TEXT="$(printf '%s' "$risked" | sed '$d')"
 }
 
 # The verified bugs section of the lane's summary, as "## Bugs discovered"
@@ -4337,6 +4349,9 @@ Review threads this round left without a reply: $UNANSWERED"
   [ -z "$PLAN_GAPS" ] || note_plan_hold "$PR_URL"
   if [ -n "$INTENT_CLASS" ] && ! timeout "$NET_TIMEOUT" gh pr edit "$PR_URL" -R "$REPO" --add-label "class:$INTENT_CLASS" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] could not add label class:$INTENT_CLASS to $PR_URL; the PR stands" >> "$LOG"
+  fi
+  if [ -n "${INTENT_TIER:-}" ] && ! timeout "$NET_TIMEOUT" gh pr edit "$PR_URL" -R "$REPO" --add-label "$INTENT_TIER" >> "$LOG" 2>&1; then
+    echo "[$(date -u +%FT%TZ)] could not add label $INTENT_TIER to $PR_URL; the PR stands" >> "$LOG"
   fi
   echo "[$(date -u +%FT%TZ)] $TICKET done" >> "$LOG"
   printf '[%s] %s agent gh calls: %s\n' "$(date -u +%FT%TZ)" "$TICKET" "$AGENT_GH_CALLS" >> "$LOG"
