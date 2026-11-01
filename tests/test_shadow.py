@@ -1046,6 +1046,7 @@ class EveryPathTest(unittest.TestCase):
         ("bus/brain.py", "settle_source"): "shadow.active(",
         ("bus/brain.py", "reopen_source"): "",
         ("bus/brain.py", "audit_proof"): "",
+        ("bus/close_audit.py", "_refuse"): "shadow.active(",
         ("bus/factory.py", "_default_close"): "",   # a pull request: let through
         ("bus/factory.py", "_close_unmerged_follow_ups"): "",
         ("bus/factory.py", "_split_pr"): "",

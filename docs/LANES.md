@@ -1972,6 +1972,18 @@ which that runner could never clear: the station retries the ticket on
 another lane as a transient ending, and that lane holds it if the base is
 red there too. The runner files no incident for it (`LOOM_CLUSTER_RUNNER`).
 
+Each base check row in the validation record names what failed in its
+`detail`: the tests the check reported, a tool the shell could not find
+(`missing make`), else the check's last line. The record travels in the
+sealed report. After two such failures of one repo at one revision on a slot
+the station stops giving that slot the repo: it parks each brief `[transient]`
+without a dispatch, until the repo's head moves or a run reports a new runner
+image (a fingerprint of the image's packages and tools, `<ticket>.image`). One
+run records two failures, because a red check runs twice. A failed `setup:`
+counts too. A check that passed on its second run counts for nothing, and only
+a fix round's default-branch rows count. A day with no report from the slot
+lets one run through, because only a run can show a new image.
+
 The job, step by step (`lanes/k8s/lane_job.py`):
 
 1. Reads the dispatch inputs (slot, ticket key, brief, run id, the slot's
@@ -1987,10 +1999,13 @@ The job, step by step (`lanes/k8s/lane_job.py`):
    that step only, and nothing printed names a parameter or a value.
 4. Runs `lanes/run_lane.sh <slot>` once, with no Actions token and no AWS
    session in its environment. Its output goes into the report, not the log.
+   The step fails when no agent started (`run_lane.sh` writes
+   `<ticket>.agent-ran` first), with only the failure class in the public
+   log, so a green run means an agent ran. The report steps run either way.
 5. Seals a report of exactly what the station reads for the run: the
    brief's `done/` or `failed/` move, the run log with its failure class
-   line, the `.answered` and `.verify` files, the transcripts, answers and
-   the slot's heartbeat. It is a tar.gz encrypted with a random key, the
+   line, the validation record, the `.image` fingerprint, the `.answered`
+   and `.verify` files, the transcripts, answers and the slot's heartbeat. It is a tar.gz encrypted with a random key, the
    key is RSA-OAEP encrypted to the station's own key
    (`state/runners/report-key.pem`, made on first use), because a public
    repository's artifacts can be downloaded by anyone signed in, and both

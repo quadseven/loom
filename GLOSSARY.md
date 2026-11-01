@@ -92,6 +92,9 @@ _Avoid_: test, check
 
 **Audit**:
 The brain re-reading the evidence of a proof a lane's verify run made; a failed audit moves the ticket back to shipped and holds that lane's verify runs for a day.
+
+**Close audit**:
+A check of what git holds for a ticket's close: each commit the closer cited, whether the default branch carries it, and which merged pull request delivered it. `bus.brain audit-close` prints it; the station reopens an unproven close by anyone else, once per ticket.
 _Avoid_: review, recheck
 
 **Journal**:
