@@ -178,7 +178,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, refusals, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -2178,7 +2178,11 @@ class Factory:
     def _rungs_left(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
                     footer: Optional[Tuple[str, str]] = None) -> List[int]:
         """The rungs the ticket may still climb to that have a lane for its
-        repo, free or not; [] once every such rung was tried."""
+        repo, free or not; [] once every such rung was tried, or once one
+        refusal class repeats (bus/refusals.py): another model meets the same
+        gate."""
+        if refusals.repeated(comments, self.trusted):
+            return []
         return [n for n in climb_rungs(*self._tried(issue, comments, footer=footer))
                 if self._rung_lanes(repo, n)]
 
@@ -2194,6 +2198,11 @@ class Factory:
         if RUNAWAY in _labels(issue):
             return None  # held until a brain clears the label
         if self._move_capped(repo, issue, comments):
+            return None
+        repeat = refusals.repeated(comments, self.trusted)
+        if repeat:
+            _say("%s#%d keeps meeting %s: no more rounds; left for a different route"
+                 % (repo, number, repeat))
             return None
         tried, reached = self._tried(issue, comments, failed_here, footer)
         up = self._up_lanes(repo)
@@ -2253,6 +2262,16 @@ class Factory:
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
                      {"labels": kept})
         issue["labels"] = [{"name": x} for x in kept]
+
+    def _leave_repeated(self, repo: str, issue: Dict[str, Any]) -> None:
+        """A ticket that keeps meeting one gate (bus/refusals.py) stays failed
+        in the hand-off pool. Its pull request stays open: its work may be
+        sound, and it is not past the ladder."""
+        if _state(issue) != "failed":
+            self.move(self.gh, repo, int(issue["number"]), "failed",
+                      note="One refusal class repeated, so another model would meet the same "
+                           "gate. Left for the hand-off pool.")
+        self._hand_off_failed(repo, issue)
 
     def _past_ladder_pr_green(self, repo: str, pr: Dict[str, Any]) -> bool:
         """True when a past-ladder pull request's head has green checks and no
@@ -2380,6 +2399,9 @@ class Factory:
         if self._climb(repo, issue, comments, why, footer=footer) is not None:
             return True
         if RUNAWAY in _labels(issue):
+            return False
+        if refusals.repeated(comments, self.trusted):
+            self._leave_repeated(repo, issue)
             return False
         if self._rungs_left(repo, issue, comments, footer):
             # Not past the ladder: no lane of an untried rung is up.
@@ -3878,6 +3900,9 @@ class Factory:
         lane = self._climb(repo, issue, comments, "it failed on lane %s" % _lane(issue),
                            footer=footer)
         if lane is None:
+            if refusals.repeated(comments, self.trusted):
+                self._leave_repeated(repo, issue)
+                return
             if self._rungs_left(repo, issue, comments, footer):
                 return  # waits: no lane of an untried rung is up yet
             # Past the last rung of the model ladder: leave the ticket failed

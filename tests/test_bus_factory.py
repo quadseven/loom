@@ -800,6 +800,18 @@ class PullRequests(Base):
         self.assertEqual(self.model(5), None)
         self.assertEqual((self.moved, self.closed), ([], []))
 
+    def test_a_ticket_refused_three_times_on_one_class_stops_climbing(self):
+        # Another model meets the same gate: rungs are left, and none is used.
+        self.gh.ticket(5, "failed")
+        self.gh.comments[5] += [{"body": "Lane codex failed: [work] public repo leak scan "
+                                         "failed; nothing pushed", "user": ME}] * 3
+        self.gh.pull(50, 5)
+        self.go()
+        self.assertEqual((self.moved, self.closed), ([], []))
+        self.assertIn(factory.HANDOFF_LABEL, [x["name"] for x in self.gh.issues[5]["labels"]])
+        self.assertFalse(any(factory.RUNG_RE.search(str(c.get("body") or ""))
+                             for c in self.gh.comments[5]))
+
     def test_a_conflict_past_the_last_rung_gets_a_brief_not_a_give_up(self):
         self.gh.ticket(5, "pr", lane="claude")
         self.gh.comments[5] += ALL_RUNGS

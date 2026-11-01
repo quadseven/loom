@@ -118,6 +118,7 @@ SUFFIXES = ("MODEL", "MODELS", "KEY_SSM", "PROBE_URL", "PROBE_HEADER", "URL",
 # Settings shared by every lane that a runner job may receive.
 SHARED = ("LOOM_REPO_OWNERS", "LOOM_AWS_REGION", "LOOM_AGENT_TIMEOUT",
           "LOOM_CHECK_TIMEOUT", "LOOM_NET_TIMEOUT", "LOOM_LEAK_DENY_SSM",
+          "LOOM_PREPUSH_RETRIES", "LOOM_PREPUSH_TIMEOUT",
           "LOOM_FREE_GATEWAY_URL", "LOOM_GITHUB_APP_ID",
           "LOOM_GITHUB_APP_INSTALLATION_ID", "LOOM_GITHUB_APP_KEY_SSM")
 # The station's environment names the lanes' App as LOOM_LANES_GITHUB_APP_*;

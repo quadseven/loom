@@ -49,6 +49,7 @@ from . import fixrounds
 from . import logrotate
 from . import flake
 from . import rebuttal
+from . import refusals
 from . import runners
 from . import scope_fit
 from . import shadow
@@ -7160,8 +7161,9 @@ class Station:
         the last one fixed anything (2026-10-26: four rounds on a local model
         left the same checks failing and the same finding open). A round whose
         failures persist by signature (bus/converge.py) climbs the model
-        ladder at once; with no rung left, or with the round cap reached on
-        its rung, the rounds stop (_stop_fix_rounds). A check in `flaky`
+        ladder at once; with no rung left, with the round cap reached on its
+        rung, or with one refusal class repeating (bus/refusals.py), the
+        rounds stop (_stop_fix_rounds). A check in `flaky`
         failed on the infrastructure (bus/flake.py) and is never read as a
         failure the last round left."""
         authors = {author.lower() for author in self.s.authors}
@@ -7169,6 +7171,7 @@ class Station:
         persisted = converge.persistent(
             converge.last_fix_body(comments, authors, (repo, pr_number)),
             failing, threads, ignore=(self.s.review_check, self.s.plan_check) + tuple(flaky))
+        repeat = refusals.repeated(comments, authors)
         if persisted:
             lane = self._climb_stuck(repo, number, pr_number, detail, comments, persisted)
             if lane is None:
@@ -7179,6 +7182,12 @@ class Station:
                                   "the fix round cap (%d) is reached on its rung" % rounds,
                                   converge.describe(failing, threads, (self.s.review_check,
                                                                        self.s.plan_check)))
+            return
+        elif repeat:
+            self._stop_fix_rounds(repo, number, pr_number,
+                                  "%s refused it %d rounds, which another round does not "
+                                  "change" % (repeat, refusals.LIMIT),
+                                  converge.describe(failing, threads, ()))
             return
         self._post_fix_comment(repo, number, pr_number, detail, sha, failed, threads, comments)
         self._move_fix_to_lane(repo, number, lane, names)

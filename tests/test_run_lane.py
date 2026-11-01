@@ -2960,6 +2960,50 @@ cat > /dev/null
         self.assertIn(before, self.parents(after))
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
+    # A first run that writes a refused line; a second run that reads the
+    # refusal from its prompt and repairs it.
+    AGENT_LEAK_THEN_FIX = """#!/usr/bin/env bash
+case "$*" in
+  *"Next action:"*) echo clean > fix.txt; echo retried >> "$FAKE_LOG" ;;
+  *) echo 'see other''#9' > fix.txt ;;
+esac
+"""
+
+    def test_a_leak_refusal_goes_back_to_the_agent_in_the_same_run(self):
+        self.drop_brief()
+        self.write_tool(self.bin / "codex", self.AGENT_LEAK_THEN_FIX)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("retried", self.calls())
+        self.assertIn("pre-push refusal (leak scan): retry 1 of 1", self.run_log())
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        self.assertEqual(self.remote_file(self.remote_head("loom/T042-fix-the-thing"), "fix.txt"),
+                         "clean\n")
+
+    def test_a_leak_refusal_after_the_retry_parks_before_the_check_runs(self):
+        self.drop_brief()
+        self.write_tool(self.bin / "codex", "#!/usr/bin/env bash\necho 'see other''#9' > fix.txt\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("public repo leak scan failed", self.run_log())
+        self.assertNotIn("loom/T042-fix-the-thing", self.remote_heads())
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_a_complexity_refusal_after_the_retry_still_pushes(self):
+        # The local rule is stricter than the review bot's, so it never holds
+        # the work back on its own.
+        tangled = "def run(a):\n" + "".join("    if a == %d:\n        a += 1\n" % n
+                                             for n in range(20)) + "    return a\n"
+        self.advance_main("fix.py", "def run(a):\n    return a\n")
+        self.drop_brief()
+        self.write_tool(self.bin / "codex",
+                        "#!/usr/bin/env bash\ncat > fix.py <<'P'\n%sP\n" % tangled)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("pre-push refusal (complexity): retry 1 of 1", self.run_log())
+        self.assertIn("pre-push refusal (complexity) stands after the retry", self.run_log())
+        self.assertIn("loom/T042-fix-the-thing", self.remote_heads())
+
     def test_a_fix_round_that_merges_main_still_scans_the_agents_change(self):
         name, before = self.fix_brief()
         self.advance_main("main.txt", "main moved\n")

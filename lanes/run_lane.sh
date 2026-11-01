@@ -273,6 +273,11 @@ KEEPALIVE_PID=$!
 trap 'drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
+# Agent retries in one run for a pre-push refusal (prepush_gate).
+PREPUSH_RETRIES="${LOOM_PREPUSH_RETRIES:-1}"
+# Seconds a retry run gets: short, so the job's own limit (lane.yml) still
+# holds the first run, the retry, the check and the push.
+PREPUSH_TIMEOUT="${LOOM_PREPUSH_TIMEOUT:-1200}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
 CHECK_TIMEOUT="${LOOM_CHECK_TIMEOUT:-1800}"
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
@@ -461,7 +466,7 @@ summary_note() {
 # (its AGENTS.md rules), and another redid work its operator notes said had
 # shipped in other repos.
 work_note() {
-  printf '\n\n## How to work\n- Before you change anything, read the repo'"'"'s AGENTS.md and CLAUDE.md and the docs they point to: they state rules its CI enforces, such as which packages a test may import.\n- When the Operator notes or a merged pull request under Linked pull requests show the work is already done or belongs elsewhere, change nothing and say why in the Intent summary.\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Do not poll pull request checks or reviews. Open or update the pull request, then stop; the station reads checks and hands work back.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line. In a public repo, never write a reference to another repo'"'"'s issue in the OWNER/NAME#<number> or NAME#<number> shape, not even a made-up one in a test fixture: write NAME#N, or add leak-guard-allow to that line when the shape is what the test is about.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
+  printf '\n\n## How to work\n- Before you change anything, read the repo'"'"'s AGENTS.md and CLAUDE.md and the docs they point to: they state rules its CI enforces, such as which packages a test may import.\n- When the Operator notes or a merged pull request under Linked pull requests show the work is already done or belongs elsewhere, change nothing and say why in the Intent summary.\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15, cognitive under 25), never add a branch to a function already over either cap (put the new logic in a new small function and call it), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Do not poll pull request checks or reviews. Open or update the pull request, then stop; the station reads checks and hands work back.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line. In a public repo, never write a reference to another repo'"'"'s issue in the OWNER/NAME#<number> or NAME#<number> shape, not even a made-up one in a test fixture: write NAME#N, or add leak-guard-allow to that line when the shape is what the test is about.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
 # Lists the sandbox probes and out-of-path scratch files the agent added
@@ -2659,6 +2664,166 @@ prepare_validation() {
   exclude_untracked
 }
 
+# One agent run over the tree, in its own process group (see the note at the
+# call), with its credentials set up and taken away again. Sets STATUS to the
+# agent's exit code. Returns 1 with LAUNCH_WHY set when the run could not be
+# set up or cleaned up.
+launch_agent() {
+  LAUNCH_WHY=""
+  LOG_START="$(log_size)"
+  if ! agent_gh_config; then LAUNCH_WHY="$AGENT_GH_WHY"; return 1; fi
+  rm -f "$LOCK/watchdog-limit"
+  # The job's proof that an agent started: without it a cluster run fails in
+  # Actions (lanes/k8s/lane_job.py run), whatever this runner exits.
+  [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || : > "$LOGDIR/$TICKET.agent-ran"
+  ( set -m
+    (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
+      { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
+      run_agent "$1") >> "$LOG" 2>&1 &
+    agent_pid=$!
+    echo $agent_pid > "$LOCK/pgid"
+    ( agent_watchdog "$agent_pid" "$LOG_START" "$LOG" ) &
+    watchdog_pid=$!
+    wait $agent_pid
+    agent_status=$?
+    kill -TERM -- "-$watchdog_pid" 2>/dev/null || kill -TERM "$watchdog_pid" 2>/dev/null || true
+    wait $watchdog_pid 2>/dev/null || true
+    exit $agent_status ) &
+  wait $!
+  STATUS=$?
+  AGENT_GH_CALLS="$((${AGENT_GH_CALLS:-0} + $(agent_gh_calls)))"
+  # The token in the store outlives the agent by up to an hour: remove it now.
+  if [ -n "$AGENT_GH_CONFIG" ] && ! rm -rf "$AGENT_GH_CONFIG"; then
+    LAUNCH_WHY="could not remove the agent's gh credential store"; return 1
+  fi
+  is_api_lane && archive_transcripts
+  if [ "$MODEL_KIND" = paid ] && [ -f "$WORKDIR/$TICKET.opencode-events" ]; then
+    # An unknown spend fails closed: the marker stops paid picks for an hour.
+    if ! model_pick settle "$MODEL" < "$WORKDIR/$TICKET.opencode-events" 2>> "$LOG"; then
+      date +%s > "$LOOM_HOME/state/usage/go-budget.unsettled"
+      echo "[$(date -u +%FT%TZ)] $TICKET could not settle $MODEL: paid models stop for an hour" | tee -a "$LOG" >&2
+    fi
+    rm -f "$WORKDIR/$TICKET.opencode-events"
+  fi
+  if ! lane_app_token; then LAUNCH_WHY="$APP_TOKEN_WHY"; return 1; fi
+}
+
+# The range a public repo's leak scan reads. A fix round that merged the
+# default branch scans what the pull request adds to it: BASE..HEAD would hold
+# all the default branch gained since, text that branch's own CI accepts and
+# the scan of a lane's change flags.
+scan_range() {
+  if [ -n "$FIX_UPSTREAM" ]; then echo "$FIX_UPSTREAM...HEAD"; else echo "$BASE..HEAD"; fi
+}
+
+# The commit the review compares the branch with, as CI sees it: BASE on a new
+# run, the merge base with the default branch on a fix round.
+review_base() {
+  local upstream="${FIX_UPSTREAM:-}"
+  if [ -z "$upstream" ] && [ -n "${FIX_PR:-}" ] && [ -n "${FIX_DEFAULT:-}" ]; then
+    upstream="$(safe_git rev-parse --verify -q "origin/$FIX_DEFAULT^{commit}")" || upstream=""
+  fi
+  if [ -n "$upstream" ]; then safe_git merge-base "$upstream" HEAD; else printf '%s\n' "$BASE"; fi
+}
+
+# The checks that refuse a push, run on the committed head. Sets PREPUSH_CLASS
+# and PREPUSH_TEXT and returns 1 on a refusal, the leak scan first. A check
+# that could not run refuses nothing here: the leak scan's own gate before the
+# push still decides, and the review bot reads the complexity.
+prepush_refusal() {
+  local out rc base
+  PREPUSH_CLASS="" PREPUSH_TEXT=""
+  if [ "$REPO_PRIVATE" = false ]; then
+    rc=0
+    out="$(cd "$TREE" && leak_scan --diff "$(scan_range)" --allow-repo-ref "$REPO" 2>&1)" || rc=$?
+    if [ "$rc" -eq 1 ]; then
+      PREPUSH_CLASS="leak scan"
+      PREPUSH_TEXT="$out
+Next action: edit each line named above so it no longer matches. Build a cross-repo issue reference in the test at run time, \"%s#%d\" % (repo, number), or write NAME#N; use a documentation-range address for an IP. A line that must keep the text carries leak-guard-allow."
+      return 1
+    fi
+  fi
+  base="$(review_base 2>> "$LOG")" || base=""
+  [ -n "$base" ] || return 0
+  rc=0
+  out="$(PYTHONPATH="$REPO_ROOT" timeout "$NET_TIMEOUT" python3 -B -m bus.complexity_gate \
+    --tree "$TREE" --base "$base" 2>> "$LOG")" || rc=$?
+  # Exit 1 with no text is a crash of the check, not a refusal.
+  if [ "$rc" -eq 1 ] && [ -n "$out" ]; then
+    PREPUSH_CLASS="complexity"
+    PREPUSH_TEXT="$out"
+    return 1
+  fi
+}
+
+# Commit what the retry run left, as the first run's edits were, and put the
+# branch at that commit. The Intent summary and replies of the first run stand,
+# and what it dropped stays named. Edits inside a submodule are not committed:
+# a push of this repo does not carry them.
+prepush_commit() {
+  local head dropped="$DROPPED_FILES" scratch="$DROPPED_SCRATCH_FILES"
+  rm -f "$TREE/$SUMMARY_FILE" "$TREE/.loom/replies.json"
+  [ -z "$(submodule_edits)" ] || return 1
+  if [ -n "$(safe_git status --porcelain)" ]; then
+    safe_git add -A && safe_git commit -qm "${TITLE:-$TICKET}: fix the pre-push refusal" || return 1
+  fi
+  head="$(safe_git rev-parse HEAD)" || return 1
+  safe_git update-ref "refs/heads/$BRANCH" "$head" && safe_git checkout -q "$BRANCH" &&
+    drop_agent_files || return 1
+  DROPPED_FILES="$(printf '%s\n%s\n' "$dropped" "$DROPPED_FILES" | sed '/^$/d' | sort -u)"
+  DROPPED_SCRATCH_FILES="$(printf '%s\n%s\n' "$scratch" "$DROPPED_SCRATCH_FILES" | sed '/^$/d' | sort -u)"
+}
+
+# One agent run on the refusal: the brief, then the failure text, under the
+# short timeout. Returns 1 when the brief could not be written or the run
+# could not be set up (LAUNCH_WHY says why).
+prepush_retry_run() {
+  local retry_brief="$WORKDIR/$TICKET.run.md" keep_timeout="$AGENT_TIMEOUT" rc=0
+  if ! { { cat "$RUN_BRIEF"
+           printf '\n\n## Pre-push refusal\n\nYour work is committed on this branch, and the %s check refused it before any push:\n\n%s\n\nDo only that, then stop.\n' "$PREPUSH_CLASS" "$PREPUSH_TEXT"
+         } > "$retry_brief.new" && mv "$retry_brief.new" "$retry_brief"; }; then
+    LAUNCH_WHY="could not write the pre-push retry brief"
+    return 1
+  fi
+  RUN_BRIEF="$retry_brief"
+  AGENT_TIMEOUT="$PREPUSH_TIMEOUT"
+  launch_agent "$RUN_BRIEF" || rc=1
+  AGENT_TIMEOUT="$keep_timeout"
+  return "$rc"
+}
+
+# What the agent gets for what would be refused after the push, in the same
+# run, so a refusal costs a local retry and not a whole round
+# (LOOM_PREPUSH_RETRIES). A retry that fails leaves the first commit, which
+# meets the same gates as before. A leak refusal that stands parks here, before
+# the long check, as transient when the retry never finished; a complexity one
+# is pushed, since the review bot stays its judge.
+prepush_gate() {
+  local tries=0 before class=""
+  while ! prepush_refusal; do
+    before="$(safe_git rev-parse HEAD)"
+    record prepush "$PREPUSH_CLASS" 1 "$before" false "$PREPUSH_TEXT"
+    if [ "$tries" -ge "$PREPUSH_RETRIES" ]; then
+      echo "[$(date -u +%FT%TZ)] $TICKET pre-push refusal ($PREPUSH_CLASS) stands after the retry" >> "$LOG"
+      [ "$PREPUSH_CLASS" != "leak scan" ] && return 0
+      park "$BRIEF" "public repo leak scan failed; nothing pushed: $PREPUSH_TEXT" "$class"
+      return 1
+    fi
+    tries=$((tries + 1))
+    echo "[$(date -u +%FT%TZ)] $TICKET pre-push refusal ($PREPUSH_CLASS): retry $tries of $PREPUSH_RETRIES" >> "$LOG"
+    if ! prepush_retry_run; then park "$BRIEF" "$LAUNCH_WHY" transient; return 1; fi
+    if [ "$STATUS" -ne 0 ] || ! prepush_commit >> "$LOG" 2>&1; then
+      [ "$STATUS" -eq 0 ] || class=transient
+      echo "[$(date -u +%FT%TZ)] $TICKET pre-push retry ended without a commit (exit $STATUS): the first commit stands" >> "$LOG"
+      if ! { safe_git reset -q --hard "$before" && safe_git clean -qfd; } >> "$LOG" 2>&1; then
+        park "$BRIEF" "could not restore the first commit after the pre-push retry" transient
+        return 1
+      fi
+    fi
+  done
+  [ "$tries" -eq 0 ] || echo "[$(date -u +%FT%TZ)] $TICKET pre-push refusal cleared in the same run" >> "$LOG"
+}
+
 # After the agent, on the committed branch head: the same check again. Sets
 # VALIDATION_REASON when it did not pass.
 final_validation() {
@@ -3409,7 +3574,8 @@ lane_extra_ready() {
 
 # Timeouts must be positive integers: `timeout 0` means no limit at all, and a
 # wedged agent would then hold the lane lock forever.
-for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1" "CHECK_TIMEOUT:$CHECK_TIMEOUT:60"; do
+for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1" "CHECK_TIMEOUT:$CHECK_TIMEOUT:60" \
+         "PREPUSH_RETRIES:$PREPUSH_RETRIES:0" "PREPUSH_TIMEOUT:$PREPUSH_TIMEOUT:60"; do
   IFS=: read -r t_name t_val t_min <<< "$t"
   if ! [[ "$t_val" =~ ^[0-9]+$ ]] || [ "$t_val" -lt "$t_min" ]; then
     heartbeat false "LOOM_$t_name must be an integer >= $t_min, got '$t_val'"
@@ -3784,41 +3950,7 @@ for BRIEF in "$INBOX"/*.md; do
   # it in its own process group (id = its pid) and records that id. If this
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
-  LOG_START="$(log_size)"
-  if ! agent_gh_config; then park "$BRIEF" "$AGENT_GH_WHY" transient; continue; fi
-  rm -f "$LOCK/watchdog-limit"
-  # The job's proof that an agent started: without it a cluster run fails in
-  # Actions (lanes/k8s/lane_job.py run), whatever this runner exits.
-  [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || : > "$LOGDIR/$TICKET.agent-ran"
-  ( set -m
-    (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
-      { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
-      run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
-    agent_pid=$!
-    echo $agent_pid > "$LOCK/pgid"
-    ( agent_watchdog "$agent_pid" "$LOG_START" "$LOG" ) &
-    watchdog_pid=$!
-    wait $agent_pid
-    agent_status=$?
-    kill -TERM -- "-$watchdog_pid" 2>/dev/null || kill -TERM "$watchdog_pid" 2>/dev/null || true
-    wait $watchdog_pid 2>/dev/null || true
-    exit $agent_status ) &
-  wait $!
-  STATUS=$?
-  AGENT_GH_CALLS="$(agent_gh_calls)"
-  # The token in the store outlives the agent by up to an hour: remove it now.
-  if [ -n "$AGENT_GH_CONFIG" ] && ! rm -rf "$AGENT_GH_CONFIG"; then
-    park "$BRIEF" "could not remove the agent's gh credential store" transient; continue
-  fi
-  is_api_lane && archive_transcripts
-  if [ "$MODEL_KIND" = paid ] && [ -f "$WORKDIR/$TICKET.opencode-events" ]; then
-    # An unknown spend fails closed: the marker stops paid picks for an hour.
-    if ! model_pick settle "$MODEL" < "$WORKDIR/$TICKET.opencode-events" 2>> "$LOG"; then
-      date +%s > "$LOOM_HOME/state/usage/go-budget.unsettled"
-      echo "[$(date -u +%FT%TZ)] $TICKET could not settle $MODEL: paid models stop for an hour" | tee -a "$LOG" >&2
-    fi
-  fi
-  if ! lane_app_token; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
+  if ! launch_agent "$RUN_BRIEF"; then park "$BRIEF" "$LAUNCH_WHY" transient; continue; fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
@@ -4062,6 +4194,9 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$BRANCH_HEAD" != "$BASE" ]; then
     COMMITTED=1
   fi
+  # The checks that refuse a push run first, while the agent can still act on
+  # them in this run and before the long validation.
+  if [ "$COMMITTED" -eq 1 ] && ! prepush_gate; then continue; fi
   # A commit that adds files outside the brief is refused before validation
   # and push: nothing is pushed, and the reason names every stray file. A fix
   # round removes them instead (drop_stray_files) and checks again, so it
@@ -4109,11 +4244,7 @@ for BRIEF in "$INBOX"/*.md; do
       note_factory_incident scanner "leak scanner not found at $LEAK_SCANNER" SCANNER_REASON
       park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed$SCANNER_REASON" "$PARK_CLASS"; continue
     fi
-    # A fix round that merged the default branch scans what the pull request
-    # adds to it: BASE..HEAD would hold all the default branch gained since,
-    # text that branch's own CI accepts and the scan of a lane's change flags.
-    SCAN_RANGE="$BASE..HEAD"
-    [ -n "$FIX_UPSTREAM" ] && SCAN_RANGE="$FIX_UPSTREAM...HEAD"
+    SCAN_RANGE="$(scan_range)"
     # The repo's own issue refs (OWNER/NAME#N and NAME#N in code or tests)
     # name nothing private; the scanner exempts exactly this repo for them.
     # Exit 2 is no scan (the deny-list could not be read), not a hit in the

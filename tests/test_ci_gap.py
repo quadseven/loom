@@ -343,5 +343,36 @@ class ReviewFactsTest(unittest.TestCase):
         self.assertIsInstance(checks[0][1], ci_facts.ReviewText)
 
 
+class ComplexityFirstStepTest(unittest.TestCase):
+    def test_a_review_thread_gives_the_same_first_step(self):
+        thread = {"id": "T1", "path": "big.py", "line": 3,
+                  "comments": {"nodes": [{"databaseId": 1, "body": self.LINE}]}}
+        body = brain._fix_body("o/r", 1, "b", "", [], [thread])
+        self.assertIn("First step: move the lines this change added to `run`", body)
+
+    LINE = ("Function `run` too tangled -- cyclomatic 25 (cap 15), cognitive 31 (cap 25). "
+            "This PR moved it 23->25 cyclomatic, 29->31 cognitive.")
+
+    def body(self, tail):
+        return brain._fix_body("o/r", 1, "b", "", [("Grug - Elder", tail)], [])
+
+    def test_a_complexity_finding_is_never_read_as_a_command(self):
+        self.assertEqual(ci_facts.facts(self.LINE, False).regenerate, [])
+
+    def test_a_finding_deep_in_a_long_review_gives_the_first_step(self):
+        body = self.body("intro line\n" + "x" * 1400 + "\n" + self.LINE + "\n")
+        self.assertIn("First step: move the lines this change added to `run`", body)
+
+    def test_a_redirect_in_a_real_render_command_still_reads_as_one(self):
+        self.assertEqual(ci_facts.regenerate_commands("python3 render.py --rbac > rbac.yaml"),
+                         ["python3 render.py --rbac > rbac.yaml"])
+
+    def test_the_first_step_is_one_literal_action(self):
+        for tail in (self.LINE, ci_facts.ReviewText(self.LINE)):
+            first = [l for l in self.body(tail).splitlines() if l.startswith("First step")]
+            self.assertEqual(first, ["First step: move the lines this change added to `run` "
+                                     "into a new small function, and call it from `run`."])
+
+
 if __name__ == "__main__":
     unittest.main()

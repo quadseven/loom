@@ -3526,6 +3526,18 @@ class HandBackTest(unittest.TestCase):
         fixes = [c for c in self.gh.comments if str(c["body"]).startswith(tickets.FIX_MARKER)]
         self.assertEqual(len(fixes), 3)
 
+    def test_one_refusal_class_three_rounds_running_stops_below_the_round_cap(self):
+        self.gh.comments.extend({"user": {"login": "alice-example"},
+                                 "body": "%s\n<!-- loom:fix-head %s -->\nFunction `run` too "
+                                         "tangled -- cyclomatic 25" % (tickets.FIX_MARKER, str(i) * 40)}
+                                for i in range(1, 4))
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "9"}):
+            self.run_hand_back(checks=[("lint", "failed")])
+        names = [x["name"] for x in self.gh.issue["labels"]]
+        self.assertIn("loom:failed", names)
+        self.assertIn(factory.HANDOFF_LABEL, names)
+        self.assertIn("the complexity rule refused it 3 rounds", self.stop_notes()[0])
+
     def test_fix_rounds_on_one_head_count_toward_the_cap(self):
         # grug#1315, 2026-10-24: its fix rounds failed [transient] and pushed
         # nothing, so the head stayed the same; the cap counted distinct heads

@@ -35,6 +35,13 @@ complexity 15, no swallowed errors, no dead code, docs in step, ASCII
 only), and commit. On 2026-10-14, 27 of 95 tickets took six or more
 rounds, and no lane ran a test before opening its pull request.
 
+Before validation and push, on a committed head, `prepush_gate` runs the leak
+scan and `bus/complexity_gate.py`. A refusal goes back to the agent in the same
+run with the failure text and one next action, `LOOM_PREPUSH_RETRIES` times
+(default 1), under `LOOM_PREPUSH_TIMEOUT` seconds (default 1200). A leak refusal that stands parks the ticket before the long check.
+A complexity refusal that stands is pushed, since the review bot is its judge.
+The refusal lands in the run's `validation.jsonl` as phase `prepush`.
+
 Before pushing a branch or opening a pull request on a public repository, the
 lane runner uses infra-public's `check_private_leaks.py` on the diff and
 generated pull request body, with the shared deny-list of names and products

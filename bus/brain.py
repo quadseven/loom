@@ -18,7 +18,7 @@ from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
-from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
+from . import answer, ci_facts, ci_gap, complexity_gate, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
 from .labels import HANDOFF, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
@@ -5709,6 +5709,18 @@ def _fix_header(repo: str, number: int, branch: str, key: str) -> List[str]:
             BRAIN_FIX_MARKER + (" " + FIX_KEY % key if key else ""), ""]
 
 
+def _tangled_steps(checks: List[Tuple[str, str]], threads: List[Dict[str, Any]]) -> List[str]:
+    """The first step for each function a complexity finding names: the one
+    action a lane can take on a function over the cap, then a blank line."""
+    said = [tail for _, tail in checks] + [str(c.get("body") or "") for thread in threads
+                                           for c in (thread.get("comments") or {}).get("nodes") or []]
+    tangled = list(dict.fromkeys(name for text in said
+                                 for name in ci_facts.tangled_functions(text)))
+    steps = ["First step: %s" % complexity_gate.next_action(name)
+             for name in tangled[:ci_facts.COMMANDS_MAX]]
+    return steps + [""] if steps else []
+
+
 def _fix_body(repo: str, number: int, branch: str, notes: str,
               checks: List[Tuple[str, str]], threads: List[Dict[str, Any]],
               conflict: bool = False, key: str = "") -> str:
@@ -5736,6 +5748,7 @@ def _fix_body(repo: str, number: int, branch: str, notes: str,
                        "%s names it as the way to regenerate a file." % (_shown(cmd), _shown(name)))
     if first:
         out.append("")
+    out += _tangled_steps(checks, threads)
     if notes.strip():
         out += [notes.strip(), ""]
     if conflict:

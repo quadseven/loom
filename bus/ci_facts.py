@@ -49,7 +49,9 @@ _AFTER_VERB = re.compile(r"\b(?:run|rerun|re-run|with|using|via)\b:?\s+(.+)$", r
 # A command that writes a file with a redirect, the shape of a render step:
 # "python3 tool.py --render-rbac > deploy/rbac.yaml".
 _RENDER = re.compile(r"((?:[\w./-]+=\S+\s+)*[\w./-]+(?:\s+[^\s>|;&`'\"]+)*\s+--?[\w-]+"
-                     r"(?:\s+[^\s>|;&`'\"]+)*\s*>\s*[\w./-]+)")
+                     r"(?:\s+[^\s>|;&`'\"]+)*\s*(?<![-=])>\s*[\w./-]+)")
+# The review bot's complexity finding: "Function `name` too tangled -- ...".
+_TANGLED = re.compile(r"`([\w.]+)` too tangled\b")
 _LEADING_VERB = re.compile(r"^(?:(?:please|try|run|rerun|re-run|with|using|via)\s+)+", re.I)
 _PROGRAM = re.compile(r"^(?:[\w./-]+=\S+\s+)*[\w./-]+$")
 # Review text: a fence line and its language tag, the tags that mark a shell
@@ -103,12 +105,22 @@ def _trimmed(text: str) -> str:
     return text.strip().rstrip(".,;:)").strip()
 
 
+def tangled_functions(text: str) -> List[str]:
+    """The functions a review's complexity finding names, in order, each once."""
+    return list(dict.fromkeys(name for line in str(text).splitlines()
+                              for name in _TANGLED.findall(_clean(line))))
+
+
 def regenerate_commands(line: str) -> List[str]:
     """The regenerate commands one log line names: a quoted command or the
     text after "run"/"with" on a line that says a file is stale or must be
-    regenerated, or any command that renders into a file with a redirect."""
+    regenerated, or any command that renders into a file with a redirect. A
+    complexity finding is none of these: its "23->25" read as a redirect and
+    the fix round was told to run the finding (loom#1785)."""
     line = _clean(line)
     found: List[str] = []
+    if _TANGLED.search(line):
+        return found
     if _REGEN_HINT.search(line):
         for match in _QUOTED.finditer(line):
             text = _trimmed(next(g for g in match.groups() if g is not None))

@@ -171,7 +171,9 @@ Rules:
 Traps:
 
 - The `Generic` metric in `bus/metrics.py` fails on a game word in any tracked file outside `tests/`, `docs/` and dotfiles, this file included. The words are in `GENERIC_TERMS`. A `Generic: 1 files` failure in `tests/test_bus_metrics.py` is that, not a flake.
-- An `owner/name#N` literal in a test fixture fails the leak scan. Build it in the test: `"%s#%d" % (repo, number)`.
+- An `owner/name#N` literal in a test fixture fails the leak scan. Build it in the test: `"%s#%d" % (repo, number)`. A lane run gets this refusal before its push and one retry (`prepush_gate` in `lanes/run_lane.sh`).
+- `bus/complexity_gate.py` copies the review bot's complexity measures. A function already over the cap may stay there, but a change may not raise it: move the added lines into a new small function. Lane runs get the same check before the push.
+- A ticket refused 3 rounds on one class stops climbing (`bus/refusals.py`). A rung 0 marker clears the count.
 - `tests/test_bus_factory.py` passes stand-ins for `brain.fix`, `brain.move` and `brain.merge`. A factory change that depends on what those accept also needs a test in `tests/test_bus_brain.py` against the real function.
 - Lanes run under `/bin/bash` 3.2 on macOS and `bwrap` on Linux. Keep shell in `lanes/` to bash 3.2. A test that needs macOS must skip on Linux.
 - `docs/ARCHITECTURE.md` section 3 must list exactly the lanes `run_agent()` runs; `tests/test_architecture_doc.py` enforces it.
