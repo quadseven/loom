@@ -5329,6 +5329,18 @@ class MoveFromGoalTests(unittest.TestCase):
         self.assertEqual([c[2] for c in self.sub_issue_posts(routes.calls)],
                          [{"sub_issue_id": 1005, "replace_parent": True}])
 
+    def test_triage_files_a_ready_area_issue_under_its_area_epic(self):
+        routes = Routes([item(5, labels=["area:stability"]), item(6, labels=["area:stability"])])
+        areas = {"stability": {"name": "area:stability", "description": "Service stability"}}
+        with unittest.mock.patch.object(brain, "_area_labels", return_value=areas) as read, \
+                unittest.mock.patch.object(brain, "intake_epic", return_value=70) as epic:
+            brain.triage(GitHub("t", transport=routes), REPO, 1, 25)
+        read.assert_called_once()
+        self.assertEqual(epic.call_args_list,
+                         [unittest.mock.call(unittest.mock.ANY, REPO, 1, area="stability")] * 2)
+        self.assertEqual([c[1] for c in self.sub_issue_posts(routes.calls)],
+                         ["/repos/%s/issues/70/sub_issues" % REPO] * 2)
+
     def test_triage_does_not_take_an_issue_out_of_another_parent(self):
         other = "https://api.github.com/repos/%s/issues/77" % REPO
         routes = Routes([item(5, parent_issue_url=other), item(6)])
@@ -5587,6 +5599,15 @@ class MoveOutsideEpicTests(unittest.TestCase):
         fake.issues[60]["title"] = "Epic: stability"
         self.assertEqual(self.move(fake), (1, 0))
         self.assertEqual(fake.subs[60][-1], 10)
+
+    def test_a_pass_reads_the_repo_labels_once(self):
+        fake = self.repo(tickets=[self.ticket(10, labels=("loom:ticket", "area:stability")),
+                                  self.ticket(11, labels=("loom:ticket", "area:stability"))],
+                         epics=[(60, 1)])
+        fake.labels = [{"name": "area:stability", "description": "Service stability"}]
+        fake.issues[60]["labels"].append({"name": "area:stability"})
+        self.assertEqual(self.move(fake), (2, 0))
+        self.assertEqual(sum(1 for c in fake.calls if "/labels?per_page" in c[1]), 1)
 
     def test_full_area_epics_open_a_labeled_epic_for_that_area(self):
         fake = self.repo(tickets=[self.ticket(10, labels=("loom:ticket", "area:stability"))],

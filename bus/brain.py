@@ -2069,14 +2069,18 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1,
     return int(made["number"])
 
 
-def _ticket_area(gh: GitHub, repo: str, ticket: Dict[str, Any]) -> Optional[str]:
+def _area_labels(gh: GitHub, repo: str) -> Dict[str, Dict[str, Any]]:
+    """The repo's `area:` labels by area name. A pass reads this once."""
+    available = gh.paginate("/repos/%s/labels?per_page=100" % repo)
+    return {str(label.get("name") or "")[5:]: label for label in available
+            if isinstance(label, dict) and
+            str(label.get("name") or "").startswith("area:") and
+            str(label.get("name") or "")[5:]}
+
+
+def _ticket_area(areas: Dict[str, Dict[str, Any]], ticket: Dict[str, Any]) -> Optional[str]:
     """Return the ticket's area label, or infer one from label descriptions."""
     labels = _labels(ticket)
-    available = gh.paginate("/repos/%s/labels?per_page=100" % repo)
-    areas = {str(label.get("name") or "")[5:]: label for label in available
-             if isinstance(label, dict) and
-             str(label.get("name") or "").startswith("area:") and
-             str(label.get("name") or "")[5:]}
     if not areas:
         return None
     selected = sorted(name[len("area:"):] for name in labels
@@ -2122,8 +2126,9 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     tickets.sort(key=lambda pair: (str(pair[0].get("created_at") or ""),
                                    int(pair[0].get("number") or 0)))
     moved = 0
+    areas = _area_labels(gh, repo)
     for ticket, old in tickets:
-        area = _ticket_area(gh, repo, ticket)
+        area = _ticket_area(areas, ticket)
         if area:
             if "area:" + area not in _labels(ticket):
                 gh.rest("POST", "/repos/%s/issues/%d/labels" %
@@ -3285,6 +3290,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
     lines: List[str] = []
     done = 0
     intake: Optional[Tuple[int, int]] = None  # (intake epic, tickets it holds)
+    areas: Optional[Dict[str, Dict[str, Any]]] = None
     for issue in _oldest_open_issues(gh, repo):
         if done >= limit:
             break
@@ -3300,7 +3306,8 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
                 continue
             # Decision 0003: a ready issue goes under the goal's intake epic,
             # opened when there is none and again when one fills up.
-            area = _ticket_area(gh, repo, issue)
+            areas = _area_labels(gh, repo) if areas is None else areas
+            area = _ticket_area(areas, issue)
             if area:
                 found = intake_epic(gh, repo, goal, area=area)
                 intake = (found, 0)
