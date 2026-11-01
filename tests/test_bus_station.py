@@ -880,6 +880,39 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("Third works.", note)
         self.assertNotIn("Second works", note)
 
+    def stale_pr(self, put="2030-01-05T00:00:00Z", **pull):
+        """Ticket 12 at loom:pr since `put`, with a merge judged long before."""
+        self.merged_with("- [x] First works; test.\n")
+        self.fake.events[12].append(dict(labeled("loom:pr", "alice-example"), created_at=put))
+        self.fake.issues[12]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                                          {"name": "lane:codex"}]
+        self.fake.timelines = getattr(self.fake, "timelines", {})
+        self.fake.timelines[12] = list(self.fake.events[12]) + [pull] if pull else list(self.fake.events[12])
+        self.fake.pulls.clear()
+        self.fake.calls.clear()
+        with mock.patch("bus.station.time.time", return_value=4102444800.0):
+            station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+
+    def test_loom_pr_with_no_open_pull_request_clears_on_the_next_pass(self):
+        # loom#2333: the label stayed 4 days with no open pull request.
+        self.stale_pr()
+        self.assertEqual(sorted(self.fake.names(12)), ["loom:queued", "loom:ticket"])
+
+    def test_loom_pr_stays_for_an_open_pull_request_in_another_repo(self):
+        self.stale_pr(**{"event": "cross-referenced", "created_at": "2030-01-05T00:00:00Z",
+                         "source": {"issue": {"state": "open", "pull_request": {},
+                                              "user": {"login": "alice-example"},
+                                              "body": "Refs %s#12" % REPO}}})
+        self.assertIn("loom:pr", self.fake.names(12))
+
+    def test_a_strangers_pull_request_does_not_keep_loom_pr(self):
+        self.stale_pr(**{"event": "cross-referenced", "created_at": "2030-01-05T00:00:00Z",
+                         "source": {"issue": {"state": "open", "pull_request": {},
+                                              "user": {"login": "stranger-example"},
+                                              "body": "Refs %s#12" % REPO}}})
+        self.assertNotIn("loom:pr", self.fake.names(12))
+        self.assertIn("loom:queued", self.fake.names(12))
+
     def test_a_fix_round_leaves_a_ticket_claimed_for_outside_work_untouched(self):
         # loom#2333: the hand-back pass re-briefed a ticket an outside
         # contributor held and took the hold label off it.
@@ -5193,6 +5226,20 @@ class FixTest(Base):
         self.assertEqual(self.listing(), [])
         self.assertIn("loom:pr", self.fake.names(12))
         self.assertNotIn("loom:running", self.fake.names(12))
+
+    def test_a_fix_for_a_merge_already_judged_is_spent_and_does_not_park_the_ticket(self):
+        # loom#2333: the merge sent the ticket back for the rest, the old fix
+        # ask still stood, and every brief parked the ticket at loom:pr.
+        self.fake.add(12)
+        self.comment(12, FIX_BODY)
+        self.comment(12, tickets.UNBUILT_NOTE % (99, "Second works."))
+        self.fake.pulls.append({"number": 99, "state": "closed",
+                                "merged_at": "2030-01-02T12:00:00Z",
+                                "merge_commit_sha": "%040x" % 99, "base": {"ref": "main"},
+                                "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        # It is a new build now, so the brief check judges it, as any build.
+        self.assertNotIn("loom:pr", self.fake.names(12))
 
     def restarted_after_a_round(self, pull):
         """A claimed attempt, a fix round on pull request 99, the pull request
