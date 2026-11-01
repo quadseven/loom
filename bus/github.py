@@ -98,8 +98,7 @@ def refuse_incomplete_close(gh: Any, method: str, path: str, body: Any) -> None:
     acceptance criteria are unchecked.
 
     The brain's close() already refuses this, but a close that bypasses it
-    -- the conducted#209 close five seconds after its PR merged is the
-    shape -- used to land anyway and get reopened by the close-completeness
+    -- a close five seconds after its PR merged is the shape -- used to land anyway and get reopened by the close-completeness
     guard seconds later. Every programmatic close passes through rest(),
     so refusing here makes the bad close impossible instead of merely
     caught. bus/closing.py asks this too, before it posts the close
