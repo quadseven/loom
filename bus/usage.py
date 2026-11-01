@@ -314,6 +314,8 @@ NO_METER = {
             "for API keys; its quota monitor covers the GLM Coding Plan only"),
     "zen": ("no meter: provider exposes no usage. OpenCode Zen's free models run without "
             "a key and have no usage endpoint"),
+    "copilot": ("no meter: provider exposes no meter for the lane's token; the lane holds "
+                "itself when Copilot says the allowance is spent"),
 }
 
 
