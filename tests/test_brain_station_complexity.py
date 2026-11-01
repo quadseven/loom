@@ -15,6 +15,8 @@ TARGETS = (
     ("bus/brain.py", "_ready_sensitive"),
     # PR 2399's review finding (loom#2393).
     ("bus/brain.py", "fleet_hold"),
+    # PR 2433's review finding (loom#2415).
+    ("bus/brain.py", "_status_pass"),
     ("bus/station.py", "Station._deliver_unlinked"),
     ("bus/station.py", "Station._claim"),
     ("bus/station.py", "Station._apply_adapter_verify"),

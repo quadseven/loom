@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -153,7 +154,10 @@ class StatusSkipTests(unittest.TestCase):
     def test_a_moved_repo_gets_a_skipped_line_and_the_others_finish(self):
         routes = {("GET", "/repos/%s/issues" % MOVED): (301, MOVED_BODY),
                   ("GET", "/repos/%s/issues" % REPO): (200, []),
-                  ("GET", "/repos/%s/issues" % LOCK_REPO): (200, [])}
+                  ("GET", "/repos/%s/issues" % LOCK_REPO): (200, []),
+                  # Each repo's size (repo_weights): the moved repo answers null.
+                  ("POST", "/graphql"): (200, {"data": {"r0": None, "r1": {}},
+                                               "errors": [{"type": "NOT_FOUND"}]})}
         out, err = quiet(brain.status, GitHub("t", transport=Routes(routes)), [MOVED, REPO],
                          LOCK_REPO, env=ENV)
         line = "skipped %s: HTTP 301 Moved Permanently: renamed or transferred" % MOVED
@@ -162,12 +166,48 @@ class StatusSkipTests(unittest.TestCase):
         self.assertIn("## %s\n\n### Goals" % REPO, out)
         self.assertIn("## Lane status", out)
 
-    def test_a_fault_still_ends_status(self):
-        routes = {("GET", "/repos/%s/issues" % MOVED): (500, {"message": "boom"}),
-                  ("GET", "/repos/%s/issues" % LOCK_REPO): (200, [])}
-        with self.assertRaises(GitHubError):
-            quiet(brain.status, GitHub("t", transport=Routes(routes)), [MOVED], LOCK_REPO, env=ENV)
+    def fault_routes(self):
+        from bus import lock
+        return {("GET", "/repos/%s/issues" % MOVED): (500, {"message": "boom"}),
+                ("GET", "/repos/%s/issues" % REPO): (200, []),
+                ("GET", "/repos/%s/issues" % LOCK_REPO): (200, []),
+                # The tick clock status prints first: no tick record yet.
+                ("GET", "/repos/%s/git/ref/heads/%s" % (LOCK_REPO, lock.LOCK_BRANCH)):
+                    (404, {"message": "Not Found"}),
+                # Each repo's size (repo_weights): the moved repo answers null.
+                ("POST", "/graphql"): (200, {"data": {"r0": None, "r1": {}},
+                                             "errors": [{"type": "NOT_FOUND"}]})}
 
+    def test_a_fault_is_named_as_failed_and_status_is_partial(self):
+        # On main a fault ended status with the GitHubError (loom#800). It
+        # is now named, as resume names it (loom#1578): the failing repo
+        # with its error, the other repos read, the partial line last, and
+        # the command exits 3 (loom#2415). A fault is still not a moved
+        # repo: it is not skipped as gone.
+        missed = []
+        out, err = quiet(brain.status, GitHub("t", transport=Routes(self.fault_routes())),
+                         [MOVED, REPO], LOCK_REPO, env=ENV, missed=missed)
+        self.assertEqual([MOVED], missed)
+        self.assertRegex(out, r"## %s\n\n- skipped %s: read failed: GET /repos/%s/issues\S* -> 500"
+                         % (MOVED, MOVED, MOVED))
+        self.assertIn("skipped %s: read failed:" % MOVED, err)
+        self.assertNotIn("renamed or transferred", out)
+        self.assertIn("## %s\n\n### Goals" % REPO, out)
+        self.assertIn("## Lane status", out)
+        self.assertEqual("status partial: not read this run: %s" % MOVED, out.splitlines()[-1])
+
+    def test_a_fault_makes_the_command_exit_3(self):
+        args = brain.parser().parse_args(["status", MOVED, REPO, "--lanes-repo", LOCK_REPO])
+        stdout = io.StringIO()
+        with unittest.mock.patch.dict(os.environ, ENV), contextlib.redirect_stdout(stdout):
+            code, err = quiet(brain.COMMANDS["status"],
+                              GitHub("t", transport=Routes(self.fault_routes())), args)
+        self.assertEqual(3, code)
+        self.assertIn("- skipped %s: read failed:" % MOVED, stdout.getvalue())
+        self.assertIn("## %s\n\n### Goals" % REPO, stdout.getvalue())
+        self.assertIn("status partial: not read this run: %s" % MOVED, err)
+        self.assertIn("status partial: not read this run: %s" % MOVED,
+                      stdout.getvalue().splitlines()[-1])
 
 if __name__ == "__main__":
     unittest.main()
