@@ -1021,10 +1021,15 @@ request's branch, gets a `Fix-PR: <number>` header and ends with a `## Fix`
 section holding the comment. A fix comment edited after it was posted is
 refused, as an untrusted ticket is. The runner then checks out that branch,
 pushes the agent's work onto it (fast-forward only, never forced) and
-comments on the pull request; it never opens a second one. The sandboxed agent
-can write `.loom/replies.json` with thread ids, reply text and a resolve
-boolean. The runner posts valid entries after a successful push and resolves
-those marked true; missing or invalid files produce no replies. An entry
+comments on the pull request; it never opens a second one. The brief requires
+the sandboxed agent to answer every review thread it lists: one entry per
+thread in `.loom/replies.json` (thread id, reply text, and a resolve boolean,
+true when the round fixed it, false with a concrete reason when it declines),
+or an answer file in `.loom-answers/`. The runner posts valid entries after a
+successful push and resolves those marked true; missing or invalid files
+produce no replies. A listed thread left with neither is named in the log and
+in the round comment on the pull request ("Review threads this round left
+without a reply"). An entry
 whose thread is not on the round's own pull request, or whose text
 `bus/text.py` refuses, is skipped and logged. A fix brief
 whose pull request is no longer open is parked as failed (a merged one is
@@ -1391,7 +1396,8 @@ its own, and none posts a comment.
 The label comes off when the answer is in the ticket (`bus/ask_state.py`): a
 comment after the ask by an operator or trusted person that is not a
 question, a dashboard answer, a trusted brain's line starting `Finished:` or
-`Done:`, or a `## Decision (<login>, <date>)` heading in the body. An answer
+`Done:` or a dated `Operator answer YYYY-MM-DD:` line (dated on or after the
+ask's day), or a `## Decision (<login>, <date>)` heading in the body. An answer
 that names a command in backticks adds `needs-brain`, so the brain sees who
 can run it. An ask whose Blocked on section names an open issue gets
 `wait:blocked`. The digest skips answered and waiting asks at once, even
@@ -1645,6 +1651,13 @@ was not built by this pull request: that repo builds it. Status prints
 merge` refuses with the same reason (loom#1711). Send a brain fix asking the
 lane to untick it and end it `; not built: belongs in <repo>`, so the station
 files the follow-up in that repo; a criterion already ending that way passes.
+
+A `; not built:` reason that says the work is already there must cite code on
+the pull request's base branch: `<path>:<line>`, `<path>#L<line>`,
+`<path>::<symbol>`, or `` `<path>` `<symbol>` ``. Status prints
+`blocked: a criterion says it is already done and cites no code`, `bus.brain
+merge` refuses, and the factory sends the pull request back when a citation is
+missing or the base cannot back it (bus/already_done.py, loom#2333).
 
 Status also prints a "Waiting on the brain" section: every open lane pull
 request whose ticket carries `needs-brain`, oldest first, with its ticket,
@@ -2260,9 +2273,12 @@ repos finish), then the sections that span every repo (Runaway tickets,
 Priorities, Waiting on you and the rest for `status`; Sensitive pull
 requests, Finished epics, Verify due and Lane proof audit for `resume`).
 Each repo's reads have a budget, `--repo-budget SECONDS` or
-`LOOM_REPO_BUDGET`, 120 seconds by default; a repo past it prints
-`skipped <repo>: timed out after ...` and is left out of the cross-repo
-sections, and the run goes on with the other repos. Within a repo, the
+`LOOM_REPO_BUDGET`, 120 seconds by default. A repo past it, or one whose
+connection failed, is read once more with a fresh budget, keeping the answers
+the first try finished. A repo that fails again prints `skipped <repo>:
+timed out after ...` or `skipped <repo>: connection failed twice: ...` and is
+left out of the cross-repo sections, and the run goes on with the other
+repos. Within a repo, the
 reads per pull request, per stuck ticket and per epic run side by side, so
 one repo's status takes about a third of the time it did when they ran one
 after another.
@@ -2285,8 +2301,13 @@ per-repo backlog goal never gets one: its status is one line in the
 station's twice-daily Discord digest, and `journal` refuses a report there. The report ends with two lines: "Needs you:" (only what only
 the operator can do for this goal, or "nothing new for this goal"; it alone
 decides new comment or edit in place) and "Waiting on you:" (the count of
-open `needs:human` issues by repo and this goal's share, or "nothing"). `status`
-prints each goal's "Waiting on you:" line under "## Waiting on you"; `journal`
+open `needs:human` issues by repo and this goal's share, or "nothing"). A goal
+home known to be private names every repo; any other home names only public
+repos and folds the rest into one "N in private repos" part, and a repo whose
+visibility cannot be read counts as private. `status`
+prints each goal's "Waiting on you:" line under "## Waiting on you", the
+station's data-only report carries the same line (left out when a repo cannot
+be counted, and a count that moved alone edits the last report); `journal`
 refuses a report that puts the count on the "Needs you:" line or says
 "nothing" beside a count (loom#1775).
 
