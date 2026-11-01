@@ -1373,12 +1373,15 @@ def repo_weights(gh: Any, repos: Sequence[str]) -> Dict[str, int]:
     return weights
 
 
-def heaviest_first(repos: Sequence[str], weights: Dict[str, int]) -> List[str]:
-    """`repos` with the heaviest first; repos of one weight, or not weighed,
-    keep their order, so the largest reads start first and the light ones
-    are what a deadline leaves behind (as bus.needs_you orders its reads,
-    loom#2409)."""
-    return sorted(dict.fromkeys(repos), key=lambda repo: -weights.get(repo, 0))
+def lightest_first(repos: Sequence[str], weights: Dict[str, int]) -> List[str]:
+    """`repos` with the lightest first; repos of one weight, or not weighed,
+    keep their order. A repo's section prints only once its whole read is
+    in, so the light repos print within seconds and a deadline leaves only
+    heavy ones unread. Heaviest first (loom#2415) put the six heaviest repos
+    on all six workers: on a link that carries about 0.35 MB/s they shared it
+    for the whole deadline, none finished, and the light repos never started,
+    so a tick printed no repo at all."""
+    return sorted(dict.fromkeys(repos), key=lambda repo: weights.get(repo, 0))
 
 
 def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
@@ -1393,8 +1396,8 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     whose read runs past the per-repo budget (per_repo.budget) is named as
     timed out in its section and left out of the cross-repo sections.
 
-    Repos are read side by side, the heaviest first (most open issues and
-    pull requests). At `deadline` minutes (STATUS_DEADLINE_MINUTES when
+    Repos are read side by side, the lightest first (fewest open issues
+    and pull requests, lightest_first). At `deadline` minutes (STATUS_DEADLINE_MINUTES when
     None) it reads no more repos and names each one it did not finish as
     `status skipped OWNER/NAME: deadline` before the cross-repo sections,
     which then span only the repos read (loom#2415). A repo GitHub refuses
@@ -1517,11 +1520,11 @@ def _status_pass(gh: GitHub, repos: List[str], lanes_repo: str, env: Dict[str, s
     caps: Dict[str, str] = {}
     # The fleet hold logins merge reads (hold_logins), from this env (loom#2393).
     hold = hold_logins(env)
-    # The heaviest repos are read first, so a deadline leaves the light
-    # ones. A status took 68 s here and 152 s from a remote brain, over a
-    # 15-minute tick (2026-10-15), and about 4 minutes for 19 repos inside a
-    # 2-minute command (loom#2415).
-    order = heaviest_first(repos, repo_weights(reads, repos))
+    # The lightest repos are read first, so a deadline leaves only heavy
+    # ones (lightest_first). A status took 68 s here and 152 s from a remote
+    # brain, over a 15-minute tick (2026-10-15), and about 4 minutes for 19
+    # repos inside a 2-minute command (loom#2415).
+    order = lightest_first(repos, repo_weights(reads, repos))
     found: Dict[str, List[Dict[str, Any]]] = {}
     waiting: Dict[str, Dict[str, Any]] = {}
     late: List[str] = []
