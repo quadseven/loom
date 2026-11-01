@@ -425,5 +425,72 @@ class OldIssueSubjectTest(unittest.TestCase):
         self.assertEqual(filer._marker(b), invariants.MARKER % b.key)
 
 
+class SettleBeforeFilingTest(unittest.TestCase):
+    """loom#2408: a lane pull request issue of the 2306 shape (marker key, a
+    title naming #N, no subject map) never closed once its pull request ended,
+    because filing other invariants spent the pass's writes before settling
+    ran. The settled callback here is the real _invariant_settled over the
+    real _lane_pull_settled."""
+
+    def setUp(self):
+        self.gh = FakeGH()
+        self.said = []
+        patcher = mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": AUTHOR})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.host = types.SimpleNamespace(
+            _pulls={}, gh=self.gh,
+            _invariant_ref=lambda repo, number, noun="issue": Ref(
+                "%s#%d" % (repo, number), "%s #%d" % (noun, number)))
+        self.host._lane_pull_settled = (
+            lambda repo, number: station.Station._lane_pull_settled(self.host, repo, number))
+
+    def settled(self, invariant, subject):
+        return station.Station._invariant_settled(self.host, Facts(T0), invariant, subject)
+
+    def old(self, number, pull):
+        key = invariants.Breach("lane-pr-stalled", "%s#%d" % (REPO, pull), "t", (), T0).key
+        self.gh.issues[number] = {
+            "number": number, "id": 9000 + number, "state": "open", "closed_at": None,
+            "title": "Lane pull request #%d open 13.5 hours: 1 review thread, no fix round" % pull,
+            "labels": [{"name": n} for n in invariants.LABELS], "created_at": stamp(T0),
+            "body": "%s\nBroken.\n\nTicket: #%d\n\nPart of #%d" % (
+                invariants.MARKER % key, pull - 3, GOAL)}
+        return self.gh.issues[number]
+
+    def others(self, tag, count=invariants.WRITES_MAX):
+        return [invariants.Breach("remote-silent", "%s-%d" % (tag, n), "Lane %s-%d silent" % (
+            tag, n), ("x",), T0) for n in range(count)]
+
+    def run_filer(self, breaches, now=T0):
+        invariants.Filer(self.gh, REPO, GOAL, {}, now, self.said.append,
+                         settled=self.settled).run(breaches)
+
+    def test_a_merged_pull_closes_its_issue_while_other_breaches_spend_the_writes(self):
+        issue = self.old(71, 660)
+        self.gh.pull_state[(REPO, 660)] = {"state": "closed", "merged_at": stamp(T0 + 60)}
+        self.run_filer(self.others("a"))
+        self.assertEqual(issue["state"], "closed", self.said)
+        self.assertTrue(any("closed settled" in s for s in self.said), self.said)
+
+    def test_the_list_drains_while_every_pass_files_something_else(self):
+        issues = [self.old(71 + n, 660 + n) for n in range(3)]
+        for n in range(3):
+            self.gh.pull_state[(REPO, 660 + n)] = {"state": "closed",
+                                                   "merged_at": stamp(T0 + 60)}
+        for n in range(2):
+            before = sum(1 for i in issues if i["state"] == "closed")
+            self.run_filer(self.others("p%d" % n), T0 + n * 60)
+            self.assertGreater(sum(1 for i in issues if i["state"] == "closed"), before,
+                               self.said)
+        self.assertEqual(sum(1 for i in issues if i["state"] == "closed"), 3)
+
+    def test_an_open_pull_keeps_its_issue_open(self):
+        issue = self.old(71, 660)
+        self.gh.pull_state[(REPO, 660)] = {"state": "open", "merged_at": None}
+        self.run_filer(self.others("a"))
+        self.assertEqual(issue["state"], "open")
+
+
 if __name__ == "__main__":
     unittest.main()

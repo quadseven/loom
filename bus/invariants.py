@@ -1793,7 +1793,6 @@ class Filer:
 
     def _clear_stale(self, current: Dict[str, Breach]) -> None:
         try:
-            self._settle(current)
             self._clear_gone(current)
         finally:
             self._summarize_folds()
@@ -2022,6 +2021,11 @@ class Filer:
         for b in current.values():
             if b.invariant in SETTLES and not b.rolling:
                 self.subjects[b.key] = b.subject
+        if self.write:
+            # Before the filing below can spend the pass's writes: settling
+            # costs at most FOLD_MAX closes, so the older issues drain even
+            # while other invariants file something every pass (loom#2408).
+            self._settle_first(current)
         for b in current.values():
             if not self.write or self.writes >= WRITES_MAX:
                 return
@@ -2034,6 +2038,12 @@ class Filer:
                 self._clear_stale(current)
             except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
                 self.say("invariants: could not close cleared issues: %s" % err)
+
+    def _settle_first(self, current: Dict[str, Breach]) -> None:
+        try:
+            self._settle(current)
+        except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
+            self.say("invariants: could not close settled issues: %s" % err)
 
 
 def load(path: str, say: Say) -> Dict[str, Any]:
