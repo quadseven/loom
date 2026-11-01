@@ -6042,6 +6042,14 @@ exit %d
                                 env={"PATH": f"{fakebin}:/usr/bin:/bin"}, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_fresh_red_base_verdict_retries_without_rereading_cache(self):
+        text = RUNNER.read_text()
+        gate = re.search(r"^  if \[ \"\$BASELINE_EXIT\" -ne 0 \].*; then$",
+                         text, re.M)
+        self.assertIsNotNone(gate)
+        self.assertIn('[ "$cached_verdict" -eq 0 ]', gate.group(0))
+        self.assertNotIn("base_verdict_read", gate.group(0))
+
     def test_resolve_factory_incidents_closes_contract_incident(self):
         function = re.search(r"^resolve_factory_incidents\(\) \{\n.*?^\}\n",
                              RUNNER.read_text(), re.S | re.M).group(0)

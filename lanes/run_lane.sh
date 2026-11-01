@@ -2494,7 +2494,7 @@ prepare_validation() {
   # under a busy station's load and passed on the next ticket's run, and
   # each such flake held its ticket behind a factory incident (56 by
   # 2026-10-25). A red base check runs once more; only a second red files.
-  if [ "$BASELINE_EXIT" -ne 0 ] && ! base_verdict_read "$verdict_key" "$now"; then
+  if [ "$BASELINE_EXIT" -ne 0 ] && [ "$cached_verdict" -eq 0 ]; then
     if [ -n "$changed" ] && ! safe_git reset --hard HEAD >> "$LOG" 2>&1; then
       SETUP_REASON="could not restore tracked files changed by the baseline check"
       return 1
