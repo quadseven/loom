@@ -534,7 +534,7 @@ RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\)
 RETRY_ORDER = ["anthropic", "anthropic-2", "anthropic-3", "anthropic-4",
                "codex", "codex-2", "opencode-go", "agy"]
 # Free lanes take only easy tickets on public repos.
-FREE_LANES = ["openrouter", "zen", "zai", "workersai"]
+FREE_LANES = list(labels.FREE_LANES)
 # The model families each lane's runner accepts (lanes/run_lane.sh); codex
 # takes any model outside the claude family. agy takes gemini-3.8-flash only:
 # its runner drops any other gemini, claude or gpt-oss pin and runs flash
@@ -1882,20 +1882,9 @@ def hold_expired(beat: Dict[str, Any], now: float) -> bool:
 
 
 def needs_public_repo(lane: str, model: str) -> bool:
-    """Free lanes, and lanes whose provider trains on prompts, take public
-    repos only. A slot named in factory.PUBLIC_ONLY counts before it is mapped
-    to its provider: free-nvidia, free-kilo and free-groq are free provider
-    slots that may train (infra#5617), while free-ollama and free-gemma may
-    take private repos."""
-    if lane in factory.PUBLIC_ONLY:
-        return True
-    # A cluster runner's inputs and logs live in this public repo's Actions
-    # (bus/runners.py).
-    if lane in runners.runner_slots():
-        return True
-    lane = provider(lane)
-    return (lane in FREE_LANES or lane in REMOTE_LANES or lane == "agy"
-            or (lane == "opencode-go" and fnmatch.fnmatchcase(model, "*muse-spark*contributor*")))
+    """The shared lane/model rule plus slots dispatched to cluster runners."""
+    return labels.needs_public_repo(
+        lane, model, cluster_runner=lane in runners.runner_slots())
 
 
 def retry_chain(comments: List[Any]) -> Tuple[int, set, Optional[Tuple[str, str]]]:

@@ -1609,10 +1609,9 @@ def difficulty_of(issue: Dict[str, Any]) -> str:
 
 
 def public_only(lane: str) -> bool:
-    """Whether the lane takes public repos only: PUBLIC_ONLY, or a slot sent to
-    cluster runners (LOOM_RUNNER_SLOTS), whose inputs and logs live in this
-    public repository's Actions, so the dispatch refuses a private repo."""
-    return lane in PUBLIC_ONLY or lane in runners.runner_slots()
+    """Whether the shared lane rule or cluster dispatch requires a public repo."""
+    return labels.needs_public_repo(
+        lane, cluster_runner=lane in runners.runner_slots())
 
 
 def lanes_of(difficulty: str, private: bool) -> Tuple[str, ...]:

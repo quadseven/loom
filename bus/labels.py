@@ -1,6 +1,7 @@
 """The label set from docs/BRAIN.md and an idempotent way to create it."""
 from __future__ import annotations
 
+import fnmatch
 import re
 import sys
 from typing import Dict, Iterable, List
@@ -63,6 +64,21 @@ def base_lane(slot: str) -> str:
 REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 4,
                          "beat_max": 2 * 3600}}
 LANES += list(REMOTE_LANES)
+
+# Public-repository routing rules shared by the factory and station. Free
+# provider slots such as free-gemma and free-ollama are intentionally absent.
+FREE_LANES = ("openrouter", "zen", "zai", "workersai")
+PUBLIC_ONLY_LANES = frozenset(("agy", "copilot", "opencode-go-4", "muse",
+                               "free-nvidia", "free-kilo", "free-groq"))
+
+
+def needs_public_repo(lane: str, model: str = "", cluster_runner: bool = False) -> bool:
+    """Whether this lane/model combination may receive public-repo work only."""
+    family = base_lane(lane)
+    return (cluster_runner or lane in PUBLIC_ONLY_LANES or family in FREE_LANES
+            or family in REMOTE_LANES or family == "agy"
+            or (family == "opencode-go" and
+                fnmatch.fnmatchcase(model, "*muse-spark*contributor*")))
 
 # The model ladder for repeatedly stuck work is bus/factory.py LADDER, and
 # the rungs a stuck ticket climbs are its CLIMB (docs/MUSE.md).

@@ -3551,6 +3551,18 @@ class Tickets(Base):
         self.assertFalse(set(factory.FREE_POOL) & set(factory.TIERS["hard"]))
         self.assertFalse(set(factory.FREE_POOL) & set(factory.SPARKS))
 
+    def test_every_private_factory_lane_passes_the_station_public_repo_gate(self):
+        from bus import station
+
+        for difficulty in factory.TIERS:
+            for lane in factory.lanes_of(difficulty, True):
+                self.assertFalse(station.needs_public_repo(lane, ""),
+                                 "%s assigned for private %s work" % (lane, difficulty))
+        for lane in ("free-gemma", "free-ollama"):
+            self.assertFalse(station.needs_public_repo(lane, ""), lane)
+        self.assertTrue(station.needs_public_repo(
+            "opencode-go-2", "opencode-go/muse-spark-contributor"))
+
     def test_a_public_easy_ticket_may_go_to_zen(self):
         self.gh.private = False
         self.limited_easy(busy=("muse", "agy", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
