@@ -134,6 +134,8 @@ class LoomSizedFake:
             return self._reply(ISSUES)
         if bare == "/repos/%s/pulls" % REPO:
             return self._reply(PULLS)
+        if "/compare/" in bare:
+            return self._reply({"behind_by": 0})
         if bare.endswith("/files"):
             return self._reply([{"filename": "bus/a.py", "patch": "+x"}])
         if PULL.match(bare):

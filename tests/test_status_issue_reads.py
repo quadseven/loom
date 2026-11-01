@@ -74,6 +74,8 @@ class PathFake:
         if re.fullmatch(r"/repos/[^/]+/[^/]+/pulls/\d+", path):
             return self._reply({"mergeable": True, "mergeable_state": "clean",
                                 "base": {"ref": "main"}, "head": {"sha": "head"}})
+        if "/compare/" in path:
+            return self._reply({"behind_by": 0})
         if path.endswith("/files"):
             return self._reply([{"filename": "bus/a.py", "patch": "+x"}])
         return self._reply([])
