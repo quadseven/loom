@@ -1619,12 +1619,15 @@ limit_until() {
 # hand on every brief still in the inbox this pass.
 hold_provider_limit() {
   local until slot source checked tmp
-  until="$(limit_until)" || return 0
+  if ! until="$(limit_until)"; then
+    until=$(( $(date +%s) + ${LIMIT_WAIT:-3600} ))
+  fi
   LIMITED=1
+  [ -n "$LIMIT_WHY" ] || LIMIT_WHY="provider limit reached"
   source="$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
   checked="$(date +%s)"
   for slot in $(limit_group); do
-    if [ "$slot" != "$SLOT" ]; then
+    if [ "$slot" != "$SLOT" ] && [ -f "$source" ]; then
       tmp="$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp"
       if ! cp "$source" "$tmp" \
         || ! mv -f "$tmp" "$LOOM_HOME/state/usage/$slot.provider-limit.json"; then
@@ -3131,6 +3134,29 @@ Do not search the whole filesystem (for example, find /). Search within the chec
   esac
 }
 
+# A watchdog for the running agent wrapper: tails the run log through
+# provider_text, and stops the agent early on a terminal limit line
+# (AI_RetryError after limit text, not a single retryable 429).
+agent_watchdog() {
+  local agent="$1" start="${2:-0}" log="$3" seen_limit=0 line
+  shopt -s nocasematch
+  tail -c +$((start + 1)) -f "$log" 2>/dev/null | provider_text | while IFS= read -r line; do
+    if [[ "$line" =~ $LIMIT_RE ]] || [[ "$line" =~ $LIMIT_CODE_RE ]] ||
+       [[ "$line" =~ 429 ]] || [[ "$line" =~ GoUsageLimitError ]]; then
+      seen_limit=1
+    fi
+    if [ "$seen_limit" -eq 1 ] && [[ "$line" =~ AI_RetryError ]]; then
+      provider_at_limit || true
+      hold_provider_limit
+      touch "$LOCK/watchdog-limit"
+      kill -TERM -- "-$agent" 2>/dev/null || kill -TERM "$agent" 2>/dev/null || true
+      sleep 1
+      kill -KILL -- "-$agent" 2>/dev/null || kill -KILL "$agent" 2>/dev/null || true
+      break
+    fi
+  done
+}
+
 spend() { PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.spend "$@"; }
 
 # The anthropic lanes spend API credits. The CLI's JSON result carries the
@@ -3583,12 +3609,20 @@ for BRIEF in "$INBOX"/*.md; do
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
   if ! agent_gh_config; then park "$BRIEF" "$AGENT_GH_WHY" transient; continue; fi
+  rm -f "$LOCK/watchdog-limit"
   ( set -m
     (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
       { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
       run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
-    echo $! > "$LOCK/pgid"
-    wait $! ) &
+    agent_pid=$!
+    echo $agent_pid > "$LOCK/pgid"
+    ( agent_watchdog "$agent_pid" "$LOG_START" "$LOG" ) &
+    watchdog_pid=$!
+    wait $agent_pid
+    agent_status=$?
+    kill -TERM -- "-$watchdog_pid" 2>/dev/null || kill -TERM "$watchdog_pid" 2>/dev/null || true
+    wait $watchdog_pid 2>/dev/null || true
+    exit $agent_status ) &
   wait $!
   STATUS=$?
   AGENT_GH_CALLS="$(agent_gh_calls)"
@@ -3604,7 +3638,7 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
   # A run that timed out may have been retrying a usage limit all along.
-  if [ "$STATUS" -eq 124 ] && provider_at_limit; then
+  if { [ "$STATUS" -eq 124 ] || [ -f "$LOCK/watchdog-limit" ]; } && provider_at_limit; then
     hold_provider_limit
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
@@ -3626,6 +3660,7 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
   fi
+  [ -f "$LOCK/watchdog-limit" ] && FAIL_CLASS=limit
   # A timeout after editing keeps its edits whatever the failure is classed as,
   # and so does a run cut short by a limit, an expired key or a transient error
   # (a free pool runs dry 20 minutes in): every park below names the branch.
