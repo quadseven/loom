@@ -6029,6 +6029,48 @@ exit %d
 
     # The validation contract (.loom/validation.conf).
 
+    def test_a_second_brief_reuses_the_green_base_verdict(self):
+        contract = ("interpreter: loom-test-python\n"
+                    "check: echo base-check-hit\n")
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.write_tool(Path(self._tmp.name) / "pybin" / "loom-test-python",
+                        f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        self.contract_repo(contract=contract)
+        self.drop_brief()
+        first = self.run_contract_lane(interpreter=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        self.drop_brief("T043-fix-the-thing.md", BRIEF.replace("T042", "T043"))
+        second = self.run_contract_lane(interpreter=True)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                   "T043-fix-the-thing.validation.jsonl").read_text().splitlines()]
+        baseline = next(r for r in records if r["phase"] == "baseline")
+        self.assertEqual(baseline["detail"], "cached verdict")
+        logs = "\n".join((self.loom / "logs" / "codex" / name).read_text()
+                          for name in ("T042-fix-the-thing.log", "T043-fix-the-thing.log"))
+        self.assertEqual(logs.count("base-check-hit"), 3)  # two first-run checks, final only on second
+
+    def test_base_verdict_key_includes_command_and_interpreter_and_red_expires(self):
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{[^\n]*\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("base_verdict_key", "base_verdict_read", "base_verdict_write"))
+        tmp = Path(self._tmp.name)
+        script = ("BASE_VERDICT_DIR=\"$1\"\nBASE_VERDICT_TTL_GREEN=86400\n"
+                  "BASE_VERDICT_TTL_RED=300\nREPO=example/repo\nC_CHECK=check-one\n"
+                  "key=$(base_verdict_key rev-one python-one)\nbase_verdict_write \"$key\" 1\n"
+                  "now=$(date +%s)\nbase_verdict_read \"$key\" \"$now\" || exit 10\n"
+                  "base_verdict_read \"$key\" $((now + 300)) && exit 11\n"
+                  "C_CHECK=check-two; [ \"$(base_verdict_key rev-one python-one)\" != \"$key\" ] || exit 12\n"
+                  "C_CHECK=check-one; [ \"$(base_verdict_key rev-one python-two)\" != \"$key\" ] || exit 13\n")
+        fakebin = tmp / "fakebin"
+        self.write_tool(fakebin / "sha256sum",
+                        f'#!{sys.executable}\nimport hashlib, sys\n'
+                        'print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest() + "  -")\n')
+        result = subprocess.run(["bash", "-c", funcs + script, "test", str(tmp / "verdicts")],
+                                env={"PATH": f"{fakebin}:/usr/bin:/bin"}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_resolve_factory_incidents_closes_contract_incident(self):
         function = re.search(r"^resolve_factory_incidents\(\) \{\n.*?^\}\n",
                              RUNNER.read_text(), re.S | re.M).group(0)

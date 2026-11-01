@@ -2082,6 +2082,29 @@ record() {
     "$(date -u +%FT%TZ)" >> "$RECORD"
 }
 
+# Base check verdicts survive the per-brief scratch HOME. A green result is
+# reusable for a day; a red result briefly stops more tickets for this repo.
+BASE_VERDICT_DIR="$LOOM_HOME/state/base-verdicts"
+BASE_VERDICT_TTL_GREEN=86400
+BASE_VERDICT_TTL_RED=300
+base_verdict_key() {
+  printf '%s\n%s\n%s\n%s\n' "$REPO" "$1" "$C_CHECK" "$2" | sha256sum | cut -d' ' -f1
+}
+base_verdict_read() {  # key, now
+  local file="$BASE_VERDICT_DIR/$1" at exit ttl
+  [ -f "$file" ] || return 1
+  IFS=' ' read -r at exit < "$file" || return 1
+  case "$at:$exit" in *[!0-9:]*|:*) return 1 ;; esac
+  if [ "$exit" -eq 0 ]; then ttl="$BASE_VERDICT_TTL_GREEN"; else ttl="$BASE_VERDICT_TTL_RED"; fi
+  [ "$2" -ge "$at" ] && [ "$(( $2 - $at ))" -lt "$ttl" ] || return 1
+  BASELINE_EXIT="$exit"
+  return 0
+}
+base_verdict_write() {  # key, exit
+  mkdir -p "$BASE_VERDICT_DIR" || return 1
+  printf '%s %s\n' "$(date +%s)" "$2" > "$BASE_VERDICT_DIR/$1"
+}
+
 # A validation failure the repo did not cause is a factory incident, not a
 # [work] failure: the contract cannot be read, the environment cannot run
 # the check (exit 125/126/127), or the check is already red on the
@@ -2384,7 +2407,7 @@ exclude_untracked() {
 # Only a red default branch check is a base-check factory incident. Returns
 # 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
-  local rc interp="" subs="" changed what baseline_rev tool=""
+  local rc interp="" subs="" changed what baseline_rev tool="" verdict_key interpreter_id now cached_verdict=0
   SETUP_REASON=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
@@ -2440,11 +2463,22 @@ prepare_validation() {
     fi
     [ "$rc" -eq 0 ] || { SETUP_REASON="setup exited $rc"; return 1; }
   fi
-  contract_run "$C_CHECK"; BASELINE_EXIT=$?
-  changed="$(tracked_changes)"
   baseline_rev="$(safe_git rev-parse HEAD)"
-  record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
-    "${changed:+changed tracked files: $changed}"
+  interpreter_id="${C_INTERP:-none}"
+  [ -z "$interp" ] || interpreter_id="$interp $($interp --version 2>&1 | head -1)"
+  verdict_key="$(base_verdict_key "$baseline_rev" "$interpreter_id")"
+  now="$(date +%s)"
+  if base_verdict_read "$verdict_key" "$now"; then
+    cached_verdict=1
+    changed=""
+    echo "base check reused cached verdict for $baseline_rev" >> "$LOG"
+    record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && echo true || echo false)" "cached verdict"
+  else
+    contract_run "$C_CHECK"; BASELINE_EXIT=$?
+    changed="$(tracked_changes)"
+    record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
+      "${changed:+changed tracked files: $changed}"
+  fi
   if [ "$BASELINE_EXIT" -eq 143 ]; then
     PARK_CLASS=transient
     SETUP_REASON="base check interrupted by SIGTERM"
@@ -2463,7 +2497,7 @@ prepare_validation() {
   # under a busy station's load and passed on the next ticket's run, and
   # each such flake held its ticket behind a factory incident (56 by
   # 2026-10-25). A red base check runs once more; only a second red files.
-  if [ "$BASELINE_EXIT" -ne 0 ]; then
+  if [ "$BASELINE_EXIT" -ne 0 ] && ! base_verdict_read "$verdict_key" "$now"; then
     if [ -n "$changed" ] && ! safe_git reset --hard HEAD >> "$LOG" 2>&1; then
       SETUP_REASON="could not restore tracked files changed by the baseline check"
       return 1
@@ -2479,6 +2513,11 @@ prepare_validation() {
       return 1
     fi
     [ "$BASELINE_EXIT" -ne 0 ] || echo "base check exited $first_exit, then passed on a second run" >> "$LOG"
+  fi
+  if [ "$cached_verdict" -eq 0 ] && [ -z "$changed" ] && [ "$BASELINE_EXIT" -ne 143 ] && [ "$BASELINE_EXIT" -ne 125 ] &&
+     [ "$BASELINE_EXIT" -ne 126 ] && [ "$BASELINE_EXIT" -ne 127 ]; then
+    base_verdict_write "$verdict_key" "$BASELINE_EXIT" ||
+      echo "could not store base check verdict for $baseline_rev" >> "$LOG"
   fi
   # Only a pass on the trusted base clears an incident: a fix round's tree
   # holds the agent's unmerged edits, so it counts only once the default
