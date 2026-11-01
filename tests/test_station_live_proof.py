@@ -156,7 +156,44 @@ class StationLiveProofTest(tbs.Base):
         self.close_pass(log)
         self.assertEqual(log.reads, [])
         self.assertNotIn("Live proof missing:", self.status_text())
-        self.assertIn("loom:human", self.fake.names(self.NUMBER))
+        self.assertIn("needs:human", self.fake.names(self.NUMBER))
+
+
+class EvidenceDropsVerifyNotesTest(unittest.TestCase):
+    """A verify run must not read the station's own verify-result lines, which
+    quote the Live criterion, as new observations of the string (loom#2052)."""
+
+    NEEDLE = "budget 0 of 5000 left"
+    PASS_LINE = "[2030-01-02T03:04:05Z] station: GitHub App budget 0 of 5000 left"
+    NOTE = ("[2030-01-02T06:00:00Z] station: verify of quadseven/example issue 1 on lane spark "
+            "left it shipped: Missing evidence: no \"budget 0 of 5000 left\" line; "
+            "tried again after 6 hours")
+
+    def command(self, *lines):
+        return "printf '%s\\n' " + " ".join("'%s'" % line for line in lines)
+
+    def test_a_verify_note_quoting_the_string_is_dropped_and_a_real_line_kept(self):
+        command = self.command(self.PASS_LINE, self.NOTE)
+        lines = evidence.lines_since(command, self.NEEDLE, 0, 1_900_000_000, 24)
+        self.assertEqual(lines, [self.PASS_LINE])
+        text, seen, _ = evidence.gather_window({"r": command}, "r", "Live: `%s`" % self.NEEDLE)
+        self.assertTrue(seen)
+        self.assertIn(self.PASS_LINE, text)
+        self.assertNotIn("verify of", text)
+
+    def test_a_verify_note_with_no_time_prefix_is_dropped_too(self):
+        bare = self.NOTE.split("] ", 1)[1]
+        self.assertTrue(bare.startswith("station: verify of "))
+        text, seen, _ = evidence.gather_window(
+            {"r": self.command(self.PASS_LINE, bare)}, "r", "Live: `%s`" % self.NEEDLE)
+        self.assertTrue(seen)
+        self.assertIn(self.PASS_LINE, text)
+        self.assertNotIn("verify of", text)
+
+    def test_a_line_that_only_mentions_verify_in_the_middle_is_kept(self):
+        timing = "[2030-01-02T03:04:06Z] station: step verify took 12s (budget 0 of 5000 left)"
+        lines = evidence.lines_since(self.command(timing), self.NEEDLE, 0, 1_900_000_000, 24)
+        self.assertEqual(lines, [timing])
 
 
 class EvidenceLinesSinceTest(unittest.TestCase):

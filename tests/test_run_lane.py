@@ -1,6 +1,7 @@
 """lanes/run_lane.sh run as a process: a temp loom home, a local bare repo as
 the remote, and fake agent and gh commands on PATH that record their calls."""
 
+import hashlib
 import json
 import os
 import re
@@ -13,10 +14,11 @@ import tempfile
 import threading
 import time
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import unittest
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -259,6 +261,10 @@ if [ "${FAKE_AGENT:-commit}" = private-ref ]; then
 fi
 if [ "${FAKE_AGENT:-commit}" = verify-file ]; then
   printf '{"missing": "the station log"}' > verify.json
+  exit 0
+fi
+if [ "${FAKE_AGENT:-commit}" = review-file ]; then
+  printf '{"blocking": [], "notes": [], "summary": "sound"}' > review.json
   exit 0
 fi
 if [ "${FAKE_AGENT:-commit}" = limit ]; then
@@ -794,6 +800,93 @@ print('leak guard: clean (shape patterns only)')
         self.assertTrue(line.startswith("[transient] public repo leak scan could not run"), line)
         self.assertIn("could not read deny-list", line)
 
+    def test_a_lane_started_without_a_clone_base_does_not_crash_on_an_unbound_variable(self):
+        """launchd starts the local lanes without LOOM_CLONE_BASE; the scanner
+        remote must default like the ticket clone does (git@github.com:), or
+        every run dies at once under set -u and no lane works."""
+        env = self.lane_env()
+        del env["LOOM_CLONE_BASE"]
+        self.drop_brief()
+        result = subprocess.run(["bash", str(RUNNER), "codex"], env=env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertNotIn("unbound variable", result.stderr)
+
+    def test_a_missing_leak_scanner_is_a_factory_incident(self):
+        # No infra-public checkout and no remote to clone it from: the scanner
+        # cannot be had, so a public-repo push is a factory incident (one issue
+        # filed, the ticket held) instead of a transient failure that the
+        # station re-briefs endlessly.
+        self.drop_brief()
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        line = self.failure_line()
+        self.assertTrue(line.startswith("[factory] "), line)
+        self.assertIn("scanner not found", line)
+        self.assertEqual(len([c for c in self.calls() if c.startswith("gh issue create")]), 1)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+        # With an infra-public remote holding the scanner but no local
+        # checkout, the lane clones it before the scan and the push opens.
+        root = Path(self._tmp.name)
+        remotes = root / "remotes"
+        remote = remotes / "quadseven" / "infra-public"
+        remote.parent.mkdir(parents=True)
+        git("init", "-q", "-b", "main", str(remote))
+        scripts = remote / ".github" / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "check_private_leaks.py").write_text(self.scanner.read_text())
+        git("add", ".github/scripts/check_private_leaks.py", cwd=remote)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "scanner", cwd=remote)
+        self.log.write_text("")
+        self.drop_brief("T043-next.md", BRIEF.replace("T042-fix-the-thing", "T043-next"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.loom / "infra-public").exists())
+        self.assertTrue((self.loom / "infra-public" / ".github" / "scripts" / "check_private_leaks.py").exists())
+        self.assertTrue((self.inbox / "done" / "T043-next.md").exists())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+
+        checkout = self.loom / "infra-public"
+        first_head = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                    capture_output=True, text=True, check=True).stdout.strip()
+        (scripts / "scanner-version").write_text("updated\n")
+        git("add", ".github/scripts/scanner-version", cwd=remote)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "update", cwd=remote)
+        self.log.write_text("")
+        self.drop_brief("T044-hourly.md", BRIEF.replace("T042-fix-the-thing", "T044-hourly"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                        capture_output=True, text=True, check=True).stdout.strip(),
+                         first_head)
+
+        stamp = self.loom / "run" / "infra-public.updated"
+        old = time.time() - 2 * 3600
+        stamp.write_text(str(int(old)) + "\n")
+        self.log.write_text("")
+        self.drop_brief("T045-hourly-refresh.md", BRIEF.replace("T042-fix-the-thing", "T045-hourly-refresh"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                           capture_output=True, text=True, check=True).stdout.strip(),
+                            first_head)
+
+        # A refresh whose fetch fails leaves the stamp stale, so the next run
+        # tries again instead of trusting a checkout it could not update.
+        stamp.write_text(str(int(old)) + "\n")
+        remote.rename(remotes / "quadseven" / "infra-public-gone")
+        self.log.write_text("")
+        self.drop_brief("T046-fetch-fails.md", BRIEF.replace("T042-fix-the-thing", "T046-fetch-fails"))
+        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stamp.read_text().strip(), str(int(old)))
+
     # A workload that selects a node label, for the live-cluster check
     # (bus/live_cluster.py, loom#1832).
     MANIFEST = ("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
@@ -1019,6 +1112,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("pull request body rebuilt from the brief", self.run_log())
         self.assertEqual(self.sticky_bodies(), [])
 
+    def test_generated_why_includes_text_under_nested_brief_headings(self):
+        brief = BRIEF.replace(
+            "The thing is broken for every user.",
+            "Short intro.\n\n### Further notes\n"
+            "These nested details explain the problem across several steps.")
+        self.drop_brief(text=brief)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        why = self.body.read_text().split("## Why\n", 1)[1].split("\n\n## Summary", 1)[0]
+        self.assertEqual(why, "Short intro.\n### Further notes\n"
+                         "These nested details explain the problem across several steps.")
+
     def test_a_brief_that_cannot_fill_the_body_opens_a_marked_pull_request_and_notes_the_ticket(self):
         brief = BRIEF.replace("S: one function.", "big")
         self.drop_brief(text=brief)
@@ -1085,6 +1190,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         log = self.run_log()
         self.assertIn("Bugs discovered line 2 left out: the line cites no issue", log)
         self.assertIn("Bugs discovered line 3 left out: the cited issue could not be looked up", log)
+        self.assertEqual(hunt_plan.problems(body), [])
+
+    def test_a_one_criterion_ticket_opens_a_body_the_gate_accepts(self):
+        # A follow-up ticket states the one criterion a lane left not built;
+        # its body failed the plan check with 1 bullet of the 3 it wants.
+        thin = BRIEF.replace("## Acceptance criteria\n", "## Acceptance\n").replace(
+            "- [ ] A test covers the thing\n- [ ] Nothing else changes\n", "")
+        self.drop_brief(text=thin)
+        result = self.run_lane(FAKE_SUMMARY="Fix the thing so it works")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("## Acceptance criteria\n- [ ] The thing works\n", body)
         self.assertEqual(hunt_plan.problems(body), [])
 
     def test_a_body_without_bugs_has_no_bugs_section(self):
@@ -1228,6 +1345,57 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual((logs / "T042-fix-the-thing.verify.model").read_text(), "gpt-test-default\n")
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def review_brief(self):
+        """A Luna review brief for PR 7 (loom#2142), whose branch is already
+        on the remote with the lane's first commit, as the station's
+        dispatch leaves it."""
+        work = Path(self._tmp.name) / "pr-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
+        (work / "first.txt").write_text("first try\n")
+        git("add", "first.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "First try", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        issue = {"number": 42, "title": "Fix the thing",
+                 "body": "Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n"}
+        head = self.remote_head(self.FIX_BRANCH)
+        name = tickets.review_name("example/repo", 42, 2)
+        self.drop_brief(name + ".md", tickets.render_review_brief(
+            "example/repo", issue, "codex", 2, 7, self.FIX_BRANCH, "main", head))
+        return name, head
+
+    def test_a_review_brief_records_its_verdict_and_pushes_nothing(self):
+        name, before = self.review_brief()
+        result = self.run_lane(FAKE_AGENT="review-file")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        logs = self.loom / "logs" / "codex"
+        self.assertEqual((logs / (name + ".review.json")).read_text(),
+                         '{"blocking": [], "notes": [], "summary": "sound"}')
+        # The brief's Model: line pins the run to Luna, not the lane default.
+        self.assertEqual((logs / (name + ".review.model")).read_text(), "gpt-6-luna\n")
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("codex ") for c in calls))
+        self.assertFalse(any(c.startswith("gh pr create") for c in calls))
+
+    def test_a_review_brief_without_a_review_pr_is_parked(self):
+        brief = BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: review")
+        self.drop_brief(text=brief)
+        result = self.run_lane(FAKE_AGENT="review-file")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("review brief needs Review-PR", log)
+        self.assertFalse((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_review_run_without_a_verdict_is_parked(self):
+        name, _ = self.review_brief()
+        result = self.run_lane(FAKE_AGENT="noop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("no review.json written", log)
 
     def test_answer_deliverable_without_file_fails_as_no_answer_written(self):
         brief = BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer")
@@ -1625,6 +1793,20 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("\nSize: S\n", body)
         self.assertEqual(hunt_plan.problems(body), [])
 
+    def test_pr_body_carries_the_bullets_the_gate_wants_for_a_thin_brief(self):
+        # The gate counts three bullets under Acceptance criteria. A ticket
+        # that states fewer (the factory files a follow-up ticket with the one
+        # criterion a lane left not built) still opens a body it accepts: a
+        # body it refuses holds the pull request.
+        self.drop_brief(text=BRIEF.replace(
+            "- [ ] The thing works\n- [ ] A test covers the thing\n"
+            "- [ ] Nothing else changes", "- [ ] The thing works"))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertEqual(hunt_plan.problems(body), [])
+        self.assertIn("- [ ] The thing works", body)
+
     def test_pr_body_has_no_refs_without_an_issue_line(self):
         self.drop_brief()
         self.run_lane()
@@ -1768,6 +1950,42 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
                                capture_output=True, text=True, check=True).stdout.split()
         self.assertNotIn(".loom/replies.json", files)
 
+    def test_a_fix_round_that_leaves_a_listed_thread_without_a_reply_says_so(self):
+        # 2026-10-31: about two thirds of open review threads on lane pull
+        # requests were findings the lane never answered, so the merge gate
+        # held those pull requests with nobody told why.
+        name, _ = self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7",
+                               FAKE_REPLIES='[{"thread":"PRRT_other","reply":"Done","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("%s: review threads left without a reply: PRRT_1" % name, log)
+        [note] = self.sticky_bodies()
+        self.assertIn("Review threads this round left without a reply: PRRT_1", note)
+
+    def test_a_listed_thread_with_a_reply_entry_is_posted_resolved_and_not_flagged(self):
+        name, _ = self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7",
+                               FAKE_REPLIES='[{"thread":"PRRT_1","reply":"Renamed in a.py.","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c and "PRRT_1" in c for c in calls))
+        self.assertTrue(any("resolveReviewThread" in c and "PRRT_1" in c for c in calls))
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertNotIn("left without a reply", log)
+        [note] = self.sticky_bodies()
+        self.assertNotIn("left without a reply", note)
+
+    def test_a_listed_thread_answered_in_loom_answers_is_not_flagged(self):
+        name, _ = self.fix_brief()
+        secret = Path(self._tmp.name) / "outside-secret"
+        secret.write_text("unused\n")
+        result = self.run_lane(FAKE_AGENT="answer", FAKE_GH_EXISTING="7",
+                               FAKE_SECRET_FILE=str(secret))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertNotIn("left without a reply", log)
+
     def test_fix_runner_never_replies_to_or_resolves_a_thread_on_another_pull_request(self):
         self.fix_brief()
         replies = ('[{"thread":"PRRT_elsewhere","reply":"Addressed","resolve":true},'
@@ -1849,6 +2067,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
 
     def test_a_provider_usage_limit_is_a_limit_not_a_failure(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        started = datetime.now()
         result = self.run_lane(FAKE_AGENT="limit")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
@@ -1858,11 +2077,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertFalse(beat["available"])
         self.assertIn("provider limit reached", beat["reason"])
         # The stated reset time, its next occurrence (2026-10-21).
-        from datetime import datetime, timedelta
-        reset = datetime.now().replace(hour=12, minute=21, second=0, microsecond=0)
-        if reset <= datetime.now():
-            reset += timedelta(days=1)
-        self.assertAlmostEqual(beat["retry_at"], reset.timestamp(), delta=30)
+        self.assert_next_occurrence(beat["retry_at"], 12, 21, started)
         # The next brief waits until the provider limit lifts.
         agents = sum(c.startswith("codex ") for c in self.calls())
         self.drop_brief("T043-next.md", BRIEF.replace("T042", "T043"))
@@ -1919,8 +2134,9 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         # Codex said when its limit resets and the lane retried every hour
         # anyway, a ticket round each time: one ticket failed rounds 6 to 11
         # an hour apart (2026-10-21). A reset days away is trusted up to a week.
-        from datetime import datetime, timedelta
-        later = (datetime.now() + timedelta(days=3)).replace(second=0, microsecond=0)
+        # Noon, as a clock change can repeat or skip the hours before 04:00.
+        later = (datetime.now() + timedelta(days=3)).replace(hour=12, minute=0, second=0,
+                                                             microsecond=0)
         day = later.day
         suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
         stamp = "%s %d%s, %d %s" % (later.strftime("%b"), day, suffix, later.year,
@@ -1933,8 +2149,9 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertAlmostEqual(beat["retry_at"], later.timestamp(), delta=1)
 
     def test_a_reset_time_of_day_is_its_next_occurrence(self):
-        from datetime import datetime, timedelta
         later = (datetime.now() + timedelta(hours=5)).replace(second=0, microsecond=0)
+        if later.hour in (1, 2):  # a clock change repeats or skips these hours
+            later += timedelta(hours=2)
         self.drop_brief()
         self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
             "ERROR: You've hit your usage limit. Try again at %s." % later.strftime("%I:%M %p").lstrip("0")))
@@ -2081,6 +2298,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         missing = [n for n, m in found.items() if m is None]
         self.assertFalse(missing, "function not found in runner: %s" % ", ".join(missing))
         return "".join(found[n].group(0) for n in names)
+
+    def test_opencode_described_step_rejects_an_empty_event_stream(self):
+        function = self.source_functions("opencode_described_step")
+        self.assertIn("events_processed = False", function)
+        self.assertIn("if not events_processed:", function)
+        code = re.search(r"<<'PY'\n(.*?)\nPY", function, re.S)
+        self.assertIsNotNone(code, "embedded event parser not found")
+        events = self.home / "empty-opencode-events.jsonl"
+        events.write_text("")
+        result = subprocess.run(["python3", "-I", "-c", code.group(1), str(events)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
 
     def test_the_agy_run_may_write_its_file_secret_store_and_not_the_keychains(self):
         # 2026-10-24: agy reads its keychain sign-in by running
@@ -2960,17 +3189,61 @@ exec /usr/bin/git "$@"
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
     def test_copilot_monthly_usage_limit_holds_until_next_month(self):
+        before = datetime.now(timezone.utc)
         script = (RUNNER.parent / "agent_cli.sh").read_text() + (
             'classify_failure 1 "Copilot monthly usage limit reached" edited; '
             'printf "%s %s\\n" "$FAIL_CLASS" "$RETRY_AT"')
         result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
         kind, retry_at = result.stdout.split()
         self.assertEqual(kind, "limit")
-        now = datetime.now(timezone.utc)
-        year = now.year + (now.month == 12)
-        month = 1 if now.month == 12 else now.month + 1
-        expected = int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp())
-        self.assertEqual(int(retry_at), expected)
+        def next_month(now):
+            year = now.year + (now.month == 12)
+            month = 1 if now.month == 12 else now.month + 1
+            return int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp())
+        self.assertIn(int(retry_at), (next_month(before), next_month(datetime.now(timezone.utc))))
+
+    def classify_as(self, lane, whole, tail):
+        """(class, retry_at) of a failed run with no edits on `lane`."""
+        script = (RUNNER.parent / "agent_cli.sh").read_text() + (
+            'LANE=%s; classify_failure 1 %s "" %s; printf "%%s|%%s\\n" "$FAIL_CLASS" "$RETRY_AT"'
+            % (shlex.quote(lane), shlex.quote(whole), shlex.quote(tail)))
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+        return result.stdout.strip().split("|")
+
+    def test_copilot_allowance_wordings_hold_the_copilot_lane_for_the_month(self):
+        # The Free allowance runs out with no "usage limit" in the message; a
+        # transient or work class sets no hold, so the next ticket hits the same wall.
+        for said in ("You have exceeded your premium request allowance",
+                     "Error: You have no quota"):
+            kind, retry_at = self.classify_as("copilot", said, said)
+            self.assertEqual(kind, "limit", said)
+            self.assertGreater(int(retry_at), time.time(), said)
+            self.assertEqual(datetime.fromtimestamp(int(retry_at), timezone.utc).day, 1, said)
+
+    def test_copilot_allowance_wordings_hold_no_other_lane(self):
+        # A ticket, diff or file can carry these words on any lane.
+        for said in ("You have exceeded your premium request allowance",
+                     "Error: You have no quota"):
+            kind, retry_at = self.classify_as("zen", said, said)
+            self.assertNotEqual(kind, "limit", said)
+            self.assertEqual(retry_at, "", said)
+
+    def test_copilot_allowance_words_earlier_in_a_run_hold_nothing(self):
+        # Only the run's last lines are the CLI's answer; earlier text can be
+        # the ticket or a file the agent read.
+        said = "the ticket quotes: you have no quota\nsome later output"
+        kind, retry_at = self.classify_as("copilot", said, "some later output")
+        self.assertNotEqual(kind, "limit")
+        self.assertEqual(retry_at, "")
+
+    def assert_next_occurrence(self, retry_at, hour, minute, before):
+        """retry_at is the next hour:minute on the local clock, read from the
+        clock before and after the run so it may cross that time, and by the
+        calendar so a day can be 23 or 25 hours."""
+        def following(now):
+            at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            return int((at if at > now else at + timedelta(days=1)).timestamp())
+        self.assertIn(int(retry_at), (following(before), following(datetime.now())))
 
     def classified(self, whole, tail, status=1):
         script = (RUNNER.parent / "agent_cli.sh").read_text() + (
@@ -3014,9 +3287,40 @@ exec /usr/bin/git "$@"
     def test_a_stated_reset_time_wins_over_a_credit_pattern(self):
         limit = ("ERROR: You've hit your usage limit. Upgrade to Pro, visit the usage page to "
                  "purchase more credits or try again at 10:28 AM.")
+        before = datetime.now()
         kind, retry_at, credit = self.classified("\n".join([self.TEST_402, limit]), limit)
         self.assertEqual((kind, credit), ("limit", "none"))
-        self.assertLess(retry_at - time.time(), 24 * 3600 - 60)
+        self.assert_next_occurrence(retry_at, 10, 28, before)
+
+    def stated_reset_at(self, now, phrase):
+        """What stated_reset prints with the clock at now, in New York: its
+        Python process reads a pinned time.time."""
+        with tempfile.TemporaryDirectory() as pin:
+            Path(pin, "sitecustomize.py").write_text("import time\ntime.time = lambda: %d\n" % now)
+            script = (RUNNER.parent / "agent_cli.sh").read_text() + 'stated_reset "$1"'
+            result = subprocess.run(["bash", "-c", script, "x", phrase], capture_output=True,
+                                    text=True, check=True,
+                                    env={**os.environ, "PYTHONPATH": pin, "TZ": "America/New_York"})
+        return int(result.stdout)
+
+    def test_a_stated_time_of_day_is_its_next_occurrence_across_a_clock_change(self):
+        zone = ZoneInfo("America/New_York")
+        def at(month, day, hour, minute, fold=0):
+            year = 2027 if month < 6 else 2026
+            return int(datetime(year, month, day, hour, minute, tzinfo=zone, fold=fold).timestamp())
+        cases = (
+            (at(10, 31, 10, 27), "10:28 AM", at(10, 31, 10, 28)),
+            (at(10, 31, 10, 28), "10:28 AM", at(11, 1, 10, 28)),  # 25 hours away
+            (at(11, 1, 1, 30), "1:15 AM", at(11, 1, 1, 15, fold=1)),  # the repeat of the hour
+            (at(11, 1, 1, 30, fold=1), "1:45 AM", at(11, 1, 1, 45, fold=1)),
+            (at(11, 1, 1, 30, fold=1), "1:15 AM", at(11, 2, 1, 15)),
+            (at(11, 1, 2, 30), "2:15 AM", at(11, 2, 2, 15)),
+            (at(3, 13, 10, 28), "10:28 AM", at(3, 14, 10, 28)),  # 23 hours away
+            (at(3, 14, 1, 30), "2:30 AM", at(3, 14, 3, 30)),  # a time the night skips
+        )
+        for now, stated, expected in cases:
+            with self.subTest(now=now, stated=stated):
+                self.assertEqual(self.stated_reset_at(now, "try again at " + stated), expected)
 
     def test_a_402_from_the_provider_is_out_of_credit(self):
         tail = "Error: 402 Payment Required: your credit balance is too low"
@@ -3039,14 +3343,10 @@ exec /usr/bin/git "$@"
 
     def test_clock_time_stated_reset_still_parses(self):
         phrase = "rate limit: try again at 7:05 PM"
+        before = datetime.now()
         kind, retry_at, _ = self.classified(phrase, phrase)
         self.assertEqual(kind, "limit")
-        from datetime import datetime, timedelta
-        now = datetime.now()
-        expected = now.replace(hour=19, minute=5, second=0, microsecond=0)
-        if expected <= now:
-            expected += timedelta(days=1)
-        self.assertAlmostEqual(retry_at, expected.timestamp(), delta=60)
+        self.assert_next_occurrence(retry_at, 19, 5, before)
 
     def test_a_rate_limit_filename_in_a_tool_result_is_not_a_limit(self):
         self.drop_brief()
@@ -3598,6 +3898,9 @@ exec /usr/bin/git "$@"
         agy = lane_home / "agy"
         self.write_tool(agy, FAKE_AGY)
         self.write_tool(self.bin / "security", FAKE_SECURITY)
+        # The fake agy is a script, which no real codesign would call hardened.
+        fake_codesign = Path(self._tmp.name) / "fake_codesign"
+        self.write_tool(fake_codesign, '#!/bin/sh\necho "CodeDirectory v=20500 size=1 flags=0x10002(adhoc,runtime) hashes=1"\n')
         runas = Path(self._tmp.name) / "runas"
         self.write_tool(runas, FAKE_RUNAS if runas_ok else "#!/usr/bin/env bash\nexit 1\n")
         inbox = self.loom / "briefs" / "agy"
@@ -3612,6 +3915,7 @@ exec /usr/bin/git "$@"
             LOOM_AGY_HOME=str(lane_home),
             LOOM_AGY_WORKDIR=str(workdir),
             LOOM_AGY_BIN=str(agy_bin or agy),
+            LOOM_AGY_CODESIGN=str(fake_codesign),
             LOOM_AGY_KEYCHAIN=str(lane_home / "loom.keychain-db"),
             LOOM_AGY_KEY_SSM="/k/kc",
             LOOM_AGY_MODEL=model,
@@ -4842,7 +5146,7 @@ echo fixed > fix.txt
         self.expired_key_lane()
         filed = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(filed), 1, self.calls())
-        self.assertIn("--label needs-operator", filed[0])
+        self.assertIn("--label needs:human", filed[0])
         self.assertIn("renew /k/go", filed[0])
         # The next lane to hit that key finds the open ask and edits one
         # repeat comment on it, so the operator has one thread to answer, not
@@ -5369,7 +5673,7 @@ exit %d
         self.assertTrue(self.beat()["available"])
         ask = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(ask), 1, self.calls())
-        self.assertIn("--label needs-operator", ask[0])
+        self.assertIn("--label needs:human", ask[0])
         self.assertIn("renew the codex lane sign-in", ask[0])
 
     def test_a_cli_sign_in_that_timed_out_is_auth_not_transient(self):
@@ -5455,7 +5759,9 @@ exit %d
         self.assertTrue(self.failure_line().startswith("[limit] "), self.failure_line())
         beat = self.beat()
         self.assertFalse(beat["available"])
-        self.assertIn(beat["retry_at"], {t - t % 86400 + 86400 for t in (before, after)})
+        # Within a minute of midnight the 60 second floor in agent_cli.sh wins.
+        self.assertIn(beat["retry_at"], {max(t - t % 86400 + 86400, t + 60)
+                                         for t in range(before, after + 1)})
 
     def test_a_limit_holds_the_lane_unavailable_until_the_providers_reset(self):
         reset = int(time.time()) + 7200
@@ -5694,6 +6000,30 @@ exit %d
 
     # The validation contract (.loom/validation.conf).
 
+    def test_resolve_factory_incidents_closes_contract_incident(self):
+        function = re.search(r"^resolve_factory_incidents\(\) \{\n.*?^\}\n",
+                             RUNNER.read_text(), re.S | re.M).group(0)
+        tmp = Path(self._tmp.name)
+        script = (function +
+                  'incident_file() { printf "%s/%s-%s" "$INCIDENT_DIR" '
+                  '"$(printf "%s" "$REPO" | tr "/" "_")" "$1"; }\n'
+                  'incident_ticket() { printf "a ticket"; }\n'
+                  'python3() { return 0; }\n'
+                  'gh() { printf "gh %s\\n" "$*" >> "$CALLS"; }\n'
+                  'mkdir -p "$INCIDENT_DIR"\nprintf "99\\n" > '
+                  '"$INCIDENT_DIR/example_repo-contract"\nresolve_factory_incidents\n')
+        calls = tmp / "calls"
+        calls.touch()
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env={"INCIDENT_DIR": str(tmp / "incidents"), "REPO": "example/repo",
+                 "FACTORY_REPO": "quadseven/loom", "LOOM_ROOT": str(tmp),
+                 "PWD": str(tmp), "CALLS": str(calls), "LOG": str(self.log)},
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("gh issue close --repo quadseven/loom 99", calls.read_text())
+        self.assertFalse((tmp / "incidents" / "example_repo-contract").exists())
+
     def contract_repo(self, contract=CONTRACT):
         """Give the remote a submodule pinned behind its tip, the contract
         and check.py. Returns the pinned submodule commit."""
@@ -5756,6 +6086,83 @@ exit %d
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertIn("setup failed: interpreter loom-test-python is not on PATH", self.lane_log())
         self.assertEqual([(r["phase"], r["ok"]) for r in self.records()], [("prepare", False)])
+
+    def broken_sha256sum(self):
+        """A directory whose sha256sum cannot execute, as an x86_64 link does
+        on an arm64 host without Rosetta, and the first PATH with it."""
+        broken = Path(self._tmp.name) / "intel-bin"
+        self.write_tool(broken / "sha256sum", "#!/bin/sh\necho 'Bad CPU type in executable' >&2\nexit 126\n")
+        return broken, f"{broken}:{self.lane_env()['PATH']}"
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_lane_resolves_sha256sum_to_one_that_runs(self):
+        # 30 runs of one repo's base check failed on the lane machine's
+        # x86_64 Homebrew sha256sum, though that repo's main was green.
+        broken, path = self.broken_sha256sum()
+        self.drop_brief()
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING +
+                        'log="$FAKE_LOG"\n'
+                        'echo "tool $(command -v sha256sum)" >> "$log"\n'
+                        "echo \"digest $(printf abc | sha256sum)\" >> \"$log\"\n"
+                        'echo "path $PATH" >> "$log"\n')
+        self.run_lane(PATH=path)
+        seen = dict(line.split(" ", 1) for line in self.calls()
+                    if line.startswith(("tool ", "digest ", "path ")))
+        tool, digest, lane_path = seen["tool"], seen["digest"], seen["path"]
+        self.assertNotEqual(tool, str(broken / "sha256sum"))
+        self.assertTrue(digest.startswith(hashlib.sha256(b"abc").hexdigest()), digest)
+        # Only the broken tool's directory and those after it are shadowed.
+        dirs = lane_path.split(":")
+        self.assertEqual(dirs[dirs.index(str(broken)) - 1], str(Path(tool).parent))
+
+    def test_a_runnable_sha256sum_goes_just_before_a_broken_one_mid_path(self):
+        # What the lane plist gives: the broken directory is not first, and
+        # the directories ahead of it keep their place.
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{.*?\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("tool_runs", "runnable_sha256sum_on_path"))
+        broken, _ = self.broken_sha256sum()
+        real = Path(shutil.which("sha256sum", path="/sbin:/usr/bin:/bin")).parent
+        first = Path(self._tmp.name) / "first-bin"
+        first.mkdir()
+        rest = "/usr/bin:/bin"
+        env = {"PATH": f"{first}:{broken}:{rest}", "LOOM_SHA256SUM_DIRS": str(real)}
+        result = subprocess.run([shutil.which("bash"), "-c",
+                                 "set -uo pipefail\n" + funcs + 'runnable_sha256sum_on_path\nprintf %s "$PATH"'],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.stdout, f"{first}:{real}:{broken}:{rest}", result.stderr)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_no_runnable_sha256sum_is_a_lane_host_fault_not_a_base_check(self):
+        broken, path = self.broken_sha256sum()
+        self.contract_repo()
+        self.drop_brief()
+        self.write_tool(Path(self._tmp.name) / "pybin" / "loom-test-python",
+                        f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        result = self.run_lane(PATH=f"{Path(self._tmp.name) / 'pybin'}:{path}",
+                               LOOM_SHA256SUM_DIRS="/nonexistent",
+                               GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="protocol.file.allow",
+                               GIT_CONFIG_VALUE_0="always")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"lane host fault: sha256sum at {broken / 'sha256sum'} cannot run", self.lane_log())
+        self.assertEqual([(r["phase"], r["ok"]) for r in self.records()], [("prepare", False)])
+        created = [c for c in self.calls() if c.startswith("gh issue create")]
+        self.assertTrue(created, self.calls())
+        self.assertFalse([c for c in created if "base-check" in c], created)
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+
+    def test_key_digest_is_unchanged_where_sha256sum_works(self):
+        text = RUNNER.read_text()
+        func = re.search(r"^key_digest\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        want = hashlib.sha256(b"the key").hexdigest()[:16]
+        fakes = Path(self._tmp.name) / "digest-bin"
+        fakes.mkdir()
+        real = shutil.which("sha256sum", path="/sbin:/usr/bin:/bin")
+        for tool, target in (("sha256sum", real), ("cut", shutil.which("cut"))):
+            (fakes / tool).symlink_to(target)
+        result = subprocess.run([shutil.which("bash"), "-c", func + 'key_digest "the key"'],
+                                env={"PATH": str(fakes)}, capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), want, result.stderr)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_prepared_workspace_checks_the_agents_commit_before_the_pr(self):
@@ -6066,6 +6473,37 @@ exec /usr/bin/git "$@"
         body = Path(f"{self.body}.issue").read_text()
         self.assertIn("Repo: example/repo", body)
         self.assertIn("python: 3.12", body)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_parsing_contract_closes_its_open_incident(self):
+        self.contract_repo()
+        incident = self.loom / "state" / "incidents" / "example_repo-contract"
+        incident.parent.mkdir(parents=True)
+        incident.write_text("99\n")
+        self.drop_brief()
+
+        result = self.run_contract_lane()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text()
+        self.assertIn("gh issue close --repo quadseven/loom 99", calls)
+        self.assertIn("Cleared: the check passed on the unmodified base", calls)
+        self.assertFalse(incident.exists())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_contract_that_still_fails_to_parse_keeps_its_incident_open(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        incident = self.loom / "state" / "incidents" / "example_repo-contract"
+        incident.parent.mkdir(parents=True)
+        incident.write_text("99\n")
+        self.drop_brief()
+
+        result = self.run_contract_lane()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("gh issue close --repo quadseven/loom 99" in call
+                             for call in self.calls()))
+        self.assertEqual(incident.read_text(), "99\n")
 
     def test_a_repeated_factory_incident_updates_the_open_issue(self):
         self.contract_repo(contract=CONTRACT + "python: 3.12\n")
