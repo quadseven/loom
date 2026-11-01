@@ -235,7 +235,8 @@ ROLL_HINTS = {
         "OWNER/NAME#N --file FIX.md`"]),
     "plan-check-failed": "Each pull request here is held by its plan check; fix the rows its "
                          "check-run summary marks failing.",
-    EPIC_OVER_CAP: "Each epic here holds more than its cap; new work goes into a next epic.",
+    EPIC_OVER_CAP: "Each epic here holds more than its cap of open tickets; new work goes into "
+                   "a next epic.",
     "epic-title-shared": "The epics on each line share one title; give each a distinct title, "
                          "and move the tickets of the older ones under one.",
 }
@@ -743,7 +744,7 @@ def epic_over_cap(f: Facts) -> List[Breach]:
                          epic.epic.label, shape.goal.label, len(epic.open_tickets),
                          EPIC_TICKETS),),
                     f.now,
-                    line="Epic %s of goal home %s: %d open tickets (cap %d)" % (
+                    line="Epic %s of goal home %s: %d tickets (cap %d)" % (
                         epic.epic.label, shape.goal.label, len(epic.open_tickets), EPIC_TICKETS),
                     where=_where(epic.epic)))
     return out

@@ -11134,7 +11134,7 @@ class Station:
                     return "epic %s is closed" % epic.epic.label
                 if (epic.epic.key == subject
                         and len(epic.open_tickets) <= invariants.EPIC_TICKETS):
-                    return "epic %s holds %d open tickets, within the cap of %d" % (
+                    return "epic %s holds %d tickets, within the cap of %d open tickets" % (
                         epic.epic.label, len(epic.open_tickets), invariants.EPIC_TICKETS)
         return None
 

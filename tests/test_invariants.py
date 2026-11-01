@@ -628,7 +628,7 @@ class StationTest(StationBase):
             "epic-over-cap": (lambda: self.gh.subs.update({
                 (REPO, GOAL): [epic(40)],
                 (REPO, 40): [ticket(n) for n in range(50, 66)]}),
-                "Epic #40 of goal home #30: 16 open tickets (cap 15)"),
+                "Epic #40 of goal home #30: 16 tickets (cap 15)"),
             "goal-epics-over-cap": (lambda: self.gh.subs.update({
                 (REPO, GOAL): [epic(n) for n in range(40, 47)]}),
                 "has 7 open epics (cap 6)"),
@@ -665,20 +665,20 @@ class StationTest(StationBase):
                 self.assertEqual(filed[0]["state"], "closed", self.said)
 
     def test_epic_over_cap_counts_sub_issues_and_part_of_links_once(self):
-        """loom#2023: 13 sub-issues plus 4 issues linked only by a Part of
-        line (one of them closed) are 16 open tickets, none counted twice."""
+        """loom#2023: 13 sub-issues plus 5 issues linked only by a Part of
+        line (one of them closed) are 17 open tickets, none counted twice."""
         part_of = lambda n, state="open": dict(ticket(n, state), body="Why.\n\nPart of #40\n")  # noqa: E731
         subs = [ticket(n) for n in range(50, 63)]
         self.gh.subs[(REPO, GOAL)] = [epic(40)]
         self.gh.subs[(REPO, 40)] = subs
-        self.gh.tickets[REPO] = subs + [part_of(70), part_of(71), part_of(72)]
+        self.gh.tickets[REPO] = subs + [part_of(70), part_of(71), part_of(72), part_of(74)]
         # The search finds every Part of #40 issue, the closed one too, and a
         # sub-issue that also says so is still counted once.
         self.gh.search_items = [part_of(70), part_of(71), part_of(72),
-                                part_of(73, "closed"), part_of(50)]
+                                part_of(73, "closed"), part_of(74), part_of(50)]
         self.run_at(T0)
         (filed,) = self.gh.filed()
-        self.assertIn("Epic #40 of goal home #30: 16 open tickets (cap 15)", filed["body"])
+        self.assertIn("Epic #40 of goal home #30: 17 tickets (cap 15)", filed["body"])
 
     def test_a_goal_makes_one_part_of_search_however_many_epics_it_holds(self):
         """loom#2321: one search per five epics, about 35 a check, spent
@@ -851,7 +851,7 @@ class SettledSubjectTest(StationBase):
         self.gh.subs[(REPO, 40)] = [ticket(n) for n in range(50, 66)]
         self.run_at(T0)
         (filed,) = self.breaches()
-        self.assertIn("Epic #40 of goal home #30: 16 open tickets (cap 15)", filed["body"])
+        self.assertIn("Epic #40 of goal home #30: 16 tickets (cap 15)", filed["body"])
         self.gh.subs[(REPO, 40)] = self.gh.subs[(REPO, 40)][:15]
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertIn(invariants.ROLL_NONE, filed["body"])
@@ -869,7 +869,7 @@ class SettledSubjectTest(StationBase):
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "closed", self.said)
         self.assertEqual(self.notes(filed), [])
-        self.assertIn("epic #40 holds 15 open tickets, within the cap of 15", filed["body"])
+        self.assertIn("epic #40 holds 15 tickets, within the cap of 15", filed["body"])
 
     def test_a_closed_epic_holding_many_tickets_files_nothing(self):
         self.gh.subs[(REPO, GOAL)] = [epic(40, state="closed")]

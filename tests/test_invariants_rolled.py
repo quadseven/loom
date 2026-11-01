@@ -198,11 +198,11 @@ class RolledKindTest(unittest.TestCase):
         self.file(shape(16, T0 + 3600), now=T0 + 3600)
         self.assertEqual(len(self.gh.writes), writes)
         (issue,) = self.gh.issues.values()
-        self.assertIn("16 open tickets (cap 15) (since %s)" % stamp(T0), issue["body"])
+        self.assertIn("16 tickets (cap 15) (since %s)" % stamp(T0), issue["body"])
         # Gone and back: it starts again.
         self.file([], now=T0 + 4000)
         self.file(shape(17, T0 + 5000), now=T0 + 5000)
-        self.assertIn("17 open tickets (cap 15) (since %s)" % stamp(T0 + 5000), issue["body"])
+        self.assertIn("17 tickets (cap 15) (since %s)" % stamp(T0 + 5000), issue["body"])
 
     def legacy(self, number, invariant="lane-pr-stalled", labels=None, subject=None):
         key = invariants.Breach(invariant, subject or "%s#%d" % (REPO, number), "t", (), T0).key
