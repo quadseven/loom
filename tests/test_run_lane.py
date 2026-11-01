@@ -4310,20 +4310,34 @@ echo fixed > fix.txt
     def pick_env(self, broken="none", go=("beam-free", "iceman-contributor-free", "mimo-v2.6-flash"),
                  zen=("flint-40b-free",)):
         self.write_tool(self.bin / "opencode", self.FAKE_OPENCODE_PICK.replace("BROKEN", broken))
-        lists = Path(self._tmp.name) / "lists"
-        lists.mkdir(exist_ok=True)
-        (lists / "go.json").write_text(json.dumps({"data": [{"id": m} for m in go]}))
-        (lists / "zen.json").write_text(json.dumps({"data": [{"id": m} for m in zen]}))
-        (lists / "status.json").write_text(json.dumps({
-            "opencode-go": {"models": {m: {} for m in go}},
-            "opencode": {"models": {m: {} for m in zen}}}))
+        lists = {"/go.json": {"data": [{"id": m} for m in go]},
+                 "/zen.json": {"data": [{"id": m} for m in zen]},
+                 "/status.json": {"opencode-go": {"models": {m: {} for m in go}},
+                                  "opencode": {"models": {m: {} for m in zen}}}}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps(lists[self.path]).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        server = LocalHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = "http://127.0.0.1:%d" % server.server_port
         return dict(LOOM_MODEL_PICK="on", LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
                     LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash",
                     LOOM_ZEN_MODEL="opencode/flint-40b-free",
                     LOOM_OPENCODE_GO_PROBE_URL="", LOOM_ZEN_PROBE_URL="",
-                    LOOM_OPENCODE_GO_MODELS_URL="file://%s/go.json" % lists,
-                    LOOM_ZEN_MODELS_URL="file://%s/zen.json" % lists,
-                    LOOM_MODELS_STATUS_URL="file://%s/status.json" % lists)
+                    LOOM_OPENCODE_GO_MODELS_URL=base + "/go.json",
+                    LOOM_ZEN_MODELS_URL=base + "/zen.json",
+                    LOOM_MODELS_STATUS_URL=base + "/status.json")
 
     def pause_models(self, *keys):
         (self.loom / "state" / "usage").mkdir(parents=True, exist_ok=True)

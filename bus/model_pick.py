@@ -135,7 +135,7 @@ def _write_json(path: Path, data: Mapping[str, Any]) -> None:
 def _open(request: urllib.request.Request, timeout: int) -> Optional[Tuple[int, Mapping[str, str], bytes]]:
     """The answer to a request; a refusal is an answer, silence is None."""
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed or operator-set URLs
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - _request checks the scheme
             return response.getcode() or 200, dict(response.headers), response.read()
     except urllib.error.HTTPError as err:
         return err.code, dict(err.headers), err.read()
@@ -143,9 +143,18 @@ def _open(request: urllib.request.Request, timeout: int) -> Optional[Tuple[int, 
         return None
 
 
+def _request(url: str, headers: Mapping[str, str], data: Optional[bytes] = None
+             ) -> Optional[urllib.request.Request]:
+    """A request to an http(s) URL. Any other scheme gets none: these URLs
+    come from settings, and urllib would open a local file."""
+    if not url.startswith(("https://", "http://")):
+        return None
+    return urllib.request.Request(url, data=data, headers=dict(headers))  # noqa: S310 - scheme checked above
+
+
 def _list_source(url: str, opener: Opener) -> Optional[Any]:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    answer = opener(request, NET_TIMEOUT)
+    request = _request(url, {"User-Agent": USER_AGENT})
+    answer = opener(request, NET_TIMEOUT) if request else None
     if answer is None or answer[0] != 200:
         return None
     try:
@@ -306,8 +315,8 @@ def _probe(model: str, slot: str, key: str, env: Mapping[str, str],
         headers["Authorization"] = "Bearer %s" % key
     body = {"model": model.split("/", 1)[1], "max_tokens": PROBE_TOKENS,
             "messages": [{"role": "user", "content": "ping"}]}
-    request = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers)
-    return _probe_verdict(model, opener(request, NET_TIMEOUT))
+    request = _request(url, headers, json.dumps(body).encode("utf-8"))
+    return _probe_verdict(model, opener(request, NET_TIMEOUT) if request else None)
 
 
 def _entries(home: Path) -> Iterable[Mapping[str, Any]]:
@@ -336,8 +345,9 @@ def spent(home: Path, now: float, model: str) -> Tuple[float, ...]:
 
 
 def _has_room(home: Path, now: float, model: str) -> bool:
-    return all(share + RUN_RESERVE / limit <= BUDGET_SHARE
-               for share, limit in zip(spent(home, now, model), GO_PAID[model]))
+    limits = GO_PAID[model]
+    return all(share + RUN_RESERVE / limits[i] <= BUDGET_SHARE
+               for i, share in enumerate(spent(home, now, model)))
 
 
 def _spend(home: Path, now: float, model: str, requests: int) -> None:

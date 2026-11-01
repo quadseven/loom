@@ -260,6 +260,11 @@ class ModelPickTest(unittest.TestCase):
         self.assertIsNone(model_pick.status("zen", self.home, self.now + 3001))
         self.assertEqual(self.provider.probed, [])
 
+    def test_a_list_url_that_is_not_http_opens_nothing(self):
+        env = dict(ENV, LOOM_MODELS_STATUS_URL="file:///etc/hosts")
+        got = model_pick.pick("zen", "slot", False, "", self.home, self.now, env, self.provider)
+        self.assertIsNone(got.model)
+
     def test_the_key_never_reaches_a_note_or_a_state_file(self):
         self.provider.answers["beam-free"] = (429, {}, b"{}")
         got = self.pick()
