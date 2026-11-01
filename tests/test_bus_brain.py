@@ -1824,6 +1824,15 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
+    def test_merge_does_not_land_on_a_compare_with_no_count_of_commits_behind(self):
+        for body in ({}, {"behind_by": None}, {"behind_by": "3"}, {"behind_by": True},
+                     {"behind_by": -1}, []):
+            with self.subTest(body=body):
+                fake = Fake(*self._level_replies(), compare=reply(200, body))
+                with self.assertRaisesRegex(ValueError, "no count of commits behind"):
+                    brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+                self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
     def test_merge_does_not_land_when_the_base_ref_is_missing(self):
         fake = Fake(*self._level_replies({"pr": {"base": {"repo": {"full_name": REPO}}}}))
         with self.assertRaisesRegex(ValueError, "no base ref or head sha"):
@@ -2732,7 +2741,7 @@ class StatusMergeRefusalTests(unittest.TestCase):
 
     def lines(self, state="pr", mergeable=True, mergeable_state="clean",
               files=("bus/a.py", "tests/test_a.py"), env=None, behind_by=0, base_ref="main",
-              search_count=0):
+              search_count=0, compare=None):
         issue = {"number": 7, "state": "open", "body": "",
                  "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]}
         routes = {
@@ -2740,7 +2749,7 @@ class StatusMergeRefusalTests(unittest.TestCase):
             ("GET", "/pulls/9"): reply(200, {"number": 9, "mergeable": mergeable,
                                              "mergeable_state": mergeable_state,
                                              "base": {"ref": base_ref}, "head": {"sha": "h"}}),
-            ("GET", "/compare/main...h"): reply(200, {"behind_by": behind_by}),
+            ("GET", "/compare/main...h"): compare or reply(200, {"behind_by": behind_by}),
             ("GET", "/pulls/9/files"): reply(200, [{"filename": f, "patch": "+x"} for f in files]),
             ("GET", "/search/issues"): reply(200, {"total_count": search_count}),
         }
@@ -2771,6 +2780,22 @@ class StatusMergeRefusalTests(unittest.TestCase):
     def test_a_pull_request_with_no_refs_to_compare_is_not_ready(self):
         line = self.lines(base_ref=None)[1]
         self.assertIn("blocked: pull request has no base ref or head sha to compare", line)
+
+    def test_a_compare_with_no_count_of_commits_behind_is_not_ready(self):
+        line = self.lines(compare=reply(200, {"status": "identical"}))[1]
+        self.assertIn("blocked: compare main...h gave no count of commits behind", line)
+
+    def test_a_revert_with_no_count_of_commits_behind_gets_no_exemption(self):
+        fake = Fake(compare=reply(200, {}))
+        pull = {"base": {"ref": "main"}, "head": {"sha": "h"}}
+        refusal = brain._behind_refusal(GitHub("t", transport=fake), REPO, 9, pull,
+                                        brain.merge_tier.REVERT)
+        self.assertIn("the revert's exemption could not be checked", refusal)
+        self.assertIn("no count of commits behind", refusal)
+
+    def test_a_failed_compare_blocks_its_line_and_status_still_reads(self):
+        line = self.lines(compare=reply(500, {"message": "no"}))[1]
+        self.assertIn("blocked: the base compare could not be read", line)
 
     def test_a_pull_request_behind_its_base_is_not_ready(self):
         self.assertIn("blocked: " + brain.BEHIND_REFUSAL, self.lines(behind_by=3)[1])

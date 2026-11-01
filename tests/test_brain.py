@@ -32,8 +32,9 @@ def ready_node(checks="SUCCESS", reviews=(), threads=()):
 
 
 class StubTransport:
-    def __init__(self, routes=None, search_counts=None, search_error=False):
+    def __init__(self, routes=None, search_counts=None, search_error=False, behind_by=0):
         self.routes = dict(routes or {})
+        self.behind_by = behind_by
         self.search_counts = search_counts or {}
         self.search_error = search_error
         self.calls = []
@@ -42,7 +43,7 @@ class StubTransport:
         path = url.split("api.github.com")[1]
         self.calls.append((method, path))
         if "/compare/" in path:
-            return 200, {}, json.dumps({"behind_by": 0}).encode()
+            return 200, {}, json.dumps({"behind_by": self.behind_by}).encode()
         if path.startswith("/search/issues"):
             if self.search_error:
                 return 500, {}, b'{"message": "Server Error"}'
@@ -93,6 +94,15 @@ class HourlyMergeCapStatusTests(unittest.TestCase):
                            "the last hour, the cap is 4 (LOOM_AUTO_MERGE_PER_HOUR)")
         self.assertTrue(lines[1].endswith(expected_suffix), lines[1])
         self.assertIn("blocked: held by the hourly merge cap", lines[1])
+
+    def test_a_pull_request_behind_its_base_is_not_ready_and_nothing_is_written(self):
+        transport = StubTransport(self.routes(), search_counts={"default": 0}, behind_by=3)
+        gh = GitHub("t", transport=transport)
+        with unittest.mock.patch.dict(os.environ, {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}):
+            lines = brain._pull_request_lines(gh, REPO, [self.PR], {"prs": {9: ready_node()}},
+                                              "grug-tribe", now=NOW)
+        self.assertIn("blocked: " + brain.BEHIND_REFUSAL, lines[1])
+        self.assertFalse(any(method == "PUT" for method, _ in transport.calls))
 
     def test_per_repo_cap_blocks_ready_pull_request(self):
         # Per-repo search count is at the per-repo cap (2).

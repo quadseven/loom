@@ -411,6 +411,42 @@ class BrainMerge(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "listed 1 of 3"):
             brain._missed_paths(gh, REPO, {"base": {"ref": "main"}, "head": {"sha": "checked"}}, 3)
 
+    def test_a_revert_at_the_commit_cap_lands_and_one_past_it_is_refused(self):
+        cap = brain.MISSED_COMMITS_CAP
+        fake, refused = self.behind_revert({"c%d" % n: ["docs/a.md"] for n in range(cap)})
+        self.assertEqual(refused, "")
+        self.assertTrue(self.merged(fake))
+        fake, refused = self.behind_revert({"c%d" % n: ["docs/a.md"] for n in range(cap + 1)})
+        self.assertIn("could not be checked", refused)
+        self.assertIn("past the cap", refused)
+        self.assertFalse(self.merged(fake))
+
+    def test_past_the_commit_cap_no_commit_is_read(self):
+        # The fake routes nothing, so any read would raise a GitHubError.
+        gh = GitHub("t", transport=Route({}))
+        with self.assertRaisesRegex(ValueError, "past the cap"):
+            brain._missed_paths(gh, REPO, {"base": {"ref": "main"}, "head": {"sha": "checked"}},
+                                brain.MISSED_COMMITS_CAP + 1)
+
+    def behind_refusal_with_files(self, files):
+        """The refusal for a revert one commit behind, whose file list reads as `files`."""
+        gh = GitHub("t", transport=Route({
+            "/repos/%s/compare/main...checked" % REPO: {"behind_by": 1},
+            "/repos/%s/compare/checked...main" % REPO: {"commits": [{"sha": "c1"}]},
+            "/repos/%s/commits/c1" % REPO: {"files": [{"filename": "docs/a.md"}]},
+            "/repos/%s/pulls/8/files" % REPO: files}))
+        pull = {"base": {"ref": "main"}, "head": {"sha": "checked"}}
+        return brain._behind_refusal(gh, REPO, 8, pull, merge_tier.REVERT)
+
+    def test_an_empty_file_list_gives_a_revert_no_exemption(self):
+        self.assertIn("could not be checked", self.behind_refusal_with_files([]))
+
+    def test_a_cut_file_list_gives_a_revert_no_exemption(self):
+        files = [{"filename": "bus/a.py"}]
+        self.assertEqual(self.behind_refusal_with_files(files), "")
+        with mock.patch.object(brain.operator_hold, "FILES_CAP", 1):
+            self.assertIn("could not be checked", self.behind_refusal_with_files(files))
+
     def test_an_unproven_revert_takes_the_normal_gates(self):
         # Security review: the label and the title alone exempted it.
         for kw in ({"ticket_labels": ()},
