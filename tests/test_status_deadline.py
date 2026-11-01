@@ -84,22 +84,8 @@ class Fake:
 
     def __call__(self, method, url, headers, body):
         path = url.split("api.github.com")[-1]
-        found = REPO.match(path)
-        repo = found.group(1) if found else ""
         query = json.loads(body or b"{}").get("query", "") if path == "/graphql" else ""
-        if query.startswith("query { r0: repository("):  # every repo's size in one query
-            with self.lock:
-                self.calls[(method, path)] += 1
-                self.order.append("")
-            return self.reply({"data": {
-                "r%s" % n: {"issues": {"totalCount": len(_listing(r)) - SIZES[r]},
-                            "pullRequests": {"totalCount": SIZES[r]}}
-                for n, r in ((n, "example-owner/" + name) for n, name in
-                             re.findall(r'r(\d+): repository\(owner:"[^"]+", name:"([^"]+)"\)',
-                                        query)) if r in SIZES}})
-        if query:
-            named = re.search(r'name:\s*"([^"]+)"', query)
-            repo = next((r for r in SIZES if named and r.endswith("/" + named.group(1))), "")
+        repo = "" if query.startswith(SIZES_QUERY) else _repo_of(path, query)
         with self.lock:
             self.calls[(method, path)] += 1
             self.order.append(repo)
@@ -107,27 +93,62 @@ class Fake:
             self.release.wait(10)
         if repo in self.fault:
             return self.fault[repo], {}, b'{"message": "Unprocessable"}'
-        if repo in SIZES:
-            if path.startswith("/repos/%s/issues?state=open" % repo):
-                return self.reply(_listing(repo))
-            if path.startswith("/repos/%s/pulls?state=open" % repo):
-                return self.reply(_pulls(repo))
-            if re.fullmatch(r"/repos/[^/]+/[^/]+/pulls/\d+", path):
-                return self.reply({"mergeable": True, "mergeable_state": "clean"})
-            if path.endswith("/files") or "/files?" in path:
-                return self.reply([{"filename": "bus/a.py", "patch": "+x"}])
-            if path == "/graphql":
-                return self.reply({"data": {"repository": {
-                    "p%d" % pr["number"]: _node() for pr in _pulls(repo)}}})
-        if "/git/ref/" in path:
-            return 404, {}, b'{"message": "Not Found"}'
-        if path == "/graphql":
-            return self.reply({"data": {"repository": {}}})
+        for matches, answer in ROUTES:
+            if matches(repo, path, query):
+                found = answer(repo, query)
+                if isinstance(found, tuple):
+                    return found
+                return self.reply(found)
         return self.reply([])
 
     @staticmethod
     def reply(body):
         return 200, {}, json.dumps(body).encode()
+
+
+SIZES_QUERY = "query { r0: repository("
+
+
+def _repo_of(path: str, query: str) -> str:
+    """The fake repo a request reads: from its REST path, or the repository
+    a GraphQL query names; "" for neither."""
+    if query:
+        named = re.search(r'name:\s*"([^"]+)"', query)
+        return next((r for r in SIZES if named and r.endswith("/" + named.group(1))), "")
+    found = REPO.match(path)
+    return found.group(1) if found else ""
+
+
+def _sizes(repo: str, query: str) -> dict:
+    """Every repo's size, as repo_weights asks for them in one query."""
+    named = re.findall(r'r(\d+): repository\(owner:"[^"]+", name:"([^"]+)"\)', query)
+    return {"data": {"r%s" % n: {"issues": {"totalCount": len(_listing(r)) - SIZES[r]},
+                                 "pullRequests": {"totalCount": SIZES[r]}}
+                     for n, r in ((n, "example-owner/" + name) for n, name in named)
+                     if r in SIZES}}
+
+
+# (matches(repo, path, query), answer(repo, query)), tried in order; the
+# first match answers. An answer that is a tuple is (status, headers, body).
+ROUTES = (
+    (lambda repo, path, query: query.startswith(SIZES_QUERY), _sizes),
+    (lambda repo, path, query: repo in SIZES and path.startswith(
+        "/repos/%s/issues?state=open" % repo), lambda repo, query: _listing(repo)),
+    (lambda repo, path, query: repo in SIZES and path.startswith(
+        "/repos/%s/pulls?state=open" % repo), lambda repo, query: _pulls(repo)),
+    (lambda repo, path, query: repo in SIZES and bool(
+        re.fullmatch(r"/repos/[^/]+/[^/]+/pulls/\d+", path)),
+     lambda repo, query: {"mergeable": True, "mergeable_state": "clean"}),
+    (lambda repo, path, query: repo in SIZES and ("/files?" in path or path.endswith("/files")),
+     lambda repo, query: [{"filename": "bus/a.py", "patch": "+x"}]),
+    (lambda repo, path, query: repo in SIZES and path == "/graphql",
+     lambda repo, query: {"data": {"repository": {
+         "p%d" % pr["number"]: _node() for pr in _pulls(repo)}}}),
+    (lambda repo, path, query: "/git/ref/" in path,
+     lambda repo, query: (404, {}, b'{"message": "Not Found"}')),
+    (lambda repo, path, query: path == "/graphql",
+     lambda repo, query: {"data": {"repository": {}}}),
+)
 
 
 def quiet_stderr(test: unittest.TestCase) -> io.StringIO:

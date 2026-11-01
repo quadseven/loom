@@ -1428,6 +1428,80 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
             gh.on_wait = None
 
 
+def _status_fault(err: GitHubError) -> str:
+    """Why a status read failed, as one line: a rate limit that resets past
+    the deadline, or GitHub's fault. A dropped connection is raised, so
+    per_repo.each reads the repo again."""
+    if isinstance(err, RateLimited):
+        return "rate limited until %s, past the deadline" % _utc(err.until)
+    if err.status == 0:
+        raise err
+    return "read failed: %s" % _one_line(str(err), 200)
+
+
+def _status_read(reads: Any, repo: str, now: datetime, bot: str, authors: Sequence[str],
+                 check: str, caps: Dict[str, str], hold: Sequence[str], stop: float
+                 ) -> Tuple[Any, ...]:
+    """One repo's status read: ("read", its section, its tickets, its waiting
+    count), or ("missed", why) when GitHub refused it (_status_fault). Each
+    read keeps its own tickets and waiting count, so a timed-out read that
+    finishes late changes nothing the run prints."""
+    _progress("status: reading %s (requests: %d)" % (repo, getattr(reads, "requests", 0)))
+    into: Dict[str, List[Dict[str, Any]]] = {}
+    waits: Dict[str, Dict[str, Any]] = {}
+    try:
+        section = _sit_out_rate_limits(lambda: _readable_section(
+            reads, repo, now, bot, authors, into, check, waits, caps, hold), stop, "status")
+    except GitHubError as err:
+        return ("missed", _status_fault(err))
+    return ("read", section, into, waits)
+
+
+def _status_outcome(repo: str, done: bool, value: Any, seconds: float
+                    ) -> Tuple[str, List[str]]:
+    """What one per_repo.each answer adds: ("late", no lines) past the
+    deadline, ("missed", its skipped section) for a repo not read, or
+    ("read", its section)."""
+    if not done and isinstance(value, per_repo.PastDeadline):
+        return "late", []
+    if not done or value[0] == "missed":
+        why = value[1] if done else per_repo.not_read(seconds, value)
+        return "missed", ["", "## %s" % repo, "", _skip_line(repo, why)]
+    return "read", value[1]
+
+
+def _lane_status_line(reads: Any, lanes_repo: str, authors: Sequence[str], now: datetime,
+                      missed: List[str]) -> str:
+    """The dated lane status, or why it was not read (added to `missed`)."""
+    try:
+        return _dated_lane_status(_lane_status(reads, lanes_repo, authors), now)
+    except GitHubError as err:
+        why = _status_fault(err)
+    missed.append("lane status")
+    return "status skipped the lane status: %s" % why.replace(", past the deadline", "")
+
+
+def _status_tail(reads: Any, repos: Sequence[str], found: Dict[str, List[Dict[str, Any]]],
+                 waiting: Dict[str, Dict[str, Any]], lanes_repo: str, authors: Sequence[str],
+                 now: datetime, env: Dict[str, str], missed: List[str]) -> List[str]:
+    """The sections across repos, from the repos read, and the partial line
+    when anything was not read: a partial read never reads as complete."""
+    found = {repo: found[repo] for repo in repos if repo in found}
+    runaway = [(repo, issue) for repo, items in found.items() for issue in items
+               if RUNAWAY in _labels(issue)
+               and tickets.ticket_state(issue) not in tickets.MERGED_STATES]
+    tail = [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
+        repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
+    tail += [""] + priority_lines(found, now)
+    tail += [""] + waiting_lines(reads, waiting, repos)
+    tail += [""] + _health_lines(env)
+    tail += [""] + validation_gap_lines(env)
+    tail += ["", "## Lane status", _lane_status_line(reads, lanes_repo, authors, now, missed)]
+    if missed:
+        tail += ["", "status partial: not read this run: %s" % " ".join(missed)]
+    return tail
+
+
 def _status_pass(gh: GitHub, repos: List[str], lanes_repo: str, env: Dict[str, str],
                  now: datetime, authors: Sequence[str],
                  emit: Optional[Callable[[str], None]], seconds: float, stop: float,
@@ -1443,24 +1517,6 @@ def _status_pass(gh: GitHub, repos: List[str], lanes_repo: str, env: Dict[str, s
     caps: Dict[str, str] = {}
     # The fleet hold logins merge reads (hold_logins), from this env (loom#2393).
     hold = hold_logins(env)
-
-    def read(repo: str) -> Tuple[Any, ...]:
-        # Each read keeps its own tickets and waiting count, so a timed-out
-        # read that finishes late changes nothing the run prints.
-        _progress("status: reading %s (requests: %d)" % (repo, getattr(gh, "requests", 0)))
-        into: Dict[str, List[Dict[str, Any]]] = {}
-        waits: Dict[str, Dict[str, Any]] = {}
-        try:
-            section = _sit_out_rate_limits(lambda: _readable_section(
-                reads, repo, now, bot, authors, into, check, waits, caps, hold), stop, "status")
-        except RateLimited as err:
-            return ("missed", "rate limited until %s, past the deadline" % _utc(err.until))
-        except GitHubError as err:
-            if err.status == 0:
-                raise  # a dropped connection: per_repo.each reads the repo again
-            return ("missed", "read failed: %s" % _one_line(str(err), 200))
-        return ("read", section, into, waits)
-
     # The heaviest repos are read first, so a deadline leaves the light
     # ones. A status took 68 s here and 152 s from a remote brain, over a
     # 15-minute tick (2026-10-15), and about 4 minutes for 19 repos inside a
@@ -1469,52 +1525,25 @@ def _status_pass(gh: GitHub, repos: List[str], lanes_repo: str, env: Dict[str, s
     found: Dict[str, List[Dict[str, Any]]] = {}
     waiting: Dict[str, Dict[str, Any]] = {}
     late: List[str] = []
-    for repo, done, value in per_repo.each(order, read, seconds,
-                                           READ_WORKERS, clock=lambda: _clock(), until=stop):
-        if not done:
-            if isinstance(value, per_repo.PastDeadline):
-                late.append(repo)
-                continue
-            missed.append(repo)
-            _say(out, emit, ["", "## %s" % repo, "", _skip_line(repo, per_repo.not_read(seconds, value))])
+    for repo, done, value in per_repo.each(
+            order, lambda r: _status_read(reads, r, now, bot, authors, check, caps, hold, stop),
+            seconds, READ_WORKERS, clock=lambda: _clock(), until=stop):
+        kind, lines = _status_outcome(repo, done, value, seconds)
+        if kind == "late":
+            late.append(repo)
             continue
-        if value[0] == "missed":
+        if kind == "missed":
             missed.append(repo)
-            _say(out, emit, ["", "## %s" % repo, "", _skip_line(repo, value[1])])
-            continue
-        _, section, into, waits = value
-        found.update(into)
-        waiting.update(waits)
-        _say(out, emit, section)
+        else:
+            found.update(value[2])
+            waiting.update(value[3])
+        _say(out, emit, lines)
     if late:
         halt()  # the reads still running end now, not at the command's exit
         missed += late
         _say(out, emit, [""] + ["status skipped %s: deadline" % repo for repo in late])
-    found = {repo: found[repo] for repo in repos if repo in found}
-    runaway = [(repo, issue) for repo, items in found.items() for issue in items
-               if RUNAWAY in _labels(issue)
-               and tickets.ticket_state(issue) not in tickets.MERGED_STATES]
-    tail = [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
-        repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
-    tail += [""] + priority_lines(found, now)
-    tail += [""] + waiting_lines(reads, waiting, repos)
-    tail += [""] + _health_lines(env)
-    tail += [""] + validation_gap_lines(env)
-    try:
-        lanes = _dated_lane_status(_lane_status(reads, lanes_repo, authors), now)
-    except RateLimited as err:
-        lanes = "status skipped the lane status: rate limited until %s" % _utc(err.until)
-        missed.append("lane status")
-    except GitHubError as err:
-        if err.status == 0:
-            raise
-        lanes = "status skipped the lane status: read failed: %s" % _one_line(str(err), 200)
-        missed.append("lane status")
-    tail += ["", "## Lane status", lanes]
-    if missed:
-        # A partial read never reads as complete: the last line says so.
-        tail += ["", "status partial: not read this run: %s" % " ".join(missed)]
-    _say(out, emit, tail)
+    _say(out, emit, _status_tail(reads, repos, found, waiting, lanes_repo, authors, now, env,
+                                 missed))
     return "\n".join(out)
 
 
