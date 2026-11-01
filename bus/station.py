@@ -4237,9 +4237,17 @@ class Station:
             return
         body = str(issue.get("body") or "")
         live = brain.live_criterion(body, limit=None)
+        step = self._adapter_answer_step(repo, number, answer, live)
+        if step is None:
+            return
+        self._apply_adapter_step(repo, number, issue, body, live, step)
+
+    def _adapter_answer_step(self, repo: str, number: int, answer: Any,
+                             live: str) -> Optional[live_proof.Step]:
+        """Validate a lane's proposed adapter step without trusting its result."""
         if not isinstance(answer, dict) or set(answer) != {"criterion", "step", "strings"}:
             self._adapter_human_ask(repo, number, "invalid adapter_step", "the answer shape is invalid")
-            return
+            return None
         strings = answer["strings"]
         if (answer["criterion"] != live or not isinstance(strings, list)
                 or not 1 <= len(strings) <= 5
@@ -4249,22 +4257,26 @@ class Station:
             self._adapter_human_ask(repo, number, str(answer.get("step")),
                                     "the step needs this exact Live criterion and one to five "
                                     "short ASCII strings")
-            return
-        sources = self._proof_sources(repo)
+            return None
         raw = answer["step"]
         if not isinstance(raw, str) or ":" not in raw:
             self._adapter_human_ask(repo, number, str(raw), "the step is not log:<source> or sql:<SELECT>")
-            return
+            return None
         kind, target = raw.split(":", 1)
         strings = tuple(strings)
         if kind == "log":
-            step = live_proof.Step(live_proof.LOG, strings[0], strings[1:], 0,
+            return live_proof.Step(live_proof.LOG, strings[0], strings[1:], 0,
                                    source=target)
-        elif kind == "sql":
-            step = live_proof.Step(live_proof.QUERY, target, strings, 0, source="adapter")
-        else:
-            self._adapter_human_ask(repo, number, raw, "the step kind is unsupported")
-            return
+        if kind == "sql":
+            return live_proof.Step(live_proof.QUERY, target, strings, 0, source="adapter")
+        self._adapter_human_ask(repo, number, raw, "the step kind is unsupported")
+        return None
+
+    def _apply_adapter_step(self, repo: str, number: int, issue: Dict[str, Any],
+                            body: str, live: str, step: live_proof.Step) -> None:
+        """Read the validated step and attach only station-observed evidence."""
+        sources = self._proof_sources(repo)
+        raw = "log:%s" % step.source if step.kind == live_proof.LOG else "sql:%s" % step.target
         passed, evidence_text = live_proof.run(step, self._shipped_stamp(repo, issue), sources,
                                                now=self.now)
         if not passed:

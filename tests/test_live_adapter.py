@@ -161,6 +161,44 @@ class StationAdapterProofTest(tbs.Base):
             brief = fh.read()
         self.assertIn("adapter_step", brief)
 
+    def test_prose_live_box_without_adapter_still_asks_for_a_person(self):
+        body = HEAD + "- [ ] Live: the production levels and cleared runs remain correct\n"
+        self.ship(body, hours_ago=2)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
+        with mock.patch.object(station.brain, "human") as human:
+            self.assertTrue(st._evidence_holds(REPO, self.fake.issues[self.NUMBER]))
+        human.assert_called_once()
+        self.assertIn("no check Loom can run", human.call_args.args[3])
+
+    def test_report_verify_dispatches_missing_adapter_step_to_one_human_ask(self):
+        body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
+        self.ship(body, hours_ago=2)
+        self.settings.live_evidence_repos = [REPO]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
+        def add_human_label(*args):
+            self.fake.issues[self.NUMBER]["labels"].append({"name": "loom:human"})
+        with (mock.patch.object(station.Station, "_read_verify", return_value=({"missing": "no step"}, "")),
+              mock.patch.object(station.Station, "_adapter_can_verify", return_value=True),
+              mock.patch.object(station.brain, "human", side_effect=add_human_label) as ask):
+            self.assertTrue(st._report_verify("codex", "done", REPO, self.NUMBER, "run"))
+            self.assertTrue(st._report_verify("codex", "done", REPO, self.NUMBER, "run"))
+        ask.assert_called_once()
+        self.assertIn("no adapter_step was returned", ask.call_args.args[3])
+
+    def test_report_verify_passes_adapter_step_to_station_reader(self):
+        body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
+        self.ship(body, hours_ago=2)
+        self.settings.live_evidence_repos = [REPO]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
+        step = {"criterion": "Live: current levels and cleared runs are correct",
+                "step": "log:worker", "strings": ["levels stable"]}
+        answer = {"adapter_step": step}
+        with (mock.patch.object(station.Station, "_read_verify", return_value=(answer, "")),
+              mock.patch.object(station.Station, "_adapter_can_verify", return_value=True),
+              mock.patch.object(station.Station, "_apply_adapter_verify") as apply):
+            st._report_verify("codex", "done", REPO, self.NUMBER, "run")
+        apply.assert_called_once_with(REPO, self.NUMBER, step)
+
     def test_station_runs_a_verify_log_step_and_keeps_its_matching_lines(self):
         body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
         self.ship(body, hours_ago=2)
