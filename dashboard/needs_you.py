@@ -9,9 +9,9 @@ where the store keys by OWNER/NAME; each item shows once whichever way it
 was named.
 
 The ask on each card is the issue body's "## Ask" section when it has one,
-else the comment the store picked (operators.pick_ask), linked. A loom:human
+else the comment the store picked (operators.pick_ask), linked. A needs:human
 issue waits on the operator as a needs-operator one does; its ask is its
-loom:human comment.
+needs:human comment.
 
 Each card takes an answer in one tap (loom#1777): the buttons the ask's own
 words offer (bus.answer.options) and an optional note, posted to POST
@@ -27,6 +27,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote
 
 from bus import answer as answers_lib
+from bus.kinds import HUMAN_KINDS, HUMAN_KIND_RE
 
 from . import operators, views
 
@@ -191,9 +192,13 @@ KINDS = (
     ("decide", "Decisions", "a reply settles each one"),
     ("access", "Access and credentials", "a sign-in, a key, a grant or a purchase"),
     ("device", "On a device or in person", "hands on a machine, a phone or a cable"),
+    ("unknown", "Unknown kind", "kind not recognized; Loom needs to learn it"),
     ("other", "Other asks", ""),
     ("missing", "No exact ask written", "an agent should write one; nothing here says what to do"),
 )
+
+# Regex for the "Kind: K" line.
+_HUMAN_KIND_RE = re.compile(HUMAN_KIND_RE, re.MULTILINE)
 _ACCESS_RE = re.compile(r"\b(sign in|log in|oauth|api key|token|credentials?|password|secret|rotate|"
                         r"grant|access|role|mint|reconnect|buy|buying|purchase|usd)\b", re.I)
 _DEVICE_RE = re.compile(r"\b(handsets?|phones?|router|monitor|power(ed)?[ -](it )?(on|off|cycle)|plug|"
@@ -243,10 +248,16 @@ def current_answer(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def action_kind(entry: Dict[str, Any]) -> str:
-    """decide, access, device, other, or missing (no ask written)."""
+    """decide, access, device, unknown, other, or missing (no ask written)."""
     text = ask_text(entry)
     if not text:
         return "missing"
+    # Check for explicit "Kind: X" in the ask - if present and not a known human kind, it's unknown
+    kind_match = _HUMAN_KIND_RE.search(text)
+    if kind_match:
+        kind_value = kind_match.group(1).strip().lower()
+        if kind_value not in HUMAN_KINDS:
+            return "unknown"
     for kind, pattern in (("access", _ACCESS_RE), ("device", _DEVICE_RE), ("decide", _DECIDE_RE)):
         if pattern.search(text):
             return kind
@@ -374,16 +385,19 @@ def _who_name(login: str) -> str:
 
 def summary(shown: List[Dict[str, Any]]) -> str:
     """One headline: how many items wait, on whom, how many a reply settles,
-    and the oldest."""
+    how many have unknown kind, and the oldest."""
     esc = html.escape
     tally = counts(shown)
     whom = ", ".join("%d on %s" % (count, _who_name(login)) for login, count in
                      sorted(tally.items(), key=lambda pair: (-pair[1], pair[0])))
     decide = sum(1 for entry in shown if action_kind(entry) == "decide")
+    unknown = sum(1 for entry in shown if action_kind(entry) == "unknown")
     oldest = next(iter(_oldest_first(shown)), None)
     parts = ['<p class="needs-headline"><strong>%d item%s wait on people</strong>: %s.</p>' % (
         len(shown), "" if len(shown) == 1 else "s", esc(whom))]
     facts = ["%d settled by a reply" % decide]
+    if unknown:
+        facts.append("%d unknown kind" % unknown)
     if oldest is not None and _since(oldest):
         facts.append("Oldest: %s, %s" % (ref(oldest), views.format_age(_since(oldest)) or "age unknown"))
     parts.append('<p class="machine-fact">%s.</p>' % esc("; ".join(facts)))
@@ -512,3 +526,103 @@ def find(operator_asks: Iterable[Any], claims: Optional[Dict[str, Any]], repo: s
     names = full_names(list(repos or []) + [entry.get("repo") for entry in every + pending])
     key = ref_key(repo, number, names)
     return next((entry for entry in every + pending if entry["key"] == key), None)
+
+
+# The station's goals stuck at their in-flight cap (bus/station.py
+# post_stuck_goals, loom#1831): kept while the station refreshes them, and
+# dropped once a report is this old (the station sends every ten minutes).
+GOAL_CAPS_MAX_AGE = 3600
+GOAL_CAPS_MAX = 200
+_GOAL_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+")
+
+
+def goal_caps(body: Any, now: float) -> Dict[str, Any]:
+    """The stored form of a POST /api/goal-caps body: each goal as
+    OWNER/NAME#N with its whole-number counts and since time, and when it was
+    received; ValueError for a body that is not that shape."""
+    goals = body.get("goals") if isinstance(body, dict) else None
+    if not isinstance(goals, list) or len(goals) > GOAL_CAPS_MAX:
+        raise ValueError("goals must be a list of at most %d entries" % GOAL_CAPS_MAX)
+    kept = []
+    for goal in goals:
+        if not (isinstance(goal, dict) and _GOAL_RE.fullmatch(str(goal.get("goal") or ""))):
+            raise ValueError("each goal needs goal as OWNER/NAME#N")
+        counts = {field: goal.get(field) for field in ("in_flight", "cap", "no_lane", "since")}
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v < 1e12
+                   for v in counts.values()):
+            raise ValueError("in_flight, cap, no_lane and since must be numbers")
+        kept.append({"goal": goal["goal"], "since": float(counts["since"]),
+                     **{field: int(counts[field]) for field in ("in_flight", "cap", "no_lane")}})
+    return {"goals": kept, "received_at": now}
+
+
+def goal_caps_section(stored: Any, now: float) -> str:
+    """A Needs-you section for each goal stuck at its in-flight cap: how
+    long, its count against the cap, and how many of its in-flight tickets
+    wait with no lane that takes them. Nothing when none is, or the report is
+    older than GOAL_CAPS_MAX_AGE."""
+    if not isinstance(stored, dict) or not isinstance(stored.get("received_at"), (int, float)):
+        return ""
+    if now - stored["received_at"] > GOAL_CAPS_MAX_AGE or not stored.get("goals"):
+        return ""
+    esc = html.escape
+    rows = "".join(
+        '<li class="card"><strong>%s</strong> has been full for %.0f hours: %d of %d tickets in '
+        'progress (the limit), %d with no lane able to take them. Waits on: Loom.</li>' % (
+            esc(goal["goal"]), max(0.0, now - goal["since"]) / 3600, goal["in_flight"], goal["cap"],
+            goal["no_lane"])
+        for goal in stored["goals"])
+    return ('<section class="needs-group needs-goal-caps" data-kind="goal-caps"><h2>Stuck in Loom, '
+            'not waiting on you (%d)</h2><p class="muted">Loom is working these itself: it skips '
+            'their triage rewrites, reroutes tickets no lane takes after a few hours, and hands '
+            'them to the hand-off pool within a day. Nothing to do unless one is still stuck '
+            'after a day.</p><ul>%s</ul></section>') % (len(stored["goals"]), rows)
+
+
+
+# The station's needs-brain holds older than a day, a repo a row (bus/station.py
+# lift_brain_holds, loom#1872): kept while the station refreshes them (a run
+# every half hour), dropped once a report is this old.
+BRAIN_HOLDS_MAX_AGE = 2 * 3600
+BRAIN_HOLDS_MAX = 200
+_REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+
+
+def brain_holds(body: Any, now: float) -> Dict[str, Any]:
+    """The stored form of a POST /api/brain-holds body: each repo as
+    OWNER/NAME with its whole-number counts, and when it was received;
+    ValueError for a body that is not that shape."""
+    repos = body.get("repos") if isinstance(body, dict) else None
+    if not isinstance(repos, list) or len(repos) > BRAIN_HOLDS_MAX:
+        raise ValueError("repos must be a list of at most %d entries" % BRAIN_HOLDS_MAX)
+    kept = []
+    for row in repos:
+        if not (isinstance(row, dict) and _REPO_RE.fullmatch(str(row.get("repo") or ""))):
+            raise ValueError("each row needs repo as OWNER/NAME")
+        counts = {field: row.get(field) for field in ("old", "person", "unknown")}
+        if not all(isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 1e6
+                   for v in counts.values()):
+            raise ValueError("old, person and unknown must be whole numbers")
+        kept.append({"repo": row["repo"], **counts})
+    return {"repos": kept, "received_at": now}
+
+
+def brain_holds_section(stored: Any, now: float) -> str:
+    """A Needs-you section with each repo's count of needs-brain holds
+    older than a day, and how many of them a person set or nobody can tell
+    who set (the factory never lifts those). Nothing when no repo has one,
+    or the report is older than BRAIN_HOLDS_MAX_AGE."""
+    if not isinstance(stored, dict) or not isinstance(stored.get("received_at"), (int, float)):
+        return ""
+    rows = [r for r in stored.get("repos") or [] if r.get("old")]
+    if now - stored["received_at"] > BRAIN_HOLDS_MAX_AGE or not rows:
+        return ""
+    esc = html.escape
+    items = "".join(
+        '<li class="card"><strong>%s</strong>: %d held over a day (%d set by a person, %d by '
+        'an unknown setter).</li>' % (esc(row["repo"]), row["old"], row["person"], row["unknown"])
+        for row in rows)
+    return ('<section class="needs-group needs-brain-holds" data-kind="brain-holds"><h2>needs-brain '
+            'holds older than a day (%d)</h2><p class="muted">the factory resolves the ones Loom set, a '
+            'few each half hour; a hold a person set, or one nobody can tell who set, waits for a '
+            'person</p><ul>%s</ul></section>') % (sum(r["old"] for r in rows), items)

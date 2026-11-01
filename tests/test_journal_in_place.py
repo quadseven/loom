@@ -18,6 +18,7 @@ from bus import brain, handoff, invariants, journal, station  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
+NOW = datetime(2030, 5, 7, 12, 0, tzinfo=timezone.utc)
 M = journal.JOURNAL_MARKER
 
 
@@ -113,11 +114,11 @@ class WriterTests(unittest.TestCase):
         # "Tick 2026-10-20 23:07Z, muse" (a space, not one token), the writer
         # did not see a Tick line and put its own on top, so the journal
         # opened with two tick headers.
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:05Z")
+        today = NOW.strftime("%Y-%m-%dT00:00:05Z")
         first = tick(today[:11] + "00:00:00Z", "muse", "- Decided: first")
         fake = Fake([comment(41, first, today)])
         loose = "\n".join([M, "Tick 2030-01-01 10:00Z, muse", "", "Unstuck evidence: 5 held."])
-        journal.post(GitHub("t", transport=fake), REPO, 7, loose, "muse")
+        journal.post(GitHub("t", transport=fake), REPO, 7, loose, "muse", now=NOW)
         [(method, path, body)] = fake.writes()
         self.assertEqual((method, path), ("PATCH", "/repos/%s/issues/comments/41" % REPO))
         top = body["body"].split(handoff.EARLIER_OPEN)[0]
@@ -137,11 +138,11 @@ class WriterTests(unittest.TestCase):
         # The 17:44Z comment on the same issue was plain prose posted with the
         # GitHub CLI, because the writer refused a body with no marker: one
         # more email to the issue's watchers.
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:05Z")
+        today = NOW.strftime("%Y-%m-%dT00:00:05Z")
         first = tick(today[:11] + "00:00:00Z", "muse", "- Decided: first")
         fake = Fake([comment(41, first, today)])
         journal.post(GitHub("t", transport=fake), REPO, 7,
-                     "Tick evidence: Zug 66 min on a vendor wait.\n", "muse")
+                     "Tick evidence: Zug 66 min on a vendor wait.\n", "muse", now=NOW)
         [(method, path, body)] = fake.writes()
         self.assertEqual((method, path), ("PATCH", "/repos/%s/issues/comments/41" % REPO))
         text = body["body"]

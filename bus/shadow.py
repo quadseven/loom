@@ -8,12 +8,14 @@ Held while a repo is in shadow:
   merge` (the station's and Muse's), the deploy-watch revert path and the
   roll pin;
 - an issue close (PATCH state=closed, GraphQL closeIssue or an update to
-  CLOSED) and an issue reopen (PATCH state=open, GraphQL reopenIssue), an
-  invariant breach's own issue included (loom#1551), except Loom's own
-  factory incidents and health signatures that carry no work label: an open
-  incident holds the tickets behind it. Closing or reopening a pull request
-  is let through: it can be undone, its branch stays, and the factory closes
-  superseded lane pull requests so lanes do not work twice;
+  CLOSED) and an issue reopen (PATCH state=open, GraphQL reopenIssue),
+  except Loom's own factory incidents, health signatures and invariant
+  breach issues that carry no work label (an open incident holds the
+  tickets behind it; a cleared breach is Loom's own report, and the
+  invariants step reopens it if it comes back); a recurring breach stays
+  held. Closing or reopening a pull request is let through: it can be
+  undone, its branch stays, and the factory closes superseded lane pull
+  requests so lanes do not work twice;
 - a label that grants a merge or marks a ticket shipped
   (MERGE_LABELS), and a GraphQL label write, whose label ids it cannot read;
 - an approving pull request review (REST or GraphQL);
@@ -21,6 +23,11 @@ Held while a repo is in shadow:
   committed or deleted through the contents API, a merge-queue entry, a fork
   sync): code landed with no pull request is a merge;
 - a branch deletion (DELETE .../git/refs/heads/B) other than Loom's own lock.
+
+One close alone passes: the station's evidence close (bus/evidence_close.py,
+operator ruling of 2026-10-31). The station names the one ticket in code
+(evidence_close()), so no label, no argument and no other process can ask for
+it, and the request is still recorded as acted. Merges stay held.
 
 A request the hold cannot read (a label list, the item's current labels, a
 body of an unknown shape, a read that failed in any way) is held as the
@@ -48,15 +55,23 @@ action, head SHA, label) is written once, so a pass that tries again every few
 minutes adds nothing. A ledger that cannot be written never lets the action
 through: the hold does not depend on the record.
 
+Each irreversible request GitHub accepts from Loom (its repo out of shadow, or
+a close let through) is one line of acted.jsonl beside the ledger, cut to its
+last ACTED_KEEP lines past ACTED_MAX; the station sends both files' newest
+lines to the dashboard's /chain page. A failed write never stops a request.
+
     python3 -m bus.shadow report [--since 24h|7d|2026-10-22[T10:00:00Z]]
                                  [--repo OWNER/NAME] [--json]
     python3 -m bus.shadow status
+    python3 -m bus.shadow prompt        # the brain tick's Shadow mode sentence
     python3 -m bus.shadow gh-guard [--lane] CWD GH-ARGS...   # exit 1: held
 """
 from __future__ import annotations
 
 import argparse
 import calendar
+import contextlib
+import contextvars
 import json
 import os
 import re
@@ -64,7 +79,7 @@ import subprocess
 import sys
 import time
 import traceback
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import unquote
 
 SWITCH = "LOOM_SHADOW"
@@ -82,6 +97,11 @@ ACTIONS = (MERGE, CLOSE, REOPEN, LABEL, DELETE_BRANCH, APPROVE)
 # ledger pairs what Loom would have done with the operator's verdict. Its
 # label is the verdict ("merge" or "hold"); it is never counted as an action.
 VERDICT = "operator-verdict"
+# Not a request the choke point holds: a label removal is reversible, so
+# GitHub._rest sends it. The station's label pass (bus/label_pass.py,
+# loom#2024) records its own removals as this action in shadow and sends
+# none, so the operator reads what the pass would clean before it does.
+UNLABEL = "unlabel"
 
 # Labels whose addition grants a merge or ships a ticket, each with the labels
 # that mean the ticket is already past it (a verified ticket moved back to
@@ -92,10 +112,15 @@ MERGE_LABELS: Dict[str, Tuple[str, ...]] = {
 }
 # A close of an issue with one of these is a decision about work: held.
 WORK_LABELS = ("loom:ticket", "loom:goal", "loom:backlog", "loom:rewritten")
-# An invariant breach's issue gates no ticket (only reports read it), so its
-# close on the invariants step's own rule is a decision shadow mode records
-# like any other (loom#1551): held, whatever other label it carries.
-HELD_SIGNAL_LABELS = ("loom:invariant", "loom:recurring")
+# A breach that keeps coming back stays open for a fix: its close is held.
+HELD_SIGNAL_LABELS = ("loom:recurring",)
+# An invariant breach's own issue, filed by the invariants step (its body
+# carries INVARIANT_MARKER), closes and reopens in shadow on that step's
+# rule. loom#1551 held it; on 2026-10-26 35 such issues the station had
+# marked cleared stayed open and the operator asked why Loom did not clean
+# up after itself. A close can be undone by the reopen the same rule makes.
+INVARIANT_LABEL = "loom:invariant"
+INVARIANT_MARKER = "<!-- loom:invariant v1 key="
 # A factory incident whose check passed again closes in shadow too: holding
 # it would hold every ticket it blocks (wait:incident). Only an issue with one
 # of these, no work label and no held signal label is let through.
@@ -186,6 +211,38 @@ def describe(env: Optional[Mapping[str, str]] = None) -> str:
         return "shadow mode off (%s=0): Loom merges and closes" % SWITCH
     which = "every repo" if repos is None else ", ".join(sorted(repos))
     return "shadow mode on for %s: merges and closes are recorded, not taken" % which
+
+
+# The brain tick's own words for "in shadow" (lanes/mac/brain.sh). The
+# fallback the wrapper uses when `prompt` cannot run is this same sentence.
+_HELD_WORDS = ("never merge, close an issue, approve a pull request, or add "
+               "ready-to-land or loom:shipped by any route (gh, curl, the API); "
+               "bus.brain merge and bus.brain close run their gates and record "
+               "what they would do")
+
+
+def prompt_line(env: Optional[Mapping[str, str]] = None) -> str:
+    """The Shadow mode sentence of the brain tick's prompt, read from scope()
+    so the prompt and the gates agree (loom#1960). The prompt used to say
+    "unless LOOM_SHADOW is 0, never merge", which ignored LOOM_SHADOW_REPOS:
+    the brain refused merges bus.brain merge would have made, in repos the
+    operator had taken out of shadow. Fails closed to every repo."""
+    try:
+        on, repos = scope(env)
+    except Exception:  # noqa: BLE001 - scope() already fails closed
+        on, repos = True, None
+    if not on:
+        return ("Shadow mode (MUSE.md) is off (LOOM_SHADOW=0) for every repo: "
+                "merge and close only through bus.brain merge and bus.brain "
+                "close, once their gates pass.")
+    if repos is None:
+        return "Shadow mode (MUSE.md) is on for every repo: %s." % _HELD_WORDS
+    held = ", ".join(sorted(repos))
+    return ("Shadow mode (MUSE.md) is on only for %s (LOOM_SHADOW_REPOS): in "
+            "those repos %s. Every other repo is out of shadow: merge and close "
+            "there through bus.brain merge and bus.brain close once their gates "
+            "pass, never any other way; a ready pull request there is not a shadow "
+            "defer." % (held, _HELD_WORDS))
 
 
 def api_path(path: Any) -> str:
@@ -369,10 +426,10 @@ def label_is_new(label: str, have: Sequence[str]) -> bool:
 def close_let_through(issue: Any) -> bool:
     """Whether a close or reopen of `issue` (as read just now; None when the
     read failed) goes through in shadow: a pull request (closed unmerged, it
-    can be reopened), or a factory incident or a watcher's health signature
-    closing on its rule (no work label, no invariant label). An invariant
-    breach's issue is held (loom#1551), and so is an issue whose labels
-    cannot be read."""
+    can be reopened), a factory incident or a watcher's health signature
+    closing on its rule (no work label), or an invariant breach's own issue
+    (its marker in the body, no work label, not recurring). An issue whose
+    labels cannot be read is held."""
     if not isinstance(issue, dict):
         return False
     if "pull_request" in issue:
@@ -382,7 +439,30 @@ def close_let_through(issue: Any) -> bool:
         return False
     if set(names) & set(SIGNAL_LABELS):
         return True
+    if INVARIANT_LABEL in names:
+        return INVARIANT_MARKER in str(issue.get("body") or "")
     return TRIAGE_LABEL in names and WATCH_MARKER in str(issue.get("body") or "")
+
+
+_evidence_ticket: "contextvars.ContextVar[Tuple[str, int]]" = contextvars.ContextVar(
+    "loom_evidence_close", default=("", 0))
+
+
+@contextlib.contextmanager
+def evidence_close(repo: str, number: int) -> Iterator[None]:
+    """Within this block the one close of `repo`#`number` is not held."""
+    token = _evidence_ticket.set((str(repo).lower(), int(number)))
+    try:
+        yield
+    finally:
+        _evidence_ticket.reset(token)
+
+
+def evidence_close_passes(found: Request) -> bool:
+    """Whether `found` is the close evidence_close() names, carrying no merge
+    or ship label."""
+    return (found.action == CLOSE and found.check == "close" and not found.labels
+            and _evidence_ticket.get() == (found.repo.lower(), found.number))
 
 
 def held_after_read(found: Request, item: Any) -> Optional[Tuple[str, List[str]]]:
@@ -423,6 +503,54 @@ def ledger_path(env: Optional[Mapping[str, str]] = None) -> str:
     home = str(values.get("LOOM_HOME") or "").strip() or os.path.join(
         os.path.expanduser("~"), "loom")
     return os.path.join(home, "state", "shadow", "ledger.jsonl")
+
+
+def acted_path(env: Optional[Mapping[str, str]] = None) -> str:
+    """acted.jsonl beside the ledger: $LOOM_HOME/state/shadow/acted.jsonl
+    by default, and a test's own folder when it points the ledger there."""
+    return os.path.join(os.path.dirname(ledger_path(env)), "acted.jsonl")
+
+
+# acted.jsonl grows past ACTED_MAX lines only to be cut to its last ACTED_KEEP.
+ACTED_MAX = 1000
+ACTED_KEEP = 500
+_acted_warned = False
+
+
+def record_acted(action: str, repo: str, number: int, kind: str, source: str = "",
+                 now: Optional[float] = None) -> None:
+    """Append one irreversible action GitHub accepted from Loom (its repo out
+    of shadow, or a close let through) to acted.jsonl, for the dashboard's
+    /chain audit. A failure of any kind is said once on stderr and never
+    raised: the request already went."""
+    global _acted_warned
+    entry = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if now is None else now)),
+             "action": action, "repo": repo or "", "number": int(number or 0), "kind": kind,
+             "source": source or caller()}
+    path = acted_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+        if len(lines) > ACTED_MAX:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines[-ACTED_KEEP:]) + "\n")
+            os.replace(tmp, path)
+    except Exception as err:  # noqa: BLE001 - the record never decides the request
+        if not _acted_warned:
+            _acted_warned = True
+            print("shadow: could not write %s (%s); actions are not recorded as acted"
+                  % (path, type(err).__name__), file=sys.stderr)
+
+
+def read_acted(limit: int, path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """The last `limit` entries of acted.jsonl, oldest first; empty when it
+    is missing. An unreadable line is skipped."""
+    return read(path or acted_path())[-limit:] if limit > 0 else []
 
 
 def link(repo: str, number: int, kind: str) -> str:
@@ -561,9 +689,10 @@ def parse_since(text: str, now: float) -> float:
 
 def _counts(entries: Sequence[Mapping[str, Any]]) -> str:
     words = {MERGE: "merge", CLOSE: "close", REOPEN: "reopen", LABEL: "ship or merge label",
-             DELETE_BRANCH: "branch deletion", APPROVE: "approving review"}
+             DELETE_BRANCH: "branch deletion", APPROVE: "approving review",
+             UNLABEL: "label removal"}
     parts = []
-    for action in ACTIONS:
+    for action in ACTIONS + (UNLABEL,):
         n = sum(1 for e in entries if e.get("action") == action)
         if n:
             parts.append("%d %s%s" % (n, words[action], "" if n == 1 else "s"))
@@ -932,7 +1061,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rep.add_argument("--ledger", default="")
     rep.add_argument("--json", action="store_true")
     sub.add_parser("status", help="say which repos are in shadow and where the ledger is")
+    sub.add_parser("prompt", help="print the brain tick prompt's Shadow mode sentence")
     args = parser.parse_args(argv)
+    if args.command == "prompt":
+        print(prompt_line())
+        return 0
     if args.command == "status":
         print(describe())
         print("ledger: %s" % ledger_path())

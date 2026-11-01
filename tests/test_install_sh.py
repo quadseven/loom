@@ -46,7 +46,7 @@ class InstallScriptTest(unittest.TestCase):
         self.lock.parent.mkdir(parents=True, exist_ok=True)
         self.lock.write_text("%s\n" % pid)
 
-    def run_install(self, **env):
+    def run_install(self, *lanes, **env):
         # The watched repos, status repo and App settings come only from the
         # test: an operator's own settings in the environment would trip the
         # owner check or the App check.
@@ -62,8 +62,33 @@ class InstallScriptTest(unittest.TestCase):
                     FAKE_LOG=str(self.log))
         full.update(env)
         return subprocess.run(
-            ["bash", str(self.checkout / "lanes" / "mac" / "install.sh"), "codex"],
+            ["bash", str(self.checkout / "lanes" / "mac" / "install.sh"), *(lanes or ("codex",))],
             env=full, capture_output=True, text=True, timeout=60)
+
+    def test_a_runner_slot_gets_no_local_runner_and_the_station_gets_its_settings(self):
+        # LOOM_RUNNER_SLOTS (docs/LANES.md, "Lanes on cluster runners"): the
+        # station dispatches the slot's briefs, so no launchd runner may take
+        # them, and the station needs the slot's settings to send.
+        shutil.copytree(INSTALL.parents[2] / "bus", self.checkout / "bus",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        (agents / "com.loom.zen.plist").write_text("old")
+        result = self.run_install("zen", "codex", LOOM_RUNNER_SLOTS="zen",
+                                  LOOM_ZEN_KEY_SSM="/x/zen", LOOM_LANES_GITHUB_APP_ID="42",
+                                  LOOM_LANES_GITHUB_APP_INSTALLATION_ID="7",
+                                  LOOM_LANES_GITHUB_APP_KEY_SSM="/x/lanes-app")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((agents / "com.loom.zen.plist").exists())
+        self.assertIn("no com.loom.zen: zen runs on cluster runners", result.stdout)
+        self.assertIn("launchctl bootout gui/%d/com.loom.zen" % os.getuid(), self.log.read_text())
+        self.assertTrue((agents / "com.loom.codex.plist").exists())
+        station = (agents / "com.loom.station.plist").read_text()
+        for key, value in (("LOOM_RUNNER_SLOTS", "zen"), ("LOOM_ZEN_KEY_SSM", "/x/zen"),
+                           ("LOOM_LANES_GITHUB_APP_ID", "42"),
+                           ("LOOM_LANES_GITHUB_APP_KEY_SSM", "/x/lanes-app")):
+            self.assertIn("<key>%s</key><string>%s</string>" % (key, value), station)
+        self.assertEqual(station.count("<key>LOOM_ZEN_MODEL</key>"), 1)
 
     def test_a_held_lock_is_waited_for_then_the_station_installs(self):
         # A live pid (this test process) holds the lock; a helper frees it
@@ -147,6 +172,31 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", plist)
 
+    def test_the_brain_plist_omits_the_fabric_key_without_the_opt_in(self):
+        # The brain's Fabric question is opt-in (LOOM_BRAIN_FABRIC_ASK) and
+        # off by default, so its plist must not carry the key parameter name
+        # at all; the station's plist keeps it exactly as before.
+        env = {k: v for k, v in os.environ.items() if k != "LOOM_BRAIN_FABRIC_ASK"}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            result = self.run_install(LOOM_FABRIC_KEY_SSM="/example/fabric/key")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        brain = (agents / "com.loom.brain.plist").read_text()
+        self.assertNotIn("LOOM_FABRIC_KEY_SSM", brain)
+        station = (agents / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", station)
+
+    def test_the_brain_plist_gets_the_fabric_key_with_the_opt_in(self):
+        result = self.run_install(LOOM_FABRIC_KEY_SSM="/example/fabric/key",
+                                  LOOM_BRAIN_FABRIC_ASK="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        brain = (agents / "com.loom.brain.plist").read_text()
+        self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", brain)
+        self.assertIn("<key>LOOM_BRAIN_FABRIC_ASK</key><string>1</string>", brain)
+        station = (agents / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", station)
+
     def test_roll_ship_documents_are_written_to_station_plist(self):
         documents = '[{"goal":"example-owner/project#12","repo":"example-owner/project","path":"docs/ship.md"}]'
         result = self.run_install(LOOM_ROLL_SHIP_DOCS=documents)
@@ -190,11 +240,20 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_SHIP_PATH_WORKFLOWS</key><string>example-owner/infra</string>", plist)
 
     def test_disk_settings_are_written_to_station_plist(self):
-        result = self.run_install(LOOM_LOG_KEEP_DAYS="14", LOOM_DISK_FREE_MIN_GB="20")
+        result = self.run_install(LOOM_LOG_KEEP_DAYS="14", LOOM_DISK_FREE_MIN_GB="20",
+                                  LOOM_LOG_MAX_GB="9", LOOM_LOG_ROTATE_MB="30")
         self.assertEqual(result.returncode, 0, result.stderr)
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_LOG_KEEP_DAYS</key><string>14</string>", plist)
-        self.assertIn("<key>LOOM_DISK_FREE_MIN_GB</key><string>20</string>", plist)
+        self.assertIn("<key>LOOM_MIN_FREE_GB</key><string>20</string>", plist)
+        self.assertIn("<key>LOOM_LOG_MAX_GB</key><string>9</string>", plist)
+        self.assertIn("<key>LOOM_LOG_ROTATE_MB</key><string>30</string>", plist)
+
+    def test_pass_deadline_is_written_to_station_plist(self):
+        result = self.run_install(LOOM_PASS_DEADLINE="2400")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_PASS_DEADLINE</key><string>2400</string>", plist)
 
     def test_claimed_settle_settings_are_written_to_station_plist(self):
         result = self.run_install(LOOM_SETTLE_CLAIMED="on", LOOM_SETTLE_CLAIMED_MAX="5")
@@ -202,6 +261,13 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_SETTLE_CLAIMED</key><string>on</string>", plist)
         self.assertIn("<key>LOOM_SETTLE_CLAIMED_MAX</key><string>5</string>", plist)
+
+    def test_claim_referee_settings_are_written_to_station_plist(self):
+        result = self.run_install(LOOM_CLAIM_REFEREE="dry", LOOM_ENGINE_CLAIMS="claim:x claim:y")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_CLAIM_REFEREE</key><string>dry</string>", plist)
+        self.assertIn("<key>LOOM_ENGINE_CLAIMS</key><string>claim:x claim:y</string>", plist)
 
     def test_trusted_briefers_are_written_to_station_and_brain_plists(self):
         result = self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example")
@@ -211,14 +277,88 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn(entry, (agents / "com.loom.station.plist").read_text())
         self.assertIn(entry, (agents / "com.loom.brain.plist").read_text())
 
+    def trusted_briefers_entries(self):
+        agents = self.home / "Library" / "LaunchAgents"
+        found = [re.search(r"<key>LOOM_TRUSTED_BRIEFERS</key><string>(.*?)</string>",
+                           (agents / (label + ".plist")).read_text())
+                 for label in ("com.loom.station", "com.loom.brain")]
+        return [match.group(1) if match else "" for match in found]
+
+    def test_a_reinstall_with_the_setting_unset_keeps_the_installed_briefers(self):
+        self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example app[bot]").returncode, 0)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.trusted_briefers_entries(), ["dana-example app[bot]"] * 2)
+
+    def test_a_reinstall_that_sets_the_briefers_replaces_them_even_with_empty(self):
+        self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example").returncode, 0)
+        self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="lee-example").returncode, 0)
+        self.assertEqual(self.trusted_briefers_entries(), ["lee-example"] * 2)
+        self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="").returncode, 0)
+        self.assertEqual(self.trusted_briefers_entries(), ["", ""])
+
+    def test_an_unreadable_installed_plist_stops_a_reinstall_that_names_no_briefers(self):
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        (agents / "com.loom.station.plist").write_text("not a plist")
+        result = self.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LOOM_TRUSTED_BRIEFERS", result.stderr)
+
+    def installed_setting(self, name):
+        agents = self.home / "Library" / "LaunchAgents"
+        found = [re.search(r"<key>%s</key><string>(.*?)</string>" % name,
+                           (agents / (label + ".plist")).read_text())
+                 for label in ("com.loom.station", "com.loom.brain")]
+        return [match.group(1) if match else "" for match in found]
+
+    def test_ask_answerers_are_written_to_station_and_brain_plists(self):
+        result = self.run_install(LOOM_ASK_ANSWERERS="dana-example app[bot]")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.installed_setting("LOOM_ASK_ANSWERERS"), ["dana-example app[bot]"] * 2)
+
+    def test_a_reinstall_with_a_login_list_unset_keeps_the_installed_list(self):
+        for name in ("LOOM_ASK_ANSWERERS", "LOOM_BRIEF_AUTHORS"):
+            with self.subTest(name):
+                self.assertEqual(self.run_install(**{name: "dana-example app[bot]"}).returncode, 0)
+                env = {k: v for k, v in os.environ.items() if k != name}
+                with unittest.mock.patch.dict(os.environ, env, clear=True):
+                    result = self.run_install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.installed_setting(name), ["dana-example app[bot]"] * 2)
+
+    def test_a_reinstall_that_sets_a_login_list_replaces_it_even_with_empty(self):
+        for name in ("LOOM_ASK_ANSWERERS", "LOOM_BRIEF_AUTHORS"):
+            with self.subTest(name):
+                self.assertEqual(self.run_install(**{name: "dana-example"}).returncode, 0)
+                self.assertEqual(self.run_install(**{name: "lee-example"}).returncode, 0)
+                self.assertEqual(self.installed_setting(name), ["lee-example"] * 2)
+                self.assertEqual(self.run_install(**{name: ""}).returncode, 0)
+                self.assertEqual(self.installed_setting(name), ["", ""])
+
+    def test_an_unreadable_installed_plist_names_each_unset_login_list(self):
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        (agents / "com.loom.station.plist").write_text("not a plist")
+        result = self.run_install(LOOM_TRUSTED_BRIEFERS="", LOOM_BRIEF_AUTHORS="x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LOOM_ASK_ANSWERERS", result.stderr)
+        result = self.run_install(LOOM_TRUSTED_BRIEFERS="", LOOM_ASK_ANSWERERS="x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LOOM_BRIEF_AUTHORS", result.stderr)
+
     def test_goal_limits_are_written_to_station_and_brain_plists(self):
-        result = self.run_install(LOOM_GOAL_CAP="28", LOOM_UNVERIFIED_LIMIT="60")
+        result = self.run_install(LOOM_GOAL_CAP="28", LOOM_UNVERIFIED_LIMIT="60",
+                                  LOOM_NO_LANE_REROUTE="4")
         self.assertEqual(result.returncode, 0, result.stderr)
         agents = self.home / "Library" / "LaunchAgents"
         for label in ("com.loom.station", "com.loom.brain"):
             plist = (agents / (label + ".plist")).read_text()
             self.assertIn("<key>LOOM_GOAL_CAP</key><string>28</string>", plist)
             self.assertIn("<key>LOOM_UNVERIFIED_LIMIT</key><string>60</string>", plist)
+        # The factory runs in the station (bus/factory.py no_lane_reroute).
+        self.assertIn("<key>LOOM_NO_LANE_REROUTE</key><string>4</string>",
+                      (agents / "com.loom.station.plist").read_text())
 
     def test_lane_model_settings_are_written_to_station_plist(self):
         # The factory reads what a lane ran from its setting (bus/brain.py
@@ -228,6 +368,39 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_CLAUDE_MODEL</key><string>claude-test</string>", plist)
         self.assertIn("<key>LOOM_CODEX_MODEL</key><string>codex-test</string>", plist)
+
+    def station_plist_with(self, **env):
+        # KUBECONFIG and the allow-list come only from the test, never from
+        # the operator's own environment.
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("KUBECONFIG", "LOOM_STATION_PASS_ENV")}
+        with unittest.mock.patch.dict(os.environ, clean, clear=True):
+            result = self.run_install(**env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+
+    def test_station_pass_env_writes_kubeconfig_to_station_plist(self):
+        # Live evidence (LOOM_LIVE_EVIDENCE_PASS_ENV=KUBECONFIG) needs the
+        # station to have KUBECONFIG; a reinstall must keep it.
+        plist = self.station_plist_with(KUBECONFIG="/example/kube/config",
+                                        LOOM_STATION_PASS_ENV="KUBECONFIG")
+        self.assertIn("<key>KUBECONFIG</key><string>/example/kube/config</string>", plist)
+        self.assertEqual(plist.count("<key>KUBECONFIG</key>"), 1)
+
+    def test_without_station_pass_env_the_station_plist_is_unchanged(self):
+        before = self.station_plist_with()
+        after = self.station_plist_with(KUBECONFIG="/example/kube/config")
+        self.assertEqual(after, before)
+        self.assertNotIn("KUBECONFIG", after)
+
+    def test_station_pass_env_skips_unset_loom_and_written_names(self):
+        plist = self.station_plist_with(LOOM_STATION_PASS_ENV="KUBECONFIG, PATH HOME LOOM_X bad-name",
+                                        LOOM_X="x")
+        self.assertNotIn("KUBECONFIG", plist)
+        self.assertNotIn("LOOM_X", plist)
+        self.assertNotIn("bad-name", plist)
+        self.assertEqual(plist.count("<key>PATH</key>"), 1)
+        self.assertEqual(plist.count("<key>HOME</key>"), 1)
 
     def test_a_bad_station_interval_installs_nothing(self):
         for bad in ("soon", "30"):

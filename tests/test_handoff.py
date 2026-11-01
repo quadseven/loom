@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import re
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -17,6 +20,7 @@ NOW = datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc)
 AUTHORS = ["allowed-bot"]
 PR = (REPO, 7)
 TICKET = (REPO, 9)
+BRIEFED = (REPO, 10)
 
 
 def at(minutes_ago: int) -> str:
@@ -52,11 +56,93 @@ class HandoffRuleTests(unittest.TestCase):
         self.assertFalse(handoff.may_act("review", PR, "lane-machine", found, NOW, current))
 
     def test_a_journal_with_an_unreadable_time_counts_as_fresh(self):
-        # An undatable journal must not open broad work to the live brain.
-        odd = {"body": "\n".join([handoff.JOURNAL_MARKER, "Tick later, muse"]),
-               "at": "not-a-time", "login": "allowed-bot"}
-        self.assertEqual([odd], handoff.peer_journals([odd], "lane-machine", NOW))
-        self.assertEqual([], handoff.peer_journals([odd], "muse", NOW))
+        # An undatable journal counts as fresh only when the comment itself
+        # was created or updated within QUIET (acceptance criterion 2).
+        now = datetime(2026, 10, 26, 13, 51, tzinfo=timezone.utc)
+        # Recent comment (within QUIET): should count as fresh for peer
+        recent = {"body": "\n".join([handoff.JOURNAL_MARKER, "Tick later, muse"]),
+                  "at": "not-a-time", "login": "allowed-bot",
+                  "created_at": "2026-10-26T12:00:00Z", "updated_at": "2026-10-26T12:00:00Z"}
+        self.assertEqual([recent], handoff.peer_journals([recent], "lane-machine", now))
+        self.assertEqual([], handoff.peer_journals([recent], "muse", now))
+        # Old comment (outside QUIET): should NOT count as fresh for peer
+        old = {"body": "\n".join([handoff.JOURNAL_MARKER, "Tick later, muse"]),
+               "at": "not-a-time", "login": "allowed-bot",
+               "created_at": "2026-10-25T12:00:00Z", "updated_at": "2026-10-25T12:00:00Z"}
+        self.assertEqual([], handoff.peer_journals([old], "lane-machine", now))
+        self.assertEqual([], handoff.peer_journals([old], "muse", now))
+
+    def test_tick_time_without_date_uses_comment_created_at_day(self):
+        # A Tick line with only a time (no date) should be dated from the
+        # comment's createdAt day. A muse journal from 2026-10-19 with
+        # "Tick 20:30Z, muse" should not appear fresh at 2026-10-26T13:51Z.
+        now = datetime(2026, 10, 26, 13, 51, tzinfo=timezone.utc)
+        # GitHub's comment timestamps date the time-only Tick lines. The
+        # journal was edited in place, so each tick's own time is its `at`.
+        created_at = "2026-10-19T19:30:00Z"
+        updated_at = "2026-10-19T20:31:00Z"
+        body = "\n".join([handoff.JOURNAL_MARKER, "Tick 20:30Z, muse",
+                          "- Waiting: merge deferred for budget",
+                          handoff.EARLIER_OPEN, "Tick 19:30Z, muse",
+                          "- Waiting: merge deferred for budget", handoff.EARLIER_CLOSE])
+        comment = {"body": body, "at": created_at, "login": "allowed-bot",
+                   "createdAt": created_at, "updatedAt": updated_at}
+        expanded = handoff.journals([comment], AUTHORS)
+        self.assertEqual(["2026-10-19T19:30:00Z", "2026-10-19T20:30:00Z"],
+                         [c["at"] for c in expanded])
+        # peer_journals should not count it as fresh (7 days old)
+        peers = handoff.peer_journals(expanded, "lane-machine", now)
+        self.assertEqual([], peers)
+        # The resume path passes only body, at (the comment's createdAt) and
+        # login: the comment's own time still dates the Tick line.
+        bare = {"body": body, "at": created_at, "login": "allowed-bot"}
+        self.assertEqual([], handoff.peer_journals(handoff.journals([bare], AUTHORS),
+                                                   "lane-machine", now))
+
+    def test_tick_time_without_date_uses_day_before_if_after_updated_at(self):
+        # If dating from createdAt day would put the tick after updated_at,
+        # use the day before instead.
+        now = datetime(2026, 10, 26, 13, 51, tzinfo=timezone.utc)
+        created_at = "2026-10-19T10:00:00Z"
+        updated_at = "2026-10-19T15:00:00Z"
+        # Tick time 20:30Z on createdAt day (2026-10-19) would be after updated_at (15:00Z)
+        # So it should be dated to 2026-10-18T20:30:00Z
+        body = "\n".join([handoff.JOURNAL_MARKER, "Tick 20:30Z, muse",
+                          "- Waiting: merge deferred for budget"])
+        comment = {"body": body, "at": created_at, "login": "allowed-bot",
+                   "created_at": created_at, "updated_at": updated_at}
+        expanded = handoff.expand_journals([comment])
+        self.assertEqual(len(expanded), 1)
+        self.assertEqual(expanded[0]["at"], "2026-10-18T20:30:00Z")
+
+    def test_unreadable_time_fresh_only_when_comment_recent(self):
+        # A journal whose time cannot be read counts as fresh only when the
+        # comment itself was created or updated within QUIET.
+        now = datetime(2026, 10, 26, 13, 51, tzinfo=timezone.utc)
+        # Comment created 3 hours ago (outside QUIET) with unreadable time
+        old_created = (now - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        old_comment = {"body": "\n".join([handoff.JOURNAL_MARKER, "Tick later, muse"]),
+                       "at": "not-a-time", "login": "allowed-bot",
+                       "created_at": old_created, "updated_at": old_created}
+        peers = handoff.peer_journals([old_comment], "lane-machine", now)
+        self.assertEqual([], peers)  # Not fresh because comment is old
+
+        # Comment created 1 hour ago (within QUIET) with unreadable time
+        recent_created = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        recent_comment = {"body": "\n".join([handoff.JOURNAL_MARKER, "Tick later, muse"]),
+                          "at": "not-a-time", "login": "allowed-bot",
+                          "created_at": recent_created, "updated_at": recent_created}
+        peers = handoff.peer_journals([recent_comment], "lane-machine", now)
+        self.assertEqual([recent_comment], peers)  # Fresh because comment is recent
+
+        # Comment created 3 hours ago but updated 1 hour ago (within QUIET)
+        old_created2 = (now - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        recent_updated = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        updated_comment = {"body": "\n".join([handoff.JOURNAL_MARKER, "Tick later, muse"]),
+                           "at": "not-a-time", "login": "allowed-bot",
+                           "created_at": old_created2, "updated_at": recent_updated}
+        peers = handoff.peer_journals([updated_comment], "lane-machine", now)
+        self.assertEqual([updated_comment], peers)  # Fresh because updated recently
 
     def test_quiet_peers_leave_every_stage_open_as_before(self):
         found = handoff.journals([journal(180, "muse"), journal(10, "lane-machine")], AUTHORS)
@@ -124,6 +210,9 @@ class Routes:
             self.posted.append((path, json.loads(body) if body else None))
         if method == "GET" and path.startswith("/repos/") and path.endswith("/pulls"):
             return 200, {}, b"[]"
+        if method == "POST" and path == "/graphql" and "subIssues" in json.loads(body)["query"]:
+            return 200, {}, json.dumps({"data": {"repository": self.sub_issue_states(
+                json.loads(body)["query"])}}).encode()
         if (method == "GET" and path.endswith("/sub_issues")
                 and (method, path) not in self.routes):
             return 200, {}, b"[]"  # a goal with no epics or tickets linked
@@ -131,6 +220,18 @@ class Routes:
             raise AssertionError("unexpected call %s %s" % (method, path))
         status, data = self.routes[(method, path)]
         return status, {}, json.dumps(data).encode()
+
+    def sub_issue_states(self, query):
+        """Resume's batched sub-issue states (brain._sub_issue_states), from
+        the same sub_issues routes a REST read answers."""
+        repo = "%s/%s" % re.search(r'owner:"([^"]+)",name:"([^"]+)"', query).groups()
+        out = {}
+        for number in re.findall(r"issue\(number:(\d+)\)", query):
+            _, subs = self.routes.get(
+                ("GET", "/repos/%s/issues/%s/sub_issues" % (repo, number)), (200, []))
+            out["e" + number] = {"subIssues": {"totalCount": len(subs), "nodes": [
+                {"number": s["number"], "state": s["state"].upper()} for s in subs]}}
+        return out
 
 
 def lock_routes(holder="lane-machine", expires="2030-01-01T12:30:00Z"):
@@ -245,6 +346,124 @@ class ResumeCommandTests(unittest.TestCase):
                          "holder=muse -->" % REPO, line)
         line = brain.defer(GitHub("t", transport=Routes(routes)), "failed", TICKET, "muse")
         self.assertIn("rev=failed-c2", line)
+
+    # loom#2174: a needs-brain decision on a ticket that stays loom:briefed
+    # gets its own stage, so the defer is a marker and not journal prose.
+    def briefed_routes(self, journals=None, **tickets):
+        """self.routes() plus open loom:briefed needs-brain tickets #10 and
+        #11 (or the labels given as t10/t11), and the goal journals given."""
+        routes = self.routes()
+        for number in (10, 11):
+            labels = tickets.get("t%d" % number, [
+                "loom:ticket", "loom:briefed", "needs-brain", "claim:human", "wait:operator"])
+            routes[("GET", "/repos/%s/issues/%d" % (REPO, number))] = (
+                200, {"state": "open", "comments": 2, "labels": [{"name": x} for x in labels]})
+        if journals is not None:
+            routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (
+                200, [comment(j) for j in journals])
+        return routes
+
+    def resume_out(self, routes):
+        fake = Routes(routes)
+        out = brain.resume(GitHub("t", transport=fake), [REPO], "lane-machine",
+                           LOCK_REPO, NOW, {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
+        return out, fake
+
+    def test_needs_brain_defer_on_a_briefed_ticket_is_a_formal_marker(self):
+        # Criterion 1: on the old code the stage did not exist, so the
+        # decision lived only in journal prose.
+        marker = brain.defer(GitHub("t", transport=Routes(self.briefed_routes())),
+                             "needs-brain", BRIEFED, "muse", note="decision needs review")
+        self.assertEqual('<!-- loom:defer v1 stage=needs-brain item=%s#10 rev=briefed-c2 '
+                         'holder=muse note="decision needs review" -->' % REPO, marker)
+        found = handoff.marks(handoff.journals([journal(5, "muse", marker)], AUTHORS))
+        self.assertEqual([("defer", "needs-brain", BRIEFED, "briefed-c2", "decision needs review")],
+                         [(m.kind, m.stage, m.item, m.rev, m.note) for m in found])
+
+    def test_resume_lists_a_needs_brain_defer_once_with_its_newest_reason(self):
+        # Criterion 2: the next resume shows ticket, stage and reason; a
+        # repeated defer (same tick, or a later tick with a new reason)
+        # replaces the older one instead of adding a second entry.
+        first = handoff.defer_marker("needs-brain", BRIEFED, "briefed-c2", "muse",
+                                     note="decision needs review")
+        again = handoff.defer_marker("needs-brain", BRIEFED, "briefed-c2", "muse",
+                                     note="split or close")
+        out, _ = self.resume_out(self.briefed_routes([
+            journal(35, "muse", first, first), journal(5, "muse", again, again)]))
+        self.assertIn("- stage needs-brain: yielded by muse at %s" % at(5), out)
+        self.assertIn("- resume needs-brain %s#10: split or close (deferred by muse at %s)"
+                      % (REPO, at(5)), out)
+        lines = [x for x in out.splitlines() if "needs-brain %s#10" % REPO in x]
+        self.assertEqual(1, len(lines), lines)
+
+    def test_recording_a_needs_brain_defer_leaves_the_ticket_alone(self):
+        # Criterion 3: defer and the resume that lists it only read: no label
+        # change (needs-brain, claim and wait holds stay), no state change, no
+        # lane start, no merge, no comment.
+        routes = self.briefed_routes()
+        before = json.dumps(routes[("GET", "/repos/%s/issues/10" % REPO)], sort_keys=True)
+        fake = Routes(routes)
+        marker = brain.defer(GitHub("t", transport=fake), "needs-brain", BRIEFED, "muse",
+                             note="decision needs review")
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (
+            200, [comment(journal(5, "muse", marker))])
+        out, read = self.resume_out(routes)
+        self.assertIn("- resume needs-brain %s#10" % REPO, out)
+        for calls in (fake.calls, read.calls):
+            self.assertEqual([], [c for c in calls if c[0] != "GET" and c[1] != "/graphql"])
+        self.assertEqual([], [p for p in fake.posted + read.posted if p[0] != "/graphql"])
+        self.assertEqual(before, json.dumps(routes[("GET", "/repos/%s/issues/10" % REPO)],
+                                            sort_keys=True))
+
+    def test_needs_brain_defer_refuses_a_ticket_that_is_not_briefed_with_needs_brain(self):
+        # Criterion 4: briefed without needs-brain, needs-brain without
+        # briefed, and a failed ticket are all refused by this stage.
+        for labels in (["loom:ticket", "loom:briefed"], ["loom:ticket", "needs-brain"],
+                       ["loom:ticket", "loom:failed", "needs-brain"]):
+            with self.subTest(labels=labels):
+                fake = Routes(self.briefed_routes(t10=labels))
+                with self.assertRaisesRegex(ValueError, "loom:briefed ticket with needs-brain"):
+                    brain.defer(GitHub("t", transport=fake), "needs-brain", BRIEFED, "muse",
+                                note="decision needs review")
+                self.assertEqual([], fake.posted)
+
+    def test_failed_defer_still_takes_only_a_failed_ticket(self):
+        # Criterion 4: the failed stage is unchanged by the new one.
+        line = brain.defer(GitHub("t", transport=Routes(self.briefed_routes())), "failed",
+                           TICKET, "muse")
+        self.assertEqual("<!-- loom:defer v1 stage=failed item=%s#9 rev=failed-c2 holder=muse -->"
+                         % REPO, line)
+        with self.assertRaisesRegex(ValueError, "a failed item is a loom:failed ticket"):
+            brain.defer(GitHub("t", transport=Routes(self.briefed_routes())), "failed",
+                        BRIEFED, "muse")
+
+    def test_done_resolves_a_needs_brain_defer_and_keeps_the_others(self):
+        # Criterion 5: the done marker from `bus.brain done` retires this
+        # ticket's defer; the failed defer and another ticket's needs-brain
+        # defer stay standing.
+        args = brain.parser().parse_args(["done", "%s#10" % REPO, "--stage", "needs-brain",
+                                          "--holder", "lane-machine"])
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            brain.COMMANDS["done"](None, args)
+        resolved = printed.getvalue().strip()
+        self.assertEqual("<!-- loom:done v1 stage=needs-brain item=%s#10 holder=lane-machine -->"
+                         % REPO, resolved)
+        other = (REPO, 11)
+        standing = [journal(35, "muse",
+                            handoff.defer_marker("needs-brain", BRIEFED, "briefed-c2", "muse",
+                                                 note="decision needs review"),
+                            handoff.defer_marker("needs-brain", other, "briefed-c2", "muse",
+                                                 note="pick a lane"),
+                            defer(TICKET, "failed-c2", stage="failed"))]
+        out, _ = self.resume_out(self.briefed_routes(standing))
+        self.assertIn("- resume needs-brain %s#10: decision needs review" % REPO, out)
+        out, _ = self.resume_out(self.briefed_routes(
+            standing + [journal(5, "lane-machine", resolved)]))
+        self.assertNotIn("- resume needs-brain %s#10" % REPO, out)
+        self.assertIn("- stage needs-brain: held by lane-machine; last done %s#10" % REPO, out)
+        self.assertIn("- resume needs-brain %s#11: pick a lane" % REPO, out)
+        self.assertIn("- resume failed %s#9" % REPO, out)
 
     def test_defer_refuses_an_unknown_stage_with_a_value_error(self):
         with self.assertRaises(ValueError) as caught:
@@ -416,9 +635,16 @@ class BriefDoneTests(unittest.TestCase):
         self.assertIn("https://example.com/12", posted)
         self.assertEqual("lane-machine", handoff.journal_holder({"body": posted}))
 
+        # Create a mock journal with the done marker at test's NOW time (fresh),
+        # so it retires the older defer marker from muse.
+        done_body = "\n".join([
+            handoff.JOURNAL_MARKER,
+            "Tick %s, lane-machine" % at(0),
+            "- Briefed: https://example.com/12",
+            handoff.done_marker("brief", (REPO, 1), "lane-machine")])
         routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
             comment(journal(10, "muse", BRIEF_DEFER)),
-            comment({"body": posted, "at": at(0), "login": "allowed-bot"})])
+            comment({"body": done_body, "at": at(0), "login": "allowed-bot"})])
         out = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
                            "lane-machine", LOCK_REPO, NOW, ENV)
         self.assertNotIn("- resume brief", out)
@@ -544,7 +770,7 @@ class HandoffPacketTests(unittest.TestCase):
                   "steps": list(brain.TICK_STEPS),
                   "notes": [{"ts": at(2), "step": "merge", "text": "two ready"}]}
         text = packet([goal(journal(40, "muse"))], record)
-        self.assertIn("- %s muse, no journal yet: at step merge (3/10). Last note: two ready."
+        self.assertIn("- %s muse, no journal yet: at step merge (3/11). Last note: two ready."
                       % at(3), text)
 
     def test_a_private_goal_home_is_neither_named_nor_quoted(self):

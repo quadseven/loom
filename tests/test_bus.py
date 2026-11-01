@@ -391,7 +391,7 @@ class LockTests(unittest.TestCase):
     def test_acquire_free(self):
         g = FakeGit()
         gh = GitHub("tok", api="https://api.github.com", transport=g)
-        self.assertTrue(lock.acquire(gh, REPO, "tick-1", 15, NOW))
+        self.assertEqual(lock.acquire(gh, REPO, "tick-1", 15, NOW), (True, "tick-1"))
         self.assertEqual(g.lock_message(),
                          "holder=tick-1 expires=" + stamp(NOW + timedelta(minutes=15)))
 
@@ -399,15 +399,23 @@ class LockTests(unittest.TestCase):
         g = FakeGit()
         g.seed_lock("other", stamp(NOW + timedelta(minutes=5)))
         gh = GitHub("tok", transport=g)
-        self.assertFalse(lock.acquire(gh, REPO, "tick-1", 15, NOW))
+        self.assertEqual(lock.acquire(gh, REPO, "tick-1", 15, NOW), (False, "other"))
         self.assertIn("holder=other", g.lock_message())
+        self.assertNotIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
+
+    def test_held_by_self(self):
+        g = FakeGit()
+        g.seed_lock("tick-1", stamp(NOW + timedelta(minutes=5)))
+        gh = GitHub("tok", transport=g)
+        self.assertEqual(lock.acquire(gh, REPO, "tick-1", 15, NOW), (False, "tick-1"))
+        self.assertIn("holder=tick-1", g.lock_message())
         self.assertNotIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
 
     def test_expired_takeover(self):
         g = FakeGit()
         g.seed_lock("other", stamp(NOW - timedelta(minutes=1)))
         gh = GitHub("tok", transport=g)
-        self.assertTrue(lock.acquire(gh, REPO, "tick-1", 15, NOW))
+        self.assertEqual(lock.acquire(gh, REPO, "tick-1", 15, NOW), (True, "tick-1"))
         self.assertIn("holder=tick-1", g.lock_message())
         self.assertIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
 
@@ -569,18 +577,27 @@ class JournalTests(unittest.TestCase):
 class CliTests(unittest.TestCase):
     def run_cli(self, argv, transport):
         gh = GitHub("tok", transport=transport)
-        err = io.StringIO()
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = cli.main(argv, gh=gh)
-        return code, err.getvalue()
+        return code, out.getvalue(), err.getvalue()
 
     def test_lock_exit_codes(self):
-        code, err = self.run_cli(["lock", REPO, "--holder", "h1"], FakeGit())
+        code, out, err = self.run_cli(["lock", REPO, "--holder", "h1"], FakeGit())
         self.assertEqual(code, 0)
         self.assertIn("requests: ", err)
+        self.assertIn("lock acquired\n", out)
         g = FakeGit()
         g.seed_lock("other", stamp(datetime.now(timezone.utc) + timedelta(hours=1)))
-        self.assertEqual(self.run_cli(["lock", REPO, "--holder", "h1"], g)[0], 1)
+        code, out, _ = self.run_cli(["lock", REPO, "--holder", "h1"], g)
+        self.assertEqual(code, 1)
+        self.assertIn("lock held by other\n", out)
+        # Test self-lock behavior prints the holder
+        g = FakeGit()
+        g.seed_lock("h1", stamp(datetime.now(timezone.utc) + timedelta(hours=1)))
+        code, out, _ = self.run_cli(["lock", REPO, "--holder", "h1"], g)
+        self.assertEqual(code, 1)
+        self.assertIn("lock held by h1\n", out)
 
     def test_unlock_exit_codes(self):
         g = FakeGit()
@@ -594,22 +611,50 @@ class CliTests(unittest.TestCase):
             path = os.path.join(d, "j.md")
             with open(path, "w") as fh:
                 fh.write(journal.JOURNAL_MARKER + "\nTick x, y\n")
-            code, err = self.run_cli(["journal", REPO + "#5", "--file", path], t)
+            code, _, err = self.run_cli(["journal", REPO + "#5", "--file", path], t)
         self.assertEqual(code, 0)
         self.assertIn("requests: 1", err)
 
     def test_journal_command_holder_adds_the_tick_line(self):
-        t = Scripted(reply(200, {"login": "me"}), reply(200, []), reply(201, {}))
+        # The tick record read first (loom#2104): no lock, no step times.
+        t = Scripted(reply(404, {"message": "Not Found"}), reply(200, {"login": "me"}),
+                     reply(200, []), reply(201, {}))
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "j.md")
             with open(path, "w") as fh:
                 fh.write(journal.JOURNAL_MARKER + "\nMoved: nothing.\n")
-            code, _ = self.run_cli(["journal", REPO + "#5", "--file", path,
+            code, _, _ = self.run_cli(["journal", REPO + "#5", "--file", path,
                                     "--holder", "lane-machine"], t)
         self.assertEqual(code, 0)
-        posted = json.loads(t.calls[2][3])["body"].splitlines()
+        posted = json.loads(t.calls[3][3])["body"].splitlines()
         self.assertRegex(posted[1], r"^Tick \S+Z, lane-machine$")
         self.assertEqual(posted[2], "Moved: nothing.")
+
+    def test_journal_command_holder_writes_full_iso_tick_time(self):
+        # bus journal --holder writes a Tick line whose time parses with
+        # %Y-%m-%dT%H:%M:%SZ (acceptance criterion 3).
+        from bus import handoff
+        # The tick record read first (loom#2104): no lock, no step times.
+        t = Scripted(reply(404, {"message": "Not Found"}), reply(200, {"login": "me"}),
+                     reply(200, []), reply(201, {}))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "j.md")
+            with open(path, "w") as fh:
+                fh.write(journal.JOURNAL_MARKER + "\nMoved: nothing.\n")
+            code, _, _ = self.run_cli(["journal", REPO + "#5", "--file", path,
+                                    "--holder", "lane-machine"], t)
+        self.assertEqual(code, 0)
+        posted = json.loads(t.calls[3][3])["body"].splitlines()
+        tick_line = posted[1]
+        self.assertTrue(tick_line.startswith("Tick "))
+        self.assertTrue(tick_line.endswith(", lane-machine"))
+        # Extract the time part between "Tick " and ", lane-machine"
+        tick_time = tick_line[len("Tick "):-len(", lane-machine")]
+        # The time should parse as full ISO format with date
+        parsed = handoff._parse(tick_time)
+        self.assertIsNotNone(parsed, "Tick time %r should parse as full ISO format" % tick_time)
+        # Should have a valid date component (year >= 2020)
+        self.assertGreaterEqual(parsed.year, 2020)
 
     def test_journal_command_says_not_posted_for_a_report_held_by_the_gap(self):
         just = (datetime.now(timezone.utc) - timedelta(minutes=8)).strftime("%Y-%m-%dT%H:%M:%SZ")

@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 import unittest
 import unittest.mock
 from datetime import datetime, timezone
@@ -164,3 +166,26 @@ class HourlyMergeCapStatusTests(unittest.TestCase):
         self.assertEqual(len(search_calls), 2)
         self.assertIn("- #8 Work 8 - blocked: held by the hourly merge cap", report)
         self.assertIn("- #9 Work - blocked: held by the hourly merge cap", report)
+
+
+class RepoCapRefusalTests(unittest.TestCase):
+    def test_threads_reading_one_repo_make_one_count(self):
+        reads = []
+
+        def count(gh, repo, now=None):
+            reads.append(repo)
+            time.sleep(0.05)
+            return "held"
+
+        caps = {}
+        answers = []
+        with unittest.mock.patch.object(brain.merge_tier, "cap_refusal", count):
+            threads = [threading.Thread(target=lambda: answers.append(
+                brain._repo_cap_refusal(None, REPO, caps, None))) for _ in range(6)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(reads, [REPO])
+        self.assertEqual(answers, ["held"] * 6)
+

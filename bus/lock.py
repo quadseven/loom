@@ -58,7 +58,7 @@ def _create_ref(gh: GitHub, repo: str, sha: str) -> bool:
 
 
 def acquire(gh: GitHub, repo: str, holder: str, minutes: int = 15,
-            now: Optional[datetime] = None) -> bool:
+            now: Optional[datetime] = None) -> Tuple[bool, str]:
     _check_holder(holder)
     now = _utc(now)
     main = gh.rest("GET", "/repos/%s/git/ref/heads/main" % repo)
@@ -72,16 +72,19 @@ def acquire(gh: GitHub, repo: str, holder: str, minutes: int = 15,
     })
     sha = commit.data["sha"]
     if _create_ref(gh, repo, sha):
-        return True
+        return True, holder
     current = _read_lock(gh, repo)
     if current is not None:
         _, when = current
         # An unreadable expiry counts as held: never steal a lock we cannot read.
         if when is None or when > now:
-            return False
+            return False, current[0]
         gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, LOCK_BRANCH),
                 ok=(404, 422))
-    return _create_ref(gh, repo, sha)
+    if _create_ref(gh, repo, sha):
+        return True, holder
+    current = _read_lock(gh, repo)
+    return False, current[0] if current else ""
 
 
 def release(gh: GitHub, repo: str, holder: str) -> bool:

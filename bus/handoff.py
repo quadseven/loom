@@ -46,7 +46,7 @@ def _trusted_report_time(comment: Any, body: str, at_key: str) -> Optional[str]:
     return stamp if created <= stamp <= updated else None
 # GitHub work any brain can do. Ships and rolls are not here: they stay with
 # whoever a goal's rules name.
-STAGES = ("review", "merge", "failed", "ask", "regression", "brief")
+STAGES = ("review", "merge", "failed", "ask", "regression", "brief", "needs-brain")
 # The old rule: a brain outside its own scope acts only when no other brain
 # journaled in this window.
 QUIET = timedelta(hours=2)
@@ -56,7 +56,7 @@ _REV = r"[A-Za-z0-9._:-]+"
 _KEY = r"[a-f0-9]{8}"
 _NOTE = r'(?:"([^"]*)"|([^\s>]+))'
 _MARK = re.compile(
-    r'<!-- loom:(defer|done) v1 stage=([a-z]+) item=(%s)(?: rev=(%s))?(?: key=(%s))?(?: note=%s)? holder=(%s)(?: note=%s)? -->'
+    r'<!-- loom:(defer|done) v1 stage=([a-z-]+) item=(%s)(?: rev=(%s))?(?: key=(%s))?(?: note=%s)? holder=(%s)(?: note=%s)? -->'
     % (_ITEM, _REV, _KEY, _NOTE, _HOLDER, _NOTE))
 _TICK = re.compile(r"^Tick \S+, (%s)\s*$" % _HOLDER, re.M)
 _TICK_AT = re.compile(r"^Tick (\S+), (%s)\s*$" % _HOLDER, re.M)
@@ -104,15 +104,16 @@ def expand_journals(comments: Iterable[Any], at_key: str = "at",
             # A report edited in place is dated by its edit (loom#1560).
             out.append(dict(comment, **{at_key: stamp}))
             continue
-        if not body.startswith(JOURNAL_MARKER) or EARLIER_OPEN not in body:
+        if not body.startswith(JOURNAL_MARKER):
             out.append(comment)
             continue
         parts = split_journal(body)
         for index, (at, part) in enumerate(parts):
             item = dict(comment, body=part)
-            item[at_key] = at or comment.get(at_key)
+            inferred_at = _infer_tick_time(at, comment, at_key) if at else comment.get(at_key)
+            item[at_key] = inferred_at
             if index < len(parts) - 1 and comment.get(id_key) is not None:
-                item[id_key] = "%s@%s" % (comment[id_key], at)
+                item[id_key] = "%s@%s" % (comment[id_key], inferred_at)
             out.append(item)
     return out
 
@@ -268,23 +269,82 @@ def _parse(value: str) -> Optional[datetime]:
         return None
 
 
+def _infer_tick_time(at: str, comment: Dict[str, Any], at_key: str) -> str:
+    """If `at` is a time-only tick (e.g. "20:30Z"), combine it with the
+    comment's created_at date. If that would be after updated_at, use the
+    previous day. Return a full ISO timestamp, or the original `at` if it
+    already has a date, or the comment's at_key value as fallback."""
+    # Already a full ISO timestamp?
+    if _parse(at) is not None:
+        return at
+    # Time-only format like "20:30Z"?
+    time_only = re.match(r"^(\d{2}:\d{2}:\d{2}Z|\d{2}:\d{2}Z)$", at)
+    if not time_only:
+        return comment.get(at_key, at)  # Unrecognized format, fall back to comment's time
+    created = str(comment.get("created_at") or comment.get("createdAt") or "")
+    updated = str(comment.get("updated_at") or comment.get("updatedAt") or "")
+    if not created:
+        return comment.get(at_key, at)
+    try:
+        created_dt = datetime.strptime(created[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return comment.get(at_key, at)
+    # Combine created_at's date with the tick's time
+    tick_time = time_only.group(1)
+    if len(tick_time) == 6:  # "HH:MMZ" -> add seconds
+        tick_time = tick_time[:5] + ":00Z"
+    combined = datetime.strptime(
+        created_dt.strftime("%Y-%m-%d") + "T" + tick_time,
+        "%Y-%m-%dT%H:%M:%SZ"
+    ).replace(tzinfo=timezone.utc)
+    # If combined would be after updated_at, use previous day
+    if updated:
+        try:
+            updated_dt = datetime.strptime(updated[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            if combined > updated_dt:
+                combined -= timedelta(days=1)
+        except ValueError:
+            pass
+    return combined.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def journal_holder(comment: Dict[str, Any]) -> str:
     """The holder a journal names on its Tick line, or "" when it names none."""
     m = _TICK.search(str(comment.get("body") or ""))
     return m.group(1) if m else ""
 
 
+def _comment_recent(comment: Dict[str, Any], now: datetime) -> bool:
+    """Whether the comment was created or updated within QUIET of now."""
+    created = str(comment.get("created_at") or comment.get("createdAt") or "")
+    updated = str(comment.get("updated_at") or comment.get("updatedAt") or "")
+    for ts in (created, updated):
+        if not ts:
+            continue
+        try:
+            dt = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            if now - dt <= QUIET:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def peer_journals(found: Iterable[Dict[str, Any]], holder: str,
                   now: datetime) -> List[Dict[str, Any]]:
     """Journals from any other brain within QUIET of now. A journal naming no
-    holder counts as another brain's, and so does one whose time cannot be
-    read: GitHub always stamps a comment, so an unreadable time is a fault,
-    and the safe reading is "fresh", which keeps broad work closed."""
+    holder counts as another brain's. A journal whose time cannot be read
+    counts as fresh only when the comment itself was created or updated
+    within QUIET."""
     out = []
     for comment in found:
         at = _parse(str(comment.get("at") or ""))
-        if journal_holder(comment) != holder and (at is None or now - at <= QUIET):
-            out.append(comment)
+        if journal_holder(comment) != holder:
+            if at is not None:
+                if now - at <= QUIET:
+                    out.append(comment)
+            elif _comment_recent(comment, now):
+                out.append(comment)
     return out
 
 

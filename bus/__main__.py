@@ -4,9 +4,10 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
-from . import app, brain, journal, labels, lock, station
+from . import app, brain, decision_claim, journal, labels, lock, naming, station, tick_clock
 from .github import GitHub, GitHubError, Transport, auth_from_env, openssl_sign
 
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
@@ -56,6 +57,8 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("target", type=_issue, metavar="OWNER/NAME#N")
     s.add_argument("--file", required=True)
     s.add_argument("--holder", help="the brain posting a journal; adds its Tick line when missing")
+    s.add_argument("--lock-repo", type=_repo, default="quadseven/loom", metavar="OWNER/NAME",
+                   help="where the tick record lives; the holder's step times go in the journal")
     sub.add_parser("station", help="one station pass: claim briefed tickets, report outcomes")
     s = sub.add_parser("app", help="set up the Loom's own GitHub App")
     app_sub = s.add_subparsers(dest="app_command", required=True)
@@ -65,13 +68,43 @@ def _parser() -> argparse.ArgumentParser:
     a.add_argument("--name", help="the App's name (default loom-OWNER)")
     a.add_argument("--form", action="store_true",
                    help="print an HTML page whose one button creates the App")
+    a.add_argument("--role", choices=app.ROLES, default="station",
+                   help="which writer's App: only the station's may dispatch workflow runs")
     app_sub.add_parser("token", help="print the installation token of the App the "
                        "LOOM_GITHUB_APP_* settings name, for gh and git (loom#1142)")
     app_sub.add_parser("login", help="print the \"<slug>[bot]\" login of the App the "
                        "LOOM_GITHUB_APP_* settings name, for the brain's journal")
     a = app_sub.add_parser("ids", help="list the App's installations and print its id settings")
     a.add_argument("--app-id", required=True, type=_number)
+    a.add_argument("--role", choices=app.ROLES, default="station",
+                   help="which writer's App the permissions are checked for")
     return p
+
+
+def _backlog_home(gh: GitHub, repo: str, number: int) -> bool:
+    """Whether issue `number` is a per-repo backlog goal home, which posts no
+    report (its status is one line in the station's digest)."""
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+    return isinstance(issue, dict) and naming.is_backlog_home(issue)
+
+
+def _steps_footer(gh: GitHub, lock_repo: str, holder: Optional[str],
+                  text: str = "") -> Optional[str]:
+    """The holder's tick step durations for its journal (loom#2104), or None
+    outside that holder's tick. A failed read is said on stderr and the
+    journal goes out without them."""
+    if not holder or text.startswith(journal.REPORT_MARKER) or journal.REPLY_RE.match(text):
+        # A report or reply carries no Steps line, so nothing is read for it.
+        return None
+    try:
+        record = brain.tick_step(gh, lock_repo)
+    except (GitHubError, KeyError, TypeError, ValueError) as exc:
+        print("tick record unread, journal posted without step times: %r" % exc,
+              file=sys.stderr)
+        return None
+    if record.get("holder") != holder:
+        return None
+    return tick_clock.footer(record, datetime.now(timezone.utc))
 
 
 def _run(args: argparse.Namespace, gh: GitHub) -> int:
@@ -81,8 +114,8 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
             print("%s: %s" % (repo, ", ".join(changed) if changed else "no changes"))
         return 0
     if args.command == "lock":
-        ok = lock.acquire(gh, args.repo, args.holder, args.minutes)
-        print("lock acquired" if ok else "lock held by someone else")
+        ok, current_holder = lock.acquire(gh, args.repo, args.holder, args.minutes)
+        print("lock acquired" if ok else "lock held by %s" % current_holder)
         return 0 if ok else 1
     if args.command == "unlock":
         ok = lock.release(gh, args.repo, args.holder)
@@ -94,12 +127,19 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
     authors = brain.trusted_authors()
     try:
         journal.post(gh, repo, int(num), text, args.holder, authors,
-                     quiet=lambda: brain.goal_quiet(gh, repo, int(num), authors))
-    except (journal.ReportTooSoon, journal.ReportQuiet) as held:
+                     quiet=lambda: brain.goal_quiet(gh, repo, int(num), authors),
+                     backlog=lambda: _backlog_home(gh, repo, int(num)),
+                     steps=_steps_footer(gh, args.lock_repo, args.holder, text))
+    except (journal.ReportTooSoon, journal.ReportQuiet, journal.ReportBacklog) as held:
         # The goal is already reported, or quiet since its last report
         # (loom#1534): not a failed step, so exit 0.
         print("not posted: %s" % held)
         return 0
+    except decision_claim.DecisionNotRecorded as bad:
+        # A journal citing a decision no person recorded (loom#2089) is the
+        # brain's to rewrite: nothing is posted and the exit is non-zero.
+        print("not posted: %s" % bad)
+        return 2
     except journal.ReportInvalid as bad:
         # A report that contradicts itself is the brain's to rewrite, so this
         # is a failed step: nothing is posted and the exit is non-zero.
@@ -112,13 +152,14 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
 def _app(args: argparse.Namespace, transport: Optional[Transport],
          sign: Optional[Callable[[bytes, str], bytes]]) -> int:
     if args.app_command == "manifest":
-        return app.print_manifest(args.owner, args.org, args.name, args.form, sys.stdout)
+        return app.print_manifest(args.owner, args.org, args.name, args.form, sys.stdout,
+                                  args.role)
     try:
         if args.app_command == "token":
             return app.print_token(sys.stdout, transport=transport, sign=sign or openssl_sign)
         if args.app_command == "login":
             return app.print_login(sys.stdout, transport=transport, sign=sign or openssl_sign)
-        return app.ids(args.app_id, transport=transport, sign=sign or openssl_sign)
+        return app.ids(args.app_id, transport=transport, sign=sign or openssl_sign, role=args.role)
     except GitHubError as err:
         print("error: %s" % err, file=sys.stderr)
         return 2

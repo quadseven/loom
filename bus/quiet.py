@@ -16,7 +16,7 @@ report when all of these hold:
   carrying loom:merged, loom:shipped, loom:verified or loom:failed was
   updated after it;
 - no open invariant breach names the goal (or sits in its scope);
-- no open ticket in its scope asks the operator (loom:human, needs-operator);
+- no open ticket in its scope asks the operator (needs:human, needs-operator);
 - nothing in its scope is stuck: no open ticket is loom:failed, loom:runaway,
   loom:regression or needs-brain, and none has sat in loom:pr past the stuck
   age;
@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence
 
 from . import handoff
+from .labels import HUMAN_LABELS
 from .github import rest_login
 
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
@@ -42,7 +43,7 @@ HEARTBEAT_EVERY = 7 * 24 * 3600
 HEARTBEAT_STAMP = "Still quiet as of %s; this report is edited in place until something moves."
 MOVED_LABELS = ("loom:merged", "loom:shipped", "loom:verified", "loom:failed")
 STUCK_LABELS = ("loom:failed", "loom:runaway", "loom:regression", "needs-brain")
-ASK_LABELS = ("loom:human", "needs-operator")
+ASK_LABELS = HUMAN_LABELS
 INVARIANT_LABEL = "loom:invariant"
 _MEASURE = re.compile(r"^-?[ \t]*Measure:[ \t]*(.*)$", re.I | re.M)
 # Dates and clock times on a Measure line say when, not how much.

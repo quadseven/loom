@@ -18,13 +18,24 @@ LANES = Path(__file__).resolve().parent.parent / "lanes"
 SCRIPT = LANES / "mac" / "brain.sh"
 
 # Fake python3: `-m bus lock` exits $FAKE_LOCK (default 0), `-m bus unlock`
-# exits 0, and `-m bus.brain_memory handoff` prints $FAKE_PACKET and exits
-# $FAKE_PACKET_EXIT (default 0). Every call is appended to $FAKE_LOG.
+# exits 0, `-m bus.brain_memory handoff` prints $FAKE_PACKET and exits
+# $FAKE_PACKET_EXIT (default 0), and `-m bus.shadow prompt` runs the real one
+# under $FAKE_REAL_PYTHON or fails. Every call is appended to $FAKE_LOG.
 FAKE_PYTHON = """#!/usr/bin/env bash
 printf 'python3 %s\\n' "$*" >> "$FAKE_LOG"
+if [ "$2 $3" = "bus.shadow prompt" ]; then
+  # FAKE_REAL_PYTHON: run the real bus.shadow from the checkout; unset, the
+  # command fails and the tick falls back to shadow for every repo.
+  [ -n "${FAKE_REAL_PYTHON:-}" ] && exec "$FAKE_REAL_PYTHON" -B "$@"
+  exit 1
+fi
 if [ "$2" = bus.brain_memory ]; then
   printf '%s\\n' "${FAKE_PACKET:-}"
   exit "${FAKE_PACKET_EXIT:-0}"
+fi
+if [ "$2" = bus.fabric ]; then
+  printf '%s\\n' "${FAKE_FABRIC:-}"
+  exit 0
 fi
 if [ "$3 $4" = "app token" ]; then
   # FAKE_APP_TOKEN: the Brain App's installation token; unset, minting fails.
@@ -199,6 +210,35 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("Read this handoff packet before anything else.", claude[0])
         self.assertIn("## Open commitments (1)", "\n".join(calls))
 
+    def test_fabric_is_not_asked_without_the_opt_in(self):
+        # The Fabric question is opt-in (LOOM_BRAIN_FABRIC_ASK) and off by
+        # default: a tick with only the key set makes no bus.fabric call,
+        # the answer never reaches the prompt, and the tick still runs.
+        run, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                               FAKE_FABRIC="Earlier decision: a fix was merged.")
+        self.assertEqual(0, run.returncode)
+        self.assertFalse(any("bus.fabric" in c for c in calls), calls)
+        self.assertNotIn("Earlier decision: a fix was merged.", "\n".join(calls))
+        self.assertEqual(1, len(self.agent_calls(calls, "claude")))
+        self.log.unlink()
+        run, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                               LOOM_BRAIN_FABRIC_ASK="",
+                               FAKE_FABRIC="Earlier decision: a fix was merged.")
+        self.assertEqual(0, run.returncode)
+        self.assertFalse(any("bus.fabric" in c for c in calls), calls)
+
+    def test_fabric_is_asked_by_the_wrapper_before_the_agent(self):
+        _, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                             LOOM_BRAIN_FABRIC_ASK="1",
+                             FAKE_FABRIC="Earlier decision: a fix was merged.")
+        fabric_call = next(i for i, call in enumerate(calls)
+                           if "bus.fabric ask" in call)
+        agent_calls = [(i, call) for i, call in enumerate(calls)
+                       if call.startswith("claude ")]
+        self.assertLess(fabric_call, agent_calls[0][0])
+        self.assertIn("Earlier decision: a fix was merged.", "\n".join(calls))
+        self.assertNotIn("LOOM_FABRIC_KEY_SSM", "\n".join(calls))
+
     def test_no_dashboard_or_a_failed_read_runs_the_tick_without_the_packet(self):
         _, calls = self.tick()
         self.assertFalse(any("bus.brain_memory" in c for c in calls))
@@ -347,7 +387,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("tick start (lane codex, model gpt-test-high, scope all)", log)
         self.assertEqual("python3 -m bus unlock example/loom --holder lane-machine", calls[-1])
 
-    def test_a_stale_heartbeat_has_no_usage(self):
+    def test_a_stale_heartbeat_goes_after_a_fresh_one(self):
         # A runner that stopped writes no heartbeat; its old one does not count.
         self.usage("claude", True, age=3600)
         self.usage("codex", True)
@@ -368,11 +408,47 @@ class BrainTickTest(unittest.TestCase):
 
     def test_a_dead_runners_lock_does_not_keep_an_aged_heartbeat(self):
         self.usage("claude", True, age=1800)
+        self.usage("codex", True)
         lock = self.home / "run" / "claude.lock"
         lock.mkdir(parents=True)
         (lock / "pid").write_text("999999\n")
-        _, calls = self.tick()
+        _, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
         self.assertEqual([], self.agent_calls(calls, "claude"))
+        self.assertEqual(1, len(self.agent_calls(calls, "codex")))
+
+    def test_stale_heartbeats_read_as_fuel_unknown_and_the_tick_still_runs(self):
+        # From 15:34Z on 2026-10-28 a crashing lane runner wrote no heartbeat
+        # for 28 hours, and each hourly tick stood down though nothing said
+        # the lanes had no usage.
+        self.usage("claude", True, age=99846)
+        self.usage("codex", True, age=99350)
+        run, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
+        self.assertEqual(0, run.returncode)
+        self.assertEqual(1, len(self.agent_calls(calls, "claude")))
+        self.assertEqual(1, sum(1 for c in calls if " -m bus lock " in c))
+        last, ok = self.beat()
+        self.assertEqual(("ok", "claude"), (last["outcome"], last["lane"]))
+        self.assertTrue(ok)
+        log = (self.home / "logs" / "brain.log").read_text()
+        self.assertIn("fuel unknown for lane claude (usage heartbeat is", log)
+
+    def test_a_missing_heartbeat_reads_as_fuel_unknown(self):
+        (self.home / "state" / "usage" / "claude.json").unlink()
+        _, calls = self.tick()
+        self.assertEqual(1, len(self.agent_calls(calls, "claude")))
+
+    def test_a_rung_with_known_usage_goes_before_one_with_unknown_fuel(self):
+        (self.home / "state" / "usage" / "claude.json").unlink()
+        self.usage("codex", True)
+        _, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
+        self.assertEqual([], self.agent_calls(calls, "claude"))
+        self.assertEqual(1, len(self.agent_calls(calls, "codex")))
+
+    def test_a_heartbeat_that_says_unavailable_still_stands_the_rung_down(self):
+        self.usage("claude", False, "limit: out of credit", age=99846)
+        run, calls = self.tick()
+        self.assertEqual(0, run.returncode)
+        self.assertEqual([], calls)
 
     def test_a_limit_failure_moves_the_tick_to_the_next_rung_once(self):
         for lane in ("codex", "spark"):
@@ -416,6 +492,7 @@ class BrainTickTest(unittest.TestCase):
 
     def test_no_rung_with_usage_skips_with_a_reason_and_runs_nothing(self):
         self.usage("claude", False, "limit: out of credit")
+        self.usage("codex", False, "limit: out of quota")
         self.usage("spark", True)
         run, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
         self.assertEqual(0, run.returncode)
@@ -426,7 +503,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertNotIn("started", last)
         self.assertIn("no brain lane has usage", last["reason"])
         self.assertIn("claude: unavailable (limit: out of credit)", last["reason"])
-        self.assertIn("codex: no usage heartbeat", last["reason"])
+        self.assertIn("codex: unavailable (limit: out of quota)", last["reason"])
         self.assertIn("spark: LOOM_SPARK_URL is not set", last["reason"])
         # Not a good tick: the station's brain-stopped check sees it go stale.
         self.assertFalse(ok)
@@ -515,8 +592,10 @@ class BrainTickTest(unittest.TestCase):
         # other LOOM_* variable, keys and SSM names included.
         _, calls = self.spark_tick(LOOM_FOO_TOKEN="foo-secret-value",
                                    LOOM_OPENCODE_GO_KEY_SSM="/example/key",
-                                   LOOM_BRIEF_AUTHORS="example-author")
+                                   LOOM_BRIEF_AUTHORS="example-author",
+                                   LOOM_ASK_ANSWERERS="example-answerer")
         settings = [c for c in calls if c.startswith("opencode setting ")]
+        self.assertIn("opencode setting LOOM_ASK_ANSWERERS=example-answerer", settings)
         self.assertIn("opencode setting LOOM_REPOS=example/project", settings)
         self.assertIn("opencode setting LOOM_BRIEF_AUTHORS=example-author", settings)
         self.assertIn("opencode setting LOOM_GITHUB_TOKEN=gho_faketoken123", settings)
@@ -546,6 +625,45 @@ class BrainTickTest(unittest.TestCase):
         self.log.unlink()
         _, calls = self.spark_tick()
         self.assertIn("gh-path-opencode %s/run/brain-home/bin/gh" % self.home, calls)
+
+    def with_real_shadow(self):
+        shutil.copytree(LANES.parent / "bus", self.root / "bus",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        git("add", ".", cwd=self.root)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "bus", cwd=self.root)
+        git("push", "-q", "origin", "main", cwd=self.root)
+        return {"FAKE_REAL_PYTHON": sys.executable}
+
+    def test_the_prompt_names_only_the_repos_still_in_shadow(self):
+        # loom#1960: the prompt said "unless LOOM_SHADOW is 0, never merge",
+        # so with LOOM_SHADOW_REPOS narrowed the brain refused merges the
+        # gates allowed, in repos the operator had taken out of shadow.
+        _, calls = self.tick(LOOM_SHADOW="1", LOOM_SHADOW_REPOS="example-owner/held",
+                             **self.with_real_shadow())
+        self.assertIn("python3 -m bus.shadow prompt", calls)
+        claude = self.agent_calls(calls, "claude")[0]
+        self.assertIn("is on only for example-owner/held", claude)
+        self.assertIn("Every other repo is out of shadow", claude)
+        self.assertNotIn("unless LOOM_SHADOW is 0", claude)
+        self.assertNotIn("is on for every repo", claude)
+
+    def test_the_prompt_says_every_repo_when_the_list_is_empty(self):
+        _, calls = self.tick(LOOM_SHADOW="1", **self.with_real_shadow())
+        claude = self.agent_calls(calls, "claude")[0]
+        self.assertIn("Shadow mode (MUSE.md) is on for every repo: never merge", claude)
+        self.assertNotIn("out of shadow", claude)
+
+    def test_a_shadow_scope_that_cannot_be_read_is_every_repo(self):
+        # The fake prompt command fails: the tick still runs, in shadow for all.
+        run, calls = self.tick(LOOM_SHADOW="0", LOOM_SHADOW_REPOS="example-owner/held")
+        self.assertEqual(0, run.returncode, run.stderr)
+        claude = self.agent_calls(calls, "claude")[0]
+        self.assertIn("Shadow mode (MUSE.md) is on for every repo: never merge, "
+                      "close an issue, approve a pull request", claude)
+        self.assertNotIn("out of shadow", claude)
+        self.assertIn("could not read the shadow scope",
+                      (self.home / "logs" / "brain.log").read_text())
 
     def test_the_guard_refuses_a_merge_in_shadow_and_runs_gh_otherwise(self):
         # The rung's checkout carries the real bus package, as origin does.

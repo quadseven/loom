@@ -22,7 +22,12 @@ Each acceptance criterion is one of three kinds (`kind`):
   tick in the ticket or pull request body, or a lane's prose, is not.
 - operator: an action only a person takes: the operator signs off, approves
   or does a step by hand, or a check on a handset. It never closes on its
-  own: the ticket goes to the operator.
+  own: the ticket goes to the operator. A decision box (`decision`) is one:
+  its text starts with "Operator decides" or "Decision:", or carries
+  DECISION_MARKER. Only an operator ticks it; a lane's tick is reverted
+  (`decision_ticks`, `untick`). On 2026-10-21 a lane's no-change report
+  ticked one with no operator having decided anything, and every later step
+  read the tick as a settled decision.
 
 A live criterion that names a check Loom can run (`check_of`) gets one: an
 `https://` URL fetched with GET, a `gh api <path>` read through the station's
@@ -31,7 +36,7 @@ GitHub client, or a read-only `kubectl get ...` / `kubectl rollout status ...`
 backticked or double-quoted strings must appear in the answer. The result is
 kept in the station's state and written to the ticket's status. A criterion
 with no runnable check, a check that keeps failing, and every operator
-criterion send the ticket to loom:human with one ask, once.
+criterion send the ticket to needs:human with one ask, once.
 """
 from __future__ import annotations
 
@@ -58,6 +63,9 @@ OPERATOR_RE = re.compile(
     r"\b(?:the|an) operator\b(?! ask)|\ba person\b|\bby hand\b|\bmanually\b"
     r"|\bsigns? off\b|\bsign-?off\b|\bapprov(?:es|ed|al)\b|\bhandsets?\b"
     r"|\bon (?:a|the) (?:phone|tablet)\b|\baccepts? the\b[^.\n]{0,40}\bdialog\b", re.I)
+# A box that asks the operator for a decision (loom#2029).
+DECISION_RE = re.compile(r"^\W*(?:(?:the|an) )?operators? decides?\b|^\W*decision\s*:", re.I)
+DECISION_MARKER = "<!-- loom:decision -->"
 TEST_RE = re.compile(r"\btests?\b|\btest_\w+|\bfails? on main\b", re.I)
 # Words that ask for something done or seen on a running system, beyond the
 # wide live-box words bus/claimed.py reads: an imperative verify, a result
@@ -74,6 +82,7 @@ LIVE_WORDS_RE = re.compile(
     r"|\b(?:the|a|its) pods?\b[^.\n]{0,40}\b(?:obtains?|sends?|serves?|becomes? ready)\b",
     re.I)
 
+_TICKED_RE = re.compile(r"^\s*[-*] \[([xX])\]\s+(.*?)\s*$")
 URL_RE = re.compile(r"\bhttps://[^\s`\"'<>)]+")
 _SPAN_RE = re.compile(r"`([^`\n]+)`|\"([^\"\n]+)\"")
 _GH_WRITE = re.compile(r"(?:^|\s)(?:-X|--method|-f|-F|--field|--raw-field|--input|-H|--header)\b")
@@ -97,6 +106,8 @@ class Check(NamedTuple):
 def kind(text: str) -> str:
     """The kind of one acceptance criterion: code, live or operator."""
     clean = " ".join((text or "").split())
+    if decision(clean):
+        return OPERATOR
     if tickets.LIVE_CRITERION_RE.match(clean):
         return LIVE
     if TEST_RE.search(clean):
@@ -107,6 +118,48 @@ def kind(text: str) -> str:
             or claimed.live_box(clean)):
         return LIVE
     return CODE
+
+
+def decision(text: str) -> bool:
+    """Whether one acceptance criterion asks the operator for a decision:
+    its text starts with "Operator decides" or "Decision:", or it carries
+    DECISION_MARKER. Only an operator ticks one."""
+    clean = " ".join((text or "").split())
+    return bool(DECISION_RE.match(clean)) or DECISION_MARKER in (text or "")
+
+
+def _norm(text: str) -> str:
+    return " ".join((text or "").split()).casefold()
+
+
+def open_decisions(body: str) -> List[str]:
+    """The texts of the body's unticked decision boxes."""
+    return [text for checked, text in proof.criteria(body or "")
+            if not checked and decision(text)]
+
+
+def decision_ticks(before: str, after: str) -> List[str]:
+    """The decision boxes ticked in `after` that `before` (the ticket body a
+    lane was briefed with) had unticked: ticked while the lane ran."""
+    was_open = {_norm(t) for t in open_decisions(before)}
+    return [text for checked, text in proof.criteria(after or "")
+            if checked and decision(text) and _norm(text) in was_open]
+
+
+def untick(body: str, texts: Sequence[str]) -> str:
+    """The body with each acceptance criterion named in `texts` unticked;
+    every other line, and the body's line endings, stay as they were."""
+    wanted = {_norm(t) for t in texts}
+    out: List[str] = []
+    inside = False
+    for line in (body or "").split("\n"):
+        if line.startswith("## "):
+            inside = line.strip() == "## Acceptance criteria"
+        match = _TICKED_RE.match(line.rstrip("\r")) if inside else None
+        if match and _norm(match.group(2)) in wanted:
+            line = line[:match.start(1)] + " " + line[match.end(1):]
+        out.append(line)
+    return "\n".join(out)
 
 
 def key(text: str) -> str:
@@ -240,6 +293,17 @@ def run(check: Check, gh: Any,
     return ok, seen + found
 
 
+# How the verification ask opens. bus/needs_you.py reads a trusted comment
+# carrying it as the station's tag, apart from an ask a person wrote.
+ASK_OPENING = ("This ticket shipped, but Loom closes a ticket only when every "
+               "acceptance criterion has evidence")
+
+
+def is_verification_ask(text: Any) -> bool:
+    """`text` is the ask of `ask`, the station's own verification tag."""
+    return ASK_OPENING in " ".join(str(text or "").split())
+
+
 def ask(gaps: Sequence[Tuple[str, str]], failed: Dict[str, str]) -> str:
     """The one ask for a shipped ticket Loom cannot verify on its own."""
     lines = []
@@ -248,10 +312,9 @@ def ask(gaps: Sequence[Tuple[str, str]], failed: Dict[str, str]) -> str:
                                          else "no check Loom can run")
         lines.append("%s (%s)" % (" ".join(text.split())[:ASK_WIDTH], why))
     more = " and %d more" % (len(gaps) - ASK_SHOWN) if len(gaps) > ASK_SHOWN else ""
-    return ("Kind: decision\nThis ticket shipped, but Loom closes a ticket only when every "
-            "acceptance criterion has evidence, and these have none it can gather: %s%s. "
+    return ("Kind: decision\n%s, and these have none it can gather: %s%s. "
             "Check each one, tick it, and close the ticket, or reopen the work if one does "
-            "not hold." % ("; ".join(lines), more))
+            "not hold." % (ASK_OPENING, "; ".join(lines), more))
 
 
 def lane_ticks(ticket_body: str, pull_body: str) -> List[str]:

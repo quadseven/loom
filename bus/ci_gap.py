@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+from datetime import datetime
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import quote
 
@@ -51,18 +52,35 @@ COMMAND_SHOWN = 400
 _TRIVIAL = re.compile(r"^(?:cd|echo|set|export|source|\.|true|:|mkdir|printf|shopt|ulimit)(?:\s|$)")
 _SPLIT = re.compile(r"\s*(?:&&|\|\||;)\s*")
 _EXPR = re.compile(r"\$\{\{.*?\}\}")
+# Runner setup, not the repo's code (loom#1942): a system package manager's
+# install, update or upgrade, with sudo, env and VAR=value before it.
+_PACKAGES = re.compile(
+    r"^(?:sudo(?:\s+-\S+)*\s+)?(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
+    r"(?:apt-get|apt|apk|dnf|yum|microdnf|zypper|brew)\s+(?:-\S+\s+)*"
+    r"(?:install|update|upgrade|add|makecache)(?:\s|$)")
+# Shell control and a tool's version printed after the install: what a setup
+# step runs around its package manager.
+_SETUP_GLUE = re.compile(
+    r"^(?:do|done|then|else|fi|esac|break|continue|exit(?:\s+\d+)?|sleep\s+\S+"
+    r"|for\s.*|case\s.*|\[\s.*\]|\[\[\s.*\]\]|test\s.*"
+    r"|(?:command\s+-v|which|type)\s+\S+"
+    r"|\S+\s+(?:--version|-V|version)(?:\s*\|\s*head(?:\s+-n)?\s+-?\d+)?)$")
+_KEYWORD = re.compile(r"^(?:if|elif|while|until|!)\s+")
 
 
 class Step(NamedTuple):
     name: str
     command: str
     workdir: str
+    # Its timeout-minutes (0 when it has none).
+    timeout: float = 0
 
 
 class Job(NamedTuple):
     ident: str
     name: str
     steps: List[Step]
+    timeout: float = 0
 
 
 class Gap(NamedTuple):
@@ -121,7 +139,8 @@ def _steps(lines: List[str], start: int, end: int, job_workdir: str) -> List[Ste
     def close() -> None:
         if current and current.get("run"):
             found.append(Step(current.get("name", ""), current["run"],
-                              current.get("working-directory", job_workdir)))
+                              current.get("working-directory", job_workdir),
+                              _minutes(current.get("timeout-minutes", ""))))
 
     for index, indent, line in _content(lines, start, end):
         item = re.match(r"^(\s*-\s+)(\S.*)$", line)
@@ -136,17 +155,25 @@ def _steps(lines: List[str], start: int, end: int, job_workdir: str) -> List[Ste
         name, rest = ship_paths._name(text)
         if name == "run":
             current["run"] = _scalar(lines, index, key_indent, rest)
-        elif name in ("name", "working-directory"):
+        elif name in ("name", "working-directory", "timeout-minutes"):
             current[name] = ship_paths._strip(rest)
     close()
     return found
+
+
+def _minutes(text: str) -> float:
+    """A timeout-minutes value; 0 for none or an expression."""
+    try:
+        return max(float(text), 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _job(lines: List[str], index: int, indent: int, ident: str) -> Job:
     """One job: its name, its run steps and the working-directory its
     defaults name before the steps."""
     job_end = _block_end(lines, index + 1, indent)
-    name, workdir, steps_at, child = ident, "", None, None
+    name, workdir, steps_at, child, timeout = ident, "", None, None, 0.0
     for c_index, c_indent, c_line in _content(lines, index + 1, job_end):
         child = c_indent if child is None else child
         key, rest = ship_paths._name(c_line)
@@ -154,12 +181,15 @@ def _job(lines: List[str], index: int, indent: int, ident: str) -> Job:
             name = ship_paths._strip(rest) or ident
         elif c_indent == child and key == "steps":
             steps_at = (c_index, c_indent)
+        elif c_indent == child and key == "timeout-minutes":
+            timeout = _minutes(ship_paths._strip(rest))
         elif key == "working-directory" and c_indent > child and steps_at is None:
             workdir = ship_paths._strip(rest)
     if steps_at is None:
-        return Job(ident, name, [])
+        return Job(ident, name, [], timeout)
     start = steps_at[0] + 1
-    return Job(ident, name, _steps(lines, start, _block_end(lines, start, steps_at[1]), workdir))
+    return Job(ident, name, _steps(lines, start, _block_end(lines, start, steps_at[1]), workdir),
+               timeout)
 
 
 def workflow_jobs(text: str) -> List[Job]:
@@ -207,24 +237,68 @@ def find_job(jobs: Sequence[Job], run_name: str) -> Optional[Job]:
     return None
 
 
+def _seconds(item: Any) -> Optional[float]:
+    """How long a job or step of the Actions job API ran; None when unknown."""
+    if not isinstance(item, dict):
+        return None
+    try:
+        start = datetime.strptime(str(item.get("started_at") or ""), "%Y-%m-%dT%H:%M:%SZ")
+        end = datetime.strptime(str(item.get("completed_at") or ""), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return (end - start).total_seconds()
+
+
+def timed_out(timeout: float, item: Any) -> bool:
+    """Whether a job or step with this timeout-minutes ran into it: the
+    Actions API reports a timed-out step as a plain failure."""
+    took = _seconds(item)
+    return bool(timeout) and took is not None and took >= timeout * 60 - 1
+
+
 def failing_steps(job: Job, api_steps: Sequence[Any]) -> List[Step]:
     """The job's run steps the Actions job API reports as failed; every run
     step when a step failed but none can be matched, and none when the API
     reports no failed step. An unnamed run step is reported as
-    "Run <first line of its command>"."""
-    failed = [str(s.get("name") or "") for s in api_steps
-              if isinstance(s, dict) and s.get("conclusion") == "failure"]
+    "Run <first line of its command>". A step that ran into its own
+    timeout-minutes failed for the runner, not the change, and is left out
+    (loom#1942)."""
+    failed = [s for s in api_steps if isinstance(s, dict) and s.get("conclusion") == "failure"]
     found: List[Step] = []
-    for name in failed:
+    unmatched = False
+    for api in failed:
+        name = str(api.get("name") or "")
+        matched = False
         for step in job.steps:
             first = step.command.strip().splitlines()[0] if step.command.strip() else ""
             if (step.name and name == step.name) or (
                     not step.name and name.startswith("Run ") and first.startswith(name[4:].strip())):
-                found.append(step)
+                matched = True
+                if not timed_out(step.timeout, api):
+                    found.append(step)
+        unmatched = unmatched or not matched
     # A failed step this reader cannot match (a renamed or composite step)
     # still names the job's commands; a job with no failed step at all (it
     # was cancelled or timed out) names none, so nothing it runs is a gap.
-    return found or (list(job.steps) if failed else [])
+    return found or (list(job.steps) if unmatched else [])
+
+
+def setup_only(command: str) -> bool:
+    """Whether a run command only installs system packages (apt-get, apk,
+    dnf, brew and the like) around shell control and version prints, so it
+    runs none of the repo's code: its failure is the runner's, and the
+    contract line it would suggest makes every lane validation install
+    those packages (loom#1942)."""
+    installs = False
+    for part in _parts(command):
+        part = _norm(_KEYWORD.sub("", part.strip()))
+        if not part:
+            continue
+        if _PACKAGES.match(part):
+            installs = True
+        elif not _SETUP_GLUE.match(part):
+            return False
+    return installs
 
 
 # ---- coverage -------------------------------------------------------------
@@ -244,17 +318,34 @@ def _norm(text: str) -> str:
     return " ".join(text.split())
 
 
+# Where a command's output goes, not what it checks: a stream merge, a
+# redirect to a file and a trailing tee into a log (loom#1977).
+_PLUMBING = re.compile(r"\s*(?:\d?>&\d|\d?>>?\s*[^\s&|;]+)(?=\s|$)")
+_TEE = re.compile(r"\s*\|\s*tee(?:\s+-\S+)*\s+[^\s|]+\s*$")
+# python3 and python3.12 run what python runs on a lane.
+_PYTHON = re.compile(r"(?<![\w./-])python3(?:\.\d+)?(?=\s|$)")
+
+
+def _plain(text: str) -> str:
+    """Text as coverage compares it: spaces collapsed, output plumbing
+    dropped and the python interpreter named one way."""
+    text = _TEE.sub("", _norm(text))
+    return _norm(_PYTHON.sub("python", _PLUMBING.sub("", text)))
+
+
 def covered(command: str, contract_text: str, workdir: str = "") -> bool:
     """Whether the contract runs the command: every part of it that checks
     something (not cd, echo, set, export) appears in the contract's setup,
     check or affected text, and so does the step's working directory when it
     has one (the same command run from the root runs another suite). A part
-    with a ${{ }} expression counts by its text before the expression."""
-    have = _norm(contract_text)
-    if workdir and _norm(workdir.split("${{", 1)[0]).rstrip("/") not in have:
+    with a ${{ }} expression counts by its text before the expression.
+    Output plumbing (2>&1, > file, a trailing | tee log) and python3 for
+    python do not change what a part runs (loom#1977)."""
+    have = " ".join(_plain(line) for line in contract_text.splitlines())
+    if workdir and _norm(workdir.split("${{", 1)[0]).rstrip("/") not in _norm(contract_text):
         return False
     for part in _parts(command):
-        part = _norm(part.split("${{", 1)[0])
+        part = _plain(part.split("${{", 1)[0])
         if part and part not in have:
             return False
     return True
@@ -348,25 +439,35 @@ class _Reads:
 
 
 def find_gaps(gh: Any, repo: str, pr: int, sha: str, fields: Dict[str, str],
-              failing: Sequence[Dict[str, Any]], changed: Callable[[], List[str]]) -> List[Gap]:
+              failing: Sequence[Dict[str, Any]], changed: Callable[[], List[str]],
+              say: Optional[Callable[[str], None]] = None) -> List[Gap]:
     """The gaps in the failing GitHub Actions check runs of a lane pull
     request's head: for each run, its job's failing steps whose commands
     the contract (its fields, contract_fields on the base branch) does not
     run. `changed` lists the pull request's files, read only when a gap's
-    workflow has a paths filter."""
+    workflow has a paths filter. A run that was cancelled or timed out, and
+    a step that only installs system packages, is the runner's failure and
+    no gap (loom#1942); `say` logs the step left out."""
+    say = say or (lambda _line: None)
     have = "\n".join(fields.get(k, "") for k in ("setup", "check", "affected"))
     reads = _Reads(gh, repo, sha, changed)
     gaps: List[Gap] = []
     for run in failing:
+        if run.get("conclusion") in ("cancelled", "timed_out"):
+            continue
         path, job_data = _run_workflow(gh, repo, run)
         text = reads.text(path) if path else None
         job = find_job(workflow_jobs(text), str(run.get("name") or job_data.get("name") or "")) \
             if text is not None else None
-        if job is None:
+        if job is None or timed_out(job.timeout, job_data):
             continue
         paths = pull_request_paths(text)
         for step in failing_steps(job, job_data.get("steps") or []):
             if covered(step.command, have, step.workdir):
+                continue
+            if setup_only(step.command):
+                say("validation gap: %s#%d CI job %s step %s only installs system packages; "
+                    "not a gap" % (repo, pr, job.name, step.name or "run step"))
                 continue
             command = _with_workdir(step)
             gaps.append(Gap(repo, pr, path, job.name, step.name or "run step", command,
