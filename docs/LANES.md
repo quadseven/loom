@@ -2138,9 +2138,20 @@ class, one line per behavior change, and the counts of files by class:
 ```
 ## Intent
 Class: logic
+Risk: app-code, two-way door, blast radius repo
 - Fix the thing for every user
 Files: 1 logic, 1 tests
 ```
+
+The Risk line (`bus/risk_line.py`) lets review sort by risk from the pull
+request page. The tier is `bus/merge_tier.py`'s, also set as a `tier:<name>`
+label, and only reports: tiers keep deciding what Loom may merge. The lane
+writes the door and blast radius in a `## Risk` section of `.loom/summary.md`
+(`Door: two-way`, `Blast radius: repo`). The runner forces one-way when the
+diff touches a migration, deletes a tracked data file, or the pull request
+lists an operator step. A lane that says nothing reads `door unstated`, never
+two-way. The line and label are set when the pull request opens; a later push
+does not change them.
 
 The behavior lines come from the lane's final summary: the agent writes
 one line per behavior change to `.loom/summary.md` at the top of its

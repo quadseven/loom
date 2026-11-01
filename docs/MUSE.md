@@ -259,8 +259,11 @@ steps on each tick:
    branch. Keep a heartbeat current while working with
    `python3 -m bus.lane heartbeat OWNER/NAME#N --lane muse`.
 4. Open the pull request with `python3 -m bus.lane pr OWNER/NAME#N
-   --base BASE`. The command writes the standard Intent section, class label
-   and ticket reference, then moves the ticket to `loom:pr`.
+   --base BASE`. The command writes the standard Intent section with its Risk
+   line, the class and tier labels and the ticket reference, then moves the
+   ticket to `loom:pr`. A `## Risk` section in `.loom/summary.md` supplies the
+   door and blast radius (docs/LANES.md); without one the line reads
+   `door unstated`.
 5. Journal one line on the ticket describing the result.
 
 Claims expire after two hours without a heartbeat. A claim without a pull

@@ -71,6 +71,7 @@ that talks to GitHub about tickets.
 | `loom:regression` | A ticket admitted for a measured regression of a shipped ticket (`brief --regresses`). Claimed and landed before other tickets. |
 | `loom:revert` | A ticket the station filed to revert the merge that turned a default branch red (see Red default branch). Claimed and landed before every other ticket. |
 | `class:logic` | A change to behavior; every revert ticket carries it. |
+| `tier:<name>` | The pull request's `bus/merge_tier.py` tier when it opened. It reports and decides nothing. |
 
 A ticket carries exactly one state label. The #35 states are queued,
 briefed, pr, shipped and verified; `merged` keeps merged apart from deployed,
