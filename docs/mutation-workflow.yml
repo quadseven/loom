@@ -1,0 +1,52 @@
+name: mutation
+
+# A weekly spot mutation run over the critical bus seams, with a survivor
+# ratchet (bus/mutation_run.py). It runs this repo's own main only, so it needs
+# no trial sandbox, and it makes no model call. The engine is the pure
+# mutate.py of the review bot's Smasher persona, read at a pinned commit;
+# Smasher itself stays off. Bump the pin on purpose and rerecord the baseline.
+#
+# This file lives in docs/ because an agent App cannot write .github/workflows.
+# The operator moves it to .github/workflows/mutation.yml to start the schedule.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: mutation
+  cancel-in-progress: false
+
+jobs:
+  spot-mutation:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Above the run's own 25 minute cap, which reports partial coverage.
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+      - name: Fetch the pinned engine
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: quadseven/grug
+          ref: 111c5fceedd7d95f22024ca796b3b2778d2da490
+          path: .engine
+          persist-credentials: false
+      # No token here: this step runs mutated code.
+      - name: Spot mutation run
+        run: python -B -m bus.mutation_run --engine .engine/services/_shared/personas/smasher/mutate.py --engine-sha 111c5fceedd7d95f22024ca796b3b2778d2da490 --report mutation-report.json
+      - name: Rolling issue
+        if: ${{ !cancelled() && hashFiles('mutation-report.json') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -B -m bus.mutation_run --post mutation-report.json --issue "$GITHUB_REPOSITORY"
