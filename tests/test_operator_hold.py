@@ -521,7 +521,9 @@ class BrainMerge(unittest.TestCase):
         routes = {"/repos/%s/issues/9" % BRAIN_REPO: {
                       "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]},
                   "/repos/%s/pulls/8/files" % BRAIN_REPO: [{"filename": "bus/a.py"}],
-                  "/repos/%s/pulls/8" % BRAIN_REPO: {"mergeable": True}}
+                  "/repos/%s/pulls/8" % BRAIN_REPO: {
+                      "mergeable": True, "base": {"ref": "main"}, "head": {"sha": "checked"}},
+                  "/repos/%s/compare/main...checked" % BRAIN_REPO: {"behind_by": 0}}
         lines = brain._pull_request_lines(GitHub("t", transport=Route(routes)), BRAIN_REPO, [pr],
                                           {"prs": {8: node}}, "grug-tribe")
         self.assertIn("blocked: held for the operator", lines[1])

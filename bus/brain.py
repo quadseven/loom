@@ -4265,7 +4265,7 @@ def _behind_by(gh: GitHub, repo: str, pr: Dict[str, Any]) -> int:
     base = str((pr.get("base") or {}).get("ref") or "")
     head = str((pr.get("head") or {}).get("sha") or "")
     if not base or not head:
-        return 0
+        raise ValueError("pull request has no base ref or head sha to compare")
     data = gh.rest("GET", "/repos/%s/compare/%s...%s"
                    % (repo, quote(base, safe=""), head)).data or {}
     return int(data.get("behind_by") or 0)
@@ -4318,7 +4318,10 @@ def _behind_refusal(gh: GitHub, repo: str, number: int, pr: Dict[str, Any], tier
     or reverted them already, so the inverse proven against the old base no
     longer holds. A read that fails gives no exemption."""
     if tier != merge_tier.REVERT:
-        return BEHIND_REFUSAL if _behind_by(gh, repo, pr) else ""
+        try:
+            return BEHIND_REFUSAL if _behind_by(gh, repo, pr) else ""
+        except ValueError as err:
+            return str(err)
     try:
         behind = _behind_by(gh, repo, pr)
         if not behind:
