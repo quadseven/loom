@@ -19,6 +19,7 @@ TARGETS = (
     ("bus/brain.py", "_status_pass"),
     ("bus/station.py", "Station._deliver_unlinked"),
     ("bus/station.py", "Station._claim"),
+    ("bus/station.py", "Station._apply_adapter_verify"),
 )
 
 

@@ -2103,6 +2103,16 @@ adapter keep themselves read-only (a SELECT-only user, a reader that cannot
 exec). An adapter error, a timeout or too much output is no evidence, and the
 status line names it.
 
+When an opted-in repo has a prose Live box with no runnable check, the
+station hands a shipped ticket to a verify lane before asking a person. The
+brief lists that adapter's log sources and whether its SQL route is available.
+The lane may return one `adapter_step`: `log:<source>` with required strings,
+or `sql:<SELECT ...>` with strings that must occur in the rows. The station
+validates and runs the step through the repo adapter itself; lane prose never
+counts as evidence. A missing step or a failed station read raises one
+`loom:human` ask naming the attempted step and reason. Repos without an opted-in
+adapter keep the existing ask path.
+
 ### The evidence close
 
 By the operator's ruling of 2026-10-31 (loom#2325), one close revises the
