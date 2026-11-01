@@ -846,6 +846,25 @@ alone. A repo in shadow records the reopen instead. Each
 pass logs `close audit: N closes read, M refused, K waiting`. That line is
 what a journal states.
 
+### Review and guard debt
+
+Review is routine, so the station reports when it stops. Once an hour it reads
+the goal home for the newest Loom review journal, a comment whose first line
+starts `Loom review`, and the `loom:factory` tickets with a line starting
+`The guard` (`bus/review_debt.py`). A guard is `open`, `shipped` (a merged pull
+request that names it, lands on the default branch, and adds or changes a test
+file), or closed with no check. A review counts only from a listed login:
+`LOOM_BRIEF_AUTHORS` and `LOOM_REVIEW_AUTHORS`, whose default is the fleet's
+three brains.
+
+A review over 7 days old raises the rolling `review-overdue` invariant, and a
+guard closed with no check raises the rolling `guard-no-check`. A ticket still
+unreadable after 5 tries raises the rolling `guard-unreadable`. All are edited
+in place, and a new review clears the first. A failed read says unknown, never
+healthy. The journal scoreboard's line comes from:
+
+    python3 -m bus.review_debt line OWNER/NAME#N
+
 ## Trust
 
 Briefs become agent prompts, and the runner pushes with the operator's

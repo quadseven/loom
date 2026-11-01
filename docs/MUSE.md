@@ -220,6 +220,9 @@ project goals. Muse, the lane machine's tick and the operator's interactive
 session are peers here: each improves the brain and the factory, through
 tickets and pull requests like any other work.
 
+- Each tick, add a `- Scoreboard:` line to the journal, copied from
+  `python3 -m bus.review_debt line OWNER/NAME#N`, naming the goal home
+  (docs/BRAIN.md, Review and guard debt).
 - Each tick, note in the journal what slowed the factory down, one
   `- Friction:` line each (docs/BRAIN.md, Journal): a lane PR that failed
   for a reason the runner could catch, a step done by hand that the station
