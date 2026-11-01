@@ -1928,7 +1928,7 @@ class Filer:
         if (any(n.startswith("needs:") for n in labels) or TICKET_LABEL in labels
                 or invariant not in self.read):
             return True
-        if self.writes + 2 > WRITES_MAX:
+        if self.writes + FOLD_WRITES > WRITES_MAX:
             return False
         into = self._rolled_into(key, current)
         at = _epoch(issue.get("created_at"))
