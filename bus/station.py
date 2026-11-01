@@ -41,6 +41,7 @@ from . import brain_hold
 from . import claimed
 from . import claim_referee
 from . import close_audit
+from . import closing
 from . import decision_claim
 from . import evidence_close
 from . import journal
@@ -10203,17 +10204,16 @@ class Station:
         if error:
             _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
         try:
-            self._routine(repo, number, "Closed: %s. %s Not verified live; its criteria "
-                          "were not ticked one by one."
-                          % (reason, verify_data.close_facts(branch, pulls, error)))
             # force-close is the close-completeness guard's escape hatch:
             # this close is by rule, not a claim that each box was seen to
             # hold. Without it the guard reopened 46 of 175 such closes,
             # each with an email (2026-10-19).
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": marks})
-            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
-                         {"state": "closed", "state_reason": "completed"})
+            closing.close(self.gh, repo, number,
+                          "Closed: %s. %s Not verified live; its criteria were not ticked "
+                          "one by one." % (reason, verify_data.close_facts(branch, pulls, error)),
+                          "completed")
             kept = brain.closing_labels(_label_names(issue), self.s.authors)
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": kept + [m for m in marks if m not in kept]})
@@ -10972,8 +10972,8 @@ class Station:
             pacer.wait()
             self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
         pacer.wait()
-        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
-                     {"state": "closed", "state_reason": "completed"})
+        # Posted above, or by an earlier pass the marker names.
+        closing.close(self.gh, repo, number, comment, "completed", said=True)
         _say("settle-claimed: closed %s#%d, merged as PR %s" % (repo, number, shown))
         return 1
 

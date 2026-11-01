@@ -1365,6 +1365,22 @@ that fails posts nothing, so a bad API answer cannot start a second comment.
   withheld; they stay in the lane log and on the ticket. A public repo's
   detail that fails the public repo leak scan is withheld the same way.
 
+## A close says why first
+
+Every close and reopen goes through `bus/closing.py` (loom#2444). It posts a
+plain-English reason in the thread, then changes the state. It refuses an empty
+reason, and a reason that is only an HTML comment. It sends no state change when
+the post fails, and it asks shadow mode and the acceptance-criteria check first,
+so a refused close leaves no comment saying it closed. Machine data in a reason
+goes in an HTML comment, since ticket comments are read as email.
+
+`python3 -m bus.brain close` with no `--note` says the proof on a completed
+close; `--reason not_planned` needs `--note`. `tests/test_closing_gateway.py`
+fails on any direct state write, and on a shell close with no `--comment`. A
+close costs two writes, and each bulk path keeps its cap: `CLOSE_DONE_PER_PASS`,
+the invariants and watch `WRITES_MAX`, `FOLD_MAX`, and the factory and sweep
+`MAX_ACTIONS`.
+
 ## Where a new comment is posted
 
 Every new comment on an issue or pull request goes through `notify.post` in

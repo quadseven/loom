@@ -1016,12 +1016,41 @@ def _gh_item(found: Request) -> Any:
         return None
 
 
+def _says_no_reason(argv: Sequence[str]) -> bool:
+    """Whether this gh command closes or reopens with no --comment reason
+    (bus/closing.py holds the same rule for Python, loom#2444). gh posts the
+    comment first and stops when that post fails."""
+    args = list(argv)
+    if not any(pair[0] in ("issue", "pr") and pair[1] in ("close", "reopen")
+               for pair in zip(args, args[1:])):
+        return False
+    for index, arg in enumerate(args):
+        if arg.startswith("--comment="):
+            return not arg.partition("=")[2].strip()
+        if arg in ("--comment", "-c"):
+            return index + 1 >= len(args) or not args[index + 1].strip()
+    return True
+
+
 def gh_guard(cwd: str, argv: Sequence[str], source: str = "brain rung gh",
              read_item: bool = False) -> int:
     """0 when the gh command may run; 1, after recording it, when shadow mode
     holds it. Any doubt holds it. Only run_lane.sh's own closes (read_item,
     --lane) read the issue and let a factory incident go: the brain rung's
-    model chooses its own arguments, so its closes and reopens are held."""
+    model chooses its own arguments, so its closes and reopens are held. A
+    rung's close or reopen with no reason is refused, shadow on or off; the
+    lane's own passes its reason to gh after this check."""
+    if _held_gh(cwd, argv, source, read_item):
+        return 1
+    if not read_item and _says_no_reason(argv):
+        print("gh close and reopen need --comment saying why, in plain English "
+              "(docs/BRAIN.md, A close says why first).", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _held_gh(cwd: str, argv: Sequence[str], source: str, read_item: bool) -> int:
+    """gh_guard's shadow check: 1, after recording it, when shadow holds it."""
     try:
         found = gh_request(argv, cwd)
     except Exception as err:  # noqa: BLE001 - a command it cannot read is held

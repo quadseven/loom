@@ -11252,8 +11252,8 @@ class CloseDoneTest(Base):
         self.assertEqual(self.fake.issues[5]["state_reason"], "completed")
         self.assertIn("force-close", self.fake.names(5))
         self.assertNotIn("force-close", self.fake.names(2))
-        plain = [c["body"] for c in self.fake.comments[5] if not status.is_status(c.get("body"))]
-        self.assertEqual(plain, [])
+        (said,) = [c["body"] for c in self.fake.comments[5] if not status.is_status(c.get("body"))]
+        self.assertIn("Closed:", said)
 
     def test_a_shipped_ticket_of_unproven_host_checks_stays_open(self):
         # 2026-10-22: a ticket whose criteria were all host checks closed as
@@ -11278,7 +11278,7 @@ class CloseDoneTest(Base):
 
     def close_text(self, number):
         return "\n".join(c["body"] for c in self.fake.comments[number]
-                         if status.is_status(c.get("body")))
+                         if not status.is_status(c.get("body")))
 
     def test_a_shipped_ticket_with_a_time_window_earlier_than_the_log_start_closes(self):
         # A shipped ticket whose Live line names a time window that ended before

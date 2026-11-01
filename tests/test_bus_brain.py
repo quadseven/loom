@@ -2468,9 +2468,11 @@ class TextAndCloseTests(unittest.TestCase):
         self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
 
     def test_close_not_planned_needs_no_proof(self):
-        fake = Fake(reply(200, ticket("failed", UNCHECKED)), reply(200, {}), reply(200, []))
-        brain.close(GitHub("t", transport=fake), REPO, 9, "not_planned", env=ENV)
-        self.assertEqual(fake.calls[1][2], {"state": "closed", "state_reason": "not_planned"})
+        fake = Fake(reply(200, ticket("failed", UNCHECKED)), reply(201, {"id": 1}),
+                    reply(200, {}), reply(200, []))
+        brain.close(GitHub("t", transport=fake), REPO, 9, "not_planned", "No longer needed.", env=ENV)
+        self.assertEqual(fake.calls[1][2], {"body": "No longer needed."})
+        self.assertEqual(fake.calls[2][2], {"state": "closed", "state_reason": "not_planned"})
         # The closed ticket keeps no active state (loom#1393).
         self.assertEqual(fake.calls[-1][2], {"labels": ["loom:ticket", "lane:codex"]})
 
@@ -2478,10 +2480,16 @@ class TextAndCloseTests(unittest.TestCase):
         issue = ticket("queued", UNCHECKED)
         issue["labels"] += [{"name": x} for x in ("claim:brain-bot", "claim:other-op",
                                                   "wait:gate", "needs-brain")]
-        fake = Fake(reply(200, issue), reply(200, {}), reply(200, []))
-        brain.close(GitHub("t", transport=fake), REPO, 9, "not_planned", env=ENV)
+        fake = Fake(reply(200, issue), reply(201, {"id": 1}), reply(200, {}), reply(200, []))
+        brain.close(GitHub("t", transport=fake), REPO, 9, "not_planned", "No longer needed.", env=ENV)
         self.assertEqual(fake.calls[-1][2],
                          {"labels": ["loom:ticket", "lane:codex", "claim:other-op"]})
+
+    def test_a_drop_with_no_note_is_refused_before_any_write(self):
+        fake = Fake()
+        with self.assertRaises(ValueError):
+            brain.close(GitHub("t", transport=fake), REPO, 9, "not_planned", " ", env=ENV)
+        self.assertEqual(fake.calls, [])
 
     def test_a_verified_ticket_keeps_the_state_that_says_how_it_ended(self):
         self.assertEqual(
@@ -2607,10 +2615,11 @@ class ProofTests(unittest.TestCase):
         self.assertEqual(proof.read(body)["contract"], proof.contract(TICKET_BODY))
 
     def _close(self, issue, comments, env=ENV):
-        # Replies: the issue, its comments, the issue again for the
-        # transport-layer close-completeness gate, then the close PATCH.
+        # Replies: the issue, its comments, the issue for bus/closing.py's
+        # close-completeness check, the reason comment, the issue again for
+        # the transport-layer check, then the close PATCH.
         fake = Fake(reply(200, issue), reply(200, comments), reply(200, issue),
-                    reply(200, {}))
+                    reply(201, {"id": 1}), reply(200, issue), reply(200, {}))
         brain.close(GitHub("t", transport=fake), REPO, 9, env=env)
         return fake
 
@@ -2646,6 +2655,7 @@ class ProofTests(unittest.TestCase):
     def test_close_a_proven_ticket(self):
         older = self._proof_comment(proof_record=record(revision="0000000"))
         fake = self._close(ticket("verified"), [older, self._proof_comment(login="other")])
+        self.assertIn("Closed as completed: the ticket is verified", fake.calls[3][2]["body"])
         self.assertEqual(fake.calls[-1][2], {"state": "closed", "state_reason": "completed"})
 
     def test_criteria_are_read_only_from_their_section(self):

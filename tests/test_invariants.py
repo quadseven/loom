@@ -785,13 +785,12 @@ class SettledSubjectTest(StationBase):
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "closed", self.said)
         self.assertEqual(filed["state_reason"], "not_planned")
-        self.assertIn("pull request #660 merged at %s" % stamp(T0 + 100), filed["body"])
-        self.assertIn(invariants.CLEARED_TEXT, filed["body"])
-        self.assertEqual(self.notes(filed), [])
+        (note,) = self.notes(filed)
+        self.assertIn("pull request #660 merged at %s" % stamp(T0 + 100), note)
+        self.assertIn(invariants.CLEARED_TEXT, note)
         # A later pass writes nothing more, and no tracking issue is filed.
-        body = filed["body"]
         self.run_at(T0 + 2 * invariants.CHECK_EVERY)
-        self.assertEqual(filed["body"], body)
+        self.assertEqual(self.notes(filed), [note])
         self.assertEqual(self.breaches(), [])
 
     def test_a_lane_pull_closed_unmerged_closes_its_issue_too(self):
@@ -800,7 +799,7 @@ class SettledSubjectTest(StationBase):
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "closed", self.said)
         self.assertIn("pull request #660 was closed unmerged at %s" % stamp(T0 + 100),
-                      filed["body"])
+                      "".join(self.notes(filed)))
 
     def test_it_closes_whatever_labels_the_issue_carries(self):
         filed = self.legacy("lane-pr-stalled", "%s#660" % REPO,
@@ -818,8 +817,8 @@ class SettledSubjectTest(StationBase):
         (rolled,) = [i for i in self.breaches() if invariants.ROLL_MARKER in i["body"]]
         self.assertIn("#660: 2 review threads, no fix round", rolled["body"])
         self.assertEqual(filed["state"], "closed", self.said)
-        self.assertEqual(self.notes(filed), [])
-        self.assertIn("#%d lists this kind" % rolled["number"], filed["body"])
+        (note,) = self.notes(filed)
+        self.assertIn("#%d lists this kind" % rolled["number"], note)
 
     def test_an_issue_whose_finding_is_still_live_stays_open(self):
         """A live subject is never closed as settled: its line stays on the
@@ -867,8 +866,8 @@ class SettledSubjectTest(StationBase):
         self.gh.subs[(REPO, 40)] = [ticket(n, state="closed") for n in range(50, 65)]
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "closed", self.said)
-        self.assertEqual(self.notes(filed), [])
-        self.assertIn("epic #40 holds 15 tickets, within the cap of 15", filed["body"])
+        (note,) = self.notes(filed)
+        self.assertIn("epic #40 holds 15 tickets, within the cap of 15", note)
 
     def test_a_closed_epic_holding_many_tickets_files_nothing(self):
         self.gh.subs[(REPO, GOAL)] = [epic(40, state="closed")]
@@ -882,7 +881,7 @@ class SettledSubjectTest(StationBase):
         self.gh.subs[(REPO, 40)] = [ticket(n, state="closed") for n in range(50, 66)]
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "closed", self.said)
-        self.assertIn("epic #40 is closed", filed["body"])
+        self.assertIn("epic #40 is closed", "".join(self.notes(filed)))
 
     def test_a_merged_pr_without_subject_map_entry_settles_its_issue(self):
         """loom#2257: a lane-pr-stalled issue whose PR merged while the
@@ -893,8 +892,8 @@ class SettledSubjectTest(StationBase):
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "closed", self.said)
         self.assertEqual(filed["state_reason"], "not_planned")
-        self.assertIn("pull request #660 merged at %s" % stamp(T0 + 100), filed["body"])
-        self.assertIn(invariants.CLEARED_TEXT, filed["body"])
+        self.assertIn("pull request #660 merged at %s" % stamp(T0 + 100), "".join(self.notes(filed)))
+        self.assertIn(invariants.CLEARED_TEXT, "".join(self.notes(filed)))
 
     def test_an_open_pr_without_subject_map_entry_stays_open(self):
         """loom#2257: a lane-pr-stalled issue whose PR is still open but
@@ -915,7 +914,7 @@ class SettledSubjectTest(StationBase):
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "closed", self.said)
         self.assertIn("pull request #660 was closed unmerged at %s" % stamp(T0 + 100),
-                      filed["body"])
+                      "".join(self.notes(filed)))
 
 
 class SettleBeforeFilingTest(StationBase):

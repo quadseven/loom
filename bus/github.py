@@ -93,6 +93,50 @@ class ShadowHeld(GitHubError, ValueError):
         self.entry = entry or {}
 
 
+def refuse_incomplete_close(gh: Any, method: str, path: str, body: Any) -> None:
+    """Refuse a PATCH that would close an issue as completed while its
+    acceptance criteria are unchecked.
+
+    The brain's close() already refuses this, but a close that bypasses it
+    -- the conducted#209 close five seconds after its PR merged is the
+    shape -- used to land anyway and get reopened by the close-completeness
+    guard seconds later. Every programmatic close passes through rest(),
+    so refusing here makes the bad close impossible instead of merely
+    caught. bus/closing.py asks this too, before it posts the close
+    comment. Closes as not_planned, force-close/wontfix labels, pull
+    requests, and issues with no criteria at all are left alone, matching
+    the guard's own escape hatches.
+    """
+    if method != "PATCH" or not _ISSUE_PATH.match(path):
+        return
+    if not isinstance(body, dict) or body.get("state") != "closed":
+        return
+    if body.get("state_reason", "completed") != "completed":
+        return
+    # Re-entering rest() for the verification GET is safe: the
+    # method != "PATCH" check above stops any recursion. A failed read
+    # raises out of rest() before the PATCH is sent, so the close is
+    # refused; a 2xx read with no issue object in it refuses it too,
+    # rather than reading as an issue with no criteria (loom#656).
+    issue = gh.rest("GET", path).data
+    if not isinstance(issue, dict):
+        raise GitHubError(
+            "refusing to close %s as completed: cannot read the issue to "
+            "check its acceptance criteria" % path)
+    if "pull_request" in issue:
+        return
+    labels = [str(label.get("name") or "").lower()
+              for label in issue.get("labels") or []]
+    if any(name in labels for name in _FORCE_CLOSE_LABELS):
+        return
+    unchecked = [text for checked, text in
+                 proof.criteria(str(issue.get("body") or "")) if not checked]
+    if unchecked:
+        raise ValueError(
+            "refusing to close %s as completed with unchecked acceptance "
+            "criterion: %s" % (path, unchecked[0]))
+
+
 class RateLimited(GitHubError):
     """GitHub refused a call for budget: a 403 or 429 with no requests left in
     the window, or its secondary rate limit. `until` is when the window
@@ -714,7 +758,7 @@ class GitHub:
     def _rest(self, method: str, path: str, body: Any = None,
               etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
         acted = self._hold_in_shadow(method, path, body)
-        self._refuse_incomplete_close(method, path, body)
+        refuse_incomplete_close(self, method, path, body)
         url = self._url(path)
         # A caller's own ETag means the caller keeps the answer; otherwise
         # the cache does, when there is one.
@@ -823,48 +867,6 @@ class GitHub:
             return self._rest("GET", "/repos/%s/issues/%d" % (found.repo, found.number)).data
         except Exception:  # noqa: BLE001 - any failed read holds the action
             return None
-
-    def _refuse_incomplete_close(self, method: str, path: str, body: Any) -> None:
-        """Refuse a PATCH that would close an issue as completed while its
-        acceptance criteria are unchecked.
-
-        The brain's close() already refuses this, but a close that bypasses it
-        -- the conducted#209 close five seconds after its PR merged is the
-        shape -- used to land anyway and get reopened by the close-completeness
-        guard seconds later. Every programmatic close passes through rest(),
-        so refusing here makes the bad close impossible instead of merely
-        caught. Closes as not_planned, force-close/wontfix labels, pull
-        requests, and issues with no criteria at all are left alone, matching
-        the guard's own escape hatches.
-        """
-        if method != "PATCH" or not _ISSUE_PATH.match(path):
-            return
-        if not isinstance(body, dict) or body.get("state") != "closed":
-            return
-        if body.get("state_reason", "completed") != "completed":
-            return
-        # Re-entering rest() for the verification GET is safe: the
-        # method != "PATCH" check above stops any recursion. A failed read
-        # raises out of rest() before the PATCH is sent, so the close is
-        # refused; a 2xx read with no issue object in it refuses it too,
-        # rather than reading as an issue with no criteria (loom#656).
-        issue = self.rest("GET", path).data
-        if not isinstance(issue, dict):
-            raise GitHubError(
-                "refusing to close %s as completed: cannot read the issue to "
-                "check its acceptance criteria" % path)
-        if "pull_request" in issue:
-            return
-        labels = [str(label.get("name") or "").lower()
-                  for label in issue.get("labels") or []]
-        if any(name in labels for name in _FORCE_CLOSE_LABELS):
-            return
-        unchecked = [text for checked, text in
-                     proof.criteria(str(issue.get("body") or "")) if not checked]
-        if unchecked:
-            raise ValueError(
-                "refusing to close %s as completed with unchecked acceptance "
-                "criterion: %s" % (path, unchecked[0]))
 
     def _request(self, body: Any,
                  if_none_match: Optional[str]) -> Tuple[Dict[str, str], Optional[bytes]]:
