@@ -1505,14 +1505,23 @@ cannot query the viewer or any other local service.
   shared limit. With nothing to keep, the brief stays in the inbox and the next
   pass picks another model, at most 3 times. A slot with every model paused
   reports unavailable until the first reset.
-- Paid Go runs serve build work only, never a verify, answer or review run,
-  and use only `bus/model_pick.py` `GO_PAID` (MiMo-V2.6-Flash and, on public
-  repos, Muse Spark 1.3 Contributor). All paid runs stop at 80% of each
-  published 5 hour, weekly and monthly limit, one model at 50%, and spending
-  within the billing period follows the calendar to the renewal (day 28,
-  `LOOM_GO_RENEWAL_DAY`), so the plan lasts the month. Spending is counted in
+- Paid Go runs serve build work only, never a verify, answer or review run. A
+  medium or hard ticket starts on `GO_STRONG` (GPT 6 Luna, then Claude Haiku
+  5.5), then free models without Beam Free, which takes easy tickets only. An
+  easy ticket runs free models, then MiMo-V2.6-Flash and, on public repos,
+  Muse Spark 1.3 Contributor. A ticket with no model left goes back as a limit,
+  never as a failure.
+- The plan guard reads `https://opencode.ai/zen/go/v1/usage` before a paid
+  run; the figures count every caller of the key. Paid runs stop at 60% rolling,
+  80% weekly and 90% monthly, and the weekly and monthly figures must stay under
+  that stop times the part of the window gone, plus 5 points. Usage that cannot
+  be read stops paid runs and free models carry on. One model may spend 50% of
+  its own published limit in any window, counted in
   `state/usage/go-budget.jsonl`.
-  Each run holds 500 requests until it settles; output and hidden reasoning
+- A failed review on a Go or Zen slot demotes the model
+  (`model:<id>` in the scorecard), not the slots: the picker skips it and the
+  slots go on. `python3 -m bus.scorecard clear model:<id>` clears it.
+  Each run holds up to 500 requests until it settles; output and hidden reasoning
   past 300 tokens per step count as more requests. DeepSeek V4.1 Flash is out
   because of its hidden reasoning. Extra usage stays off.
 - Each run logs `model pick:` and `model report:` lines: the model, why it

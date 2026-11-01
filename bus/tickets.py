@@ -33,8 +33,9 @@ FORBIDDEN_MODELS: Tuple[Tuple[str, str], ...] = (
     ("gpt-6-sol", "gpt-6-luna"),
     ("gemini-4-argon", "gemini-3.8-flash-high"),
 )
-# The only models an opencode-go lane may run: OpenCode Go's free models and
-# the paid ones with an allowance of at least 10,000 requests per 5 hours.
+# The only models an opencode-go lane may run: OpenCode Go's free models, the
+# paid ones with an allowance of at least 10,000 requests per 5 hours, and the
+# strong models bus/model_pick.py runs under its usage guard.
 # Kimi K2.7 Code (1,350 per 5 h) spent the Go plan's allowance in hours on
 # 2026-10-23 (operator: "why the hell are we using the most expensive
 # models... STOP THAT"). An allow-list, not a deny-list, so a model Go adds
@@ -48,6 +49,8 @@ OPENCODE_GO_MODELS: Tuple[str, ...] = (
     "opencode-go/mimo-v2.6-flash",              # 30,100
     "opencode-go/deepseek-v4.1-flash",          # 34,670
     "opencode-go/muse-spark-1.3-contributor",   # 45,300; trains on prompts
+    "opencode-go/gpt-6-luna",                   # 5,640; strong tier, guarded
+    "opencode-go/claude-haiku-5-5",             # 5,133; strong tier, guarded
 )
 # What a ticket's Model: line naming another opencode-go model runs instead.
 OPENCODE_GO_STAND_IN = "opencode-go/mimo-v2.6-flash"
