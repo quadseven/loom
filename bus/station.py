@@ -2152,6 +2152,9 @@ class Station:
         self._stale_asks_withdrawn = 0
         # Per pass: each path-scoped repo's workflow filters, and its deploy runs.
         self._path_filters: Dict[str, Dict[str, List[str]]] = {}
+        # Memoization cache for _carries: (repo, commit, revision) -> bool
+        # Does not cache 404 responses.
+        self._carries_cache: Dict[Tuple[str, str, str], bool] = {}
         self._manual_listed: Dict[str, List[str]] = {}
         self._path_runs: Dict[Tuple[str, str], Optional[Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]]] = {}
         # Repos whose claim:<login> label this pass has made sure of.
@@ -6286,10 +6289,16 @@ class Station:
     def _carries(self, repo: str, commit: str, revision: str) -> bool:
         """The commit is the revision or one of its ancestors in the repo on
         GitHub (the compare API); an unknown commit is not."""
+        key = (repo, commit, revision)
+        if key in self._carries_cache:
+            return self._carries_cache[key]
         resp = self.gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, commit, revision),
                             ok=(404,))
         data = resp.data if resp.status != 404 and isinstance(resp.data, dict) else {}
-        return data.get("status") in ("ahead", "identical")
+        result = data.get("status") in ("ahead", "identical")
+        if resp.status != 404:
+            self._carries_cache[key] = result
+        return result
 
     def _ship_published(self, source: str, short: str, deploy: str, pin: Dict[str, Any],
                         left: List[int]) -> bool:
@@ -6317,6 +6326,8 @@ class Station:
             deploy, int(pin["number"]), str(pin["merged_at"]).replace("T", " "),
             source, revision[:12])
         finished = True
+        if left[0] <= 0:
+            return False
         for _, number, pr in carried:
             if left[0] <= 0:
                 return False

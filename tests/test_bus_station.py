@@ -697,6 +697,56 @@ class StationReadBudgetTest(Base):
                               if "/issues/12/comments" in p]), 2)
 
 
+class CarriesMemoTest(Base):
+    """Tests for _carries memoization (station._carries and health._carries)."""
+
+    def test_station_carries_memoizes_same_triple(self):
+        """Repeated _carries call for same (repo, commit, revision) makes one request."""
+        self.fake.carried = {"abc1234"}
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        repo = REPO
+        commit = "abc1234"
+        revision = "def5678"
+
+        first = st._carries(repo, commit, revision)
+        second = st._carries(repo, commit, revision)
+        third = st._carries(repo, commit, revision)
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertTrue(third)
+        compare_calls = [c for c in self.fake.calls if c[0] == "GET" and "/compare/" in c[1]]
+        self.assertEqual(len(compare_calls), 1)
+
+    def test_station_carries_caches_behind_response(self):
+        """A 200 'behind' response is cached; subsequent calls use cache."""
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        repo = REPO
+        commit = "unknown123"
+        revision = "def5678"
+
+        first = st._carries(repo, commit, revision)
+        second = st._carries(repo, commit, revision)
+
+        self.assertFalse(first)
+        self.assertFalse(second)
+        compare_calls = [c for c in self.fake.calls if c[0] == "GET" and "/compare/" in c[1]]
+        self.assertEqual(len(compare_calls), 1)
+
+    def test_station_carries_different_triples_not_cached(self):
+        """Different (repo, commit, revision) triples are not cross-cached."""
+        self.fake.carried = {"abc1234", "def5678"}
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        repo = REPO
+
+        st._carries(repo, "abc1234", "rev1")
+        st._carries(repo, "def5678", "rev2")
+        st._carries(repo, "abc1234", "rev3")
+
+        compare_calls = [c for c in self.fake.calls if c[0] == "GET" and "/compare/" in c[1]]
+        self.assertEqual(len(compare_calls), 3)
+
+
 class ReconcilePullRequestTest(Base):
     def test_trusted_same_repo_open_pr_promotes_queued_ticket(self):
         self.fake.add(12, state="queued")

@@ -152,6 +152,10 @@ _COMMAND_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,39}(?:\.[a-z]{1,4})?")
 SHIP_PER_PASS = 20
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 SHIP_RUNS_URL = "/repos/%s/actions/workflows/%s/runs?status=success&event=push&branch=%s"
+
+# Memoization cache for _carries: (repo, commit, revision) -> bool
+# Does not cache 404 responses.
+_carries_cache: Dict[Tuple[str, str, str], bool] = {}
 PULL_FILES_MAX = 3000
 
 
@@ -247,6 +251,9 @@ def _next_link(link_header: str) -> Optional[str]:
 
 def _carries(gh: GitHub, repo: str, commit: str, revision: str) -> bool:
     """Check if commit is ancestor of revision (or identical)."""
+    key = (repo, commit, revision)
+    if key in _carries_cache:
+        return _carries_cache[key]
     try:
         resp = gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, commit, revision))
     except (GitHubError, ValueError, TypeError, AttributeError):
@@ -254,7 +261,9 @@ def _carries(gh: GitHub, repo: str, commit: str, revision: str) -> bool:
     if resp.status == 404:
         return False
     data = resp.data if isinstance(resp.data, dict) else {}
-    return data.get("status") in ("ahead", "identical")
+    result = data.get("status") in ("ahead", "identical")
+    _carries_cache[key] = result
+    return result
 
 
 def _deploy_runs(gh: GitHub, repo: str, workflow: str, branch: str) -> List[Dict[str, Any]]:

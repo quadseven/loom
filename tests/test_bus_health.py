@@ -563,6 +563,77 @@ class Sources(unittest.TestCase):
         self.assertIn("none", health.status_lines(None, "")[1])
 
 
+class HealthCarriesMemoTest(unittest.TestCase):
+    """Tests for health._carries memoization."""
+
+    def setUp(self):
+        class Reply:
+            def __init__(self, data, status=200):
+                self.data = data
+                self.status = status
+
+        class FakeGitHub:
+            def __init__(self):
+                self.carried = set()
+                self.calls = []
+
+            def rest(self, method, path, ok=()):
+                if method == "GET" and path.startswith("/repos/") and "/compare/" in path:
+                    self.calls.append((method, path))
+                    commit, revision = path.split("/compare/")[1].split("...", 1)
+                    if commit in self.carried:
+                        return Reply({"status": "ahead"})
+                    if 404 in ok:
+                        return Reply(None, 404)
+                    return Reply({"status": "behind"})
+                return Reply({})
+
+        self.fake = FakeGitHub()
+
+    def test_health_carries_memoizes_same_triple(self):
+        """Repeated _carries call for same (repo, commit, revision) makes one request."""
+        self.fake.carried = {"abc1234"}
+        repo = "example-owner/other-repo"
+        commit = "abc1234"
+        revision = "def5678"
+
+        first = health._carries(self.fake, repo, commit, revision)
+        second = health._carries(self.fake, repo, commit, revision)
+        third = health._carries(self.fake, repo, commit, revision)
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertTrue(third)
+        compare_calls = [c for c in self.fake.calls if "/compare/" in c[1]]
+        self.assertEqual(len(compare_calls), 1)
+
+    def test_health_carries_caches_behind_response(self):
+        """A 200 'behind' response is cached; subsequent calls use cache."""
+        repo = "example-owner/other-repo"
+        commit = "unknown123"
+        revision = "def5678"
+
+        first = health._carries(self.fake, repo, commit, revision)
+        second = health._carries(self.fake, repo, commit, revision)
+
+        self.assertFalse(first)
+        self.assertFalse(second)
+        compare_calls = [c for c in self.fake.calls if "/compare/" in c[1]]
+        self.assertEqual(len(compare_calls), 1)
+
+    def test_health_carries_different_triples_not_cached(self):
+        """Different (repo, commit, revision) triples are not cross-cached."""
+        self.fake.carried = {"abc1234", "def5678"}
+        repo = "example-owner/other-repo"
+
+        health._carries(self.fake, repo, "abc1234", "rev1")
+        health._carries(self.fake, repo, "def5678", "rev2")
+        health._carries(self.fake, repo, "abc1234", "rev3")
+
+        compare_calls = [c for c in self.fake.calls if "/compare/" in c[1]]
+        self.assertEqual(len(compare_calls), 3)
+
+
 class StationStep(unittest.TestCase):
     def test_settings_read_the_health_urls_and_interval(self):
         s = station.Settings.from_env({"LOOM_REPOS": REPO, "LOOM_HEALTH_URLS": "%s#1=%s" % (REPO, URL),

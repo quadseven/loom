@@ -200,5 +200,81 @@ class HeldTest(unittest.TestCase):
         self.assertTrue(audit.proven([proof_comment(9), audit_comment(7, "pass")], ["station-bot"]))
 
 
+class LabelledHourRoundTest(unittest.TestCase):
+    """Tests for audit._labelled rounding since to hour for ETag caching."""
+
+    def setUp(self):
+        class FakeGitHub:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, method, url, headers, body):
+                self.calls.append(url)
+                return 200, {}, b"[]"
+
+            def paginate(self, path):
+                return []
+
+        self.fake = FakeGitHub()
+        self.gh = GitHub("t", transport=self.fake)
+
+    def test_labelled_rounds_since_down_to_hour(self):
+        """Two calls within the same hour build the same URL."""
+        now = 1_700_000_000.0  # Some timestamp
+        since1 = now - 30 * 60  # 30 minutes ago
+        since2 = now - 45 * 60  # 45 minutes ago, same hour as since1
+
+        audit._labelled(self.gh, "example-owner/repo", "loom:verified", since1)
+        audit._labelled(self.gh, "example-owner/repo", "loom:verified", since2)
+
+        self.assertEqual(len(self.fake.calls), 2)
+        self.assertEqual(self.fake.calls[0], self.fake.calls[1])
+
+    def test_labelled_different_hours_different_urls(self):
+        """Calls in different hours build different URLs."""
+        now = 1_700_000_000.0
+        since1 = now - 30 * 60  # 30 minutes ago
+        since2 = now - 90 * 60  # 90 minutes ago, previous hour
+
+        audit._labelled(self.gh, "example-owner/repo", "loom:verified", since1)
+        audit._labelled(self.gh, "example-owner/repo", "loom:verified", since2)
+
+        self.assertEqual(len(self.fake.calls), 2)
+        self.assertNotEqual(self.fake.calls[0], self.fake.calls[1])
+
+    def test_due_returns_same_tickets_within_hour(self):
+        """due() returns same tickets when called twice within same hour."""
+        class FakeGitHub2:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, method, url, headers, body):
+                self.calls.append(url)
+                if "/issues?" in url and "labels=loom:verified" in url:
+                    return 200, {}, b'[{"number": 12, "title": "Test", "labels": [{"name": "loom:ticket"}]}]'
+                if "/issues/12/comments" in url:
+                    return 200, {}, b'[{"body": "<!-- loom:proof v1 -->\\nTick 2030-01-01T00:00:00Z, station-bot\\n\\n## Acceptance criteria\\n- [x] Test\\n", "user": {"login": "station-bot"}, "created_at": "2030-01-01T12:00:00Z"}]'
+                return 200, {}, b"[]"
+
+            def paginate(self, path):
+                # The GitHub client calls rest() internally, so we don't need to record here
+                # The transport's __call__ will be invoked by rest()
+                return []
+
+        fake = FakeGitHub2()
+        gh = GitHub("t", transport=fake)
+        now = 1_700_000_000.0
+        authors = ["station-bot"]
+
+        first = audit.due(gh, ["example-owner/repo"], authors, now)
+        second = audit.due(gh, ["example-owner/repo"], authors, now)
+
+        self.assertEqual(first, second)
+        # Verify only one call to the issues endpoint (second call should use cache)
+        issues_calls = [c for c in fake.calls if "/issues?" in c and "labels=loom:verified" in c]
+        self.assertEqual(len(issues_calls), 2)  # two calls made, but same URL
+        self.assertEqual(issues_calls[0], issues_calls[1])
+
+
 if __name__ == "__main__":
     unittest.main()
