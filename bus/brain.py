@@ -6423,6 +6423,29 @@ def _count_move(load: Dict[str, int], issue: Dict[str, Any], lane: str) -> None:
     load[lane] = load.get(lane, 0) + 1
 
 
+def past_move_cap(moves: int) -> bool:
+    """Whether a ticket moved `moves` times with no claim stops moving."""
+    from . import factory  # factory imports this module
+    cap = factory.move_cap()
+    return bool(cap) and moves >= cap
+
+
+def hold_unclaimed(gh: GitHub, repo: str, number: int, names: Sequence[str],
+                   moves: int) -> List[str]:
+    """Stop moving a ticket no lane took: the runaway hold and needs-brain,
+    where every mover stops and the brain sees it. Returns its labels."""
+    from . import factory  # factory imports this module
+    kept = sorted(set(names) | {"needs-brain", RUNAWAY})
+    gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+    notify.post(gh, repo, number,
+                "%s\nRunaway: moved %d times with no lane taking it (the cap is %d). It "
+                "moves no further; the ticket is held for brain review."
+                % (factory.MOVE_CAP_MARKER, moves, factory.move_cap()), notify.RUNAWAY)
+    print("brain: %s#%d held after %d moves with no claim" % (repo, number, moves),
+          file=sys.stderr)
+    return kept
+
+
 def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
              lanes_repo: str = "quadseven/loom") -> str:
     """Move a repeatedly stuck ticket to the lowest untried rung of the model
@@ -6462,6 +6485,11 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     if not history.reasons:
         raise ValueError("ticket is not repeatedly stuck")
     open_pr = int(found_pr["number"]) if found_pr is not None else None
+    moves = factory.unclaimed_moves(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)),
+                                    trusted_authors())
+    if past_move_cap(moves):
+        hold_unclaimed(gh, repo, number, names, moves)
+        return "needs-brain"
     pending_brain_fix = open_pr is not None and _pending_brain_fix(
         gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)), trusted_authors())
     finished = (_nothing_to_fix(gh, repo, open_pr)

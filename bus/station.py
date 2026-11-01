@@ -2571,7 +2571,7 @@ class Station:
         except ValueError as err:
             self._refuse(repo, issue, str(err))
             return False
-        fix, fix_comment_id = fix_source if fix_source else (None, None)
+        fix, fix_comment_id = self._live_fix(repo, number, fix_source)
         if self._held_before_claim(repo, issue, fix, comments):
             return False
 
@@ -4658,6 +4658,15 @@ class Station:
              % (repo, number, int(pr["number"])))
         return True
 
+    def _live_fix(self, repo: str, number: int, found: Optional[Tuple[tickets.Fix, Any]]
+                  ) -> Tuple[Optional[tickets.Fix], Any]:
+        """The fix ask and its comment id, or nothing. An ask for a merged pull
+        request the station already judged is spent: the ticket went back for
+        the rest, and the ask parked it at loom:pr on every brief (loom#2333)."""
+        if found is None or found[0].pr in tickets.judged_pulls(self._status_texts(repo, number)):
+            return None, None
+        return found
+
     def _held_before_claim(self, repo: str, issue: Dict[str, Any], fix: Any,
                            comments: List[Any]) -> bool:
         """A fix round its pull request blocks, or a new build the brief
@@ -5040,6 +5049,34 @@ class Station:
                         # Check if it moved to merged
                         if "loom:merged" in _label_names(ticket):
                             _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
+        for number, ticket in tickets_by_number.items():
+            self._clear_pull_gone(repo, number, ticket, open_prs)
+
+    def _clear_pull_gone(self, repo: str, number: int, ticket: Dict[str, Any],
+                         open_prs: List[Dict[str, Any]]) -> None:
+        """A ticket cannot hold loom:pr with no open pull request: it goes
+        back to the queue for a lane (loom#2333). Reconcile, above, has moved
+        every ticket whose pull request closed in the window it reads."""
+        names = _label_names(ticket)
+        allowed = {a.lower() for a in self.s.authors}
+        if ("loom:pr" not in names
+                or any(_covers_pr(ticket, repo, p) for p in open_prs
+                       if tickets._login(p.get("user")) in allowed)
+                or self._adopted_pull_number(ticket) is not None
+                or self._owned_elsewhere(repo, ticket)):
+            return
+        timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
+        if not tickets.pull_gone(timeline, repo, number, self.now, self.s.authors):
+            return
+        states = {"loom:" + state for state in brain.STATES}
+        kept = self._drop_claim(n for n in names if n not in states
+                                and not n.startswith(("lane:", WAIT)))
+        kept.append("loom:queued")
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        ticket["labels"] = [{"name": name} for name in kept]
+        self._routine(repo, number, "No open pull request carries this ticket, so it left "
+                      "loom:pr and is back at loom:queued.")
+        _say("%s#%d: loom:pr with no open pull request, requeued" % (repo, number))
 
     def _unlinked_tickets(self, repo: str, linked: Dict[int, Dict[str, Any]],
                           found: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
