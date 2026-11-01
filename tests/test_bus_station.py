@@ -880,6 +880,18 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("Third works.", note)
         self.assertNotIn("Second works", note)
 
+    def test_a_fix_round_leaves_a_ticket_claimed_for_outside_work_untouched(self):
+        # loom#2333: the hand-back pass re-briefed a ticket an outside
+        # contributor held and took the hold label off it.
+        self.fake.add(12, state="pr", body=BODY + "\n" + self.CRITERIA, lane="codex")
+        self.fake.issues[12]["labels"].append({"name": "claim:overflow"})
+        before = self.fake.names(12)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.hand_back()
+        st.reconcile_pull_requests()
+        self.assertEqual(self.fake.paths("PUT"), [])
+        self.assertEqual(self.fake.names(12), before)
+
     def test_the_requeue_note_names_every_open_box_of_any_kind(self):
         # loom#2333: six boxes were left and the note named one. A box read as
         # a live check is still open, so the ticket's next reader must see it.
@@ -13193,7 +13205,11 @@ class OwnershipHelpersTest(unittest.TestCase):
     def test_owned_elsewhere(self):
         self.assertIsNone(tickets.owned_elsewhere({}, AUTHORS))
         self.assertIsNone(tickets.owned_elsewhere(
-            {"assignees": [{"login": "Bob-Example"}, {"login": "carol-example"}]}, AUTHORS))
+            {"assignees": [{"login": "Bob-Example"}]}, AUTHORS))
+        # An outside person beside an operator holds it (loom#2333).
+        self.assertEqual(tickets.owned_elsewhere(
+            {"assignees": [{"login": "Bob-Example"}, {"login": "carol-example"}]}, AUTHORS),
+            "carol-example")
         self.assertEqual(tickets.owned_elsewhere(
             {"assignees": [{"login": "carol-example"}]}, AUTHORS), "carol-example")
         self.assertEqual(tickets.owned_elsewhere(
