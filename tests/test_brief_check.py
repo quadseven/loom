@@ -299,7 +299,7 @@ class StationClaim(unittest.TestCase):
         asks = [b["body"] for m, p, b in fake.writes if m == "POST" and p.endswith("/comments")]
         self.assertEqual(len(asks), 1)
         self.assertIn("<!-- loom:stale-brief source-124 -->", asks[0])
-        self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO, {"labels": ["loom:human"]}),
+        self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO, {"labels": ["needs:human"]}),
                       fake.writes)
 
     def test_a_health_ticket_with_no_cause_goes_to_the_brain(self):
@@ -350,7 +350,7 @@ class FactoryQueue(unittest.TestCase):
         worker = factory.Factory(self.gh, [self.repo], NOW, trusted=["alice-example"])
         worker.assign_queued()
         self.assertEqual(worker.waits["%s#7" % self.repo], "health ticket names no cause")
-        self.assertEqual(worker.waits["%s#8" % self.repo], "waits for a person (loom:human)")
+        self.assertEqual(worker.waits["%s#8" % self.repo], "waits for a person (needs:human)")
         self.assertEqual((self.lane_of(7), self.lane_of(8)), ([], []))
         self.assertNotIn("%s#9" % self.repo, worker.waits)
 
@@ -483,6 +483,54 @@ class SupersededOrBlocked(unittest.TestCase):
         self.assertNotIn("%s#7" % self.repo, worker.waits)
         self.assertTrue(any(n.startswith("lane:") for n in self.names(7)))
         self.assertNotIn("wait:blocked", self.names(7))
+
+class Criteria(unittest.TestCase):
+    """A brief is not dispatchable until each acceptance criterion is
+    restated as the check that proves it (loom#2162): a ticket with no
+    criteria can carry no proof checks, so it gets no lane. The runner
+    already parks such a brief as a work failure; the station now holds
+    the ticket for the brain instead of spending the claim and the lane
+    slot to learn it."""
+
+    NO_CRITERIA = ("## Why\n\nThe totals are wrong.\n\n"
+                   "## What\n\n- Fix the total.\n")
+    WITH_CRITERIA = (NO_CRITERIA + "\n## Acceptance criteria\n"
+                     "- [ ] A test fails without the fix and passes with it.\n")
+    EMPTY_SECTION = (NO_CRITERIA + "\n## Acceptance criteria\n\n## Size\nS\n")
+    SHORT_HEADING = (NO_CRITERIA + "\n## Acceptance\n"
+                     "- [ ] A test fails without the fix and passes with it.\n")
+    ANSWER = ("Deliverable: answer\n\n" + NO_CRITERIA)
+
+    def setUp(self):
+        self.fake = Route({"/repos/%s/issues/206/timeline" % REPO: []})
+
+    def check(self, body):
+        gh = GitHub("t", transport=self.fake)
+        return brief_check.check(gh, REPO, ticket(body=body), [], TRUSTED, "main")
+
+    def test_a_ticket_with_no_criteria_is_not_dispatchable(self):
+        got = brief_check.criteria_verdict(self.NO_CRITERIA)
+        self.assertEqual(got.kind, brief_check.CRITERIA)
+        self.assertIn("names no acceptance criteria", got.reason)
+        self.assertEqual(self.check(self.NO_CRITERIA).kind, brief_check.CRITERIA)
+
+    def test_an_empty_criteria_section_is_no_criteria(self):
+        self.assertIsNotNone(brief_check.criteria_verdict(self.EMPTY_SECTION))
+
+    def test_a_ticket_with_criteria_is_dispatchable(self):
+        self.assertIsNone(brief_check.criteria_verdict(self.WITH_CRITERIA))
+        self.assertIsNone(self.check(self.WITH_CRITERIA))
+
+    def test_the_short_acceptance_heading_counts(self):
+        # The runner reads criteria under "## Acceptance" too; a ticket it
+        # would build is not held.
+        self.assertIsNone(brief_check.criteria_verdict(self.SHORT_HEADING))
+
+    def test_an_answer_ticket_needs_no_criteria(self):
+        # An answer brief opens no pull request; the runner's criteria park
+        # never applied to it, and neither does this hold.
+        self.assertIsNone(brief_check.criteria_verdict(self.ANSWER))
+
 
 if __name__ == "__main__":
     unittest.main()

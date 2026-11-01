@@ -91,6 +91,10 @@ MONTHLY_RE='copilot.*(allowance|limit|quota|usage|request)|monthly ([a-z]+ )*(al
 # the model stays gone; free catalogs rotate within hours (2026-10-21: zen's
 # model was listed again within 13 hours, with the lane parked for 11 more).
 MODEL_GONE_RE='ProviderModelNotFoundError: Model not found'
+# GitHub Copilot Free's spent allowance. These words hold a lane for a month,
+# so they count only on the copilot lane and only in the last lines of its run:
+# a ticket, a diff or a file the agent read can say them on any lane.
+COPILOT_ALLOWANCE_RE='exceeded your [a-z ]*allowance|you have no quota'
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
 # A reset time the provider states ("try again at 11:46 PM", "try again at
@@ -112,16 +116,20 @@ done = False
 if m:
     hour = int(m.group(4)) % 12 + (12 if m.group(6).upper() == "PM" else 0)
     minute = int(m.group(5)) if m.group(5) else 0
-    now = datetime.now()
+    now = time.time()
     try:
         if m.group(1):
             at = datetime.strptime("%s %s %s" % (m.group(1).title(), m.group(2), m.group(3)), "%b %d %Y")
-            at = at.replace(hour=hour, minute=minute)
+            print(int(at.replace(hour=hour, minute=minute).timestamp()))
         else:
-            at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if at <= now:
-                at += timedelta(days=1)
-        print(int(time.mktime(at.timetuple())))
+            today = datetime.fromtimestamp(now).replace(hour=hour, minute=minute, second=0, microsecond=0)
+            # Compared as epochs: a clock change repeats an hour, and a time in
+            # it comes twice. A skipped time reads as the hour after the skip.
+            stamps = []
+            for day in (today, today + timedelta(days=1)):
+                first = day.timestamp()
+                stamps += [first, max(first, day.replace(fold=1).timestamp())]
+            print(int(min(s for s in stamps if s > now)))
         done = True
     except ValueError:
         pass
@@ -160,7 +168,12 @@ WORK_EVENT_RE='^\{"type":"(tool_use|text|reasoning|step_start|step_finish)"'
 
 # Stdin without the agent's work events, for the limit and credit patterns.
 provider_text() {
-  grep -vE "$WORK_EVENT_RE" || true
+  grep --line-buffered -vE "$WORK_EVENT_RE" || true
+}
+
+# The epoch the next UTC month begins.
+next_utc_month() {
+  python3 -c 'from datetime import datetime, timezone; n=datetime.now(timezone.utc); y=n.year+(n.month==12); m=1 if n.month==12 else n.month+1; print(int(datetime(y,m,1,tzinfo=timezone.utc).timestamp()))'
 }
 
 classify_failure() {
@@ -179,6 +192,8 @@ classify_failure() {
     FAIL_CLASS=auth
   elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
+  elif [ "${LANE:-}" = copilot ] && [[ "$tail" =~ $COPILOT_ALLOWANCE_RE ]]; then
+    FAIL_CLASS=limit RETRY_AT="$(next_utc_month)"
   elif [[ "$seen" =~ $LIMIT_RE ]] || [[ "$tail" =~ $LIMIT_CODE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT)) cap=$LIMIT_WAIT_MAX
     # A reset time or duration the provider states wins: codex's five-hour
@@ -198,7 +213,7 @@ classify_failure() {
       RETRY_AT=$((now - now % 86400 + 86400))
     elif [[ "$whole" =~ $MONTHLY_RE ]]; then
       monthly=1
-      RETRY_AT="$(python3 -c 'from datetime import datetime, timezone; n=datetime.now(timezone.utc); y=n.year+(n.month==12); m=1 if n.month==12 else n.month+1; print(int(datetime(y,m,1,tzinfo=timezone.utc).timestamp()))')"
+      RETRY_AT="$(next_utc_month)"
     fi
     [ "$RETRY_AT" -ge $((now + 60)) ] || RETRY_AT=$((now + 60))
     if [ "$monthly" -eq 0 ] && [ "$RETRY_AT" -gt $((now + cap)) ]; then

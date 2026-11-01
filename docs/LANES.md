@@ -105,6 +105,12 @@ unset variables.
   check is recorded but does not stop the run (a ticket may exist to fix
   it). What setup leaves untracked goes into `.git/info/exclude`, so it is
   never committed.
+- On a host, a base check verdict is reused by repo, base revision, check
+  command and interpreter identity. Green verdicts last 24 hours; red
+  verdicts last five minutes and still follow the base-check incident path.
+  Setup still runs for each brief, and the final check on the agent's commit
+  is never cached. Verdicts live under the host's `state/base-verdicts/`;
+  each write sweeps the ones older than a day.
 - The agent is told the check and how it did on the base.
 - A lane change that adds or edits `.loom/validation.conf` must read and pass
   under itself. Before the push the runner reads the committed file with the
@@ -271,7 +277,9 @@ there runs or steers the next tick.
 Each tick writes `$LOOM_HOME/state/brain.json` (how it ended, and the
 holder, lane and model that ran) and touches
 `$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock
-included. When no rung has usage, the tick takes no lock and runs no CLI: it
+included. A rung with no heartbeat, or an old one, has unknown fuel: it runs
+after the rungs with known usage, and its log line says so. When every rung
+says it has no usage or cannot run, the tick takes no lock and runs no CLI: it
 records `skipped` with each rung's reason and leaves `brain-ok` alone, so
 the brain-stopped check below reports it with that reason. The station adds a `brain` row to the lane status. The brain also
 runs on Muse, so the station reads GitHub too: while no local tick has ended
@@ -282,6 +290,16 @@ local tick or a journal is at most 2 hours old. Only when both are older does
 the station send one urgent Discord message, naming the newest journal's time
 and goal, then one more when the brain is back. A GitHub read error never
 counts as stale; that pass makes no decision.
+
+A live brain hides a stopped one in that check, since any fresh journal
+counts. `LOOM_BRAIN_BACKUP_HOLDERS` (holder names, as a journal's
+`Tick <time>, <holder>` line gives them, such as `lane-machine`; empty is off)
+judges each named holder on its own journal ticks from the same read: when a
+holder's newest tick is over 2 hours old, or it has none in the last day, the
+station sends one urgent Discord message naming it, then one more when it
+ticks again. Each holder keeps its own alert state in
+`state/station/brain-holders-alert.json`, apart from the brain-stopped alert
+above (loom#2141).
 
 ## The station
 
@@ -322,7 +340,7 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 flags `loom:runaway`, and every lane that bills that key stays unavailable
 with `API key expired: renew <the SSM parameter>` in its heartbeat, with no
 `retry_at`, until the value at that parameter changes. The runner opens one
-`needs-operator` ask on the factory repo naming that parameter. opencode
+`needs:human` ask on the factory repo naming that parameter. opencode
 lanes run with `--print-logs --log-level ERROR`, because opencode's own
 output says only "UnknownError: Unexpected server error" for every provider
 fault: the logged error shows an upstream 429 (a limit) or a model opencode
@@ -419,8 +437,11 @@ beat written while the pass runs counts, one stamped more than a minute
 ahead of the clock does not) and keeps one comment on the
 open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
 `origin`; the issue is created when missing) current. It edits the comment
-only when a yes or no changes, when an anthropic run is recorded, and at
-least hourly, and never publishes the heartbeat's reason. With anthropic
+only when a yes or no changes, when an anthropic run is recorded, and when
+the table is older than 15 minutes (`LANES_REPUBLISH`), which it does at the
+start of the pass so a pass that stops at its request target still publishes.
+It never publishes the heartbeat's reason. `bus.brain status` prints the
+table's age beside `Updated` and calls it stale past the same age. With anthropic
 spend recorded or a budget set, it ends with the spend line ("Anthropic
 spend" below).
 
@@ -453,7 +474,8 @@ operator is brought up to date with its base while it waits, and still never
 merges on the factory's say-so. Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
-starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
+starts a ticket's ladder again and ends any fix round posted before it, so
+the restart runs as a normal attempt on a fresh branch. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
 `claude-opus-5-5`), each
 climb recorded as a `<!-- loom:rung N -->` comment.
 A climb takes the lowest rung the ticket has not run on since its ladder
@@ -568,8 +590,8 @@ most 2 questions a pass and 3 citations each; the key is read for each call
 and only asks, never writes. Fabric unset, down, slow or silent builds the
 ticket as before.
 
-Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
-(ETag polls) and forwards those whose author and latest `needs-operator`
+Asks: the station reads open `needs:human` issues in each `LOOM_REPOS` repo
+(ETag polls) and forwards those whose author and latest `needs:human`
 labeller are in `LOOM_BRIEF_AUTHORS` to a Discord webhook whose URL it reads
 from the SSM parameter named by `LOOM_DISCORD_WEBHOOK_SSM` (region
 `LOOM_AWS_REGION`, default us-east-1; never printed, and with the setting
@@ -666,6 +688,14 @@ only what is its own, and adding an operator is configuration:
   routing and pull request pass, `bus.brain move`, the station's claim, pull
   request adoption and the verify picker all skip one assigned to anyone
   else. The station logs each skip once (`state/station/owned.json`).
+- Outside work beats a claim of ours. A `claim:overflow` label, an `overflow:`
+  price with no `overflow paid:` label yet, or a person outside
+  `LOOM_BRIEF_AUTHORS` among the assignees makes a ticket someone else's even
+  with this Loom's claim or operator on it. An App assignee owns nothing. The
+  hand-back pass, `bus.brain escalate`, `bus.brain fix`, the status stuck marks
+  and remote lanes skip it too. `claim:overflow` is a person's claim: it is
+  never an engine claim, never expires and is never removed. A contributor's
+  own pull request still moves their ticket to `loom:pr` and `loom:merged`.
 - A claim is not forever. Once an hour the station reads each open issue
   another operator claims (a `claim:<login>` label not its own, or an
   assignment to a `LOOM_TRUSTED_BRIEFERS` login). When neither the claim nor
@@ -689,6 +719,31 @@ only what is its own, and adding an operator is configuration:
   (events by this Loom's App logins) are not activity for this lapse, so a
   ticket that moves between lanes and the brain still lapses; only the claim
   label's own putting-on, a person's act, or a pull request update count.
+- Engine claims have one referee (`bus/claim_referee.py`). Each engine that
+  works the backlog has one claim label (`LOOM_ENGINE_CLAIMS`). Every 30
+  minutes the station reads the open issues carrying one. With two or more it
+  keeps the one put on first (each label's newest labeled event) and removes
+  the others with a status note. It removes the claim it keeps when nothing
+  on the ticket is newer than 2 hours: no event by the claimer (who put the
+  label on) or a trusted login (`LOOM_BRIEF_AUTHORS`, `LOOM_TRUSTED_BRIEFERS`,
+  never the station's own Apps), not the claim's putting-on. Only events a
+  writer performed count: a comment, label, assignment, close, reopen, commit
+  or reference, not a mention or subscription. An open pull request one of them
+  wrote in the same repo, referenced from the ticket by one of them, holds the
+  claim for 7 days after that reference. Every claim that may expire has its
+  timeline read, because a comment by anyone moves `updated_at`: all repos share
+  one list and 40 reads a run, and the next run reads on from where it stopped.
+  A comment line
+  `waiting: <what> until <time>` (ISO time, UTC unless it says otherwise) by
+  one of them holds the claim until that time plus 30 minutes; the time counts
+  for at most 24 hours after the comment, and the latest stated time wins. A
+  ticket with `loom:running`, assigned to a person, or with no Loom label never
+  expires; a duplicate on it is still removed. A claim whose labeled event the
+  timeline does not show waits for a later pass. A claim label
+  that is not an engine's is a person's and is never touched. The first pass
+  over the claims that already exist removes at most 5 a run and posts no
+  notes; after it, at most 10 a run, and an expiry never posts a note.
+  `LOOM_CLAIM_REFEREE=dry` logs each removal instead, `off` skips the step.
 - The claim marks a run, not a ticket's whole life. Any station or brain move
   out of `loom:running` (a retry, a limit, a failure, a pull request opened, a
   merge) removes this Loom's own `claim:<login>` label in the same labels
@@ -745,7 +800,9 @@ when it is unset) or any `LOOM_REPOS` repo has an owner outside
 
 `LOOM_TRUSTED_BRIEFERS` (space separated GitHub logins, default empty) lets
 another operator hand work to this Loom's lanes without this Loom adopting
-their claims. It is briefing trust only:
+their claims. A reinstall that leaves it unset keeps the list in the installed
+station plist; set it, even to empty, to replace the list. It is briefing trust
+only:
 
 - A `loom:ticket` authored by a trusted briefer is trusted for briefing and
   building exactly like one from `LOOM_BRIEF_AUTHORS`: the station's claim and
@@ -767,6 +824,41 @@ their claims. It is briefing trust only:
 The installer writes the setting into the station plist and the brain
 plist, and the brain passes it to a sandboxed rung, like
 `LOOM_BRIEF_AUTHORS`.
+
+### Ask answerers
+
+`LOOM_ASK_ANSWERERS` (space separated GitHub logins, an App as `<slug>[bot]`,
+default empty) names logins that may answer an ask with two line forms, without
+any other trust. A reinstall that leaves it unset keeps the list in the
+installed station plist, and `LOOM_BRIEF_AUTHORS` is kept the same way; set
+either, even to empty, to replace it. Unset, asks are judged as if the setting
+did not exist.
+
+- Each form starts a line and has words after its colon on that line:
+  `Finished: <the step>`, or `Operator answer YYYY-MM-DD: <the answer>` dated
+  from the ask's day to the comment's own day. The comment must follow the
+  ask. A line in a fenced or indented block, in an HTML comment, or in a comment
+  with a Loom marker does not count. `Done:` and every other comment from these
+  logins leave the ask open, prose from a person login included. Only the line
+  is the answer: the rest of the comment reaches neither the `needs-brain`
+  check nor the printed answer.
+- Only the judges of an ask read it: the label pass (`bus/label_pass.py`), the
+  station's ask inputs (the digest and the pass) and `python3 -m bus.needs_you`.
+- It grants nothing else. Ownership, proofs, audits, journals, adoption,
+  merges, briefing, holds, revert labels, dashboard operators and
+  `decision_claim.person_comment` read their own settings, and a listed login
+  gains no standing in any of them. A listed bot's line is no person's record
+  for the decision claim guard, nor is the ask label's removal after it.
+- Taking `needs:human` off lifts that hold in `evidence_close.label_hold`, so a
+  listed login can clear the way to a close without closing anything itself.
+- The guard runs inside Loom's write commands. `close`, `reply`, `bus journal`
+  and the rest still refuse the dated line with no person's record, but a
+  listed login that posts with its own GitHub client passes no guard. List only
+  a login whose writer records what the operator said and nothing else.
+
+The installer writes the setting into the station plist and the brain plist,
+and the brain passes it to a sandboxed rung. Muse sets the same value
+(docs/MUSE.md).
 
 ### Verify runs
 
@@ -996,8 +1088,18 @@ The loom home is kept bounded by the station and the runner (loom#643).
   `LOOM_LOG_KEEP_DAYS` days (default 7; `0` keeps them all). An entry is kept
   however old while a brief of its name is waiting or running in a lane
   inbox, and, while transcripts are uploaded, until the ledger holds the run
-  as sent or settled; an unreadable inbox or ledger removes nothing. The
-  station's own logs at the top of `logs/` are not touched.
+  as sent or settled; an unreadable inbox or ledger removes nothing.
+- `logs/` as a whole stays under `LOOM_LOG_MAX_GB` (default 10; `0` for no
+  limit, loom#2268). Past it the oldest entries go first, younger than
+  `LOOM_LOG_KEEP_DAYS` if need be, but never one kept above or one changed in
+  the last day. `station.log` says `logs hold ...` every hour, and says
+  `over` when what is left is kept.
+- Each `*.log` at the top of `logs/` past `LOOM_LOG_ROTATE_MB` (default 20)
+  is renamed to `<name>.<UTC stamp>` (`bus/logrotate.py`), and the next start
+  of its service makes a new one. A process still running keeps writing the
+  renamed file, so no line is lost, and the file is compressed once `lsof`
+  shows nothing holds it. Five `.gz` copies of each log stay. `viewer.log`
+  and `dashboard.log` are not rotated: launchd opens them once.
 - The runner removes a check's scratch home (`run/<slot>-check`) after the
   final check and when it exits, so `run/` holds one only while that lane runs.
 - While the home's disk has less than `LOOM_MIN_FREE_GB` free (default 15;
@@ -1021,8 +1123,8 @@ The loom home is kept bounded by the station and the runner (loom#643).
   every pass meanwhile.
 - Every hour the station removes the old lane logs, compresses each finished
   run's opencode session store (`logs/<slot>/<run>/.local/share/opencode/
-  opencode.db`, to `opencode.db.gz`, once its transcript is uploaded; the
-  readers read either), and logs the home's size by top-level folder
+  opencode.db`, to `opencode.db.gz`, once its transcript is uploaded or a
+  day after the run; the readers read either), and logs the home's size by top-level folder
   (`loom home holds ...`), kept in `state/station/disk.json`. A compressed
   store goes with its run's other logs after `LOOM_LOG_KEEP_DAYS`.
 
@@ -1173,7 +1275,7 @@ Each invariant is one function returning breaches with evidence:
   `Epic cap: N until DATE` exception), and a closed epic that still holds
   open tickets. These replaced the goal home sub-issue count check.
 - An open lane pull request whose plan check failed more than 30 minutes ago.
-- An open lane pull request nothing drives for over 6 hours (the time a lane
+- An open lane pull request nothing drives for over 24 hours (the time a lane
   has to open one): no open `loom:ticket` carries it, its ticket is past the
   last rung of the model ladder (`loom:failed`), its ticket is marked
   `needs-brain`, or it holds unresolved review threads from the review bot
@@ -1207,7 +1309,51 @@ hold that comes and goes never closes and reopens an issue (each reopen mailed
 the people watching it). The lanes it listed move into a "Hold log" in the body
 (a line per hold, newest first, the last 20).
 
-Each breach files one issue labelled `loom:triage` and `loom:invariant` under
+Four kinds file no issue per violation at all (loom#2099): `lane-pr-stalled`,
+`plan-check-failed`, `epic-over-cap` and `epic-title-shared`
+(`invariants.ROLLED`). Each restates state the pull request, the epic or
+`python3 -m bus.brain status` already shows, and filing one ticket per
+violation was most of 185 invariant issues in 7 days (109 stalled lane pull
+requests, 36 over-cap epics, 13 failed plan checks), every one closing itself
+later. Instead each kind has one tracking
+issue per subject repo, titled `Invariant: <kind> in <repo>` (a private repo
+named in words with a short hash), labelled `loom:invariant` only (not
+`loom:triage`, so the rewriter never turns the list into a ticket and freezes
+it). Its body lists every current violation, a line each with its link and
+when it started (`since <time>`: a lane pull request's open time, a plan
+check's completion, else when the station first saw it, kept in
+`invariants.json` under `seen`), and a "Last checked" line. The station
+rewrites the body only when the list changes: an unchanged list, or only a
+newer check time, writes nothing. When a kind's list empties, the next pass
+rewrites it to "Current violations: none." with a "Clear since" time; once it
+has said none for 6 hours (`CLEAR_AFTER`) the issue closes as not planned
+with one cleared note, which a later clear edits in place rather than posting
+again; a violation that returns reopens that same issue (the one "Broken
+again" note, edited in place), so the kind keeps one stable issue number. A
+pass that could not read a kind's facts (the lane pull requests, the plan
+checks, the goal shapes) leaves its tracking issue as it is, and so does a
+pass that could not read one repo's open pull requests for that repo's
+lane-pr-stalled issue: the other repos' issues still update. Closing it rather than leaving it
+open keeps an empty list from holding a goal out of quiet (docs/BRAIN.md).
+The per-violation issues these kinds filed before this close into the
+tracking issue of their kind and their own subject repo as the station meets
+them: closed as not planned with no comment, their note at the foot of the
+body, and a running count in one comment on the tracking issue, edited in
+place (a comment on each would mail everyone watching). The subject comes from
+the station's map, else the `subject=` of the issue's marker, else a reference
+in its text, and only one that hashes back to the key counts. The marker names
+a subject only where the breach's public text already does, so a private repo
+never reaches it. One whose repo cannot be told (a private repo the title
+names in words) closes with a note naming no tracking issue, and one with a
+known repo and no open tracking issue waits out `CLEAR_AFTER` first. At most
+`FOLD_MAX` (2) old issues close a pass, each logged, so the migration cannot
+spend the GitHub budget.
+One rewritten into a `loom:ticket` is work the factory carries and is never
+folded, nor is one asking an operator (`needs:<login>`); every other kind,
+`lane-no-success` with its per-lane keys for the dead-lane release included,
+files as below.
+
+Each other breach files one issue labelled `loom:triage` and `loom:invariant` under
 the standing repairs epic (docs/BRAIN.md, Filing under an epic; the goal home
 itself when that epic cannot be read) of the invariant goal home
 (`LOOM_INVARIANT_GOAL`; empty means
@@ -1226,11 +1372,14 @@ ticket gets one separate invariant issue that refs the ticket (loom#1223
 flipped 18 times in a day before this). Issues and pull requests in a private repo are named in words, and
 failure reasons have repos, paths and credentials replaced. One pass files
 or reopens at most 5, and below the GitHub budget floor files nothing.
-A `lane-pr-stalled` or `epic-over-cap` issue whose subject settled for good
+A per-violation `lane-pr-stalled` or `epic-over-cap` issue filed before
+loom#2099 whose subject settled for good
 (its pull request merged or was closed unmerged, its epic is back at the
 cap) closes on the first pass the breach is gone, whatever labels it carries
-(not a `loom:ticket`), with one note naming how; these closes come before
-the other clears and read no comments (loom#2022). Other cleared issues
+(not a `loom:ticket`), with one note in its body naming how; these closes
+come before the other clears, read no comments (loom#2022), and walk the
+issue listing rather than the local map, so one filed before the map or gone
+while the station was down settles too (loom#2257). Other cleared issues
 close once the breach has been gone 6 hours.
 `python3 -m bus.brain status` lists the open ones under "Invariants broken"
 for the brain's report, and the station's own standup on that goal home
@@ -1286,12 +1435,20 @@ cannot query the viewer or any other local service.
   without running. Restarts cannot re-run a ticket.
 - Otherwise: fresh clone, the lane's official CLI with the brief, then the
   runner (not the agent) pushes the branch and opens the PR in the format
-  the Chief check requires.
+  the Chief check requires. The body carries the standard Acceptance criteria
+  bullets when the ticket states fewer than the three the check wants (the
+  factory files a follow-up ticket with the one criterion a lane left not
+  built): a body the Chief check refuses holds the pull request until the
+  plan-check invariant fires.
 - `copilot` reads its token from `LOOM_COPILOT_KEY_SSM` and exports it only as
   `COPILOT_GITHUB_TOKEN`. It invokes one `copilot -p` prompt with
   `--allow-all-tools`; the run output, including any CLI usage details, is
-  retained in the lane log. Monthly usage-limit messages hold the lane until
-  the next UTC month begins.
+  retained in the lane log. Monthly usage-limit messages, and the Free plan's
+  "exceeded your ... allowance" and "you have no quota" answers, hold the lane
+  instead of failing the ticket until the next UTC month begins. Those two
+  answers count only on this lane and only in the last lines of its run. `lanes/mac/install.sh` installs it with
+  the default lanes; set `LOOM_COPILOT_KEY_SSM` when installing, or the lane
+  reports itself unavailable.
 - Model choice on the priced Anthropic routes follows
   docs/USAGE_ROUTING.md ("October 2026 price changes"): high-volume
   subtasks pin `claude-haiku-5-5`; cache-heavy work stays on
@@ -1689,6 +1846,37 @@ Plan:
   stays read-only as well, including shell startup files, `~/.gemini`
   config (with the skills copied to `~/.gemini/config/skills`, see Skills
   on every lane), and MCP servers.
+- agy's sign-in files, `antigravity-oauth-token` in its file store
+  (`Library/Application Support/antigravity`) and in its state directory,
+  are readable only by agy's own binary (a profile rule on the process
+  path). A command agy launches cannot read, link, move or delete either
+  file, or move its folder; in a validation run's profile no process may
+  read them. The named path is the launched binary itself, never an
+  interpreter's or helper's path: if the file at that path were a
+  script, or the token's reader a helper image, widening the exception
+  to that image would hand the token to any launched command running
+  under the same runtime, so that case needs a distinguishing rule of
+  its own (the outside-helper design in #1623), not a broader
+  exception. The same profile keeps the keychain server and
+  `Library/Keychains` denied.
+- The token exception trusts whatever runs as agy's binary, so the runner
+  refuses to start the agy lane (and names the file) unless that binary
+  meets two requirements. It must be signed with the hardened runtime:
+  `codesign -d --verbose=2 <agy>` must show the `runtime` flag (for
+  example `flags=0x10000(runtime)`). Without it a command could write an
+  injection library and run `DYLD_INSERT_LIBRARIES=<lib> <agy>`, and the
+  library would read the token inside agy's image; a hardened binary
+  makes dyld ignore that. To fix a refusal, re-sign with
+  `codesign -f -s - -o runtime <agy>` or ask the operator for a
+  hardened-runtime agy. It must also be the agy binary itself, not an
+  interpreter or launcher image (a script has no signature and is
+  refused; a runtime that honours variables such as NODE_OPTIONS would
+  defeat the rule), and it must sit outside every area a sandboxed
+  command can write: the worktree, the agent's scratch home and agy's
+  state directory, file store and caches. Residual note: a sandboxed
+  command may still overwrite the token file (writes are not denied),
+  which costs agy its sign-in but leaks nothing. Whether the real agy
+  meets the hardened-runtime requirement is shown by the first live run.
 - Before each run, the runner clears agy's memory of earlier runs
   (`agy_forget`), deleting everything in its state directory except sign-in
   and install state. Kept entries in the state directory are `settings.json`,

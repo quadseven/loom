@@ -95,7 +95,9 @@ def _node():
                                               "statusCheckRollup": {"state": "SUCCESS"}}}]},
             "reviews": {"nodes": [{"author": GRUG, "state": "APPROVED",
                                    "submittedAt": "2030-01-01T13:00:00Z"}]},
-            "reviewThreads": {"nodes": []}}
+            "reviewThreads": {"nodes": []},
+            # Status reads the pull request's comments here (loom#2393).
+            "comments": {"totalCount": 0, "nodes": []}}
 
 
 class LoomSizedFake:
@@ -132,6 +134,8 @@ class LoomSizedFake:
             return self._reply(ISSUES)
         if bare == "/repos/%s/pulls" % REPO:
             return self._reply(PULLS)
+        if bare.startswith("/search/issues"):
+            return self._reply({"total_count": 0})
         if bare.endswith("/files"):
             return self._reply([{"filename": "bus/a.py", "patch": "+x"}])
         if PULL.match(bare):

@@ -310,6 +310,33 @@ mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
 PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
 
+# A check that hashes a file needs a sha256sum this machine can execute. The
+# lane plist puts the Intel Homebrew bin directory ahead of everything but the
+# arm64 one, and an x86_64 coreutils link there never runs on an arm64 host
+# without Rosetta (#2317). The macOS system binary sits in /sbin, on no lane's
+# PATH, so its directory goes in just before the one that holds the broken
+# tool: it can shadow only that directory and those after it.
+tool_runs() { printf '' | "$1" > /dev/null 2>&1; }
+runnable_sha256sum_on_path() {
+  local found dir holder tail
+  found="$(command -v sha256sum)"
+  [ -n "$found" ] && tool_runs "$found" && return 0
+  for dir in ${LOOM_SHA256SUM_DIRS:-/sbin /usr/bin /bin}; do
+    [ -x "$dir/sha256sum" ] && tool_runs "$dir/sha256sum" || continue
+    if [ -n "$found" ]; then
+      holder="$(dirname "$found")"
+      case "$PATH" in
+        "$holder":*) PATH="$dir:$PATH" ;;
+        *) tail="${PATH#*:"$holder":}"; PATH="${PATH%%:"$holder":*}:$dir:$holder:$tail" ;;
+      esac
+    else
+      PATH="$PATH:$dir"
+    fi
+    return 0
+  done
+}
+runnable_sha256sum_on_path
+
 field() { grep -m1 "^$1:" "$2" | cut -d' ' -f2-; }
 
 # LOOM_<LANE>_<SUFFIX>, e.g. opencode-go + MODEL -> LOOM_OPENCODE_GO_MODEL.
@@ -390,7 +417,7 @@ utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
 
 # Body of one "## <name>" section of the brief, blank lines dropped.
 section() {
-  awk -v h="## $1" '$0 == h {on=1; next} /^#+ / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
+  awk -v h="## $1" '$0 == h {on=1; next} /^##? / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
 }
 
 # The acceptance criteria of $1, blank lines dropped: its "## Acceptance
@@ -423,7 +450,7 @@ BUGS_SECTION="Bugs discovered"
 # What section, or the reason a run changed nothing (no_change_reason). The
 # file itself is never committed.
 summary_note() {
-  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion the change builds; leave every live check (a Live line, or anything seen on a running system, a host, a network or over time) and every operator action unticked, since only the station'"'"'s verifier ticks those; and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If you found a bug outside this ticket, add a ## %s section, one bug per line, each citing its issue as #N (this repo) or OWNER/NAME#N; file the issue first if none exists. The station looks each issue up and leaves out any line whose issue does not exist, is a pull request, or is closed and was not filed in the last two days. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION" "$BUGS_SECTION"
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion the change builds; leave every live check (a Live line, or anything seen on a running system, a host, a network or over time) and every operator action unticked, since only the station'"'"'s verifier ticks those; and for an unbuilt criterion append \"; not built: <reason>\". A reason saying the work is already there must cite the code on the base branch as <path>:<line> or <path>::<symbol>, or the pull request goes back. The runner puts that checklist in the pull request body. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If you found a bug outside this ticket, add a ## %s section, one bug per line, each citing its issue as #N (this repo) or OWNER/NAME#N; file the issue first if none exists. The station looks each issue up and leaves out any line whose issue does not exist, is a pull request, or is closed and was not filed in the last two days. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION" "$BUGS_SECTION"
 }
 
 # How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
@@ -862,6 +889,33 @@ post_replies() {
   rm -f "$REPLIES_FILE"
 }
 
+# The review threads a fix brief lists (the "### Thread PRRT_..." lines of its
+# ## Fix section) that this round left without an answer: no entry in its
+# replies file and no file kept from .loom-answers. Prints them ", "-joined,
+# or nothing. The brief requires an answer for every one (bus/tickets.py
+# REPLIES_NOTE); an unanswered thread holds the merge gate, so the round says
+# which ones it left.
+unanswered_threads() {
+  python3 - "$BRIEF" "${REPLIES_FILE:-}" "$INBOX/answers/$TICKET" <<'PY' 2>> "$LOG"
+import json, os, re, sys
+brief, replies, answers = sys.argv[1:]
+with open(brief, encoding="utf-8", errors="replace") as stream:
+    parts = stream.read().rsplit("\n## Fix\n", 1)
+listed = (re.findall(r"^### Thread (PRRT_[A-Za-z0-9_-]{1,100}) ", parts[1], re.M)
+          if len(parts) > 1 else [])
+answered = set()
+if replies and os.path.isfile(replies):
+    try:
+        with open(replies, encoding="utf-8") as stream:
+            answered |= {entry["thread"] for entry in json.load(stream)}
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print("the replies file could not be read: %s" % error, file=sys.stderr)
+if os.path.isdir(answers):
+    answered |= {name[:-3] for name in os.listdir(answers) if name.endswith(".md")}
+print(", ".join(dict.fromkeys(t for t in listed if t not in answered)))
+PY
+}
+
 # Reconcile the generated title/body sections of an existing PR with the
 # approved ticket revision in the brief, preserving reviewer-authored text
 # outside those sections. Scope changes are logged with old/new body hashes.
@@ -1141,7 +1195,8 @@ park() {
 # startup files, ~/.gemini config, MCP servers). Other lanes get no rules here.
 # antigravity-oauth-token is agy's sign-in when it cannot reach the keychain
 # (the sandbox denies /usr/bin/security): wiped, every run asked for a browser
-# login (2026-10-22 to 10-24, #1620).
+# login (2026-10-22 to 10-24, #1620). The sandbox profile lets only agy's own
+# binary read it (agy_token_rules in lanes/agent_sandbox.sh, #1623).
 AGY_STATE_KEEP=(settings.json bin builtin installation_id jetski_state.pbtxt updater last_check.timestamp log cli.log crashes cache antigravity-oauth-token)
 AGY_CACHE_KEEP=(onboarding.json default_project_id.txt)
 # agy keeps its sign-in in its file store, Library/Application Support/
@@ -1564,12 +1619,15 @@ limit_until() {
 # hand on every brief still in the inbox this pass.
 hold_provider_limit() {
   local until slot source checked tmp
-  until="$(limit_until)" || return 0
+  if ! until="$(limit_until)"; then
+    until=$(( $(date +%s) + ${LIMIT_WAIT:-3600} ))
+  fi
   LIMITED=1
+  [ -n "$LIMIT_WHY" ] || LIMIT_WHY="provider limit reached"
   source="$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
   checked="$(date +%s)"
   for slot in $(limit_group); do
-    if [ "$slot" != "$SLOT" ]; then
+    if [ "$slot" != "$SLOT" ] && [ -f "$source" ]; then
       tmp="$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp"
       if ! cp "$source" "$tmp" \
         || ! mv -f "$tmp" "$LOOM_HOME/state/usage/$slot.provider-limit.json"; then
@@ -1684,7 +1742,7 @@ ask_sign_in() {
   file_ask "$title" "$body" "Sign-in failed again"
 }
 
-# File a needs-operator ask titled $1 with body $2, or, with one already open,
+# File a needs:human ask titled $1 with body $2, or, with one already open,
 # keep one comment on it with a running count headed $3, never one per failure.
 file_ask() {
   local title="$1" body="$2" headline="$3" number existing
@@ -1696,10 +1754,10 @@ file_ask() {
     return 0
   fi
   number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
-             --label needs-operator --body "$body" 2>>"$LOG" ||
+             --label needs:human --body "$body" 2>>"$LOG" ||
            gh issue create --repo "$FACTORY_REPO" --title "$title" --body "$body" 2>>"$LOG")"
   number="${number##*/}"
-  case "$number" in ''|*[!0-9]*) echo "needs-operator ask filing failed" >> "$LOG" ;; esac
+  case "$number" in ''|*[!0-9]*) echo "needs:human ask filing failed" >> "$LOG" ;; esac
   return 0
 }
 
@@ -1785,6 +1843,7 @@ import json
 import sys
 
 text = tool = False
+events_processed = False
 for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
     try:
         event = json.loads(line)
@@ -1792,6 +1851,7 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
         continue
     if not isinstance(event, dict):
         continue
+    events_processed = True
     kind = event.get("type")
     part = event.get("part") if isinstance(event.get("part"), dict) else {}
     if kind == "step_start":
@@ -1800,6 +1860,8 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
         text = True
     elif kind in ("tool_use", "tool") or part.get("type") == "tool":
         tool = True
+if not events_processed:
+    sys.exit(1)
 sys.exit(0 if text and not tool else 1)
 PY
 }
@@ -2020,6 +2082,32 @@ record() {
     "$(date -u +%FT%TZ)" >> "$RECORD"
 }
 
+# Base check verdicts survive the per-brief scratch HOME. A green result is
+# reusable for a day; a red result briefly stops more tickets for this repo.
+BASE_VERDICT_DIR="$LOOM_HOME/state/base-verdicts"
+BASE_VERDICT_TTL_GREEN=86400
+BASE_VERDICT_TTL_RED=300
+base_verdict_key() {
+  printf '%s\n%s\n%s\n%s\n' "$REPO" "$1" "$C_CHECK" "$2" | sha256sum | cut -d' ' -f1
+}
+base_verdict_read() {  # key, now
+  local file="$BASE_VERDICT_DIR/$1" at exit ttl
+  [ -f "$file" ] || return 1
+  IFS=' ' read -r at exit < "$file" || return 1
+  case "$at:$exit" in *[!0-9:]*|:*) return 1 ;; esac
+  if [ "$exit" -eq 0 ]; then ttl="$BASE_VERDICT_TTL_GREEN"; else ttl="$BASE_VERDICT_TTL_RED"; fi
+  [ "$2" -ge "$at" ] && [ "$(( $2 - $at ))" -lt "$ttl" ] || return 1
+  BASELINE_EXIT="$exit"
+  return 0
+}
+base_verdict_write() {  # key, exit
+  mkdir -p "$BASE_VERDICT_DIR" || return 1
+  printf '%s %s\n' "$(date +%s)" "$2" > "$BASE_VERDICT_DIR/$1" || return 1
+  # Every revision mints a new file; sweep the ones no read can use. A
+  # failed sweep never fails the write.
+  find "$BASE_VERDICT_DIR" -type f -mmin +"$(( BASE_VERDICT_TTL_GREEN / 60 ))" -delete 2>/dev/null || true
+}
+
 # A validation failure the repo did not cause is a factory incident, not a
 # [work] failure: the contract cannot be read, the environment cannot run
 # the check (exit 125/126/127), or the check is already red on the
@@ -2030,7 +2118,7 @@ record() {
 # failing line or command, and the exit code.
 FACTORY_REPO=quadseven/loom
 INCIDENT_MARKER="<!-- loom:factory-incident v1 -->"
-# The marker on the body of the needs-operator ask an expired key files.
+# The marker on the body of the needs:human ask an expired key files.
 KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"
 # The markers on the one comment that counts repeats on an open ask or incident.
 KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"
@@ -2048,11 +2136,11 @@ open_issue() {
 # checks had passed again for hours (2026-10-19).
 INCIDENT_DIR="$LOOM_HOME/state/incidents"
 incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr '/' '_')" "$1"; }
-# Close this repo's environment and base-check incidents once the check has
-# passed on the unmodified base; the station then releases their tickets.
+# Close this repo's environment, contract and base-check incidents once the
+# check has passed on the unmodified base; the station then releases tickets.
 resolve_factory_incidents() {
   local kind file number
-  for kind in environment base-check; do
+  for kind in environment contract base-check; do
     file="$(incident_file "$kind")"
     [ -f "$file" ] || continue
     number="$(tr -cd '0-9' < "$file")"
@@ -2322,7 +2410,7 @@ exclude_untracked() {
 # Only a red default branch check is a base-check factory incident. Returns
 # 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
-  local rc interp="" subs="" changed what baseline_rev
+  local rc interp="" subs="" changed what baseline_rev tool="" verdict_key interpreter_id now cached_verdict=0
   SETUP_REASON=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
@@ -2330,6 +2418,11 @@ prepare_validation() {
   if ! sandbox_ready; then
     SETUP_REASON="$SANDBOX_WHY"
     note_factory_incident environment "$SANDBOX_WHY" SETUP_REASON
+  elif ! tool="$(command -v sha256sum)" || ! tool_runs "$tool"; then
+    # The host's fault, whatever the repo: a check that hashes a file would
+    # read as a red default branch and file a base-check incident.
+    SETUP_REASON="lane host fault: sha256sum${tool:+ at $tool} cannot run"
+    note_factory_incident environment "sha256sum: ${tool:-not on PATH}" SETUP_REASON
   elif [ -n "$C_INTERP" ] && ! interp="$(command -v "$C_INTERP")"; then
     SETUP_REASON="interpreter $C_INTERP is not on PATH"
     note_factory_incident environment "interpreter: $C_INTERP" SETUP_REASON
@@ -2373,11 +2466,23 @@ prepare_validation() {
     fi
     [ "$rc" -eq 0 ] || { SETUP_REASON="setup exited $rc"; return 1; }
   fi
-  contract_run "$C_CHECK"; BASELINE_EXIT=$?
-  changed="$(tracked_changes)"
   baseline_rev="$(safe_git rev-parse HEAD)"
-  record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
-    "${changed:+changed tracked files: $changed}"
+  # interp already holds "path version" (set above), so it is the identity as
+  # it stands; running it again would hand its own output to the key.
+  interpreter_id="${interp:-${C_INTERP:-none}}"
+  verdict_key="$(base_verdict_key "$baseline_rev" "$interpreter_id")"
+  now="$(date +%s)"
+  if base_verdict_read "$verdict_key" "$now"; then
+    cached_verdict=1
+    changed=""
+    echo "base check reused cached verdict for $baseline_rev" >> "$LOG"
+    record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && echo true || echo false)" "cached verdict"
+  else
+    contract_run "$C_CHECK"; BASELINE_EXIT=$?
+    changed="$(tracked_changes)"
+    record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
+      "${changed:+changed tracked files: $changed}"
+  fi
   if [ "$BASELINE_EXIT" -eq 143 ]; then
     PARK_CLASS=transient
     SETUP_REASON="base check interrupted by SIGTERM"
@@ -2396,7 +2501,9 @@ prepare_validation() {
   # under a busy station's load and passed on the next ticket's run, and
   # each such flake held its ticket behind a factory incident (56 by
   # 2026-10-25). A red base check runs once more; only a second red files.
-  if [ "$BASELINE_EXIT" -ne 0 ]; then
+  # A cached red skips the rerun; a fresh red always reruns. The flag is set
+  # once above, so a verdict another lane writes meanwhile cannot change it.
+  if [ "$BASELINE_EXIT" -ne 0 ] && [ "$cached_verdict" -eq 0 ]; then
     if [ -n "$changed" ] && ! safe_git reset --hard HEAD >> "$LOG" 2>&1; then
       SETUP_REASON="could not restore tracked files changed by the baseline check"
       return 1
@@ -2412,6 +2519,11 @@ prepare_validation() {
       return 1
     fi
     [ "$BASELINE_EXIT" -ne 0 ] || echo "base check exited $first_exit, then passed on a second run" >> "$LOG"
+  fi
+  if [ "$cached_verdict" -eq 0 ] && [ -z "$changed" ] && [ "$BASELINE_EXIT" -ne 143 ] && [ "$BASELINE_EXIT" -ne 125 ] &&
+     [ "$BASELINE_EXIT" -ne 126 ] && [ "$BASELINE_EXIT" -ne 127 ]; then
+    base_verdict_write "$verdict_key" "$BASELINE_EXIT" ||
+      echo "could not store base check verdict for $baseline_rev" >> "$LOG"
   fi
   # Only a pass on the trusted base clears an incident: a fix round's tree
   # holds the agent's unmerged edits, so it counts only once the default
@@ -3067,6 +3179,29 @@ Do not search the whole filesystem (for example, find /). Search within the chec
   esac
 }
 
+# A watchdog for the running agent wrapper: tails the run log through
+# provider_text, and stops the agent early on a terminal limit line
+# (AI_RetryError after limit text, not a single retryable 429).
+agent_watchdog() {
+  local agent="$1" start="${2:-0}" log="$3" seen_limit=0 line
+  shopt -s nocasematch
+  tail -c +$((start + 1)) -f "$log" 2>/dev/null | provider_text | while IFS= read -r line; do
+    if [[ "$line" =~ $LIMIT_RE ]] || [[ "$line" =~ $LIMIT_CODE_RE ]] ||
+       [[ "$line" =~ 429 ]] || [[ "$line" =~ GoUsageLimitError ]]; then
+      seen_limit=1
+    fi
+    if [ "$seen_limit" -eq 1 ] && [[ "$line" =~ AI_RetryError ]]; then
+      provider_at_limit || true
+      hold_provider_limit
+      touch "$LOCK/watchdog-limit"
+      kill -TERM -- "-$agent" 2>/dev/null || kill -TERM "$agent" 2>/dev/null || true
+      sleep 1
+      kill -KILL -- "-$agent" 2>/dev/null || kill -KILL "$agent" 2>/dev/null || true
+      break
+    fi
+  done
+}
+
 spend() { PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.spend "$@"; }
 
 # The anthropic lanes spend API credits. The CLI's JSON result carries the
@@ -3519,12 +3654,20 @@ for BRIEF in "$INBOX"/*.md; do
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
   if ! agent_gh_config; then park "$BRIEF" "$AGENT_GH_WHY" transient; continue; fi
+  rm -f "$LOCK/watchdog-limit"
   ( set -m
     (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
       { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
       run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
-    echo $! > "$LOCK/pgid"
-    wait $! ) &
+    agent_pid=$!
+    echo $agent_pid > "$LOCK/pgid"
+    ( agent_watchdog "$agent_pid" "$LOG_START" "$LOG" ) &
+    watchdog_pid=$!
+    wait $agent_pid
+    agent_status=$?
+    kill -TERM -- "-$watchdog_pid" 2>/dev/null || kill -TERM "$watchdog_pid" 2>/dev/null || true
+    wait $watchdog_pid 2>/dev/null || true
+    exit $agent_status ) &
   wait $!
   STATUS=$?
   AGENT_GH_CALLS="$(agent_gh_calls)"
@@ -3540,7 +3683,7 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
   # A run that timed out may have been retrying a usage limit all along.
-  if [ "$STATUS" -eq 124 ] && provider_at_limit; then
+  if { [ "$STATUS" -eq 124 ] || [ -f "$LOCK/watchdog-limit" ]; } && provider_at_limit; then
     hold_provider_limit
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
@@ -3562,6 +3705,7 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
   fi
+  [ -f "$LOCK/watchdog-limit" ] && FAIL_CLASS=limit
   # A timeout after editing keeps its edits whatever the failure is classed as,
   # and so does a run cut short by a limit, an expired key or a transient error
   # (a free pool runs dry 20 minutes in): every park below names the branch.
@@ -3971,6 +4115,7 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
     : > "$LOGDIR/$TICKET.pushed"
   fi
   if [ -n "$FIX_PR" ]; then
+    UNANSWERED="$(unanswered_threads)"
     post_replies
     ITEMS="$(fix_items "$BRIEF")"
     if [ "$COMMITTED" -eq 1 ]; then
@@ -3998,6 +4143,12 @@ $LIVE_NOTES"
       COMMENT="$COMMENT
 
 Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+    fi
+    if [ -n "$UNANSWERED" ]; then
+      echo "[$(date -u +%FT%TZ)] $TICKET: review threads left without a reply: $UNANSWERED" >> "$LOG"
+      COMMENT="$COMMENT
+
+Review threads this round left without a reply: $UNANSWERED"
     fi
     # One comment per pull request, edited each round; the push and the body
     # edit are already on the pull request's timeline.
