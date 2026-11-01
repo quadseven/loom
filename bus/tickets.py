@@ -674,6 +674,60 @@ def reads_stored_rows(body: str) -> bool:
                for m in _WHAT_OR_CRITERIA_RE.finditer(body or ""))
 
 
+# What proves one acceptance criterion, by its kind (bus/criteria_gate.py):
+# a code criterion is the lane's own to meet in its pull request, a live
+# one only the station's verifier can meet, and an operator one only the
+# operator's hand.
+PROOF_CHECK_BY_KIND = {
+    "code": "the pull request for this brief: it ticks this criterion, and "
+            "the change's tests pass",
+    "live": "the station's verify run, which observes it on the live system "
+            "after the change ships; a lane never ticks it",
+    "operator": "the operator, who does it by hand and ticks it; the ticket "
+                "goes to the operator for this one",
+}
+
+PROOF_CHECKS_NOTE = (
+    "Each acceptance criterion above, restated as the check that proves it. "
+    "The pull request body answers criterion by criterion: tick each code "
+    "criterion the change builds, and mark each one it does not build "
+    "\"not built: <reason>\".")
+
+
+_ACCEPTANCE_BOX_RE = re.compile(r"^\s*[-*] \[([ xX])\]\s+(.*?)\s*$")
+
+
+def _criteria_texts(body: str) -> List[str]:
+    """The ticket's acceptance criteria, as texts: the checkboxes under
+    `## Acceptance criteria` (bus/proof.py's reading), or, when that
+    section names none, under the shorter `## Acceptance` heading the
+    runner also reads. The brief check reads them the same way, so a
+    ticket it calls dispatchable always has criteria to restate."""
+    texts = [text for _, text in proof.criteria(body)]
+    if texts:
+        return texts
+    found: List[str] = []
+    inside = False
+    for line in (body or "").replace("\r", "").split("\n"):
+        if line.startswith("## "):
+            inside = line.strip() == "## Acceptance"
+            continue
+        match = _ACCEPTANCE_BOX_RE.match(line) if inside else None
+        if match:
+            found.append(match.group(2))
+    return found
+
+
+def proof_checks(body: str) -> List[Tuple[str, str]]:
+    """(criterion, the check that proves it) for each acceptance criterion
+    of a ticket body, in order (loom#2162). A brief carries these so the
+    lane knows before it starts what would prove each criterion, instead
+    of learning it from a review send-back."""
+    from . import criteria_gate  # criteria_gate imports this module
+    return [(text, PROOF_CHECK_BY_KIND[criteria_gate.kind(text)])
+            for text in _criteria_texts(body or "")]
+
+
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   fix: Optional[Fix] = None,
                   ci_checks: Optional[List[Tuple[str, str]]] = None,
@@ -714,6 +768,12 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += "\n"
     if body:
         text += body + "\n"
+    if fix is None:
+        checks = proof_checks(body)
+        if checks:
+            text += "\n## Proof checks\n\n" + PROOF_CHECKS_NOTE + "\n\n"
+            text += "".join("- %s - proved by %s.\n" % (criterion, check)
+                            for criterion, check in checks)
     if reads_stored_rows(body):
         text += "\n" + FIXTURE_NOTE + "\n"
     text += _context_text(notes, linked)

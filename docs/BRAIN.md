@@ -950,11 +950,26 @@ fund's holder carried, so the finding vanished while every affected member
 stayed affected, and by a sibling that held refunds back to stay above the
 floor. A read the check needs that fails holds the ticket for the next pass.
 
+A build ticket whose body names no acceptance criteria gets no lane either:
+no criterion could be restated as the check that proves it (the brief carries
+that restatement, under `## Proof checks`), and the runner would only park
+the brief as a work failure. The ticket goes back to `loom:queued` with
+`needs-brain` and a status event, like a health ticket, until its body names
+each criterion as a checkbox under `## Acceptance criteria` (or the shorter
+`## Acceptance` heading). An answer ticket opens no pull request and is
+exempt, as at the runner.
+
 A ticket briefed again after `loom:failed` gets a fresh branch:
 `loom/<number>-<slug>-r<attempt>`, where the attempt is one more than the
 station's earlier claim comments on it.
 
-The station polls lane PRs once per pass. Once checks finish, failed checks
+The station polls lane PRs once per pass. Once checks finish, the diff is
+scanned first for weakened tests (`bus/weakened.py`): an assertion deleted,
+a skip marker added, or an assertion loosened to a weaker form in a test
+file is sent back to the same lane as a fix round naming the lines, before
+any ready mark, since the diff alone proves it and no review round needs
+to run to find it. A file list that cannot be read skips the scan; the
+review remains the backstop. Then failed checks
 and unresolved threads started by `grug-tribe[bot]` are sent back to the same
 lane as a `loom:fix` comment, using the same findings format as
 `python3 -m bus.brain fix`. The ticket returns to `loom:briefed`; the runner
@@ -1650,6 +1665,16 @@ completed with `success`. A tick takes that line as given instead of
 re-reading the review list. `bus.brain merge` keeps its own checks.
 When a trusted brain fix is still pending on the linked ticket, status adds
 `pending brain fix` to the blockers instead of marking the pull request READY.
+A fleet hold blocks too (loom#2393): a plain pull request comment from a
+`LOOM_BRIEF_AUTHORS` or `LOOM_TRUSTED_BRIEFERS` login, made after the head
+commit, whose text opens with `Not merging` or `Hold` (any letter case, after
+optional whitespace or markdown marks such as `**`, `>` or `#`). A later
+comment by the pull request's author lifts it, as does a later trusted comment
+naming the head commit's sha (7 or more hex characters), or a newer push.
+Status prints `held by a fleet comment from LOGIN: <comment link>`, and
+`bus.brain merge` refuses with the same words. Comments that cannot be read
+block as `pull request comments unreadable`. Only the opener counts: no other
+comment text is read as a hold.
 For a line that would otherwise be READY, status also reads what `bus.brain
 merge` refuses on, through the same functions merge uses (loom#1643): a
 ticket not at `loom:pr` (`ticket at loom:running, not loom:pr`), a REST

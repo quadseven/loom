@@ -235,7 +235,10 @@ READY_FIELDS = (
     "commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } }"
     " reviews(last:100) { nodes { author { __typename login } state submittedAt } }"
     " reviewThreads(first:100) { nodes { isResolved"
-    " root: comments(first:1) { nodes { author { __typename login } createdAt } } } }")
+    " root: comments(first:1) { nodes { author { __typename login } createdAt } } } }"
+    # The pull request's own comments, for a fleet hold (loom#2393).
+    " comments(last:100) { totalCount nodes { databaseId url createdAt body"
+    " author { __typename login } } }")
 
 
 # What the "Past the last rung" section reads on top: the merge state and each
@@ -754,6 +757,113 @@ def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
     return newest > last_claim
 
 
+# A fleet hold (loom#2393): a plain pull request comment whose text opens
+# with "Not merging" or "Hold", after optional whitespace or markdown marks.
+_HOLD_OPENER = re.compile(r"^[\s>*_#`~-]*(?:not\s+merging|hold)\b", re.I)
+# A commit sha a lifting comment names: 7 to 40 hex characters.
+_SHA_WORD = re.compile(r"\b[0-9a-f]{7,40}\b", re.I)
+
+
+def hold_logins(env: Optional[Dict[str, str]] = None) -> List[str]:
+    """The fleet logins whose hold comment stops a merge: LOOM_BRIEF_AUTHORS
+    and LOOM_TRUSTED_BRIEFERS. A hold only ever blocks, so the wider list
+    is the safe one."""
+    return trusted_authors(env) + trusted_briefers(env)
+
+
+def _is_hold(login: str, body: str, allowed: set) -> bool:
+    """A trusted login's comment that opens with a hold opener."""
+    return login in allowed and bool(_HOLD_OPENER.match(body))
+
+
+def _after_push(comment: Dict[str, Any], committed: str) -> bool:
+    """Made after the head commit; with either time unknown it counts."""
+    created = str(comment.get("created_at") or "")
+    return not (committed and created and created <= committed)
+
+
+def _comments_since_push(comments: Sequence[Any], head: Dict[str, Any]
+                         ) -> List[Dict[str, Any]]:
+    """The comments made after the head commit, oldest first."""
+    committed = str(head.get("committedDate") or "")
+    found = [c for c in comments or () if isinstance(c, dict) and _after_push(c, committed)]
+    return sorted(found, key=lambda c: str(c.get("created_at") or ""))
+
+
+def _names_sha(body: str, sha: str) -> bool:
+    """The text names `sha`: a 7+ hex word its start matches."""
+    return bool(sha) and any(sha.startswith(m.group(0).lower())
+                             for m in _SHA_WORD.finditer(body))
+
+
+def _lifts_hold(login: str, body: str, author: str, sha: str, allowed: set) -> bool:
+    """A comment after a hold that lifts it: the pull request author's, or
+    a trusted one naming the head commit's sha."""
+    return (bool(author) and login == author) or (login in allowed and _names_sha(body, sha))
+
+
+def fleet_hold(comments: Sequence[Any], head: Dict[str, Any], head_sha: str,
+               pr_author: str, trusted: Sequence[str]) -> Optional[Dict[str, Any]]:
+    """The standing hold comment on a pull request, else None (loom#2393).
+    A hold is a trusted login's comment opening with "Not merging" or "Hold",
+    made after the head commit (a newer push lifts it). A later comment by
+    the pull request's author lifts it, and so does a later trusted comment
+    naming the head commit's sha. With no head commit date every hold counts."""
+    allowed = {a.lower() for a in trusted if a}
+    if not allowed:
+        return None
+    author = (pr_author or "").lower()
+    sha = (head_sha or "").lower()
+    held: Optional[Dict[str, Any]] = None
+    for comment in _comments_since_push(comments, head):
+        login = comment_login(comment).lower()
+        body = str(comment.get("body") or "")
+        if _is_hold(login, body, allowed):
+            held = comment
+        elif held is not None and _lifts_hold(login, body, author, sha, allowed):
+            held = None
+    return held
+
+
+def _hold_name(comment: Dict[str, Any]) -> str:
+    """How a refusal names a hold comment: its link, else its id."""
+    return str(comment.get("html_url") or "comment %s" % comment.get("id", "unknown"))
+
+
+def _node_comments(node: Optional[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    """A pull request's comments from status's READY_FIELDS read, in the REST
+    form fleet_hold reads, or None when that read does not hold them all."""
+    found = (node or {}).get("comments")
+    if not isinstance(found, dict) or not isinstance(found.get("nodes"), list):
+        return None
+    nodes = [n for n in found["nodes"] if isinstance(n, dict)]
+    if int(found.get("totalCount") or 0) > len(nodes):
+        return None
+    return [{"id": n.get("databaseId"), "html_url": n.get("url"), "created_at": n.get("createdAt"),
+             "body": n.get("body"), "author": n.get("author")} for n in nodes]
+
+
+def _hold_blocker(gh: GitHub, repo: str, number: int, head: Dict[str, Any],
+                  head_sha: str, pr_author: str, trusted: Sequence[str],
+                  known: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    """The blocker a standing fleet hold puts on a pull request, else None.
+    `known` is every comment, already read; else they are read from REST.
+    Comments that cannot be read block as unreadable, as other gates do."""
+    if not [a for a in trusted if a]:
+        return None
+    comments = known
+    if comments is None:
+        try:
+            comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        except GitHubError as err:
+            return ("pull request comments unreadable, so a fleet hold cannot be ruled out (%s)"
+                    % err)
+    held = fleet_hold(list(comments), head, head_sha, pr_author, trusted)
+    if held is None:
+        return None
+    return "held by a fleet comment from %s: %s" % (comment_login(held), _hold_name(held))
+
+
 def _one_line(value: Any, limit: int = 200) -> str:
     line = " ".join(str(value or "").split())
     return line if len(line) <= limit else line[:limit - 3] + "..."
@@ -843,18 +953,24 @@ def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
                         data: Dict[str, Any], bot: str,
                         authors: Sequence[str] = (), check: str = "Grug - Elder",
                         caps: Optional[Dict[str, str]] = None,
-                        now: Optional[datetime] = None) -> List[str]:
+                        now: Optional[datetime] = None,
+                        hold: Optional[Sequence[str]] = None) -> List[str]:
     """The pull request lines for status: heading, merge readiness for each
-    loom pull request, including a pending brain fix as a blocker."""
+    loom pull request, including a pending brain fix as a blocker. `hold`
+    is the fleet hold logins, hold_logins of status's env, the list merge
+    reads; None reads them from the process environment."""
     caps = {} if caps is None else caps
+    logins = hold_logins() if hold is None else list(hold)
     return ["### Pull requests"] + _read_each(
-        lambda pr: _pull_request_line(gh, repo, pr, data, bot, authors, check, caps, now), prs)
+        lambda pr: _pull_request_line(gh, repo, pr, data, bot, authors, check, caps, now,
+                                      logins), prs)
 
 
 def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
                        data: Dict[str, Any], bot: str, authors: Sequence[str],
                        check: str, caps: Optional[Dict[str, str]] = None,
-                       now: Optional[datetime] = None) -> str:
+                       now: Optional[datetime] = None,
+                       hold: Sequence[str] = ()) -> str:
     """Build one status line, including brain and goal-home blockers."""
     node = data["prs"].get(int(pr["number"]))
     line = _status_pr_line(gh, repo, pr, node, bot, check)
@@ -864,6 +980,12 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
         for blocker in _merge_refusals(gh, repo, pr, ticket, caps=caps, now=now):
             line = _add_blocker(line, blocker)
     line = _pending_fix_blocker(gh, ticket, authors, line)
+    hold = _hold_blocker(gh, repo, int(pr["number"]), _head_commit(node or {}),
+                         str((pr.get("head") or {}).get("sha") or ""),
+                         str((pr.get("user") or {}).get("login") or ""),
+                         hold, _node_comments(node))
+    if hold:
+        line = _add_blocker(line, hold)
     if operator_hold.operator_steps(str(pr.get("body") or "")):
         line = _add_blocker(line, "held for the operator: operator steps before merge")
     return _goal_rule_line(gh, repo, pr, ticket, line)
@@ -1025,12 +1147,13 @@ def _readable_section(gh: GitHub, repo: str, now: datetime, bot: str,
                       into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
                       check: str = "Grug - Elder",
                       waiting: Optional[Dict[str, Dict[str, Any]]] = None,
-                      caps: Optional[Dict[str, str]] = None) -> List[str]:
+                      caps: Optional[Dict[str, str]] = None,
+                      hold: Optional[Sequence[str]] = None) -> List[str]:
     """_repo_section, or one skipped line when GitHub will not show the repo
     (moved, gone or forbidden: github.unreadable), so one moved repo does
     not end the status of every other. Any other GitHubError still ends it."""
     try:
-        return _repo_section(gh, repo, now, bot, authors, into, check, waiting, caps)
+        return _repo_section(gh, repo, now, bot, authors, into, check, waiting, caps, hold)
     except GitHubError as err:
         reason = unreadable(err)
         if reason is None:
@@ -1047,7 +1170,8 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
                   check: str = "Grug - Elder",
                   waiting: Optional[Dict[str, Dict[str, Any]]] = None,
-                  caps: Optional[Dict[str, str]] = None) -> List[str]:
+                  caps: Optional[Dict[str, str]] = None,
+                  hold: Optional[Sequence[str]] = None) -> List[str]:
     """The repo's status section; with into, its open tickets are kept
     there under the repo's name for the cross-repo Priorities section. With
     waiting, so are the repo's open needs:human count and, per goal, the share
@@ -1082,7 +1206,8 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
-    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check, caps, now)
+    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check, caps,
+                                        now, hold)
     lines += [""] + _sensitive_pr_lines(prs)
     lines += [""] + _waiting_brain_lines(tickets, pr_of, data, now, bot)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
@@ -1227,13 +1352,15 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     _say(out, emit, ["# Loom status", "", trusted_line(authors)])
     check = review_check_name(env)
     caps: Dict[str, str] = {}
+    # The fleet hold logins merge reads (hold_logins), from this env (loom#2393).
+    hold = hold_logins(env)
 
     def read(repo: str) -> Tuple[List[str], Dict[str, Any], Dict[str, Any]]:
         # Each read keeps its own tickets and waiting count, so a timed-out
         # read that finishes late changes nothing the run prints.
         into: Dict[str, List[Dict[str, Any]]] = {}
         waits: Dict[str, Dict[str, Any]] = {}
-        return (_readable_section(gh, repo, now, bot, authors, into, check, waits, caps),
+        return (_readable_section(gh, repo, now, bot, authors, into, check, waits, caps, hold),
                 into, waits)
 
     # Each repo's reads are independent, so they run side by side; a section
@@ -3984,6 +4111,10 @@ def merge(gh: GitHub, repo: str, number: int,
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
+    hold = _hold_blocker(gh, repo, number, _head_commit(details), str(sha),
+                         str((pr.get("user") or {}).get("login") or ""), hold_logins(env))
+    if hold:
+        raise ValueError("blocked: " + hold)
     if shadow.active(repo):
         _shadow_merge(repo, number, str(sha), association, adopt,
                       "" if adopt else tier,
@@ -4065,7 +4196,7 @@ def _shadow_merge(repo: str, number: int, sha: str, ticket: Optional[Tuple[str, 
         gates = ["ticketless adopt checks"]
     else:
         gates = ["settled", "checks green and mergeable", "ticket linked and trusted",
-                 "no pending brain fix", "no operator hold"]
+                 "no pending brain fix", "no operator hold", "no fleet hold comment"]
         if sensitive:
             gates.append("sensitive review")
         gates.append("risk tier %s: review check passed, no blocking finding, under the cap"
