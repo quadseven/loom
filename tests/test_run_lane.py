@@ -299,6 +299,7 @@ fi
 if [ -n "${FAKE_REPLIES:-}" ]; then mkdir -p .loom; printf '%s' "$FAKE_REPLIES" > .loom/replies.json; fi
 if [ -n "${FAKE_SUMMARY:-}" ]; then mkdir -p .loom; printf '%s\n' "$FAKE_SUMMARY" > .loom/summary.md; fi
 if [ "${FAKE_AGENT:-commit}" = replies-only ]; then exit 0; fi
+if [ -n "${FAKE_MIGRATION:-}" ]; then mkdir -p migrations; echo 'select 1;' > migrations/0001_add.sql; fi
 if [ "${FAKE_AGENT:-commit}" = probes ]; then
   printf '# test\\n' > .test_write
   mkdir -p bin
@@ -1705,6 +1706,26 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual(len(create), 1)
         self.assertNotIn("--label", create[0])
         self.assertTrue(any(c.startswith("gh pr edit") and "--add-label class:" in c for c in self.calls()))
+
+    def test_a_migration_gets_a_one_way_risk_line_and_its_tier_label(self):
+        self.drop_brief(text=BRIEF + "\nThe new file is migrations/0001_add.sql.\n")
+        result = self.run_lane(
+            FAKE_MIGRATION="1",
+            FAKE_SUMMARY="Add the column\n\n## Risk\nDoor: two-way\nBlast radius: repo")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.body.exists(), self.run_log()[-1500:])
+        text = self.body.read_text()
+        self.assertIn("Risk: app-code, one-way door, blast radius repo", text)
+        self.assertLess(text.index("## Intent"), text.index("Risk: "))
+        self.assertLess(text.index("Risk: "), text.index("## Why"))
+        self.assertTrue(any(c.startswith("gh pr edit") and "--add-label tier:app-code" in c
+                            for c in self.calls()), self.calls())
+
+    def test_a_lane_that_says_nothing_about_risk_reads_door_unstated(self):
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(self.body.read_text(), r"Risk: \S+, door unstated, blast radius unstated")
 
     def test_a_failed_pr_create_is_parked_as_transient(self):
         # The agent's work is done and pushed; only the pull request is missing.
