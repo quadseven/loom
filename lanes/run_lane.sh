@@ -2489,8 +2489,10 @@ prepare_validation() {
   # agent's), one line of printable ASCII, at most 1000 characters; and
   # contract_run runs them sandboxed with an emptied environment.
   if [ -n "$C_SETUP" ]; then
+    check_start="$(log_size)"
     contract_run "$C_SETUP"; rc=$?
-    record setup "$C_SETUP" "$rc" "$BASE" "$([ "$rc" -eq 0 ] && echo true || echo false)"
+    [ "$rc" -eq 0 ] || failures="$(check_failures "$check_start")"
+    record setup "$C_SETUP" "$rc" "$BASE" "$([ "$rc" -eq 0 ] && echo true || echo false)" "$failures"
     if [ "$rc" -eq 143 ]; then
       PARK_CLASS=transient
       SETUP_REASON="setup interrupted by SIGTERM"

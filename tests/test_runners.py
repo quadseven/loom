@@ -49,6 +49,7 @@ class FakeGitHub:
         self.zips = {}          # artifact id -> bytes
         self.next_run = 900
         self.heads = {}         # repo -> default branch head
+        self.refs = {}          # other branch -> head
 
     def rest(self, method, path, body=None, etag=None, ok=()):
         self.calls.append((method, path, body))
@@ -72,8 +73,10 @@ class FakeGitHub:
             return Response(302, None, headers={"location": "https://blob.example.com/%s" % parts[-2]})
         if "/actions/runs/" in path:
             return Response(200, self.runs[int(parts[-1])])
-        if path.endswith("/commits/HEAD"):
-            return Response(200, {"sha": self.heads["/".join(parts[2:4])]})
+        if "/commits/" in path:
+            ref = parts[-1]
+            sha = self.heads["/".join(parts[2:4])] if ref == "HEAD" else self.refs[ref]
+            return Response(200, {"sha": sha})
         raise AssertionError("unexpected request %s %s" % (method, path))
 
     def posts(self, suffix):
@@ -304,9 +307,9 @@ class RunnersTest(unittest.TestCase):
         self.assertTrue(self.beat()["available"])
 
     # -- a repo whose base check is red on the slot's runner -------------------
-    def run_base(self, name, rows, image="image-a"):
+    def run_base(self, name, rows, image="image-a", text=BRIEF):
         """Dispatch brief `name` and finish its run with these validation rows."""
-        self.drop_brief(name=name)
+        self.drop_brief(text, name=name)
         self.runner().tend()
         run, run_id = self.last_run()
         log = "logs/opencode-go-2/%s" % name
@@ -378,6 +381,60 @@ class RunnersTest(unittest.TestCase):
         rows = self.RED + [{"phase": "default-baseline", "exit": 0, "revision": "ccc", "ok": True}]
         self.gh.heads["owner/app"] = "ccc"
         self.run_base("owner.app-1", rows)
+        sent = len(self.gh.posts("/dispatches"))
+        self.drop_brief(name="owner.app-2")
+        self.runner().tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), sent + 1)
+
+    def test_a_base_check_that_passes_on_its_second_run_counts_for_nothing(self):
+        self.gh.heads["owner/app"] = "aaa"
+        flake = [self.RED[0], {"phase": "baseline", "exit": 0, "revision": "aaa", "ok": True}]
+        self.run_base("owner.app-1", flake)
+        self.run_base("owner.app-2", flake)
+        sent = len(self.gh.posts("/dispatches"))
+        self.drop_brief(name="owner.app-3")
+        self.runner().tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), sent + 1)
+
+    def test_a_fix_round_head_never_counts_as_the_base(self):
+        self.gh.heads["owner/app"] = "aaa"
+        self.run_base("owner.app-1", [self.RED[0]])
+        fix = BRIEF.replace("Lane:", "Fix-PR: 12\nLane:")
+        green_head = [{"phase": "baseline", "exit": 0, "revision": "fff", "ok": True}]
+        self.run_base("owner.app-2", green_head, text=fix)
+        self.run_base("owner.app-3", [self.RED[0]])
+        sent = len(self.gh.posts("/dispatches"))
+        self.drop_brief(name="owner.app-4")
+        self.runner().tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), sent)
+
+    def test_a_failing_setup_counts_like_a_failing_check(self):
+        self.gh.heads["owner/app"] = "aaa"
+        row = {"phase": "setup", "exit": 127, "revision": "aaa", "ok": False}
+        self.run_base("owner.app-1", [row])
+        self.run_base("owner.app-2", [row])
+        sent = len(self.gh.posts("/dispatches"))
+        self.drop_brief(name="owner.app-3")
+        self.runner().tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), sent)
+
+    def test_a_stop_compares_the_briefs_own_base_branch(self):
+        self.gh.heads["owner/app"] = "zzz"
+        self.gh.refs["release"] = "aaa"
+        self.run_base("owner.app-1", self.RED, text=BRIEF.replace("Lane:", "Base: release\nLane:"))
+        sent = len(self.gh.posts("/dispatches"))
+        self.drop_brief(BRIEF.replace("Lane:", "Base: release\nLane:"), name="owner.app-2")
+        self.runner().tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), sent)
+        self.drop_brief(name="owner.app-3")
+        self.runner().tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), sent + 1)
+
+    def test_a_slot_with_no_run_for_a_day_tries_a_stopped_repo_once(self):
+        # A sole red repo stops every run, so no report could show a new image.
+        self.gh.heads["owner/app"] = "aaa"
+        self.run_base("owner.app-1", self.RED)
+        self.now += runners.IMAGE_PROBE + 1
         sent = len(self.gh.posts("/dispatches"))
         self.drop_brief(name="owner.app-2")
         self.runner().tend()

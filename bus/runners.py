@@ -51,6 +51,7 @@ import tarfile
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import sys
@@ -95,7 +96,9 @@ OPENSSL_TIMEOUT = 60
 # A runner's base check failures of one repo at one revision before the slot
 # stops taking the repo: one run records two (a red check runs twice).
 BASE_RED_MAX = 2
-BASE_PHASES = ("baseline", "default-baseline")
+BASE_PHASES = ("setup", "baseline", "default-baseline")
+# With no report from a slot for this long, a stopped repo gets one more run.
+IMAGE_PROBE = 86400
 # Ledger entries whose brief has left the inbox are dropped after this long.
 KEEP_SECONDS = 7 * 86400
 
@@ -363,7 +366,8 @@ class Runners:
             self._park(slot, ticket, "runner slots take public repos only, and %s is not one"
                        % (repo or "the brief's repo"), "transient")
             return
-        red = self._base_red(ledger, slot, repo)
+        base = brief_field(brief, "Base")
+        red = self._base_red(ledger, slot, repo, base)
         if red:
             entry["state"] = "refused"
             self.save(ledger)
@@ -374,7 +378,7 @@ class Runners:
             self._park(slot, ticket, "the base check of %s is red on this runner at %s; "
                        "another lane takes it" % (repo, red["revision"][:12]), "transient")
             return
-        entry["repo"] = repo
+        entry.update({"repo": repo, "base": base, "fix": bool(brief_field(brief, "Fix-PR"))})
         run_id = uuid.uuid4().hex
         mac_key = secrets.token_hex(32)
         inputs = {"slot": slot, "ticket": ticket, "brief": brief, "run_id": run_id,
@@ -428,15 +432,24 @@ class Runners:
         self.say("dispatched %s to a cluster runner (run id %s)" % (key, run_id))
 
     # -- a repo whose base check is red on the slot's runner ----------------
-    def _base_red(self, ledger: Dict[str, Any], slot: str, repo: str) -> Optional[Dict[str, Any]]:
-        """The record that stops `repo` on `slot`, or None. A head that moved
-        off the failing revision clears it; a head that cannot be read keeps
-        it, and the next dispatch asks again."""
+    def _base_red(self, ledger: Dict[str, Any], slot: str, repo: str,
+                  base: str) -> Optional[Dict[str, Any]]:
+        """The record that stops `repo` on `slot` for a brief on branch `base`
+        (empty is the default branch), or None. A head that moved off the
+        failing revision clears it, and so does a day with no report from the
+        slot: only a run can show a new runner image, and a sole red repo
+        lets none run. A head that cannot be read keeps it."""
         red = (ledger["base_red"].get(slot) or {}).get(repo)
-        if not red or int(red.get("failures") or 0) < BASE_RED_MAX:
+        if (not red or int(red.get("failures") or 0) < BASE_RED_MAX
+                or red.get("base", "") != base):
+            return None
+        seen = (ledger["images"].get(slot) or {}).get("at") or 0
+        if self.now - float(seen) >= IMAGE_PROBE:
+            del ledger["base_red"][slot][repo]
             return None
         try:
-            head = self.gh.rest("GET", "/repos/%s/commits/HEAD" % repo).data
+            head = self.gh.rest("GET", "/repos/%s/commits/%s"
+                                % (repo, urllib.parse.quote(base or "HEAD", safe=""))).data
         except RateLimited:
             raise
         except Exception as err:  # noqa: BLE001 - any failed read keeps the stop
@@ -456,41 +469,44 @@ class Runners:
         image = raw.decode("ascii", "replace").strip() if raw else ""
         if not image:
             return
-        if ledger["images"].get(slot) not in (None, image):
+        known = ledger["images"].get(slot) or {}
+        if known.get("id") not in (None, image):
             ledger["base_red"].pop(slot, None)
-        ledger["images"][slot] = image
+        ledger["images"][slot] = {"id": image, "at": self.now}
 
     def _note_base(self, ledger: Dict[str, Any], entry: Dict[str, Any],
                    files: Dict[str, bytes]) -> None:
-        """Count a report's base check failures for the entry's repo. A green
-        default branch means only a fix round's head was red, and a pass on
-        the base clears the count. SIGTERM (143) says nothing of the repo."""
+        """Count a report's base failures for the entry's repo. A run's last
+        row decides: a check that passed on its second run is green, and a
+        pass clears the count. A fix round's own head is not the base, so only
+        its default-branch rows count. SIGTERM (143) says nothing of the repo."""
         slot, ticket, repo = entry["slot"], entry["ticket"], entry.get("repo")
         raw = files.get("logs/%s/%s.validation.jsonl" % (slot, ticket))
         if not repo or raw is None:
             return
+        phases = ("default-baseline",) if entry.get("fix") else BASE_PHASES
         rows = []
         for line in raw.decode("utf-8", "replace").splitlines():
             try:
                 row = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(row, dict) and row.get("phase") in BASE_PHASES and row.get("exit") != 143:
+            if isinstance(row, dict) and row.get("phase") in phases and row.get("exit") != 143:
                 rows.append(row)
-        reds = [r for r in rows if not r.get("ok")]
-        repos = ledger["base_red"].setdefault(slot, {})
-        if not rows or any(r.get("ok") for r in rows if r["phase"] == "default-baseline"):
+        if not rows:
             return
-        if not reds:
+        repos = ledger["base_red"].setdefault(slot, {})
+        last = rows[-1]
+        if last.get("ok"):
             repos.pop(repo, None)
             return
-        revision = str(reds[-1].get("revision") or "")
-        count = sum(1 for r in reds if str(r.get("revision") or "") == revision)
+        revision = str(last.get("revision") or "")
+        count = sum(1 for r in rows if not r.get("ok") and str(r.get("revision") or "") == revision)
         known = repos.get(repo) or {}
         if known.get("revision") == revision:
             count += int(known.get("failures") or 0)
-        repos[repo] = {"revision": revision, "failures": count,
-                       "why": str(reds[-1].get("detail") or "exit %s" % reds[-1].get("exit"))[:200]}
+        repos[repo] = {"revision": revision, "failures": count, "base": entry.get("base", ""),
+                       "why": str(last.get("detail") or "exit %s" % last.get("exit"))[:200]}
 
     # -- following a run ---------------------------------------------------
     def provenance(self, run: Dict[str, Any]) -> str:

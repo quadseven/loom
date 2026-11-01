@@ -1973,8 +1973,10 @@ sealed report. After two such failures of one repo at one revision on a slot
 the station stops giving that slot the repo: it parks each brief `[transient]`
 without a dispatch, until the repo's head moves or a run reports a new runner
 image (a fingerprint of the image's packages and tools, `<ticket>.image`). One
-run records two failures, because a red check runs twice. A red fix head over
-a green default branch counts for nothing.
+run records two failures, because a red check runs twice. A failed `setup:`
+counts too. A check that passed on its second run counts for nothing, and only
+a fix round's default-branch rows count. A day with no report from the slot
+lets one run through, because only a run can show a new image.
 
 The job, step by step (`lanes/k8s/lane_job.py`):
 
