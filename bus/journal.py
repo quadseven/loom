@@ -1,7 +1,6 @@
 """The journal and report comment formats from docs/BRAIN.md."""
 from __future__ import annotations
 
-import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import (Any, Callable, Collection, Dict, Iterable, Mapping, Optional, Sequence, Set,
@@ -252,13 +251,7 @@ def _self_login(gh: GitHub) -> str:
     LOOM_GITHUB_LOGIN (brain.sh sets it for an agent that holds only an
     installation token, which GET /user refuses), else the token's user (read
     once and kept on the client)."""
-    login = gh.app_login() or os.environ.get("LOOM_GITHUB_LOGIN", "").strip()
-    if login:
-        return login
-    if getattr(gh, "_journal_login", None) is None:
-        data = gh.rest("GET", "/user").data
-        gh._journal_login = str((data or {}).get("login") or "") if isinstance(data, dict) else ""
-    return gh._journal_login
+    return _decision_claim.client_login(gh)
 
 
 def todays_journal(gh: GitHub, repo: str, issue_number: int,

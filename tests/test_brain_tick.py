@@ -592,8 +592,10 @@ class BrainTickTest(unittest.TestCase):
         # other LOOM_* variable, keys and SSM names included.
         _, calls = self.spark_tick(LOOM_FOO_TOKEN="foo-secret-value",
                                    LOOM_OPENCODE_GO_KEY_SSM="/example/key",
-                                   LOOM_BRIEF_AUTHORS="example-author")
+                                   LOOM_BRIEF_AUTHORS="example-author",
+                                   LOOM_ASK_ANSWERERS="example-answerer")
         settings = [c for c in calls if c.startswith("opencode setting ")]
+        self.assertIn("opencode setting LOOM_ASK_ANSWERERS=example-answerer", settings)
         self.assertIn("opencode setting LOOM_REPOS=example/project", settings)
         self.assertIn("opencode setting LOOM_BRIEF_AUTHORS=example-author", settings)
         self.assertIn("opencode setting LOOM_GITHUB_TOKEN=gho_faketoken123", settings)
