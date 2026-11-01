@@ -424,6 +424,7 @@ def brain_routes(body, files, patches):
         "/repos/%s/contents/.github/workflows" % BRAIN_REPO: [{"name": "sync.yml"}],
         # bus/merge_tier.py: the review check passed on the head, and no
         # loom/ pull request merged in the last hour.
+        "/repos/%s/compare/main...checked" % BRAIN_REPO: {"behind_by": 0},
         "/repos/%s/commits/checked/check-runs" % BRAIN_REPO: {"check_runs": [
             {"name": "Grug - Elder", "status": "completed", "conclusion": "success"}]},
         "/search/issues": {"total_count": 0},

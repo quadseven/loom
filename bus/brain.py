@@ -949,7 +949,7 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
         return found + [str(err)]
     if tier != merge_tier.REVERT and tier not in merge_tier.auto_tiers(None):
         found.append("held for the operator: %s" % tier)
-    if _behind_by(gh, repo, rest):
+    if tier != merge_tier.REVERT and _behind_by(gh, repo, rest):
         found.append(BEHIND_REFUSAL)
     return found
 
@@ -3895,7 +3895,8 @@ def merge(gh: GitHub, repo: str, number: int,
             raise ValueError(reason)
         _refuse_merge_constraints(gh, repo, number, association, issue)
         tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env, verdict)
-    if _behind_by(gh, repo, pr):
+    # A deploy revert goes through on its old base: waiting would keep the fault live.
+    if tier != merge_tier.REVERT and _behind_by(gh, repo, pr):
         raise ValueError(BEHIND_REFUSAL)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
